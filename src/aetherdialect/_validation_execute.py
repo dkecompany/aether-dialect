@@ -366,7 +366,12 @@ def validate_sql(
             raw = (explain_err or "").strip()
             if explain_diags and explain_diags[0].code == SqlDiagnosticCode.EXPLAIN_COST_EXCEEDED:
                 msg = explain_diags[0].message or raw
-                return False, msg, FailureCategory.EXECUTION_COST_EXCEEDED, list(explain_diags)
+                return (
+                    False,
+                    msg,
+                    FailureCategory.EXECUTION_COST_EXCEEDED,
+                    list(explain_diags),
+                )
             code = _classify_explain_sql_failure(raw)
             formatted = _format_explain_validation_error(code, raw)
             ecat = _classify_explain_error(getattr(dialect, "name", ""), raw)
@@ -1565,9 +1570,7 @@ def validate_semantics(
                 cte_context,
             )
         )
-        all_issues.extend(
-            validate_expr_vs_expr_filters(cte.filters_param or [], schema, cte_outputs, cte_context)
-        )
+        all_issues.extend(validate_expr_vs_expr_filters(cte.filters_param or [], schema, cte_outputs, cte_context))
         all_issues.extend(validate_agg_vs_agg_having(cte.having_param or [], schema, cte_outputs, cte_context))
         all_issues.extend(
             _validate_case_branches_for_scope(
@@ -1674,9 +1677,7 @@ def curated_warmup_semantic_issues(intent: RuntimeIntent, schema: SchemaGraph) -
 
     vr = validate_semantics(intent, schema, post_binding=True)
     return list(
-        dict.fromkeys(
-            i.message for i in vr.issues if (i.severity or "").lower() == "error"
-        ),
+        dict.fromkeys(i.message for i in vr.issues if (i.severity or "").lower() == "error"),
     )
 
 

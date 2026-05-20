@@ -4101,7 +4101,11 @@ class TestRepairArrayFiltersIntent:
         title = ColumnMetadata(name="title", data_type="varchar", value_type="string")
         t = TableMetadata(
             name="article",
-            columns={"tags": tags, "title": title, "cnt": ColumnMetadata(name="cnt", data_type="integer", value_type="integer")},
+            columns={
+                "tags": tags,
+                "title": title,
+                "cnt": ColumnMetadata(name="cnt", data_type="integer", value_type="integer"),
+            },
             foreign_keys=[],
             primary_key="",
         )

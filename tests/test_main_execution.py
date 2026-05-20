@@ -74,7 +74,7 @@ class TestLoadConfigFile:
         path.write_text(
             "\n".join(
                 (
-                    '[openai]',
+                    "[openai]",
                     'api_key = "oak"',
                     'base_url = "https://example-openai/v1"',
                     "",
@@ -158,7 +158,9 @@ class TestLoadConfigFile:
         assert frozenset(expected.keys()) <= claimed
 
 
-def test_load_config_file_claims_empty_openai_api_key_without_flat_value(tmp_path) -> None:
+def test_load_config_file_claims_empty_openai_api_key_without_flat_value(
+    tmp_path,
+) -> None:
     path = tmp_path / "empty_key.toml"
     path.write_text('[openai]\napi_key = ""\n', encoding="utf-8")
     flat, claimed = main_execution_module._load_config_file(str(path))
@@ -166,7 +168,9 @@ def test_load_config_file_claims_empty_openai_api_key_without_flat_value(tmp_pat
     assert "OPENAI_API_KEY" in claimed
 
 
-def test_merge_configuration_environment_precedence(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_merge_configuration_environment_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("POSTGRES_HOST", "from_os")
     config_values = {"POSTGRES_HOST": "from_toml"}
     merged, _keys = main_execution_module._merge_configuration_environment(config_values)
@@ -180,7 +184,9 @@ def test_merge_toml_diagnostic_when_toml_wins(monkeypatch: pytest.MonkeyPatch) -
     assert "POSTGRES_HOST" in keys
 
 
-def test_merge_configuration_environment_ssot_clears_claimed_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_merge_configuration_environment_ssot_clears_claimed_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "from_env")
     merged, _diag = main_execution_module._merge_configuration_environment(
         {},
@@ -189,7 +195,9 @@ def test_merge_configuration_environment_ssot_clears_claimed_empty(monkeypatch: 
     assert "OPENAI_API_KEY" not in merged
 
 
-def test_merge_configuration_environment_ssot_toml_wins(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_merge_configuration_environment_ssot_toml_wins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("POSTGRES_HOST", "from_os")
     merged, keys = main_execution_module._merge_configuration_environment(
         {"POSTGRES_HOST": "from_toml"},
@@ -203,7 +211,10 @@ class TestPrepareSchemaContextForInit:
     """Tests for :func:`aetherdialect._main_execution._prepare_schema_context_for_init`."""
 
     def test_reuses_cached_sql_when_missing_in_explicit_context(self, tmp_path) -> None:
-        from aetherdialect._main_execution import _prepare_schema_context_for_init, write_schema_context_cache
+        from aetherdialect._main_execution import (
+            _prepare_schema_context_for_init,
+            write_schema_context_cache,
+        )
 
         sql = tmp_path / "ddl.sql"
         sql.write_text("SELECT 1;", encoding="utf-8")
@@ -858,9 +869,15 @@ class TestPipelineSessionSuspendToStep:
         assert step.data is None
 
     def test_direct_reuse_suspend_populates_sql_data_message(self) -> None:
-        from aetherdialect._config import PIPELINE_SUSPEND_ID_DIRECT_REUSE, GenerationPath
+        from aetherdialect._config import (
+            PIPELINE_SUSPEND_ID_DIRECT_REUSE,
+            GenerationPath,
+        )
         from aetherdialect._contracts_base import PipelineSuspended
-        from aetherdialect._contracts_core import DirectReuseSuspendContext, RuntimeIntent
+        from aetherdialect._contracts_core import (
+            DirectReuseSuspendContext,
+            RuntimeIntent,
+        )
         from aetherdialect._main_execution import PipelineSession
 
         ri = RuntimeIntent(
@@ -958,9 +975,16 @@ def test_reader_mode_does_not_save_templates(monkeypatch: pytest.MonkeyPatch, tm
 def test_writer_drain_applies_reader_event(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     from datetime import datetime, timezone
 
-    from aetherdialect._config import AUDIT_EVENT_WRITE_QUEUE_FEEDBACK_RECORD, EngineConfig
+    from aetherdialect._config import (
+        AUDIT_EVENT_WRITE_QUEUE_FEEDBACK_RECORD,
+        EngineConfig,
+    )
     from aetherdialect._contracts_base import WriteQueueEvent
-    from aetherdialect._contracts_core import FeedbackKind, QuestionFeedbackEntry, RejectionBucket
+    from aetherdialect._contracts_core import (
+        FeedbackKind,
+        QuestionFeedbackEntry,
+        RejectionBucket,
+    )
     from aetherdialect._main_execution import drain_write_queue, emit_write_queue_event
     from aetherdialect._templates import empty_template_store, store_to_templates
 
@@ -1027,7 +1051,10 @@ def test_writer_lock_reentered_on_resume() -> None:
     sess = PipelineSession(owner, mode="writer")
     sess._suspended = PipelineSuspended("st", "m", MagicMock())
 
-    with patch("aetherdialect._main_execution._core_utils.llm_execution_scope", lambda *_a, **_k: nullcontext()):
+    with patch(
+        "aetherdialect._main_execution._core_utils.llm_execution_scope",
+        lambda *_a, **_k: nullcontext(),
+    ):
         with patch("aetherdialect._main_execution.dispatch_pipeline_resume", lambda s, e: None):
             sess._resume_from_suspend()
     assert lock.__enter__.call_count >= 1

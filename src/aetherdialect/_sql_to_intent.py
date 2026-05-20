@@ -60,8 +60,16 @@ from ._contracts_core import (
     runtime_intent_to_concrete,
 )
 from ._core_utils import sha256, stable_json
-from ._dialect import DatabricksDialect, PostgresDialect, _pg_columnref_to_pair, _pg_funcname
-from ._intent_process import cte_structural_signature, union_runtime_concrete_compatibility
+from ._dialect import (
+    DatabricksDialect,
+    PostgresDialect,
+    _pg_columnref_to_pair,
+    _pg_funcname,
+)
+from ._intent_process import (
+    cte_structural_signature,
+    union_runtime_concrete_compatibility,
+)
 from ._sql_gen import build_deterministic_sql
 from ._utils import body_similarity_key, sql_shape
 from sqlalchemy import text
@@ -190,7 +198,9 @@ def _runtime_intent_from_cte_step(step: RuntimeCteStep) -> RuntimeIntent:
     )
 
 
-def _merge_union_compatible_cte_cluster(cluster: list[RuntimeCteStep]) -> list[RuntimeCteStep]:
+def _merge_union_compatible_cte_cluster(
+    cluster: list[RuntimeCteStep],
+) -> list[RuntimeCteStep]:
     """Greedy union-merge of CTE steps sharing :func:`_cte_body_shell_key`."""
 
     if len(cluster) <= 1:
@@ -350,7 +360,9 @@ def _infer_sqlglot_read(dialect: Any) -> str:
     return "postgres"
 
 
-def _expr_from_sqlglot_projection(node: sqlglot_exp.Expression) -> NormalizedExpr | None:
+def _expr_from_sqlglot_projection(
+    node: sqlglot_exp.Expression,
+) -> NormalizedExpr | None:
     """
     Build a minimal :class:`NormalizedExpr` leaf from a sqlglot SELECT projection.
 
@@ -482,7 +494,12 @@ def _runtime_from_pglast_sql(sql: str, schema: SchemaGraph) -> RuntimeIntent | N
     tables_agg: set[str] = set(intent.tables or [])
     for st in cte_steps:
         tables_agg.update(st.tables or [])
-    intent = replace(intent, tables=sorted(tables_agg), param_values=dict(param_store), cte_steps=cte_steps)
+    intent = replace(
+        intent,
+        tables=sorted(tables_agg),
+        param_values=dict(param_store),
+        cte_steps=cte_steps,
+    )
     return intent
 
 
@@ -535,7 +552,9 @@ def _pg_convert_select_stmt(
             prior.add(name)
         allowed_cte = allowed_cte | prior
 
-    body_pair = _pg_runtime_intent_body_from_select(sel, schema, param_store, next_lit_key, frozenset(allowed_cte), PgExtra())
+    body_pair = _pg_runtime_intent_body_from_select(
+        sel, schema, param_store, next_lit_key, frozenset(allowed_cte), PgExtra()
+    )
     body, sj_body = body_pair
     if body is None:
         return None
@@ -581,7 +600,9 @@ def _pg_materialize_cte_body(
             prior.add(nm)
         allowed_here |= prior
 
-    body_pair = _pg_runtime_intent_body_from_select(sel, schema, param_store, next_lit_key, frozenset(allowed_here), PgExtra())
+    body_pair = _pg_runtime_intent_body_from_select(
+        sel, schema, param_store, next_lit_key, frozenset(allowed_here), PgExtra()
+    )
     body, sj_local = body_pair
     if body is None:
         return None
@@ -919,7 +940,13 @@ def _pg_runtime_intent_body_from_select(
     group_by_cols: list[NormalizedExpr] = []
     if getattr(sel, "groupClause", None):
         gb = _pg_group_clause(
-            sel.groupClause, alias_map, single_alias, select_cols, param_store, next_lit_key, pgx
+            sel.groupClause,
+            alias_map,
+            single_alias,
+            select_cols,
+            param_store,
+            next_lit_key,
+            pgx,
         )
         if gb is None:
             return None, []
@@ -928,7 +955,13 @@ def _pg_runtime_intent_body_from_select(
     order_by_cols: list[OrderByCol] = []
     if getattr(sel, "sortClause", None):
         ob = _pg_sort_clause(
-            sel.sortClause, alias_map, single_alias, param_store, next_lit_key, select_cols, pgx
+            sel.sortClause,
+            alias_map,
+            single_alias,
+            param_store,
+            next_lit_key,
+            select_cols,
+            pgx,
         )
         if ob is None:
             return None, []
@@ -1261,7 +1294,6 @@ def _pg_expr_leaf(
     return None
 
 
-
 def _pg_typename_cast_str(type_name: Any) -> str | None:
     """Render a ``TypeName`` chain as a SQL type string."""
 
@@ -1478,7 +1510,13 @@ def _pg_window_def_to_spec(
     if part is None:
         return None
     order = _pg_window_sort_clause(
-        wdef.orderClause, alias_map, single_alias, param_store, next_lit_key, select_cols, pgx
+        wdef.orderClause,
+        alias_map,
+        single_alias,
+        param_store,
+        next_lit_key,
+        select_cols,
+        pgx,
     )
     if order is None:
         return None
@@ -1553,7 +1591,16 @@ def _pg_funcall_with_over_to_registry_step(
 
     if not isinstance(fn, FuncCall) or not getattr(fn, "over", None):
         return None
-    ws = _pg_window_def_to_spec(fn.over, fn, alias_map, single_alias, param_store, next_lit_key, select_cols, pgx)
+    ws = _pg_window_def_to_spec(
+        fn.over,
+        fn,
+        alias_map,
+        single_alias,
+        param_store,
+        next_lit_key,
+        select_cols,
+        pgx,
+    )
     if ws is None:
         return None
     rid = pgx.next_window_id()
@@ -1579,9 +1626,7 @@ def _pg_caseexpr_to_registry_step(
     for cw in node.args or ():
         if not isinstance(cw, CaseWhen):
             return None
-        cond = _pg_single_predicate_to_filter(
-            cw.expr, alias_map, single_alias, param_store, next_lit_key, pgx
-        )
+        cond = _pg_single_predicate_to_filter(cw.expr, alias_map, single_alias, param_store, next_lit_key, pgx)
         if cond is None:
             return None
         cond = replace(cond, bool_op="AND", filter_group=None)
@@ -1616,7 +1661,10 @@ def _pg_caseexpr_to_registry_step(
             return None
     rid = pgx.next_case_id()
     pgx.case_registry.append(
-        CaseRegistryStep(registry_id=rid, case_when=CaseWhenExpr(branches=branches, else_result=else_result))
+        CaseRegistryStep(
+            registry_id=rid,
+            case_when=CaseWhenExpr(branches=branches, else_result=else_result),
+        )
     )
     return NormalizedExpr.from_column(rid)
 
@@ -1724,13 +1772,17 @@ def _pg_expr_full(
             if not (allow_window and pgx is not None and select_cols is not None):
                 return None
             win = _pg_funcall_with_over_to_registry_step(
-                node, alias_map, single_alias, param_store, next_lit_key, select_cols, pgx
+                node,
+                alias_map,
+                single_alias,
+                param_store,
+                next_lit_key,
+                select_cols,
+                pgx,
             )
             return win
         if allow_aggregate:
-            agg = _pg_aggregate_funcall_to_expr(
-                node, alias_map, single_alias, param_store, next_lit_key, pgx
-            )
+            agg = _pg_aggregate_funcall_to_expr(node, alias_map, single_alias, param_store, next_lit_key, pgx)
             if agg is not None:
                 return agg
         raw = (_pg_funcname(node) or "").strip().lower()
@@ -1755,7 +1807,11 @@ def _pg_expr_full(
             )
             if inner is None:
                 return None
-            mg = MulGroup(multiply=[inner], scalar_func="extract", scalar_func_args=[str(fld[0]).strip()])
+            mg = MulGroup(
+                multiply=[inner],
+                scalar_func="extract",
+                scalar_func_args=[str(fld[0]).strip()],
+            )
             return NormalizedExpr(add_groups=[mg])
         if fn_name in {"upper", "lower", "trim"}:
             parts = list(node.args or ())
@@ -1833,7 +1889,11 @@ def _pg_expr_full(
             )
             if l_e is None or r_e is None:
                 return None
-            mg = MulGroup(multiply=[l_e], scalar_func="nullif", scalar_func_args=[_pg_expr_sql_token(r_e)])
+            mg = MulGroup(
+                multiply=[l_e],
+                scalar_func="nullif",
+                scalar_func_args=[_pg_expr_sql_token(r_e)],
+            )
             return NormalizedExpr(add_groups=[mg])
         op_raw = (_pg_a_expr_op_name(node) or "").strip()
         if node.kind == A_Expr_Kind.AEXPR_OP and op_raw in {"+", "-", "*", "/"}:
@@ -1958,7 +2018,6 @@ def _pg_res_target_to_expr(
         allow_window=True,
         select_cols=select_cols,
     )
-
 
 
 def _pg_flatten_bool_and(node: Any) -> list[Any]:
@@ -2259,9 +2318,7 @@ def _pg_walk_bool_to_filter_groups(
                 sub = _pg_flatten_bool_and(arg)
                 first_arm = True
                 for subp in sub:
-                    fp = _pg_single_predicate_to_filter(
-                        subp, alias_map, single_alias, param_store, next_lit_key, pgx
-                    )
+                    fp = _pg_single_predicate_to_filter(subp, alias_map, single_alias, param_store, next_lit_key, pgx)
                     if fp is None:
                         return None
                     bo = "AND"
@@ -2752,7 +2809,9 @@ def convert_sql_to_intent(
         return ConverterResult(h, None, "ROUND_TRIP_SHAPE_MISMATCH", "shape gate failed")
     if not _check_round_trip_intent_parity(intent, schema, dialect, sqlglot_read):
         return ConverterResult(h, None, "ROUND_TRIP_INTENT_DRIFT", "intent parity gate failed")
-    if verify_via_execute and not _check_round_trip_execute(sql, intent, schema, dialect, limit=WARMUP_ROUND_TRIP_LIMIT):
+    if verify_via_execute and not _check_round_trip_execute(
+        sql, intent, schema, dialect, limit=WARMUP_ROUND_TRIP_LIMIT
+    ):
         return ConverterResult(h, None, "ROUND_TRIP_EXECUTE_MISMATCH", "execute oracle gate failed")
     return ConverterResult(h, intent, None, "")
 
@@ -2785,7 +2844,9 @@ def _union_merge_bucket_key(intent: RuntimeIntent) -> str:
     return sha256(stable_json(fp))
 
 
-def _merge_union_compatible_intents(cluster: list[RuntimeIntent]) -> list[RuntimeIntent]:
+def _merge_union_compatible_intents(
+    cluster: list[RuntimeIntent],
+) -> list[RuntimeIntent]:
     """
     Pairwise-merge compatible intents using the same union rules as template matching.
 
@@ -3170,4 +3231,3 @@ def sql_history_paraphrase_budget() -> int:
     """Return configured paraphrase count for SQL-history warmup."""
 
     return int(WARMUP_PARAPHRASE_COUNT_FROM_SQL)
-

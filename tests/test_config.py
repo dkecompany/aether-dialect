@@ -670,7 +670,9 @@ class TestEngineConfig:
         ad_pkg = importlib.import_module("aetherdialect")
         assert "EngineConfig" not in getattr(ad_pkg, "__all__", ())
         with pytest.raises(ImportError):
-            from aetherdialect import EngineConfig  # noqa: F401 — intentionally invalid public import
+            from aetherdialect import (
+                EngineConfig,
+            )  # noqa: F401 — intentionally invalid public import
 
 
 class TestQSimConfig:
@@ -955,9 +957,7 @@ class TestPlannerMandatoryConventions:
         from aetherdialect._intent_process import PLANNER_NL_CONVENTIONS
 
         mandatory = list(PLANNER_NL_CONVENTIONS["mandatory"])
-        assert any(
-            "group_by" in m and "order_by" in m and "limit" in m and "empty" in m.lower() for m in mandatory
-        )
+        assert any("group_by" in m and "order_by" in m and "limit" in m and "empty" in m.lower() for m in mandatory)
 
 
 class TestConfigFileFullCoverage:
@@ -970,7 +970,7 @@ class TestConfigFileFullCoverage:
         path.write_text(
             "\n".join(
                 (
-                    '[openai]',
+                    "[openai]",
                     'api_key = "oak"',
                     'base_url = "https://example-openai/v1"',
                     "",

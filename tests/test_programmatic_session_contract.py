@@ -77,7 +77,10 @@ def test_pipeline_session_ask_typeerror_non_str() -> None:
 def test_pipeline_session_ask_blocked_emits_audit() -> None:
     from aetherdialect._contracts_base import SessionActiveError
     from aetherdialect._main_execution import PipelineSession
-    from aetherdialect._pipeline import PIPELINE_SUSPEND_ID_INTENT_CONFIRM, PipelineSuspended
+    from aetherdialect._pipeline import (
+        PIPELINE_SUSPEND_ID_INTENT_CONFIRM,
+        PipelineSuspended,
+    )
 
     owner = _session_owner()
     sess = PipelineSession(owner)
@@ -93,7 +96,10 @@ def test_pipeline_session_ask_blocked_emits_audit() -> None:
 
 def test_ask_until_done_yes_resumes_to_completion() -> None:
     from aetherdialect._main_execution import PipelineSession
-    from aetherdialect._pipeline import PIPELINE_SUSPEND_ID_INTENT_CONFIRM, PipelineSuspended
+    from aetherdialect._pipeline import (
+        PIPELINE_SUSPEND_ID_INTENT_CONFIRM,
+        PipelineSuspended,
+    )
 
     owner = _session_owner()
     sess = PipelineSession(owner)
@@ -110,7 +116,10 @@ def test_ask_until_done_yes_resumes_to_completion() -> None:
 def test_ask_until_done_free_text_suspend_raises() -> None:
     from aetherdialect._contracts_base import SessionActiveError
     from aetherdialect._main_execution import PipelineSession
-    from aetherdialect._pipeline import PIPELINE_SUSPEND_ID_INTENT_FEEDBACK, PipelineSuspended
+    from aetherdialect._pipeline import (
+        PIPELINE_SUSPEND_ID_INTENT_FEEDBACK,
+        PipelineSuspended,
+    )
 
     owner = _session_owner()
     sess = PipelineSession(owner)

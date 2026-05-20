@@ -2230,7 +2230,11 @@ class TestSchemaOverrideNullSkipAndPrune:
         import json
 
         from aetherdialect._config import SCHEMA_OVERRIDES_SIDECAR_FILENAME
-        from aetherdialect._schema import apply_schema_overrides_to_graph, compute_metadata_hash, save_overrides_sidecar
+        from aetherdialect._schema import (
+            apply_schema_overrides_to_graph,
+            compute_metadata_hash,
+            save_overrides_sidecar,
+        )
 
         monkeypatch.setattr("aetherdialect._schema.llm_credentials_configured", lambda: False)
         cache_path = tmp_path / "schema.json.gz"
@@ -2255,7 +2259,10 @@ class TestSchemaOverrides:
     """JSON-roundtrip user editing of the built schema graph."""
 
     def test_dump_dict_round_trips_current_state(self, schema_graph):
-        from aetherdialect._config import SCHEMA_OVERRIDES_EXPORT_DEFAULT_OWNER, SCHEMA_OVERRIDES_VERSION
+        from aetherdialect._config import (
+            SCHEMA_OVERRIDES_EXPORT_DEFAULT_OWNER,
+            SCHEMA_OVERRIDES_VERSION,
+        )
         from aetherdialect._schema import dump_schema_overrides_dict
 
         d = dump_schema_overrides_dict(schema_graph)
@@ -2834,7 +2841,10 @@ class TestBundleI:
 
     def test_primary_keys_add_endorses_profile_inferred_pk(self, schema_graph, monkeypatch):
         from aetherdialect._contracts_base import PkInferenceTag
-        from aetherdialect._schema import apply_schema_overrides_to_graph, dump_schema_overrides_dict
+        from aetherdialect._schema import (
+            apply_schema_overrides_to_graph,
+            dump_schema_overrides_dict,
+        )
 
         monkeypatch.setattr("aetherdialect._schema.llm_credentials_configured", lambda: False)
 
@@ -2858,7 +2868,10 @@ class TestBundleI:
 
     def test_primary_keys_add_endorses_catalog_pk(self, schema_graph, monkeypatch):
         from aetherdialect._contracts_base import PkInferenceTag
-        from aetherdialect._schema import apply_schema_overrides_to_graph, dump_schema_overrides_dict
+        from aetherdialect._schema import (
+            apply_schema_overrides_to_graph,
+            dump_schema_overrides_dict,
+        )
 
         monkeypatch.setattr("aetherdialect._schema.llm_credentials_configured", lambda: False)
 
@@ -2960,7 +2973,10 @@ class TestBundleI:
         assert loaded["_internal"]["fk_block_inferred"] == [{"from": "a.x", "to": "b.y"}]
 
     def test_sidecar_corrupt_returns_none(self, tmp_path):
-        from aetherdialect._schema import _overrides_sidecar_path, load_overrides_sidecar
+        from aetherdialect._schema import (
+            _overrides_sidecar_path,
+            load_overrides_sidecar,
+        )
 
         cache_path = tmp_path / "schema.json.gz"
         cache_path.write_bytes(b"")

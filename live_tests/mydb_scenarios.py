@@ -1900,7 +1900,10 @@ def agg_filter_join_scenarios() -> list[Scenario]:
             expected=Expected(
                 contains_cte=True,
                 min_rows=1,
-                sql_contains_one_of=[["ROW_NUMBER", "RANK", "DENSE_RANK"], ["PARTITION"]],
+                sql_contains_one_of=[
+                    ["ROW_NUMBER", "RANK", "DENSE_RANK"],
+                    ["PARTITION"],
+                ],
             ),
             category="agg_filter_join",
         ),

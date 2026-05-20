@@ -1834,7 +1834,10 @@ class ColumnMetadata:
             if not self.is_usable:
                 return ColumnVisibilityBlockReason.UNUSABLE
             return None
-        if self.sensitivity in (SensitivityClassification.STRICT, SensitivityClassification.FORBIDDEN):
+        if self.sensitivity in (
+            SensitivityClassification.STRICT,
+            SensitivityClassification.FORBIDDEN,
+        ):
             return ColumnVisibilityBlockReason.SENSITIVE_PII
         if not self.is_usable:
             return ColumnVisibilityBlockReason.UNUSABLE
@@ -2225,7 +2228,9 @@ class SchemaGraph:
     notes_sha256: str = ""
     scope_descriptor: dict[str, Any] | None = None
     schema_revision: int = 0
-    _database_feature_capability_cache: DatabaseFeatureCapability | None = field(default=None, repr=False, compare=False)
+    _database_feature_capability_cache: DatabaseFeatureCapability | None = field(
+        default=None, repr=False, compare=False
+    )
     _stats_dirty: bool = field(default=True, repr=False, compare=False)
 
     def __post_init__(self) -> None:

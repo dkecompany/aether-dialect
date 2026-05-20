@@ -490,7 +490,9 @@ def _effective_reflect_include(ctx: SchemaContext) -> SchemaInclude:
     return ctx.include
 
 
-def _allow_objects_lower_set(allow_objects: frozenset[str] | None) -> frozenset[str] | None:
+def _allow_objects_lower_set(
+    allow_objects: frozenset[str] | None,
+) -> frozenset[str] | None:
     """Return lowercase relation names for filtering, or ``None`` when no allow-list."""
 
     if not allow_objects:
@@ -2213,10 +2215,7 @@ def _infer_missing_pks_from_profile(
                             statistical_unique = rc > 0 and dist_ft == rc and rc >= min_rows
                 else:
                     statistical_unique = (
-                        col.distinct_count is not None
-                        and rc > 0
-                        and col.distinct_count == rc
-                        and rc >= min_rows
+                        col.distinct_count is not None and rc > 0 and col.distinct_count == rc and rc >= min_rows
                     )
             if not (unique_constraint or statistical_unique):
                 continue
@@ -3258,13 +3257,9 @@ def build_schema_graph_with_diff(
                             f"{src_t}.{new_src_c}->{dst_t}.{new_dst_c}"
                         )
                     for src_t, src_c, dst_t, dst_c, tag in diff.dropped_user_fks:
-                        sink(
-                            f"  Schema: user FK dropped (endpoint missing) [{tag}]: {src_t}.{src_c}->{dst_t}.{dst_c}"
-                        )
+                        sink(f"  Schema: user FK dropped (endpoint missing) [{tag}]: {src_t}.{src_c}->{dst_t}.{dst_c}")
                     for src_t, src_c, dst_t, dst_c in diff.dropped_catalog_fks:
-                        sink(
-                            f"  Schema: catalog FK removed by upstream DDL change: {src_t}.{src_c}->{dst_t}.{dst_c}"
-                        )
+                        sink(f"  Schema: catalog FK removed by upstream DDL change: {src_t}.{src_c}->{dst_t}.{dst_c}")
                     notify_schema_path_health(sg)
                     return sg, diff
                 except SchemaAccessError:
@@ -3365,7 +3360,13 @@ def build_schema_graph_with_diff(
     _apply_schema_context_allow_columns(sg, schema_context)
     col_total = sum(len(t.columns) for t in sg.tables.values())
     sink(f"  Schema: profiling {col_total} columns...")
-    _add_profiling_data(dialect, sg, notes_content=notes_content, schema_json_path=schema_json_path, log_sink=sink)
+    _add_profiling_data(
+        dialect,
+        sg,
+        notes_content=notes_content,
+        schema_json_path=schema_json_path,
+        log_sink=sink,
+    )
 
     sg.join_paths_multi = _recompute_join_paths_multi(sg.tables)
 
@@ -4498,9 +4499,7 @@ def _parse_editable_role_json(
                     rv = str(val).strip().lower()
                     allowed_vt = ROLE_VALUE_TYPE_COMPAT.get(rv)
                     if allowed_vt is not None and vt not in allowed_vt:
-                        raise ValueError(
-                            f"{path}: role {val!r} is incompatible with column value_type {value_type!r}"
-                        )
+                        raise ValueError(f"{path}: role {val!r} is incompatible with column value_type {value_type!r}")
             return val, RoleOwner.CATALOG
     elif raw is None or isinstance(raw, str):
         val = raw
@@ -4514,9 +4513,7 @@ def _parse_editable_role_json(
             rv = str(val).strip().lower()
             allowed_vt = ROLE_VALUE_TYPE_COMPAT.get(rv)
             if allowed_vt is not None and vt not in allowed_vt:
-                raise ValueError(
-                    f"{path}: role {val!r} is incompatible with column value_type {value_type!r}"
-                )
+                raise ValueError(f"{path}: role {val!r} is incompatible with column value_type {value_type!r}")
     return val, RoleOwner.USER_OVERRIDE
 
 
@@ -4656,7 +4653,8 @@ def _primary_keys_current_dump(sg: SchemaGraph) -> list[dict[str, Any]]:
                 "columns": list(tbl.primary_key),
                 "pk_inference_tag": tag,
                 "declared": all(
-                    tbl.columns.get(cn) is not None and tbl.columns[cn].pk_inference_tag is None for cn in tbl.primary_key
+                    tbl.columns.get(cn) is not None and tbl.columns[cn].pk_inference_tag is None
+                    for cn in tbl.primary_key
                 ),
             }
         )
@@ -4672,14 +4670,10 @@ def _tables_current_dump(sg: SchemaGraph) -> list[dict[str, Any]]:
             {
                 "name": tname,
                 "role": sg.tables[tname].role,
-                "role_owner": (
-                    sg.tables[tname].role_owner.value if sg.tables[tname].role_owner is not None else None
-                ),
+                "role_owner": (sg.tables[tname].role_owner.value if sg.tables[tname].role_owner is not None else None),
                 "description": sg.tables[tname].description or "",
                 "description_owner": (
-                    sg.tables[tname].description_owner.value
-                    if sg.tables[tname].description_owner is not None
-                    else None
+                    sg.tables[tname].description_owner.value if sg.tables[tname].description_owner is not None else None
                 ),
             }
             for tname in sg.tables
@@ -4701,13 +4695,11 @@ def _columns_current_dump(sg: SchemaGraph) -> list[dict[str, Any]]:
                     "table": tname,
                     "column": cname,
                     "role": col.role,
-                    "role_owner": col.role_owner.value if col.role_owner is not None else None,
+                    "role_owner": (col.role_owner.value if col.role_owner is not None else None),
                     "sensitivity": col.sensitivity,
                     "is_selectable": bool(col.is_selectable),
                     "description": col.description or "",
-                    "description_owner": (
-                        col.description_owner.value if col.description_owner is not None else None
-                    ),
+                    "description_owner": (col.description_owner.value if col.description_owner is not None else None),
                     "value_type": vt,
                     "boolean_truth_value": col.boolean_truth_value,
                 }
@@ -4776,18 +4768,14 @@ def compute_metadata_hash(sg: SchemaGraph) -> str:
             col = tbl.columns[cname]
             cols_payload[cname] = {
                 "description": col.description or "",
-                "description_owner": (
-                    col.description_owner.value if col.description_owner is not None else None
-                ),
+                "description_owner": (col.description_owner.value if col.description_owner is not None else None),
                 "role": col.role,
-                "role_owner": col.role_owner.value if col.role_owner is not None else None,
+                "role_owner": (col.role_owner.value if col.role_owner is not None else None),
                 "sensitivity": col.sensitivity,
             }
         tables_payload[tname] = {
             "description": tbl.description or "",
-            "description_owner": (
-                tbl.description_owner.value if tbl.description_owner is not None else None
-            ),
+            "description_owner": (tbl.description_owner.value if tbl.description_owner is not None else None),
             "role": tbl.role,
             "role_owner": tbl.role_owner.value if tbl.role_owner is not None else None,
             "columns": cols_payload,
@@ -5347,8 +5335,7 @@ def _coerce_pk_fk_columns_to_identifier(sg: SchemaGraph) -> list[tuple[str, str,
                 continue
             if col.role_owner == RoleOwner.USER_OVERRIDE:
                 debug(
-                    f"[schema._coerce_pk_fk_columns_to_identifier] preserving user role for "
-                    f"{tbl_name}.{col_name}",
+                    f"[schema._coerce_pk_fk_columns_to_identifier] preserving user role for {tbl_name}.{col_name}",
                 )
                 continue
             if not can_overwrite_role(col.role_owner, RoleOwner.PK_FK_COERCION):
@@ -5405,14 +5392,21 @@ def apply_schema_overrides_to_graph(
                 )
                 new_desc = (new_desc or "").strip()
                 cur_desc = (tbl.description or "").strip()
-                cur_owner_norm = tbl.description_owner if tbl.description_owner is not None else DescriptionOwner.CATALOG
+                cur_owner_norm = (
+                    tbl.description_owner if tbl.description_owner is not None else DescriptionOwner.CATALOG
+                )
                 desc_changed = new_desc != cur_desc
                 owner_changed = want_owner != cur_owner_norm
                 if desc_changed or (owner_changed and new_desc != ""):
                     path = f"tables.{tname}.description"
                     previous_text = tbl.description or ""
                     description_changes.append(
-                        {"path": path, "kind": "table", "text": new_desc, "previous_text": previous_text},
+                        {
+                            "path": path,
+                            "kind": "table",
+                            "text": new_desc,
+                            "previous_text": previous_text,
+                        },
                     )
                     description_targets[path] = (tname, None, want_owner)
                     touched_table = True
@@ -5469,7 +5463,12 @@ def apply_schema_overrides_to_graph(
                     continue
                 col = tbl.columns.get(cname)
                 if col is None:
-                    skipped.append(OverrideSkip(path=f"tables.{tname}.columns.{cname}", reason="unknown column"))
+                    skipped.append(
+                        OverrideSkip(
+                            path=f"tables.{tname}.columns.{cname}",
+                            reason="unknown column",
+                        )
+                    )
                     continue
                 touched_col = False
                 if "sensitivity" in cval or "pii" in cval:
@@ -6066,7 +6065,10 @@ def apply_schema_overrides_to_graph(
         cname = entry.get("column")
         if not isinstance(tname, str) or not isinstance(cname, str):
             skipped.append(
-                OverrideSkip(path=path, reason="malformed_pk_block: expected string table and column"),
+                OverrideSkip(
+                    path=path,
+                    reason="malformed_pk_block: expected string table and column",
+                ),
             )
             continue
         tbl = sg.tables.get(tname)
@@ -6321,9 +6323,7 @@ def _migrate_sidecar_for_diff(schema_json_path: str | Path, diff: SchemaDiff) ->
     source_hash = sidecar.get("source_schema_hash") or ""
     resolved_cache = str(Path(schema_json_path).expanduser().resolve())
     snap = load_schema_graph_snapshot(resolved_cache)
-    meta_hash = (
-        compute_metadata_hash(snap) if snap is not None else str(sidecar.get("metadata_hash") or "")
-    )
+    meta_hash = compute_metadata_hash(snap) if snap is not None else str(sidecar.get("metadata_hash") or "")
     save_overrides_sidecar(
         schema_json_path,
         sidecar,

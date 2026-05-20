@@ -28,7 +28,11 @@ from aetherdialect._contracts_core import (
     Template,
     ValueHistory,
 )
-from aetherdialect._core_utils import read_gzip_json, write_artifact_manifest, write_gzip_json_atomic
+from aetherdialect._core_utils import (
+    read_gzip_json,
+    write_artifact_manifest,
+    write_gzip_json_atomic,
+)
 from aetherdialect._schema import SchemaDiff, TableDiff
 from aetherdialect._templates import (
     TemplateStoreView,

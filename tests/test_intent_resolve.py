@@ -56,7 +56,10 @@ from aetherdialect._intent_resolve import (
     sort_having,
     sort_select_cols,
 )
-from aetherdialect._sql_gen import _join_clause_parts_with_bool_op, _join_flat_predicate_parts_with_filter_groups
+from aetherdialect._sql_gen import (
+    _join_clause_parts_with_bool_op,
+    _join_flat_predicate_parts_with_filter_groups,
+)
 
 
 class TestReplaceRefsInExpr:
@@ -2814,7 +2817,12 @@ class TestPruneUnusedCteOutputColumns:
         film = TableMetadata(
             name="film",
             columns={
-                "film_id": ColumnMetadata(name="film_id", data_type="integer", role="identifier", is_primary_key=True),
+                "film_id": ColumnMetadata(
+                    name="film_id",
+                    data_type="integer",
+                    role="identifier",
+                    is_primary_key=True,
+                ),
                 "title": ColumnMetadata(name="title", data_type="varchar", role="categorical"),
                 "description": ColumnMetadata(name="description", data_type="varchar", role="free_text"),
             },
@@ -2828,7 +2836,12 @@ class TestPruneUnusedCteOutputColumns:
         payment = TableMetadata(
             name="payment",
             columns={
-                "payment_id": ColumnMetadata(name="payment_id", data_type="integer", role="identifier", is_primary_key=True),
+                "payment_id": ColumnMetadata(
+                    name="payment_id",
+                    data_type="integer",
+                    role="identifier",
+                    is_primary_key=True,
+                ),
                 "customer_id": ColumnMetadata(
                     name="customer_id",
                     data_type="integer",
@@ -2840,7 +2853,11 @@ class TestPruneUnusedCteOutputColumns:
             primary_key=["payment_id"],
             foreign_keys=[],
         )
-        return SchemaGraph(tables={"payment": payment}, join_paths_multi={}, effective_structural_hash="h")
+        return SchemaGraph(
+            tables={"payment": payment},
+            join_paths_multi={},
+            effective_structural_hash="h",
+        )
 
     def test_downstream_reference_only_preserves_referenced_column(self) -> None:
         from aetherdialect._intent_resolve import prune_unused_cte_output_columns
@@ -2931,7 +2948,12 @@ class TestPruneUnusedCteOutputColumns:
 
         expr_pk_plus = NormalizedExpr(
             add_groups=[
-                MulGroup(multiply=[NormalizedExpr.from_column("film.film_id"), NormalizedExpr(raw_sql="1")]),
+                MulGroup(
+                    multiply=[
+                        NormalizedExpr.from_column("film.film_id"),
+                        NormalizedExpr(raw_sql="1"),
+                    ]
+                ),
             ],
         )
         cte = RuntimeCteStep(
@@ -2964,7 +2986,9 @@ class TestCollectColumnRefsConcatMultiply:
     """collect_column_refs_for_post_processing walks CONCAT multiply parts."""
 
     def test_concat_multiply_column_refs(self) -> None:
-        from aetherdialect._intent_resolve import collect_column_refs_for_post_processing
+        from aetherdialect._intent_resolve import (
+            collect_column_refs_for_post_processing,
+        )
 
         expr = NormalizedExpr(
             add_groups=[

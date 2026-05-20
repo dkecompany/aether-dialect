@@ -19,7 +19,10 @@ from aetherdialect._contracts_base import (
 )
 from aetherdialect._contracts_core import FilterParam, NormalizedExpr, RuntimeIntent
 from aetherdialect._core_utils import stable_json
-from aetherdialect._dialect import DatabricksDialect, unity_structural_constraints_index_from_information_schema_rows
+from aetherdialect._dialect import (
+    DatabricksDialect,
+    unity_structural_constraints_index_from_information_schema_rows,
+)
 from aetherdialect._schema_profiling import (
     SCHEMA_CONSISTENCY_REFINE_SYSTEM,
     SCHEMA_NOTES_REFINE_SYSTEM,
@@ -992,7 +995,10 @@ class TestParseSqlFileConditionalLlm:
         sg = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"a": ta, "b": tb})
 
         monkeypatch.setattr("aetherdialect._schema_profiling._parse_sql_file_fallback", lambda _c: {})
-        monkeypatch.setattr("aetherdialect._schema_profiling._parse_sql_file_regex_reflect", lambda _c: {})
+        monkeypatch.setattr(
+            "aetherdialect._schema_profiling._parse_sql_file_regex_reflect",
+            lambda _c: {},
+        )
 
         calls: list[tuple[Any, ...]] = []
 
@@ -1017,7 +1023,10 @@ class TestParseSqlFileConditionalLlm:
         sg = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"t": t})
 
         monkeypatch.setattr("aetherdialect._schema_profiling._parse_sql_file_fallback", lambda _c: {})
-        monkeypatch.setattr("aetherdialect._schema_profiling._parse_sql_file_regex_reflect", lambda _c: {})
+        monkeypatch.setattr(
+            "aetherdialect._schema_profiling._parse_sql_file_regex_reflect",
+            lambda _c: {},
+        )
 
         calls: list[Any] = []
 
@@ -1050,7 +1059,10 @@ class TestParseSqlFileViaLlmNullability:
                 }
             }
         }
-        monkeypatch.setattr("aetherdialect._schema_profiling.llm_chat", lambda *a, **k: stable_json(payload))
+        monkeypatch.setattr(
+            "aetherdialect._schema_profiling.llm_chat",
+            lambda *a, **k: stable_json(payload),
+        )
         out = _parse_sql_file_via_llm(ddl)
         u = out["u"]
         assert u["column_is_nullable"] == [False, False, True]
@@ -1072,7 +1084,10 @@ class TestParseSqlFileViaLlmNullability:
                 }
             }
         }
-        monkeypatch.setattr("aetherdialect._schema_profiling.llm_chat", lambda *a, **k: stable_json(payload))
+        monkeypatch.setattr(
+            "aetherdialect._schema_profiling.llm_chat",
+            lambda *a, **k: stable_json(payload),
+        )
         out = _parse_sql_file_via_llm(ddl)
         v = out["v"]
         assert v["column_is_nullable"] == [True]
@@ -1474,7 +1489,11 @@ class TestApplyColumnRolesLlmBooleanStringValueType:
             primary_key=[],
             foreign_keys=[],
         )
-        sg = SchemaGraph(join_paths_multi={}, effective_structural_hash="h", tables={"clinical_data": table})
+        sg = SchemaGraph(
+            join_paths_multi={},
+            effective_structural_hash="h",
+            tables={"clinical_data": table},
+        )
 
         def fake_classify(schema: SchemaGraph, notes_content: str | None = None):
             return {
@@ -2062,4 +2081,8 @@ class TestCollectProfilingTopKValues:
     """``collect_profiling_topk_values`` preserves profiling sample order."""
 
     def test_preserves_first_seen_order(self) -> None:
-        assert collect_profiling_topk_values(["30", "10", "20", "10"]) == ["30", "10", "20"]
+        assert collect_profiling_topk_values(["30", "10", "20", "10"]) == [
+            "30",
+            "10",
+            "20",
+        ]

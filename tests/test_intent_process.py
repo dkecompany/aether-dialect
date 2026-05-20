@@ -768,8 +768,13 @@ class TestPlannerSingleOutputWindowRule:
     """Planner Stage-A decomposition includes the no-CTE-for-single-window rule (WF-009)."""
 
     def test_logical_decomposition_guidance_contains_rule(self):
-        from aetherdialect._intent_process import PLANNER_SINGLE_OUTPUT_WINDOW_NO_CTE_RULE
-        from aetherdialect._intent_process import _LOGICAL_DECOMPOSITION_GUIDANCE, _build_intent_logical_prompt
+        from aetherdialect._intent_process import (
+            PLANNER_SINGLE_OUTPUT_WINDOW_NO_CTE_RULE,
+        )
+        from aetherdialect._intent_process import (
+            _LOGICAL_DECOMPOSITION_GUIDANCE,
+            _build_intent_logical_prompt,
+        )
 
         guidance = stable_json(list(_LOGICAL_DECOMPOSITION_GUIDANCE))
         q = "list rentals with rental id and next rental date for the same inventory item ordered by rental date"
@@ -2306,7 +2311,10 @@ class TestInvokeIntentParseWithHints:
                 "is_post_restart": "False",
             }
         ]
-        with patch("aetherdialect._intent_process.full_intent_parse", side_effect=_stub_full_parse):
+        with patch(
+            "aetherdialect._intent_process.full_intent_parse",
+            side_effect=_stub_full_parse,
+        ):
             _invoke_intent_parse_with_hints(
                 "q norm",
                 schema_graph,
@@ -2397,7 +2405,12 @@ class TestApplyPostProcessingIdempotence:
         film = TableMetadata(
             name="film",
             columns={
-                "film_id": ColumnMetadata(name="film_id", data_type="integer", role="identifier", is_primary_key=True),
+                "film_id": ColumnMetadata(
+                    name="film_id",
+                    data_type="integer",
+                    role="identifier",
+                    is_primary_key=True,
+                ),
                 "title": ColumnMetadata(name="title", data_type="varchar", role="categorical"),
             },
             primary_key=["film_id"],

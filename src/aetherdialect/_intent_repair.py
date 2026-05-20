@@ -748,11 +748,7 @@ def qualify_cte_output_columns(intent: RuntimeIntent) -> RuntimeIntent:
         out: list[FilterParam] = []
         for fp in fps or []:
             le = _qualify_expr_scoped(fp.left_expr, scope)
-            re = (
-                _qualify_expr_scoped(fp.right_expr, scope)
-                if fp.right_expr is not None
-                else None
-            )
+            re = _qualify_expr_scoped(fp.right_expr, scope) if fp.right_expr is not None else None
             out.append(replace(fp, left_expr=le, right_expr=re))
         return out
 
@@ -763,11 +759,7 @@ def qualify_cte_output_columns(intent: RuntimeIntent) -> RuntimeIntent:
         out: list[HavingParam] = []
         for hp in hps or []:
             le = _qualify_expr_scoped(hp.left_expr, scope)
-            re = (
-                _qualify_expr_scoped(hp.right_expr, scope)
-                if hp.right_expr is not None
-                else None
-            )
+            re = _qualify_expr_scoped(hp.right_expr, scope) if hp.right_expr is not None else None
             out.append(replace(hp, left_expr=le, right_expr=re))
         return out
 
@@ -779,15 +771,8 @@ def qualify_cte_output_columns(intent: RuntimeIntent) -> RuntimeIntent:
         for step in regs or []:
             ws = step.window_spec
             np = [_qualify_expr_scoped(e, scope) for e in (ws.partition_by or [])]
-            no = [
-                replace(o, expr=_qualify_expr_scoped(o.expr, scope))
-                for o in (ws.order_by or [])
-            ]
-            na = (
-                _qualify_expr_scoped(ws.argument, scope)
-                if ws.argument is not None
-                else None
-            )
+            no = [replace(o, expr=_qualify_expr_scoped(o.expr, scope)) for o in (ws.order_by or [])]
+            na = _qualify_expr_scoped(ws.argument, scope) if ws.argument is not None else None
             steps.append(
                 replace(
                     step,
@@ -809,19 +794,11 @@ def qualify_cte_output_columns(intent: RuntimeIntent) -> RuntimeIntent:
                 new_cond = replace(
                     cond,
                     left_expr=_qualify_expr_scoped(cond.left_expr, scope),
-                    right_expr=(
-                        _qualify_expr_scoped(cond.right_expr, scope)
-                        if cond.right_expr is not None
-                        else None
-                    ),
+                    right_expr=(_qualify_expr_scoped(cond.right_expr, scope) if cond.right_expr is not None else None),
                 )
                 new_res = _qualify_expr_scoped(br.result, scope)
                 new_branches.append(CaseWhenBranch(condition=new_cond, result=new_res))
-            new_else = (
-                _qualify_expr_scoped(cw.else_result, scope)
-                if cw.else_result is not None
-                else None
-            )
+            new_else = _qualify_expr_scoped(cw.else_result, scope) if cw.else_result is not None else None
             out_r.append(
                 replace(
                     step,
@@ -831,11 +808,7 @@ def qualify_cte_output_columns(intent: RuntimeIntent) -> RuntimeIntent:
         return out_r
 
     new_select_cols = [
-        (
-            replace(sc, expr=_qualify_expr(sc.expr, output_to_cte))
-            if not _should_skip(sc.expr.primary_column)
-            else sc
-        )
+        (replace(sc, expr=_qualify_expr(sc.expr, output_to_cte)) if not _should_skip(sc.expr.primary_column) else sc)
         for sc in (intent.select_cols or [])
     ]
     new_group_by = [
@@ -868,7 +841,7 @@ def qualify_cte_output_columns(intent: RuntimeIntent) -> RuntimeIntent:
             for sc in (cte.select_cols or [])
         ]
         c_gb = [
-            _qualify_expr(g, output_to_cte) if not _should_skip_scoped(g.primary_column, scope) else g
+            (_qualify_expr(g, output_to_cte) if not _should_skip_scoped(g.primary_column, scope) else g)
             for g in (cte.group_by_cols or [])
         ]
         c_ob = [
@@ -1768,7 +1741,9 @@ def _align_pred_value_type(
     return pred
 
 
-def _collect_number_typed_predicate_param_keys(pred: FilterParam | HavingParam) -> set[str]:
+def _collect_number_typed_predicate_param_keys(
+    pred: FilterParam | HavingParam,
+) -> set[str]:
     if (pred.value_type or "").lower() != "number":
         return set()
     keys: set[str] = set()
@@ -1782,7 +1757,9 @@ def _collect_number_typed_predicate_param_keys(pred: FilterParam | HavingParam) 
     return keys
 
 
-def _maybe_coerce_bool_literal_for_numeric_pred(pred: FilterParam | HavingParam) -> FilterParam | HavingParam:
+def _maybe_coerce_bool_literal_for_numeric_pred(
+    pred: FilterParam | HavingParam,
+) -> FilterParam | HavingParam:
     if (pred.value_type or "").lower() != "number":
         return pred
     if isinstance(pred.raw_value, bool):
@@ -1808,7 +1785,9 @@ def _collect_numeric_predicate_param_keys_from_case_registry(
     return keys
 
 
-def _coerce_boolean_bindings_for_number_typed_filters(intent: RuntimeIntent) -> RuntimeIntent:
+def _coerce_boolean_bindings_for_number_typed_filters(
+    intent: RuntimeIntent,
+) -> RuntimeIntent:
     keys: set[str] = set()
     for fp in intent.filters_param or []:
         keys.update(_collect_number_typed_predicate_param_keys(fp))
@@ -2954,9 +2933,7 @@ def repair_case_when_intent(
         return [s for s in (regs or []) if s.case_when and s.case_when.branches]
 
     new_cr = _strip_registry(intent.case_registry)
-    new_ctes = [
-        replace(cte, case_registry=_strip_registry(cte.case_registry)) for cte in (intent.cte_steps or [])
-    ]
+    new_ctes = [replace(cte, case_registry=_strip_registry(cte.case_registry)) for cte in (intent.cte_steps or [])]
     return replace(intent, case_registry=new_cr, cte_steps=new_ctes)
 
 

@@ -719,10 +719,7 @@ def _run_pipeline_core(
 
     neg_drop = False
     normalized_canonical = normalize_question_via_llm(corrected_text, raw_original=raw_question)
-    if (
-        normalized_canonical != corrected_text
-        and has_any_rejection_history_for_question(store, corrected_text)
-    ):
+    if normalized_canonical != corrected_text and has_any_rejection_history_for_question(store, corrected_text):
         neg_drop = True
         normalized_canonical = corrected_text
 
@@ -899,9 +896,7 @@ def _run_pipeline_core(
         rows,
         structural_defaults=tmpl_sd,
         template_display_alias_map=(
-            getattr(gen_out.matched_template, "display_alias_map", None)
-            if gen_out.matched_template
-            else None
+            getattr(gen_out.matched_template, "display_alias_map", None) if gen_out.matched_template else None
         ),
     )
 
@@ -928,9 +923,7 @@ def _run_pipeline_core(
             structural_defaults=tmpl_sd,
             q_norm=q_norm,
             template_display_alias_map=(
-                getattr(gen_out.matched_template, "display_alias_map", None)
-                if gen_out.matched_template
-                else None
+                getattr(gen_out.matched_template, "display_alias_map", None) if gen_out.matched_template else None
             ),
         )
         if df_out is not None:

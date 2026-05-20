@@ -290,7 +290,10 @@ class TestRenderGroupSql:
     def test_concat_two_columns_comma_joined(self):
         """CONCAT MulGroup joins multiply terms with commas inside CONCAT."""
         g = MulGroup(
-            multiply=[NormalizedExpr.from_column("tbl_a.first_name"), NormalizedExpr.from_column("tbl_a.last_name")],
+            multiply=[
+                NormalizedExpr.from_column("tbl_a.first_name"),
+                NormalizedExpr.from_column("tbl_a.last_name"),
+            ],
             scalar_func="concat",
         )
         result = _render_group_sql(g)
@@ -881,7 +884,12 @@ class TestBuildDeterministicSql:
             tables=["payment"],
             grain="row_level",
             select_cols=[
-                SelectCol(expr=NormalizedExpr(add_groups=[MulGroup(multiply=["payment.payment_id"])], sub_groups=[])),
+                SelectCol(
+                    expr=NormalizedExpr(
+                        add_groups=[MulGroup(multiply=["payment.payment_id"])],
+                        sub_groups=[],
+                    )
+                ),
             ],
             group_by_cols=[],
             order_by_cols=[],

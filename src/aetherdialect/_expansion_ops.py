@@ -187,28 +187,38 @@ def _agg_change_allowed_for_meta(new_agg: str, meta: dict[str, Any]) -> bool:
     vt = (meta.get("value_type") or "").strip().lower()
     if na == "count":
         return True
-    numericish = vt in (
-        "numeric",
-        "integer",
-        "float",
-        "decimal",
-        "double",
-        "bigint",
-        "smallint",
-    ) or role == ColumnRole.NUMERIC_MEASURE.value.lower()
-    orderable = numericish or vt in (
-        "date",
-        "datetime",
-        "timestamp",
-        "time",
-        "string",
-        "categorical",
-        "text",
-        "varchar",
-    ) or role in (
-        ColumnRole.NUMERIC_MEASURE.value.lower(),
-        ColumnRole.TEMPORAL.value.lower(),
-        ColumnRole.CATEGORICAL.value.lower(),
+    numericish = (
+        vt
+        in (
+            "numeric",
+            "integer",
+            "float",
+            "decimal",
+            "double",
+            "bigint",
+            "smallint",
+        )
+        or role == ColumnRole.NUMERIC_MEASURE.value.lower()
+    )
+    orderable = (
+        numericish
+        or vt
+        in (
+            "date",
+            "datetime",
+            "timestamp",
+            "time",
+            "string",
+            "categorical",
+            "text",
+            "varchar",
+        )
+        or role
+        in (
+            ColumnRole.NUMERIC_MEASURE.value.lower(),
+            ColumnRole.TEMPORAL.value.lower(),
+            ColumnRole.CATEGORICAL.value.lower(),
+        )
     )
     if na in ("sum", "avg"):
         return numericish
@@ -689,7 +699,7 @@ def _rewrite_table_qualifier(
         new_cw = replace(
             cw,
             branches=new_branches,
-            else_result=_rex(cw.else_result) if cw.else_result is not None else cw.else_result,
+            else_result=(_rex(cw.else_result) if cw.else_result is not None else cw.else_result),
         )
         new_cr.append(replace(cr, case_when=new_cw))
     intent.case_registry = new_cr
@@ -1463,9 +1473,7 @@ def _table_remove(
         dropped_case: set[str] = {
             cr.registry_id for cr in (new_intent.case_registry or []) if _case_refs_removed_table(cr)
         }
-        new_intent.case_registry = [
-            cr for cr in (new_intent.case_registry or []) if cr.registry_id not in dropped_case
-        ]
+        new_intent.case_registry = [cr for cr in (new_intent.case_registry or []) if cr.registry_id not in dropped_case]
 
         new_intent.group_by_cols = [
             c for c in (new_intent.group_by_cols or []) if _table_from_column_ref(c.primary_column) in ts

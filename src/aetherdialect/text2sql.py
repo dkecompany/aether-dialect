@@ -426,7 +426,11 @@ class Text2SQL:
 
         self._ensure_llm()
         with _core_utils.diagnostic_print_listener(lambda m: print(m, file=sys.stdout, flush=True)):
-            _core_utils.notify("\nInteractive mode", stage="interactive", code=DIAGNOSTIC_CODE_ENGINE_INFO)
+            _core_utils.notify(
+                "\nInteractive mode",
+                stage="interactive",
+                code=DIAGNOSTIC_CODE_ENGINE_INFO,
+            )
             empty_streak = 0
             question = ""
             while True:
@@ -715,32 +719,60 @@ def _print_override_summary(report: OverrideReport) -> None:
 
     _core_utils.notify("Schema overrides applied:", stage="overrides", code=DIAGNOSTIC_CODE_ENGINE_INFO)
     _core_utils.notify(
-        f"  Tables updated:           {report.table_edits}", stage="overrides", code=DIAGNOSTIC_CODE_ENGINE_INFO
+        f"  Tables updated:           {report.table_edits}",
+        stage="overrides",
+        code=DIAGNOSTIC_CODE_ENGINE_INFO,
     )
     _core_utils.notify(
-        f"  Columns updated:          {report.column_edits}", stage="overrides", code=DIAGNOSTIC_CODE_ENGINE_INFO
-    )
-    _core_utils.notify(f"  FK edges added:           {report.fks_added}", stage="overrides", code=DIAGNOSTIC_CODE_ENGINE_INFO)
-    _core_utils.notify(
-        f"  FK edges endorsed (user): {report.fks_endorsed}", stage="overrides", code=DIAGNOSTIC_CODE_ENGINE_INFO
-    )
-    _core_utils.notify(f"  FK edges removed:         {report.fks_removed}", stage="overrides", code=DIAGNOSTIC_CODE_ENGINE_INFO)
-    _core_utils.notify(
-        f"  PKs endorsed (user):     {report.pks_endorsed}", stage="overrides", code=DIAGNOSTIC_CODE_ENGINE_INFO
-    )
-    _core_utils.notify(f"  Inferred PKs cleared:     {report.pks_blocked}", stage="overrides", code=DIAGNOSTIC_CODE_ENGINE_INFO)
-    _core_utils.notify(
-        f"  PK/FK roles coerced:      {report.coerced_columns}", stage="overrides", code=DIAGNOSTIC_CODE_ENGINE_INFO
+        f"  Columns updated:          {report.column_edits}",
+        stage="overrides",
+        code=DIAGNOSTIC_CODE_ENGINE_INFO,
     )
     _core_utils.notify(
-        f"  Redundant inferences:     {report.collapsed_inferences}", stage="overrides", code=DIAGNOSTIC_CODE_ENGINE_INFO
+        f"  FK edges added:           {report.fks_added}",
+        stage="overrides",
+        code=DIAGNOSTIC_CODE_ENGINE_INFO,
     )
     _core_utils.notify(
-        f"  Descriptions refined:     {report.descriptions_refined}", stage="overrides", code=DIAGNOSTIC_CODE_ENGINE_INFO
+        f"  FK edges endorsed (user): {report.fks_endorsed}",
+        stage="overrides",
+        code=DIAGNOSTIC_CODE_ENGINE_INFO,
+    )
+    _core_utils.notify(
+        f"  FK edges removed:         {report.fks_removed}",
+        stage="overrides",
+        code=DIAGNOSTIC_CODE_ENGINE_INFO,
+    )
+    _core_utils.notify(
+        f"  PKs endorsed (user):     {report.pks_endorsed}",
+        stage="overrides",
+        code=DIAGNOSTIC_CODE_ENGINE_INFO,
+    )
+    _core_utils.notify(
+        f"  Inferred PKs cleared:     {report.pks_blocked}",
+        stage="overrides",
+        code=DIAGNOSTIC_CODE_ENGINE_INFO,
+    )
+    _core_utils.notify(
+        f"  PK/FK roles coerced:      {report.coerced_columns}",
+        stage="overrides",
+        code=DIAGNOSTIC_CODE_ENGINE_INFO,
+    )
+    _core_utils.notify(
+        f"  Redundant inferences:     {report.collapsed_inferences}",
+        stage="overrides",
+        code=DIAGNOSTIC_CODE_ENGINE_INFO,
+    )
+    _core_utils.notify(
+        f"  Descriptions refined:     {report.descriptions_refined}",
+        stage="overrides",
+        code=DIAGNOSTIC_CODE_ENGINE_INFO,
     )
     if report.skipped:
         _core_utils.notify(
-            f"  Soft skips ({len(report.skipped)}):", stage="overrides", code=DIAGNOSTIC_CODE_ENGINE_INFO
+            f"  Soft skips ({len(report.skipped)}):",
+            stage="overrides",
+            code=DIAGNOSTIC_CODE_ENGINE_INFO,
         )
         for skip in report.skipped:
             _core_utils.notify(
@@ -750,7 +782,11 @@ def _print_override_summary(report: OverrideReport) -> None:
                 details=(("path", skip.path), ("reason", skip.reason)),
             )
     else:
-        _core_utils.notify("  Soft skips:               none", stage="overrides", code=DIAGNOSTIC_CODE_ENGINE_INFO)
+        _core_utils.notify(
+            "  Soft skips:               none",
+            stage="overrides",
+            code=DIAGNOSTIC_CODE_ENGINE_INFO,
+        )
 
 
 __all__ = [

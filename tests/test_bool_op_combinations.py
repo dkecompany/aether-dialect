@@ -20,11 +20,17 @@ from aetherdialect._dialect import PostgresDialect
 from aetherdialect._intent_expr import decompose_between_params
 from aetherdialect._intent_process import _compute_filters_similarity
 from aetherdialect._intent_repair import decompose_in_not_in_filters
-from aetherdialect._intent_resolve import _dedup_filters, coerce_filter_group_mode, normalize_filters_havings
+from aetherdialect._intent_resolve import (
+    _dedup_filters,
+    coerce_filter_group_mode,
+    normalize_filters_havings,
+)
 from aetherdialect._sql_gen import _build_deterministic_select_block
 from aetherdialect._utils import _normalize_cte_steps
 from aetherdialect._validation_execute import validate_semantics
-from aetherdialect._validation_semantic import validate_predicate_bool_op_filter_group_hints
+from aetherdialect._validation_semantic import (
+    validate_predicate_bool_op_filter_group_hints,
+)
 from aetherdialect._contracts_base import SchemaGraph
 
 
@@ -134,66 +140,119 @@ class TestBoolOpWhereMatrix:
 
     def test_flat_and(self) -> None:
         fs = [
-            FilterParam(NormalizedExpr.from_column("t.a"), op="=", param_key="p1", value_type="string"),
-            FilterParam(NormalizedExpr.from_column("t.b"), op="=", param_key="p2", value_type="string"),
-            FilterParam(NormalizedExpr.from_column("t.c"), op="=", param_key="p3", value_type="string"),
+            FilterParam(
+                NormalizedExpr.from_column("t.a"),
+                op="=",
+                param_key="p1",
+                value_type="string",
+            ),
+            FilterParam(
+                NormalizedExpr.from_column("t.b"),
+                op="=",
+                param_key="p2",
+                value_type="string",
+            ),
+            FilterParam(
+                NormalizedExpr.from_column("t.c"),
+                op="=",
+                param_key="p3",
+                value_type="string",
+            ),
         ]
-        assert (
-            _where_after_pipeline(fs)
-            == 'LOWER("t"."a") = :p1 AND LOWER("t"."b") = :p2 AND LOWER("t"."c") = :p3'
-        )
+        assert _where_after_pipeline(fs) == 'LOWER("t"."a") = :p1 AND LOWER("t"."b") = :p2 AND LOWER("t"."c") = :p3'
 
     def test_flat_mixed_forward(self) -> None:
         fs = [
             FilterParam(
-                NormalizedExpr.from_column("t.a"), op="=", param_key="p1", value_type="string", bool_op="AND"
+                NormalizedExpr.from_column("t.a"),
+                op="=",
+                param_key="p1",
+                value_type="string",
+                bool_op="AND",
             ),
             FilterParam(
-                NormalizedExpr.from_column("t.b"), op="=", param_key="p2", value_type="string", bool_op="OR"
+                NormalizedExpr.from_column("t.b"),
+                op="=",
+                param_key="p2",
+                value_type="string",
+                bool_op="OR",
             ),
             FilterParam(
-                NormalizedExpr.from_column("t.c"), op="=", param_key="p3", value_type="string", bool_op="AND"
+                NormalizedExpr.from_column("t.c"),
+                op="=",
+                param_key="p3",
+                value_type="string",
+                bool_op="AND",
             ),
             FilterParam(
-                NormalizedExpr.from_column("t.d"), op="=", param_key="p4", value_type="string", bool_op="AND"
+                NormalizedExpr.from_column("t.d"),
+                op="=",
+                param_key="p4",
+                value_type="string",
+                bool_op="AND",
             ),
         ]
         got = _unwrap_outer_parens(_where_after_pipeline(fs))
-        assert got == (
-            'LOWER("t"."a") = :p1 AND LOWER("t"."b") = :p2 OR LOWER("t"."c") = :p3 AND LOWER("t"."d") = :p4'
-        )
+        assert got == ('LOWER("t"."a") = :p1 AND LOWER("t"."b") = :p2 OR LOWER("t"."c") = :p3 AND LOWER("t"."d") = :p4')
 
     def test_flat_or_backward_promote(self) -> None:
         fs = [
-            FilterParam(NormalizedExpr.from_column("t.a"), op="=", param_key="p1", value_type="string"),
             FilterParam(
-                NormalizedExpr.from_column("t.b"), op="=", param_key="p2", value_type="string", bool_op="OR"
+                NormalizedExpr.from_column("t.a"),
+                op="=",
+                param_key="p1",
+                value_type="string",
+            ),
+            FilterParam(
+                NormalizedExpr.from_column("t.b"),
+                op="=",
+                param_key="p2",
+                value_type="string",
+                bool_op="OR",
             ),
         ]
         assert _where_after_pipeline(fs) == 'LOWER("t"."a") = :p1 OR LOWER("t"."b") = :p2'
 
     def test_flat_or_backward_chain(self) -> None:
         fs = [
-            FilterParam(NormalizedExpr.from_column("t.a"), op="=", param_key="p1", value_type="string"),
             FilterParam(
-                NormalizedExpr.from_column("t.b"), op="=", param_key="p2", value_type="string", bool_op="OR"
+                NormalizedExpr.from_column("t.a"),
+                op="=",
+                param_key="p1",
+                value_type="string",
             ),
             FilterParam(
-                NormalizedExpr.from_column("t.c"), op="=", param_key="p3", value_type="string", bool_op="OR"
+                NormalizedExpr.from_column("t.b"),
+                op="=",
+                param_key="p2",
+                value_type="string",
+                bool_op="OR",
+            ),
+            FilterParam(
+                NormalizedExpr.from_column("t.c"),
+                op="=",
+                param_key="p3",
+                value_type="string",
+                bool_op="OR",
             ),
         ]
-        assert (
-            _where_after_pipeline(fs)
-            == 'LOWER("t"."a") = :p1 OR LOWER("t"."b") = :p2 OR LOWER("t"."c") = :p3'
-        )
+        assert _where_after_pipeline(fs) == 'LOWER("t"."a") = :p1 OR LOWER("t"."b") = :p2 OR LOWER("t"."c") = :p3'
 
     def test_two_disjuncts(self) -> None:
         fs = [
             FilterParam(
-                NormalizedExpr.from_column("t.a"), op="=", param_key="p1", value_type="string", filter_group=1
+                NormalizedExpr.from_column("t.a"),
+                op="=",
+                param_key="p1",
+                value_type="string",
+                filter_group=1,
             ),
             FilterParam(
-                NormalizedExpr.from_column("t.b"), op="=", param_key="p2", value_type="string", filter_group=2
+                NormalizedExpr.from_column("t.b"),
+                op="=",
+                param_key="p2",
+                value_type="string",
+                filter_group=2,
             ),
         ]
         assert _where_after_pipeline(fs) == 'LOWER("t"."a") = :p1 OR LOWER("t"."b") = :p2'
@@ -201,10 +260,18 @@ class TestBoolOpWhereMatrix:
     def test_two_in_one_group(self) -> None:
         fs = [
             FilterParam(
-                NormalizedExpr.from_column("t.a"), op="=", param_key="p1", value_type="string", filter_group=1
+                NormalizedExpr.from_column("t.a"),
+                op="=",
+                param_key="p1",
+                value_type="string",
+                filter_group=1,
             ),
             FilterParam(
-                NormalizedExpr.from_column("t.b"), op="=", param_key="p2", value_type="string", filter_group=1
+                NormalizedExpr.from_column("t.b"),
+                op="=",
+                param_key="p2",
+                value_type="string",
+                filter_group=1,
             ),
         ]
         assert _where_after_pipeline(fs) == 'LOWER("t"."a") = :p1 AND LOWER("t"."b") = :p2'
@@ -212,16 +279,32 @@ class TestBoolOpWhereMatrix:
     def test_four_or_of_and(self) -> None:
         fs = [
             FilterParam(
-                NormalizedExpr.from_column("t.a"), op="=", param_key="p1", value_type="string", filter_group=1
+                NormalizedExpr.from_column("t.a"),
+                op="=",
+                param_key="p1",
+                value_type="string",
+                filter_group=1,
             ),
             FilterParam(
-                NormalizedExpr.from_column("t.b"), op="=", param_key="p2", value_type="string", filter_group=1
+                NormalizedExpr.from_column("t.b"),
+                op="=",
+                param_key="p2",
+                value_type="string",
+                filter_group=1,
             ),
             FilterParam(
-                NormalizedExpr.from_column("t.c"), op="=", param_key="p3", value_type="string", filter_group=2
+                NormalizedExpr.from_column("t.c"),
+                op="=",
+                param_key="p3",
+                value_type="string",
+                filter_group=2,
             ),
             FilterParam(
-                NormalizedExpr.from_column("t.d"), op="=", param_key="p4", value_type="string", filter_group=2
+                NormalizedExpr.from_column("t.d"),
+                op="=",
+                param_key="p4",
+                value_type="string",
+                filter_group=2,
             ),
         ]
         assert (
@@ -232,45 +315,82 @@ class TestBoolOpWhereMatrix:
     def test_or_of_and_3disj(self) -> None:
         fs = [
             FilterParam(
-                NormalizedExpr.from_column("t.a"), op="=", param_key="p1", value_type="string", filter_group=1
+                NormalizedExpr.from_column("t.a"),
+                op="=",
+                param_key="p1",
+                value_type="string",
+                filter_group=1,
             ),
             FilterParam(
-                NormalizedExpr.from_column("t.b"), op="=", param_key="p2", value_type="string", filter_group=1
+                NormalizedExpr.from_column("t.b"),
+                op="=",
+                param_key="p2",
+                value_type="string",
+                filter_group=1,
             ),
             FilterParam(
-                NormalizedExpr.from_column("t.c"), op="=", param_key="p3", value_type="string", filter_group=2
+                NormalizedExpr.from_column("t.c"),
+                op="=",
+                param_key="p3",
+                value_type="string",
+                filter_group=2,
             ),
             FilterParam(
-                NormalizedExpr.from_column("t.d"), op="=", param_key="p4", value_type="string", filter_group=3
+                NormalizedExpr.from_column("t.d"),
+                op="=",
+                param_key="p4",
+                value_type="string",
+                filter_group=3,
             ),
             FilterParam(
-                NormalizedExpr.from_column("t.e"), op="=", param_key="p5", value_type="string", filter_group=3
+                NormalizedExpr.from_column("t.e"),
+                op="=",
+                param_key="p5",
+                value_type="string",
+                filter_group=3,
             ),
             FilterParam(
-                NormalizedExpr.from_column("t.f"), op="=", param_key="p6", value_type="string", filter_group=3
+                NormalizedExpr.from_column("t.f"),
+                op="=",
+                param_key="p6",
+                value_type="string",
+                filter_group=3,
             ),
         ]
-        assert (
-            _where_after_pipeline(fs)
-            == (
-                '(LOWER("t"."a") = :p1 AND LOWER("t"."b") = :p2) OR LOWER("t"."c") = :p3 OR '
-                '(LOWER("t"."d") = :p4 AND LOWER("t"."e") = :p5 AND LOWER("t"."f") = :p6)'
-            )
+        assert _where_after_pipeline(fs) == (
+            '(LOWER("t"."a") = :p1 AND LOWER("t"."b") = :p2) OR LOWER("t"."c") = :p3 OR '
+            '(LOWER("t"."d") = :p4 AND LOWER("t"."e") = :p5 AND LOWER("t"."f") = :p6)'
         )
 
     def test_interleaved_groups(self) -> None:
         fs = [
             FilterParam(
-                NormalizedExpr.from_column("t.a"), op="=", param_key="p1", value_type="string", filter_group=1
+                NormalizedExpr.from_column("t.a"),
+                op="=",
+                param_key="p1",
+                value_type="string",
+                filter_group=1,
             ),
             FilterParam(
-                NormalizedExpr.from_column("t.b"), op="=", param_key="p2", value_type="string", filter_group=2
+                NormalizedExpr.from_column("t.b"),
+                op="=",
+                param_key="p2",
+                value_type="string",
+                filter_group=2,
             ),
             FilterParam(
-                NormalizedExpr.from_column("t.c"), op="=", param_key="p3", value_type="string", filter_group=1
+                NormalizedExpr.from_column("t.c"),
+                op="=",
+                param_key="p3",
+                value_type="string",
+                filter_group=1,
             ),
             FilterParam(
-                NormalizedExpr.from_column("t.d"), op="=", param_key="p4", value_type="string", filter_group=2
+                NormalizedExpr.from_column("t.d"),
+                op="=",
+                param_key="p4",
+                value_type="string",
+                filter_group=2,
             ),
         ]
         assert (
@@ -281,42 +401,69 @@ class TestBoolOpWhereMatrix:
     def test_single_group_many_rows(self) -> None:
         fs = [
             FilterParam(
-                NormalizedExpr.from_column("t.a"), op="=", param_key="p1", value_type="string", filter_group=1
+                NormalizedExpr.from_column("t.a"),
+                op="=",
+                param_key="p1",
+                value_type="string",
+                filter_group=1,
             ),
             FilterParam(
-                NormalizedExpr.from_column("t.b"), op="=", param_key="p2", value_type="string", filter_group=1
+                NormalizedExpr.from_column("t.b"),
+                op="=",
+                param_key="p2",
+                value_type="string",
+                filter_group=1,
             ),
             FilterParam(
-                NormalizedExpr.from_column("t.c"), op="=", param_key="p3", value_type="string", filter_group=1
+                NormalizedExpr.from_column("t.c"),
+                op="=",
+                param_key="p3",
+                value_type="string",
+                filter_group=1,
             ),
         ]
-        assert (
-            _where_after_pipeline(fs)
-            == 'LOWER("t"."a") = :p1 AND LOWER("t"."b") = :p2 AND LOWER("t"."c") = :p3'
-        )
+        assert _where_after_pipeline(fs) == 'LOWER("t"."a") = :p1 AND LOWER("t"."b") = :p2 AND LOWER("t"."c") = :p3'
 
     def test_mixed_mode_coerce(self) -> None:
         fs = [
-            FilterParam(NormalizedExpr.from_column("t.a"), op="=", param_key="p1", value_type="string"),
             FilterParam(
-                NormalizedExpr.from_column("t.b"), op="=", param_key="p2", value_type="string", filter_group=1
+                NormalizedExpr.from_column("t.a"),
+                op="=",
+                param_key="p1",
+                value_type="string",
             ),
             FilterParam(
-                NormalizedExpr.from_column("t.c"), op="=", param_key="p3", value_type="string", filter_group=2
+                NormalizedExpr.from_column("t.b"),
+                op="=",
+                param_key="p2",
+                value_type="string",
+                filter_group=1,
+            ),
+            FilterParam(
+                NormalizedExpr.from_column("t.c"),
+                op="=",
+                param_key="p3",
+                value_type="string",
+                filter_group=2,
             ),
         ]
-        assert (
-            _where_after_pipeline(fs)
-            == 'LOWER("t"."a") = :p1 OR LOWER("t"."b") = :p2 OR LOWER("t"."c") = :p3'
-        )
+        assert _where_after_pipeline(fs) == 'LOWER("t"."a") = :p1 OR LOWER("t"."b") = :p2 OR LOWER("t"."c") = :p3'
 
     def test_fg0_used(self) -> None:
         fs = [
             FilterParam(
-                NormalizedExpr.from_column("t.a"), op="=", param_key="p1", value_type="string", filter_group=0
+                NormalizedExpr.from_column("t.a"),
+                op="=",
+                param_key="p1",
+                value_type="string",
+                filter_group=0,
             ),
             FilterParam(
-                NormalizedExpr.from_column("t.b"), op="=", param_key="p2", value_type="string", filter_group=1
+                NormalizedExpr.from_column("t.b"),
+                op="=",
+                param_key="p2",
+                value_type="string",
+                filter_group=1,
             ),
         ]
         assert _where_after_pipeline(fs) == 'LOWER("t"."a") = :p1 OR LOWER("t"."b") = :p2'
@@ -376,7 +523,11 @@ class TestBoolOpWhereMatrix:
     def test_between_in_group(self) -> None:
         fs = [
             FilterParam(
-                NormalizedExpr.from_column("t.a"), op="=", param_key="p1", value_type="string", filter_group=1
+                NormalizedExpr.from_column("t.a"),
+                op="=",
+                param_key="p1",
+                value_type="string",
+                filter_group=1,
             ),
             FilterParam(
                 left_expr=NormalizedExpr.from_column("t.len"),
@@ -387,7 +538,11 @@ class TestBoolOpWhereMatrix:
                 filter_group=1,
             ),
             FilterParam(
-                NormalizedExpr.from_column("t.d"), op="=", param_key="p3", value_type="string", filter_group=2
+                NormalizedExpr.from_column("t.d"),
+                op="=",
+                param_key="p3",
+                value_type="string",
+                filter_group=2,
             ),
         ]
         w = _where_after_pipeline(fs)
@@ -447,7 +602,11 @@ class TestBoolOpWhereMatrix:
                 filter_group=1,
             ),
             FilterParam(
-                NormalizedExpr.from_column("t.c"), op="=", param_key="p2", value_type="string", filter_group=2
+                NormalizedExpr.from_column("t.c"),
+                op="=",
+                param_key="p2",
+                value_type="string",
+                filter_group=2,
             ),
         ]
         w = _where_after_pipeline(fs)
@@ -462,10 +621,34 @@ class TestHavingOrOfAnd:
         left_c = NormalizedExpr(add_groups=[MulGroup(multiply=["t.id"], agg_func="count")], sub_groups=[])
         left_d = NormalizedExpr(add_groups=[MulGroup(multiply=["t.amt"], agg_func="sum")], sub_groups=[])
         hs = [
-            HavingParam(left_expr=left_a, op=">", param_key="h1", value_type="integer", filter_group=1),
-            HavingParam(left_expr=left_b, op=">", param_key="h2", value_type="number", filter_group=1),
-            HavingParam(left_expr=left_c, op="<", param_key="h3", value_type="integer", filter_group=2),
-            HavingParam(left_expr=left_d, op="<", param_key="h4", value_type="number", filter_group=2),
+            HavingParam(
+                left_expr=left_a,
+                op=">",
+                param_key="h1",
+                value_type="integer",
+                filter_group=1,
+            ),
+            HavingParam(
+                left_expr=left_b,
+                op=">",
+                param_key="h2",
+                value_type="number",
+                filter_group=1,
+            ),
+            HavingParam(
+                left_expr=left_c,
+                op="<",
+                param_key="h3",
+                value_type="integer",
+                filter_group=2,
+            ),
+            HavingParam(
+                left_expr=left_d,
+                op="<",
+                param_key="h4",
+                value_type="number",
+                filter_group=2,
+            ),
         ]
         got = _having_after_pipeline(hs)
         assert got.startswith("(")
@@ -524,14 +707,24 @@ class TestCteCaseDedupQsimWarnings:
         assert br.condition.filter_group is None
 
     def test_dedup_keeps_distinct_groups(self) -> None:
-        fp = FilterParam(NormalizedExpr.from_column("t.a"), op="=", param_key="p1", value_type="string")
+        fp = FilterParam(
+            NormalizedExpr.from_column("t.a"),
+            op="=",
+            param_key="p1",
+            value_type="string",
+        )
         a = replace(fp, filter_group=1)
         b = replace(fp, filter_group=2)
         out = _dedup_filters([a, b])
         assert len(out) == 2
 
     def test_dedup_collapses_within_group(self) -> None:
-        fp = FilterParam(NormalizedExpr.from_column("t.a"), op="=", param_key="p1", value_type="string")
+        fp = FilterParam(
+            NormalizedExpr.from_column("t.a"),
+            op="=",
+            param_key="p1",
+            value_type="string",
+        )
         a = replace(fp, filter_group=1, bool_op="AND")
         b = replace(fp, filter_group=1, bool_op="AND")
         out = _dedup_filters([a, b])
@@ -540,18 +733,34 @@ class TestCteCaseDedupQsimWarnings:
     def test_qsim_grouped_match(self) -> None:
         f1 = [
             FilterParam(
-                NormalizedExpr.from_column("t.a"), op="=", param_key="p1", value_type="string", filter_group=1
+                NormalizedExpr.from_column("t.a"),
+                op="=",
+                param_key="p1",
+                value_type="string",
+                filter_group=1,
             ),
             FilterParam(
-                NormalizedExpr.from_column("t.b"), op="=", param_key="p2", value_type="string", filter_group=2
+                NormalizedExpr.from_column("t.b"),
+                op="=",
+                param_key="p2",
+                value_type="string",
+                filter_group=2,
             ),
         ]
         f2 = [
             FilterParam(
-                NormalizedExpr.from_column("t.a"), op="=", param_key="p9", value_type="string", filter_group=1
+                NormalizedExpr.from_column("t.a"),
+                op="=",
+                param_key="p9",
+                value_type="string",
+                filter_group=1,
             ),
             FilterParam(
-                NormalizedExpr.from_column("t.b"), op="=", param_key="p8", value_type="string", filter_group=2
+                NormalizedExpr.from_column("t.b"),
+                op="=",
+                param_key="p8",
+                value_type="string",
+                filter_group=2,
             ),
         ]
         assert _compute_filters_similarity(f1, f2) == pytest.approx(1.0)
@@ -559,18 +768,34 @@ class TestCteCaseDedupQsimWarnings:
     def test_qsim_grouped_vs_old_template(self) -> None:
         template = [
             FilterParam(
-                NormalizedExpr.from_column("t.a"), op="=", param_key="p1", value_type="string", bool_op="OR"
+                NormalizedExpr.from_column("t.a"),
+                op="=",
+                param_key="p1",
+                value_type="string",
+                bool_op="OR",
             ),
             FilterParam(
-                NormalizedExpr.from_column("t.b"), op="=", param_key="p2", value_type="string", bool_op="AND"
+                NormalizedExpr.from_column("t.b"),
+                op="=",
+                param_key="p2",
+                value_type="string",
+                bool_op="AND",
             ),
         ]
         intent = [
             FilterParam(
-                NormalizedExpr.from_column("t.a"), op="=", param_key="p1", value_type="string", filter_group=1
+                NormalizedExpr.from_column("t.a"),
+                op="=",
+                param_key="p1",
+                value_type="string",
+                filter_group=1,
             ),
             FilterParam(
-                NormalizedExpr.from_column("t.b"), op="=", param_key="p2", value_type="string", filter_group=2
+                NormalizedExpr.from_column("t.b"),
+                op="=",
+                param_key="p2",
+                value_type="string",
+                filter_group=2,
             ),
         ]
         assert _compute_filters_similarity(template, intent) == pytest.approx(1.0)
@@ -580,10 +805,16 @@ class TestCteCaseDedupQsimWarnings:
             "Show rows where name is Alice or Bob",
             [
                 FilterParam(
-                    NormalizedExpr.from_column("t.name"), op="=", param_key="p1", value_type="string"
+                    NormalizedExpr.from_column("t.name"),
+                    op="=",
+                    param_key="p1",
+                    value_type="string",
                 ),
                 FilterParam(
-                    NormalizedExpr.from_column("t.name"), op="=", param_key="p2", value_type="string"
+                    NormalizedExpr.from_column("t.name"),
+                    op="=",
+                    param_key="p2",
+                    value_type="string",
                 ),
             ],
             [],

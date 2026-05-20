@@ -47,9 +47,7 @@ _FAILURE_MESSAGE = "seeded intent validation issue: missing column"
 
 @pytest.mark.live
 @patch("aetherdialect._templates.llm_credentials_configured", return_value=False)
-def test_validation_failure_feedback_surfaces_for_prompt(
-    _mock_no_llm, schema, schema_terms, t2s
-) -> None:
+def test_validation_failure_feedback_surfaces_for_prompt(_mock_no_llm, schema, schema_terms, t2s) -> None:
     """Seeded structural validation row surfaces through ``collect_question_feedback_for_prompt``."""
 
     intent = intent_customer_first_names()

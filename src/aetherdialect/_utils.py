@@ -296,7 +296,10 @@ def normalize_question_via_llm(corrected: str, *, raw_original: str | None = Non
 
     raw_use = raw_original if raw_original is not None else corrected
     vocab_block = QUESTION_NORMALIZE_VOCABULARY_HEADING + "\n" + QUESTION_NORMALIZE_VOCABULARY_GUIDANCE
-    user_obj: dict[str, Any] = {"question": corrected, "normalization_preferences": vocab_block}
+    user_obj: dict[str, Any] = {
+        "question": corrected,
+        "normalization_preferences": vocab_block,
+    }
     try:
         result = llm_json(_QUESTION_NORMALIZE_SYSTEM, stable_json(user_obj), task="default")
     except LlmJsonExhausted as exc:
@@ -431,7 +434,7 @@ def neighboring_question_token_fingerprint_norms(norm: str) -> frozenset[str]:
             for sub in "abcdefghijklmnopqrstuvwxyz0123456789_":
                 if sub == tok[j]:
                     continue
-                variant = tok[:j] + sub + tok[j + 1:]
+                variant = tok[:j] + sub + tok[j + 1 :]
                 lst = list(toks)
                 lst[i] = variant
                 lst.sort()
@@ -1317,9 +1320,7 @@ def generate_question(
         question = question.strip()
         template_start = selected_style.split("{")[0].strip()
         if template_start and not question.startswith(template_start):
-            debug(
-                f"[utils.generate_question] phrasing_violation: expected_start={template_start}, got={question[:30]}"
-            )
+            debug(f"[utils.generate_question] phrasing_violation: expected_start={template_start}, got={question[:30]}")
             return None
         debug(f"[utils.generate_question] generated: {question[:50]}")
         return question
@@ -1350,8 +1351,7 @@ _QUESTION_FROM_SQL_SYSTEM = (
 )
 
 _QUESTION_FROM_SQL_SYSTEM_WARMUP_STYLED = (
-    _QUESTION_FROM_SQL_SYSTEM
-    + "\n"
+    _QUESTION_FROM_SQL_SYSTEM + "\n"
     "- When style_slots is present in the input JSON, produce exactly three strings in "
     "questions[0], questions[1], and questions[2] aligned to each slot in order; "
     "question must equal questions[0]. Each question follows its slot style and guidance.\n"

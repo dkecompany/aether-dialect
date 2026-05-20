@@ -25,9 +25,7 @@ from ._config import (
     PolicyConfig,
 )
 
-JOIN_PRIOR_FEEDBACK_HEADING: str = (
-    "Previously rejected joins for this question (avoid these table sets / FK paths):"
-)
+JOIN_PRIOR_FEEDBACK_HEADING: str = "Previously rejected joins for this question (avoid these table sets / FK paths):"
 
 from ._contracts_base import (
     JoinInjectionAlignmentError,
@@ -2411,9 +2409,7 @@ def _render_window_over_sql(
         pe = ", ".join(render_expr_sql(e, dialect) for e in ws.partition_by)
         over_parts.append(f"PARTITION BY {pe}")
     if ws.order_by:
-        ob = ", ".join(
-            f"{render_expr_sql(o.expr, dialect)} {o.direction.upper()}" for o in ws.order_by
-        )
+        ob = ", ".join(f"{render_expr_sql(o.expr, dialect)} {o.direction.upper()}" for o in ws.order_by)
         over_parts.append(f"ORDER BY {ob}")
     inner = " ".join(over_parts)
     if ws.frame_kind in ("rows", "range") and ws.order_by:
@@ -2612,14 +2608,10 @@ def build_deterministic_sql(
     """
     keep_cte = {s.cte_name.lower() for s in (intent.cte_steps or []) if s.cte_name}
     if cte_join_hints:
-        cte_join_hints = {
-            k: v for k, v in cte_join_hints.items() if str(k).strip().lower() in keep_cte
-        }
+        cte_join_hints = {k: v for k, v in cte_join_hints.items() if str(k).strip().lower() in keep_cte}
     if cte_join_signatures_for_from_anchor:
         cte_join_signatures_for_from_anchor = {
-            k: v
-            for k, v in cte_join_signatures_for_from_anchor.items()
-            if str(k).strip().lower() in keep_cte
+            k: v for k, v in cte_join_signatures_for_from_anchor.items() if str(k).strip().lower() in keep_cte
         }
     if dialect is None:
         dialect = get_dialect()

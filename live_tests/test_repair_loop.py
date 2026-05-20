@@ -16,6 +16,7 @@ from aetherdialect._contracts_core import (
 )
 from aetherdialect._live_testing import run_seeded_schema_semantic_repair
 
+
 @pytest.mark.live
 def test_seeded_repair_fixes_mixed_grain(schema) -> None:
     """Row-level grain plus an aggregated select must be normalised by repair."""
@@ -109,4 +110,3 @@ def test_seeded_repair_realigns_filter_on_unrelated_table(schema) -> None:
     if filter_tables:
         assert filter_tables.issubset(set(repaired.tables))
     assert llm_calls >= 0
-

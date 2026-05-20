@@ -63,7 +63,9 @@ def test_postgres_and_sqlglot_spark_bucket_parity(schema_graph: SchemaGraph, sql
     assert _union_merge_bucket_key(pg) == _union_merge_bucket_key(sg)
 
 
-def test_sqlglot_spark_cte_reuses_pglast_via_transpile(schema_graph: SchemaGraph) -> None:
+def test_sqlglot_spark_cte_reuses_pglast_via_transpile(
+    schema_graph: SchemaGraph,
+) -> None:
     """Databricks sqlglot reader transpiles to PostgreSQL-shaped SQL for pglast extraction."""
 
     pytest.importorskip("pglast")
@@ -95,7 +97,7 @@ def test_load_sql_history_statements(tmp_path: Path) -> None:
     """Numbered SQL lines parse like seed questions."""
 
     p = tmp_path / "hist.txt"
-    p.write_text('1. SELECT a FROM customers\n2. SELECT b FROM orders\n', encoding="utf-8")
+    p.write_text("1. SELECT a FROM customers\n2. SELECT b FROM orders\n", encoding="utf-8")
     rows = load_sql_history_statements(str(p))
     assert rows == ["SELECT a FROM customers", "SELECT b FROM orders"]
 
@@ -247,7 +249,9 @@ def test_fetch_query_log_unknown_engine_returns_empty() -> None:
     assert fetch_query_log("mysql", None, lookback_days=1, max_queries=10, min_runs=1, user_filter=None) == []
 
 
-def test_pglast_where_literal_masks_into_param_values(schema_graph: SchemaGraph) -> None:
+def test_pglast_where_literal_masks_into_param_values(
+    schema_graph: SchemaGraph,
+) -> None:
     """AST tier binds WHERE literals into ``param_values`` via stable keys."""
 
     dialect = _pg()
@@ -262,10 +266,7 @@ def test_pglast_inner_join_qualifiers(schema_graph: SchemaGraph) -> None:
     """AST tier resolves INNER JOIN aliases for SELECT qualification."""
 
     dialect = _pg()
-    sql = (
-        "SELECT c.customer_id FROM customers c "
-        "INNER JOIN orders o ON c.customer_id = o.customer_id"
-    )
+    sql = "SELECT c.customer_id FROM customers c INNER JOIN orders o ON c.customer_id = o.customer_id"
     cr = convert_sql_to_intent(sql, schema_graph, dialect, verify_via_execute=False)
     assert cr.failure_code is None and cr.intent is not None
     assert set(cr.intent.tables) >= {"customers", "orders"}
@@ -276,9 +277,7 @@ def test_pglast_with_cte_extracts_cte_step(schema_graph: SchemaGraph) -> None:
     """Non-recursive WITH lists become ``RuntimeCteStep`` rows plus merged physical tables."""
 
     dialect = _pg()
-    sql = (
-        "WITH c AS (SELECT customer_id FROM customers) SELECT c.customer_id FROM c"
-    )
+    sql = "WITH c AS (SELECT customer_id FROM customers) SELECT c.customer_id FROM c"
     cr = convert_sql_to_intent(sql, schema_graph, dialect, verify_via_execute=False)
     assert cr.failure_code is None and cr.intent is not None
     assert len(cr.intent.cte_steps) == 1
@@ -286,7 +285,9 @@ def test_pglast_with_cte_extracts_cte_step(schema_graph: SchemaGraph) -> None:
     assert "customers" in cr.intent.tables
 
 
-def test_pglast_with_nested_cte_orders_inner_before_outer(schema_graph: SchemaGraph) -> None:
+def test_pglast_with_nested_cte_orders_inner_before_outer(
+    schema_graph: SchemaGraph,
+) -> None:
     """Nested ``WITH`` inside a CTE body flattens to multiple ``RuntimeCteStep`` rows in dependency order."""
 
     dialect = _pg()
@@ -307,10 +308,7 @@ def test_pglast_left_join_collects_tables(schema_graph: SchemaGraph) -> None:
     """LEFT JOIN range vars participate in alias qualification like INNER."""
 
     dialect = _pg()
-    sql = (
-        "SELECT c.customer_id FROM customers c "
-        "LEFT JOIN orders o ON c.customer_id = o.customer_id"
-    )
+    sql = "SELECT c.customer_id FROM customers c LEFT JOIN orders o ON c.customer_id = o.customer_id"
     cr = convert_sql_to_intent(sql, schema_graph, dialect, verify_via_execute=False)
     assert cr.failure_code is None and cr.intent is not None
     assert set(cr.intent.tables) >= {"customers", "orders"}
@@ -369,9 +367,7 @@ def test_pglast_where_top_level_or(schema_graph: SchemaGraph) -> None:
     """Top-level ``OR`` of supported predicates assigns distinct ``filter_group`` ids."""
 
     dialect = _pg()
-    sql = (
-        "SELECT customer_id FROM customers WHERE customer_id = 1 OR customer_id = 2"
-    )
+    sql = "SELECT customer_id FROM customers WHERE customer_id = 1 OR customer_id = 2"
     cr = convert_sql_to_intent(sql, schema_graph, dialect, verify_via_execute=False)
     assert cr.failure_code is None and cr.intent is not None
     assert len(cr.intent.filters_param) == 2
@@ -383,9 +379,7 @@ def test_pglast_where_between_and_like(schema_graph: SchemaGraph) -> None:
     """``BETWEEN`` uses paired param keys; ``LIKE`` maps to an existing filter op."""
 
     dialect = _pg()
-    sql_bt = (
-        "SELECT customer_id FROM customers WHERE customer_id BETWEEN 1 AND 100"
-    )
+    sql_bt = "SELECT customer_id FROM customers WHERE customer_id BETWEEN 1 AND 100"
     cr = convert_sql_to_intent(sql_bt, schema_graph, dialect, verify_via_execute=False)
     assert cr.failure_code is None and cr.intent is not None
     fp = cr.intent.filters_param[0]
@@ -404,9 +398,7 @@ def test_pglast_having_aggregate_compare(schema_graph: SchemaGraph) -> None:
     """``HAVING`` on a simple aggregate FunCall maps to ``HavingParam``."""
 
     dialect = _pg()
-    sql = (
-        "SELECT customer_id FROM customers GROUP BY customer_id HAVING count(*) > 1"
-    )
+    sql = "SELECT customer_id FROM customers GROUP BY customer_id HAVING count(*) > 1"
     cr = convert_sql_to_intent(sql, schema_graph, dialect, verify_via_execute=False)
     assert cr.failure_code is None and cr.intent is not None
     hp = cr.intent.having_param[0]
@@ -430,10 +422,7 @@ def test_pglast_self_join_lift_second_alias(schema_graph: SchemaGraph) -> None:
     """Repeated physical table aliases lift the lighter branch into a synthetic self-join CTE."""
 
     dialect = _pg()
-    sql = (
-        "SELECT c1.customer_id FROM customers c1 "
-        "INNER JOIN customers c2 ON c1.customer_id = c2.customer_id"
-    )
+    sql = "SELECT c1.customer_id FROM customers c1 INNER JOIN customers c2 ON c1.customer_id = c2.customer_id"
     cr = convert_sql_to_intent(sql, schema_graph, dialect, verify_via_execute=False)
     assert cr.failure_code is None and cr.intent is not None
     assert len(cr.intent.cte_steps) >= 1
@@ -444,10 +433,7 @@ def test_pglast_case_registry_emission(schema_graph: SchemaGraph) -> None:
     """CASE expressions emit ``case_registry`` rows and ``cNN`` select references."""
 
     dialect = _pg()
-    sql = (
-        "SELECT CASE WHEN customer_id = 1 THEN 'a' WHEN customer_id = 2 THEN 'b' ELSE 'c' END "
-        "FROM customers"
-    )
+    sql = "SELECT CASE WHEN customer_id = 1 THEN 'a' WHEN customer_id = 2 THEN 'b' ELSE 'c' END FROM customers"
     cr = convert_sql_to_intent(sql, schema_graph, dialect, verify_via_execute=False)
     assert cr.failure_code is None and cr.intent is not None
     assert cr.intent.case_registry and cr.intent.case_registry[0].registry_id.startswith("c")
@@ -459,9 +445,7 @@ def test_pglast_window_registry_row_number(schema_graph: SchemaGraph) -> None:
     """Inline ``OVER`` clauses populate ``window_registry`` with ``wNN`` references."""
 
     dialect = _pg()
-    sql = (
-        "SELECT row_number() OVER (PARTITION BY customer_id ORDER BY name) FROM customers"
-    )
+    sql = "SELECT row_number() OVER (PARTITION BY customer_id ORDER BY name) FROM customers"
     cr = convert_sql_to_intent(sql, schema_graph, dialect, verify_via_execute=False)
     assert cr.failure_code is None and cr.intent is not None
     assert cr.intent.window_registry and cr.intent.window_registry[0].registry_id.startswith("w")
@@ -495,10 +479,7 @@ def test_pglast_where_or_of_and_two_groups(schema_graph: SchemaGraph) -> None:
     """Top-level ``OR`` of ``AND`` arms assigns ``filter_group`` ids."""
 
     dialect = _pg()
-    sql = (
-        "SELECT order_id FROM orders WHERE "
-        "(customer_id = 1 AND order_id = 1) OR (customer_id = 2 AND order_id = 2)"
-    )
+    sql = "SELECT order_id FROM orders WHERE (customer_id = 1 AND order_id = 1) OR (customer_id = 2 AND order_id = 2)"
     cr = convert_sql_to_intent(sql, schema_graph, dialect, verify_via_execute=False)
     assert cr.failure_code is None and cr.intent is not None
     assert len(cr.intent.filters_param) == 4

@@ -358,19 +358,13 @@ def _canonicalize_scope(
     repl = lambda r: rename.get(r, r)
     new_select = [_rename_select_col_refs(sc, rename) for sc in select_cols or []]
     new_group_by = [replace_refs_in_expr(g, repl) for g in group_by_cols or []]
-    new_order_by = [
-        replace(obc, expr=replace_refs_in_expr(obc.expr, repl)) for obc in order_by_cols or []
-    ]
+    new_order_by = [replace(obc, expr=replace_refs_in_expr(obc.expr, repl)) for obc in order_by_cols or []]
     new_filters = [_rename_filter_param_refs(fp, rename) for fp in filters_param or []]
     new_having = [_rename_having_param_refs(hp, rename) for hp in having_param or []]
     wr_expr = _rename_window_registry_steps(window_registry or [], rename)
     cr_expr = _rename_case_registry_steps(case_registry or [], rename)
-    new_window_registry = [
-        replace(step, registry_id=f"w{idx + 1:02d}") for idx, step in enumerate(wr_expr)
-    ]
-    new_case_registry = [
-        replace(step, registry_id=f"c{idx + 1:02d}") for idx, step in enumerate(cr_expr)
-    ]
+    new_window_registry = [replace(step, registry_id=f"w{idx + 1:02d}") for idx, step in enumerate(wr_expr)]
+    new_case_registry = [replace(step, registry_id=f"c{idx + 1:02d}") for idx, step in enumerate(cr_expr)]
     return (
         new_select,
         new_group_by,
@@ -634,17 +628,13 @@ def _coerce_filter_group_list(filters: list[FilterParam]) -> list[FilterParam]:
         if len(items) <= 1:
             return items
         first_b = (items[0].bool_op or "AND").strip().upper()
-        rest_all_or = all(
-            (items[j].bool_op or "AND").strip().upper() == "OR" for j in range(1, len(items))
-        )
+        rest_all_or = all((items[j].bool_op or "AND").strip().upper() == "OR" for j in range(1, len(items)))
         # Backward-style LLM pattern: first row keeps default AND while every later row
         # carries OR (meaning "OR with the previous row" in prompt terms). Promote to
         # one disjunct per row so SQL matches A OR B OR C. Forward mixed AND/OR chains
         # (OR only on some interior rows) stay flat — see combinatorial matrix §5.
         if first_b == "AND" and rest_all_or:
-            return [
-                replace(fp, filter_group=gid, bool_op="AND") for gid, fp in enumerate(items, start=1)
-            ]
+            return [replace(fp, filter_group=gid, bool_op="AND") for gid, fp in enumerate(items, start=1)]
         return items
 
     max_gid = max((fp.filter_group for fp in items if fp.filter_group is not None), default=-1)
@@ -669,13 +659,9 @@ def _coerce_having_group_list(having: list[HavingParam]) -> list[HavingParam]:
         if len(items) <= 1:
             return items
         first_b = (items[0].bool_op or "AND").strip().upper()
-        rest_all_or = all(
-            (items[j].bool_op or "AND").strip().upper() == "OR" for j in range(1, len(items))
-        )
+        rest_all_or = all((items[j].bool_op or "AND").strip().upper() == "OR" for j in range(1, len(items)))
         if first_b == "AND" and rest_all_or:
-            return [
-                replace(hp, filter_group=gid, bool_op="AND") for gid, hp in enumerate(items, start=1)
-            ]
+            return [replace(hp, filter_group=gid, bool_op="AND") for gid, hp in enumerate(items, start=1)]
         return items
 
     max_gid = max((hp.filter_group for hp in items if hp.filter_group is not None), default=-1)
@@ -1226,7 +1212,12 @@ def prune_unused_cte_output_columns(
         ocm = cte.output_column_metadata or {}
         new_meta = {a: m for a, m in ocm.items() if a.lower() in kept_aliases_lower}
         new_steps.append(
-            replace(cte, select_cols=new_select, output_columns=new_output, output_column_metadata=new_meta)
+            replace(
+                cte,
+                select_cols=new_select,
+                output_columns=new_output,
+                output_column_metadata=new_meta,
+            )
         )
         changed = True
     if not changed:

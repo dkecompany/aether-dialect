@@ -300,7 +300,9 @@ def _pg_root_plan_estimates(plan: dict[str, Any]) -> tuple[float | None, float |
     return pr, est_bytes
 
 
-def _databricks_plan_stats_from_explain_text(text_payload: str) -> tuple[float | None, float | None]:
+def _databricks_plan_stats_from_explain_text(
+    text_payload: str,
+) -> tuple[float | None, float | None]:
     """Extract coarse row and byte estimates from Spark/Databricks ``EXPLAIN COST`` text."""
 
     if not text_payload:
@@ -371,9 +373,7 @@ def _trace_finalize_render_stage(stage: str, sql_in: str, sql_out: str) -> None:
         sql_out: SQL string leaving the sub-step.
     """
 
-    debug(
-        f"[dialect.finalize_render.{stage}] in_sql_len={len(sql_in)} out_sql_len={len(sql_out)}"
-    )
+    debug(f"[dialect.finalize_render.{stage}] in_sql_len={len(sql_in)} out_sql_len={len(sql_out)}")
     pipeline_trace_lazy(
         f"dialect.finalize_render.{stage}",
         lambda: stable_json({"in": sql_in, "out": sql_out}),
@@ -446,9 +446,7 @@ def _qualify_tables_ast(
     try:
         out = parsed.sql(dialect=sqlglot_dialect, identify=backtick)
         if sql.strip() and not out.strip():
-            debug(
-                f"[_qualify_tables_ast] sqlglot emission empty; preserving input SQL (len={len(sql)})"
-            )
+            debug(f"[_qualify_tables_ast] sqlglot emission empty; preserving input SQL (len={len(sql)})")
             return sql
         return out
     except Exception:
@@ -1021,23 +1019,17 @@ def sql_simplify_executable(sql: str, *, sqlglot_dialect: str) -> str:
 
     parsed = _inspect_parse(sql, sqlglot_dialect=sqlglot_dialect)
     if parsed is None:
-        debug(
-            f"[sql_simplify_executable] parse returned None; preserving input SQL (len={len(sql)})"
-        )
+        debug(f"[sql_simplify_executable] parse returned None; preserving input SQL (len={len(sql)})")
         return sql
     simplified = _simplify_arithmetic_identities_in_tree(parsed)
     try:
         out = _normalize_named_placeholders(simplified.sql(dialect=sqlglot_dialect))
         if sql.strip() and not out.strip():
-            debug(
-                f"[sql_simplify_executable] sqlglot emission empty; preserving input SQL (len={len(sql)})"
-            )
+            debug(f"[sql_simplify_executable] sqlglot emission empty; preserving input SQL (len={len(sql)})")
             return sql
         return out
     except Exception:
-        debug(
-            f"[sql_simplify_executable] sqlglot round-trip refused; preserving input SQL (len={len(sql)})"
-        )
+        debug(f"[sql_simplify_executable] sqlglot round-trip refused; preserving input SQL (len={len(sql)})")
         return sql
 
 
@@ -2162,11 +2154,7 @@ class PostgresDialect(Dialect):
                         allow = False
                         if scalar_cte_names:
                             rarg = getattr(item, "rarg", None)
-                            rtag = (
-                                getattr(rarg, "__class__", type("x", (), {})).__name__
-                                if rarg is not None
-                                else ""
-                            )
+                            rtag = getattr(rarg, "__class__", type("x", (), {})).__name__ if rarg is not None else ""
                             if rtag == "RangeVar" and rarg is not None:
                                 reln = (getattr(rarg, "relname", "") or "").lower()
                                 if reln and reln in scalar_cte_names:
@@ -3338,9 +3326,7 @@ def _databricks_normalize_datetrunc_sql(sql: str) -> str:
     try:
         tree = sqlglot.parse_one(sql, dialect="spark")
     except Exception:
-        debug(
-            f"[_databricks_normalize_datetrunc_sql] sqlglot parse failed; preserving input SQL (len={len(sql)})"
-        )
+        debug(f"[_databricks_normalize_datetrunc_sql] sqlglot parse failed; preserving input SQL (len={len(sql)})")
         return sql
     exp = sqlglot.expressions
     for anon in list(tree.find_all(exp.Anonymous)):
@@ -3382,9 +3368,7 @@ def _databricks_normalize_datetrunc_sql(sql: str) -> str:
             return sql
         return out
     except Exception:
-        debug(
-            f"[_databricks_normalize_datetrunc_sql] sqlglot serialize failed; preserving input SQL (len={len(sql)})"
-        )
+        debug(f"[_databricks_normalize_datetrunc_sql] sqlglot serialize failed; preserving input SQL (len={len(sql)})")
         return sql
 
 
@@ -4187,7 +4171,12 @@ class DatabricksDialect(Dialect):
                 if failed:
                     return (
                         False,
-                        [SqlDiagnostic(code=SqlDiagnosticCode.EXPLAIN_COST_EXCEEDED, message=why)],
+                        [
+                            SqlDiagnostic(
+                                code=SqlDiagnosticCode.EXPLAIN_COST_EXCEEDED,
+                                message=why,
+                            )
+                        ],
                         why,
                     )
                 return True, _databricks_diagnostics_from_explain_text(text_payload), ""
@@ -4212,7 +4201,12 @@ class DatabricksDialect(Dialect):
                 if failed:
                     return (
                         False,
-                        [SqlDiagnostic(code=SqlDiagnosticCode.EXPLAIN_COST_EXCEEDED, message=why)],
+                        [
+                            SqlDiagnostic(
+                                code=SqlDiagnosticCode.EXPLAIN_COST_EXCEEDED,
+                                message=why,
+                            )
+                        ],
                         why,
                     )
                 return True, _databricks_diagnostics_from_explain_text(text_payload), ""
@@ -4241,7 +4235,12 @@ class DatabricksDialect(Dialect):
                 if failed:
                     return (
                         False,
-                        [SqlDiagnostic(code=SqlDiagnosticCode.EXPLAIN_COST_EXCEEDED, message=why)],
+                        [
+                            SqlDiagnostic(
+                                code=SqlDiagnosticCode.EXPLAIN_COST_EXCEEDED,
+                                message=why,
+                            )
+                        ],
                         why,
                     )
                 return True, _databricks_diagnostics_from_explain_text(text_payload), ""
@@ -4835,8 +4834,6 @@ def register_dialect(name: str, cls: type[Dialect]) -> None:
         cls: Concrete ``Dialect`` subclass.
     """
     _DIALECT_REGISTRY[name] = cls
-
-
 
 
 def resolve_dialect(name_or_api: str | Dialect) -> Dialect:

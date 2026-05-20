@@ -339,7 +339,11 @@ class TestSchemaMigrationMapParse:
         from aetherdialect._templates import _parse_schema_migration_map_payload
 
         m = _parse_schema_migration_map_payload(
-            {"version": 1, "action": "remap", "refresh_existing_descriptions_on_addition": True}
+            {
+                "version": 1,
+                "action": "remap",
+                "refresh_existing_descriptions_on_addition": True,
+            }
         )
         assert m.refresh_existing_descriptions_on_addition is True
 
@@ -349,7 +353,11 @@ class TestSchemaMigrationMapParse:
 
         with pytest.raises(MigrationPendingError, match="refresh_existing_descriptions_on_addition"):
             _parse_schema_migration_map_payload(
-                {"version": 1, "action": "remap", "refresh_existing_descriptions_on_addition": "yes"}
+                {
+                    "version": 1,
+                    "action": "remap",
+                    "refresh_existing_descriptions_on_addition": "yes",
+                }
             )
 
 

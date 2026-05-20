@@ -15,7 +15,11 @@ from aetherdialect._config import (
     diagnostic_force_enter,
     diagnostic_force_exit,
 )
-from aetherdialect._contracts_base import LlmJsonExhausted, MigrationReport, MigrationTier
+from aetherdialect._contracts_base import (
+    LlmJsonExhausted,
+    MigrationReport,
+    MigrationTier,
+)
 from aetherdialect._core_utils import (
     ArtifactManifest,
     RephraseHint,
@@ -1146,7 +1150,10 @@ class TestPipelineTraceLazy:
 
         with (
             patch("aetherdialect._core_utils.diagnostic_debug_enabled", return_value=False),
-            patch("aetherdialect._core_utils.diagnostic_pipeline_trace_full_enabled", return_value=False),
+            patch(
+                "aetherdialect._core_utils.diagnostic_pipeline_trace_full_enabled",
+                return_value=False,
+            ),
             patch("aetherdialect._core_utils._telemetry_sink", None),
         ):
             pipeline_trace_lazy("h", factory)
@@ -1618,8 +1625,14 @@ class TestLlmChat:
             mock_client = MagicMock()
             mock_client.responses.create.return_value = mock_resp
             with patch("aetherdialect._core_utils._provider_order", return_value=["azure"]):
-                with patch("aetherdialect._core_utils._provider_is_configured", return_value=True):
-                    with patch("aetherdialect._core_utils._build_client", return_value=mock_client):
+                with patch(
+                    "aetherdialect._core_utils._provider_is_configured",
+                    return_value=True,
+                ):
+                    with patch(
+                        "aetherdialect._core_utils._build_client",
+                        return_value=mock_client,
+                    ):
                         with patch("aetherdialect._core_utils.debug"):
                             with patch("aetherdialect._core_utils.pipeline_trace"):
                                 llm_chat("sys", "usr", max_retries=1, task="join")
@@ -1640,8 +1653,14 @@ class TestLlmChat:
             mock_client = MagicMock()
             mock_client.responses.create.return_value = mock_resp
             with patch("aetherdialect._core_utils._provider_order", return_value=["openai"]):
-                with patch("aetherdialect._core_utils._provider_is_configured", return_value=True):
-                    with patch("aetherdialect._core_utils._build_client", return_value=mock_client):
+                with patch(
+                    "aetherdialect._core_utils._provider_is_configured",
+                    return_value=True,
+                ):
+                    with patch(
+                        "aetherdialect._core_utils._build_client",
+                        return_value=mock_client,
+                    ):
                         with patch("aetherdialect._core_utils.debug"):
                             with patch("aetherdialect._core_utils.pipeline_trace"):
                                 llm_chat("sys", "usr", max_retries=1, task="join")
@@ -1708,7 +1727,10 @@ class TestTelemetryCapturesPipelineTrace:
     def test_pipeline_trace_always_appends_to_sink(self):
         with telemetry_capture(suppress_console=True) as buf:
             with (
-                patch("aetherdialect._core_utils.diagnostic_debug_enabled", return_value=False),
+                patch(
+                    "aetherdialect._core_utils.diagnostic_debug_enabled",
+                    return_value=False,
+                ),
                 patch(
                     "aetherdialect._core_utils.diagnostic_pipeline_trace_full_enabled",
                     return_value=False,
@@ -1721,7 +1743,10 @@ class TestTelemetryCapturesPipelineTrace:
     def test_pipeline_trace_lazy_always_appends_to_sink(self):
         with telemetry_capture(suppress_console=True) as buf:
             with (
-                patch("aetherdialect._core_utils.diagnostic_debug_enabled", return_value=False),
+                patch(
+                    "aetherdialect._core_utils.diagnostic_debug_enabled",
+                    return_value=False,
+                ),
                 patch(
                     "aetherdialect._core_utils.diagnostic_pipeline_trace_full_enabled",
                     return_value=False,
@@ -1773,7 +1798,10 @@ class TestLlmChatBranches:
         def pick_client(name):
             return bad if name == "openai" else good
 
-        with patch("aetherdialect._core_utils._provider_order", return_value=["openai", "azure"]):
+        with patch(
+            "aetherdialect._core_utils._provider_order",
+            return_value=["openai", "azure"],
+        ):
             with patch("aetherdialect._core_utils._provider_is_configured", return_value=True):
                 with patch("aetherdialect._core_utils._build_client", side_effect=pick_client):
                     with patch("aetherdialect._core_utils.debug"):
@@ -1894,7 +1922,10 @@ class TestWriteGzipJsonAtomicFailure:
 
     def test_unlinks_temp_when_replace_fails(self, tmp_path):
         path = tmp_path / "out.json.gz"
-        with patch("aetherdialect._core_utils.os.replace", side_effect=OSError("replace failed")):
+        with patch(
+            "aetherdialect._core_utils.os.replace",
+            side_effect=OSError("replace failed"),
+        ):
             with pytest.raises(OSError, match="replace failed"):
                 write_gzip_json_atomic(str(path), {"a": 1}, sort_keys=True)
         assert not path.is_file()

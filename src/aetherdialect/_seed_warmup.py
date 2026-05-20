@@ -102,7 +102,10 @@ from ._utils import (
     template_instance_key_from_parts,
 )
 from ._validation_execute import bind_params_for_sql, validate_sql
-from ._validation_execute import curated_warmup_post_binding_issues, curated_warmup_semantic_issues
+from ._validation_execute import (
+    curated_warmup_post_binding_issues,
+    curated_warmup_semantic_issues,
+)
 
 _SEED_LINE_NORMALIZE_SYSTEM = (
     "You rephrase database analyst questions for clarity only. Do not answer them. "
@@ -121,7 +124,9 @@ def warmup_intent_fingerprint(intent: SeedWarmupIntent) -> str:
     ).hexdigest()
 
 
-def warmup_pool_operator_feature_stats(intents: list[SeedWarmupIntent]) -> dict[str, Any]:
+def warmup_pool_operator_feature_stats(
+    intents: list[SeedWarmupIntent],
+) -> dict[str, Any]:
     """
     Summarize operator-vector diversity for seed-warmup funnel reporting.
 
@@ -136,10 +141,7 @@ def warmup_pool_operator_feature_stats(intents: list[SeedWarmupIntent]) -> dict[
 
     vectors = [operator_feature_vector_for_seed_intent(i) for i in intents]
     distinct_vectors = len(set(vectors))
-    bits = {
-        (v.has_aggregate, v.has_grouping, v.has_having, v.window_kind != "none")
-        for v in vectors
-    }
+    bits = {(v.has_aggregate, v.has_grouping, v.has_having, v.window_kind != "none") for v in vectors}
     max_4 = WARMUP_OPERATOR_FEATURE_TUPLE_4BIT_CARDINALITY
     distinct_bits = len(bits)
     union_atoms: set[str] = set()
@@ -149,9 +151,7 @@ def warmup_pool_operator_feature_stats(intents: list[SeedWarmupIntent]) -> dict[
         "warmup_queue_distinct_operator_vectors": distinct_vectors,
         "warmup_queue_operator_feature_4bit_tuple_distinct": distinct_bits,
         "warmup_queue_operator_feature_4bit_tuple_max": max_4,
-        "warmup_queue_operator_feature_4bit_tuple_coverage_ratio": (
-            round(distinct_bits / max_4, 4) if max_4 else 0.0
-        ),
+        "warmup_queue_operator_feature_4bit_tuple_coverage_ratio": (round(distinct_bits / max_4, 4) if max_4 else 0.0),
         "warmup_queue_coverage_atom_union_size": len(union_atoms),
     }
 
@@ -175,10 +175,7 @@ def _warmup_anchor_lattice_json_path(output_root: str, schema: SchemaGraph) -> s
         output_root,
         SeedWarmupConfig.WARMUP_ANCHOR_LATTICE_SUBDIR,
     )
-    fn = (
-        f"lattice_{schema.effective_structural_hash}_"
-        f"v{SeedWarmupConfig.WARMUP_ANCHOR_LATTICE_CODE_VERSION}.json"
-    )
+    fn = f"lattice_{schema.effective_structural_hash}_v{SeedWarmupConfig.WARMUP_ANCHOR_LATTICE_CODE_VERSION}.json"
     return os.path.join(base, fn)
 
 
@@ -455,9 +452,13 @@ def open_seed_warmup_cache_session(
     identity_ok = False
     if seed_content_sha256 is not None and manifest.get("seed_content_hash") == seed_content_sha256:
         identity_ok = True
-    if sql_history_content_sha256 is not None and manifest.get(
-        "sql_history_content_hash",
-    ) == sql_history_content_sha256:
+    if (
+        sql_history_content_sha256 is not None
+        and manifest.get(
+            "sql_history_content_hash",
+        )
+        == sql_history_content_sha256
+    ):
         identity_ok = True
     seed_ok = identity_ok
     prev_eff = str(manifest.get("effective_structural_hash") or manifest.get("schema_hash") or "")
@@ -834,10 +835,20 @@ def _confirm_gold_intent(
     if choice is None:
         return False, None
     elif choice == "y":
-        notify("\nIntent accepted.", stage="cli", code=DIAGNOSTIC_CODE_ENGINE_INFO, level="info")
+        notify(
+            "\nIntent accepted.",
+            stage="cli",
+            code=DIAGNOSTIC_CODE_ENGINE_INFO,
+            level="info",
+        )
         return True, intent
     else:
-        notify("\nIntent rejected.", stage="cli", code=DIAGNOSTIC_CODE_ENGINE_INFO, level="info")
+        notify(
+            "\nIntent rejected.",
+            stage="cli",
+            code=DIAGNOSTIC_CODE_ENGINE_INFO,
+            level="info",
+        )
         return False, None
 
 
@@ -1457,9 +1468,7 @@ def _warmup_dedupe_jaccard_positions(
                     "stratum_id": sk,
                     "quota": None,
                     "rank_in_stratum": None,
-                    "detail": (
-                        f"redundant_cover_representative stratum_id={sk!r} kept_index={best}"
-                    ),
+                    "detail": (f"redundant_cover_representative stratum_id={sk!r} kept_index={best}"),
                 }
             )
     return sorted(kept), drop_records

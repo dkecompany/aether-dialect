@@ -1037,7 +1037,12 @@ class TestExplainCostGate:
         def _explain(sql: str, params=None, **kwargs):
             return (
                 False,
-                [SqlDiagnostic(code=SqlDiagnosticCode.EXPLAIN_COST_EXCEEDED, message="cost cap tripped")],
+                [
+                    SqlDiagnostic(
+                        code=SqlDiagnosticCode.EXPLAIN_COST_EXCEEDED,
+                        message="cost cap tripped",
+                    )
+                ],
                 "cost cap tripped",
             )
 

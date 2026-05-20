@@ -1356,7 +1356,11 @@ def generate_and_validate_sql(
                 dialect=dialect,
                 prior_join_feedback=prior_join_fb,
             )
-        except (NoJoinPathError, JoinInjectionAlignmentError, JoinInjectionFailedError) as exc:
+        except (
+            NoJoinPathError,
+            JoinInjectionAlignmentError,
+            JoinInjectionFailedError,
+        ) as exc:
             debug(f"[pipeline.generate_and_validate_sql] {exc}")
             print_rephrase_hint(RephraseHint.SQL_VALIDATION_FAILED)
             if persist_template_learning:
@@ -1464,7 +1468,11 @@ def generate_and_validate_sql(
                 dialect=dialect,
                 prior_join_feedback=prior_join_fb,
             )
-        except (NoJoinPathError, JoinInjectionAlignmentError, JoinInjectionFailedError) as exc:
+        except (
+            NoJoinPathError,
+            JoinInjectionAlignmentError,
+            JoinInjectionFailedError,
+        ) as exc:
             debug(f"[pipeline.generate_and_validate_sql] {exc}")
             print_rephrase_hint(RephraseHint.SQL_VALIDATION_FAILED)
             if persist_template_learning:
@@ -1531,7 +1539,11 @@ def generate_and_validate_sql(
                 dialect=dialect,
                 prior_join_feedback=prior_join_fb,
             )
-        except (NoJoinPathError, JoinInjectionAlignmentError, JoinInjectionFailedError) as exc:
+        except (
+            NoJoinPathError,
+            JoinInjectionAlignmentError,
+            JoinInjectionFailedError,
+        ) as exc:
             debug(f"[pipeline.generate_and_validate_sql] {exc}")
             print_rephrase_hint(RephraseHint.SQL_VALIDATION_FAILED)
             if persist_template_learning:
@@ -2410,7 +2422,7 @@ def handle_user_feedback(
                 )
                 log(f"promoted prior-negative-memory path to template {new_tmpl.id}")
                 promoted = True
-            
+
             if not promoted and resolved_path == GenerationPath.FRESH:
                 debug("[pipeline.handle_user_feedback] insert_template path 5")
                 sm_list = list(structural_match_templates or [])
@@ -2556,7 +2568,7 @@ def handle_user_feedback(
                     align_template_to_widened_intent(tmpl, intent, dialect)
                     reconcile_template_store_until_stable(
                         templates,
-                        template_store_view=store if isinstance(store, TemplateStoreView) else None,
+                        template_store_view=(store if isinstance(store, TemplateStoreView) else None),
                     )
             elif (
                 not promoted
@@ -2597,9 +2609,9 @@ def handle_user_feedback(
                     align_template_to_widened_intent(tmpl, intent, dialect)
                     reconcile_template_store_until_stable(
                         templates,
-                        template_store_view=store if isinstance(store, TemplateStoreView) else None,
+                        template_store_view=(store if isinstance(store, TemplateStoreView) else None),
                     )
-            
+
             store = templates_to_store(store, templates)
             save_template_store(store)
         else:
@@ -2608,13 +2620,11 @@ def handle_user_feedback(
                 "q_norm": q_norm,
                 "sql": sql,
                 "intent": intent.to_dict(),
-                "matched_template_id": matched_template.id if matched_template is not None else "",
+                "matched_template_id": (matched_template.id if matched_template is not None else ""),
                 "matched_rejected_id": getattr(matched_rejected_template, "id", "") or "",
                 "join_matches": join_matches_template,
-                "structural_ids": ",".join(
-                    t.id for t in (structural_match_templates or []) if getattr(t, "id", None)
-                ),
-                "form_storage": asdict(form_storage) if form_storage is not None else None,
+                "structural_ids": ",".join(t.id for t in (structural_match_templates or []) if getattr(t, "id", None)),
+                "form_storage": (asdict(form_storage) if form_storage is not None else None),
                 "promoted_from_rejected": matched_rejected_template is not None,
             }
             ev = WriteQueueEvent(

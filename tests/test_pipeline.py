@@ -488,7 +488,10 @@ class TestMatchQuestionLevelTemplateReuse:
             SHAPE_QUESTION_INDEX_KEY: {"shape_key": ["T0001"]},
             TEMPLATE_QUESTION_TOKEN_INDEX_KEY: {"fp1": [["T0001", "0"]]},
             TEMPLATE_INTENT_KEY_INDEX_KEY: {"intent_key_1": ["T0001"]},
-            TEMPLATE_UNION_FAMILY_INDEX_KEY: {"body_k": ["T0001"], "body_k|join_k": ["T0001"]},
+            TEMPLATE_UNION_FAMILY_INDEX_KEY: {
+                "body_k": ["T0001"],
+                "body_k|join_k": ["T0001"],
+            },
         }
         rt = RuntimeIntent(
             tables=["orders"],
@@ -508,7 +511,10 @@ class TestMatchQuestionLevelTemplateReuse:
         assert kwargs["shape_question_index"] == {"shape_key": ["T0001"]}
         assert kwargs["question_token_index"] is store[TEMPLATE_QUESTION_TOKEN_INDEX_KEY]
         assert kwargs["intent_key_index"] == {"intent_key_1": ["T0001"]}
-        assert kwargs["union_family_index"] == {"body_k": ["T0001"], "body_k|join_k": ["T0001"]}
+        assert kwargs["union_family_index"] == {
+            "body_k": ["T0001"],
+            "body_k|join_k": ["T0001"],
+        }
         assert kwargs["candidate_intent"] is rt
 
 
@@ -926,7 +932,10 @@ class TestHandleUserFeedback:
 
     @patch("aetherdialect._pipeline.save_template_store")
     @patch("aetherdialect._pipeline.templates_to_store", side_effect=lambda s, t: s)
-    @patch("aetherdialect._pipeline.other_template_owns_question_string", return_value=False)
+    @patch(
+        "aetherdialect._pipeline.other_template_owns_question_string",
+        return_value=False,
+    )
     @patch("aetherdialect._pipeline.runtime_intent_to_concrete")
     @patch(
         "aetherdialect._pipeline.flatten_param_values",
@@ -1647,7 +1656,10 @@ class TestResolveJoinsFresh:
             captured.append(sigs)
             return det_sql
 
-        with patch("aetherdialect._pipeline.inject_join_into_deterministic_sql", side_effect=_inj):
+        with patch(
+            "aetherdialect._pipeline.inject_join_into_deterministic_sql",
+            side_effect=_inj,
+        ):
             _resolve_joins_fresh(
                 det,
                 intent,
@@ -1929,7 +1941,13 @@ class TestGenerationPathSqlBranches:
         return_value=(True, "", None, []),
     )
     def test_path41_union_widen_skips_align_when_join_fingerprint_mismatches(
-        self, _mock_val, _mock_build, _mock_save, mock_align, _mock_jm, schema_graph: SchemaGraph
+        self,
+        _mock_val,
+        _mock_build,
+        _mock_save,
+        mock_align,
+        _mock_jm,
+        schema_graph: SchemaGraph,
     ):
         sc1 = SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))
         sc2 = SelectCol(expr=NormalizedExpr.from_column("orders.customer_id"))

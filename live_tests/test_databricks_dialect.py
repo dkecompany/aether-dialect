@@ -36,6 +36,8 @@ from .conftest import (
     _relax_dvdrental_selectability,
     write_live_env_file_to_temp_config_toml,
 )
+
+
 def _dbr_param(name: str, default: str) -> str:
     return os.environ.get(name, default)
 

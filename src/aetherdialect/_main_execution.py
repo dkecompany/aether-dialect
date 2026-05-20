@@ -404,7 +404,11 @@ def _drain_dispatch_write_queue_event(owner: Any, event: WriteQueueEvent) -> boo
         try:
             entry_doc = json.loads(raw_entry)
         except json.JSONDecodeError:
-            notify("write_queue: malformed entry_json", stage="pipeline", code=DIAGNOSTIC_CODE_ENGINE_INFO)
+            notify(
+                "write_queue: malformed entry_json",
+                stage="pipeline",
+                code=DIAGNOSTIC_CODE_ENGINE_INFO,
+            )
             return False
         if not isinstance(entry_doc, dict):
             return False
@@ -422,7 +426,11 @@ def _drain_dispatch_write_queue_event(owner: Any, event: WriteQueueEvent) -> boo
         try:
             ctx_doc = json.loads(raw_ctx)
         except json.JSONDecodeError:
-            notify("write_queue: malformed ctx_json", stage="pipeline", code=DIAGNOSTIC_CODE_ENGINE_INFO)
+            notify(
+                "write_queue: malformed ctx_json",
+                stage="pipeline",
+                code=DIAGNOSTIC_CODE_ENGINE_INFO,
+            )
             return False
         if not isinstance(ctx_doc, dict):
             return False
@@ -468,7 +476,11 @@ def _drain_dispatch_write_queue_event(owner: Any, event: WriteQueueEvent) -> boo
         try:
             rep = json.loads(raw)
         except json.JSONDecodeError:
-            notify("write_queue: malformed replay_json", stage="pipeline", code=DIAGNOSTIC_CODE_ENGINE_INFO)
+            notify(
+                "write_queue: malformed replay_json",
+                stage="pipeline",
+                code=DIAGNOSTIC_CODE_ENGINE_INFO,
+            )
             return False
         if not isinstance(rep, dict):
             return False
@@ -526,7 +538,11 @@ def _drain_dispatch_write_queue_event(owner: Any, event: WriteQueueEvent) -> boo
         try:
             document = json.loads(raw_doc)
         except json.JSONDecodeError:
-            notify("write_queue: malformed document_json", stage="pipeline", code=DIAGNOSTIC_CODE_ENGINE_INFO)
+            notify(
+                "write_queue: malformed document_json",
+                stage="pipeline",
+                code=DIAGNOSTIC_CODE_ENGINE_INFO,
+            )
             return False
         if not isinstance(document, dict):
             return False
@@ -590,13 +606,21 @@ def drain_write_queue(owner: Any, artifacts_dir: str) -> int:
             try:
                 doc = json.loads(line)
             except json.JSONDecodeError:
-                notify("write_queue: malformed line skipped", stage="pipeline", code=DIAGNOSTIC_CODE_ENGINE_INFO)
+                notify(
+                    "write_queue: malformed line skipped",
+                    stage="pipeline",
+                    code=DIAGNOSTIC_CODE_ENGINE_INFO,
+                )
                 continue
             if not isinstance(doc, dict):
                 continue
             evt = _decode_write_queue_event(doc)
             if evt is None:
-                notify("write_queue: unknown event skipped", stage="pipeline", code=DIAGNOSTIC_CODE_ENGINE_INFO)
+                notify(
+                    "write_queue: unknown event skipped",
+                    stage="pipeline",
+                    code=DIAGNOSTIC_CODE_ENGINE_INFO,
+                )
                 continue
             if _drain_dispatch_write_queue_event(owner, evt):
                 should_save = True
@@ -833,9 +857,19 @@ def print_latest_seed_warmup_summary(artifacts_dir: str) -> None:
 
     s = find_latest_seed_warmup_summary(artifacts_dir)
     if s is None:
-        notify("Seed warmup summary: none found.", stage="cli", code=DIAGNOSTIC_CODE_ENGINE_INFO, level="info")
+        notify(
+            "Seed warmup summary: none found.",
+            stage="cli",
+            code=DIAGNOSTIC_CODE_ENGINE_INFO,
+            level="info",
+        )
         return
-    notify(_format_seed_warmup_summary(s), stage="cli", code=DIAGNOSTIC_CODE_ENGINE_INFO, level="info")
+    notify(
+        _format_seed_warmup_summary(s),
+        stage="cli",
+        code=DIAGNOSTIC_CODE_ENGINE_INFO,
+        level="info",
+    )
 
 
 def _print_migration_applied(report: MigrationReport, sink: Callable[[str], None]) -> None:
@@ -1026,14 +1060,24 @@ def qsim_run_once(
         json.dump(summaries, f, ensure_ascii=False, separators=JSON_COMPACT_SEPARATORS)
 
     log(f"Question simulation complete: {len(results)} questions saved")
-    notify(f"QSim version: {version}", stage="cli", code=DIAGNOSTIC_CODE_ENGINE_INFO, level="info")
+    notify(
+        f"QSim version: {version}",
+        stage="cli",
+        code=DIAGNOSTIC_CODE_ENGINE_INFO,
+        level="info",
+    )
 
     if results and diagnostic_debug_enabled():
         debug("[main_execution.qsim_run_once] samples:")
         for i, item in enumerate(results[:5]):
             debug(f"[main_execution.qsim_run_once]   {i + 1}. {item.question}")
 
-    notify(_format_qsim_summary_line(summary_entry), stage="cli", code=DIAGNOSTIC_CODE_ENGINE_INFO, level="info")
+    notify(
+        _format_qsim_summary_line(summary_entry),
+        stage="cli",
+        code=DIAGNOSTIC_CODE_ENGINE_INFO,
+        level="info",
+    )
     return None
 
 
@@ -1442,7 +1486,12 @@ def seed_warmup_run_once(
         question_generation_failed=int(warmup_funnel.get("question_generation_failed", 0)),
         early_pipeline_failed=int(warmup_funnel.get("early_pipeline_failed", 0)),
     )
-    notify(_format_seed_warmup_summary(summary), stage="cli", code=DIAGNOSTIC_CODE_ENGINE_INFO, level="info")
+    notify(
+        _format_seed_warmup_summary(summary),
+        stage="cli",
+        code=DIAGNOSTIC_CODE_ENGINE_INFO,
+        level="info",
+    )
     return None
 
 
@@ -1749,7 +1798,12 @@ def _run_seed_warmup_sql_history_pipeline(
         question_generation_failed=int(warmup_funnel.get("question_generation_failed", 0)),
         early_pipeline_failed=int(warmup_funnel.get("early_pipeline_failed", 0)),
     )
-    notify(_format_seed_warmup_summary(summary), stage="cli", code=DIAGNOSTIC_CODE_ENGINE_INFO, level="info")
+    notify(
+        _format_seed_warmup_summary(summary),
+        stage="cli",
+        code=DIAGNOSTIC_CODE_ENGINE_INFO,
+        level="info",
+    )
 
 
 def run_seed_warmup_from_history_execution(
@@ -2045,9 +2099,7 @@ def _run_sql_phase_after_intent_confirm(
             rows,
             structural_defaults=tmpl_sd,
             template_display_alias_map=(
-                getattr(gen_out.matched_template, "display_alias_map", None)
-                if gen_out.matched_template
-                else None
+                getattr(gen_out.matched_template, "display_alias_map", None) if gen_out.matched_template else None
             ),
         )
 
@@ -2092,9 +2144,7 @@ def _run_sql_phase_after_intent_confirm(
             structural_defaults=tmpl_sd,
             q_norm=q_norm,
             template_display_alias_map=(
-                getattr(gen_out.matched_template, "display_alias_map", None)
-                if gen_out.matched_template
-                else None
+                getattr(gen_out.matched_template, "display_alias_map", None) if gen_out.matched_template else None
             ),
         )
         if df_full is not None:
@@ -2135,7 +2185,14 @@ def _run_sql_phase_after_intent_confirm(
             rejection_bucket=rb,
         )
     else:
-        _note_interactive_turn(choice_port, outcome="success", sql=sql, rows=row_tuples, columns=cols, intent=intent)
+        _note_interactive_turn(
+            choice_port,
+            outcome="success",
+            sql=sql,
+            rows=row_tuples,
+            columns=cols,
+            intent=intent,
+        )
 
 
 def _run_interactive_after_parsed_intent(
@@ -2408,7 +2465,14 @@ def _complete_interactive_sql_feedback(
             rejection_bucket=rb,
         )
     else:
-        _note_interactive_turn(choice_port, outcome="success", sql=sql, rows=row_tuples, columns=cols, intent=intent)
+        _note_interactive_turn(
+            choice_port,
+            outcome="success",
+            sql=sql,
+            rows=row_tuples,
+            columns=cols,
+            intent=intent,
+        )
 
 
 def _complete_intent_rejection_feedback(
@@ -2554,7 +2618,12 @@ def interactive_run_once(
         A dict with pipeline results on a full run, or `None` on early exit.
     """
     if question is None:
-        notify("Enter question", stage="cli", code=DIAGNOSTIC_CODE_ENGINE_INFO, level="info")
+        notify(
+            "Enter question",
+            stage="cli",
+            code=DIAGNOSTIC_CODE_ENGINE_INFO,
+            level="info",
+        )
         try:
             question = _core_utils.prompt("").strip()
         except (EOFError, KeyboardInterrupt):
@@ -2641,13 +2710,9 @@ def interactive_run_once(
 
     neg_drop = False
     normalized_canonical = normalize_question_via_llm(corrected_text, raw_original=raw_question)
-    if (
-        normalized_canonical != corrected_text
-        and has_any_rejection_history_for_question(store, corrected_text)
-    ):
+    if normalized_canonical != corrected_text and has_any_rejection_history_for_question(store, corrected_text):
         debug(
-            f"[main_execution.interactive_run_once] dropped_normalized_due_to_negative_memory "
-            f"{normalized_canonical!r}"
+            f"[main_execution.interactive_run_once] dropped_normalized_due_to_negative_memory {normalized_canonical!r}"
         )
         neg_drop = True
         normalized_canonical = corrected_text
@@ -2656,9 +2721,7 @@ def interactive_run_once(
     if normalized_canonical != corrected_text:
         tmpl_norm = match_question_level_template_reuse(normalized_canonical, templates, template_store=store)
         if tmpl_norm.reuse_type == "direct_reuse":
-            log(
-                f"direct SQL reuse via normalized question match (trust>=1, template='{tmpl_norm.best_template.id}')"
-            )
+            log(f"direct SQL reuse via normalized question match (trust>=1, template='{tmpl_norm.best_template.id}')")
             assert tmpl_norm.reuse_candidate_normalized is not None
             fs_norm = QuestionFormStorage(
                 corrected=corrected_text,
@@ -2787,7 +2850,9 @@ def get_seed_warmup_summary_from_dir(artifacts_dir: str, version: int) -> SeedWa
     )
 
 
-def _load_config_file(path: str | os.PathLike[str] | None) -> tuple[dict[str, str], frozenset[str]]:
+def _load_config_file(
+    path: str | os.PathLike[str] | None,
+) -> tuple[dict[str, str], frozenset[str]]:
     """
     Parse a TOML configuration file into flat environment-style string keys.
 
@@ -2876,8 +2941,16 @@ def _load_config_file(path: str | os.PathLike[str] | None) -> tuple[dict[str, st
     execution_block = document.get("execution")
     if isinstance(execution_block, dict):
         _claim_put(execution_block, "max_query_cost_rows", "AETHERDIALECT_MAX_QUERY_COST_ROWS")
-        _claim_put(execution_block, "max_query_cost_bytes", "AETHERDIALECT_MAX_QUERY_COST_BYTES")
-        _claim_put(execution_block, "statement_timeout_ms", "AETHERDIALECT_STATEMENT_TIMEOUT_MS")
+        _claim_put(
+            execution_block,
+            "max_query_cost_bytes",
+            "AETHERDIALECT_MAX_QUERY_COST_BYTES",
+        )
+        _claim_put(
+            execution_block,
+            "statement_timeout_ms",
+            "AETHERDIALECT_STATEMENT_TIMEOUT_MS",
+        )
         _claim_put(execution_block, "llm_timeout_ms", "AETHERDIALECT_LLM_TIMEOUT_MS")
         _claim_put(execution_block, "profile_timeout_ms", "AETHERDIALECT_PROFILE_TIMEOUT_MS")
         _claim_put(execution_block, "explain_timeout_ms", "AETHERDIALECT_EXPLAIN_TIMEOUT_MS")
@@ -3076,6 +3149,8 @@ def _prepare_schema_context_for_init(
             sql_file=sql_use,
         )
     return schema_context
+
+
 def _env_all_non_empty(env: Mapping[str, str], keys: tuple[str, ...]) -> bool:
     """Return True when every key maps to a non-blank string."""
 
@@ -3241,12 +3316,7 @@ def _select_engine_name(env: Mapping[str, str]) -> Literal["postgresql", "databr
             + "; "
             + _env_role_hint("schema", POSTGRES_ENV_SCHEMA),
         )
-    if (
-        not dbx_env
-        and _databricks_uc_scope_complete(env)
-        and _databricks_sql_warehouse_complete(env)
-        and not dbx_drv
-    ):
+    if not dbx_env and _databricks_uc_scope_complete(env) and _databricks_sql_warehouse_complete(env) and not dbx_drv:
         missing.append(
             "Databricks SQL warehouse variables are set but the databricks-sql-connector package is not installed.",
         )
@@ -3367,7 +3437,9 @@ def _configure_llm_from_environment(env: Mapping[str, str]) -> None:
             _configure_openai_from_environment(env)
         else:
             if not azure_ready:
-                raise ConfigError("AETHERDIALECT_LLM_PROVIDER is 'azure' but the Azure OpenAI environment is incomplete.")
+                raise ConfigError(
+                    "AETHERDIALECT_LLM_PROVIDER is 'azure' but the Azure OpenAI environment is incomplete."
+                )
             _configure_azure_from_environment(env)
         clear_llm_clients()
         return
@@ -4218,10 +4290,7 @@ class PipelineSession(InteractiveChoicePort):
                         PIPELINE_SUSPEND_ID_USER_FEEDBACK_REJECT,
                         SESSION_KIND_ERROR,
                     ),
-                    message=(
-                        "Reject reason cannot be empty.\n\n"
-                        + _SESSION_USER_FEEDBACK_BODY
-                    ),
+                    message=("Reject reason cannot be empty.\n\n" + _SESSION_USER_FEEDBACK_BODY),
                 )
             self._choice_queue.append((PIPELINE_SUSPEND_ID_USER_FEEDBACK_REJECT, text))
             return self._resume_from_suspend()
@@ -4235,10 +4304,7 @@ class PipelineSession(InteractiveChoicePort):
                         PIPELINE_SUSPEND_ID_INTENT_FEEDBACK,
                         SESSION_KIND_ERROR,
                     ),
-                    message=(
-                        "Feedback text cannot be empty.\n\n"
-                        + _SESSION_INTENT_FEEDBACK_BODY
-                    ),
+                    message=("Feedback text cannot be empty.\n\n" + _SESSION_INTENT_FEEDBACK_BODY),
                 )
             self._choice_queue.append((PIPELINE_SUSPEND_ID_INTENT_FEEDBACK, text))
             return self._resume_from_suspend()

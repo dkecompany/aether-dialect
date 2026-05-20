@@ -136,27 +136,13 @@ REPHRASE_HINT_MESSAGES: dict[str, str] = {
 }
 
 USER_REJECTED_RESULT_BUCKET_TIPS: dict[str, str] = {
-    "MISSING_FILTER": (
-        "Tips: name the filter or dimension you care about (time range, status, category)."
-    ),
-    "WRONG_GROUPING": (
-        "Tips: say whether you want totals per entity, per period, or overall."
-    ),
-    "WRONG_AGGREGATION": (
-        "Tips: specify sum, average, count, or another metric clearly."
-    ),
-    "WRONG_TIME_RANGE": (
-        "Tips: give an explicit date range or relative window."
-    ),
-    "WRONG_TABLES_OR_JOINS": (
-        "Tips: name the tables or relationships that should connect your answer."
-    ),
-    "WRONG_SORT_OR_LIMIT": (
-        "Tips: say how results should be ordered or how many rows you need."
-    ),
-    "OTHER": (
-        "Tips: be more specific about columns, filters, grouping, or time range."
-    ),
+    "MISSING_FILTER": ("Tips: name the filter or dimension you care about (time range, status, category)."),
+    "WRONG_GROUPING": ("Tips: say whether you want totals per entity, per period, or overall."),
+    "WRONG_AGGREGATION": ("Tips: specify sum, average, count, or another metric clearly."),
+    "WRONG_TIME_RANGE": ("Tips: give an explicit date range or relative window."),
+    "WRONG_TABLES_OR_JOINS": ("Tips: name the tables or relationships that should connect your answer."),
+    "WRONG_SORT_OR_LIMIT": ("Tips: say how results should be ordered or how many rows you need."),
+    "OTHER": ("Tips: be more specific about columns, filters, grouping, or time range."),
 }
 
 QUERY_RESULTS_HEADER: str = "Query Results"
@@ -326,13 +312,23 @@ def result(message: str) -> None:
 def warn(message: str) -> None:
     """Emit a non-fatal warning through :func:`notify`, prefixed with ``! ``."""
 
-    notify(f"{USER_WARN_PREFIX}{message}", stage="user_warn", code=DIAGNOSTIC_CODE_ENGINE_INFO, level="warn")
+    notify(
+        f"{USER_WARN_PREFIX}{message}",
+        stage="user_warn",
+        code=DIAGNOSTIC_CODE_ENGINE_INFO,
+        level="warn",
+    )
 
 
 def error(message: str) -> None:
     """Emit an error line through :func:`notify`, prefixed with ``Error: ``."""
 
-    notify(f"{USER_ERROR_PREFIX}{message}", stage="user_error", code=DIAGNOSTIC_CODE_ENGINE_INFO, level="error")
+    notify(
+        f"{USER_ERROR_PREFIX}{message}",
+        stage="user_error",
+        code=DIAGNOSTIC_CODE_ENGINE_INFO,
+        level="error",
+    )
 
 
 def prompt(message: str) -> str:
@@ -344,16 +340,31 @@ def prompt(message: str) -> str:
 def terminated() -> None:
     """Emit the canonical user-termination line through :func:`notify`."""
 
-    notify(USER_TERMINATED_LINE, stage="user_terminated", code=DIAGNOSTIC_CODE_ENGINE_INFO, level="info")
+    notify(
+        USER_TERMINATED_LINE,
+        stage="user_terminated",
+        code=DIAGNOSTIC_CODE_ENGINE_INFO,
+        level="info",
+    )
 
 
 def invalid_input(detail: str | None = None) -> None:
     """Emit the canonical invalid-input line through :func:`notify`, or *detail* when provided."""
 
     if detail:
-        notify(detail.strip(), stage="user_invalid_input", code=DIAGNOSTIC_CODE_ENGINE_INFO, level="warn")
+        notify(
+            detail.strip(),
+            stage="user_invalid_input",
+            code=DIAGNOSTIC_CODE_ENGINE_INFO,
+            level="warn",
+        )
     else:
-        notify(USER_INVALID_INPUT_LINE, stage="user_invalid_input", code=DIAGNOSTIC_CODE_ENGINE_INFO, level="warn")
+        notify(
+            USER_INVALID_INPUT_LINE,
+            stage="user_invalid_input",
+            code=DIAGNOSTIC_CODE_ENGINE_INFO,
+            level="warn",
+        )
 
 
 class InteractiveChoicePort(Protocol):
@@ -604,9 +615,7 @@ def pipeline_trace_lazy(heading: str, body_factory: Callable[[], str]) -> None:
 
     sink_on = _telemetry_sink is not None
     console_on = (
-        not _telemetry_suppress_console
-        and diagnostic_debug_enabled()
-        and diagnostic_pipeline_trace_full_enabled()
+        not _telemetry_suppress_console and diagnostic_debug_enabled() and diagnostic_pipeline_trace_full_enabled()
     )
     if not sink_on and not console_on:
         return
@@ -1468,7 +1477,12 @@ def print_query_result(
             out_lines.append(f"  {line}")
         if len(rows) > 5:
             out_lines.append(f"  ... ({len(rows)} total rows)")
-    notify("\n".join(out_lines), stage="query_result", code=DIAGNOSTIC_CODE_ENGINE_INFO, level="info")
+    notify(
+        "\n".join(out_lines),
+        stage="query_result",
+        code=DIAGNOSTIC_CODE_ENGINE_INFO,
+        level="info",
+    )
 
 
 def dataframe_to_row_tuples(df: Any) -> list[tuple[Any, ...]]:
@@ -1529,7 +1543,12 @@ def ask_user_choice(prompt: str, options: list[str], silent_no: bool = False) ->
         ``"y"``, ``"n"``, or ``None`` on EOF/invalid.
     """
     options_display = "/".join(options)
-    notify(f"{prompt} ({options_display}): ", stage="interactive_choice", code=DIAGNOSTIC_CODE_ENGINE_INFO, level="info")
+    notify(
+        f"{prompt} ({options_display}): ",
+        stage="interactive_choice",
+        code=DIAGNOSTIC_CODE_ENGINE_INFO,
+        level="info",
+    )
     try:
         user_input = input().strip()
     except (EOFError, KeyboardInterrupt):
@@ -1542,10 +1561,20 @@ def ask_user_choice(prompt: str, options: list[str], silent_no: bool = False) ->
 
     normalized = user_input.lower()
     if normalized in ("y", "yes"):
-        notify("Yes", stage="interactive_choice", code=DIAGNOSTIC_CODE_ENGINE_INFO, level="info")
+        notify(
+            "Yes",
+            stage="interactive_choice",
+            code=DIAGNOSTIC_CODE_ENGINE_INFO,
+            level="info",
+        )
         return "y"
     elif normalized in ("n", "no"):
-        notify("No", stage="interactive_choice", code=DIAGNOSTIC_CODE_ENGINE_INFO, level="info")
+        notify(
+            "No",
+            stage="interactive_choice",
+            code=DIAGNOSTIC_CODE_ENGINE_INFO,
+            level="info",
+        )
         if not silent_no:
             terminated()
         return "n"
@@ -1627,7 +1656,12 @@ def print_info(title: str, items: dict[str, Any] | None = None, footer: str | No
             lines.append(f"  {key}: {val}")
     if footer:
         lines.append(f"\n{footer}")
-    notify("\n".join(lines), stage="print_info", code=DIAGNOSTIC_CODE_ENGINE_INFO, level="info")
+    notify(
+        "\n".join(lines),
+        stage="print_info",
+        code=DIAGNOSTIC_CODE_ENGINE_INFO,
+        level="info",
+    )
 
 
 def join_sig_string(sig: list[str]) -> str:

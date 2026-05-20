@@ -606,9 +606,8 @@ def build_schema_context(tables: list[str], schema: SchemaGraph) -> str:
         for col_name, col_meta in table_ir.columns.items():
             if not col_meta.is_visible:
                 continue
-            col_type = (
-                (col_meta.value_type or "").strip()
-                or (data_type_to_value_type(col_meta.data_type) if col_meta.data_type else "unknown")
+            col_type = (col_meta.value_type or "").strip() or (
+                data_type_to_value_type(col_meta.data_type) if col_meta.data_type else "unknown"
             )
             col_desc = f"{col_name} ({col_type})"
             if col_meta.is_primary_key:

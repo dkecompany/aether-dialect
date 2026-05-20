@@ -241,7 +241,11 @@ def _build_merged_tier_buckets(
         pool = _build_skeleton_pool(schema, column_roles, num_tables=nt)
         for tk in pool.table_set_keys:
             ts = tk.split("|")
-            for tier_dict in (pool.tier_a_by_table_set, pool.tier_b_by_table_set, pool.tier_c_by_table_set):
+            for tier_dict in (
+                pool.tier_a_by_table_set,
+                pool.tier_b_by_table_set,
+                pool.tier_c_by_table_set,
+            ):
                 for skel in tier_dict[tk]:
                     ct = classify_qsim_skeleton_complexity(skel)
                     merged[ct.value].append((skel, ts))
@@ -650,9 +654,7 @@ def _llm_fill_intent(
             if target_tier is not None:
                 classified = classify_qsim_intent_complexity(parse_result)
                 if not qsim_intent_matches_target_tier(classified, target_tier):
-                    last_failure_reason = (
-                        f"tier_conformance: classified={classified.value} target={target_tier.value}"
-                    )
+                    last_failure_reason = f"tier_conformance: classified={classified.value} target={target_tier.value}"
                     failure_context = None
                     debug(
                         f"[qsim_ops.llm_fill_intent] attempt {attempt + 1}/{(PolicyConfig.MAX_STAGE_B_REPAIRS + 1)} "

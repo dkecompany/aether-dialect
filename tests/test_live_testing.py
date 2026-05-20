@@ -466,7 +466,11 @@ class TestAssertScenario:
 
     def test_column_names_pass(self):
         """Column names assertion should pass when matching."""
-        from aetherdialect._contracts_core import NormalizedExpr, RuntimeIntent, SelectCol
+        from aetherdialect._contracts_core import (
+            NormalizedExpr,
+            RuntimeIntent,
+            SelectCol,
+        )
 
         intent = RuntimeIntent(
             tables=["film"],
@@ -485,7 +489,11 @@ class TestAssertScenario:
 
     def test_column_names_fail(self):
         """Column names mismatch should record failure."""
-        from aetherdialect._contracts_core import NormalizedExpr, RuntimeIntent, SelectCol
+        from aetherdialect._contracts_core import (
+            NormalizedExpr,
+            RuntimeIntent,
+            SelectCol,
+        )
 
         intent = RuntimeIntent(
             tables=["film"],
@@ -504,7 +512,11 @@ class TestAssertScenario:
 
     def test_column_names_one_of_multi_option_pass(self):
         """When multiple column sets allowed, matching one passes."""
-        from aetherdialect._contracts_core import NormalizedExpr, RuntimeIntent, SelectCol
+        from aetherdialect._contracts_core import (
+            NormalizedExpr,
+            RuntimeIntent,
+            SelectCol,
+        )
 
         intent = RuntimeIntent(
             tables=["customer"],
@@ -968,7 +980,10 @@ class TestRunPipelineCoreUnionPreview:
                 "aetherdialect._live_testing.prepare_union_match_join_phase",
                 side_effect=prep,
             ),
-            patch("aetherdialect._live_testing.generate_and_validate_sql", return_value=gen_out),
+            patch(
+                "aetherdialect._live_testing.generate_and_validate_sql",
+                return_value=gen_out,
+            ),
             patch("aetherdialect._live_testing.compute_final_metrics", return_value=0.99),
             patch(
                 "aetherdialect._live_testing.display_final_results_to_stdout",

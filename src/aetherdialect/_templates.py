@@ -94,7 +94,12 @@ from ._intent_process import (
     join_path_key_runtime,
     register_templates_module,
 )
-from ._schema import SchemaDiff, TableDiff, _migrate_sidecar_for_diff, destructive_migration_execute
+from ._schema import (
+    SchemaDiff,
+    TableDiff,
+    _migrate_sidecar_for_diff,
+    destructive_migration_execute,
+)
 from ._sql_gen import generate_col_alias
 from ._utils import (
     build_shape_question_index,
@@ -110,7 +115,9 @@ from ._utils import (
 )
 
 
-def _build_intent_key_index_for_templates(templates: list[Template]) -> dict[str, list[str]]:
+def _build_intent_key_index_for_templates(
+    templates: list[Template],
+) -> dict[str, list[str]]:
     idx: dict[str, set[str]] = defaultdict(set)
     for t in templates:
         ik = (t.intent_key or "").strip()
@@ -119,7 +126,9 @@ def _build_intent_key_index_for_templates(templates: list[Template]) -> dict[str
     return {k: sorted(v) for k, v in idx.items()}
 
 
-def _build_union_family_index_for_templates(templates: list[Template]) -> dict[str, list[str]]:
+def _build_union_family_index_for_templates(
+    templates: list[Template],
+) -> dict[str, list[str]]:
     idx: dict[str, set[str]] = defaultdict(set)
     for t in templates:
         bk = body_similarity_key_for_concrete(t.intent_signature)
@@ -129,7 +138,9 @@ def _build_union_family_index_for_templates(templates: list[Template]) -> dict[s
     return {k: sorted(v) for k, v in idx.items()}
 
 
-def _build_question_token_index_for_templates(templates: list[Template]) -> dict[str, list[list[str]]]:
+def _build_question_token_index_for_templates(
+    templates: list[Template],
+) -> dict[str, list[list[str]]]:
     idx: dict[str, list[list[str]]] = defaultdict(list)
     for t in templates:
         tid = str(t.id)
@@ -309,7 +320,13 @@ class TemplateStoreView:
         if os.path.isfile(path):
             try:
                 raw = read_gzip_json(path)
-            except (OSError, EOFError, gzip.BadGzipFile, json.JSONDecodeError, UnicodeDecodeError):
+            except (
+                OSError,
+                EOFError,
+                gzip.BadGzipFile,
+                json.JSONDecodeError,
+                UnicodeDecodeError,
+            ):
                 raw = {}
         else:
             raw = {}
@@ -472,9 +489,7 @@ class TemplateStoreView:
         other.question_feedback = copy.deepcopy(self.question_feedback, memo)
         other.partition_map = dict(self.partition_map)
         other._indexes = {k: copy.deepcopy(v, memo) for k, v in self._indexes.items()}
-        other._partition_cache = OrderedDict(
-            (k, copy.deepcopy(v, memo)) for k, v in self._partition_cache.items()
-        )
+        other._partition_cache = OrderedDict((k, copy.deepcopy(v, memo)) for k, v in self._partition_cache.items())
         other._dirty_partitions = set()
         other._lru_max = self._lru_max
         other._templates_proxy = _TemplateBodiesView(other)
@@ -655,7 +670,9 @@ def _feedback_iso_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def compute_intent_structural_signature(intent: RuntimeIntent | None) -> tuple[str, str]:
+def compute_intent_structural_signature(
+    intent: RuntimeIntent | None,
+) -> tuple[str, str]:
     """Return ``(sha256_first_16_hex, stable_json_of_concrete_intent)`` for deduplication and LLM context."""
 
     if intent is None:
@@ -1315,9 +1332,7 @@ def apply_schema_rename_migration_to_store(
             structural_hash=prev.structural_hash if prev else "",
             profiling_hash=prev.profiling_hash if prev else "",
             scope_hash=prev.scope_hash if prev else "",
-            effective_structural_hash=(
-                prev.effective_structural_hash if prev else view.effective_structural_hash
-            ),
+            effective_structural_hash=(prev.effective_structural_hash if prev else view.effective_structural_hash),
             notes_hash=prev.notes_hash if prev else "",
             semantic_edges_hash=prev.semantic_edges_hash if prev else "",
             last_migration_tier=prev.last_migration_tier if prev else "",
@@ -1983,9 +1998,7 @@ def _load_template_store_locked(
         TEMPLATE_UNION_FAMILY_INDEX_KEY,
         TEMPLATE_QUESTION_TOKEN_INDEX_KEY,
     )
-    need_index_rebuild = any(
-        k not in header or not isinstance(header.get(k), dict) for k in index_keys
-    )
+    need_index_rebuild = any(k not in header or not isinstance(header.get(k), dict) for k in index_keys)
 
     stored = header.get("effective_structural_hash", header.get("schema_hash", ""))
     view = TemplateStoreView.from_header_payload(store_dir, header)
@@ -1999,8 +2012,7 @@ def _load_template_store_locked(
             if isinstance(rows, list):
                 qfn += len(rows)
         debug(
-            f"[templates.load_template_store] loaded: templates={len(view.partition_map)} "
-            f"question_feedback_rows={qfn}"
+            f"[templates.load_template_store] loaded: templates={len(view.partition_map)} question_feedback_rows={qfn}"
         )
         return view
     if schema is None:
@@ -2031,10 +2043,7 @@ def save_template_store(store: dict[str, Any] | TemplateStoreView) -> None:
     for _qk, rows in qf.items():
         if isinstance(rows, list):
             qfn += len(rows)
-    debug(
-        f"[templates.save_template_store] saving: templates={len(store.partition_map)} "
-        f"question_feedback_rows={qfn}"
-    )
+    debug(f"[templates.save_template_store] saving: templates={len(store.partition_map)} question_feedback_rows={qfn}")
     refresh_template_store_indexes(store)
     header_doc = _convert_to_json_serializable(store._header_document())
     _debug_check_types(header_doc, "store")
@@ -2515,7 +2524,12 @@ def _parse_schema_migration_map_payload(payload: dict[str, Any]) -> SchemaMigrat
             tpart, cpart = tpart.strip(), cpart.strip()
             if tpart and cpart:
                 dropped_c.append(
-                    SchemaMigrationMapEntry(entry_type="dropped_column", table=tpart, from_name=cpart, to_name="")
+                    SchemaMigrationMapEntry(
+                        entry_type="dropped_column",
+                        table=tpart,
+                        from_name=cpart,
+                        to_name="",
+                    )
                 )
     added_tb: list[str] = []
     for x in payload.get("added_tables") or []:
@@ -2532,7 +2546,14 @@ def _parse_schema_migration_map_payload(payload: dict[str, Any]) -> SchemaMigrat
             for nc in inner.keys():
                 ncn = str(nc).strip()
                 if ncn:
-                    added_c.append(SchemaMigrationMapEntry(entry_type="added_column", table=bt, to_name=ncn, from_name=""))
+                    added_c.append(
+                        SchemaMigrationMapEntry(
+                            entry_type="added_column",
+                            table=bt,
+                            to_name=ncn,
+                            from_name="",
+                        )
+                    )
     refresh_desc = payload.get("refresh_existing_descriptions_on_addition", False)
     if not isinstance(refresh_desc, bool):
         raise MigrationPendingError(
@@ -2584,7 +2605,9 @@ def _validate_schema_migration_map(
 
     problems: list[str] = []
     stale: list[str] = []
-    tmap = {e.from_name: e.to_name for e in map_obj.table_renames if e.entry_type == "table" and e.from_name and e.to_name}
+    tmap = {
+        e.from_name: e.to_name for e in map_obj.table_renames if e.entry_type == "table" and e.from_name and e.to_name
+    }
 
     def _new_table(old: str) -> str:
         return tmap.get(old, old)
@@ -2662,7 +2685,9 @@ def _schema_diff_from_user_drops(map_obj: SchemaMigrationMap) -> SchemaDiff | No
 def _schema_diff_for_sidecar_renames(map_obj: SchemaMigrationMap) -> SchemaDiff | None:
     """Build a rename-only :class:`SchemaDiff` for overrides sidecar migration."""
 
-    tr = tuple((e.from_name, e.to_name) for e in map_obj.table_renames if e.entry_type == "table" and e.from_name != e.to_name)
+    tr = tuple(
+        (e.from_name, e.to_name) for e in map_obj.table_renames if e.entry_type == "table" and e.from_name != e.to_name
+    )
     col_groups: dict[str, list[tuple[str, str]]] = defaultdict(list)
     tmap = {a: b for a, b in tr}
 
@@ -2699,26 +2724,36 @@ def _apply_schema_migration_map(
     if map_obj.action == MIGRATION_MAP_ACTION_DESTRUCTIVE:
         destroyed = _disk_template_row_count(artifacts_dir)
         destructive_migration_execute(artifacts_dir, schema)
-        _stamp_manifest(artifacts_dir, schema, tier=MigrationTier.DESTRUCTIVE, last_action=ARTIFACT_LAST_ACTION_DESTRUCTIVE_USER_MAP)
+        _stamp_manifest(
+            artifacts_dir,
+            schema,
+            tier=MigrationTier.DESTRUCTIVE,
+            last_action=ARTIFACT_LAST_ACTION_DESTRUCTIVE_USER_MAP,
+        )
         return MigrationReport(tier=MigrationTier.DESTRUCTIVE, destroyed_templates=destroyed)
     sidecar_diff = _schema_diff_for_sidecar_renames(map_obj)
     if sidecar_diff is not None:
         _migrate_sidecar_for_diff(schema_json_path, sidecar_diff)
     renamed_tables = tuple((e.from_name, e.to_name) for e in map_obj.table_renames if e.entry_type == "table")
     renamed_columns = tuple(
-        (e.table, e.from_name, e.to_name)
-        for e in map_obj.column_renames
-        if e.entry_type == "column"
+        (e.table, e.from_name, e.to_name) for e in map_obj.column_renames if e.entry_type == "column"
     )
     remapped = 0
     destroyed = 0
     if renamed_tables or renamed_columns:
-        remapped, destroyed = apply_schema_rename_migration_to_store(artifacts_dir, schema, renamed_tables, renamed_columns)
+        remapped, destroyed = apply_schema_rename_migration_to_store(
+            artifacts_dir, schema, renamed_tables, renamed_columns
+        )
     surg = 0
     drop_diff = _schema_diff_from_user_drops(map_obj)
     if drop_diff is not None:
         surg = surgical_invalidate_templates_by_diff(artifacts_dir, schema, drop_diff)
-    _stamp_manifest(artifacts_dir, schema, tier=MigrationTier.REMAP, last_action=ARTIFACT_LAST_ACTION_REMAP_USER_MAP)
+    _stamp_manifest(
+        artifacts_dir,
+        schema,
+        tier=MigrationTier.REMAP,
+        last_action=ARTIFACT_LAST_ACTION_REMAP_USER_MAP,
+    )
     return MigrationReport(
         tier=MigrationTier.REMAP,
         renamed_tables=renamed_tables,
@@ -2735,7 +2770,7 @@ def export_schema_migration_map_skeleton(
     *,
     tier: MigrationTier,
     schema_diff: SchemaDiff | None,
-    rename_plan: tuple[tuple[tuple[str, str], ...], tuple[tuple[str, str, str], ...]] | None,
+    rename_plan: (tuple[tuple[tuple[str, str], ...], tuple[tuple[str, str, str], ...]] | None),
 ) -> Path:
     """
     Write ``schema_migration_map.json`` with auto-detected fields pre-filled.
@@ -2744,9 +2779,7 @@ def export_schema_migration_map_skeleton(
     """
 
     path = cwd_path / MIGRATION_MAP_FILENAME
-    action = (
-        MIGRATION_MAP_ACTION_DESTRUCTIVE if tier == MigrationTier.DESTRUCTIVE else MIGRATION_MAP_ACTION_REMAP
-    )
+    action = MIGRATION_MAP_ACTION_DESTRUCTIVE if tier == MigrationTier.DESTRUCTIVE else MIGRATION_MAP_ACTION_REMAP
     table_renames: dict[str, str] = {}
     column_renames: dict[str, dict[str, str]] = {}
     if rename_plan is not None:

@@ -1365,7 +1365,9 @@ class TestValidateHavingOperatorIsNumeric:
     """Tests for validate_having_operator_is_numeric."""
 
     def test_numeric_ops_clean(self):
-        from aetherdialect._validation_semantic import validate_having_operator_is_numeric
+        from aetherdialect._validation_semantic import (
+            validate_having_operator_is_numeric,
+        )
 
         hp = HavingParam(
             left_expr=NormalizedExpr.from_agg("count", "t.a"),
@@ -1375,7 +1377,9 @@ class TestValidateHavingOperatorIsNumeric:
         assert validate_having_operator_is_numeric([hp]) == []
 
     def test_ilike_rejected(self):
-        from aetherdialect._validation_semantic import validate_having_operator_is_numeric
+        from aetherdialect._validation_semantic import (
+            validate_having_operator_is_numeric,
+        )
 
         hp = HavingParam(
             left_expr=NormalizedExpr.from_agg("count", "t.a"),
@@ -3232,7 +3236,10 @@ class TestValidateConcatMulgroup:
 
     def test_sum_outer_rejected(self) -> None:
         g = MulGroup(
-            multiply=[NormalizedExpr.from_column("a.b"), NormalizedExpr.from_column("c.d")],
+            multiply=[
+                NormalizedExpr.from_column("a.b"),
+                NormalizedExpr.from_column("c.d"),
+            ],
             scalar_func="concat",
             agg_func="sum",
         )
@@ -3241,7 +3248,10 @@ class TestValidateConcatMulgroup:
 
     def test_count_outer_allowed(self) -> None:
         g = MulGroup(
-            multiply=[NormalizedExpr.from_column("a.b"), NormalizedExpr.from_column("c.d")],
+            multiply=[
+                NormalizedExpr.from_column("a.b"),
+                NormalizedExpr.from_column("c.d"),
+            ],
             scalar_func="concat",
             agg_func="count",
             distinct=True,

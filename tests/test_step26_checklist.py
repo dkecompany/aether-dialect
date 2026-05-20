@@ -22,14 +22,22 @@ from aetherdialect._contracts_base import (
     TableMetadata,
     ColumnMetadata,
 )
-from aetherdialect._contracts_core import FeedbackKind, QuestionFeedbackEntry, RejectionBucket, RefinementContext
+from aetherdialect._contracts_core import (
+    FeedbackKind,
+    QuestionFeedbackEntry,
+    RejectionBucket,
+    RefinementContext,
+)
 from aetherdialect._core_utils import _azure_deployment_for_model, llm_execution_scope
 from aetherdialect._intent_process import (
     _build_intent_logical_prompt,
     _logical_intent_to_serialisable,
     _parse_logical_intent_response,
 )
-from aetherdialect._main_execution import PIPELINE_SUSPEND_ID_INTENT_CONFIRM, PipelineSuspended
+from aetherdialect._main_execution import (
+    PIPELINE_SUSPEND_ID_INTENT_CONFIRM,
+    PipelineSuspended,
+)
 from aetherdialect._templates import (
     collect_question_feedback_for_prompt,
     compute_question_feedback_penalty,
@@ -71,9 +79,17 @@ class TestStageALogicalPromptAndRoundTrip:
         sg = SchemaGraph(
             tables={
                 "customers": TableMetadata(
-                    name="customers", columns={"id": col}, primary_key=["id"], foreign_keys=[]
+                    name="customers",
+                    columns={"id": col},
+                    primary_key=["id"],
+                    foreign_keys=[],
                 ),
-                "orders": TableMetadata(name="orders", columns={"id": col}, primary_key=["id"], foreign_keys=[]),
+                "orders": TableMetadata(
+                    name="orders",
+                    columns={"id": col},
+                    primary_key=["id"],
+                    foreign_keys=[],
+                ),
             },
             join_paths_multi={},
             effective_structural_hash="h",
@@ -121,7 +137,11 @@ class TestParseIntentPassesConversationHints:
 
     @patch("aetherdialect._pipeline._invoke_intent_parse_with_hints")
     def test_prior_user_corrections_from_refinement_context(self, mock_invoke: MagicMock) -> None:
-        from aetherdialect._contracts_base import ColumnMetadata, SchemaGraph, TableMetadata
+        from aetherdialect._contracts_base import (
+            ColumnMetadata,
+            SchemaGraph,
+            TableMetadata,
+        )
         from aetherdialect._pipeline import parse_intent_via_llm
 
         col = ColumnMetadata(
@@ -223,7 +243,12 @@ class TestPipelineSuspendedIntentSummary:
     """Suspended intent-confirm steps carry intent summary when payload exposes intent."""
 
     def test_intent_confirm_suspend_gets_summary(self) -> None:
-        from aetherdialect._contracts_core import InteractiveTailSnapshot, RuntimeIntent, SelectCol, NormalizedExpr
+        from aetherdialect._contracts_core import (
+            InteractiveTailSnapshot,
+            RuntimeIntent,
+            SelectCol,
+            NormalizedExpr,
+        )
         from aetherdialect._main_execution import PipelineSession
 
         intent = RuntimeIntent(
@@ -267,8 +292,13 @@ class TestEmitRuntimeConfigOverrideDiagnostics:
 
     def test_emits_one_diagnostic_per_key(self) -> None:
         from aetherdialect._config import DIAGNOSTIC_CODE_CONFIG_FILE_VALUE_APPLIED
-        from aetherdialect._core_utils import reset_diagnostic_collector, set_diagnostic_collector
-        from aetherdialect._main_execution import _emit_runtime_config_override_diagnostics
+        from aetherdialect._core_utils import (
+            reset_diagnostic_collector,
+            set_diagnostic_collector,
+        )
+        from aetherdialect._main_execution import (
+            _emit_runtime_config_override_diagnostics,
+        )
 
         buf: list = []
         tok = set_diagnostic_collector(buf)
@@ -286,7 +316,11 @@ class TestMakeIntentIssueStageAttribution:
 
     def test_known_issue_ids(self) -> None:
         from aetherdialect._contracts_base import FailureCategory
-        from aetherdialect._contracts_base import FailureCategory, STAGE_ATTRIBUTION_TABLE, make_intent_issue
+        from aetherdialect._contracts_base import (
+            FailureCategory,
+            STAGE_ATTRIBUTION_TABLE,
+            make_intent_issue,
+        )
 
         for issue_id, expected in STAGE_ATTRIBUTION_TABLE.items():
             issue = make_intent_issue(
@@ -321,8 +355,14 @@ class TestRefinementContinuationTerminalError:
         sess._session_busy = True
         sess._refinement_ctx = RefinementContext("q1", form_storage=QuestionFormStorage(corrected="q1"))
         with (
-            patch("aetherdialect._main_execution._interactive_run_intent_pass", return_value=False),
-            patch("aetherdialect._main_execution._core_utils.llm_execution_scope", lambda *_a, **_k: nullcontext()),
+            patch(
+                "aetherdialect._main_execution._interactive_run_intent_pass",
+                return_value=False,
+            ),
+            patch(
+                "aetherdialect._main_execution._core_utils.llm_execution_scope",
+                lambda *_a, **_k: nullcontext(),
+            ),
         ):
             step = sess._continue_after_refinement_retry()
         assert step.kind == SESSION_KIND_ERROR
@@ -334,7 +374,11 @@ class TestLlmTaskDeploymentMatrix:
 
     def test_all_task_labels_resolve(self) -> None:
         from aetherdialect._config import LlmExecutionConfig
-        from aetherdialect._core_utils import _azure_deployment_for_model, _task_model_for_profile, llm_execution_scope
+        from aetherdialect._core_utils import (
+            _azure_deployment_for_model,
+            _task_model_for_profile,
+            llm_execution_scope,
+        )
 
         cfg = LlmExecutionConfig(
             azure_endpoint="x",
@@ -423,9 +467,20 @@ class TestFullIntentParseStageARetryDiagnostic:
         import json
 
         from aetherdialect._config import DIAGNOSTIC_CODE_STAGE_A_RETRY
-        from aetherdialect._contracts_base import ColumnMetadata, SchemaGraph, TableMetadata
-        from aetherdialect._contracts_core import NormalizedExpr, RuntimeIntent, SelectCol
-        from aetherdialect._core_utils import reset_diagnostic_collector, set_diagnostic_collector
+        from aetherdialect._contracts_base import (
+            ColumnMetadata,
+            SchemaGraph,
+            TableMetadata,
+        )
+        from aetherdialect._contracts_core import (
+            NormalizedExpr,
+            RuntimeIntent,
+            SelectCol,
+        )
+        from aetherdialect._core_utils import (
+            reset_diagnostic_collector,
+            set_diagnostic_collector,
+        )
         from aetherdialect._intent_process import (
             _logical_intent_to_serialisable,
             full_intent_parse,

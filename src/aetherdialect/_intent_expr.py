@@ -763,11 +763,7 @@ def _tag_single_expr(
         Updated expression (copy via ``replace``).
     """
     numeric = _is_expr_numeric(expr, schema, cte_steps)
-    bare_leaf = (
-        not expr.add_groups
-        and not expr.sub_groups
-        and bool(expr.column_ref or expr.star or expr.keyword)
-    )
+    bare_leaf = not expr.add_groups and not expr.sub_groups and bool(expr.column_ref or expr.star or expr.keyword)
     if numeric:
         if skip_value_injection:
             return replace(expr, is_numeric=True)
@@ -1503,14 +1499,9 @@ def _canonicalise_cte_output_columns(intent_dict: dict[str, Any]) -> None:
             oc_raw = [oc_raw]
         if not isinstance(oc_raw, list):
             continue
-        derived = (
-            derive_cte_output_columns(cte_select_cols, cte_ordinal=cte_ordinal)
-            if cte_select_cols
-            else []
-        )
+        derived = derive_cte_output_columns(cte_select_cols, cte_ordinal=cte_ordinal) if cte_select_cols else []
         new_oc = [
-            _canonicalise_one_output_column_item(str(raw), cte_select_cols, derived, i)
-            for i, raw in enumerate(oc_raw)
+            _canonicalise_one_output_column_item(str(raw), cte_select_cols, derived, i) for i, raw in enumerate(oc_raw)
         ]
         cte["output_columns"] = new_oc
 
@@ -2135,9 +2126,7 @@ def _assign_structural_window_registry(
     return idx
 
 
-def _assign_structural_date_predicate_payload(
-    pred: FilterParam | HavingParam, idx: int, pv: dict[str, Any]
-) -> int:
+def _assign_structural_date_predicate_payload(pred: FilterParam | HavingParam, idx: int, pv: dict[str, Any]) -> int:
     """Bind ``s*`` for calendar unit in ``date_diff`` / ``date_window`` dict payloads; clear ``raw_value``."""
 
     vt = (pred.value_type or "").lower()
@@ -2354,11 +2343,7 @@ def _assign_case_registry_param_keys(
             if cond is None:
                 new_branches.append(branch)
                 continue
-            if (
-                cond.op in ("is null", "is not null")
-                or cond.right_expr is not None
-                or cond.param_key
-            ):
+            if cond.op in ("is null", "is not null") or cond.right_expr is not None or cond.param_key:
                 new_branches.append(branch)
                 continue
             cvt = (cond.value_type or "").lower()
@@ -2390,7 +2375,13 @@ def assign_param_keys(
     having_param: list[HavingParam],
     cte_steps: list[RuntimeCteStep] | None = None,
     case_registry: list[CaseRegistryStep] | None = None,
-) -> tuple[list[FilterParam], list[HavingParam], list[RuntimeCteStep], list[CaseRegistryStep], int]:
+) -> tuple[
+    list[FilterParam],
+    list[HavingParam],
+    list[RuntimeCteStep],
+    list[CaseRegistryStep],
+    int,
+]:
     """
     Assign ``p*`` keys to filter/having value params and CASE-branch conditions (CTEs first).
 
@@ -2465,7 +2456,13 @@ def assign_param_keys(
             new_having_param.append(replace(hp, param_key=f"p{idx}"))
             idx += 1
     new_case_registry, idx = _assign_case_registry_param_keys(case_registry, idx)
-    return new_filters_param, new_having_param, updated_cte_steps, new_case_registry, idx
+    return (
+        new_filters_param,
+        new_having_param,
+        updated_cte_steps,
+        new_case_registry,
+        idx,
+    )
 
 
 def _parse_between_raw_value(raw_value: Any) -> tuple[Any, Any] | None:
@@ -2824,13 +2821,9 @@ def normalize_date_diff_raw_values(intent: RuntimeIntent) -> RuntimeIntent:
             if p.value_type in ("date_window", "date_diff") and p.raw_value is not None:
                 if isinstance(p.raw_value, (int, float)) and not isinstance(p.raw_value, bool):
                     if p.value_type == "date_diff":
-                        out.append(
-                            replace(p, raw_value={"unit": "day", "amount": int(p.raw_value)})
-                        )
+                        out.append(replace(p, raw_value={"unit": "day", "amount": int(p.raw_value)}))
                     else:
-                        out.append(
-                            replace(p, raw_value={"unit": "day", "amount": int(p.raw_value)})
-                        )
+                        out.append(replace(p, raw_value={"unit": "day", "amount": int(p.raw_value)}))
                 elif isinstance(p.raw_value, dict):
                     out.append(replace(p, raw_value=_normalize_date_unit_in_raw_value(p.raw_value)))
                 else:

@@ -1307,12 +1307,10 @@ class WindowSpec:
         "argument": "Inner SQL expression for windowed aggregates and offsets.",
         "frame_kind": "rows, range, or none when no explicit frame.",
         "frame_start": (
-            "Frame start bound when frame_kind is rows or range "
-            "(e.g. UNBOUNDED PRECEDING, CURRENT ROW, N PRECEDING)."
+            "Frame start bound when frame_kind is rows or range (e.g. UNBOUNDED PRECEDING, CURRENT ROW, N PRECEDING)."
         ),
         "frame_end": (
-            "Frame end bound when frame_kind is rows or range "
-            "(e.g. CURRENT ROW, UNBOUNDED FOLLOWING, N FOLLOWING)."
+            "Frame end bound when frame_kind is rows or range (e.g. CURRENT ROW, UNBOUNDED FOLLOWING, N FOLLOWING)."
         ),
         "frame_start_offset": "Integer row/range offset when the bound uses N PRECEDING or N FOLLOWING.",
         "frame_end_offset": "Integer row/range offset for the end bound when using N PRECEDING or N FOLLOWING.",
@@ -1419,7 +1417,7 @@ class CaseWhenBranch:
                 res_expr = NormalizedExpr()
         return CaseWhenBranch(
             condition=replace(
-                FilterParam.from_dict(cond) if isinstance(cond, dict) else FilterParam(),
+                (FilterParam.from_dict(cond) if isinstance(cond, dict) else FilterParam()),
                 bool_op="AND",
                 filter_group=None,
             ),
@@ -1711,7 +1709,10 @@ class WindowRegistryStep:
     def to_prompt_dict(self) -> dict[str, Any]:
         """Shorthand registry entry for LLM repair and parse examples."""
 
-        return {"registry_id": self.registry_id, "window_spec": self.window_spec.to_prompt_dict()}
+        return {
+            "registry_id": self.registry_id,
+            "window_spec": self.window_spec.to_prompt_dict(),
+        }
 
     @classmethod
     def prompt_example_dict(cls) -> dict[str, Any]:
@@ -1774,9 +1775,7 @@ class CaseRegistryStep:
         cw_raw = d.get("case_when")
         if isinstance(cw_raw, list):
             cw = CaseWhenExpr(
-                branches=[
-                    CaseWhenBranch.from_dict(b) if isinstance(b, dict) else CaseWhenBranch() for b in cw_raw
-                ],
+                branches=[(CaseWhenBranch.from_dict(b) if isinstance(b, dict) else CaseWhenBranch()) for b in cw_raw],
             )
         elif isinstance(cw_raw, dict):
             cw = CaseWhenExpr.from_dict(cw_raw)
@@ -1828,7 +1827,10 @@ class CaseRegistryStep:
     def to_prompt_dict(self) -> dict[str, Any]:
         """Shorthand case registry row for LLM JSON."""
 
-        out: dict[str, Any] = {"registry_id": self.registry_id, "case_when": self.case_when.to_prompt_dict()}
+        out: dict[str, Any] = {
+            "registry_id": self.registry_id,
+            "case_when": self.case_when.to_prompt_dict(),
+        }
         if self.label:
             out["label"] = self.label
         return out
@@ -2075,7 +2077,10 @@ class OrderByCol:
     def to_prompt_dict(self) -> dict[str, Any]:
         """ORDER BY entry shorthand."""
 
-        return {"expr": _expr_prompt_sql(self.expr), "direction": self.direction.lower()}
+        return {
+            "expr": _expr_prompt_sql(self.expr),
+            "direction": self.direction.lower(),
+        }
 
     @classmethod
     def prompt_example_dict(cls) -> dict[str, Any]:
@@ -3119,7 +3124,9 @@ def _seed_intent_json_contains_unnest(intent: SeedWarmupIntent) -> bool:
     return "unnest" in blob
 
 
-def _window_operator_kind_from_registry(steps: list[WindowRegistryStep]) -> WindowOperatorKind:
+def _window_operator_kind_from_registry(
+    steps: list[WindowRegistryStep],
+) -> WindowOperatorKind:
     """Map window registry rows to a coarse rank versus aggregate versus navigate class."""
 
     if not steps:
@@ -3169,7 +3176,9 @@ def infer_workload_family_for_seed_intent(intent: SeedWarmupIntent) -> WorkloadF
     return WorkloadFamily.EXTRACT
 
 
-def operator_feature_vector_for_seed_intent(intent: SeedWarmupIntent) -> OperatorFeatureVector:
+def operator_feature_vector_for_seed_intent(
+    intent: SeedWarmupIntent,
+) -> OperatorFeatureVector:
     """
     Summarize observable structural operators for diversity metrics and lattice keys.
 
@@ -3356,8 +3365,7 @@ def anchor_lattice_key_for_seed_intent(intent: SeedWarmupIntent) -> AnchorLattic
         nov = NoveltyBand.HIGH
     digest = hashlib.sha256(
         (
-            f"warmup_lattice_style:{SeedWarmupConfig.WARMUP_SAMPLING_POLICY_VERSION}:"
-            f"{tid}:{tier.value}:{nov.value}"
+            f"warmup_lattice_style:{SeedWarmupConfig.WARMUP_SAMPLING_POLICY_VERSION}:{tid}:{tier.value}:{nov.value}"
         ).encode(),
     ).hexdigest()
     slot = int(digest[0:2], 16) % len(SeedWarmupConfig.WARMUP_QUESTION_STYLES)

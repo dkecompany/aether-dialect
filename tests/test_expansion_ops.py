@@ -1079,7 +1079,10 @@ class TestDeterministicRepairWarmupSeed:
             ),
             result=NormalizedExpr(add_values=[ExprValue(value=1.0)]),
         )
-        cw = CaseWhenExpr(branches=[branch], else_result=NormalizedExpr(add_values=[ExprValue(value=0.0)]))
+        cw = CaseWhenExpr(
+            branches=[branch],
+            else_result=NormalizedExpr(add_values=[ExprValue(value=0.0)]),
+        )
         seed = SeedWarmupIntent(
             intent_id="reg_seed",
             tables=["orders"],
@@ -1215,7 +1218,10 @@ class TestTableRemovePruning:
             ),
             result=NormalizedExpr(add_values=[ExprValue(value=1.0)]),
         )
-        cw = CaseWhenExpr(branches=[branch], else_result=NormalizedExpr(add_values=[ExprValue(value=0.0)]))
+        cw = CaseWhenExpr(
+            branches=[branch],
+            else_result=NormalizedExpr(add_values=[ExprValue(value=0.0)]),
+        )
         intent = SeedWarmupIntent(
             intent_id="tr4",
             tables=["orders", "customers"],
@@ -1340,8 +1346,18 @@ class TestDimensionSwapRewrite:
             },
             primary_key=["id"],
             foreign_keys=[
-                FKEdge(src_table="fact", src_cols=["a_id"], dst_table="dim_a", dst_cols=["id"]),
-                FKEdge(src_table="fact", src_cols=["b_id"], dst_table="dim_b", dst_cols=["id"]),
+                FKEdge(
+                    src_table="fact",
+                    src_cols=["a_id"],
+                    dst_table="dim_a",
+                    dst_cols=["id"],
+                ),
+                FKEdge(
+                    src_table="fact",
+                    src_cols=["b_id"],
+                    dst_table="dim_b",
+                    dst_cols=["id"],
+                ),
             ],
             role=TableRole.FACT.value,
             row_count=100,
@@ -1657,10 +1673,30 @@ class TestFilterExprAddPairing:
             },
             primary_key=["id"],
             foreign_keys=[
-                FKEdge(src_table="factt", src_cols=["u1"], dst_table="dimt", dst_cols=["id"]),
-                FKEdge(src_table="factt", src_cols=["u2"], dst_table="dimt", dst_cols=["id"]),
-                FKEdge(src_table="factt", src_cols=["z1"], dst_table="dimt", dst_cols=["id"]),
-                FKEdge(src_table="factt", src_cols=["z2"], dst_table="other", dst_cols=["id"]),
+                FKEdge(
+                    src_table="factt",
+                    src_cols=["u1"],
+                    dst_table="dimt",
+                    dst_cols=["id"],
+                ),
+                FKEdge(
+                    src_table="factt",
+                    src_cols=["u2"],
+                    dst_table="dimt",
+                    dst_cols=["id"],
+                ),
+                FKEdge(
+                    src_table="factt",
+                    src_cols=["z1"],
+                    dst_table="dimt",
+                    dst_cols=["id"],
+                ),
+                FKEdge(
+                    src_table="factt",
+                    src_cols=["z2"],
+                    dst_table="other",
+                    dst_cols=["id"],
+                ),
             ],
             role=TableRole.FACT.value,
             row_count=10,
@@ -1732,7 +1768,10 @@ class TestExpandSingleDepthPostRepair:
             return [v]
 
         seen: set[str] = set()
-        with mock.patch("aetherdialect._expansion_ops._deterministic_repair_warmup_seed", side_effect=bad_repair):
+        with mock.patch(
+            "aetherdialect._expansion_ops._deterministic_repair_warmup_seed",
+            side_effect=bad_repair,
+        ):
             out = _expand_single_depth(
                 [_warmup_intent(tables=["orders"])],
                 schema_graph,

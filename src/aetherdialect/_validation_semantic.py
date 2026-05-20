@@ -331,7 +331,12 @@ def _issues_for_non_selectable_expr(
                 category=category,
                 severity="error",
                 message=msg,
-                context={"table": t, "column": c, "location": location, "surface": surface},
+                context={
+                    "table": t,
+                    "column": c,
+                    "location": location,
+                    "surface": surface,
+                },
             )
         )
     return issues
@@ -467,7 +472,11 @@ def _filter_bound_norm(fp: FilterParam, pv: Mapping[str, Any] | None) -> str | N
     rv = fp.resolved_value(pv)
     if fp.value_type == "date_window" and isinstance(rv, dict) and "start" in rv and "end" in rv:
         return stable_json(
-            {"vt": "date_window_range", "start": _scalar_norm_for_window_bounds(rv.get("start")), "end": _scalar_norm_for_window_bounds(rv.get("end"))}
+            {
+                "vt": "date_window_range",
+                "start": _scalar_norm_for_window_bounds(rv.get("start")),
+                "end": _scalar_norm_for_window_bounds(rv.get("end")),
+            }
         )
     if fp.value_type == "date_window" and isinstance(rv, dict):
         unit = str(rv.get("unit", "day") or "day").lower()
@@ -2219,7 +2228,11 @@ def validate_cte_grain_complete(cte: RuntimeCteStep, context: str) -> list[Inten
                         f"CTE '{cte.cte_name}' uses aggregation without GROUP BY but not every "
                         f"SELECT column is aggregated in {context}"
                     ),
-                    context={"cte_name": cte.cte_name, "grain": grain, "location": context},
+                    context={
+                        "cte_name": cte.cte_name,
+                        "grain": grain,
+                        "location": context,
+                    },
                 )
             )
         if grain == "grouped" and not group_by:
@@ -2229,7 +2242,11 @@ def validate_cte_grain_complete(cte: RuntimeCteStep, context: str) -> list[Inten
                     category=FailureCategory.CTE_GRAIN_CONSISTENCY,
                     severity="error",
                     message=f"CTE '{cte.cte_name}' has grain=grouped but no group_by_cols in {context}",
-                    context={"cte_name": cte.cte_name, "grain": grain, "location": context},
+                    context={
+                        "cte_name": cte.cte_name,
+                        "grain": grain,
+                        "location": context,
+                    },
                 )
             )
         if grain in {"scalar", "row_level"} and group_by:

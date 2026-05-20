@@ -70,6 +70,8 @@ def _restore_saved_policy_diagnostics() -> None:
         PolicyConfig.LIVE_DEEP_TRACE,
     ) = _saved_policy_diagnostics
     _saved_policy_diagnostics = None
+
+
 def _is_databricks_live_nodeid(nodeid: str) -> bool:
     """Return True when the test lives under Databricks-only live modules."""
     path = nodeid.replace("\\", "/")
@@ -109,7 +111,10 @@ def _relax_dvdrental_selectability(schema: Any, database_name: str) -> None:
         return
     for table in schema.tables.values():
         for column in table.columns.values():
-            if getattr(column, "sensitivity", None) not in (None, SensitivityClassification.NONE):
+            if getattr(column, "sensitivity", None) not in (
+                None,
+                SensitivityClassification.NONE,
+            ):
                 column.sensitivity = SensitivityClassification.NONE
             column.distinct_count = max(column.distinct_count or 0, 2)
             column.null_ratio = 0.0
@@ -256,7 +261,15 @@ def _flat_live_env_to_nested_document(flat: dict[str, str]) -> dict[str, Any]:
 
 def _nested_document_to_toml_str(doc: Mapping[str, Any]) -> str:
     lines: list[str] = []
-    for name in ("openai", "azure_openai", "postgresql", "databricks", "engine", "llm", "execution"):
+    for name in (
+        "openai",
+        "azure_openai",
+        "postgresql",
+        "databricks",
+        "engine",
+        "llm",
+        "execution",
+    ):
         if name not in doc:
             continue
         _toml_emit_section(name, doc[name], lines)

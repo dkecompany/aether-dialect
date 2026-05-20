@@ -130,4 +130,3 @@ def test_seeded_semantic_rejection_bucket(schema, schema_terms, t2s) -> None:
         )
         assert rt.intent_key == ikey
         assert "seeded semantic rejection" in rt.value_history.rejection_reasons
-

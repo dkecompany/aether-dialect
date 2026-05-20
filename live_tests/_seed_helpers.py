@@ -431,7 +431,7 @@ def capture_parse_prompt() -> Iterator[list[dict[str, Any]]]:
             {
                 "via": "_build_intent_parse_prompt",
                 "question": question,
-                "prior_question_feedback": list(prior_question_feedback) if prior_question_feedback else None,
+                "prior_question_feedback": (list(prior_question_feedback) if prior_question_feedback else None),
             }
         )
         return original_build(question, schema_literal_json, table_list, prior_question_feedback)
@@ -734,7 +734,10 @@ def _kit_rejected_join_paths(runner: LiveTestRunner) -> dict[str, str]:
         "FROM staff JOIN store ON staff.store_id = store.store_id",
         reason="seeded wrong join edge: chose work FK for manager question",
     )
-    return {"work_wrong_edge": str(rt_work.id), "manager_wrong_edge": str(rt_manager.id)}
+    return {
+        "work_wrong_edge": str(rt_work.id),
+        "manager_wrong_edge": str(rt_manager.id),
+    }
 
 
 def _kit_intent_failures(runner: LiveTestRunner) -> dict[str, str]:
@@ -940,10 +943,7 @@ def assert_new_rejected_template(before: dict[str, Any], after: dict[str, Any]) 
 
     b = int(before.get("question_feedback_total_entries", 0))
     a = int(after.get("question_feedback_total_entries", 0))
-    assert a > b, (
-        f"[assert_new_rejected_template] no new question_feedback rows; "
-        f"before_count={b!r} after_count={a!r}"
-    )
+    assert a > b, f"[assert_new_rejected_template] no new question_feedback rows; before_count={b!r} after_count={a!r}"
     return set()
 
 

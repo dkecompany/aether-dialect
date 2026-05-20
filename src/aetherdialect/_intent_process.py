@@ -472,8 +472,8 @@ INTENT_CRITICAL_RULES: tuple[str, ...] = (
     "Nested aggregation (e.g. SUM(COUNT(...))) is forbidden; compute inner aggregates in a CTE step, then aggregate in the main query.",
     "Do not use EXTRACT(EPOCH FROM ...) for time differences; subtract date columns directly or use supported date functions.",
     "CTE output_columns are snake_case alias tokens matching ^[a-z_][a-z0-9_]*$; never qualified table.column, never function call text, never AS clauses; align positionally with select_cols.",
-    "Relative date-window filters use value_type date_window with value {\"unit\", \"amount\"}; "
-    "column-to-column date spans use value_type date_diff with value {\"unit\", \"amount\"}. Use singular unit names.",
+    'Relative date-window filters use value_type date_window with value {"unit", "amount"}; '
+    'column-to-column date spans use value_type date_diff with value {"unit", "amount"}. Use singular unit names.',
     "BETWEEN uses op between with value [lower, upper]. NULL checks use op is null or is not null without a value field.",
     "filter_group (integer) labels OR-of-AND blocks: predicates sharing a filter_group are joined by AND; "
     "distinct filter_group values are joined by OR. Use bool_op only when every row has filter_group unset "
@@ -1019,7 +1019,7 @@ def _build_intent_parse_prompt(
         "Output ONLY valid JSON that matches the required format. "
         "Identical inputs must produce identical outputs. The "
         "natural_language field is a single short sentence in plain English that describes the structured intent you just produced — what the query computes. Read your own SELECT expressions, FROM tables, filters, grouping, and ordering, then describe that result. "
-        "Aggregation words like \"count\", \"sum\", \"average\", \"minimum\", \"maximum\", \"total\" are encouraged whenever the intent uses them. Use the same domain nouns as the schema (table and column names rendered in plain English). Do not mention SQL syntax tokens (JOIN, GROUP BY, WHERE, ORDER BY, LIMIT, etc.). Reuse the user's domain words when they correctly name the intent's tables/columns/aggregations; only avoid copying the question verbatim when the question contains filler words, polite phrasing, or wording the structured intent does not actually reflect. "
+        'Aggregation words like "count", "sum", "average", "minimum", "maximum", "total" are encouraged whenever the intent uses them. Use the same domain nouns as the schema (table and column names rendered in plain English). Do not mention SQL syntax tokens (JOIN, GROUP BY, WHERE, ORDER BY, LIMIT, etc.). Reuse the user\'s domain words when they correctly name the intent\'s tables/columns/aggregations; only avoid copying the question verbatim when the question contains filler words, polite phrasing, or wording the structured intent does not actually reflect. '
         + _INTENT_SYSTEM_SEMANTIC_JOIN_INTERMEDIATES
         + " "
         + _INTENT_SYSTEM_NATURAL_LANGUAGE_FIELD_SHAPE
@@ -2194,7 +2194,9 @@ def full_intent_parse(
                 code=DIAGNOSTIC_CODE_STAGE_A_RETRY,
                 details=(("attempt", str(attempt_a + 1)),),
             )
-            prior_grounding_failures = prior_grounding_failures + tuple(_issue_to_planner_hint(iss) for iss in logical_issues)
+            prior_grounding_failures = prior_grounding_failures + tuple(
+                _issue_to_planner_hint(iss) for iss in logical_issues
+            )
             attempt_a += 1
             continue
 
@@ -2261,7 +2263,10 @@ def full_intent_parse(
                     "Stage A retry after post-bind validation flagged logical grounding issues.",
                     stage="intent",
                     code=DIAGNOSTIC_CODE_STAGE_A_RETRY,
-                    details=(("attempt", str(attempt_a + 1)), ("phase", "post_stage_b")),
+                    details=(
+                        ("attempt", str(attempt_a + 1)),
+                        ("phase", "post_stage_b"),
+                    ),
                 )
                 prior_grounding_failures = prior_grounding_failures + tuple(
                     _issue_to_planner_hint(iss) for iss in errors if iss.responsible_stage == "logical"
@@ -2301,7 +2306,10 @@ def full_intent_parse(
                 "Stage B post-bind format repair LLM invocation.",
                 stage="intent",
                 code=DIAGNOSTIC_CODE_STAGE_B_REPAIR,
-                details=(("phase", "post_stage_b"), ("repair_round", str(b_repairs_used + 1))),
+                details=(
+                    ("phase", "post_stage_b"),
+                    ("repair_round", str(b_repairs_used + 1)),
+                ),
             )
             rollback_intent = result
             repaired_raw = llm_chat(system_b, repair_prompt, task="intent")
@@ -2326,9 +2334,9 @@ def full_intent_parse(
             intent = repaired
             intent = _align_runtime_tables_to_planner(intent, logical)
             intent = _propagate_planner_schema_invalid_flag(intent, logical)
-            if not _runtime_intent_select_cols_have_substance(intent) or _runtime_intent_case_registry_has_empty_branches(
+            if not _runtime_intent_select_cols_have_substance(
                 intent
-            ):
+            ) or _runtime_intent_case_registry_has_empty_branches(intent):
                 debug("[intent_process.full_intent_parse] post-Stage B repair_reverted_empty_select")
                 intent = rollback_intent
             b_repairs_used += 1
@@ -2374,7 +2382,10 @@ def full_intent_parse(
                 "Stage A retry after schema/semantic validation surfaced logical-stage issues.",
                 stage="intent",
                 code=DIAGNOSTIC_CODE_STAGE_A_RETRY,
-                details=(("attempt", str(attempt_a + 1)), ("phase", "schema_semantic_loop")),
+                details=(
+                    ("attempt", str(attempt_a + 1)),
+                    ("phase", "schema_semantic_loop"),
+                ),
             )
             prior_grounding_failures = prior_grounding_failures + planner_hints
             attempt_a += 1
@@ -2569,9 +2580,9 @@ def _run_schema_semantic_repair_loop(
             if logical is not None:
                 intent = _align_runtime_tables_to_planner(intent, logical)
                 intent = _propagate_planner_schema_invalid_flag(intent, logical)
-            if not _runtime_intent_select_cols_have_substance(intent) or _runtime_intent_case_registry_has_empty_branches(
+            if not _runtime_intent_select_cols_have_substance(
                 intent
-            ):
+            ) or _runtime_intent_case_registry_has_empty_branches(intent):
                 debug("[intent_process._run_schema_semantic_repair_loop] repair_reverted_empty_select")
                 intent = intent_before_schema_llm
             debug(
@@ -2835,8 +2846,10 @@ def _compute_filters_similarity(filters1: list[FilterParam], filters2: list[Filt
     if score > 0:
         g1 = any(fp.filter_group is not None for fp in c1)
         g2 = any(fp.filter_group is not None for fp in c2)
-        if len(c1) >= 2 and len(c1) == len(c2) and sorted(fp.signature_key for fp in c1) == sorted(
-            fp.signature_key for fp in c2
+        if (
+            len(c1) >= 2
+            and len(c1) == len(c2)
+            and sorted(fp.signature_key for fp in c1) == sorted(fp.signature_key for fp in c2)
         ):
             if g1 != g2:
                 return score
@@ -2873,8 +2886,10 @@ def _compute_having_similarity(having1: list[HavingParam], having2: list[HavingP
     if score > 0:
         g1 = any(hp.filter_group is not None for hp in c1)
         g2 = any(hp.filter_group is not None for hp in c2)
-        if len(c1) >= 2 and len(c1) == len(c2) and sorted(hp.signature_key for hp in c1) == sorted(
-            hp.signature_key for hp in c2
+        if (
+            len(c1) >= 2
+            and len(c1) == len(c2)
+            and sorted(hp.signature_key for hp in c1) == sorted(hp.signature_key for hp in c2)
         ):
             if g1 != g2:
                 return score
@@ -3118,11 +3133,7 @@ def find_trusted_template_match(
         return None
 
     scan_templates: list[Template] = list(templates)
-    if (
-        candidate_intent is not None
-        and union_family_index is not None
-        and intent_key_index is not None
-    ):
+    if candidate_intent is not None and union_family_index is not None and intent_key_index is not None:
         bk = body_similarity_key(candidate_intent)
         jk = join_path_key_runtime(candidate_intent)
         uf_key = f"{bk}|{jk}"

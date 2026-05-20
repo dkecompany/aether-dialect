@@ -721,12 +721,20 @@ def _unity_trailing_table_identifier(ref: str) -> str:
     return tokens[-1] if tokens else ""
 
 
-def _tables_meta_foreign_key_dicts_from_edges(edges: list[FKEdge]) -> list[dict[str, Any]]:
+def _tables_meta_foreign_key_dicts_from_edges(
+    edges: list[FKEdge],
+) -> list[dict[str, Any]]:
     """Convert :class:`FKEdge` instances into ``tables_meta`` foreign-key dict entries."""
 
     out: list[dict[str, Any]] = []
     for e in edges:
-        out.append({"src_cols": list(e.src_cols), "dst_table": str(e.dst_table), "dst_cols": list(e.dst_cols)})
+        out.append(
+            {
+                "src_cols": list(e.src_cols),
+                "dst_table": str(e.dst_table),
+                "dst_cols": list(e.dst_cols),
+            }
+        )
     return out
 
 
@@ -1491,7 +1499,7 @@ def _llm_classify_schema(
         "For each table provide a one-line business purpose that includes: (a) what entity or event the table represents, (b) which related tables it connects to via foreign keys, and (c) the notable descriptive or measure columns it provides that users commonly ask about.\n\n"
         "SENSITIVITY (per column, optional):\n"
         'Include "sensitivity" in each column object: always null in this pass.\n'
-        "A later second-pass refine step may set \"pii\" only when domain notes explicitly require it.\n\n"
+        'A later second-pass refine step may set "pii" only when domain notes explicitly require it.\n\n'
         "Reason internally, output only JSON:\n"
         '{"table1": {"table_role": "...", "description": "...", '
         '"columns": {"col1": {"role": "...", "hint": "...", "sensitivity": null}, ...}}, ...}'
@@ -2277,13 +2285,9 @@ def _parse_unity_catalog_constraints(
         cols = [c.strip().strip("`").strip('"') for c in match.split(",")]
         primary_keys.extend(cols)
 
-    ref_table_segment = (
-        r"((?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)(?:\s*\.\s*(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*))*)"
-    )
+    ref_table_segment = r"((?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)(?:\s*\.\s*(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*))*)"
     fk_pattern = (
-        r"(?:CONSTRAINT\s+\w+\s+)?FOREIGN\s+KEY\s*\(([^)]+)\)\s+REFERENCES\s+"
-        + ref_table_segment
-        + r"\s*\(([^)]+)\)"
+        r"(?:CONSTRAINT\s+\w+\s+)?FOREIGN\s+KEY\s*\(([^)]+)\)\s+REFERENCES\s+" + ref_table_segment + r"\s*\(([^)]+)\)"
     )
     fk_matches = re.findall(fk_pattern, create_stmt, re.IGNORECASE | re.DOTALL)
     for match in fk_matches:
@@ -2354,9 +2358,9 @@ def _parse_sql_file_regex_reflect(sql_content: str) -> dict[str, dict[str, Any]]
         re.IGNORECASE | re.DOTALL,
     )
     for m in pattern.finditer(sql_content):
-        raw = m.group(1).strip().strip("`\"")
+        raw = m.group(1).strip().strip('`"')
         if "." in raw:
-            tname = raw.split(".")[-1].strip("`\"")
+            tname = raw.split(".")[-1].strip('`"')
         else:
             tname = raw
         if not tname:

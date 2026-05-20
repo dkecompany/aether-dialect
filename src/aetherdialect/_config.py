@@ -303,7 +303,15 @@ VALID_SCALAR_FUNCTIONS = {
     "month",
     "day",
 }
-SCALAR_FUNCTIONS_STRING = {"upper", "lower", "trim", "ltrim", "rtrim", "length", "concat"}
+SCALAR_FUNCTIONS_STRING = {
+    "upper",
+    "lower",
+    "trim",
+    "ltrim",
+    "rtrim",
+    "length",
+    "concat",
+}
 SCALAR_FUNCTIONS_VARIADIC = frozenset({"concat"})
 SCALAR_FUNCTIONS_NUMERIC = {"abs", "round", "floor", "ceil"}
 SCALAR_FUNCTIONS_TEMPORAL = {
@@ -1442,9 +1450,7 @@ class PolicyConfig:
 
     MAX_STAGE_B_REPAIRS: ClassVar[int] = 2
     MAX_FRESH_RESTARTS: ClassVar[int] = 1
-    SEMANTIC_RESTART_REASONS: ClassVar[frozenset[str]] = frozenset(
-        {"semantic_oscillation", "semantic_max_rounds"}
-    )
+    SEMANTIC_RESTART_REASONS: ClassVar[frozenset[str]] = frozenset({"semantic_oscillation", "semantic_max_rounds"})
 
     SCHEMA_DESCRIPTION_TOP_VALUE_SAMPLES: ClassVar[int] = 0
 
@@ -1573,9 +1579,6 @@ def effective_llm_timeout_ms() -> int:
     if cost_cap_active(tm):
         return int(tm)
     return 60_000
-
-
-
 
 
 class PostgresRuntimeConfig:
@@ -2546,7 +2549,14 @@ OVERRIDES_EDITABLE_ENUMS: dict[str, list[str]] = {
         "free_text",
         "audit",
     ],
-    "column_sensitivity": ["none", "hygiene", "strict", "forbidden", "pii", "restricted"],
+    "column_sensitivity": [
+        "none",
+        "hygiene",
+        "strict",
+        "forbidden",
+        "pii",
+        "restricted",
+    ],
     "foreign_key_kind": ["structural", "semantic"],
 }
 

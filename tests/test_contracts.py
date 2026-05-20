@@ -1782,7 +1782,11 @@ class TestSchemaGraphMethods:
             primary_key=["customer_id"],
             foreign_keys=[],
         )
-        sg = SchemaGraph(tables={"orders": t1, "customers": t2}, join_paths_multi={}, effective_structural_hash="h")
+        sg = SchemaGraph(
+            tables={"orders": t1, "customers": t2},
+            join_paths_multi={},
+            effective_structural_hash="h",
+        )
         payload = json.loads(sg.structural_schema_literal_json(["orders"]))
         assert set(payload.keys()) == {"orders"}
         assert "description" not in payload["orders"]
