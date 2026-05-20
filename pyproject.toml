@@ -1,0 +1,92 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aetherdialect"
+version = "0.1.7"
+description = "Deterministic, validation-first Text-to-SQL system for business databases"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Akul Ameya", email = "akul.ameya@gmail.com"}]
+dependencies = [
+    "pandas>=2.0,<3",
+    "packaging>=23.0,<25",
+    "jsonschema>=4.0,<5",
+    "openai>=2.0.0,<3",
+    "platformdirs>=2.0.0,<5",
+    "sqlglot>=29.0,<30",
+    "SQLAlchemy>=2.0,<3",
+]
+
+[project.optional-dependencies]
+databricks = [
+    "databricks-sql-connector>=3.0,<4",
+    "databricks-sqlalchemy>=2.0,<3",
+]
+postgresql = [
+    "pglast>=5.0,<8",
+    "psycopg2-binary>=2.9,<3",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "vulture>=2.11,<3",
+    "ruff>=0.4",
+    "mypy>=1.10",
+    "twine>=5.0",
+    "build>=1.0",
+    "pre-commit>=3.0",
+    "black>=24,<25",
+    "docformatter>=1.7,<2",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+src = ["src", "tests", "live_tests"]
+exclude = [
+    "dev_workspace",
+    ".venv",
+    "venv",
+    ".pytest_cache",
+    "__pycache__",
+    "src/aetherdialect/__pycache__",
+    "tests/__pycache__",
+    "live_tests/__pycache__"
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
+
+[tool.docformatter]
+wrap-summaries = 72
+wrap-descriptions = 72
+style = "google"
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "live_tests"]
+pythonpath = ["src"]
+markers = [
+    "live: integration test against a real database and LLM",
+    "live_no_llm: integration test against a real database without LLM calls",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["aetherdialect*"]
+exclude = ["__pycache__"]
+
+[project.urls]
+Homepage = "https://github.com/dkecompany/aether-dialect"
