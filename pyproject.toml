@@ -35,6 +35,7 @@ dev = [
     "vulture>=2.11,<3",
     "ruff>=0.4",
     "mypy>=1.10",
+    "bandit[toml]>=1.7",
     "twine>=5.0",
     "build>=1.0",
     "pre-commit>=3.0",
@@ -81,6 +82,25 @@ pythonpath = ["src"]
 markers = [
     "live: integration test against a real database and LLM",
     "live_no_llm: integration test against a real database without LLM calls",
+]
+
+[tool.bandit]
+exclude_dirs = [
+    "tests",
+    "live_tests",
+    ".venv",
+    "venv",
+    "dev_workspace",
+    ".pytest_cache",
+    "MagicMock",
+]
+skips = [
+    "B101",
+    "B105",
+    "B110",
+    "B112",
+    "B311",
+    "B608",
 ]
 
 [tool.setuptools.packages.find]

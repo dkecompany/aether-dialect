@@ -1567,7 +1567,7 @@ def _synthetic_warmup_llm_diversity_enabled(intent: SeedWarmupIntent) -> bool:
     if div <= 0:
         return True
     key = (intent.intent_id or "x").encode("utf-8")
-    h = int(hashlib.md5(key).hexdigest()[:12], 16)
+    h = int(hashlib.md5(key, usedforsecurity=False).hexdigest()[:12], 16)
     return (h % div) == 0
 
 

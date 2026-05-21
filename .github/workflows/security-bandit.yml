@@ -18,7 +18,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install Bandit
-        run: pip install bandit
+        run: pip install "bandit[toml]>=1.7"
 
       - name: Run Bandit
-        run: bandit -r . -c .bandit
+        run: bandit -r src -c pyproject.toml
