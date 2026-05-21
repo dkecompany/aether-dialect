@@ -9,8 +9,8 @@ import pytest
 
 import aetherdialect
 from aetherdialect import SessionStep
-from aetherdialect.text2sql import Text2SQL, AsyncPipelineSession
 from aetherdialect._templates import empty_template_store
+from aetherdialect.text2sql import AsyncPipelineSession, Text2SQL
 
 
 def test_public_all_excludes_legacy_types() -> None:
@@ -66,7 +66,6 @@ def _session_owner() -> MagicMock:
 
 
 def test_pipeline_session_ask_typeerror_non_str() -> None:
-    from aetherdialect._contracts_base import SessionActiveError
     from aetherdialect._main_execution import PipelineSession
 
     sess = PipelineSession(_session_owner())

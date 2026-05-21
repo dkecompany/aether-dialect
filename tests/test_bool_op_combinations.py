@@ -6,6 +6,7 @@ from dataclasses import replace
 
 import pytest
 
+from aetherdialect._contracts_base import SchemaGraph
 from aetherdialect._contracts_core import (
     CaseWhenBranch,
     FilterParam,
@@ -31,7 +32,6 @@ from aetherdialect._validation_execute import validate_semantics
 from aetherdialect._validation_semantic import (
     validate_predicate_bool_op_filter_group_hints,
 )
-from aetherdialect._contracts_base import SchemaGraph
 
 
 def _pg() -> PostgresDialect:

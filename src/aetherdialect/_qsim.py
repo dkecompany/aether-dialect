@@ -29,7 +29,6 @@ from ._contracts_base import (
     SkeletonLimits,
     ValueDomain,
     data_type_to_value_type,
-    is_integer_value_type,
 )
 from ._contracts_core import QSimFilter, QSimHaving, QSimIntent
 from ._core_utils import (

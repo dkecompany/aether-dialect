@@ -27,13 +27,13 @@ from ._config import (
     SHAPE_QUESTION_INDEX_KEY,
     TEMPLATE_INTENT_KEY_INDEX_KEY,
     TEMPLATE_QUESTION_TOKEN_INDEX_KEY,
-    TEMPLATE_UNION_FAMILY_INDEX_KEY,
     TEMPLATE_STORE_HEADER_FILENAME,
     TEMPLATE_STORE_LEGACY_SINGLE_FILE,
     TEMPLATE_STORE_PARTITION_COUNT,
     TEMPLATE_STORE_PARTITION_LRU_MAX,
     TEMPLATE_STORE_PARTITION_PREFIX,
     TEMPLATE_STORE_SEGMENT,
+    TEMPLATE_UNION_FAMILY_INDEX_KEY,
     TRUST_AUTO_ACCEPT_THRESHOLD,
     TRUST_CEILING,
     TRUST_FLOOR,
@@ -88,11 +88,11 @@ from ._dialect import (
     compute_sql_fp,
     parameter_abstract,
 )
-from ._intent_process import (
+from ._intent_process import register_templates_module
+from ._intent_resolve import (
     compute_intent_union,
     join_path_key_concrete,
     join_path_key_runtime,
-    register_templates_module,
 )
 from ._schema import (
     SchemaDiff,
@@ -102,8 +102,8 @@ from ._schema import (
 )
 from ._sql_gen import generate_col_alias
 from ._utils import (
-    build_shape_question_index,
     body_similarity_key_for_concrete,
+    build_shape_question_index,
     extract_tables_from_sql,
     flatten_param_values,
     generate_paraphrases_of_seed_question,

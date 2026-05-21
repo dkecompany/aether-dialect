@@ -31,7 +31,6 @@ from aetherdialect._core_utils import substitute_params
 from aetherdialect._intent_expr import (
     _assign_structural_expr,
     _assign_structural_group,
-    classify_cte_expr,
     _fill_expr_defaults,
     _fill_group_defaults,
     _is_date_or_interval_expr,
@@ -47,6 +46,7 @@ from aetherdialect._intent_expr import (
     assign_param_keys,
     build_cte_output_metadata,
     canonicalize_temporal_unit_args,
+    classify_cte_expr,
     cleared_param_runtime_intent,
     collect_raw_param_values,
     decompose_between_params,

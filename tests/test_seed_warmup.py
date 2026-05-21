@@ -37,7 +37,6 @@ from aetherdialect._core_utils import debug
 from aetherdialect._dialect import PostgresDialect
 from aetherdialect._seed_warmup import (
     SeedWarmupCacheSession,
-    build_anchor_lattice,
     _abstract_values,
     _allocate_stratum_quotas,
     _ambiguous_join_reuse_from_parent,
@@ -48,14 +47,18 @@ from aetherdialect._seed_warmup import (
     _gold_failure_trace_text,
     _identify_range_pairs,
     _load_seed_questions,
+    _load_warmup_anchor_lattice,
     _parse_gold_intent_strict,
     _replay_gold_intent_parse_for_telemetry,
+    _save_warmup_anchor_lattice,
     _seed_warmup_intent_sort_key,
+    _warmup_anchor_lattice_json_path,
     _warmup_pack_execute,
-    _warmup_submodular_cover_select,
     _warmup_stratum_key,
+    _warmup_submodular_cover_select,
     _warmup_synthetic_store_path_blocks,
     accepted_template_instance_keys,
+    build_anchor_lattice,
     get_next_seed_warmup_version,
     get_next_warmup_preflight_version,
     instantiate_intent,
@@ -71,9 +74,6 @@ from aetherdialect._seed_warmup import (
     seed_warmup_drops_jsonl_path_for_report,
     warmup_intent_fingerprint,
     warmup_pool_operator_feature_stats,
-    _load_warmup_anchor_lattice,
-    _save_warmup_anchor_lattice,
-    _warmup_anchor_lattice_json_path,
 )
 
 

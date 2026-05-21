@@ -2,7 +2,7 @@
 
 from importlib.metadata import PackageNotFoundError, version
 
-from ._config import LlmExecutionConfig, load_runtime_config
+from ._config import LlmExecutionConfig
 from ._contracts_base import (
     AuditEvent,
     ConfigError,
@@ -40,6 +40,7 @@ __all__ = [
     "AuditEvent",
     "PipelineSession",
     "ConfigError",
+    "ConnectionError",
     "ConfigSnapshot",
     "DatabasePingFailed",
     "Diagnostic",

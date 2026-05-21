@@ -14,30 +14,64 @@ from sqlglot import exp as sqlglot_exp
 
 try:
     import pglast
+    from pglast.ast import (
+        A_Const,
+        A_Expr,
+        Alias,
+        BoolExpr,
+        CaseExpr,
+        CaseWhen,
+        CoalesceExpr,
+        ColumnRef,
+        CommonTableExpr,
+        FuncCall,
+        Integer,
+        JoinExpr,
+        NullTest,
+        RangeSubselect,
+        RangeVar,
+        RawStmt,
+        ResTarget,
+        SelectStmt,
+        SortBy,
+        SQLValueFunction,
+        SubLink,
+        TypeCast,
+    )
+    from pglast.enums import (
+        A_Expr_Kind,
+        BoolExprType,
+        JoinType,
+        NullTestType,
+        SetOperation,
+        SortByDir,
+        SQLValueFunctionOp,
+    )
 except ImportError:
     pglast = None
+
+from sqlalchemy import text
 
 from ._config import (
     PG_LAST_WINDOW_FRAME_OPTIONS_INLINE_DEFAULT,
     PG_LAST_WINDOW_FRAME_OPTIONS_RANGE_UNBOUNDED_CURRENT,
     PG_LAST_WINDOW_FRAME_OPTIONS_ROWS_OFFSET_CURRENT,
     PG_LAST_WINDOW_FRAME_OPTIONS_ROWS_UNBOUNDED_PAIR,
-    SQLGLOT_DIALECT_BY_ENGINE,
+    SELF_JOIN_CTE_NAME_PREFIX,
     SQL_TO_INTENT_LIMIT_OFFSET_PARAM_KEY,
-    SQL_TO_INTENT_LITERAL_PLACEHOLDER_DATE,
     SQL_TO_INTENT_LITERAL_PLACEHOLDER_NUM,
     SQL_TO_INTENT_LITERAL_PLACEHOLDER_STR,
     SQL_TO_INTENT_PARAM_KEY_PREFIX,
-    SELF_JOIN_CTE_NAME_PREFIX,
+    SQLGLOT_DIALECT_BY_ENGINE,
     WARMUP_PARAPHRASE_COUNT_FROM_SQL,
     WARMUP_ROUND_TRIP_CARDINALITY_TOLERANCE,
     WARMUP_ROUND_TRIP_LIMIT,
-    WINDOW_DEFAULT_FRAME_END_WITHOUT_ORDER,
     WINDOW_DEFAULT_FRAME_END_WITH_ORDER,
-    WINDOW_DEFAULT_FRAME_KIND_WITHOUT_ORDER,
+    WINDOW_DEFAULT_FRAME_END_WITHOUT_ORDER,
     WINDOW_DEFAULT_FRAME_KIND_WITH_ORDER,
-    WINDOW_DEFAULT_FRAME_START_WITHOUT_ORDER,
+    WINDOW_DEFAULT_FRAME_KIND_WITHOUT_ORDER,
     WINDOW_DEFAULT_FRAME_START_WITH_ORDER,
+    WINDOW_DEFAULT_FRAME_START_WITHOUT_ORDER,
     SeedWarmupConfig,
 )
 from ._contracts_base import SchemaGraph
@@ -45,7 +79,6 @@ from ._contracts_core import (
     CaseRegistryStep,
     CaseWhenBranch,
     CaseWhenExpr,
-    ExprValue,
     FilterParam,
     HavingParam,
     MulGroup,
@@ -72,7 +105,6 @@ from ._intent_process import (
 )
 from ._sql_gen import build_deterministic_sql
 from ._utils import body_similarity_key, sql_shape
-from sqlalchemy import text
 
 
 @dataclass
@@ -470,7 +502,6 @@ def _runtime_from_pglast_sql(sql: str, schema: SchemaGraph) -> RuntimeIntent | N
 
     if pglast is None:
         return None
-    from pglast.ast import RawStmt
 
     try:
         stmts = pglast.parse_sql(sql)
@@ -511,8 +542,6 @@ def _pg_convert_pg_statement(
 ) -> tuple[RuntimeIntent, list[RuntimeCteStep]] | None:
     """Dispatch top-level ``SELECT`` (optionally wrapped in ``WITH``)."""
 
-    from pglast.ast import SelectStmt
-
     if not isinstance(stmt, SelectStmt):
         return None
     return _pg_convert_select_stmt(stmt, schema, param_store, next_lit_key)
@@ -527,8 +556,6 @@ def _pg_convert_select_stmt(
     outer_allowed_cte: frozenset[str] | None = None,
 ) -> tuple[RuntimeIntent, list[RuntimeCteStep]] | None:
     """Convert one ``SelectStmt``, recursively stripping ``WITH`` into ``RuntimeCteStep`` rows."""
-
-    from pglast.ast import CommonTableExpr, SelectStmt
 
     allowed_cte = set(outer_allowed_cte or ())
     cte_steps: list[RuntimeCteStep] = []
@@ -574,8 +601,6 @@ def _pg_materialize_cte_body(
 
     Nested non-recursive ``WITH`` inside the body is expanded into preceding steps, then the named CTE shell.
     """
-
-    from pglast.ast import CommonTableExpr, SelectStmt
 
     if not isinstance(sel, SelectStmt):
         return None
@@ -665,9 +690,6 @@ def _pg_collect_range_bindings(
         Binding list or ``None`` when an unsupported join construct appears.
     """
 
-    from pglast.ast import JoinExpr, RangeSubselect, RangeVar
-    from pglast.enums import JoinType
-
     allowed_joins = frozenset(
         {
             JoinType.JOIN_INNER,
@@ -728,8 +750,6 @@ def _pg_count_alias_refs(sel: Any, alias: str) -> int:
         Non-negative hit count.
     """
 
-    from pglast.ast import ColumnRef
-
     n = 0
 
     def visit(node: Any) -> None:
@@ -781,9 +801,6 @@ def _pg_rewrite_rangevar_to_cte(
 
         True when a matching range was rewritten.
     """
-
-    from pglast.ast import Alias, JoinExpr, RangeVar
-    from pglast.enums import JoinType
 
     allowed_joins = frozenset(
         {
@@ -838,8 +855,6 @@ def _pg_try_lift_self_join(sel: Any, schema_tables: set[str], allowed_cte: froze
         False when the statement must be rejected at the pglast tier.
     """
 
-    from pglast.ast import SelectStmt
-
     if not isinstance(sel, SelectStmt) or not getattr(sel, "fromClause", None):
         return True
     bindings = _pg_collect_range_bindings(sel.fromClause, schema_tables, allowed_cte)
@@ -889,9 +904,6 @@ def _pg_runtime_intent_body_from_select(
     pg_extra: PgExtra | None = None,
 ) -> tuple[RuntimeIntent | None, list[RuntimeCteStep]]:
     """Convert ``SelectStmt`` core fields when ``WITH`` was already lifted."""
-
-    from pglast.ast import A_Const, ResTarget, SelectStmt
-    from pglast.enums import SetOperation
 
     if not isinstance(sel, SelectStmt):
         return None, []
@@ -1080,8 +1092,6 @@ def _pg_distinct_select_index(
 ) -> int:
     """Derive ``distinct_select_index`` from ``distinctClause`` when parsable."""
 
-    from pglast.ast import ColumnRef
-
     dc = getattr(sel, "distinctClause", None)
     if not dc:
         return -1
@@ -1110,9 +1120,6 @@ def _pg_having_to_params(
     pgx: PgExtra | None = None,
 ) -> list[HavingParam] | None:
     """Extract ``HavingParam`` rows from ``HAVING`` (``AND`` chains; aggregate left, literal/column right)."""
-
-    from pglast.ast import A_Expr, BoolExpr, ColumnRef, FuncCall, NullTest, SubLink
-    from pglast.enums import A_Expr_Kind, BoolExprType, NullTestType
 
     if isinstance(having, BoolExpr) and having.boolop != BoolExprType.AND_EXPR:
         return None
@@ -1220,8 +1227,6 @@ def _pg_having_to_params(
 def _pg_const_int_only(node: Any) -> int | None:
     """Parse ``A_Const`` integer literal."""
 
-    from pglast.ast import A_Const, Integer
-
     if not isinstance(node, A_Const) or getattr(node, "isnull", False):
         return None
     v = node.val
@@ -1239,8 +1244,6 @@ def _pg_const_payload(node: Any) -> tuple[Any, str, str] | None:
 
     ``placeholder_expr`` is one of the SQL_TO_INTENT_LITERAL_PLACEHOLDER_* tokens stored in ``NormalizedExpr.string_literal``.
     """
-
-    from pglast.ast import A_Const
 
     if not isinstance(node, A_Const) or getattr(node, "isnull", False):
         return None
@@ -1273,8 +1276,6 @@ def _pg_expr_leaf(
     pgx: PgExtra | None = None,
 ) -> NormalizedExpr | None:
     """Recognise column refs or literals for projections / predicates."""
-
-    from pglast.ast import A_Const, ColumnRef, TypeCast
 
     if isinstance(node, ColumnRef):
         qn = _pg_qual_column_name(node, alias_map, single_alias, pgx)
@@ -1333,9 +1334,6 @@ def _pg_interval_magnitude_unit_from_string(raw: str) -> tuple[float, str] | Non
 
 def _pg_sql_value_function_keyword(node: Any) -> str | None:
     """Map ``SQLValueFunction`` to ``NormalizedExpr.keyword``."""
-
-    from pglast.ast import SQLValueFunction
-    from pglast.enums import SQLValueFunctionOp
 
     if not isinstance(node, SQLValueFunction):
         return None
@@ -1449,9 +1447,6 @@ def _pg_window_sort_clause(
 ) -> list[OrderByCol] | None:
     """Convert ``ORDER BY`` inside ``OVER``."""
 
-    from pglast.ast import A_Const, SortBy
-    from pglast.enums import SortByDir
-
     out: list[OrderByCol] = []
     for sb in nodes or ():
         if not isinstance(sb, SortBy):
@@ -1493,8 +1488,6 @@ def _pg_window_def_to_spec(
     pgx: PgExtra | None,
 ) -> WindowSpec | None:
     """Build ``WindowSpec`` from an inline ``WindowDef``."""
-
-    from pglast.ast import FuncCall
 
     if wdef is None:
         return None
@@ -1587,8 +1580,6 @@ def _pg_funcall_with_over_to_registry_step(
 ) -> NormalizedExpr | None:
     """Emit ``WindowRegistryStep`` for ``FuncCall`` with ``OVER``."""
 
-    from pglast.ast import FuncCall
-
     if not isinstance(fn, FuncCall) or not getattr(fn, "over", None):
         return None
     ws = _pg_window_def_to_spec(
@@ -1617,8 +1608,6 @@ def _pg_caseexpr_to_registry_step(
     pgx: PgExtra,
 ) -> NormalizedExpr | None:
     """Emit ``CaseRegistryStep`` for ``CaseExpr``."""
-
-    from pglast.ast import CaseExpr, CaseWhen
 
     if not isinstance(node, CaseExpr):
         return None
@@ -1678,8 +1667,6 @@ def _pg_coalesce_to_expr(
     pgx: PgExtra | None,
 ) -> NormalizedExpr | None:
     """Map ``CoalesceExpr`` to ``NormalizedExpr``."""
-
-    from pglast.ast import A_Const, CoalesceExpr
 
     if not isinstance(node, CoalesceExpr):
         return None
@@ -1751,9 +1738,6 @@ def _pg_expr_full(
     select_cols: list[SelectCol] | None = None,
 ) -> NormalizedExpr | None:
     """Parse PostgreSQL expression trees into ``NormalizedExpr`` or registry references."""
-
-    from pglast.ast import A_Const, A_Expr, CaseExpr, CoalesceExpr, FuncCall, TypeCast
-    from pglast.enums import A_Expr_Kind
 
     leaf = _pg_expr_leaf(node, alias_map, single_alias, param_store, next_lit_key, pgx)
     if leaf is not None:
@@ -1962,8 +1946,6 @@ def _pg_aggregate_funcall_to_expr(
 ) -> NormalizedExpr | None:
     """Map aggregate ``FuncCall`` nodes to ``NormalizedExpr``."""
 
-    from pglast.ast import FuncCall
-
     if not isinstance(fn, FuncCall):
         return None
     raw = (_pg_funcname(fn) or "").strip().lower()
@@ -2023,9 +2005,6 @@ def _pg_res_target_to_expr(
 def _pg_flatten_bool_and(node: Any) -> list[Any]:
     """Flatten nested ``AND`` ``BoolExpr`` chains."""
 
-    from pglast.ast import BoolExpr
-    from pglast.enums import BoolExprType
-
     if isinstance(node, BoolExpr) and node.boolop == BoolExprType.AND_EXPR:
         out: list[Any] = []
         for a in node.args or ():
@@ -2036,8 +2015,6 @@ def _pg_flatten_bool_and(node: Any) -> list[Any]:
 
 def _pg_where_literal_payload(node: Any) -> tuple[Any, str] | None:
     """Extract typed literal for WHERE RHS without masking SELECT placeholders."""
-
-    from pglast.ast import A_Const, TypeCast
 
     if isinstance(node, A_Const):
         p = _pg_const_payload(node)
@@ -2078,9 +2055,6 @@ def _pg_single_predicate_to_filter(
     pgx: PgExtra | None = None,
 ) -> FilterParam | None:
     """Convert one ``WHERE`` predicate leaf (no nested ``BoolExpr``)."""
-
-    from pglast.ast import A_Expr, ColumnRef, NullTest, SubLink
-    from pglast.enums import A_Expr_Kind, NullTestType
 
     if isinstance(p, SubLink):
         return None
@@ -2258,9 +2232,6 @@ def _pg_bool_nesting_too_deep(node: Any, depth: int) -> bool:
         True when the subtree violates the depth bound.
     """
 
-    from pglast.ast import BoolExpr
-    from pglast.enums import BoolExprType
-
     if depth > 2:
         return True
     if isinstance(node, BoolExpr):
@@ -2301,9 +2272,6 @@ def _pg_walk_bool_to_filter_groups(
 
         Filters or ``None`` when the shape is outside the supported OR-of-AND tier.
     """
-
-    from pglast.ast import BoolExpr
-    from pglast.enums import BoolExprType
 
     if _pg_bool_nesting_too_deep(where, 0):
         return None
@@ -2384,8 +2352,6 @@ def _pg_group_clause(
 ) -> list[NormalizedExpr] | None:
     """Convert ``GROUP BY`` list: columns, ordinals, or leaf expressions."""
 
-    from pglast.ast import A_Const, ColumnRef
-
     out: list[NormalizedExpr] = []
     for n in nodes or ():
         if isinstance(n, ColumnRef):
@@ -2426,9 +2392,6 @@ def _pg_sort_clause(
     pgx: PgExtra | None = None,
 ) -> list[OrderByCol] | None:
     """Convert ``ORDER BY`` using column refs, ordinals, or leaf expressions."""
-
-    from pglast.ast import A_Const, SortBy
-    from pglast.enums import SortByDir
 
     out: list[OrderByCol] = []
     for sb in nodes or ():

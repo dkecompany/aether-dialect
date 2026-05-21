@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from enum import Enum
-import hashlib
-import json
-import re
 from typing import Any, ClassVar, Literal, NamedTuple, Protocol
 
 from ._config import (
@@ -18,11 +18,11 @@ from ._config import (
     FILTER_VALUE_TYPE_DATE_WINDOW,
     OP_FLIP,
     REGISTRY_REF_TOKEN_RE,
-    GenerationPath,
-    SeedWarmupConfig,
     WINDOW_REGISTRY_AGG_KIND_HINTS,
     WINDOW_REGISTRY_NAV_KIND_HINTS,
     WINDOW_REGISTRY_RANK_KIND_HINTS,
+    GenerationPath,
+    SeedWarmupConfig,
 )
 from ._contracts_base import (
     ComplexityTier,

@@ -24,6 +24,10 @@ from aetherdialect._contracts_core import (
     WindowRegistryStep,
     WindowSpec,
 )
+from aetherdialect._validation_execute import (
+    curated_warmup_post_binding_issues,
+    curated_warmup_semantic_issues,
+)
 from aetherdialect._validation_semantic import (
     _check_mixed_aggregation_in_expr,
     _check_mixed_aggregation_in_group,
@@ -44,6 +48,7 @@ from aetherdialect._validation_semantic import (
     validate_cte_grain_consistency,
     validate_denied_references,
     validate_deny_bare_select,
+    validate_empty_window,
     validate_expr_vs_expr_filters,
     validate_filter_expr_types,
     validate_filter_no_aggregation,
@@ -52,26 +57,21 @@ from aetherdialect._validation_semantic import (
     validate_grouped_requires_aggregation,
     validate_having_expr_types,
     validate_having_requires_aggregation,
+    validate_logical_intent_numeric_coverage,
     validate_mixed_aggregation_in_mulgroup,
     validate_no_nested_aggregation,
     validate_order_by_aggregation_context,
     validate_order_by_expr_types,
     validate_pii_group_by,
     validate_pii_order_by,
-    validate_empty_window,
     validate_predicate_sidedness,
     validate_question_agg_keyword_coverage,
     validate_question_distinct_hint,
-    validate_logical_intent_numeric_coverage,
     validate_question_table_mentions,
     validate_select_expr_types,
     validate_select_group_by_membership,
     validate_semantic_contradictions,
     validate_threshold_missing_having,
-)
-from aetherdialect._validation_execute import (
-    curated_warmup_post_binding_issues,
-    curated_warmup_semantic_issues,
 )
 
 

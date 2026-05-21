@@ -24,9 +24,6 @@ from ._config import (
     SQL_WINDOW_FUNCTION_UPPER,
     PolicyConfig,
 )
-
-JOIN_PRIOR_FEEDBACK_HEADING: str = "Previously rejected joins for this question (avoid these table sets / FK paths):"
-
 from ._contracts_base import (
     JoinInjectionAlignmentError,
     JoinInjectionFailedError,
@@ -62,6 +59,8 @@ from ._core_utils import (
 )
 from ._dialect import Dialect, JoinEdge, get_dialect
 from ._validation_schema import get_col_meta
+
+JOIN_PRIOR_FEEDBACK_HEADING: str = "Previously rejected joins for this question (avoid these table sets / FK paths):"
 
 
 def _databricks_unqualify_agg_arg_sql(sql: str) -> str:
@@ -787,12 +786,12 @@ def inject_join_into_deterministic_sql(
     except JoinInjectionAlignmentError as exc:
         pipeline_trace_lazy(
             "sql_gen.inject_join.alignment_failed",
-            lambda: stable_json(
+            lambda err=exc: stable_json(
                 {
                     "det_sql": det_sql,
                     "join_sigs_ordered": join_sigs_ordered,
                     "edge_kinds_ordered": kinds_in,
-                    "error": str(exc),
+                    "error": str(err),
                 }
             ),
         )

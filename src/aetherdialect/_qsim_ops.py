@@ -16,11 +16,11 @@ from ._config import (
     QSimConfig,
 )
 from ._contracts_base import (
+    QSIM_COMPLEXITY_TIER_SPECS,
+    QSIM_SUPPORTED_ADVANCED_FEATURES,
     DatabaseFeatureCapability,
     LlmJsonExhausted,
     QSimSkeleton,
-    QSIM_COMPLEXITY_TIER_SPECS,
-    QSIM_SUPPORTED_ADVANCED_FEATURES,
     RetryFailureContext,
     SchemaGraph,
     SkeletonPool,
@@ -99,7 +99,7 @@ def _allocate_tier_int_quotas(weights: dict[str, float], total: int) -> dict[str
     order = sorted(range(len(keys)), key=lambda i: raw[i] - floors[i], reverse=True)
     for j in range(max(0, rem)):
         floors[order[j % len(order)]] += 1
-    return dict(zip(keys, floors))
+    return dict(zip(keys, floors, strict=False))
 
 
 def _skeleton_bucket_lookup_key(target: ComplexityTier) -> str:

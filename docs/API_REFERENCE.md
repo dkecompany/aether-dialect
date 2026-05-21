@@ -309,7 +309,6 @@ Hand-edited files for `apply_schema_overrides` should use **plain strings** for 
 | `get_qsim_summary(start, end)` | `QSimSummarySnapshot` | Reads QSim summary index for inclusive version range. |
 | `get_questions_only(version)` | `None` | Prints numbered questions and writes `qsim_v{version}_questions.txt` in the working directory. |
 | `run_qsim(num_intents=20, num_questions=100, seed=None)` | `None` | QSim generator; prints summary. |
-| `emit_otel_span(name, **attrs)` | context manager | Starts an OpenTelemetry span when `opentelemetry` is installed; otherwise no-op so callers can wrap `ask` / `step` without conditional imports. |
 | `clear_persisted_overrides()` | `bool` | Removes overrides sidecar and schema cache when present; rebuilds init bundle; returns whether a sidecar existed. |
 | `clear_template_store()` | `bool` | Removes `intent_templates/` (header and shards) and legacy `intent_templates.json.gz` when present; rebuilds init bundle. |
 | `clear_simulation_caches()` | `int` | Deletes QSim and seed-warmup artefacts; returns removed file count; rebuilds init bundle. |

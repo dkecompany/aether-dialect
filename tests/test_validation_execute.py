@@ -1,9 +1,8 @@
 """Unit tests for aetherdialect._validation_execute module."""
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
-
 from typing import Any
+from unittest.mock import MagicMock
 
 from aetherdialect._contracts_base import (
     FailureCategory,

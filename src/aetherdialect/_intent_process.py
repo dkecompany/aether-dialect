@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from collections import defaultdict
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from enum import Enum
-from typing import Any, Literal, NamedTuple
 from types import MappingProxyType
+from typing import Any, Literal, NamedTuple
 
 import jsonschema
 
@@ -56,7 +54,6 @@ from ._contracts_core import (
     concrete_intent_to_runtime_skeleton,
     expr_registry_ref,
     intent_prompt_structural_index,
-    runtime_intent_to_concrete,
 )
 from ._core_utils import (
     debug,
@@ -113,6 +110,7 @@ from ._intent_repair import (
     strip_spurious_group_by,
 )
 from ._intent_resolve import (
+    UnionSelectColumnDelta,
     _coerce_filter_group_list,
     _coerce_having_group_list,
     _normalized_expr_is_absent,
@@ -122,16 +120,19 @@ from ._intent_resolve import (
     check_qualified_refs_exist,
     coerce_filter_group_mode,
     collect_column_refs_for_post_processing,
+    compute_intent_union,
     enforce_case_branch_param_keys,
     enforce_cte_grain_consistency,
     enforce_grain_consistency,
+    join_path_key_concrete,
+    join_path_key_runtime,
     lift_distinct_select_from_raw_sql,
     normalize_count_star,
     normalize_cte_names,
     normalize_filters_havings,
-    qualify_cte_count_star_mulgroups,
     prune_unused_cte_output_columns,
     prune_unused_cte_steps,
+    qualify_cte_count_star_mulgroups,
     reorder_cte_steps_by_dag,
     resolve_column_map,
     resolve_cte_column_maps,
@@ -236,6 +237,26 @@ def _in_turn_row_from_semantic_errors(
 def register_templates_module(module: Any) -> None:
     global _TEMPLATES_MODULE
     _TEMPLATES_MODULE = module
+
+
+def _is_template_store_view(store: Any) -> bool:
+    """Return True when *store* is the registered templates module :class:`TemplateStoreView`."""
+
+    mod = _TEMPLATES_MODULE
+    return mod is not None and isinstance(store, mod.TemplateStoreView)
+
+
+def _refresh_template_store_indexes_for_view(
+    store: Any,
+    *,
+    template_objs: list[Template] | None = None,
+) -> None:
+    """Refresh matcher indexes on *store* when it is a registered :class:`TemplateStoreView`."""
+
+    mod = _TEMPLATES_MODULE
+    if mod is None:
+        return
+    mod.refresh_template_store_indexes(store, template_objs=template_objs)
 
 
 INTENT_PLACEHOLDER_FORMAT_REPAIR_PARSE_ERROR = (
@@ -3326,12 +3347,6 @@ def _diff_cols_span_disjoint_tables(
     return False
 
 
-def _non_agg_select_signature_keys(select_cols: list[SelectCol] | None) -> set[str]:
-    """Return ``signature_key`` values for non-aggregated select columns."""
-
-    return {sc.signature_key for sc in select_cols or [] if not sc.is_aggregated}
-
-
 def select_col_is_plain_column(sc: SelectCol) -> bool:
     """
     Return True when *sc* is a bare ``table.column`` reference with no transforms.
@@ -3386,15 +3401,6 @@ def _diff_select_cols_are_plain_columns(
         if not select_col_is_plain_column(sc):
             return False
     return True
-
-
-class UnionSelectColumnDelta(str, Enum):
-    """Select-list delta between runtime intent and template concrete intent (non-aggregated keys)."""
-
-    EQUAL = "equal"
-    TEMPLATE_ONLY_EXTRA = "template_only_extra"
-    INTENT_ONLY_EXTRA = "intent_only_extra"
-    BOTH_EXTRA = "both_extra"
 
 
 def resolve_sql_path(
@@ -3490,8 +3496,6 @@ def reconcile_template_store_until_stable(
         Count of template ids removed across all iterations.
     """
 
-    from ._templates import TemplateStoreView, refresh_template_store_indexes
-
     total = 0
     for _ in range(max_iterations):
         r1 = reconcile_union_family_after_mutation(
@@ -3506,8 +3510,8 @@ def reconcile_template_store_until_stable(
         )
         n = len(r1) + len(r2)
         total += n
-        if isinstance(template_store_view, TemplateStoreView):
-            refresh_template_store_indexes(
+        if _is_template_store_view(template_store_view):
+            _refresh_template_store_indexes_for_view(
                 template_store_view,
                 template_objs=list(templates.values()),
             )
@@ -3582,49 +3586,6 @@ def _union_sql_eligibility_strict_shape(
         return False
     rt = concrete_intent_to_runtime_skeleton(concrete)
     return _runtime_intent_union_select_structures_safe(rt)
-
-
-def classify_union_merge_case(
-    intent: RuntimeIntent,
-    concrete: ConcreteIntent,
-) -> UnionSelectColumnDelta:
-    """Classify how runtime select keys differ from template concrete selects (non-aggregated only)."""
-
-    i_keys = _non_agg_select_signature_keys(intent.select_cols)
-    c_keys = _non_agg_select_signature_keys(concrete.select_cols)
-    i_only = i_keys - c_keys
-    c_only = c_keys - i_keys
-    if not i_only and not c_only:
-        return UnionSelectColumnDelta.EQUAL
-    if i_only and c_only:
-        return UnionSelectColumnDelta.BOTH_EXTRA
-    if i_only:
-        return UnionSelectColumnDelta.INTENT_ONLY_EXTRA
-    return UnionSelectColumnDelta.TEMPLATE_ONLY_EXTRA
-
-
-def _join_path_signature_hash(layers: list[list[str]]) -> str:
-    """SHA-256 hex of layered join path signatures (main then CTEs)."""
-
-    return hashlib.sha256(stable_json(layers).encode("utf-8")).hexdigest()
-
-
-def join_path_key_runtime(intent: RuntimeIntent) -> str:
-    """Stable join fingerprint for a runtime intent."""
-
-    layers: list[list[str]] = [list(intent.chosen_join_path_signature or [])]
-    for step in intent.cte_steps or []:
-        layers.append(list(step.chosen_join_path_signature or []))
-    return _join_path_signature_hash(layers)
-
-
-def join_path_key_concrete(concrete: ConcreteIntent) -> str:
-    """Stable join fingerprint for a concrete intent signature."""
-
-    layers: list[list[str]] = [list(concrete.chosen_join_path_signature or [])]
-    for step in concrete.cte_steps or []:
-        layers.append(list(step.chosen_join_path_signature or []))
-    return _join_path_signature_hash(layers)
 
 
 def join_runtime_intent_has_join_fingerprint(intent: RuntimeIntent) -> bool:
@@ -3847,13 +3808,10 @@ def reconcile_union_family_after_mutation(
             removed.append(dup_id)
 
     ufi = union_family_index
-    if not ufi and template_store_view is not None:
-        from ._templates import TemplateStoreView
-
-        if isinstance(template_store_view, TemplateStoreView):
-            raw = template_store_view._indexes.get(TEMPLATE_UNION_FAMILY_INDEX_KEY)
-            if isinstance(raw, dict) and any(isinstance(v, list) and v for v in raw.values()):
-                ufi = {str(k): [str(x) for x in v] for k, v in raw.items() if isinstance(v, list)}
+    if not ufi and _is_template_store_view(template_store_view):
+        raw = template_store_view._indexes.get(TEMPLATE_UNION_FAMILY_INDEX_KEY)
+        if isinstance(raw, dict) and any(isinstance(v, list) and v for v in raw.values()):
+            ufi = {str(k): [str(x) for x in v] for k, v in raw.items() if isinstance(v, list)}
     if not ufi:
         ufi = _union_family_index_from_templates(templates)
 
@@ -4015,13 +3973,10 @@ def reconcile_union_family_body_join_after_mutation(
             removed.append(dup_id)
 
     ufi = union_family_index
-    if not ufi and template_store_view is not None:
-        from ._templates import TemplateStoreView
-
-        if isinstance(template_store_view, TemplateStoreView):
-            raw = template_store_view._indexes.get(TEMPLATE_UNION_FAMILY_INDEX_KEY)
-            if isinstance(raw, dict) and any(isinstance(v, list) and v for v in raw.values()):
-                ufi = {str(k): [str(x) for x in v] for k, v in raw.items() if isinstance(v, list)}
+    if not ufi and _is_template_store_view(template_store_view):
+        raw = template_store_view._indexes.get(TEMPLATE_UNION_FAMILY_INDEX_KEY)
+        if isinstance(raw, dict) and any(isinstance(v, list) and v for v in raw.values()):
+            ufi = {str(k): [str(x) for x in v] for k, v in raw.items() if isinstance(v, list)}
     if not ufi:
         ufi = _union_family_index_from_templates(templates)
 
@@ -4074,44 +4029,3 @@ def match_template_for_union(
         f"non_agg_diff={best.non_agg_symmetric_diff} union_cols={len(best.union_cols)} sql_path={best.union_sql_path.code}"
     )
     return best.template, best.union_cols, best.cols_changed, best.union_sql_path
-
-
-def compute_intent_union(
-    intent: RuntimeIntent,
-    concrete: ConcreteIntent,
-) -> tuple[list[SelectCol], bool, UnionSelectColumnDelta]:
-    """
-    Merge selects by ``signature_key``: concrete order first, then new from *intent*.
-
-    Args:
-
-        intent: Runtime intent.
-
-        concrete: Matched template intent.
-
-    Returns:
-
-        ``(union_cols, changed_vs_concrete, merge_case)``.
-    """
-    seen_keys: set[str] = set()
-    union_cols: list[SelectCol] = []
-    for sc in concrete.select_cols or []:
-        key = sc.signature_key
-        if key not in seen_keys:
-            seen_keys.add(key)
-            union_cols.append(sc)
-    for sc in intent.select_cols or []:
-        key = sc.signature_key
-        if key not in seen_keys:
-            seen_keys.add(key)
-            union_cols.append(sc)
-
-    cols_changed = sorted(seen_keys) != sorted(s.signature_key for s in (concrete.select_cols or []))
-
-    sorted_union = sort_select_cols(union_cols)
-    merge_case = classify_union_merge_case(intent, concrete)
-    debug(
-        f"[intent_process.compute_intent_union] union_cols={len(sorted_union)} "
-        f"cols_changed={cols_changed} merge_case={merge_case.value}"
-    )
-    return sorted_union, cols_changed, merge_case

@@ -9,7 +9,6 @@ import pytest
 from aetherdialect._config import (
     JOIN_CHOICE_SCOPE_MAIN,
 )
-from aetherdialect._sql_gen import JOIN_PRIOR_FEEDBACK_HEADING
 from aetherdialect._contracts_base import (
     ColumnMetadata,
     ColumnRole,
@@ -48,6 +47,7 @@ from aetherdialect._dialect import (
     finalize_executable_sql,
 )
 from aetherdialect._sql_gen import (
+    JOIN_PRIOR_FEEDBACK_HEADING,
     ScopeClass,
     _analyze_join_topology,
     _build_deterministic_select_block,

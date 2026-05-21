@@ -11,22 +11,18 @@ import pytest as _pt
 
 from aetherdialect._config import (
     JOIN_CHOICE_SCOPE_MAIN,
+    PIPELINE_SUSPEND_ID_DIRECT_REUSE,
+    PIPELINE_SUSPEND_ID_INTENT_CONFIRM,
+    PIPELINE_SUSPEND_ID_SQL,
+    SESSION_KIND_AWAITING_INTENT_CONFIRM,
+    SESSION_KIND_AWAITING_SQL_CONFIRM,
+    SESSION_KIND_IDLE,
+    SESSION_KIND_RESULT,
     SHAPE_QUESTION_INDEX_KEY,
     TEMPLATE_INTENT_KEY_INDEX_KEY,
     TEMPLATE_QUESTION_TOKEN_INDEX_KEY,
     TEMPLATE_UNION_FAMILY_INDEX_KEY,
     EngineConfig,
-    PIPELINE_SUSPEND_ID_DIRECT_REUSE,
-    PIPELINE_SUSPEND_ID_INTENT_CONFIRM,
-    PIPELINE_SUSPEND_ID_INTENT_FEEDBACK,
-    PIPELINE_SUSPEND_ID_SQL,
-    SESSION_KIND_AWAITING_INTENT_CONFIRM,
-    SESSION_KIND_AWAITING_SQL_CONFIRM,
-    SESSION_KIND_AWAITING_SQL_FEEDBACK,
-    SESSION_KIND_DONE,
-    SESSION_KIND_ERROR,
-    SESSION_KIND_IDLE,
-    SESSION_KIND_RESULT,
     GenerationPath,
     PolicyConfig,
 )
@@ -63,12 +59,12 @@ from aetherdialect._core_utils import diagnostic_print_listener
 from aetherdialect._dialect import Dialect
 from aetherdialect._intent_process import TrustedTemplateHit
 from aetherdialect._main_execution import PipelineSession
-from aetherdialect._templates import empty_template_store
 from aetherdialect._pipeline import (
     PathSelectionState,
     _choose_generation_path,
     _join_signatures_for_deterministic_from_anchor,
     _most_frequent_natural_language,
+    _refinement_retry_available,
     _remap_value_history_structural_keys,
     _resolve_joins_fresh,
     _run_sql_validation_cascade,
@@ -78,7 +74,9 @@ from aetherdialect._pipeline import (
     align_template_to_widened_intent,
     best_accepted_template_similarity,
     build_interactive_tail_snapshot,
+    build_result_dataframe,
     complete_direct_sql_reuse_user_choice,
+    complete_user_feedback_reject,
     compute_final_metrics,
     confirm_intent_with_user,
     display_final_results,
@@ -94,14 +92,14 @@ from aetherdialect._pipeline import (
     other_template_owns_question_string,
     parse_intent_via_llm,
     prepare_union_match_join_phase,
-    build_result_dataframe,
-    complete_user_feedback_reject,
     save_result_csv,
     should_skip_intent_confirmation,
-    _refinement_retry_available,
 )
 from aetherdialect._sql_gen import generate_col_alias
-from aetherdialect._templates import compute_question_feedback_penalty
+from aetherdialect._templates import (
+    compute_question_feedback_penalty,
+    empty_template_store,
+)
 from aetherdialect._utils import QuestionReuseMatch, intent_key
 from aetherdialect._validation_execute import bind_params_for_sql
 

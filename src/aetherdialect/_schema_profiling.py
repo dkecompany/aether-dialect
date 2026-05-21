@@ -18,6 +18,7 @@ from ._config import (
     BOOLEAN_NEGATION_SUFFIXES,
     BOOLEAN_TRUTH_PATTERN_MAP,
     COLUMN_DEFINITION_STOP_WORDS,
+    DIAGNOSTIC_CODE_ENGINE_INFO,
     NAME_COLUMN_PATTERN,
     PROFILING_TOP_K,
     ROLE_VALUE_TYPE_COMPAT,
@@ -27,8 +28,39 @@ from ._config import (
     QSimConfig,
     cost_cap_active,
     diagnostic_debug_enabled,
-    DIAGNOSTIC_CODE_ENGINE_INFO,
 )
+from ._contracts_base import (
+    CatalogStructuralConstraintsIndex,
+    ColumnMetadata,
+    ColumnRole,
+    DescriptionOwner,
+    FKEdge,
+    RoleOwner,
+    SchemaGraph,
+    SensitivityClassification,
+    TableMetadata,
+    TableRole,
+    can_overwrite_role,
+    set_description,
+    set_sensitivity,
+)
+from ._core_utils import debug, llm_chat, safe_json_loads, stable_json
+
+if TYPE_CHECKING:
+    from ._dialect import Dialect
+
+try:
+    import pglast
+    from pglast.ast import AlterTableStmt, CreateStmt
+    from pglast.enums import AlterTableType, ConstrType
+    from pglast.stream import RawStream
+except ImportError:
+    pglast = None
+    AlterTableStmt = None
+    CreateStmt = None
+    AlterTableType = None
+    ConstrType = None
+    RawStream = None
 
 SCHEMA_NOTES_REFINE_SYSTEM: str = (
     "You refine base_classification using domain_notes.\n\n"
@@ -62,39 +94,6 @@ SCHEMA_CONSISTENCY_REFINE_SYSTEM: str = (
     '{"table1": {"table_role": "...", "description": "...", '
     '"columns": {"col1": {"role": "...", "hint": "...", "sensitivity": null}, ...}}, ...}'
 )
-
-from ._contracts_base import (
-    CatalogStructuralConstraintsIndex,
-    ColumnMetadata,
-    ColumnRole,
-    DescriptionOwner,
-    FKEdge,
-    RoleOwner,
-    SchemaGraph,
-    TableMetadata,
-    TableRole,
-    can_overwrite_role,
-    set_description,
-    set_sensitivity,
-    SensitivityClassification,
-)
-from ._core_utils import debug, llm_chat, safe_json_loads, stable_json
-
-if TYPE_CHECKING:
-    from ._dialect import Dialect
-
-try:
-    import pglast
-    from pglast.ast import AlterTableStmt, CreateStmt
-    from pglast.enums import AlterTableType, ConstrType
-    from pglast.stream import RawStream
-except ImportError:
-    pglast = None
-    AlterTableStmt = None
-    CreateStmt = None
-    AlterTableType = None
-    ConstrType = None
-    RawStream = None
 
 _PG_LAST_SQL_AVAILABLE: bool = pglast is not None
 

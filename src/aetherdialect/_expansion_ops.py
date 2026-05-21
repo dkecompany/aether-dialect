@@ -18,13 +18,13 @@ from ._config import (
     SeedWarmupConfig,
 )
 from ._contracts_base import (
+    WORKLOAD_FAMILY_SPECS,
     ColumnRole,
     ExpansionMetadata,
     SchemaGraph,
     SchemaLimits,
     TableRole,
     WorkloadFamily,
-    WORKLOAD_FAMILY_SPECS,
 )
 from ._contracts_core import (
     CaseRegistryStep,
@@ -49,9 +49,8 @@ from ._intent_expr import extract_columns_from_expr, replace_refs_in_expr
 from ._intent_process import apply_deterministic_repairs
 from ._intent_repair import drop_invalid_case_registry_entries, repair_case_when_intent
 from ._intent_resolve import check_qualified_refs_exist
-from ._validation_schema import runtime_scope_registry_error_messages
 from ._utils import intent_key
-
+from ._validation_schema import runtime_scope_registry_error_messages
 
 _EXPANSION_SUBTREE_POOL: list[SeedWarmupIntent] = []
 _EXPANSION_SUBTREE_POOL_MAX: int = 128
@@ -1408,47 +1407,47 @@ def _table_remove(
         new_intent.tables = sorted(new_tables)
         ts = set(new_tables)
 
-        def _having_refs_removed_table(hp: HavingParam) -> bool:
+        def _having_refs_removed_table(hp: HavingParam, *, _table: str = table) -> bool:
             for col in extract_columns_from_expr(hp.left_expr):
-                if "." in col and _table_from_column_ref(col) == table:
+                if "." in col and _table_from_column_ref(col) == _table:
                     return True
             if hp.right_expr:
                 for col in extract_columns_from_expr(hp.right_expr):
-                    if "." in col and _table_from_column_ref(col) == table:
+                    if "." in col and _table_from_column_ref(col) == _table:
                         return True
             return False
 
-        def _window_refs_removed_table(ws: WindowSpec) -> bool:
+        def _window_refs_removed_table(ws: WindowSpec, *, _table: str = table) -> bool:
             for p in ws.partition_by or []:
                 for col in extract_columns_from_expr(p):
-                    if "." in col and _table_from_column_ref(col) == table:
+                    if "." in col and _table_from_column_ref(col) == _table:
                         return True
             for o in ws.order_by or []:
                 for col in extract_columns_from_expr(o.expr):
-                    if "." in col and _table_from_column_ref(col) == table:
+                    if "." in col and _table_from_column_ref(col) == _table:
                         return True
             if ws.argument:
                 for col in extract_columns_from_expr(ws.argument):
-                    if "." in col and _table_from_column_ref(col) == table:
+                    if "." in col and _table_from_column_ref(col) == _table:
                         return True
             return False
 
-        def _case_refs_removed_table(cr: CaseRegistryStep) -> bool:
+        def _case_refs_removed_table(cr: CaseRegistryStep, *, _table: str = table) -> bool:
             cw = cr.case_when
             for br in cw.branches or []:
                 for col in extract_columns_from_expr(br.result):
-                    if "." in col and _table_from_column_ref(col) == table:
+                    if "." in col and _table_from_column_ref(col) == _table:
                         return True
                 for col in extract_columns_from_expr(br.condition.left_expr):
-                    if "." in col and _table_from_column_ref(col) == table:
+                    if "." in col and _table_from_column_ref(col) == _table:
                         return True
                 if br.condition.right_expr:
                     for col in extract_columns_from_expr(br.condition.right_expr):
-                        if "." in col and _table_from_column_ref(col) == table:
+                        if "." in col and _table_from_column_ref(col) == _table:
                             return True
             if cw.else_result:
                 for col in extract_columns_from_expr(cw.else_result):
-                    if "." in col and _table_from_column_ref(col) == table:
+                    if "." in col and _table_from_column_ref(col) == _table:
                         return True
             return False
 
@@ -1479,26 +1478,38 @@ def _table_remove(
             c for c in (new_intent.group_by_cols or []) if _table_from_column_ref(c.primary_column) in ts
         ]
 
-        def _order_keeps(o: OrderByCol) -> bool:
+        def _order_keeps(
+            o: OrderByCol,
+            *,
+            _dropped_win: set[str] = dropped_win,
+            _dropped_case: set[str] = dropped_case,
+            _ts: set[str] = ts,
+        ) -> bool:
             rid = expr_registry_ref(o.expr) or ""
-            if rid.startswith("w") and rid in dropped_win:
+            if rid.startswith("w") and rid in _dropped_win:
                 return False
-            if rid.startswith("c") and rid in dropped_case:
+            if rid.startswith("c") and rid in _dropped_case:
                 return False
             pr_t = _table_from_column_ref(o.expr.primary_column)
             if pr_t:
-                return pr_t in ts
+                return pr_t in _ts
             return True
 
-        def _select_keeps(sc: SelectCol) -> bool:
+        def _select_keeps(
+            sc: SelectCol,
+            *,
+            _dropped_win: set[str] = dropped_win,
+            _dropped_case: set[str] = dropped_case,
+            _ts: set[str] = ts,
+        ) -> bool:
             rid = expr_registry_ref(sc.expr) or ""
-            if rid.startswith("w") and rid in dropped_win:
+            if rid.startswith("w") and rid in _dropped_win:
                 return False
-            if rid.startswith("c") and rid in dropped_case:
+            if rid.startswith("c") and rid in _dropped_case:
                 return False
             pr_t = _table_from_column_ref(sc.expr.primary_column)
             if pr_t:
-                return pr_t in ts
+                return pr_t in _ts
             return True
 
         new_intent.order_by_cols = [o for o in (new_intent.order_by_cols or []) if _order_keeps(o)]

@@ -46,7 +46,6 @@ from ._contracts_base import (
     CatalogStructuralConstraintsIndex,
     CatalogTableStructuralConstraints,
     ConfigError,
-    ConnectionError,
     DatabasePingFailed,
     FKEdge,
     SchemaContext,
@@ -4384,9 +4383,6 @@ class DatabricksDialect(Dialect):
                     "dialect.finalize_render produced empty SQL from non-empty input; "
                     "last_non_empty_stage=inject_partition_filters"
                 )
-            last_stage = "inject_partition_filters"
-        else:
-            last_stage = "_databricks_normalize_datetrunc_sql"
         return substituted
 
     def execute(self, sql: str, params: dict[str, Any] | None = None) -> list[tuple]:

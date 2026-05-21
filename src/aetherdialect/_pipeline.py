@@ -8,15 +8,12 @@ from collections import Counter
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any
 
 import pandas
 
-from . import _core_utils
 from ._config import (
     DIAGNOSTIC_CODE_ENGINE_INFO,
-    DIAGNOSTIC_CODE_LARGE_RESULT_WARNING,
-    DIAGNOSTIC_CODE_LOW_CONFIDENCE,
     DIAGNOSTIC_CODE_REUSE_HIT,
     DIAGNOSTIC_CODE_REUSE_MISS,
     INTERACTIVE_STAGE_DIRECT_REUSE,
@@ -28,11 +25,11 @@ from ._config import (
     PIPELINE_SUSPEND_ID_INTENT_FEEDBACK,
     PIPELINE_SUSPEND_ID_USER_FEEDBACK_REJECT,
     SHAPE_QUESTION_INDEX_KEY,
+    SOFT_DIAGNOSTIC_CODES,
+    SUPPORTED_ENGINES,
     TEMPLATE_INTENT_KEY_INDEX_KEY,
     TEMPLATE_QUESTION_TOKEN_INDEX_KEY,
     TEMPLATE_UNION_FAMILY_INDEX_KEY,
-    SOFT_DIAGNOSTIC_CODES,
-    SUPPORTED_ENGINES,
     EngineConfig,
     GenerationPath,
     PolicyConfig,
@@ -76,7 +73,9 @@ from ._core_utils import (
     InteractiveChoicePort,
     RephraseHint,
     debug,
+    emit_write_queue_event,
     interactive_yes_no,
+    invalid_input,
     llm_chat,
     log,
     notify,
@@ -84,10 +83,12 @@ from ._core_utils import (
     print_info,
     print_query_result,
     print_rephrase_hint,
+    progress,
     prompt,
     reduce_structural_sql_placeholders,
     safe_json_loads,
     stable_json,
+    terminated,
 )
 from ._dialect import (
     Dialect,
@@ -106,7 +107,6 @@ from ._intent_expr import (
 from ._intent_process import (
     _invoke_intent_parse_with_hints,
     find_trusted_template_match,
-    join_path_key_concrete,
     list_union_match_candidates,
     pick_union_match_for_runtime_join,
     reconcile_template_store_until_stable,
@@ -114,7 +114,7 @@ from ._intent_process import (
     structural_compare,
 )
 from ._intent_repair import apply_diagnostic_repairs, collect_referenced_tables
-from ._intent_resolve import prune_unused_cte_steps
+from ._intent_resolve import join_path_key_concrete, prune_unused_cte_steps
 from ._sql_gen import (
     ScopeClass,
     build_deterministic_sql,
@@ -436,7 +436,7 @@ def match_question_level_template_reuse(
         )
 
     if templates_list:
-        _core_utils.notify(
+        notify(
             "No trusted template matched for direct SQL reuse.",
             stage="pipeline",
             code=DIAGNOSTIC_CODE_REUSE_MISS,
@@ -536,8 +536,6 @@ def _artifact_dir_for_template_store(store: Any) -> str:
 
 
 def _emit_reader_write_queue_event(store: Any, event: WriteQueueEvent) -> None:
-    from ._main_execution import emit_write_queue_event
-
     emit_write_queue_event(_artifact_dir_for_template_store(store), event)
 
 
@@ -2301,7 +2299,7 @@ def complete_user_feedback_reject(
         ctx_ref.pending_retry = True
         raise RefinementRetry
     if choice_port is None:
-        _core_utils.notify(
+        notify(
             "\nFeedback recorded — your note will guide the next attempt.",
             stage="pipeline",
             code=DIAGNOSTIC_CODE_ENGINE_INFO,
@@ -2382,7 +2380,7 @@ def handle_user_feedback(
         On reject, dict with ``category`` (rejection bucket string), ``normalized_reason``, and ``reject_reason``; otherwise ``None``.
     """
     if choice not in ("y", "n"):
-        _core_utils.invalid_input("Invalid choice — please answer y or n.")
+        invalid_input("Invalid choice — please answer y or n.")
         if persist_template_learning:
             save_template_store(store)
         return None
@@ -2676,12 +2674,12 @@ def handle_user_feedback(
                 else:
                     reject_reason = prompt("").strip()
             except (EOFError, KeyboardInterrupt):
-                _core_utils.terminated()
+                terminated()
                 if persist_template_learning:
                     save_template_store(store)
                 return
             if not reject_reason:
-                _core_utils.invalid_input()
+                invalid_input()
                 if persist_template_learning:
                     save_template_store(store)
                 return None
@@ -3026,7 +3024,7 @@ def handle_direct_sql_reuse(
         debug(f"[pipeline.handle_direct_sql_reuse] validation_failed: {err}")
         return None
 
-    _core_utils.notify(
+    notify(
         "Direct SQL reuse: validated template parameters and SQL.",
         stage="pipeline",
         code=DIAGNOSTIC_CODE_REUSE_HIT,
@@ -3041,7 +3039,7 @@ def handle_direct_sql_reuse(
         structural_defaults=sd_reuse,
     )
     try:
-        _core_utils.progress("Executing SQL...")
+        progress("Executing SQL...")
         rows = dialect.execute(exec_sql)
     except AccessError:
         debug("[pipeline.handle_direct_sql_reuse] execute permission denied — continuing to intent parse")
@@ -3204,7 +3202,7 @@ def _intent_decline_feedback_bucket(
         else:
             feedback = prompt("").strip()
     except (EOFError, KeyboardInterrupt):
-        _core_utils.terminated()
+        terminated()
     entry = summarize_failure_for_memory(
         question=q_norm,
         intent=intent,

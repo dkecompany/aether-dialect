@@ -44,7 +44,6 @@ from ._config import (
     JSON_COMPACT_SEPARATORS,
     LEGACY_ARTIFACT_FILENAMES,
     LEGACY_ARTIFACT_GLOBS,
-    LlmExecutionConfig,
     MIGRATION_DATA_OVERLAP_MIN,
     MIN_COMPATIBLE_PACKAGE_VERSION,
     PROFILING_TOP_K,
@@ -52,18 +51,18 @@ from ._config import (
     STRUCTURAL_INLINE_SQL_LITERAL_LIST_RE,
     STRUCTURAL_SQL_PLACEHOLDER_PARAM_RE,
     TEMPLATE_STORE_SEGMENT,
+    WRITE_QUEUE_FILENAME,
     EngineConfig,
-    PolicyConfig,
+    LlmExecutionConfig,
     diagnostic_debug_enabled,
-    effective_llm_timeout_ms,
     diagnostic_force_enter,
     diagnostic_force_exit,
     diagnostic_pipeline_trace_full_enabled,
     diagnostic_verbose_enabled,
+    effective_llm_timeout_ms,
 )
 from ._contracts_base import (
     ColumnMetadata,
-    ConfigError,
     Diagnostic,
     FKEdge,
     LlmJsonExhausted,
@@ -72,6 +71,7 @@ from ._contracts_base import (
     SchemaContext,
     SchemaGraph,
     TableMetadata,
+    WriteQueueEvent,
 )
 
 _DIAGNOSTIC_COLLECTOR: ContextVar[list[Diagnostic] | None] = ContextVar(
@@ -1132,7 +1132,7 @@ def llm_chat(
                 debug(f"[core_utils.llm_chat] provider={provider} RAW OUTPUT:\n{output}")
                 pipeline_trace_lazy(
                     f"llm_chat.response task={task} attempt={attempt + 1}",
-                    lambda: output,
+                    lambda out=output: out,
                 )
                 usage = getattr(r, "usage", None)
                 in_tok = getattr(usage, "input_tokens", None)
@@ -1155,7 +1155,7 @@ def llm_chat(
                 )
                 pipeline_trace_lazy(
                     f"llm_chat.error task={task} provider={provider} attempt={attempt + 1}",
-                    lambda: err_full,
+                    lambda err=err_full: err,
                 )
         if attempt < max_retries - 1:
             wait = 2**attempt
@@ -2004,6 +2004,53 @@ def write_artifact_manifest(
             except OSError:
                 pass
     debug(f"[core_utils.write_artifact_manifest] path={path}")
+
+
+def emit_write_queue_event(artifacts_dir: str, event: WriteQueueEvent) -> None:
+    """Append one JSON line representing a deferred writer event to the artifact write queue."""
+
+    path = os.path.join(artifacts_dir, WRITE_QUEUE_FILENAME)
+    os.makedirs(artifacts_dir, exist_ok=True)
+    obj = {
+        "kind": event.kind,
+        "schema_hash": event.schema_hash,
+        "produced_at": event.produced_at,
+        "payload": [list(pair) for pair in event.payload],
+    }
+    line = json.dumps(obj, separators=(",", ":"), ensure_ascii=False) + "\n"
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(line)
+
+
+def decode_write_queue_event(obj: dict[str, Any]) -> WriteQueueEvent | None:
+    """Parse one write-queue JSON object into a :class:`WriteQueueEvent`, or return ``None`` when invalid."""
+
+    kinds = {
+        "template_accept",
+        "template_reject",
+        "paraphrase_emit",
+        "override_proposal",
+        "feedback_record",
+    }
+    kind = str(obj.get("kind") or "")
+    if kind not in kinds:
+        return None
+    schema_hash = str(obj.get("schema_hash") or "")
+    produced_at = str(obj.get("produced_at") or "")
+    raw_pl = obj.get("payload")
+    if not isinstance(raw_pl, list):
+        return None
+    pairs: list[tuple[str, str]] = []
+    for row in raw_pl:
+        if not isinstance(row, (list, tuple)) or len(row) != 2:
+            continue
+        pairs.append((str(row[0]), str(row[1])))
+    return WriteQueueEvent(
+        kind=kind,  # type: ignore[arg-type]
+        schema_hash=schema_hash,
+        produced_at=produced_at,
+        payload=tuple(pairs),
+    )
 
 
 def _wipe_filenames(artifacts_dir: str, names: tuple[str, ...]) -> int:

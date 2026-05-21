@@ -63,7 +63,6 @@ from ._validation_schema import (
     is_col_arithmetic_role,
     is_col_numeric,
     selectability_exempt_qualified_refs,
-    validate_join_path_reachability,
 )
 
 

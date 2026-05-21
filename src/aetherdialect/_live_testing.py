@@ -1,6 +1,8 @@
 """
 Live pipeline tests: scenarios, soft asserts, I/O patching, and runners against real LLM/DB.
 
+Absolute ``import aetherdialect._*`` names exist only so ``unittest.mock.patch`` can target stable module paths; production code uses relative imports.
+
 Fixtures stay caller-specific.
 """
 

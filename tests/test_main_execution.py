@@ -918,7 +918,7 @@ class TestPipelineSessionSuspendToStep:
     def test_user_feedback_reject_suspend_reason_prompt(self) -> None:
         from aetherdialect._config import PIPELINE_SUSPEND_ID_USER_FEEDBACK_REJECT
         from aetherdialect._contracts_base import PipelineSuspended
-        from aetherdialect._main_execution import PipelineSession, SESSION_PROMPT_REASON
+        from aetherdialect._main_execution import SESSION_PROMPT_REASON, PipelineSession
 
         sess = PipelineSession(MagicMock())
         ex = PipelineSuspended(PIPELINE_SUSPEND_ID_USER_FEEDBACK_REJECT, "What was wrong?", None)
@@ -985,7 +985,8 @@ def test_writer_drain_applies_reader_event(monkeypatch: pytest.MonkeyPatch, tmp_
         QuestionFeedbackEntry,
         RejectionBucket,
     )
-    from aetherdialect._main_execution import drain_write_queue, emit_write_queue_event
+    from aetherdialect._core_utils import emit_write_queue_event
+    from aetherdialect._main_execution import drain_write_queue
     from aetherdialect._templates import empty_template_store, store_to_templates
 
     store_dir = tmp_path / "intent_templates"
@@ -1052,7 +1053,7 @@ def test_writer_lock_reentered_on_resume() -> None:
     sess._suspended = PipelineSuspended("st", "m", MagicMock())
 
     with patch(
-        "aetherdialect._main_execution._core_utils.llm_execution_scope",
+        "aetherdialect._main_execution.llm_execution_scope",
         lambda *_a, **_k: nullcontext(),
     ):
         with patch("aetherdialect._main_execution.dispatch_pipeline_resume", lambda s, e: None):

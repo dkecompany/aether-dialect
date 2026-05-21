@@ -12,10 +12,10 @@ import hashlib
 import json
 import os
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal
 
 from sqlalchemy import MetaData, inspect, text
@@ -40,8 +40,8 @@ from ._config import (
     OVERRIDES_EDITABLE_ENUMS,
     PK_STYLE_FK_STEMS,
     ROLE_VALUE_TYPE_COMPAT,
-    SCHEMA_OVERRIDES_MAX_DESCRIPTION_CHARS,
     SCHEMA_OVERRIDES_EXPORT_DEFAULT_OWNER,
+    SCHEMA_OVERRIDES_MAX_DESCRIPTION_CHARS,
     SCHEMA_OVERRIDES_SIDECAR_FILENAME,
     SCHEMA_OVERRIDES_VERSION,
     STRING_VALUE_TYPES,
@@ -88,8 +88,8 @@ from ._contracts_base import (
     is_numeric_type,
     sensitivity_classification_from_legacy_fields,
     set_description,
-    set_sensitivity,
     set_schema_helpers,
+    set_sensitivity,
 )
 from ._core_utils import (
     artifact_lock,
@@ -109,6 +109,7 @@ from ._core_utils import (
 )
 from ._qsim import get_aggregatable_columns, get_groupable_columns
 from ._schema_profiling import (
+    _llm_classify_schema,
     apply_boolean_coercion_pass,
     apply_column_roles_llm,
     assign_column_ops,
@@ -118,7 +119,6 @@ from ._schema_profiling import (
     extract_tables_from_catalog_sql_connector,
     parse_sql_file,
     replay_user_semantic_neighbors_to_columns,
-    _llm_classify_schema,
 )
 
 if TYPE_CHECKING:
@@ -626,7 +626,7 @@ def _prune_foreign_keys_after_column_removal(sg: SchemaGraph) -> None:
     """Drop FK edges whose source or destination columns were removed from the graph."""
 
     tindex = _graph_tables_lower_index(sg.tables)
-    for canon_tbl, tbl in sg.tables.items():
+    for _canon_tbl, tbl in sg.tables.items():
         kept: list[FKEdge] = []
         for fk in tbl.foreign_keys:
             if any(c not in tbl.columns for c in fk.src_cols):
@@ -5438,7 +5438,6 @@ def apply_schema_overrides_to_graph(
                     )
                     tval.pop("role", None)
                 else:
-                    cur_r_own = tbl.role_owner if tbl.role_owner is not None else RoleOwner.CATALOG
                     if tbl.role != r_val:
                         if can_overwrite_role(tbl.role_owner, r_own):
                             tbl.role = r_val
@@ -5544,7 +5543,6 @@ def apply_schema_overrides_to_graph(
                             )
                             cval.pop("role", None)
                         else:
-                            cur_r_own = col.role_owner if col.role_owner is not None else RoleOwner.CATALOG
                             if col.role != r_val:
                                 if can_overwrite_role(col.role_owner, r_own):
                                     col.role = r_val

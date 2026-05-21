@@ -11,16 +11,10 @@ import os
 import shutil
 import sys
 import threading
-from collections.abc import Callable, Mapping
-from contextlib import AbstractContextManager, nullcontext
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
-
-try:
-    from opentelemetry import trace as _otel_trace
-except ImportError:
-    _otel_trace = None
 
 from . import _core_utils
 from ._config import (
@@ -65,8 +59,10 @@ from ._main_execution import (
 )
 from ._schema import (
     apply_overrides_and_persist,
-    clear_persisted_overrides as _clear_persisted_overrides,
     dump_schema_overrides_to_path,
+)
+from ._schema import (
+    clear_persisted_overrides as _clear_persisted_overrides,
 )
 
 
@@ -175,7 +171,6 @@ class Text2SQL:
                 "run_qsim",
                 "get_qsim_summary",
                 "get_questions_only",
-                "emit_otel_span",
                 "get_schema_stats",
                 "get_seed_warmup_summary",
                 "export_schema_overrides",
@@ -335,17 +330,6 @@ class Text2SQL:
         """Async wrapper around :meth:`session` (uses threads; underlying API remains synchronous)."""
 
         return AsyncPipelineSession(self.session(mode=mode))
-
-    def emit_otel_span(self, name: str, **attrs: Any) -> AbstractContextManager[None]:
-        """Emit an OpenTelemetry span when available; otherwise return a no-op context manager."""
-
-        if _otel_trace is None:
-            return nullcontext()
-        try:
-            tracer = _otel_trace.get_tracer("aetherdialect")
-            return tracer.start_as_current_span(name, attributes={k: str(v) for k, v in attrs.items()})
-        except Exception:
-            return nullcontext()
 
     @classmethod
     def apply_migration_map(

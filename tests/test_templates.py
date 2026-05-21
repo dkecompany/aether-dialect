@@ -9,12 +9,12 @@ from unittest.mock import patch
 import pytest
 
 from aetherdialect._config import (
-    PolicyConfig,
-    EngineConfig,
     SHAPE_QUESTION_INDEX_KEY,
     TEMPLATE_INTENT_KEY_INDEX_KEY,
     TEMPLATE_QUESTION_TOKEN_INDEX_KEY,
     TEMPLATE_UNION_FAMILY_INDEX_KEY,
+    EngineConfig,
+    PolicyConfig,
 )
 from aetherdialect._contracts_base import SchemaGraph, SQLShape, TableMetadata
 from aetherdialect._contracts_core import (
@@ -29,7 +29,9 @@ from aetherdialect._contracts_core import (
     TemplateStats,
     ValueHistory,
 )
+from aetherdialect._core_utils import read_gzip_json, write_gzip_json_atomic
 from aetherdialect._templates import (
+    TemplateStoreView,
     collect_question_feedback_for_prompt,
     compute_question_feedback_penalty,
     demote_template_to_rejected,
@@ -44,9 +46,7 @@ from aetherdialect._templates import (
     template_partition_number,
     template_schema_refs,
     templates_to_store,
-    TemplateStoreView,
 )
-from aetherdialect._core_utils import read_gzip_json, write_gzip_json_atomic
 from aetherdialect._utils import intent_key, question_token_fingerprint_from_raw
 
 

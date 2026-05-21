@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+
 from aetherdialect._dialect import (
     DatabricksDialect,
     Dialect,

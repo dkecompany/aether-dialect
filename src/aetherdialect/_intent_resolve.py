@@ -7,17 +7,17 @@ import json
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
-from typing import Any, Literal
+from enum import Enum
+from typing import Any
 
 import sqlglot
 from sqlglot import exp
 
 from ._config import NULL_CHECK_OPS, REVERSE_OP_MAP, normalize_value_type
 from ._contracts_base import (
-    CteIntent,
+    LITERAL_BEARING_CATEGORIES,
     FailureCategory,
     IntentIssue,
-    LITERAL_BEARING_CATEGORIES,
     LogicalIntent,
     SchemaGraph,
     make_intent_issue,
@@ -26,6 +26,7 @@ from ._contracts_core import (
     CaseRegistryStep,
     CaseWhenBranch,
     CaseWhenExpr,
+    ConcreteIntent,
     ExprValue,
     FilterParam,
     HavingParam,
@@ -297,7 +298,10 @@ def _rename_window_registry_steps(
     """Apply *rename* to ``partition_by``, ``order_by``, and ``argument`` expressions."""
 
     out: list[WindowRegistryStep] = []
-    repl = lambda r: rename.get(r, r)
+
+    def repl(r: str) -> str:
+        return rename.get(r, r)
+
     for step in regs or []:
         ws = step.window_spec
         np = [replace_refs_in_expr(p, repl) for p in (ws.partition_by or [])]
@@ -355,7 +359,10 @@ def _canonicalize_scope(
             new_window_registry,
             new_case_registry,
         )
-    repl = lambda r: rename.get(r, r)
+
+    def repl(r: str) -> str:
+        return rename.get(r, r)
+
     new_select = [_rename_select_col_refs(sc, rename) for sc in select_cols or []]
     new_group_by = [replace_refs_in_expr(g, repl) for g in group_by_cols or []]
     new_order_by = [replace(obc, expr=replace_refs_in_expr(obc.expr, repl)) for obc in order_by_cols or []]
@@ -2948,3 +2955,103 @@ def validate_cte_dependencies(logical: LogicalIntent) -> list[IntentIssue]:
             )
         prior_names.add(name)
     return issues
+
+
+def _non_agg_select_signature_keys(select_cols: list[SelectCol] | None) -> set[str]:
+    """Return signature_key values for non-aggregated select columns."""
+
+    return {sc.signature_key for sc in select_cols or [] if not sc.is_aggregated}
+
+
+class UnionSelectColumnDelta(str, Enum):
+    """Select-list delta between runtime intent and template concrete intent (non-aggregated keys)."""
+
+    EQUAL = "equal"
+    TEMPLATE_ONLY_EXTRA = "template_only_extra"
+    INTENT_ONLY_EXTRA = "intent_only_extra"
+    BOTH_EXTRA = "both_extra"
+
+
+def classify_union_merge_case(
+    intent: RuntimeIntent,
+    concrete: ConcreteIntent,
+) -> UnionSelectColumnDelta:
+    """Classify how runtime select keys differ from template concrete selects (non-aggregated only)."""
+
+    i_keys = _non_agg_select_signature_keys(intent.select_cols)
+    c_keys = _non_agg_select_signature_keys(concrete.select_cols)
+    i_only = i_keys - c_keys
+    c_only = c_keys - i_keys
+    if not i_only and not c_only:
+        return UnionSelectColumnDelta.EQUAL
+    if i_only and c_only:
+        return UnionSelectColumnDelta.BOTH_EXTRA
+    if i_only:
+        return UnionSelectColumnDelta.INTENT_ONLY_EXTRA
+    return UnionSelectColumnDelta.TEMPLATE_ONLY_EXTRA
+
+
+def _join_path_signature_hash(layers: list[list[str]]) -> str:
+    """SHA-256 hex of layered join path signatures (main then CTEs)."""
+
+    return hashlib.sha256(stable_json(layers).encode("utf-8")).hexdigest()
+
+
+def join_path_key_runtime(intent: RuntimeIntent) -> str:
+    """Stable join fingerprint for a runtime intent."""
+
+    layers: list[list[str]] = [list(intent.chosen_join_path_signature or [])]
+    for step in intent.cte_steps or []:
+        layers.append(list(step.chosen_join_path_signature or []))
+    return _join_path_signature_hash(layers)
+
+
+def join_path_key_concrete(concrete: ConcreteIntent) -> str:
+    """Stable join fingerprint for a concrete intent signature."""
+
+    layers: list[list[str]] = [list(concrete.chosen_join_path_signature or [])]
+    for step in concrete.cte_steps or []:
+        layers.append(list(step.chosen_join_path_signature or []))
+    return _join_path_signature_hash(layers)
+
+
+def compute_intent_union(
+    intent: RuntimeIntent,
+    concrete: ConcreteIntent,
+) -> tuple[list[SelectCol], bool, UnionSelectColumnDelta]:
+    """
+    Merge selects by signature_key: concrete order first, then new keys from intent.
+
+    Args:
+
+        intent: Runtime intent.
+
+        concrete: Matched template intent.
+
+    Returns:
+
+        Tuple of union_cols, changed_vs_concrete flag, and merge_case classification.
+    """
+
+    seen_keys: set[str] = set()
+    union_cols: list[SelectCol] = []
+    for sc in concrete.select_cols or []:
+        key = sc.signature_key
+        if key not in seen_keys:
+            seen_keys.add(key)
+            union_cols.append(sc)
+    for sc in intent.select_cols or []:
+        key = sc.signature_key
+        if key not in seen_keys:
+            seen_keys.add(key)
+            union_cols.append(sc)
+
+    cols_changed = sorted(seen_keys) != sorted(s.signature_key for s in (concrete.select_cols or []))
+
+    sorted_union = sort_select_cols(union_cols)
+    merge_case = classify_union_merge_case(intent, concrete)
+    debug(
+        f"[intent_resolve.compute_intent_union] union_cols={len(sorted_union)} "
+        f"cols_changed={cols_changed} merge_case={merge_case.value}"
+    )
+    return sorted_union, cols_changed, merge_case

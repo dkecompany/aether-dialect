@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import InitVar, asdict, dataclass, field
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Callable, Literal
+from typing import Any, Literal
 
 import pandas
 

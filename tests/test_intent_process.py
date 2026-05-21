@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
-from aetherdialect._config import MAX_NON_AGG_COL_DIFF, GenerationPath, VALID_HAVING_OPS
+from aetherdialect._config import MAX_NON_AGG_COL_DIFF, VALID_HAVING_OPS, GenerationPath
 from aetherdialect._contracts_base import (
     ColumnMetadata,
     FailureCategory,
@@ -36,9 +36,7 @@ from aetherdialect._contracts_core import (
 )
 from aetherdialect._core_utils import stable_json
 from aetherdialect._intent_process import (
-    UnionSelectColumnDelta,
     INTENT_CRITICAL_RULES,
-    apply_runtime_post_processing_lite,
     INTENT_FORMAT_REPAIR_JSON_RULES,
     INTENT_PARSE_RULES_APPEND,
     _apply_post_processing,
@@ -59,30 +57,34 @@ from aetherdialect._intent_process import (
     _format_repair_loop,
     _invoke_intent_parse_with_hints,
     _jaccard,
+    _logical_intent_to_serialisable,
     _normalize_cte_output_aliases,
     _phase_g_post_validation_passes,
     _resolve_repair_instruction,
     _runtime_intent_case_registry_has_empty_branches,
-    select_col_diff,
     _structural_body_matches,
     _summarize_intent_changes,
-    _logical_intent_to_serialisable,
-    classify_union_merge_case,
+    _union_family_index_from_templates,
+    apply_runtime_post_processing_lite,
     collect_structural_match_templates,
-    compute_intent_union,
     find_trusted_template_match,
     intent_similarity,
-    join_path_key_concrete,
-    join_path_key_runtime,
     logical_intent_from_parsed,
     match_template_for_union,
     reconcile_union_family_after_mutation,
     reconcile_union_family_body_join_after_mutation,
     resolve_sql_path,
+    select_col_diff,
     structural_compare,
     structural_compare_runtime,
     union_template_compatibility,
-    _union_family_index_from_templates,
+)
+from aetherdialect._intent_resolve import (
+    UnionSelectColumnDelta,
+    classify_union_merge_case,
+    compute_intent_union,
+    join_path_key_concrete,
+    join_path_key_runtime,
 )
 from aetherdialect._utils import body_similarity_key, intent_key
 
@@ -769,10 +771,8 @@ class TestPlannerSingleOutputWindowRule:
 
     def test_logical_decomposition_guidance_contains_rule(self):
         from aetherdialect._intent_process import (
-            PLANNER_SINGLE_OUTPUT_WINDOW_NO_CTE_RULE,
-        )
-        from aetherdialect._intent_process import (
             _LOGICAL_DECOMPOSITION_GUIDANCE,
+            PLANNER_SINGLE_OUTPUT_WINDOW_NO_CTE_RULE,
             _build_intent_logical_prompt,
         )
 

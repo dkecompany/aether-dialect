@@ -670,9 +670,10 @@ class TestEngineConfig:
         ad_pkg = importlib.import_module("aetherdialect")
         assert "EngineConfig" not in getattr(ad_pkg, "__all__", ())
         with pytest.raises(ImportError):
-            from aetherdialect import (
-                EngineConfig,
-            )  # noqa: F401 — intentionally invalid public import
+            exec(
+                "from aetherdialect import EngineConfig",
+                {"__builtins__": __builtins__},
+            )
 
 
 class TestQSimConfig:
@@ -932,7 +933,7 @@ class TestPromptNeutrality:
     def test_negation_tokens_not_in_stopwords(self):
         """Negators must remain available to the question normaliser."""
 
-        from aetherdialect._config import PolicyConfig, STOPWORDS_GRAMMATICAL_PARTICLES
+        from aetherdialect._config import STOPWORDS_GRAMMATICAL_PARTICLES, PolicyConfig
 
         negators = ("not", "without", "except", "no", "never", "neither", "nor")
         for t in negators:

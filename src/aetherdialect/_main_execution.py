@@ -14,9 +14,7 @@ import os
 import random
 import re
 import shutil
-import uuid
 import sys
-import tomllib
 import zipfile
 from collections import Counter, deque
 from collections.abc import Callable, Mapping
@@ -26,6 +24,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import pandas
+import tomllib
 from platformdirs import user_data_dir
 
 try:
@@ -33,10 +32,12 @@ try:
 except ImportError:
     SparkSession = None
 
-from . import _core_utils
 from ._config import (
     ARTIFACT_DIRECTORY_SEGMENT,
-    SCHEMA_OVERRIDES_VERSION,
+    AUDIT_EVENT_WRITE_QUEUE_FEEDBACK_RECORD,
+    AUDIT_EVENT_WRITE_QUEUE_OVERRIDE_PROPOSAL,
+    AUDIT_EVENT_WRITE_QUEUE_TEMPLATE_ACCEPT,
+    AUDIT_EVENT_WRITE_QUEUE_TEMPLATE_REJECT,
     AZURE_OPENAI_ENV_REQUIRED,
     DATABRICKS_ENV_CATALOG,
     DATABRICKS_ENV_HTTP_PATH,
@@ -47,10 +48,6 @@ from ._config import (
     DIAGNOSTIC_CODE_ENGINE_INFO,
     DIAGNOSTIC_CODE_LARGE_RESULT_WARNING,
     DIAGNOSTIC_CODE_LOW_CONFIDENCE,
-    AUDIT_EVENT_WRITE_QUEUE_FEEDBACK_RECORD,
-    AUDIT_EVENT_WRITE_QUEUE_OVERRIDE_PROPOSAL,
-    AUDIT_EVENT_WRITE_QUEUE_TEMPLATE_ACCEPT,
-    AUDIT_EVENT_WRITE_QUEUE_TEMPLATE_REJECT,
     ENGINE_STORAGE_SLUG_MAX_CHARS,
     INTERACTIVE_STAGE_SQL_FEEDBACK,
     JSON_COMPACT_SEPARATORS,
@@ -75,6 +72,7 @@ from ._config import (
     SCHEMA_CONTEXT_CACHED_DDL,
     SCHEMA_CONTEXT_CACHED_NOTES,
     SCHEMA_OVERRIDES_APPLIED_TIMESTAMP_FORMAT,
+    SCHEMA_OVERRIDES_VERSION,
     SECRET_ENV_KEYS,
     SEED_NORMALIZATION_JSON,
     SESSION_KIND_ERROR,
@@ -138,28 +136,34 @@ from ._contracts_core import (
     classify_seed_warmup_intent_complexity,
 )
 from ._core_utils import (
+    USER_REJECTED_RESULT_BUCKET_TIPS,
     InteractiveChoicePort,
     RephraseHint,
-    artifact_lock,
     _wipe_filenames,
     _wipe_globs,
+    artifact_lock,
     classify_migration_tier,
     clear_llm_clients,
     debug,
+    decode_write_queue_event,
     detect_legacy_artifacts,
     diagnostic_segment,
     drain_diagnostic_collector,
     interactive_yes_no,
+    invalid_input,
+    llm_execution_scope,
     log,
     normalize_question,
     notify,
     print_rephrase_hint,
+    progress,
+    prompt,
     read_artifact_manifest,
     reset_diagnostic_collector,
     set_diagnostic_collector,
     take_and_clear_orphan_diagnostics,
+    terminated,
     try_rename_migration_plan,
-    USER_REJECTED_RESULT_BUCKET_TIPS,
     wipe_versioned_artifacts,
 )
 from ._dialect import DatabricksDialect, PostgresDialect, get_dialect
@@ -195,7 +199,6 @@ from ._pipeline import (
 from ._qsim import instantiate_all
 from ._qsim_ops import generate_all_intents, generate_all_questions
 from ._schema import (
-    _column_names_lower_index,
     _finalize_with_overrides,
     apply_schema_overrides_to_graph,
     build_schema_graph_with_diff,
@@ -302,51 +305,6 @@ def _persist_template_learning_for_pipeline_session(port: Any | None) -> bool:
     if port is None:
         return True
     return getattr(port, "_session_mode", "writer") == "writer"
-
-
-def emit_write_queue_event(artifacts_dir: str, event: WriteQueueEvent) -> None:
-    """Append one JSON line representing a deferred writer event."""
-
-    path = os.path.join(artifacts_dir, WRITE_QUEUE_FILENAME)
-    os.makedirs(artifacts_dir, exist_ok=True)
-    obj = {
-        "kind": event.kind,
-        "schema_hash": event.schema_hash,
-        "produced_at": event.produced_at,
-        "payload": [list(pair) for pair in event.payload],
-    }
-    line = json.dumps(obj, separators=(",", ":"), ensure_ascii=False) + "\n"
-    with open(path, "a", encoding="utf-8") as fh:
-        fh.write(line)
-
-
-def _decode_write_queue_event(obj: dict[str, Any]) -> WriteQueueEvent | None:
-    kinds = {
-        "template_accept",
-        "template_reject",
-        "paraphrase_emit",
-        "override_proposal",
-        "feedback_record",
-    }
-    kind = str(obj.get("kind") or "")
-    if kind not in kinds:
-        return None
-    schema_hash = str(obj.get("schema_hash") or "")
-    produced_at = str(obj.get("produced_at") or "")
-    raw_pl = obj.get("payload")
-    if not isinstance(raw_pl, list):
-        return None
-    pairs: list[tuple[str, str]] = []
-    for row in raw_pl:
-        if not isinstance(row, (list, tuple)) or len(row) != 2:
-            continue
-        pairs.append((str(row[0]), str(row[1])))
-    return WriteQueueEvent(
-        kind=kind,  # type: ignore[arg-type]
-        schema_hash=schema_hash,
-        produced_at=produced_at,
-        payload=tuple(pairs),
-    )
 
 
 def _reload_reader_learning_if_manifest_drift(owner: Any) -> None:
@@ -614,7 +572,7 @@ def drain_write_queue(owner: Any, artifacts_dir: str) -> int:
                 continue
             if not isinstance(doc, dict):
                 continue
-            evt = _decode_write_queue_event(doc)
+            evt = decode_write_queue_event(doc)
             if evt is None:
                 notify(
                     "write_queue: unknown event skipped",
@@ -656,7 +614,7 @@ def _interactive_run_intent_pass(
         else:
             refinement_ctx.refinement_rounds_executed += 1
     msg = "Refining intent..." if refinement_ctx.accumulated_reasons else "Processing intent..."
-    _core_utils.progress(msg)
+    progress(msg)
     parsed_intent, semantic_warnings, _ = parse_intent_via_llm(
         corrected_text,
         schema,
@@ -2047,11 +2005,11 @@ def _run_sql_phase_after_intent_confirm(
         execution_sql_override=None,
         structural_defaults=tmpl_sd,
     )
-    _core_utils.progress("Executing SQL...")
+    progress("Executing SQL...")
     try:
         rows = dialect.execute(exec_sql)
         if len(rows) > int(PolicyConfig.RESULT_ROW_COUNT_SOFT_WARNING):
-            _core_utils.notify(
+            notify(
                 f"Query result row count {len(rows)} exceeds the soft warning threshold.",
                 stage="execution",
                 code=DIAGNOSTIC_CODE_LARGE_RESULT_WARNING,
@@ -2078,7 +2036,7 @@ def _run_sql_phase_after_intent_confirm(
     )
 
     if conf < PolicyConfig.FINAL_SQL_AUTO_ACCEPT_THRESHOLD:
-        _core_utils.notify(
+        notify(
             f"SQL confidence {conf:.3f} is below the auto-accept threshold.",
             stage="pipeline",
             code=DIAGNOSTIC_CODE_LOW_CONFIDENCE,
@@ -2625,15 +2583,15 @@ def interactive_run_once(
             level="info",
         )
         try:
-            question = _core_utils.prompt("").strip()
+            question = prompt("").strip()
         except (EOFError, KeyboardInterrupt):
-            _core_utils.terminated()
+            terminated()
             return None
 
     if not question:
-        _core_utils.invalid_input()
+        invalid_input()
         return None
-    _core_utils.progress("\nValidating question...")
+    progress("\nValidating question...")
 
     raw_question = question
 
@@ -2762,7 +2720,7 @@ def interactive_run_once(
         raw_h = getattr(choice_port, "_pending_conversation_rejection_hints", None)
         if isinstance(raw_h, tuple):
             conv_hints = raw_h
-            setattr(choice_port, "_pending_conversation_rejection_hints", ())
+            choice_port._pending_conversation_rejection_hints = ()
 
     refinement_ctx = RefinementContext(
         corrected_text,
@@ -3632,7 +3590,7 @@ def _emit_runtime_config_override_diagnostics(overridden: frozenset[str]) -> Non
     """Emit one diagnostic per runtime-config field whose effective value came from the TOML file over env."""
 
     for key in sorted(overridden):
-        _core_utils.notify(
+        notify(
             f"Runtime config file overrides environment for {key}",
             stage="config",
             code=DIAGNOSTIC_CODE_CONFIG_FILE_VALUE_APPLIED,
@@ -3650,7 +3608,7 @@ def initialize_text2sql(
 ) -> Text2SQLInitResult:
     """Configure the process environment, build the schema graph, migrate templates, and load stores."""
 
-    sink: Callable[[str], None] = log_sink if log_sink is not None else _core_utils.notify
+    sink: Callable[[str], None] = log_sink if log_sink is not None else notify
     sink("Initialising Text2SQL.")
     config_file_values, toml_claimed_keys = _load_config_file(config_file)
     ssot = config_file is not None and bool(str(config_file).strip())
@@ -3925,7 +3883,7 @@ def echo_choice_line_after_input(label: str, normalized: str | None, *, silent_n
         sys.stdout.write(block)
     sys.stdout.flush()
     if normalized == "n" and not silent_no:
-        _core_utils.terminated()
+        terminated()
 
 
 def normalise_yes_no(raw: str, options: list[str]) -> str | None:
@@ -4056,7 +4014,7 @@ class PipelineSession(InteractiveChoicePort):
         q_norm = normalize_question(corrected)
         while True:
             try:
-                with _core_utils.llm_execution_scope(self._owner._runtime_config.llm_execution):
+                with llm_execution_scope(self._owner._runtime_config.llm_execution):
                     ok = _interactive_run_intent_pass(
                         corrected_text=corrected,
                         q_norm=q_norm,
@@ -4509,7 +4467,7 @@ class PipelineSession(InteractiveChoicePort):
         schema, store, templates, rejected, schema_terms = self._resources()
 
         def _run_turn() -> SessionStep:
-            with _core_utils.llm_execution_scope(self._owner._runtime_config.llm_execution):
+            with llm_execution_scope(self._owner._runtime_config.llm_execution):
                 try:
                     interactive_run_once(
                         schema,
@@ -4580,7 +4538,7 @@ class PipelineSession(InteractiveChoicePort):
         self._resume_choice_stage_id = ex.state_id
 
         def _resume_work() -> None:
-            with _core_utils.llm_execution_scope(self._owner._runtime_config.llm_execution):
+            with llm_execution_scope(self._owner._runtime_config.llm_execution):
                 dispatch_pipeline_resume(self, ex)
 
         try:

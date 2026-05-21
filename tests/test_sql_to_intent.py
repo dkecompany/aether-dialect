@@ -2,19 +2,16 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
-from dataclasses import replace
-
-from aetherdialect._contracts_base import SchemaGraph
+import pytest
 
 from aetherdialect._config import (
     SQL_TO_INTENT_LIMIT_OFFSET_PARAM_KEY,
     SQL_TO_INTENT_LITERAL_PLACEHOLDER_NUM,
 )
-
-import pytest
-
+from aetherdialect._contracts_base import SchemaGraph
 from aetherdialect._contracts_core import (
     NormalizedExpr,
     RuntimeCteStep,

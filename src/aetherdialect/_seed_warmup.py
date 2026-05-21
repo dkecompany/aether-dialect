@@ -24,10 +24,10 @@ from ._config import (
     SEED_NORMALIZATION_BATCH_SIZE,
     SEED_WARMUP_DROP_CODES,
     SEED_WARMUP_FAILURE_CODES,
-    GenerationPath,
-    SeedWarmupConfig,
     WARMUP_OPERATOR_FEATURE_TUPLE_4BIT_CARDINALITY,
     WARMUP_PARAPHRASE_COUNT_FROM_SQL,
+    GenerationPath,
+    SeedWarmupConfig,
     seed_warmup_failure_code_from_validate_sql_error,
 )
 from ._contracts_base import LlmJsonExhausted, SchemaGraph, TemplateStats, ValueDomain
@@ -66,19 +66,22 @@ from ._intent_process import (
     apply_deterministic_repairs,
     apply_runtime_post_processing_lite,
     full_intent_parse,
-    join_path_key_concrete,
-    join_path_key_runtime,
     structural_compare,
 )
 from ._intent_repair import apply_diagnostic_repairs
-from ._intent_resolve import check_qualified_refs_exist, prune_unused_cte_steps
+from ._intent_resolve import (
+    check_qualified_refs_exist,
+    join_path_key_concrete,
+    join_path_key_runtime,
+    prune_unused_cte_steps,
+)
 from ._pipeline import finalize_substitute_sql, other_template_owns_question_string
-from ._qsim_ops import greedy_cover_indices_by_atoms
 from ._qsim import (
     deterministic_having_value,
     sample_coordinated_range,
     sample_value_from_domain,
 )
+from ._qsim_ops import greedy_cover_indices_by_atoms
 from ._sql_gen import (
     build_deterministic_sql,
     get_join_choice_from_llm,
@@ -101,10 +104,11 @@ from ._utils import (
     select_three_warmup_styles,
     template_instance_key_from_parts,
 )
-from ._validation_execute import bind_params_for_sql, validate_sql
 from ._validation_execute import (
+    bind_params_for_sql,
     curated_warmup_post_binding_issues,
     curated_warmup_semantic_issues,
+    validate_sql,
 )
 
 _SEED_LINE_NORMALIZE_SYSTEM = (
@@ -2008,6 +2012,40 @@ def run_seed_warmup_execution(
 
     for idx, intent in enumerate(ordered_intents):
         ifp = warmup_intent_fingerprint(intent)
+
+        def _wu_record(
+            rt: RuntimeIntent,
+            *,
+            ok: bool,
+            final_sql: str | None,
+            fc: str | None,
+            err: str | None,
+            tik: str = "",
+            unit_fp: str = ifp,
+            unit_intent: SeedWarmupIntent = intent,
+        ) -> None:
+            if warmup_cache is None:
+                return
+            bk = body_similarity_key(rt)
+            jkr = join_path_key_runtime(rt)
+            pack = _warmup_pack_execute(
+                rt,
+                ok=ok,
+                final_sql=final_sql,
+                failure_code=fc,
+                error=err,
+                body_key=bk,
+                join_path_key=jkr,
+                template_instance_key=tik,
+            )
+            warmup_cache.write_work_unit(
+                unit_fp,
+                unit_intent,
+                pack,
+                report_version=warmup_report_version,
+                is_preflight=warmup_dry_run_session,
+            )
+
         runtime = intent.to_runtime_intent()
         runtime = apply_deterministic_repairs(
             runtime,
@@ -2063,39 +2101,6 @@ def run_seed_warmup_execution(
             )
             continue
         runtime = lit_rt
-
-        def _wu_record(
-            rt: RuntimeIntent,
-            *,
-            ok: bool,
-            final_sql: str | None,
-            fc: str | None,
-            err: str | None,
-            tik: str = "",
-            unit_fp: str = ifp,
-            unit_intent: SeedWarmupIntent = intent,
-        ) -> None:
-            if warmup_cache is None:
-                return
-            bk = body_similarity_key(rt)
-            jkr = join_path_key_runtime(rt)
-            pack = _warmup_pack_execute(
-                rt,
-                ok=ok,
-                final_sql=final_sql,
-                failure_code=fc,
-                error=err,
-                body_key=bk,
-                join_path_key=jkr,
-                template_instance_key=tik,
-            )
-            warmup_cache.write_work_unit(
-                unit_fp,
-                unit_intent,
-                pack,
-                report_version=warmup_report_version,
-                is_preflight=warmup_dry_run_session,
-            )
 
         sem_msgs = curated_warmup_semantic_issues(runtime, schema)
         if sem_msgs:
@@ -2553,11 +2558,6 @@ def run_seed_warmup_execution(
         judge_ctx = schema_context_enriched_lines_for_tables(schema, intent.tables or [])
         origin_sql_history = (intent.source or "") == "sql_history"
         origin_gold = (intent.source or "gold") == "gold"
-        lk = anchor_lattice_signature(
-            anchor_lattice_key_for_seed_intent(intent),
-            schema.effective_structural_hash,
-        )
-        lattice_hit = False
 
         if origin_sql_history:
             triple = select_three_warmup_styles(seed_idx, intent.intent_id)
@@ -2663,7 +2663,6 @@ def run_seed_warmup_execution(
                     )
                 return False
             raw_phrases = list(cell.anchors)
-            lattice_hit = lk in lattice_disk and bool(lattice_disk.get(lk))
 
         filtered: list[str] = []
         for phrase in raw_phrases:

@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import os
 
-import pytest
-
 from aetherdialect._config import (
     TEMPLATE_QUESTION_TOKEN_INDEX_KEY,
     TEMPLATE_STORE_HEADER_FILENAME,
@@ -36,12 +34,12 @@ from aetherdialect._core_utils import (
 from aetherdialect._schema import SchemaDiff, TableDiff
 from aetherdialect._templates import (
     TemplateStoreView,
+    _load_partitioned_view_unlocked,
     apply_migration_policy,
     empty_template_store,
     save_template_store,
     surgical_invalidate_templates_by_diff,
     templates_to_store,
-    _load_partitioned_view_unlocked,
 )
 
 

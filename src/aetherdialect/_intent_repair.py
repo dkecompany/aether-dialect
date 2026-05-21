@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-import sys
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import replace
 from difflib import get_close_matches
@@ -20,7 +19,6 @@ from ._config import (
     DESCRIPTIVE_EXCLUDED_VALUE_TYPES,
     DIAGNOSTIC_CODE_PII_GATE_HIT,
     DIAGNOSTIC_FUZZY_CUTOFF,
-    DIAGNOSTIC_REPAIR_HANDLER_KEYS,
     IDENTIFIER_RE,
     IMPOSSIBLE_HAVING_RE,
     INTENT_PLACEHOLDER_ANGLE_RE,
@@ -4135,24 +4133,22 @@ def _repair_param_binding(
     return replace(intent, filters_param=new_filters)
 
 
-def _build_diagnostic_repair_dispatch() -> dict[
-    SqlDiagnosticCode,
-    Callable[[RuntimeIntent, SchemaGraph, SqlDiagnostic], RuntimeIntent | None],
-]:
-    mod = sys.modules[__name__]
-    out: dict[
-        SqlDiagnosticCode,
-        Callable[[RuntimeIntent, SchemaGraph, SqlDiagnostic], RuntimeIntent | None],
-    ] = {}
-    for code_wire, fn_name in DIAGNOSTIC_REPAIR_HANDLER_KEYS.items():
-        out[SqlDiagnosticCode(code_wire)] = getattr(mod, fn_name)
-    return out
-
-
 DIAGNOSTIC_REPAIR_DISPATCH: dict[
     SqlDiagnosticCode,
     Callable[[RuntimeIntent, SchemaGraph, SqlDiagnostic], RuntimeIntent | None],
-] = _build_diagnostic_repair_dispatch()
+] = {
+    SqlDiagnosticCode(code_wire): handler
+    for code_wire, handler in (
+        ("unknown_column", _repair_unknown_column),
+        ("ambiguous_column", _repair_ambiguous_column),
+        ("unknown_table", _repair_unknown_table),
+        ("non_grouped_select_col", _repair_grain_consistency),
+        ("agg_in_where", _repair_agg_in_where),
+        ("explain_cartesian_join", _repair_cartesian),
+        ("explain_zero_estimate", _repair_filter_overlap),
+        ("param_unbound", _repair_param_binding),
+    )
+}
 
 
 def apply_diagnostic_repairs(

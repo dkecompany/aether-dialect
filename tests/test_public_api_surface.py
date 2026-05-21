@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-from contextlib import AbstractContextManager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -20,8 +19,8 @@ from aetherdialect._contracts_base import (
     SessionActiveError,
     SessionStep,
 )
-from aetherdialect.text2sql import AsyncPipelineSession, Text2SQL
 from aetherdialect._templates import empty_template_store
+from aetherdialect.text2sql import AsyncPipelineSession, Text2SQL
 
 
 def _minimal_t2s(**overrides: object) -> Text2SQL:
@@ -63,6 +62,7 @@ def test_package_all_matches_documented_exports() -> None:
         "AsyncPipelineSession",
         "AuditEvent",
         "ConfigError",
+        "ConnectionError",
         "ConfigSnapshot",
         "DatabasePingFailed",
         "Diagnostic",
@@ -147,14 +147,6 @@ def test_audit_sink_invoked_on_init(tmp_path: Path) -> None:
 
 def test_pipeline_session_active_error_is_public() -> None:
     assert issubclass(SessionActiveError, Exception)
-
-
-def test_emit_otel_span_returns_context_manager() -> None:
-    t2s = _minimal_t2s()
-    ctx = t2s.emit_otel_span("test_span", k=1)
-    assert isinstance(ctx, AbstractContextManager)
-    with ctx:
-        pass
 
 
 def test_session_step_dataclass_shape() -> None:

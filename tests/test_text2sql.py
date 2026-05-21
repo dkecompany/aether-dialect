@@ -10,7 +10,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from aetherdialect._config import MIGRATION_MAP_FILENAME, load_runtime_config
-from aetherdialect._templates import empty_template_store
 from aetherdialect._contracts_base import (
     ConfigError,
     LLMConfig,
@@ -25,6 +24,7 @@ from aetherdialect._contracts_core import (
     RuntimeIntent,
     SelectCol,
 )
+from aetherdialect._templates import empty_template_store
 from aetherdialect.text2sql import Text2SQL
 
 

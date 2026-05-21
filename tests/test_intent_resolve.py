@@ -2,7 +2,6 @@
 
 import pytest
 
-from tests.conftest import term_strs
 from aetherdialect._contracts_base import (
     ColumnMetadata,
     ColumnRole,
@@ -57,9 +56,9 @@ from aetherdialect._intent_resolve import (
     sort_select_cols,
 )
 from aetherdialect._sql_gen import (
-    _join_clause_parts_with_bool_op,
     _join_flat_predicate_parts_with_filter_groups,
 )
+from tests.conftest import term_strs
 
 
 class TestReplaceRefsInExpr:

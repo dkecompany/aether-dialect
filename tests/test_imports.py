@@ -11,7 +11,8 @@ _OPTIONAL_DEP_MODULE_ROOTS = frozenset(
         "databricks",
         "pyspark",
         "pglast",
-        "opentelemetry",
+        "msvcrt",
+        "fcntl",
     },
 )
 
@@ -27,8 +28,6 @@ def _import_roots(stmt: ast.Import | ast.ImportFrom) -> set[str]:
 
 
 def _import_allowed_in_function(stmt: ast.Import | ast.ImportFrom) -> bool:
-    if isinstance(stmt, ast.ImportFrom) and stmt.level and stmt.level > 0:
-        return True
     roots = _import_roots(stmt)
     if not roots:
         return True
@@ -63,7 +62,7 @@ class _FunctionLocalImportVisitor(ast.NodeVisitor):
 
 
 def test_no_function_local_imports() -> None:
-    """Disallow function-scoped imports except optional-driver / relative package imports."""
+    """Disallow function-scoped imports except optional-driver roots (pglast, databricks, pyspark, …)."""
 
     pkg = Path(__file__).resolve().parents[1] / "src" / "aetherdialect"
     assert pkg.is_dir(), pkg

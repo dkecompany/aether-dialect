@@ -45,9 +45,3 @@ def test_audit_sink_receives_turn_events(t2s) -> None:
         session.ask_until_done("list one film title", on_confirm="y")
     kinds = [e.event_type for e in events]
     assert "ask_begin" in kinds and "ask_done" in kinds
-
-
-@pytest.mark.live
-def test_emit_otel_span_smoke(t2s) -> None:
-    with t2s.emit_otel_span("livetest.span", suite="public_api"):
-        pass

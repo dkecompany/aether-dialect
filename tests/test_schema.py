@@ -19,7 +19,6 @@ from aetherdialect._core_utils import schema_hash_fp
 from aetherdialect._schema import (
     _analyze_fk_path_topology,
     _apply_schema_context_allow_columns,
-    _strip_schema_context_denied_columns,
     _edge_key,
     _fingerprint_tables_after_document_round_trip,
     _first_table_where_stable_json_differs,
@@ -34,6 +33,7 @@ from aetherdialect._schema import (
     _reverse_fk_path,
     _schema_cache_json_blob,
     _select_inferred_pk_candidate,
+    _strip_schema_context_denied_columns,
     _table_from_dict,
     _table_to_dict,
     _tables_meta_to_schema_graph,
@@ -2268,7 +2268,7 @@ class TestSchemaOverrides:
         d = dump_schema_overrides_dict(schema_graph)
         assert d["version"] == SCHEMA_OVERRIDES_VERSION
         assert set(d["tables"].keys()) == {"customers", "orders", "products"}
-        for tname, tval in d["tables"].items():
+        for _tname, tval in d["tables"].items():
             assert set(tval["description"].keys()) == {"value", "owner"}
             assert set(tval["role"].keys()) == {"value", "owner"}
             assert tval["description"]["owner"] == SCHEMA_OVERRIDES_EXPORT_DEFAULT_OWNER

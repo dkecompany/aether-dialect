@@ -5,8 +5,6 @@ from __future__ import annotations
 import json
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from aetherdialect._config import (
     SESSION_KIND_AWAITING_INTENT_CONFIRM,
     SESSION_KIND_AWAITING_INTENT_FEEDBACK,
@@ -16,17 +14,17 @@ from aetherdialect._config import (
     SESSION_KIND_RESULT,
 )
 from aetherdialect._contracts_base import (
+    ColumnMetadata,
     CteIntent,
     LogicalIntent,
     SchemaGraph,
     TableMetadata,
-    ColumnMetadata,
 )
 from aetherdialect._contracts_core import (
     FeedbackKind,
     QuestionFeedbackEntry,
-    RejectionBucket,
     RefinementContext,
+    RejectionBucket,
 )
 from aetherdialect._core_utils import _azure_deployment_for_model, llm_execution_scope
 from aetherdialect._intent_process import (
@@ -245,9 +243,9 @@ class TestPipelineSuspendedIntentSummary:
     def test_intent_confirm_suspend_gets_summary(self) -> None:
         from aetherdialect._contracts_core import (
             InteractiveTailSnapshot,
+            NormalizedExpr,
             RuntimeIntent,
             SelectCol,
-            NormalizedExpr,
         )
         from aetherdialect._main_execution import PipelineSession
 
@@ -315,10 +313,9 @@ class TestMakeIntentIssueStageAttribution:
     """``STAGE_ATTRIBUTION_TABLE`` keys set ``responsible_stage`` on issues from :func:`make_intent_issue`."""
 
     def test_known_issue_ids(self) -> None:
-        from aetherdialect._contracts_base import FailureCategory
         from aetherdialect._contracts_base import (
-            FailureCategory,
             STAGE_ATTRIBUTION_TABLE,
+            FailureCategory,
             make_intent_issue,
         )
 
@@ -340,7 +337,6 @@ class TestRefinementContinuationTerminalError:
 
         from aetherdialect._contracts_core import QuestionFormStorage, RefinementContext
         from aetherdialect._main_execution import SESSION_KIND_ERROR, PipelineSession
-
         from aetherdialect._templates import empty_template_store
 
         owner = MagicMock()
@@ -360,7 +356,7 @@ class TestRefinementContinuationTerminalError:
                 return_value=False,
             ),
             patch(
-                "aetherdialect._main_execution._core_utils.llm_execution_scope",
+                "aetherdialect._main_execution.llm_execution_scope",
                 lambda *_a, **_k: nullcontext(),
             ),
         ):

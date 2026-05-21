@@ -8,13 +8,12 @@ from __future__ import annotations
 
 import os
 import re
-import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from importlib.util import find_spec
 from types import MappingProxyType
-from typing import Any, ClassVar, Literal
+from typing import Any, ClassVar
 from urllib.parse import quote
 
 from platformdirs import user_data_dir
