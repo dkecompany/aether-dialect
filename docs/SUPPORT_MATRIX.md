@@ -1,0 +1,105 @@
+# Support matrix
+
+This matrix lists the main analytical SQL features the NL→SQL engine handles, and how they land on each supported dialect. The cells use these terms with fixed meaning:
+
+- **native** — the IR represents the feature directly; the dialect renders it with the corresponding native SQL construct.
+- **translated** — the IR represents the feature; the dialect rewrites it into one or more native constructs (for example Databricks `DATETRUNC` argument reordering or `ARRAY_CONTAINS` for array membership).
+- **partial** — the feature is supported with documented restrictions inside the IR.
+- **not supported** — the IR has no first-class representation. The intent-parser system prompt instructs the LLM to reformulate using available primitives where possible.
+- **blocked** — the structural validator rejects the construct; it cannot be emitted regardless of how the question is phrased.
+
+Two notes before reading the table:
+
+- "Native" on Databricks means the engine emits Spark SQL through the Databricks dialect adapter; correctness on the warehouse depends on the Databricks runtime version.
+- "Blocked" features cannot be reached even by reformulating the question. The IR is intentionally narrower than full SQL; see [Security § SQL surface](SECURITY.md#6-sql-surface-what-the-engine-refuses-to-generate) for the security rationale.
+
+Where PostgreSQL and Databricks behave the same, one row covers both. Adjacent topics (for example several window families) are merged when they share the same support class and the same whitelist.
+
+## Feature matrix
+
+| # | Feature | PostgreSQL | Databricks | Notes |
+|---|---|---|---|---|
+| 1 | `ILIKE` / case-insensitive matching | native | partial | PostgreSQL emits `ILIKE` natively. Databricks rendering does not swap `ILIKE` to `LOWER(...) LIKE`; correctness depends on the warehouse runtime. The IR carries `ilike` and `not ilike` ops. For non-ILIKE case-insensitive comparison, both dialects use a `LOWER(...)` wrap. |
+| 2 | Window functions (whitelist) | native | native | `VALID_WINDOW_FUNCTIONS`: ranking (`row_number`, `rank`, `dense_rank`), window `sum` / `avg`, `lag` / `lead`, `first_value` / `last_value`. |
+| 3 | Other window functions (`NTILE`, `MIN`/`MAX`/`COUNT` over windows, …) | not supported | not supported | Outside the whitelist; rejected during intent / schema validation. |
+| 4 | Arrays: membership filters | native | translated | PostgreSQL: `value = ANY(col)` and `string_to_array(...)`. Databricks: `ARRAY_CONTAINS(col, value)` and `TRANSFORM(...)`. |
+| 5 | Arrays: `UNNEST` / `EXPLODE` in CTE select | native | translated | PostgreSQL: `UNNEST`. Databricks: `EXPLODE`. Available only in CTE select lists for typed array columns. |
+| 6 | CTEs (non-recursive) | native | native | IR represents the CTE chain explicitly via `RuntimeIntent.cte_steps`. |
+| 7 | Recursive CTEs | blocked | blocked | Both dialect structural passes reject recursive CTEs. |
+| 8 | Scalar subqueries (uncorrelated) | partial | partial | Emitted as explicit `CROSS JOIN` in both dialects; the rhs name is in the scalar-allowed set. |
+| 9 | Scalar subqueries (correlated) | blocked | blocked | PostgreSQL `WHERE` subtree rejects `RangeSubselect` / `SubLink` / `SetOperationStmt`. Databricks rejects any `Subquery` shape. |
+| 10 | `CASE` in `SELECT` | native | native | Represented as `CaseWhenExpr`; `CaseRegistryStep` carries named CASE expressions. |
+| 11 | `CASE` in `WHERE`, `HAVING` | not supported | not supported | The IR carries CASE only in the select list; the system prompt instructs the LLM to push CASE-like predicates into a `CaseRegistryStep` referenced from a select column when needed. |
+| 12 | `EXISTS` / `NOT EXISTS` | blocked | blocked | Structural validators reject. The intent-parser prompt rewrites these as left-join + null-check. |
+| 13 | Set operations: `UNION`, `EXCEPT`, `INTERSECT` | blocked | blocked | `FORBIDDEN_SQL` regex; structural validators reject any `Union` / `SetOperationStmt`. The intent-parser prompt rewrites set difference as a left-join + null-check. |
+| 14 | Lateral joins: `LATERAL`, `CROSS APPLY` | blocked | blocked | Structural validators reject; regex blocks `LATERAL`. |
+| 15 | DML: `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `TRUNCATE` | blocked | blocked | Select-only enforcement plus the `FORBIDDEN_SQL` regex list. |
+| 16 | DDL: `CREATE`, `ALTER`, `DROP`, `RENAME` | blocked | blocked | Same enforcement. |
+| 17 | `date_trunc`, `date_part`, `extract` | partial | translated | Allowed in the scalar function whitelist. `EXTRACT(EPOCH FROM ...)` is rejected by schema validation rules for epoch extraction. Databricks reorders some `DATETRUNC` calls in a post-pass. |
+| 18 | `INTERVAL` arithmetic | native | translated | PostgreSQL emits native `INTERVAL`. Databricks uses `date_sub`, `add_months`, or sub-day `INTERVAL` constructs. |
+| 19 | `date_diff` filters | native | translated | PostgreSQL: `INTERVAL` arithmetic plus optional AST-backed emission. Databricks: `DATEDIFF` plus approximate-day thresholds via unit-to-days helpers for non-day units. |
+| 20 | `date_window` (anchor unit + offset) | native | translated | PostgreSQL: `DATE_TRUNC` + `INTERVAL`. Databricks: `date_trunc` + `date_sub` / `add_months` / sub-day `INTERVAL`. Quarter and half-year are folded to months internally before rendering. |
+| 21 | `current_date`, `current_timestamp` | native | native | Both dialects support directly. |
+| 22 | String concatenation via `concat` scalar | native | native | IR and prompts use the variadic `concat` scalar (rendered as `CONCAT(...)`). The SQL string-concatenation operator made of two vertical bars is not modelled and must not appear in intent expr strings (see system prompt). |
+| 23 | JSON / struct field access | not supported | not supported | No first-class IR for `->`, `->>`, JSON path, struct extraction. The generic `NormalizedExpr.raw_sql` exists but no dedicated validators run on raw JSON paths; subqueries / lateral / forbidden tokens still apply. |
+| 24 | `BETWEEN` in IR | partial | partial | The IR decomposes `BETWEEN` into a pair of comparison predicates at parse time. CASE branch rendering can still emit `BETWEEN` with bound parameters when `Case` predicate branches are involved. |
+| 25 | `IN (list)` | native | native | Bound list literals; `WHERE col IN (?, ?, ...)` form. |
+| 26 | `LIKE`, `NOT LIKE` | native | native | Both dialects emit native `LIKE`. Case-insensitive variants use the path described in row 1. |
+| 27 | `DISTINCT` (select-level) | native | native | Emitted as `SELECT DISTINCT` when `RuntimeIntent.distinct_select_index >= 0`. |
+| 28 | `DISTINCT ON` | blocked | blocked | Forbidden by regex. |
+| 29 | `GROUP BY` ordinals | not supported | not supported | The clause builder always projects expression text from `NormalizedExpr`. |
+| 30 | `ORDER BY` ordinals | not supported | not supported | Same; positional integers are not represented. |
+| 31 | `ORDER BY ... NULLS FIRST` / `NULLS LAST` | partial | partial | `OrderByCol.null_order` carries `NULLS FIRST` / `NULLS LAST` when present. |
+| 32 | `LIMIT` | native | native | Only `RuntimeIntent.limit` exists in the intent JSON schema; emitted as `LIMIT n`. |
+| 33 | `OFFSET` and `FETCH FIRST` (row skipping) | blocked | blocked | No IR field for skipping rows after `LIMIT`. `FORBIDDEN_SQL` rejects `OFFSET` and `FETCH FIRST` in generated SQL. |
+| 34 | Self-joins on the same physical table | blocked | blocked | Structural validators reject duplicate range-vars on the same physical table in `FROM`. The intent-parser prompt instructs the LLM to lift the second occurrence into a CTE step before joining; this is a repair-level workaround, not a structural change. |
+| 35 | Cross joins (`CROSS JOIN`) | partial | partial | Allowed only as the explicit emission for scalar subqueries (row 8). User-driven cross joins are not represented in the IR. |
+| 36 | Join modifiers (`INNER` vs `LEFT`) | native | native | Join SQL is assembled from FK paths, not from user-authored `JOIN` syntax in the IR. The emitter chooses **only** `INNER JOIN` or `LEFT JOIN` per edge (nullable FK on the join-from side → `LEFT`, else `INNER`). `RIGHT JOIN` and `FULL OUTER JOIN` are never emitted from the planner; SQL-to-intent ingestion may still parse them from external text. |
+| 37 | `USING (col)` | not supported | not supported | The IR always renders join conditions as `ON` predicates. |
+| 38 | `WHERE` with `OR` (top-level disjunctions) | partial | partial | The IR's `FilterParam.filter_group` represents **OR-of-AND** (disjunctive normal form). Adjacent rows use `bool_op` only when every row has `filter_group` unset (flat AND/OR chains). **AND-of-OR** grouping `(a OR b) AND (c OR d)` is not faithfully representable as a flat chain; the intent parser is instructed to rewrite into an equivalent DNF when feasible (see reformulation table below). |
+| 39 | `WHERE` with `NOT` (predicate negation) | partial | partial | Predicates carry their own negated forms (`!=`, `not in`, `not like`); standalone `NOT` of a compound predicate is rewritten through De Morgan rather than represented directly. |
+| 40 | `HAVING` clause | native | native | `HavingParam` is aggregate-aware; the validator enforces aggregate-on-left, literal-or-column-on-right. |
+| 41 | `GROUP BY ROLLUP / CUBE / GROUPING SETS` | not supported | not supported | The IR does not carry grouping-set syntax. |
+| 42 | Common aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) | native | native | All carried as `NormalizedExpr.from_agg`. `COUNT(*)` is supported. |
+| 43 | `COUNT(DISTINCT ...)` | partial | partial | The IR represents distinct count via the aggregate's `distinct=True` flag where supported. |
+| 44 | Custom aggregates (`STRING_AGG`, `LISTAGG`, `ARRAY_AGG`) | not supported | not supported | Not in the allowed aggregate set. |
+| 45 | Bound parameters (`pyformat`) | native | native | All literal values are bound as parameters; AST validation includes `PARAM_UNBOUND` checks. |
+| 46 | Views and materialised views in scope | native | native | Reflected according to `SchemaContext.include` (`tables`, `views`, `both`). Materialised views surface as table-like objects when `include` includes tables. |
+
+## IR-unsupported constructs and reformulations
+
+USER_GUIDE, HOW_IT_WORKS, and SECURITY link here for all questions about unsupported constructs. Do not duplicate this content elsewhere.
+
+This table is the **single source of truth** for constructs the IR cannot emit directly and the reformulations the intent parser is instructed to prefer.
+
+| Construct | Reason | Reformulation the engine uses |
+|-----------|--------|--------------------------------|
+| Set difference (`A EXCEPT B`) | IR cannot emit | Rewrite as left join from A to B with `IS NULL` on the B side. |
+| `EXISTS` / `NOT EXISTS` | IR cannot emit | Rewrite as left join to the inner subject, `IS NOT NULL` for EXISTS or `IS NULL` for NOT EXISTS. |
+| Anti-join | IR cannot emit | Same pattern as NOT EXISTS. |
+| Correlated subquery | IR cannot emit | Rewrite as an aggregation inside a CTE keyed on the correlation column, joined back. |
+| Lateral join | IR cannot emit | Rewrite as a CTE-projected aggregate. |
+| Recursive CTE | not representable; refused. | — |
+| AND-of-OR predicates `(a OR b) AND (c OR d)` | the `filter_group` IR represents OR-of-AND (DNF); flat `bool_op` chains do not preserve grouping precedence. | The intent parser is instructed to rewrite into an equivalent DNF when feasible; otherwise the engine refuses. |
+| `DISTINCT ON` | not representable as a bare clause | rewrite as a window-function `ROW_NUMBER() = 1` filter. |
+| Self-join on the same physical table without a CTE bridge | refused. | — |
+
+## Dialect-specific notes
+
+### PostgreSQL
+
+- AST validation uses `pglast`. The dialect adapter applies structural rejection rules (CTE checks, `WHERE` subtree, lateral, EXISTS, subquery, set ops, self-join).
+- Profiling uses standard SQL with `LIMIT` to bound row counts.
+- `EXPLAIN` is run as a smoke check; failures are classified by code.
+
+### Databricks
+
+- AST validation uses `sqlglot` with the Spark dialect.
+- `CROSS JOIN` is allowed for scalar subquery emission, with the rhs name in the scalar-allowed set.
+- `DATETRUNC` post-pass reorders arguments to match the warehouse's expected form.
+- Sub-day temporal arithmetic uses `INTERVAL` directly; day and above use `date_sub` / `add_months`.
+- The Databricks SQL connector is preferred when the SQL warehouse trio (host, HTTP path, token) is configured. PySpark is the fallback.
+
+---
+
+**See also:** [How it works](HOW_IT_WORKS.md) · [API reference](API_REFERENCE.md) · [Offline testing and mock LLM (design)](OFFLINE_AND_MOCK_LLM.md) · [README](../README.md)

@@ -1,0 +1,118 @@
+"""Unit tests for planner-prose literal attribution helpers."""
+
+from __future__ import annotations
+
+from aetherdialect._contracts_base import (
+    CteIntent,
+    FailureCategory,
+    IntentIssue,
+    LogicalIntent,
+)
+from aetherdialect._intent_resolve import (
+    attribute_post_stage_b_issue,
+    literal_in_logical_prose,
+)
+
+
+def _issue_missing_numeric(value: str) -> IntentIssue:
+    return IntentIssue(
+        issue_id=f"missing_numeric_{value}_main",
+        category=FailureCategory.MISSING_NUMERIC_FILTER,
+        severity="warning",
+        message=f"Coverage text mentions number '{value}'",
+        context={"value": value, "location": "main"},
+        responsible_stage="format",
+    )
+
+
+class TestLiteralInLogicalProse:
+    def test_pg13_substring_in_filter(self) -> None:
+        li = LogicalIntent(
+            tables=("film",),
+            select="title",
+            filter="films whose rating equals 'PG-13'",
+        )
+        assert literal_in_logical_prose(li, "PG-13") is True
+
+    def test_case_insensitive_pg13(self) -> None:
+        li = LogicalIntent(
+            tables=("film",),
+            select="title",
+            filter="rating equals pg-13",
+        )
+        assert literal_in_logical_prose(li, "PG-13") is True
+
+    def test_token_in_second_cte_filter(self) -> None:
+        li = LogicalIntent(
+            tables=("a",),
+            select="x",
+            cte_steps=(
+                CteIntent(name="c0", depends_on=(), tables=("a",), select="pk"),
+                CteIntent(
+                    name="c1",
+                    depends_on=("c0",),
+                    tables=("a",),
+                    select="y",
+                    filter="amount is greater than 5",
+                ),
+            ),
+        )
+        assert literal_in_logical_prose(li, "5") is True
+
+    def test_empty_token_false(self) -> None:
+        li = LogicalIntent(tables=("t",), select="x")
+        assert literal_in_logical_prose(li, "") is False
+
+
+class TestAttributePostStageBIssue:
+    def test_pg13_in_prose_routes_format(self) -> None:
+        li = LogicalIntent(
+            tables=("film",),
+            select="title",
+            filter="films whose rating equals 'PG-13'",
+        )
+        iss = _issue_missing_numeric("PG-13")
+        out = attribute_post_stage_b_issue(iss, li)
+        assert out.responsible_stage == "format"
+
+    def test_vague_prose_routes_logical(self) -> None:
+        li = LogicalIntent(
+            tables=("film",),
+            select="title",
+            filter="films with the right rating",
+        )
+        iss = _issue_missing_numeric("PG-13")
+        out = attribute_post_stage_b_issue(iss, li)
+        assert out.responsible_stage == "logical"
+
+    def test_payments_above_5_format(self) -> None:
+        li = LogicalIntent(
+            tables=("payment",),
+            select="amount",
+            filter="payments above 5",
+        )
+        iss = _issue_missing_numeric("5")
+        out = attribute_post_stage_b_issue(iss, li)
+        assert out.responsible_stage == "format"
+
+    def test_wrong_digit_logical(self) -> None:
+        li = LogicalIntent(
+            tables=("payment",),
+            select="amount",
+            filter="payments above 5",
+        )
+        iss = _issue_missing_numeric("13")
+        out = attribute_post_stage_b_issue(iss, li)
+        assert out.responsible_stage == "logical"
+
+    def test_non_literal_category_unchanged(self) -> None:
+        li = LogicalIntent(tables=("t",), select="x")
+        iss = IntentIssue(
+            issue_id="other",
+            category=FailureCategory.UNKNOWN_TABLE,
+            severity="error",
+            message="x",
+            context={},
+            responsible_stage="logical",
+        )
+        assert attribute_post_stage_b_issue(iss, li) is iss

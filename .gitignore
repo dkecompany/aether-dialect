@@ -1,0 +1,78 @@
+# Python bytecode
+*__pycache__/
+*.py[cod]
+
+# C extensions
+*.so
+*.pyd
+
+# Build / packaging
+*.egg-info/
+dist/
+build/
+*.egg
+*.whl
+*.tar.gz
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Testing / coverage
+*.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+MagicMock/
+
+# Type checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Linting
+.ruff_cache/
+
+# Docs build
+site/
+
+# Runtime artifacts
+dev_workspace/*.env
+dev_workspace/*.txt
+!dev_workspace/updates.txt
+!dev_workspace/dialect_expansions.txt
+!dev_workspace/notes.txt
+dev_workspace/*.csv
+dev_workspace/*.svg
+dev_workspace/docs/
+dev_workspace/databricks/dvdrental_csv/
+dev_workspace/databricks/*.txt
+dev_workspace/postgres/dvdrental_csv/
+dev_workspace/postgres/*.txt
+dev_workspace/out_csv/
+dev_workspace/text2sql_artifacts/*
+
+live_tests/*.txt
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Secrets
+.env
+.env.*
+env.env
+
+# Databricks
+.databricks/
+databricks.yml
+typings/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
