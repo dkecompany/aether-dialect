@@ -108,5 +108,10 @@ where = ["src"]
 include = ["aetherdialect*"]
 exclude = ["__pycache__"]
 
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
+
 [project.urls]
 Homepage = "https://github.com/dkecompany/aether-dialect"
