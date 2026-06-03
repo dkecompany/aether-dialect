@@ -1,4 +1,4 @@
-# AetherDialect — validation-first Text-to-SQL for PostgreSQL and Databricks
+# AetherDialect — The **deterministic** Text-to-SQL engine
 
 `aetherdialect` turns analytical questions into read-only `SELECT` pipelines: a structured intent representation, multi-stage validation (including dialect `EXPLAIN`), template reuse from accepted answers, and bounded learning from rejections. The language model fills bounded slots in that intent; it does not author unconstrained SQL.
 
