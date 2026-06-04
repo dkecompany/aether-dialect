@@ -38,22 +38,7 @@ dmypy.json
 # Docs build
 site/
 
-# Runtime artifacts
-dev_workspace/*.env
-dev_workspace/*.txt
-!dev_workspace/updates.txt
-!dev_workspace/dialect_expansions.txt
-!dev_workspace/notes.txt
-dev_workspace/*.csv
-dev_workspace/*.svg
-dev_workspace/docs/
-dev_workspace/databricks/dvdrental_csv/
-dev_workspace/databricks/*.txt
-dev_workspace/postgres/dvdrental_csv/
-dev_workspace/postgres/*.txt
-dev_workspace/out_csv/
-dev_workspace/text2sql_artifacts/*
-
+# Local live-test env files
 live_tests/*.txt
 
 # Jupyter
@@ -63,15 +48,6 @@ live_tests/*.txt
 .env
 .env.*
 env.env
-
-# Databricks
-.databricks/
-databricks.yml
-typings/
-
-# IDE
-.vscode/
-.idea/
 
 # OS
 .DS_Store
