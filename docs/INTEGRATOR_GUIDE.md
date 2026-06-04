@@ -2,15 +2,11 @@
 
 This guide is for engineers embedding `aetherdialect` in a service, job runner, notebook, or automation. Stable programmatic surfaces are `Text2SQL`, `PipelineSession`, and `AsyncPipelineSession`.
 
-**Navigation:** [User guide](USER_GUIDE.md) · [API reference](API_REFERENCE.md) · [How it works](HOW_IT_WORKS.md) · [Offline testing and mock LLM (design)](OFFLINE_AND_MOCK_LLM.md) · [Security](SECURITY.md) · [Support matrix](SUPPORT_MATRIX.md)
+**Navigation:** [User guide](USER_GUIDE.md) · [API reference](API_REFERENCE.md) · [How it works](HOW_IT_WORKS.md) · [Security](SECURITY.md) · [Support matrix](SUPPORT_MATRIX.md)
 
 Diagrams in this guide require a Mermaid-capable preview (editor preview or a Mermaid extension).
 
 Analyst-facing setup and migration are in the [User guide](USER_GUIDE.md). Types, configuration keys, JSON shapes, and method tables are in the [API reference](API_REFERENCE.md). Architecture is in [How it works](HOW_IT_WORKS.md). The export list is `aetherdialect.__all__` in the [API reference](API_REFERENCE.md).
-
-### Offline and mock LLM testing (design)
-
-Until a first-party **`llm_provider="mock"`** ships, hermetic automation usually **stubs** `llm_chat` / `llm_json` at import boundaries, or uses the repository **`live_tests`** harness with real API keys. See [Offline testing and mock LLM (design)](OFFLINE_AND_MOCK_LLM.md).
 
 ## When to embed
 
@@ -69,11 +65,11 @@ where `<artifacts_parent>` is your expanded `artifacts_dir` or the platform user
 
 Three channels answer different questions:
 
-| Channel | What you get | When | Typical use |
-| ------- | ------------ | ---- | ----------- |
-| **`audit_sink`** | `AuditEvent` rows via **your callback** | Coarse lifecycle (`init`, `ask_begin`, `ask_done`, cache clears, write-queue drain) | Centralised audit log, metrics counters |
-| **`SessionStep.diagnostics`** | `tuple[Diagnostic, ...]` on every step | Each `ask` / `step` return | UI detail, support tooling, metrics by code |
-| **Exceptions and `step.error`** | Typed failures | Config, migration, busy session, terminal errors | Control flow |
+| Channel                         | What you get                            | When                                                                                | Typical use                                 |
+| ------------------------------- | --------------------------------------- | ----------------------------------------------------------------------------------- | ------------------------------------------- |
+| **`audit_sink`**                | `AuditEvent` rows via **your callback** | Coarse lifecycle (`init`, `ask_begin`, `ask_done`, cache clears, write-queue drain) | Centralised audit log, metrics counters     |
+| **`SessionStep.diagnostics`**   | `tuple[Diagnostic, ...]` on every step  | Each `ask` / `step` return                                                          | UI detail, support tooling, metrics by code |
+| **Exceptions and `step.error`** | Typed failures                          | Config, migration, busy session, terminal errors                                    | Control flow                                |
 
 **`audit_sink` is not a boolean.** Pass a function, or omit it (default `None`). The engine does not print audit events unless your callback does.
 
@@ -119,52 +115,52 @@ The constructor does not read stdin. Init status is not replayed on later `Sessi
 
 ## `SessionStep` fields
 
-| Field | Type | Meaning |
-| ----- | ---- | ------- |
-| `done` | `bool` | `True` when the turn finished (success or terminal failure). |
-| `prompt` | `str` or `None` | Short line before collecting the user reply. |
-| `kind` | `str` | Stable suspend or terminal identifier; branch UI on this. |
-| `sql` | `str` or `None` | SQL under discussion, or final SQL on success. |
-| `data` | `pandas.DataFrame` or `None` | Preview at suspend (up to five rows) or full frame on terminal success. |
-| `message` | `str` or `None` | Multi-line body (intent readback, guidance, tips). |
-| `error` | `str` or `None` | Terminal failure text. |
-| `diagnostics` | `tuple` of `Diagnostic` | Structured rows for this step; forward to observability. |
-| `intent_summary` | `IntentSummary` or `None` | Compact intent headline when applicable. |
-| `status` | `str` or `None` | Coarse failure category on terminal error steps. |
-| `reply_shape` | `"yes_no"`, `"free_text"`, or `None` | Expected shape of the next `step` payload when `done` is `False`. |
-| `semantic_warnings` | `tuple` of `str` | Normalised warnings for intent confirmation. |
+| Field               | Type                                 | Meaning                                                                 |
+| ------------------- | ------------------------------------ | ----------------------------------------------------------------------- |
+| `done`              | `bool`                               | `True` when the turn finished (success or terminal failure).            |
+| `prompt`            | `str` or `None`                      | Short line before collecting the user reply.                            |
+| `kind`              | `str`                                | Stable suspend or terminal identifier; branch UI on this.               |
+| `sql`               | `str` or `None`                      | SQL under discussion, or final SQL on success.                          |
+| `data`              | `pandas.DataFrame` or `None`         | Preview at suspend (up to five rows) or full frame on terminal success. |
+| `message`           | `str` or `None`                      | Multi-line body (intent readback, guidance, tips).                      |
+| `error`             | `str` or `None`                      | Terminal failure text.                                                  |
+| `diagnostics`       | `tuple` of `Diagnostic`              | Structured rows for this step; forward to observability.                |
+| `intent_summary`    | `IntentSummary` or `None`            | Compact intent headline when applicable.                                |
+| `status`            | `str` or `None`                      | Coarse failure category on terminal error steps.                        |
+| `reply_shape`       | `"yes_no"`, `"free_text"`, or `None` | Expected shape of the next `step` payload when `done` is `False`.       |
+| `semantic_warnings` | `tuple` of `str`                     | Normalised warnings for intent confirmation.                            |
 
 ## Suspend and terminal `kind` values
 
-| `kind` | Meaning | Expected next `step` |
-| ------ | ------- | -------------------- |
-| `awaiting_intent_confirm` | Intent readback; yes or no before generation continues. | `y` or `n` |
-| `awaiting_intent_feedback` | User rejected intent readback; short free-text reason. | Non-empty string |
-| `awaiting_sql_confirm` | Stored or generated SQL preview; yes or no. | `y` or `n` |
-| `awaiting_sql_feedback` | Post-execution confirm (`yes_no`) or rejection reason (`free_text`). | `y`, `n`, or non-empty reason |
-| `result` | Terminal success; read `sql`, `data`, `intent_summary`, `diagnostics`. | None |
-| `error` | Terminal failure; read `error`, `status`, `diagnostics`. | None |
-| `idle` | `step` without active `ask`; surface `error`. | None until new `ask` |
+| `kind`                     | Meaning                                                                | Expected next `step`          |
+| -------------------------- | ---------------------------------------------------------------------- | ----------------------------- |
+| `awaiting_intent_confirm`  | Intent readback; yes or no before generation continues.                | `y` or `n`                    |
+| `awaiting_intent_feedback` | User rejected intent readback; short free-text reason.                 | Non-empty string              |
+| `awaiting_sql_confirm`     | Stored or generated SQL preview; yes or no.                            | `y` or `n`                    |
+| `awaiting_sql_feedback`    | Post-execution confirm (`yes_no`) or rejection reason (`free_text`).   | `y`, `n`, or non-empty reason |
+| `result`                   | Terminal success; read `sql`, `data`, `intent_summary`, `diagnostics`. | None                          |
+| `error`                    | Terminal failure; read `error`, `status`, `diagnostics`.               | None                          |
+| `idle`                     | `step` without active `ask`; surface `error`.                          | None until new `ask`          |
 
-| Internal `state_id` | Public `kind` |
-| ------------------- | ------------- |
-| `awaiting_direct_reuse_confirmation` | `awaiting_sql_confirm` |
-| `awaiting_intent_confirmation` | `awaiting_intent_confirm` |
-| `awaiting_intent_rejection_feedback` | `awaiting_intent_feedback` |
-| `awaiting_sql_result_confirmation` | `awaiting_sql_confirm` |
-| `awaiting_user_feedback_reject_reason` | `awaiting_sql_feedback` |
+| Internal `state_id`                    | Public `kind`              |
+| -------------------------------------- | -------------------------- |
+| `awaiting_direct_reuse_confirmation`   | `awaiting_sql_confirm`     |
+| `awaiting_intent_confirmation`         | `awaiting_intent_confirm`  |
+| `awaiting_intent_rejection_feedback`   | `awaiting_intent_feedback` |
+| `awaiting_sql_result_confirmation`     | `awaiting_sql_confirm`     |
+| `awaiting_user_feedback_reject_reason` | `awaiting_sql_feedback`    |
 
 Branch UI on public `kind` only, not on internal `state_id` strings.
 
 ## `PipelineSession` and `AsyncPipelineSession` methods
 
-| Method | Returns | Contract |
-| ------ | ------- | -------- |
-| `ask(question: str)` | `SessionStep` | Starts a turn; raises `SessionActiveError` if busy. |
-| `ask_until_done(question, *, on_confirm="y" \| "n")` | `SessionStep` | Auto-`step` through yes-or-no suspends; raises on free-text suspends. |
-| `step(response=None)` | `SessionStep` | Next answer for the current suspend. |
-| `awaiting_prompt()` | `bool` | `True` when input must go to `step`. |
-| `reset()` | `None` | Clears suspend state and partial turn state; context manager exit calls this. |
+| Method                                               | Returns       | Contract                                                                      |
+| ---------------------------------------------------- | ------------- | ----------------------------------------------------------------------------- |
+| `ask(question: str)`                                 | `SessionStep` | Starts a turn; raises `SessionActiveError` if busy.                           |
+| `ask_until_done(question, *, on_confirm="y" \| "n")` | `SessionStep` | Auto-`step` through yes-or-no suspends; raises on free-text suspends.         |
+| `step(response=None)`                                | `SessionStep` | Next answer for the current suspend.                                          |
+| `awaiting_prompt()`                                  | `bool`        | `True` when input must go to `step`.                                          |
+| `reset()`                                            | `None`        | Clears suspend state and partial turn state; context manager exit calls this. |
 
 `AsyncPipelineSession` delegates the same methods on worker threads.
 

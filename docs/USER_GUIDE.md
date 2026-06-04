@@ -1,6 +1,6 @@
 # User guide
 
-**Reading order:** this guide → [Integrator guide](INTEGRATOR_GUIDE.md) → [API reference](API_REFERENCE.md) → [How it works](HOW_IT_WORKS.md) → [Offline testing and mock LLM (design)](OFFLINE_AND_MOCK_LLM.md) → [Security](SECURITY.md) → [Support matrix](SUPPORT_MATRIX.md).
+**Reading order:** this guide → [Integrator guide](INTEGRATOR_GUIDE.md) → [API reference](API_REFERENCE.md) → [How it works](HOW_IT_WORKS.md) → [Security](SECURITY.md) → [Support matrix](SUPPORT_MATRIX.md).
 
 This guide is for analysts and operators: install the package, configure credentials, understand scope and overrides, ask questions, handle migrations and warmup, and avoid common mistakes. Programmatic embedding (sessions, threading, the write queue) lives in the [Integrator guide](INTEGRATOR_GUIDE.md). Types and every configuration key are in the [API reference](API_REFERENCE.md).
 
@@ -60,12 +60,12 @@ Sensitivity tiers and repair behaviour are in [Sensitivity classification](#sens
 
 Each column carries a `SensitivityClassification` set by the classifier or analyst overrides (`schema_overrides.json`). Legacy `pii` / `restricted` strings in override JSON normalize into these tiers on load.
 
-| Tier | LLM visibility | Projection and grouping | Filters |
-| ---- | -------------- | ----------------------- | ------- |
-| **`none`** | Full when statistically usable | Bare `SELECT`, `GROUP BY`, `ORDER BY` allowed | Allowed |
-| **`hygiene`** | May appear in prompts when usable | Aggregates and `GROUP BY` allowed; not bare `SELECT` | Allowed |
-| **`strict`** | Withheld from prompts | No bare `SELECT`, `GROUP BY`, or `ORDER BY`; aggregates may wrap the column where policy allows | Equality-shaped filters and aggregate-wrapped references where allowed |
-| **`forbidden`** | Withheld | No bare projection, `GROUP BY`, or `ORDER BY` | Predicates referencing the column are rejected |
+| Tier            | LLM visibility                    | Projection and grouping                                                                         | Filters                                                                |
+| --------------- | --------------------------------- | ----------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| **`none`**      | Full when statistically usable    | Bare `SELECT`, `GROUP BY`, `ORDER BY` allowed                                                   | Allowed                                                                |
+| **`hygiene`**   | May appear in prompts when usable | Aggregates and `GROUP BY` allowed; not bare `SELECT`                                            | Allowed                                                                |
+| **`strict`**    | Withheld from prompts             | No bare `SELECT`, `GROUP BY`, or `ORDER BY`; aggregates may wrap the column where policy allows | Equality-shaped filters and aggregate-wrapped references where allowed |
+| **`forbidden`** | Withheld                          | No bare projection, `GROUP BY`, or `ORDER BY`                                                   | Predicates referencing the column are rejected                         |
 
 **Denied columns** (`deny_columns` on `SchemaContext`) differ from hidden sensitivity: denied columns are removed from the graph entirely and cannot be targeted by name.
 
@@ -162,4 +162,4 @@ The public API exposes scoped resets: clearing only persisted overrides, only th
 
 ---
 
-**See also:** [README](../README.md) · [Integrator guide](INTEGRATOR_GUIDE.md) · [How it works](HOW_IT_WORKS.md) · [Offline testing and mock LLM (design)](OFFLINE_AND_MOCK_LLM.md) · [Support matrix](SUPPORT_MATRIX.md) · [Security](SECURITY.md) · [API reference](API_REFERENCE.md)
+**See also:** [README](../README.md) · [Integrator guide](INTEGRATOR_GUIDE.md) · [How it works](HOW_IT_WORKS.md) · [Support matrix](SUPPORT_MATRIX.md) · [Security](SECURITY.md) · [API reference](API_REFERENCE.md)

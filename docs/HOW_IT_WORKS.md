@@ -309,4 +309,4 @@ Embedding contracts are in the [Integrator guide — Observability](INTEGRATOR_G
 
 ---
 
-**See also:** [User guide](USER_GUIDE.md) · [Integrator guide](INTEGRATOR_GUIDE.md) · [API reference](API_REFERENCE.md) · [Offline testing and mock LLM (design)](OFFLINE_AND_MOCK_LLM.md) · [Support matrix](SUPPORT_MATRIX.md) · [Security](SECURITY.md) · [README](../README.md)
+**See also:** [User guide](USER_GUIDE.md) · [Integrator guide](INTEGRATOR_GUIDE.md) · [API reference](API_REFERENCE.md) · [Support matrix](SUPPORT_MATRIX.md) · [Security](SECURITY.md) · [README](../README.md)
