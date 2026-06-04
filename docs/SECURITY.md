@@ -4,7 +4,7 @@ Nothing in the engine generates raw SQL from free-form text. The LLM is asked on
 
 This document describes what the engine sees, what it sends to the LLM provider, what it persists on disk, and the threat model behind the design choices. It complements your warehouse's security posture, not replaces it.
 
-**Next:** [How it works](HOW_IT_WORKS.md) · [Offline testing and mock LLM (design)](OFFLINE_AND_MOCK_LLM.md) · [User guide](USER_GUIDE.md) · [API reference](API_REFERENCE.md) · [Support matrix](SUPPORT_MATRIX.md)
+**Next:** [How it works](HOW_IT_WORKS.md) · [User guide](USER_GUIDE.md) · [API reference](API_REFERENCE.md) · [Support matrix](SUPPORT_MATRIX.md)
 
 Configuration is built from a merged in-process mapping: without **`config_file`**, a string copy of `os.environ` only. With **`config_file`**, each mapped field present in the TOML is authoritative (non-empty values replace the environment copy; empty values remove that key); fields omitted from the file still read from `os.environ`. Full rules are in the [API reference](API_REFERENCE.md). The library does not load a `.env` file implicitly and does not mutate `os.environ` while reading settings.
 
@@ -19,28 +19,28 @@ The engine is built for the case where:
 
 The engine's defences are layered to address three concrete risks:
 
-| Risk | Mitigation |
-|------|------------|
-| User crafts a question that runs arbitrary SQL | `SELECT`-only enforcement, `FORBIDDEN_SQL` regex list, dialect AST validation, structured intent IR, `EXPLAIN` gate before execution. |
-| LLM output escapes the analytical subset | Same gates plus validators that reject constructs the IR cannot represent safely. |
-| Sensitive column data leaks through prompts or artifacts | `pii` and `restricted` sensitivity tags, deny lists, `is_visible` gate, top-k caps; no full raw row dumps in artifacts. |
+| Risk                                                     | Mitigation                                                                                                                            |
+| -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| User crafts a question that runs arbitrary SQL           | `SELECT`-only enforcement, `FORBIDDEN_SQL` regex list, dialect AST validation, structured intent IR, `EXPLAIN` gate before execution. |
+| LLM output escapes the analytical subset                 | Same gates plus validators that reject constructs the IR cannot represent safely.                                                     |
+| Sensitive column data leaks through prompts or artifacts | `pii` and `restricted` sensitivity tags, deny lists, `is_visible` gate, top-k caps; no full raw row dumps in artifacts.               |
 
 The engine is **not** designed for the case where the database credentials themselves are untrusted. Database-level security (least-privilege roles, network isolation, audit logging) is the operator's responsibility.
 
 ### Persisted versus sent-to-LLM (summary)
 
-| Data class | Persisted on disk under the engine storage directory | Sent to the LLM provider |
-|------------|------------------------------------------------------|---------------------------|
-| Table names | yes (`schema_graph.json.gz`, templates) | yes (schema literals and prompts) |
-| Visible column names | yes | yes (post `is_visible` / scope filters) |
-| Column descriptions / roles | yes | yes (merged into prompt-safe schema text) |
-| Top-k profiling values | yes, bounded per column | mostly no; rare enum-detection paths may include small heads |
-| Raw database rows | no | no |
-| Query result rows | no (session-only frames) | no |
-| Failed SQL | no long-term verbatim dump; feedback stores **summarised** text | summarised failure payloads only in the feedback summariser path |
-| Reuse SQL templates | yes (`intent_templates/` directory: `header.json.gz` plus lazy `partition_*.json.gz` shards; legacy `intent_templates.json.gz` removed on upgrade paths) | parameterised template text for bounded extraction when that path runs |
-| Accepted templates (text form) | yes | yes when prompts include prior accepted shapes |
-| Runtime config TOML | yes (operator-owned path) | no |
+| Data class                     | Persisted on disk under the engine storage directory                                                                                                     | Sent to the LLM provider                                               |
+| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| Table names                    | yes (`schema_graph.json.gz`, templates)                                                                                                                  | yes (schema literals and prompts)                                      |
+| Visible column names           | yes                                                                                                                                                      | yes (post `is_visible` / scope filters)                                |
+| Column descriptions / roles    | yes                                                                                                                                                      | yes (merged into prompt-safe schema text)                              |
+| Top-k profiling values         | yes, bounded per column                                                                                                                                  | mostly no; rare enum-detection paths may include small heads           |
+| Raw database rows              | no                                                                                                                                                       | no                                                                     |
+| Query result rows              | no (session-only frames)                                                                                                                                 | no                                                                     |
+| Failed SQL                     | no long-term verbatim dump; feedback stores **summarised** text                                                                                          | summarised failure payloads only in the feedback summariser path       |
+| Reuse SQL templates            | yes (`intent_templates/` directory: `header.json.gz` plus lazy `partition_*.json.gz` shards; legacy `intent_templates.json.gz` removed on upgrade paths) | parameterised template text for bounded extraction when that path runs |
+| Accepted templates (text form) | yes                                                                                                                                                      | yes when prompts include prior accepted shapes                         |
+| Runtime config TOML            | yes (operator-owned path)                                                                                                                                | no                                                                     |
 
 Call-site detail is in section 2 below.
 
@@ -91,9 +91,9 @@ The engine uses **OpenAI-shaped models** with Azure or OpenAI transports. Integr
 
 - **Model:** OpenAI-compatible deployment configured for this task.
 - **System prompt:** rubric for table roles, column roles, hints, profile-hint usage rules.
-- **User content:** per-table envelopes containing `table`, declared FKs, and column profiles. Column profiles include name, data type, PK / FK flags, and **distinct ratio / null ratio**; when `PolicyConfig.SCHEMA_DESCRIPTION_TOP_VALUE_SAMPLES` is greater than zero, qualifying string-like columns with low distinct_ratio may also include a capped ``top_values`` list sampled from profiling ``top_k_values`` (columns with sensitivity ``pii`` or ``restricted``, denied columns, or high distinct_ratio never receive ``top_values``).
+- **User content:** per-table envelopes containing `table`, declared FKs, and column profiles. Column profiles include name, data type, PK / FK flags, and **distinct ratio / null ratio**; when `PolicyConfig.SCHEMA_DESCRIPTION_TOP_VALUE_SAMPLES` is greater than zero, qualifying string-like columns with low distinct_ratio may also include a capped `top_values` list sampled from profiling `top_k_values` (columns with sensitivity `pii` or `restricted`, denied columns, or high distinct_ratio never receive `top_values`).
 - **Schema sent:** all visible tables and columns.
-- **Sample data sent:** **distinct counts and null ratios** always; **optional** small ``top_values`` lists only when the policy ClassVars above request it and every qualifier passes.
+- **Sample data sent:** **distinct counts and null ratios** always; **optional** small `top_values` lists only when the policy ClassVars above request it and every qualifier passes.
 - **Raw rows sent:** none.
 
 ### 2.6 Schema role classification (`_llm_classify_schema`, always-on consistency refine pass)
@@ -166,17 +166,17 @@ This is the only call site that intentionally sends prior bound values back to t
 
 Every file the engine writes under the **engine storage directory** (`<artifacts_parent>/aetherdialect/<connection_slug>/`). Nothing here contains raw row data.
 
-| File | Contents | Sensitivity |
-|------|----------|-------------|
-| `artifact_manifest.json` | Six fingerprints plus `last_action`. | Low. Hashes only. |
-| `schema_graph.json.gz` | Frozen `SchemaGraph` snapshot: tables, columns, types, declared and inferred PK / FK, roles, descriptions, sensitivity, profiling stats, top-k values for visible columns. | Medium. Contains `top_k_values` for visible columns (cap `PROFILING_TOP_K = 50`). Treat like a schema dump plus a tiny representative sample. |
-| `intent_templates/` | Partitioned template store: `header.json.gz` (indexes, feedback, partition map) plus `partition_<NN>.json.gz` shards (`NN` in `00`–`ff`). Legacy monolithic `intent_templates.json.gz` is deleted when present during clears. | Medium-high. Captures user-supplied question text and bound literals. Treat as user-input log. |
-| `applied_overrides.json` | Resolved user layer: descriptions, role assignments, sensitivity tags, added or removed PK / FK edges, internal block lists. | Low-medium. User-authored text plus structural metadata. |
-| `schema_context.json` | Last-known `SchemaContext`: include mode, allow / deny lists, notes file path, sql file path. | Low. Configuration only. |
-| `write_queue.jsonl` | Append-only `WriteQueueEvent` records when the reader defers learning mutations. | Medium. May contain question text and template identifiers. |
-| `qsim_skeletons.json.gz`, `qsim_summary.json`, `qsim_v*_questions.txt` | Synthetic skeleton enumerations and generated questions. | Low. No raw data. |
-| `seed_warmup_cache.zip`, `seed_warmup_v*.zip`, `seed_warmup_report_v*.json` | Seed warmup outputs. | Medium. Captures questions and intent payloads from your seed file. |
-| `anchor_lattice/*` | Internal warmup support files. | Low. |
+| File                                                                        | Contents                                                                                                                                                                                                                      | Sensitivity                                                                                                                                   |
+| --------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `artifact_manifest.json`                                                    | Six fingerprints plus `last_action`.                                                                                                                                                                                          | Low. Hashes only.                                                                                                                             |
+| `schema_graph.json.gz`                                                      | Frozen `SchemaGraph` snapshot: tables, columns, types, declared and inferred PK / FK, roles, descriptions, sensitivity, profiling stats, top-k values for visible columns.                                                    | Medium. Contains `top_k_values` for visible columns (cap `PROFILING_TOP_K = 50`). Treat like a schema dump plus a tiny representative sample. |
+| `intent_templates/`                                                         | Partitioned template store: `header.json.gz` (indexes, feedback, partition map) plus `partition_<NN>.json.gz` shards (`NN` in `00`–`ff`). Legacy monolithic `intent_templates.json.gz` is deleted when present during clears. | Medium-high. Captures user-supplied question text and bound literals. Treat as user-input log.                                                |
+| `applied_overrides.json`                                                    | Resolved user layer: descriptions, role assignments, sensitivity tags, added or removed PK / FK edges, internal block lists.                                                                                                  | Low-medium. User-authored text plus structural metadata.                                                                                      |
+| `schema_context.json`                                                       | Last-known `SchemaContext`: include mode, allow / deny lists, notes file path, sql file path.                                                                                                                                 | Low. Configuration only.                                                                                                                      |
+| `write_queue.jsonl`                                                         | Append-only `WriteQueueEvent` records when the reader defers learning mutations.                                                                                                                                              | Medium. May contain question text and template identifiers.                                                                                   |
+| `qsim_skeletons.json.gz`, `qsim_summary.json`, `qsim_v*_questions.txt`      | Synthetic skeleton enumerations and generated questions.                                                                                                                                                                      | Low. No raw data.                                                                                                                             |
+| `seed_warmup_cache.zip`, `seed_warmup_v*.zip`, `seed_warmup_report_v*.json` | Seed warmup outputs.                                                                                                                                                                                                          | Medium. Captures questions and intent payloads from your seed file.                                                                           |
+| `anchor_lattice/*`                                                          | Internal warmup support files.                                                                                                                                                                                                | Low.                                                                                                                                          |
 
 To back up your learning, copy the whole engine storage directory (or the parent you passed as `artifacts_dir`, which contains the `aetherdialect` segment). To reset, remove that directory or point `Text2SQL` at a fresh parent path.
 
