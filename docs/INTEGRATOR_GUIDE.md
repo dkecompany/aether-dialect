@@ -1,361 +1,234 @@
 # Integrator guide
 
-This guide is for engineers embedding `aetherdialect` in a service, job runner, notebook, or automation. Stable programmatic surfaces are `Text2SQL`, `PipelineSession`, and `AsyncPipelineSession`.
+Engineers embedding the engine in a service, job runner, notebook, or automation. Stable programmatic surfaces: `AetherEngine`, `PipelineSession`, and `AsyncPipelineSession`.
 
-**Navigation:** [User guide](USER_GUIDE.md) · [API reference](API_REFERENCE.md) · [How it works](HOW_IT_WORKS.md) · [Security](SECURITY.md) · [Support matrix](SUPPORT_MATRIX.md)
+**Reading order:** [README — Documentation](../README.md#documentation) → [Getting started](GETTING_STARTED.md) → [User guide](USER_GUIDE.md) → this guide → [Sandbox guide](SANDBOX.md) → [API reference](API_REFERENCE.md) → [How it works](HOW_IT_WORKS.md) → [Security](SECURITY.md) → [Support matrix](SUPPORT_MATRIX.md).
 
-Diagrams in this guide require a Mermaid-capable preview (editor preview or a Mermaid extension).
+## Sections
 
-Analyst-facing setup and migration are in the [User guide](USER_GUIDE.md). Types, configuration keys, JSON shapes, and method tables are in the [API reference](API_REFERENCE.md). Architecture is in [How it works](HOW_IT_WORKS.md). The export list is `aetherdialect.__all__` in the [API reference](API_REFERENCE.md).
+| Section | Contents |
+| --- | --- |
+| [Core objects](#core-objects) | Engine, contexts, spaces, roles, modes |
+| [Engine storage](#engine-storage) | Artifacts layout and connection slug |
+| [Suspend and terminal steps](#suspend-and-terminal-steps) | SessionStep contract and kind mapping |
+| [Minimal embedding (sync)](#minimal-embedding-sync) | ask/step loop |
+| [Async support](#async-support) | AsyncPipelineSession |
+| [Reader and writer split](#reader-and-writer-split) | Queue semantics |
+| [Multi-user deployment](#multi-user-deployment) | Owner/consumer on any engine |
+| [Observability](#observability) | Audit, diagnostics, config snapshot |
 
-## When to embed
+Operator-facing semantics (notes, overrides, migration): [User guide](USER_GUIDE.md). Method signatures and JSON shapes: [API reference](API_REFERENCE.md).
 
-Embed when your product owns transport, authentication, persistence, and UI, and you need a bounded text-to-SQL engine that returns structured steps rather than streaming raw model text. Supply one self-contained natural-language `str` per `ask`, render suspend prompts from `SessionStep`, relay answers through `step`, and read SQL plus frames from the terminal step. Rewrite conversational follow-ups into standalone questions before each new `ask`.
+---
 
-## Stable imports
+## Core objects
 
-```python
-from aetherdialect import (
-    Text2SQL,
-    PipelineSession,
-    AsyncPipelineSession,
-    SchemaContext,
-    SessionStep,
-    Diagnostic,
-    AuditEvent,
-    ConfigSnapshot,
-    SchemaStatsSnapshot,
-    SeedWarmupSummarySnapshot,
-    QSimSummarySnapshot,
-    ConfigError,
-    ConnectionError,
-    SchemaAccessError,
-    SessionActiveError,
-    MigrationPendingError,
-    RetryableError,
-    DatabasePingFailed,
-    LlmTransientFailure,
-    StatementTimeoutError,
-    LlmExecutionConfig,
-    RuntimeConfig,
-    MigrationPreview,
-    __version__,
-)
-```
+Read this section before the session method tables below.
 
-## Concepts (define before use)
+### AetherEngine
 
-### SchemaContext
+Root facade for one database connection. Construction reflects the catalog (or loads cache), builds or loads the master schema graph, and stamps artifact fingerprints. One instance binds exactly one database; artifacts live under `<artifacts_dir>/aetherdialect/<connection_slug>/`.
 
-Frozen scope passed to `Text2SQL`: which tables and columns enter the graph, optional notes and SQL files, and deny/allow lists. Field semantics and sensitivity policy are in the [User guide — SchemaContext](USER_GUIDE.md) and [Sensitivity classification](USER_GUIDE.md#sensitivity-classification).
+### EngineContext
 
-### Configuration
+Frozen scope at construction. Controls which relations enter the graph, master notes/DDL paths, and execution-time allow/deny lists (`allow_objects`, `deny_objects`, `allow_columns`, `deny_columns`). The implicit first context is always **`master`**; that name cannot be removed. Named engine contexts are subset specs stored beside the master graph — consumers pass a context **name string** only.
 
-Without `config_file`, settings come from a string copy of `os.environ`. With `config_file`, each mapped TOML field present in the file is authoritative for that key (empty clears inherited env); omitted fields still use `os.environ`. The library never mutates `os.environ` during reads. Keys, aliases, defaults, and required flags are in the [API reference — Configuration](API_REFERENCE.md#configuration).
+### SpaceContext and AetherSpace
 
-### Engine storage
+**SpaceContext** defines a knowledge subset: `tables`, `columns`, `deny_objects`, and `deny_columns` (same RBAC-like shape as engine scope, but applied at question time only). **AetherSpace** is the persisted named instance. Define with `engine.aetherspace(name, space_context=..., notes_file=...)`. Select at session open: `engine.session(space="catalog")`.
 
-Versioned artefacts live under:
+Named spaces inherit master graph learning; template stores partition by space name. All SpaceContexts are created on the master engine context — never as an intersection with a non-master engine context.
 
-`join(<artifacts_parent>, "aetherdialect", <connection_slug>)`
+### Roles and session modes
 
-where `<artifacts_parent>` is your expanded `artifacts_dir` or the platform user-data root when omitted. Template header, partition shards, and fingerprints are described in [How it works — Engine storage](HOW_IT_WORKS.md).
+| Knob | Values | Effect |
+| --- | --- | --- |
+| `AetherEngine(..., role=...)` | `owner` (default), `consumer` | Owner builds/mutates artifacts; consumer pins owner snapshot. |
+| `engine.session(mode=...)` | `writer` (default), `reader` | Writer persists learning; reader enqueues to `write_queue.jsonl`. |
 
-### Observability
+---
 
-Three channels answer different questions:
+## Engine storage
 
-| Channel                         | What you get                            | When                                                                                | Typical use                                 |
-| ------------------------------- | --------------------------------------- | ----------------------------------------------------------------------------------- | ------------------------------------------- |
-| **`audit_sink`**                | `AuditEvent` rows via **your callback** | Coarse lifecycle (`init`, `ask_begin`, `ask_done`, cache clears, write-queue drain) | Centralised audit log, metrics counters     |
-| **`SessionStep.diagnostics`**   | `tuple[Diagnostic, ...]` on every step  | Each `ask` / `step` return                                                          | UI detail, support tooling, metrics by code |
-| **Exceptions and `step.error`** | Typed failures                          | Config, migration, busy session, terminal errors                                    | Control flow                                |
+Versioned artifacts live under:
 
-**`audit_sink` is not a boolean.** Pass a function, or omit it (default `None`). The engine does not print audit events unless your callback does.
+`<artifacts_parent>/aetherdialect/<connection_slug>/`
 
-```python
-def audit_sink(ev: AuditEvent) -> None:
-    log.info(
-        "aetherdialect",
-        extra={
-            "event_type": ev.event_type,
-            "question": ev.question,
-            "schema_hash": ev.schema_hash,
-            **dict(ev.details),
-        },
-    )
+- **`<artifacts_parent>`** — expanded `artifacts_dir` argument, or platform user-data when omitted.
+- **`<connection_slug>`** — deterministic from **database connection parameters** (engine, host, database, and similar). User names and role names do not appear in the slug so shared learning and consumer deployments stay aligned.
 
-t2s = Text2SQL(SchemaContext(), artifacts_dir="./data", audit_sink=audit_sink)
-```
+Each database connection gets its own directory and its own master context snapshot. Named engine contexts and AetherSpaces persist as JSON sidecars under the same tree. Layout detail: [How it works — Engine storage](HOW_IT_WORKS.md#3-engine-storage-and-artifact-lifecycle).
 
-For turn-level detail, read `step.diagnostics` and terminal `step.sql` / `step.error` — not audit rows. Event types and diagnostic codes are catalogued in the [API reference — Observability](API_REFERENCE.md#observability).
+---
 
-CLI helpers such as `run_interactive` print human text to stdout; services should use `SessionStep.diagnostics` instead.
+## Suspend and terminal steps
 
-## Construction
+Every `session.ask(...)` or `session.step(...)` returns a **`SessionStep`**. Your middle layer should branch on **`step.kind`** and **`step.done`** — not on parsing `step.prompt` text.
 
-By the time `Text2SQL(...)` returns (unless it raises `ConfigError`, `ConnectionError`, `MigrationPendingError`, or another init failure):
+### Terminal vs suspended
 
-- Configuration is merged per [Configuration](#configuration) above.
-- The database engine is `postgresql` or `databricks` from merged settings.
-- The schema graph is built or rehydrated when fingerprints match; first run can take noticeable time ([User guide — First run](USER_GUIDE.md)).
-- When structural migration requires your decision, the constructor raises `MigrationPendingError` after writing `schema_migration_map.json` ([User guide — Migration](USER_GUIDE.md)).
+| State | `step.done` | What to do |
+| --- | --- | --- |
+| **Suspended** | `False` | Pipeline waits for user input. Render `step.prompt` (and optional `step.message` / SQL preview), collect a reply, call `session.step(reply)`. |
+| **Terminal** | `True` | Turn finished. Read `step.sql`, `step.data`, or `step.error`. No further `step` call for this turn unless you `ask` a new question. |
 
-```python
-from aetherdialect import MigrationPendingError, SchemaContext, Text2SQL
+Use **`step.reply_shape`** (`"yes_no"` or `"free_text"`) to choose UI controls while suspended.
 
-try:
-    t2s = Text2SQL(SchemaContext(), artifacts_dir="./my_run", config_file="./aetherdialect.toml")
-except MigrationPendingError:
-    # edit schema_migration_map.json in the working directory, then reconstruct
-    t2s = Text2SQL(SchemaContext(), artifacts_dir="./my_run", config_file="./aetherdialect.toml")
-```
+### Public `kind` values
 
-The constructor does not read stdin. Init status is not replayed on later `SessionStep` objects.
+Inside the pipeline, suspend points carry an internal `state_id`. Before returning `SessionStep`, the engine maps each internal id to a stable public **`kind`** string (via `SUSPEND_ID_TO_SESSION_KIND`). Integrators should use **`kind` only** — the internal ids are not part of the public contract.
 
-## `SessionStep` fields
+| Public `kind` | Typical suspend | `reply_shape` | Meaning |
+| --- | --- | --- | --- |
+| `awaiting_intent_confirm` | intent confirmation | `yes_no` | Confirm interpreted plan. |
+| `awaiting_intent_feedback` | intent rejection | `free_text` | Supply reason intent is wrong. |
+| `awaiting_sql_confirm` | SQL preview / direct reuse | `yes_no` | Confirm generated or reused SQL. |
+| `execute` | execute gate | `yes_no` | Confirm running stored SQL. |
+| `awaiting_sql_feedback` | SQL rejection | `free_text` | Supply reason SQL is wrong. |
+| `result` | — | — | Terminal success (`step.done == True`). |
+| `error` | — | — | Terminal failure (`step.done == True`, `step.error` set). |
+| `idle` | — | — | Session reset / no active turn. |
 
-| Field               | Type                                 | Meaning                                                                 |
-| ------------------- | ------------------------------------ | ----------------------------------------------------------------------- |
-| `done`              | `bool`                               | `True` when the turn finished (success or terminal failure).            |
-| `prompt`            | `str` or `None`                      | Short line before collecting the user reply.                            |
-| `kind`              | `str`                                | Stable suspend or terminal identifier; branch UI on this.               |
-| `sql`               | `str` or `None`                      | SQL under discussion, or final SQL on success.                          |
-| `data`              | `pandas.DataFrame` or `None`         | Preview at suspend (up to five rows) or full frame on terminal success. |
-| `message`           | `str` or `None`                      | Multi-line body (intent readback, guidance, tips).                      |
-| `error`             | `str` or `None`                      | Terminal failure text.                                                  |
-| `diagnostics`       | `tuple` of `Diagnostic`              | Structured rows for this step; forward to observability.                |
-| `intent_summary`    | `IntentSummary` or `None`            | Compact intent headline when applicable.                                |
-| `status`            | `str` or `None`                      | Coarse failure category on terminal error steps.                        |
-| `reply_shape`       | `"yes_no"`, `"free_text"`, or `None` | Expected shape of the next `step` payload when `done` is `False`.       |
-| `semantic_warnings` | `tuple` of `str`                     | Normalised warnings for intent confirmation.                            |
+Direct template reuse during a normal `ask` turn suspends with `kind="awaiting_sql_confirm"` (same as a SQL preview). For orchestrators that already resolved new bind values, `reuse_saved_question` executes the stored template directly without fuzzy matching or parameter extraction.
 
-## Suspend and terminal `kind` values
+### SessionStep fields (embedding checklist)
 
-| `kind`                     | Meaning                                                                | Expected next `step`          |
-| -------------------------- | ---------------------------------------------------------------------- | ----------------------------- |
-| `awaiting_intent_confirm`  | Intent readback; yes or no before generation continues.                | `y` or `n`                    |
-| `awaiting_intent_feedback` | User rejected intent readback; short free-text reason.                 | Non-empty string              |
-| `awaiting_sql_confirm`     | Stored or generated SQL preview; yes or no.                            | `y` or `n`                    |
-| `awaiting_sql_feedback`    | Post-execution confirm (`yes_no`) or rejection reason (`free_text`).   | `y`, `n`, or non-empty reason |
-| `result`                   | Terminal success; read `sql`, `data`, `intent_summary`, `diagnostics`. | None                          |
-| `error`                    | Terminal failure; read `error`, `status`, `diagnostics`.               | None                          |
-| `idle`                     | `step` without active `ask`; surface `error`.                          | None until new `ask`          |
+| Field | Use |
+| --- | --- |
+| `done` | Loop until `True`. |
+| `kind` | Branch UI logic ([table above](#public-kind-values)). |
+| `prompt` | Short line to show before collecting input. |
+| `reply_shape` | `"yes_no"` vs `"free_text"` while suspended. |
+| `message` | Optional narrative (also printed by `run_interactive`). |
+| `sql` / `data` | Preview or final result. |
+| `parameters` | Tuple of `ParameterBinding` on terminal success (`handle`, `current_value`, `display_name`). |
+| `error` | Terminal error text. |
+| `diagnostics` | Turn-level tracing rows. |
 
-| Internal `state_id`                    | Public `kind`              |
-| -------------------------------------- | -------------------------- |
-| `awaiting_direct_reuse_confirmation`   | `awaiting_sql_confirm`     |
-| `awaiting_intent_confirmation`         | `awaiting_intent_confirm`  |
-| `awaiting_intent_rejection_feedback`   | `awaiting_intent_feedback` |
-| `awaiting_sql_result_confirmation`     | `awaiting_sql_confirm`     |
-| `awaiting_user_feedback_reject_reason` | `awaiting_sql_feedback`    |
+Full type definitions: [API reference — PipelineSession methods](API_REFERENCE.md#pipelinesession-methods).
 
-Branch UI on public `kind` only, not on internal `state_id` strings.
-
-## `PipelineSession` and `AsyncPipelineSession` methods
-
-| Method                                               | Returns       | Contract                                                                      |
-| ---------------------------------------------------- | ------------- | ----------------------------------------------------------------------------- |
-| `ask(question: str)`                                 | `SessionStep` | Starts a turn; raises `SessionActiveError` if busy.                           |
-| `ask_until_done(question, *, on_confirm="y" \| "n")` | `SessionStep` | Auto-`step` through yes-or-no suspends; raises on free-text suspends.         |
-| `step(response=None)`                                | `SessionStep` | Next answer for the current suspend.                                          |
-| `awaiting_prompt()`                                  | `bool`        | `True` when input must go to `step`.                                          |
-| `reset()`                                            | `None`        | Clears suspend state and partial turn state; context manager exit calls this. |
-
-`AsyncPipelineSession` delegates the same methods on worker threads.
-
-## Session state machine
-
-```mermaid
-stateDiagram-v2
-    state idle
-    state awaiting_intent_confirm
-    state awaiting_intent_feedback
-    state awaiting_sql_confirm
-    state awaiting_sql_feedback
-    state result
-    state error
-    [*] --> idle
-    idle --> awaiting_intent_confirm: ask
-    idle --> awaiting_sql_confirm: ask_direct_reuse
-    awaiting_intent_confirm --> awaiting_intent_feedback: step_n
-    awaiting_intent_feedback --> awaiting_intent_confirm: step_reason
-    awaiting_intent_confirm --> awaiting_sql_confirm: step_y
-    awaiting_intent_confirm --> awaiting_sql_feedback: step_y_gen_path
-    awaiting_sql_confirm --> result: step_y
-    awaiting_sql_confirm --> awaiting_sql_feedback: step_n
-    awaiting_sql_feedback --> result: step_y_or_reason
-    result --> idle: reset_or_new_ask
-    error --> idle: reset_or_new_ask
-    awaiting_intent_confirm --> error: terminal_failure
-    awaiting_sql_confirm --> error: terminal_failure
-```
-
-Exact transitions depend on reuse and validation; always branch on `SessionStep.kind`.
-
-## Free-text suspends versus yes or no
-
-Use `reply_shape`: `yes_no` expects `y` or `n`; `free_text` expects a short sentence. Pass user text through `step` unchanged.
-
-## `ask_until_done`
-
-Loops internally through yes-or-no suspends until `done`. Raises `SessionActiveError` on free-text suspends. For rejection reasons or custom copy, use the explicit `ask` / `step` loop below.
+---
 
 ## Minimal embedding (sync)
 
 ```python
-from aetherdialect import SchemaContext, Text2SQL
+from aetherdialect import EngineContext, AetherEngine
 
-t2s = Text2SQL(
-    SchemaContext(),
+engine = AetherEngine(
+    EngineContext(),
     artifacts_dir="./my_run",
     config_file="./aetherdialect.toml",
 )
 
-with t2s.session() as session:
-    step = session.ask("How many orders did each customer place last quarter?")
+with engine.session() as session:
+    step = session.ask("Top 5 customers by total payment?")
     while not step.done:
-        if step.kind == "awaiting_sql_confirm":
-            reply = input("Run the stored SQL as-is? [y/N]: ").strip() or "n"
-        elif step.reply_shape == "yes_no":
-            reply = input(step.prompt or "y/n: ").strip()
+        if step.reply_shape == "yes_no":
+            reply = "y"
         else:
-            reply = input(step.prompt or "").strip()
+            reply = "count distinct customers only"
         step = session.step(reply)
-    if step.error:
-        handle_error(step)
-    else:
-        consume_result(step.sql, step.data)
-```
 
-## Complete embedding (all suspend branches)
-
-```python
-from aetherdialect import AuditEvent, Diagnostic, SchemaContext, SessionStep, Text2SQL
-
-
-def render_diagnostics(rows: tuple[Diagnostic, ...]) -> None:
-    for d in rows:
-        print(f"  [{d.code}] {d.message}")
-
-
-def prompt_for_step(step: SessionStep) -> str:
-    if step.reply_shape == "yes_no":
-        return input(step.prompt or "y/n: ").strip()
-    return input(step.prompt or "").strip()
-
-
-def handle_terminal(step: SessionStep) -> None:
-    render_diagnostics(step.diagnostics)
-    if step.error:
-        print("ERROR:", step.error, step.status or "")
-        return
-    print("SQL:", step.sql)
-    if step.data is not None and not step.data.empty:
-        print(step.data.to_string(index=False))
-
-
-def audit_sink(ev: AuditEvent) -> None:
-    print(f"AUDIT {ev.event_type} q={ev.question!r} details={dict(ev.details)}")
-
-
-t2s = Text2SQL(
-    SchemaContext(),
-    artifacts_dir="./my_run",
-    config_file="./aetherdialect.toml",
-    audit_sink=audit_sink,
-)
-
-with t2s.session() as session:
-    step = session.ask("How many orders per customer last quarter?")
-    while not step.done:
-        if step.message:
-            print(step.message)
-        if step.sql:
-            print("SQL (preview):", step.sql)
-        if step.data is not None and not step.data.empty:
-            print(step.data.head().to_string(index=False))
-        reply = prompt_for_step(step)
-        step = session.step(reply)
-    handle_terminal(step)
-
-    session.reset()
-    step2 = session.ask("List the top five customers by order count.")
-    while not step2.done:
-        step2 = session.step(prompt_for_step(step2))
-    handle_terminal(step2)
-```
-
-For unattended yes-or-no-only batch jobs, `ask_until_done(question, on_confirm="y")` is documented in the [API reference](API_REFERENCE.md).
-
-## Minimal embedding (async)
-
-```python
-import asyncio
-
-from aetherdialect import SchemaContext, Text2SQL
-
-t2s = Text2SQL(SchemaContext(), artifacts_dir="./my_run", config_file="./aetherdialect.toml")
-
-
-async def main() -> None:
-    async with t2s.asession() as session:
-        step = await session.ask("Top 10 customers by revenue last month.")
-        while not step.done:
-            if step.reply_shape == "yes_no":
-                reply = (await asyncio.to_thread(input, step.prompt or "y/n: ")).strip()
-            else:
-                reply = (await asyncio.to_thread(input, step.prompt or "")).strip()
-            step = await session.step(reply)
-        if step.error:
-            raise RuntimeError(step.error)
+    if not step.error:
         print(step.sql)
-
-
-asyncio.run(main())
+        print(step.data)
 ```
 
-## Reader and writer split
+Helper methods:
 
-- **Writer** (`mode="writer"`, default): one writer session at a time per `Text2SQL`; serialised with a per-instance lock; persists learning to disk.
-- **Reader** (`mode="reader"`): may overlap other readers and a writer in-process; defers learning to `write_queue.jsonl` under engine storage.
+- `session.ask_until_done(question, on_confirm="y")` — auto-answers **yes/no** suspends only; raises on free-text suspends.
+- `session.accept_until_done(question, ...)` — auto-answers both yes/no and free-text suspends until the turn ends.
+- `session.reuse_saved_question(question_old, question_new, new_values)` — re-executes a stored template when your orchestrator already knows the new bind values (`{"p1": ...}`). Returns a terminal step with SQL, data, and `parameters`.
+
+Pass `on_confirm` as `"y"` or `"n"` (string, not Python `or`).
+
+### Forced template reuse
+
+When an outer orchestrator has already rewritten natural-language questions and resolved new parameter values, call `reuse_saved_question` instead of `ask`:
 
 ```python
-# Dashboard or read-only API tier
-with t2s.session(mode="reader") as reader:
-    step = reader.ask("Count active customers")
-    while not step.done:
-        step = reader.step("y")  # relay from your UI
-
-# Single learning consumer (one process per artifacts_dir recommended)
-with t2s.session(mode="writer") as writer:
-    step = writer.ask("Count active customers")
-    while not step.done:
-        step = writer.step("y")
-    # writer drains write_queue.jsonl at turn start and applies deferred events
+step = session.reuse_saved_question(
+    "count of item in category alpha",
+    "count of item in category beta",
+    {"p1": "beta"},
+)
+assert step.done and step.parameters[0].handle == "p1"
 ```
 
-```mermaid
-sequenceDiagram
-    participant readerA as readerSessionA
-    participant readerB as readerSessionB
-    participant queueFile as write_queue_jsonl
-    participant writerSession as writerSession
-    participant diskStore as templateStoreOnDisk
-    readerA->>queueFile: append deferred event
-    readerB->>queueFile: append deferred event
-    writerSession->>queueFile: drain at writer turn start
-    writerSession->>diskStore: apply events and save
-```
-
-After a writer applies queued events, start new reader sessions (or reconstruct `Text2SQL`) so in-memory templates match disk. Do not share one `artifacts_dir` across unsynchronised writer processes.
-
-## Embedding patterns
-
-- **HTTP service** — one `Text2SQL` per process or tenant `artifacts_dir`; map each HTTP session to `PipelineSession` state; POST replies to `step`.
-- **Queue worker** — one writer consumer calls `ask` / `step`; dashboards use `mode="reader"`.
-- **MCP or tool hosts** — return `SessionStep` fields at each suspend; accept the next user message and call `step`.
+The engine locates the template that owns `question_old`, overlays `new_values` on the stored bind map, validates shape, executes, records the new question row, and returns bindings with display names. It does not run fuzzy reuse detection or LLM parameter extraction on this path.
 
 ---
 
-**See also:** [README](../README.md) · [How it works](HOW_IT_WORKS.md) · [User guide](USER_GUIDE.md) · [Support matrix](SUPPORT_MATRIX.md) · [Security](SECURITY.md) · [API reference](API_REFERENCE.md)
+## Async support
+
+`AsyncPipelineSession` delegates blocking work to worker threads:
+
+```python
+async with engine.asession() as session:
+    step = await session.ask("...")
+    while not step.done:
+        reply = await get_user_input(step)
+        step = await session.step(reply)
+```
+
+---
+
+## Reader and writer split
+
+- **Writer** (`mode="writer"`, default): persists learning directly. One active writer per artifacts directory recommended.
+- **Reader** (`mode="reader"`): enqueues learning to `write_queue.jsonl`. Many readers can overlap on the same artifacts path.
+
+A writer turn drains the queue at start under the engine's writer lock. Queue path: `engine.write_queue_path`.
+
+Offline demo: [Sandbox guide — Reader/writer queue](SANDBOX.md#readerwriter-queue).
+
+---
+
+## Multi-user deployment
+
+Pattern for **any supported database engine** (not PostgreSQL-specific):
+
+1. **Owner writer** — one process with `role="owner"`, `mode="writer"`, full `EngineContext`, and durable `artifacts_dir` on shared storage. Builds the master graph and drains the write queue.
+2. **Consumer readers** — processes with `role="consumer"`, `engine_context="context_name"`, restricted database credentials matching their allow lists, and `mode="reader"` (or `"writer"` only on the owner).
+3. **Align scope** — `EngineContext.allow_objects` / `allow_columns` must match each consumer's database grants.
+4. **Optional AetherSpaces** — further narrow model focus per team or product surface without changing warehouse roles.
+
+Readers share the owner's artifacts directory but never mutate it directly; they append queue events the owner drains.
+
+```python
+# Owner (any engine — fill config_file for yours)
+owner = AetherEngine(
+    EngineContext(allow_objects=frozenset({"orders", "customers"})),
+    artifacts_dir="/shared/aether_artifacts",
+    config_file="./aetherdialect.toml",
+    role="owner",
+)
+
+# Consumer — context name only, matching DB login scope
+consumer = AetherEngine(
+    "analyst_scope",
+    artifacts_dir="/shared/aether_artifacts",
+    config_file="./aetherdialect.toml",
+    role="consumer",
+)
+with consumer.session(mode="reader", space="master") as session:
+    session.accept_until_done("How many orders last month?")
+```
+
+Practice the same pattern offline: [Sandbox guide — Owner vs consumer presets](SANDBOX.md#owner-vs-consumer-presets).
+
+---
+
+## Observability
+
+| Channel | Access | Granularity |
+| --- | --- | --- |
+| **`audit_sink`** | Constructor callback | Coarse lifecycle (`init`, `ask_begin`, `ask_done`, queue drain events). |
+| **`SessionStep.diagnostics`** | Every `ask` / `step` return | Turn-level codes (`REUSE_HIT`, `COMPOSE_REPAIR`, `SENSITIVITY_GATE_HIT`, …). |
+| **`engine.show_config()`** | Method call | Redacted config snapshot. |
+
+Diagnostic catalog: [API reference — Observability](API_REFERENCE.md#observability).
+
+---
+
+**See also:** [User guide](USER_GUIDE.md) · [Sandbox guide](SANDBOX.md) · [API reference](API_REFERENCE.md) · [How it works](HOW_IT_WORKS.md) · [Security](SECURITY.md) · [Support matrix](SUPPORT_MATRIX.md) · [README](../README.md#documentation)

@@ -38,8 +38,39 @@ dmypy.json
 # Docs build
 site/
 
-# Local live-test env files
-live_tests/*.txt
+# scripts/ generated data (private dev pipeline)
+scripts/data/rental_shop_csvs/
+scripts/data/rental_shop.zip
+scripts/data/_llm_cache/
+scripts/data/_downloads/
+scripts/sandbox_staging/
+scripts/sandbox_staging.zip
+scripts/**/*.sqlite
+scripts/**/*.duckdb
+scripts/**/*.duckdb.*
+scripts/logs/
+scripts/*.zip
+
+# Secrets (repo-local credentials; never commit)
+secrets/
+
+# live test output (private only)
+live_tests/results.txt
+
+# Pipeline cwd artifacts (pytest / sandbox recipes use Path.cwd())
+results.csv
+schema_overrides.json
+schema_overrides.applied.json
+schema_overrides.applied.schema.json
+schema_overrides.applied.*.json
+
+# Accidental sandbox zip extract (data.zip itself is package data)
+src/aetherdialect/sandbox/data/
+
+# Local schema-migration workflow (cwd-relative)
+schema_migration_map.json
+schema_migration_map.applied.json
+schema_migration_map.*.json
 
 # Jupyter
 .ipynb_checkpoints/
@@ -48,6 +79,17 @@ live_tests/*.txt
 .env
 .env.*
 env.env
+
+# Databricks
+.databricks/
+databricks.yml
+typings/
+
+# IDE
+.vscode/
+.cursor/
+.trae/
+.idea/
 
 # OS
 .DS_Store

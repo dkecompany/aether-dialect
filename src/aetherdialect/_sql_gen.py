@@ -1,119 +1,174 @@
-"""
-Deterministic SQL building, FK join enumeration, repair prompts, and canonical join/predicate normalisation.
-
-Each backend uses its own AST library exclusively: pglast for PostgreSQL, sqlglot (Spark dialect) for Databricks.
-
-The:class:`~aetherdialect._dialect.Dialect` adapter exposes ``parse_select``, ``ordered_join_carrier_froms``, ``attach_joins``, and ``emit_sql`` so this module never names a parser library directly.
-"""
+"""Deterministic SQL building, FK join enumeration, repair prompts, and canonical join/predicate normalisation. Each registered engine uses its own AST path via the :class:`~aetherdialect._dialect.Dialect` adapter (pglast for PostgreSQL; sqlglot for all other engines). The adapter exposes ``parse_select``, ``ordered_join_carrier_froms``, ``attach_joins``, and ``emit_sql`` so this module never names a parser library directly."""
 
 from __future__ import annotations
 
 import itertools
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from copy import deepcopy
 from enum import Enum
 from typing import Any, Literal
 
 from sqlglot import exp, parse_one
 
-from ._config import (
+from ._config import PolicyConfig
+from ._constants import (
+    CANONICAL_FEEDBACK_DIALECT,
     JOIN_CHOICE_SCOPE_MAIN,
     JOIN_EDGE_KIND_RANK,
+    JOIN_PRIOR_FEEDBACK_HEADING,
     SCALAR_FUNCTIONS_LEADING_ARG,
     SQL_WINDOW_FUNCTION_UPPER,
-    PolicyConfig,
 )
 from ._contracts_base import (
-    JoinInjectionAlignmentError,
-    JoinInjectionFailedError,
-    LlmJsonExhausted,
-    NoJoinPathError,
-    SchemaGraph,
-    VirtualTableSpec,
-)
-from ._contracts_core import (
-    CaseWhenExpr,
     CteEmissionKind,
     FilterParam,
     HavingParam,
+    JoinInjectionAlignmentError,
+    JoinInjectionFailedError,
+    LlmJsonExhausted,
     MulGroup,
+    NoJoinPathError,
     NormalizedExpr,
+    OrderByCol,
+    ScalarArg,
+    expr_registry_ref,
+    register_render_expr_sql,
+)
+from ._contracts_core import (
     RuntimeCteStep,
     RuntimeIntent,
-    ScalarArg,
     SelectCol,
+    effective_select_parts,
+)
+from ._contracts_schema import (
+    CaseWhenExpr,
+    SchemaGraph,
+    VirtualTableSpec,
     WindowSpec,
     current_case_registry_steps,
     current_window_registry_steps,
-    effective_select_parts,
-    expr_registry_ref,
-    register_render_expr_sql,
     registry_render_scope,
 )
 from ._core_utils import (
     debug,
-    llm_json,
-    pipeline_trace_lazy,
+    pipeline_trace,
     stable_json,
 )
 from ._dialect import Dialect, JoinEdge, get_dialect
-from ._validation_schema import get_col_meta
+from ._intent_expr import extract_columns_from_expr
+from ._llm_provider import llm_json
+from ._validation_schema import get_col_meta, get_col_type
 
-JOIN_PRIOR_FEEDBACK_HEADING: str = "Previously rejected joins for this question (avoid these table sets / FK paths):"
+_SQL_GEN_SCHEMA: ContextVar[SchemaGraph | None] = ContextVar("_SQL_GEN_SCHEMA", default=None)
+_SQL_GEN_CTE_OUTPUTS: ContextVar[dict[str, Any] | None] = ContextVar("_SQL_GEN_CTE_OUTPUTS", default=None)
 
 
-def _databricks_unqualify_agg_arg_sql(sql: str) -> str:
-    """
-    For Spark/Databricks output, drop table qualifiers on the first argument of
-    ``COUNT`` / ``SUM`` / ``AVG`` / ``MIN`` / ``MAX`` within *sql*.
+@contextmanager
+def sql_gen_type_scope(
+    schema: SchemaGraph | None,
+    cte_outputs: dict[str, Any] | None = None,
+) -> Iterator[None]:
+    """Bind schema and CTE output metadata for operand type checks during expression render."""
+    token_schema = _SQL_GEN_SCHEMA.set(schema)
+    token_cte = _SQL_GEN_CTE_OUTPUTS.set(cte_outputs or {})
+    try:
+        yield
+    finally:
+        _SQL_GEN_SCHEMA.reset(token_schema)
+        _SQL_GEN_CTE_OUTPUTS.reset(token_cte)
 
-    Args:
 
-        sql: Rendered fragment (argument or ``ORDER BY`` sub-expression).
+def _mulgroup_value_kind(g: MulGroup) -> str | None:
+    """Return ``date``, ``integer``, ``number``, or ``None`` from column metadata when schema is bound."""
+    schema = _SQL_GEN_SCHEMA.get()
+    if schema is None:
+        return None
+    cte_outputs = _SQL_GEN_CTE_OUTPUTS.get() or {}
+    kinds: set[str] = set()
+    for term in g.multiply + g.divide:
+        for col in extract_columns_from_expr(term):
+            vt = get_col_type(col, schema, cte_outputs)
+            if vt == "date":
+                kinds.add("date")
+            elif vt == "integer":
+                kinds.add("integer")
+            elif vt == "number":
+                kinds.add("number")
+            elif vt:
+                kinds.add("other")
+    if "date" in kinds and len(kinds) == 1:
+        return "date"
+    if kinds <= {"integer"}:
+        return "integer"
+    if kinds <= {"number", "integer"}:
+        return "number"
+    return None
 
-    Returns:
 
-        Possibly rewritten SQL text.
-    """
+def _literal_param_is_integer_day(value: Any) -> bool:
+    try:
+        int(value)
+        return True
+    except (TypeError, ValueError):
+        return False
 
+
+def _operands_are_date_minus_date(base: MulGroup, offset: MulGroup) -> bool:
+    return _mulgroup_value_kind(base) == "date" and _mulgroup_value_kind(offset) == "date"
+
+
+def _operands_are_numeric_minus_numeric(base: MulGroup, offset: MulGroup) -> bool:
+    base_kind = _mulgroup_value_kind(base)
+    offset_kind = _mulgroup_value_kind(offset)
+    return base_kind in ("number", "integer") and offset_kind in ("number", "integer")
+
+
+def _operands_allow_date_integer_days(
+    base: MulGroup,
+    offset: MulGroup | None,
+    *,
+    offset_literal: Any | None = None,
+) -> bool:
+    if _mulgroup_value_kind(base) != "date":
+        return False
+    if offset_literal is not None:
+        return _literal_param_is_integer_day(offset_literal)
+    if offset is not None:
+        return _mulgroup_value_kind(offset) in ("integer", "number")
+    return False
+
+
+def databricks_unqualify_agg_arg_sql(sql: str) -> str:
+    """For Spark/Databricks output, drop table qualifiers on the first. argument of ``COUNT`` / ``SUM`` / ``AVG`` / ``MIN`` / ``MAX`` within *sql*."""
     if not (sql and sql.strip()):
         return sql
     try:
-        tree = parse_one(sql, dialect="spark")
+        tree = parse_one(sql, dialect="databricks")
     except Exception:
         return sql
     if isinstance(tree, exp.Column) and tree.table:
         tree.set("table", None)
-        return tree.sql(dialect="spark")
+        return tree.sql(dialect="databricks")
     for cls in (exp.Count, exp.Sum, exp.Avg, exp.Min, exp.Max):
         for node in tree.find_all(cls):
             first = getattr(node, "this", None)
             if isinstance(first, exp.Column) and first.table:
                 first.set("table", None)
-    return tree.sql(dialect="spark")
+    return tree.sql(dialect="databricks")
 
 
 def _maybe_databricks_unqualify_window_sql_frag(sql: str, dialect: Dialect | None) -> str:
-    """Apply :func:`_databricks_unqualify_agg_arg_sql` only on Databricks dialect."""
-
-    if dialect is None or getattr(dialect, "name", "") != "databricks":
+    """Apply dialect window-aggregate normalization when supported."""
+    if dialect is None:
         return sql
-    return _databricks_unqualify_agg_arg_sql(sql)
+    return dialect.normalize_window_agg_sql_frag(sql)
 
 
 def cte_to_intent_for_ranking(cte: RuntimeCteStep) -> RuntimeIntent:
-    """
-    Build a synthetic `RuntimeIntent` from `RuntimeCteStep` for CTE-scope join enumeration.
-
-    Args:
-
-        cte: CTE step whose body defines the local join scope.
-
-    Returns:
-
-        A minimal intent mirroring the CTE body lists and limits.
-    """
+    """Build a synthetic `RuntimeIntent` from `RuntimeCteStep` for CTE- scope join enumeration."""
     return RuntimeIntent(
         tables=cte.tables,
         grain=cte.grain,
@@ -131,18 +186,54 @@ def cte_to_intent_for_ranking(cte: RuntimeCteStep) -> RuntimeIntent:
     )
 
 
+def join_signature_tables(sig: list[str]) -> set[str]:
+    """Extract physical table names referenced in a join path signature."""
+    tables: set[str] = set()
+    for item in sig:
+        if "->" not in item:
+            continue
+        left, right = item.split("->", 1)
+        tables.add(left.split(".")[0].strip())
+        tables.add(right.split(".")[0].strip())
+    return tables
+
+
+def join_candidate_spans_tables(candidate: dict[str, Any], scope_tables: list[str]) -> bool:
+    """Return True when a candidate's join path touches every table in *scope_tables*."""
+    sig = candidate.get("join_path_signature") or []
+    if not isinstance(sig, list):
+        return False
+    covered = join_signature_tables([str(x) for x in sig])
+    return set(scope_tables) <= covered
+
+
+def _compose_hybrid_fk_semantic_paths(
+    base_paths: list[list[dict[str, Any]]],
+    sem_paths: list[list[dict[str, Any]]],
+    target: frozenset[str],
+    schema: SchemaGraph,
+) -> list[list[dict[str, Any]]]:
+    """Attach semantic bridge edge(s) onto FK-spanning backbones for partial connectivity."""
+    if len(target) < 2 or not sem_paths:
+        return []
+    out: list[list[dict[str, Any]]] = []
+    seen: set[tuple[str, ...]] = set()
+    bases = [p for p in base_paths if p] or [[]]
+    for base in bases:
+        extended = _extend_join_paths_with_bridges([base], sem_paths, target, schema)
+        for path in extended:
+            if not _path_has_semantic_edge(path):
+                continue
+            sig = _join_edge_sig_tuple(path, schema)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            out.append(path)
+    return out
+
+
 def join_candidate_map(join_hints: dict[str, Any]) -> dict[str, list[str]]:
-    """
-    Build map from candidate ID to join path signature.
-
-    Args:
-
-        join_hints: The join hints dict produced by `join_hints_multi`.
-
-    Returns:
-
-        Dict mapping `candidate_id` to list of join path signature strings.
-    """
+    """Build map from candidate ID to join path signature."""
     out: dict[str, list[str]] = {}
     for c in join_hints.get("candidates", []):
         cid = c.get("candidate_id")
@@ -153,17 +244,7 @@ def join_candidate_map(join_hints: dict[str, Any]) -> dict[str, list[str]]:
 
 
 def _analyze_join_topology(sig: list[str]) -> tuple[str, str, list[str]]:
-    """
-    Analyze join signature to determine topology type, hub table, and leaf tables.
-
-    Args:
-
-        sig: List of join path signature strings.
-
-    Returns:
-
-        the list of endpoint tables.
-    """
+    """Analyze join signature to determine topology type, hub table, and. leaf tables."""
     if not sig:
         return ("none", "", [])
     table_counts: dict[str, int] = {}
@@ -200,31 +281,17 @@ def _analyze_join_topology(sig: list[str]) -> tuple[str, str, list[str]]:
 
 
 def _wrap_for_case_insensitive(expr: str, dialect: Dialect) -> str:
-    """
-    Wrap expression for case-insensitive string comparison.
-
-    Args:
-
-        expr: SQL expression fragment to wrap.
-
-        dialect: Active database dialect.
-
-    Returns:
-
-        SQL fragment for case-insensitive comparison of `expr`.
-    """
+    """Wrap expression for case-insensitive string comparison."""
     return dialect.render_case_insensitive_wrap(expr)
 
 
 def _phys_table_key(tbl: str) -> str:
     """Return the unqualified lowercase table name for join bookkeeping."""
-
     return tbl.split(".")[-1].strip().strip('"').strip("`").lower()
 
 
 def _table_sql_token(tbl: str) -> str:
     """Unqualified table token suitable for SQL references (preserves casing of last segment)."""
-
     return tbl.split(".")[-1].strip().strip('"').strip("`")
 
 
@@ -234,12 +301,7 @@ def _join_kind_for_edge(
     cols_on_join: list[str],
     schema: SchemaGraph | None,
 ) -> str:
-    """
-    Return ``LEFT`` or ``INNER`` join modifier (leading space) for one edge.
-
-    ``LEFT`` is emitted only when the joining FK column on the source side is nullable; otherwise ``INNER``. Dimension-role bias is intentionally not used here.
-    """
-
+    """Return ``LEFT`` or ``INNER`` join modifier (leading space) for one edge. ``LEFT`` is emitted only when the joining FK column on the source side is nullable; otherwise ``INNER``. Dimension-role bias is intentionally not used here."""
     if schema is None:
         return " INNER"
     tmeta = schema.tables.get(join_tbl)
@@ -272,186 +334,6 @@ def _join_on_equality_sql(
     return f"{left_tbl}.{lc} = {right_tbl}.{rc}"
 
 
-def _join_clause_from_signature(
-    signature: list[str],
-    from_table: str = "",
-    schema: SchemaGraph | None = None,
-    dialect: Dialect | None = None,
-) -> str:
-    """
-    Build JOIN clause text from a join path signature.
-
-    Args:
-
-        signature: Description.
-
-        from_table: Optional FROM table name; tables already in the chain are tracked to avoid duplicate JOINs.
-
-        schema: Optional schema graph used to choose `LEFT` vs `INNER` join from table role.
-
-    Returns:
-
-        `signature` is empty.
-    """
-    if not signature:
-        return ""
-    edges: list[tuple[int, str, str, list[str], list[str], str, str]] = []
-    for idx, seg in enumerate(signature):
-        seg = seg.strip()
-        if "->" not in seg:
-            continue
-        left_part, right_part = seg.split("->", 1)
-        left_part = left_part.strip()
-        right_part = right_part.strip()
-        if "." not in left_part or "." not in right_part:
-            continue
-        left_tbl, left_cols = left_part.split(".", 1)
-        right_tbl, right_cols = right_part.split(".", 1)
-        left_col_list = [c.strip() for c in left_cols.split(",")]
-        right_col_list = [c.strip() for c in right_cols.split(",")]
-        on_terms_join = [
-            _join_on_equality_sql(left_tbl, lc, right_tbl, rc, dialect)
-            for lc, rc in zip(left_col_list, right_col_list, strict=False)
-        ]
-        if not on_terms_join:
-            continue
-        on_sql = " AND ".join(on_terms_join)
-        edges.append(
-            (
-                idx,
-                left_tbl,
-                right_tbl,
-                left_col_list,
-                right_col_list,
-                on_sql,
-                left_tbl + right_tbl,
-            ),
-        )
-    if not edges:
-        return ""
-    if not from_table:
-        chain: set[str] = set()
-        parts_legacy: list[str] = []
-        for (
-            _idx,
-            left_tbl,
-            right_tbl,
-            left_col_list,
-            right_col_list,
-            on_sql,
-            _key,
-        ) in edges:
-            right_tbl_lower = right_tbl.lower()
-            if right_tbl_lower in chain:
-                join_tbl = left_tbl
-            else:
-                join_tbl = right_tbl
-            join_key = join_tbl.strip().lower()
-            if join_key in chain:
-                continue
-            chain.add(join_key)
-            if join_tbl == left_tbl:
-                cols_on_join = left_col_list
-                paired_tbl = right_tbl
-            else:
-                cols_on_join = right_col_list
-                paired_tbl = left_tbl
-            join_kind = _join_kind_for_edge(join_tbl, paired_tbl, cols_on_join, schema)
-            parts_legacy.append(f"{join_kind} JOIN {join_tbl} ON {on_sql}")
-        return "".join(parts_legacy)
-    anchor = from_table.strip()
-    anchor_key = _phys_table_key(anchor)
-    phys_instances: dict[str, list[str]] = defaultdict(list)
-    phys_instances[anchor_key].append(_table_sql_token(anchor))
-    parts: list[str] = []
-    unused: list[tuple[int, str, str, list[str], list[str], str, str]] = list(edges)
-    while unused:
-        frontier: list[tuple[int, int, str, str, str, list[str], str]] = []
-        for u_idx, (
-            sig_i,
-            left_tbl,
-            right_tbl,
-            lcols,
-            rcols,
-            _on_sql,
-            _ek,
-        ) in enumerate(unused):
-            lk = _phys_table_key(left_tbl)
-            rk = _phys_table_key(right_tbl)
-            if lk == rk:
-                if len(phys_instances[lk]) < 1:
-                    continue
-                existing = phys_instances[lk][-1]
-                inst_n = len(phys_instances[lk]) + 1
-                new_alias = f"{_table_sql_token(left_tbl)}__sj{inst_n}"
-                on_new = " AND ".join(
-                    _join_on_equality_sql(existing, lc, new_alias, rc, dialect)
-                    for lc, rc in zip(lcols, rcols, strict=False)
-                )
-                join_kind = _join_kind_for_edge(
-                    _table_sql_token(left_tbl),
-                    _table_sql_token(right_tbl),
-                    lcols,
-                    schema,
-                )
-                frontier.append(
-                    (
-                        sig_i,
-                        u_idx,
-                        left_tbl,
-                        new_alias,
-                        on_new,
-                        lcols,
-                        f"SELF::{new_alias}",
-                    ),
-                )
-                continue
-            li = lk in phys_instances and bool(phys_instances[lk])
-            ri = rk in phys_instances and bool(phys_instances[rk])
-            if li and ri:
-                continue
-            if li:
-                join_tbl, paired_tbl, cols_on_join = right_tbl, left_tbl, rcols
-                existing = phys_instances[lk][-1]
-            elif ri:
-                join_tbl, paired_tbl, cols_on_join = left_tbl, right_tbl, lcols
-                existing = phys_instances[rk][-1]
-            else:
-                continue
-            join_k = _phys_table_key(join_tbl)
-            if join_k in phys_instances:
-                continue
-            new_tok = _table_sql_token(join_tbl)
-            if join_tbl == right_tbl:
-                on_new = " AND ".join(
-                    _join_on_equality_sql(existing, lc, new_tok, rc, dialect)
-                    for lc, rc in zip(lcols, rcols, strict=False)
-                )
-            else:
-                on_new = " AND ".join(
-                    _join_on_equality_sql(new_tok, lc, existing, rc, dialect)
-                    for lc, rc in zip(lcols, rcols, strict=False)
-                )
-            frontier.append((sig_i, u_idx, join_tbl, paired_tbl, on_new, cols_on_join, new_tok))
-        if not frontier:
-            break
-        sig_i, u_idx, join_tbl, paired_tbl, on_new, cols_on_join, extra = min(
-            frontier,
-            key=lambda t: (t[0], _phys_table_key(t[2]), _phys_table_key(t[3])),
-        )
-        unused.pop(u_idx)
-        join_kind = _join_kind_for_edge(join_tbl, paired_tbl, cols_on_join, schema)
-        if isinstance(extra, str) and extra.startswith("SELF::"):
-            new_alias = extra.split("SELF::", 1)[1]
-            parts.append(f"{join_kind} JOIN {join_tbl} AS {new_alias} ON {on_new}")
-            phys_instances[_phys_table_key(join_tbl)].append(new_alias)
-        else:
-            new_tok = extra
-            parts.append(f"{join_kind} JOIN {join_tbl} ON {on_new}")
-            phys_instances[_phys_table_key(join_tbl)].append(new_tok)
-    return "".join(parts)
-
-
 _WHERE_BUCKET_EDGE_KINDS: frozenset[str] = frozenset({"semantic_profile", "semantic_profile_virtual"})
 
 
@@ -462,11 +344,7 @@ def _partition_path_join_vs_where(
     list[tuple[int, str, str, list[str], list[str]]],
     list[tuple[int, str, str, list[str], list[str]]],
 ]:
-    """
-    Split parsed path segments into JOIN-bucket and WHERE-bucket edges by ``edge_kinds``.
-
-    Each returned tuple is ``(orig_index, left_tbl, right_tbl, left_cols, right_cols)`` parsed from the signature. WHERE-bucket edges are those whose corresponding kind is in :data:`_WHERE_BUCKET_EDGE_KINDS` (Tier-B semantic edges); all other kinds (including missing or unknown) flow into the JOIN bucket.
-    """
+    """Split parsed path segments into JOIN-bucket and WHERE-bucket edges by ``edge_kinds``. Each returned tuple is ``(orig_index, left_tbl, right_tbl, left_cols, right_cols)`` parsed from the signature. WHERE-bucket edges are those whose corresponding kind is in :data:`_WHERE_BUCKET_EDGE_KINDS` (Tier-B semantic edges); all other kinds (including missing or unknown) flow into the JOIN bucket."""
     join_bucket: list[tuple[int, str, str, list[str], list[str]]] = []
     where_bucket: list[tuple[int, str, str, list[str], list[str]]] = []
     for idx, seg in enumerate(signature):
@@ -495,11 +373,7 @@ def _extra_from_tables_for_where_edges(
     where_edges: list[tuple[int, str, str, list[str], list[str]]],
     tables_already_in_from: set[str],
 ) -> list[str]:
-    """
-    Return deduplicated extra-FROM table names introduced only by WHERE-bucket edges.
-
-    Tables already covered by the anchor or JOIN tree are skipped. Order is the first appearance across the where edges.
-    """
+    """Return deduplicated extra-FROM table names introduced only by WHERE-bucket edges. Tables already covered by the anchor or JOIN tree are skipped. Order is the first appearance across the where edges."""
     seen: set[str] = set(tables_already_in_from)
     out: list[str] = []
     for _idx, left_tbl, right_tbl, _lc, _rc in where_edges:
@@ -518,16 +392,7 @@ def _join_edges_from_signature(
     from_table: str,
     schema: SchemaGraph | None = None,
 ) -> tuple[list[JoinEdge], list[JoinEdge], list[str]] | None:
-    """
-    Resolve a join-path signature into JOIN edges, WHERE-bucket edges, and extra FROM tables.
-
-    The signature is partitioned by ``edge_kinds`` into two buckets via :func:`_partition_path_join_vs_where`:
-
-    * **JOIN bucket** — Tier-A FK / virtual-bridge segments are walked outward from ``from_table`` and rendered as :class:`JoinEdge` objects suitable for :meth:`aetherdialect._dialect.Dialect.attach_joins`. * **WHERE bucket** — Tier-B semantic segments become :class:`JoinEdge` objects whose ``on_terms`` carry equality conjuncts; the dialect's :meth:`attach_extra_from_and_where` AND-injects them into ``WHERE`` and adds any missing endpoints to ``FROM``.
-
-    Self-joins are not handled by the planner — they must come from a CTE wrap. A self-join segment in the JOIN bucket therefore raises :class:`NoJoinPathError`.
-    """
-
+    """Resolve a join-path signature into JOIN edges, WHERE-bucket edges, and extra FROM tables. The signature is partitioned by ``edge_kinds`` into two buckets via :func:`_partition_path_join_vs_where`: * **JOIN bucket** — Tier-A FK / virtual-bridge segments are walked outward from ``from_table`` and rendered as :class:`JoinEdge` objects suitable for :meth:`aetherdialect._dialect.Dialect.attach_joins`. * **WHERE bucket** — Tier-B semantic segments become :class:`JoinEdge` objects whose ``on_terms`` carry equality conjuncts; the dialect's :meth:`attach_extra_from_and_where` AND-injects them into ``WHERE`` and adds any missing endpoints to ``FROM``. Self-joins are not handled by the planner — they must come from a CTE wrap. A self-join segment in the JOIN bucket therefore raises :class:`NoJoinPathError`."""
     if not from_table or not signature:
         return None
     join_segments, where_segments = _partition_path_join_vs_where(signature, edge_kinds)
@@ -620,19 +485,7 @@ def _orient_join_sig_for_from(
     sig: list[str],
     from_table: str,
 ) -> list[str]:
-    """
-    Reorient join segments so that no target duplicates the FROM table.
-
-    Args:
-
-        sig: Description.
-
-        from_table: Current FROM table name used to flip segments whose right side matches it.
-
-    Returns:
-
-        JOIN t` artefacts when `tables[0]` sits on the target side.
-    """
+    """Reorient join segments so that no target duplicates the FROM. table."""
     if not from_table:
         return sig
     oriented: list[str] = []
@@ -650,17 +503,7 @@ def _orient_join_sig_for_from(
 
 
 def _canonicalize_join_sig_segments(oriented: list[str]) -> list[str]:
-    """
-    Sort join signature segments for star/tree topologies before SQL emission.
-
-    Args:
-
-        oriented: Join segments already oriented to the active ``FROM`` table.
-
-    Returns:
-
-        Lexicographically ordered segments when topology is star or tree; otherwise unchanged.
-    """
+    """Sort join signature segments for star/tree topologies before SQL. emission."""
     if len(oriented) <= 1:
         return oriented
     topology_type, _, _ = _analyze_join_topology(oriented)
@@ -676,12 +519,7 @@ def _try_ast_inject_joins(
     schema: SchemaGraph | None,
     dialect: Dialect,
 ) -> str | None:
-    """
-    Parse deterministic SQL via the dialect adapter, attach joins on ordered carriers, and re-render.
-
-    Returns ``None`` when parsing fails, carrier count mismatches, any slot fails to resolve structured edges, or any attach call fails.
-    """
-
+    """Parse deterministic SQL via the dialect adapter, attach joins on ordered carriers, and re-render. Returns ``None`` when parsing fails, carrier count mismatches, any slot fails to resolve structured edges, or any attach call fails."""
     parsed = dialect.parse_select(det_sql)
     if parsed is None:
         return None
@@ -755,20 +593,8 @@ def inject_join_into_deterministic_sql(
     edge_kinds_ordered: list[list[str]] | None = None,
     dialect: Dialect | None = None,
 ) -> str:
-    """
-    Attach JOIN clauses for each ordered carrier (CTE inner SELECTs left-to-right then outer SELECT) via the dialect's AST adapter and re-emit.
-
-    Returns *det_sql* unchanged when *join_sigs_ordered* is empty or *dialect* is ``None``.
-
-    Raises:class:`JoinInjectionAlignmentError` when the carrier count from the dialect does not match ``join_sigs_ordered``.
-
-    Raises:class:`JoinInjectionFailedError` when parsing fails, no join anchor can be read, edges cannot be resolved, or AST attach/emit fails.
-
-    The AST path preserves ``:pN`` / ``:sN`` placeholders verbatim.
-
-        ``edge_kinds_ordered`` carries one parallel per-segment kind list per carrier; segments with a kind in :data:`_WHERE_BUCKET_EDGE_KINDS` (Tier-B semantic edges) are routed through :meth:`aetherdialect._dialect.Dialect.attach_extra_from_and_where` instead of ``JOIN ... ON``.
-    """
-    pipeline_trace_lazy(
+    """Attach JOIN clauses for each ordered carrier (CTE inner SELECTs. left-to-right then outer SELECT) via the dialect's AST adapter and re-emit. Returns *det_sql* unchanged when *join_sigs_ordered* is empty or *dialect* is ``None``."""
+    pipeline_trace(
         "sql_gen.inject_join_into_deterministic_sql.input",
         lambda: stable_json(
             {
@@ -784,20 +610,20 @@ def inject_join_into_deterministic_sql(
     try:
         ast_out = _try_ast_inject_joins(det_sql, join_sigs_ordered, kinds_in, schema, dialect)
     except JoinInjectionAlignmentError as exc:
-        pipeline_trace_lazy(
+        pipeline_trace(
             "sql_gen.inject_join.alignment_failed",
-            lambda err=exc: stable_json(
+            stable_json(
                 {
                     "det_sql": det_sql,
                     "join_sigs_ordered": join_sigs_ordered,
                     "edge_kinds_ordered": kinds_in,
-                    "error": str(err),
+                    "error": str(exc),
                 }
             ),
         )
         raise
     if ast_out is None:
-        pipeline_trace_lazy(
+        pipeline_trace(
             "sql_gen.inject_join_into_deterministic_sql.ast_failed",
             lambda: stable_json(
                 {
@@ -813,7 +639,7 @@ def inject_join_into_deterministic_sql(
             join_sigs_ordered=list(join_sigs_ordered),
             edge_kinds_ordered=list(kinds_in),
         )
-    pipeline_trace_lazy(
+    pipeline_trace(
         "sql_gen.inject_join_into_deterministic_sql.output",
         lambda: stable_json({"sql": ast_out}),
     )
@@ -821,22 +647,7 @@ def inject_join_into_deterministic_sql(
 
 
 def _canonical_join_edge_string(schema: SchemaGraph | None, e: dict[str, Any]) -> str:
-    """
-    Build one undirected join edge string in a stable orientation.
-
-    When *schema* is provided, a physical edge matching a declared catalog ``FKEdge`` is oriented as ``src->dst`` from that edge. Otherwise, lexicographic ``src_table`` / ``dst_table`` order breaks ties for inferred or virtual edges.
-
-    Args:
-
-        schema: Optional schema graph for catalog FK lookup.
-
-        e: Edge dict with ``src_table``, ``src_cols``, ``dst_table``, ``dst_cols``.
-
-    Returns:
-
-        A single ``table.col,...->table.col,...`` fragment.
-    """
-
+    """Build one undirected join edge string in a stable orientation. When *schema* is provided, a physical edge matching a declared catalog ``FKEdge`` is oriented as ``src->dst`` from that edge. Otherwise, lexicographic ``src_table`` / ``dst_table`` order breaks ties for inferred or virtual edges."""
     st = str(e["src_table"])
     dt = str(e["dst_table"])
     sc = [str(c) for c in e["src_cols"]]
@@ -870,37 +681,12 @@ def _join_path_signature_for_path(
     path: list[dict[str, Any]],
     schema: SchemaGraph | None = None,
 ) -> list[str]:
-    """
-    Generate signature strings for each edge on a join path.
-
-    Args:
-
-        path: Ordered edge dicts for one candidate path.
-
-        schema: Optional graph used to orient catalog FK edges consistently.
-
-    Returns:
-
-        One string per edge, each ``src.cols->dst.cols`` in canonical orientation.
-    """
-
+    """Generate signature strings for each edge on a join path."""
     return [_canonical_join_edge_string(schema, e) for e in path]
 
 
 def _candidate_join_paths_for_tables(schema: SchemaGraph, tables: list[str]) -> list[list[dict[str, Any]]]:
-    """
-    Compute all candidate join paths for a set of tables by trying every table as root.
-
-    Args:
-
-        schema: The schema graph containing pre-computed join paths.
-
-        tables: List of table names that must all be reachable in each candidate.
-
-    Returns:
-
-        when no direct paths exist.
-    """
+    """Compute all candidate join paths for a set of tables by trying. every table as root."""
     tables = sorted(set(tables))
     if len(tables) < 2:
         return [[]]
@@ -917,7 +703,7 @@ def _candidate_join_paths_for_tables(schema: SchemaGraph, tables: list[str]) -> 
 
             List of edges with duplicate logical pairs removed.
         """
-        seen: set = set()
+        seen: set[tuple[Any, ...]] = set()
         out: list[dict[str, Any]] = []
         for e in edges:
             pair = (
@@ -934,19 +720,7 @@ def _candidate_join_paths_for_tables(schema: SchemaGraph, tables: list[str]) -> 
     table_set = set(tables)
 
     def _edges_cover_tables(edges: list[dict[str, Any]], root: str) -> set[str]:
-        """
-        Collect all table names reachable from edges plus the given root.
-
-        Args:
-
-            edges: List of join edge dicts.
-
-            root: Root table name always included in the covered set.
-
-        Returns:
-
-            Set of table names appearing in `edges` union `{root}`.
-        """
+        """Collect all table names reachable from edges plus the given. root. Args: edges: List of join edge dicts. root: Root table name always included in the covered set. Returns: Set of table names appearing in `edges` union `{root}`."""
         covered = {root}
         for e in edges:
             covered.add(e["src_table"])
@@ -954,22 +728,7 @@ def _candidate_join_paths_for_tables(schema: SchemaGraph, tables: list[str]) -> 
         return covered
 
     def _merge_paths_cartesian(root: str, others: list[str], allow_bridges: bool) -> list[list[dict[str, Any]]]:
-        """
-        Merge shortest-path ties from root to every other table via a capped cross-product.
-
-        Args:
-
-            root: Root table for path lookup in ``schema.join_paths_multi``.
-
-            others: Tables that must be connected via merged edges.
-
-            allow_bridges: When false, path endpoints must stay within the intent table set.
-
-        Returns:
-
-            Distinct merged edge lists, each covering every required table when possible.
-        """
-
+        """Merge shortest-path ties from root to every other table via. a. capped cross-product. Args: root: Root table for path lookup in ``schema.join_paths_multi``. others: Tables that must be connected via merged edges. allow_bridges: When false, path endpoints must stay within the intent table set. Returns: Distinct merged edge lists, each covering every required table when possible."""
         max_out = max(1, int(PolicyConfig.JOIN_CANDIDATE_CROSS_PRODUCT_CAP))
         others_sorted = sorted(others)
         if not others_sorted:
@@ -1012,19 +771,9 @@ def _candidate_join_paths_for_tables(schema: SchemaGraph, tables: list[str]) -> 
                 break
         return out_merges
 
-    def _collect(allow_bridges: bool) -> dict[tuple, list[dict[str, Any]]]:
-        """
-        Enumerate deduped join path candidates for all roots under bridge policy.
-
-        Args:
-
-            allow_bridges: Description.
-
-        Returns:
-
-            unique path shape.
-        """
-        candidates: dict[tuple, list[dict[str, Any]]] = {}
+    def _collect(allow_bridges: bool) -> dict[tuple[Any, ...], list[dict[str, Any]]]:
+        """Enumerate deduped join path candidates for all roots under. bridge policy. Args: allow_bridges: Description. Returns: unique path shape."""
+        candidates: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
         for root in tables:
             others = [t for t in tables if t != root]
             for merged in _merge_paths_cartesian(root, others, allow_bridges):
@@ -1094,9 +843,8 @@ def _tag_physical_join_path(path: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "dst_cols": list(e["dst_cols"]),
         }
         tag = e.get("inference_tag")
-        assert tag != "user_override_semantic", (
-            "user_override_semantic must be routed through semantic_join_neighbors, not as an FKEdge"
-        )
+        _semantic_edge_msg = "user_override_semantic must be routed through semantic_join_neighbors, not as an FKEdge"
+        assert tag != "user_override_semantic", _semantic_edge_msg
         if tag is None or tag == "" or tag == "catalog" or tag == "user_override_structural":
             d["edge_kind"] = "catalog_fk"
         elif tag == "self":
@@ -1154,7 +902,7 @@ def _collect_virtual_bridge_single_edges(
             and src_t in virt_names
             and dst_t in virt_names
         ):
-            pipeline_trace_lazy(
+            pipeline_trace(
                 "pipeline.join_resolve.skip_bridge_for_same_lineage_ctes",
                 lambda: stable_json({"edge_kind": ek, "src_table": src_t, "dst_table": dst_t}),
             )
@@ -1322,22 +1070,22 @@ def _extend_join_paths_with_bridges(
             out_map.setdefault(_join_edge_sig_tuple(acc, schema), acc)
 
     if not out_map:
-        acc: list[dict[str, Any]] = []
+        bridge_acc: list[dict[str, Any]] = []
         steps = 0
-        while not (target <= _nodes_in_join_path(acc)) and steps < max_steps:
+        while not (target <= _nodes_in_join_path(bridge_acc)) and steps < max_steps:
             steps += 1
-            before = len(_nodes_in_join_path(acc))
+            before = len(_nodes_in_join_path(bridge_acc))
             progressed = False
             for br in bridges_sorted:
-                acc2 = _dedupe_edges_stable(acc + br)
+                acc2 = _dedupe_edges_stable(bridge_acc + br)
                 if len(_nodes_in_join_path(acc2)) > before:
-                    acc = acc2
+                    bridge_acc = acc2
                     progressed = True
                     break
             if not progressed:
                 break
-        if target <= _nodes_in_join_path(acc):
-            out_map.setdefault(_join_edge_sig_tuple(acc, schema), acc)
+        if target <= _nodes_in_join_path(bridge_acc):
+            out_map.setdefault(_join_edge_sig_tuple(bridge_acc, schema), bridge_acc)
 
     return list(out_map.values())
 
@@ -1346,11 +1094,7 @@ def _path_uses_only_visible_columns(
     path: list[dict[str, Any]],
     schema: SchemaGraph,
 ) -> bool:
-    """
-    Return True iff every physical-table column referenced by *path* edges is visible.
-
-    Virtual (CTE) columns are not gated here; only physical schema columns are checked against :attr:`ColumnMetadata.is_visible`. Used to filter LLM-facing join candidates so denied or hidden-sensitivity columns never appear in any rendered signature.
-    """
+    """Return True iff every physical-table column referenced by *path* edges is visible. Virtual (CTE) columns are not gated here; only physical schema columns are checked against :attr:`ColumnMetadata.is_visible`. Used to filter LLM-facing join candidates so denied or hidden-sensitivity columns never appear in any rendered signature."""
     for edge in path:
         for tbl_key, cols_key in (("src_table", "src_cols"), ("dst_table", "dst_cols")):
             tbl = edge.get(tbl_key)
@@ -1359,7 +1103,7 @@ def _path_uses_only_visible_columns(
             tmeta = schema.tables[tbl]
             for col in edge.get(cols_key, []) or []:
                 cm = tmeta.columns.get(col)
-                if cm is not None and not cm.is_visible:
+                if cm is not None and (not cm.is_visible or not cm.is_selectable):
                     return False
     return True
 
@@ -1369,21 +1113,7 @@ def enumerate_join_paths_base(
     schema: SchemaGraph,
     virtual_specs: dict[str, VirtualTableSpec],
 ) -> list[list[dict[str, Any]]]:
-    """
-    Enumerate FK-derived and virtual-bridge join paths covering all scope tables.
-
-    Args:
-
-        scope_tables: Physical and virtual (CTE) names in this join scope.
-
-        schema: Physical schema graph.
-
-        virtual_specs: Virtual column specs keyed by CTE name.
-
-    Returns:
-
-        Edge lists with ``edge_kind`` on each edge; empty inner list when impossible.
-    """
+    """Enumerate FK-derived and virtual-bridge join paths covering all. scope tables."""
     stable_scope = list(dict.fromkeys(scope_tables))
     if len(stable_scope) < 2:
         return [[]]
@@ -1420,23 +1150,7 @@ def enumerate_semantic_paths(
     schema: SchemaGraph,
     virtual_specs: dict[str, VirtualTableSpec],
 ) -> list[list[dict[str, Any]]]:
-    """
-    Build single-edge semantic paths from profiled ``semantic_join_neighbors`` on physical
-    columns (and the same lists lifted onto virtual CTE columns), plus an overlap pass for
-    virtual–virtual pairs that is not represented on the physical graph.
-
-    Args:
-
-        scope_tables: Tables and CTE names in the join scope.
-
-        schema: Physical schema.
-
-        virtual_specs: CTE virtual column specs.
-
-    Returns:
-
-        One-edge paths using ``semantic_profile`` / ``semantic_profile_virtual`` kinds.
-    """
+    """Build single-edge semantic paths from profiled. ``semantic_join_neighbors`` on physical columns (and the same lists lifted onto virtual CTE columns), plus an overlap pass for virtual–virtual pairs that is not represented on the physical graph."""
     scope_set = set(scope_tables)
     out: list[list[dict[str, Any]]] = []
     seen: set[tuple[tuple[str, str], tuple[str, str]]] = set()
@@ -1549,25 +1263,7 @@ def tables_in_join_scope(
     schema: SchemaGraph,
     virtual_specs: dict[str, VirtualTableSpec],
 ) -> list[str]:
-    """
-    Return declared names that resolve to physical tables or non-scalar virtual CTE specs.
-
-    Scalar-subquery CTEs (``emission == "scalar_subquery"``) are excluded from the join scope:
-    they are CROSS JOIN'd into the FROM list at render time and do not participate in
-    physical / virtual FK enumeration.
-
-    Args:
-
-        tables: Intent or CTE ``tables`` list.
-
-        schema: Physical schema graph.
-
-        virtual_specs: Map of CTE name to virtual table spec.
-
-    Returns:
-
-        Stable-unique names in first-seen order.
-    """
+    """Return declared names that resolve to physical tables or non- scalar virtual CTE specs. Scalar-subquery CTEs (``emission == "scalar_subquery"``) are excluded from the join scope: they are CROSS JOIN'd into the FROM list at render time and do not participate in physical / virtual FK enumeration."""
     out: list[str] = []
     seen: set[str] = set()
     for t in tables or []:
@@ -1591,20 +1287,7 @@ def physical_tables_for_join_hints(
     tables: list[str] | None,
     schema: SchemaGraph,
 ) -> list[str]:
-    """
-    Return physical table names from `tables` that exist in `schema`.
-
-    Args:
-
-        tables: Declared table list, possibly mixing CTE names and bases.
-
-        schema: Loaded schema graph.
-
-    Returns:
-
-        Schema table keys in input order. The same physical table may appear more than once
-        when *tables* lists it repeatedly (self-join). CTE aliases and unknown names are dropped.
-    """
+    """Return physical table names from `tables` that exist in `schema`."""
     if not tables:
         return []
     by_lower: dict[str, str] = {k.lower(): k for k in schema.tables}
@@ -1627,27 +1310,7 @@ def join_hints_multi(
     virtual_specs: dict[str, VirtualTableSpec] | None = None,
     include_semantic: bool = False,
 ) -> dict[str, Any]:
-    """
-    Build ordered join candidates with ``edge_kinds`` and ``candidate_tier`` labels.
-
-    Args:
-
-        schema: The schema graph.
-
-        tables: Physical and virtual table names for this scope.
-
-        intent: Optional intent slice (unused for ordering after scoring removal).
-
-        prepend_paths: Deprecated; ignored.
-
-        virtual_specs: CTE virtual specs for lineage-aware bridges.
-
-        include_semantic: When true, append semantic overlap edges (extended tier).
-
-    Returns:
-
-        Dict with ``candidates`` carrying ids, signatures, ``edge_kinds``, and ``candidate_tier``.
-    """
+    """Build ordered join candidates with ``edge_kinds`` and. ``candidate_tier`` labels."""
     _ = intent
     _ = prepend_paths
     virtual_specs = virtual_specs or {}
@@ -1667,7 +1330,15 @@ def join_hints_multi(
 
     base_paths = enumerate_join_paths_base(tables, schema, virtual_specs)
     sem_paths = enumerate_semantic_paths(tables, schema, virtual_specs) if include_semantic else []
-    merged_paths = _dedupe_paths_by_sig(base_paths + sem_paths, schema)
+    hybrid_paths: list[list[dict[str, Any]]] = []
+    if include_semantic and len(tables) >= 2:
+        hybrid_paths = _compose_hybrid_fk_semantic_paths(
+            base_paths,
+            sem_paths,
+            frozenset(tables),
+            schema,
+        )
+    merged_paths = _dedupe_paths_by_sig(base_paths + sem_paths + hybrid_paths, schema)
     if not include_semantic:
         merged_paths = [p for p in merged_paths if not _path_has_semantic_edge(p)]
     ordered = _order_join_candidates_stable(merged_paths, schema)
@@ -1711,7 +1382,6 @@ def join_hints_multi(
 
 def join_choice_scope_key_cte(cte_name: str) -> str:
     """Return the canonical join-choice scope key for a CTE name."""
-
     return f"cte:{cte_name}"
 
 
@@ -1727,9 +1397,8 @@ class ScopeClass(str, Enum):
     empty = "empty"
 
 
-def _join_candidate_bucket(c: dict[str, Any]) -> Literal["fk", "semantic"]:
+def _join_candiother_date_columnucket(c: dict[str, Any]) -> Literal["fk", "semantic"]:
     """Map stored tiers to FK versus semantic buckets for join policy."""
-
     tier = c.get("candidate_tier")
     if tier in ("extended", "semantic"):
         return "semantic"
@@ -1740,14 +1409,13 @@ def split_fk_vs_semantic_candidates(
     candidates: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Partition non-``J00`` candidates into FK-style paths versus semantic tiers."""
-
     fk: list[dict[str, Any]] = []
     sem: list[dict[str, Any]] = []
     for c in candidates:
         cid = c.get("candidate_id")
         if not isinstance(cid, str) or cid == "J00":
             continue
-        if _join_candidate_bucket(c) == "semantic":
+        if _join_candiother_date_columnucket(c) == "semantic":
             sem.append(c)
         else:
             fk.append(c)
@@ -1759,12 +1427,7 @@ def classify_scope_candidates(
     *,
     needs_join: bool = True,
 ) -> ScopeClass:
-    """
-    Classify a scope's candidate list for deterministic resolution versus LLM routing.
-
-    When *needs_join* is false, an all-``J00`` payload is treated as ``single_table`` instead of ``empty``.
-    """
-
+    """Classify a scope's candidate list for deterministic resolution versus LLM routing. When *needs_join* is false, an all-``J00`` payload is treated as ``single_table`` instead of ``empty``."""
     if not candidates:
         return ScopeClass.empty if needs_join else ScopeClass.single_table
     non_j00 = [c for c in candidates if c.get("candidate_id") != "J00"]
@@ -1786,24 +1449,8 @@ def classify_scope_candidates(
     return ScopeClass.multi_fk_with_semantic
 
 
-def join_llm_needed_from_candidate_hints(
-    candidates: list[dict[str, Any]],
-    *,
-    needs_join: bool = True,
-) -> bool:
-    """Return True when join disambiguation still requires a join-choice LLM call."""
-
-    sc = classify_scope_candidates(candidates, needs_join=needs_join)
-    return sc in (
-        ScopeClass.multi_fk,
-        ScopeClass.single_fk_with_semantic,
-        ScopeClass.multi_fk_with_semantic,
-        ScopeClass.semantic_only,
-    )
-
-
 def _candidates_slice_fk_only(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    sliced = [c for c in candidates if c.get("candidate_id") == "J00" or _join_candidate_bucket(c) == "fk"]
+    sliced = [c for c in candidates if c.get("candidate_id") == "J00" or _join_candiother_date_columnucket(c) == "fk"]
     if sliced:
         return sliced
     return [c for c in candidates if c.get("candidate_id") == "J00"]
@@ -1817,13 +1464,7 @@ def join_scope_pass1_plan(
     cte_scopes: list[tuple[str, list[str], list[dict[str, Any]]]],
     forbid_na: bool,
 ) -> tuple[dict[str, str], list[dict[str, Any]], dict[str, bool], dict[str, ScopeClass]]:
-    """
-    Build preset join ids and the first-pass join-choice LLM scope list.
-
-    Raises:
-        NoJoinPathError: When a multi-table scope has no substantive candidates.
-    """
-
+    """Build preset join ids and the first-pass join-choice LLM scope. list."""
     preset: dict[str, str] = {}
     llm_scopes: list[dict[str, Any]] = []
     accept_na_by_scope: dict[str, bool] = {}
@@ -1860,23 +1501,27 @@ def join_scope_pass1_plan(
             )
             accept_na_by_scope[JOIN_CHOICE_SCOPE_MAIN] = False
         elif sc_main == ScopeClass.single_fk_with_semantic:
+            fk_slice = _candidates_slice_fk_only(main_candidates)
             llm_scopes.append(
                 {
                     "scope": JOIN_CHOICE_SCOPE_MAIN,
                     "tables": list(main_tables),
-                    "candidates": _candidates_slice_fk_only(main_candidates),
+                    "candidates": fk_slice,
                 }
             )
-            accept_na_by_scope[JOIN_CHOICE_SCOPE_MAIN] = False if forbid_na else True
+            spans = any(join_candidate_spans_tables(c, main_tables) for c in fk_slice)
+            accept_na_by_scope[JOIN_CHOICE_SCOPE_MAIN] = False if (forbid_na or spans) else True
         else:
+            fk_slice = _candidates_slice_fk_only(main_candidates)
             llm_scopes.append(
                 {
                     "scope": JOIN_CHOICE_SCOPE_MAIN,
                     "tables": list(main_tables),
-                    "candidates": _candidates_slice_fk_only(main_candidates),
+                    "candidates": fk_slice,
                 }
             )
-            accept_na_by_scope[JOIN_CHOICE_SCOPE_MAIN] = False if forbid_na else True
+            spans = any(join_candidate_spans_tables(c, main_tables) for c in fk_slice)
+            accept_na_by_scope[JOIN_CHOICE_SCOPE_MAIN] = False if (forbid_na or spans) else True
 
     for cte_name, tbls, cands in cte_scopes:
         sk = join_choice_scope_key_cte(cte_name)
@@ -1902,23 +1547,27 @@ def join_scope_pass1_plan(
             )
             accept_na_by_scope[sk] = False
         elif sc_cte == ScopeClass.single_fk_with_semantic:
+            fk_slice = _candidates_slice_fk_only(cands)
             llm_scopes.append(
                 {
                     "scope": sk,
                     "tables": list(tbls),
-                    "candidates": _candidates_slice_fk_only(cands),
+                    "candidates": fk_slice,
                 }
             )
-            accept_na_by_scope[sk] = False if forbid_na else True
+            spans = any(join_candidate_spans_tables(c, tbls) for c in fk_slice)
+            accept_na_by_scope[sk] = False if (forbid_na or spans) else True
         else:
+            fk_slice = _candidates_slice_fk_only(cands)
             llm_scopes.append(
                 {
                     "scope": sk,
                     "tables": list(tbls),
-                    "candidates": _candidates_slice_fk_only(cands),
+                    "candidates": fk_slice,
                 }
             )
-            accept_na_by_scope[sk] = False if forbid_na else True
+            spans = any(join_candidate_spans_tables(c, tbls) for c in fk_slice)
+            accept_na_by_scope[sk] = False if (forbid_na or spans) else True
 
     return preset, llm_scopes, accept_na_by_scope, scope_class
 
@@ -1932,7 +1581,6 @@ def join_scope_pass2_llm_scopes(
     virtual_specs: dict[str, VirtualTableSpec],
 ) -> list[dict[str, Any]]:
     """Build second-pass join-choice payloads with FK and semantic candidates for NA scopes."""
-
     out: list[dict[str, Any]] = []
     for sk in na_scope_keys:
         if sk == JOIN_CHOICE_SCOPE_MAIN:
@@ -1958,27 +1606,7 @@ def merge_join_hints_for_na_scopes(
     virtual_specs: dict[str, VirtualTableSpec],
     na_scopes: frozenset[str],
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
-    """
-    Rebuild join hint payloads for scopes that returned NA, keeping others on pass one.
-
-    Args:
-
-        pass1_main: First-pass main join hints.
-
-        pass1_cte: First-pass per-CTE join hints.
-
-        intent: Full runtime intent.
-
-        schema: Physical schema graph.
-
-        virtual_specs: Virtual CTE column specs.
-
-        na_scopes: ``"main"`` and/or CTE names that chose NA.
-
-    Returns:
-
-        ``(main_hints, cte_hints)`` for the second join-selector call.
-    """
+    """Rebuild join hint payloads for scopes that returned NA, keeping. others on pass one."""
     if JOIN_CHOICE_SCOPE_MAIN in na_scopes:
         scope = tables_in_join_scope(intent.tables, schema, virtual_specs)
         main = join_hints_multi(
@@ -2015,7 +1643,6 @@ def merge_join_hints_for_na_scopes(
 
 def _quote_simple_qualified_mul_token(term: str, dialect: Dialect | None) -> str:
     """Quote ``table.column`` tokens in a MulGroup multiply/divide term when *dialect* is set."""
-
     if dialect is None or not term:
         return term
     raw = term
@@ -2037,23 +1664,7 @@ def _render_scalar_func_args(
     args: list[ScalarArg] | None,
     param_keys: list[str] | None,
 ) -> list[str]:
-    """
-    Render scalar-function argument tokens, inlining literals when a param key is absent.
-
-    Args:
-
-        func_name: Scalar function name driving unit-literal formatting (``EXTRACT`` keeps
-        bare identifiers; all others quote string literals).
-
-    args: Ordered argument values from the normalized expression.
-
-        param_keys: Bind-parameter keys aligned by index with *args*; empty strings denote
-        literals that must be emitted inline rather than as ``:placeholder``.
-
-    Returns:
-
-        List of SQL token fragments ready to be joined with ``", "``.
-    """
+    """Render scalar-function argument tokens, inlining literals when a. param key is absent."""
     out: list[str] = []
     fn = (func_name or "").lower()
     keys = list(param_keys or [])
@@ -2079,7 +1690,6 @@ def _render_scalar_func_args(
 
 def _render_mul_term(node: NormalizedExpr, dialect: Dialect | None) -> str:
     """Render a multiply/divide leaf NormalizedExpr child as a SQL token."""
-
     if node.raw_sql:
         return node.raw_sql
     if node.star:
@@ -2102,19 +1712,7 @@ def _render_mul_term(node: NormalizedExpr, dialect: Dialect | None) -> str:
 
 
 def _render_group_sql(g: MulGroup, dialect: Dialect | None = None) -> str:
-    """
-    Render a MulGroup as a SQL fragment for expression guide.
-
-    Args:
-
-        g: Description.
-
-        dialect: When set, quotes bare ``table.column`` multiply/divide tokens.
-
-    Returns:
-
-        `"ROUND(SUM(:coeff * table.col), 2)"`.
-    """
+    """Render a MulGroup as a SQL fragment for expression guide."""
     if not g.multiply:
         return "1"
     if (g.scalar_func or "").lower() == "concat":
@@ -2154,33 +1752,66 @@ def _render_group_sql(g: MulGroup, dialect: Dialect | None = None) -> str:
     return mid
 
 
+def _try_render_date_integer_day_expr(expr: NormalizedExpr, dialect: Dialect | None) -> str | None:
+    """Render date-column +/- integer days when operand types match; skip date-date and numeric-numeric."""
+    if dialect is None or expr.agg_func or expr.scalar_func or expr.inner_scalar_func:
+        return None
+    if expr.add_values and len(expr.add_groups) == 1 and not expr.sub_groups and not expr.sub_values:
+        if not _operands_allow_date_integer_days(
+            expr.add_groups[0],
+            None,
+            offset_literal=expr.add_values[0].value,
+        ):
+            return None
+        base_sql = _render_group_sql(expr.add_groups[0], dialect)
+        return dialect.render_date_integer_days(base_sql, "+", str(int(expr.add_values[0].value)))
+    if expr.sub_values and len(expr.add_groups) == 1 and not expr.sub_groups and not expr.add_values:
+        if not _operands_allow_date_integer_days(
+            expr.add_groups[0],
+            None,
+            offset_literal=expr.sub_values[0].value,
+        ):
+            return None
+        base_sql = _render_group_sql(expr.add_groups[0], dialect)
+        return dialect.render_date_integer_days(base_sql, "-", str(int(expr.sub_values[0].value)))
+    if len(expr.add_groups) == 2 and not expr.sub_groups and not expr.add_values and not expr.sub_values:
+        base_group = expr.add_groups[1]
+        offset_group = expr.add_groups[0]
+        if not _operands_allow_date_integer_days(base_group, offset_group):
+            return None
+        offset_sql = _render_group_sql(offset_group, dialect)
+        base_sql = _render_group_sql(base_group, dialect)
+        return dialect.render_date_integer_days(base_sql, "+", offset_sql)
+    if len(expr.add_groups) == 1 and len(expr.sub_groups) == 1 and not expr.add_values and not expr.sub_values:
+        base_group = expr.add_groups[0]
+        offset_group = expr.sub_groups[0]
+        if _operands_are_date_minus_date(base_group, offset_group) or _operands_are_numeric_minus_numeric(
+            base_group,
+            offset_group,
+        ):
+            return None
+        if not _operands_allow_date_integer_days(base_group, offset_group):
+            return None
+        base_sql = _render_group_sql(base_group, dialect)
+        offset_sql = _render_group_sql(offset_group, dialect)
+        return dialect.render_date_integer_days(base_sql, "-", offset_sql)
+    return None
+
+
 def render_expr_sql(expr: NormalizedExpr, dialect: Dialect | None = None) -> str:
-    """
-    Render a NormalizedExpr as a SQL fragment for expression guide.
-
-    Args:
-
-        expr: Description.
-
-        dialect: When set, quotes bare ``table.column`` tokens inside groups.
-
-    Returns:
-
-        SQL fragment string that the LLM should produce for this expression.
-    """
-
+    """Render a NormalizedExpr as a SQL fragment for expression guide."""
     ref = expr_registry_ref(expr) or ""
     if ref.startswith("w"):
         win_by = {s.registry_id: s for s in current_window_registry_steps()}
-        step = win_by.get(ref)
-        if step is not None:
-            return _render_window_over_sql(step.window_spec, dialect)
+        win_step = win_by.get(ref)
+        if win_step is not None:
+            return _render_window_over_sql(win_step.window_spec, dialect)
         return "0"
     if ref.startswith("c"):
         case_by = {s.registry_id: s for s in current_case_registry_steps()}
-        step = case_by.get(ref)
-        if step is not None:
-            return _render_case_when_sql(step.case_when, dialect)
+        case_step = case_by.get(ref)
+        if case_step is not None:
+            return _render_case_when_sql(case_step.case_when, dialect)
         return "0"
     sl = (expr.string_literal or "").strip()
     if sl:
@@ -2207,6 +1838,9 @@ def render_expr_sql(expr: NormalizedExpr, dialect: Dialect | None = None) -> str
             return expr.raw_sql
         if expr.cast_type or expr.interval is not None:
             return _render_mul_term(expr, dialect)
+    date_int = _try_render_date_integer_day_expr(expr, dialect)
+    if date_int is not None:
+        return date_int
     parts: list[str] = []
     for g in expr.add_groups:
         parts.append(_render_group_sql(g, dialect))
@@ -2250,26 +1884,7 @@ def classify_cte_emission(
     intent: RuntimeIntent,
     schema: SchemaGraph | None,
 ) -> CteEmissionKind:
-    """
-    Decide whether a CTE renders as a regular join table or a single-row CROSS JOIN scalar.
-
-    Args:
-
-        cte: CTE step after structural normalization.
-
-        intent: Full intent (unused; kept for API stability).
-
-        schema: Physical schema; unused.
-
-    Returns:
-
-        ``scalar_subquery`` only when the CTE produces exactly one row at planning time:
-        ``grain == "scalar"``, exactly one output column, exactly one base table, exactly
-        one select column, that select column is aggregated, and there is no ``GROUP BY``.
-        Any deviation forces ``join_table`` so the CTE participates as a normal joinable
-        relation. Inlining as ``(SELECT ...)`` is never produced; CROSS JOIN against a real
-        ``WITH`` clause is the only scalar path.
-    """
+    """Decide whether a CTE renders as a regular join table or a single- row CROSS JOIN scalar."""
     _ = intent
     _ = schema
     if (cte.grain or "") != "scalar":
@@ -2294,25 +1909,7 @@ def classify_cte_emission(
 
 
 def _render_case_branch_sql(fp: FilterParam, dialect: Dialect | None = None) -> str:
-    """
-    Render a single filter as a SQL predicate for CASE WHEN.
-
-    Args:
-
-        fp: Description.
-
-        dialect: Optional dialect for qualified column quoting.
-
-    Returns:
-
-        SQL predicate string for one `WHEN` branch.
-
-    Raises:
-
-        ValueError: If the filter has neither a literal *right_expr* nor a *param_key*
-        and the operator is not a unary null-check, indicating the upstream pipeline
-        failed to allocate a parameter binding for the branch's literal value.
-    """
+    """Render a single filter as a SQL predicate for CASE WHEN."""
     left = render_expr_sql(fp.left_expr, dialect)
     op = fp.op or "="
     if fp.op in ("is null", "is not null"):
@@ -2332,19 +1929,7 @@ def _render_case_branch_sql(fp: FilterParam, dialect: Dialect | None = None) -> 
 
 
 def _render_case_when_sql(cw: CaseWhenExpr, dialect: Dialect | None = None) -> str:
-    """
-    Render a CASE expression for SELECT.
-
-    Args:
-
-        cw: Case/when branches and optional else result.
-
-        dialect: Optional dialect for qualified column quoting.
-
-    Returns:
-
-        SQL `CASE ... END` fragment.
-    """
+    """Render a CASE expression for SELECT."""
     parts: list[str] = ["CASE"]
     for br in cw.branches:
         parts.append(
@@ -2358,7 +1943,6 @@ def _render_case_when_sql(cw: CaseWhenExpr, dialect: Dialect | None = None) -> s
 
 def _window_bound_sql(kind: str, offset: int | None) -> str:
     """Map a window frame bound token to SQL text."""
-
     k = (kind or "current_row").strip().lower()
     if k == "unbounded_preceding":
         return "UNBOUNDED PRECEDING"
@@ -2377,21 +1961,7 @@ def _render_window_over_sql(
     ws: WindowSpec,
     dialect: Dialect | None = None,
 ) -> str:
-    """
-    Render a window aggregate or function with ``OVER (PARTITION BY ... ORDER BY ...)``.
-
-    Args:
-
-        expr: Inner expression for window arguments when applicable.
-
-        ws: Window specification.
-
-        dialect: Optional dialect for qualified column quoting.
-
-    Returns:
-
-        SQL fragment including ``OVER`` clause.
-    """
+    """Render a window aggregate or function with ``OVER (PARTITION BY. ... ORDER BY ...)``."""
     fn = SQL_WINDOW_FUNCTION_UPPER.get(ws.function, ws.function.upper())
     if ws.function in ("sum", "avg"):
         arg_sql = render_expr_sql(ws.argument, dialect) if ws.argument else "*"
@@ -2423,20 +1993,7 @@ def _render_window_over_sql(
 
 
 def render_select_col_sql(sc: SelectCol, dialect: Dialect | None = None) -> str:
-    """
-    Render a select column including optional CASE or window function.
-
-    Args:
-
-        sc: Select column metadata (case/window/aggregate/plain expression).
-
-        dialect: Optional dialect for qualified column quoting.
-
-    Returns:
-
-        SQL fragment for the SELECT list entry.
-    """
-
+    """Render a select column including optional CASE or window. function."""
     parts = effective_select_parts(sc, None, None)
     if parts.case_when is not None:
         return _render_case_when_sql(parts.case_when, dialect)
@@ -2447,7 +2004,6 @@ def render_select_col_sql(sc: SelectCol, dialect: Dialect | None = None) -> str:
 
 def _driver_table_from_join_path_signature(signature: list[str]) -> str | None:
     """Return the left-hand table name from the first valid join path segment."""
-
     for seg in signature:
         seg_stripped = seg.strip()
         if "->" not in seg_stripped:
@@ -2462,8 +2018,7 @@ def _driver_table_from_join_path_signature(signature: list[str]) -> str | None:
 
 
 def _intent_table_spelling(name: str, tables: list[str]) -> str | None:
-    """Resolve *name* to the spelling used in *tables* when case-insensitively equal."""
-
+    """Resolve *name* to the spelling used in *tables* when case- insensitively equal."""
     for t in tables:
         if t.lower() == name.lower():
             return t
@@ -2475,7 +2030,6 @@ def _first_anchor_table_from_group_by_cols(
     tables: list[str],
 ) -> str | None:
     """Return the first group-by column table that appears in *tables*, or ``None``."""
-
     for expr in group_by_cols or []:
         col = getattr(expr, "primary_column", "") or ""
         if "." not in col:
@@ -2492,7 +2046,6 @@ def _first_anchor_table_from_order_by_cols(
     tables: list[str],
 ) -> str | None:
     """Return the first order-by column table that appears in *tables*, or ``None``."""
-
     for obc in order_by_cols or []:
         expr = getattr(obc, "expr", None)
         col = getattr(expr, "primary_column", "") or "" if expr is not None else ""
@@ -2514,12 +2067,7 @@ def _from_anchor_for_multi_table_block(
     grain: str | None = None,
     group_by_cols: list[NormalizedExpr] | None = None,
 ) -> str | None:
-    """
-    Pick ``FROM`` for a multi-table block.
-
-    Precedence: grouped grain uses the first group-by table in scope; else the first order-by table in scope; else the join-path signature driver; else row-count heuristic.
-    """
-
+    """Pick ``FROM`` for a multi-table block. Precedence: grouped grain uses the first group-by table in scope; else the first order-by table in scope; else the join-path signature driver; else row-count heuristic."""
     if not tables or len(tables) <= 1:
         return None
     sig_list = [s for s in (join_signature or []) if s]
@@ -2542,11 +2090,10 @@ def _from_anchor_for_multi_table_block(
 
 def _deterministic_from_anchor_table(
     tables: list[str],
-    order_by_cols: list,
+    order_by_cols: list[OrderByCol],
     schema: SchemaGraph | None,
 ) -> str | None:
     """Pick a ``FROM`` anchor for multi-table row-level blocks without reordering *tables* list."""
-
     if not tables or len(tables) <= 1:
         return None
     for obc in order_by_cols or []:
@@ -2576,6 +2123,20 @@ def _deterministic_from_anchor_table(
     return ranked[0][1] if ranked else None
 
 
+def render_feedback_sql(intent: RuntimeIntent, schema: SchemaGraph | None) -> str | None:
+    """Render dialect-neutral SQL for failure-summary LLM payloads only; never persisted."""
+    if schema is None:
+        return None
+    try:
+        return build_deterministic_sql(
+            intent,
+            schema=schema,
+            dialect=get_dialect(CANONICAL_FEEDBACK_DIALECT),
+        )
+    except Exception:
+        return None
+
+
 def build_deterministic_sql(
     intent: RuntimeIntent,
     cte_join_hints: dict[str, dict[str, Any]] | None = None,
@@ -2584,27 +2145,7 @@ def build_deterministic_sql(
     join_signature_for_from_anchor: list[str] | None = None,
     cte_join_signatures_for_from_anchor: dict[str, list[str]] | None = None,
 ) -> str:
-    """
-    Build a rough deterministic SQL from a RuntimeIntent.
-
-    Args:
-
-        intent: Description.
-
-        cte_join_hints: Optional per-CTE join hint payloads for downstream use.
-
-        schema: Optional schema graph for deterministic block rendering.
-
-        dialect: Dialect for render helpers; defaults to ``get_dialect()``.
-
-        join_signature_for_from_anchor: Optional main-query join path to align ``FROM`` with path driver.
-
-        cte_join_signatures_for_from_anchor: Optional CTE name to join signature for per-CTE ``FROM`` alignment.
-
-    Returns:
-
-        SELECT expressions.
-    """
+    """Build a rough deterministic SQL from a RuntimeIntent."""
     keep_cte = {s.cte_name.lower() for s in (intent.cte_steps or []) if s.cte_name}
     if cte_join_hints:
         cte_join_hints = {k: v for k, v in cte_join_hints.items() if str(k).strip().lower() in keep_cte}
@@ -2701,18 +2242,7 @@ def build_deterministic_sql(
 
 
 def _render_clause_chain_inner(parts: Sequence[tuple[str, str]]) -> str:
-    """
-    Join ``(fragment, bool_op)`` tuples using each tuple's ``bool_op`` as the connector after that fragment.
-
-    Args:
-
-        parts: Non-empty sequence of SQL fragments with forward ``bool_op`` links.
-
-    Returns:
-
-        Single SQL clause without outer parentheses.
-    """
-
+    """Join ``(fragment, bool_op)`` tuples using each tuple's. ``bool_op`` as the connector after that fragment."""
     result = parts[0][0]
     for i in range(1, len(parts)):
         raw = parts[i - 1][1] or "AND"
@@ -2724,18 +2254,7 @@ def _render_clause_chain_inner(parts: Sequence[tuple[str, str]]) -> str:
 
 
 def _render_clause_chain(parts: list[tuple[str, str]]) -> str:
-    """
-    Join clause fragments and parenthesize the full chain when any forward link is ``OR``.
-
-    Args:
-
-        parts: SQL fragments with ``bool_op`` after each fragment except the last (ignored).
-
-    Returns:
-
-        Combined SQL string.
-    """
-
+    """Join clause fragments and parenthesize the full chain when any. forward link is ``OR``."""
     if not parts:
         return ""
     inner = _render_clause_chain_inner(parts)
@@ -2748,19 +2267,7 @@ def _render_clause_chain(parts: list[tuple[str, str]]) -> str:
 def _join_flat_predicate_parts_with_filter_groups(
     parts: list[tuple[str, str, int | None]],
 ) -> str:
-    """
-    Join rendered predicate fragments.
-
-    Flat mode (every ``filter_group`` is ``None``): forward ``bool_op`` between adjacent
-    fragments via :func:`_render_clause_chain`.
-
-    Grouped mode (any row has a non-``None`` ``filter_group``): bucket by ``filter_group``
-    in first-seen order; within each bucket join with **AND** (ignoring stored ``bool_op``);
-    join distinct buckets with **OR**. Single-row buckets are not parenthesized;
-    multi-row buckets are wrapped in ``(...)``. A single bucket with multiple rows is
-    joined with AND only (no outer parentheses).
-    """
-
+    """Join rendered predicate fragments. Flat mode (every ``filter_group`` is ``None``): forward ``bool_op`` between adjacent fragments via :func:`_render_clause_chain`. Grouped mode (any row has a non-``None`` ``filter_group``): bucket by ``filter_group`` in first-seen order; within each bucket join with **AND** (ignoring stored ``bool_op``); join distinct buckets with **OR**. Single-row buckets are not parenthesized; multi-row buckets are wrapped in ``(...)``. A single bucket with multiple rows is joined with AND only (no outer parentheses)."""
     if not parts:
         return ""
     flat_mode = all(gid is None for _, _, gid in parts)
@@ -2800,7 +2307,6 @@ def _join_clause_parts_with_bool_op(
     parts: list[tuple[str, str]],
 ) -> str:
     """Chain SQL clause fragments using forward ``bool_op`` links; delegates to :func:`_render_clause_chain`."""
-
     return _render_clause_chain(parts)
 
 
@@ -2814,30 +2320,10 @@ def _maybe_render_array_unnest_select(
     *,
     for_cte: bool,
 ) -> str | None:
-    """
-    When building a CTE, expand bare array columns via UNNEST/EXPLODE.
-
-    Args:
-
-        sc: Select column for the CTE output.
-
-        schema: Schema graph for column element type lookup.
-
-        cte_outputs: Map of CTE names to prior outputs for metadata resolution.
-
-        dialect: Dialect for UNNEST/EXPLODE rendering.
-
-        output_aliases: Optional deterministic output aliases for the CTE.
-
-        idx: Zero-based index into `select_cols` and `output_aliases`.
-
-        for_cte: When false, array unnest is skipped.
-
-    Returns:
-
-        UNNEST/EXPLODE select expression SQL, or `None` when not applicable.
-    """
+    """When building a CTE, expand bare array columns via. UNNEST/EXPLODE."""
     if not for_cte or schema is None:
+        return None
+    if not dialect.supports_unnest_select_item:
         return None
     parts = effective_select_parts(sc, None, None)
     if parts.window_spec or parts.case_when or sc.is_aggregated:
@@ -2853,23 +2339,30 @@ def _maybe_render_array_unnest_select(
     return dialect.render_array_unnest(col_sql, alias)
 
 
+def _column_meta_for_predicate(
+    pred: FilterParam | HavingParam,
+    schema: SchemaGraph | None,
+    cte_outputs: dict[str, Any] | None = None,
+) -> Any | None:
+    """Resolve column metadata when the predicate left side is a single qualified column."""
+    if schema is None:
+        return None
+    cols = extract_columns_from_expr(pred.left_expr)
+    if len(cols) != 1:
+        return None
+    return get_col_meta(cols[0], schema, cte_outputs or {})
+
+
 def _render_predicate_clause(
     pred: FilterParam | HavingParam,
     dialect: Dialect,
     *,
     is_having: bool = False,
     param_values: Mapping[str, Any] | None = None,
+    schema: SchemaGraph | None = None,
+    cte_outputs: dict[str, Any] | None = None,
 ) -> list[tuple[str, str]]:
-    """
-    Render one WHERE or HAVING predicate into one or more ``(fragment, bool_op)`` tuples.
-
-    Handles case-insensitive string compares, ``date_window``, ``date_diff``, ``contains``, expression-vs-expression, bound parameters, and inline ``raw_value`` binds.
-
-    Date-arithmetic value dicts are looked up via :meth:`FilterParam.resolved_value` so harvested params remain accessible.
-
-    When ``is_having`` is true and no branch matches, emits a placeholder ``?`` bind (legacy HAVING shape).
-    """
-
+    """Render one WHERE or HAVING predicate into one or more ``(fragment, bool_op)`` tuples. Handles case-insensitive string compares, ``date_window``, ``date_diff``, ``contains``, expression-vs-expression, bound parameters, and inline ``raw_value`` binds. Date-arithmetic value dicts are looked up via :meth:`FilterParam.resolved_value` so harvested params remain accessible. When ``is_having`` is true and no branch matches, emits a placeholder ``?`` bind (legacy HAVING shape)."""
     left = render_expr_sql(pred.left_expr, dialect)
     op = pred.op or (">" if is_having else "=")
     op_cmp = (pred.op or "").strip().lower()
@@ -2902,26 +2395,51 @@ def _render_predicate_clause(
         hop = pred.op or ">"
         add_parts = [_render_group_sql(g, dialect) for g in pred.left_expr.add_groups]
         sub_parts = [_render_group_sql(g, dialect) for g in pred.left_expr.sub_groups]
-        frag = dialect.render_date_diff(
-            left,
-            hop,
-            unit,
-            amount,
-            minuend_sql=add_parts[0] if add_parts else "",
-            subtrahend_sql=sub_parts[0] if sub_parts else "",
-        )
+        if pred.right_expr is not None and not add_parts and not sub_parts:
+            left_sql = render_expr_sql(pred.left_expr, dialect)
+            right_sql = render_expr_sql(pred.right_expr, dialect)
+            minuend_sql = right_sql
+            subtrahend_sql = left_sql
+            if hop in (">", ">="):
+                minuend_sql, subtrahend_sql = right_sql, left_sql
+            elif hop in ("<", "<="):
+                minuend_sql, subtrahend_sql = left_sql, right_sql
+            frag = dialect.render_date_diff(
+                left_sql,
+                hop,
+                unit,
+                amount,
+                minuend_sql=minuend_sql,
+                subtrahend_sql=subtrahend_sql,
+            )
+        else:
+            frag = dialect.render_date_diff(
+                left,
+                hop,
+                unit,
+                amount,
+                minuend_sql=add_parts[0] if add_parts else "",
+                subtrahend_sql=sub_parts[0] if sub_parts else "",
+            )
         out.append((frag, bool_op))
         return out
     if (pred.op or "").strip().lower() == "contains":
         pk = pred.param_key or "p?"
-        frag = dialect.render_array_contains(left, pk)
+        column_meta = _column_meta_for_predicate(pred, schema, cte_outputs)
+        frag = dialect.render_array_contains(left, pk, column_meta=column_meta)
         out.append((frag, bool_op))
         return out
     if pred.right_expr:
         right = render_expr_sql(pred.right_expr, dialect)
+        cmp_op = op
+        op_lower = (pred.op or "").strip().lower()
+        if op_lower == "in":
+            cmp_op = "="
+        elif op_lower == "not in":
+            cmp_op = "<>"
         if case_insensitive:
             right = _wrap_for_case_insensitive(right, dialect)
-        out.append((f"{left} {op} {right}", bool_op))
+        out.append((f"{left} {cmp_op} {right}", bool_op))
         return out
     if (pred.op or "").lower() in ("in", "not in"):
         pkey = pred.param_key or "p?"
@@ -2947,9 +2465,9 @@ def _build_deterministic_select_block(
     select_cols: list[SelectCol],
     tables: list[str],
     group_by_cols: list[NormalizedExpr],
-    order_by_cols: list,
-    filters_param: list,
-    having_param: list,
+    order_by_cols: list[OrderByCol],
+    filters_param: list[FilterParam],
+    having_param: list[HavingParam],
     limit: int | None,
     grain: str,
     dialect: Dialect,
@@ -2962,141 +2480,99 @@ def _build_deterministic_select_block(
     distinct_select_index: int = -1,
     param_values: Mapping[str, Any] | None = None,
 ) -> str:
-    """
-    Build a single SELECT block from structured intent clauses.
-
-    Args:
-
-        select_cols: Columns for the SELECT list.
-
-        tables: FROM tables; only ``tables[0]`` (or ``from_table_override``) appears in the
-        emitted ``FROM``. Any additional tables are attached as JOIN nodes downstream
-        via :func:`inject_join_into_deterministic_sql`.
-
-        group_by_cols: Expressions for GROUP BY.
-
-        order_by_cols: Order-by column specs.
-
-        filters_param: WHERE filter parameters.
-
-        having_param: HAVING filter parameters.
-
-        limit: Optional LIMIT value.
-
-        grain: Grain string (for example row-level vs aggregate).
-
-        output_aliases: Optional AS aliases for CTE output columns.
-
-        dialect: Dialect for rendering helpers.
-
-        schema: Optional schema for array unnest and column metadata.
-
-        for_cte: When true, enables CTE-specific rendering such as array unnest.
-
-        from_table_override: When set, used as the ``FROM`` table instead of ``tables[0]``.
-
-    Returns:
-
-        multiple tables are present.
-    """
+    """Build a single SELECT block from structured intent clauses."""
     lines: list[str] = []
 
     select_exprs: list[str] = []
     cte_outputs: dict[str, Any] = {}
-    for idx, sc in enumerate(select_cols):
-        unnest_sql = _maybe_render_array_unnest_select(
-            sc,
-            schema,
-            cte_outputs,
-            dialect,
-            output_aliases,
-            idx,
-            for_cte=for_cte,
-        )
-        if unnest_sql is not None:
-            rendered = unnest_sql
-        else:
-            rendered = render_select_col_sql(sc, dialect)
-            if output_aliases and idx < len(output_aliases):
-                rendered = f"{rendered} AS {output_aliases[idx]}"
-        select_exprs.append(rendered)
-
-    select_keyword = "SELECT DISTINCT" if distinct_select_index >= 0 else "SELECT"
-    lines.append(select_keyword + " " + ", ".join(select_exprs))
-
-    if tables:
-        from_tbl = from_table_override if from_table_override else tables[0]
-        from_sql = dialect.quote_schema_qualified(from_tbl)
-        if extra_from_tables:
-            pipeline_trace_lazy(
-                "pipeline.generate_and_validate_sql.scalar_cte_cross_join",
-                lambda: stable_json({"anchor": from_tbl, "scalar_ctes": list(extra_from_tables)}),
+    with sql_gen_type_scope(schema, cte_outputs):
+        for idx, sc in enumerate(select_cols):
+            unnest_sql = _maybe_render_array_unnest_select(
+                sc,
+                schema,
+                cte_outputs,
+                dialect,
+                output_aliases,
+                idx,
+                for_cte=for_cte,
             )
-            for extra in extra_from_tables:
-                from_sql = f"{from_sql} CROSS JOIN {dialect.quote_schema_qualified(extra)}"
-        lines.append(f"FROM {from_sql}")
+            if unnest_sql is not None:
+                rendered = unnest_sql
+            else:
+                rendered = render_select_col_sql(sc, dialect)
+                if output_aliases and idx < len(output_aliases):
+                    rendered = f"{rendered} AS {output_aliases[idx]}"
+            select_exprs.append(rendered)
 
-    where_rows: list[tuple[str, str, int | None]] = []
-    for fp in filters_param:
-        for frag, bop in _render_predicate_clause(fp, dialect, is_having=False, param_values=param_values):
-            where_rows.append((frag, bop, fp.filter_group))
-    if where_rows:
-        lines.append("WHERE " + _join_flat_predicate_parts_with_filter_groups(where_rows))
+        select_keyword = "SELECT DISTINCT" if distinct_select_index >= 0 else "SELECT"
+        lines.append(select_keyword + " " + ", ".join(select_exprs))
 
-    if group_by_cols:
-        gb_exprs = [render_expr_sql(g, dialect) for g in group_by_cols]
-        lines.append("GROUP BY " + ", ".join(gb_exprs))
+        if tables:
+            from_tbl = from_table_override if from_table_override else tables[0]
+            from_sql = dialect.quote_schema_qualified(from_tbl)
+            if extra_from_tables:
+                pipeline_trace(
+                    "pipeline.generate_and_validate_sql.scalar_cte_cross_join",
+                    lambda: stable_json({"anchor": from_tbl, "scalar_ctes": list(extra_from_tables)}),
+                )
+                for extra in extra_from_tables:
+                    from_sql = f"{from_sql} CROSS JOIN {dialect.quote_schema_qualified(extra)}"
+            lines.append(f"FROM {from_sql}")
 
-    having_rows: list[tuple[str, str, int | None]] = []
-    for hp in having_param:
-        for frag, bop in _render_predicate_clause(hp, dialect, is_having=True, param_values=param_values):
-            having_rows.append((frag, bop, hp.filter_group))
-    if having_rows:
-        lines.append("HAVING " + _join_flat_predicate_parts_with_filter_groups(having_rows))
+        where_rows: list[tuple[str, str, int | None]] = []
+        for fp in filters_param:
+            for frag, bop in _render_predicate_clause(
+                fp,
+                dialect,
+                is_having=False,
+                param_values=param_values,
+                schema=schema,
+                cte_outputs=cte_outputs,
+            ):
+                where_rows.append((frag, bop, fp.filter_group))
+        if where_rows:
+            lines.append("WHERE " + _join_flat_predicate_parts_with_filter_groups(where_rows))
 
-    if order_by_cols:
-        ob_exprs = []
-        for obc in order_by_cols:
-            rendered = render_expr_sql(obc.expr, dialect)
-            direction = obc.direction.upper() if obc.direction else "ASC"
-            ob_exprs.append(f"{rendered} {direction}")
-        lines.append("ORDER BY " + ", ".join(ob_exprs))
+        if group_by_cols:
+            gb_exprs = [render_expr_sql(g, dialect) for g in group_by_cols]
+            lines.append("GROUP BY " + ", ".join(gb_exprs))
 
-    if limit:
-        lines.append(f"LIMIT {limit}")
+        having_rows: list[tuple[str, str, int | None]] = []
+        for hp in having_param:
+            for frag, bop in _render_predicate_clause(
+                hp,
+                dialect,
+                is_having=True,
+                param_values=param_values,
+                schema=schema,
+                cte_outputs=cte_outputs,
+            ):
+                having_rows.append((frag, bop, hp.filter_group))
+        if having_rows:
+            lines.append("HAVING " + _join_flat_predicate_parts_with_filter_groups(having_rows))
+
+        if order_by_cols:
+            ob_exprs = []
+            for obc in order_by_cols:
+                rendered = render_expr_sql(obc.expr, dialect)
+                direction = obc.direction.upper() if obc.direction else "ASC"
+                ob_exprs.append(f"{rendered} {direction}")
+            lines.append("ORDER BY " + ", ".join(ob_exprs))
+
+        if limit:
+            lines.append(f"LIMIT {limit}")
 
     return "\n".join(lines)
 
 
 def _effective_select_col_for_sql(sc: SelectCol) -> SelectCol:
-    """
-    Return a select column with registry references reduced to the resolved base expression.
-
-    Args:
-
-        sc: Original select column.
-
-    Returns:
-
-        Select column without registry indirection in ``expr``.
-    """
-
+    """Return a select column with registry references reduced to the. resolved base expression."""
     parts = effective_select_parts(sc, None, None)
     return SelectCol(expr=parts.expr)
 
 
 def generate_col_alias(sc: SelectCol) -> str:
-    """
-    Build a deterministic display alias from a SelectCol's expression metadata.
-
-    Args:
-
-        sc: Description.
-
-    Returns:
-
-        the caller must assign `col_<idx>`.
-    """
+    """Build a deterministic display alias from a SelectCol's. expression. metadata."""
     sc = _effective_select_col_for_sql(sc)
     expr = sc.expr
     col = expr.primary_column
@@ -3152,32 +2628,35 @@ def generate_col_alias(sc: SelectCol) -> str:
 
 
 def select_col_prefers_llm_display_alias(sc: SelectCol) -> bool:
-    """
-    Whether :func:`aetherdialect._pipeline.enriched_display_alias_map` should ask the LLM for a display header.
-
-    Args:
-
-        sc: Select column contract.
-
-    Returns:
-
-        True for CASE/window/aggregations/scalar wrappers or when deterministic alias is empty.
-    """
-
+    """Whether. :func:`aetherdialect._pipeline.enriched_display_alias_map` should ask the LLM for a display header."""
     parts = effective_select_parts(sc, None, None)
     if parts.case_when is not None:
         return True
     if parts.window_spec is not None:
         return True
-    sc = _effective_select_col_for_sql(sc)
-    if sc.is_aggregated:
-        return True
-    expr = sc.expr
-    if expr.scalar_func or expr.inner_scalar_func:
-        return True
     if not generate_col_alias(sc):
         return True
-    return False
+    sc_eff = _effective_select_col_for_sql(sc)
+    expr = sc_eff.expr
+    agg_count = sum(1 for g in (expr.add_groups or []) if g.agg_func)
+    if expr.agg_func:
+        agg_count += 1
+    if sc_eff.is_aggregated and agg_count == 0:
+        agg_count = 1
+    if agg_count > 1:
+        return False
+    scalars: list[str] = []
+    if expr.scalar_func:
+        scalars.append(expr.scalar_func.lower())
+    if expr.inner_scalar_func:
+        scalars.append(expr.inner_scalar_func.lower())
+    if len(scalars) > 1:
+        return False
+    groups = expr.add_groups or []
+    subs = expr.sub_groups or []
+    if (len(groups) >= 2 or subs) and agg_count == 0 and "concat" not in scalars:
+        return False
+    return True
 
 
 def build_display_sql(
@@ -3186,28 +2665,7 @@ def build_display_sql(
     display_alias_map: dict[str, str] | None,
     dialect: Dialect,
 ) -> str:
-    """
-    Build display SQL with deterministic aliases via the dialect's AST projection-replace path.
-
-    The projection list flows through :meth:`aetherdialect._dialect.Dialect.replace_projection`
-    and re-emitted via :meth:`aetherdialect._dialect.Dialect.emit_sql`. Returns *sql_param* unchanged
-    when ``select_cols`` is empty or the AST replace cannot be performed.
-
-    Args:
-
-        sql_param: Parameterized SQL whose ``FROM`` clause and tail are preserved.
-
-        intent: Runtime intent whose ``select_cols`` define the projection.
-
-        display_alias_map: Optional ``signature_key`` to display header overrides.
-
-        dialect: Dialect adapter for AST-driven rewriting; required.
-
-    Returns:
-
-        SQL with the rewritten projection list, or *sql_param* unchanged on no-op or AST failure.
-    """
-
+    """Build display SQL with deterministic aliases via the dialect's. AST projection-replace path. The projection list flows through :meth:`aetherdialect._dialect.Dialect.replace_projection` and re- emitted via :meth:`aetherdialect._dialect.Dialect.emit_sql`. Returns *sql_param* unchanged when ``select_cols`` is empty or the AST replace cannot be performed."""
     cols = intent.select_cols or []
     if not cols:
         return sql_param
@@ -3247,16 +2705,7 @@ def build_display_sql(
 
 def _date_window_inclusive_upper_sql(left_rendered: str, unit: str, dialect: Dialect) -> str:
     """Upper inclusive anchor for relative ``date_window`` ranges (through the clock anchor for the unit class)."""
-
-    u = str(unit or "day").lower()
-    if dialect.name == "postgresql":
-        anchor = "CURRENT_TIMESTAMP" if u in {"hour", "minute", "second"} else "CURRENT_DATE"
-        return f"{left_rendered} <= {anchor}"
-    if dialect.name == "databricks":
-        anchor = "current_timestamp()" if u in {"hour", "minute", "second"} else "current_date()"
-        return f"{left_rendered} <= {anchor}"
-    anchor = "CURRENT_DATE"
-    return f"{left_rendered} <= {anchor}"
+    return dialect.render_date_window_inclusive_upper(left_rendered, unit)
 
 
 def _render_date_window_predicate(
@@ -3266,26 +2715,7 @@ def _render_date_window_predicate(
     *,
     param_values: Mapping[str, Any] | None = None,
 ) -> list[str]:
-    """
-    Render WHERE/HAVING clause part(s) for a date_window filter or having condition.
-
-    Args:
-
-        pred: Filter or HAVING row with ``value_type`` ``date_window`` and a dict value (inline ``raw_value`` or harvested into ``param_values``).
-
-        left_rendered: Left-hand SQL for the filtered column.
-
-        dialect: Dialect for date window rendering.
-
-        param_values: Bound parameter map used as a fallback when ``raw_value`` was harvested.
-
-    Returns:
-
-        List of SQL fragments: explicit ``start``/``end`` windows emit two literals; relative
-        ``unit``/``amount`` windows emit a lower bound from :meth:`Dialect.render_date_window`
-        plus a dialect-specific inclusive upper anchor (for example ``CURRENT_DATE`` / ``current_date()``).
-    """
-
+    """Render WHERE/HAVING clause part(s) for a date_window filter or. having condition."""
     resolved = pred.resolved_value(param_values)
     rv = resolved if isinstance(resolved, dict) else {}
     if "start" in rv and "end" in rv:
@@ -3309,12 +2739,7 @@ def _serialize_join_candidate_row(
     *,
     schema: SchemaGraph | None = None,
 ) -> dict[str, Any]:
-    """
-    Return a join-candidate row suitable for join-choice JSON payloads.
-
-    When *schema* is supplied, asserts that no column in the rendered ``join_path_signature`` is hidden by visibility rules. This is a defensive guard against missed filter paths in :func:`enumerate_join_paths_base` / :func:`enumerate_semantic_paths`.
-    """
-
+    """Return a join-candidate row suitable for join-choice JSON payloads. When *schema* is supplied, asserts that no column in the rendered ``join_path_signature`` is hidden by visibility rules. This is a defensive guard against missed filter paths in :func:`enumerate_join_paths_base` / :func:`enumerate_semantic_paths`."""
     if schema is not None:
         sigs = c.get("join_path_signature") or []
         for seg in sigs:
@@ -3352,26 +2777,7 @@ def build_join_choice_prompt(
     schema: SchemaGraph | None = None,
     prior_join_feedback: list[str] | None = None,
 ) -> tuple[str, str]:
-    """
-    Build minimal prompt for LLM to return per-scope join candidate IDs.
-
-    Args:
-
-        q_norm: Normalised natural-language question.
-
-        deterministic_sql: Template SQL whose joins must be chosen.
-
-        llm_scopes: Each entry has ``scope``, ``tables``, and ``candidates`` for one join scope.
-
-        schema: Optional schema graph forwarded to ``_serialize_join_candidate_row`` so that
-        non-visible columns surfacing in any candidate signature raise ``AssertionError``.
-
-        prior_join_feedback: Optional user rejection summaries for this question.
-
-    Returns:
-
-        System and user strings for ``llm_json``.
-    """
+    """Build minimal prompt for LLM to return per-scope join candidate. IDs."""
     system = (
         "You are a join selector for text-to-SQL. Output ONLY valid JSON. "
         "Each scope lists its own join candidates; candidate ids are scoped and may repeat across "
@@ -3413,7 +2819,6 @@ def _valid_join_choice_ids_from_candidates(
     candidates: list[dict[str, Any]],
 ) -> frozenset[str]:
     """Collect stripped non-empty ``candidate_id`` strings from a candidate list."""
-
     out: set[str] = set()
     for c in candidates or []:
         cid = c.get("candidate_id")
@@ -3422,58 +2827,8 @@ def _valid_join_choice_ids_from_candidates(
     return frozenset(out)
 
 
-def _valid_main_join_candidate_ids(join_candidates: dict[str, Any]) -> frozenset[str]:
-    """
-    Collect non-empty ``candidate_id`` strings from the main join hint payload.
-
-    Args:
-
-        join_candidates: Dict with a ``candidates`` list from ``join_hints_multi``.
-
-    Returns:
-
-        Frozenset of allowed main-query join candidate ids.
-    """
-
-    return _valid_join_choice_ids_from_candidates(join_candidates.get("candidates") or [])
-
-
-def _valid_cte_join_candidate_ids(
-    cte_join_hints: dict[str, dict[str, Any]] | None,
-) -> dict[str, frozenset[str]]:
-    """
-    Map each CTE name to the set of allowed ``candidate_id`` strings for that CTE.
-
-    Args:
-
-        cte_join_hints: Per-CTE join hint payloads or ``None``.
-
-    Returns:
-
-        CTE name to allowed ids; empty when *cte_join_hints* is ``None``.
-    """
-
-    if not cte_join_hints:
-        return {}
-    result: dict[str, frozenset[str]] = {}
-    for cte, h in cte_join_hints.items():
-        result[cte] = _valid_join_choice_ids_from_candidates(h.get("candidates") or [])
-    return result
-
-
 def _parse_join_choice_payload(parsed: dict[str, Any]) -> dict[str, str]:
-    """
-    Extract per-scope join choices from an LLM JSON object.
-
-    Args:
-
-        parsed: Raw dict from the join-selector model.
-
-    Returns:
-
-        Scope key to stripped candidate id or ``NA``.
-    """
-
+    """Extract per-scope join choices from an LLM JSON object."""
     raw = parsed.get("choices")
     if not isinstance(raw, dict):
         return {}
@@ -3490,7 +2845,6 @@ def _scope_choice_valid_ids(
     allow_na: bool,
 ) -> frozenset[str]:
     """Allowed ids for one scope, optionally including the ``NA`` sentinel."""
-
     base = _valid_join_choice_ids_from_candidates(candidates)
     return base | frozenset({"NA"}) if allow_na else base
 
@@ -3502,7 +2856,6 @@ def _join_choice_payload_acceptable_pass1(
     accept_na_by_scope: dict[str, bool],
 ) -> bool:
     """Return whether merged choices satisfy first-pass validation for every required scope."""
-
     scope_candidates = {str(s["scope"]): list(s.get("candidates") or []) for s in llm_scopes if "scope" in s}
     for sk in required_scopes:
         if sk not in merged:
@@ -3521,7 +2874,6 @@ def _join_choice_payload_valid_final(
     llm_scopes: list[dict[str, Any]],
 ) -> bool:
     """Return whether every required scope has a non-NA candidate id present in that scope's list."""
-
     scope_candidates = {str(s["scope"]): list(s.get("candidates") or []) for s in llm_scopes if "scope" in s}
     for sk in required_scopes:
         if sk not in merged:
@@ -3554,34 +2906,7 @@ def get_join_choice_from_llm(
     schema: SchemaGraph | None = None,
     prior_join_feedback: list[str] | None = None,
 ) -> dict[str, str]:
-    """
-    Call LLM to get per-scope join candidate ids for the listed scopes.
-
-    Args:
-
-        q_norm: Normalised natural-language question.
-
-        deterministic_sql: Template SQL sent to the join selector.
-
-        llm_scopes: Scopes sent to the model; each dict has ``scope``, ``tables``, ``candidates``.
-
-        preset_choices: Deterministic preset ids merged before validation.
-
-        accept_na_by_scope: Whether ``NA`` is accepted for each scope key on this pass.
-
-        require_final: When true, only non-``NA`` ids that appear in each scope's candidate list pass.
-
-        schema: Schema graph for serialization guards.
-
-        prior_join_feedback: Summaries of earlier wrong-table/join rejections for this question.
-
-    Returns:
-
-        Merged scope-to-id map including presets. After retries, each unresolved scope picks the
-        first non-``J00`` candidate in stable id order, or raises :class:`NoJoinPathError` when the
-        scope spans multiple tables and no join path exists.
-    """
-
+    """Call LLM to get per-scope join candidate ids for the listed. scopes."""
     preset = dict(preset_choices or {})
     accept_na = dict(accept_na_by_scope or {})
     if not llm_scopes:
@@ -3599,8 +2924,6 @@ def get_join_choice_from_llm(
             parsed = llm_json(system, user, retries=1, task="join")
         except LlmJsonExhausted as exc:
             debug(f"[sql_gen.get_join_choice_from_llm] exhausted attempt {_attempt + 1}: {exc}")
-            continue
-        if not isinstance(parsed, dict):
             continue
         raw = _parse_join_choice_payload(parsed)
         merged = dict(preset)

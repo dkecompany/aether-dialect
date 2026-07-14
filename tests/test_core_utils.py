@@ -7,27 +7,21 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aetherdialect._config import (
-    ARTIFACT_FORMAT_VERSION,
-    ARTIFACT_MANIFEST_FILENAME,
-    EngineConfig,
-    PolicyConfig,
-    diagnostic_force_enter,
-    diagnostic_force_exit,
-)
+from aetherdialect._config import EngineConfig, PolicyConfig
+from aetherdialect._constants import ARTIFACT_FORMAT_VERSION, ARTIFACT_MANIFEST_FILENAME
 from aetherdialect._contracts_base import (
     LlmJsonExhausted,
     MigrationReport,
     MigrationTier,
 )
 from aetherdialect._core_utils import (
-    ArtifactManifest,
     RephraseHint,
-    _build_client,
+    _ArtifactManifest,
     _extract_first_json_object,
     _format_cell,
-    _llm_user_text_without_sensitivity_classification,
-    _provider_order,
+    _manifest_path,
+    _normalize_sql_operator_spaces,
+    _result,
     _strip_fences,
     ask_user_choice,
     canonicalize_sql,
@@ -36,24 +30,20 @@ from aetherdialect._core_utils import (
     dataframe_to_row_tuples,
     debug,
     detect_legacy_artifacts,
+    diagnostic_force_enter,
+    diagnostic_force_exit,
     diagnostic_print_listener,
     error,
     intent_id,
     interactive_yes_no,
     invalid_input,
-    join_sig_string,
-    llm_chat,
-    llm_json,
-    log,
-    manifest_path,
     normalize_array_contains_param_value,
     normalize_op,
     normalize_question,
     normalize_sql,
-    normalize_sql_operator_spaces,
     notify,
+    pipeline_capture,
     pipeline_trace,
-    pipeline_trace_lazy,
     print_info,
     print_query_result,
     print_rephrase_hint,
@@ -62,7 +52,6 @@ from aetherdialect._core_utils import (
     prompt,
     read_artifact_manifest,
     read_gzip_json,
-    result,
     safe_json_loads,
     schema_hash_fp,
     scope_hash_fp,
@@ -71,15 +60,21 @@ from aetherdialect._core_utils import (
     substitute_params,
     telemetry_capture,
     terminated,
-    warn,
     wipe_versioned_artifacts,
     write_artifact_manifest,
     write_gzip_json_atomic,
 )
 from aetherdialect._dialect import (
+    _sql_simplify_executable,
     compute_sql_fp,
     parameter_abstract,
-    sql_simplify_executable,
+)
+from aetherdialect._llm_provider import (
+    _build_client,
+    _llm_user_text_without_sensitivity_classification,
+    _provider_order,
+    llm_chat,
+    llm_json,
 )
 from aetherdialect._templates import apply_migration_policy
 
@@ -297,24 +292,24 @@ class TestScopeHashFp:
     """scope_hash_fp incorporates allow_columns alongside deny_columns."""
 
     def test_allow_columns_changes_scope_hash(self):
-        from aetherdialect._contracts_base import SchemaContext
+        from aetherdialect._contracts_base import EngineContext
 
-        a = SchemaContext()
-        b = SchemaContext(allow_columns=frozenset({"users.id"}))
+        a = EngineContext()
+        b = EngineContext(allow_columns=frozenset({"users.id"}))
         assert scope_hash_fp(a) != scope_hash_fp(b)
 
     def test_allow_columns_order_independent(self):
-        from aetherdialect._contracts_base import SchemaContext
+        from aetherdialect._contracts_base import EngineContext
 
-        a = SchemaContext(allow_columns=frozenset({"users.id", "orders.amount"}))
-        b = SchemaContext(allow_columns=frozenset({"orders.amount", "users.id"}))
+        a = EngineContext(allow_columns=frozenset({"users.id", "orders.amount"}))
+        b = EngineContext(allow_columns=frozenset({"orders.amount", "users.id"}))
         assert scope_hash_fp(a) == scope_hash_fp(b)
 
     def test_allow_columns_distinct_from_deny_columns(self):
-        from aetherdialect._contracts_base import SchemaContext
+        from aetherdialect._contracts_base import EngineContext
 
-        a = SchemaContext(allow_columns=frozenset({"users.id"}))
-        b = SchemaContext(deny_columns=frozenset({"users.id"}))
+        a = EngineContext(allow_columns=frozenset({"users.id"}))
+        b = EngineContext(deny_columns=frozenset({"users.id"}))
         assert scope_hash_fp(a) != scope_hash_fp(b)
 
 
@@ -402,6 +397,12 @@ class TestSubstituteParams:
         result = substitute_params("WHERE name = :p1", {"p1": "Alice"})
         assert "'Alice'" in result
 
+    def test_substitutes_dollar_placeholder(self):
+        """substitute_params replaces sqlglot-emitted ``$pN`` placeholders."""
+        result = substitute_params('WHERE LOWER("category"."name") = $p1', {"p1": "horror"})
+        assert "'horror'" in result
+        assert "$p1" not in result
+
     def test_substitutes_number(self):
         """substitute_params replaces numeric placeholders."""
         result = substitute_params("WHERE id = :p1", {"p1": 42})
@@ -419,17 +420,17 @@ class TestSubstituteParams:
 
     def test_strips_trivial_coefficient(self):
         """sql_simplify_executable removes 1 * prefix."""
-        result = sql_simplify_executable("SELECT 1 * col FROM t", sqlglot_dialect="postgres")
+        result = _sql_simplify_executable("SELECT 1 * col FROM t", sqlglot_dialect="postgres")
         assert "1 *" not in result
 
     def test_strips_trivial_offset(self):
         """sql_simplify_executable removes + 0 suffix."""
-        result = sql_simplify_executable("SELECT col + 0 FROM t", sqlglot_dialect="postgres")
+        result = _sql_simplify_executable("SELECT col + 0 FROM t", sqlglot_dialect="postgres")
         assert "+ 0" not in result
 
     def test_strips_limit_none(self):
         """sql_simplify_executable removes LIMIT NULL."""
-        result = sql_simplify_executable("SELECT * FROM t LIMIT NULL", sqlglot_dialect="postgres")
+        result = _sql_simplify_executable("SELECT * FROM t LIMIT NULL", sqlglot_dialect="postgres")
         assert "LIMIT" not in result.upper()
 
     def test_substitutes_quoted_string_in_list(self):
@@ -475,6 +476,7 @@ class TestNormalizeArrayContainsParamValue:
         assert normalize_array_contains_param_value('  "Deleted Scenes"  ') == "Deleted Scenes"
         assert normalize_array_contains_param_value('"""x"""') == "x"
         assert normalize_array_contains_param_value(7) == 7
+        assert normalize_array_contains_param_value("%Trailers%") == "Trailers"
 
 
 class TestComputeSqlFp:
@@ -508,22 +510,6 @@ class TestComputeSqlFp:
         assert compute_sql_fp("", sqlglot_dialect="postgres") == compute_sql_fp("", sqlglot_dialect="postgres")
 
 
-class TestJoinSigString:
-    """Tests for join_sig_string."""
-
-    def test_joins_with_pipe(self):
-        """join_sig_string joins elements with pipe."""
-        assert join_sig_string(["a->b", "b->c"]) == "a->b|b->c"
-
-    def test_empty_list(self):
-        """join_sig_string returns empty string for empty list."""
-        assert join_sig_string([]) == ""
-
-    def test_single_element(self):
-        """join_sig_string returns element for single-item list."""
-        assert join_sig_string(["a->b"]) == "a->b"
-
-
 class TestFormatCell:
     """Tests for _format_cell."""
 
@@ -549,20 +535,20 @@ class TestFormatCell:
         assert "3.14" in result
 
 
-class TestLog:
-    """Tests for log."""
+class TestDebugGating:
+    """Tests for debug output gating."""
 
-    def test_prints_when_verbose(self, capsys):
-        """Log prints when verbose diagnostics are enabled."""
-        with patch("aetherdialect._core_utils.diagnostic_verbose_enabled", return_value=True):
-            log("hello")
+    def test_prints_when_debug_enabled(self, capsys):
+        """Debug prints when diagnostics are enabled."""
+        with patch("aetherdialect._core_utils.diagnostic_debug_enabled", return_value=True):
+            debug("hello")
         out = capsys.readouterr().out
-        assert "[LOG] hello" in out
+        assert "[DEBUG] hello" in out
 
-    def test_silent_when_not_verbose(self, capsys):
-        """Log is silent when verbose diagnostics are off."""
-        with patch("aetherdialect._core_utils.diagnostic_verbose_enabled", return_value=False):
-            log("hello")
+    def test_silent_when_debug_disabled(self, capsys):
+        """Debug is silent when diagnostics are off."""
+        with patch("aetherdialect._core_utils.diagnostic_debug_enabled", return_value=False):
+            debug("hello")
         out = capsys.readouterr().out
         assert out == ""
 
@@ -675,8 +661,7 @@ class TestPrintQueryResult:
 
     def test_results_heading(self, capsys):
         """print_query_result prints the configured results heading."""
-
-        from aetherdialect._core_utils import QUERY_RESULTS_HEADER
+        from aetherdialect._constants import QUERY_RESULTS_HEADER
 
         with diagnostic_print_listener(print):
             print_query_result([(1,)], "SELECT 1")
@@ -960,20 +945,6 @@ class TestComputeSqlFpEdgeCases:
         assert len(h) == 64
 
 
-class TestJoinSigStringEdgeCases:
-    """Edge-case tests for join_sig_string."""
-
-    def test_multiple_elements(self):
-        """join_sig_string joins multiple elements."""
-        result = join_sig_string(["a->b", "c->d", "e->f"])
-        assert result == "a->b|c->d|e->f"
-
-    def test_elements_with_special_chars(self):
-        """join_sig_string handles elements with special characters."""
-        result = join_sig_string(["t1.id=t2.fk"])
-        assert result == "t1.id=t2.fk"
-
-
 class TestFormatCellEdgeCases:
     """Edge-case tests for _format_cell."""
 
@@ -1048,14 +1019,14 @@ class TestSchemaHashFpEdgeCases:
 class TestTelemetryCapture:
     """Tests for telemetry_capture."""
 
-    def test_collects_log_and_debug_lines(self):
-        """Buffered lines include log/debug output while sink is active."""
+    def test_collects_debug_lines(self):
+        """Buffered lines include debug output while sink is active."""
         diagnostic_force_enter()
         try:
             with telemetry_capture(suppress_console=True) as buf:
-                log("L1")
+                debug("L1")
                 debug("D1")
-            assert any("[LOG] L1" in line for line in buf)
+            assert any("[DEBUG] L1" in line for line in buf)
             assert any("[DEBUG] D1" in line for line in buf)
         finally:
             diagnostic_force_exit()
@@ -1065,83 +1036,47 @@ class TestTelemetryCapture:
         diagnostic_force_enter()
         try:
             with telemetry_capture(suppress_console=True):
-                log("silent")
+                debug("silent")
             assert capsys.readouterr().out == ""
         finally:
             diagnostic_force_exit()
 
     def test_force_diagnostic_flags_restored(self, monkeypatch):
         """force_diagnostic_flags enables diagnostics only inside the block."""
-        import aetherdialect._config as cfg_mod
-        from aetherdialect._config import (
-            diagnostic_debug_enabled,
-            diagnostic_pipeline_trace_full_enabled,
-        )
+        import aetherdialect._config
+        from aetherdialect._core_utils import diagnostic_debug_enabled
 
-        monkeypatch.setattr(cfg_mod, "_DIAGNOSTIC_FORCE_DEPTH", 0, raising=False)
-        saved = (
-            PolicyConfig.DEBUG,
-            PolicyConfig.VERBOSE,
-            PolicyConfig.PIPELINE_TRACE_FULL,
-            PolicyConfig.LIVE_DEEP_TRACE,
-        )
+        monkeypatch.setattr(aetherdialect._config, "_DIAGNOSTIC_FORCE_DEPTH", 0, raising=False)
+        saved = PolicyConfig.DEBUG
         PolicyConfig.DEBUG = False
-        PolicyConfig.VERBOSE = False
-        PolicyConfig.PIPELINE_TRACE_FULL = False
-        PolicyConfig.LIVE_DEEP_TRACE = False
         try:
             assert not diagnostic_debug_enabled()
             with telemetry_capture(force_diagnostic_flags=True, suppress_console=True):
                 assert diagnostic_debug_enabled()
-                assert diagnostic_pipeline_trace_full_enabled()
             assert not diagnostic_debug_enabled()
-            assert not diagnostic_pipeline_trace_full_enabled()
         finally:
-            (
-                PolicyConfig.DEBUG,
-                PolicyConfig.VERBOSE,
-                PolicyConfig.PIPELINE_TRACE_FULL,
-                PolicyConfig.LIVE_DEEP_TRACE,
-            ) = saved
+            PolicyConfig.DEBUG = saved
 
 
 class TestPipelineTrace:
     """Tests for pipeline_trace."""
 
-    def test_prints_when_debug_and_full_trace(self, capsys):
-        """pipeline_trace prints when debug and full pipeline trace diagnostics are on."""
-        with (
-            patch("aetherdialect._core_utils.diagnostic_debug_enabled", return_value=True),
-            patch(
-                "aetherdialect._core_utils.diagnostic_pipeline_trace_full_enabled",
-                return_value=True,
-            ),
-        ):
+    def test_prints_when_debug_enabled(self, capsys):
+        """pipeline_trace prints when debug diagnostics are on."""
+        with patch("aetherdialect._core_utils.diagnostic_debug_enabled", return_value=True):
             pipeline_trace("step", "payload")
         out = capsys.readouterr().out
         assert "[PIPELINE_TRACE] step" in out
         assert "payload" in out
 
-    def test_silent_when_not_full_trace(self, capsys):
-        """pipeline_trace does not print when full pipeline trace is off."""
-        with (
-            patch("aetherdialect._core_utils.diagnostic_debug_enabled", return_value=True),
-            patch(
-                "aetherdialect._core_utils.diagnostic_pipeline_trace_full_enabled",
-                return_value=False,
-            ),
-        ):
+    def test_silent_when_debug_disabled(self, capsys):
+        """pipeline_trace does not print when debug is off."""
+        with patch("aetherdialect._core_utils.diagnostic_debug_enabled", return_value=False):
             pipeline_trace("step", "x")
         assert capsys.readouterr().out == ""
 
-
-class TestPipelineTraceLazy:
-    """Tests for pipeline_trace_lazy."""
-
     def test_skips_body_factory_when_inactive_and_no_sink(self) -> None:
         """Body factory is not invoked when console trace is off and no telemetry sink."""
-        from unittest.mock import patch
-
         called = {"n": 0}
 
         def factory() -> str:
@@ -1150,41 +1085,37 @@ class TestPipelineTraceLazy:
 
         with (
             patch("aetherdialect._core_utils.diagnostic_debug_enabled", return_value=False),
-            patch(
-                "aetherdialect._core_utils.diagnostic_pipeline_trace_full_enabled",
-                return_value=False,
-            ),
-            patch("aetherdialect._core_utils._telemetry_sink", None),
+            patch("aetherdialect._core_utils.prev_sink", None),
         ):
-            pipeline_trace_lazy("h", factory)
+            pipeline_trace("h", factory)
         assert called["n"] == 0
 
 
-class TestText2SqlInitSurface:
+class TestAetherEngineInitSurface:
     """Public package surface excludes internal diagnostics helpers."""
 
     def test_init_does_not_export_diagnostics_enabled(self) -> None:
         """``diagnostics_enabled`` is not part of the stable import surface."""
-        import aetherdialect as pkg
+        import aetherdialect
 
-        assert "diagnostics_enabled" not in pkg.__all__
+        assert "diagnostics_enabled" not in aetherdialect.__all__
 
 
 class TestNormalizeSqlOperatorSpaces:
-    """Tests for normalize_sql_operator_spaces."""
+    """Tests for _normalize_sql_operator_spaces."""
 
     def test_empty_returns_empty(self):
         """Empty string is returned unchanged."""
-        assert normalize_sql_operator_spaces("") == ""
+        assert _normalize_sql_operator_spaces("") == ""
 
     def test_whitespace_only_returns_original(self):
         """Whitespace-only input is returned without merging operators."""
-        assert normalize_sql_operator_spaces("   ") == "   "
+        assert _normalize_sql_operator_spaces("   ") == "   "
 
     def test_merges_split_operators(self):
         """Split comparison operators are merged."""
         s = "WHERE x > = 1 AND y < = 2 AND z ! = 3"
-        out = normalize_sql_operator_spaces(s)
+        out = _normalize_sql_operator_spaces(s)
         assert ">=" in out
         assert "<=" in out
         assert "!=" in out
@@ -1230,12 +1161,12 @@ class TestSubstituteParamsMoreCases:
 
     def test_trailing_star_one_removed(self):
         """Trailing * 1 is simplified."""
-        result = sql_simplify_executable("SELECT col * 1 FROM t", sqlglot_dialect="postgres")
+        result = _sql_simplify_executable("SELECT col * 1 FROM t", sqlglot_dialect="postgres")
         assert "* 1" not in result
 
     def test_subtract_zero_removed(self):
         """Subtraction of zero is stripped."""
-        result = sql_simplify_executable("SELECT col - 0 FROM t", sqlglot_dialect="postgres")
+        result = _sql_simplify_executable("SELECT col - 0 FROM t", sqlglot_dialect="postgres")
         assert "- 0" not in result
 
 
@@ -1268,7 +1199,7 @@ class TestPrintInfoEdgeCases:
     """Edge cases for print_info."""
 
     def test_explicit_none_items_skips_block(self, capsys):
-        """items=None does not iterate."""
+        """Items=None does not iterate."""
         with diagnostic_print_listener(print):
             print_info("T", items=None)
         assert "T" in capsys.readouterr().out
@@ -1374,8 +1305,8 @@ class TestGzipJsonRoundtrip:
 
 def _manifest_schema_stub() -> MagicMock:
     """Minimal schema graph stand-in for migration policy tests."""
-
     s = MagicMock()
+    s.schema_graph_id = "sg_abc123def4567890__live_e"
     s.effective_structural_hash = "live_e"
     s.profiling_hash = "live_p"
     s.notes_hash = "live_n"
@@ -1386,11 +1317,11 @@ def _manifest_schema_stub() -> MagicMock:
 
 
 class TestArtifactManifest:
-    """manifest_path, read/write manifest, apply_migration_policy."""
+    """_manifest_path, read/write manifest, apply_migration_policy."""
 
     def test_manifest_path_joins_filename(self, tmp_path):
         d = str(tmp_path)
-        assert manifest_path(d) == os.path.join(d, ARTIFACT_MANIFEST_FILENAME)
+        assert _manifest_path(d) == os.path.join(d, ARTIFACT_MANIFEST_FILENAME)
 
     def test_read_missing_returns_none(self, tmp_path):
         assert read_artifact_manifest(str(tmp_path)) is None
@@ -1409,9 +1340,10 @@ class TestArtifactManifest:
         d = str(tmp_path)
         with patch("aetherdialect._core_utils.debug"):
             write_artifact_manifest(d)
-        mp = manifest_path(d)
+        mp = _manifest_path(d)
         assert os.path.isfile(mp)
-        data = json.loads(open(mp, encoding="utf-8").read())
+        with open(mp, encoding="utf-8") as fh:
+            data = json.load(fh)
         assert "artifact_format_version" in data
         assert "created_with_package_version" in data
 
@@ -1458,7 +1390,7 @@ class TestArtifactManifest:
         assert rep.tier == MigrationTier.DESTRUCTIVE
 
     def test_classify_profiling_change_overlap_gate(self):
-        m = ArtifactManifest(
+        m = _ArtifactManifest(
             artifact_format_version=ARTIFACT_FORMAT_VERSION,
             effective_structural_hash="e",
             structural_hash="t",
@@ -1475,13 +1407,13 @@ class TestArtifactManifest:
         sch.notes_hash = "n"
         sch.semantic_edges_hash = "s"
         prev = MagicMock()
-        with patch("aetherdialect._core_utils.profiling_value_overlap", return_value=0.5):
+        with patch("aetherdialect._core_utils._profiling_value_overlap", return_value=0.5):
             assert classify_migration_tier(m, sch, previous_schema=prev) == MigrationTier.SOFT_REFRESH
-        with patch("aetherdialect._core_utils.profiling_value_overlap", return_value=0.01):
+        with patch("aetherdialect._core_utils._profiling_value_overlap", return_value=0.01):
             assert classify_migration_tier(m, sch, previous_schema=prev) == MigrationTier.DESTRUCTIVE
 
     def test_classify_stale_artifact_format_is_destructive(self):
-        m = ArtifactManifest(
+        m = _ArtifactManifest(
             artifact_format_version=1,
             effective_structural_hash="e",
             structural_hash="t",
@@ -1500,7 +1432,7 @@ class TestArtifactManifest:
         assert classify_migration_tier(m, sch) == MigrationTier.DESTRUCTIVE
 
     def test_classify_package_below_manifest_min_is_destructive(self):
-        m = ArtifactManifest(
+        m = _ArtifactManifest(
             artifact_format_version=ARTIFACT_FORMAT_VERSION,
             min_compatible_package_version="99.0.0",
             effective_structural_hash="e",
@@ -1521,10 +1453,9 @@ class TestArtifactManifest:
 
     def test_classify_schema_diff_implies_remap_when_rename_plan_missing(self) -> None:
         """Non-empty diff with column renames yields REMAP when scope is stable even if try_rename is None."""
+        from aetherdialect._schema_graph import SchemaDiff, TableDiff
 
-        from aetherdialect._schema import SchemaDiff, TableDiff
-
-        m = ArtifactManifest(
+        m = _ArtifactManifest(
             artifact_format_version=ARTIFACT_FORMAT_VERSION,
             effective_structural_hash="e1",
             structural_hash="t1",
@@ -1586,13 +1517,23 @@ class TestDetectLegacyArtifacts:
         assert "qsim_summary_v1.json.gz" in result
 
     def test_manifest_present_returns_empty(self, tmp_path):
-        from aetherdialect._core_utils import ARTIFACT_MANIFEST_FILENAME
+        from aetherdialect._constants import ARTIFACT_MANIFEST_FILENAME
 
         (tmp_path / ARTIFACT_MANIFEST_FILENAME).write_text("{}", encoding="utf-8")
         (tmp_path / "schema_graph.json.gz").write_bytes(b"")
         assert detect_legacy_artifacts(str(tmp_path)) == []
 
 
+@pytest.fixture
+def _non_mock_llm_provider():
+    """Sandbox tests set ``EngineConfig.LLM_PROVIDER`` to ``mock``; restore for unit tests."""
+    prev = EngineConfig.LLM_PROVIDER
+    EngineConfig.LLM_PROVIDER = "openai"
+    yield
+    EngineConfig.LLM_PROVIDER = prev
+
+
+@pytest.mark.usefixtures("_non_mock_llm_provider")
 class TestLlmChat:
     """llm_chat with mocked OpenAI client."""
 
@@ -1602,9 +1543,9 @@ class TestLlmChat:
         mock_client = MagicMock()
         mock_client.responses.create.return_value = mock_resp
 
-        with patch("aetherdialect._core_utils._provider_order", return_value=["openai"]):
-            with patch("aetherdialect._core_utils._provider_is_configured", return_value=True):
-                with patch("aetherdialect._core_utils._build_client", return_value=mock_client):
+        with patch("aetherdialect._llm_provider._provider_order", return_value=["openai"]):
+            with patch("aetherdialect._llm_provider._provider_is_configured", return_value=True):
+                with patch("aetherdialect._llm_provider._build_client", return_value=mock_client):
                     with patch("aetherdialect._core_utils.debug"):
                         with patch("aetherdialect._core_utils.pipeline_trace"):
                             out = llm_chat("sys", "usr", max_retries=1, task="join")
@@ -1624,13 +1565,13 @@ class TestLlmChat:
             mock_resp.output_text = "{}"
             mock_client = MagicMock()
             mock_client.responses.create.return_value = mock_resp
-            with patch("aetherdialect._core_utils._provider_order", return_value=["azure"]):
+            with patch("aetherdialect._llm_provider._provider_order", return_value=["azure"]):
                 with patch(
-                    "aetherdialect._core_utils._provider_is_configured",
+                    "aetherdialect._llm_provider._provider_is_configured",
                     return_value=True,
                 ):
                     with patch(
-                        "aetherdialect._core_utils._build_client",
+                        "aetherdialect._llm_provider._build_client",
                         return_value=mock_client,
                     ):
                         with patch("aetherdialect._core_utils.debug"):
@@ -1652,13 +1593,13 @@ class TestLlmChat:
             mock_resp.output_text = "{}"
             mock_client = MagicMock()
             mock_client.responses.create.return_value = mock_resp
-            with patch("aetherdialect._core_utils._provider_order", return_value=["openai"]):
+            with patch("aetherdialect._llm_provider._provider_order", return_value=["openai"]):
                 with patch(
-                    "aetherdialect._core_utils._provider_is_configured",
+                    "aetherdialect._llm_provider._provider_is_configured",
                     return_value=True,
                 ):
                     with patch(
-                        "aetherdialect._core_utils._build_client",
+                        "aetherdialect._llm_provider._build_client",
                         return_value=mock_client,
                     ):
                         with patch("aetherdialect._core_utils.debug"):
@@ -1670,8 +1611,8 @@ class TestLlmChat:
             EngineConfig.LLM_PROVIDER = snap_p
 
     def test_no_provider_raises(self):
-        with patch("aetherdialect._core_utils._provider_order", return_value=["openai"]):
-            with patch("aetherdialect._core_utils._provider_is_configured", return_value=False):
+        with patch("aetherdialect._llm_provider._provider_order", return_value=["openai"]):
+            with patch("aetherdialect._llm_provider._provider_is_configured", return_value=False):
                 with pytest.raises(RuntimeError, match="No configured"):
                     llm_chat("s", "u", max_retries=1)
 
@@ -1680,12 +1621,12 @@ class TestLlmJson:
     """llm_json behaviour via mocked llm_chat."""
 
     def test_parses_json_object(self):
-        with patch("aetherdialect._core_utils.llm_chat", return_value='{"k": 1}'):
+        with patch("aetherdialect._llm_provider.llm_chat", return_value='{"k": 1}'):
             with patch("aetherdialect._core_utils.debug"):
                 assert llm_json("s", "u") == {"k": 1}
 
     def test_wraps_raw_select(self):
-        with patch("aetherdialect._core_utils.llm_chat", return_value="SELECT 1"):
+        with patch("aetherdialect._llm_provider.llm_chat", return_value="SELECT 1"):
             with patch("aetherdialect._core_utils.debug"):
                 d = llm_json("s", "u", retries=0)
         assert d["sql"] == "SELECT 1"
@@ -1698,7 +1639,7 @@ class TestLlmJson:
             calls["n"] += 1
             return "not json"
 
-        with patch("aetherdialect._core_utils.llm_chat", side_effect=side_effect):
+        with patch("aetherdialect._llm_provider.llm_chat", side_effect=side_effect):
             with patch("aetherdialect._core_utils.debug"):
                 with pytest.raises(LlmJsonExhausted) as exc_info:
                     llm_json("s", "u", retries=0, task="intent")
@@ -1706,7 +1647,7 @@ class TestLlmJson:
         assert exc_info.value.attempts == 1
 
     def test_retries_exhausted_after_multiple_retries(self):
-        with patch("aetherdialect._core_utils.llm_chat", return_value="still not json"):
+        with patch("aetherdialect._llm_provider.llm_chat", return_value="still not json"):
             with patch("aetherdialect._core_utils.debug"):
                 with pytest.raises(LlmJsonExhausted) as exc_info:
                     llm_json("s", "u", retries=2)
@@ -1726,38 +1667,38 @@ class TestTelemetryCapturesPipelineTrace:
 
     def test_pipeline_trace_always_appends_to_sink(self):
         with telemetry_capture(suppress_console=True) as buf:
-            with (
-                patch(
-                    "aetherdialect._core_utils.diagnostic_debug_enabled",
-                    return_value=False,
-                ),
-                patch(
-                    "aetherdialect._core_utils.diagnostic_pipeline_trace_full_enabled",
-                    return_value=False,
-                ),
-            ):
+            with patch("aetherdialect._core_utils.diagnostic_debug_enabled", return_value=False):
                 pipeline_trace("ev", "data")
         assert any("[PIPELINE_TRACE] ev" in line for line in buf)
         assert any("data" in line for line in buf)
 
-    def test_pipeline_trace_lazy_always_appends_to_sink(self):
+    def test_pipeline_trace_callable_body_appends_to_sink(self):
         with telemetry_capture(suppress_console=True) as buf:
-            with (
-                patch(
-                    "aetherdialect._core_utils.diagnostic_debug_enabled",
-                    return_value=False,
-                ),
-                patch(
-                    "aetherdialect._core_utils.diagnostic_pipeline_trace_full_enabled",
-                    return_value=False,
-                ),
-            ):
-                pipeline_trace_lazy("ev", lambda: "payload")
+            with patch("aetherdialect._core_utils.diagnostic_debug_enabled", return_value=False):
+                pipeline_trace("ev", lambda: "payload")
         joined = "\n".join(buf)
         assert "[PIPELINE_TRACE]" in joined
         assert "payload" in joined
 
+    def test_pipeline_capture_routes_llm_provider_trace_to_buffer(self, capsys):
+        import aetherdialect._llm_provider
 
+        with pipeline_capture(auto_responses=["y"]) as capture:
+            with patch.object(
+                aetherdialect._llm_provider,
+                "diagnostic_debug_enabled",
+                return_value=True,
+            ):
+                aetherdialect._llm_provider.pipeline_trace(
+                    "llm_chat.request task=intent user_message",
+                    "secret prompt body",
+                )
+        out = capsys.readouterr().out
+        assert "secret prompt body" not in out
+        assert any("secret prompt body" in line for line in capture["logs"])
+
+
+@pytest.mark.usefixtures("_non_mock_llm_provider")
 class TestProviderOrderAndBuildClient:
     """Private LLM routing helpers (pure config + cache)."""
 
@@ -1774,18 +1715,19 @@ class TestProviderOrderAndBuildClient:
             assert _provider_order() == ["openai"]
 
     def test_build_client_unsupported_raises(self):
-        import aetherdialect._core_utils as cu
+        import aetherdialect._llm_provider
 
-        prev = dict(cu._clients)
-        cu._clients.clear()
+        prev = dict(aetherdialect._llm_provider._clients)
+        aetherdialect._llm_provider._clients.clear()
         try:
             with pytest.raises(RuntimeError, match="Unsupported LLM provider"):
                 _build_client("not-a-provider")
         finally:
-            cu._clients.clear()
-            cu._clients.update(prev)
+            aetherdialect._llm_provider._clients.clear()
+            aetherdialect._llm_provider._clients.update(prev)
 
 
+@pytest.mark.usefixtures("_non_mock_llm_provider")
 class TestLlmChatBranches:
     """More llm_chat branches without a real API."""
 
@@ -1799,14 +1741,14 @@ class TestLlmChatBranches:
             return bad if name == "openai" else good
 
         with patch(
-            "aetherdialect._core_utils._provider_order",
+            "aetherdialect._llm_provider._provider_order",
             return_value=["openai", "azure"],
         ):
-            with patch("aetherdialect._core_utils._provider_is_configured", return_value=True):
-                with patch("aetherdialect._core_utils._build_client", side_effect=pick_client):
+            with patch("aetherdialect._llm_provider._provider_is_configured", return_value=True):
+                with patch("aetherdialect._llm_provider._build_client", side_effect=pick_client):
                     with patch("aetherdialect._core_utils.debug"):
                         with patch("aetherdialect._core_utils.pipeline_trace"):
-                            with patch("aetherdialect._core_utils.log"):
+                            with patch("aetherdialect._core_utils.debug"):
                                 out = llm_chat("s", "u", max_retries=1, task="join")
         assert out == "ok"
         assert bad.responses.create.call_count == 1
@@ -1816,12 +1758,12 @@ class TestLlmChatBranches:
         client = MagicMock()
         client.responses.create.side_effect = ValueError("nope")
 
-        with patch("aetherdialect._core_utils._provider_order", return_value=["openai"]):
-            with patch("aetherdialect._core_utils._provider_is_configured", return_value=True):
-                with patch("aetherdialect._core_utils._build_client", return_value=client):
+        with patch("aetherdialect._llm_provider._provider_order", return_value=["openai"]):
+            with patch("aetherdialect._llm_provider._provider_is_configured", return_value=True):
+                with patch("aetherdialect._llm_provider._build_client", return_value=client):
                     with patch("aetherdialect._core_utils.debug"):
                         with patch("aetherdialect._core_utils.pipeline_trace"):
-                            with patch("aetherdialect._core_utils.log"):
+                            with patch("aetherdialect._core_utils.debug"):
                                 with patch("aetherdialect._core_utils.time.sleep"):
                                     with pytest.raises(RuntimeError, match="LLM call failed"):
                                         llm_chat("s", "u", max_retries=2, task="join")
@@ -1833,9 +1775,9 @@ class TestLlmChatBranches:
         client = MagicMock()
         client.responses.create.return_value = mock_resp
 
-        with patch("aetherdialect._core_utils._provider_order", return_value=["openai"]):
-            with patch("aetherdialect._core_utils._provider_is_configured", return_value=True):
-                with patch("aetherdialect._core_utils._build_client", return_value=client):
+        with patch("aetherdialect._llm_provider._provider_order", return_value=["openai"]):
+            with patch("aetherdialect._llm_provider._provider_is_configured", return_value=True):
+                with patch("aetherdialect._llm_provider._build_client", return_value=client):
                     with patch("aetherdialect._core_utils.debug"):
                         with patch("aetherdialect._core_utils.pipeline_trace"):
                             llm_chat("s", "u", max_retries=1, task="intent")
@@ -1850,9 +1792,9 @@ class TestLlmChatBranches:
         client = MagicMock()
         client.responses.create.return_value = mock_resp
 
-        with patch("aetherdialect._core_utils._provider_order", return_value=["openai"]):
-            with patch("aetherdialect._core_utils._provider_is_configured", return_value=True):
-                with patch("aetherdialect._core_utils._build_client", return_value=client):
+        with patch("aetherdialect._llm_provider._provider_order", return_value=["openai"]):
+            with patch("aetherdialect._llm_provider._provider_is_configured", return_value=True):
+                with patch("aetherdialect._llm_provider._build_client", return_value=client):
                     with patch("aetherdialect._core_utils.debug"):
                         with patch("aetherdialect._core_utils.pipeline_trace"):
                             llm_chat("s", "u", max_retries=1, task="join")
@@ -1871,7 +1813,7 @@ class TestLlmJsonBranches:
         def fake_chat(*_a, **_k):
             return next(replies)
 
-        with patch("aetherdialect._core_utils.llm_chat", side_effect=fake_chat):
+        with patch("aetherdialect._llm_provider.llm_chat", side_effect=fake_chat):
             with patch("aetherdialect._core_utils.debug"):
                 assert llm_json("s", "u", retries=1) == {"fixed": True}
 
@@ -1881,7 +1823,7 @@ class TestLlmJsonBranches:
         def fake_chat(*_a, **_k):
             return next(replies)
 
-        with patch("aetherdialect._core_utils.llm_chat", side_effect=fake_chat):
+        with patch("aetherdialect._llm_provider.llm_chat", side_effect=fake_chat):
             with patch("aetherdialect._core_utils.debug"):
                 d = llm_json("s", "u", retries=1)
         assert d["sql"] == "SELECT 2"
@@ -1893,7 +1835,7 @@ class TestLlmJsonBranches:
         def fake_chat(*_a, **_k):
             return next(replies)
 
-        with patch("aetherdialect._core_utils.llm_chat", side_effect=fake_chat):
+        with patch("aetherdialect._llm_provider.llm_chat", side_effect=fake_chat):
             with patch("aetherdialect._core_utils.debug"):
                 assert llm_json("s", "u", retries=1) == {"only": "dict"}
 
@@ -1902,7 +1844,7 @@ class TestSubstituteParamsPlusZero:
     """sql_simplify_executable strips + 0 as well as - 0."""
 
     def test_plus_zero_removed(self):
-        result = sql_simplify_executable("SELECT col + 0 FROM t", sqlglot_dialect="postgres")
+        result = _sql_simplify_executable("SELECT col + 0 FROM t", sqlglot_dialect="postgres")
         assert "+ 0" not in result
 
 
@@ -2027,17 +1969,8 @@ class TestResult:
 
     def test_writes_message(self, capsys):
         with diagnostic_print_listener(print):
-            result("col1 | col2")
+            _result("col1 | col2")
         assert capsys.readouterr().out == "col1 | col2\n"
-
-
-class TestWarn:
-    """``warn`` prefixes with ``! ``."""
-
-    def test_warn_prefix(self, capsys):
-        with diagnostic_print_listener(print):
-            warn("careful")
-        assert capsys.readouterr().out == "! careful\n"
 
 
 class TestError:
@@ -2106,13 +2039,12 @@ class TestPrompt:
 class TestLlmUserSensitivityStrip:
     """``_llm_user_text_without_sensitivity_classification`` removes tier keys from JSON user payloads."""
 
-    def test_strips_nested_sensitivity_and_pii(self) -> None:
-        payload = '{"tables":{"t":{"columns":{"c":{"role":"x","sensitivity":"strict","pii":null}}}}}'
+    def test_strips_nested_sensitivity(self) -> None:
+        payload = '{"tables":{"t":{"columns":{"c":{"role":"x","sensitivity":"strict"}}}}}'
         out = _llm_user_text_without_sensitivity_classification(payload)
         data = json.loads(out)
         col = data["tables"]["t"]["columns"]["c"]
         assert "sensitivity" not in col
-        assert "pii" not in col
         assert col["role"] == "x"
 
     def test_plain_text_unchanged(self) -> None:

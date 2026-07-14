@@ -3,24 +3,27 @@
 import pytest
 
 from aetherdialect._contracts_base import (
-    ColumnMetadata,
     ColumnRole,
-    CteOutputColumnMeta,
-    FKEdge,
-    SchemaGraph,
-    TableMetadata,
-)
-from aetherdialect._contracts_core import (
-    CaseRegistryStep,
-    CaseWhenBranch,
-    CaseWhenExpr,
+    FailureCategory,
     FilterParam,
     HavingParam,
     MulGroup,
     NormalizedExpr,
     OrderByCol,
+)
+from aetherdialect._contracts_core import (
     RuntimeCteStep,
     SelectCol,
+)
+from aetherdialect._contracts_schema import (
+    CaseRegistryStep,
+    CaseWhenBranch,
+    CaseWhenExpr,
+    ColumnMetadata,
+    CteOutputColumnMeta,
+    FKEdge,
+    SchemaGraph,
+    TableMetadata,
     WindowRegistryStep,
     WindowSpec,
     registry_render_scope,
@@ -30,7 +33,6 @@ from aetherdialect._validation_schema import (
     _validate_filter_col,
     _validate_having_agg,
     _validate_scalar_func_valid,
-    collect_column_refs_for_access_policy,
     extract_agg_col,
     extract_col_from_scalar_wrapper,
     extract_functions_from_term,
@@ -53,8 +55,10 @@ from aetherdialect._validation_schema import (
     validate_no_between_ops,
     validate_null_filters,
     validate_order_by_cols_schema,
+    validate_redundant_extract_year_column_literals,
     validate_select_cols_schema,
     validate_selectability,
+    validate_window_partition_group_by_alignment,
     validate_window_spec_schema,
 )
 
@@ -1584,7 +1588,8 @@ class TestContainsArrayValidator:
     def test_contains_on_array_ok(self, typed_schema):
         tags = typed_schema.tables["orders"].columns.get("tags")
         if tags is None:
-            from aetherdialect._contracts_base import ColumnMetadata, ColumnRole
+            from aetherdialect._contracts_base import ColumnRole
+            from aetherdialect._contracts_schema import ColumnMetadata
 
             typed_schema.tables["orders"].columns["tags"] = ColumnMetadata(
                 name="tags",
@@ -1627,15 +1632,23 @@ class TestSelectabilityValidator:
     """Tests for validate_selectability."""
 
     def test_non_selectable_column(self, typed_schema):
-        typed_schema.tables["customers"].columns["name"].sensitivity = "pii"
+        typed_schema.tables["customers"].columns["name"].sensitivity = "hidden"
         sc = SelectCol(expr=NormalizedExpr.from_column("customers.name"))
         issues = validate_selectability([sc], typed_schema, {}, "main")
         assert len(issues) >= 1
 
+    def test_restricted_column_blocked(self, typed_schema):
+        """Restricted columns are blocked in bare SELECT list."""
+        typed_schema.tables["customers"].columns["name"].sensitivity = "restricted"
+        sc = SelectCol(expr=NormalizedExpr.from_column("customers.name"))
+        issues = validate_selectability([sc], typed_schema, {}, "main")
+        assert len(issues) == 1
+        assert issues[0].category == FailureCategory.ACCESS_POLICY
+        assert "not selectable" in issues[0].message
+
     def test_count_star_allows_non_selectable_absent(self, typed_schema):
         """COUNT(*) has no column refs; no selectability issues."""
-
-        typed_schema.tables["customers"].columns["name"].sensitivity = "pii"
+        typed_schema.tables["customers"].columns["name"].sensitivity = "hidden"
         expr = NormalizedExpr(add_groups=[MulGroup(multiply=["*"], agg_func="count")])
         sc = SelectCol(expr=expr)
         issues = validate_selectability([sc], typed_schema, {}, "main")
@@ -1643,8 +1656,7 @@ class TestSelectabilityValidator:
 
     def test_count_pk_exempt(self, typed_schema):
         """COUNT on primary key excuses non-selectable flag on that column."""
-
-        typed_schema.tables["customers"].columns["id"].sensitivity = "pii"
+        typed_schema.tables["customers"].columns["id"].sensitivity = "hidden"
         expr = NormalizedExpr(
             add_groups=[MulGroup(multiply=["customers.id"], agg_func="count")],
         )
@@ -1654,8 +1666,7 @@ class TestSelectabilityValidator:
 
     def test_sum_on_non_selectable_allowed_in_aggregate(self, typed_schema):
         """SUM (and other aggs) on a non-selectable column are allowed in SELECT."""
-
-        typed_schema.tables["customers"].columns["name"].sensitivity = "pii"
+        typed_schema.tables["customers"].columns["name"].sensitivity = "hidden"
         expr = NormalizedExpr(
             add_groups=[MulGroup(multiply=["customers.name"], agg_func="sum")],
         )
@@ -1664,7 +1675,7 @@ class TestSelectabilityValidator:
         assert issues == []
 
     def test_count_distinct_non_selectable_allowed(self, typed_schema):
-        typed_schema.tables["customers"].columns["name"].sensitivity = "pii"
+        typed_schema.tables["customers"].columns["name"].sensitivity = "hidden"
         expr = NormalizedExpr(
             add_groups=[MulGroup(multiply=["DISTINCT customers.name"], agg_func="count")],
         )
@@ -1673,7 +1684,7 @@ class TestSelectabilityValidator:
         assert issues == []
 
     def test_window_partition_bare_non_selectable_errors(self, typed_schema):
-        typed_schema.tables["customers"].columns["name"].sensitivity = "pii"
+        typed_schema.tables["customers"].columns["name"].sensitivity = "hidden"
         ws = WindowSpec(
             function="rank",
             partition_by=[NormalizedExpr.from_column("customers.name")],
@@ -1692,7 +1703,7 @@ class TestSelectabilityValidator:
         assert "partition" in issues[0].message.lower()
 
     def test_window_order_by_non_selectable_allowed(self, typed_schema):
-        typed_schema.tables["customers"].columns["name"].sensitivity = "pii"
+        typed_schema.tables["customers"].columns["name"].sensitivity = "hidden"
         ws = WindowSpec(
             function="rank",
             partition_by=[NormalizedExpr.from_column("customers.id")],
@@ -1712,7 +1723,7 @@ class TestSelectabilityValidator:
     def test_cte_output_bare_non_selectable_consumer_blocked(self, typed_schema):
         cte_outputs = {
             "inner_cte": {
-                "secret": CteOutputColumnMeta(source="passthrough", sensitivity="pii"),
+                "secret": CteOutputColumnMeta(source="passthrough", sensitivity="hidden"),
             }
         }
         sc = SelectCol(expr=NormalizedExpr.from_column("inner_cte.secret"))
@@ -1722,7 +1733,7 @@ class TestSelectabilityValidator:
     def test_cte_output_non_selectable_wrapped_in_sum_allowed(self, typed_schema):
         cte_outputs = {
             "inner_cte": {
-                "secret": CteOutputColumnMeta(source="passthrough", sensitivity="pii"),
+                "secret": CteOutputColumnMeta(source="passthrough", sensitivity="restricted"),
             }
         }
         expr = NormalizedExpr(
@@ -1734,7 +1745,6 @@ class TestSelectabilityValidator:
 
     def test_selectability_exempt_refs_nonempty_for_count_pk(self, typed_schema):
         """Exempt set includes PK ref for COUNT(pk)."""
-
         expr = NormalizedExpr(
             add_groups=[MulGroup(multiply=["customers.id"], agg_func="count")],
         )
@@ -1882,59 +1892,6 @@ class TestValidateHavingAggCteBareRef:
             "h1",
         )
         assert issues == []
-
-
-class TestCollectColumnRefsForAccessPolicy:
-    """Tests for collect_column_refs_for_access_policy."""
-
-    def test_collects_filter_having_and_case(self, simple_schema):
-        cw = CaseWhenExpr(
-            branches=[
-                CaseWhenBranch(
-                    condition=FilterParam(
-                        left_expr=NormalizedExpr.from_column("customers.id"),
-                        op=">",
-                        value_type="integer",
-                        raw_value=1,
-                    ),
-                    result=NormalizedExpr.from_column("customers.name"),
-                ),
-            ],
-            else_result=NormalizedExpr.from_column("customers.email"),
-        )
-        sc = SelectCol(expr=NormalizedExpr.from_column("c01"))
-        cr = [CaseRegistryStep(registry_id="c01", case_when=cw)]
-        fp = FilterParam(
-            left_expr=NormalizedExpr.from_column("orders.customer_id"),
-            right_expr=NormalizedExpr.from_column("customers.id"),
-            op="=",
-            value_type="integer",
-        )
-        hp = HavingParam(
-            left_expr=NormalizedExpr.from_agg("count", "customers.id"),
-            op=">",
-            value_type="integer",
-            raw_value=0,
-        )
-        refs = collect_column_refs_for_access_policy(
-            [sc],
-            [NormalizedExpr.from_column("customers.name")],
-            [OrderByCol(expr=NormalizedExpr.from_column("orders.amount"), direction="ASC")],
-            [fp],
-            [hp],
-            case_registry=cr,
-        )
-        for expected in (
-            "orders.amount",
-            "customers.id",
-            "customers.name",
-            "customers.email",
-            "orders.customer_id",
-        ):
-            assert expected in refs
-
-    def test_none_lists_treated_as_empty(self):
-        assert collect_column_refs_for_access_policy(None, None, None, None, None) == []
 
 
 class TestValidateCaseWhenSchema:
@@ -2164,7 +2121,6 @@ class TestValidateWindowSpecSchemaMore:
 
     def test_lag_allows_non_numeric_offset_argument(self, typed_schema):
         """LEAD/LAG offset may reference non-numeric columns; schema does not enforce numeric-only."""
-
         ws = WindowSpec(
             function="lag",
             partition_by=[NormalizedExpr.from_column("orders.customer_id")],
@@ -2219,3 +2175,101 @@ class TestValidateGroupByColsEdgeCases:
     def test_empty_expr_unqualified(self, simple_schema):
         issues = validate_group_by_cols_schema([NormalizedExpr()], simple_schema, {"customers"})
         assert any("qualified" in i.message for i in issues)
+
+
+class TestValidateWindowPartitionGroupByAlignment:
+    def test_grouped_scope_missing_partition_col_errors(self):
+        ws = WindowSpec(
+            function="row_number",
+            partition_by=[NormalizedExpr.from_column("tbl_a.col_k")],
+            order_by=[OrderByCol(expr=NormalizedExpr.from_column("tbl_a.col_a"), direction="asc")],
+        )
+        wr = [WindowRegistryStep(registry_id="w01", window_spec=ws)]
+        issues = validate_window_partition_group_by_alignment(
+            grain="grouped",
+            group_by_cols=[NormalizedExpr.from_column("tbl_a.col_a")],
+            window_registry=wr,
+            context="main query",
+        )
+        assert len(issues) == 1
+        assert "window_partition_column_missing" in issues[0].issue_id
+
+    def test_row_level_outer_scope_no_error(self):
+        ws = WindowSpec(
+            function="row_number",
+            partition_by=[NormalizedExpr.from_column("tbl_a.col_k")],
+            order_by=[OrderByCol(expr=NormalizedExpr.from_column("tbl_a.col_a"), direction="asc")],
+        )
+        wr = [WindowRegistryStep(registry_id="w01", window_spec=ws)]
+        issues = validate_window_partition_group_by_alignment(
+            grain="row_level",
+            group_by_cols=[],
+            window_registry=wr,
+            context="main query",
+        )
+        assert issues == []
+
+    def test_partition_col_present_in_group_by_ok(self):
+        ws = WindowSpec(
+            function="row_number",
+            partition_by=[NormalizedExpr.from_column("tbl_a.col_k")],
+            order_by=[OrderByCol(expr=NormalizedExpr.from_column("tbl_a.col_a"), direction="asc")],
+        )
+        wr = [WindowRegistryStep(registry_id="w01", window_spec=ws)]
+        issues = validate_window_partition_group_by_alignment(
+            grain="grouped",
+            group_by_cols=[
+                NormalizedExpr.from_column("tbl_a.col_k"),
+                NormalizedExpr.from_column("tbl_a.col_a"),
+            ],
+            window_registry=wr,
+            context="main query",
+        )
+        assert issues == []
+
+
+class TestValidateRedundantExtractYearLiterals:
+    def test_bare_year_equality_with_extract_errors(self):
+        filters = [
+            FilterParam(
+                left_expr=NormalizedExpr(
+                    add_groups=[MulGroup(multiply=[NormalizedExpr.from_column("tbl_a.date_a")])],
+                    scalar_func="extract",
+                    scalar_func_args=["year", "tbl_a.date_a"],
+                ),
+                op="=",
+                raw_value="2026",
+                value_type="integer",
+            ),
+            FilterParam(
+                left_expr=NormalizedExpr.from_column("tbl_a.date_a"),
+                op="=",
+                raw_value="2026",
+                value_type="integer",
+            ),
+        ]
+        issues = validate_redundant_extract_year_column_literals(filters, [], "main")
+        assert len(issues) == 1
+        assert "redundant" in issues[0].message.lower()
+
+    def test_bare_year_gt_with_extract_errors(self):
+        filters = [
+            FilterParam(
+                left_expr=NormalizedExpr(
+                    add_groups=[MulGroup(multiply=[NormalizedExpr.from_column("tbl_a.date_a")])],
+                    scalar_func="extract",
+                    scalar_func_args=["year", "tbl_a.date_a"],
+                ),
+                op="=",
+                raw_value="2026",
+                value_type="integer",
+            ),
+            FilterParam(
+                left_expr=NormalizedExpr.from_column("tbl_a.date_a"),
+                op=">=",
+                raw_value="2025",
+                value_type="integer",
+            ),
+        ]
+        issues = validate_redundant_extract_year_column_literals(filters, [], "main")
+        assert len(issues) == 1

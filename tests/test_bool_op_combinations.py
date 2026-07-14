@@ -6,20 +6,20 @@ from dataclasses import replace
 
 import pytest
 
-from aetherdialect._contracts_base import SchemaGraph
-from aetherdialect._contracts_core import (
-    CaseWhenBranch,
+from aetherdialect._contracts_base import (
     FilterParam,
     HavingParam,
     MulGroup,
     NormalizedExpr,
+)
+from aetherdialect._contracts_core import (
     RuntimeCteStep,
     RuntimeIntent,
     SelectCol,
 )
-from aetherdialect._dialect import PostgresDialect
-from aetherdialect._intent_expr import decompose_between_params
-from aetherdialect._intent_process import _compute_filters_similarity
+from aetherdialect._contracts_schema import CaseWhenBranch, SchemaGraph
+from aetherdialect._dialect_postgres import PostgresDialect
+from aetherdialect._intent_expr import _compute_filters_similarity, decompose_between_params
 from aetherdialect._intent_repair import decompose_in_not_in_filters
 from aetherdialect._intent_resolve import (
     _dedup_filters,

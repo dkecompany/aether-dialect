@@ -3,98 +3,143 @@
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
-from types import MappingProxyType
 from typing import Any, Literal, NamedTuple
 
-import jsonschema
-
 from ._config import (
+    PolicyConfig,
+)
+from ._constants import (
+    ASK_PHASE_B,
+    ASK_PHASE_C,
+    ASK_PHASE_D,
+    ASK_PHASE_E,
+    ASK_PHASE_F,
+    ASK_PHASE_G,
+    ASK_PHASE_H,
+    COMPOSE_SUPPORTED_CAPABILITIES,
+    DIAGNOSTIC_CODE_COMPOSE_REPAIR,
     DIAGNOSTIC_CODE_FALLBACK_FRESH_RESTART,
-    DIAGNOSTIC_CODE_STAGE_A_RETRY,
-    DIAGNOSTIC_CODE_STAGE_B_REPAIR,
+    DIAGNOSTIC_CODE_INTERPRET_GROUND_RETRY,
+    ENCODER_IR_ASSEMBLY_RULES,
+    ENCODER_NL_PHRASE_MAPPINGS,
+    ENCODER_NL_TO_IR_GUIDANCE,
+    EXPR_TABLE_COLUMN_REF_RE,
+    FORMAT_STRUCTURAL_GUIDANCE,
+    GROUND_SUPPORTED_CAPABILITIES,
+    IDENTIFIER_RE,
+    INTENT_COMPOSE_SYSTEM,
+    INTENT_CRITICAL_RULES,
+    INTENT_FORMAT_REPAIR_JSON_RULES,
+    INTENT_GROUND_SYSTEM,
+    INTENT_INTERPRET_SYSTEM,
+    INTENT_PARSE_RULES_APPEND,
+    INTENT_PLACEHOLDER_FORMAT_REPAIR_PARSE_ERROR,
+    INTENT_SYSTEM_NATURAL_LANGUAGE_FIELD_SHAPE,
+    INTENT_SYSTEM_SEMANTIC_JOIN_INTERMEDIATES,
+    INTERPRET_PLAN_SCHEMA,
+    INTERPRET_SUPPORTED_CAPABILITIES,
+    LOGICAL_DECOMPOSITION_GUIDANCE,
     LOGICAL_INTENT_SCHEMA,
     MAX_NON_AGG_COL_DIFF,
-    MAX_STAGE_A_RETRIES,
+    NATURAL_LANGUAGE_REFUSAL_PARSE_ERROR,
+    PLANNER_NL_CONVENTIONS,
+    PLANNER_PROSE_FIELDS,
+    REGISTRY_TOKEN_PATTERN,
+    REPAIR_INSTRUCTIONS,
     TEMPLATE_UNION_FAMILY_INDEX_KEY,
     VALID_HAVING_OPS,
     GenerationPath,
-    PolicyConfig,
-    diagnostic_debug_enabled,
-    diagnostic_pipeline_trace_full_enabled,
 )
 from ._contracts_base import (
-    ConfigError,
-    CteIntent,
     FailureCategory,
-    IntentIssue,
-    LogicalIntent,
-    SchemaGraph,
-    make_intent_issue,
-)
-from ._contracts_core import (
-    CaseRegistryStep,
-    ConcreteIntent,
-    FeedbackKind,
     FilterParam,
     HavingParam,
+    LogicalIntent,
     MulGroup,
     NormalizedExpr,
-    OrderByCol,
-    RejectionBucket,
+    expr_registry_ref,
+)
+from ._contracts_core import (
+    ConcreteCteStep,
+    ConcreteIntent,
+    FeedbackKind,
+    InterpretPlan,
     RuntimeCteStep,
     RuntimeIntent,
     SelectCol,
     StructuralCompareResult,
     Template,
-    WindowRegistryStep,
     concrete_intent_to_runtime_skeleton,
-    expr_registry_ref,
     intent_prompt_structural_index,
+)
+from ._contracts_schema import (
+    CaseRegistryStep,
+    IntentIssue,
+    SchemaGraph,
+    WindowRegistryStep,
+    make_intent_issue,
 )
 from ._core_utils import (
     debug,
-    llm_chat,
+    diagnostic_debug_enabled,
+    diagnostic_pipeline_trace_full_enabled,
     notify,
-    pipeline_trace_lazy,
-    safe_json_loads,
+    pipeline_trace,
     stable_json,
 )
 from ._dialect import extra_filter_ops_for_engine
 from ._intent_expr import (
+    RestartBudget,
     assign_param_keys,
     build_cte_output_metadata,
     canonicalize_temporal_unit_args,
+    classify_cte_expr,
     collect_raw_param_values,
     decompose_between_params,
+    dedupe_prior_question_feedback_rows,
     derive_cte_output_columns,
     ensure_scalar_func_defaults,
     extract_structural_params,
+    get_templates_module,
+    in_turn_row_from_semantic_errors,
+    intent_similarity,
+    interpret_plan_for_ground,
+    is_template_store_view,
     normalize_date_diff_raw_values,
     normalize_in_raw_values,
     parse_intent_response,
+    parse_interpret_plan_response,
+    parse_logical_intent_response,
+    promote_date_subtraction_to_date_diff,
+    refresh_template_store_indexes_for_view,
     repair_misclassified_date_diff,
     replace_refs_in_expr,
+    runtime_intent_has_refusal_natural_language,
+    serialized_prior_feedback_rows,
     tag_case_when_condition_scope,
     tag_expr_numeric,
 )
 from ._intent_repair import (
     align_filter_value_type_to_exprs,
+    apply_filters_to_main_and_ctes,
     auto_repair_filter_having,
     dedup_contradictory_filters,
+    dedup_extract_year_vs_column_literal,
     dedup_value_vs_right_expr,
     drop_invalid_case_registry_entries,
     enforce_sensitivity_policy_intent,
     expand_fk_select_to_descriptive,
+    expand_shared_pk_tables_for_refs,
     lift_distinct_modifier_in_multiply,
     normalize_boolean_filter_values,
     normalize_in_filter_types,
     normalize_null_filter_values,
     normalize_pk_distinct,
-    qualify_cte_output_columns,
+    promote_temporal_keyword_rhs,
     reconcile_tables,
     repair_array_filters_intent,
     repair_case_when_intent,
@@ -103,19 +148,16 @@ from ._intent_repair import (
     repair_intent_placeholder_tokens,
     repair_null_equality_filters,
     replace_unknown_scalar_funcs,
-    resolve_filter_value_case,
     runtime_intent_has_instructional_placeholders,
+    sanitize_table_names,
     strip_impossible_having,
     strip_join_conditions,
     strip_spurious_group_by,
 )
 from ._intent_resolve import (
     UnionSelectColumnDelta,
-    _coerce_filter_group_list,
-    _coerce_having_group_list,
-    _normalized_expr_is_absent,
     apply_aggregatability_gate,
-    attribute_post_stage_b_issue,
+    attribute_post_compose_issue,
     canonicalize_registry_ids,
     check_qualified_refs_exist,
     coerce_filter_group_mode,
@@ -124,26 +166,33 @@ from ._intent_resolve import (
     enforce_case_branch_param_keys,
     enforce_cte_grain_consistency,
     enforce_grain_consistency,
+    ensure_cte_output_columns_exposure,
     join_path_key_concrete,
     join_path_key_runtime,
     lift_distinct_select_from_raw_sql,
     normalize_count_star,
     normalize_cte_names,
     normalize_filters_havings,
+    normalized_expr_is_absent,
     prune_unused_cte_output_columns,
     prune_unused_cte_steps,
-    qualify_cte_count_star_mulgroups,
+    qualify_count_star_mulgroups,
+    qualify_cte_output_columns,
+    rename_window_registry_steps,
     reorder_cte_steps_by_dag,
+    repair_window_partition_group_by_alignment,
     resolve_column_map,
     resolve_cte_column_maps,
+    resolve_filter_value_case,
+    resolve_window_registry_filter_rhs,
     rewrite_cte_output_refs_to_aliases,
     rewrite_main_query_refs_to_final_cte_columns,
     simplify_exprs,
     sort_select_cols,
-    validate_cte_dependencies,
-    validate_tables_exist,
+    strip_redundant_identifier_group_by,
 )
-from ._sql_gen import classify_cte_emission
+from ._llm_provider import llm_chat
+from ._sql_gen import classify_cte_emission, render_feedback_sql
 from ._utils import (
     QuestionReuseMatch,
     body_similarity_key,
@@ -154,606 +203,64 @@ from ._utils import (
 )
 from ._validation_execute import validate_semantics
 
-_TEMPLATES_MODULE: Any = None
 
-_INTENT_SYSTEM_SEMANTIC_JOIN_INTERMEDIATES = (
-    "Semantically-required join intermediates. The join enumerator only considers the SHORTEST FK paths "
-    "connecting the tables in `tables`, and any table listed in `tables` whose columns are not referenced "
-    "elsewhere in the intent (in `select_cols`, filters, `group_by_cols`, `having_param`, `order_by_cols`, "
-    "or registry expressions) is pruned before enumeration. Therefore, listing an extra table in `tables` "
-    "alone is never enough to force the join through it. "
-    "When the descriptions on the endpoint tables (or on tables related to them) indicate that two "
-    "semantically distinct FK paths connect the same pair of tables, and one path is strictly LONGER than "
-    "the other, the shorter path will always be chosen unless you force the longer one explicitly. "
-    "To force the longer path, reference at least one column from each required intermediate table inside "
-    "the intent. Adding such a column to `select_cols` is preferred — typically the intermediate table's "
-    "primary key or its most descriptive column — because it both keeps the table from being pruned and "
-    "surfaces context to the user that this specific semantic was intended. "
-    "Concretely, suppose the intent connects `tbl_a` to `tbl_b` and the descriptions indicate two semantic "
-    "paths: `tbl_a -> tbl_x -> tbl_b` for one semantic and `tbl_a -> tbl_y -> tbl_z -> tbl_b` for another. "
-    "If the question requires the second semantic, add at least one column from `tbl_y` or one column from "
-    "`tbl_z` (preferably to `select_cols`, ideally a primary key or the most descriptive column from each). "
-    "If the question requires the first semantic, no extra columns are needed because the shorter path is "
-    "already what the resolver will pick. When descriptions are silent about distinct paths, or when only "
-    "one FK path exists between the endpoints, no extra columns are needed."
-)
-
-_INTENT_SYSTEM_NATURAL_LANGUAGE_FIELD_SHAPE = (
-    "`natural_language` field shape. The `natural_language` field must read like a question a non-technical "
-    "user would ask, not a description of how the SQL is computed. Even when the intent uses CTEs, derived "
-    "steps, or window functions, compress the overall information need into a single conversational sentence. "
-    "Never enumerate steps, never reference CTE names, never mention SQL operators. The reader of this field "
-    'is the end user being asked "I understood: ; is this what you wanted?"'
-)
-
-
-def _dedupe_prior_question_feedback_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
-    """Return *rows* de-duplicated by ``(intent_structural_hash, summary prefix)``, preserving order."""
-
-    seen: set[tuple[str, str]] = set()
-    out: list[dict[str, str]] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        ihash = str(row.get("intent_structural_hash", "") or "")
-        summary = str(row.get("summary", "") or "")
-        key = (ihash, summary[:120])
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(row)
-    return out
-
-
-def _in_turn_row_from_semantic_errors(
-    errors: list[IntentIssue],
-    schema_hash: str,
-    intent: RuntimeIntent,
-) -> dict[str, str]:
-    """Build one ``to_prompt_row``-shaped dict from semantic validation errors."""
-
-    max_b = PolicyConfig.MAX_SUMMARY_BULLETS
-    lines = [f"[{e.category.value}] {e.message}" for e in errors[:max_b]]
-    summary = "\n".join(lines)
-    ts = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    tplm = _TEMPLATES_MODULE
-    if tplm is None:
-        ish, ipay = "", ""
-    else:
-        ish, ipay = tplm.compute_intent_structural_signature(intent)
-    return {
-        "kind": FeedbackKind.VALIDATION_FAILURE.value,
-        "summary": summary,
-        "buckets": RejectionBucket.OTHER.value,
-        "effective_structural_hash": schema_hash,
-        "intent_structural_hash": ish,
-        "intent_payload": ipay,
-        "created_at": ts,
-        "updated_at": ts,
-        "is_post_restart": "False",
-    }
-
-
-def register_templates_module(module: Any) -> None:
-    global _TEMPLATES_MODULE
-    _TEMPLATES_MODULE = module
-
-
-def _is_template_store_view(store: Any) -> bool:
-    """Return True when *store* is the registered templates module :class:`TemplateStoreView`."""
-
-    mod = _TEMPLATES_MODULE
-    return mod is not None and isinstance(store, mod.TemplateStoreView)
-
-
-def _refresh_template_store_indexes_for_view(
-    store: Any,
-    *,
-    template_objs: list[Template] | None = None,
-) -> None:
-    """Refresh matcher indexes on *store* when it is a registered :class:`TemplateStoreView`."""
-
-    mod = _TEMPLATES_MODULE
-    if mod is None:
-        return
-    mod.refresh_template_store_indexes(store, template_objs=template_objs)
-
-
-INTENT_PLACEHOLDER_FORMAT_REPAIR_PARSE_ERROR = (
-    "Instructional placeholder tokens appear in expression strings. Replace "
-    "each with exact table.column names from schema_info. Do not leave "
-    "angle-bracket markup, table_N or column_N instructional tokens, or "
-    "synthetic shape tokens from the prompt (tbl_a, tbl_b, col_a, date_a, date_b)."
-)
-
-REPAIR_INSTRUCTIONS: dict[str, str] = {
-    "extract_epoch": (
-        "Do not use EXTRACT(EPOCH FROM ...). Use date column subtraction "
-        "(e.g. tbl_a.date_a - tbl_b.date_b) or other supported "
-        "date functions for time differences."
-    ),
-    "grain_validity": "Use one of the allowed grain values: 'scalar', 'grouped', or 'row_level'.",
-    "grain_consistency": "Ensure grain matches the query structure. 'grouped' requires group_by_cols and aggregation in select_cols. 'row_level' means no GROUP BY and no aggregation. 'scalar' means a single aggregated value with no GROUP BY.",
-    "schema_validation": "One or more tables or columns do not exist in the schema. Check allowed_tables and use only exact column names from each table.",
-    "unknown_table": "The table does not exist in the schema. Remove it from tables and rewrite any references to use only tables that appear in allowed_tables.",
-    "unknown_column": "The column does not exist in its table. Check the schema for available columns with a similar name or meaning and replace the reference.",
-    "semantic_contradiction": "The intent contains contradictory operations. Keep only the aggregation or pattern that matches the question.",
-    "expression_type": "Arithmetic expressions require numeric columns. Ensure all operands in arithmetic and all comparison sides have compatible types.",
-    "filter_aggregation": "Conditions with aggregation functions (COUNT, SUM, AVG, MIN, MAX) belong in having_param, not filters_param. Move the condition.",
-    "having_aggregation": "HAVING conditions must have an aggregation function in left_expr. Conditions without aggregation belong in filters_param.",
-    "filter_semantic": "Fix the filter comparison: remove self-comparisons and ensure type compatibility between left and right expressions.",
-    "having_semantic": "Fix the HAVING comparison: remove self-comparisons and ensure type compatibility between aggregated expressions.",
-    "nested_aggregation": "Nested aggregation (e.g. SUM(COUNT(...))) is not allowed. Use a CTE: compute the inner aggregation in a CTE step, then aggregate the CTE output in the main query.",
-    "mixed_aggregation": "An expression cannot mix aggregated and bare column terms. Either wrap all terms in an aggregation function or add bare columns to group_by_cols.",
-    "group_by_membership": "Every non-aggregated column in select_cols must appear in group_by_cols when grain is 'grouped'. Add the missing column to group_by_cols or wrap it in an aggregation.",
-    "order_by_aggregation": "ORDER BY cannot contain aggregation when grain is 'row_level'. Change grain to 'grouped' or remove the aggregation from order_by_cols.",
-    "aggregation_hint": "The question contains a quantity-comparison phrase that typically requires COUNT or SUM aggregation with GROUP BY and HAVING. Add aggregation in select_cols, group_by_cols on the entity, having_param with the threshold, and set grain to 'grouped'.",
-    "column_schema": "A referenced column does not exist in its table. Check the schema for the correct column name.",
-    "table_schema": "A referenced table does not exist in the schema. Use only tables from allowed_tables.",
-    "filter_type_ops": "The filter operator is not compatible with the column data type. Use an appropriate operator for the column type.",
-    "null_filter": "NULL checks must use 'is null' or 'is not null' operator with no value or value_type field.",
-    "between_filter": (
-        "Use op 'between' with value as a two-element array [lower, upper]. "
-        "The pipeline decomposes it into >= and <= automatically."
-    ),
-    "date_window": (
-        "For relative time filters (e.g. 'last 90 days', 'past 6 months'), "
-        "use value_type 'date_window' with the date column in left_expr, "
-        'op \'>=\' and value as {"unit": "day"|"week"|"month"|"year", "amount": N}. '
-        "Use singular unit names. The amount is interpreted as an ISO half-open window: "
-        "the start is N units before today, the end is exclusive. Prefer unit 'day' whenever "
-        "the question phrases the window in days, weeks, or fortnights (convert weeks to days as N*7) "
-        "so the start/end boundary matches the schema's daily granularity."
-    ),
-    "date_diff": (
-        "For date-difference filters comparing two date columns "
-        "(e.g. tbl_a.date_b - tbl_a.date_a compared to N days), use value_type 'date_diff' with "
-        "left_expr as the date subtraction expression (later minus earlier per the question), "
-        "op as the comparison operator, and value as "
-        '{"unit": "day"|"week"|"month"|"year", "amount": N}. '
-        "Use singular unit names. Prefer unit 'day' whenever the question phrases the duration in "
-        "days or weeks (convert weeks to days as N*7). Do NOT use date_diff for relative date-window "
-        "filters; use date_window instead."
-    ),
-    "agg_role": "SUM and AVG should only be applied to numeric measure columns. Use COUNT for non-measure columns, or select a numeric column.",
-    "agg_type": "SUM and AVG require a numeric column. The referenced column is not numeric. Use COUNT instead or choose a numeric column.",
-    "for_each_grouping": "The question contains a 'for each', 'per', or 'by' phrase implying a GROUP BY on the referenced entity. Add the entity's identifying column to group_by_cols, include it as a non-aggregated entry in select_cols, and set grain to 'grouped'.",
-    "scalar_func_type": "The scalar function is applied to an incompatible column type. Ensure the column type matches what the function expects (e.g. YEAR needs a date column, UPPER needs a text column).",
-    "threshold_missing_having": "The question contains a threshold phrase (e.g. 'more than', 'at least') and the intent already has aggregation, but no HAVING condition is defined. Add a HAVING clause that compares the aggregated column to the numeric threshold in the question.",
-    "cte_structure": "CTE steps require a cte_name string, an output_columns list of alias strings, and valid tables.",
-    "cte_grain_consistency": "CTE grain must match its structure: same rules as the main query regarding grain, group_by_cols, and aggregation.",
-    "cte_table_reference": "A CTE references an unknown table. A CTE can only reference schema tables or CTEs defined earlier in the same WITH list.",
-    "cte_grain_compatibility": "A row_level query or CTE depends on an aggregated CTE. Ensure the grain is compatible with upstream CTE grains.",
-    "cte_aggregation": "A CTE has HAVING conditions but no aggregation in its select_cols. Add aggregation or remove the HAVING.",
-    "missing_scoping_table": "The question explicitly mentions a schema table that is missing from the intent. Add the table to 'tables', join it via its foreign-key relationship, and include relevant columns in select_cols or filters as appropriate.",
-    "agg_keyword_missing": "The question asks for an aggregation (total, count, average, sum, etc.) but the intent has no aggregated column and no HAVING condition. Add the appropriate aggregation function to select_cols, include all tables needed to compute the aggregated value, and set grain to 'grouped' with the correct group_by_cols.",
-}
-
-if PolicyConfig.MAX_STAGE_B_REPAIRS < 1:
-    raise ConfigError("PolicyConfig.MAX_STAGE_B_REPAIRS must be >= 1")
-if PolicyConfig.MAX_FRESH_RESTARTS < 0:
-    raise ConfigError("PolicyConfig.MAX_FRESH_RESTARTS must be >= 0")
-
-
-@dataclass
-class RestartBudget:
-    """Mutable counter bounding the number of fresh full-parse restarts per top-level invocation."""
-
-    fresh_restarts_left: int
-
-    @classmethod
-    def default(cls) -> RestartBudget:
-        """Construct a budget initialised from :data:`PolicyConfig.MAX_FRESH_RESTARTS`."""
-        return cls(fresh_restarts_left=PolicyConfig.MAX_FRESH_RESTARTS)
-
-
-_PLANNER_NL_CONVENTIONS_BODY: dict[str, Any] = {
-    "mandatory": [
-        "Copy every literal that constrains rows or ordering into the matching prose field; the encoder never sees the original question.",
-        "List only semantic base tables in tables; omit junction tables.",
-        "Reference window and case output names from select when you define them in window or case using as <registry_name>.",
-        "Never emit SQL set operators, EXISTS, NOT EXISTS, LATERAL, param_key, raw_value, wNN, cNN, filter_group, or IR vocabulary.",
-        "Never use as <name> inside select, filter, having, group_by, order_by, or limit; select output aliases are assigned later by the pipeline.",
-        "Leave group_by, order_by, and limit empty unless the question explicitly asks for grouping, ordering, or a row cap; do not invent presentation-layer sorting or grouping for context.",
-        "Project select prose to primary keys, primary human-readable label columns such as names or titles, and every column referenced by stated filters, ordering, grouping, having, or limits; never enumerate every physical column unless the question explicitly asks for all columns, every column, or complete row dumps.",
-        "Set schema_invalid to true in the planner JSON only when the question cannot be represented with the listed semantic base tables and prose fields; otherwise omit schema_invalid or set it to false. The structural formatter never authors this flag.",
-    ],
-    "recommended": [
-        "Qualify columns as tbl_a.col_x when multiple listed tables share a column name.",
-        "Describe aggregates with phrases such as sum of tbl_b.col_y.",
-        "Describe anti-existence with plain language or tbl_b.pk is null style wording.",
-    ],
-}
-
-PLANNER_NL_CONVENTIONS: Mapping[str, Any] = MappingProxyType(_PLANNER_NL_CONVENTIONS_BODY)
-
-PLANNER_NL_EXAMPLES: tuple[dict[str, Any], ...] = (
-    {
-        "tables": ["tbl_a", "tbl_b"],
-        "select": "tbl_a.col_x and the sum of tbl_b.col_y per tbl_a.col_x",
-        "filter": "tbl_a rows whose tbl_a.col_z equals 'L1'",
-        "group_by": "tbl_a.col_x",
-        "having": "the sum of tbl_b.col_y is greater than 100",
-        "order_by": "the sum of tbl_b.col_y descending",
-        "limit": "10",
-        "window": "",
-        "case": "",
-        "cte_steps": [],
-    },
-    {
-        "tables": ["tbl_a", "tbl_b"],
-        "select": "tbl_a.col_x",
-        "filter": "tbl_a rows where tbl_b.pk is null",
-        "group_by": "",
-        "having": "",
-        "order_by": "",
-        "limit": None,
-        "window": "",
-        "case": "",
-        "cte_steps": [],
-    },
-    {
-        "tables": ["tbl_a"],
-        "select": "tbl_a.col_x, tbl_a.col_y, and metric_x from the step_a step",
-        "filter": "rows where metric_x is at most 3",
-        "group_by": "",
-        "having": "",
-        "order_by": "tbl_a.col_y ascending, metric_x ascending",
-        "limit": None,
-        "window": "",
-        "case": "",
-        "cte_steps": [
-            {
-                "name": "step_a",
-                "depends_on": ["tbl_a"],
-                "tables": ["tbl_a"],
-                "select": "tbl_a.pk and metric_x from the per-group ranking",
-                "filter": "",
-                "group_by": "",
-                "having": "",
-                "order_by": "",
-                "limit": None,
-                "window": "rank tbl_a.col_z descending partitioned by tbl_a.col_y as metric_x",
-                "case": "",
-            }
-        ],
-    },
-    {
-        "tables": ["customer"],
-        "select": "customer.customer_id and customer.first_name",
-        "filter": "customer rows whose customer.active equals true",
-        "group_by": "",
-        "having": "",
-        "order_by": "",
-        "limit": None,
-        "window": "",
-        "case": "",
-        "cte_steps": [],
-    },
-)
-
-ENCODER_NL_PHRASE_MAPPINGS: Mapping[str, tuple[str, ...]] = MappingProxyType(
-    {
-        "=": ("equals", "equal to", "is", "are", "="),
-        "!=": ("not equal", "not equals", "different from", "!="),
-        ">": ("greater than", "more than", "above", "over", ">"),
-        ">=": ("at least", "greater than or equal to", ">="),
-        "<": ("less than", "below", "under", "<"),
-        "<=": ("at most", "less than or equal to", "<="),
-        "like": ("like", "matches", "contains pattern"),
-        "not like": ("not like", "does not match"),
-        "in": ("in", "one of", "any of", "among"),
-        "not in": ("not in", "none of", "not among"),
-        "between": ("between", "from", "to"),
-        "is null": ("is null", "is absent", "is missing", "has no", "without"),
-        "is not null": ("is not null", "has", "with", "present"),
-        "sum": ("sum of", "total of", "sum", "total"),
-        "avg": ("average of", "avg of", "mean of", "average"),
-        "min": ("minimum of", "min of", "smallest", "lowest"),
-        "max": ("maximum of", "max of", "largest", "highest"),
-        "count": ("count of", "number of", "how many"),
-        "asc": ("ascending", "asc", "lowest first"),
-        "desc": ("descending", "desc", "highest first"),
-    }
-)
-
-ENCODER_NL_TO_IR_GUIDANCE: tuple[str, ...] = (
-    "Match planner prose phrases against nl_phrase_mappings case-insensitively to pick IR operators and aggregates.",
-    "Infer value_type from literal form: single-quoted text is string; bare digits are integer or number; ISO dates are date; true or false are boolean; is null operator uses value_type null without a value.",
-    "Emit AggregateCol with alias empty string; never invent select-column aliases.",
-    "WindowRegistryStep.name and CaseRegistryStep.name come from as <registry_name> inside planner window and case prose; CTE names come from cte_steps[].name.",
-)
-
-ENCODER_IR_ASSEMBLY_RULES: tuple[str, ...] = (
-    "filter_group is OR-of-AND groups parsed from planner prose.",
-    "Emit raw_value for every Filter and Having literal; never emit param_key or param_values.",
-    "Every column_ref is table.column using only structural_schema_for_chosen_tables identifiers.",
-    "Runtime tables lists are overwritten to match the planner immediately after Stage B parse; emit tables consistent with planner tables at the main query and each CTE with the same cte_name.",
-    "For CONCAT expressions, place every concat argument into the same MulGroup.multiply list under scalar_func='concat'. Do not introduce divisors or coefficients for CONCAT groups. Use only COUNT as the outer aggregation wrapper for a CONCAT MulGroup; SUM, AVG, MIN, and MAX are not valid as that outer aggregation.",
-)
-
-
-INTENT_CRITICAL_RULES: tuple[str, ...] = (
-    "Every JSON object uses only keys listed in structural_json_keys for its structural type "
-    "(the root object follows RuntimeIntent; nested rows follow their named type; SQL expressions "
-    "are always a single string field such as expr or left_expr per structural_json_keys.sql_expression). "
-    "Do not emit extra sibling keys at any level.",
-    "Qualify every column reference as table.column using names from the schema text and allowed_tables; "
-    "never emit bare column names except the bare wNN and cNN registry tokens on select_cols that point at window_registry and case_registry entries. "
-    "Qualify columns inside every window_registry.window_spec.partition_by, order_by, and argument, and inside every case_registry case_when branch (condition sides, result, else_result).",
-    "Use only tables and columns from the provided schema text and allowed_tables; do not invent identifiers.",
-    "Join path discovery, foreign-key traversal, and bridge or junction tables are handled only by the downstream engine after this JSON is parsed; never refuse or shrink the intent because tables look disconnected in the structural payload.",
-    "Do not judge whether the question is answerable from schema connectivity; translate the planner prose into IR using only the listed planner tables and their columns.",
-    "Grain must match structure: grouped requires group_by_cols and aggregation in select_cols; "
-    "row_level means no GROUP BY and no aggregation in select_cols; "
-    "scalar is a single aggregated result with no GROUP BY.",
-    "Row-level predicates belong in filters_param; predicates on aggregates belong in having_param. "
-    "Never put join predicates in filters_param or having_param.",
-    "SUM and AVG apply only to numeric measure columns; use COUNT for non-measure columns.",
-    "Nested aggregation (e.g. SUM(COUNT(...))) is forbidden; compute inner aggregates in a CTE step, then aggregate in the main query.",
-    "Do not use EXTRACT(EPOCH FROM ...) for time differences; subtract date columns directly or use supported date functions.",
-    "CTE output_columns are snake_case alias tokens matching ^[a-z_][a-z0-9_]*$; never qualified table.column, never function call text, never AS clauses; align positionally with select_cols.",
-    'Relative date-window filters use value_type date_window with value {"unit", "amount"}; '
-    'column-to-column date spans use value_type date_diff with value {"unit", "amount"}. Use singular unit names.',
-    "BETWEEN uses op between with value [lower, upper]. NULL checks use op is null or is not null without a value field.",
-    "filter_group (integer) labels OR-of-AND blocks: predicates sharing a filter_group are joined by AND; "
-    "distinct filter_group values are joined by OR. Use bool_op only when every row has filter_group unset "
-    "(a single AND chain or a flat AND/OR chain). Do not put bool_op on rows that carry filter_group.",
-    "window_registry defines registry_id and window_spec; select_cols reference entries with bare wNN tokens. "
-    "Never put a window_spec key on a select_cols entry.",
-    "case_registry defines registry_id and case_when with non-empty branches; select_cols reference entries with bare cNN tokens. "
-    "When the question asks for conditional labels or buckets over columns, populate case_registry rather than dropping the derived column.",
-    "SELECT DISTINCT prefixes the column expr with the bare token DISTINCT and a space "
-    "(e.g. 'DISTINCT tbl_a.col_a'). Use COUNT(DISTINCT tbl_a.col_a) for distinct counts; "
-    "do not wrap DISTINCT around arbitrary expressions except as COUNT(DISTINCT ...). "
-    "Do not embed COUNT(*) inside arithmetic subexpressions—use COUNT(*) only as a top-level aggregate where appropriate.",
-    "Arithmetic combines expressions with +, -, *, /; aggregations may wrap arithmetic (e.g. SUM(tbl_a.col_a * tbl_a.col_b)). "
-    "Subtract date columns directly (tbl_a.date_a - tbl_a.date_b) for day differences.",
-    "String concatenation uses CONCAT(expr1, ' ', expr2, ...) in expr strings; do not use the SQL || operator (pipe-pipe).",
-    "Apply scalar functions such as ROUND after aggregates when needed (e.g. ROUND(SUM(tbl_a.col_a), 2)).",
-    "Use exact identifiers from the provided schema text; never leave synthetic shape tokens from this prompt "
-    "(tbl_a, tbl_b, col_a, date_a, date_b), generic instructional tokens (table_N, column_N), or angle-bracket markup in expressions.",
-)
-
-INTENT_PARSE_RULES_APPEND: tuple[str, ...] = (
-    "output_format lists every required top-level key; use [] for empty arrays and null for unused scalars.",
-    "natural_language is required: a short, direct description of what the query returns using real entity names from the question and schema.",
-    (
-        "Constructs the intermediate representation cannot emit directly "
-        "(set difference, EXISTS / NOT EXISTS, anti-joins, correlated subqueries, lateral joins) "
-        "should be reformulated using available primitives such as IS NULL / IS NOT NULL filters on "
-        "left-joined sources or conditional aggregations inside GROUP BY."
-    ),
-    (
-        "For (predicate_A OR predicate_B) emit two filters_param objects with different filter_group integers "
-        "and no bool_op fields. "
-        "For (predicate_A AND predicate_B) OR (predicate_C AND predicate_D) emit four objects with "
-        "filter_group values 1, 1, 2, 2 and no bool_op. "
-        "Each disjunct gets its own integer filter_group; predicates inside the same disjunct share the same "
-        "filter_group. Do not emit bool_op on rows that have a filter_group. "
-        "Use qualified column references from the schema for left_expr; bind literals via value placeholders as elsewhere in these rules. "
-        "Do not nest filter_group as an array; each filters_param element must include op."
-    ),
-)
-
-PLANNER_SINGLE_OUTPUT_WINDOW_NO_CTE_RULE: str = (
-    "When the question can be answered with a single SELECT whose only added structure is a window function "
-    "over the primary table, do not introduce a CTE. Emit the window function directly in the main SELECT. "
-    "CTEs are appropriate when reused across multiple SELECT bodies or when the question explicitly asks for "
-    "staged computation."
-)
-
-INTENT_FORMAT_REPAIR_JSON_RULES: tuple[str, ...] = (
-    "Return JSON only with no prose, markdown fences, or trailing commas.",
-    "Preserve intent content while correcting syntax; ensure all required fields are present.",
-    "Use [] for empty array fields and null for absent optional scalars.",
-)
-
-
-_INTENT_STAGE_A_SYSTEM = (
-    "You are a logical intent planner for text-to-SQL. Output ONLY valid JSON matching the logical_intent_json_schema "
-    "embedded in the user payload. Follow nl_conventions and nl_examples. Never emit SQL, IR operators, EXISTS, "
-    "NOT EXISTS, UNION, INTERSECT, or EXCEPT. The downstream structural formatter does not see the original question; "
-    "your JSON is the sole source of truth for literals and table choice."
-)
-
-_INTENT_STAGE_B_SYSTEM = (
-    "You are a structural intent formatter for text-to-SQL. Output ONLY valid JSON matching output_format. "
-    "Translate logical_intent natural language into the runtime IR using nl_phrase_mappings for phrasing hints. "
-    "logical_intent is the sole source of truth. Use only identifiers from structural_schema_for_chosen_tables. "
-    "NEVER emit param_key, param_values, or any harvested-literal mapping; emit raw_value for each Filter and "
-    "Having literal and leave SelectCol.alias and AggregateCol.alias empty strings."
-)
-
-_LOGICAL_DECOMPOSITION_GUIDANCE: tuple[str, ...] = (
-    "Describe each prose field thoroughly enough that a structural converter can build the IR without re-reading the question.",
-    "Only tables may name real schema tables; every other field is natural language.",
-    "Use cte_steps when the question needs a reusable intermediate; each step lists name, depends_on, tables, and the same prose fields as the top level.",
-    "Put window definitions in the window prose field and case definitions in the case prose field; use as <registry_name> only inside those two fields.",
-    "Never describe joins as explicit paths; the engine discovers FK paths.",
-    PLANNER_SINGLE_OUTPUT_WINDOW_NO_CTE_RULE,
-)
-
-_FORMAT_STRUCTURAL_GUIDANCE: tuple[str, ...] = (
-    "Window semantics belong in window_registry only; map logical_intent.window and each cte_steps[].window prose into WindowRegistryStep rows with wNN ids.",
-    "Case semantics belong in case_registry only; map logical_intent.case and each cte_steps[].case prose into CaseRegistryStep rows with cNN ids.",
-    "Reference registry outputs from select_cols using window_ref or case_ref tokens alongside other projected columns.",
-    "Do not encode row filters as CASE branches; use filters_param for row membership.",
-    "Never put AVG, SUM, COUNT, MIN, MAX calls or OVER (...) frames inside filters_param.right_expr as raw_sql. "
-    "Compare to aggregates using an extra cte_steps row, a scalar subquery shape allowed by the IR, or window_registry references.",
-)
-
-_INTENT_ANSWER_STYLE_GUIDANCE: tuple[str, ...] = _LOGICAL_DECOMPOSITION_GUIDANCE + _FORMAT_STRUCTURAL_GUIDANCE
-
-
-def _logical_coerce_str_list(v: Any) -> list[str]:
-    if v is None:
-        return []
-    if isinstance(v, str):
-        return [v] if v.strip() else []
-    if isinstance(v, list):
-        return [str(x) for x in v if str(x).strip()]
-    return []
-
-
-def _logical_coerce_optional_str(v: Any) -> str:
-    if v is None:
-        return ""
-    return str(v).strip()
-
-
-def _logical_coerce_limit(v: Any) -> str | None:
-    if v is None:
-        return None
-    if isinstance(v, str):
-        s = v.strip()
-        return s or None
-    s = str(v).strip()
-    return s or None
-
-
-def _logical_coerce_bool(v: Any) -> bool:
-    if v is True:
-        return True
-    if v is False or v is None:
-        return False
-    if isinstance(v, str):
-        return v.strip().lower() in ("true", "1", "yes")
-    return bool(v)
-
-
-def _cte_intent_from_obj(obj: dict[str, Any]) -> CteIntent:
-    """Materialise one :class:`CteIntent` from a planner JSON object."""
-
-    if not isinstance(obj, dict):
-        return CteIntent(name="", tables=(), select="")
-    return CteIntent(
-        name=str(obj.get("name", "") or "").strip(),
-        depends_on=tuple(_logical_coerce_str_list(obj.get("depends_on"))),
-        tables=tuple(_logical_coerce_str_list(obj.get("tables"))),
-        select=str(obj.get("select", "") or "").strip(),
-        filter=_logical_coerce_optional_str(obj.get("filter")),
-        group_by=_logical_coerce_optional_str(obj.get("group_by")),
-        having=_logical_coerce_optional_str(obj.get("having")),
-        order_by=_logical_coerce_optional_str(obj.get("order_by")),
-        limit=_logical_coerce_limit(obj.get("limit")),
-        window=_logical_coerce_optional_str(obj.get("window")),
-        case=_logical_coerce_optional_str(obj.get("case")),
-    )
-
-
-def logical_intent_from_parsed(d: dict[str, Any]) -> LogicalIntent:
-    """Materialise a :class:`LogicalIntent` from validated planner JSON."""
-
-    ctes: list[CteIntent] = []
-    for c in d.get("cte_steps") or []:
-        if isinstance(c, dict):
-            ctes.append(_cte_intent_from_obj(c))
-    return LogicalIntent(
-        tables=tuple(_logical_coerce_str_list(d.get("tables"))),
-        select=str(d.get("select", "") or "").strip(),
-        filter=_logical_coerce_optional_str(d.get("filter")),
-        group_by=_logical_coerce_optional_str(d.get("group_by")),
-        having=_logical_coerce_optional_str(d.get("having")),
-        order_by=_logical_coerce_optional_str(d.get("order_by")),
-        limit=_logical_coerce_limit(d.get("limit")),
-        window=_logical_coerce_optional_str(d.get("window")),
-        case=_logical_coerce_optional_str(d.get("case")),
-        cte_steps=tuple(ctes),
-        schema_invalid=_logical_coerce_bool(d.get("schema_invalid")),
-    )
-
-
-def _logical_intent_schema_issues(parsed: dict[str, Any] | None) -> list[IntentIssue]:
-    """Return Stage A JSON-schema violations as logical-stage issues."""
-
-    if parsed is None or not isinstance(parsed, dict):
-        return [
-            make_intent_issue(
-                issue_id="json_schema_violation_logical_root",
-                category=FailureCategory.INTENT_SCHEMA_INVALID_ABORT,
-                severity="error",
-                message="Stage A logical intent JSON must be a single object.",
-                responsible_stage="logical",
-            )
-        ]
-    try:
-        jsonschema.validate(instance=parsed, schema=LOGICAL_INTENT_SCHEMA)
-    except jsonschema.ValidationError as exc:
-        return [
-            make_intent_issue(
-                issue_id="json_schema_violation_logical_detail",
-                category=FailureCategory.INTENT_SCHEMA_INVALID_ABORT,
-                severity="error",
-                message=str(exc.message),
-                context={"path": [str(p) for p in exc.path]},
-                responsible_stage="logical",
-            )
-        ]
-    return []
-
-
-def _parse_logical_intent_response(
-    raw: str,
-    schema_graph: SchemaGraph,
-) -> tuple[LogicalIntent | None, list[IntentIssue]]:
-    """Parse and validate a planner model payload against schema and graph rules."""
-
-    obj = safe_json_loads(raw.strip())
-    issues = _logical_intent_schema_issues(obj if isinstance(obj, dict) else None)
-    if issues:
-        return None, issues
-    assert isinstance(obj, dict)
-    li = logical_intent_from_parsed(obj)
-    if not li.tables or not li.select.strip():
-        return None, [
-            make_intent_issue(
-                issue_id="logical_intent_empty_core",
-                category=FailureCategory.INTENT_SCHEMA_INVALID_ABORT,
-                severity="error",
-                message="Planner must populate tables and a non-empty select field.",
-                responsible_stage="logical",
-            )
-        ]
-    issues = list(validate_tables_exist(li.tables, schema_graph))
-    issues.extend(validate_cte_dependencies(li))
-    for step in li.cte_steps:
-        issues.extend(validate_tables_exist(step.tables, schema_graph))
-    if issues:
-        return None, issues
-    return li, []
-
-
-def _serialized_prior_feedback_rows(rows: list[dict[str, str]] | None) -> str:
-    """Serialise merged feedback rows for Stage A as compact JSON text."""
-
-    if not rows:
-        return ""
-    return stable_json({"items": rows})
-
-
-def _build_intent_logical_prompt(
+def build_intent_interpret_prompt(
     question: str,
-    schema_literal_json: str,
+    domain_payload: str,
+    prior_question_feedback: str,
+    prior_user_corrections: tuple[str, ...],
+    prior_attempt_failures: tuple[str, ...] = (),
+) -> str:
+    """Build the Interpret user JSON instructing the model to emit INTERPRET_PLAN_SCHEMA JSON. ``prior_attempt_failures`` carries hints from earlier interpret/ground attempts in the same ask. It is empty on the first attempt (so that prompt is unchanged) and non-empty on retries, which both informs the replan and gives each retry a distinct, deterministically replayable cache key - without it, a re-interpreted retry would reuse the first attempt's key while the live model resampled a different plan, making the recorded chain impossible to replay."""
+    body: dict[str, Any] = {
+        "task": "Read the question against the domain schema and produce a thinking pathway (interpret_plan).",
+        "question": question,
+        "schema_domain": json.loads(domain_payload),
+        "supported_capabilities": list(INTERPRET_SUPPORTED_CAPABILITIES),
+        "interpret_plan_schema": INTERPRET_PLAN_SCHEMA,
+    }
+    if prior_question_feedback.strip():
+        body["prior_question_feedback"] = prior_question_feedback
+    if prior_user_corrections:
+        body["prior_user_corrections"] = list(prior_user_corrections)
+    if prior_attempt_failures:
+        body["prior_attempt_failures"] = list(prior_attempt_failures)
+    return stable_json(body)
+
+
+def build_intent_ground_prompt(
+    question: str,
+    interpret_plan: InterpretPlan,
+    ground_payload: str,
     prior_question_feedback: str,
     logical_decomposition_guidance: str,
     prior_user_corrections: tuple[str, ...],
     prior_grounding_failures: tuple[str, ...],
 ) -> str:
-    """Build the planner user JSON instructing the model to emit LOGICAL_INTENT_SCHEMA JSON."""
-
+    """Build the Ground user JSON instructing the model to emit LOGICAL_INTENT_SCHEMA JSON."""
     body: dict[str, Any] = {
-        "task": "Decompose the question into planner JSON matching logical_intent_json_schema.",
+        "task": "Convert interpret_plan into logical intent JSON with natural-language clause fields bound to schema identifiers.",
         "question": question,
-        "schema_literal_json": schema_literal_json,
+        "interpret_plan": interpret_plan_for_ground(interpret_plan),
+        "schema_literal_json": json.loads(ground_payload),
         "logical_intent_json_schema": LOGICAL_INTENT_SCHEMA,
         "nl_conventions": json.loads(stable_json(dict(PLANNER_NL_CONVENTIONS))),
-        "nl_examples": [json.loads(stable_json(x)) for x in PLANNER_NL_EXAMPLES],
         "logical_schema_rules": [
             "Do not plan UNION, INTERSECT, or EXCEPT; describe set-like needs with plain language or CTE steps.",
             "Use the filter prose field for row predicates; never name EXISTS or NOT EXISTS.",
             "Use cte_steps for self-comparisons and per-entity top-N style questions without prescribing IR shapes.",
+            "After structural encoding, only tables with qualified column references in that scope remain in join scope; "
+            "name every required table with explicit table.column in the appropriate prose field.",
+            "Omitting a junction_table from tables is correct when its columns appear in prose; the tables list alone never keeps a table in join scope.",
+            "When membership or existence requires link_table or junction_table, name junction_table.column or bridge_table.column in select prose "
+            "(not only join-equality narration in filter prose, which downstream steps strip).",
+            "Per-entity breakdown phrasing maps to group_by, not row-level DISTINCT deduplication.",
+            "Existence or membership conditions belong in filter prose with binding columns named.",
+            "Time-window and duration comparisons must name bound date column(s) in filter prose and preserve unit and amount in that prose.",
+            "For cte_steps, tables lists base schema tables and prior cte_steps names; there is no depends_on field.",
+            "When schema shows role temporal with type integer on a column, treat it as a day-count duration for elapsed-time comparisons, not a calendar date.",
         ],
+        "supported_capabilities": list(GROUND_SUPPORTED_CAPABILITIES),
     }
     if prior_question_feedback.strip():
         body["prior_question_feedback"] = prior_question_feedback
@@ -766,9 +273,8 @@ def _build_intent_logical_prompt(
     return stable_json(body)
 
 
-def _logical_intent_to_serialisable(logical: LogicalIntent) -> dict[str, Any]:
+def logical_intent_to_serialisable(logical: LogicalIntent) -> dict[str, Any]:
     """Convert logical intent into JSON-serialisable dict for the encoder."""
-
     return {
         "tables": list(logical.tables),
         "select": logical.select,
@@ -779,11 +285,9 @@ def _logical_intent_to_serialisable(logical: LogicalIntent) -> dict[str, Any]:
         "limit": logical.limit,
         "window": logical.window,
         "case": logical.case,
-        "schema_invalid": logical.schema_invalid,
         "cte_steps": [
             {
                 "name": c.name,
-                "depends_on": list(c.depends_on),
                 "tables": list(c.tables),
                 "select": c.select,
                 "filter": c.filter,
@@ -799,27 +303,23 @@ def _logical_intent_to_serialisable(logical: LogicalIntent) -> dict[str, Any]:
     }
 
 
-def _propagate_planner_schema_invalid_flag(intent: RuntimeIntent, logical: LogicalIntent) -> RuntimeIntent:
-    """
-    Overwrite runtime schema_invalid with the planner-only flag after structural parsing.
-
-    Args:
-
-        intent: Runtime intent produced by the structural formatter and post-alignment steps.
-
-        logical: Stage A logical intent whose schema_invalid field is the sole source of truth for this signal.
-
-    Returns:
-
-        RuntimeIntent whose schema_invalid matches logical.schema_invalid regardless of formatter output.
-    """
-
-    return replace(intent, schema_invalid=logical.schema_invalid)
+def _propagate_interpret_schema_invalid_flag(intent: RuntimeIntent, plan: InterpretPlan) -> RuntimeIntent:
+    """Overwrite runtime schema_invalid with the Interpret-only flag after structural parsing."""
+    return replace(intent, schema_invalid=plan.schema_invalid)
 
 
-def _build_intent_format_prompt(logical: LogicalIntent, structural_schema_json: str) -> str:
+def finalize_planner_schema_invalid_flag(
+    intent: RuntimeIntent,
+    plan: InterpretPlan,
+    schema_graph: SchemaGraph,
+) -> RuntimeIntent:
+    """Copy Interpret ``schema_invalid`` onto the runtime intent after structural parsing."""
+    del schema_graph
+    return replace(intent, schema_invalid=plan.schema_invalid)
+
+
+def _build_intent_compose_prompt(logical: LogicalIntent, structural_payload: str) -> str:
     """Build the encoder user JSON that maps logical intent into runtime IR JSON."""
-
     parse_filter_ops = [
         "=",
         "!=",
@@ -830,7 +330,7 @@ def _build_intent_format_prompt(logical: LogicalIntent, structural_schema_json: 
         "like",
         "not like",
     ]
-    parse_filter_ops.extend(extra_filter_ops_for_engine())
+    parse_filter_ops.extend(sorted(extra_filter_ops_for_engine()))
     parse_filter_ops.extend(
         [
             "in",
@@ -841,19 +341,36 @@ def _build_intent_format_prompt(logical: LogicalIntent, structural_schema_json: 
             "contains",
         ]
     )
-    structural_obj = json.loads(structural_schema_json)
+    structural_obj = json.loads(structural_payload)
     body: dict[str, Any] = {
         "task": (
-            "Translate logical_intent into runtime intent JSON that conforms to field_specifications and output_format. "
-            "Use only identifiers present in structural_schema_for_chosen_tables. Output ONLY valid JSON."
+            "Encode logical_intent into runtime intent JSON conforming to field_specifications and output_format. "
+            "You are a structural encoder only; do not re-plan. Use only identifiers in "
+            "structural_schema_for_chosen_tables. Output ONLY valid JSON."
         ),
-        "logical_intent": _logical_intent_to_serialisable(logical),
+        "logical_intent": logical_intent_to_serialisable(logical),
+        "logical_to_ir_field_map": {
+            "select": "select_cols",
+            "filter": "filters_param",
+            "group_by": "group_by_cols",
+            "having": "having_param",
+            "order_by": "order_by_cols",
+            "limit": "limit",
+            "window": "window_registry",
+            "case": "case_registry",
+            "cte_steps": "cte_steps",
+        },
+        "cte_tables_encoding": (
+            "Each runtime cte_steps row uses cte_name from logical name and tables from logical tables. "
+            "Logical tables may list base schema tables and prior logical cte_steps names."
+        ),
         "structural_schema_for_chosen_tables": structural_obj,
         "structural_json_keys": intent_prompt_structural_index(),
         "critical_rules": list(INTENT_CRITICAL_RULES),
         "parse_rules_append": list(INTENT_PARSE_RULES_APPEND),
         "field_specifications": dict(RuntimeIntent.PROMPT_FIELD_SPEC.items()),
         "output_format": RuntimeIntent.prompt_example_dict(),
+        "supported_capabilities": list(COMPOSE_SUPPORTED_CAPABILITIES),
         "nl_phrase_mappings": {k: list(v) for k, v in ENCODER_NL_PHRASE_MAPPINGS.items()},
         "nl_to_ir_guidance": list(ENCODER_NL_TO_IR_GUIDANCE),
         "ir_assembly_rules": list(ENCODER_IR_ASSEMBLY_RULES),
@@ -875,23 +392,27 @@ def _build_intent_format_prompt(logical: LogicalIntent, structural_schema_json: 
             "having": ["integer", "number"],
         },
         "structural_pattern_rules": [
-            "Existence filters: INNER join plus DISTINCT on the X grain; anti-join uses LEFT join plus IS NULL on Y keys.",
-            "Self-references: separate CTEs per view of the same base table, then join on the entity key—no inline self-join.",
-            "Correlated lookups: prefer ROW_NUMBER partitioned per entity with outer filter row_number = 1—no LATERAL or correlated scalar subqueries.",
-            "Mixed aggregates with row detail: compute aggregates in a grouped CTE and join back for row-level columns.",
-            "Planner having prose maps to HAVING on the aggregated source, not outer WHERE.",
+            "Translate each populated logical_intent prose field into its mapped IR slot only.",
+            "Planner having prose maps to having_param on the aggregated source, not outer filters_param.",
+            "Do not invent filters, grouping, tables, or columns absent from logical_intent prose fields.",
+            "Join path discovery is downstream; do not author join predicates in filters_param or having_param.",
         ],
-        "format_structural_guidance": list(_FORMAT_STRUCTURAL_GUIDANCE),
+        "format_structural_guidance": list(FORMAT_STRUCTURAL_GUIDANCE),
+        "compose_priority_rules": [
+            "Translate each populated clause prose field mechanically into its IR slot.",
+            "Use nl_phrase_mappings and operator_reference only to choose operators and aggregates.",
+            "Do not re-interpret semantics; logical_intent is the full contract because the question is not in this payload.",
+        ],
     }
     return stable_json(body)
 
 
-def _resolve_repair_instruction(issue: IntentIssue) -> str:
+def resolve_repair_instruction(issue: IntentIssue) -> str:
     """Return a targeted fix instruction for a semantic issue."""
     return REPAIR_INSTRUCTIONS.get(issue.category.value, issue.message)
 
 
-def _classify_schema_error(error_message: str) -> FailureCategory:
+def classify_schema_error(error_message: str) -> FailureCategory:
     """
     Classify a schema enforcement error into a specific category.
 
@@ -911,7 +432,7 @@ def _classify_schema_error(error_message: str) -> FailureCategory:
     return FailureCategory.SCHEMA_VALIDATION
 
 
-def _build_intent_semantic_repair_prompt(
+def build_intent_semantic_repair_prompt(
     question: str,
     current_intent_json: str,
     errors: list[IntentIssue],
@@ -920,36 +441,14 @@ def _build_intent_semantic_repair_prompt(
     *,
     prior_question_feedback: list[dict[str, str]] | None = None,
 ) -> str:
-    """
-    Build a user-prompt for the LLM to repair semantic issues in a parsed intent.
-
-    Errors are presented as errors_to_fix with targeted fix instructions sourced from REPAIR_INSTRUCTIONS and warnings are presented as non- binding suggestions.
-
-    Args:
-
-        question: Original natural language question.
-
-        current_intent_json: JSON string of the current flawed parsed intent.
-
-        errors: IntentIssue objects with severity equal to "error".
-
-    warnings: IntentIssue objects with severity equal to "warning".
-
-        schema_literal_json: Compact JSON schema literal for the LLM context.
-
-        prior_question_feedback: Optional rows scoped to this question and schema hash.
-
-    Returns:
-
-        JSON-formatted prompt string ready to send as the user message.
-    """
+    """Build a user-prompt for the LLM to repair semantic issues in a. parsed intent. Errors are presented as errors_to_fix with targeted fix instructions sourced from REPAIR_INSTRUCTIONS and warnings are presented as non- binding suggestions. Args: question: Original natural language question. current_intent_json: JSON string of the current flawed parsed intent. errors: IntentIssue objects with severity equal to "error". warnings: IntentIssue objects with severity equal to "warning". schema_literal_json: Compact JSON schema literal for the LLM context. prior_question_feedback: Optional rows scoped to this question and schema hash. Returns: JSON-formatted prompt string ready to send as the user message."""
     errors_to_fix: list[dict[str, str]] = []
     for err in errors:
         errors_to_fix.append(
             {
                 "category": err.category,
                 "issue": err.message,
-                "fix": _resolve_repair_instruction(err),
+                "fix": resolve_repair_instruction(err),
             }
         )
 
@@ -981,16 +480,14 @@ def _build_intent_semantic_repair_prompt(
     return stable_json(body)
 
 
-def _build_intent_format_repair_prompt(question: str, raw_response: str, parse_error: str) -> str:
+def build_intent_format_repair_prompt(question: str, raw_response: str, parse_error: str) -> str:
     """
     Build the JSON format-repair user message for a bad LLM response.
 
     Args:
 
         question: User question.
-
         raw_response: Malformed model output.
-
         parse_error: Parse failure reason.
 
     Returns:
@@ -1012,38 +509,22 @@ def _build_intent_format_repair_prompt(question: str, raw_response: str, parse_e
     return prompt
 
 
-def _build_intent_parse_prompt(
+def build_intent_parse_prompt(
     question: str,
     schema_literal_json: str,
     table_list: list[str],
     prior_question_feedback: list[dict[str, str]] | None = None,
 ) -> tuple[str, str]:
-    """
-    Build ``(system, user_json)`` strings for the initial intent LLM call.
-
-    Args:
-
-        question: User question.
-
-        schema_literal_json: Compact JSON schema literal for prompts.
-
-        table_list: Allowed table names.
-
-        prior_question_feedback: Optional summarized failures for this question from persisted memory and the current attempt.
-
-    Returns:
-
-        System prompt and stable-JSON user payload.
-    """
+    """Build ``(system, user_json)`` strings for the initial intent LLM. call. Args: question: User question. schema_literal_json: Compact JSON schema literal for prompts. table_list: Allowed table names. prior_question_feedback: Optional summarized failures for this question from persisted memory and the current attempt. Returns: System prompt and stable-JSON user payload."""
     system = (
         "You are a deterministic intent parser for text-to-SQL. "
         "Output ONLY valid JSON that matches the required format. "
         "Identical inputs must produce identical outputs. The "
         "natural_language field is a single short sentence in plain English that describes the structured intent you just produced — what the query computes. Read your own SELECT expressions, FROM tables, filters, grouping, and ordering, then describe that result. "
         'Aggregation words like "count", "sum", "average", "minimum", "maximum", "total" are encouraged whenever the intent uses them. Use the same domain nouns as the schema (table and column names rendered in plain English). Do not mention SQL syntax tokens (JOIN, GROUP BY, WHERE, ORDER BY, LIMIT, etc.). Reuse the user\'s domain words when they correctly name the intent\'s tables/columns/aggregations; only avoid copying the question verbatim when the question contains filler words, polite phrasing, or wording the structured intent does not actually reflect. '
-        + _INTENT_SYSTEM_SEMANTIC_JOIN_INTERMEDIATES
+        + INTENT_SYSTEM_SEMANTIC_JOIN_INTERMEDIATES
         + " "
-        + _INTENT_SYSTEM_NATURAL_LANGUAGE_FIELD_SHAPE
+        + INTENT_SYSTEM_NATURAL_LANGUAGE_FIELD_SHAPE
     )
 
     parse_filter_ops = [
@@ -1057,7 +538,7 @@ def _build_intent_parse_prompt(
         "not like",
     ]
 
-    parse_filter_ops.extend(extra_filter_ops_for_engine())
+    parse_filter_ops.extend(sorted(extra_filter_ops_for_engine()))
     parse_filter_ops.extend(
         [
             "in",
@@ -1079,14 +560,11 @@ def _build_intent_parse_prompt(
         "schema_summary": schema_literal_json,
         "allowed_tables": table_list,
         "naming_conventions": {
-            "shape_token_table_a": "tbl_a",
-            "shape_token_table_b": "tbl_b",
-            "shape_token_column_a": "col_a",
-            "shape_token_date_a": "date_a",
-            "shape_token_date_b": "date_b",
+            "qualified_column_reference": "table.column",
             "note": (
-                "tbl_a, tbl_b, col_a, date_a, date_b appear only to illustrate JSON shape. "
-                "Replace every expression with real identifiers from schema_summary or allowed_tables."
+                "table.column, other_table.other_column, and bare table names such as table or other_table "
+                "appear only to illustrate JSON shape. Replace every expression with real identifiers "
+                "from schema_summary or allowed_tables."
             ),
         },
         "field_specifications": dict(RuntimeIntent.PROMPT_FIELD_SPEC.items()),
@@ -1099,8 +577,8 @@ def _build_intent_parse_prompt(
             ),
         },
         "rules": list(INTENT_CRITICAL_RULES) + list(INTENT_PARSE_RULES_APPEND),
-        "logical_decomposition_guidance": list(_LOGICAL_DECOMPOSITION_GUIDANCE),
-        "format_structural_guidance": list(_FORMAT_STRUCTURAL_GUIDANCE),
+        "logical_decomposition_guidance": list(LOGICAL_DECOMPOSITION_GUIDANCE),
+        "format_structural_guidance": list(FORMAT_STRUCTURAL_GUIDANCE),
         "output_format": RuntimeIntent.prompt_example_dict(),
         "operator_reference": {
             "filter_ops": parse_filter_ops,
@@ -1137,7 +615,7 @@ def _format_repair_loop(
     system: str,
     raw: str,
     question: str,
-    max_retries: int = PolicyConfig.MAX_STAGE_B_REPAIRS,
+    max_retries: int = PolicyConfig.MAX_ASK_COMPOSE_REPAIRS,
 ) -> tuple[RuntimeIntent | None, int]:
     """
     Parse *raw* to ``RuntimeIntent``, optionally calling format- repair LLM rounds.
@@ -1145,11 +623,8 @@ def _format_repair_loop(
     Args:
 
         system: System prompt.
-
         raw: Model output string.
-
         question: User question (for parse context).
-
         max_retries: Max format-repair attempts after parse failure or placeholder leakage in parsed expressions.
 
     Returns:
@@ -1158,33 +633,41 @@ def _format_repair_loop(
     """
 
     def _acceptable(candidate: RuntimeIntent | None) -> bool:
-        return candidate is not None and not runtime_intent_has_instructional_placeholders(candidate)
+        if candidate is None or runtime_intent_has_instructional_placeholders(candidate):
+            return False
+        return not runtime_intent_has_refusal_natural_language(candidate)
 
     llm_calls = 0
     parse_detail: list[str] = []
     intent = parse_intent_response(raw, question, parse_detail_out=parse_detail)
     if _acceptable(intent):
-        if diagnostic_debug_enabled() and diagnostic_pipeline_trace_full_enabled() and intent is not None:
-            pipeline_trace_lazy(
+        assert intent is not None
+        accepted_intent = intent
+        if diagnostic_debug_enabled() and diagnostic_pipeline_trace_full_enabled():
+            pipeline_trace(
                 "intent_after_parse_intent_response.initial",
-                lambda: stable_json(intent.to_dict()),
+                lambda: stable_json(accepted_intent.to_dict()),
             )
         return intent, llm_calls
     for _ in range(max_retries):
         if intent is None:
             parse_error = parse_detail[-1] if parse_detail else "JSON parse failed"
+        elif runtime_intent_has_refusal_natural_language(intent):
+            parse_error = NATURAL_LANGUAGE_REFUSAL_PARSE_ERROR
         else:
             parse_error = INTENT_PLACEHOLDER_FORMAT_REPAIR_PARSE_ERROR
         parse_detail.clear()
-        repair_prompt = _build_intent_format_repair_prompt(question, raw, parse_error)
+        repair_prompt = build_intent_format_repair_prompt(question, raw, parse_error)
         raw = llm_chat(system, repair_prompt, task="intent")
         llm_calls += 1
         intent = parse_intent_response(raw, question, parse_detail_out=parse_detail)
         if _acceptable(intent):
-            if diagnostic_debug_enabled() and diagnostic_pipeline_trace_full_enabled() and intent is not None:
-                pipeline_trace_lazy(
+            assert intent is not None
+            accepted_intent = intent
+            if diagnostic_debug_enabled() and diagnostic_pipeline_trace_full_enabled():
+                pipeline_trace(
                     "intent_after_parse_intent_response.format_repair",
-                    lambda it=intent: stable_json(it.to_dict()),
+                    stable_json(accepted_intent.to_dict()),
                 )
             return intent, llm_calls
     return intent, llm_calls
@@ -1222,23 +705,100 @@ def _compute_error_signature_strings(errors: list[str]) -> frozenset[str]:
     return frozenset(errors)
 
 
-def _detect_oscillation(history: list[frozenset[str]]) -> bool:
-    """
-    Return True on repeated identical signatures or A-B-A-B alternation.
-
-    Args:
-
-        history: Recent signature frozensets, oldest first.
-
-    Returns:
-
-        True when repair should stop for oscillation.
-    """
+def _detect_oscillation_strings(history: list[frozenset[str]]) -> bool:
+    """Return True on repeated identical string-error signatures or A-B- A-B alternation."""
     if len(history) >= 2 and history[-1] == history[-2]:
         return True
     if len(history) >= 4 and history[-1] == history[-3] and history[-2] == history[-4]:
         return True
     return False
+
+
+def _detect_oscillation(history: list[frozenset[tuple[FailureCategory, str]]]) -> bool:
+    """Return True on repeated identical signatures or A-B-A-B. alternation. Args: history: Recent signature frozensets, oldest first. Returns: True when repair should stop for oscillation."""
+    if len(history) >= 2 and history[-1] == history[-2]:
+        return True
+    if len(history) >= 4 and history[-1] == history[-3] and history[-2] == history[-4]:
+        return True
+    return False
+
+
+def _derive_window_registry_output_alias(
+    step: WindowRegistryStep,
+    *,
+    explicit_alias: str | None,
+    cte_ordinal: int,
+    registry_id: str,
+) -> str:
+    """Derive a CTE output alias for a ``window_registry`` select token."""
+    if explicit_alias:
+        return explicit_alias
+    ws = step.window_spec
+    fn = (ws.function or "").strip().lower()
+    if fn in {"row_number", "rank", "dense_rank", "ntile"}:
+        return f"cte{cte_ordinal}_{registry_id.lower()}"
+    arg = ws.argument
+    base = ""
+    if arg is not None:
+        col = arg.primary_column or ""
+        base = "*" if col == "*" else col.split(".")[-1]
+    if fn == "count":
+        if base == "*":
+            return "row_count"
+        if base:
+            return f"count_{base}"
+    elif fn and base and base != "*":
+        return f"{fn}_{base}"
+    return f"cte{cte_ordinal}_{registry_id.lower()}"
+
+
+def _derive_cte_output_columns_resolved(
+    cte: RuntimeCteStep,
+    *,
+    cte_ordinal: int,
+) -> list[str]:
+    """Derive CTE ``output_columns`` including window-registry select tokens."""
+    wr_by = {s.registry_id: s for s in (cte.window_registry or [])}
+    old_oc = list(cte.output_columns or [])
+    derived: list[str] = []
+    seen: dict[str, int] = {}
+    expr_counter = 0
+    for i, sc in enumerate(cte.select_cols or []):
+        explicit_raw = old_oc[i].strip() if i < len(old_oc) and old_oc[i] else ""
+        explicit = explicit_raw.lower() if explicit_raw else None
+        if explicit and re.fullmatch(REGISTRY_TOKEN_PATTERN, explicit):
+            explicit = None
+        rid = expr_registry_ref(sc.expr) or ""
+        if rid.startswith("w"):
+            step = wr_by.get(rid)
+            if step is not None:
+                name = _derive_window_registry_output_alias(
+                    step,
+                    explicit_alias=explicit,
+                    cte_ordinal=cte_ordinal,
+                    registry_id=rid,
+                )
+            else:
+                name = explicit or f"cte{cte_ordinal}_{rid.lower()}"
+        elif rid.startswith("c"):
+            name = explicit or f"cte{cte_ordinal}_{rid.lower()}"
+        else:
+            single = derive_cte_output_columns([sc], cte_ordinal=cte_ordinal)
+            if single:
+                name = single[0]
+            else:
+                expr_counter += 1
+                name = f"expr{expr_counter}"
+        kind = classify_cte_expr(sc.expr)
+        if kind != "passthrough" and not rid.startswith(("w", "c")):
+            name = name.lower()
+        if name in seen:
+            seen[name] += 1
+            name = f"{name}_{seen[name]}"
+        else:
+            seen[name] = 1
+        derived.append(name)
+    return derived
 
 
 def _normalize_cte_output_aliases(
@@ -1251,7 +811,6 @@ def _normalize_cte_output_aliases(
     Args:
 
         intent: Intent whose CTE outputs should be canonical.
-
         schema_graph: Metadata for ``build_cte_output_metadata``.
 
     Returns:
@@ -1266,7 +825,7 @@ def _normalize_cte_output_aliases(
     refreshed_cte_steps = []
     for idx, cte in enumerate(cte_steps):
         old_oc = list(cte.output_columns or [])
-        new_oc = derive_cte_output_columns(cte.select_cols or [], cte_ordinal=idx + 1)
+        new_oc = _derive_cte_output_columns_resolved(cte, cte_ordinal=idx + 1)
         ocm = build_cte_output_metadata(
             cte.select_cols or [],
             new_oc,
@@ -1302,6 +861,7 @@ def _normalize_cte_output_aliases(
             select_cols=[replace(sc, expr=_remap_expr(sc.expr)) for sc in (cte.select_cols or [])],
             order_by_cols=[replace(obc, expr=_remap_expr(obc.expr)) for obc in (cte.order_by_cols or [])],
             group_by_cols=[_remap_expr(g) for g in (cte.group_by_cols or [])],
+            window_registry=rename_window_registry_steps(cte.window_registry, alias_map),
             filters_param=[
                 replace(
                     fp,
@@ -1328,6 +888,7 @@ def _normalize_cte_output_aliases(
         select_cols=[replace(sc, expr=_remap_expr(sc.expr)) for sc in (intent.select_cols or [])],
         order_by_cols=[replace(obc, expr=_remap_expr(obc.expr)) for obc in (intent.order_by_cols or [])],
         group_by_cols=[_remap_expr(g) for g in (intent.group_by_cols or [])],
+        window_registry=rename_window_registry_steps(intent.window_registry, alias_map),
         filters_param=[
             replace(
                 fp,
@@ -1368,7 +929,7 @@ def _trace_intent_after_deterministic_step(
         for field_name in changed_fields
     }
     if diagnostic_debug_enabled() and diagnostic_pipeline_trace_full_enabled():
-        pipeline_trace_lazy(
+        pipeline_trace(
             f"intent_after_deterministic_repair.{step_name}",
             lambda: stable_json(diff_payload),
         )
@@ -1381,17 +942,6 @@ def _intent_changed_fields(before: RuntimeIntent, after: RuntimeIntent) -> list[
     return [
         field_name for field_name in sorted(before_dict.keys()) if before_dict[field_name] != after_dict[field_name]
     ]
-
-
-def _summarize_intent_changes(
-    before: RuntimeIntent,
-    after: RuntimeIntent,
-) -> str:
-    """Return a concise top-level field diff summary between two intents."""
-    changed_fields = _intent_changed_fields(before, after)
-    if not changed_fields:
-        return "no_changes"
-    return ", ".join(changed_fields)
 
 
 def _deterministic_repair_step(
@@ -1419,9 +969,7 @@ def apply_deterministic_repairs(
     Args:
 
         intent: Intent after LLM parse.
-
         schema_graph: Schema graph.
-
         natural_language: Question text (e.g. filter casing); may be empty.
 
     Returns:
@@ -1445,11 +993,7 @@ def apply_deterministic_repairs(
         new_cols: list[Any],
         old_index: int,
     ) -> int:
-        """
-        Translate ``distinct_select_index`` after select-col reordering.
-
-        The index points to the column that originally carried ``DISTINCT``; after sorting we locate the same identity in the new list and return its new position. Returns ``-1`` when no DISTINCT was set or the original column cannot be located.
-        """
+        """Translate ``distinct_select_index`` after select-col reordering. The index points to the column that originally carried ``DISTINCT``; after sorting we locate the same identity in the new list and return its new position. Returns ``-1`` when no DISTINCT was set or the original column cannot be located."""
         if old_index < 0 or old_index >= len(old_cols):
             return old_index if old_index < 0 else -1
         target = old_cols[old_index]
@@ -1503,34 +1047,49 @@ def apply_deterministic_repairs(
         return replace(out, cte_steps=new_cte_steps)
 
     intent = _deterministic_repair_step(
+        "dedup_extract_year_vs_column_literal",
+        intent,
+        lambda x: apply_filters_to_main_and_ctes(x, dedup_extract_year_vs_column_literal),
+    )
+    intent = _deterministic_repair_step(
         "repair_intent_placeholder_tokens",
         intent,
         lambda x: repair_intent_placeholder_tokens(x, schema_graph),
     )
     intent = _deterministic_repair_step("normalize_count_star", intent, normalize_count_star)
+    intent = _deterministic_repair_step(
+        "promote_temporal_keyword_rhs",
+        intent,
+        promote_temporal_keyword_rhs,
+    )
     intent = _deterministic_repair_step("dedup_value_vs_right_expr", intent, dedup_value_vs_right_expr)
     intent = _deterministic_repair_step(
-        "qualify_cte_count_star_mulgroups",
+        "qualify_count_star_mulgroups",
         intent,
-        lambda x: qualify_cte_count_star_mulgroups(x, schema_graph),
+        lambda x: qualify_count_star_mulgroups(x, schema_graph),
     )
     intent = _deterministic_repair_step(
         "lift_distinct_select_from_raw_sql",
         intent,
         lambda x: lift_distinct_select_from_raw_sql(x, schema_graph),
     )
+    intent = _deterministic_repair_step("canonicalize_registry_ids", intent, canonicalize_registry_ids)
+    intent = _deterministic_repair_step("reorder_cte_steps_by_dag", intent, reorder_cte_steps_by_dag)
+    intent = _deterministic_repair_step("normalize_cte_names", intent, normalize_cte_names)
     intent = _deterministic_repair_step(
         "normalize_cte_output_aliases",
         intent,
         lambda x: _normalize_cte_output_aliases(x, schema_graph),
     )
-    intent = _deterministic_repair_step("canonicalize_registry_ids", intent, canonicalize_registry_ids)
-    intent = _deterministic_repair_step("reorder_cte_steps_by_dag", intent, reorder_cte_steps_by_dag)
-    intent = _deterministic_repair_step("normalize_cte_names", intent, normalize_cte_names)
     intent = _deterministic_repair_step(
         "rewrite_main_query_refs_to_final_cte_columns",
         intent,
         rewrite_main_query_refs_to_final_cte_columns,
+    )
+    intent = _deterministic_repair_step(
+        "ensure_cte_output_columns_exposure",
+        intent,
+        ensure_cte_output_columns_exposure,
     )
     intent = _deterministic_repair_step("qualify_cte_output_columns", intent, qualify_cte_output_columns)
     intent = _deterministic_repair_step(
@@ -1538,11 +1097,31 @@ def apply_deterministic_repairs(
         intent,
         lambda x: reconcile_tables(x),
     )
+    intent = _deterministic_repair_step(
+        "expand_shared_pk_tables_for_refs",
+        intent,
+        lambda x: expand_shared_pk_tables_for_refs(x, schema_graph),
+    )
+    intent = _deterministic_repair_step(
+        "sanitize_table_names",
+        intent,
+        lambda x: sanitize_table_names(x, schema_graph),
+    )
     intent = _deterministic_repair_step("replace_unknown_scalar_funcs", intent, replace_unknown_scalar_funcs)
     intent = _deterministic_repair_step(
         "enforce_grain_consistency",
         intent,
         lambda x: enforce_grain_consistency(x, schema_graph),
+    )
+    intent = _deterministic_repair_step(
+        "repair_window_partition_group_by_alignment",
+        intent,
+        lambda x: repair_window_partition_group_by_alignment(x, schema_graph),
+    )
+    intent = _deterministic_repair_step(
+        "strip_redundant_identifier_group_by",
+        intent,
+        lambda x: strip_redundant_identifier_group_by(x, schema_graph),
     )
     intent = _deterministic_repair_step("strip_spurious_group_by", intent, strip_spurious_group_by)
     intent = _deterministic_repair_step("decompose_between_params", intent, decompose_between_params)
@@ -1562,6 +1141,11 @@ def apply_deterministic_repairs(
     )
     intent = _deterministic_repair_step("simplify_exprs", intent, simplify_exprs)
     intent = _deterministic_repair_step("normalize_in_raw_values", intent, normalize_in_raw_values)
+    intent = _deterministic_repair_step(
+        "promote_date_subtraction_to_date_diff",
+        intent,
+        promote_date_subtraction_to_date_diff,
+    )
     intent = _deterministic_repair_step("repair_misclassified_date_diff", intent, repair_misclassified_date_diff)
     intent = _deterministic_repair_step("normalize_date_diff_raw_values", intent, normalize_date_diff_raw_values)
     intent = _deterministic_repair_step("canonicalize_temporal_unit_args", intent, canonicalize_temporal_unit_args)
@@ -1611,7 +1195,7 @@ def apply_deterministic_repairs(
     intent = _deterministic_repair_step(
         "repair_array_filters_intent",
         intent,
-        lambda x: repair_array_filters_intent(x, schema_graph),
+        lambda x: repair_array_filters_intent(x, schema_graph, natural_language),
     )
     intent = _deterministic_repair_step(
         "enforce_sensitivity_policy_intent",
@@ -1634,20 +1218,17 @@ def _apply_post_processing(
     question: str,
 ) -> tuple[RuntimeIntent | None, list[IntentIssue]]:
     """
-    Resolve columns, wire CTEs, assign params, prune tables; fail if params missing.
+    Resolve columns, wire CTEs, assign params, prune tables; fail if.
 
-    Args:
+    params missing. Args: intent: Intent that passed semantic
 
-        intent: Intent that passed semantic validation.
-
-        schema_graph: Schema graph.
-
-        question: User question.
+    validation. schema_graph: Schema graph. question: User question.
 
     Returns:
 
-        ``(ready_intent_or_none, resolution_issues)``; issues include ``column_ambiguous`` errors when
-        bare names span multiple tables. ``None`` intent when required param values are missing.
+        ``(ready_intent_or_none, resolution_issues)``; issues include
+        ``column_ambiguous`` errors when bare names span multiple tables.
+        ``None`` intent when required param values are missing.
     """
     all_cols = collect_column_refs_for_post_processing(intent)
     column_map, col_issues = resolve_column_map(all_cols, schema_graph, intent.tables or [])
@@ -1657,64 +1238,10 @@ def _apply_post_processing(
         intent = replace(intent, cte_steps=resolve_cte_column_maps(intent.cte_steps))
 
     if intent.cte_steps:
-        debug(f"[_apply_post_processing] CTE chain: {[c.cte_name for c in intent.cte_steps]}")
-        alias_map: dict[str, str] = {}
-        refreshed_cte_steps = []
-        for idx, cte in enumerate(intent.cte_steps):
-            old_oc = list(cte.output_columns or [])
-            new_oc = derive_cte_output_columns(cte.select_cols or [], cte_ordinal=idx + 1)
-            ocm = build_cte_output_metadata(
-                cte.select_cols or [],
-                new_oc,
-                schema_graph,
-                window_registry=cte.window_registry,
-            )
-            debug(
-                f"[_apply_post_processing] CTE '{cte.cte_name}' "
-                f"tables={cte.tables} grain={cte.grain} "
-                f"old_oc={old_oc} new_oc={new_oc}"
-            )
-            for old_col, new_col in zip(old_oc, new_oc, strict=False):
-                if old_col != new_col:
-                    alias_map[f"{cte.cte_name}.{old_col}"] = f"{cte.cte_name}.{new_col}"
-            refreshed_cte_steps.append(replace(cte, output_columns=new_oc, output_column_metadata=ocm))
-        intent = replace(intent, cte_steps=refreshed_cte_steps)
-        if alias_map:
-            debug(f"[_apply_post_processing] CTE alias remap: {alias_map}")
-
-            def _remap_alias(s: str) -> str:
-                return alias_map.get(s, s)
-
-            def _remap_expr(expr: NormalizedExpr) -> NormalizedExpr:
-                return replace_refs_in_expr(expr, _remap_alias)
-
-            intent = replace(
-                intent,
-                select_cols=[replace(sc, expr=_remap_expr(sc.expr)) for sc in (intent.select_cols or [])],
-                order_by_cols=[replace(obc, expr=_remap_expr(obc.expr)) for obc in (intent.order_by_cols or [])],
-                group_by_cols=[_remap_expr(g) for g in (intent.group_by_cols or [])],
-                filters_param=[
-                    replace(
-                        fp,
-                        left_expr=_remap_expr(fp.left_expr),
-                        right_expr=(_remap_expr(fp.right_expr) if fp.right_expr else None),
-                    )
-                    for fp in (intent.filters_param or [])
-                ],
-                having_param=[
-                    replace(
-                        hp,
-                        left_expr=_remap_expr(hp.left_expr),
-                        right_expr=(_remap_expr(hp.right_expr) if hp.right_expr else None),
-                    )
-                    for hp in (intent.having_param or [])
-                ],
-            )
-
-    if intent.cte_steps:
         intent = qualify_cte_output_columns(intent)
 
     intent = rewrite_cte_output_refs_to_aliases(intent)
+    intent = resolve_window_registry_filter_rhs(intent)
 
     if intent.cte_steps:
         intent = prune_unused_cte_steps(intent)
@@ -1762,8 +1289,6 @@ def _apply_post_processing(
                 continue
             for branch in cw.branches or []:
                 cond = branch.condition
-                if cond is None:
-                    continue
                 if cond.op == "between" and cond.param_key and cond.param_key_hi:
                     out.extend([cond.param_key, cond.param_key_hi])
                 elif cond.param_key and cond.op not in ("is null", "is not null") and not cond.right_expr:
@@ -1809,9 +1334,9 @@ def _apply_post_processing(
                     continue
                 for branch in cw.branches or []:
                     cond = branch.condition
-                    if cond is not None and cond.param_key:
+                    if cond.param_key:
                         cte_pks.add(cond.param_key)
-                    if cond is not None and getattr(cond, "param_key_hi", ""):
+                    if cond.param_key_hi:
                         cte_pks.add(cond.param_key_hi)
             cte_pv = {k: v for k, v in all_pv.items() if k in cte_pks}
             new_cte_steps.append(replace(cte, param_values=cte_pv))
@@ -1823,7 +1348,7 @@ def _apply_post_processing(
     intent = simplify_exprs(intent)
 
     if diagnostic_debug_enabled() and diagnostic_pipeline_trace_full_enabled():
-        pipeline_trace_lazy("intent_after_post_processing", lambda: stable_json(intent.to_dict()))
+        pipeline_trace("intent_after_post_processing", lambda: stable_json(intent.to_dict()))
 
     return intent, col_issues
 
@@ -1832,30 +1357,10 @@ def _align_runtime_tables_to_planner(
     runtime: RuntimeIntent,
     logical: LogicalIntent,
 ) -> RuntimeIntent:
-    """
-    Overwrite runtime main and matching-CTE tables with the planner's authoritative lists.
-
-    The planner is the source of truth for which tables the query needs, including join
-    bridges. Encoder drift on the tables field is silently corrected here so the downstream
-    deterministic pipeline (reconcile_tables, JOIN engine) sees consistent state. Encoder
-    column hallucinations remain caught by check_qualified_refs_exist.
-
-    Args:
-
-        runtime: Encoder output runtime intent before deterministic repair.
-
-        logical: Planner output logical intent.
-
-    Returns:
-
-        Runtime intent whose main tables list matches the planner's tables list. For every
-        runtime cte_steps entry whose cte_name matches a planner CteIntent.name, that CTE's
-        tables list is aligned with the planner's CTE tables list. Unmatched CTE steps are
-        returned unchanged.
-    """
-
+    """Overwrite runtime main and matching-CTE tables with the. planner's. authoritative lists. The planner is the source of truth for which tables the query needs, including join bridges. Encoder drift on the tables field is silently corrected here so the downstream deterministic pipeline (reconcile_tables, JOIN engine) sees consistent state. Encoder column hallucinations remain caught by check_qualified_refs_exist. Args: runtime: Encoder output runtime intent before deterministic repair. logical: Planner output logical intent. Returns: Runtime intent whose main tables list matches the planner's tables list. For every runtime cte_steps entry whose cte_name matches a planner CteIntent.name, that CTE's tables list is aligned with the planner's CTE tables list. Unmatched CTE steps are returned unchanged."""
     aligned_main = list(logical.tables)
     planner_cte_by_name = {s.name: s for s in (logical.cte_steps or ()) if s.name}
+    planner_cte_names = [s.name for s in (logical.cte_steps or ()) if s.name]
     new_cte_steps: list[RuntimeCteStep] = []
     for cte in runtime.cte_steps or []:
         cname = (cte.cte_name or "").strip()
@@ -1864,21 +1369,56 @@ def _align_runtime_tables_to_planner(
             new_cte_steps.append(replace(cte, tables=list(planned.tables)))
         else:
             new_cte_steps.append(cte)
-    return replace(runtime, tables=aligned_main, cte_steps=new_cte_steps)
+    return replace(
+        runtime,
+        tables=aligned_main,
+        cte_steps=new_cte_steps,
+        planner_cte_names=planner_cte_names,
+    )
+
+
+def _base_tables_from_prose_text(text: str) -> set[str]:
+    """Return base table names from qualified ``table.column`` tokens in planner prose."""
+    if not text:
+        return set()
+    tables: set[str] = set()
+    for match in EXPR_TABLE_COLUMN_REF_RE.finditer(text):
+        token = match.group(0)
+        parts = token.split(".", 1)
+        if len(parts) != 2:
+            continue
+        tbl, col = parts
+        if IDENTIFIER_RE.match(tbl) and IDENTIFIER_RE.match(col):
+            tables.add(tbl)
+    return tables
+
+
+def _base_tables_from_logical_prose(logical: LogicalIntent) -> set[str]:
+    """Collect base table names referenced as qualified column tokens across logical prose fields."""
+    names: set[str] = set()
+    for field in PLANNER_PROSE_FIELDS:
+        text = getattr(logical, field, "") or ""
+        if isinstance(text, str):
+            names.update(_base_tables_from_prose_text(text))
+    for step in logical.cte_steps:
+        for field in PLANNER_PROSE_FIELDS:
+            text = getattr(step, field, "") or ""
+            if isinstance(text, str):
+                names.update(_base_tables_from_prose_text(text))
+    return names
 
 
 def _structural_tables_for_logical(logical: LogicalIntent) -> tuple[str, ...]:
-    """Return sorted union of planner base tables and every CTE step table list."""
-
+    """Return sorted union of planner table lists and base tables named as qualified column tokens in prose."""
     names: set[str] = set(logical.tables)
     for step in logical.cte_steps:
         names.update(step.tables)
+    names.update(_base_tables_from_logical_prose(logical))
     return tuple(sorted(names))
 
 
 def _issue_to_planner_hint(issue: IntentIssue) -> str:
     """Return a compact NL hint appended to planner restarts."""
-
     cat = issue.category
     ctx = issue.context or {}
     if cat == FailureCategory.UNKNOWN_TABLE:
@@ -1904,43 +1444,43 @@ def _issue_to_planner_hint(issue: IntentIssue) -> str:
     return (issue.message or "").strip()
 
 
-def _collect_post_stage_b_validation_issues(
+def _collect_post_compose_validation_issues(
     intent: RuntimeIntent,
     schema_graph: SchemaGraph,
     post_resolution_issues: list[IntentIssue],
     logical: LogicalIntent | None = None,
 ) -> list[IntentIssue]:
     """
-    Aggregate schema-ref strings, semantic validation, and post-resolution issues after Stage B.
+    Aggregate schema-ref strings, semantic validation, and post-
 
-    Used by :func:`full_intent_parse` to route logical versus format retries before the schema and semantic repair loop.
+    resolution issues after the Compose phase.
 
-    Args:
+    Used by :func:`full_intent_parse` to route Ground versus Compose
 
-        intent: Post-processed runtime intent candidate.
+    retries before the schema and semantic repair loop. Args: intent:
 
-        schema_graph: Active schema graph.
+    Post-processed runtime intent candidate. schema_graph: Active schema
 
-        post_resolution_issues: Column resolution or binding issues from post-processing.
+    graph. post_resolution_issues: Column resolution or binding issues
 
-        logical: Planner intent when available for table fidelity, numeric coverage source, and literal attribution.
+    from post-processing. logical: Planner intent when available for
 
-    Returns:
+    table fidelity, numeric coverage source, and literal attribution.
 
-        Combined issues including inferred ``responsible_stage`` where applicable.
+    Returns: Combined issues including inferred ``responsible_stage``
+        where applicable.
     """
-
     issues: list[IntentIssue] = list(post_resolution_issues)
     _, schema_errors = check_qualified_refs_exist(intent, schema_graph)
     for idx, err in enumerate(schema_errors):
         issues.append(
             make_intent_issue(
-                issue_id=f"schema_ref_post_stage_b_{idx}",
-                category=_classify_schema_error(err),
+                issue_id=f"schema_ref_post_compose_{idx}",
+                category=classify_schema_error(err),
                 severity="error",
                 message=err,
                 context={},
-                responsible_stage="format",
+                responsible_stage="compose",
             )
         )
     vr = validate_semantics(
@@ -1950,7 +1490,7 @@ def _collect_post_stage_b_validation_issues(
         numeric_coverage_logical=logical,
     )
     if logical is not None:
-        issues.extend(attribute_post_stage_b_issue(iss, logical) for iss in vr.issues)
+        issues.extend(attribute_post_compose_issue(iss, logical) for iss in vr.issues)
     else:
         issues.extend(vr.issues)
     return issues
@@ -1962,22 +1502,7 @@ def apply_runtime_post_processing_lite(
     *,
     question_fallback: str = "",
 ) -> tuple[RuntimeIntent | None, list[IntentIssue]]:
-    """
-    Apply deterministic column resolution and normalization from :func:`_apply_post_processing`.
-
-    Args:
-
-        intent: Runtime intent after deterministic structural repairs.
-
-        schema_graph: Active schema graph.
-
-        question_fallback: Text substituted when ``intent.natural_language`` is empty.
-
-    Returns:
-
-        Same contract as :func:`_apply_post_processing`: ``(intent_or_none, column_issues)``.
-    """
-
+    """Apply deterministic column resolution and normalization from. :func:`_apply_post_processing`. Args: intent: Runtime intent after deterministic structural repairs. schema_graph: Active schema graph. question_fallback: Text substituted when ``intent.natural_language`` is empty. Returns: Same contract as :func:`_apply_post_processing`: ``(intent_or_none, column_issues)``."""
     q = (intent.natural_language or "").strip() or question_fallback
     return _apply_post_processing(intent, schema_graph, q)
 
@@ -1995,51 +1520,23 @@ def _attempt_fresh_restart(
     *,
     prior_user_corrections: tuple[str, ...] = (),
     persist_template_learning: bool = True,
-) -> tuple[RuntimeIntent | None, list[str], int]:
-    """
-    Re-run a full intent parse once after repair exhaustion, bounded by *budget*.
-
-    When *reason* is in :data:`PolicyConfig.SEMANTIC_RESTART_REASONS` and in-memory semantic error rows exist, one ``VALIDATION_FAILURE`` summary is persisted before attempting the restart.
-
-    Decrements :attr:`RestartBudget.fresh_restarts_left` and recurses into
-    :func:`full_intent_parse` with the same shared budget so a nested restart cannot occur.
-
-    Args:
-
-        question: Normalised user question text.
-
-        schema_graph: Schema graph for validation and table listing.
-
-        max_retries: JSON format-repair attempts for the new parse.
-
-        llm_calls: LLM calls already spent before this restart.
-
-        store: Template store; optional validation summaries are persisted at the restart boundary.
-
-        in_turn_summaries: Current-turn feedback rows not yet written to the store.
-
-        budget: Shared :class:`RestartBudget` controlling how many restarts remain.
-
-        reason: Short label describing which exit branch triggered the restart attempt.
-
-        last_intent: Most recent intent from the repair loop, if any.
-
-    Returns:
-
-        ``(intent_or_none, warnings, new_llm_call_total)``.
-    """
-    tpl = _TEMPLATES_MODULE
+    visible_objects: frozenset[str] | None = None,
+    allowed_columns: frozenset[str] | None = None,
+    deny_objects: frozenset[str] | None = None,
+    deny_columns: frozenset[str] | None = None,
+    description_overlay: dict[str, Any] | None = None,
+) -> tuple[RuntimeIntent | None, list[str], int, InterpretPlan | None]:
+    """Re-run a full intent parse once after repair exhaustion, bounded. by *budget*. When *reason* is in :data:`PolicyConfig.SEMANTIC_RESTART_REASONS` and in-memory semantic error rows exist, one ``VALIDATION_FAILURE`` summary is persisted before attempting the restart. Decrements:attr:`RestartBudget.fresh_restarts_left` and recurses into :func:`full_intent_parse` with the same shared budget so a nested restart cannot occur. Args: question: Normalised user question text. schema_graph: Schema graph for validation and table listing. max_retries: JSON format-repair attempts for the new parse. llm_calls: LLM calls already spent before this restart. store: Template store; optional validation summaries are persisted at the restart boundary. in_turn_summaries: Current-turn feedback rows not yet written to the store. budget: Shared :class:`RestartBudget` controlling how many restarts remain. reason: Short label describing which exit branch triggered the restart attempt. last_intent: Most recent intent from the repair loop, if any. Returns: ``(intent_or_none, warnings, new_llm_call_total)``."""
+    tpl = get_templates_module()
     should_persist = (
         store is not None
         and last_intent is not None
         and reason in PolicyConfig.SEMANTIC_RESTART_REASONS
         and bool(in_turn_summaries)
     )
-    if should_persist and persist_template_learning:
+    if should_persist and persist_template_learning and tpl is not None:
         flat_errs: list[str] = []
         for row in in_turn_summaries:
-            if not isinstance(row, dict):
-                continue
             for line in str(row.get("summary", "")).split("\n"):
                 t = line.strip()
                 if t:
@@ -2052,6 +1549,7 @@ def _attempt_fresh_restart(
             schema_hash=schema_graph.effective_structural_hash,
             validator_errors=flat_errs or None,
             is_post_restart=is_post_restart,
+            sql=render_feedback_sql(last_intent, schema_graph) if last_intent is not None else None,
         )
         tpl.record_question_feedback(store, question, ent)
         tpl.save_template_store(store)
@@ -2060,7 +1558,7 @@ def _attempt_fresh_restart(
             f"[intent_process._attempt_fresh_restart] fresh restart denied (reason={reason}, "
             f"fresh_restarts_left=0); terminating."
         )
-        return None, [], llm_calls
+        return None, [], llm_calls, None
     budget.fresh_restarts_left -= 1
     debug(
         f"[intent_process._attempt_fresh_restart] fresh restart triggered (reason={reason}, "
@@ -2073,7 +1571,7 @@ def _attempt_fresh_restart(
         code=DIAGNOSTIC_CODE_FALLBACK_FRESH_RESTART,
         details=(("fresh_restarts_left", str(budget.fresh_restarts_left)),),
     )
-    intent, warns, inner = full_intent_parse(
+    intent, warns, inner, plan = full_intent_parse(
         question,
         schema_graph,
         max_retries=max_retries,
@@ -2082,24 +1580,33 @@ def _attempt_fresh_restart(
         budget=budget,
         prior_user_corrections=prior_user_corrections,
         persist_template_learning=persist_template_learning,
+        visible_objects=visible_objects,
+        allowed_columns=allowed_columns,
+        deny_objects=deny_objects,
+        deny_columns=deny_columns,
+        description_overlay=description_overlay,
     )
-    return intent, warns, llm_calls + inner
+    return intent, warns, llm_calls + inner, plan
 
 
-def _invoke_intent_parse_with_hints(
+def invoke_intent_parse_with_hints(
     question: str,
     schema_graph: SchemaGraph,
     *,
-    max_retries: int = PolicyConfig.MAX_STAGE_B_REPAIRS,
+    max_retries: int = PolicyConfig.MAX_ASK_COMPOSE_REPAIRS,
     store: dict[str, Any] | None = None,
     in_turn_seed: list[dict[str, str]] | None = None,
     extra_user_feedback: list[str] | None = None,
     prior_user_corrections: tuple[str, ...] = (),
     budget: RestartBudget | None = None,
     persist_template_learning: bool = True,
-) -> tuple[RuntimeIntent | None, list[str], int]:
+    visible_objects: frozenset[str] | None = None,
+    allowed_columns: frozenset[str] | None = None,
+    deny_objects: frozenset[str] | None = None,
+    deny_columns: frozenset[str] | None = None,
+    description_overlay: dict[str, Any] | None = None,
+) -> tuple[RuntimeIntent | None, list[str], int, InterpretPlan | None]:
     """Run :func:`full_intent_parse` with persisted question feedback merged from *store*."""
-
     return full_intent_parse(
         question,
         schema_graph,
@@ -2110,59 +1617,91 @@ def _invoke_intent_parse_with_hints(
         prior_user_corrections=prior_user_corrections,
         budget=budget,
         persist_template_learning=persist_template_learning,
+        visible_objects=visible_objects,
+        allowed_columns=allowed_columns,
+        deny_objects=deny_objects,
+        deny_columns=deny_columns,
+        description_overlay=description_overlay,
     )
 
 
-def full_intent_parse(
+def parse_intent_for_question(
     question: str,
     schema_graph: SchemaGraph,
-    max_retries: int = PolicyConfig.MAX_STAGE_B_REPAIRS,
     *,
+    max_retries: int = PolicyConfig.MAX_ASK_COMPOSE_REPAIRS,
     store: dict[str, Any] | None = None,
     in_turn_seed: list[dict[str, str]] | None = None,
     extra_user_feedback: list[str] | None = None,
     prior_user_corrections: tuple[str, ...] = (),
     budget: RestartBudget | None = None,
     persist_template_learning: bool = True,
-) -> tuple[RuntimeIntent | None, list[str], int]:
-    """
-    End-to-end parse: Stage A logical JSON, Stage B IR JSON, post-bind validation loop, then schema and semantic repair.
+    visible_objects: frozenset[str] | None = None,
+    allowed_columns: frozenset[str] | None = None,
+) -> tuple[RuntimeIntent | None, list[str], int, InterpretPlan | None]:
+    """Parse one question into a :class:`RuntimeIntent` (alias of :func:`invoke_intent_parse_with_hints`)."""
+    return invoke_intent_parse_with_hints(
+        question,
+        schema_graph,
+        max_retries=max_retries,
+        store=store,
+        in_turn_seed=in_turn_seed,
+        extra_user_feedback=extra_user_feedback,
+        prior_user_corrections=prior_user_corrections,
+        budget=budget,
+        persist_template_learning=persist_template_learning,
+        visible_objects=visible_objects,
+        allowed_columns=allowed_columns,
+    )
 
-    After Stage B, the engine applies deterministic repairs and post-processing, then aggregates schema-ref,
-    semantic, and resolution issues. Any issue attributed to the logical stage restarts Stage A with accumulated
-    grounding failures (bounded by :data:`MAX_STAGE_A_RETRIES`). Format-only issues trigger the same repair prompt
-    shape as semantic repair (bounded by *max_retries*). On success the pipeline continues into
-    :func:`_run_schema_semantic_repair_loop` for schema oscillation handling, semantic repair, and phase-G checks.
 
-    Args:
-
-        question: Natural language question.
-
-        schema_graph: Schema and literal text provider.
-
-        max_retries: JSON format-repair attempts per parse.
-
-        store: Optional template store for ``question_feedback`` reads.
-
-        in_turn_seed: Current-turn prompt rows merged ahead of persisted feedback.
-
-        extra_user_feedback: Optional user-supplied rejection reasons merged into prior feedback rows.
-
-        prior_user_corrections: Short operator or conversation hints appended to Stage A as ``prior_user_corrections``.
-
-        budget: Shared :class:`RestartBudget` controlling fresh-restart count; constructed from
-        :data:`PolicyConfig.MAX_FRESH_RESTARTS` when ``None``.
-
-    Returns:
-
-        ``(intent, warning_messages, llm_call_count)``; intent is ``None`` on failure.
-    """
-    tpl = _TEMPLATES_MODULE
-
+def full_intent_parse(
+    question: str,
+    schema_graph: SchemaGraph,
+    *,
+    max_retries: int = PolicyConfig.MAX_ASK_COMPOSE_REPAIRS,
+    store: dict[str, Any] | None = None,
+    in_turn_seed: list[dict[str, str]] | None = None,
+    extra_user_feedback: list[str] | None = None,
+    prior_user_corrections: tuple[str, ...] = (),
+    budget: RestartBudget | None = None,
+    persist_template_learning: bool = True,
+    visible_objects: frozenset[str] | None = None,
+    allowed_columns: frozenset[str] | None = None,
+    deny_objects: frozenset[str] | None = None,
+    deny_columns: frozenset[str] | None = None,
+    description_overlay: dict[str, Any] | None = None,
+) -> tuple[RuntimeIntent | None, list[str], int, InterpretPlan | None]:
+    """End-to-end parse: Interpret, Ground, Compose, then post-compose validation and repair."""
+    tpl = get_templates_module()
     if budget is None:
         budget = RestartBudget.default()
-    table_list = sorted(schema_graph.tables.keys())
-    schema_literal_json = schema_graph.schema_literal_json
+    table_filter, column_filter = schema_graph._resolve_payload_filters(
+        visible_objects=visible_objects,
+        allowed_columns=allowed_columns,
+        deny_objects=deny_objects,
+        deny_columns=deny_columns,
+    )
+    if column_filter:
+        table_list = sorted(table_filter if table_filter else schema_graph.tables.keys())
+    elif table_filter:
+        table_list = sorted(table_filter)
+    else:
+        table_list = sorted(schema_graph.tables.keys())
+    interpret_payload = schema_graph.schema_payload_interpret(
+        visible_objects=visible_objects,
+        allowed_columns=allowed_columns,
+        deny_objects=deny_objects,
+        deny_columns=deny_columns,
+        description_overlay=description_overlay,
+    )
+    ground_payload = schema_graph.schema_payload_ground(
+        visible_objects=visible_objects,
+        allowed_columns=allowed_columns,
+        deny_objects=deny_objects,
+        deny_columns=deny_columns,
+        description_overlay=description_overlay,
+    )
     llm_calls = 0
     seed_rows = [dict(r) for r in (in_turn_seed or []) if isinstance(r, dict)]
     if extra_user_feedback:
@@ -2171,32 +1710,33 @@ def full_intent_parse(
             if t:
                 seed_rows.append({"summary": t, "source": "user_refinement"})
     persisted: list[dict[str, str]] = []
-    if store is not None:
-        persisted = tpl.collect_question_feedback_for_prompt(store, question, schema_graph.effective_structural_hash)
-    merged_feedback = _dedupe_prior_question_feedback_rows(seed_rows + persisted)
-    prior_fb_text = _serialized_prior_feedback_rows(merged_feedback)
-    answer_style_text = stable_json(list(_LOGICAL_DECOMPOSITION_GUIDANCE))
-    system_b = _INTENT_STAGE_B_SYSTEM
+    if store is not None and tpl is not None:
+        persisted = tpl.collect_question_feedback_for_prompt(store, question, schema_graph.schema_graph_id)
+    merged_feedback = dedupe_prior_question_feedback_rows(seed_rows + persisted)
+    prior_fb_text = serialized_prior_feedback_rows(merged_feedback)
+    answer_style_text = stable_json(list(LOGICAL_DECOMPOSITION_GUIDANCE))
+    system_compose = INTENT_COMPOSE_SYSTEM
     prior_grounding_failures: tuple[str, ...] = ()
-    max_a_attempts = MAX_STAGE_A_RETRIES + 1
+    prior_attempt_failures: tuple[str, ...] = ()
+    max_a_attempts = PolicyConfig.MAX_ASK_INTERPRET_GROUND_RETRIES + 1
     attempt_a = 0
+    interpret_plan: InterpretPlan | None = None
     while attempt_a < max_a_attempts:
-        user_a = _build_intent_logical_prompt(
+        user_interpret = build_intent_interpret_prompt(
             question,
-            schema_literal_json,
+            interpret_payload,
             prior_fb_text,
-            answer_style_text,
             prior_user_corrections,
-            prior_grounding_failures,
+            prior_attempt_failures,
         )
-        raw_a = llm_chat(_INTENT_STAGE_A_SYSTEM, user_a, task="intent")
+        raw_interpret = llm_chat(INTENT_INTERPRET_SYSTEM, user_interpret, task="intent")
         llm_calls += 1
-        debug(f"[intent_process.full_intent_parse] Stage A raw_llm_response (attempt {attempt_a + 1}): {raw_a}")
-        logical_candidate, logical_issues = _parse_logical_intent_response(raw_a, schema_graph)
-        if logical_candidate is None:
+        debug(f"[{ASK_PHASE_B}] raw_llm_response (attempt {attempt_a + 1}): {raw_interpret}")
+        interpret_candidate, interpret_issues = parse_interpret_plan_response(raw_interpret)
+        if interpret_candidate is None:
             if attempt_a >= max_a_attempts - 1:
-                debug("[intent_process.full_intent_parse] Stage A exhausted after logical validation failures")
-                return _attempt_fresh_restart(
+                debug(f"[{ASK_PHASE_B}] exhausted after interpret validation failures")
+                intent, warns, calls, plan = _attempt_fresh_restart(
                     question,
                     schema_graph,
                     max_retries,
@@ -2204,35 +1744,98 @@ def full_intent_parse(
                     store,
                     seed_rows,
                     budget,
-                    "stage_a_exhausted",
+                    "interpret_exhausted",
                     None,
                     prior_user_corrections=prior_user_corrections,
                     persist_template_learning=persist_template_learning,
+                    visible_objects=visible_objects,
+                    allowed_columns=allowed_columns,
+                    deny_objects=deny_objects,
+                    deny_columns=deny_columns,
+                    description_overlay=description_overlay,
                 )
+                return intent, warns, calls, plan
             notify(
-                "Stage A logical intent retry after schema or core-field validation failures.",
+                "Interpret retry after plan validation failures.",
                 stage="intent",
-                code=DIAGNOSTIC_CODE_STAGE_A_RETRY,
+                code=DIAGNOSTIC_CODE_INTERPRET_GROUND_RETRY,
                 details=(("attempt", str(attempt_a + 1)),),
             )
-            prior_grounding_failures = prior_grounding_failures + tuple(
-                _issue_to_planner_hint(iss) for iss in logical_issues
+            prior_attempt_failures = prior_attempt_failures + tuple(
+                _issue_to_planner_hint(iss) for iss in interpret_issues
             )
             attempt_a += 1
             continue
 
-        logical = logical_candidate
-        structural_json = schema_graph.structural_schema_literal_json(_structural_tables_for_logical(logical))
-        user_b = _build_intent_format_prompt(logical, structural_json)
-        raw_b = llm_chat(system_b, user_b, task="intent")
+        interpret_plan = interpret_candidate
+        pipeline_trace(
+            ASK_PHASE_B,
+            stable_json(
+                {
+                    "approach": interpret_plan.approach,
+                    "grounding": [{"ref": r, "used_for": u} for r, u in interpret_plan.grounding],
+                }
+            ),
+        )
+        user_ground = build_intent_ground_prompt(
+            question,
+            interpret_plan,
+            ground_payload,
+            prior_fb_text,
+            answer_style_text,
+            prior_user_corrections,
+            prior_grounding_failures,
+        )
+        raw_ground = llm_chat(INTENT_GROUND_SYSTEM, user_ground, task="intent")
         llm_calls += 1
-        debug(f"[intent_process.full_intent_parse] Stage B raw_llm_response: {raw_b}")
-        intent, fmt_calls = _format_repair_loop(system_b, raw_b, question, max_retries)
+        debug(f"[{ASK_PHASE_C}] raw_llm_response (attempt {attempt_a + 1}): {raw_ground}")
+        logical_candidate, logical_issues = parse_logical_intent_response(raw_ground, schema_graph)
+        if logical_candidate is None:
+            if attempt_a >= max_a_attempts - 1:
+                debug(f"[{ASK_PHASE_C}] exhausted after ground validation failures")
+                intent, warns, calls, plan = _attempt_fresh_restart(
+                    question,
+                    schema_graph,
+                    max_retries,
+                    llm_calls,
+                    store,
+                    seed_rows,
+                    budget,
+                    "ground_exhausted",
+                    None,
+                    prior_user_corrections=prior_user_corrections,
+                    persist_template_learning=persist_template_learning,
+                    visible_objects=visible_objects,
+                    allowed_columns=allowed_columns,
+                    deny_objects=deny_objects,
+                    deny_columns=deny_columns,
+                    description_overlay=description_overlay,
+                )
+                return intent, warns, calls, plan
+            notify(
+                "Ground retry after schema or core-field validation failures.",
+                stage="intent",
+                code=DIAGNOSTIC_CODE_INTERPRET_GROUND_RETRY,
+                details=(("attempt", str(attempt_a + 1)),),
+            )
+            new_hints = tuple(_issue_to_planner_hint(iss) for iss in logical_issues)
+            prior_grounding_failures = prior_grounding_failures + new_hints
+            prior_attempt_failures = prior_attempt_failures + new_hints
+            attempt_a += 1
+            continue
+
+        logical = logical_candidate
+        structural_json = schema_graph.schema_payload_compose(_structural_tables_for_logical(logical))
+        user_compose = _build_intent_compose_prompt(logical, structural_json)
+        raw_compose = llm_chat(system_compose, user_compose, task="intent")
+        llm_calls += 1
+        debug(f"[{ASK_PHASE_D}] raw_llm_response: {raw_compose}")
+        intent, fmt_calls = _format_repair_loop(system_compose, raw_compose, question, max_retries)
         llm_calls += fmt_calls
 
         if not intent:
-            debug("[intent_process.full_intent_parse] Stage B format repair exhausted")
-            return _attempt_fresh_restart(
+            debug(f"[{ASK_PHASE_D}] format repair exhausted")
+            intent, warns, calls, plan = _attempt_fresh_restart(
                 question,
                 schema_graph,
                 max_retries,
@@ -2240,34 +1843,51 @@ def full_intent_parse(
                 store,
                 seed_rows,
                 budget,
-                "stage_b_format_exhausted",
+                "compose_format_exhausted",
                 None,
                 prior_user_corrections=prior_user_corrections,
                 persist_template_learning=persist_template_learning,
+                visible_objects=visible_objects,
+                allowed_columns=allowed_columns,
+                deny_objects=deny_objects,
+                deny_columns=deny_columns,
             )
+            return intent, warns, calls, plan
 
-        debug(f"[intent_process.full_intent_parse] normalized intent after Stage B:\n{stable_json(intent.to_dict())}")
+        debug(f"[{ASK_PHASE_D}] normalized intent:\n{stable_json(intent.to_dict())}")
 
         intent = _align_runtime_tables_to_planner(intent, logical)
-        intent = _propagate_planner_schema_invalid_flag(intent, logical)
+        intent = _propagate_interpret_schema_invalid_flag(intent, interpret_plan)
 
-        avoid_rows = _dedupe_prior_question_feedback_rows(list(seed_rows) + persisted)
+        avoid_rows = dedupe_prior_question_feedback_rows(list(seed_rows) + persisted)
         logical_restart = False
         b_repairs_used = 0
+        compose_repair_json = schema_graph.schema_payload_compose(intent.tables or table_list)
         while True:
             intent = apply_deterministic_repairs(intent, schema_graph, question)
             result, post_issues = _apply_post_processing(intent, schema_graph, question)
             if result is None:
-                debug("[intent_process.full_intent_parse] post-processing missing params — terminating")
-                return None, [], llm_calls
-            merged_issues = _collect_post_stage_b_validation_issues(result, schema_graph, post_issues, logical)
+                debug(f"[{ASK_PHASE_H}] post-processing missing params — terminating")
+                return None, [], llm_calls, interpret_plan
+            merged_issues = _collect_post_compose_validation_issues(result, schema_graph, post_issues, logical)
             errors = [iss for iss in merged_issues if iss.severity == "error"]
             if not errors:
                 intent = result
                 break
-            if any(iss.responsible_stage == "logical" for iss in errors):
+            if (
+                errors
+                and not any(iss.responsible_stage == "ground" for iss in errors)
+                and all(
+                    (iss.issue_id or "").startswith(("non_selectable_filter", "non_selectable_having"))
+                    or iss.category == FailureCategory.ACCESS_POLICY
+                    for iss in errors
+                )
+            ):
+                debug(f"[{ASK_PHASE_H}] post-compose unfixable policy errors — terminating")
+                return None, [], llm_calls, interpret_plan
+            if any(iss.responsible_stage == "ground" for iss in errors):
                 if attempt_a >= max_a_attempts - 1:
-                    return _attempt_fresh_restart(
+                    intent, warns, calls, plan = _attempt_fresh_restart(
                         question,
                         schema_graph,
                         max_retries,
@@ -2275,28 +1895,33 @@ def full_intent_parse(
                         store,
                         seed_rows,
                         budget,
-                        "stage_a_orchestrator_exhausted",
+                        "ground_orchestrator_exhausted",
                         None,
                         prior_user_corrections=prior_user_corrections,
                         persist_template_learning=persist_template_learning,
+                        visible_objects=visible_objects,
+                        allowed_columns=allowed_columns,
+                        deny_objects=deny_objects,
+                        deny_columns=deny_columns,
                     )
+                    return intent, warns, calls, plan
                 notify(
-                    "Stage A retry after post-bind validation flagged logical grounding issues.",
+                    "Ground retry after phase validation flagged Ground-stage issues.",
                     stage="intent",
-                    code=DIAGNOSTIC_CODE_STAGE_A_RETRY,
+                    code=DIAGNOSTIC_CODE_INTERPRET_GROUND_RETRY,
                     details=(
                         ("attempt", str(attempt_a + 1)),
-                        ("phase", "post_stage_b"),
+                        ("phase", ASK_PHASE_H),
                     ),
                 )
                 prior_grounding_failures = prior_grounding_failures + tuple(
-                    _issue_to_planner_hint(iss) for iss in errors if iss.responsible_stage == "logical"
+                    _issue_to_planner_hint(iss) for iss in errors if iss.responsible_stage == "ground"
                 )
                 logical_restart = True
                 break
             if b_repairs_used >= max_retries:
-                debug("[intent_process.full_intent_parse] post-Stage B format repair budget exhausted")
-                return _attempt_fresh_restart(
+                debug(f"[{ASK_PHASE_E}] post-compose format repair budget exhausted")
+                intent, warns, calls, plan = _attempt_fresh_restart(
                     question,
                     schema_graph,
                     max_retries,
@@ -2304,42 +1929,46 @@ def full_intent_parse(
                     store,
                     seed_rows,
                     budget,
-                    "post_stage_b_format_exhausted",
+                    "post_compose_format_exhausted",
                     intent,
                     prior_user_corrections=prior_user_corrections,
                     persist_template_learning=persist_template_learning,
+                    visible_objects=visible_objects,
+                    allowed_columns=allowed_columns,
+                    deny_objects=deny_objects,
+                    deny_columns=deny_columns,
+                    description_overlay=description_overlay,
                 )
+                return intent, warns, calls, plan
             warnings = [iss for iss in merged_issues if iss.severity == "warning"]
             intent_json = stable_json(result.to_prompt_dict())
-            debug(
-                f"[intent_process.full_intent_parse] post-Stage B repair errors: "
-                f"{[(e.category, e.message) for e in errors]}"
-            )
-            repair_prompt = _build_intent_semantic_repair_prompt(
+            debug(f"[{ASK_PHASE_E}] post-compose repair errors: {[(e.category, e.message) for e in errors]}")
+            compose_repair_json = schema_graph.schema_payload_compose(result.tables or table_list)
+            repair_prompt = build_intent_semantic_repair_prompt(
                 question,
                 intent_json,
                 errors,
                 warnings,
-                schema_literal_json,
+                compose_repair_json,
                 prior_question_feedback=avoid_rows or None,
             )
             notify(
-                "Stage B post-bind format repair LLM invocation.",
+                "Compose repair LLM invocation.",
                 stage="intent",
-                code=DIAGNOSTIC_CODE_STAGE_B_REPAIR,
+                code=DIAGNOSTIC_CODE_COMPOSE_REPAIR,
                 details=(
-                    ("phase", "post_stage_b"),
+                    ("phase", ASK_PHASE_E),
                     ("repair_round", str(b_repairs_used + 1)),
                 ),
             )
             rollback_intent = result
-            repaired_raw = llm_chat(system_b, repair_prompt, task="intent")
+            repaired_raw = llm_chat(system_compose, repair_prompt, task="intent")
             llm_calls += 1
-            repaired, fmt_rep_calls = _format_repair_loop(system_b, repaired_raw, question, max_retries)
+            repaired, fmt_rep_calls = _format_repair_loop(system_compose, repaired_raw, question, max_retries)
             llm_calls += fmt_rep_calls
             if not repaired:
-                debug("[intent_process.full_intent_parse] format repair exhausted after post-Stage B repair")
-                return _attempt_fresh_restart(
+                debug(f"[{ASK_PHASE_E}] format repair exhausted after post-compose repair")
+                intent, warns, calls, plan = _attempt_fresh_restart(
                     question,
                     schema_graph,
                     max_retries,
@@ -2347,18 +1976,24 @@ def full_intent_parse(
                     store,
                     seed_rows,
                     budget,
-                    "post_stage_b_format_repair_exhausted",
+                    "post_compose_format_repair_exhausted",
                     intent,
                     prior_user_corrections=prior_user_corrections,
                     persist_template_learning=persist_template_learning,
+                    visible_objects=visible_objects,
+                    allowed_columns=allowed_columns,
+                    deny_objects=deny_objects,
+                    deny_columns=deny_columns,
+                    description_overlay=description_overlay,
                 )
+                return intent, warns, calls, plan
             intent = repaired
             intent = _align_runtime_tables_to_planner(intent, logical)
-            intent = _propagate_planner_schema_invalid_flag(intent, logical)
+            intent = _propagate_interpret_schema_invalid_flag(intent, interpret_plan)
             if not _runtime_intent_select_cols_have_substance(
                 intent
             ) or _runtime_intent_case_registry_has_empty_branches(intent):
-                debug("[intent_process.full_intent_parse] post-Stage B repair_reverted_empty_select")
+                debug(f"[{ASK_PHASE_E}] repair_reverted_empty_select")
                 intent = rollback_intent
             b_repairs_used += 1
 
@@ -2371,9 +2006,9 @@ def full_intent_parse(
         repaired_intent, sem_warns, llm_calls, planner_hints = _run_schema_semantic_repair_loop(
             intent=intent,
             question=question,
-            system=system_b,
+            system=system_compose,
             schema_graph=schema_graph,
-            schema_literal_json=schema_literal_json,
+            schema_literal_json=compose_repair_json,
             table_list=table_list,
             max_retries=max_retries,
             llm_calls=llm_calls,
@@ -2381,12 +2016,17 @@ def full_intent_parse(
             in_turn_summaries=in_turn_live,
             budget=budget,
             logical=logical,
+            interpret_plan=interpret_plan,
             prior_user_corrections=prior_user_corrections,
             persist_template_learning=persist_template_learning,
+            visible_objects=visible_objects,
+            allowed_columns=allowed_columns,
+            deny_objects=deny_objects,
+            deny_columns=deny_columns,
         )
         if planner_hints is not None:
             if attempt_a >= max_a_attempts - 1:
-                return _attempt_fresh_restart(
+                intent, warns, calls, plan = _attempt_fresh_restart(
                     question,
                     schema_graph,
                     max_retries,
@@ -2394,28 +2034,34 @@ def full_intent_parse(
                     store,
                     seed_rows,
                     budget,
-                    "stage_a_after_schema_semantic_exhausted",
+                    "ground_after_schema_semantic_exhausted",
                     None,
                     prior_user_corrections=prior_user_corrections,
                     persist_template_learning=persist_template_learning,
+                    visible_objects=visible_objects,
+                    allowed_columns=allowed_columns,
+                    deny_objects=deny_objects,
+                    deny_columns=deny_columns,
+                    description_overlay=description_overlay,
                 )
+                return intent, warns, calls, plan
             notify(
-                "Stage A retry after schema/semantic validation surfaced logical-stage issues.",
+                "Ground retry after schema/semantic validation surfaced logical-stage issues.",
                 stage="intent",
-                code=DIAGNOSTIC_CODE_STAGE_A_RETRY,
+                code=DIAGNOSTIC_CODE_INTERPRET_GROUND_RETRY,
                 details=(
                     ("attempt", str(attempt_a + 1)),
-                    ("phase", "schema_semantic_loop"),
+                    ("phase", ASK_PHASE_G),
                 ),
             )
             prior_grounding_failures = prior_grounding_failures + planner_hints
             attempt_a += 1
             continue
 
-        return repaired_intent, sem_warns, llm_calls
+        return repaired_intent, sem_warns, llm_calls, interpret_plan
 
-    debug("[intent_process.full_intent_parse] Stage A outer budget exhausted (unexpected)")
-    return _attempt_fresh_restart(
+    debug(f"[{ASK_PHASE_C}] outer budget exhausted (unexpected)")
+    intent, warns, calls, plan = _attempt_fresh_restart(
         question,
         schema_graph,
         max_retries,
@@ -2423,20 +2069,23 @@ def full_intent_parse(
         store,
         seed_rows,
         budget,
-        "stage_a_outer_exhausted",
+        "ground_outer_exhausted",
         None,
         prior_user_corrections=prior_user_corrections,
         persist_template_learning=persist_template_learning,
+        visible_objects=visible_objects,
+        allowed_columns=allowed_columns,
+        deny_objects=deny_objects,
+        deny_columns=deny_columns,
     )
+    return intent, warns, calls, plan
 
 
 def _runtime_intent_select_cols_have_substance(intent: RuntimeIntent) -> bool:
-    """
-    Return False when any select column expression is structurally empty in the main query or a CTE.
-    """
+    """Return False when any select column expression is structurally empty in the main query or a CTE."""
 
     def scope_ok(cols: list[SelectCol]) -> bool:
-        return all(not _normalized_expr_is_absent(sc.expr) for sc in cols or [])
+        return all(not normalized_expr_is_absent(sc.expr) for sc in cols or [])
 
     if not scope_ok(intent.select_cols):
         return False
@@ -2444,9 +2093,7 @@ def _runtime_intent_select_cols_have_substance(intent: RuntimeIntent) -> bool:
 
 
 def _runtime_intent_case_registry_has_empty_branches(intent: RuntimeIntent) -> bool:
-    """
-    Return True when any case-registry step has no branches (main query or a CTE).
-    """
+    """Return True when any case-registry step has no branches (main query or a CTE)."""
 
     def scope_bad(steps: list[CaseRegistryStep]) -> bool:
         return any(not step.case_when.branches for step in steps or [])
@@ -2470,94 +2117,75 @@ def _run_schema_semantic_repair_loop(
     budget: RestartBudget | None = None,
     *,
     logical: LogicalIntent | None = None,
+    interpret_plan: InterpretPlan | None = None,
     prior_user_corrections: tuple[str, ...] = (),
     persist_template_learning: bool = True,
+    visible_objects: frozenset[str] | None = None,
+    allowed_columns: frozenset[str] | None = None,
+    deny_objects: frozenset[str] | None = None,
+    deny_columns: frozenset[str] | None = None,
 ) -> tuple[RuntimeIntent | None, list[str], int, tuple[str, ...] | None]:
     """
-    Schema + semantic repair loops, post-processing, and phase-G revalidation.
-
-    Each level performs one initial validation followed by up to :data:`PolicyConfig.MAX_STAGE_B_REPAIRS` repair attempts (so total = original + ``MAX_STAGE_B_REPAIRS`` validations). Exhaustion or oscillation funnels into :func:`_attempt_fresh_restart`, which is bounded by the shared *budget*.
+    Schema + semantic repair loops, post-processing, and post-processing revalidation. Each level performs one initial validation followed by up to :data:`PolicyConfig.MAX_ASK_COMPOSE_REPAIRS` repair attempts (so total = original + ``MAX_ASK_COMPOSE_REPAIRS`` validations). Exhaustion or oscillation funnels into :func:`_attempt_fresh_restart`, which is bounded by the shared *budget*.
 
     Returns:
 
-        ``(intent, warnings, llm_calls, planner_restart_hints)``. When *planner_restart_hints* is not ``None``, the caller should retry the planner (Stage A) with those hints instead of treating the tuple as success.
+        ``(intent, warnings, llm_calls, planner_restart_hints)``. When *planner_restart_hints* is not ``None``, the caller should retry the planner (Interpret/Ground phase) with those hints instead of treating the tuple as success.
     """
     semantic_warnings: list[str] = []
     seen_warning_ids: set[str] = set()
-    semantic_error_history: list[frozenset[str]] = []
-    accumulated_failure_hints: list[str] = []
+    semantic_error_history: list[frozenset[tuple[FailureCategory, str]]] = []
     in_turn: list[dict[str, str]] = list(in_turn_summaries) if in_turn_summaries is not None else []
     if budget is None:
         budget = RestartBudget.default()
-    max_repair = PolicyConfig.MAX_STAGE_B_REPAIRS
+    max_repair = PolicyConfig.MAX_ASK_COMPOSE_REPAIRS
     sem_iterations = max_repair + 1
     schema_iterations = max_repair + 1
 
     for sem_round in range(sem_iterations):
-        debug(f"[intent_process._run_schema_semantic_repair_loop] semantic round {sem_round + 1}/{sem_iterations}")
-        tpl = _TEMPLATES_MODULE
+        debug(f"[{ASK_PHASE_G}] semantic round {sem_round + 1}/{sem_iterations}")
+        tpl = get_templates_module()
 
         persisted_rows: list[dict[str, str]] = []
-        if store is not None:
-            persisted_rows = tpl.collect_question_feedback_for_prompt(
-                store, question, schema_graph.effective_structural_hash
-            )
-        avoid_rows = _dedupe_prior_question_feedback_rows(list(in_turn) + persisted_rows)
+        if store is not None and tpl is not None:
+            persisted_rows = tpl.collect_question_feedback_for_prompt(store, question, schema_graph.schema_graph_id)
+        avoid_rows = dedupe_prior_question_feedback_rows(list(in_turn) + persisted_rows)
         intent = apply_deterministic_repairs(intent, schema_graph, question)
-        debug(
-            f"[intent_process._run_schema_semantic_repair_loop] full intent after deterministic repairs:\n"
-            f"{stable_json(intent.to_dict())}"
-        )
+        debug(f"[{ASK_PHASE_E}] repairs:\n{stable_json(intent.to_dict())}")
 
         schema_error_history: list[frozenset[str]] = []
         schema_resolved = False
         for schema_sub in range(schema_iterations):
             intent, schema_errors = check_qualified_refs_exist(intent, schema_graph)
             if not schema_errors:
-                debug(
-                    f"[intent_process._run_schema_semantic_repair_loop] schema validation passed on sub-round {schema_sub + 1}/{schema_iterations}"
-                )
+                debug(f"[{ASK_PHASE_F}] validation passed on sub-round {schema_sub + 1}/{schema_iterations}")
                 schema_resolved = True
                 break
-            debug(
-                f"[intent_process._run_schema_semantic_repair_loop] schema sub-round {schema_sub + 1}/{schema_iterations}: "
-                f"{len(schema_errors)} errors"
-            )
-            sig = _compute_error_signature_strings(schema_errors)
-            schema_error_history.append(sig)
-            if _detect_oscillation(schema_error_history):
-                debug(
-                    "[intent_process._run_schema_semantic_repair_loop] schema oscillation detected — breaking sub-loop"
-                )
-                accumulated_failure_hints.extend(schema_errors)
+            debug(f"[{ASK_PHASE_F}] sub-round {schema_sub + 1}/{schema_iterations}: {len(schema_errors)} errors")
+            schema_sig = _compute_error_signature_strings(schema_errors)
+            schema_error_history.append(schema_sig)
+            if _detect_oscillation_strings(schema_error_history):
+                debug(f"[{ASK_PHASE_F}] schema oscillation detected — breaking sub-loop")
                 break
             if schema_sub >= schema_iterations - 1:
-                accumulated_failure_hints.extend(schema_errors)
                 break
             schema_issues = [
                 make_intent_issue(
                     issue_id=f"schema_error_{idx}",
-                    category=_classify_schema_error(err),
+                    category=classify_schema_error(err),
                     severity="error",
                     message=err,
-                    responsible_stage="format",
+                    responsible_stage="compose",
                 )
                 for idx, err in enumerate(schema_errors)
             ]
             for iss in schema_issues:
-                debug(
-                    f"[intent_process._run_schema_semantic_repair_loop]   issue_id={iss.issue_id} message={iss.message}"
-                )
+                debug(f"[{ASK_PHASE_F}]   issue_id={iss.issue_id} message={iss.message}")
             intent_before_schema_llm = intent
             intent_json = stable_json(intent.to_prompt_dict())
-            debug(
-                f"[intent_process._run_schema_semantic_repair_loop] intent being sent to schema repair LLM:\n{intent_json}"
-            )
-            debug(
-                f"[intent_process._run_schema_semantic_repair_loop] schema errors_to_fix: "
-                f"{[(iss.category, iss.message) for iss in schema_issues]}"
-            )
-            repair_prompt = _build_intent_semantic_repair_prompt(
+            debug(f"[{ASK_PHASE_F}] intent being sent to schema repair LLM:\n{intent_json}")
+            debug(f"[{ASK_PHASE_F}] errors_to_fix: {[(iss.category, iss.message) for iss in schema_issues]}")
+            repair_prompt = build_intent_semantic_repair_prompt(
                 question,
                 intent_json,
                 schema_issues,
@@ -2566,9 +2194,9 @@ def _run_schema_semantic_repair_loop(
                 prior_question_feedback=avoid_rows or None,
             )
             notify(
-                "Stage B schema repair LLM invocation.",
+                "Compose schema repair LLM invocation.",
                 stage="intent",
-                code=DIAGNOSTIC_CODE_STAGE_B_REPAIR,
+                code=DIAGNOSTIC_CODE_COMPOSE_REPAIR,
                 details=(
                     ("phase", "schema"),
                     ("semantic_round", str(sem_round + 1)),
@@ -2580,10 +2208,8 @@ def _run_schema_semantic_repair_loop(
             repaired, fmt_calls = _format_repair_loop(system, repaired_raw, question, max_retries)
             llm_calls += fmt_calls
             if not repaired:
-                debug(
-                    "[intent_process._run_schema_semantic_repair_loop] format repair exhausted after schema repair — terminating"
-                )
-                fi, fw, fc = _attempt_fresh_restart(
+                debug(f"[{ASK_PHASE_F}] format repair exhausted after schema repair — terminating")
+                fi, fw, fc, _ = _attempt_fresh_restart(
                     question,
                     schema_graph,
                     max_retries,
@@ -2600,23 +2226,19 @@ def _run_schema_semantic_repair_loop(
             intent = repaired
             if logical is not None:
                 intent = _align_runtime_tables_to_planner(intent, logical)
-                intent = _propagate_planner_schema_invalid_flag(intent, logical)
+            if interpret_plan is not None:
+                intent = _propagate_interpret_schema_invalid_flag(intent, interpret_plan)
             if not _runtime_intent_select_cols_have_substance(
                 intent
             ) or _runtime_intent_case_registry_has_empty_branches(intent):
-                debug("[intent_process._run_schema_semantic_repair_loop] repair_reverted_empty_select")
+                debug(f"[{ASK_PHASE_F}] repair_reverted_empty_select")
                 intent = intent_before_schema_llm
-            debug(
-                f"[intent_process._run_schema_semantic_repair_loop] normalized intent after schema repair:\n"
-                f"{stable_json(intent.to_dict())}"
-            )
+            debug(f"[{ASK_PHASE_F}] normalized intent after schema repair:\n{stable_json(intent.to_dict())}")
             intent = apply_deterministic_repairs(intent, schema_graph, question)
 
         if not schema_resolved:
-            debug(
-                "[intent_process._run_schema_semantic_repair_loop] schema errors persist after sub-loop — terminating"
-            )
-            fi, fw, fc = _attempt_fresh_restart(
+            debug(f"[{ASK_PHASE_F}] schema errors persist after sub-loop — terminating")
+            fi, fw, fc, _ = _attempt_fresh_restart(
                 question,
                 schema_graph,
                 max_retries,
@@ -2637,44 +2259,37 @@ def _run_schema_semantic_repair_loop(
             numeric_coverage_logical=logical,
         )
         if logical is not None:
-            validation_result.issues = [attribute_post_stage_b_issue(i, logical) for i in validation_result.issues]
-        debug(
-            f"[intent_process._run_schema_semantic_repair_loop] semantic validation completed: issues={len(validation_result.issues)}"
-        )
+            validation_result.issues = [attribute_post_compose_issue(i, logical) for i in validation_result.issues]
+        debug(f"[{ASK_PHASE_G}] validation completed: issues={len(validation_result.issues)}")
 
         errors = [iss for iss in validation_result.issues if iss.severity == "error"]
         warnings = [iss for iss in validation_result.issues if iss.severity == "warning"]
 
         if logical is not None:
-            logical_issues = [iss for iss in validation_result.issues if iss.responsible_stage == "logical"]
+            logical_issues = [iss for iss in validation_result.issues if iss.responsible_stage == "ground"]
             if logical_issues:
                 hints = tuple(dict.fromkeys(_issue_to_planner_hint(iss) for iss in logical_issues))
                 return None, [], llm_calls, hints
 
         for iss in validation_result.issues:
-            debug(f"[intent_process._run_schema_semantic_repair_loop]   issue_id={iss.issue_id} message={iss.message}")
+            debug(f"[{ASK_PHASE_G}]   issue_id={iss.issue_id} message={iss.message}")
         for w in warnings:
             if w.issue_id not in seen_warning_ids:
                 seen_warning_ids.add(w.issue_id)
                 semantic_warnings.append(w.message)
 
         if not errors:
-            debug(f"[intent_process._run_schema_semantic_repair_loop] no semantic errors in round {sem_round + 1}")
+            debug(f"[{ASK_PHASE_G}] no semantic errors in round {sem_round + 1}")
             break
 
-        debug(
-            f"[intent_process._run_schema_semantic_repair_loop] {len(errors)} errors, {len(warnings)} warnings in round {sem_round + 1}"
-        )
-        in_turn.append(_in_turn_row_from_semantic_errors(errors, schema_graph.effective_structural_hash, intent))
-        accumulated_failure_hints.extend(iss.message for iss in errors)
+        debug(f"[{ASK_PHASE_G}] {len(errors)} errors, {len(warnings)} warnings in round {sem_round + 1}")
+        in_turn.append(in_turn_row_from_semantic_errors(errors, schema_graph.effective_structural_hash, intent))
 
-        sig = _compute_error_signature_issues(errors)
-        semantic_error_history.append(sig)
+        semantic_sig = _compute_error_signature_issues(errors)
+        semantic_error_history.append(semantic_sig)
         if _detect_oscillation(semantic_error_history):
-            debug(
-                "[intent_process._run_schema_semantic_repair_loop] semantic oscillation detected — trying fresh restart"
-            )
-            fi, fw, fc = _attempt_fresh_restart(
+            debug(f"[{ASK_PHASE_G}] semantic oscillation detected — trying fresh restart")
+            fi, fw, fc, _ = _attempt_fresh_restart(
                 question,
                 schema_graph,
                 max_retries,
@@ -2690,10 +2305,8 @@ def _run_schema_semantic_repair_loop(
             return fi, fw, fc, None
 
         if sem_round >= sem_iterations - 1:
-            debug(
-                "[intent_process._run_schema_semantic_repair_loop] semantic errors persist after max rounds — trying fresh restart"
-            )
-            fi, fw, fc = _attempt_fresh_restart(
+            debug(f"[{ASK_PHASE_G}] semantic errors persist after max rounds — trying fresh restart")
+            fi, fw, fc, _ = _attempt_fresh_restart(
                 question,
                 schema_graph,
                 max_retries,
@@ -2710,13 +2323,9 @@ def _run_schema_semantic_repair_loop(
 
         intent_before_semantic_llm = intent
         intent_json = stable_json(intent.to_prompt_dict())
-        debug(
-            f"[intent_process._run_schema_semantic_repair_loop] intent being sent to semantic repair LLM:\n{intent_json}"
-        )
-        debug(
-            f"[intent_process._run_schema_semantic_repair_loop] errors_to_fix: {[(e.category, e.message) for e in errors]}"
-        )
-        repair_prompt = _build_intent_semantic_repair_prompt(
+        debug(f"[{ASK_PHASE_G}] intent being sent to semantic repair LLM:\n{intent_json}")
+        debug(f"[{ASK_PHASE_G}] errors_to_fix: {[(e.category, e.message) for e in errors]}")
+        repair_prompt = build_intent_semantic_repair_prompt(
             question,
             intent_json,
             errors,
@@ -2725,9 +2334,9 @@ def _run_schema_semantic_repair_loop(
             prior_question_feedback=avoid_rows or None,
         )
         notify(
-            "Stage B semantic repair LLM invocation.",
+            "Compose semantic repair LLM invocation.",
             stage="intent",
-            code=DIAGNOSTIC_CODE_STAGE_B_REPAIR,
+            code=DIAGNOSTIC_CODE_COMPOSE_REPAIR,
             details=(
                 ("phase", "semantic"),
                 ("semantic_round", str(sem_round + 1)),
@@ -2739,10 +2348,8 @@ def _run_schema_semantic_repair_loop(
         llm_calls += fmt_calls
 
         if not repaired:
-            debug(
-                "[intent_process._run_schema_semantic_repair_loop] format repair exhausted after semantic repair — trying fresh restart"
-            )
-            fi, fw, fc = _attempt_fresh_restart(
+            debug(f"[{ASK_PHASE_G}] format repair exhausted after semantic repair — trying fresh restart")
+            fi, fw, fc, _ = _attempt_fresh_restart(
                 question,
                 schema_graph,
                 max_retries,
@@ -2760,350 +2367,73 @@ def _run_schema_semantic_repair_loop(
         intent = repaired
         if logical is not None:
             intent = _align_runtime_tables_to_planner(intent, logical)
-            intent = _propagate_planner_schema_invalid_flag(intent, logical)
+            if interpret_plan is not None:
+                intent = _propagate_interpret_schema_invalid_flag(intent, interpret_plan)
         if not _runtime_intent_select_cols_have_substance(intent) or _runtime_intent_case_registry_has_empty_branches(
             intent
         ):
-            debug("[intent_process._run_schema_semantic_repair_loop] repair_reverted_empty_select")
+            debug(f"[{ASK_PHASE_G}] repair_reverted_empty_select")
             intent = intent_before_semantic_llm
-        debug(
-            f"[intent_process._run_schema_semantic_repair_loop] normalized intent after semantic repair:\n"
-            f"{stable_json(intent.to_dict())}"
-        )
-        pipeline_trace_lazy(
-            "intent_process._run_schema_semantic_repair_loop.after_llm_semantic_repair",
-            lambda it=intent: stable_json(it.to_dict()),
+        debug(f"[{ASK_PHASE_G}] normalized intent after semantic repair:\n{stable_json(intent.to_dict())}")
+        pipeline_trace(
+            ASK_PHASE_G,
+            stable_json(intent.to_dict()),
         )
 
     result, post_issues = _apply_post_processing(intent, schema_graph, question)
     if result is None:
         return None, [], llm_calls, None
     if any(i.severity == "error" for i in post_issues):
-        debug(
-            "[intent_process._run_schema_semantic_repair_loop] post-processing column resolution errors — terminating"
-        )
+        debug(f"[{ASK_PHASE_H}] post-processing column resolution errors — terminating")
         return None, [], llm_calls, None
 
-    if not _phase_g_post_validation_passes(result, schema_graph):
-        debug("[intent_process._run_schema_semantic_repair_loop] phase-G soft recovery: attempted")
+    if not _post_processing_revalidation_passes(result, schema_graph):
+        debug(f"[{ASK_PHASE_H}] post-processing revalidation soft recovery: attempted")
         recovered = apply_deterministic_repairs(result, schema_graph, question)
-        if _phase_g_post_validation_passes(recovered, schema_graph):
-            debug("[intent_process._run_schema_semantic_repair_loop] phase-G soft recovery: succeeded")
+        if _post_processing_revalidation_passes(recovered, schema_graph):
+            debug(f"[{ASK_PHASE_H}] post-processing revalidation soft recovery: succeeded")
             result = recovered
         else:
-            debug("[intent_process._run_schema_semantic_repair_loop] phase-G soft recovery: failed")
-            debug(
-                "[intent_process._run_schema_semantic_repair_loop] phase-G post-processing revalidation failed — terminating"
-            )
+            debug(f"[{ASK_PHASE_H}] post-processing revalidation soft recovery: failed")
+            debug(f"[{ASK_PHASE_H}] post-processing revalidation failed — terminating")
             return None, [], llm_calls, None
 
     debug(
-        f"[intent_process._run_schema_semantic_repair_loop] parsed intent with {len(result.tables or [])} tables, "
+        f"[{ASK_PHASE_H}] parsed intent with {len(result.tables or [])} tables, "
         f"{len(result.filters_param or [])} filters, {llm_calls} LLM calls"
     )
-    pipeline_trace_lazy(
-        "intent_process._run_schema_semantic_repair_loop.final_intent",
-        lambda: stable_json(result.to_dict()),
+    assert result is not None
+    final_result = result
+    pipeline_trace(
+        ASK_PHASE_H,
+        lambda: stable_json(final_result.to_dict()),
     )
 
-    if logical is not None:
-        result = _propagate_planner_schema_invalid_flag(result, logical)
+    if interpret_plan is not None:
+        result = finalize_planner_schema_invalid_flag(result, interpret_plan, schema_graph)
 
     return result, semantic_warnings, llm_calls, None
 
 
-def _phase_g_post_validation_passes(
+def _post_processing_revalidation_passes(
     intent: RuntimeIntent,
     schema_graph: SchemaGraph,
 ) -> bool:
-    """
-    Lightweight revalidation after post-processing.
-
-    Runs ``check_qualified_refs_exist`` and ``validate_semantics`` once with no repair loop or LLM call. A post-processing step (param resolution, CTE alias rewrite, table pruning) should never invalidate what earlier phases proved, but any surfaced error is treated as terminal because there is no safe way to recover at this point without re-entering the full repair pipeline.
-    """
+    """Lightweight revalidation after post-processing. Runs ``check_qualified_refs_exist`` and ``validate_semantics`` once with no repair loop or LLM call. A post-processing step (param resolution, CTE alias rewrite, table pruning) should never invalidate what earlier phases proved, but any surfaced error is treated as terminal because there is no safe way to recover at this point without re-entering the full repair pipeline."""
     _, schema_errors = check_qualified_refs_exist(intent, schema_graph)
     if schema_errors:
-        debug(f"[intent_process._phase_g_post_validation_passes] schema errors: {len(schema_errors)}")
+        debug(f"[intent_process._post_processing_revalidation_passes] schema errors: {len(schema_errors)}")
         for err in schema_errors:
-            debug(f"[intent_process._phase_g_post_validation_passes]   {err}")
+            debug(f"[intent_process._post_processing_revalidation_passes]   {err}")
         return False
     validation_result = validate_semantics(intent, schema_graph, post_binding=True)
     final_errors = [iss for iss in validation_result.issues if iss.severity == "error"]
     if final_errors:
-        debug(f"[intent_process._phase_g_post_validation_passes] semantic errors: {len(final_errors)}")
+        debug(f"[intent_process._post_processing_revalidation_passes] semantic errors: {len(final_errors)}")
         for iss in final_errors:
-            debug(f"[intent_process._phase_g_post_validation_passes]   {iss.category}: {iss.message}")
+            debug(f"[intent_process._post_processing_revalidation_passes]   {iss.category}: {iss.message}")
         return False
     return True
-
-
-def _compute_filters_similarity(filters1: list[FilterParam], filters2: list[FilterParam]) -> float:
-    """
-    Jaccard similarity on ``signature_key``, with a small penalty when coerced
-    ``(signature_key, filter_group)`` wiring differs.
-
-    Coercion matches the main pipeline so flat ``bool_op=OR`` rows align with
-    ``filter_group`` disjuncts for template reuse.
-
-    Args:
-
-        filters1: First filter list.
-
-        filters2: Second filter list.
-
-    Returns:
-
-        Score in ``[0, 1]``; ``1.0`` when both empty.
-    """
-    if not filters1 and not filters2:
-        return 1.0
-    if not filters1 or not filters2:
-        return 0.0
-    c1 = _coerce_filter_group_list(list(filters1))
-    c2 = _coerce_filter_group_list(list(filters2))
-    keys1 = {fp.signature_key for fp in c1}
-    keys2 = {fp.signature_key for fp in c2}
-    score = _jaccard(keys1, keys2)
-    if score > 0:
-        g1 = any(fp.filter_group is not None for fp in c1)
-        g2 = any(fp.filter_group is not None for fp in c2)
-        if (
-            len(c1) >= 2
-            and len(c1) == len(c2)
-            and sorted(fp.signature_key for fp in c1) == sorted(fp.signature_key for fp in c2)
-        ):
-            if g1 != g2:
-                return score
-        sig_fg1 = sorted((fp.signature_key, fp.filter_group) for fp in c1)
-        sig_fg2 = sorted((fp.signature_key, fp.filter_group) for fp in c2)
-        if sig_fg1 != sig_fg2:
-            score *= 0.9
-    return score
-
-
-def _compute_having_similarity(having1: list[HavingParam], having2: list[HavingParam]) -> float:
-    """
-    Same as ``_compute_filters_similarity`` for having clauses.
-
-    Args:
-
-        having1: First having list.
-
-        having2: Second having list.
-
-    Returns:
-
-        Score in ``[0, 1]``.
-    """
-    if not having1 and not having2:
-        return 1.0
-    if not having1 or not having2:
-        return 0.0
-    c1 = _coerce_having_group_list(list(having1))
-    c2 = _coerce_having_group_list(list(having2))
-    keys1 = {hp.signature_key for hp in c1}
-    keys2 = {hp.signature_key for hp in c2}
-    score = _jaccard(keys1, keys2)
-    if score > 0:
-        g1 = any(hp.filter_group is not None for hp in c1)
-        g2 = any(hp.filter_group is not None for hp in c2)
-        if (
-            len(c1) >= 2
-            and len(c1) == len(c2)
-            and sorted(hp.signature_key for hp in c1) == sorted(hp.signature_key for hp in c2)
-        ):
-            if g1 != g2:
-                return score
-        sig_fg1 = sorted((hp.signature_key, hp.filter_group) for hp in c1)
-        sig_fg2 = sorted((hp.signature_key, hp.filter_group) for hp in c2)
-        if sig_fg1 != sig_fg2:
-            score *= 0.9
-    return score
-
-
-def _compute_select_cols_similarity(cols1: list[SelectCol], cols2: list[SelectCol]) -> float:
-    """
-    Jaccard similarity on select ``signature_key``.
-
-    Args:
-
-        cols1: First select list.
-
-        cols2: Second select list.
-
-    Returns:
-
-        Score in ``[0, 1]``.
-    """
-    if not cols1 and not cols2:
-        return 1.0
-    if not cols1 or not cols2:
-        return 0.0
-    keys1 = {sc.signature_key for sc in cols1}
-    keys2 = {sc.signature_key for sc in cols2}
-    return _jaccard(keys1, keys2)
-
-
-def _compute_order_by_cols_similarity(cols1: list[OrderByCol], cols2: list[OrderByCol]) -> float:
-    """
-    Jaccard similarity on order-by ``signature_key``.
-
-    Args:
-
-        cols1: First order-by list.
-
-        cols2: Second order-by list.
-
-    Returns:
-
-        Score in ``[0, 1]``.
-    """
-    if not cols1 and not cols2:
-        return 1.0
-    if not cols1 or not cols2:
-        return 0.0
-    keys1 = {obc.signature_key for obc in cols1}
-    keys2 = {obc.signature_key for obc in cols2}
-    return _jaccard(keys1, keys2)
-
-
-def _base_similarity(
-    tables1: list[str],
-    tables2: list[str],
-    select1: list[SelectCol],
-    select2: list[SelectCol],
-    group1: list[NormalizedExpr],
-    group2: list[NormalizedExpr],
-    order1: list[OrderByCol],
-    order2: list[OrderByCol],
-    filters1: list[FilterParam],
-    filters2: list[FilterParam],
-    having1: list[HavingParam],
-    having2: list[HavingParam],
-) -> float:
-    """
-    Weighted blend of Jaccard-like scores (tables, filters, select, group, order, having).
-
-    Args:
-
-        filters1, filters2, having1, having2: Parallel clause lists from two intents.
-
-    Returns:
-
-        Score in ``[0, 1]``.
-    """
-    tables_sim = _jaccard(set(tables1), set(tables2))
-    select_sim = _compute_select_cols_similarity(select1, select2)
-    group_sim = _jaccard({g.signature_key for g in group1}, {g.signature_key for g in group2})
-    order_sim = _compute_order_by_cols_similarity(order1, order2)
-    filter_sim = _compute_filters_similarity(filters1, filters2)
-    having_sim = _compute_having_similarity(having1, having2)
-    return (
-        0.30 * tables_sim
-        + 0.25 * filter_sim
-        + 0.15 * select_sim
-        + 0.15 * group_sim
-        + 0.08 * order_sim
-        + 0.07 * having_sim
-    )
-
-
-def _cte_step_similarity(cte1: RuntimeCteStep, cte2: RuntimeCteStep) -> float:
-    """
-    ``_base_similarity`` applied to two CTE bodies.
-
-    Args:
-
-        cte1: First step.
-
-        cte2: Second step.
-
-    Returns:
-
-        Score in ``[0, 1]``.
-    """
-    return _base_similarity(
-        cte1.tables or [],
-        cte2.tables or [],
-        cte1.select_cols or [],
-        cte2.select_cols or [],
-        cte1.group_by_cols or [],
-        cte2.group_by_cols or [],
-        cte1.order_by_cols or [],
-        cte2.order_by_cols or [],
-        cte1.filters_param or [],
-        cte2.filters_param or [],
-        cte1.having_param or [],
-        cte2.having_param or [],
-    )
-
-
-def intent_similarity(intent1: RuntimeIntent | ConcreteIntent, intent2: RuntimeIntent | ConcreteIntent) -> float:
-    """
-    Blend weighted main-body clause similarity with per-step CTE similarity (position-aligned).
-
-    Main body uses :func:`_base_similarity` (tables, filters, select, group, order, having). It does not use :func:`aetherdialect._utils.intent_key`; keys hash serialised clauses while similarity uses clause-wise scores, so equal keys imply high similarity but the converse is not guaranteed.
-
-    Args:
-
-        intent1: First intent.
-
-        intent2: Second intent.
-
-    Returns:
-
-        Score in ``[0, 1]``.
-    """
-    base_sim = _base_similarity(
-        intent1.tables or [],
-        intent2.tables or [],
-        intent1.select_cols or [],
-        intent2.select_cols or [],
-        intent1.group_by_cols or [],
-        intent2.group_by_cols or [],
-        intent1.order_by_cols or [],
-        intent2.order_by_cols or [],
-        intent1.filters_param or [],
-        intent2.filters_param or [],
-        intent1.having_param or [],
-        intent2.having_param or [],
-    )
-    ctes1 = intent1.cte_steps or []
-    ctes2 = intent2.cte_steps or []
-    n_cte = max(len(ctes1), len(ctes2))
-    if n_cte == 0:
-        return base_sim
-    intent_weight = {1: 0.7, 2: 0.6}.get(n_cte, 0.4)
-    cte_total_weight = 1.0 - intent_weight
-    cte_per_weight = cte_total_weight / n_cte
-    cte_score = 0.0
-    for i in range(n_cte):
-        if i < len(ctes1) and i < len(ctes2):
-            cte_score += cte_per_weight * _cte_step_similarity(ctes1[i], ctes2[i])
-    return intent_weight * base_sim + cte_score
-
-
-def _jaccard(set1: set[str], set2: set[str]) -> float:
-    """
-    |intersection| / |union| for string sets; ``1.0`` when both empty.
-
-    Args:
-
-        set1: First set.
-
-        set2: Second set.
-
-    Returns:
-
-        Jaccard coefficient in ``[0, 1]``.
-    """
-    if not set1 and not set2:
-        return 1.0
-    if not set1 or not set2:
-        return 0.0
-    intersection = set1 & set2
-    union = set1 | set2
-    return len(intersection) / len(union) if union else 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -3130,21 +2460,15 @@ def find_trusted_template_match(
     Args:
 
         question: Raw or normalized user question; normalized inside ``match_question_against_template_history``.
-
         templates: Candidate templates.
-
         shape_question_index: Optional coarse index keyed by ``compute_shape_form``.
-
         question_token_index: Optional inverted index for question-token fingerprints.
-
         intent_key_index: Optional inverted index from structural intent key to template ids.
-
         union_family_index: Optional inverted index (body key and ``body|join`` composite) to template ids.
-
         candidate_intent: When provided with both indexes, templates are narrowed to
-            ``(union_family[body|join] ∪ union_family[body]) ∩ intent_key_index[intent_key(runtime)]``
-            before fuzzy history matching; when that intersection is empty, narrowing is skipped
-            (shape + question-token indexes still apply).
+        ``(union_family[body|join] ∪ union_family[body]) ∩ intent_key_index[intent_key(runtime)]``
+        before fuzzy history matching; when that intersection is empty, narrowing is skipped
+        (shape + question-token indexes still apply).
 
     Returns:
 
@@ -3152,7 +2476,6 @@ def find_trusted_template_match(
     """
     if not templates:
         return None
-
     scan_templates: list[Template] = list(templates)
     if candidate_intent is not None and union_family_index is not None and intent_key_index is not None:
         bk = body_similarity_key(candidate_intent)
@@ -3188,18 +2511,8 @@ def find_trusted_template_match(
     return None
 
 
-def cte_structural_signature(steps: list) -> list[tuple[str, str]]:
-    """
-    Sorted ``(cte_name, body_sig)`` tuples excluding select columns (union logic).
-
-    Args:
-
-        steps: CTE steps.
-
-    Returns:
-
-        Sorted signature list.
-    """
+def cte_structural_signature(steps: Sequence[RuntimeCteStep | ConcreteCteStep]) -> list[tuple[str, str]]:
+    """Sorted ``(cte_name, body_sig)`` tuples excluding select columns. (union logic). Args: steps: CTE steps. Returns: Sorted signature list."""
     sigs: list[tuple[str, str]] = []
     for cte in steps:
         parts: list[str] = [
@@ -3220,19 +2533,7 @@ def _structural_body_matches(
     intent: RuntimeIntent,
     concrete: ConcreteIntent,
 ) -> bool:
-    """
-    True when tables, grain, limit, filters, group/order/having, and CTE skeletons match.
-
-    Args:
-
-        intent: New runtime intent.
-
-        concrete: Template's concrete intent.
-
-    Returns:
-
-        Whether non-select structure is identical.
-    """
+    """True when tables, grain, limit, filters, group/order/having, and. CTE skeletons match. Args: intent: New runtime intent. concrete: Template's concrete intent. Returns: Whether non-select structure is identical."""
     if (intent.grain or "row_level") != (concrete.grain or "row_level"):
         return False
     if sorted(intent.tables or []) != sorted(concrete.tables or []):
@@ -3283,19 +2584,7 @@ def select_col_diff(
     intent_cols: list[SelectCol],
     concrete_cols: list[SelectCol],
 ) -> tuple[bool, int]:
-    """
-    Compare agg select keys for equality; count symmetric diff of non-agg keys.
-
-    Args:
-
-        intent_cols: Runtime select list.
-
-        concrete_cols: Template select list.
-
-    Returns:
-
-        ``(aggregates_match, non_agg_symmetric_diff_count)``.
-    """
+    """Compare agg select keys for equality; count symmetric diff of. non-agg keys. Args: intent_cols: Runtime select list. concrete_cols: Template select list. Returns: ``(aggregates_match, non_agg_symmetric_diff_count)``."""
     i_agg = sorted(s.signature_key for s in intent_cols if s.is_aggregated)
     c_agg = sorted(s.signature_key for s in concrete_cols if s.is_aggregated)
     agg_match = i_agg == c_agg
@@ -3313,23 +2602,7 @@ def _diff_cols_span_disjoint_tables(
     intent_tables: list[str],
     concrete_tables: list[str],
 ) -> bool:
-    """
-    True if any differing non-agg column sits on a table outside both table sets' intersection.
-
-    Args:
-
-        intent_cols: Runtime selects.
-
-        concrete_cols: Template selects.
-
-        intent_tables: Runtime ``tables``.
-
-        concrete_tables: Template ``tables``.
-
-    Returns:
-
-        Whether the diff spans disjoint table namespaces.
-    """
+    """True if any differing non-agg column sits on a table outside. both. table sets' intersection. Args: intent_cols: Runtime selects. concrete_cols: Template selects. intent_tables: Runtime ``tables``. concrete_tables: Template ``tables``. Returns: Whether the diff spans disjoint table namespaces."""
     shared_tables = set(intent_tables or []) & set(concrete_tables or [])
     i_non = {s.signature_key for s in intent_cols if not s.is_aggregated}
     c_non = {s.signature_key for s in concrete_cols if not s.is_aggregated}
@@ -3347,13 +2620,8 @@ def _diff_cols_span_disjoint_tables(
     return False
 
 
-def select_col_is_plain_column(sc: SelectCol) -> bool:
-    """
-    Return True when *sc* is a bare ``table.column`` reference with no transforms.
-
-    Path 4 widening only inlines select columns that need no expression rebuild — neither aggregates, scalar/inner-scalar functions, coefficients, expression composition, registry window/case references, nor CASE expressions are tolerated.
-    """
-
+def _select_col_is_plain_column(sc: SelectCol) -> bool:
+    """Return True when *sc* is a bare ``table.column`` reference with no transforms. Path 4 widening only inlines select columns that need no expression rebuild — neither aggregates, scalar/inner-scalar functions, coefficients, expression composition, registry window/case references, nor CASE expressions are tolerated."""
     rid = expr_registry_ref(sc.expr) or ""
     if rid.startswith("w") or rid.startswith("c"):
         return False
@@ -3390,7 +2658,6 @@ def _diff_select_cols_are_plain_columns(
     concrete_cols: list[SelectCol],
 ) -> bool:
     """Return True when every non-aggregated symmetric-diff select column is a plain column ref."""
-
     i_map = {sc.signature_key: sc for sc in intent_cols if not sc.is_aggregated}
     c_map = {sc.signature_key: sc for sc in concrete_cols if not sc.is_aggregated}
     diff_keys = (set(i_map) | set(c_map)) - (set(i_map) & set(c_map))
@@ -3398,7 +2665,7 @@ def _diff_select_cols_are_plain_columns(
         sc = i_map.get(k) or c_map.get(k)
         if sc is None:
             continue
-        if not select_col_is_plain_column(sc):
+        if not _select_col_is_plain_column(sc):
             return False
     return True
 
@@ -3409,25 +2676,7 @@ def resolve_sql_path(
     cols_changed: bool,
     union_sql_path: GenerationPath | None,
 ) -> GenerationPath:
-    """
-    Resolve the persisted :class:`GenerationPath` for template-scoped SQL generation.
-
-    When a template row is in play but no precomputed union path was supplied, infer
-    ``INTENT_DIRECT_MATCH`` versus union widen codes from column-change flags only.
-
-    Args:
-
-        matched_template: Accepted template chosen for reuse, if any.
-
-        cols_changed: Whether merged union columns differ from the template concrete list.
-
-        union_sql_path: Path from structural union analysis, when already computed.
-
-    Returns:
-
-        Canonical path ``1``–``5`` family member; :attr:`GenerationPath.FRESH` when no template.
-    """
-
+    """Resolve the persisted :class:`GenerationPath` for template- scoped. SQL generation. When a template row is in play but no precomputed union path was supplied, infer ``INTENT_DIRECT_MATCH`` versus union widen codes from column-change flags only. Args: matched_template: Accepted template chosen for reuse, if any. cols_changed: Whether merged union columns differ from the template concrete list. union_sql_path: Path from structural union analysis, when already computed. Returns: Canonical path ``1``–``5`` family member; :attr:`GenerationPath.FRESH` when no template."""
     if matched_template is None:
         return GenerationPath.FRESH
     if union_sql_path is not None:
@@ -3440,23 +2689,11 @@ def generation_path_for_eligible_union(
     cols_changed: bool,
     select_equal: bool,
     delta: UnionSelectColumnDelta,
+    distinct_select_index: int = -1,
 ) -> GenerationPath:
-    """
-    Map structural union facts to the canonical :class:`GenerationPath` for this match.
-
-    Args:
-
-        cols_changed: Whether merged union column keys differ from the template concrete list.
-
-        select_equal: Whether aggregate rules hold with zero symmetric non-agg diff.
-
-        delta: Non-aggregated key-set relationship between runtime and concrete selects.
-
-    Returns:
-
-        ``INTENT_DIRECT_MATCH``, ``RUNTIME_SUBSET_TEMPLATE_WIDE``, or union widen codes ``4.1`` / ``4.2``.
-    """
-
+    """Map structural union facts to the canonical. :class:`GenerationPath` for this match. Args: cols_changed: Whether merged union column keys differ from the template concrete list. select_equal: Whether aggregate rules hold with zero symmetric non- agg diff. delta: Non-aggregated key-set relationship between runtime and concrete selects. Returns: ``INTENT_DIRECT_MATCH``, ``RUNTIME_SUBSET_TEMPLATE_WIDE``, or union widen codes ``4.1`` / ``4.2``."""
+    if distinct_select_index >= 0 and delta is UnionSelectColumnDelta.TEMPLATE_ONLY_EXTRA:
+        return GenerationPath.INTENT_DIRECT_MATCH
     if not cols_changed and delta is UnionSelectColumnDelta.TEMPLATE_ONLY_EXTRA:
         return GenerationPath.RUNTIME_SUBSET_TEMPLATE_WIDE
     if not cols_changed and select_equal and delta is UnionSelectColumnDelta.EQUAL:
@@ -3478,24 +2715,7 @@ def reconcile_template_store_until_stable(
     max_iterations: int = 16,
     template_store_view: Any | None = None,
 ) -> int:
-    """
-    Run paired union reconcilers until a full pass removes no template ids.
-
-    Args:
-
-        templates: Accepted template id map (mutated in place).
-
-        max_iterations: Safety cap to avoid infinite loops on pathological stores.
-
-        template_store_view: When a :class:`~aetherdialect._templates.TemplateStoreView` is supplied,
-            reconcilers read ``union_family_index`` from its header indexes; after each pass the
-            view's matcher indexes are refreshed from the live template bodies.
-
-    Returns:
-
-        Count of template ids removed across all iterations.
-    """
-
+    """Run paired union reconcilers until a full pass removes no. template ids. Args: templates: Accepted template id map (mutated in place). max_iterations: Safety cap to avoid infinite loops on pathological stores. template_store_view: When a :class:`~aetherdialect._templates.TemplateStoreView` is supplied, reconcilers read ``union_family_index`` from its header indexes; after each pass the view's matcher indexes are refreshed from the live template bodies. Returns: Count of template ids removed across all iterations."""
     total = 0
     for _ in range(max_iterations):
         r1 = reconcile_union_family_after_mutation(
@@ -3510,8 +2730,8 @@ def reconcile_template_store_until_stable(
         )
         n = len(r1) + len(r2)
         total += n
-        if _is_template_store_view(template_store_view):
-            _refresh_template_store_indexes_for_view(
+        if is_template_store_view(template_store_view):
+            refresh_template_store_indexes_for_view(
                 template_store_view,
                 template_objs=list(templates.values()),
             )
@@ -3522,7 +2742,6 @@ def reconcile_template_store_until_stable(
 
 def _mulgroup_strict_union_safe(mg: MulGroup) -> bool:
     """Return False when a multiply group carries scalar transforms or non-trivial coefficients."""
-
     if mg.coefficient != 1.0 or (mg.coeff_param_key or ""):
         return False
     if mg.scalar_func or mg.inner_scalar_func:
@@ -3534,7 +2753,6 @@ def _mulgroup_strict_union_safe(mg: MulGroup) -> bool:
 
 def _expr_strict_union_safe(expr: NormalizedExpr) -> bool:
     """Return False when outer expression uses scalar transforms reserved for fresh-SQL paths."""
-
     if expr.scalar_func or expr.inner_scalar_func:
         return False
     if expr.sarg_param_keys or expr.isarg_param_keys:
@@ -3547,7 +2765,6 @@ def _expr_strict_union_safe(expr: NormalizedExpr) -> bool:
 
 def _select_col_strict_union_safe(sc: SelectCol) -> bool:
     """Return False when window, CASE, or expression tree blocks union merge."""
-
     rid = expr_registry_ref(sc.expr) or ""
     if rid.startswith("w") or rid.startswith("c"):
         return False
@@ -3556,7 +2773,6 @@ def _select_col_strict_union_safe(sc: SelectCol) -> bool:
 
 def _concrete_step_select_cols_safe(select_cols: list[SelectCol] | None) -> bool:
     """Return True when every non-aggregated concrete select passes the strict union gate."""
-
     for sc in select_cols or []:
         if sc.is_aggregated:
             continue
@@ -3567,7 +2783,6 @@ def _concrete_step_select_cols_safe(select_cols: list[SelectCol] | None) -> bool
 
 def _runtime_intent_union_select_structures_safe(intent: RuntimeIntent) -> bool:
     """Return True when main and CTE selects satisfy strict union merge rules."""
-
     if not _concrete_step_select_cols_safe(intent.select_cols):
         return False
     for step in intent.cte_steps or []:
@@ -3581,29 +2796,22 @@ def _union_sql_eligibility_strict_shape(
     concrete: ConcreteIntent,
 ) -> bool:
     """Return True when both sides pass scalar- and coefficient-gates for union comparison."""
-
     if not _runtime_intent_union_select_structures_safe(intent):
         return False
     rt = concrete_intent_to_runtime_skeleton(concrete)
     return _runtime_intent_union_select_structures_safe(rt)
 
 
-def join_runtime_intent_has_join_fingerprint(intent: RuntimeIntent) -> bool:
-    """Return True when the runtime intent carries at least one non-empty join path signature layer."""
-
+def _join_runtime_intent_has_join_fingerprint(intent: RuntimeIntent) -> bool:
+    """Return True when the runtime intent carries at least one non- empty join path signature layer."""
     if intent.chosen_join_path_signature:
         return True
     return any(bool(s.chosen_join_path_signature) for s in (intent.cte_steps or []))
 
 
-def join_runtime_matches_template_concrete(intent: RuntimeIntent, tmpl: Template) -> bool:
-    """
-    Return True when runtime join layers match the template concrete fingerprint.
-
-    When the runtime intent has no join fingerprint yet, returns True so callers can defer gating.
-    """
-
-    if not join_runtime_intent_has_join_fingerprint(intent):
+def _join_runtime_matches_template_concrete(intent: RuntimeIntent, tmpl: Template) -> bool:
+    """Return True when runtime join layers match the template concrete fingerprint. When the runtime intent has no join fingerprint yet, returns True so callers can defer gating."""
+    if not _join_runtime_intent_has_join_fingerprint(intent):
         return True
     return join_path_key_runtime(intent) == join_path_key_concrete(tmpl.intent_signature)
 
@@ -3612,12 +2820,7 @@ def union_runtime_concrete_compatibility(
     intent: RuntimeIntent,
     concrete: ConcreteIntent,
 ) -> tuple[list[SelectCol], bool, UnionSelectColumnDelta, int] | None:
-    """
-    Return union columns, column-change flag, merge case, and non-agg diff when structural union rules pass.
-
-    Does not evaluate template trust; callers apply trust when comparing accepted templates.
-    """
-
+    """Return union columns, column-change flag, merge case, and non-agg diff when structural union rules pass. Does not evaluate template trust; callers apply trust when comparing accepted templates."""
     if not _structural_body_matches(intent, concrete):
         return None
     if not _union_sql_eligibility_strict_shape(intent, concrete):
@@ -3657,7 +2860,6 @@ def _structural_compare_from_union_row(
     mode: Literal["full", "warmup_gold_store_check"],
 ) -> StructuralCompareResult:
     """Build a ``StructuralCompareResult`` from a precomputed optional union-compatibility row."""
-
     agg_match, non_agg_diff = select_col_diff(
         intent.select_cols or [],
         concrete.select_cols or [],
@@ -3677,6 +2879,7 @@ def _structural_compare_from_union_row(
         cols_changed=cols_changed,
         select_equal=select_equal,
         delta=merge_case,
+        distinct_select_index=intent.distinct_select_index,
     )
     return StructuralCompareResult(
         non_agg_symmetric_diff=nad,
@@ -3695,12 +2898,7 @@ def structural_compare_runtime(
     *,
     mode: Literal["full", "warmup_gold_store_check"] = "full",
 ) -> StructuralCompareResult:
-    """
-    Compare *intent* to a stored concrete signature and SQL fingerprint without template trust gating.
-
-    Union eligibility matches accepted-template rules except ``trust_level`` is not consulted.
-    """
-
+    """Compare *intent* to a stored concrete signature and SQL fingerprint without template trust gating. Union eligibility matches accepted-template rules except ``trust_level`` is not consulted."""
     row = union_runtime_concrete_compatibility(intent, concrete)
     return _structural_compare_from_union_row(intent, concrete, sql_fp_val, row, mode=mode)
 
@@ -3711,12 +2909,7 @@ def structural_compare(
     *,
     mode: Literal["full", "warmup_gold_store_check"] = "full",
 ) -> StructuralCompareResult:
-    """
-    Compare *intent* to *tmpl* for body key, join path, union eligibility, and ``union_sql_path``.
-
-    *mode* ``full`` attaches ``similarity_score`` via :func:`intent_similarity`; ``warmup_gold_store_check`` omits that score.
-    """
-
+    """Compare *intent* to *tmpl* for body key, join path, union eligibility, and ``union_sql_path``. *mode* ``full`` attaches ``similarity_score`` via :func:`intent_similarity`; ``warmup_gold_store_check`` omits that score."""
     concrete = tmpl.intent_signature
     row = union_template_compatibility(intent, tmpl)
     return _structural_compare_from_union_row(intent, concrete, tmpl.sql_fp, row, mode=mode)
@@ -3727,7 +2920,6 @@ def union_template_compatibility(
     tmpl: Template,
 ) -> tuple[list[SelectCol], bool, UnionSelectColumnDelta, int] | None:
     """Return union columns, column-change flag, merge case, and non-agg diff when *tmpl* is eligible."""
-
     if tmpl.trust_level < 1:
         return None
     return union_runtime_concrete_compatibility(intent, tmpl.intent_signature)
@@ -3738,7 +2930,6 @@ def collect_structural_match_templates(
     templates: dict[str, Template],
 ) -> list[Template]:
     """Trusted templates with same body similarity key as *intent* and union-compatible without column change."""
-
     ibk = body_similarity_key(intent)
     out: list[Template] = []
     for tmpl in templates.values():
@@ -3754,7 +2945,6 @@ def collect_structural_match_templates(
 
 def _union_family_index_from_templates(templates: dict[str, Template]) -> dict[str, list[str]]:
     """Inverted union-family buckets (body key and ``body|join`` composite) used by reconcilers."""
-
     idx: dict[str, set[str]] = defaultdict(set)
     for tid, tmpl in templates.items():
         bk = body_similarity_key_for_concrete(tmpl.intent_signature)
@@ -3770,23 +2960,7 @@ def reconcile_union_family_after_mutation(
     union_family_index: dict[str, list[str]] | None = None,
     template_store_view: Any | None = None,
 ) -> list[str]:
-    """
-    Merge accepted templates that share the same warmup ``template_instance_key`` into one row.
-
-    Args:
-
-        templates: Live accepted-template map (mutated in place).
-
-        union_family_index: Optional inverted union-family index (body keys and ``body|join`` keys).
-
-        template_store_view: When *union_family_index* is omitted, read persisted
-            ``union_family_index`` from this view's header indexes.
-
-    Returns:
-
-        Template ids removed after merging value history into the lexicographically smallest keeper id.
-    """
-
+    """Merge accepted templates that share the same warmup. ``template_instance_key`` into one row. Args: templates: Live accepted-template map (mutated in place). union_family_index: Optional inverted union-family index (body keys and ``body|join`` keys). template_store_view: When *union_family_index* is omitted, read persisted ``union_family_index`` from this view's header indexes. Returns: Template ids removed after merging value history into the lexicographically smallest keeper id."""
     removed: list[str] = []
 
     def _merge_instance_group(tids_sorted: list[str]) -> None:
@@ -3794,7 +2968,9 @@ def reconcile_union_family_after_mutation(
         if len(tids_sorted) <= 1:
             return
         keeper_id = tids_sorted[0]
-        keeper = templates[keeper_id]
+        keeper = templates.get(keeper_id)
+        if keeper is None:
+            return
         for dup_id in tids_sorted[1:]:
             if dup_id not in templates:
                 continue
@@ -3808,10 +2984,12 @@ def reconcile_union_family_after_mutation(
             removed.append(dup_id)
 
     ufi = union_family_index
-    if not ufi and _is_template_store_view(template_store_view):
-        raw = template_store_view._indexes.get(TEMPLATE_UNION_FAMILY_INDEX_KEY)
-        if isinstance(raw, dict) and any(isinstance(v, list) and v for v in raw.values()):
-            ufi = {str(k): [str(x) for x in v] for k, v in raw.items() if isinstance(v, list)}
+    if not ufi and is_template_store_view(template_store_view):
+        indexes = getattr(template_store_view, "_indexes", None)
+        if isinstance(indexes, dict):
+            raw = indexes.get(TEMPLATE_UNION_FAMILY_INDEX_KEY)
+            if isinstance(raw, dict) and any(isinstance(v, list) and v for v in raw.values()):
+                ufi = {str(k): [str(x) for x in v] for k, v in raw.items() if isinstance(v, list)}
     if not ufi:
         ufi = _union_family_index_from_templates(templates)
 
@@ -3824,7 +3002,9 @@ def reconcile_union_family_after_mutation(
                 continue
             by_inst: dict[str, list[str]] = defaultdict(list)
             for tid in uniq_tids:
-                tmpl = templates[tid]
+                tmpl = templates.get(tid)
+                if tmpl is None:
+                    continue
                 inst = template_instance_key_from_parts(
                     bk,
                     join_path_key_concrete(tmpl.intent_signature),
@@ -3835,20 +3015,20 @@ def reconcile_union_family_after_mutation(
                 _merge_instance_group(sorted(tids))
         return removed
 
-    by_inst: dict[str, list[str]] = defaultdict(list)
+    by_inst_body: dict[str, list[str]] = defaultdict(list)
     for tid, tmpl in list(templates.items()):
         inst = template_instance_key_from_parts(
             body_similarity_key_for_concrete(tmpl.intent_signature),
             join_path_key_concrete(tmpl.intent_signature),
             tmpl.sql_fp,
         )
-        by_inst[inst].append(tid)
-    for _inst, tids in by_inst.items():
+        by_inst_body[inst].append(tid)
+    for _inst, tids in by_inst_body.items():
         _merge_instance_group(sorted(tids))
     return removed
 
 
-class UnionMatchCandidate(NamedTuple):
+class _UnionMatchCandidate(NamedTuple):
     """One accepted template row eligible for union-style reuse with resolved column metadata."""
 
     template: Template
@@ -3861,21 +3041,17 @@ class UnionMatchCandidate(NamedTuple):
 def list_union_match_candidates(
     intent: RuntimeIntent,
     templates: dict[str, Template],
-) -> list[UnionMatchCandidate]:
-    """
-    List every trusted template that passes structural union gates for *intent*.
+) -> list[_UnionMatchCandidate]:
+    """List every trusted template that passes structural union gates for *intent*. Used for paths ``3`` and ``4.x`` so the join phase can pick among templates that differ only in stored join fingerprints."""
 
-    Used for paths ``3`` and ``4.x`` so the join phase can pick among templates that differ only in stored join fingerprints.
-    """
-
-    def _collect() -> list[UnionMatchCandidate]:
-        rows: list[UnionMatchCandidate] = []
+    def _collect() -> list[_UnionMatchCandidate]:
+        rows: list[_UnionMatchCandidate] = []
         for tmpl in templates.values():
             cr = structural_compare(intent, tmpl, mode="full")
             if not cr.union_eligible or cr.union_sql_path is None:
                 continue
             rows.append(
-                UnionMatchCandidate(
+                _UnionMatchCandidate(
                     tmpl,
                     cr.union_cols,
                     cr.cols_changed,
@@ -3898,25 +3074,20 @@ def list_union_match_candidates(
 
 def pick_union_match_for_runtime_join(
     intent: RuntimeIntent,
-    candidates: Sequence[UnionMatchCandidate],
-) -> UnionMatchCandidate | None:
-    """
-    Choose the union candidate whose stored join fingerprint matches the runtime intent.
-
-    When the runtime intent has no join fingerprint yet and every candidate shares one join key, returns the lexicographically smallest stable pick. When candidates disagree on join keys and the runtime intent is not pinned yet, returns ``None`` so the join LLM can run first.
-    """
-
+    candidates: Sequence[_UnionMatchCandidate],
+) -> _UnionMatchCandidate | None:
+    """Choose the union candidate whose stored join fingerprint matches the runtime intent. When the runtime intent has no join fingerprint yet and every candidate shares one join key, returns the lexicographically smallest stable pick. When candidates disagree on join keys and the runtime intent is not pinned yet, returns ``None`` so the join LLM can run first."""
     if not candidates:
         return None
     jkeys = {join_path_key_concrete(c.template.intent_signature) for c in candidates}
-    if len(jkeys) > 1 and not join_runtime_intent_has_join_fingerprint(intent):
+    if len(jkeys) > 1 and not _join_runtime_intent_has_join_fingerprint(intent):
         return None
-    if len(jkeys) == 1 and not join_runtime_intent_has_join_fingerprint(intent):
+    if len(jkeys) == 1 and not _join_runtime_intent_has_join_fingerprint(intent):
         return min(
             candidates,
             key=lambda c: (c.non_agg_symmetric_diff, len(c.union_cols), c.template.id),
         )
-    filtered = [c for c in candidates if join_runtime_matches_template_concrete(intent, c.template)]
+    filtered = [c for c in candidates if _join_runtime_matches_template_concrete(intent, c.template)]
     if not filtered:
         return None
     return min(
@@ -3937,17 +3108,14 @@ def reconcile_union_family_body_join_after_mutation(
     Args:
 
         templates: Live accepted-template map (mutated in place).
-
         union_family_index: Optional inverted union-family index (``body|join`` composite keys).
-
         template_store_view: When *union_family_index* is omitted, read persisted
-            ``union_family_index`` from this view's header indexes.
+        ``union_family_index`` from this view's header indexes.
 
     Returns:
 
         Template ids removed after value-history merge into the lexicographically smallest keeper id.
     """
-
     removed: list[str] = []
 
     def _merge_family_group(tids_sorted: list[str]) -> None:
@@ -3955,7 +3123,9 @@ def reconcile_union_family_body_join_after_mutation(
         if len(tids_sorted) <= 1:
             return
         keeper_id = tids_sorted[0]
-        keeper = templates[keeper_id]
+        keeper = templates.get(keeper_id)
+        if keeper is None:
+            return
         keeper_rt = concrete_intent_to_runtime_skeleton(keeper.intent_signature)
         for dup_id in tids_sorted[1:]:
             if dup_id not in templates:
@@ -3973,10 +3143,12 @@ def reconcile_union_family_body_join_after_mutation(
             removed.append(dup_id)
 
     ufi = union_family_index
-    if not ufi and _is_template_store_view(template_store_view):
-        raw = template_store_view._indexes.get(TEMPLATE_UNION_FAMILY_INDEX_KEY)
-        if isinstance(raw, dict) and any(isinstance(v, list) and v for v in raw.values()):
-            ufi = {str(k): [str(x) for x in v] for k, v in raw.items() if isinstance(v, list)}
+    if not ufi and is_template_store_view(template_store_view):
+        indexes = getattr(template_store_view, "_indexes", None)
+        if isinstance(indexes, dict):
+            raw = indexes.get(TEMPLATE_UNION_FAMILY_INDEX_KEY)
+            if isinstance(raw, dict) and any(isinstance(v, list) and v for v in raw.values()):
+                ufi = {str(k): [str(x) for x in v] for k, v in raw.items() if isinstance(v, list)}
     if not ufi:
         ufi = _union_family_index_from_templates(templates)
 
@@ -4006,20 +3178,7 @@ def match_template_for_union(
     intent: RuntimeIntent,
     templates: dict[str, Template],
 ) -> tuple[Template, list[SelectCol], bool, GenerationPath] | None:
-    """
-    Pick a ``trust_level>=1`` template with matching body and small select diff.
-
-    Args:
-
-        intent: Validated runtime intent.
-
-        templates: Id -> template map.
-
-    Returns:
-
-        ``(template, union_select_cols, cols_changed, union_sql_path)`` or ``None``.
-    """
-
+    """Pick a ``trust_level>=1`` template with matching body and small. select diff. Args: intent: Validated runtime intent. templates: Id -> template map. Returns: ``(template, union_select_cols, cols_changed, union_sql_path)`` or ``None``."""
     rows = list_union_match_candidates(intent, templates)
     if not rows:
         return None

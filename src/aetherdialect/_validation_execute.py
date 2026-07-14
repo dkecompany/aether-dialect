@@ -6,34 +6,45 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
-from ._config import (
+from ._config import PolicyConfig
+from ._constants import (
     DIAG_TO_FAILURE_CATEGORY,
-    SOFT_DIAGNOSTIC_CODES,
-    SQL_BIND_TOKEN_RE,
+    PERMISSION_DENIED_USER_MESSAGE,
+    SCALAR_FUNCTIONS_NUMERIC,
+    SCALAR_FUNCTIONS_STRING,
+    SCALAR_FUNCTIONS_TEMPORAL,
     UNBOUND_PYFORMAT_PLACEHOLDER_RE,
-    PolicyConfig,
+    VALID_AGGREGATION_FUNCTIONS,
 )
 from ._contracts_base import (
-    CteOutputColumnMeta,
+    AccessError,
+    ColumnRole,
+    EngineContext,
     FailureCategory,
-    IntentIssue,
-    IntentValidationResult,
+    HavingParam,
     LogicalIntent,
-    SchemaGraph,
+    OrderByCol,
     SqlDiagnostic,
     SqlDiagnosticCode,
-    make_intent_issue,
 )
 from ._contracts_core import (
-    CaseRegistryStep,
     RuntimeCteStep,
     RuntimeIntent,
     SelectCol,
+)
+from ._contracts_schema import (
+    CaseRegistryStep,
+    CteOutputColumnMeta,
+    IntentIssue,
+    IntentValidationResult,
+    SchemaGraph,
     WindowRegistryStep,
+    make_intent_issue,
 )
 from ._core_utils import (
     debug,
-    pipeline_trace_lazy,
+    pipeline_trace,
+    reconcile_execute_bind_params,
     stable_json,
 )
 from ._dialect import Dialect
@@ -43,20 +54,13 @@ from ._intent_resolve import (
     collect_column_refs_for_post_processing,
     resolve_column_map,
 )
-from ._validation_agg import (
-    validate_column_types,
-    validate_having_agg_per_role,
-    validate_order_by_agg_per_role,
-    validate_order_by_agg_semantics,
-    validate_pk_fk_aggregation,
-    validate_scalar_expression_semantics,
-    validate_scalar_func_type_semantics,
-    validate_select_agg_per_role,
-    validate_select_agg_semantics,
-    validate_temporal_columns,
-)
+from ._schema_graph import assert_consumer_sql_in_scope
 from ._validation_schema import (
+    extract_agg_col,
+    extract_col_from_scalar_wrapper,
+    extract_functions_from_term,
     filter_param_to_having_param,
+    get_col_type,
     iterate_case_branch_conditions,
     validate_case_when_schema,
     validate_contains_array_filters,
@@ -74,9 +78,11 @@ from ._validation_schema import (
     validate_no_between_ops,
     validate_null_filters,
     validate_order_by_cols_schema,
+    validate_redundant_extract_year_column_literals,
     validate_scope_registries,
     validate_select_cols_schema,
     validate_selectability,
+    validate_window_partition_group_by_alignment,
     validate_window_spec_schema,
 )
 from ._validation_semantic import (
@@ -106,23 +112,21 @@ from ._validation_semantic import (
     validate_non_selectable_predicates,
     validate_order_by_aggregation_context,
     validate_order_by_expr_types,
-    validate_pii_group_by,
-    validate_pii_order_by,
     validate_predicate_bool_op_filter_group_hints,
     validate_predicate_sidedness,
     validate_question_agg_keyword_coverage,
     validate_question_distinct_hint,
-    validate_question_table_mentions,
     validate_select_expr_types,
     validate_select_group_by_membership,
     validate_semantic_contradictions,
+    validate_sensitivity_group_by,
+    validate_sensitivity_order_by,
     validate_threshold_missing_having,
 )
 
 
 def _scalar_subquery_cte_names(intent: RuntimeIntent | None) -> frozenset[str]:
     """Lowercased CTE names whose pipeline emission is ``scalar_subquery``."""
-
     if intent is None:
         return frozenset()
     names: list[str] = []
@@ -136,12 +140,7 @@ def _scalar_subquery_cte_names(intent: RuntimeIntent | None) -> frozenset[str]:
 
 
 def _classify_explain_sql_failure(message: str) -> str:
-    """
-    Bucket database ``EXPLAIN`` failures for seed-warmup telemetry and policy.
-
-    Returns one of ``explain_transient``, ``explain_schema``, ``explain_semantic``, or ``explain_failed``.
-    """
-
+    """Bucket database ``EXPLAIN`` failures for seed-warmup telemetry and policy. Returns one of ``explain_transient``, ``explain_schema``, ``explain_semantic``, or ``explain_failed``."""
     low = message.lower()
     transient_markers = (
         "timeout",
@@ -187,20 +186,7 @@ def _classify_explain_sql_failure(message: str) -> str:
 
 
 def _classify_explain_error(dialect_name: str, exc_text: str) -> FailureCategory:
-    """
-    Map an ``EXPLAIN`` exception string to ``FailureCategory`` for telemetry and outcomes.
-
-    Args:
-
-        dialect_name: Engine label (for example ``"postgres"`` or ``"databricks"``).
-
-        exc_text: Raw database error text.
-
-    Returns:
-
-        A coarse execution-time failure bucket.
-    """
-
+    """Map an ``EXPLAIN`` exception string to ``FailureCategory`` for. telemetry and outcomes."""
     _ = dialect_name
     code = _classify_explain_sql_failure(exc_text or "")
     if code == "explain_transient":
@@ -223,7 +209,6 @@ def _column_resolution_issues(
     context: str,
 ) -> list[IntentIssue]:
     """Run ``resolve_column_map`` and prefix messages with *context* for non-main scopes."""
-
     _, raw = resolve_column_map(columns, schema, tables)
     if context == "main query":
         return raw
@@ -242,27 +227,8 @@ def _column_resolution_issues(
     return out
 
 
-def bind_params_for_sql(sql: str, param_values: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Return bind map for EXPLAIN only when *sql* still contains ``:pN`` / ``:sN`` placeholders."""
-    if not param_values:
-        return None
-    return param_values if SQL_BIND_TOKEN_RE.search(sql) else None
-
-
 def _enforce_select_only(sql: str, dialect: Dialect) -> tuple[bool, str]:
-    """
-    Check whether SQL is a safe SELECT-only statement.
-
-    Args:
-
-        sql: The SQL string to check.
-
-        dialect: Active dialect (PostgreSQL parses via pglast; Databricks parses via sqlglot spark).
-
-    Returns:
-
-        Tuple ``(ok, reason)`` where ``ok`` is ``True`` for safe ``SELECT`` statements and ``reason`` is ``'ok'``, ``'not_select'``, or ``'forbidden_sql'``.
-    """
+    """Check whether SQL is a safe SELECT-only statement."""
     s = sql.lower().strip()
     for p in PolicyConfig.FORBIDDEN_SQL:
         if re.search(p, s, re.IGNORECASE):
@@ -280,38 +246,15 @@ def validate_sql(
     schema: SchemaGraph | None = None,
     intent: RuntimeIntent | None = None,
 ) -> tuple[bool, str | None, FailureCategory | None, list[SqlDiagnostic]]:
-    """
-    Validate SQL as a safe ``SELECT`` and syntactically valid via the dialect AST.
-
-    ``EXPLAIN`` is always attempted via ``dialect.explain_sql`` when the dialect
-    still has a usable backend; it is skipped only after the dialect has
-    self-disabled EXPLAIN in response to a permission-denied response from the
-    database (see :meth:`Dialect._disable_explain_on_permission_denied`).
-
-    Args:
-
-        dialect: The database dialect instance for AST validation.
-
-        sql: The SQL string to validate.
-
-        params: Optional bind-parameter values keyed by placeholder name (for example ``{"p1": "value"}``), forwarded to ``explain_sql`` so the database can resolve ``:p1``-style placeholders.
-
-        schema: Optional schema graph forwarded to ``explain_sql`` for engines that align ``EXPLAIN`` SQL with execution (Databricks partition pruning).
-
-        intent: Optional runtime intent forwarded with *schema* for the same alignment.
-
-    Returns:
-
-        Tuple ``(ok, error_message, failure_category, diagnostics)``. ``error_message`` and ``failure_category`` are ``None`` on success. ``diagnostics`` is the structured :class:`SqlDiagnostic` list returned by ``ast_validate_full`` and ``explain_diagnose`` (including soft EXPLAIN findings); on hard failure it contains at least the offending diagnostic.
-    """
+    """Validate SQL as a safe ``SELECT`` and syntactically valid via. the. dialect AST. ``EXPLAIN`` is always attempted via ``dialect.explain_sql`` when the dialect still has a usable backend; it is skipped only after the dialect has self-disabled EXPLAIN in response to a permission-denied response from the database (see :meth:`Dialect._disable_explain_on_permission_denied`)."""
     debug(f"[validation_execute.validate_sql] checking SQL length={len(sql)}")
-    pipeline_trace_lazy(
+    pipeline_trace(
         "validation_execute.validate_sql.input",
         lambda: stable_json({"sql": sql, "params": params or {}}),
     )
     if UNBOUND_PYFORMAT_PLACEHOLDER_RE.search(sql):
         debug("[validation_execute.validate_sql] unbound pyformat placeholder detected")
-        pipeline_trace_lazy(
+        pipeline_trace(
             "validation_execute.validate_sql.FAILED_unbound_placeholder",
             lambda: sql,
         )
@@ -329,7 +272,7 @@ def validate_sql(
     ok, reason = _enforce_select_only(sql, dialect)
     if not ok:
         debug(f"[validation_execute.validate_sql] enforce_select_only FAILED: {reason}")
-        pipeline_trace_lazy(
+        pipeline_trace(
             "validation_execute.validate_sql.FAILED_enforce_select_only",
             lambda: f"reason={reason}\n{sql}",
         )
@@ -348,7 +291,7 @@ def validate_sql(
         first = ast_diags[0]
         ast_err = first.message if first.message else first.code.value
         debug(f"[validation_execute.validate_sql] AST validation failed: {ast_err}")
-        pipeline_trace_lazy(
+        pipeline_trace(
             "validation_execute.validate_sql.FAILED_ast",
             lambda: f"ast_err={ast_err}\n{sql}",
         )
@@ -376,7 +319,7 @@ def validate_sql(
             formatted = _format_explain_validation_error(code, raw)
             ecat = _classify_explain_error(getattr(dialect, "name", ""), raw)
             debug(f"[validation_execute.validate_sql] explain_sql failed ({code}): {explain_err}")
-            pipeline_trace_lazy(
+            pipeline_trace(
                 "validation_execute.validate_sql.FAILED_explain",
                 lambda: f"explain_err={explain_err}\n{sql}\nparams={stable_json(params or {})}",
             )
@@ -387,11 +330,47 @@ def validate_sql(
             )
             return False, formatted, ecat, hard_diags
         debug("[validation_execute.validate_sql] explain_sql passed")
-    pipeline_trace_lazy(
+    pipeline_trace(
         "validation_execute.validate_sql.PASSED",
         lambda: sql,
     )
     return True, None, None, list(explain_diags)
+
+
+def execute_guarded_sql(
+    dialect: Dialect,
+    sql: str,
+    params: dict[str, Any] | None = None,
+    *,
+    schema: SchemaGraph | None = None,
+    intent: RuntimeIntent | None = None,
+    schema_role: str = "owner",
+    schema_context: EngineContext | None = None,
+    visible_objects: frozenset[str] | None = None,
+) -> list[tuple[Any, ...]]:
+    """Validate *sql* then execute via *dialect*, enforcing consumer scope when applicable."""
+    if schema is not None:
+        runtime_cfg_ctx = schema_context
+        ctx = runtime_cfg_ctx if runtime_cfg_ctx is not None else EngineContext()
+        gate_active = (
+            schema_role == "consumer"
+            or getattr(ctx, "name", "master") != "master"
+            or bool(ctx.allow_objects or ctx.deny_objects or ctx.deny_columns or ctx.allow_columns)
+            or visible_objects is not None
+        )
+        if gate_active and not assert_consumer_sql_in_scope(sql, dialect, ctx, schema, visible_objects):
+            raise AccessError("execute", PERMISSION_DENIED_USER_MESSAGE)
+    ok, err, _cat, _diags = validate_sql(
+        dialect,
+        sql,
+        params,
+        schema=schema,
+        intent=intent,
+    )
+    if not ok:
+        raise ValueError(err or "sql validation failed")
+    exec_params = reconcile_execute_bind_params(sql, params)
+    return dialect.execute(sql, exec_params)
 
 
 def compute_confidence(
@@ -404,33 +383,7 @@ def compute_confidence(
     num_cte_pen: float = 0.0,
     explain_pen: float = 0.0,
 ) -> float:
-    """
-    Compute overall confidence score for a query result.
-
-    Combines template similarity score, gap to next-best, new-table penalty, shape distance penalty, negative memory penalty, column-map penalty, CTE count penalty, and EXPLAIN soft-diagnostic penalty into a single float.
-
-    Args:
-
-        best_score: Similarity score of the best matching template in ``[0, 1]``.
-
-        score_gap: Gap between best and second-best template scores.
-
-        used_new_tables: Whether the query uses tables not seen in any template.
-
-        shape_penalty: Shape distance penalty in ``[0, 1]``.
-
-        negative_pen: Accumulated negative memory penalty in ``[0, 1]``.
-
-        colmap_pen: Column-map rejection penalty in ``[0, 1]``.
-
-        num_cte_pen: Optional CTE-count penalty in ``[0, 1]``.
-
-        explain_pen: Soft EXPLAIN-derived penalty in ``[0, 1]`` accumulated from ``SOFT_DIAGNOSTIC_CODES`` in ``_config`` (sequential scans on indexed columns, zero-row estimates) so plan-shape findings reduce confidence without rejecting the SQL.
-
-    Returns:
-
-        Confidence float clamped to ``[0, 1]``.
-    """
+    """Compute overall confidence score for a query result. Combines. template similarity score, gap to next-best, new-table penalty, shape distance penalty, negative memory penalty, column-map penalty, CTE count penalty, and EXPLAIN soft-diagnostic penalty into a single float."""
     debug("[validation_execute.compute_confidence] inputs:")
     debug(
         f"[validation_execute.compute_confidence] used_new_tables={used_new_tables}, shape_penalty={shape_penalty:.3f}, num_cte_pen={num_cte_pen:.3f}, explain_pen={explain_pen:.3f}"
@@ -471,29 +424,8 @@ def compute_confidence(
     return result
 
 
-def explain_penalty_from_diagnostics(diagnostics: list[SqlDiagnostic]) -> float:
-    """
-    Return the aggregated soft-diagnostic penalty in ``[0, 1]`` for *diagnostics*.
-
-    Each soft-coded diagnostic (those listed in ``SOFT_DIAGNOSTIC_CODES`` in ``_config``) contributes a fixed quantum (0.34) so two findings reach 0.68 and three or more saturate the term to 1.0.
-    """
-    soft = sum(1 for d in diagnostics if d.code.value in SOFT_DIAGNOSTIC_CODES)
-    return min(1.0, 0.34 * soft)
-
-
 def canonicalize_rejection_reason(text: str) -> str:
-    """
-    Normalise a rejection summary to a single line, max 160 characters, no trailing sentence punctuation.
-
-    Args:
-
-        text: Raw summary or user reason fragment.
-
-    Returns:
-
-        Canonical string safe for storage and prompts.
-    """
-
+    """Normalise a rejection summary to a single line, max 160. characters, no trailing sentence punctuation."""
     s = " ".join((text or "").split())
     if not s:
         return ""
@@ -508,11 +440,7 @@ def _merge_cte_projection_columns_into_outputs(
     meta_by_col: dict[str, CteOutputColumnMeta],
     output_columns: list[str],
 ) -> None:
-    """
-    Ensure *meta_by_col* contains a permissive entry for every bare name in *output_columns*.
-
-    LLM payloads sometimes omit ``output_column_metadata`` keys even when ``output_columns`` is authoritative; schema validators key off this map.
-    """
+    """Ensure *meta_by_col* contains a permissive entry for every bare name in *output_columns*. LLM payloads sometimes omit ``output_column_metadata`` keys even when ``output_columns`` is authoritative; schema validators key off this map."""
     for oc in output_columns:
         bare = oc.split(".")[-1].strip()
         if not bare:
@@ -524,7 +452,6 @@ def _merge_cte_projection_columns_into_outputs(
 
 def _cte_names_from_column_refs(refs: list[str], cte_names_lower: set[str]) -> set[str]:
     """Return lowercase CTE names that appear as qualified table prefixes in *refs*."""
-
     found: set[str] = set()
     for ref in refs:
         if "." not in ref:
@@ -540,28 +467,8 @@ def _validate_main_query_cte_usage(
     cte_outputs: dict[str, list[str]],
     cte_steps: list[RuntimeCteStep] | None = None,
 ) -> list[IntentIssue]:
-    """
-    Validate that the main query references CTE outputs correctly.
-
-    Checks for unreferenced CTEs (computed via transitive closure through ``cte_steps[*].tables``
-    so a CTE consumed by another used CTE is itself considered used), main-query select columns
-    not present in their referenced CTE outputs, ``column_map`` references missing from CTE
-    outputs, and filter column references missing from CTE outputs.
-
-    Args:
-
-        intent: The main ``RuntimeIntent``.
-
-        cte_outputs: Mapping of CTE name to output column list (as produced when validating the CTE chain).
-
-        cte_steps: Optional CTE chain used to compute transitive usage. When omitted only direct
-        references from ``intent.tables`` are considered.
-
-    Returns:
-
-        List of ``IntentIssue`` objects.
-    """
-    issues = []
+    """Validate that the main query references CTE outputs correctly. Checks for unreferenced CTEs (computed via transitive closure through ``cte_steps[*].tables`` so a CTE consumed by another used CTE is itself considered used), main-query select columns not present in their referenced CTE outputs, ``column_map`` references missing from CTE outputs, and filter column references missing from CTE outputs."""
+    issues: list[IntentIssue] = []
     debug(
         f"[validation_execute.validate_main_query_cte_usage] checking main query uses CTEs: {list(cte_outputs.keys())}"
     )
@@ -696,22 +603,8 @@ def _validate_main_query_cte_usage(
 
 
 def _validate_cte_output_types(cte_steps: list[RuntimeCteStep], schema: SchemaGraph) -> list[IntentIssue]:
-    """
-    Validate that CTE output column types are consistent with aggregation usage.
-
-    Warns when ``SUM`` or ``AVG`` is applied to a column whose inferred type is not numeric.
-
-    Args:
-
-        cte_steps: Ordered list of ``RuntimeCteStep`` objects.
-
-        schema: The ``SchemaGraph`` for column type lookup.
-
-    Returns:
-
-        List of ``IntentIssue`` objects with severity ``'warning'`` for type mismatches.
-    """
-    issues = []
+    """Validate that CTE output column types are consistent with. aggregation usage. Warns when ``SUM`` or ``AVG`` is applied to a column whose inferred type is not numeric."""
+    issues: list[IntentIssue] = []
     cte_output_types: dict[str, dict[str, str]] = {}
     debug(f"[validation_execute.validate_cte_output_types] validating {len(cte_steps)} CTE output types")
     for cte in cte_steps:
@@ -720,11 +613,12 @@ def _validate_cte_output_types(cte_steps: list[RuntimeCteStep], schema: SchemaGr
         select_cols = cte.select_cols or []
         col_types: dict[str, str] = {}
         for col in output_cols:
+            table_name: str | None
             if "." in col:
-                table, col_name = col.rsplit(".", 1)
+                table_name, col_name = col.rsplit(".", 1)
             else:
                 col_name = col
-                table = cte.tables[0] if cte.tables else None
+                table_name = cte.tables[0] if cte.tables else None
             for sc in select_cols:
                 if sc.is_aggregated:
                     term = sc.expr.primary_term
@@ -734,12 +628,12 @@ def _validate_cte_output_types(cte_steps: list[RuntimeCteStep], schema: SchemaGr
                         col_types[col_name] = "numeric"
                         break
             else:
-                if table and table in schema.tables:
-                    schema_col = schema.tables[table].columns.get(col_name)
+                if table_name and table_name in schema.tables:
+                    schema_col = schema.tables[table_name].columns.get(col_name)
                     if schema_col and schema_col.value_type:
                         col_types[col_name] = schema_col.value_type
-                elif table and table in cte_output_types:
-                    dep_types = cte_output_types[table]
+                elif table_name and table_name in cte_output_types:
+                    dep_types = cte_output_types[table_name]
                     if col_name in dep_types:
                         col_types[col_name] = dep_types[col_name]
         cte_output_types[cte_name] = col_types
@@ -757,13 +651,14 @@ def _validate_cte_output_types(cte_steps: list[RuntimeCteStep], schema: SchemaGr
             col_expr = sc.expr.primary_column
             if not col_expr:
                 continue
+            agg_table: str | None
             if "." in col_expr:
-                table, col_name = col_expr.rsplit(".", 1)
+                agg_table, col_name = col_expr.rsplit(".", 1)
             else:
                 col_name = col_expr
-                table = cte.tables[0] if cte.tables else None
-            if table in cte_output_types:
-                col_type = cte_output_types[table].get(col_name, "")
+                agg_table = cte.tables[0] if cte.tables else None
+            if agg_table in cte_output_types:
+                col_type = cte_output_types[agg_table].get(col_name, "")
                 if col_type and col_type not in ("integer", "number"):
                     issues.append(
                         make_intent_issue(
@@ -790,20 +685,8 @@ def _validate_cte_output_types(cte_steps: list[RuntimeCteStep], schema: SchemaGr
 
 
 def _validate_cte_cardinality(cte_steps: list[RuntimeCteStep]) -> list[IntentIssue]:
-    """
-    Validate CTE cardinality expectations are internally consistent.
-
-    Warns when scalar-grain CTEs have ``expected_rows != 'one'``, ``LIMIT 1`` CTEs have ``expected_rows != 'one'``, and notes when a many-row CTE depends on a single-row CTE.
-
-    Args:
-
-        cte_steps: Ordered list of ``RuntimeCteStep`` objects.
-
-    Returns:
-
-        List of ``IntentIssue`` objects.
-    """
-    issues = []
+    """Validate CTE cardinality expectations are internally consistent. Warns when scalar-grain CTEs have ``expected_rows != 'one'``, ``LIMIT 1`` CTEs have ``expected_rows != 'one'``, and notes when a many-row CTE depends on a single-row CTE."""
+    issues: list[IntentIssue] = []
     cte_expected_rows: dict[str, str] = {}
     debug(f"[validation_execute.validate_cte_cardinality] validating {len(cte_steps)} CTE cardinalities")
     for cte in cte_steps:
@@ -868,45 +751,7 @@ def _validate_case_branches_for_scope(
     location_prefix: str,
     param_values: Mapping[str, Any] | None,
 ) -> list[IntentIssue]:
-    """
-    Apply the filter/HAVING-shaped validators against every CASE branch condition.
-
-    Walks ``case_registry[*].case_when`` branch conditions via :func:`iterate_case_branch_conditions`.
-    For each branch the helper routes the condition through the same validators that the main and CTE bodies
-    use for ``filters_param`` (when ``condition_scope`` is ``"filter"``) or
-    ``having_param`` (when ``condition_scope`` is ``"having"``). Each branch is
-    treated as a one-element list so that operator, type-alignment, NULL,
-    array, and date-unit rules surface inside CASE branches with the same
-    diagnostics as flat WHERE/HAVING predicates. Flat ``filters_param`` / ``having_param``
-    lists still run ``validate_no_between_ops`` at body scope so decomposable ``between``
-    rows are caught there; CASE branch conditions skip that check because each branch
-    holds a single ``FilterParam`` and shares the CASE renderer path for ``between``,
-    ``in``, and ``not in`` (:func:`aetherdialect._sql_gen._render_case_branch_sql`).
-
-    Args:
-
-        select_cols: SELECT list entries for the body being validated.
-
-        case_registry: Standalone CASE registry steps for the body.
-
-        window_registry: Window registry passed through to registry resolution.
-
-        schema: Schema graph for column and relationship metadata.
-
-        allowed_tables: Tables permitted in the body's scope.
-
-        cte_outputs: Mapping of CTE name to output column metadata.
-
-        cte_steps: All CTE steps for unit-validators that take the chain.
-
-        location_prefix: Scope label such as ``"main query"`` or ``"CTE 'x'"``.
-
-        param_values: Bound literals for the body.
-
-    Returns:
-
-        Aggregated `IntentIssue` instances from every per-branch validator call.
-    """
+    """Apply the filter/HAVING-shaped validators against every CASE. branch condition. Walks ``case_registry[*].case_when`` branch conditions via :func:`iterate_case_branch_conditions`. For each branch the helper routes the condition through the same validators that the main and CTE bodies use for ``filters_param`` (when ``condition_scope`` is ``"filter"``) or ``having_param`` (when ``condition_scope`` is ``"having"``). Each branch is treated as a one-element list so that operator, type-alignment, NULL, array, and date-unit rules surface inside CASE branches with the same diagnostics as flat WHERE/HAVING predicates. Flat ``filters_param`` / ``having_param`` lists still run ``validate_no_between_ops`` at body scope so decomposable ``between`` rows are caught there; CASE branch conditions skip that check because each branch holds a single ``FilterParam`` and shares the CASE renderer path for ``between``, ``in``, and ``not in`` (:func:`aetherdialect._sql_gen._render_case_branch_sql`)."""
     issues: list[IntentIssue] = []
     for cond, branch_scope, location in iterate_case_branch_conditions(
         select_cols, case_registry, window_registry, location_prefix
@@ -964,38 +809,11 @@ def validate_semantics(
     post_binding: bool = False,
     numeric_coverage_logical: LogicalIntent | None = None,
 ) -> IntentValidationResult:
-    """
-    Run the full semantic validation suite against a ``RuntimeIntent``.
-
-    Validators are grouped by tier. Tier 1 structural checks run on the main query body
-    and again on each CTE body with that scope's ``tables`` and ``param_values``. Tier 2
-    NL-dependent checks use ``intent.natural_language`` for the main query and
-    ``cte.description`` for CTE scopes; ``validate_question_table_mentions`` applies to
-    the main query only and is skipped when ``post_binding`` is ``True``. Tier 3
-    cross-scope checks run once on the full intent (CTE naming, dependency grains, and
-    related rules).
-
-    Applies every schema-level and semantic-level validation function to the main query
-    and each CTE step, then aggregates CTE grain compatibility checks across the full
-    CTE chain.
-
-    Args:
-
-        intent: The resolved runtime intent to validate.
-
-        schema: Schema graph providing table, column, and relationship metadata.
-
-        post_binding: When ``True``, skip validators that depend on the pre-prune table list (for example ``validate_question_table_mentions``). Use after post-processing revalidation.
-
-        numeric_coverage_logical: When set, digit-run coverage checks scan planner prose from this intent instead of the runtime question text.
-
-    Returns:
-
-        An ``IntentValidationResult`` containing all ``IntentIssue`` entries found across the main query and all CTE steps.
-    """
+    """Run the full semantic validation suite against a. ``RuntimeIntent``. Validators are grouped by tier. Tier 1 structural checks run on the main query body and again on each CTE body with that scope's ``tables`` and ``param_values``. Tier 2 NL-dependent checks use ``intent.natural_language`` for the main query and ``cte.description`` for CTE scopes. Tier 3 cross-scope checks run once on the full intent (CTE naming, dependency grains, and related rules). Applies every schema-level and semantic-level validation function to the main query and each CTE step, then aggregates CTE grain compatibility checks across the full CTE chain."""
     all_issues: list[IntentIssue] = []
+    debug(f"[validation_execute.validate_semantics] post_binding={post_binding}")
     debug("[validation_execute.validate_semantics] running semantic validation suite")
-    pipeline_trace_lazy(
+    pipeline_trace(
         "validation_execute.validate_semantics.input_intent",
         lambda: stable_json(intent.to_dict()),
     )
@@ -1105,8 +923,8 @@ def validate_semantics(
     )
     all_issues.extend(validate_deny_bare_select(intent, schema))
     all_issues.extend(validate_denied_references(intent, schema))
-    all_issues.extend(validate_pii_group_by(intent, schema))
-    all_issues.extend(validate_pii_order_by(intent, schema))
+    all_issues.extend(validate_sensitivity_group_by(intent, schema))
+    all_issues.extend(validate_sensitivity_order_by(intent, schema))
     all_issues.extend(validate_non_selectable_predicates(intent, schema))
     all_issues.extend(validate_empty_window(intent, schema))
     all_issues.extend(
@@ -1117,6 +935,14 @@ def validate_semantics(
             "main query",
             window_registry=list(intent.window_registry or []),
             case_registry=list(intent.case_registry or []),
+        )
+    )
+    all_issues.extend(
+        validate_window_partition_group_by_alignment(
+            grain=intent.grain or "row_level",
+            group_by_cols=intent.group_by_cols or [],
+            window_registry=list(intent.window_registry or []),
+            context="main query",
         )
     )
     all_issues.extend(
@@ -1216,6 +1042,13 @@ def validate_semantics(
             scope_param_values=intent.param_values,
         )
     )
+    all_issues.extend(
+        validate_redundant_extract_year_column_literals(
+            intent.filters_param or [],
+            cte_steps,
+            "main query",
+        )
+    )
     all_issues.extend(validate_column_types(intent.select_cols or [], schema, "main query"))
     all_issues.extend(
         validate_filter_value_type_alignment(
@@ -1295,6 +1128,7 @@ def validate_semantics(
             intent.limit,
             "main query",
             param_values=intent.param_values,
+            case_registry=intent.case_registry,
         )
     )
     all_issues.extend(
@@ -1305,18 +1139,6 @@ def validate_semantics(
             distinct_select_index=intent.distinct_select_index,
         )
     )
-    if not post_binding:
-        cte_consumed_tables: list[str] = []
-        for cte in intent.cte_steps or []:
-            cte_consumed_tables.extend(cte.tables or [])
-        all_issues.extend(
-            validate_question_table_mentions(
-                intent.natural_language,
-                (intent.tables or []) + cte_consumed_tables,
-                schema,
-                "main query",
-            )
-        )
     all_issues.extend(
         validate_question_agg_keyword_coverage(
             intent.natural_language,
@@ -1439,6 +1261,14 @@ def validate_semantics(
                 cte_context,
                 window_registry=list(cte.window_registry or []),
                 case_registry=list(cte.case_registry or []),
+            )
+        )
+        all_issues.extend(
+            validate_window_partition_group_by_alignment(
+                grain=cte.grain or "row_level",
+                group_by_cols=cte.group_by_cols or [],
+                window_registry=list(cte.window_registry or []),
+                context=cte_context,
             )
         )
         all_issues.extend(
@@ -1655,12 +1485,16 @@ def validate_semantics(
             f"[validation_execute.validate_semantics] issue[{idx}]: "
             f"{iss.issue_id} | {iss.category} | {iss.severity} | {iss.message} | context={iss.context}"
         )
-        pipeline_trace_lazy(
+
+        def _issue_trace_body(issue: IntentIssue = iss) -> str:
+            return stable_json(issue.to_dict())
+
+        pipeline_trace(
             f"validation_execute.validate_semantics.issue[{idx}]",
-            lambda iss=iss: stable_json(iss.to_dict()),
+            _issue_trace_body,
         )
     result = IntentValidationResult(issues=all_issues)
-    pipeline_trace_lazy(
+    pipeline_trace(
         "validation_execute.validate_semantics.result",
         lambda: stable_json(result.to_dict()),
     )
@@ -1668,13 +1502,7 @@ def validate_semantics(
 
 
 def curated_warmup_semantic_issues(intent: RuntimeIntent, schema: SchemaGraph) -> list[str]:
-    """
-    Semantic checks aligned with live pipeline validation after deterministic repairs and lite post-processing.
-
-    Delegates to :func:`validate_semantics` with ``post_binding=True`` so NL-conditioned rules stay disabled
-    while the full schema-tier suite runs (including scope-registries via that suite).
-    """
-
+    """Semantic checks aligned with live pipeline validation after deterministic repairs and lite post-processing. Delegates to :func:`validate_semantics` with ``post_binding=True`` so NL-conditioned rules stay disabled while the full schema-tier suite runs (including scope-registries via that suite)."""
     vr = validate_semantics(intent, schema, post_binding=True)
     return list(
         dict.fromkeys(i.message for i in vr.issues if (i.severity or "").lower() == "error"),
@@ -1686,10 +1514,7 @@ def curated_warmup_post_binding_issues(
     schema: SchemaGraph,
     final_sql: str,
 ) -> list[str]:
-    """
-    Post-substitution parity checks mirroring :func:`_phase_g_post_validation_passes` without LLM use.
-    """
-
+    """Post-substitution parity checks mirroring :func:`_post_processing_revalidation_passes` without LLM use."""
     _ = final_sql
     msgs: list[str] = []
     _, qerr = check_qualified_refs_exist(intent, schema)
@@ -1697,3 +1522,787 @@ def curated_warmup_post_binding_issues(
     vr = validate_semantics(intent, schema, post_binding=True)
     msgs.extend(i.message for i in vr.issues if (i.severity or "").lower() == "error")
     return list(dict.fromkeys(msgs))
+
+
+def validate_having_agg_per_role(
+    having_param: list[HavingParam],
+    schema: SchemaGraph,
+    cte_outputs: dict[str, dict[str, CteOutputColumnMeta]] | None = None,
+    context: str = "main",
+) -> list[IntentIssue]:
+    """Validate that HAVING aggregation functions are valid for each. column's role."""
+    issues = []
+    if not having_param:
+        return []
+    cte_outputs = cte_outputs or {}
+    for hp in having_param:
+        agg_expr = hp.left_expr.primary_term
+        if not agg_expr:
+            continue
+        func, actual_target, _ = extract_agg_col(agg_expr)
+        if not func or not actual_target or actual_target == "*":
+            continue
+        if "." not in actual_target:
+            continue
+        table_name, col_name = actual_target.rsplit(".", 1)
+        if table_name in cte_outputs:
+            cte_cols = cte_outputs[table_name]
+            matched_key = next((c for c in cte_cols if c.lower() == col_name.lower()), None)
+            if matched_key:
+                cte_meta = cte_cols[matched_key]
+                if cte_meta.valid_aggregations and func not in cte_meta.valid_aggregations:
+                    issues.append(
+                        make_intent_issue(
+                            issue_id=f"having_agg_invalid_for_cte_{context}_{actual_target}_{func}",
+                            category=FailureCategory.HAVING_VALIDITY,
+                            severity="error",
+                            message=f"Aggregation '{func.upper()}' not valid for CTE column '{actual_target}' (role={cte_meta.role}) in HAVING for {context}. Valid: {sorted(cte_meta.valid_aggregations)}",
+                            context={
+                                "column": actual_target,
+                                "function": func,
+                                "role": cte_meta.role,
+                                "valid_aggs": sorted(cte_meta.valid_aggregations),
+                                "location": context,
+                            },
+                        )
+                    )
+            continue
+        if table_name not in schema.tables:
+            continue
+        table_meta = schema.tables[table_name]
+        col_meta = table_meta.columns.get(col_name) or table_meta.columns.get(col_name.lower())
+        if not col_meta:
+            continue
+        valid_aggs = col_meta.get_valid_aggregations()
+        if func not in valid_aggs:
+            issues.append(
+                make_intent_issue(
+                    issue_id=f"having_agg_invalid_for_role_{context}_{actual_target}_{func}",
+                    category=FailureCategory.HAVING_VALIDITY,
+                    severity="error",
+                    message=f"Aggregation '{func.upper()}' not valid for column '{actual_target}' (role={col_meta.role}) in HAVING for {context}. Valid: {sorted(valid_aggs)}",
+                    context={
+                        "column": actual_target,
+                        "function": func,
+                        "role": col_meta.role,
+                        "valid_aggs": sorted(valid_aggs),
+                        "location": context,
+                    },
+                )
+            )
+    debug(f"[validation_schema.validate_having_agg_per_role] {len(issues)} issues in {context}")
+    return issues
+
+
+def validate_select_agg_per_role(
+    select_cols: list[SelectCol],
+    schema: SchemaGraph,
+    cte_outputs: dict[str, dict[str, CteOutputColumnMeta]] | None = None,
+    context: str = "main",
+) -> list[IntentIssue]:
+    """Validate that SELECT aggregation functions are valid for each. column's role."""
+    issues = []
+    if not select_cols:
+        return []
+    cte_outputs = cte_outputs or {}
+    for sc in select_cols:
+        _, agg_func = extract_functions_from_term(sc.expr.primary_term)
+        if not agg_func:
+            continue
+        col_expr = sc.expr.primary_column
+        if not col_expr:
+            continue
+        actual_col = extract_col_from_scalar_wrapper(col_expr)
+        if actual_col == "*":
+            continue
+        if "." not in actual_col:
+            continue
+        table_name, col_name = actual_col.rsplit(".", 1)
+        if table_name in cte_outputs:
+            cte_cols = cte_outputs[table_name]
+            matched_key = next((c for c in cte_cols if c.lower() == col_name.lower()), None)
+            if matched_key:
+                cte_meta = cte_cols[matched_key]
+                if cte_meta.valid_aggregations:
+                    func_lower = agg_func.lower()
+                    if func_lower not in cte_meta.valid_aggregations:
+                        issues.append(
+                            make_intent_issue(
+                                issue_id=f"select_agg_invalid_for_cte_{context}_{actual_col}_{agg_func}",
+                                category=FailureCategory.AGGREGATION_VALIDITY,
+                                severity="error",
+                                message=f"Aggregation '{agg_func.upper()}' not valid for CTE column '{actual_col}' (role={cte_meta.role}) in {context}. Valid: {sorted(cte_meta.valid_aggregations)}",
+                                context={
+                                    "column": actual_col,
+                                    "function": agg_func,
+                                    "role": cte_meta.role,
+                                    "valid_aggs": sorted(cte_meta.valid_aggregations),
+                                    "location": context,
+                                },
+                            )
+                        )
+            continue
+        if table_name not in schema.tables:
+            continue
+        table_meta = schema.tables[table_name]
+        col_meta = table_meta.columns.get(col_name) or table_meta.columns.get(col_name.lower())
+        if not col_meta:
+            continue
+        valid_aggs = col_meta.get_valid_aggregations()
+        func_lower = agg_func.lower()
+        if func_lower not in valid_aggs:
+            issues.append(
+                make_intent_issue(
+                    issue_id=f"select_agg_invalid_for_role_{context}_{actual_col}_{agg_func}",
+                    category=FailureCategory.AGGREGATION_VALIDITY,
+                    severity="error",
+                    message=f"Aggregation '{agg_func.upper()}' not valid for column '{actual_col}' (role={col_meta.role}) in {context}. Valid: {sorted(valid_aggs)}",
+                    context={
+                        "column": actual_col,
+                        "function": agg_func,
+                        "role": col_meta.role,
+                        "valid_aggs": sorted(valid_aggs),
+                        "location": context,
+                    },
+                )
+            )
+    debug(f"[validation_schema.validate_select_agg_per_role] {len(issues)} issues in {context}")
+    return issues
+
+
+def validate_select_agg_semantics(
+    select_cols: list[SelectCol],
+    schema: SchemaGraph,
+    context: str = "main",
+) -> list[IntentIssue]:
+    """Validate that SELECT aggregation functions are semantically. appropriate for column types. Errors for SUM/AVG on non-numeric columns; warns for MIN/MAX on FREE_TEXT columns."""
+    issues = []
+    if not select_cols:
+        return []
+    numeric_aggs = {"sum", "avg"}
+    for sc in select_cols:
+        _, agg_func = extract_functions_from_term(sc.expr.primary_term)
+        if not agg_func:
+            continue
+        func_lower = agg_func
+        if func_lower not in numeric_aggs and func_lower not in {"min", "max"}:
+            continue
+        col_expr = sc.expr.primary_column
+        if not col_expr:
+            continue
+        actual_col = extract_col_from_scalar_wrapper(col_expr)
+        if actual_col == "*":
+            continue
+        if "." not in actual_col:
+            continue
+        table_name, col_name = actual_col.rsplit(".", 1)
+        if table_name not in schema.tables:
+            continue
+        col_meta = schema.tables[table_name].columns.get(col_name)
+        if not col_meta:
+            continue
+        vt = col_meta.value_type
+        numeric = vt in ("integer", "number")
+        temporal = vt == "date"
+        if func_lower in numeric_aggs and not numeric:
+            issues.append(
+                make_intent_issue(
+                    issue_id=f"invalid_agg_semantics_{func_lower}_{table_name}_{col_name}",
+                    category=FailureCategory.AGGREGATION_SEMANTICS,
+                    severity="error",
+                    message=f"Cannot {func_lower.upper()} on {actual_col} (type={col_meta.data_type}): {func_lower.upper()} requires numeric column",
+                    context={
+                        "aggregation": func_lower,
+                        "column": actual_col,
+                        "data_type": col_meta.data_type,
+                        "location": context,
+                    },
+                )
+            )
+            debug(f"[validation_schema.validate_select_agg_semantics] invalid {func_lower.upper()} on {actual_col}")
+        elif func_lower in {"min", "max"} and not numeric and not temporal:
+            col_role = col_meta.role if col_meta.role else None
+            if col_role == ColumnRole.FREE_TEXT.value:
+                issues.append(
+                    make_intent_issue(
+                        issue_id=f"questionable_agg_{func_lower}_{table_name}_{col_name}",
+                        category=FailureCategory.AGGREGATION_SEMANTICS,
+                        severity="warning",
+                        message=f"Questionable {func_lower.upper()} on {actual_col} (type={col_meta.data_type}): {func_lower.upper()} on free text is semantically meaningless",
+                        context={
+                            "aggregation": func_lower,
+                            "column": actual_col,
+                            "data_type": col_meta.data_type,
+                            "location": context,
+                        },
+                    )
+                )
+                debug(
+                    f"[validation_schema.validate_select_agg_semantics] questionable {func_lower.upper()} on {actual_col}"
+                )
+    if issues:
+        debug(f"[validation_schema.validate_select_agg_semantics] found {len(issues)} semantic issues")
+    else:
+        debug("[validation_schema.validate_select_agg_semantics] no semantic issues")
+    return issues
+
+
+def validate_order_by_agg_per_role(
+    order_by_cols: list[OrderByCol],
+    schema: SchemaGraph,
+    cte_outputs: dict[str, dict[str, CteOutputColumnMeta]] | None = None,
+    context: str = "main",
+) -> list[IntentIssue]:
+    """Validate that ORDER BY aggregation functions are valid for each. column's role."""
+    issues = []
+    if not order_by_cols:
+        return []
+    cte_outputs = cte_outputs or {}
+    for obc in order_by_cols:
+        _, agg_func = extract_functions_from_term(obc.expr.primary_term)
+        if not agg_func:
+            continue
+        col_expr = obc.expr.primary_column
+        if not col_expr:
+            continue
+        actual_col = extract_col_from_scalar_wrapper(col_expr)
+        if actual_col == "*":
+            continue
+        if "." not in actual_col:
+            continue
+        table_name, col_name = actual_col.rsplit(".", 1)
+        if table_name in cte_outputs:
+            cte_cols = cte_outputs[table_name]
+            matched_key = next((c for c in cte_cols if c.lower() == col_name.lower()), None)
+            if matched_key:
+                cte_meta = cte_cols[matched_key]
+                if cte_meta.valid_aggregations:
+                    func_lower = agg_func.lower()
+                    if func_lower not in cte_meta.valid_aggregations:
+                        issues.append(
+                            make_intent_issue(
+                                issue_id=f"order_by_agg_invalid_for_cte_{context}_{actual_col}_{agg_func}",
+                                category=FailureCategory.AGGREGATION_VALIDITY,
+                                severity="error",
+                                message=f"Aggregation '{agg_func.upper()}' not valid for CTE column '{actual_col}' (role={cte_meta.role}) in order_by for {context}. Valid: {sorted(cte_meta.valid_aggregations)}",
+                                context={
+                                    "column": actual_col,
+                                    "function": agg_func,
+                                    "role": cte_meta.role,
+                                    "valid_aggs": sorted(cte_meta.valid_aggregations),
+                                    "location": context,
+                                },
+                            )
+                        )
+            continue
+        if table_name not in schema.tables:
+            continue
+        table_meta = schema.tables[table_name]
+        col_meta = table_meta.columns.get(col_name) or table_meta.columns.get(col_name.lower())
+        if not col_meta:
+            continue
+        valid_aggs = col_meta.get_valid_aggregations()
+        func_lower = agg_func.lower()
+        if func_lower not in valid_aggs:
+            issues.append(
+                make_intent_issue(
+                    issue_id=f"order_by_agg_invalid_for_role_{context}_{actual_col}_{agg_func}",
+                    category=FailureCategory.AGGREGATION_VALIDITY,
+                    severity="error",
+                    message=f"Aggregation '{agg_func.upper()}' not valid for column '{actual_col}' (role={col_meta.role}) in order_by for {context}. Valid: {sorted(valid_aggs)}",
+                    context={
+                        "column": actual_col,
+                        "function": agg_func,
+                        "role": col_meta.role,
+                        "valid_aggs": sorted(valid_aggs),
+                        "location": context,
+                    },
+                )
+            )
+    debug(f"[validation_schema.validate_order_by_agg_per_role] {len(issues)} issues in {context}")
+    return issues
+
+
+def validate_order_by_agg_semantics(
+    order_by_cols: list[OrderByCol],
+    schema: SchemaGraph,
+    context: str = "main",
+) -> list[IntentIssue]:
+    """Validate that ORDER BY aggregation functions are semantically. appropriate for column types. Errors for SUM/AVG on non-numeric columns; warns for MIN/MAX on FREE_TEXT columns."""
+    issues = []
+    if not order_by_cols:
+        return []
+    numeric_aggs = {"sum", "avg"}
+    for obc in order_by_cols:
+        _, agg_func = extract_functions_from_term(obc.expr.primary_term)
+        if not agg_func:
+            continue
+        func_lower = agg_func
+        if func_lower not in numeric_aggs and func_lower not in {"min", "max"}:
+            continue
+        col_expr = obc.expr.primary_column
+        if not col_expr:
+            continue
+        actual_col = extract_col_from_scalar_wrapper(col_expr)
+        if actual_col == "*":
+            continue
+        if "." not in actual_col:
+            continue
+        table_name, col_name = actual_col.rsplit(".", 1)
+        if table_name not in schema.tables:
+            continue
+        col_meta = schema.tables[table_name].columns.get(col_name)
+        if not col_meta:
+            continue
+        vt = col_meta.value_type
+        numeric = vt in ("integer", "number")
+        temporal = vt == "date"
+        if func_lower in numeric_aggs and not numeric:
+            issues.append(
+                make_intent_issue(
+                    issue_id=f"invalid_order_by_agg_semantics_{func_lower}_{table_name}_{col_name}",
+                    category=FailureCategory.AGGREGATION_SEMANTICS,
+                    severity="error",
+                    message=f"Cannot {func_lower.upper()} on {actual_col} (type={col_meta.data_type}) in ORDER BY: {func_lower.upper()} requires numeric column",
+                    context={
+                        "aggregation": func_lower,
+                        "column": actual_col,
+                        "data_type": col_meta.data_type,
+                        "location": context,
+                    },
+                )
+            )
+            debug(f"[validation_schema.validate_order_by_agg_semantics] invalid {func_lower.upper()} on {actual_col}")
+        elif func_lower in {"min", "max"} and not numeric and not temporal:
+            col_role = col_meta.role if col_meta.role else None
+            if col_role == ColumnRole.FREE_TEXT.value:
+                issues.append(
+                    make_intent_issue(
+                        issue_id=f"questionable_order_by_agg_{func_lower}_{table_name}_{col_name}",
+                        category=FailureCategory.AGGREGATION_SEMANTICS,
+                        severity="warning",
+                        message=f"Questionable {func_lower.upper()} on {actual_col} (type={col_meta.data_type}) in ORDER BY: {func_lower.upper()} on free text is semantically meaningless",
+                        context={
+                            "aggregation": func_lower,
+                            "column": actual_col,
+                            "data_type": col_meta.data_type,
+                            "location": context,
+                        },
+                    )
+                )
+                debug(
+                    f"[validation_schema.validate_order_by_agg_semantics] questionable {func_lower.upper()} on {actual_col}"
+                )
+    if issues:
+        debug(f"[validation_schema.validate_order_by_agg_semantics] found {len(issues)} semantic issues")
+    else:
+        debug("[validation_schema.validate_order_by_agg_semantics] no semantic issues")
+    return issues
+
+
+def validate_scalar_func_type_semantics(
+    select_cols: list[SelectCol],
+    order_by_cols: list[OrderByCol],
+    schema: SchemaGraph,
+    context: str = "main",
+) -> list[IntentIssue]:
+    """Validate that scalar functions are appropriate for column types. and aggregation context. Errors when a non-aggregate-compatible scalar wraps an aggregation, or when a type-specific scalar (string, numeric, temporal) is applied to the wrong column type."""
+    issues = []
+
+    def check_scalar_semantics(
+        scalar_func: str, col_expr: str, agg_func: str | None, location: str
+    ) -> list[IntentIssue]:
+        """
+        Check scalar function semantics for one term.
+
+        Args:
+
+            scalar_func: Outer scalar function name.
+            col_expr: Column expression string.
+            agg_func: Inner aggregation function if present.
+            location: Location label for issues.
+
+        Returns:
+
+            List of `IntentIssue` objects for violations.
+        """
+        inner_issues = []
+        func_lower = scalar_func.lower()
+        if agg_func and func_lower not in SCALAR_FUNCTIONS_NUMERIC:
+            inner_issues.append(
+                make_intent_issue(
+                    issue_id=f"scalar_on_agg_invalid_{location}_{func_lower}",
+                    category=FailureCategory.SCALAR_SEMANTICS,
+                    severity="error",
+                    message=f"Scalar '{scalar_func}' cannot wrap aggregation '{agg_func.upper()}' in {location}. Only {sorted(SCALAR_FUNCTIONS_NUMERIC)} allowed on aggregates",
+                    context={
+                        "scalar": scalar_func,
+                        "aggregation": agg_func,
+                        "location": location,
+                        "allowed": sorted(SCALAR_FUNCTIONS_NUMERIC),
+                    },
+                )
+            )
+            return inner_issues
+        if agg_func:
+            return inner_issues
+        actual_col = extract_col_from_scalar_wrapper(col_expr)
+        if not actual_col or "." not in actual_col or actual_col == "*":
+            return inner_issues
+        table_name, col_name = actual_col.rsplit(".", 1)
+        if table_name not in schema.tables:
+            return inner_issues
+        col_meta = schema.tables[table_name].columns.get(col_name) or schema.tables[table_name].columns.get(
+            col_name.lower()
+        )
+        if not col_meta:
+            return inner_issues
+        vt = col_meta.value_type
+        string = vt == "string"
+        numeric = vt in ("integer", "number")
+        temporal = vt == "date"
+        if func_lower in SCALAR_FUNCTIONS_STRING and not string:
+            inner_issues.append(
+                make_intent_issue(
+                    issue_id=f"scalar_type_mismatch_{location}_{func_lower}_{actual_col}",
+                    category=FailureCategory.SCALAR_SEMANTICS,
+                    severity="error",
+                    message=f"Scalar '{scalar_func}' requires string column, got '{actual_col}' (type={col_meta.data_type}) in {location}",
+                    context={
+                        "scalar": scalar_func,
+                        "column": actual_col,
+                        "data_type": col_meta.data_type,
+                        "expected_type": "string",
+                        "location": location,
+                    },
+                )
+            )
+        elif func_lower in SCALAR_FUNCTIONS_NUMERIC and not numeric:
+            inner_issues.append(
+                make_intent_issue(
+                    issue_id=f"scalar_type_mismatch_{location}_{func_lower}_{actual_col}",
+                    category=FailureCategory.SCALAR_SEMANTICS,
+                    severity="error",
+                    message=f"Scalar '{scalar_func}' requires numeric column, got '{actual_col}' (type={col_meta.data_type}) in {location}",
+                    context={
+                        "scalar": scalar_func,
+                        "column": actual_col,
+                        "data_type": col_meta.data_type,
+                        "expected_type": "numeric",
+                        "location": location,
+                    },
+                )
+            )
+        elif func_lower in SCALAR_FUNCTIONS_TEMPORAL and not temporal:
+            inner_issues.append(
+                make_intent_issue(
+                    issue_id=f"scalar_type_mismatch_{location}_{func_lower}_{actual_col}",
+                    category=FailureCategory.SCALAR_SEMANTICS,
+                    severity="error",
+                    message=f"Scalar '{scalar_func}' requires temporal column, got '{actual_col}' (type={col_meta.data_type}) in {location}",
+                    context={
+                        "scalar": scalar_func,
+                        "column": actual_col,
+                        "data_type": col_meta.data_type,
+                        "expected_type": "date/timestamp",
+                        "location": location,
+                    },
+                )
+            )
+        return inner_issues
+
+    for idx, sc in enumerate(select_cols or []):
+        sc_scalar, sc_agg = extract_functions_from_term(sc.expr.primary_term)
+        if sc_scalar:
+            issues.extend(check_scalar_semantics(sc_scalar, sc.expr.primary_column, sc_agg, f"select_cols[{idx}]"))
+    for idx, obc in enumerate(order_by_cols or []):
+        obc_scalar, obc_agg = extract_functions_from_term(obc.expr.primary_term)
+        if obc_scalar:
+            issues.extend(
+                check_scalar_semantics(
+                    obc_scalar,
+                    obc.expr.primary_column,
+                    obc_agg,
+                    f"order_by_cols[{idx}]",
+                )
+            )
+    if issues:
+        debug(
+            f"[validation_schema.validate_scalar_func_type_semantics] found {len(issues)} semantic issues in {context}"
+        )
+    else:
+        debug(f"[validation_schema.validate_scalar_func_type_semantics] no semantic issues in {context}")
+    return issues
+
+
+def validate_column_types(
+    select_cols: list[SelectCol],
+    schema: SchemaGraph,
+    context: str = "main",
+) -> list[IntentIssue]:
+    """Validate that operations match their column types (heuristic. checks). Warns for numeric aggregations on text columns, date operations on non-date columns, and string operations on numeric columns."""
+    issues = []
+    debug("[validation_schema.validate_column_types] checking type consistency")
+    numeric_aggs = {"sum", "avg", "average", "total", "mean"}
+    date_ops = {"latest", "earliest", "recent", "oldest", "newest", "before", "after"}
+    string_ops = {"contains", "starts", "ends", "like", "match"}
+    for sc in select_cols:
+        _, agg_func = extract_functions_from_term(sc.expr.primary_term)
+        if not agg_func:
+            continue
+        func_lower = agg_func
+        col_expr = sc.expr.primary_column
+        if not col_expr:
+            continue
+        actual_col = extract_col_from_scalar_wrapper(col_expr)
+        if "." not in actual_col:
+            continue
+        table_name, col_name = actual_col.rsplit(".", 1)
+        if table_name not in schema.tables:
+            continue
+        table_meta = schema.tables[table_name]
+        col_meta = table_meta.columns.get(col_name) or table_meta.columns.get(col_name.lower())
+        if not col_meta:
+            continue
+        vt = col_meta.value_type
+        if vt:
+            numeric = vt in ("integer", "number")
+            date = vt == "date"
+            text = vt == "string"
+        else:
+            numeric = any(
+                hint in col_name.lower()
+                for hint in [
+                    "amount",
+                    "price",
+                    "total",
+                    "count",
+                    "qty",
+                    "quantity",
+                    "rate",
+                    "cost",
+                    "num",
+                ]
+            )
+            date = any(
+                hint in col_name.lower()
+                for hint in [
+                    "date",
+                    "time",
+                    "created",
+                    "updated",
+                    "at",
+                    "day",
+                    "year",
+                    "month",
+                ]
+            )
+            text = any(
+                hint in col_name.lower() for hint in ["name", "title", "description", "email", "address", "text"]
+            )
+        if func_lower in numeric_aggs and text and not numeric:
+            issues.append(
+                make_intent_issue(
+                    issue_id=f"numeric_on_text_{table_name}_{col_name}",
+                    category=FailureCategory.TYPE_MISMATCH,
+                    severity="warning",
+                    message=f"Attempting numeric aggregation ({func_lower}) on text column '{col_name}' (type: {col_meta.data_type})",
+                    context={
+                        "table": table_name,
+                        "column": col_name,
+                        "type": col_meta.data_type,
+                        "agg": func_lower,
+                        "location": context,
+                    },
+                )
+            )
+            debug("[validation_schema.validate_column_types] type_mismatch: numeric_on_text")
+        if func_lower in date_ops and not date:
+            issues.append(
+                make_intent_issue(
+                    issue_id=f"date_on_non_date_{table_name}_{col_name}",
+                    category=FailureCategory.TYPE_MISMATCH,
+                    severity="warning",
+                    message=f"Attempting date operation ({func_lower}) on non-date column '{col_name}' (type: {col_meta.data_type})",
+                    context={
+                        "table": table_name,
+                        "column": col_name,
+                        "type": col_meta.data_type,
+                        "op": func_lower,
+                        "location": context,
+                    },
+                )
+            )
+            debug("[validation_schema.validate_column_types] type_mismatch: date_on_non_date")
+        if func_lower in string_ops and numeric and "_id" not in col_name.lower():
+            issues.append(
+                make_intent_issue(
+                    issue_id=f"string_on_numeric_{table_name}_{col_name}",
+                    category=FailureCategory.TYPE_MISMATCH,
+                    severity="warning",
+                    message=f"Attempting string operation ({func_lower}) on numeric column '{col_name}' (type: {col_meta.data_type})",
+                    context={
+                        "table": table_name,
+                        "column": col_name,
+                        "type": col_meta.data_type,
+                        "op": func_lower,
+                        "location": context,
+                    },
+                )
+            )
+            debug("[validation_schema.validate_column_types] TYPE MISMATCH: string op on numeric column")
+    if issues:
+        debug(f"[validation_schema.validate_column_types] FAILED with {len(issues)} issues")
+    else:
+        debug("[validation_schema.validate_column_types] PASSED")
+    return issues
+
+
+def validate_scalar_expression_semantics(
+    select_cols: list[SelectCol],
+    schema: SchemaGraph,
+    context: str = "main",
+) -> list[IntentIssue]:
+    """Validate that scalar functions are applied to semantically. appropriate column types."""
+    issues = []
+    debug("[validation_semantic.validate_scalar_expression_semantics] checking scalar semantics")
+    numeric_scalars = {"abs", "round", "ceil", "floor", "sqrt"}
+    string_scalars = {"upper", "lower", "trim", "ltrim", "rtrim", "length"}
+    for sc in select_cols:
+        outer_func, _, _ = extract_agg_col(sc.expr.primary_term)
+        if not outer_func or outer_func in VALID_AGGREGATION_FUNCTIONS:
+            continue
+        func_lower = outer_func
+        col_type = get_col_type(sc.expr.primary_column, schema, {})
+        if col_type:
+            numeric = col_type in ("integer", "number")
+            text = col_type == "string"
+            if func_lower in numeric_scalars and not numeric and not sc.is_aggregated:
+                issues.append(
+                    make_intent_issue(
+                        issue_id=f"numeric_scalar_on_non_numeric_{sc.expr.primary_column}_{func_lower}",
+                        category=FailureCategory.SCALAR_SEMANTIC,
+                        severity="warning",
+                        message=f"Numeric scalar '{func_lower}' on non-numeric column '{sc.expr.primary_column}' (type: {col_type})",
+                        context={
+                            "column": sc.expr.primary_column,
+                            "scalar": func_lower,
+                            "type": col_type,
+                            "location": context,
+                        },
+                    )
+                )
+            if func_lower in string_scalars and not text:
+                issues.append(
+                    make_intent_issue(
+                        issue_id=f"string_scalar_on_non_string_{sc.expr.primary_column}_{func_lower}",
+                        category=FailureCategory.SCALAR_SEMANTIC,
+                        severity="warning",
+                        message=f"String scalar '{func_lower}' on non-string column '{sc.expr.primary_column}' (type: {col_type})",
+                        context={
+                            "column": sc.expr.primary_column,
+                            "scalar": func_lower,
+                            "type": col_type,
+                            "location": context,
+                        },
+                    )
+                )
+    debug(f"[validation_semantic.validate_scalar_expression_semantics] {len(issues)} issues in {context}")
+    return issues
+
+
+def validate_temporal_columns(
+    select_cols: list[SelectCol],
+    schema: SchemaGraph,
+    context: str = "main",
+) -> list[IntentIssue]:
+    """Validate temporal aggregates against date-type columns in the. intent."""
+    issues = []
+    temporal_ops = {"latest", "recent", "last", "first", "earliest", "oldest", "newest"}
+    agg_funcs: set[str] = set()
+    for sc in select_cols:
+        if not sc.is_aggregated:
+            continue
+        fn, _, _ = extract_agg_col(sc.expr.primary_term)
+        if fn:
+            agg_funcs.add(fn)
+    if not (agg_funcs & temporal_ops):
+        return []
+    debug("[validation_semantic.validate_temporal_columns] checking temporal column presence")
+    has_date_column = False
+    for sc in select_cols:
+        col_expr = sc.expr.primary_column
+        if not col_expr:
+            continue
+        actual_col = extract_col_from_scalar_wrapper(col_expr)
+        if "." not in actual_col:
+            continue
+        table_name, col_name = actual_col.rsplit(".", 1)
+        if table_name in schema.tables:
+            col_meta = schema.tables[table_name].columns.get(col_name)
+            if col_meta:
+                if col_meta.value_type == "date":
+                    has_date_column = True
+                    break
+        if any(hint in col_name.lower() for hint in ["date", "time", "created", "updated", "at"]):
+            has_date_column = True
+            break
+    if not has_date_column:
+        issues.append(
+            make_intent_issue(
+                issue_id=f"temporal_no_date_col_{','.join(sorted(agg_funcs & temporal_ops))}",
+                category=FailureCategory.MISSING_TEMPORAL_COLUMN,
+                severity="warning",
+                message=f"Intent uses temporal operation ({agg_funcs & temporal_ops}) but no date/time column identified",
+                context={
+                    "temporal_ops": list(agg_funcs & temporal_ops),
+                    "location": context,
+                },
+            )
+        )
+        debug("[validation_semantic.validate_temporal_columns] AMBIGUITY: temporal ops but no date column")
+    return issues
+
+
+def validate_pk_fk_aggregation(
+    select_cols: list[SelectCol],
+    schema: SchemaGraph,
+    context: str = "main",
+) -> list[IntentIssue]:
+    """Validate that primary-key and foreign-key columns are not. aggregated with SUM or AVG."""
+    issues = []
+    suspicious_aggs = {"sum", "avg"}
+    debug("[validation_semantic.validate_pk_fk_aggregation] checking PK/FK aggregation")
+    for sc in select_cols:
+        if not sc.is_aggregated:
+            continue
+        func_lower, _, _ = extract_agg_col(sc.expr.primary_term)
+        if not func_lower or func_lower not in suspicious_aggs:
+            continue
+        col_expr = sc.expr.primary_column
+        if not col_expr:
+            continue
+        actual_col = extract_col_from_scalar_wrapper(col_expr)
+        if "." not in actual_col:
+            continue
+        table_name, col_name = actual_col.rsplit(".", 1)
+        if table_name not in schema.tables:
+            continue
+        col_meta = schema.tables[table_name].columns.get(col_name)
+        if col_meta and (col_meta.is_primary_key or col_meta.is_foreign_key):
+            issues.append(
+                make_intent_issue(
+                    issue_id=f"agg_on_pk_fk_{table_name}_{col_name}_{func_lower}",
+                    category=FailureCategory.AGGREGATION_SEMANTICS,
+                    severity="warning",
+                    message=f"{func_lower.upper()} on PK/FK column {actual_col} is suspicious",
+                    context={
+                        "table": table_name,
+                        "column": col_name,
+                        "agg": func_lower,
+                        "location": context,
+                    },
+                )
+            )
+            debug(f"[validation_semantic.validate_pk_fk_aggregation] {func_lower.upper()} on PK/FK: {actual_col}")
+    return issues

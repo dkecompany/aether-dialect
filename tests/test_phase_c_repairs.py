@@ -1,16 +1,15 @@
 """Tests for symmetric table sanitization and deny-column bare-select checks."""
 
-from aetherdialect._contracts_base import (
-    ColumnMetadata,
-    FailureCategory,
-    SchemaGraph,
-    TableMetadata,
-)
+from aetherdialect._contracts_base import FailureCategory, NormalizedExpr
 from aetherdialect._contracts_core import (
-    NormalizedExpr,
     RuntimeCteStep,
     RuntimeIntent,
     SelectCol,
+)
+from aetherdialect._contracts_schema import (
+    ColumnMetadata,
+    SchemaGraph,
+    TableMetadata,
 )
 from aetherdialect._intent_repair import sanitize_table_names
 from aetherdialect._validation_semantic import (
@@ -135,9 +134,8 @@ def test_tier2_numeric_coverage_short_circuits_on_empty_nl() -> None:
     )
 
 
-def test_runtime_and_cte_step_match_query_body_protocol_fields() -> None:
-    """Structural fields required by ``QueryBody`` exist on runtime models."""
-
+def test_runtime_and_cte_step_share_query_body_field_parity() -> None:
+    """Runtime intent and CTE step expose the same structural body fields."""
     ri = RuntimeIntent(
         tables=["t"],
         grain="row_level",

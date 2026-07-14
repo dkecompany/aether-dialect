@@ -7,25 +7,16 @@ from unittest.mock import patch
 
 import pytest
 
-from aetherdialect._config import MAX_NON_AGG_COL_DIFF, VALID_HAVING_OPS, GenerationPath
+from aetherdialect._constants import MAX_NON_AGG_COL_DIFF, VALID_HAVING_OPS, GenerationPath
 from aetherdialect._contracts_base import (
-    ColumnMetadata,
     FailureCategory,
-    IntentIssue,
-    SchemaGraph,
-    SQLShape,
-    TableMetadata,
-    TemplateStats,
-)
-from aetherdialect._contracts_core import (
-    CaseRegistryStep,
-    CaseWhenBranch,
-    CaseWhenExpr,
-    ConcreteIntent,
     FilterParam,
     HavingParam,
     NormalizedExpr,
     OrderByCol,
+)
+from aetherdialect._contracts_core import (
+    ConcreteIntent,
     RuntimeCteStep,
     RuntimeIntent,
     SelectCol,
@@ -34,45 +25,59 @@ from aetherdialect._contracts_core import (
     concrete_intent_to_runtime_skeleton,
     runtime_intent_to_concrete,
 )
+from aetherdialect._contracts_schema import (
+    CaseRegistryStep,
+    CaseWhenBranch,
+    CaseWhenExpr,
+    ColumnMetadata,
+    IntentIssue,
+    SchemaGraph,
+    SQLShape,
+    TableMetadata,
+    TemplateStats,
+    WindowRegistryStep,
+    WindowSpec,
+)
 from aetherdialect._core_utils import stable_json
-from aetherdialect._intent_process import (
-    INTENT_CRITICAL_RULES,
-    INTENT_FORMAT_REPAIR_JSON_RULES,
-    INTENT_PARSE_RULES_APPEND,
-    _apply_post_processing,
+from aetherdialect._intent_expr import (
     _base_similarity,
-    _build_intent_format_repair_prompt,
-    _build_intent_parse_prompt,
-    _build_intent_semantic_repair_prompt,
-    _classify_schema_error,
-    _compute_error_signature_issues,
-    _compute_error_signature_strings,
     _compute_filters_similarity,
     _compute_having_similarity,
     _compute_order_by_cols_similarity,
     _compute_select_cols_similarity,
     _cte_step_similarity,
+    _jaccard,
+    intent_similarity,
+    logical_intent_from_parsed,
+)
+from aetherdialect._intent_process import (
+    INTENT_CRITICAL_RULES,
+    INTENT_FORMAT_REPAIR_JSON_RULES,
+    INTENT_PARSE_RULES_APPEND,
+    _apply_post_processing,
+    _compute_error_signature_issues,
+    _compute_error_signature_strings,
     _detect_oscillation,
     _diff_cols_span_disjoint_tables,
     _format_repair_loop,
-    _invoke_intent_parse_with_hints,
-    _jaccard,
-    _logical_intent_to_serialisable,
     _normalize_cte_output_aliases,
-    _phase_g_post_validation_passes,
-    _resolve_repair_instruction,
+    _post_processing_revalidation_passes,
     _runtime_intent_case_registry_has_empty_branches,
     _structural_body_matches,
-    _summarize_intent_changes,
     _union_family_index_from_templates,
     apply_runtime_post_processing_lite,
+    build_intent_format_repair_prompt,
+    build_intent_parse_prompt,
+    build_intent_semantic_repair_prompt,
+    classify_schema_error,
     collect_structural_match_templates,
     find_trusted_template_match,
-    intent_similarity,
-    logical_intent_from_parsed,
+    invoke_intent_parse_with_hints,
+    logical_intent_to_serialisable,
     match_template_for_union,
     reconcile_union_family_after_mutation,
     reconcile_union_family_body_join_after_mutation,
+    resolve_repair_instruction,
     resolve_sql_path,
     select_col_diff,
     structural_compare,
@@ -81,6 +86,7 @@ from aetherdialect._intent_process import (
 )
 from aetherdialect._intent_resolve import (
     UnionSelectColumnDelta,
+    check_qualified_refs_exist,
     classify_union_merge_case,
     compute_intent_union,
     join_path_key_concrete,
@@ -202,7 +208,7 @@ class TestBuildIntentSemanticRepairPrompt:
             severity="error",
             message="missing table",
         )
-        result = _build_intent_semantic_repair_prompt("test q", '{"tables":[]}', [issue], [], "schema text")
+        result = build_intent_semantic_repair_prompt("test q", '{"tables":[]}', [issue], [], "schema text")
         assert isinstance(result, str)
 
     def test_contains_question(self):
@@ -213,7 +219,7 @@ class TestBuildIntentSemanticRepairPrompt:
             severity="error",
             message="missing",
         )
-        result = _build_intent_semantic_repair_prompt("my question", "{}", [issue], [], "schema")
+        result = build_intent_semantic_repair_prompt("my question", "{}", [issue], [], "schema")
         assert "my question" in result
 
     def test_contains_issue_message(self):
@@ -224,7 +230,7 @@ class TestBuildIntentSemanticRepairPrompt:
             severity="warning",
             message="bad column",
         )
-        result = _build_intent_semantic_repair_prompt("q", "{}", [], [issue], "schema")
+        result = build_intent_semantic_repair_prompt("q", "{}", [], [issue], "schema")
         assert "bad column" in result
 
     def test_multiple_issues(self):
@@ -243,7 +249,7 @@ class TestBuildIntentSemanticRepairPrompt:
                 message="issue2",
             ),
         ]
-        result = _build_intent_semantic_repair_prompt("q", "{}", [issues[0]], [issues[1]], "schema")
+        result = build_intent_semantic_repair_prompt("q", "{}", [issues[0]], [issues[1]], "schema")
         assert "issue1" in result
         assert "issue2" in result
 
@@ -253,28 +259,28 @@ class TestBuildIntentFormatRepairPrompt:
 
     def test_returns_string(self):
         """build_intent_format_repair_prompt returns a string."""
-        result = _build_intent_format_repair_prompt("q", "bad json", "expected }")
+        result = build_intent_format_repair_prompt("q", "bad json", "expected }")
         assert isinstance(result, str)
 
     def test_contains_parse_error(self):
         """build_intent_format_repair_prompt includes parse error."""
-        result = _build_intent_format_repair_prompt("q", "raw", "missing bracket")
+        result = build_intent_format_repair_prompt("q", "raw", "missing bracket")
         assert "missing bracket" in result
 
     def test_includes_full_response(self):
         """build_intent_format_repair_prompt includes full raw response."""
         long_raw = "x" * 5000
-        result = _build_intent_format_repair_prompt("q", long_raw, "err")
+        result = build_intent_format_repair_prompt("q", long_raw, "err")
         assert "x" * 5000 in result
 
     def test_includes_instructional_placeholder_mapping(self):
         """Format-repair payload uses SSOT field_specifications and output_format."""
-        result = _build_intent_format_repair_prompt("q", "{}", "err")
+        result = build_intent_format_repair_prompt("q", "{}", "err")
         assert "field_specifications" in result
         assert "output_format" in result
 
     def test_instructions_concat_json_rules_and_critical_rules(self):
-        result = _build_intent_format_repair_prompt("q", "{}", "err")
+        result = build_intent_format_repair_prompt("q", "{}", "err")
         data = json.loads(result)
         assert data["instructions"] == list(INTENT_FORMAT_REPAIR_JSON_RULES) + list(INTENT_CRITICAL_RULES)
 
@@ -284,7 +290,6 @@ class TestFormatRepairLoop:
 
     def test_no_llm_when_parse_clean(self):
         """Valid JSON without instructional placeholders skips repair calls."""
-
         raw = json.dumps(
             {
                 "tables": ["film"],
@@ -300,7 +305,6 @@ class TestFormatRepairLoop:
 
     def test_llm_round_when_instructional_placeholder_in_expr(self):
         """Parsed intent with table_N in expr triggers one format-repair LLM call."""
-
         bad = json.dumps(
             {
                 "tables": ["film"],
@@ -718,37 +722,37 @@ class TestComputeHavingSimilarity:
 
 
 class TestBuildIntentParsePrompt:
-    """Tests for _build_intent_parse_prompt."""
+    """Tests for build_intent_parse_prompt."""
 
     def test_returns_tuple_of_strings(self):
         """Returns (system_message, user_message) tuple."""
-        system, user = _build_intent_parse_prompt("how many orders?", "schema text here", ["orders", "customers"])
+        system, user = build_intent_parse_prompt("how many orders?", "schema text here", ["orders", "customers"])
         assert isinstance(system, str)
         assert isinstance(user, str)
 
     def test_system_contains_parser_role(self):
         """System message contains parser role description."""
-        system, _ = _build_intent_parse_prompt("q", "schema", ["orders"])
+        system, _ = build_intent_parse_prompt("q", "schema", ["orders"])
         assert "parser" in system.lower() or "json" in system.lower()
 
     def test_user_contains_table_list(self):
         """User message contains the allowed tables."""
-        _, user = _build_intent_parse_prompt("q", "schema", ["orders", "customers"])
+        _, user = build_intent_parse_prompt("q", "schema", ["orders", "customers"])
         assert "orders" in user
         assert "customers" in user
 
     def test_user_contains_question(self):
         """User message contains the question (embedded in the JSON task payload)."""
-        _, user = _build_intent_parse_prompt("total revenue by customer", "schema", ["orders"])
+        _, user = build_intent_parse_prompt("total revenue by customer", "schema", ["orders"])
         assert "total revenue" in user or "task" in user.lower()
 
     def test_rules_use_canonical_critical_rules_plus_parse_suffix(self):
-        _, user = _build_intent_parse_prompt("q", "schema", ["orders"])
+        _, user = build_intent_parse_prompt("q", "schema", ["orders"])
         data = json.loads(user)
         assert data["rules"] == list(INTENT_CRITICAL_RULES) + list(INTENT_PARSE_RULES_APPEND)
 
     def test_rules_include_flat_or_of_and_filters_param_example(self):
-        _, user = _build_intent_parse_prompt("q", "schema", ["orders"])
+        _, user = build_intent_parse_prompt("q", "schema", ["orders"])
         data = json.loads(user)
         joined = "\n".join(data["rules"])
         compact = joined.replace(" ", "")
@@ -761,25 +765,52 @@ class TestBuildIntentParsePrompt:
         assert "Do not nest filter_group as an array" in joined
 
     def test_operator_reference_having_ops_match_valid_having_ops(self):
-        _, user = _build_intent_parse_prompt("q", "schema", ["t"])
+        _, user = build_intent_parse_prompt("q", "schema", ["t"])
         data = json.loads(user)
         assert data["operator_reference"]["having_ops"] == sorted(VALID_HAVING_OPS)
 
 
 class TestPlannerSingleOutputWindowRule:
-    """Planner Stage-A decomposition includes the no-CTE-for-single-window rule (WF-009)."""
+    """Planner Stage-A decomposition includes the no-CTE-for-single- window rule (WF-009)."""
 
     def test_logical_decomposition_guidance_contains_rule(self):
-        from aetherdialect._intent_process import (
-            _LOGICAL_DECOMPOSITION_GUIDANCE,
+        from aetherdialect._constants import (
+            LOGICAL_DECOMPOSITION_GUIDANCE,
+            PLANNER_CARDINALITY_RELATIONSHIP_RULE,
+            PLANNER_SHARED_PK_TABLE_SCOPE_RULE,
             PLANNER_SINGLE_OUTPUT_WINDOW_NO_CTE_RULE,
-            _build_intent_logical_prompt,
         )
+        from aetherdialect._contracts_core import InterpretPlan
+        from aetherdialect._intent_process import build_intent_ground_prompt
 
-        guidance = stable_json(list(_LOGICAL_DECOMPOSITION_GUIDANCE))
+        guidance = stable_json(list(LOGICAL_DECOMPOSITION_GUIDANCE))
         q = "list rentals with rental id and next rental date for the same inventory item ordered by rental date"
-        payload = _build_intent_logical_prompt(q, "{}", "", guidance, (), ())
+        plan = InterpretPlan(approach="list entity rows with ordering", tables=("tbl_a",))
+        payload = build_intent_ground_prompt(q, plan, "{}", "", guidance, (), ())
         assert PLANNER_SINGLE_OUTPUT_WINDOW_NO_CTE_RULE in payload
+        assert PLANNER_CARDINALITY_RELATIONSHIP_RULE in payload
+        assert PLANNER_SHARED_PK_TABLE_SCOPE_RULE in payload
+
+    def test_ground_prompt_receives_full_interpret_projection(self):
+        from aetherdialect._contracts_core import InterpretPlan
+        from aetherdialect._intent_process import build_intent_ground_prompt
+
+        plan = InterpretPlan(
+            approach="count grouped rows",
+            tables=("tbl_a", "tbl_b"),
+            grounding=(("tbl_a.status", "status filter"), ("tbl_b.amount", "measure binding")),
+            schema_invalid=True,
+            missing="ambiguous time column",
+        )
+        payload = json.loads(build_intent_ground_prompt("q", plan, "{}", "", "[]", (), ()))
+        assert payload["interpret_plan"]["approach"] == "count grouped rows"
+        assert payload["interpret_plan"]["tables"] == ["tbl_a", "tbl_b"]
+        assert payload["interpret_plan"]["grounding"] == [
+            {"ref": "tbl_a.status", "used_for": "status filter"},
+            {"ref": "tbl_b.amount", "used_for": "measure binding"},
+        ]
+        assert payload["interpret_plan"]["schema_invalid"] is True
+        assert payload["interpret_plan"]["missing"] == "ambiguous time column"
 
 
 class TestFindTrustedTemplateMatch:
@@ -855,22 +886,22 @@ class TestFindTrustedTemplateMatch:
 
 
 class TestClassifySchemaError:
-    """Tests for _classify_schema_error."""
+    """Tests for classify_schema_error."""
 
     def test_unknown_table(self):
-        assert _classify_schema_error("Unknown table: payment") == FailureCategory.UNKNOWN_TABLE
+        assert classify_schema_error("Unknown table: payment") == FailureCategory.UNKNOWN_TABLE
 
     def test_unknown_column(self):
-        assert _classify_schema_error("Unknown select column: film.revenue") == FailureCategory.UNKNOWN_COLUMN
+        assert classify_schema_error("Unknown select column: film.revenue") == FailureCategory.UNKNOWN_COLUMN
 
     def test_fallback(self):
-        assert _classify_schema_error("Some other error") == FailureCategory.SCHEMA_VALIDATION
+        assert classify_schema_error("Some other error") == FailureCategory.SCHEMA_VALIDATION
 
     def test_unknown_table_case_insensitive(self):
-        assert _classify_schema_error("UNKNOWN TABLE: foo") == FailureCategory.UNKNOWN_TABLE
+        assert classify_schema_error("UNKNOWN TABLE: foo") == FailureCategory.UNKNOWN_TABLE
 
     def test_unknown_column_varied_phrasing(self):
-        assert _classify_schema_error("Unknown filter column: x.y") == FailureCategory.UNKNOWN_COLUMN
+        assert classify_schema_error("Unknown filter column: x.y") == FailureCategory.UNKNOWN_COLUMN
 
 
 class TestComputeErrorSignatureIssues:
@@ -970,7 +1001,7 @@ class TestSemanticRepairPromptCriticalRules:
             severity="error",
             message="missing table",
         )
-        result = _build_intent_semantic_repair_prompt("test q", '{"tables":[]}', [issue], [], "schema text")
+        result = build_intent_semantic_repair_prompt("test q", '{"tables":[]}', [issue], [], "schema text")
         assert "critical_rules" in result
         assert "having_param" in result
         assert "window_registry" in result
@@ -1587,7 +1618,7 @@ class TestStructuralCompareVsUnionTemplateCompatibility:
 
 
 class TestResolveRepairInstruction:
-    """Tests for _resolve_repair_instruction."""
+    """Tests for resolve_repair_instruction."""
 
     def test_known_category_uses_mapping(self):
         issue = IntentIssue(
@@ -1596,7 +1627,7 @@ class TestResolveRepairInstruction:
             severity="error",
             message="raw message",
         )
-        assert "schema" in _resolve_repair_instruction(issue).lower()
+        assert "schema" in resolve_repair_instruction(issue).lower()
 
     def test_unknown_category_falls_back_to_message(self):
         issue = IntentIssue(
@@ -1605,21 +1636,7 @@ class TestResolveRepairInstruction:
             severity="error",
             message="only this text",
         )
-        assert _resolve_repair_instruction(issue) == "only this text"
-
-
-class TestSummarizeIntentChanges:
-    """Tests for _summarize_intent_changes."""
-
-    def test_no_changes(self):
-        ri = _runtime(["t"], [_col("t", "a")])
-        assert _summarize_intent_changes(ri, ri) == "no_changes"
-
-    def test_reports_changed_top_level_fields(self):
-        a = _runtime(["t"], [_col("t", "a")])
-        b = replace(a, grain="grouped")
-        summary = _summarize_intent_changes(a, b)
-        assert "grain" in summary
+        assert resolve_repair_instruction(issue) == "only this text"
 
 
 class TestNormalizeCteOutputAliases:
@@ -1665,6 +1682,74 @@ class TestNormalizeCteOutputAliases:
         out = _normalize_cte_output_aliases(intent, sg)
         assert out.cte_steps[0].output_columns == ["film_id"]
         assert out.select_cols[0].expr.primary_column == "sq.film_id"
+
+    def test_window_registry_outputs_and_qualified_refs(self):
+        """SB-004: index-aligned output_columns remap resolves qualified CTE refs."""
+        film = TableMetadata(
+            name="film",
+            columns={
+                "item_id": ColumnMetadata(name="item_id", data_type="integer", role="identifier"),
+                "category_id": ColumnMetadata(name="category_id", data_type="integer", role="identifier"),
+            },
+            primary_key=["item_id"],
+            foreign_keys=[],
+        )
+        category = TableMetadata(
+            name="category",
+            columns={
+                "category_id": ColumnMetadata(name="category_id", data_type="integer", role="identifier"),
+            },
+            primary_key=["category_id"],
+            foreign_keys=[],
+        )
+        sg = SchemaGraph(
+            tables={"film": film, "category": category}, join_paths_multi={}, effective_structural_hash="h"
+        )
+        cte = RuntimeCteStep(
+            cte_name="cte1",
+            tables=["category", "film"],
+            select_cols=[
+                SelectCol(expr=NormalizedExpr.from_column("category.category_id")),
+                SelectCol(expr=NormalizedExpr.from_agg("count", "film.item_id")),
+                SelectCol(expr=NormalizedExpr.from_column("w01")),
+            ],
+            output_columns=["category_id", "film_count", "avg_films_per_category"],
+            window_registry=[
+                WindowRegistryStep(
+                    registry_id="w01",
+                    window_spec=WindowSpec(
+                        function="avg",
+                        argument=NormalizedExpr.from_agg("count", "film.item_id"),
+                        partition_by=[NormalizedExpr.from_column("category.category_id")],
+                    ),
+                )
+            ],
+        )
+        intent = RuntimeIntent(
+            tables=["cte1"],
+            grain="row_level",
+            select_cols=[SelectCol(expr=NormalizedExpr.from_column("cte1.category_id"))],
+            group_by_cols=[],
+            order_by_cols=[],
+            filters_param=[
+                FilterParam(
+                    left_expr=NormalizedExpr.from_column("cte1.film_count"),
+                    op="<",
+                    right_expr=NormalizedExpr.from_column("cte1.avg_films_per_category"),
+                )
+            ],
+            cte_steps=[cte],
+        )
+        out = _normalize_cte_output_aliases(intent, sg)
+        _, errors = check_qualified_refs_exist(out, sg)
+        assert errors == []
+        assert out.cte_steps[0].output_columns == [
+            "category_id",
+            "count_item_id",
+            "avg_films_per_category",
+        ]
+        assert out.filters_param[0].left_expr.primary_term == "cte1.count_item_id"
+        assert out.filters_param[0].right_expr.primary_term == "cte1.avg_films_per_category"
 
 
 class TestJoinPathKeys:
@@ -1831,7 +1916,7 @@ class TestReconcileUnionFamilies:
 
 
 class TestPhaseGPostValidation:
-    """Tests for _phase_g_post_validation_passes."""
+    """Tests for _post_processing_revalidation_passes."""
 
     @staticmethod
     def _minimal_schema() -> SchemaGraph:
@@ -1859,11 +1944,11 @@ class TestPhaseGPostValidation:
         )
 
     def test_passes_when_schema_and_semantics_clean(self):
-        assert _phase_g_post_validation_passes(self._valid_intent(), self._minimal_schema()) is True
+        assert _post_processing_revalidation_passes(self._valid_intent(), self._minimal_schema()) is True
 
     def test_fails_on_schema_error(self):
         intent = replace(self._valid_intent(), tables=["does_not_exist"])
-        assert _phase_g_post_validation_passes(intent, self._minimal_schema()) is False
+        assert _post_processing_revalidation_passes(intent, self._minimal_schema()) is False
 
 
 class TestApplyPostProcessingMissingParams:
@@ -1929,7 +2014,7 @@ class TestFormatRepairLoopEdgeCases:
 
 
 class TestBuildIntentParsePromptHintsAndEngineOps:
-    """Edge cases for _build_intent_parse_prompt."""
+    """Edge cases for build_intent_parse_prompt."""
 
     def test_prior_question_feedback_embedded_in_user_json(self):
         rows = [
@@ -1950,7 +2035,7 @@ class TestBuildIntentParsePromptHintsAndEngineOps:
                 "is_post_restart": "False",
             },
         ]
-        _, user = _build_intent_parse_prompt(
+        _, user = build_intent_parse_prompt(
             "q",
             "schema",
             ["t1"],
@@ -1963,7 +2048,7 @@ class TestBuildIntentParsePromptHintsAndEngineOps:
         from aetherdialect._config import EngineConfig
 
         with patch.object(EngineConfig, "TYPE", "postgresql"):
-            _, user = _build_intent_parse_prompt("q", "schema", ["t"])
+            _, user = build_intent_parse_prompt("q", "schema", ["t"])
         assert "ilike" in user
 
 
@@ -2196,10 +2281,10 @@ class TestFindTrustedTemplateMatchUnionFamilyIntentKey:
 
 
 class TestClassifySchemaErrorEdge:
-    """Boundary cases for _classify_schema_error."""
+    """Boundary cases for classify_schema_error."""
 
     def test_unknown_without_column_word_is_fallback(self):
-        assert _classify_schema_error("Something unknown happened") == "schema_validation"
+        assert classify_schema_error("Something unknown happened") == "schema_validation"
 
 
 class TestIntentSimilarityThreeCtes:
@@ -2297,9 +2382,9 @@ class TestInvokeIntentParseWithHints:
             sg: SchemaGraph,
             max_retries: int = 3,
             **kwargs: Any,
-        ) -> tuple[None, list[str], int]:
+        ) -> tuple[None, list[str], int, None]:
             captured.update(kwargs)
-            return None, [], 1
+            return None, [], 1, None
 
         seed = [
             {
@@ -2315,7 +2400,7 @@ class TestInvokeIntentParseWithHints:
             "aetherdialect._intent_process.full_intent_parse",
             side_effect=_stub_full_parse,
         ):
-            _invoke_intent_parse_with_hints(
+            invoke_intent_parse_with_hints(
                 "q norm",
                 schema_graph,
                 store={},
@@ -2394,7 +2479,8 @@ class TestLogicalIntentNlRoundTrip:
         assert li.tables == ("orders",)
         assert li.select == "tier label from c0"
         assert "c0" in li.case
-        assert _logical_intent_to_serialisable(li)["case"] == raw["case"]
+        out = logical_intent_to_serialisable(li)
+        assert out["case"] == raw["case"]
 
 
 class TestApplyPostProcessingIdempotence:
@@ -2528,3 +2614,67 @@ class TestAlignRuntimeTablesToPlanner:
         )
         out = _align_runtime_tables_to_planner(runtime, logical)
         assert out.cte_steps[0].tables == ["only"]
+
+
+class TestSchemaInvalidContinuesPipeline:
+    """Interpret schema_invalid must not skip Ground or Compose."""
+
+    def test_full_intent_parse_calls_ground_when_schema_invalid(self, schema_graph: SchemaGraph):
+        from aetherdialect._intent_process import full_intent_parse
+
+        llm_calls = {"count": 0}
+
+        def _fake_llm(system: str, user: str, **kwargs: Any) -> str:
+            llm_calls["count"] += 1
+            if llm_calls["count"] == 1:
+                return (
+                    '{"approach":"List customer identifiers from the customer table.",'
+                    '"tables":["customers"],"schema_invalid":true,'
+                    '"grounding":[{"ref":"customers","used_for":"source rows"}]}'
+                )
+            if llm_calls["count"] == 2:
+                return (
+                    '{"tables":["customers"],"select":"customers.customer_id","filter":"",'
+                    '"group_by":"","having":"","limit":null,"order_by":"","window":"",'
+                    '"case":"","cte_steps":[]}'
+                )
+            return "{}"
+
+        with patch("aetherdialect._intent_process.llm_chat", side_effect=_fake_llm):
+            try:
+                full_intent_parse("list customers", schema_graph, max_retries=0)
+            except Exception:
+                pass
+        assert llm_calls["count"] >= 2
+
+
+class TestParseInterpretPlanLegacyMissing:
+    """Interpret payloads may carry missing when the semantic plan still has unresolved ambiguity."""
+
+    def test_missing_key_survives_validation(self):
+        from aetherdialect._intent_expr import parse_interpret_plan_response
+
+        raw = (
+            '{"approach":"Count rows in tbl_a.","tables":["tbl_a"],'
+            '"schema_invalid":true,"missing":"legacy reason field"}'
+        )
+        plan, issues = parse_interpret_plan_response(raw)
+        assert not [i for i in issues if i.severity == "error"]
+        assert plan is not None
+        assert plan.schema_invalid is True
+        assert plan.missing == "legacy reason field"
+
+
+def test_structural_tables_includes_prose_qualified_columns() -> None:
+    """Prose table.column tokens union into compose structural schema without mutating logical.tables."""
+    from aetherdialect._contracts_base import LogicalIntent
+    from aetherdialect._intent_process import _structural_tables_for_logical
+
+    logical = LogicalIntent(
+        tables=("table", "other_table"),
+        select="table.column",
+        filter="junction_table.column equals other_table.other_column",
+    )
+    tables = _structural_tables_for_logical(logical)
+    assert "junction_table" in tables
+    assert logical.tables == ("table", "other_table")

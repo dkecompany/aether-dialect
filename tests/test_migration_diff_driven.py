@@ -4,34 +4,32 @@ from __future__ import annotations
 
 import os
 
-from aetherdialect._config import (
-    TEMPLATE_QUESTION_TOKEN_INDEX_KEY,
-    TEMPLATE_STORE_HEADER_FILENAME,
-    TEMPLATE_STORE_SEGMENT,
-    EngineConfig,
-)
+from aetherdialect._config import EngineConfig
+from aetherdialect._constants import TEMPLATE_QUESTION_TOKEN_INDEX_KEY, TEMPLATE_STORE_HEADER_FILENAME
 from aetherdialect._contracts_base import (
-    ColumnMetadata,
     ColumnRole,
     MigrationTier,
+    NormalizedExpr,
+)
+from aetherdialect._contracts_core import (
+    ConcreteIntent,
+    SelectCol,
+    Template,
+    ValueHistory,
+)
+from aetherdialect._contracts_schema import (
+    ColumnMetadata,
     SchemaGraph,
     SQLShape,
     TableMetadata,
     TemplateStats,
-)
-from aetherdialect._contracts_core import (
-    ConcreteIntent,
-    NormalizedExpr,
-    SelectCol,
-    Template,
-    ValueHistory,
 )
 from aetherdialect._core_utils import (
     read_gzip_json,
     write_artifact_manifest,
     write_gzip_json_atomic,
 )
-from aetherdialect._schema import SchemaDiff, TableDiff
+from aetherdialect._schema_graph import SchemaDiff, TableDiff
 from aetherdialect._templates import (
     TemplateStoreView,
     _load_partitioned_view_unlocked,
@@ -39,6 +37,7 @@ from aetherdialect._templates import (
     empty_template_store,
     save_template_store,
     surgical_invalidate_templates_by_diff,
+    template_store_dir_for_space,
     templates_to_store,
 )
 
@@ -146,9 +145,8 @@ def _seed_store(
     stale_eff: str = "eff_old",
 ) -> str:
     """Write a partitioned template store + a *stale* manifest so apply_migration_policy proceeds."""
-
     os.makedirs(artifacts_dir, exist_ok=True)
-    store_dir = os.path.join(artifacts_dir, TEMPLATE_STORE_SEGMENT)
+    store_dir = template_store_dir_for_space(artifacts_dir, "master")
     os.makedirs(store_dir, exist_ok=True)
     prev = EngineConfig.TEMPLATE_STORE_DIR
     EngineConfig.TEMPLATE_STORE_DIR = store_dir
@@ -172,8 +170,7 @@ def _seed_store(
 
 def _reload_store(artifacts_dir: str):
     """Load the on-disk partitioned store for assertions (ignores hash reconciliation)."""
-
-    store_dir = os.path.join(artifacts_dir, TEMPLATE_STORE_SEGMENT)
+    store_dir = template_store_dir_for_space(artifacts_dir, "master")
     prev = EngineConfig.TEMPLATE_STORE_DIR
     EngineConfig.TEMPLATE_STORE_DIR = store_dir
     try:
@@ -321,12 +318,7 @@ class TestApplyMigrationPolicyDiffDriven:
         assert report.surgically_invalidated == 1
 
     def test_remap_via_diff_with_added_columns(self, tmp_path) -> None:
-        """
-        A diff that mixes a table rename with an added column must still REMAP.
-
-        ``try_rename_migration_plan`` would refuse this (column counts differ); the diff-driven path takes the ``table_renames`` directly.
-        """
-
+        """A diff that mixes a table rename with an added column must still REMAP. ``try_rename_migration_plan`` would refuse this (column counts differ); the diff-driven path takes the ``table_renames`` directly."""
         new_schema = _schema(
             {
                 "sales_orders": _table(

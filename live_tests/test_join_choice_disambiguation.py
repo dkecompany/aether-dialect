@@ -1,20 +1,10 @@
-"""
-Seeded live tests for the ``store``/``staff`` FK-choice ambiguity in dvdrental.
-
-Between ``store`` and ``staff`` the catalog exposes two foreign keys:
-
-* ``staff.store_id`` -> ``store.store_id`` (assignment: which store a staff member works at). * ``store.manager_staff_id`` -> ``staff.staff_id`` (manager: which staff member manages a store).
-
-Each test owns an ``isolated_runner`` so the join-choice assertion is never contaminated by prior runs, and uses ``runner.run`` directly so it can inspect ``StepResult.intent.chosen_join_path_signature`` before committing to the next step.
-"""
+"""Seeded live tests for the ``store``/``staff`` FK-choice ambiguity in rental_shop. Between ``store`` and ``staff`` the catalog exposes two foreign keys: * ``staff.store_id`` -> ``store.store_id`` (assignment: which store a staff member works at). * ``store.manager_staff_id`` -> ``staff.staff_id`` (manager: which staff member manages a store). Each test owns an ``isolated_runner`` so the join-choice assertion is never contaminated by prior runs, and uses ``runner.run`` directly so it can inspect ``StepResult.intent.chosen_join_path_signature`` before committing to the next step."""
 
 from __future__ import annotations
 
 from typing import Any
 
-import pytest
-
-from aetherdialect._config import GenerationPath
+from aetherdialect._constants import GenerationPath
 from aetherdialect._contracts_core import RuntimeIntent
 from aetherdialect._live_testing import Expected, LiveTestRunner, Scenario
 from aetherdialect._templates import store_to_templates
@@ -40,7 +30,6 @@ _MANAGER_SEED_Q_NORM = normalize_question(_MANAGER_QUESTION)
 
 def _join_signature_contains(intent: RuntimeIntent | None, edge: str) -> bool:
     """Return whether *intent*'s chosen join signature includes *edge*."""
-
     if intent is None:
         return False
     return edge in list(intent.chosen_join_path_signature or [])
@@ -48,7 +37,6 @@ def _join_signature_contains(intent: RuntimeIntent | None, edge: str) -> bool:
 
 def _run(runner: LiveTestRunner, question: str, scenario_id: str) -> Any:
     """Execute *question* against *runner* with permissive expectations; return ``StepResult``."""
-
     scenario = Scenario(
         id=scenario_id,
         question=question,
@@ -60,7 +48,6 @@ def _run(runner: LiveTestRunner, question: str, scenario_id: str) -> Any:
 
 def _assert_edge(result: Any, edge: str, label: str) -> None:
     """Assert *result*'s intent picked *edge*; include a diagnostic header on failure."""
-
     assert result is not None and result.intent is not None, f"[{label}] pipeline returned no intent"
     sig = list(result.intent.chosen_join_path_signature or [])
     assert edge in sig, f"[{label}] expected join edge {edge!r} to be chosen; got {sig!r}"
@@ -68,14 +55,11 @@ def _assert_edge(result: Any, edge: str, label: str) -> None:
 
 def _templates_with_edge(templates: dict[str, Any], edge: str) -> list[Any]:
     """Return stored templates whose ``chosen_join_path_signature`` contains *edge*."""
-
     return [t for t in templates.values() if edge in list(t.chosen_join_path_signature or [])]
 
 
-@pytest.mark.live
 def test_fresh_work_edge(schema, schema_terms, t2s) -> None:
     """Empty store + work-assignment NL picks the ``staff.store_id`` edge and stores a template."""
-
     with isolated_runner(schema, schema_terms, t2s, label="jc_work") as runner:
         result = _run(
             runner,
@@ -83,15 +67,14 @@ def test_fresh_work_edge(schema, schema_terms, t2s) -> None:
             "JC-FRESH-WORK",
         )
         _assert_edge(result, _WORK_EDGE, "JC-FRESH-WORK")
-        assert _templates_with_edge(runner.templates, _WORK_EDGE), (
+        _work_template_msg = (
             f"[JC-FRESH-WORK] expected an accepted template on the work edge; got {sorted(runner.templates)!r}"
         )
+        assert _templates_with_edge(runner.templates, _WORK_EDGE), _work_template_msg
 
 
-@pytest.mark.live
 def test_fresh_manager_edge(schema, schema_terms, t2s) -> None:
     """Empty store + manager NL picks the ``store.manager_staff_id`` edge and stores a template."""
-
     with isolated_runner(schema, schema_terms, t2s, label="jc_manager") as runner:
         result = _run(
             runner,
@@ -99,19 +82,14 @@ def test_fresh_manager_edge(schema, schema_terms, t2s) -> None:
             "JC-FRESH-MANAGER",
         )
         _assert_edge(result, _MANAGER_EDGE, "JC-FRESH-MANAGER")
-        assert _templates_with_edge(runner.templates, _MANAGER_EDGE), (
+        _manager_template_msg = (
             f"[JC-FRESH-MANAGER] expected an accepted template on the manager edge; got {sorted(runner.templates)!r}"
         )
+        assert _templates_with_edge(runner.templates, _MANAGER_EDGE), _manager_template_msg
 
 
-@pytest.mark.live
 def test_two_edges_coexist_after_fresh_runs(schema, schema_terms, t2s) -> None:
-    """
-    Two disjoint NL questions produce two templates with distinct join signatures.
-
-    Starts from an empty store, runs the work-assignment question first and the manager question second, then asserts both templates are persisted and each carries its own join signature.
-    """
-
+    """Two disjoint NL questions produce two templates with distinct join signatures. Starts from an empty store, runs the work-assignment question first and the manager question second, then asserts both templates are persisted and each carries its own join signature."""
     with isolated_runner(schema, schema_terms, t2s, label="jc_coexist") as runner:
         work_result = _run(
             runner,
@@ -131,19 +109,12 @@ def test_two_edges_coexist_after_fresh_runs(schema, schema_terms, t2s) -> None:
         manager_templates = _templates_with_edge(runner.templates, _MANAGER_EDGE)
         assert work_templates, "[JC-COEXIST] missing work-edge template"
         assert manager_templates, "[JC-COEXIST] missing manager-edge template"
-        assert {t.id for t in work_templates} & {t.id for t in manager_templates} == set(), (
-            "[JC-COEXIST] work and manager templates must be distinct rows"
-        )
+        _distinct_templates_msg = "[JC-COEXIST] work and manager templates must be distinct rows"
+        assert {t.id for t in work_templates} & {t.id for t in manager_templates} == set(), _distinct_templates_msg
 
 
-@pytest.mark.live
 def test_reuse_picks_matching_history(schema, schema_terms, t2s) -> None:
-    """
-    Both edges are seeded up front; each variant NL question reuses the matching template.
-
-    The work question must route through a reuse path (``1`` / ``2.1`` / ``2.2`` / ``3``) on the work template; the manager question must reuse the manager template.
-    """
-
+    """Both edges are seeded up front; each variant NL question reuses the matching template. The work question must route through a reuse path (``1`` / ``2.1`` / ``2.2`` / ``3``) on the work template; the manager question must reuse the manager template."""
     reuse_paths = (
         GenerationPath.EXACT_QUESTION_REUSE.code,
         GenerationPath.FUZZY_REUSE_LITERAL_STRUCTURAL.code,
@@ -188,9 +159,8 @@ def test_reuse_picks_matching_history(schema, schema_terms, t2s) -> None:
             "JC-REUSE-WORK",
         )
         _assert_edge(work_result, _WORK_EDGE, "JC-REUSE-WORK")
-        assert work_result.generation_path in reuse_paths, (
-            f"[JC-REUSE-WORK] expected a reuse path; got {work_result.generation_path!r}"
-        )
+        _work_reuse_msg = f"[JC-REUSE-WORK] expected a reuse path; got {work_result.generation_path!r}"
+        assert work_result.generation_path in reuse_paths, _work_reuse_msg
 
         manager_result = _run(
             runner,
@@ -198,9 +168,8 @@ def test_reuse_picks_matching_history(schema, schema_terms, t2s) -> None:
             "JC-REUSE-MANAGER",
         )
         _assert_edge(manager_result, _MANAGER_EDGE, "JC-REUSE-MANAGER")
-        assert manager_result.generation_path in reuse_paths, (
-            f"[JC-REUSE-MANAGER] expected a reuse path; got {manager_result.generation_path!r}"
-        )
+        _manager_reuse_msg = f"[JC-REUSE-MANAGER] expected a reuse path; got {manager_result.generation_path!r}"
+        assert manager_result.generation_path in reuse_paths, _manager_reuse_msg
 
         after = snapshot_store(runner)
         assert after["template_ids"] == before["template_ids"], (
@@ -209,14 +178,8 @@ def test_reuse_picks_matching_history(schema, schema_terms, t2s) -> None:
         )
 
 
-@pytest.mark.live
 def test_reuse_then_fork(schema, schema_terms, t2s) -> None:
-    """
-    With only the work edge seeded, asking a manager question forks a new template.
-
-    The forked template must carry the manager join signature; the original work-edge template must remain untouched.
-    """
-
+    """With only the work edge seeded, asking a manager question forks a new template. The forked template must carry the manager join signature; the original work-edge template must remain untouched."""
     with isolated_runner(schema, schema_terms, t2s, label="jc_fork") as runner:
         work_intent = intent_store_staff_by_work()
         work_intent.chosen_join_candidate_id = "J01"
@@ -243,8 +206,9 @@ def test_reuse_then_fork(schema, schema_terms, t2s) -> None:
         new_ids = assert_new_template_forked(before, after)
         assert_template_unchanged(before, after, seeded.id)
         forked = [runner.templates[tid] for tid in new_ids]
-        assert any(_MANAGER_EDGE in list(t.chosen_join_path_signature or []) for t in forked), (
+        _fork_manager_msg = (
             f"[JC-FORK] expected at least one forked template on manager edge; got "
             f"{[list(t.chosen_join_path_signature or []) for t in forked]!r}"
         )
+        assert any(_MANAGER_EDGE in list(t.chosen_join_path_signature or []) for t in forked), _fork_manager_msg
         assert seeded.id in runner.templates, "[JC-FORK] seeded work template must still exist"

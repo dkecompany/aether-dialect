@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "tables": {
+    "staff": {
+      "columns": {
+        "ssn": {
+          "sensitivity": "hidden"
+        },
+        "password": {
+          "sensitivity": "hidden"
+        }
+      }
+    }
+  },
+  "foreign_keys_add": [
+    {
+      "src_table": "film",
+      "src_cols": ["item_id"],
+      "dst_table": "item_category",
+      "dst_cols": ["item_id"]
+    },
+    {
+      "src_table": "book",
+      "src_cols": ["item_id"],
+      "dst_table": "item_category",
+      "dst_cols": ["item_id"]
+    },
+    {
+      "src_table": "game",
+      "src_cols": ["item_id"],
+      "dst_table": "item_category",
+      "dst_cols": ["item_id"]
+    },
+    {
+      "src_table": "game",
+      "src_cols": ["item_id"],
+      "dst_table": "game_supported_language",
+      "dst_cols": ["item_id"]
+    },
+    {
+      "src_table": "customer",
+      "src_cols": ["address_id"],
+      "dst_table": "address",
+      "dst_cols": ["address_id"]
+    },
+    {
+      "src_table": "address",
+      "src_cols": ["city_id"],
+      "dst_table": "city",
+      "dst_cols": ["city_id"]
+    },
+    {
+      "src_table": "city",
+      "src_cols": ["country_id"],
+      "dst_table": "country",
+      "dst_cols": ["country_id"]
+    },
+    {
+      "src_table": "rental",
+      "src_cols": ["inventory_id"],
+      "dst_table": "inventory",
+      "dst_cols": ["inventory_id"]
+    },
+    {
+      "src_table": "inventory",
+      "src_cols": ["item_id"],
+      "dst_table": "item",
+      "dst_cols": ["item_id"]
+    }
+  ]
+}

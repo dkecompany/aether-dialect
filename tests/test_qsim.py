@@ -6,22 +6,26 @@ from types import SimpleNamespace
 
 import pytest
 
-from aetherdialect._config import (
+from aetherdialect._config import QSimConfig
+from aetherdialect._constants import (
     HAVING_COUNT_VALUES,
     HAVING_MIN_MAX_VALUES,
     HAVING_SUM_AVG_VALUES,
-    QSimConfig,
 )
 from aetherdialect._contracts_base import (
-    ColumnMetadata,
     ColumnRole,
+)
+from aetherdialect._contracts_schema import (
+    ColumnMetadata,
     FKEdge,
+    QSimFilter,
+    QSimHaving,
+    QSimIntent,
     QSimSkeleton,
     SchemaGraph,
     TableMetadata,
     ValueDomain,
 )
-from aetherdialect._contracts_core import QSimFilter, QSimHaving, QSimIntent
 from aetherdialect._qsim import (
     _SKELETON_CACHE,
     _compute_intent_variance,
@@ -1217,12 +1221,12 @@ class TestParseDate:
         assert result == datetime(2024, 3, 20)
 
     def test_dd_mm_yyyy_format(self):
-        """dd-mm-yyyy format parsed."""
+        """Dd-mm-yyyy format parsed."""
         result = _parse_date("15-01-2024")
         assert result == datetime(2024, 1, 15)
 
     def test_dd_slash_mm_slash_yyyy_format(self):
-        """dd/mm/yyyy format parsed."""
+        """Dd/mm/yyyy format parsed."""
         result = _parse_date("15/01/2024")
         assert result == datetime(2024, 1, 15)
 
@@ -1272,7 +1276,6 @@ class TestSampleCategorical:
 
     def test_variant_indexes_cover_all_values_each_period(self):
         """Across ``variant_idx`` 0..n-1, each categorical value appears once per period (diversity)."""
-
         domain = ValueDomain(values=["red", "green", "blue"])
         n = len(domain.values)
         assert {_sample_categorical(domain, i) for i in range(n)} == set(domain.values)
@@ -1512,7 +1515,6 @@ class TestInstantiateIntent:
 
     def test_missing_value_domain_skips_entire_variant(self):
         """When a non-null filter column has no domain entry, instantiation returns None."""
-
         intent = self._make_intent(
             filters_param=[QSimFilter(column="orders.missing_col", op="=", value_type="categorical")],
         )
@@ -1567,7 +1569,7 @@ class TestInstantiateAll:
         defaults = dict(
             data_type="varchar",
             value_type="string",
-            top_k_values=["a", "b", "c"],
+            frequent_values=["a", "b", "c"],
             min_val=None,
             max_val=None,
             distinct_count=3,

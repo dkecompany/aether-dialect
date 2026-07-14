@@ -3,26 +3,32 @@
 import pytest
 
 from aetherdialect._contracts_base import (
-    ColumnMetadata,
     ColumnRole,
-    CteOutputColumnMeta,
-    SchemaGraph,
-    TableMetadata,
-)
-from aetherdialect._contracts_core import (
     ExprValue,
     FilterParam,
     HavingParam,
     MulGroup,
     NormalizedExpr,
     OrderByCol,
+)
+from aetherdialect._contracts_core import (
     RuntimeCteStep,
     RuntimeIntent,
     SelectCol,
+)
+from aetherdialect._contracts_schema import (
+    ColumnMetadata,
+    CteOutputColumnMeta,
+    SchemaGraph,
+    TableMetadata,
     WindowRegistryStep,
     WindowSpec,
 )
-from aetherdialect._intent_expr import parse_expr_string, replace_refs_in_expr
+from aetherdialect._intent_expr import (
+    parse_expr_string,
+    promote_date_subtraction_to_date_diff,
+    replace_refs_in_expr,
+)
 from aetherdialect._intent_resolve import (
     _canonicalize_condition_order,
     _dedup_filters,
@@ -45,9 +51,10 @@ from aetherdialect._intent_resolve import (
     normalize_count_star,
     normalize_cte_names,
     normalize_filters_havings,
-    qualify_cte_count_star_mulgroups,
+    qualify_count_star_mulgroups,
     resolve_column_map,
     resolve_cte_column_maps,
+    resolve_window_registry_filter_rhs,
     rewrite_cte_output_refs_to_aliases,
     rewrite_main_query_refs_to_final_cte_columns,
     simplify_exprs,
@@ -74,7 +81,7 @@ class TestReplaceRefsInExpr:
 
     def test_preserves_add_values_and_sub_values(self):
         """replace_refs_in_expr does not modify add_values or sub_values."""
-        from aetherdialect._contracts_core import ExprValue
+        from aetherdialect._contracts_base import ExprValue
 
         expr = NormalizedExpr(
             add_groups=[],
@@ -147,8 +154,8 @@ class TestNormalizeCountStarInIntent:
         assert term_strs(result.cte_steps[0].select_cols[0].expr.add_groups[0].multiply) == ["COUNT(*)"]
 
 
-class TestQualifyCteCountStarMulgroups:
-    """Tests for qualify_cte_count_star_mulgroups."""
+class TestQualifyCountStarMulgroups:
+    """Tests for qualify_count_star_mulgroups."""
 
     def test_rewrites_count_star_when_cte_reads_one_base_table(self):
         schema = SchemaGraph(
@@ -186,9 +193,118 @@ class TestQualifyCteCountStarMulgroups:
             filters_param=[],
             cte_steps=[cte],
         )
-        out = qualify_cte_count_star_mulgroups(intent, schema)
+        out = qualify_count_star_mulgroups(intent, schema)
         mul = out.cte_steps[0].select_cols[0].expr.add_groups[0]
         assert term_strs(mul.multiply) == ["rental.rental_id"]
+
+    def test_rewrites_main_single_table_select_and_window(self):
+        schema = SchemaGraph(
+            join_paths_multi={},
+            effective_structural_hash="",
+            tables={
+                "rental": TableMetadata(
+                    name="rental",
+                    columns={
+                        "rental_id": ColumnMetadata(
+                            name="rental_id",
+                            data_type="integer",
+                            value_type="integer",
+                            is_primary_key=True,
+                        ),
+                    },
+                    foreign_keys=[],
+                    primary_key="rental_id",
+                )
+            },
+        )
+        intent = RuntimeIntent(
+            tables=["rental"],
+            grain="grouped",
+            select_cols=[SelectCol(expr=NormalizedExpr(add_groups=[MulGroup(agg_func="count", multiply=["*"])]))],
+            group_by_cols=[NormalizedExpr.from_column("rental.customer_id")],
+            order_by_cols=[],
+            filters_param=[],
+            window_registry=[
+                WindowRegistryStep(
+                    registry_id="w01",
+                    window_spec=WindowSpec(
+                        function="rank",
+                        order_by=[
+                            OrderByCol(expr=NormalizedExpr(add_groups=[MulGroup(agg_func="count", multiply=["*"])]))
+                        ],
+                    ),
+                )
+            ],
+        )
+        out = qualify_count_star_mulgroups(intent, schema)
+        assert term_strs(out.select_cols[0].expr.add_groups[0].multiply) == ["rental.rental_id"]
+        assert term_strs(out.window_registry[0].window_spec.order_by[0].expr.add_groups[0].multiply) == [
+            "rental.rental_id"
+        ]
+
+    def test_leaves_multi_table_count_star_unchanged(self):
+        from aetherdialect._intent_repair import reconcile_tables
+
+        schema = SchemaGraph(
+            join_paths_multi={},
+            effective_structural_hash="",
+            tables={
+                "category": TableMetadata(
+                    name="category",
+                    columns={
+                        "name": ColumnMetadata(name="name", data_type="text", value_type="string"),
+                        "category_id": ColumnMetadata(
+                            name="category_id",
+                            data_type="integer",
+                            value_type="integer",
+                            is_primary_key=True,
+                        ),
+                    },
+                    foreign_keys=[],
+                    primary_key="category_id",
+                ),
+                "rental": TableMetadata(
+                    name="rental",
+                    columns={
+                        "rental_id": ColumnMetadata(
+                            name="rental_id",
+                            data_type="integer",
+                            value_type="integer",
+                            is_primary_key=True,
+                        ),
+                    },
+                    foreign_keys=[],
+                    primary_key="rental_id",
+                ),
+            },
+        )
+        intent = RuntimeIntent(
+            tables=["category", "rental"],
+            grain="grouped",
+            select_cols=[
+                SelectCol(expr=NormalizedExpr.from_column("category.name")),
+                SelectCol(expr=NormalizedExpr(add_groups=[MulGroup(agg_func="count", multiply=["*"])])),
+            ],
+            group_by_cols=[NormalizedExpr.from_column("category.name")],
+            order_by_cols=[],
+            filters_param=[],
+        )
+        out = qualify_count_star_mulgroups(intent, schema)
+        assert term_strs(out.select_cols[1].expr.add_groups[0].multiply) == ["*"]
+        qualified = RuntimeIntent(
+            tables=["category", "rental"],
+            grain="grouped",
+            select_cols=[
+                SelectCol(expr=NormalizedExpr.from_column("category.name")),
+                SelectCol(expr=NormalizedExpr.from_agg("count", "rental.rental_id")),
+            ],
+            group_by_cols=[NormalizedExpr.from_column("category.name")],
+            order_by_cols=[],
+            filters_param=[],
+        )
+        reconciled = reconcile_tables(qualified)
+        assert "rental" in reconciled.tables
+        assert "category" in reconciled.tables
 
 
 class TestSortFunctions:
@@ -1673,6 +1789,39 @@ class TestNormalizeCteNames:
         result = normalize_cte_names(intent)
         assert result.cte_steps[0].output_columns == ["rate"]
 
+    def test_planner_cte_alias_rewrites_window_registry_refs(self):
+        """Planner-only CTE aliases map to canonical cteN names (RS-004)."""
+        cte = RuntimeCteStep(
+            cte_name="customer_totals",
+            tables=["customer"],
+            select_cols=[SelectCol(expr=NormalizedExpr.from_agg("sum", "customer.amount"))],
+            output_columns=["total"],
+        )
+        intent = RuntimeIntent(
+            tables=["customer_totals"],
+            grain="row_level",
+            select_cols=[SelectCol(expr=NormalizedExpr.from_column("customer_totals.total"))],
+            group_by_cols=[],
+            order_by_cols=[],
+            filters_param=[],
+            cte_steps=[cte],
+            planner_cte_names=["customer_totals"],
+            window_registry=[
+                WindowRegistryStep(
+                    registry_id="w01",
+                    window_spec=WindowSpec(
+                        function="row_number",
+                        partition_by=[NormalizedExpr.from_column("customer_totals.total")],
+                        order_by=[],
+                    ),
+                )
+            ],
+        )
+        result = normalize_cte_names(intent)
+        assert result.cte_steps[0].cte_name == "cte1"
+        part_col = result.window_registry[0].window_spec.partition_by[0].primary_column
+        assert part_col == "cte1.total"
+
     def test_rewrite_main_query_refs_to_final_cte_columns_updates_filter(self):
         cte = RuntimeCteStep(
             cte_name="cte1",
@@ -2228,6 +2377,113 @@ class TestRewriteCteOutputRefsToAliases:
         result = rewrite_cte_output_refs_to_aliases(intent)
         left = result.cte_steps[0].filters_param[0].left_expr
         assert left.primary_term == "inner.amt"
+
+    def test_maps_inferred_alias_to_output_column(self):
+        cte = RuntimeCteStep(
+            cte_name="cte1",
+            tables=["film_actor"],
+            select_cols=[SelectCol(expr=NormalizedExpr.from_agg("count", "film_actor.film_id"))],
+            output_columns=["count_film_id"],
+        )
+        intent = RuntimeIntent(
+            tables=["cte1"],
+            grain="row_level",
+            select_cols=[],
+            group_by_cols=[],
+            order_by_cols=[],
+            filters_param=[
+                FilterParam(
+                    left_expr=NormalizedExpr.from_column("cte1.film_count"),
+                    op=">",
+                    right_expr=NormalizedExpr.from_column("w01"),
+                )
+            ],
+            cte_steps=[cte],
+        )
+        result = rewrite_cte_output_refs_to_aliases(intent)
+        assert result.filters_param[0].left_expr.primary_term == "cte1.count_film_id"
+
+
+class TestResolveWindowRegistryFilterRhs:
+    """Tests for resolve_window_registry_filter_rhs."""
+
+    def test_moves_registry_token_from_raw_value_to_right_expr(self):
+        intent = RuntimeIntent(
+            tables=["orders"],
+            grain="row_level",
+            select_cols=[],
+            group_by_cols=[],
+            order_by_cols=[],
+            filters_param=[
+                FilterParam(
+                    left_expr=NormalizedExpr.from_column("orders.amount"),
+                    op=">",
+                    raw_value="w01",
+                    param_key="p1",
+                )
+            ],
+            window_registry=[
+                WindowRegistryStep(
+                    registry_id="w01",
+                    window_spec=WindowSpec(function="avg", argument=NormalizedExpr.from_column("orders.amount")),
+                )
+            ],
+        )
+        out = resolve_window_registry_filter_rhs(intent)
+        fp = out.filters_param[0]
+        assert fp.right_expr is not None
+        assert fp.right_expr.column_ref == "w01"
+        assert fp.raw_value is None
+        assert fp.param_key == ""
+
+
+class TestPromoteDateSubtractionToDateDiff:
+    """Tests for promote_date_subtraction_to_date_diff."""
+
+    def test_promotes_subtraction_filter_with_scalar_bound(self):
+        left = parse_expr_string("rental.return_date - rental.rental_date")
+        intent = RuntimeIntent(
+            tables=["rental"],
+            grain="row_level",
+            select_cols=[],
+            group_by_cols=[],
+            order_by_cols=[],
+            filters_param=[
+                FilterParam(
+                    left_expr=left,
+                    op=">",
+                    raw_value=7,
+                    value_type="number",
+                )
+            ],
+        )
+        out = promote_date_subtraction_to_date_diff(intent)
+        fp = out.filters_param[0]
+        assert fp.value_type == "date_diff"
+        assert fp.raw_value == {"unit": "day", "amount": 7}
+
+    def test_expr_vs_expr_date_subtraction_unchanged(self):
+        """Expr-vs-expr date subtraction vs integer column passes through unchanged."""
+        left = parse_expr_string("rental.return_date - rental.rental_date")
+        right = parse_expr_string("item.rental_duration")
+        intent = RuntimeIntent(
+            tables=["rental", "item"],
+            grain="row_level",
+            select_cols=[],
+            group_by_cols=[],
+            order_by_cols=[],
+            filters_param=[
+                FilterParam(
+                    left_expr=left,
+                    op=">",
+                    right_expr=right,
+                )
+            ],
+        )
+        out = promote_date_subtraction_to_date_diff(intent)
+        fp = out.filters_param[0]
+        assert fp.right_expr is not None
+        assert fp.value_type != "date_diff"
 
 
 class TestEnforceGrainConsistencyExtended:

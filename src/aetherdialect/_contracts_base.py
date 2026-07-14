@@ -2,32 +2,40 @@
 
 from __future__ import annotations
 
-import json
 import re
-from collections.abc import Callable, Iterable, Mapping
-from dataclasses import InitVar, asdict, dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
 from enum import Enum
-from types import MappingProxyType
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal, cast
 
 import pandas
 
-from ._config import (
+from ._config import ConfigError, LlmExecutionConfig
+from ._constants import (
     COLUMN_TYPE_TO_VALUE_TYPE,
     CONFIG_ERROR_SCHEMA_CONTEXT_COLUMN_SPEC,
     DATE_TYPE_TOKENS,
-    DEFAULT_RANDOM_SEED,
-    EXCLUDED_FILTER_PATTERNS,
-    HIDDEN_SENSITIVITIES,
+    INFERENCE_TAG_VALUES,
     NUMERIC_TYPE_TOKENS,
-    ROLE_ALLOWED_AGGREGATIONS,
+    OP_FLIP,
+    PK_INFERENCE_TAG_VALUES,
+    RAW_SQL_AGG_OR_WINDOW_RE,
+    REGISTRY_REF_TOKEN_RE,
+    ROLE_OWNER_VALUES,
     STRING_TYPE_TOKENS,
-    LlmExecutionConfig,
-    PolicyConfig,
-    normalize_column_type,
 )
 
+
+def normalize_column_type(col_type: str) -> str:
+    """Lowercase a SQL type and remove `(n)` / `(n,m)` parameter lists."""
+    normalized = col_type.lower().strip()
+    normalized = re.sub(r"\(\d+(?:,\s*\d+)?\)", "", normalized)
+    normalized = normalized.strip()
+    return normalized
+
+
 SchemaInclude = Literal["tables", "views", "both"]
+SchemaRole = Literal["owner", "consumer"]
 
 
 class ComplexityTier(str, Enum):
@@ -48,20 +56,22 @@ class WarmupStyle(str, Enum):
     INTERROGATIVE = "interrogative"
     DESCRIPTIVE = "descriptive"
     CONCISE = "concise"
+    KEYWORD = "keyword"
+    BUSINESS_JARGON = "business_jargon"
+    BEGINNER = "beginner"
+    VERBOSE = "verbose"
 
 
 class SensitivityClassification(str, Enum):
     """Single-column sensitivity tier for projection, filtering, and LLM visibility."""
 
     NONE = "none"
-    HYGIENE = "hygiene"
-    STRICT = "strict"
-    FORBIDDEN = "forbidden"
+    RESTRICTED = "restricted"
+    HIDDEN = "hidden"
 
 
 def coerce_sensitivity_classification(raw: Any) -> SensitivityClassification | None:
     """Parse :class:`SensitivityClassification` tokens from overrides JSON or other string inputs."""
-
     if raw is None:
         return None
     if isinstance(raw, SensitivityClassification):
@@ -75,44 +85,9 @@ def coerce_sensitivity_classification(raw: Any) -> SensitivityClassification | N
     return None
 
 
-def sensitivity_classification_from_legacy_fields(sensitivity: Any, pii: Any) -> SensitivityClassification:
-    """
-    Map legacy ``sensitivity`` string plus optional ``pii`` tier to :class:`SensitivityClassification`.
-
-    Documents that stored ``\"pii\"`` without a ``pii`` tier behave as :attr:`SensitivityClassification.STRICT`.
-    """
-
-    s = str(sensitivity).strip().lower() if sensitivity is not None else ""
-    if s == "restricted":
-        return SensitivityClassification.FORBIDDEN
-    if s == "pii":
-        tier = coerce_sensitivity_classification(pii)
-        if tier is None or tier == SensitivityClassification.NONE:
-            return SensitivityClassification.STRICT
-        if tier in (
-            SensitivityClassification.HYGIENE,
-            SensitivityClassification.STRICT,
-            SensitivityClassification.FORBIDDEN,
-        ):
-            return tier
-        return SensitivityClassification.STRICT
-    if s in ("", "none"):
-        return SensitivityClassification.NONE
-    direct = coerce_sensitivity_classification(sensitivity)
-    if direct is not None:
-        return direct
-    return SensitivityClassification.NONE
-
-
 def column_sensitivity_from_dict(d: Mapping[str, Any]) -> SensitivityClassification:
-    """Resolve persisted ``sensitivity`` / ``pii`` keys into a single :class:`SensitivityClassification`."""
-
-    sens = d.get("sensitivity")
-    pii = d.get("pii")
-    s = str(sens).strip().lower() if sens is not None else ""
-    if s in ("pii", "restricted") or pii is not None:
-        return sensitivity_classification_from_legacy_fields(sens, pii)
-    return coerce_sensitivity_classification(sens) or SensitivityClassification.NONE
+    """Resolve a persisted ``sensitivity`` key into a :class:`SensitivityClassification`."""
+    return coerce_sensitivity_classification(d.get("sensitivity")) or SensitivityClassification.NONE
 
 
 class NoveltyBand(str, Enum):
@@ -162,7 +137,7 @@ class OperatorFeatureVector:
 
 
 @dataclass(frozen=True)
-class AdvancedFeatureSpec:
+class _AdvancedFeatureSpec:
     """Named advanced SQL intent capability surfaced to tier-conditioned QSim prompts."""
 
     feature_id: str
@@ -171,7 +146,7 @@ class AdvancedFeatureSpec:
 
 
 @dataclass(frozen=True)
-class ComplexityTierSpec:
+class _ComplexityTierSpec:
     """Declared bounds for one complexity band."""
 
     tier: ComplexityTier
@@ -205,20 +180,7 @@ class DatabaseFeatureCapability:
 
 
 def _tier_feasible_for_capability(tier_key: str, cap: DatabaseFeatureCapability) -> bool:
-    """
-    Return whether a complexity tier remains achievable on this database snapshot.
-
-    Args:
-
-        tier_key: One of ``simple``, ``moderate``, ``complex``, ``highly_complex``.
-
-        cap: Capability snapshot from :func:`compute_database_feature_capability`.
-
-    Returns:
-
-        False when structural prerequisites for that tier are absent.
-    """
-
+    """Return whether a complexity tier remains achievable on this. database snapshot. Args: tier_key: One of ``simple``, ``moderate``, ``complex``, ``highly_complex``. cap: Capability snapshot from :func:`compute_database_feature_capability`. Returns: False when structural prerequisites for that tier are absent."""
     if cap.table_count <= 0:
         return False
     if tier_key == ComplexityTier.SIMPLE.value:
@@ -245,20 +207,7 @@ def rebalance_complexity_target_proportions(
     proportions: Mapping[str, float],
     cap: DatabaseFeatureCapability,
 ) -> dict[str, float]:
-    """
-    Zero unreachable tier mass and renormalize remaining targets for QSim and warmup budgets.
-
-    Args:
-
-        proportions: Named tier weights summing to approximately one.
-
-        cap: Live capability snapshot for structural feasibility.
-
-    Returns:
-
-        Renormalized tier weights over feasible tiers only.
-    """
-
+    """Zero unreachable tier mass and renormalize remaining targets for. QSim and warmup budgets. Args: proportions: Named tier weights summing to approximately one. cap: Live capability snapshot for structural feasibility. Returns: Renormalized tier weights over feasible tiers only."""
     keys = [
         ComplexityTier.SIMPLE.value,
         ComplexityTier.MODERATE.value,
@@ -288,73 +237,73 @@ def rebalance_complexity_target_proportions(
 
 
 @dataclass(frozen=True)
-class SurfaceTemplateSpec:
+class _SurfaceTemplateSpec:
     """Declarative NL surface pattern for deterministic warmup anchoring."""
 
     construct_kind: str
     surface_forms: tuple[str, ...]
 
 
-QSIM_SUPPORTED_ADVANCED_FEATURES: tuple[AdvancedFeatureSpec, ...] = (
-    AdvancedFeatureSpec(
+QSIM_SUPPORTED_ADVANCED_FEATURES: tuple[_AdvancedFeatureSpec, ...] = (
+    _AdvancedFeatureSpec(
         feature_id="multi_cte_chain",
         summary="Stacked CTE definitions where one CTE references another.",
         example_fragment="WITH daily AS (...), rolled AS (SELECT ... FROM daily) SELECT ...",
     ),
-    AdvancedFeatureSpec(
+    _AdvancedFeatureSpec(
         feature_id="scalar_cte_bridge",
         summary="Scalar-valued CTE row merged via cross join for threshold constants.",
-        example_fragment="WITH params AS (SELECT 100.0 AS min_amt) SELECT ... FROM orders CROSS JOIN params",
+        example_fragment="WITH params AS (SELECT 100.0 AS min_amt) SELECT ... FROM table CROSS JOIN params",
     ),
-    AdvancedFeatureSpec(
+    _AdvancedFeatureSpec(
         feature_id="self_join_via_cte",
         summary="Second reference to a base table mediated through a named CTE.",
-        example_fragment="WITH o1 AS (SELECT * FROM orders) SELECT ... FROM orders JOIN o1 ON ...",
+        example_fragment="WITH a1 AS (SELECT * FROM table) SELECT ... FROM table JOIN a1 ON ...",
     ),
-    AdvancedFeatureSpec(
+    _AdvancedFeatureSpec(
         feature_id="window_partition_order",
         summary="ROW_NUMBER/RANK/SUM over PARTITION BY with ORDER BY.",
-        example_fragment="ROW_NUMBER() OVER (PARTITION BY region ORDER BY revenue DESC)",
+        example_fragment="ROW_NUMBER() OVER (PARTITION BY table.column ORDER BY table.other_column DESC)",
     ),
-    AdvancedFeatureSpec(
+    _AdvancedFeatureSpec(
         feature_id="case_when_select",
         summary="CASE expressions in the projected SELECT list.",
-        example_fragment="CASE WHEN status = 'open' THEN amount ELSE 0 END",
+        example_fragment="CASE WHEN table.column = 'x' THEN table.other_column ELSE 0 END",
     ),
-    AdvancedFeatureSpec(
+    _AdvancedFeatureSpec(
         feature_id="date_window_filter",
         summary="Rolling calendar predicates using relative windows.",
-        example_fragment="order_date >= CURRENT_DATE - INTERVAL '30 days'",
+        example_fragment="table.date_column >= CURRENT_DATE - INTERVAL '30 days'",
     ),
-    AdvancedFeatureSpec(
+    _AdvancedFeatureSpec(
         feature_id="date_diff_shapes",
         summary="Difference-between-dates filters.",
-        example_fragment="DATE_PART('day', shipped_at - ordered_at) > 3",
+        example_fragment="DATE_PART('day', table.end_date_column - table.start_date_column) > 3",
     ),
-    AdvancedFeatureSpec(
+    _AdvancedFeatureSpec(
         feature_id="unnest_array_column",
         summary="EXPLODE/UNNEST typed array columns inside a subordinate SELECT.",
         example_fragment="FROM tags CROSS JOIN UNNEST(tag_ids) AS u(tag)",
     ),
-    AdvancedFeatureSpec(
+    _AdvancedFeatureSpec(
         feature_id="distinct_select",
         summary="SELECT DISTINCT non-aggregated projections.",
-        example_fragment="SELECT DISTINCT country FROM customers",
+        example_fragment="SELECT DISTINCT table.column FROM table",
     ),
-    AdvancedFeatureSpec(
+    _AdvancedFeatureSpec(
         feature_id="ilike_predicate",
         summary="ILIKE / NOT ILIKE text predicates.",
-        example_fragment="note ILIKE '%refund%'",
+        example_fragment="table.text_column ILIKE '%pattern%'",
     ),
-    AdvancedFeatureSpec(
+    _AdvancedFeatureSpec(
         feature_id="having_aggregate_compare",
         summary="HAVING clauses comparing aggregated measures to literals.",
-        example_fragment="HAVING SUM(amount) > 5000",
+        example_fragment="HAVING SUM(table.column) > 5000",
     ),
 )
 
-QSIM_COMPLEXITY_TIER_SPECS: tuple[ComplexityTierSpec, ...] = (
-    ComplexityTierSpec(
+QSIM_COMPLEXITY_TIER_SPECS: tuple[_ComplexityTierSpec, ...] = (
+    _ComplexityTierSpec(
         tier=ComplexityTier.SIMPLE,
         min_tables=1,
         max_tables=1,
@@ -362,9 +311,9 @@ QSIM_COMPLEXITY_TIER_SPECS: tuple[ComplexityTierSpec, ...] = (
         allows_window=False,
         allows_multi_cte=False,
         summary="Single-table scans with optional equality or range filters; projections stay non-aggregated.",
-        example_sketch="Show recent invoices for account 42.",
+        example_sketch="Show recent rows for a single entity by its id.",
     ),
-    ComplexityTierSpec(
+    _ComplexityTierSpec(
         tier=ComplexityTier.MODERATE,
         min_tables=1,
         max_tables=2,
@@ -372,9 +321,9 @@ QSIM_COMPLEXITY_TIER_SPECS: tuple[ComplexityTierSpec, ...] = (
         allows_window=False,
         allows_multi_cte=False,
         summary="One or two joined tables with simple aggregates, light grouping, ORDER BY, or LIMIT.",
-        example_sketch="Top 50 customers by orders last month.",
+        example_sketch="Top 50 entities by a count over a recent period.",
     ),
-    ComplexityTierSpec(
+    _ComplexityTierSpec(
         tier=ComplexityTier.COMPLEX,
         min_tables=2,
         max_tables=3,
@@ -382,9 +331,9 @@ QSIM_COMPLEXITY_TIER_SPECS: tuple[ComplexityTierSpec, ...] = (
         allows_window=True,
         allows_multi_cte=False,
         summary="Multi-table joins with grouped aggregates, HAVING, DISTINCT, or cross-column comparisons.",
-        example_sketch="Average fulfillment hours by warehouse having more than 100 shipments.",
+        example_sketch="Average of a measure by group, keeping only groups with more than 100 related rows.",
     ),
-    ComplexityTierSpec(
+    _ComplexityTierSpec(
         tier=ComplexityTier.HIGHLY_COMPLEX,
         min_tables=3,
         max_tables=3,
@@ -392,7 +341,7 @@ QSIM_COMPLEXITY_TIER_SPECS: tuple[ComplexityTierSpec, ...] = (
         allows_window=True,
         allows_multi_cte=True,
         summary="Dense shapes combining multiple predicates, aggregates at aligned grains, and ordered analytic heads.",
-        example_sketch="Rank districts within each territory by margin contribution using layered filters.",
+        example_sketch="Rank entities within each group by a contribution measure using layered filters.",
     ),
 )
 
@@ -503,7 +452,6 @@ def parse_failure_category(raw: FailureCategory | str | None) -> FailureCategory
 
         ``None`` when *raw* is empty; otherwise the matching enum member or ``OTHER``.
     """
-
     if raw is None:
         return None
     if isinstance(raw, FailureCategory):
@@ -518,7 +466,7 @@ def parse_failure_category(raw: FailureCategory | str | None) -> FailureCategory
 
 
 class SqlDiagnosticCode(str, Enum):
-    """Structured codes emitted by AST validation and EXPLAIN-plan diagnostics for both PostgreSQL and Databricks dialects."""
+    """Structured codes emitted by AST validation and EXPLAIN-plan diagnostics across registered dialects."""
 
     AST_PARSE_FAILED = "ast_parse_failed"
     MULTIPLE_STATEMENTS = "multiple_statements"
@@ -561,24 +509,22 @@ class SqlDiagnostic:
     details: Mapping[str, str] = field(default_factory=dict)
 
 
-def _norm_schema_identifier(name: str, *, what: str) -> str:
+def norm_schema_identifier(name: str, *, what: str) -> str:
     """Lowercase and strip *name*; raise when empty after strip."""
-
     s = str(name).strip().lower()
     if not s:
         raise ValueError(f"{what} must be non-empty")
     return s
 
 
-class ConfigError(ValueError):
-    """Raised when environment variables or static configuration are missing or contradictory."""
+class OwnerOnlyOperationError(ConfigError):
+    """Raised when a consumer-role instance attempts a schema-identity mutation."""
+
+    def __init__(self, operation: str) -> None:
+        super().__init__(f"Operation {operation!r} requires role='owner'; this instance is a consumer.")
 
 
-class Text2SQLError(ValueError):
-    """Base class for recoverable Text2SQL engine lifecycle failures."""
-
-
-class MigrationPendingError(Text2SQLError):
+class MigrationPendingError(ValueError):
     """Init terminated because schema_migration_map.json is required, malformed, missing after export, or conflicts with validation."""
 
 
@@ -587,13 +533,7 @@ class ConnectionError(OSError):
 
 
 class RetryableError(Exception):
-    """
-    Marker base class for transient failures that may succeed on retry.
-
-    Concrete subclasses combine this marker with :class:`ConnectionError`,
-    :class:`RuntimeError`, etc. Integrators may use ``isinstance(exc, RetryableError)``
-    without inspecting messages.
-    """
+    """Marker base class for transient failures that may succeed on retry. Concrete subclasses combine this marker with :class:`ConnectionError`, :class:`RuntimeError`, etc. Integrators may use ``isinstance(exc, RetryableError)`` without inspecting messages."""
 
 
 class DatabasePingFailed(ConnectionError, RetryableError):
@@ -617,17 +557,14 @@ class SessionActiveError(RuntimeError):
 
 
 class SchemaInvariantError(RuntimeError):
-    """
-    Raised by :func:`assert_schema_invariants` when the canonical containers fall out of sync.
-
-    Indicates a programmer error elsewhere in the build pipeline: e.g. an FK referencing a missing column, a PK column missing from its table, an unwired column-table back reference, or a stale canonical-bearer index. Always indicates the offending source-of-truth has been violated and never represents a recoverable runtime condition.
-    """
+    """Raised by :func:`assert_schema_invariants` when the canonical containers fall out of sync. Indicates a programmer error elsewhere in the build pipeline: e.g. an FK referencing a missing column, a PK column missing from its table, an unwired column-table back reference, or a stale canonical-bearer index. Always indicates the offending source-of-truth has been violated and never represents a recoverable runtime condition."""
 
 
 class MigrationTier(str, Enum):
     """Classified migration severity between a stored artifact fingerprint and the live graph."""
 
     NO_CHANGE = "no_change"
+    PERMISSION_FILTERED = "permission_filtered"
     SOFT_REFRESH = "soft_refresh"
     REMAP = "remap"
     DESTRUCTIVE = "destructive"
@@ -638,7 +575,7 @@ class ColumnVisibilityBlockReason(str, Enum):
 
     DENIED = "denied"
     NOT_IN_ALLOW_COLUMNS = "not_in_allow_columns"
-    SENSITIVE_PII = "sensitive_pii"
+    SENSITIVE_HIDDEN = "sensitive_hidden"
     SENSITIVE_RESTRICTED = "sensitive_restricted"
     UNUSABLE = "unusable"
 
@@ -670,12 +607,7 @@ class SchemaMigrationMapEntry:
 
 @dataclass(frozen=True, slots=True)
 class SchemaMigrationMap:
-    """User-authored migration mapping consumed once at init time.
-
-    When ``refresh_existing_descriptions_on_addition`` is true and the live schema diff includes newly added
-    tables, the engine runs a full-graph LLM classifier pass after subset profiling and merges refreshed
-    table/column descriptions and roles only for tables that were otherwise unchanged by the diff.
-    """
+    """User-authored migration mapping consumed once at init time. When ``refresh_existing_descriptions_on_addition`` is true and the live schema diff includes newly added tables, the engine runs a full-graph LLM classifier pass after subset profiling and merges refreshed table/column descriptions and roles only for tables that were otherwise unchanged by the diff."""
 
     version: int
     action: str
@@ -685,12 +617,14 @@ class SchemaMigrationMap:
     dropped_columns: tuple[SchemaMigrationMapEntry, ...]
     added_tables: tuple[str, ...]
     added_columns: tuple[SchemaMigrationMapEntry, ...]
+    fk_remaps: tuple[SchemaMigrationMapEntry, ...] = ()
+    pk_remaps: tuple[SchemaMigrationMapEntry, ...] = ()
     refresh_existing_descriptions_on_addition: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class OverrideSkip:
-    """One JSON entry that was rejected during ``Text2SQL.apply_schema_overrides``."""
+    """One JSON entry that was rejected during ``AetherEngine.apply_schema_overrides``."""
 
     path: str
     reason: str
@@ -707,7 +641,7 @@ class SidecarReconcileReport:
 
 @dataclass(frozen=True, slots=True)
 class OverrideReport:
-    """Summary of edits produced by ``Text2SQL.apply_schema_overrides``."""
+    """Summary of edits produced by ``AetherEngine.apply_schema_overrides``."""
 
     table_edits: int = 0
     column_edits: int = 0
@@ -738,6 +672,14 @@ class Diagnostic:
 
 
 @dataclass(frozen=True, slots=True)
+class IntentInterpretation:
+    """Compact Interpret-stage traceability attached to session steps."""
+
+    approach: str
+    grounding: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True, slots=True)
 class IntentSummary:
     """Compact projection of a resolved :class:`RuntimeIntent` for UI and telemetry."""
 
@@ -748,6 +690,17 @@ class IntentSummary:
     order_by: tuple[str, ...]
     limit: int | None
     natural_language: str
+
+
+@dataclass(frozen=True, slots=True)
+class ParameterBinding:
+    """One bind slot on an accepted template for programmatic callers."""
+
+    handle: str
+    current_value: ParamValue | None
+    display_name: str
+    upper_handle: str = ""
+    unit_handle: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -762,58 +715,7 @@ class MigrationPreview:
 
 @dataclass(frozen=True, slots=True)
 class SessionStep:
-    """Single observable point in a programmatic interactive turn.
-
-    Carries whether the turn has finished, a short instruction string, a stage discriminant, optional SQL, tabular data, a free-form body, and an error string when the engine fails.
-
-    done:
-
-        True when the pipeline finished successfully or ended in a terminal error; False when the caller must respond via ``PipelineSession.step``.
-
-    prompt:
-
-        The short line the interactive layer should show immediately before collecting input (for example yes or no, or a free-text rejection reason prompt).
-
-    kind:
-
-        Stable stage identifier matching the active suspend kind or a terminal sentinel; used to branch programmatic UIs without parsing ``prompt``.
-
-    sql:
-
-        The formatted SQL under discussion when the step pertains to execution or confirmation; otherwise None.
-
-    data:
-
-        Row-level query preview or full result as a ``pandas.DataFrame``; None for scalar outcomes, previews trimmed to five rows at suspend boundaries, and the full frame on the terminal acceptance step when rows exist.
-
-    message:
-
-        Multi-line contextual body: consolidated intent confirmation, migration DDL, rejection guidance, or a rendered scalar value; empty or None when nothing extra should print beyond ``prompt`` and ``data``.
-
-    error:
-
-        Terminal failure explanation when ``done`` is True and processing stopped; otherwise None.
-
-    intent_summary:
-
-        Structured intent headline when the step reflects a parsed intent or later pipeline stages; otherwise None.
-
-    diagnostics:
-
-        Structured diagnostics captured during this step (from ``notify`` / ``debug`` when a collector is active).
-
-    status:
-
-        On terminal error steps, a coarse failure category name (same string values as :class:`FailureCategory`); None on success or non-terminal steps.
-
-    reply_shape:
-
-        When ``done`` is False, whether the caller should collect a yes or no token or free text; None on terminal steps.
-
-    semantic_warnings:
-
-        Normalised warning strings for intent confirmation, often empty on non-intent suspend steps.
-    """
+    """Single observable point in a programmatic interactive turn. Carries whether the turn has finished, a short instruction string, a stage discriminant, optional SQL, tabular data, a free-form body, and an error string when the engine fails. done: True when the pipeline finished successfully or ended in a terminal error; False when the caller must respond via ``PipelineSession.step``. prompt: The short line the interactive layer should show immediately before collecting input (for example yes or no, or a free-text rejection reason prompt). kind: Stable stage identifier matching the active suspend kind or a terminal sentinel; used to branch programmatic UIs without parsing ``prompt``. sql: The formatted SQL under discussion when the step pertains to execution or confirmation; otherwise None. data: Row-level query preview or full result as a ``pandas.DataFrame``; None for scalar outcomes, previews trimmed to five rows at suspend boundaries, and the full frame on the terminal acceptance step when rows exist. message: Multi-line contextual body: consolidated intent confirmation, migration DDL, rejection guidance, or a rendered scalar value; empty or None when nothing extra should print beyond ``prompt`` and ``data``. error: Terminal failure explanation when ``done`` is True and processing stopped; otherwise None. intent_summary: Structured intent headline when the step reflects a parsed intent or later pipeline stages; otherwise None. diagnostics: Structured diagnostics captured during this step (from ``notify`` / ``debug`` when a collector is active). status: On terminal error steps, a coarse failure category name (same string values as :class:`FailureCategory`); None on success or non-terminal steps. reply_shape: When ``done`` is False, whether the caller should collect a yes or no token or free text; None on terminal steps. semantic_warnings: Normalised warning strings for intent confirmation, often empty on non-intent suspend steps."""
 
     done: bool
     prompt: str | None
@@ -827,20 +729,13 @@ class SessionStep:
     status: str | None = None
     reply_shape: Literal["yes_no", "free_text"] | None = None
     semantic_warnings: tuple[str, ...] = ()
+    interpretation: IntentInterpretation | None = None
+    parameters: tuple[ParameterBinding, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class WriteQueueEvent:
-    """Structured event a reader-mode session records for a writer to apply later.
-
-    kind: Discriminator selecting which writer-side handler applies (template accept or reject, paraphrase emission, override proposal materialisation, or question feedback).
-
-    schema_hash: Structural hash of the schema graph at event creation; the writer drops events when this value no longer matches the live graph.
-
-    produced_at: ISO-8601 timestamp string when the reader enqueued the event.
-
-    payload: Ordered key-value pairs serialising handler-specific fields; a tuple of pairs keeps the event hashable and avoids dict key-order ambiguity across processes.
-    """
+    """Structured event a reader-mode session records for a writer to apply later. kind: Discriminator selecting which writer-side handler applies (template accept or reject, paraphrase emission, override proposal materialisation, or question feedback). schema_graph_id: Stable schema-graph identity stamped at enqueue time; the writer matches and drops events when this value no longer matches the live snapshot. schema_hash: Advisory effective structural hash at event creation for audit and debug only. produced_at: ISO-8601 timestamp string when the reader enqueued the event. payload: Ordered key-value pairs serialising handler-specific fields; a tuple of pairs keeps the event hashable and avoids dict key-order ambiguity across processes."""
 
     kind: Literal[
         "template_accept",
@@ -849,6 +744,7 @@ class WriteQueueEvent:
         "override_proposal",
         "feedback_record",
     ]
+    schema_graph_id: str
     schema_hash: str
     produced_at: str
     payload: tuple[tuple[str, str], ...]
@@ -862,7 +758,7 @@ class AuditEvent:
     timestamp_iso: str
     question: str | None
     schema_hash: str | None
-    provider: Literal["openai", "azure"]
+    provider: Literal["openai", "azure", "mock"]
     details: tuple[tuple[str, str], ...] = ()
 
 
@@ -908,24 +804,47 @@ class QSimSummarySnapshot:
 
 
 @dataclass(frozen=True, slots=True)
-class SchemaContext:
+class EngineContext:
     """Frozen schema scope: optional explicit relation names, include mode, deny lists, and paths."""
 
+    name: str = "master"
     allow_objects: frozenset[str] = frozenset()
     include: SchemaInclude = "tables"
+    deny_objects: frozenset[str] = frozenset()
     deny_columns: frozenset[str] = frozenset()
     allow_columns: frozenset[str] = frozenset()
     notes_file: str | None = None
     sql_file: str | None = None
 
     def __post_init__(self) -> None:
+        name_norm = str(self.name).strip().lower() or "master"
+        if "/" in name_norm or "\\" in name_norm:
+            raise ConfigError(f"invalid EngineContext name: {self.name!r}")
+        object.__setattr__(self, "name", name_norm)
+        if name_norm != "master":
+            if self.sql_file is not None:
+                raise ConfigError(
+                    "named EngineContext cannot set sql_file; only master defines DDL",
+                )
+            if self.notes_file is not None:
+                raise ConfigError(
+                    "named EngineContext cannot set notes_file; only master defines notes",
+                )
+            if self.include != "tables":
+                raise ConfigError(
+                    "named EngineContext cannot set include; only master defines include mode",
+                )
         if self.include not in ("tables", "views", "both"):
             raise ConfigError(f"include must be 'tables', 'views', or 'both', not {self.include!r}")
         if self.notes_file is not None and not str(self.notes_file).strip():
             raise ConfigError("notes_file must be omitted or a non-empty path")
         if self.sql_file is not None and not str(self.sql_file).strip():
             raise ConfigError("sql_file must be omitted or a non-empty path")
-        allow_norm = frozenset(_norm_schema_identifier(t, what="allow_objects entry") for t in self.allow_objects)
+        allow_norm = frozenset(norm_schema_identifier(t, what="allow_objects entry") for t in self.allow_objects)
+        deny_obj_norm = frozenset(norm_schema_identifier(t, what="deny_objects entry") for t in self.deny_objects)
+        overlap_obj = allow_norm & deny_obj_norm
+        if overlap_obj:
+            raise ConfigError(f"allow_objects and deny_objects overlap: {sorted(overlap_obj)!r}")
         normalized_specs: list[str] = []
         for spec in self.deny_columns:
             raw = str(spec).strip()
@@ -933,8 +852,8 @@ class SchemaContext:
             if dot_count != 1:
                 raise ConfigError(CONFIG_ERROR_SCHEMA_CONTEXT_COLUMN_SPEC.format(spec=spec))
             tbl_raw, col_raw = raw.split(".", 1)
-            tbl = _norm_schema_identifier(tbl_raw, what="deny_columns table")
-            col = _norm_schema_identifier(col_raw, what="deny_columns column")
+            tbl = norm_schema_identifier(tbl_raw, what="deny_columns table")
+            col = norm_schema_identifier(col_raw, what="deny_columns column")
             if tbl == "*":
                 normalized_specs.append(f"*.{col}")
             else:
@@ -947,8 +866,8 @@ class SchemaContext:
             if dot_count != 1:
                 raise ConfigError(CONFIG_ERROR_SCHEMA_CONTEXT_COLUMN_SPEC.format(spec=spec))
             tbl_raw, col_raw = raw.split(".", 1)
-            tbl = _norm_schema_identifier(tbl_raw, what="allow_columns table")
-            col = _norm_schema_identifier(col_raw, what="allow_columns column")
+            tbl = norm_schema_identifier(tbl_raw, what="allow_columns table")
+            col = norm_schema_identifier(col_raw, what="allow_columns column")
             if tbl == "*":
                 allow_col_specs.append(f"*.{col}")
             else:
@@ -959,13 +878,18 @@ class SchemaContext:
                 dt, _, _rest = spec.partition(".")
                 if dt != "*" and dt == t:
                     raise ConfigError(f"allow_objects entry {t!r} is denied by deny_columns entry {spec!r}")
+        for t in deny_obj_norm:
+            for spec in col_set:
+                dt, _, _rest = spec.partition(".")
+                if dt != "*" and dt == t:
+                    raise ConfigError(f"deny_objects entry {t!r} conflicts with deny_columns entry {spec!r}")
         object.__setattr__(self, "allow_objects", allow_norm)
+        object.__setattr__(self, "deny_objects", deny_obj_norm)
         object.__setattr__(self, "deny_columns", col_set)
         object.__setattr__(self, "allow_columns", allow_col_set)
 
     def qualified_denies(self) -> frozenset[tuple[str, str]]:
         """Return the subset of ``deny_columns`` parsed as ``(table, column)`` pairs."""
-
         result: set[tuple[str, str]] = set()
         for spec in self.deny_columns:
             if "." in spec:
@@ -976,7 +900,6 @@ class SchemaContext:
 
     def glob_column_denies(self) -> frozenset[str]:
         """Return column suffixes from ``*.column`` deny specs."""
-
         result: set[str] = set()
         for spec in self.deny_columns:
             tbl, col = spec.split(".", 1)
@@ -986,12 +909,10 @@ class SchemaContext:
 
     def bare_denies(self) -> frozenset[str]:
         """Return bare deny tokens; always empty because only qualified ``table.column`` specs are accepted."""
-
         return frozenset()
 
     def qualified_allows(self) -> frozenset[tuple[str, str]]:
         """Return the subset of ``allow_columns`` parsed as ``(table, column)`` pairs."""
-
         result: set[tuple[str, str]] = set()
         for spec in self.allow_columns:
             tbl, col = spec.split(".", 1)
@@ -1001,7 +922,6 @@ class SchemaContext:
 
     def glob_column_allows(self) -> frozenset[str]:
         """Return column suffixes from ``*.column`` allow specs."""
-
         result: set[str] = set()
         for spec in self.allow_columns:
             tbl, col = spec.split(".", 1)
@@ -1011,8 +931,78 @@ class SchemaContext:
 
     def bare_allows(self) -> frozenset[str]:
         """Return bare allow tokens; always empty because only qualified ``table.column`` specs are accepted."""
-
         return frozenset()
+
+
+@dataclass(frozen=True, slots=True)
+class SpaceContext:
+    """Frozen intent-stage scope: allowed/denied tables and qualified ``table.column`` pairs."""
+
+    tables: frozenset[str] = frozenset()
+    columns: frozenset[str] = frozenset()
+    deny_objects: frozenset[str] = frozenset()
+    deny_columns: frozenset[str] = frozenset()
+
+    def __post_init__(self) -> None:
+        allow_norm = frozenset(norm_schema_identifier(t, what="tables entry") for t in self.tables)
+        deny_obj_norm = frozenset(norm_schema_identifier(t, what="deny_objects entry") for t in self.deny_objects)
+        overlap_obj = allow_norm & deny_obj_norm
+        if overlap_obj:
+            raise ConfigError(f"SpaceContext tables and deny_objects overlap: {sorted(overlap_obj)!r}")
+        normalized_cols: list[str] = []
+        for spec in self.columns:
+            raw = str(spec).strip()
+            if raw.count(".") != 1:
+                raise ConfigError(CONFIG_ERROR_SCHEMA_CONTEXT_COLUMN_SPEC.format(spec=spec))
+            tbl_raw, col_raw = raw.split(".", 1)
+            tbl = norm_schema_identifier(tbl_raw, what="columns table")
+            col = norm_schema_identifier(col_raw, what="columns column")
+            normalized_cols.append(f"{tbl}.{col}")
+        col_set = frozenset(normalized_cols)
+        deny_col_specs: list[str] = []
+        for spec in self.deny_columns:
+            raw = str(spec).strip()
+            if raw.count(".") != 1:
+                raise ConfigError(CONFIG_ERROR_SCHEMA_CONTEXT_COLUMN_SPEC.format(spec=spec))
+            tbl_raw, col_raw = raw.split(".", 1)
+            tbl = norm_schema_identifier(tbl_raw, what="deny_columns table")
+            col = norm_schema_identifier(col_raw, what="deny_columns column")
+            if tbl == "*":
+                deny_col_specs.append(f"*.{col}")
+            else:
+                deny_col_specs.append(f"{tbl}.{col}")
+        deny_col_set = frozenset(deny_col_specs)
+        if allow_norm:
+            for qc in col_set:
+                tbl_part = qc.rsplit(".", 1)[0]
+                if tbl_part not in allow_norm:
+                    raise ConfigError(
+                        f"columns entry {qc!r} references table {tbl_part!r} not listed in tables",
+                    )
+        for t in deny_obj_norm:
+            for spec in deny_col_set:
+                dt, _, _rest = spec.partition(".")
+                if dt != "*" and dt == t:
+                    raise ConfigError(
+                        f"deny_objects entry {t!r} conflicts with deny_columns entry {spec!r}",
+                    )
+        object.__setattr__(self, "tables", allow_norm)
+        object.__setattr__(self, "columns", col_set)
+        object.__setattr__(self, "deny_objects", deny_obj_norm)
+        object.__setattr__(self, "deny_columns", deny_col_set)
+
+
+@dataclass(frozen=True, slots=True)
+class AetherSpace:
+    """Read-only descriptor for a named aetherspace scope."""
+
+    name: str
+    _scope: dict[str, tuple[str, ...]]
+    notes: str | None = None
+
+    def list_scope(self) -> dict[str, tuple[str, ...]]:
+        """Return ``tables`` and ``columns`` tuples describing this space."""
+        return dict(self._scope)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1020,7 +1010,6 @@ class CteIntent:
     """Planner-only natural-language description of one reusable intermediate aligned with a runtime CTE step."""
 
     name: str
-    depends_on: tuple[str, ...] = ()
     tables: tuple[str, ...] = ()
     select: str = ""
     filter: str = ""
@@ -1046,24 +1035,24 @@ class LogicalIntent:
     window: str = ""
     case: str = ""
     cte_steps: tuple[CteIntent, ...] = ()
-    schema_invalid: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class RuntimeConfig:
     """Engine, artifact root, frozen schema scope, and merged LLM plus execution limits for runtime introspection."""
 
-    engine: Literal["postgresql", "databricks"]
+    engine: str
     artifacts_dir: str
-    schema_context: SchemaContext
+    engine_context: EngineContext
     llm_execution: LlmExecutionConfig
+    execution_context: EngineContext | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class LLMConfig:
     """Active LLM provider label after environment configuration."""
 
-    provider: Literal["openai", "azure"]
+    provider: Literal["openai", "azure", "mock"]
 
 
 def is_numeric_type(data_type: str) -> bool:
@@ -1126,48 +1115,6 @@ def data_type_to_value_type(data_type: str) -> str:
     if is_string_type(data_type):
         return "string"
     return "string"
-
-
-def is_numeric_value_type(value_type: str | None) -> bool:
-    """Return True when normalized intent ``value_type`` is numeric (integer or number)."""
-
-    if not value_type:
-        return False
-    vt = value_type.strip().lower()
-    return vt in ("integer", "number")
-
-
-def is_integer_value_type(value_type: str | None) -> bool:
-    """Return True when ``value_type`` is integer."""
-
-    if not value_type:
-        return False
-    return value_type.strip().lower() == "integer"
-
-
-def is_temporal_value_type(value_type: str | None) -> bool:
-    """Return True when ``value_type`` denotes a date or time column."""
-
-    if not value_type:
-        return False
-    vt = value_type.strip().lower()
-    return vt in ("date", "timestamp", "time", "datetime")
-
-
-def is_string_value_type(value_type: str | None) -> bool:
-    """Return True when ``value_type`` is string."""
-
-    if not value_type:
-        return False
-    return value_type.strip().lower() == "string"
-
-
-def is_boolean_value_type(value_type: str | None) -> bool:
-    """Return True when ``value_type`` is boolean."""
-
-    if not value_type:
-        return False
-    return value_type.strip().lower() == "boolean"
 
 
 class ColumnRole(Enum):
@@ -1297,11 +1244,7 @@ WORKLOAD_FAMILY_SPECS: dict[WorkloadFamily, WorkloadFamilySpec] = {
 
 
 class InferenceTag(str, Enum):
-    """
-    Provenance tag for an :class:`FKEdge`.
-
-    A catalog-declared edge is represented by ``None`` rather than a member of this enum so that presence-of-tag and identity-of-inferred-layer are reflected by a single attribute. Inherits ``str`` so members compare equal to their wire value and round-trip through JSON without custom encoding.
-    """
+    """Provenance tag for an :class:`FKEdge`. A catalog-declared edge is represented by ``None`` rather than a member of this enum so that presence-of-tag and identity-of- inferred-layer are reflected by a single attribute. Inherits ``str`` so members compare equal to their wire value and round-trip through JSON without custom encoding."""
 
     SUFFIX = "suffix"
     SELF = "self"
@@ -1312,61 +1255,38 @@ class InferenceTag(str, Enum):
     USER_SEMANTIC = "user_override_semantic"
 
 
-_INFERENCE_TAG_VALUES: frozenset[str] = frozenset(t.value for t in InferenceTag)
-
-
 def coerce_inference_tag(raw: object) -> InferenceTag | None:
-    """
-    Normalise raw cache or override input into :class:`InferenceTag` (``None`` for catalog).
-
-    Raises ``ValueError`` when *raw* is a non-empty string that does not match any enum value.
-    """
-
+    """Normalise raw cache or override input into :class:`InferenceTag` (``None`` for catalog). Raises ``ValueError`` when *raw* is a non-empty string that does not match any enum value."""
     if raw is None or raw == "":
         return None
     if isinstance(raw, InferenceTag):
         return raw
-    if isinstance(raw, str) and raw in _INFERENCE_TAG_VALUES:
+    if isinstance(raw, str) and raw in INFERENCE_TAG_VALUES:
         return InferenceTag(raw)
     raise ValueError(f"unknown FK inference_tag: {raw!r}")
 
 
 class PkInferenceTag(str, Enum):
-    """
-    Provenance tag for an inferred or user-supplied primary key.
+    """Provenance tag for an inferred or user-supplied primary key. Engine-reflected catalog keys use ``None`` (locked). SQL-file- declared keys use ``DDL`` (overridable). Inferred and user-supplied keys use the remaining members."""
 
-    Catalog primary keys are represented by ``None``; only inferred or user-injected keys carry a member of this enum.
-    """
-
+    DDL = "ddl"
     PROFILE = "profile"
     USER_OVERRIDE = "user_override"
 
 
-_PK_INFERENCE_TAG_VALUES: frozenset[str] = frozenset(t.value for t in PkInferenceTag)
-
-
 def coerce_pk_inference_tag(raw: object) -> PkInferenceTag | None:
-    """
-    Normalise raw cache or override input into :class:`PkInferenceTag` (``None`` for catalog).
-
-    Raises ``ValueError`` when *raw* is a non-empty string that does not match any enum value.
-    """
-
+    """Normalise raw cache or override input into :class:`PkInferenceTag` (``None`` for catalog). Raises ``ValueError`` when *raw* is a non-empty string that does not match any enum value."""
     if raw is None or raw == "":
         return None
     if isinstance(raw, PkInferenceTag):
         return raw
-    if isinstance(raw, str) and raw in _PK_INFERENCE_TAG_VALUES:
+    if isinstance(raw, str) and raw in PK_INFERENCE_TAG_VALUES:
         return PkInferenceTag(raw)
     raise ValueError(f"unknown pk_inference_tag: {raw!r}")
 
 
 class RoleOwner(str, Enum):
-    """
-    Provenance for the writer that last set :attr:`ColumnMetadata.role`.
-
-    The members are ordered by ascending precedence: a writer with strictly greater precedence may overwrite a role assigned by a lower-precedence owner, while equal-or-lower-precedence writers must skip the column. PK/FK coercion is treated as the highest authority because it is required for join correctness; user overrides win over LLM inference, which in turn wins over profile heuristics, which in turn wins over the default catalog fallback.
-    """
+    """Provenance for the writer that last set :attr:`ColumnMetadata.role`. The members are ordered by ascending precedence: a writer with strictly greater precedence may overwrite a role assigned by a lower-precedence owner, while equal-or-lower-precedence writers must skip the column. PK/FK coercion is treated as the highest authority because it is required for join correctness; user overrides win over LLM inference, which in turn wins over profile heuristics, which in turn wins over the default catalog fallback."""
 
     CATALOG = "catalog"
     PROFILE = "profile"
@@ -1385,43 +1305,27 @@ _ROLE_OWNER_PRECEDENCE: dict[RoleOwner, int] = {
     RoleOwner.PK_FK_COERCION: 5,
 }
 
-_ROLE_OWNER_VALUES: frozenset[str] = frozenset(o.value for o in RoleOwner)
-
 
 def coerce_role_owner(raw: object) -> RoleOwner | None:
-    """
-    Normalise raw cache or override input into :class:`RoleOwner` (``None`` when unset).
-
-    Raises ``ValueError`` when *raw* is a non-empty string that does not match any enum value.
-    """
-
+    """Normalise raw cache or override input into :class:`RoleOwner` (``None`` when unset). Raises ``ValueError`` when *raw* is a non-empty string that does not match any enum value."""
     if raw is None or raw == "":
         return None
     if isinstance(raw, RoleOwner):
         return raw
-    if isinstance(raw, str) and raw in _ROLE_OWNER_VALUES:
+    if isinstance(raw, str) and raw in ROLE_OWNER_VALUES:
         return RoleOwner(raw)
     raise ValueError(f"unknown role_owner: {raw!r}")
 
 
 def can_overwrite_role(current: RoleOwner | None, candidate: RoleOwner) -> bool:
-    """
-    Return whether a writer with provenance *candidate* may overwrite a role currently owned by *current*.
-
-    A column whose role has never been claimed (``current is None``) accepts any writer. Otherwise the candidate must have strictly greater precedence than the incumbent owner; equal-precedence writes are rejected so the first writer of a given tier wins deterministically.
-    """
-
+    """Return whether a writer with provenance *candidate* may overwrite a role currently owned by *current*. A column whose role has never been claimed (``current is None``) accepts any writer. Otherwise the candidate must have strictly greater precedence than the incumbent owner; equal-precedence writes are rejected so the first writer of a given tier wins deterministically."""
     if current is None:
         return True
     return _ROLE_OWNER_PRECEDENCE[candidate] > _ROLE_OWNER_PRECEDENCE[current]
 
 
 class DescriptionOwner(str, Enum):
-    """
-    Provenance for the writer that last set a description on a table or column.
-
-    Members are ordered by ascending precedence; the dedicated helper :func:`set_description` enforces a strict-greater-precedence rule so a later writer can only overwrite an existing description when its provenance outranks the incumbent owner.
-    """
+    """Provenance for the writer that last set a description on a table or column. Members are ordered by ascending precedence; the dedicated helper :func:`set_description` enforces a strict-greater-precedence rule so a later writer can only overwrite an existing description when its provenance outranks the incumbent owner."""
 
     CATALOG = "catalog"
     PROFILE = "profile"
@@ -1438,29 +1342,15 @@ _DESCRIPTION_OWNER_PRECEDENCE: dict[DescriptionOwner, int] = {
     DescriptionOwner.USER_OVERRIDE: 4,
 }
 
-_DESCRIPTION_OWNER_VALUES: frozenset[str] = frozenset(o.value for o in DescriptionOwner)
-
-
-def _coerce_description_owner(raw: object) -> DescriptionOwner | None:
-    """Normalise raw cache or override input into :class:`DescriptionOwner` (``None`` when unset)."""
-    if raw is None or raw == "":
-        return None
-    if isinstance(raw, DescriptionOwner):
-        return raw
-    if isinstance(raw, str) and raw in _DESCRIPTION_OWNER_VALUES:
-        return DescriptionOwner(raw)
-    raise ValueError(f"unknown description_owner: {raw!r}")
-
 
 def set_description(target: Any, text: str | None, owner: DescriptionOwner) -> bool:
     """
     Single writer for ``description`` on tables and columns.
 
     Args:
+
         target: Either a :class:`TableMetadata` or :class:`ColumnMetadata` instance.
-
-        text: New description text (``None`` rejects the write; empty string clears to ``\"\"``).
-
+        text: New description text (``None`` rejects the write; empty string clears to ``""``).
         owner: Provenance of the writer.
 
     Returns:
@@ -1468,7 +1358,6 @@ def set_description(target: Any, text: str | None, owner: DescriptionOwner) -> b
         write was rejected because *owner* has lower precedence than the current owner
         (strictly higher precedence wins; equal precedence allows replacement).
     """
-
     if text is None:
         return False
     current_owner = getattr(target, "description_owner", None)
@@ -1487,1722 +1376,20 @@ def set_description(target: Any, text: str | None, owner: DescriptionOwner) -> b
 
 
 def set_sensitivity(col: Any, value: SensitivityClassification | str | None) -> None:
-    """
-    Single writer for :attr:`ColumnMetadata.sensitivity`.
-
-    Accepts :class:`SensitivityClassification`, legacy ``\"pii\"`` / ``\"restricted\"`` strings from classifiers, or ``None`` for :attr:`SensitivityClassification.NONE`. Clears concrete profile samples whenever the classification is not :attr:`SensitivityClassification.NONE`.
-    """
-
+    """Single writer for :attr:`ColumnMetadata.sensitivity`. Accepts :class:`SensitivityClassification` or ``None`` for :attr:`SensitivityClassification.NONE`. Clears concrete profile samples whenever the classification is not :attr:`SensitivityClassification.NONE`."""
     if value is None or (isinstance(value, str) and not str(value).strip()):
         resolved = SensitivityClassification.NONE
     elif isinstance(value, SensitivityClassification):
         resolved = value
     else:
         sv = str(value).strip().lower()
-        if sv == "restricted":
-            resolved = SensitivityClassification.FORBIDDEN
-        elif sv == "pii":
-            resolved = SensitivityClassification.STRICT
-        else:
-            resolved = coerce_sensitivity_classification(value) or SensitivityClassification.NONE
+        resolved = coerce_sensitivity_classification(sv) or SensitivityClassification.NONE
     col.sensitivity = resolved
     if resolved != SensitivityClassification.NONE:
-        col.top_k_values = []
+        col.frequent_values = []
+        col.value_overlap_sample = []
         col.min_val = None
         col.max_val = None
-
-
-@dataclass
-class FKEdge:
-    """Foreign key relationship between two tables."""
-
-    src_table: str
-    src_cols: list[str]
-    dst_table: str
-    dst_cols: list[str]
-    inference_tag: InferenceTag | None = None
-
-    def __post_init__(self) -> None:
-        """Coerce ``inference_tag`` from raw cache strings into :class:`InferenceTag`."""
-        if not isinstance(self.inference_tag, InferenceTag):
-            self.inference_tag = coerce_inference_tag(self.inference_tag)
-
-
-@dataclass
-class CatalogTableStructuralConstraints:
-    """
-    Catalog-sourced primary-key column names, foreign-key edges, and single-column unique names for one table.
-
-    Each :class:`FKEdge` carries ``src_table`` equal to the referencing table so the bundle can be converted into ``tables_meta`` foreign-key dicts without losing the child table identity.
-    """
-
-    primary_keys: list[str] = field(default_factory=list)
-    foreign_keys: list[FKEdge] = field(default_factory=list)
-    unique_columns: list[str] = field(default_factory=list)
-
-
-@dataclass
-class CatalogStructuralConstraintsIndex:
-    """
-    Per-table structural constraint bundles keyed by lowercased relation name within one catalog schema.
-
-    When ``tables`` is empty the caller should treat catalog reflection as unavailable and continue with DDL-based parsing.
-    """
-
-    tables: dict[str, CatalogTableStructuralConstraints] = field(default_factory=dict)
-
-    @classmethod
-    def empty(cls) -> CatalogStructuralConstraintsIndex:
-        """
-        Construct an empty index for failed information_schema queries.
-
-        Returns:
-
-            Empty :class:`CatalogStructuralConstraintsIndex` instance.
-        """
-
-        return cls(tables={})
-
-
-@dataclass
-class ValueDomain:
-    """Value domain for sampling concrete values during question generation."""
-
-    values: list[str] = field(default_factory=list)
-    min_val: str | None = None
-    max_val: str | None = None
-    data_type: str | None = None
-    value_type: str = ""
-
-    def __post_init__(self) -> None:
-        """Derive ``value_type`` from ``data_type`` when unset."""
-
-        if not self.value_type and self.data_type:
-            self.value_type = data_type_to_value_type(self.data_type)
-
-
-@dataclass
-class ColumnMetadata:
-    """
-    Consolidated column metadata with profile, role, and value domain.
-
-    Holds counts, overrides, filter/aggregation rules, and boolean hints used by validation and generation.
-    """
-
-    name: str
-    data_type: str
-    enum_type_name: str | None = None
-    is_primary_key: InitVar[bool] = False
-    is_foreign_key: InitVar[bool] = False
-    fk_target: InitVar[tuple[str, str] | None] = None
-    role: str | None = None
-    value_type: str = ""
-    row_count: int = 0
-    distinct_count: int = 0
-    distinct_from_sample: bool = False
-    distinct_ratio: float = 0.0
-    null_ratio: float = 0.0
-    min_val: str | None = None
-    max_val: str | None = None
-    top_k_values: list[str] = field(default_factory=list)
-    is_aggregatable_override: bool | None = None
-    is_groupable_override: bool | None = None
-    is_filterable_override: bool | None = None
-    valid_filter_ops: list[str] = field(default_factory=list)
-    valid_aggregations: list[str] = field(default_factory=list)
-    valid_having_ops: list[str] = field(default_factory=list)
-    description: str = ""
-    description_owner: DescriptionOwner | None = None
-    is_unique: bool = False
-    sensitivity: SensitivityClassification = SensitivityClassification.NONE
-    element_type: str | None = None
-    is_nullable: bool = True
-    semantic_distinct_values: list[str] = field(default_factory=list)
-    semantic_join_neighbors: list[tuple[str, str]] = field(default_factory=list)
-    is_denied: InitVar[bool] = False
-    mode_frequency_ratio: float = 0.0
-    is_canonical_duplicate: InitVar[bool] = True
-    pk_inference_tag: PkInferenceTag | None = None
-    role_owner: RoleOwner | None = None
-    boolean_truth_value: str | None = None
-
-    def __post_init__(
-        self,
-        is_primary_key: bool,
-        is_foreign_key: bool,
-        fk_target: tuple[str, str] | None,
-        is_denied: bool,
-        is_canonical_duplicate: bool,
-    ) -> None:
-        """
-        Set `value_type` from `data_type` when `value_type` is empty and capture PK/FK/deny seeds.
-
-        ``is_primary_key``, ``is_foreign_key``, ``fk_target``, and ``is_denied`` are accepted as constructor arguments for ergonomic standalone construction (tests, ad-hoc fixtures), but they are merely seeds: the authoritative store of primary-key membership is ``TableMetadata.primary_key``, of foreign-key membership is ``TableMetadata.foreign_keys``, and of deny-list membership is ``SchemaGraph.deny_columns`` on the owning graph. When this column is attached to a :class:`TableMetadata` (and that table to a :class:`SchemaGraph`), the relevant ``__post_init__`` consolidates the seeds into the canonical containers and clears them so the :attr:`is_primary_key`, :attr:`is_foreign_key`, :attr:`fk_target`, and :attr:`is_denied` properties always read from a single owner. The seed and back-reference attributes are stored outside the dataclass field set so :func:`dataclasses.asdict` does not traverse a column-table-graph cycle.
-        """
-        if not self.value_type and self.data_type:
-            self.value_type = data_type_to_value_type(self.data_type)
-        object.__setattr__(self, "_seed_is_primary_key", bool(is_primary_key))
-        object.__setattr__(self, "_seed_is_foreign_key", bool(is_foreign_key))
-        object.__setattr__(
-            self,
-            "_seed_fk_target",
-            (tuple(fk_target) if isinstance(fk_target, (list, tuple)) and len(fk_target) == 2 else None),
-        )
-        object.__setattr__(self, "_seed_is_denied", bool(is_denied))
-        object.__setattr__(self, "_seed_is_canonical_duplicate", bool(is_canonical_duplicate))
-        object.__setattr__(self, "_owner_table", None)
-        if not isinstance(self.sensitivity, SensitivityClassification):
-            set_sensitivity(self, self.sensitivity)
-
-    @staticmethod
-    def from_dict(d: dict[str, Any]) -> ColumnMetadata:
-        """
-        Create `ColumnMetadata` from a dictionary.
-
-        Args:
-
-            d: Dictionary with keys matching `ColumnMetadata` fields.
-
-        Returns:
-
-            Populated `ColumnMetadata` instance.
-        """
-        fk_target = None
-        if d.get("fk_target"):
-            fk_target = tuple(d["fk_target"]) if isinstance(d["fk_target"], list) else d["fk_target"]
-        sens = column_sensitivity_from_dict(d)
-        return ColumnMetadata(
-            name=d.get("name", ""),
-            data_type=d.get("data_type", ""),
-            is_primary_key=d.get("is_primary_key", False),
-            is_foreign_key=d.get("is_foreign_key", False),
-            fk_target=fk_target,
-            role=d.get("role"),
-            value_type=d.get("value_type", ""),
-            enum_type_name=d.get("enum_type_name"),
-            row_count=d.get("row_count", 0),
-            distinct_count=d.get("distinct_count", 0),
-            distinct_from_sample=d.get("distinct_from_sample", False),
-            distinct_ratio=d.get("distinct_ratio", 0.0),
-            null_ratio=d.get("null_ratio", 0.0),
-            min_val=d.get("min_val"),
-            max_val=d.get("max_val"),
-            top_k_values=d.get("top_k_values", []),
-            is_aggregatable_override=d.get("is_aggregatable_override"),
-            is_groupable_override=d.get("is_groupable_override"),
-            is_filterable_override=d.get("is_filterable_override"),
-            valid_filter_ops=d.get("valid_filter_ops", []),
-            valid_aggregations=d.get("valid_aggregations", []),
-            valid_having_ops=d.get("valid_having_ops", []),
-            description=d.get("description", ""),
-            description_owner=_coerce_description_owner(d.get("description_owner")),
-            is_unique=d.get("is_unique", False),
-            sensitivity=sens,
-            element_type=d.get("element_type"),
-            is_nullable=d.get("is_nullable", True),
-            semantic_distinct_values=d.get("semantic_distinct_values", []),
-            semantic_join_neighbors=[
-                (str(x[0]), str(x[1]))
-                for x in (d.get("semantic_join_neighbors") or [])
-                if isinstance(x, (list, tuple)) and len(x) == 2
-            ],
-            is_denied=d.get("is_denied", False),
-            mode_frequency_ratio=d.get("mode_frequency_ratio", 0.0),
-            is_canonical_duplicate=d.get("is_canonical_duplicate", True),
-            pk_inference_tag=coerce_pk_inference_tag(d.get("pk_inference_tag")),
-            role_owner=coerce_role_owner(d.get("role_owner")),
-            boolean_truth_value=d.get("boolean_truth_value"),
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        """
-        Serialize to a plain dictionary for JSON storage.
-
-        Returns:
-
-            Dictionary with all `ColumnMetadata` fields as primitives.
-        """
-        return {
-            "name": self.name,
-            "data_type": self.data_type,
-            "is_primary_key": self.is_primary_key,
-            "is_foreign_key": self.is_foreign_key,
-            "fk_target": list(self.fk_target) if self.fk_target else None,
-            "role": self.role,
-            "value_type": self.value_type,
-            "enum_type_name": self.enum_type_name,
-            "row_count": self.row_count,
-            "distinct_count": self.distinct_count,
-            "distinct_from_sample": self.distinct_from_sample,
-            "distinct_ratio": self.distinct_ratio,
-            "null_ratio": self.null_ratio,
-            "min_val": self.min_val,
-            "max_val": self.max_val,
-            "top_k_values": self.top_k_values,
-            "is_aggregatable_override": self.is_aggregatable_override,
-            "is_groupable_override": self.is_groupable_override,
-            "is_filterable_override": self.is_filterable_override,
-            "valid_filter_ops": self.valid_filter_ops,
-            "valid_aggregations": self.valid_aggregations,
-            "valid_having_ops": self.valid_having_ops,
-            "description": self.description,
-            "description_owner": (self.description_owner.value if self.description_owner is not None else None),
-            "is_unique": self.is_unique,
-            "sensitivity": self.sensitivity.value,
-            "is_selectable": self.is_selectable,
-            "element_type": self.element_type,
-            "is_nullable": self.is_nullable,
-            "semantic_distinct_values": self.semantic_distinct_values,
-            "semantic_join_neighbors": [list(p) for p in self.semantic_join_neighbors],
-            "is_denied": self.is_denied,
-            "mode_frequency_ratio": self.mode_frequency_ratio,
-            "is_canonical_duplicate": self.is_canonical_duplicate,
-            "pk_inference_tag": (self.pk_inference_tag.value if self.pk_inference_tag is not None else None),
-            "role_owner": (self.role_owner.value if self.role_owner is not None else None),
-            "boolean_truth_value": self.boolean_truth_value,
-        }
-
-    @property
-    def is_selectable(self) -> bool:
-        """
-        Whether the column may be projected in a ``SELECT`` list.
-
-        :attr:`SensitivityClassification.FORBIDDEN` columns are never selectable. Only
-        :attr:`SensitivityClassification.HYGIENE` may be projected among non-public tiers.
-        """
-
-        if self.sensitivity == SensitivityClassification.FORBIDDEN:
-            return False
-        if self.sensitivity == SensitivityClassification.HYGIENE:
-            return True
-        if self.sensitivity == SensitivityClassification.NONE:
-            return True
-        return False
-
-    @property
-    def is_usable(self) -> bool:
-        """
-        Whether the column has enough variance and signal to be exposed to the LLM.
-
-        Returns:
-
-            True for primary or foreign key columns regardless of other signals (structural columns must remain visible for joins). Otherwise False for columns with at most one distinct value, columns whose null ratio meets or exceeds ``PolicyConfig.UNUSABLE_NULL_RATIO_THRESHOLD``, or columns where one value dominates the non-null distribution at or above ``PolicyConfig.SENTINEL_MODE_FREQUENCY_THRESHOLD`` (sentinel-dominated columns carry no useful filter or grouping signal). Otherwise True.
-        """
-        if self.is_primary_key or self.is_foreign_key:
-            return True
-        if self.distinct_count is not None and self.distinct_count <= 1:
-            return False
-        if self.null_ratio >= PolicyConfig.UNUSABLE_NULL_RATIO_THRESHOLD:
-            return False
-        if self.mode_frequency_ratio >= PolicyConfig.SENTINEL_MODE_FREQUENCY_THRESHOLD:
-            return False
-        return True
-
-    @property
-    def is_visible(self) -> bool:
-        """
-        Whether this column should appear in LLM-facing schema context.
-
-        Combines structural usability with policy gates. Returns False when the column is denied via ``SchemaContext.deny_columns`` (``is_denied``). :attr:`SensitivityClassification.FORBIDDEN` columns are never visible. :attr:`SensitivityClassification.HYGIENE` requires :attr:`is_usable`; stricter tiers are withheld from prompts.
-        """
-
-        if self.is_denied:
-            return False
-        if self.sensitivity == SensitivityClassification.FORBIDDEN:
-            return False
-        if self.sensitivity == SensitivityClassification.HYGIENE:
-            return self.is_usable
-        if self.sensitivity != SensitivityClassification.NONE:
-            return False
-        return self.is_usable
-
-    def visibility_block_reason(self) -> ColumnVisibilityBlockReason | None:
-        """Return why this column is not LLM-visible, or ``None`` when it is visible."""
-
-        owner = self._owner_table
-        graph = getattr(owner, "_owner_graph", None) if owner is not None else None
-        if owner is not None and graph is not None:
-            deny_set = graph.deny_columns.get(owner.name)
-            if deny_set and self.name in deny_set:
-                return ColumnVisibilityBlockReason.DENIED
-            disallowed = graph.disallowed_columns.get(owner.name)
-            if disallowed and self.name in disallowed:
-                return ColumnVisibilityBlockReason.NOT_IN_ALLOW_COLUMNS
-        elif self._seed_is_denied:
-            return ColumnVisibilityBlockReason.DENIED
-        if self.sensitivity == SensitivityClassification.HYGIENE:
-            if not self.is_usable:
-                return ColumnVisibilityBlockReason.UNUSABLE
-            return None
-        if self.sensitivity in (
-            SensitivityClassification.STRICT,
-            SensitivityClassification.FORBIDDEN,
-        ):
-            return ColumnVisibilityBlockReason.SENSITIVE_PII
-        if not self.is_usable:
-            return ColumnVisibilityBlockReason.UNUSABLE
-        return None
-
-    @property
-    def is_filterable(self) -> bool:
-        """
-        Whether the column may appear in `WHERE` predicates.
-
-        Returns:
-
-            False if the name matches an excluded pattern; else override, key, or role-based rules.
-        """
-        for pattern in EXCLUDED_FILTER_PATTERNS:
-            if re.search(pattern, self.name, re.IGNORECASE):
-                return False
-        if self.is_filterable_override is not None:
-            return self.is_filterable_override
-        if self.is_primary_key:
-            return True
-        if self.is_foreign_key:
-            return True
-        if self.role in (
-            ColumnRole.CATEGORICAL.value,
-            ColumnRole.NUMERIC_CATEGORICAL.value,
-            ColumnRole.NUMERIC_MEASURE.value,
-            ColumnRole.TEMPORAL.value,
-            ColumnRole.BOOLEAN.value,
-            ColumnRole.FREE_TEXT.value,
-            ColumnRole.AUDIT.value,
-        ):
-            return True
-        return False
-
-    def get_valid_filter_ops(self) -> list[str]:
-        """
-        Valid filter operators for this column, always including null checks.
-
-        Returns:
-
-            Operator strings such as `=`, `!=`, `like`, `between`, plus `is null` / `is not null`.
-        """
-        null_ops = ["is null", "is not null"]
-        if self.valid_filter_ops:
-            return list(set(self.valid_filter_ops + null_ops))
-        return null_ops
-
-    def get_valid_aggregations(self) -> set[str]:
-        """
-        Valid aggregation function names for this column.
-
-        Returns:
-
-            Lowercased names from `valid_aggregations`, or an empty set if none are stored.
-        """
-        if self.valid_aggregations:
-            return set(agg.lower() for agg in self.valid_aggregations)
-        if self.role:
-            rk = self.role.upper()
-            if rk in ROLE_ALLOWED_AGGREGATIONS:
-                return {a.lower() for a in ROLE_ALLOWED_AGGREGATIONS[rk]}
-        return set()
-
-    def get_valid_having_ops(self) -> list[str]:
-        """
-        Valid `HAVING` operators for this column.
-
-        Returns:
-
-            A copy of `valid_having_ops` if set, otherwise an empty list.
-        """
-        if self.valid_having_ops:
-            return list(self.valid_having_ops)
-        return []
-
-    @property
-    def is_groupable(self) -> bool:
-        """
-        Whether the column may appear in `GROUP BY`.
-
-        Returns:
-
-            True when override, foreign key, or role allows grouping.
-        """
-        if self.is_groupable_override is not None:
-            return self.is_groupable_override
-        if self.is_foreign_key:
-            return True
-        return self.role in (
-            ColumnRole.CATEGORICAL.value,
-            ColumnRole.NUMERIC_CATEGORICAL.value,
-            ColumnRole.BOOLEAN.value,
-            ColumnRole.TEMPORAL.value,
-            ColumnRole.IDENTIFIER.value,
-        )
-
-    @property
-    def is_aggregatable(self) -> bool:
-        """
-        Whether measures like `SUM` / `AVG` apply to this column.
-
-        Returns:
-
-            True when override is set, or role is numeric measure.
-        """
-        if self.is_aggregatable_override is not None:
-            return self.is_aggregatable_override
-        return self.role == ColumnRole.NUMERIC_MEASURE.value
-
-
-def _column_metadata_is_foreign_key(self: ColumnMetadata) -> bool:
-    """
-    Whether this column participates as the source of any foreign-key edge on its owning table.
-
-    Derived strictly from ``TableMetadata.foreign_keys`` once an owner is wired; before wiring, falls back to the constructor seed value (used by standalone fixtures with no parent table).
-    """
-    owner = self._owner_table
-    if owner is None:
-        return self._seed_is_foreign_key
-    for fk in owner.foreign_keys:
-        if self.name in fk.src_cols:
-            return True
-    return False
-
-
-def _column_metadata_fk_target(self: ColumnMetadata) -> tuple[str, str] | None:
-    """
-    Destination ``(table, column)`` of the first foreign-key edge whose source includes this column.
-
-    Looked up from ``TableMetadata.foreign_keys`` when an owner is wired; before wiring, returns the constructor seed.
-    """
-    owner = self._owner_table
-    if owner is None:
-        return self._seed_fk_target
-    for fk in owner.foreign_keys:
-        for sc, dc in zip(fk.src_cols, fk.dst_cols, strict=False):
-            if sc == self.name:
-                return (fk.dst_table, dc)
-    return None
-
-
-ColumnMetadata.is_foreign_key = property(_column_metadata_is_foreign_key)
-ColumnMetadata.fk_target = property(_column_metadata_fk_target)
-
-
-def _column_metadata_is_primary_key(self: ColumnMetadata) -> bool:
-    """
-    Whether this column appears in its owning table's primary-key list.
-
-    Derived strictly from ``TableMetadata.primary_key`` once an owner is wired; before wiring, falls back to the constructor seed value (used by standalone fixtures with no parent table).
-    """
-    owner = self._owner_table
-    if owner is None:
-        return self._seed_is_primary_key
-    return self.name in owner.primary_key
-
-
-ColumnMetadata.is_primary_key = property(_column_metadata_is_primary_key)
-
-
-def _column_metadata_is_denied(self: ColumnMetadata) -> bool:
-    """
-    Whether this column is denied by scope policy on its owning :class:`SchemaGraph`.
-
-    True when the column appears in ``SchemaGraph.deny_columns`` or ``SchemaGraph.disallowed_columns`` for its owning table (once wired), or when the standalone fixture seed marks it denied.
-    """
-    owner = self._owner_table
-    if owner is None:
-        return self._seed_is_denied
-    graph = getattr(owner, "_owner_graph", None)
-    if graph is None:
-        return self._seed_is_denied
-    deny_set = graph.deny_columns.get(owner.name)
-    if deny_set and self.name in deny_set:
-        return True
-    disallowed = graph.disallowed_columns.get(owner.name)
-    return bool(disallowed and self.name in disallowed)
-
-
-ColumnMetadata.is_denied = property(_column_metadata_is_denied)
-
-
-def _column_metadata_is_canonical_duplicate(self: ColumnMetadata) -> bool:
-    """
-    Whether this column is the canonical bearer for its name across the schema graph.
-
-    A column whose name is unique across all tables is trivially canonical. When the same name appears in two or more tables, exactly one bearer is selected by ``recompute_canonical_bearers`` on the owning :class:`SchemaGraph` and recorded in ``SchemaGraph._canonical_bearers``; that bearer reads ``True`` and the others read ``False``. Before owner-graph wiring, falls back to the constructor seed value.
-    """
-    owner = self._owner_table
-    if owner is None:
-        return self._seed_is_canonical_duplicate
-    graph = getattr(owner, "_owner_graph", None)
-    if graph is None:
-        return self._seed_is_canonical_duplicate
-    bearers = getattr(graph, "_canonical_bearers", None)
-    if not bearers:
-        return True
-    bearer = bearers.get(self.name.lower())
-    if bearer is None:
-        return True
-    return bearer == (owner.name, self.name)
-
-
-ColumnMetadata.is_canonical_duplicate = property(_column_metadata_is_canonical_duplicate)
-
-
-@dataclass
-class TableMetadata:
-    """Table metadata with nested columns, foreign keys, partition columns, and role."""
-
-    name: str
-    columns: dict[str, ColumnMetadata]
-    primary_key: list[str]
-    foreign_keys: list[FKEdge]
-    kind: Literal["table", "view"] = "table"
-    partition_columns: list[str] = field(default_factory=list)
-    role: str | None = None
-    row_count: int = 0
-    description: str = ""
-    description_owner: DescriptionOwner | None = None
-    role_owner: RoleOwner | None = None
-    composite_descriptive_ratios: dict[tuple[str, str], float] = field(
-        default_factory=dict,
-    )
-    _user_semantic_neighbors: list[tuple[str, str, str, str]] = field(
-        default_factory=list,
-    )
-
-    def __post_init__(self) -> None:
-        """
-        Wire each child :class:`ColumnMetadata` back to this table and consolidate any PK / FK seeds.
-
-        Tests and ad-hoc fixtures may pass ``is_primary_key``, ``is_foreign_key`` / ``fk_target`` as constructor arguments to :class:`ColumnMetadata` without separately populating :attr:`primary_key` or appending an :class:`FKEdge` to :attr:`foreign_keys`. After wiring the per-column ``_owner_table`` back-reference, this method (a) appends any PK seed to :attr:`primary_key` when not already present, and (b) synthesises a single-column :class:`FKEdge` for every column whose seed declares an FK that is not already covered by an entry in :attr:`foreign_keys`. The seeds are then cleared so the :class:`ColumnMetadata` properties always read from this table's :attr:`primary_key` and :attr:`foreign_keys` as the single source of truth.
-        """
-        covered_fk: set[str] = set()
-        for fk in self.foreign_keys:
-            for sc in fk.src_cols:
-                covered_fk.add(sc)
-        if isinstance(self.primary_key, str):
-            self.primary_key = [self.primary_key] if self.primary_key else []
-        existing_pk = set(self.primary_key)
-        seeded_denies: set[str] = set()
-        for cname, col in self.columns.items():
-            col._owner_table = self
-            if col._seed_is_primary_key and cname not in existing_pk:
-                self.primary_key.append(cname)
-                existing_pk.add(cname)
-            if col._seed_is_foreign_key and col._seed_fk_target is not None and cname not in covered_fk:
-                dst_t, dst_c = col._seed_fk_target
-                self.foreign_keys.append(
-                    FKEdge(
-                        src_table=self.name,
-                        src_cols=[cname],
-                        dst_table=dst_t,
-                        dst_cols=[dst_c],
-                        inference_tag=None,
-                    )
-                )
-                covered_fk.add(cname)
-            if col._seed_is_denied:
-                seeded_denies.add(cname)
-            col._seed_is_primary_key = False
-            col._seed_is_foreign_key = False
-            col._seed_fk_target = None
-        object.__setattr__(self, "_owner_graph", None)
-        object.__setattr__(self, "_pending_denies", seeded_denies)
-
-    @staticmethod
-    def from_dict(d: dict[str, Any]) -> TableMetadata:
-        """
-        Create `TableMetadata` from a dictionary.
-
-        Args:
-
-            d: Dictionary with keys matching `TableMetadata` fields.
-
-        Returns:
-
-            Populated `TableMetadata` with nested `ColumnMetadata` and `FKEdge` objects.
-        """
-        cols_raw = d.get("columns", {})
-        columns = {k: ColumnMetadata.from_dict(v) for k, v in cols_raw.items()} if isinstance(cols_raw, dict) else {}
-        fk_raw = d.get("foreign_keys", [])
-        foreign_keys = [FKEdge(**fk) if isinstance(fk, dict) else fk for fk in fk_raw]
-        kind_raw = d.get("kind", "table")
-        kind: Literal["table", "view"] = "table" if kind_raw == "table" else "view"
-        return TableMetadata(
-            name=d.get("name", ""),
-            columns=columns,
-            primary_key=d.get("primary_key", []),
-            foreign_keys=foreign_keys,
-            kind=kind,
-            partition_columns=d.get("partition_columns", []),
-            role=d.get("role"),
-            row_count=d.get("row_count", 0),
-            description=d.get("description", ""),
-            description_owner=_coerce_description_owner(d.get("description_owner")),
-            role_owner=coerce_role_owner(d.get("role_owner")),
-            composite_descriptive_ratios={
-                tuple(k.split("|", 1)): v for k, v in d.get("composite_descriptive_ratios", {}).items() if "|" in k
-            },
-            _user_semantic_neighbors=[
-                tuple(item)
-                for item in (d.get("_user_semantic_neighbors", []) or [])
-                if isinstance(item, (list, tuple)) and len(item) == 4
-            ],
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        """
-        Serialize to a plain dictionary for JSON storage.
-
-        Returns:
-
-            Dictionary with all `TableMetadata` fields; nested columns and foreign keys are serialized recursively.
-        """
-        return {
-            "name": self.name,
-            "kind": self.kind,
-            "columns": {k: v.to_dict() for k, v in self.columns.items()},
-            "primary_key": self.primary_key,
-            "foreign_keys": [asdict(fk) for fk in self.foreign_keys],
-            "partition_columns": self.partition_columns,
-            "role": self.role,
-            "row_count": self.row_count,
-            "description": self.description,
-            "description_owner": (self.description_owner.value if self.description_owner is not None else None),
-            "role_owner": (self.role_owner.value if self.role_owner is not None else None),
-            "composite_descriptive_ratios": {
-                f"{c1}|{c2}": ratio for (c1, c2), ratio in self.composite_descriptive_ratios.items()
-            },
-            "_user_semantic_neighbors": [list(t) for t in self._user_semantic_neighbors],
-        }
-
-    @property
-    def column_names(self) -> list[str]:
-        """
-        Ordered column names for this table.
-
-        Returns:
-
-            Keys of `columns` as a list.
-        """
-        return list(self.columns.keys())
-
-
-_SchemaGraphStatsFn = Callable[["SchemaGraph"], dict[str, Any]]
-_SchemaGraphCapabilityFn = Callable[["SchemaGraph"], DatabaseFeatureCapability]
-
-_schema_graph_stats_fn: _SchemaGraphStatsFn | None = None
-_schema_graph_capability_fn: _SchemaGraphCapabilityFn | None = None
-
-
-def set_schema_helpers(
-    stats_fn: _SchemaGraphStatsFn,
-    capability_fn: _SchemaGraphCapabilityFn,
-) -> None:
-    """
-    Wire :meth:`SchemaGraph.refresh_schema_stats` and :attr:`SchemaGraph.database_feature_capability`
-    to the implementations in :mod:`aetherdialect._schema` (called once at import time from that module).
-    """
-
-    global _schema_graph_stats_fn, _schema_graph_capability_fn
-    _schema_graph_stats_fn = stats_fn
-    _schema_graph_capability_fn = capability_fn
-
-
-@dataclass
-class SchemaGraph:
-    """Schema graph with nested tables, join paths, and metadata."""
-
-    tables: dict[str, TableMetadata]
-    join_paths_multi: dict[str, dict[str, list[list[dict[str, Any]]]]]
-    structural_hash: str = ""
-    profiling_hash: str = ""
-    scope_hash: str = ""
-    effective_structural_hash: str = ""
-    notes_hash: str = ""
-    semantic_edges_hash: str = ""
-    ddl_probe_hash: str = ""
-    include: SchemaInclude = "tables"
-    created_at: str = ""
-    enum_values: dict[str, list[str]] | None = None
-    schema_stats: dict[str, Any] | None = None
-    deny_columns: dict[str, set[str]] = field(default_factory=dict)
-    disallowed_columns: dict[str, set[str]] = field(default_factory=dict)
-    notes_sha256: str = ""
-    scope_descriptor: dict[str, Any] | None = None
-    schema_revision: int = 0
-    _database_feature_capability_cache: DatabaseFeatureCapability | None = field(
-        default=None, repr=False, compare=False
-    )
-    _stats_dirty: bool = field(default=True, repr=False, compare=False)
-
-    def __post_init__(self) -> None:
-        """
-        Wire owner-graph back-references and consolidate per-column deny seeds into ``deny_columns``.
-
-        After this runs, ``deny_columns`` is the single source of truth for ``ColumnMetadata.is_denied``. Existing ``deny_columns`` entries are preserved; per-column seeds (set on standalone-built columns) and per-table pending-deny sets (collected by :meth:`TableMetadata.__post_init__`) are folded in.
-        """
-        deny_columns: dict[str, set[str]] = {k: set(v) for k, v in (self.deny_columns or {}).items()}
-        disallowed_columns: dict[str, set[str]] = {k: set(v) for k, v in (self.disallowed_columns or {}).items()}
-        for tbl_name, tbl in self.tables.items():
-            object.__setattr__(tbl, "_owner_graph", self)
-            pending = getattr(tbl, "_pending_denies", set())
-            if pending:
-                deny_columns.setdefault(tbl_name, set()).update(pending)
-                object.__setattr__(tbl, "_pending_denies", set())
-            for col_name, col in tbl.columns.items():
-                if getattr(col, "_seed_is_denied", False):
-                    deny_columns.setdefault(tbl_name, set()).add(col_name)
-                    col._seed_is_denied = False
-        self.deny_columns = deny_columns
-        self.disallowed_columns = disallowed_columns
-        if not hasattr(self, "_canonical_bearers"):
-            object.__setattr__(self, "_canonical_bearers", {})
-
-    def mark_stats_dirty(self) -> None:
-        """Flag :attr:`schema_stats` as stale so the next :meth:`ensure_schema_stats` call recomputes it."""
-
-        self._stats_dirty = True
-
-    def refresh_schema_stats(self) -> dict[str, Any]:
-        """Unconditionally recompute :attr:`schema_stats` from the current graph and clear the dirty flag."""
-
-        fn = _schema_graph_stats_fn
-        if fn is None:
-            raise RuntimeError("Schema helpers not wired (aetherdialect._schema did not load)")
-        self.schema_stats = fn(self)
-        self._stats_dirty = False
-        return self.schema_stats
-
-    def ensure_schema_stats(self) -> dict[str, Any]:
-        """Recompute :attr:`schema_stats` only when the dirty flag is set or the cached payload is missing/empty; otherwise return the cached value."""
-
-        if self._stats_dirty or not self.schema_stats:
-            return self.refresh_schema_stats()
-        return self.schema_stats
-
-    @property
-    def fk_edges(self) -> list[FKEdge]:
-        """
-        All foreign-key edges declared on tables in the graph.
-
-        Returns:
-
-            Flattened list of `FKEdge` from every `TableMetadata.foreign_keys`.
-        """
-        return [fk for table in self.tables.values() for fk in table.foreign_keys]
-
-    @property
-    def table_names(self) -> list[str]:
-        """
-        Table names present in the graph.
-
-        Returns:
-
-            Keys of `tables` as a list.
-        """
-        return list(self.tables.keys())
-
-    @property
-    def schema_hash(self) -> str:
-        """Alias for ``effective_structural_hash`` for legacy call sites."""
-
-        return self.effective_structural_hash
-
-    @property
-    def database_feature_capability(self) -> DatabaseFeatureCapability:
-        """
-        Cached structural feasibility snapshot for tier-conditioned generators.
-
-        Returns:
-
-            :class:`DatabaseFeatureCapability` computed once per graph instance.
-        """
-
-        cached = self._database_feature_capability_cache
-        if cached is None:
-            cap_fn = _schema_graph_capability_fn
-            if cap_fn is None:
-                raise RuntimeError("Schema helpers not wired (aetherdialect._schema did not load)")
-            cached = cap_fn(self)
-            object.__setattr__(self, "_database_feature_capability_cache", cached)
-        return cached
-
-    def get_column(self, table: str, column: str) -> ColumnMetadata | None:
-        """
-        Look up column metadata by table and column name.
-
-        Args:
-
-            table: Table name to look up.
-
-            column: Column name within that table.
-
-        Returns:
-
-            `ColumnMetadata` if found, otherwise None.
-        """
-        if table in self.tables and column in self.tables[table].columns:
-            return self.tables[table].columns[column]
-        return None
-
-    def _schema_literal_public_role(self, role: str | None) -> str | None:
-        if role is None:
-            return None
-        r = str(role).strip()
-        if not r or r in (ColumnRole.IDENTIFIER.value, ColumnRole.AUDIT.value):
-            return None
-        return r
-
-    def _schema_literal_column_type_token(self, col: ColumnMetadata) -> str:
-        vt = (col.value_type or "").strip()
-        if vt:
-            return vt
-        if col.data_type:
-            return data_type_to_value_type(col.data_type)
-        return "unknown"
-
-    def _schema_literal_column_object(
-        self,
-        col: ColumnMetadata,
-        *,
-        structural_only: bool,
-    ) -> dict[str, Any]:
-        col_body: dict[str, Any] = {"type": self._schema_literal_column_type_token(col)}
-        if col.is_primary_key:
-            col_body["pk"] = True
-        if col.fk_target:
-            col_body["fk"] = f"{col.fk_target[0]}.{col.fk_target[1]}"
-        if col.is_unique and not col.is_primary_key:
-            col_body["unique"] = True
-        if not structural_only:
-            desc = (col.description or "").strip()
-            if desc:
-                col_body["description"] = desc
-            pub_role = self._schema_literal_public_role(col.role)
-            if pub_role is not None:
-                col_body["role"] = pub_role
-            if col_body["type"].lower() == "boolean":
-                tv = (col.boolean_truth_value or "").strip()
-                if tv:
-                    col_body["truth_value"] = tv
-        return col_body
-
-    def _schema_literal_payload(
-        self,
-        *,
-        structural_only: bool,
-        table_filter: frozenset[str] | None,
-    ) -> dict[str, Any]:
-        root: dict[str, Any] = {}
-        for tname in sorted(self.tables):
-            if table_filter is not None and tname not in table_filter:
-                continue
-            tm = self.tables[tname]
-            col_map: dict[str, dict[str, Any]] = {}
-            for col_name in sorted(tm.columns.keys()):
-                col = tm.columns[col_name]
-                if not col.is_visible:
-                    continue
-                col_map[col_name] = self._schema_literal_column_object(col, structural_only=structural_only)
-            table_body: dict[str, Any] = {"columns": col_map}
-            if not structural_only:
-                td = (tm.description or "").strip()
-                if td:
-                    table_body["description"] = td
-                tr = self._schema_literal_public_role(tm.role)
-                if tr is not None:
-                    table_body["role"] = tr
-            root[tname] = table_body
-        if not structural_only and self.enum_values:
-            enum_block: dict[str, Any] = {}
-            for ename in sorted(self.enum_values.keys()):
-                values = self.enum_values[ename]
-                if len(values) <= 10:
-                    enum_block[ename] = list(values)
-                else:
-                    enum_block[ename] = list(values[:10]) + ["..."]
-            root["enum_types"] = enum_block
-        return root
-
-    @property
-    def schema_literal_json(self) -> str:
-        """
-        JSON string describing visible, scope-permitted tables and columns for LLM prompts.
-
-        Columns whose ``is_visible`` is false are omitted. Optional ``enum_types`` summarizes enumerated domains when present. Boolean columns may include ``truth_value`` when configured.
-
-        Returns:
-
-            Compact JSON text; an empty graph yields ``"{}"``.
-        """
-
-        payload = self._schema_literal_payload(structural_only=False, table_filter=None)
-        return json.dumps(payload, separators=(",", ":"), sort_keys=True)
-
-    def structural_schema_literal_json(self, tables: Iterable[str] | None = None) -> str:
-        """
-        Structural schema JSON with descriptions stripped, optionally restricted to *tables*.
-
-        Args:
-
-            tables: When ``None``, every graph table is included; otherwise only listed names that exist.
-
-        Returns:
-
-            Compact JSON text; unknown table names in *tables* are ignored.
-        """
-
-        filt: frozenset[str] | None = frozenset(str(t) for t in tables) if tables is not None else None
-        payload = self._schema_literal_payload(structural_only=True, table_filter=filt)
-        return json.dumps(payload, separators=(",", ":"), sort_keys=True)
-
-    @staticmethod
-    def from_dict(d: dict[str, Any]) -> SchemaGraph:
-        """
-        Create `SchemaGraph` from a dictionary.
-
-        Args:
-
-            d: Dictionary with keys matching `SchemaGraph` fields, typically loaded from JSON.
-
-        Returns:
-
-            Populated `SchemaGraph` with nested `TableMetadata` instances.
-        """
-        tables_raw = d.get("tables", {})
-        tables = {k: TableMetadata.from_dict(v) for k, v in tables_raw.items()}
-        deny_cols_raw = d.get("deny_columns", {})
-        deny_columns: dict[str, set[str]] = {}
-        if isinstance(deny_cols_raw, dict):
-            for tbl, cols in deny_cols_raw.items():
-                if isinstance(cols, list):
-                    deny_columns[str(tbl)] = set(str(c) for c in cols)
-        disallowed_raw = d.get("disallowed_columns", {})
-        disallowed_columns: dict[str, set[str]] = {}
-        if isinstance(disallowed_raw, dict):
-            for tbl, cols in disallowed_raw.items():
-                if isinstance(cols, list):
-                    disallowed_columns[str(tbl)] = set(str(c) for c in cols)
-        legacy_hash = str(d.get("schema_hash", "") or "")
-        structural_hash = str(d.get("structural_hash", "") or legacy_hash)
-        profiling_hash = str(d.get("profiling_hash", "") or legacy_hash)
-        scope_hash = str(d.get("scope_hash", "") or legacy_hash)
-        effective_structural_hash = str(d.get("effective_structural_hash", "") or legacy_hash)
-        inc_raw = d.get("include")
-        if inc_raw in ("tables", "views", "both"):
-            include_val: SchemaInclude = inc_raw
-        else:
-            okind = d.get("object_kind", "table")
-            include_val = "views" if okind == "view" else "tables"
-        return SchemaGraph(
-            tables=tables,
-            join_paths_multi=d.get("join_paths_multi", {}),
-            structural_hash=structural_hash,
-            profiling_hash=profiling_hash,
-            scope_hash=scope_hash,
-            effective_structural_hash=effective_structural_hash,
-            notes_hash=str(d.get("notes_hash", "") or ""),
-            semantic_edges_hash=str(d.get("semantic_edges_hash", "") or ""),
-            ddl_probe_hash=str(d.get("ddl_probe_hash", "") or ""),
-            include=include_val,
-            created_at=d.get("created_at", ""),
-            enum_values=d.get("enum_values"),
-            schema_stats=d.get("schema_stats"),
-            deny_columns=deny_columns,
-            disallowed_columns=disallowed_columns,
-            notes_sha256=str(d.get("notes_sha256", "") or ""),
-            scope_descriptor=(d.get("scope_descriptor") if isinstance(d.get("scope_descriptor"), dict) else None),
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        """
-        Serialize to a plain dictionary for JSON storage.
-
-        Returns:
-
-            Dictionary with all `SchemaGraph` fields; nested tables are serialized recursively.
-        """
-        return {
-            "tables": {k: v.to_dict() for k, v in self.tables.items()},
-            "join_paths_multi": self.join_paths_multi,
-            "structural_hash": self.structural_hash,
-            "profiling_hash": self.profiling_hash,
-            "scope_hash": self.scope_hash,
-            "effective_structural_hash": self.effective_structural_hash,
-            "notes_hash": self.notes_hash,
-            "semantic_edges_hash": self.semantic_edges_hash,
-            "ddl_probe_hash": self.ddl_probe_hash,
-            "include": self.include,
-            "created_at": self.created_at,
-            "enum_values": self.enum_values,
-            "schema_stats": self.schema_stats,
-            "deny_columns": {k: sorted(v) for k, v in self.deny_columns.items()},
-            "disallowed_columns": {k: sorted(v) for k, v in self.disallowed_columns.items()},
-            "notes_sha256": self.notes_sha256,
-            "scope_descriptor": self.scope_descriptor,
-        }
-
-
-@dataclass
-class ExpansionMetadata:
-    """Metadata for intent expansion operations."""
-
-    operator: str
-    parent_intent_id: str | None = None
-    depth: int = 0
-    expansion_path: list[str] = field(default_factory=list)
-
-    @staticmethod
-    def from_dict(d: dict[str, Any]) -> ExpansionMetadata:
-        """
-        Create `ExpansionMetadata` from a dictionary.
-
-        Args:
-
-            d: Dictionary with keys matching `ExpansionMetadata` fields.
-
-        Returns:
-
-            Populated `ExpansionMetadata` instance.
-        """
-        return ExpansionMetadata(
-            operator=d.get("operator", ""),
-            parent_intent_id=d.get("parent_intent_id"),
-            depth=d.get("depth", 0),
-            expansion_path=d.get("expansion_path", []),
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        """
-        Serialize expansion metadata to a plain dict.
-
-        Returns:
-
-            `asdict` of all fields.
-        """
-        return asdict(self)
-
-
-@dataclass
-class CteOutputColumnMeta:
-    """Metadata for a CTE output column, including source, role, and aggregation info."""
-
-    source: str
-    agg_func: str = ""
-    role: str | None = None
-    filterable: bool = True
-    aggregatable: bool = True
-    data_type: str = "unknown"
-    value_type: str = ""
-    groupable: bool = True
-    valid_filter_ops: list[str] = field(default_factory=list)
-    valid_aggregations: list[str] = field(default_factory=list)
-    valid_having_ops: list[str] = field(default_factory=list)
-    sensitivity: str | None = None
-    lineage_phys_table: str | None = None
-    lineage_phys_column: str | None = None
-    lineage_inherits_pk: bool = False
-    lineage_fk_to_table: str | None = None
-    lineage_fk_to_column: str | None = None
-    semantic_distinct_values: list[str] = field(default_factory=list)
-    semantic_join_neighbors: list[tuple[str, str]] = field(default_factory=list)
-
-    def __post_init__(self) -> None:
-        """Set `value_type` from `data_type` when `value_type` is empty."""
-        if not self.value_type and self.data_type:
-            self.value_type = data_type_to_value_type(self.data_type)
-
-    @property
-    def is_selectable(self) -> bool:
-        """Whether the CTE output column may be projected; derived from ``sensitivity`` (hidden tags suppress selection)."""
-
-        if self.sensitivity is None:
-            return True
-        return str(self.sensitivity).strip().lower() not in HIDDEN_SENSITIVITIES
-
-    def get_valid_filter_ops(self) -> list[str]:
-        """
-        Filter operators allowed on this CTE output column.
-
-        Returns:
-
-            Stored ops plus null checks, or defaults when `filterable`, else null checks only.
-        """
-        null_ops = ["is null", "is not null"]
-        if self.valid_filter_ops:
-            return list(set(self.valid_filter_ops + null_ops))
-        if self.filterable:
-            return [
-                "=",
-                "!=",
-                "<",
-                "<=",
-                ">",
-                ">=",
-                "in",
-                "not in",
-                "is null",
-                "is not null",
-            ]
-        return null_ops
-
-    def get_valid_aggregations(self) -> set[str]:
-        """
-        Aggregation names allowed on this CTE output column.
-
-        Returns:
-
-            Lowercased `valid_aggregations`, or defaults by `aggregatable` flag.
-        """
-        if self.valid_aggregations:
-            return set(agg.lower() for agg in self.valid_aggregations)
-        if not self.role:
-            return set()
-        rk = self.role.upper()
-        if rk in ROLE_ALLOWED_AGGREGATIONS:
-            return {a.lower() for a in ROLE_ALLOWED_AGGREGATIONS[rk]}
-        if self.aggregatable:
-            return {"count", "sum", "avg", "min", "max"}
-        return {"count"}
-
-    def get_valid_having_ops(self) -> list[str]:
-        """
-        `HAVING` operators allowed on this CTE output column.
-
-        Returns:
-
-            Stored list, comparison ops when `aggregatable`, or an empty list.
-        """
-        if self.valid_having_ops:
-            return list(self.valid_having_ops)
-        if self.aggregatable:
-            return ["=", "!=", "<", "<=", ">", ">="]
-        return []
-
-    @staticmethod
-    def from_dict(d: dict[str, Any]) -> CteOutputColumnMeta:
-        """
-        Create `CteOutputColumnMeta` from a dictionary.
-
-        Args:
-
-            d: Dictionary with keys matching `CteOutputColumnMeta` fields.
-
-        Returns:
-
-            Populated `CteOutputColumnMeta` instance.
-        """
-        return CteOutputColumnMeta(
-            source=d.get("source", "passthrough"),
-            agg_func=d.get("agg_func", ""),
-            role=d.get("role"),
-            filterable=d.get("filterable", True),
-            aggregatable=d.get("aggregatable", True),
-            data_type=d.get("data_type", "unknown"),
-            value_type=d.get("value_type", ""),
-            groupable=d.get("groupable", True),
-            valid_filter_ops=d.get("valid_filter_ops", []),
-            valid_aggregations=d.get("valid_aggregations", []),
-            valid_having_ops=d.get("valid_having_ops", []),
-            sensitivity=d.get("sensitivity"),
-            lineage_phys_table=d.get("lineage_phys_table"),
-            lineage_phys_column=d.get("lineage_phys_column"),
-            lineage_inherits_pk=d.get("lineage_inherits_pk", False),
-            lineage_fk_to_table=d.get("lineage_fk_to_table"),
-            lineage_fk_to_column=d.get("lineage_fk_to_column"),
-            semantic_distinct_values=d.get("semantic_distinct_values", []),
-            semantic_join_neighbors=[
-                (str(x[0]), str(x[1]))
-                for x in (d.get("semantic_join_neighbors") or [])
-                if isinstance(x, (list, tuple)) and len(x) == 2
-            ],
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        """
-        Serialize CTE column meta to a plain dict.
-
-        Returns:
-
-            Plain dict including JSON-friendly neighbor pairs.
-        """
-        d = asdict(self)
-        d["is_selectable"] = self.is_selectable
-        d["semantic_join_neighbors"] = [list(p) for p in self.semantic_join_neighbors]
-        return d
-
-
-@dataclass
-class VirtualColumnSpec:
-    """Join-discovery view of one CTE output column with lifted physical lineage."""
-
-    lineage_phys_table: str | None
-    lineage_phys_column: str | None
-    inherits_pk: bool
-    fk_to: tuple[str, str] | None
-    semantic_distinct_values: list[str]
-    semantic_join_neighbors: list[tuple[str, str]] = field(default_factory=list)
-
-
-@dataclass
-class VirtualTableSpec:
-    """In-memory join graph node for a CTE keyed by ``cte_name``."""
-
-    cte_name: str
-    columns: dict[str, VirtualColumnSpec]
-    emission: str = "join_table"
-
-
-@dataclass
-class RetryFailureContext:
-    """Structured failure context for LLM retry guidance."""
-
-    failure_type: str
-    required_tables: list[str]
-    used_tables: set[str]
-    missing_tables: set[str]
-    attempt_number: int
-
-
-@dataclass
-class SQLShape:
-    """Structural features of a SQL query for comparison."""
-
-    num_joins: int
-    has_group_by: bool
-    has_agg: bool
-    num_cte: int = 0
-    num_filters: int = 0
-    num_having: int = 0
-    has_distinct: bool = False
-
-    @staticmethod
-    def from_dict(d: dict[str, Any]) -> SQLShape:
-        """
-        Create `SQLShape` from a dictionary.
-
-        Args:
-
-            d: Dictionary with keys matching `SQLShape` fields.
-
-        Returns:
-
-            Populated `SQLShape` instance.
-        """
-        return SQLShape(
-            num_joins=d.get("num_joins", 0),
-            has_group_by=d.get("has_group_by", False),
-            has_agg=d.get("has_agg", False),
-            num_cte=d.get("num_cte", 0),
-            num_filters=d.get("num_filters", 0),
-            num_having=d.get("num_having", 0),
-            has_distinct=d.get("has_distinct", False),
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        """
-        Serialize shape flags to a plain dict.
-
-        Returns:
-
-            `asdict` of all fields.
-        """
-        return asdict(self)
-
-
-@dataclass
-class IntentIssue:
-    """Issue detected during intent validation or resolution."""
-
-    issue_id: str
-    category: FailureCategory
-    severity: str
-    message: str
-    context: dict[str, Any] = field(default_factory=dict)
-    responsible_stage: Literal["logical", "format"] = "format"
-
-    @staticmethod
-    def from_dict(d: dict[str, Any]) -> IntentIssue:
-        """
-        Create `IntentIssue` from a dictionary.
-
-        Args:
-
-            d: Dictionary with keys matching `IntentIssue` fields.
-
-        Returns:
-
-            Populated `IntentIssue` instance.
-        """
-        raw_cat = d.get("category", "")
-        if isinstance(raw_cat, FailureCategory):
-            category: FailureCategory = raw_cat
-        else:
-            category = parse_failure_category(str(raw_cat) if raw_cat is not None else None) or FailureCategory.OTHER
-        rs = d.get("responsible_stage", "format")
-        stage: Literal["logical", "format"] = "logical" if rs == "logical" else "format"
-        return IntentIssue(
-            issue_id=d.get("issue_id", ""),
-            category=category,
-            severity=d.get("severity", "error"),
-            message=d.get("message", ""),
-            context=d.get("context", {}),
-            responsible_stage=stage,
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        """
-        Serialize the issue to a plain dict.
-
-        Returns:
-
-            Primitive field mapping including `context`.
-        """
-        return {
-            "issue_id": self.issue_id,
-            "category": self.category.value,
-            "severity": self.severity,
-            "message": self.message,
-            "context": dict(self.context),
-            "responsible_stage": self.responsible_stage,
-        }
-
-
-STAGE_ATTRIBUTION_TABLE: Mapping[str, Literal["logical", "format"]] = MappingProxyType(
-    {
-        "column_not_found_in_chosen_tables": "format",
-        "chosen_table_lacks_required_column": "format",
-        "filter_targets_missing_column": "format",
-        "joinpath_does_not_exist": "logical",
-        "grain_inconsistent_with_chosen_tables": "logical",
-        "cte_chosen_tables_inconsistent": "logical",
-        "window_partition_column_missing": "format",
-        "encoder_added_or_removed_tables": "format",
-        "json_schema_violation": "format",
-        "missing_required_field": "format",
-        "invalid_operator": "format",
-        "invalid_value_type": "format",
-        "unqualified_column_reference": "format",
-        "cte_dependency_cycle": "format",
-        "window_frame_syntax_invalid": "format",
-        "existence_filter_encoded_as_subquery": "format",
-        "self_reference_encoded_as_inline_self_join": "format",
-        "correlated_lookup_encoded_as_lateral": "format",
-    }
-)
-
-_LOGICAL_FAILURE_CATEGORIES: frozenset[FailureCategory] = frozenset(
-    {
-        FailureCategory.UNKNOWN_TABLE,
-        FailureCategory.WRONG_TABLES,
-        FailureCategory.WRONG_JOIN,
-        FailureCategory.GRAIN_CONSISTENCY,
-        FailureCategory.GRAIN_VALIDITY,
-        FailureCategory.CTE_TABLE_REFERENCE,
-        FailureCategory.CTE_GRAIN_CONSISTENCY,
-        FailureCategory.CTE_GRAIN_COMPATIBILITY,
-        FailureCategory.WRONG_COLUMN_SELECTION,
-        FailureCategory.WRONG_FILTER_LOGIC,
-    }
-)
-
-
-LITERAL_BEARING_CATEGORIES: frozenset[FailureCategory] = frozenset(
-    {
-        FailureCategory.MISSING_NUMERIC_FILTER,
-        FailureCategory.MISSING_TEMPORAL_COLUMN,
-    }
-)
-
-
-def make_intent_issue(
-    *,
-    issue_id: str,
-    category: FailureCategory,
-    severity: str,
-    message: str,
-    context: dict[str, Any] | None = None,
-    responsible_stage: Literal["logical", "format"] | None = None,
-) -> IntentIssue:
-    """
-    Construct an :class:`IntentIssue` with ``responsible_stage`` from :data:`STAGE_ATTRIBUTION_TABLE` when omitted.
-
-    Args:
-
-        issue_id: Stable identifier; substring keys in :data:`STAGE_ATTRIBUTION_TABLE` select the default stage when *responsible_stage* is omitted.
-
-        category: Failure category for the issue.
-
-        severity: ``error``, ``warning``, or other severity token retained by validation.
-
-        message: Human-readable explanation.
-
-        context: Optional structured context copied into the issue.
-
-        responsible_stage: When ``None``, the stage is inferred from *issue_id* and *category*.
-
-    Returns:
-
-        A new :class:`IntentIssue` with ``responsible_stage`` set explicitly or inferred.
-    """
-
-    ctx = dict(context or {})
-    if responsible_stage is not None:
-        return IntentIssue(
-            issue_id=issue_id,
-            category=category,
-            severity=severity,
-            message=message,
-            context=ctx,
-            responsible_stage=responsible_stage,
-        )
-    iid = (issue_id or "").lower()
-    for key, stage in STAGE_ATTRIBUTION_TABLE.items():
-        if key in iid:
-            return IntentIssue(
-                issue_id=issue_id,
-                category=category,
-                severity=severity,
-                message=message,
-                context=ctx,
-                responsible_stage=stage,
-            )
-    if category in _LOGICAL_FAILURE_CATEGORIES:
-        inferred: Literal["logical", "format"] = "logical"
-    else:
-        inferred = "format"
-    return IntentIssue(
-        issue_id=issue_id,
-        category=category,
-        severity=severity,
-        message=message,
-        context=ctx,
-        responsible_stage=inferred,
-    )
-
-
-_KEPT_ISSUE_SEVERITIES: frozenset[str] = frozenset({"error", "warning"})
-
-
-@dataclass
-class IntentValidationResult:
-    """
-    Result container for intent validation with issue tracking.
-
-    Only ``error`` and ``warning`` severity issues are retained; any ``info`` (or otherwise non-actionable) severity issue is dropped at construction time so downstream consumers never have to filter them out.
-    """
-
-    issues: list[IntentIssue] = field(default_factory=list)
-
-    def __post_init__(self) -> None:
-        """Drop any issue whose severity is not ``error`` or ``warning``."""
-        self.issues = [i for i in self.issues if i.severity in _KEPT_ISSUE_SEVERITIES]
-
-    @property
-    def is_valid(self) -> bool:
-        """
-        Whether validation found no error-severity issues.
-
-        Returns:
-
-            True if no `IntentIssue` has `severity == 'error'`.
-        """
-        return not any(i.severity == "error" for i in self.issues)
-
-    @staticmethod
-    def from_dict(d: dict[str, Any]) -> IntentValidationResult:
-        """
-        Create `IntentValidationResult` from a dictionary.
-
-        Args:
-
-            d: Dictionary with an `issues` list of serialized `IntentIssue` dicts.
-
-        Returns:
-
-            Populated `IntentValidationResult` with deserialized `IntentIssue` objects.
-        """
-        issues_raw = d.get("issues", [])
-        return IntentValidationResult(
-            issues=[IntentIssue.from_dict(i) for i in issues_raw],
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        """
-        Serialize validation result for JSON.
-
-        Returns:
-
-            Dict with an `issues` list of serialized `IntentIssue` dicts.
-        """
-        return {"issues": [i.to_dict() for i in self.issues]}
-
-
-@dataclass
-class TemplateStats:
-    """Template acceptance and rejection statistics."""
-
-    accept: int = 0
-    reject: int = 0
-
-    @staticmethod
-    def from_dict(d: dict[str, Any]) -> TemplateStats:
-        """
-        Create `TemplateStats` from a dictionary.
-
-        Args:
-
-            d: Dictionary with `accept` and `reject` integer keys.
-
-        Returns:
-
-            Populated `TemplateStats` instance.
-        """
-        return TemplateStats(
-            accept=int(d.get("accept", 0)),
-            reject=int(d.get("reject", 0)),
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        """
-        Serialize accept/reject counts.
-
-        Returns:
-
-            `asdict` of `accept` and `reject`.
-        """
-        return asdict(self)
-
-
-@dataclass
-class QSimSkeleton:
-    """Structural skeleton for QSim intent before the LLM fills semantics."""
-
-    tables: list[str]
-    has_aggregation: bool
-    num_filters: int
-    num_groupby: int
-    has_orderby: bool
-    num_having: int
-    has_distinct: bool = False
-    has_expr_comparison: bool = False
-
-
-@dataclass
-class SkeletonPool:
-    """Tiered skeleton pool with round-robin table-set selection."""
-
-    tier_a_by_table_set: dict[str, list[QSimSkeleton]]
-    tier_b_by_table_set: dict[str, list[QSimSkeleton]]
-    tier_c_by_table_set: dict[str, list[QSimSkeleton]]
-    table_set_keys: list[str]
-    tier_a_indices: dict[str, int]
-    tier_b_indices: dict[str, int]
-    tier_c_indices: dict[str, int]
-    current_table_idx: int = 0
-
-
-@dataclass
-class TemplateInfo:
-    """User-facing template information with obfuscated internals."""
-
-    id: str
-    natural_language: str
-    example_question: str
-    trust_level: str
-    source: str
-
-
-@dataclass
-class RejectedTemplateInfo:
-    """User-facing rejected template with generic categories."""
-
-    id: str
-    natural_language: str
-    example_question: str
-    rejection_category: str
-    rejection_count: int
-
-
-@dataclass
-class SeedWarmupSummary:
-    """Aggregate statistics for a seed warmup preflight or full run."""
-
-    version: int
-    total: int
-    success: int
-    failed: int
-    success_rate: float
-    seed_questions_loaded: int = 0
-    gold_intents_total: int = 0
-    unique_prompts: int = 0
-    gold_new: int = 0
-    gold_skipped: int = 0
-    gold_failed: int = 0
-    gold_user_rejected: int = 0
-    deduped_prompts_count: int = 0
-    gold_prompts_count: int = 0
-    templates_added: int = 0
-    validation_drop: int = 0
-    realism_drop: int = 0
-    question_generation_failed: int = 0
-    early_pipeline_failed: int = 0
-
-
-@dataclass
-class QSimSummary:
-    """QSim (question generation) run metadata with version, counts, and seed."""
-
-    version: int
-    num_intents: int
-    num_questions: int
-    seed: int
-
-    @staticmethod
-    def from_dict(d: dict[str, Any]) -> QSimSummary:
-        """
-        Create `QSimSummary` from a dictionary.
-
-        Args:
-
-            d: Dictionary with keys matching `QSimSummary` fields.
-
-        Returns:
-
-            Populated `QSimSummary` instance.
-        """
-        return QSimSummary(
-            version=int(d.get("version", 0)),
-            num_intents=d.get("num_intents", 0),
-            num_questions=d.get("num_questions", 0),
-            seed=d.get("seed", DEFAULT_RANDOM_SEED),
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        """
-        Serialize QSim run metadata.
-
-        Returns:
-
-            `asdict` of version, counts, and seed.
-        """
-        return asdict(self)
-
-
-@dataclass
-class SchemaLimits:
-    """Internal schema-based limits for adaptive parameter validation."""
-
-    max_filters: int
-    max_groupby: int
-    max_tables: int
-
-
-@dataclass
-class SkeletonLimits:
-    """Schema-derived limits for QSim skeleton enumeration."""
-
-    max_filters: int
-    max_groupby: int
-    max_having: int
 
 
 class AccessError(RuntimeError):
@@ -3216,7 +1403,6 @@ class AccessError(RuntimeError):
         relation: str | None = None,
     ) -> None:
         """Attach *operation*, human *message*, and optional *relation* hint for UX."""
-
         self.operation = operation
         self.relation = relation
         super().__init__(message)
@@ -3238,11 +1424,7 @@ class PipelineSuspended(Exception):
 
 
 class NoJoinPathError(Exception):
-    """
-    Raised when multi-table scope has no foreign-key or semantic join path.
-
-    This is a terminal, deterministic pipeline failure: no LLM call can invent a plausible join when neither the physical foreign-key graph nor the semantic edge set connects the requested tables.
-    """
+    """Raised when multi-table scope has no foreign-key or semantic join path. This is a terminal, deterministic pipeline failure: no LLM call can invent a plausible join when neither the physical foreign-key graph nor the semantic edge set connects the requested tables."""
 
     def __init__(
         self,
@@ -3282,13 +1464,1194 @@ class JoinInjectionFailedError(Exception):
 
 
 class LlmJsonExhausted(Exception):
-    """
-    Raised by ``llm_json`` when every retry attempt fails to produce valid JSON.
-
-    Callers decide whether exhaustion is recoverable (e.g., retry loops, deterministic fallbacks) or terminal.
-    """
+    """Raised by ``llm_json`` when every retry attempt fails to produce valid JSON. Callers decide whether exhaustion is recoverable (e.g., retry loops, deterministic fallbacks) or terminal."""
 
     def __init__(self, task: str, attempts: int) -> None:
         self.task = task
         self.attempts = attempts
         super().__init__(f"llm_json exhausted after {attempts} attempt(s) for task={task!r}")
+
+
+_PARSE_EXPR_STRING_FN: Any | None = None
+_RENDER_EXPR_SQL_FN: Any | None = None
+
+
+def register_parse_expr_string(fn: Any) -> None:
+    global _PARSE_EXPR_STRING_FN
+    _PARSE_EXPR_STRING_FN = fn
+
+
+def register_render_expr_sql(fn: Any) -> None:
+    global _RENDER_EXPR_SQL_FN
+    _RENDER_EXPR_SQL_FN = fn
+
+
+def parse_expr_string_for_json(s: str) -> NormalizedExpr:
+    """Parse a JSON string field that contains a SQL expression into a. ``NormalizedExpr``. Args: s: Non-empty expression text from the model. Returns: Parsed structure when the registered parser is available; otherwise a column ref leaf."""
+    t = (s or "").strip()
+    if not t:
+        return NormalizedExpr()
+    fn = _PARSE_EXPR_STRING_FN
+    if fn is not None:
+        return cast(NormalizedExpr, fn(t))
+    return NormalizedExpr.from_column(t)
+
+
+ScalarArg = str | int | float
+ParamValue = str | int | float | bool | list[str | int | float]
+RawValue = str | int | float | bool | list[str | int | float] | dict[str, str | int] | None
+
+CteEmissionKind = Literal["join_table", "scalar_subquery"]
+WindowFrameKind = Literal["rows", "range", "none"]
+
+
+def coerce_cte_emission(raw: Any) -> CteEmissionKind:
+    """
+    Normalize a stored emission string to a supported literal.
+
+    Args:
+
+        raw: Value from JSON or legacy payloads.
+
+    Returns:
+
+        ``join_table`` unless ``raw`` is exactly ``scalar_subquery``.
+    """
+    return "scalar_subquery" if raw == "scalar_subquery" else "join_table"
+
+
+def normalized_expr_from_stored_json(raw: Any) -> NormalizedExpr:
+    """
+    Coerce JSON or template `expr` payloads into a `NormalizedExpr`.
+
+    Args:
+
+        raw: String, dict, or existing `NormalizedExpr`.
+
+    Returns:
+
+        Normalised expression; empty expr if unsupported.
+    """
+    if isinstance(raw, str):
+        return NormalizedExpr.from_column(raw)
+    if isinstance(raw, dict):
+        return NormalizedExpr.from_dict(raw)
+    if isinstance(raw, NormalizedExpr):
+        return raw
+    return NormalizedExpr()
+
+
+@dataclass
+class ExprValue:
+    """Parameterized literal value for expression arithmetic with param_key for template reuse."""
+
+    value: float = 0.0
+    param_key: str = ""
+
+    @staticmethod
+    def from_dict(d: Any) -> ExprValue:
+        """
+        Create ExprValue from dictionary.
+
+        Args:
+
+            d: Dictionary with 'value' and 'param_key' keys, or a bare numeric value.
+
+        Returns:
+
+            Populated ExprValue instance.
+        """
+        if isinstance(d, int | float):
+            return ExprValue(value=float(d))
+        if isinstance(d, dict):
+            return ExprValue(value=d.get("value", 0.0), param_key=d.get("param_key", ""))
+        return ExprValue()
+
+    def to_dict(self) -> dict[str, Any]:
+        """
+        Serialize to a plain dictionary.
+
+        Returns:
+
+            Dictionary with 'value' and 'param_key' keys.
+        """
+        return {"value": self.value, "param_key": self.param_key}
+
+    @property
+    def signature_key(self) -> str:
+        """Structural signature for template matching (ignores concrete. value). Returns: Always the string `val` (parameterisation uses `param_key` elsewhere)."""
+        return "val"
+
+
+def _coerce_mul_term(raw: Any) -> NormalizedExpr:
+    """Coerce a multiply/divide list element to a `NormalizedExpr` leaf. Accepts a `NormalizedExpr` instance, a dict (round-trip), or a bare string. Bare strings that look like function calls or compound expressions are routed through the sqlglot-backed `parse_expr_string` parser to recover structural fields; simple identifiers become `column_ref` leaves."""
+    if isinstance(raw, NormalizedExpr):
+        return raw
+    if isinstance(raw, dict):
+        return NormalizedExpr.from_dict(raw)
+    if isinstance(raw, str):
+        s = raw.strip()
+        if s == "*":
+            return NormalizedExpr(star=True)
+        if s == "":
+            return NormalizedExpr()
+        if s.upper().startswith("DISTINCT "):
+            s = s[9:].strip()
+        while s.startswith("(") and s.endswith(")"):
+            inner = s[1:-1].strip()
+            if not inner:
+                break
+            s = inner
+        if "(" in s or " " in s:
+            fn = _PARSE_EXPR_STRING_FN
+            if fn is None:
+                return NormalizedExpr(raw_sql=s)
+            try:
+                parsed = cast(NormalizedExpr, fn(s))
+                if (
+                    parsed.add_groups
+                    and len(parsed.add_groups) == 1
+                    and not parsed.sub_groups
+                    and not parsed.add_values
+                    and not parsed.sub_values
+                ):
+                    g = parsed.add_groups[0]
+                    if (
+                        g.coefficient == 1.0
+                        and not g.divide
+                        and len(g.multiply) == 1
+                        and not g.agg_func
+                        and not g.scalar_func
+                    ):
+                        return g.multiply[0]
+                return parsed
+            except Exception:
+                return NormalizedExpr(raw_sql=s)
+        return NormalizedExpr(column_ref=s)
+    return NormalizedExpr()
+
+
+@dataclass
+class MulGroup:
+    """Single multiplicative term: scalar_func(agg_func(inner_scalar_func(coefficient * multiply[0] * ... / divide[0] / ...))) with scalar_func_args and inner_scalar_func_args. `multiply` and `divide` carry nested `NormalizedExpr` sub-trees (column refs are leaf NormalizedExpr with `column_ref` set; CAST/COALESCE/EXTRACT/INTERVAL/ keyword nodes use the structural fields on `NormalizedExpr`). When `scalar_func` is ``concat``, `multiply` is an ordered list of CONCAT arguments rendered comma-separated inside ``CONCAT(...)``; `divide` and non- unit coefficients must remain empty. Otherwise `multiply` is a multiplicative chain rendered with ``*``."""
+
+    coefficient: float = 1.0
+    multiply: list[NormalizedExpr] = field(default_factory=list)
+    divide: list[NormalizedExpr] = field(default_factory=list)
+    agg_func: str | None = None
+    scalar_func: str | None = None
+    inner_scalar_func: str | None = None
+    scalar_func_args: list[ScalarArg] = field(default_factory=list)
+    inner_scalar_func_args: list[ScalarArg] = field(default_factory=list)
+    coeff_param_key: str = ""
+    sarg_param_keys: list[str] = field(default_factory=list)
+    isarg_param_keys: list[str] = field(default_factory=list)
+    distinct: bool = False
+
+    def __post_init__(self) -> None:
+        """Coerce string entries to leaf NormalizedExpr, sort multiply/divide, and normalise function name casing/order."""
+        self.multiply = sorted(
+            (_coerce_mul_term(t) for t in self.multiply),
+            key=lambda e: e.signature_key,
+        )
+        self.divide = sorted(
+            (_coerce_mul_term(t) for t in self.divide),
+            key=lambda e: e.signature_key,
+        )
+        if self.agg_func:
+            self.agg_func = self.agg_func.lower()
+        if self.scalar_func:
+            self.scalar_func = self.scalar_func.lower()
+        if self.inner_scalar_func:
+            self.inner_scalar_func = self.inner_scalar_func.lower()
+        if self.scalar_func and self.inner_scalar_func:
+            if self.scalar_func == "extract":
+                pass
+            elif self.inner_scalar_func == "extract":
+                self.scalar_func, self.inner_scalar_func = (
+                    self.inner_scalar_func,
+                    self.scalar_func,
+                )
+                self.scalar_func_args, self.inner_scalar_func_args = (
+                    self.inner_scalar_func_args,
+                    self.scalar_func_args,
+                )
+            elif self.scalar_func > self.inner_scalar_func:
+                self.scalar_func, self.inner_scalar_func = (
+                    self.inner_scalar_func,
+                    self.scalar_func,
+                )
+                self.scalar_func_args, self.inner_scalar_func_args = (
+                    self.inner_scalar_func_args,
+                    self.scalar_func_args,
+                )
+
+    @staticmethod
+    def from_dict(d: dict[str, Any]) -> MulGroup:
+        """Create MulGroup from dictionary; multiply/divide entries may be dicts (new nested form) or strings (legacy column ref) — both are accepted on read, always serialized as dicts on write."""
+        return MulGroup(
+            coefficient=d.get("coefficient", 1.0),
+            multiply=[_coerce_mul_term(t) for t in d.get("multiply", [])],
+            divide=[_coerce_mul_term(t) for t in d.get("divide", [])],
+            agg_func=d.get("agg_func"),
+            scalar_func=d.get("scalar_func"),
+            inner_scalar_func=d.get("inner_scalar_func"),
+            scalar_func_args=d.get("scalar_func_args", []),
+            inner_scalar_func_args=d.get("inner_scalar_func_args", []),
+            coeff_param_key=d.get("coeff_param_key", ""),
+            sarg_param_keys=d.get("sarg_param_keys", []),
+            isarg_param_keys=d.get("isarg_param_keys", []),
+            distinct=bool(d.get("distinct", False)),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize all `MulGroup` fields; multiply/divide are nested dicts."""
+        out = {
+            "coefficient": self.coefficient,
+            "multiply": [m.to_dict() for m in self.multiply],
+            "divide": [d.to_dict() for d in self.divide],
+            "agg_func": self.agg_func,
+            "scalar_func": self.scalar_func,
+            "inner_scalar_func": self.inner_scalar_func,
+            "scalar_func_args": self.scalar_func_args,
+            "inner_scalar_func_args": self.inner_scalar_func_args,
+            "coeff_param_key": self.coeff_param_key,
+            "sarg_param_keys": self.sarg_param_keys,
+            "isarg_param_keys": self.isarg_param_keys,
+        }
+        if self.distinct:
+            out["distinct"] = True
+        return out
+
+    @property
+    def signature_key(self) -> str:
+        """Pipe-separated structural key (recurses through nested multiply/divide)."""
+        parts = ["coeff"]
+        if self.distinct:
+            parts.append("distinct")
+        if self.agg_func:
+            parts.append(f"agg={self.agg_func}")
+        if self.scalar_func:
+            parts.append(f"scalar={self.scalar_func}")
+        if self.scalar_func_args:
+            parts.append(f"sargs={len(self.scalar_func_args)}")
+        if self.inner_scalar_func:
+            parts.append(f"inner={self.inner_scalar_func}")
+        if self.inner_scalar_func_args:
+            parts.append(f"iargs={len(self.inner_scalar_func_args)}")
+        parts.extend(f"*{m.signature_key}" for m in self.multiply)
+        parts.extend(f"/{d.signature_key}" for d in self.divide)
+        return "|".join(parts)
+
+    @property
+    def structural_key(self) -> str:
+        """Like `signature_key` but omits the coefficient marker."""
+        parts: list[str] = []
+        if self.distinct:
+            parts.append("distinct")
+        if self.agg_func:
+            parts.append(f"agg={self.agg_func}")
+        if self.scalar_func:
+            parts.append(f"scalar={self.scalar_func}")
+        if self.scalar_func_args:
+            parts.append(f"sargs={len(self.scalar_func_args)}")
+        if self.inner_scalar_func:
+            parts.append(f"inner={self.inner_scalar_func}")
+        if self.inner_scalar_func_args:
+            parts.append(f"iargs={len(self.inner_scalar_func_args)}")
+        parts.extend(f"*{m.signature_key}" for m in self.multiply)
+        parts.extend(f"/{d.signature_key}" for d in self.divide)
+        return "|".join(parts)
+
+
+@dataclass
+class NormalizedExpr:
+    """Canonical sum-of-products expression: scalar_func(agg_func(inner_scalar_func(sum of add_groups minus sub_groups plus add_values minus sub_values))) with scalar_func_args and inner_scalar_func_args. Structural leaf forms (mutually exclusive with add_groups/sub_groups when set): - column_ref: bare or qualified column reference (`"t.c"`). - star: True for the SQL `*` token. - cast_type: when set, this expression is `CAST(<inner> AS cast_type)` where `<inner>` is the single child reachable via add_groups[0].multiply[0]. - interval: `(magnitude, unit)` for SQL `INTERVAL '<n>' <unit>`. - keyword: bare SQL keyword like ``current_date``."""
+
+    add_groups: list[MulGroup] = field(default_factory=list)
+    sub_groups: list[MulGroup] = field(default_factory=list)
+    add_values: list[ExprValue] = field(default_factory=list)
+    sub_values: list[ExprValue] = field(default_factory=list)
+    agg_func: str | None = None
+    scalar_func: str | None = None
+    inner_scalar_func: str | None = None
+    scalar_func_args: list[ScalarArg] = field(default_factory=list)
+    inner_scalar_func_args: list[ScalarArg] = field(default_factory=list)
+    sarg_param_keys: list[str] = field(default_factory=list)
+    isarg_param_keys: list[str] = field(default_factory=list)
+    is_numeric: bool = True
+    column_ref: str | None = None
+    star: bool = False
+    cast_type: str | None = None
+    interval: tuple[float, str] | None = None
+    keyword: str | None = None
+    raw_sql: str | None = None
+    string_literal: str = ""
+
+    def __post_init__(self) -> None:
+        """Sort child groups/values and normalise outer function name. casing/order. Returns: None."""
+        self.add_groups = sorted(self.add_groups, key=lambda g: g.signature_key)
+        self.sub_groups = sorted(self.sub_groups, key=lambda g: g.signature_key)
+        self.add_values = sorted(self.add_values, key=lambda v: v.value)
+        self.sub_values = sorted(self.sub_values, key=lambda v: v.value)
+        if self.agg_func:
+            self.agg_func = self.agg_func.lower()
+        if self.scalar_func:
+            self.scalar_func = self.scalar_func.lower()
+        if self.inner_scalar_func:
+            self.inner_scalar_func = self.inner_scalar_func.lower()
+        if self.scalar_func and self.inner_scalar_func:
+            if self.scalar_func == "extract":
+                pass
+            elif self.inner_scalar_func == "extract":
+                self.scalar_func, self.inner_scalar_func = (
+                    self.inner_scalar_func,
+                    self.scalar_func,
+                )
+                self.scalar_func_args, self.inner_scalar_func_args = (
+                    self.inner_scalar_func_args,
+                    self.scalar_func_args,
+                )
+            elif self.scalar_func > self.inner_scalar_func:
+                self.scalar_func, self.inner_scalar_func = (
+                    self.inner_scalar_func,
+                    self.scalar_func,
+                )
+                self.scalar_func_args, self.inner_scalar_func_args = (
+                    self.inner_scalar_func_args,
+                    self.scalar_func_args,
+                )
+        if self.column_ref is not None:
+            self.column_ref = str(self.column_ref).strip() or None
+        if self.keyword is not None:
+            self.keyword = str(self.keyword).strip().lower() or None
+        if self.cast_type is not None:
+            self.cast_type = str(self.cast_type).strip() or None
+        if self.interval is not None:
+            mag, unit = self.interval
+            self.interval = (float(mag), str(unit).strip())
+        if self.string_literal is not None:
+            self.string_literal = str(self.string_literal).strip()
+        if self.string_literal:
+            self.column_ref = None
+            self.raw_sql = None
+            self.star = False
+            self.keyword = None
+            self.cast_type = None
+            self.interval = None
+            self.add_groups = []
+            self.sub_groups = []
+            self.add_values = []
+            self.sub_values = []
+            self.agg_func = None
+            self.scalar_func = None
+            self.inner_scalar_func = None
+            self.scalar_func_args = []
+            self.inner_scalar_func_args = []
+            self.sarg_param_keys = []
+            self.isarg_param_keys = []
+
+    @staticmethod
+    def from_dict(d: Any) -> NormalizedExpr:
+        """Create NormalizedExpr from a dictionary, a column-reference string, or ``None``."""
+        if d is None:
+            return NormalizedExpr()
+        if isinstance(d, str):
+            return NormalizedExpr.from_column(d.strip())
+        if isinstance(d, dict):
+            s_lit = d.get("string_literal")
+            if isinstance(s_lit, str) and s_lit.strip():
+                return NormalizedExpr(string_literal=s_lit.strip())
+            lit_plain = d.get("literal")
+            if isinstance(lit_plain, str) and lit_plain.strip():
+                return NormalizedExpr(string_literal=lit_plain.strip())
+        column_ref_raw = d.get("column_ref")
+        if column_ref_raw is None:
+            legacy_ref = d.get("registry_ref")
+            if isinstance(legacy_ref, str) and legacy_ref.strip():
+                column_ref_raw = legacy_ref.strip()
+        iv_raw = d.get("interval")
+        iv: tuple[float, str] | None = None
+        if isinstance(iv_raw, list | tuple) and len(iv_raw) == 2:
+            iv = (float(iv_raw[0]), str(iv_raw[1]))
+        return NormalizedExpr(
+            add_groups=[MulGroup.from_dict(g) for g in d.get("add_groups", [])],
+            sub_groups=[MulGroup.from_dict(g) for g in d.get("sub_groups", [])],
+            add_values=[ExprValue.from_dict(v) for v in d.get("add_values", [])],
+            sub_values=[ExprValue.from_dict(v) for v in d.get("sub_values", [])],
+            agg_func=d.get("agg_func"),
+            scalar_func=d.get("scalar_func"),
+            inner_scalar_func=d.get("inner_scalar_func"),
+            scalar_func_args=d.get("scalar_func_args", []),
+            inner_scalar_func_args=d.get("inner_scalar_func_args", []),
+            sarg_param_keys=d.get("sarg_param_keys", []),
+            isarg_param_keys=d.get("isarg_param_keys", []),
+            is_numeric=d.get("is_numeric", True),
+            column_ref=column_ref_raw,
+            star=bool(d.get("star", False)),
+            cast_type=d.get("cast_type"),
+            interval=iv,
+            keyword=d.get("keyword"),
+            raw_sql=d.get("raw_sql"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a plain dictionary."""
+        out: dict[str, Any] = {
+            "add_groups": [g.to_dict() for g in self.add_groups],
+            "sub_groups": [g.to_dict() for g in self.sub_groups],
+            "add_values": [v.to_dict() for v in self.add_values],
+            "sub_values": [v.to_dict() for v in self.sub_values],
+            "agg_func": self.agg_func,
+            "scalar_func": self.scalar_func,
+            "inner_scalar_func": self.inner_scalar_func,
+            "scalar_func_args": self.scalar_func_args,
+            "inner_scalar_func_args": self.inner_scalar_func_args,
+            "sarg_param_keys": self.sarg_param_keys,
+            "isarg_param_keys": self.isarg_param_keys,
+            "is_numeric": self.is_numeric,
+        }
+        if self.column_ref:
+            out["column_ref"] = self.column_ref
+        if self.star:
+            out["star"] = True
+        if self.cast_type:
+            out["cast_type"] = self.cast_type
+        if self.interval is not None:
+            out["interval"] = [self.interval[0], self.interval[1]]
+        if self.keyword:
+            out["keyword"] = self.keyword
+        if self.raw_sql:
+            out["raw_sql"] = self.raw_sql
+        if self.string_literal:
+            out["string_literal"] = self.string_literal
+        return out
+
+    @staticmethod
+    def from_column(col: str) -> NormalizedExpr:
+        """Build a leaf NormalizedExpr that references a single column (or `*`)."""
+        s = col.strip()
+        if s == "*":
+            return NormalizedExpr(star=True)
+        return NormalizedExpr(column_ref=s)
+
+    @staticmethod
+    def from_agg(agg_func: str, col: str) -> NormalizedExpr:
+        """Build a NormalizedExpr for `agg_func(column)` with the column as a leaf child."""
+        leaf = NormalizedExpr.from_column(col)
+        return NormalizedExpr(add_groups=[MulGroup(multiply=[leaf], agg_func=agg_func.lower())])
+
+    @property
+    def signature_key(self) -> str:
+        """Pipe-separated key over outer funcs, structural leaf info, and signed groups/values."""
+        parts: list[str] = []
+        if self.column_ref:
+            parts.append(f"col={self.column_ref}")
+        if self.star:
+            parts.append("star")
+        if self.keyword:
+            parts.append(f"kw={self.keyword}")
+        if self.cast_type:
+            parts.append(f"cast={self.cast_type}")
+        if self.interval is not None:
+            parts.append(f"iv={self.interval[0]}:{self.interval[1]}")
+        if self.raw_sql:
+            parts.append(f"raw={self.raw_sql}")
+        if self.string_literal:
+            parts.append(f"strlit={self.string_literal!r}")
+        if self.agg_func:
+            parts.append(f"expr_agg={self.agg_func}")
+        if self.scalar_func:
+            parts.append(f"expr_scalar={self.scalar_func}")
+        if self.scalar_func_args:
+            parts.append(f"expr_sargs={len(self.scalar_func_args)}")
+        if self.inner_scalar_func:
+            parts.append(f"expr_inner={self.inner_scalar_func}")
+        if self.inner_scalar_func_args:
+            parts.append(f"expr_iargs={len(self.inner_scalar_func_args)}")
+        parts.extend(f"+{g.signature_key}" for g in self.add_groups)
+        parts.extend(f"-{g.signature_key}" for g in self.sub_groups)
+        parts.extend(f"+{v.signature_key}" for v in self.add_values)
+        parts.extend(f"-{v.signature_key}" for v in self.sub_values)
+        return "|".join(parts)
+
+    @property
+    def has_column_reference(self) -> bool:
+        """Return True when this expression references any column, aggregate, scalar, or registry entry."""
+        if self.string_literal:
+            return False
+        if self.raw_sql:
+            return True
+        if self.column_ref or self.star or self.keyword or self.cast_type or self.interval is not None:
+            if self.column_ref:
+                return True
+            if self.cast_type:
+                return True
+            if self.star or self.keyword:
+                return True
+            if self.interval is not None:
+                return True
+        if self.add_groups or self.sub_groups:
+            return True
+        if self.agg_func or self.scalar_func or self.inner_scalar_func:
+            return True
+        return False
+
+    @property
+    def is_literal_only(self) -> bool:
+        """Return True when this expression is composed solely of numeric literals."""
+        return not self.has_column_reference
+
+    @property
+    def has_aggregation(self) -> bool:
+        """Whether any subterm uses SQL aggregation (outer or per-`MulGroup`)."""
+        if self.agg_func:
+            return True
+        raw_sql = self.raw_sql
+        if raw_sql and RAW_SQL_AGG_OR_WINDOW_RE.search(raw_sql):
+            return True
+        for group in self.add_groups + self.sub_groups:
+            if group.agg_func:
+                return True
+            for term in group.multiply + group.divide:
+                if term.has_aggregation:
+                    return True
+        return False
+
+    @property
+    def primary_column(self) -> str:
+        """Innermost column name reached by drilling into the first multiplicative term. Strips DISTINCT, walks through cast/scalar wrappers, returns "" when no column."""
+        if self.string_literal:
+            return ""
+        if self.column_ref:
+            return self.column_ref
+        if self.star:
+            return "*"
+        if self.keyword:
+            return self.keyword
+        if self.interval is not None:
+            return "interval"
+        if self.raw_sql:
+            return ""
+        if not self.add_groups or not self.add_groups[0].multiply:
+            return ""
+        first = self.add_groups[0].multiply[0]
+        return first.primary_column
+
+    @property
+    def primary_term(self) -> str:
+        """First multiply operand of the first `add_groups` entry rendered as a token string. Returns the leaf `column_ref` for a column reference, ``"*"`` for star, the upper-cased `keyword` for a keyword leaf, or empty when no add_groups exist or the leaf is a complex sub-tree (cast/coalesce/case/interval)."""
+        if self.column_ref:
+            return self.column_ref
+        if self.star:
+            return "*"
+        if self.keyword:
+            return self.keyword.upper()
+        if not self.add_groups or not self.add_groups[0].multiply:
+            return ""
+        first = self.add_groups[0].multiply[0]
+        if first.column_ref:
+            return first.column_ref
+        if first.star:
+            return "*"
+        if first.keyword:
+            return first.keyword.upper()
+        fn = _RENDER_EXPR_SQL_FN
+        if fn is not None:
+            try:
+                return cast(str, fn(first))
+            except Exception:
+                return ""
+        return ""
+
+    PROMPT_FIELD_SPEC: ClassVar[dict[str, str]] = {
+        "expr": "SQL expression text using qualified columns from the schema.",
+    }
+
+    def to_prompt_dict(self) -> dict[str, Any]:
+        """Shorthand ``expr`` string for LLM-facing JSON."""
+        return {"expr": expr_prompt_sql(self)}
+
+    @classmethod
+    def prompt_example_dict(cls) -> dict[str, Any]:
+        """Canonical ``expr`` field example for prompts."""
+        return {"expr": "table.column"}
+
+
+def expr_registry_ref(expr: NormalizedExpr) -> str | None:
+    """Return the canonical registry id when *expr* is a bare ``column_ref`` matching ``^[wc]\\d{2}$``. A registry reference is conventionally encoded as a single bare ``column_ref`` with no other expression complexity. The rest of the system treats this leaf shape as the canonical way to point at a window or case registry entry from select, group_by, order_by, filter, or having."""
+    if expr.string_literal:
+        return None
+    col = (expr.column_ref or "").strip()
+    if not col or not REGISTRY_REF_TOKEN_RE.match(col):
+        return None
+    if expr.add_groups or expr.sub_groups or expr.add_values or expr.sub_values:
+        return None
+    if expr.agg_func or expr.scalar_func or expr.inner_scalar_func:
+        return None
+    if expr.star or expr.cast_type or expr.interval is not None:
+        return None
+    if expr.keyword or expr.raw_sql:
+        return None
+    return col
+
+
+def expr_prompt_sql(expr: NormalizedExpr) -> str:
+    """Render *expr* as the shorthand SQL string shown in LLM prompts. Registry references ``wNN`` / ``cNN`` emit as bare tokens; other expressions use the registered renderer when available."""
+    ref = expr_registry_ref(expr)
+    if ref:
+        return ref
+    if expr.string_literal:
+        return expr.string_literal
+    fn = _RENDER_EXPR_SQL_FN
+    if fn is not None:
+        try:
+            return cast(str, fn(expr))
+        except Exception:
+            pass
+    col = expr.primary_column
+    return col if col else ""
+
+
+def _canonicalize_predicate_sides(predicate: Any) -> None:
+    """Enforce column-bearing side on the left and flip the operator when a swap is required. When exactly one of ``left_expr`` / ``right_expr`` contains column / aggregate / scalar / registry references, that side is moved to ``left_expr`` and the operator is flipped. When both sides are column-bearing or both are literal-only, sides are left untouched."""
+    left = predicate.left_expr
+    right = predicate.right_expr
+    if right is None:
+        return
+    left_has_col = left.has_column_reference
+    right_has_col = right.has_column_reference
+    if left_has_col and not right_has_col:
+        return
+    if right_has_col and not left_has_col:
+        predicate.left_expr, predicate.right_expr = right, left
+        predicate.op = OP_FLIP.get(predicate.op, predicate.op)
+
+
+def _filter_group_int_from_stored(raw: Any) -> int | None:
+    if raw is None:
+        return None
+    if isinstance(raw, list | tuple):
+        if not raw:
+            return None
+        raw = raw[0]
+    if isinstance(raw, bool):
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+@dataclass
+class OrderByCol:
+    """Order by column with expression and sort direction."""
+
+    expr: NormalizedExpr = field(default_factory=NormalizedExpr)
+    direction: str = "ASC"
+
+    def __post_init__(self) -> None:
+        """
+        Strip and upper-case `direction` (e.g. `ASC` / `DESC`).
+
+        Returns:
+
+            None.
+        """
+        self.direction = self.direction.strip().upper()
+
+    @staticmethod
+    def from_dict(d: dict[str, Any]) -> OrderByCol:
+        """
+        Create OrderByCol from dictionary.
+
+        Args:
+
+            d: Dictionary with 'expr' and 'direction' keys.
+
+        Returns:
+
+            Populated OrderByCol instance.
+        """
+        expr_raw = d.get("expr", {})
+        if isinstance(expr_raw, str):
+            expr = parse_expr_string_for_json(expr_raw)
+        elif isinstance(expr_raw, dict):
+            expr = NormalizedExpr.from_dict(expr_raw)
+        elif isinstance(expr_raw, NormalizedExpr):
+            expr = expr_raw
+        else:
+            expr = NormalizedExpr()
+        return OrderByCol(
+            expr=expr,
+            direction=d.get("direction", "ASC"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """
+        Serialize to a plain dictionary.
+
+        Returns:
+
+            Dictionary with the serialized expr and direction string.
+        """
+        return {"expr": self.expr.to_dict(), "direction": self.direction}
+
+    @property
+    def is_aggregated(self) -> bool:
+        """
+        Whether the order key expression carries an aggregate.
+
+        Returns:
+
+            Same as `self.expr.has_aggregation`.
+        """
+        return self.expr.has_aggregation
+
+    @property
+    def signature_key(self) -> str:
+        """
+        Expr signature plus sort direction.
+
+        Returns:
+
+            `expr_key|DIRECTION` string.
+        """
+        return "|".join([self.expr.signature_key, self.direction])
+
+    PROMPT_FIELD_SPEC: ClassVar[dict[str, str]] = {
+        "expr": "ORDER BY key as a SQL expression string.",
+        "direction": "Sort direction asc or desc in lowercase in prompts.",
+    }
+
+    def to_prompt_dict(self) -> dict[str, Any]:
+        """ORDER BY entry shorthand."""
+        return {
+            "expr": expr_prompt_sql(self.expr),
+            "direction": self.direction.lower(),
+        }
+
+    @classmethod
+    def prompt_example_dict(cls) -> dict[str, Any]:
+        """Example order_by_cols row."""
+        return {"expr": "table.column", "direction": "asc"}
+
+
+@dataclass
+class FilterParam:
+    """Filter condition with left expression, operator, and optional right expression for expr-vs-expr comparisons."""
+
+    left_expr: NormalizedExpr = field(default_factory=NormalizedExpr)
+    op: str = "="
+    right_expr: NormalizedExpr | None = None
+    value_type: str = "string"
+    param_key: str | None = ""
+    param_key_hi: str = ""
+    param_key_unit: str = ""
+    raw_value: RawValue = None
+    bool_op: str = "AND"
+    filter_group: int | None = None
+
+    def __post_init__(self) -> None:
+        """
+        Normalise operators/types, canonicalise expr-vs-expr sides, merge literals to the value side.
+
+        Returns:
+
+            None.
+        """
+        self.op = self.op.strip().lower()
+        self.value_type = self.value_type.strip().lower()
+        self.bool_op = self.bool_op.strip().upper() if self.bool_op else "AND"
+        if self.bool_op not in ("AND", "OR"):
+            self.bool_op = "AND"
+        if self.right_expr is not None:
+            _canonicalize_predicate_sides(self)
+            for ev in self.left_expr.add_values:
+                self.right_expr.sub_values.append(ExprValue(value=ev.value, param_key=ev.param_key))
+            for ev in self.left_expr.sub_values:
+                self.right_expr.add_values.append(ExprValue(value=ev.value, param_key=ev.param_key))
+            self.left_expr.add_values = []
+            self.left_expr.sub_values = []
+        elif (
+            self.raw_value is not None
+            and isinstance(self.raw_value, int | float)
+            and not isinstance(self.raw_value, bool)
+        ):
+            offset = sum(ev.value for ev in self.left_expr.add_values) - sum(
+                ev.value for ev in self.left_expr.sub_values
+            )
+            self.raw_value = self.raw_value - offset
+            self.left_expr.add_values = []
+            self.left_expr.sub_values = []
+
+    @staticmethod
+    def from_dict(d: dict[str, Any]) -> FilterParam:
+        """
+        Create FilterParam from dictionary.
+
+        Args:
+
+            d: Dictionary with 'left_expr', 'op', optional 'right_expr', 'value_type', and 'param_key'.
+
+        Returns:
+
+            Populated FilterParam instance.
+        """
+        left_raw = d.get("left_expr", {})
+        right_raw = d.get("right_expr")
+        fg_raw = d.get("filter_group")
+        return FilterParam(
+            left_expr=normalized_expr_from_stored_json(left_raw),
+            op=d.get("op", "="),
+            right_expr=(normalized_expr_from_stored_json(right_raw) if right_raw else None),
+            value_type=d.get("value_type", "string"),
+            param_key=d.get("param_key", ""),
+            param_key_hi=d.get("param_key_hi", ""),
+            param_key_unit=d.get("param_key_unit", ""),
+            raw_value=d.get("value") or d.get("raw_value"),
+            bool_op=d.get("bool_op", "AND"),
+            filter_group=_filter_group_int_from_stored(fg_raw),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """
+        Serialize to a plain dictionary.
+
+        Returns:
+
+            Dictionary with filter fields; raw_value is intentionally excluded.
+        """
+        d: dict[str, Any] = {
+            "left_expr": self.left_expr.to_dict(),
+            "op": self.op,
+            "right_expr": self.right_expr.to_dict() if self.right_expr else None,
+            "value_type": self.value_type,
+            "param_key": self.param_key,
+        }
+        if self.param_key_hi:
+            d["param_key_hi"] = self.param_key_hi
+        if self.param_key_unit:
+            d["param_key_unit"] = self.param_key_unit
+        if self.bool_op != "AND":
+            d["bool_op"] = self.bool_op
+        if self.filter_group is not None:
+            d["filter_group"] = self.filter_group
+        return d
+
+    @property
+    def signature_key(self) -> str:
+        """
+        Structural key for WHERE-style template matching.
+
+        Returns:
+
+            Left expr, op, value type, and optional right expr signature joined by `|`.
+        """
+        parts = [self.left_expr.signature_key, self.op, self.value_type]
+        if self.right_expr:
+            parts.append(f"r:{self.right_expr.signature_key}")
+        return "|".join(parts)
+
+    def resolved_value(self, param_values: Mapping[str, Any] | None) -> Any:
+        """Resolve the filter literal from inline storage or bound. parameters. After post-processing, ``raw_value`` may be cleared while ``param_key`` still identifies the bound slot in the owning body ``param_values`` map. Args: param_values: Bound parameter map; treated as empty when ``None``. Returns: ``raw_value`` when set; otherwise ``param_values[param_key]`` when ``param_key`` is non-empty; otherwise ``None``."""
+        if self.raw_value is not None:
+            return self.raw_value
+        store = param_values or {}
+        pk = (self.param_key or "").strip()
+        pku = (self.param_key_unit or "").strip()
+        vt = (self.value_type or "").lower()
+        if vt == "date_diff" and pk and pku:
+            amt = store.get(pk)
+            unit = store.get(pku)
+            if amt is not None or unit is not None:
+                u = unit if isinstance(unit, str) and unit else "day"
+                a = int(amt) if amt is not None and not isinstance(amt, bool) else 0
+                return {"unit": u, "amount": a}
+        if vt == "date_window" and pk and pku:
+            amt = store.get(pk)
+            unit = store.get(pku)
+            if amt is not None or unit is not None:
+                a = int(amt) if amt is not None and not isinstance(amt, bool) else 0
+                u = unit if isinstance(unit, str) and unit else "day"
+                return {"unit": u, "amount": a}
+        if not pk:
+            return None
+        return store.get(pk)
+
+    PROMPT_FIELD_SPEC: ClassVar[dict[str, str]] = {
+        "left_expr": "SQL expression for the predicate left side using qualified columns.",
+        "op": "Comparison or membership operator (lowercase).",
+        "right_expr": "Optional SQL expression for expr-vs-expr predicates.",
+        "value_type": "Semantic type for expr-vs-value predicates.",
+        "value": "Inline literal or structured date_window or date_diff payload.",
+        "bool_op": "AND or OR connecting to the next filter entry.",
+        "filter_group": "Optional integer for OR-of-AND grouping.",
+    }
+
+    def to_prompt_dict(self) -> dict[str, Any]:
+        """LLM shorthand dict with SQL strings for expression sides."""
+        out: dict[str, Any] = {
+            "left_expr": expr_prompt_sql(self.left_expr),
+            "op": self.op,
+            "value_type": self.value_type,
+        }
+        if self.right_expr is not None:
+            out["right_expr"] = expr_prompt_sql(self.right_expr)
+        elif self.raw_value is not None:
+            out["value"] = self.raw_value
+        if self.bool_op != "AND":
+            out["bool_op"] = self.bool_op
+        if self.filter_group is not None:
+            out["filter_group"] = self.filter_group
+        return out
+
+    @classmethod
+    def prompt_example_dict(cls) -> dict[str, Any]:
+        """Example WHERE predicate shape for prompts."""
+        return {
+            "left_expr": "table.other_column",
+            "op": "=",
+            "value_type": "string",
+            "value": "<literal>",
+        }
+
+
+@dataclass
+class HavingParam:
+    """Having condition with left expression, operator, and optional right expression for expr-vs-expr comparisons."""
+
+    left_expr: NormalizedExpr = field(default_factory=NormalizedExpr)
+    op: str = "="
+    right_expr: NormalizedExpr | None = None
+    value_type: str = "number"
+    param_key: str | None = ""
+    param_key_unit: str = ""
+    raw_value: RawValue = None
+    bool_op: str = "AND"
+    filter_group: int | None = None
+
+    def __post_init__(self) -> None:
+        """
+        Normalise operators/types, canonicalise expr-vs-expr sides, merge literals to the value side.
+
+        Returns:
+
+            None.
+        """
+        self.op = self.op.strip().lower()
+        self.value_type = self.value_type.strip().lower()
+        self.bool_op = self.bool_op.strip().upper() if self.bool_op else "AND"
+        if self.bool_op not in ("AND", "OR"):
+            self.bool_op = "AND"
+        if self.right_expr is not None:
+            _canonicalize_predicate_sides(self)
+            for ev in self.left_expr.add_values:
+                self.right_expr.sub_values.append(ExprValue(value=ev.value, param_key=ev.param_key))
+            for ev in self.left_expr.sub_values:
+                self.right_expr.add_values.append(ExprValue(value=ev.value, param_key=ev.param_key))
+            self.left_expr.add_values = []
+            self.left_expr.sub_values = []
+        elif (
+            self.raw_value is not None
+            and isinstance(self.raw_value, int | float)
+            and not isinstance(self.raw_value, bool)
+        ):
+            offset = sum(ev.value for ev in self.left_expr.add_values) - sum(
+                ev.value for ev in self.left_expr.sub_values
+            )
+            self.raw_value = self.raw_value - offset
+            self.left_expr.add_values = []
+            self.left_expr.sub_values = []
+
+    @staticmethod
+    def from_dict(d: dict[str, Any]) -> HavingParam:
+        """
+        Create HavingParam from dictionary.
+
+        Args:
+
+            d: Dictionary with 'left_expr', 'op', optional 'right_expr', 'value_type', and 'param_key'.
+
+        Returns:
+
+            Populated HavingParam instance.
+        """
+        left_raw = d.get("left_expr", {})
+        right_raw = d.get("right_expr")
+        fg_raw = d.get("filter_group")
+        return HavingParam(
+            left_expr=normalized_expr_from_stored_json(left_raw),
+            op=d.get("op", "="),
+            right_expr=(normalized_expr_from_stored_json(right_raw) if right_raw else None),
+            value_type=d.get("value_type", "number"),
+            param_key=d.get("param_key", ""),
+            param_key_unit=d.get("param_key_unit", ""),
+            raw_value=d.get("value") or d.get("raw_value"),
+            bool_op=d.get("bool_op", "AND"),
+            filter_group=_filter_group_int_from_stored(fg_raw),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize HAVING parameters; omits `raw_value` (like. `FilterParam.to_dict`). Returns: Dict of exprs, op, types, and optional `bool_op` / `filter_group`."""
+        d: dict[str, Any] = {
+            "left_expr": self.left_expr.to_dict(),
+            "op": self.op,
+            "right_expr": self.right_expr.to_dict() if self.right_expr else None,
+            "value_type": self.value_type,
+            "param_key": self.param_key,
+        }
+        if self.param_key_unit:
+            d["param_key_unit"] = self.param_key_unit
+        if self.bool_op != "AND":
+            d["bool_op"] = self.bool_op
+        if self.filter_group is not None:
+            d["filter_group"] = self.filter_group
+        return d
+
+    @property
+    def signature_key(self) -> str:
+        """
+        Structural key for HAVING-style template matching.
+
+        Returns:
+
+            Same pipe-joined pattern as `FilterParam.signature_key`.
+        """
+        parts = [self.left_expr.signature_key, self.op, self.value_type]
+        if self.right_expr:
+            parts.append(f"r:{self.right_expr.signature_key}")
+        return "|".join(parts)
+
+    def resolved_value(self, param_values: Mapping[str, Any] | None) -> Any:
+        """Resolve the HAVING literal from inline storage or bound. parameters. After post-processing, ``raw_value`` may be cleared while ``param_key`` still identifies the bound slot in the owning body ``param_values`` map. Args: param_values: Bound parameter map; treated as empty when ``None``. Returns: ``raw_value`` when set; otherwise ``param_values[param_key]`` when ``param_key`` is non-empty; otherwise ``None``."""
+        if self.raw_value is not None:
+            return self.raw_value
+        store = param_values or {}
+        pk = (self.param_key or "").strip()
+        pku = (self.param_key_unit or "").strip()
+        vt = (self.value_type or "").lower()
+        if vt == "date_diff" and pk and pku:
+            amt = store.get(pk)
+            unit = store.get(pku)
+            if amt is not None or unit is not None:
+                u = unit if isinstance(unit, str) and unit else "day"
+                a = int(amt) if amt is not None and not isinstance(amt, bool) else 0
+                return {"unit": u, "amount": a}
+        if vt == "date_window" and pk and pku:
+            amt = store.get(pk)
+            unit = store.get(pku)
+            if amt is not None or unit is not None:
+                a = int(amt) if amt is not None and not isinstance(amt, bool) else 0
+                u = unit if isinstance(unit, str) and unit else "day"
+                return {"unit": u, "amount": a}
+        if not pk:
+            return None
+        return store.get(pk)
+
+    PROMPT_FIELD_SPEC: ClassVar[dict[str, str]] = {
+        "left_expr": "Aggregate or grouped SQL expression on the left side.",
+        "op": "Comparison operator for aggregate predicates.",
+        "right_expr": "Optional SQL expression for agg-vs-agg predicates.",
+        "value_type": "Semantic type for agg-vs-value predicates.",
+        "value": "Numeric or structured literal compared to the left aggregate.",
+        "bool_op": "AND or OR connecting to the next HAVING entry.",
+        "filter_group": "Optional integer grouping OR-of-AND conjunct blocks.",
+    }
+
+    def to_prompt_dict(self) -> dict[str, Any]:
+        """LLM shorthand dict with SQL strings for HAVING sides."""
+        out: dict[str, Any] = {
+            "left_expr": expr_prompt_sql(self.left_expr),
+            "op": self.op,
+            "value_type": self.value_type,
+        }
+        if self.right_expr is not None:
+            out["right_expr"] = expr_prompt_sql(self.right_expr)
+        elif self.raw_value is not None:
+            out["value"] = self.raw_value
+        if self.bool_op != "AND":
+            out["bool_op"] = self.bool_op
+        if self.filter_group is not None:
+            out["filter_group"] = self.filter_group
+        return out
+
+    @classmethod
+    def prompt_example_dict(cls) -> dict[str, Any]:
+        """Example HAVING predicate shape for prompts."""
+        return {
+            "left_expr": "COUNT(table.column)",
+            "op": ">",
+            "value_type": "integer",
+            "value": 1,
+        }
+
+
+def _clamp_negative_filter_group_filter(fp: FilterParam) -> FilterParam:
+    fg = fp.filter_group
+    if fg is not None and fg < 0:
+        return replace(fp, filter_group=None)
+    return fp
+
+
+def _clamp_negative_filter_group_having(hp: HavingParam) -> HavingParam:
+    fg = hp.filter_group
+    if fg is not None and fg < 0:
+        return replace(hp, filter_group=None)
+    return hp
+
+
+def coerce_filter_group_list(filters: list[FilterParam]) -> list[FilterParam]:
+    """Normalise flat OR chains and mixed filter_group wiring on filter rows."""
+    if not filters:
+        return []
+    items = [_clamp_negative_filter_group_filter(fp) for fp in filters]
+
+    any_grouped = any(fp.filter_group is not None for fp in items)
+    if not any_grouped:
+        if len(items) <= 1:
+            return items
+        first_b = (items[0].bool_op or "AND").strip().upper()
+        rest_all_or = all((items[j].bool_op or "AND").strip().upper() == "OR" for j in range(1, len(items)))
+        if first_b == "AND" and rest_all_or:
+            return [replace(fp, filter_group=gid, bool_op="AND") for gid, fp in enumerate(items, start=1)]
+        return items
+
+    max_gid = max((fp.filter_group for fp in items if fp.filter_group is not None), default=-1)
+    next_gid = max_gid + 1
+    out: list[FilterParam] = []
+    for fp in items:
+        if fp.filter_group is None:
+            out.append(replace(fp, filter_group=next_gid, bool_op="AND"))
+            next_gid += 1
+        else:
+            out.append(replace(fp, bool_op="AND"))
+    return out
+
+
+def coerce_having_group_list(having: list[HavingParam]) -> list[HavingParam]:
+    """Normalise flat OR chains and mixed filter_group wiring on HAVING rows."""
+    if not having:
+        return []
+    items = [_clamp_negative_filter_group_having(hp) for hp in having]
+
+    any_grouped = any(hp.filter_group is not None for hp in items)
+    if not any_grouped:
+        if len(items) <= 1:
+            return items
+        first_b = (items[0].bool_op or "AND").strip().upper()
+        rest_all_or = all((items[j].bool_op or "AND").strip().upper() == "OR" for j in range(1, len(items)))
+        if first_b == "AND" and rest_all_or:
+            return [replace(hp, filter_group=gid, bool_op="AND") for gid, hp in enumerate(items, start=1)]
+        return items
+
+    max_gid = max((hp.filter_group for hp in items if hp.filter_group is not None), default=-1)
+    next_gid = max_gid + 1
+    out: list[HavingParam] = []
+    for hp in items:
+        if hp.filter_group is None:
+            out.append(replace(hp, filter_group=next_gid, bool_op="AND"))
+            next_gid += 1
+        else:
+            out.append(replace(hp, bool_op="AND"))
+    return out

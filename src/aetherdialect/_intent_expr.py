@@ -5,16 +5,20 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Sequence
 from copy import deepcopy
-from dataclasses import replace
-from typing import Any
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
+from typing import Any, TypeVar, cast
 
 import jsonschema
 import sqlglot
 from sqlglot import exp
 
 from ._config import (
-    CASE_RESULT_BARE_LABEL_RE,
-    CASE_RESULT_REGISTRY_TOKEN_RE,
+    ConfigError,
+    PolicyConfig,
+)
+from ._constants import (
+    AST_AGG_NODE_TO_NAME,
     CTE_DEFAULT_AGGS,
     CTE_FULL_AGGS,
     CTE_HAVING_COMPARE_OPS,
@@ -27,72 +31,111 @@ from ._config import (
     IN_STRING_SEPARATORS,
     INTEGER_SCALARS,
     INTENT_SCHEMA,
+    INTERPRET_PLAN_SCHEMA,
+    LOGICAL_INTENT_SCHEMA,
     NUMERIC_RESULT_AGGS,
     NUMERIC_RESULT_SCALARS,
     PLANNER_PROSE_FIELDS,
     REGISTRY_TOKEN_PATTERN,
     SCALAR_FUNC_DEFAULTS,
     SCALAR_FUNCTIONS_LEADING_ARG,
-    is_structural_param_key,
+    SQL_AGG_FUNC_CALL_RE,
 )
 from ._contracts_base import (
-    CteOutputColumnMeta,
-    LogicalIntent,
-    SchemaGraph,
-    VirtualColumnSpec,
-    VirtualTableSpec,
-)
-from ._contracts_core import (
-    CaseRegistryStep,
-    CaseWhenBranch,
-    CaseWhenExpr,
+    CteIntent,
     ExprValue,
+    FailureCategory,
     FilterParam,
     HavingParam,
+    LogicalIntent,
     MulGroup,
     NormalizedExpr,
     OrderByCol,
-    RuntimeCteStep,
-    RuntimeIntent,
-    SelectCol,
-    WindowRegistryStep,
-    WindowSpec,
+    RawValue,
+    coerce_filter_group_list,
+    coerce_having_group_list,
     expr_registry_ref,
     register_parse_expr_string,
 )
-from ._core_utils import debug, normalize_op, safe_json_loads, stable_json
+from ._contracts_core import (
+    ConcreteIntent,
+    FeedbackKind,
+    InterpretPlan,
+    RejectionBucket,
+    RuntimeCteStep,
+    RuntimeIntent,
+    SelectCol,
+    Template,
+)
+from ._contracts_schema import (
+    CaseRegistryStep,
+    CaseWhenBranch,
+    CaseWhenExpr,
+    CteOutputColumnMeta,
+    IntentIssue,
+    SchemaGraph,
+    VirtualColumnSpec,
+    VirtualTableSpec,
+    WindowRegistryStep,
+    WindowSpec,
+    make_intent_issue,
+    validate_cte_tables_and_dag,
+    validate_tables_exist,
+)
+from ._core_utils import debug, is_structural_param_key, normalize_op, safe_json_loads, stable_json
 
 
 def _is_date_or_interval_expr(s: str) -> bool:
-    """
-    Return True when *s* looks like a date/interval literal (keep as ``right_expr``).
-
-    Args:
-
-        s: Candidate right-hand string.
-
-    Returns:
-
-        True if substring markers match ``DATE_INTERVAL_EXPR_SUBSTRINGS``.
-    """
+    """Return True when *s* looks like a date/interval literal (keep as. ``right_expr``). Args: s: Candidate right-hand string. Returns: True if substring markers match ``DATE_INTERVAL_EXPR_SUBSTRINGS``."""
     if not s or not isinstance(s, str):
         return False
     lower = s.strip().lower()
     return any(p in lower for p in DATE_INTERVAL_EXPR_SUBSTRINGS)
 
 
+def _expr_is_sql_bound_not_literal(expr: NormalizedExpr) -> bool:
+    """
+    Return True when *expr* denotes SQL text rather than a scalar
+
+    bind literal.
+
+    Args: expr: Parsed bound operand. Returns: True when the tree should render as ``right_expr``.
+    """
+    if expr.keyword or expr.interval:
+        return True
+    if expr.scalar_func or expr.inner_scalar_func:
+        return True
+    for group in expr.add_groups + expr.sub_groups:
+        if group.scalar_func or group.inner_scalar_func or group.agg_func:
+            return True
+    if expr.raw_sql and _is_date_or_interval_expr(expr.raw_sql):
+        return True
+    return False
+
+
+def _bound_value_to_right_expr(value: Any) -> NormalizedExpr | None:
+    """
+    Return a structural ``right_expr`` for *value* when it is SQL
+
+    text rather than a literal bind operand.
+
+    Args: value: Filter or having bound operand. Returns: Parsed expression tree, or ``None`` when the operand should remain ``raw_value``.
+    """
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if not s:
+        return None
+    if _is_date_or_interval_expr(s):
+        return parse_expr_string(s)
+    expr = parse_expr_string(s)
+    if _expr_is_sql_bound_not_literal(expr):
+        return expr
+    return None
+
+
 def strip_leading_distinct_from_column_ref(ref: str) -> str:
-    """
-    Remove a leading SQL DISTINCT prefix from a column reference token.
-
-    Args:
-
-        ref: Raw reference substring, possibly ``DISTINCT tbl.col``.
-
-    Returns:
-
-        Reference without a leading ``DISTINCT`` keyword.
-    """
+    """Remove a leading SQL DISTINCT prefix from a column reference. token. Args: ref: Raw reference substring, possibly ``DISTINCT tbl.col``. Returns: Reference without a leading ``DISTINCT`` keyword."""
     s = ref.strip()
     upper = s.upper()
     if upper.startswith("DISTINCT "):
@@ -101,21 +144,12 @@ def strip_leading_distinct_from_column_ref(ref: str) -> str:
 
 
 def expr_canonical_key(expr: NormalizedExpr) -> str:
-    """
-    Return a stable string key for the same logical aggregation or scalar expression.
-
-    Used for HAVING dedup and diagnostics where ``primary_column`` is absent on aggregate LHS.
-    """
-
+    """Return a stable string key for the same logical aggregation or scalar expression. Used for HAVING dedup and diagnostics where ``primary_column`` is absent on aggregate LHS."""
     return stable_json(expr.to_dict())
 
 
 def extract_columns_from_expr(expr: NormalizedExpr) -> list[str]:
-    """
-    Collect unique column refs from every nested term in *expr*.
-
-    Walks the structural NormalizedExpr tree (including nested multiply/divide children, CAST inner expressions, etc.) and yields the leaf ``column_ref`` values in first-seen order. For ``raw_sql`` escape-hatch leaves, attempts a secondary sqlglot parse to recover any embedded column references.
-    """
+    """Collect unique column refs from every nested term in *expr*. Walks the structural NormalizedExpr tree (including nested multiply/divide children, CAST inner expressions, etc.) and yields the leaf ``column_ref`` values in first-seen order. For ``raw_sql`` escape-hatch leaves, attempts a secondary sqlglot parse to recover any embedded column references."""
     cols: list[str] = []
     seen: set[str] = set()
 
@@ -165,11 +199,7 @@ def extract_columns_from_expr(expr: NormalizedExpr) -> list[str]:
 
 
 def _remap_qualified_column_refs_in_raw_sql(fragment: str, replacer: Callable[[str], str]) -> str:
-    """
-    Apply *replacer* to qualified ``table.column`` tokens inside a raw SQL fragment.
-
-    Used when :func:`replace_refs_in_expr` encounters a ``raw_sql`` leaf so CTE rewrites still reach escape-hatch SQL text.
-    """
+    """Apply *replacer* to qualified ``table.column`` tokens inside a raw SQL fragment. Used when :func:`replace_refs_in_expr` encounters a ``raw_sql`` leaf so CTE rewrites still reach escape-hatch SQL text."""
     if not (fragment and fragment.strip()):
         return fragment
     try:
@@ -252,15 +282,6 @@ def replace_refs_in_expr(expr: NormalizedExpr, replacer: Callable[[str], str]) -
     return _walk(expr)
 
 
-_AST_AGG_NODE_TO_NAME: dict[type[exp.Expression], str] = {
-    exp.Sum: "sum",
-    exp.Count: "count",
-    exp.Avg: "avg",
-    exp.Min: "min",
-    exp.Max: "max",
-}
-
-
 def _ast_unwrap_paren(node: exp.Expression) -> exp.Expression:
     while isinstance(node, exp.Paren):
         node = node.this
@@ -312,7 +333,8 @@ def _ast_node_to_normalized(node: exp.Expression) -> NormalizedExpr:
 
     if isinstance(node, exp.Cast):
         inner = _ast_node_to_normalized(node.this)
-        type_name = node.args.get("to").sql(dialect=None).upper() if node.args.get("to") else ""
+        to_node = node.args.get("to")
+        type_name = to_node.sql(dialect=None).upper() if to_node is not None else ""
         wrapper = NormalizedExpr(
             cast_type=type_name,
             add_groups=[MulGroup(multiply=[inner])],
@@ -339,7 +361,7 @@ def _ast_node_to_normalized(node: exp.Expression) -> NormalizedExpr:
     if isinstance(node, exp.Distinct):
         return NormalizedExpr(raw_sql=node.sql(dialect=None))
 
-    agg_name = _AST_AGG_NODE_TO_NAME.get(type(node))
+    agg_name = AST_AGG_NODE_TO_NAME.get(type(node))
     if agg_name is not None:
         inner = node.this
         distinct_flag = False
@@ -576,62 +598,18 @@ def _additive_to_normalized(
     )
 
 
-def _coerce_case_result_string_literal(parsed: NormalizedExpr, raw: str) -> NormalizedExpr:
-    """
-    Treat a bare unqualified identifier in a CASE result as a string literal.
-
-    The LLM frequently writes CASE branch results like ``"active"`` without quoting, which sqlglot parses as a column reference. When the parsed expression is just a bare ``column_ref`` token (no ``.``, no functions, no registry id pattern) and the raw text matches a simple identifier shape, we emit a quoted string literal via ``raw_sql`` so SQL generation produces the user-intended literal.
-    """
-
-    if not raw or "." in raw:
-        return parsed
-    text = raw.strip()
-    if not text or "'" in text or '"' in text:
-        return parsed
-    if not CASE_RESULT_BARE_LABEL_RE.match(text):
-        return parsed
-    if CASE_RESULT_REGISTRY_TOKEN_RE.match(text):
-        return parsed
-    if not parsed.column_ref:
-        return parsed
-    if (
-        parsed.add_groups
-        or parsed.sub_groups
-        or parsed.add_values
-        or parsed.sub_values
-        or parsed.agg_func
-        or parsed.scalar_func
-        or parsed.inner_scalar_func
-        or parsed.cast_type
-        or parsed.interval is not None
-        or parsed.keyword
-        or parsed.star
-    ):
-        return parsed
-    escaped = text.replace("'", "''")
-    return NormalizedExpr(raw_sql=f"'{escaped}'")
-
-
-def parse_expr_string(expr_str: str | dict) -> NormalizedExpr:
-    """
-    Parse LLM SQL text (or ``{"expr": ...}``) into a structural :class:`NormalizedExpr` tree.
-
-    Uses sqlglot as the sole parser – no string-based fallback.
-    """
+def parse_expr_string(expr_str: Any) -> NormalizedExpr:
+    """Parse LLM SQL text (or ``{"expr": ...}``) into a structural :class:`NormalizedExpr` tree. Uses sqlglot as the sole parser – no string-based fallback."""
     if isinstance(expr_str, dict):
-        raw_str = expr_str.get("expr", "")
-    elif isinstance(expr_str, str):
-        raw_str = expr_str
+        raw_str = str(expr_str.get("expr", "") or "")
     else:
-        raw_str = str(expr_str) if expr_str else ""
+        raw_str = str(expr_str or "")
     raw_str = (raw_str or "").strip()
     if not raw_str:
         return NormalizedExpr()
     try:
         tree = sqlglot.parse_one(raw_str, dialect=None)
     except Exception:
-        return NormalizedExpr(raw_sql=raw_str)
-    if tree is None:
         return NormalizedExpr(raw_sql=raw_str)
     if isinstance(tree, (exp.Command, exp.Select)):
         return NormalizedExpr(raw_sql=raw_str)
@@ -652,9 +630,7 @@ def _is_expr_numeric(
     Args:
 
         expr: Candidate expression.
-
         schema: Column ``value_type`` lookup.
-
         cte_steps: Optional CTE steps consulted when ``expr.primary_column`` references
         a CTE-qualified column whose physical schema entry does not exist.
 
@@ -747,21 +723,7 @@ def _tag_single_expr(
     skip_value_injection: bool = False,
     cte_steps: Sequence[RuntimeCteStep] | None = None,
 ) -> NormalizedExpr:
-    """
-    Set ``is_numeric``; inject ``0.0`` offset for numeric groups unless skipped; strip non-numeric junk.
-
-    Args:
-
-        expr: Expression to tag.
-
-        schema: Column metadata for ``_is_expr_numeric``.
-
-        skip_value_injection: If True, no ``ExprValue(0.0)`` (filters/having LHS).
-
-    Returns:
-
-        Updated expression (copy via ``replace``).
-    """
+    """Set ``is_numeric``; inject ``0.0`` offset for numeric groups. unless skipped; strip non-numeric junk. Args: expr: Expression to tag. schema: Column metadata for ``_is_expr_numeric``. skip_value_injection: If True, no ``ExprValue(0.0)`` (filters/having LHS). Returns: Updated expression (copy via ``replace``)."""
     numeric = _is_expr_numeric(expr, schema, cte_steps)
     bare_leaf = not expr.add_groups and not expr.sub_groups and bool(expr.column_ref or expr.star or expr.keyword)
     if numeric:
@@ -798,7 +760,6 @@ def tag_expr_numeric(intent: RuntimeIntent, schema: SchemaGraph) -> RuntimeInten
     Args:
 
         intent: Full intent.
-
         schema: Schema graph.
 
     Returns:
@@ -894,21 +855,7 @@ def classify_cte_expr(expr: NormalizedExpr) -> str:
 
 
 def derive_cte_output_columns(select_cols: list[SelectCol], *, cte_ordinal: int = 1) -> list[str]:
-    """
-    Derive CTE output aliases with dedup suffixes; passthrough preserves base name case.
-
-    Args:
-
-        select_cols:
-            CTE ``SelectCol`` list.
-
-        cte_ordinal:
-            1-based index of this CTE in ``intent.cte_steps`` for stable ``cteN_wMM`` / ``cteN_cMM`` naming.
-
-    Returns:
-
-        One alias string per select column, same order.
-    """
+    """Derive CTE output aliases with dedup suffixes; passthrough. preserves base name case. Args: select_cols: CTE ``SelectCol`` list. cte_ordinal: 1-based index of this CTE in ``intent.cte_steps`` for stable ``cteN_wMM`` / ``cteN_cMM`` naming. Returns: One alias string per select column, same order."""
     derived: list[str] = []
     seen: dict[str, int] = {}
     expr_counter = 0
@@ -961,7 +908,6 @@ def derive_cte_output_columns(select_cols: list[SelectCol], *, cte_ordinal: int 
 
 def _data_and_value_type_for_window_spec(ws: WindowSpec, schema: SchemaGraph) -> tuple[str, str]:
     """Infer ``(data_type, value_type)`` for a window function projection."""
-
     fn = (ws.function or "").strip().lower()
     if fn in {"row_number", "rank", "dense_rank", "ntile"}:
         return "integer", "integer"
@@ -1010,9 +956,7 @@ def build_cte_output_metadata(
     Args:
 
         select_cols: CTE selects.
-
         output_columns: Aliases parallel to *select_cols*.
-
         schema: Base table column metadata.
 
     Returns:
@@ -1132,11 +1076,11 @@ def build_cte_output_metadata(
                 if src_meta.fk_target:
                     lineage_fk_to_table = src_meta.fk_target[0]
                     lineage_fk_to_column = src_meta.fk_target[1]
-                semantic_distinct_values = list(src_meta.semantic_distinct_values)
+                semantic_distinct_values = list(src_meta.value_overlap_sample)
                 semantic_join_neighbors = list(src_meta.semantic_join_neighbors)
         result[out_col] = CteOutputColumnMeta(
             source=kind,
-            agg_func=agg,
+            agg_func=agg or "",
             role=role,
             filterable=filterable,
             aggregatable=aggregatable,
@@ -1161,19 +1105,7 @@ def build_virtual_table_specs(
     intent: RuntimeIntent,
     schema: SchemaGraph | None,
 ) -> dict[str, VirtualTableSpec]:
-    """
-    Build join-graph virtual nodes for each CTE that exposes output column metadata.
-
-    Args:
-
-        intent: Runtime intent including ``cte_steps`` with ``output_column_metadata``.
-
-        schema: Physical schema (unused today; reserved for cross-checks).
-
-    Returns:
-
-        Map ``cte_name -> VirtualTableSpec`` for CTEs with at least one output column.
-    """
+    """Build join-graph virtual nodes for each CTE that exposes output. column metadata. Args: intent: Runtime intent including ``cte_steps`` with ``output_column_metadata``. schema: Physical schema (unused today; reserved for cross-checks). Returns: Map ``cte_name -> VirtualTableSpec`` for CTEs with at least one output column."""
     if schema is None:
         return {}
     out: dict[str, VirtualTableSpec] = {}
@@ -1206,17 +1138,7 @@ def build_virtual_table_specs(
 
 
 def _strip_angle_brackets(obj: Any) -> Any:
-    """
-    Recursively strip angle-bracket placeholders from all string values in a parsed LLM output.
-
-    Args:
-
-        obj: Parsed JSON value such as a dict, list, string, or other type.
-
-    Returns:
-
-        The same structure with <word> placeholders expanded into literal words.
-    """
+    """Recursively strip angle-bracket placeholders from all string. values in a parsed LLM output. Args: obj: Parsed JSON value such as a dict, list, string, or other type. Returns: The same structure with <word> placeholders expanded into literal words."""
     if isinstance(obj, str):
         return re.sub(r"<(\w+)>", r"\1", obj)
     if isinstance(obj, list):
@@ -1226,7 +1148,7 @@ def _strip_angle_brackets(obj: Any) -> Any:
     return obj
 
 
-def _normalize_order_direction(direction: str) -> str:
+def _normalize_order_direction(direction: object) -> str:
     """
     Normalize sort direction to ``asc`` or ``desc``.
 
@@ -1271,7 +1193,6 @@ def _strip_order_direction(expr_raw: object) -> tuple[str, str]:
 
 def _order_by_col_from_obc(obc: dict[str, Any]) -> OrderByCol:
     """Parse one LLM ``order_by_cols`` object into ``OrderByCol``."""
-
     expr_raw = obc.get("expr")
     if isinstance(expr_raw, str):
         expr_clean, dir_from_expr = _strip_order_direction(expr_raw)
@@ -1336,6 +1257,11 @@ def _parse_filter_param_from_llm(fp: dict[str, Any]) -> list[FilterParam]:
     right_ex = parse_expr_string(right_str) if right_str else None
     vt = fp.get("value_type", "string")
     raw_v = fp.get("value")
+    if right_ex is None and raw_v is not None and not isinstance(raw_v, (list, dict)):
+        promoted = _bound_value_to_right_expr(raw_v)
+        if promoted is not None:
+            right_ex = promoted
+            raw_v = None
     bop = fp.get("bool_op", "AND")
     return [
         FilterParam(
@@ -1375,6 +1301,11 @@ def _parse_having_param_from_llm(hp: dict[str, Any]) -> list[HavingParam]:
     right_ex = parse_expr_string(right_str) if right_str else None
     vt = hp.get("value_type", "integer")
     raw_v = hp.get("value")
+    if right_ex is None and raw_v is not None and not isinstance(raw_v, (list, dict)):
+        promoted = _bound_value_to_right_expr(raw_v)
+        if promoted is not None:
+            right_ex = promoted
+            raw_v = None
     bop = hp.get("bool_op", "AND")
     return [
         HavingParam(
@@ -1419,7 +1350,6 @@ def _sanitize_cte_alias_token(s: str) -> str:
 
         Sanitized string (may still violate the strict alias regex).
     """
-
     t = s.lower()
     t = t.replace(".", "_")
     t = re.sub(r"[^a-z0-9_]+", "_", t)
@@ -1435,24 +1365,7 @@ def _canonicalise_one_output_column_item(
     derived: list[str],
     index: int,
 ) -> str:
-    """
-    Map one raw ``output_columns`` string to a snake_case alias matching ``INTENT_SCHEMA``.
-
-    Args:
-
-        raw: One cell from the LLM.
-
-        select_cols: Parsed CTE ``select_cols`` (same order as output columns).
-
-        derived: Result of :func:`derive_cte_output_columns` when *select_cols* is non-empty.
-
-        index: Position of this cell.
-
-    Returns:
-
-        Canonical alias string.
-    """
-
+    """Map one raw ``output_columns`` string to a snake_case alias. matching ``INTENT_SCHEMA``. Args: raw: One cell from the LLM. select_cols: Parsed CTE ``select_cols`` (same order as output columns). derived: Result of :func:`derive_cte_output_columns` when *select_cols* is non-empty. index: Position of this cell. Returns: Canonical alias string."""
     s = raw.strip()
     if re.search(r"\s+AS\s+", s, flags=re.I):
         s = re.split(r"\s+AS\s+", s, flags=re.I)[-1].strip()
@@ -1469,14 +1382,7 @@ def _canonicalise_one_output_column_item(
 
 
 def _canonicalise_cte_output_columns(intent_dict: dict[str, Any]) -> None:
-    """
-    Rewrite ``cte_steps[*].output_columns`` in place so each entry matches ``^[a-z_][a-z0-9_]*$``.
-
-    Args:
-
-        intent_dict: Root intent object from ``safe_json_loads`` before ``INTENT_SCHEMA`` validation.
-    """
-
+    """Rewrite ``cte_steps[*].output_columns`` in place so each entry. matches ``^[a-z_][a-z0-9_]*$``. Args: intent_dict: Root intent object from ``safe_json_loads`` before ``INTENT_SCHEMA`` validation."""
     ctes = intent_dict.get("cte_steps")
     if not isinstance(ctes, list):
         return
@@ -1506,11 +1412,43 @@ def _canonicalise_cte_output_columns(intent_dict: dict[str, Any]) -> None:
         cte["output_columns"] = new_oc
 
 
-def _intent_schema_validation_error(parsed: dict[str, Any]) -> str | None:
-    """
-    Return a jsonschema validation message when *parsed* fails ``INTENT_SCHEMA``, else ``None``.
-    """
+def _sanitize_filter_having_param_item(item: dict[str, Any]) -> None:
+    """Coerce compose JSON filter/having rows so they pass ``INTENT_SCHEMA`` validation."""
+    if item.get("bool_op") is None:
+        item.pop("bool_op", None)
+    if item.get("filter_group") is None:
+        item.pop("filter_group", None)
+    for key in ("left_expr", "right_expr", "left_agg", "right_agg"):
+        val = item.get(key)
+        if isinstance(val, dict):
+            expr_text = val.get("expr", "")
+            if isinstance(expr_text, str) and expr_text.strip():
+                item[key] = expr_text.strip()
+            else:
+                item.pop(key, None)
+        elif isinstance(val, str) and val.strip() and SQL_AGG_FUNC_CALL_RE.search(val):
+            parsed = parse_expr_string(val)
+            if parsed.agg_func or parsed.add_groups or parsed.sub_groups:
+                item[key] = val.strip()
 
+
+def _sanitize_compose_intent_json(parsed: dict[str, Any]) -> None:
+    """Normalize compose intent JSON in place before ``INTENT_SCHEMA`` validation."""
+    for key in ("filters_param", "having_param"):
+        for item in parsed.get(key, []) or []:
+            if isinstance(item, dict):
+                _sanitize_filter_having_param_item(item)
+    for cte in parsed.get("cte_steps", []) or []:
+        if not isinstance(cte, dict):
+            continue
+        for key in ("filters_param", "having_param"):
+            for item in cte.get(key, []) or []:
+                if isinstance(item, dict):
+                    _sanitize_filter_having_param_item(item)
+
+
+def _intent_schema_validation_error(parsed: dict[str, Any]) -> str | None:
+    """Return a jsonschema validation message when *parsed* fails ``INTENT_SCHEMA``, else ``None``."""
     try:
         jsonschema.validate(instance=parsed, schema=INTENT_SCHEMA)
     except jsonschema.ValidationError as exc:
@@ -1519,92 +1457,116 @@ def _intent_schema_validation_error(parsed: dict[str, Any]) -> str | None:
     return None
 
 
-def _validate_intent_schema(parsed: dict[str, Any]) -> bool:
-    """
-    Validate parsed intent dict against INTENT_SCHEMA.
-
-    Args:
-
-        parsed: Parsed JSON dict from an LLM response.
-
-    Returns:
-
-        True if the structure is valid for the schema and False otherwise.
-    """
-
-    return _intent_schema_validation_error(parsed) is None
-
-
 def _flatten_dpipe_chain_operands(node: exp.Expression) -> list[exp.Expression]:
     """Flatten a left-associative ``DPipe`` tree into ordered operand expressions."""
-
     if isinstance(node, exp.DPipe):
         return _flatten_dpipe_chain_operands(node.this) + [node.expression]
     return [node]
 
 
-def _split_root_concat_or_dpipe_sql(expr: str) -> list[str] | None:
-    """
-    When *expr* is a top-level ``CONCAT`` or ``||`` chain, return one SQL string per operand.
-
-    Args:
-
-        expr: Raw expression text from the model.
-
-    Returns:
-
-        Operand SQL fragments, or ``None`` when no split applies or parsing fails.
-    """
-
-    t = expr.strip()
-    if not t:
-        return None
-    try:
-        tree = sqlglot.parse_one(t, dialect=None)
-    except Exception:
-        return None
-    if isinstance(tree, exp.Concat):
-        return [x.sql() for x in tree.expressions]
-    if isinstance(tree, exp.DPipe):
-        return [x.sql() for x in _flatten_dpipe_chain_operands(tree)]
-    return None
+CaseBranchTransform = Callable[[list[FilterParam]], list[FilterParam]]
 
 
-def _expand_select_cols_raw_entries(select_cols_raw: list[Any]) -> list[Any]:
-    """
-    Expand top-level ``CONCAT`` / ``||`` dict or string entries into separate raw select entries.
+def walk_case_when_branches(
+    case_when: CaseWhenExpr,
+    transform: CaseBranchTransform,
+    scopes: frozenset[str],
+    location: str,
+) -> tuple[CaseWhenExpr, bool]:
+    """Apply *transform* to each branch condition whose scope is in *scopes*; return updated CASE and changed flag."""
+    if not case_when or not case_when.branches:
+        return case_when, False
+    branch_scope = (case_when.condition_scope or "filter").strip().lower()
+    if branch_scope not in scopes:
+        return case_when, False
+    new_branches: list[CaseWhenBranch] = []
+    changed = False
+    for bi, branch in enumerate(case_when.branches):
+        cond = branch.condition
+        produced = transform([cond])
+        if not produced:
+            debug(
+                f"[intent_expr.walk_case_when_branches] {location}.branches[{bi}]: transform returned empty; keeping original",
+            )
+            new_branches.append(branch)
+            continue
+        if len(produced) > 1:
+            debug(
+                f"[intent_expr.walk_case_when_branches] {location}.branches[{bi}]: transform expanded to {len(produced)} predicates; CASE branch only accepts one — keeping first",
+            )
+        new_cond = produced[0]
+        if new_cond is cond:
+            new_branches.append(branch)
+            continue
+        new_branches.append(replace(branch, condition=new_cond))
+        changed = True
+    if not changed:
+        return case_when, False
+    return replace(case_when, branches=new_branches), True
 
-    Args:
 
-        select_cols_raw: Raw ``select_cols`` array from parsed intent JSON.
+def walk_case_registry(
+    registry: Sequence[CaseRegistryStep] | None,
+    transform: CaseBranchTransform,
+    scopes: frozenset[str],
+    location: str,
+) -> tuple[list[CaseRegistryStep] | None, bool]:
+    """Apply transform to every registered CASE; return new registry list and changed flag."""
+    if not registry:
+        return list(registry) if registry is not None else None, False
+    new_steps: list[CaseRegistryStep] = []
+    changed = False
+    for step in registry:
+        new_cw, c = walk_case_when_branches(
+            step.case_when,
+            transform,
+            scopes,
+            f"{location}.case_registry[{step.registry_id}]",
+        )
+        if c:
+            new_steps.append(replace(step, case_when=new_cw))
+            changed = True
+        else:
+            new_steps.append(step)
+    return new_steps, changed
 
-    Returns:
 
-        Expanded raw entries suitable for :func:`_parse_select_col_from_llm` / :func:`parse_expr_string`.
-    """
+def map_case_branch_conditions(
+    intent: RuntimeIntent,
+    transform: CaseBranchTransform,
+    *,
+    scopes: frozenset[str] = frozenset({"filter", "having"}),
+) -> RuntimeIntent:
+    """Apply *transform* to every CASE WHEN branch condition in the intent."""
+    new_main_registry, mr_changed = walk_case_registry(
+        intent.case_registry,
+        transform,
+        scopes,
+        "main",
+    )
 
-    out: list[Any] = []
-    for entry in select_cols_raw:
-        if isinstance(entry, dict) and isinstance(entry.get("expr"), str):
-            parts = _split_root_concat_or_dpipe_sql(entry["expr"])
-            if parts and len(parts) > 1:
-                base_alias = str(entry.get("alias") or "").strip()
-                for i, p in enumerate(parts):
-                    row = dict(entry)
-                    row["expr"] = p
-                    if base_alias:
-                        row["alias"] = f"{base_alias}__p{i}"
-                    elif "alias" in row:
-                        del row["alias"]
-                    out.append(row)
-                continue
-        if isinstance(entry, str):
-            parts = _split_root_concat_or_dpipe_sql(entry)
-            if parts and len(parts) > 1:
-                out.extend(parts)
-                continue
-        out.append(entry)
-    return out
+    new_cte_steps: list[RuntimeCteStep] = []
+    cte_any_changed = False
+    for ci, cte in enumerate(intent.cte_steps or []):
+        new_cte_registry, cr_changed = walk_case_registry(
+            cte.case_registry,
+            transform,
+            scopes,
+            f"cte_steps[{ci}]",
+        )
+        if cr_changed:
+            cte_any_changed = True
+            new_cte_steps.append(replace(cte, case_registry=new_cte_registry or []))
+        else:
+            new_cte_steps.append(cte)
+
+    if not mr_changed and not cte_any_changed:
+        return intent
+    return replace(
+        intent,
+        case_registry=new_main_registry or [],
+        cte_steps=new_cte_steps,
+    )
 
 
 def parse_intent_response(
@@ -1619,9 +1581,7 @@ def parse_intent_response(
     Args:
 
         raw: Model output string.
-
         question: Fallback for ``natural_language``.
-
         parse_detail_out: When provided, append one human-readable failure line before returning ``None``.
 
     Returns:
@@ -1636,6 +1596,7 @@ def parse_intent_response(
     parsed = _strip_angle_brackets(parsed)
     parsed.pop("intent_status", None)
     _canonicalise_cte_output_columns(parsed)
+    _sanitize_compose_intent_json(parsed)
     schema_err = _intent_schema_validation_error(parsed)
     if schema_err:
         debug("[intent_expr.parse_intent_response] schema validation failed")
@@ -1650,7 +1611,7 @@ def parse_intent_response(
     select_cols_raw_in = parsed.get("select_cols", [])
     if not isinstance(select_cols_raw_in, list):
         select_cols_raw_in = [select_cols_raw_in] if select_cols_raw_in else []
-    select_cols_raw = _expand_select_cols_raw_entries(select_cols_raw_in)
+    select_cols_raw = select_cols_raw_in
     select_cols = []
     for sc in select_cols_raw:
         if isinstance(sc, str):
@@ -1692,7 +1653,7 @@ def parse_intent_response(
             if not isinstance(cte_sc_in, list):
                 cte_sc_in = [cte_sc_in] if cte_sc_in else []
             cte_select_cols = []
-            for sc in _expand_select_cols_raw_entries(cte_sc_in):
+            for sc in cte_sc_in:
                 if isinstance(sc, str):
                     cte_select_cols.append(SelectCol(expr=parse_expr_string(sc)))
                 elif isinstance(sc, dict):
@@ -1754,7 +1715,7 @@ def parse_intent_response(
             cte_steps.append(
                 RuntimeCteStep(
                     cte_name=cte.get("cte_name", ""),
-                    description=cte.get("description"),
+                    description=str(cte.get("description") or ""),
                     tables=cte.get("tables", []),
                     select_cols=cte_select_cols,
                     group_by_cols=cte_group_by,
@@ -1830,23 +1791,7 @@ def _is_nontrivial_group(g: MulGroup) -> bool:
 
 
 def _assign_structural_group(g: MulGroup, idx: int, pv: dict[str, Any], is_numeric: bool = True) -> int:
-    """
-    Assign structural param keys to a single MulGroup and collect values.
-
-    Args:
-
-        g: The MulGroup to assign param keys to.
-
-        idx: The current structural param index counter.
-
-        pv: The param_values dict to populate with key and value pairs.
-
-        is_numeric: If False, skip coefficient parameterization entirely.
-
-    Returns:
-
-        The updated index after all assignments.
-    """
+    """Assign structural param keys to a single MulGroup and collect. values. Args: g: The MulGroup to assign param keys to. idx: The current structural param index counter. pv: The param_values dict to populate with key and value pairs. is_numeric: If False, skip coefficient parameterization entirely. Returns: The updated index after all assignments."""
     if is_numeric and _is_nontrivial_group(g) and g.coefficient not in (1, 1.0):
         key = f"s{idx}"
         g.coeff_param_key = key
@@ -1875,7 +1820,6 @@ def _assign_structural_group(g: MulGroup, idx: int, pv: dict[str, Any], is_numer
 
 def _assign_structural_filter_param(fp: FilterParam, idx: int, pv: dict[str, Any]) -> int:
     """Assign structural keys to both sides of a filter predicate."""
-
     idx = _assign_structural_date_predicate_payload(fp, idx, pv)
     idx = _assign_structural_expr(fp.left_expr, idx, pv)
     if fp.right_expr is not None:
@@ -1885,7 +1829,6 @@ def _assign_structural_filter_param(fp: FilterParam, idx: int, pv: dict[str, Any
 
 def _assign_structural_having_param(hp: HavingParam, idx: int, pv: dict[str, Any]) -> int:
     """Assign structural keys to a HAVING predicate."""
-
     idx = _assign_structural_date_predicate_payload(hp, idx, pv)
     idx = _assign_structural_expr(hp.left_expr, idx, pv)
     if hp.right_expr is not None:
@@ -1895,7 +1838,6 @@ def _assign_structural_having_param(hp: HavingParam, idx: int, pv: dict[str, Any
 
 def _assign_structural_case_when_expr(cw: CaseWhenExpr, idx: int, pv: dict[str, Any]) -> int:
     """Assign structural keys across CASE branches and else clause."""
-
     for br in cw.branches or []:
         idx = _assign_structural_filter_param(br.condition, idx, pv)
         idx = _assign_structural_expr(br.result, idx, pv)
@@ -1906,7 +1848,6 @@ def _assign_structural_case_when_expr(cw: CaseWhenExpr, idx: int, pv: dict[str, 
 
 def _assign_structural_select_col(sc: SelectCol, idx: int, pv: dict[str, Any]) -> int:
     """Assign structural keys for one SELECT column expression."""
-
     return _assign_structural_expr(sc.expr, idx, pv)
 
 
@@ -1916,28 +1857,13 @@ def _assign_structural_case_registry(
     pv: dict[str, Any],
 ) -> int:
     """Assign structural keys across ``case_registry[*].case_when`` bodies."""
-
     for step in registry or []:
         idx = _assign_structural_case_when_expr(step.case_when, idx, pv)
     return idx
 
 
 def _assign_structural_expr(expr: NormalizedExpr, idx: int, pv: dict[str, Any]) -> int:
-    """
-    Assign structural param keys to a single NormalizedExpr including ExprValue offsets and collect values.
-
-    Args:
-
-        expr: The NormalizedExpr to assign param keys to.
-
-        idx: The current structural param index counter.
-
-        pv: The param_values dict to populate with key and value pairs.
-
-    Returns:
-
-        The updated index after all assignments.
-    """
+    """Assign structural param keys to a single NormalizedExpr. including. ExprValue offsets and collect values. Args: expr: The NormalizedExpr to assign param keys to. idx: The current structural param index counter. pv: The param_values dict to populate with key and value pairs. Returns: The updated index after all assignments."""
     for g in expr.add_groups:
         idx = _assign_structural_group(g, idx, pv, is_numeric=expr.is_numeric)
     for g in expr.sub_groups:
@@ -1978,17 +1904,7 @@ def _assign_structural_expr(expr: NormalizedExpr, idx: int, pv: dict[str, Any]) 
 
 
 def _infer_date_unit(column: str) -> str:
-    """
-    Infer a temporal unit keyword from a column name for date function default arguments.
-
-    Args:
-
-        column: Fully qualified or bare column name string.
-
-    Returns:
-
-        One of 'month', 'day', 'week', 'quarter', or 'year', defaulting to 'month' when no date keyword is found in the column name.
-    """
+    """Infer a temporal unit keyword from a column name for date. function default arguments. Args: column: Fully qualified or bare column name string. Returns: One of 'month', 'day', 'week', 'quarter', or 'year', defaulting to 'month' when no date keyword is found in the column name."""
     col_lower = column.lower()
     for keyword, unit in DATE_UNIT_KEYWORDS:
         if keyword in col_lower:
@@ -2114,7 +2030,6 @@ def _assign_structural_window_registry(
     pv: dict[str, Any],
 ) -> int:
     """Assign structural keys for window registry expressions nested in ``window_spec``."""
-
     for step in registry or []:
         ws = step.window_spec
         for part in ws.partition_by or []:
@@ -2128,7 +2043,6 @@ def _assign_structural_window_registry(
 
 def _assign_structural_date_predicate_payload(pred: FilterParam | HavingParam, idx: int, pv: dict[str, Any]) -> int:
     """Bind ``s*`` for calendar unit in ``date_diff`` / ``date_window`` dict payloads; clear ``raw_value``."""
-
     vt = (pred.value_type or "").lower()
     if vt not in ("date_diff", "date_window"):
         return idx
@@ -2149,17 +2063,7 @@ def _assign_structural_date_predicate_payload(pred: FilterParam | HavingParam, i
 
 
 def extract_structural_params(intent: RuntimeIntent) -> RuntimeIntent:
-    """
-    Assign ``s*`` keys to limits, coeffs, and func args; fill ``param_values``.
-
-    Args:
-
-        intent: Tagged intent (``is_numeric``, etc.).
-
-    Returns:
-
-        ``replace`` copy with ``param_values`` and ``limit_param_key``.
-    """
+    """Assign ``s*`` keys to limits, coeffs, and func args; fill. ``param_values``. Args: intent: Tagged intent (``is_numeric``, etc.). Returns: ``replace`` copy with ``param_values`` and ``limit_param_key``."""
     pv: dict[str, Any] = dict(intent.param_values or {})
     idx = 1
     for cte in intent.cte_steps or []:
@@ -2203,18 +2107,7 @@ def extract_structural_params(intent: RuntimeIntent) -> RuntimeIntent:
 
 
 def apply_default_structural_values(intent: RuntimeIntent) -> RuntimeIntent:
-    """
-    Ensure structural ``s*`` slots in ``param_values`` are never unset before substitution.
-
-    Args:
-
-        intent: Runtime intent after deterministic repairs.
-
-    Returns:
-
-        Intent copy with missing structural keys coerced to numeric zero.
-    """
-
+    """Ensure structural ``s*`` slots in ``param_values`` are never. unset before substitution. Args: intent: Runtime intent after deterministic repairs. Returns: Intent copy with missing structural keys coerced to numeric zero."""
     pv = dict(intent.param_values or {})
     changed = False
     for k in list(pv.keys()):
@@ -2228,7 +2121,6 @@ def apply_default_structural_values(intent: RuntimeIntent) -> RuntimeIntent:
 
 def cleared_param_runtime_intent(intent: RuntimeIntent) -> RuntimeIntent:
     """Return a deep copy of *intent* with all ``param_values`` cleared (main and CTEs)."""
-
     out = deepcopy(intent)
     empty_ctes = [replace(cte, param_values={}) for cte in (out.cte_steps or [])]
     return replace(out, param_values={}, limit_param_key="", cte_steps=empty_ctes)
@@ -2236,7 +2128,6 @@ def cleared_param_runtime_intent(intent: RuntimeIntent) -> RuntimeIntent:
 
 def structural_s_key_assignment_order(intent: RuntimeIntent) -> list[str]:
     """Return structural ``s*`` keys in the same assignment order as ``extract_structural_params``."""
-
     blank = cleared_param_runtime_intent(intent)
     tagged = extract_structural_params(blank)
     return [k for k in tagged.param_values if is_structural_param_key(k)]
@@ -2244,14 +2135,15 @@ def structural_s_key_assignment_order(intent: RuntimeIntent) -> list[str]:
 
 def collect_raw_param_values(intent: RuntimeIntent) -> dict[str, Any]:
     """
-    Harvest ``raw_value`` into a dict and clear ``raw_value`` on each param (CTEs first).
+    Harvest ``raw_value`` into a dict and clear ``raw_value`` on.
 
-    Walks ``filters_param``, ``having_param``, and ``case_registry[*].case_when`` branch conditions
-    in both the main intent and every CTE so CASE literals are bound alongside WHERE / HAVING parameters.
+    each. param (CTEs first). Walks ``filters_param``, ``having_param``,
 
-    Args:
+    and ``case_registry[*].case_when`` branch conditions in both the
 
-        intent: Intent to scan and mutate.
+    main intent and every CTE so CASE literals are bound alongside WHERE
+
+    / HAVING parameters. Args: intent: Intent to scan and mutate.
 
     Returns:
 
@@ -2265,8 +2157,8 @@ def collect_raw_param_values(intent: RuntimeIntent) -> dict[str, Any]:
             rv = dict(fp.raw_value)
             if fp.param_key:
                 num = rv.get("amount")
-                if num is not None and not isinstance(num, dict):
-                    pv[fp.param_key] = int(num) if not isinstance(num, bool) else 0
+                if isinstance(num, (int, float)) and not isinstance(num, bool):
+                    pv[fp.param_key] = int(num)
             unit_val = rv.get("unit", "day")
             fp.raw_value = {"unit": unit_val}
             return
@@ -2280,6 +2172,11 @@ def collect_raw_param_values(intent: RuntimeIntent) -> dict[str, Any]:
                 fp.raw_value = None
             return
         if fp.param_key and fp.raw_value is not None:
+            promoted = _bound_value_to_right_expr(fp.raw_value)
+            if promoted is not None and fp.right_expr is None:
+                fp.right_expr = promoted
+                fp.raw_value = None
+                return
             pv[fp.param_key] = fp.raw_value
             fp.raw_value = None
 
@@ -2289,24 +2186,26 @@ def collect_raw_param_values(intent: RuntimeIntent) -> dict[str, Any]:
             rv = dict(hp.raw_value)
             if hp.param_key:
                 num = rv.get("amount")
-                if num is not None and not isinstance(num, dict):
-                    pv[hp.param_key] = int(num) if not isinstance(num, bool) else 0
+                if isinstance(num, (int, float)) and not isinstance(num, bool):
+                    pv[hp.param_key] = int(num)
             hp.raw_value = {"unit": rv.get("unit", "day")}
             return
         if vt in ("date_window", "date_diff"):
             return
         if hp.param_key and hp.raw_value is not None:
+            promoted = _bound_value_to_right_expr(hp.raw_value)
+            if promoted is not None and hp.right_expr is None:
+                hp.right_expr = promoted
+                hp.raw_value = None
+                return
             pv[hp.param_key] = hp.raw_value
             hp.raw_value = None
 
     def _harvest_case_registry(regs: list[CaseRegistryStep] | None) -> None:
         for step in regs or []:
             cw = step.case_when
-            if cw is None:
-                continue
             for branch in cw.branches or []:
-                if branch.condition is not None:
-                    _harvest_filter(branch.condition)
+                _harvest_filter(branch.condition)
 
     for cte in intent.cte_steps or []:
         for fp in cte.filters_param or []:
@@ -2327,7 +2226,6 @@ def _assign_case_registry_param_keys(
     start_idx: int,
 ) -> tuple[list[CaseRegistryStep], int]:
     """Allocate ``p*`` keys to CASE branch conditions inside ``case_registry`` entries."""
-
     if not case_registry:
         return list(case_registry or []), start_idx
     idx = start_idx
@@ -2340,9 +2238,6 @@ def _assign_case_registry_param_keys(
         new_branches: list[CaseWhenBranch] = []
         for branch in cw.branches:
             cond = branch.condition
-            if cond is None:
-                new_branches.append(branch)
-                continue
             if cond.op in ("is null", "is not null") or cond.right_expr is not None or cond.param_key:
                 new_branches.append(branch)
                 continue
@@ -2382,27 +2277,7 @@ def assign_param_keys(
     list[CaseRegistryStep],
     int,
 ]:
-    """
-    Assign ``p*`` keys to filter/having value params and CASE-branch conditions (CTEs first).
-
-    Skips null operators, date_window/date_diff value types, and predicates whose RHS is a
-    column expression. Each CTE ``case_registry`` is keyed before main filters/having; main
-    ``case_registry`` follows.
-
-    Args:
-
-        filters_param: Main filters.
-
-        having_param: Main having list.
-
-        cte_steps: Optional CTE chain to key before main.
-
-        case_registry: Main-query CASE registry rows (``c01``, …).
-
-    Returns:
-
-        ``(filters, having, cte_steps, case_registry, next_index)``.
-    """
+    """Assign ``p*`` keys to filter/having value params and CASE-branch. conditions (CTEs first). Skips null operators, date_window/date_diff value types, and predicates whose RHS is a column expression. Each CTE ``case_registry`` is keyed before main filters/having; main ``case_registry`` follows. Args: filters_param: Main filters. having_param: Main having list. cte_steps: Optional CTE chain to key before main. case_registry: Main-query CASE registry rows (``c01``, …). Returns: ``(filters, having, cte_steps, case_registry, next_index)``."""
     idx = 1
     updated_cte_steps: list[RuntimeCteStep] = []
     for cte in cte_steps or []:
@@ -2490,9 +2365,12 @@ def _parse_between_raw_value(raw_value: Any) -> tuple[Any, Any] | None:
     return None
 
 
+_PredParamT = TypeVar("_PredParamT", FilterParam, HavingParam)
+
+
 def _decompose_between_param_list(
-    params: list[FilterParam] | list[HavingParam],
-) -> list[FilterParam] | list[HavingParam]:
+    params: list[_PredParamT],
+) -> list[_PredParamT]:
     """
     Replace each ``between`` with ``>=`` and ``<=`` pair.
 
@@ -2504,15 +2382,29 @@ def _decompose_between_param_list(
 
         Expanded list (same element types).
     """
-    result: list = []
+    result: list[_PredParamT] = []
     for p in params:
         if p.op.lower() != "between":
             result.append(p)
             continue
         bounds = _parse_between_raw_value(p.raw_value)
         if bounds is not None:
-            result.append(replace(p, op=">=", raw_value=bounds[0], bool_op="AND"))
-            result.append(replace(p, op="<=", raw_value=bounds[1]))
+            lo_expr = _bound_value_to_right_expr(bounds[0])
+            hi_expr = _bound_value_to_right_expr(bounds[1])
+            ge_fields: dict[str, Any] = {"op": ">=", "bool_op": "AND"}
+            le_fields: dict[str, Any] = {"op": "<="}
+            if lo_expr is not None:
+                ge_fields["right_expr"] = lo_expr
+                ge_fields["raw_value"] = None
+            else:
+                ge_fields["raw_value"] = bounds[0]
+            if hi_expr is not None:
+                le_fields["right_expr"] = hi_expr
+                le_fields["raw_value"] = None
+            else:
+                le_fields["raw_value"] = bounds[1]
+            result.append(replace(p, **ge_fields))
+            result.append(replace(p, **le_fields))
         else:
             result.append(replace(p, op=">=", bool_op="AND"))
             result.append(replace(p, op="<="))
@@ -2522,20 +2414,7 @@ def _decompose_between_param_list(
 def _normalize_case_registry_between(
     case_registry: list[CaseRegistryStep] | None,
 ) -> list[CaseRegistryStep] | None:
-    """
-    Canonicalise BETWEEN raw_values inside CASE branches stored in the case_registry.
-
-    Branch predicates live under ``case_registry[*].case_when.branches[*].condition``.
-
-    Args:
-
-        case_registry: Registry list to scan; ``None`` is returned unchanged.
-
-    Returns:
-
-        New registry list with BETWEEN bounds expanded to ``[lo, hi]`` tuples, or the
-        original value when no rewrites apply.
-    """
+    """Canonicalise BETWEEN raw_values inside CASE branches stored in. the case_registry. Branch predicates live under ``case_registry[*].case_when.branches[*].condition``. Args: case_registry: Registry list to scan; ``None`` is returned unchanged. Returns: New registry list with BETWEEN bounds expanded to ``[lo, hi]`` tuples, or the original value when no rewrites apply."""
     if not case_registry:
         return case_registry
     out: list[CaseRegistryStep] = []
@@ -2569,21 +2448,24 @@ def _normalize_case_registry_between(
 
 def decompose_between_params(intent: RuntimeIntent) -> RuntimeIntent:
     """
-    Decompose BETWEEN filter and having operators into paired >= and <= conditions.
+    Decompose BETWEEN filter and having operators into paired >= and.
 
-    Applies to filters_param, having_param, and their counterparts in CTE steps. CASE branch
-    conditions under ``case_registry[*].case_when`` cannot be split into two flat predicates;
-    instead their raw_value is normalised to a ``(lo, hi)`` tuple and rendered via the BETWEEN
-    arm of ``_render_case_branch_sql`` after two param keys are allocated.
+    <= conditions. Applies to filters_param, having_param, and their
 
-    Args:
+    counterparts in CTE steps. CASE branch conditions under
 
-        intent: RuntimeIntent containing filters_param, having_param, and cte_steps to process.
+    ``case_registry[*].case_when`` cannot be split into two flat
 
-    Returns:
+    predicates; instead their raw_value is normalised to a ``(lo, hi)``
 
-        New RuntimeIntent with all BETWEEN operators split into >= and <= pairs in flat lists
-        and canonicalised raw_values inside CASE branches.
+    tuple and rendered via the BETWEEN arm of
+
+    ``_render_case_branch_sql`` after two param keys are allocated.
+
+    Args: intent: RuntimeIntent containing filters_param, having_param,
+        and cte_steps to process. Returns: New RuntimeIntent with all
+        BETWEEN operators split into >= and <= pairs in flat lists and
+        canonicalised raw_values inside CASE branches.
     """
     new_fp = _decompose_between_param_list(intent.filters_param or [])
     new_hp = _decompose_between_param_list(intent.having_param or [])
@@ -2598,39 +2480,27 @@ def decompose_between_params(intent: RuntimeIntent) -> RuntimeIntent:
                 cte,
                 filters_param=cte_fp,
                 having_param=cte_hp,
-                case_registry=cte_cr,
+                case_registry=cte_cr or [],
             )
         )
     return replace(
         intent,
         filters_param=new_fp,
         having_param=new_hp,
-        case_registry=new_case_registry,
+        case_registry=new_case_registry or [],
         cte_steps=new_cte_steps,
     )
 
 
 def _parse_in_string_to_list(raw_value: str) -> list[str]:
-    """
-    Parse a string-encoded IN-list into a list of stripped string elements.
-
-    Handles formats such as "R, PG-13", "'R','PG-13'", and "1, 2, 3" and strips leading and trailing quotes on each element.
-
-    Args:
-
-        raw_value: String representation of an IN-list value.
-
-    Returns:
-
-        List of individual value strings with surrounding quotes removed.
-    """
+    """Parse a string-encoded IN-list into a list of stripped string. elements. Handles formats such as "R, PG-13", "'R','PG-13'", and "1, 2, 3" and strips leading and trailing quotes on each element. Args: raw_value: String representation of an IN-list value. Returns: List of individual value strings with surrounding quotes removed."""
     parts = IN_STRING_SEPARATORS.split(raw_value)
     return [p.strip().strip("'\"") for p in parts if p.strip().strip("'\"")]
 
 
 def _normalize_in_param_list(
-    params: list[FilterParam] | list[HavingParam],
-) -> list[FilterParam] | list[HavingParam]:
+    params: list[_PredParamT],
+) -> list[_PredParamT]:
     """
     Convert string raw_values to lists for IN / NOT IN operators.
 
@@ -2642,14 +2512,14 @@ def _normalize_in_param_list(
 
         New list with string IN-values parsed into Python lists.
     """
-    result: list = []
+    result: list[_PredParamT] = []
     for p in params:
         if p.op.lower() not in IN_OPS or not isinstance(p.raw_value, str):
             result.append(p)
             continue
         parsed = _parse_in_string_to_list(p.raw_value)
         if len(parsed) > 1:
-            result.append(replace(p, raw_value=parsed))
+            result.append(replace(p, raw_value=cast(RawValue, parsed)))
         else:
             result.append(p)
     return result
@@ -2676,13 +2546,13 @@ def normalize_in_raw_values(intent: RuntimeIntent) -> RuntimeIntent:
         cte_hp = _normalize_in_param_list(cte.having_param or [])
         cte_cr = _normalize_in_case_registry_raw_values(cte.case_registry)
         new_cte_steps.append(
-            replace(cte, filters_param=cte_fp, having_param=cte_hp, case_registry=cte_cr),
+            replace(cte, filters_param=cte_fp, having_param=cte_hp, case_registry=cte_cr or []),
         )
     return replace(
         intent,
         filters_param=new_fp,
         having_param=new_hp,
-        case_registry=new_cr,
+        case_registry=new_cr or [],
         cte_steps=new_cte_steps,
     )
 
@@ -2691,7 +2561,6 @@ def _normalize_in_case_registry_raw_values(
     case_registry: list[CaseRegistryStep] | None,
 ) -> list[CaseRegistryStep] | None:
     """Canonicalise IN/NOT IN ``raw_value`` from string to list inside registry CASE branch conditions."""
-
     if not case_registry:
         return case_registry
     out: list[CaseRegistryStep] = []
@@ -2712,7 +2581,7 @@ def _normalize_in_case_registry_raw_values(
             if len(parsed) <= 1:
                 new_branches.append(branch)
                 continue
-            new_cond = replace(cond, raw_value=parsed)
+            new_cond = replace(cond, raw_value=cast(RawValue, parsed))
             new_branches.append(replace(branch, condition=new_cond))
             step_changed = True
         if step_changed:
@@ -2725,7 +2594,6 @@ def _normalize_in_case_registry_raw_values(
 
 def _tag_case_registry_condition_scope(case_registry: list[Any] | None) -> list[Any]:
     """Set ``condition_scope`` on every CASE registry step based on aggregate use."""
-
     if not case_registry:
         return list(case_registry or [])
     out: list[Any] = []
@@ -2743,12 +2611,7 @@ def _tag_case_registry_condition_scope(case_registry: list[Any] | None) -> list[
 
 
 def tag_case_when_condition_scope(intent: RuntimeIntent) -> RuntimeIntent:
-    """
-    Tag every ``CaseWhenExpr`` with ``condition_scope`` (``"filter"`` vs ``"having"``).
-
-    A branch condition that references SQL aggregates (e.g. ``SUM(amount) > 100``) implies the parent scope must use GROUP BY semantics — surfaced as ``"having"`` so downstream validators can gate aggregation consistency.
-    """
-
+    """Tag every ``CaseWhenExpr`` with ``condition_scope`` (``"filter"`` vs ``"having"``). A branch condition that references SQL aggregates (e.g. ``SUM(amount) > 100``) implies the parent scope must use GROUP BY semantics — surfaced as ``"having"`` so downstream validators can gate aggregation consistency."""
     new_registry = _tag_case_registry_condition_scope(intent.case_registry)
     new_cte_steps = []
     for cte in intent.cte_steps or []:
@@ -2780,17 +2643,7 @@ def _canonicalize_temporal_unit(unit: Any) -> Any:
 
 
 def _normalize_date_unit_in_raw_value(raw_value: Any) -> Any:
-    """
-    Canonicalize ``unit`` in a date filter dict via ``DATE_UNIT_ALIAS_TO_CANONICAL``.
-
-    Args:
-
-        raw_value: Filter ``raw_value`` (expect dict with ``unit``).
-
-    Returns:
-
-        Updated dict or unchanged *raw_value*.
-    """
+    """Canonicalize ``unit`` in a date filter dict via. ``DATE_UNIT_ALIAS_TO_CANONICAL``. Args: raw_value: Filter ``raw_value`` (expect dict with ``unit``). Returns: Updated dict or unchanged *raw_value*."""
     if not isinstance(raw_value, dict):
         return raw_value
     unit = raw_value.get("unit")
@@ -2803,20 +2656,22 @@ def _normalize_date_unit_in_raw_value(raw_value: Any) -> Any:
 
 def normalize_date_diff_raw_values(intent: RuntimeIntent) -> RuntimeIntent:
     """
-    Canonicalize ``unit`` in date_window and date_diff filters via ``DATE_UNIT_ALIAS_TO_CANONICAL``.
-    Coerce legacy numeric scalars to structured ``{unit, amount}`` payloads for both value types.
+    Canonicalize ``unit`` in date_window and date_diff filters via.
 
-    Args:
+    ``DATE_UNIT_ALIAS_TO_CANONICAL``. Coerce legacy numeric scalars to
 
-        intent: RuntimeIntent whose date filters may use colloquial units.
+    structured ``{unit, amount}`` payloads for both value types. Args:
+
+    intent: RuntimeIntent whose date filters may use colloquial units.
 
     Returns:
 
-        Updated intent with canonical units, or unchanged when nothing matches.
+        Updated intent with canonical units, or unchanged when nothing
+        matches.
     """
 
-    def _process(params: list) -> list:
-        out = []
+    def _process(params: list[_PredParamT]) -> list[_PredParamT]:
+        out: list[_PredParamT] = []
         for p in params or []:
             if p.value_type in ("date_window", "date_diff") and p.raw_value is not None:
                 if isinstance(p.raw_value, (int, float)) and not isinstance(p.raw_value, bool):
@@ -2844,11 +2699,9 @@ def normalize_date_diff_raw_values(intent: RuntimeIntent) -> RuntimeIntent:
 
 def _canonicalize_group_temporal_args(g: MulGroup) -> None:
     """
-    Mutate *g*: canonicalize the leading temporal-unit arg for date_trunc/date_part/extract.
+    Mutate *g*: canonicalize the leading temporal-unit arg for.
 
-    Args:
-
-        g: Mul group to update in place.
+    date_trunc/date_part/extract. Args: g: Mul group to update in place.
 
     Returns:
 
@@ -2861,17 +2714,7 @@ def _canonicalize_group_temporal_args(g: MulGroup) -> None:
 
 
 def _canonicalize_expr_temporal_args(expr: NormalizedExpr) -> None:
-    """
-    Mutate *expr* and its nested groups: canonicalize temporal-unit leading args.
-
-    Args:
-
-        expr: Expression to update in place.
-
-    Returns:
-
-        None.
-    """
+    """Mutate *expr* and its nested groups: canonicalize temporal-unit. leading args. Args: expr: Expression to update in place. Returns: None."""
     if expr.scalar_func and expr.scalar_func.lower() in SCALAR_FUNCTIONS_LEADING_ARG and expr.scalar_func_args:
         expr.scalar_func_args[0] = _canonicalize_temporal_unit(expr.scalar_func_args[0])
     if (
@@ -2963,17 +2806,17 @@ def _reclassify_date_diff_param(
     fp: FilterParam,
 ) -> FilterParam:
     """
-    If ``date_diff`` targets a plain column, retype to ``date_window`` preserving ``amount``.
+    If ``date_diff`` targets a plain column, retype to.
 
-    Args:
-
-        fp: Candidate filter.
+    ``date_window`` preserving ``amount``. Args: fp: Candidate filter.
 
     Returns:
 
         Rewritten or original *fp*.
     """
     if fp.value_type != "date_diff":
+        return fp
+    if fp.right_expr is not None:
         return fp
     if not isinstance(fp.raw_value, dict):
         return fp
@@ -2985,6 +2828,66 @@ def _reclassify_date_diff_param(
         return fp
     new_rv = {"unit": rv.get("unit", "day"), "amount": int(amount)}
     return replace(fp, value_type="date_window", raw_value=new_rv)
+
+
+def promote_date_subtraction_to_date_diff(
+    intent: RuntimeIntent,
+) -> RuntimeIntent:
+    """
+    Retype date-column subtraction filters compared to a scalar bound as ``date_diff``.
+
+    Args:
+
+        intent: Intent to fix.
+
+    Returns:
+
+        Updated intent.
+    """
+
+    def _is_date_subtraction(expr: NormalizedExpr) -> bool:
+        return bool(expr.sub_groups and expr.add_groups)
+
+    def _process(params: list[FilterParam]) -> list[FilterParam]:
+        out: list[FilterParam] = []
+        for fp in params:
+            if fp.value_type == "date_diff":
+                out.append(fp)
+                continue
+            if fp.right_expr is not None:
+                out.append(fp)
+                continue
+            if not _is_date_subtraction(fp.left_expr):
+                out.append(fp)
+                continue
+            if fp.raw_value is None and not fp.param_key:
+                out.append(fp)
+                continue
+            amount: int | None = None
+            if isinstance(fp.raw_value, (int, float, str)) and not isinstance(fp.raw_value, bool):
+                try:
+                    amount = int(fp.raw_value)
+                except (TypeError, ValueError):
+                    out.append(fp)
+                    continue
+            else:
+                out.append(fp)
+                continue
+            out.append(
+                replace(
+                    fp,
+                    value_type="date_diff",
+                    raw_value={"unit": "day", "amount": amount},
+                )
+            )
+        return out
+
+    new_fp = _process(intent.filters_param or [])
+    new_cte_steps = []
+    for cte in intent.cte_steps or []:
+        cte_fp = _process(cte.filters_param or [])
+        new_cte_steps.append(replace(cte, filters_param=cte_fp))
+    return replace(intent, filters_param=new_fp, cte_steps=new_cte_steps)
 
 
 def repair_misclassified_date_diff(
@@ -3014,18 +2917,7 @@ def repair_misclassified_date_diff(
 
 
 def concat_logical_intent_prose(logical: LogicalIntent) -> str:
-    """
-    Concatenate every planner prose field from the top intent and each CTE step.
-
-    Args:
-
-        logical: Parsed planner intent whose string fields should be flattened.
-
-    Returns:
-
-        Lowercase-friendly haystack text; empty fields are skipped so spacing stays stable.
-    """
-
+    """Concatenate every planner prose field from the top intent and. each CTE step. Args: logical: Parsed planner intent whose string fields should be flattened. Returns: Lowercase-friendly haystack text; empty fields are skipped so spacing stays stable."""
     chunks: list[str] = []
     for field in PLANNER_PROSE_FIELDS:
         chunks.append(str(getattr(logical, field, "") or ""))
@@ -3036,3 +2928,577 @@ def concat_logical_intent_prose(logical: LogicalIntent) -> str:
 
 
 register_parse_expr_string(parse_expr_string)
+
+_TEMPLATES_MODULE: Any = None
+
+
+def dedupe_prior_question_feedback_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Return *rows* de-duplicated by ``(intent_structural_hash, summary prefix)``, preserving order."""
+    seen: set[tuple[str, str]] = set()
+    out: list[dict[str, str]] = []
+    for row in rows:
+        ihash = str(row.get("intent_structural_hash", "") or "")
+        summary = str(row.get("summary", "") or "")
+        key = (ihash, summary[:120])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(row)
+    return out
+
+
+def in_turn_row_from_semantic_errors(
+    errors: list[IntentIssue],
+    schema_hash: str,
+    intent: RuntimeIntent,
+) -> dict[str, str]:
+    """Build one ``to_prompt_row``-shaped dict from semantic validation errors."""
+    max_b = PolicyConfig.MAX_SUMMARY_BULLETS
+    lines = [f"[{e.category.value}] {e.message}" for e in errors[:max_b]]
+    summary = "\n".join(lines)
+    ts = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    tplm = _TEMPLATES_MODULE
+    if tplm is None:
+        ish, ipay = "", ""
+    else:
+        ish, ipay = tplm.compute_intent_structural_signature(intent)
+    return {
+        "kind": FeedbackKind.VALIDATION_FAILURE.value,
+        "summary": summary,
+        "buckets": RejectionBucket.OTHER.value,
+        "effective_structural_hash": schema_hash,
+        "intent_structural_hash": ish,
+        "intent_payload": ipay,
+        "created_at": ts,
+        "updated_at": ts,
+        "is_post_restart": "False",
+    }
+
+
+def register_templates_module(module: Any) -> None:
+    global _TEMPLATES_MODULE
+    _TEMPLATES_MODULE = module
+
+
+def get_templates_module() -> Any:
+    """Return the module registered via :func:`register_templates_module`."""
+    return _TEMPLATES_MODULE
+
+
+def is_template_store_view(store: Any) -> bool:
+    """Return True when *store* is the registered templates module :class:`TemplateStoreView`."""
+    mod = _TEMPLATES_MODULE
+    return mod is not None and isinstance(store, mod.TemplateStoreView)
+
+
+def refresh_template_store_indexes_for_view(
+    store: Any,
+    *,
+    template_objs: list[Template] | None = None,
+) -> None:
+    """Refresh matcher indexes on *store* when it is a registered :class:`TemplateStoreView`."""
+    mod = _TEMPLATES_MODULE
+    if mod is None:
+        return
+    mod._refresh_template_store_indexes(store, template_objs=template_objs)
+
+
+if PolicyConfig.MAX_ASK_COMPOSE_REPAIRS < 1:
+    raise ConfigError("PolicyConfig.MAX_ASK_COMPOSE_REPAIRS must be >= 1")
+
+
+def runtime_intent_has_refusal_natural_language(intent: RuntimeIntent) -> bool:
+    """
+    Return True when ``natural_language`` reads like a refusal while the IR still projects columns.
+
+    Args:
+
+        intent: Parsed runtime intent from Compose.
+
+    Returns:
+
+        True when refusal substrings appear with a non-empty ``select_cols`` list.
+    """
+    nl = (intent.natural_language or "").strip().lower()
+    if not nl or not (intent.select_cols or []):
+        return False
+    return any(sub in nl for sub in PolicyConfig.NATURAL_LANGUAGE_REFUSAL_SUBSTRINGS)
+
+
+if PolicyConfig.MAX_FRESH_RESTARTS < 0:
+    raise ConfigError("PolicyConfig.MAX_FRESH_RESTARTS must be >= 0")
+
+
+@dataclass
+class RestartBudget:
+    """Mutable counter bounding the number of fresh full-parse restarts per top-level invocation."""
+
+    fresh_restarts_left: int
+
+    @classmethod
+    def default(cls) -> RestartBudget:
+        """Construct a budget initialised from :data:`PolicyConfig.MAX_FRESH_RESTARTS`."""
+        return cls(fresh_restarts_left=PolicyConfig.MAX_FRESH_RESTARTS)
+
+
+def _logical_coerce_str_list(v: Any) -> list[str]:
+    if v is None:
+        return []
+    if isinstance(v, str):
+        return [v] if v.strip() else []
+    if isinstance(v, list):
+        return [str(x) for x in v if str(x).strip()]
+    return []
+
+
+def _logical_coerce_optional_str(v: Any) -> str:
+    if v is None:
+        return ""
+    return str(v).strip()
+
+
+def _logical_coerce_limit(v: Any) -> str | None:
+    if v is None:
+        return None
+    if isinstance(v, str):
+        s = v.strip()
+        return s or None
+    s = str(v).strip()
+    return s or None
+
+
+def _logical_coerce_bool(v: Any) -> bool:
+    if v is True:
+        return True
+    if v is False or v is None:
+        return False
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "1", "yes")
+    return bool(v)
+
+
+def _cte_intent_from_obj(obj: dict[str, Any]) -> CteIntent:
+    """Materialise one :class:`CteIntent` from a planner JSON object."""
+    return CteIntent(
+        name=str(obj.get("name", "") or "").strip(),
+        tables=tuple(_logical_coerce_str_list(obj.get("tables"))),
+        select=str(obj.get("select", "") or "").strip(),
+        filter=_logical_coerce_optional_str(obj.get("filter")),
+        group_by=_logical_coerce_optional_str(obj.get("group_by")),
+        having=_logical_coerce_optional_str(obj.get("having")),
+        order_by=_logical_coerce_optional_str(obj.get("order_by")),
+        limit=_logical_coerce_limit(obj.get("limit")),
+        window=_logical_coerce_optional_str(obj.get("window")),
+        case=_logical_coerce_optional_str(obj.get("case")),
+    )
+
+
+def logical_intent_from_parsed(d: dict[str, Any]) -> LogicalIntent:
+    """Materialise a :class:`LogicalIntent` from validated planner JSON."""
+    ctes: list[CteIntent] = []
+    for c in d.get("cte_steps") or []:
+        if isinstance(c, dict):
+            ctes.append(_cte_intent_from_obj(c))
+    return LogicalIntent(
+        tables=tuple(_logical_coerce_str_list(d.get("tables"))),
+        select=str(d.get("select", "") or "").strip(),
+        filter=_logical_coerce_optional_str(d.get("filter")),
+        group_by=_logical_coerce_optional_str(d.get("group_by")),
+        having=_logical_coerce_optional_str(d.get("having")),
+        order_by=_logical_coerce_optional_str(d.get("order_by")),
+        limit=_logical_coerce_limit(d.get("limit")),
+        window=_logical_coerce_optional_str(d.get("window")),
+        case=_logical_coerce_optional_str(d.get("case")),
+        cte_steps=tuple(ctes),
+    )
+
+
+def interpret_plan_for_ground(plan: InterpretPlan) -> dict[str, Any]:
+    """Return the Interpret projection fed to Ground."""
+    return {
+        "approach": plan.approach,
+        "tables": list(plan.tables),
+        "grounding": [{"ref": ref, "used_for": used_for} for ref, used_for in plan.grounding],
+        "schema_invalid": plan.schema_invalid,
+        "missing": plan.missing,
+    }
+
+
+def _interpret_plan_from_dict(d: dict[str, Any]) -> InterpretPlan:
+    """Materialise an :class:`InterpretPlan` from validated JSON."""
+    grounding_rows: list[tuple[str, str]] = []
+    for item in d.get("grounding") or []:
+        if isinstance(item, dict):
+            ref = str(item.get("ref", "") or "").strip()
+            used_for = str(item.get("used_for", "") or "").strip()
+            if ref and used_for:
+                grounding_rows.append((ref, used_for))
+    tables = tuple(str(t).strip() for t in (d.get("tables") or []) if str(t).strip())
+    return InterpretPlan(
+        approach=str(d.get("approach", "") or "").strip(),
+        tables=tables,
+        grounding=tuple(grounding_rows),
+        schema_invalid=_logical_coerce_bool(d.get("schema_invalid")),
+        missing=str(d.get("missing", "") or "").strip(),
+    )
+
+
+def parse_interpret_plan_response(raw: str) -> tuple[InterpretPlan | None, list[IntentIssue]]:
+    """Parse Interpret-stage LLM JSON into an :class:`InterpretPlan`."""
+    issues: list[IntentIssue] = []
+    parsed = safe_json_loads(raw)
+    if parsed is None or not isinstance(parsed, dict):
+        return None, [
+            make_intent_issue(
+                issue_id="json_schema_violation_interpret_root",
+                category=FailureCategory.INTENT_SCHEMA_INVALID_ABORT,
+                severity="error",
+                message="Interpret plan JSON must be a single object.",
+                responsible_stage="interpret",
+            )
+        ]
+    try:
+        jsonschema.validate(instance=parsed, schema=INTERPRET_PLAN_SCHEMA)
+    except jsonschema.ValidationError as exc:
+        return None, [
+            make_intent_issue(
+                issue_id="json_schema_violation_interpret_detail",
+                category=FailureCategory.INTENT_SCHEMA_INVALID_ABORT,
+                severity="error",
+                message=str(exc.message),
+                context={"path": [str(p) for p in exc.path]},
+                responsible_stage="interpret",
+            )
+        ]
+    plan = _interpret_plan_from_dict(parsed)
+    if not plan.approach:
+        issues.append(
+            make_intent_issue(
+                issue_id="interpret_empty_approach",
+                category=FailureCategory.INTENT_SCHEMA_INVALID_ABORT,
+                severity="error",
+                message="Interpret plan approach must be non-empty.",
+                responsible_stage="interpret",
+            )
+        )
+    if not plan.tables:
+        issues.append(
+            make_intent_issue(
+                issue_id="interpret_empty_tables",
+                category=FailureCategory.INTENT_SCHEMA_INVALID_ABORT,
+                severity="error",
+                message="Interpret plan must list at least one table.",
+                responsible_stage="interpret",
+            )
+        )
+    if issues:
+        return None, issues
+    return plan, []
+
+
+def _logical_intent_schema_issues(parsed: dict[str, Any] | None) -> list[IntentIssue]:
+    """Return Ground-stage JSON-schema violations as logical-stage issues."""
+    if parsed is None or not isinstance(parsed, dict):
+        return [
+            make_intent_issue(
+                issue_id="json_schema_violation_logical_root",
+                category=FailureCategory.INTENT_SCHEMA_INVALID_ABORT,
+                severity="error",
+                message="Ground logical intent JSON must be a single object.",
+                responsible_stage="ground",
+            )
+        ]
+    try:
+        jsonschema.validate(instance=parsed, schema=LOGICAL_INTENT_SCHEMA)
+    except jsonschema.ValidationError as exc:
+        return [
+            make_intent_issue(
+                issue_id="json_schema_violation_logical_detail",
+                category=FailureCategory.INTENT_SCHEMA_INVALID_ABORT,
+                severity="error",
+                message=str(exc.message),
+                context={"path": [str(p) for p in exc.path]},
+                responsible_stage="ground",
+            )
+        ]
+    return []
+
+
+def parse_logical_intent_response(
+    raw: str,
+    schema_graph: SchemaGraph,
+) -> tuple[LogicalIntent | None, list[IntentIssue]]:
+    """Parse and validate a planner model payload against schema and graph rules."""
+    obj = safe_json_loads(raw.strip())
+    issues = _logical_intent_schema_issues(obj if isinstance(obj, dict) else None)
+    if issues:
+        return None, issues
+    assert isinstance(obj, dict)
+    li = logical_intent_from_parsed(obj)
+    if not li.tables or not li.select.strip():
+        return None, [
+            make_intent_issue(
+                issue_id="logical_intent_empty_core",
+                category=FailureCategory.INTENT_SCHEMA_INVALID_ABORT,
+                severity="error",
+                message="Planner must populate tables and a non-empty select field.",
+                responsible_stage="ground",
+            )
+        ]
+    issues = list(validate_tables_exist(li.tables, schema_graph))
+    issues.extend(validate_cte_tables_and_dag(li, schema_graph))
+    if issues:
+        return None, issues
+    return li, []
+
+
+def serialized_prior_feedback_rows(rows: list[dict[str, str]] | None) -> str:
+    """Serialise merged feedback rows for Ground as compact JSON text."""
+    if not rows:
+        return ""
+    return stable_json({"items": rows})
+
+
+def _compute_filters_similarity(filters1: list[FilterParam], filters2: list[FilterParam]) -> float:
+    """Jaccard similarity on ``signature_key``, with a small penalty. when coerced ``(signature_key, filter_group)`` wiring differs. Coercion matches the main pipeline so flat ``bool_op=OR`` rows align with ``filter_group`` disjuncts for template reuse. Args: filters1: First filter list. filters2: Second filter list. Returns: Score in ``[0, 1]``; ``1.0`` when both empty."""
+    if not filters1 and not filters2:
+        return 1.0
+    if not filters1 or not filters2:
+        return 0.0
+
+    c1 = coerce_filter_group_list(list(filters1))
+    c2 = coerce_filter_group_list(list(filters2))
+    keys1 = {fp.signature_key for fp in c1}
+    keys2 = {fp.signature_key for fp in c2}
+    score = _jaccard(keys1, keys2)
+    if score > 0:
+        g1 = any(fp.filter_group is not None for fp in c1)
+        g2 = any(fp.filter_group is not None for fp in c2)
+        if (
+            len(c1) >= 2
+            and len(c1) == len(c2)
+            and sorted(fp.signature_key for fp in c1) == sorted(fp.signature_key for fp in c2)
+        ):
+            if g1 != g2:
+                return score
+        sig_fg1 = sorted((fp.signature_key, fp.filter_group) for fp in c1)
+        sig_fg2 = sorted((fp.signature_key, fp.filter_group) for fp in c2)
+        if sig_fg1 != sig_fg2:
+            score *= 0.9
+    return score
+
+
+def _compute_having_similarity(having1: list[HavingParam], having2: list[HavingParam]) -> float:
+    """
+    Same as ``_compute_filters_similarity`` for having clauses.
+
+    Args:
+
+        having1: First having list.
+        having2: Second having list.
+
+    Returns:
+
+        Score in ``[0, 1]``.
+    """
+    if not having1 and not having2:
+        return 1.0
+    if not having1 or not having2:
+        return 0.0
+
+    c1 = coerce_having_group_list(list(having1))
+    c2 = coerce_having_group_list(list(having2))
+    keys1 = {hp.signature_key for hp in c1}
+    keys2 = {hp.signature_key for hp in c2}
+    score = _jaccard(keys1, keys2)
+    if score > 0:
+        g1 = any(hp.filter_group is not None for hp in c1)
+        g2 = any(hp.filter_group is not None for hp in c2)
+        if (
+            len(c1) >= 2
+            and len(c1) == len(c2)
+            and sorted(hp.signature_key for hp in c1) == sorted(hp.signature_key for hp in c2)
+        ):
+            if g1 != g2:
+                return score
+        sig_fg1 = sorted((hp.signature_key, hp.filter_group) for hp in c1)
+        sig_fg2 = sorted((hp.signature_key, hp.filter_group) for hp in c2)
+        if sig_fg1 != sig_fg2:
+            score *= 0.9
+    return score
+
+
+def _compute_select_cols_similarity(cols1: list[SelectCol], cols2: list[SelectCol]) -> float:
+    """
+    Jaccard similarity on select ``signature_key``.
+
+    Args:
+
+        cols1: First select list.
+        cols2: Second select list.
+
+    Returns:
+
+        Score in ``[0, 1]``.
+    """
+    if not cols1 and not cols2:
+        return 1.0
+    if not cols1 or not cols2:
+        return 0.0
+    keys1 = {sc.signature_key for sc in cols1}
+    keys2 = {sc.signature_key for sc in cols2}
+    return _jaccard(keys1, keys2)
+
+
+def _compute_order_by_cols_similarity(cols1: list[OrderByCol], cols2: list[OrderByCol]) -> float:
+    """
+    Jaccard similarity on order-by ``signature_key``.
+
+    Args:
+
+        cols1: First order-by list.
+        cols2: Second order-by list.
+
+    Returns:
+
+        Score in ``[0, 1]``.
+    """
+    if not cols1 and not cols2:
+        return 1.0
+    if not cols1 or not cols2:
+        return 0.0
+    keys1 = {obc.signature_key for obc in cols1}
+    keys2 = {obc.signature_key for obc in cols2}
+    return _jaccard(keys1, keys2)
+
+
+def _base_similarity(
+    tables1: list[str],
+    tables2: list[str],
+    select1: list[SelectCol],
+    select2: list[SelectCol],
+    group1: list[NormalizedExpr],
+    group2: list[NormalizedExpr],
+    order1: list[OrderByCol],
+    order2: list[OrderByCol],
+    filters1: list[FilterParam],
+    filters2: list[FilterParam],
+    having1: list[HavingParam],
+    having2: list[HavingParam],
+) -> float:
+    """
+    Weighted blend of Jaccard-like scores (tables, filters, select, group, order, having).
+
+    Args:
+
+        filters1, filters2, having1, having2: Parallel clause lists from two intents.
+
+    Returns:
+
+        Score in ``[0, 1]``.
+    """
+    tables_sim = _jaccard(set(tables1), set(tables2))
+    select_sim = _compute_select_cols_similarity(select1, select2)
+    group_sim = _jaccard({g.signature_key for g in group1}, {g.signature_key for g in group2})
+    order_sim = _compute_order_by_cols_similarity(order1, order2)
+    filter_sim = _compute_filters_similarity(filters1, filters2)
+    having_sim = _compute_having_similarity(having1, having2)
+    return (
+        0.30 * tables_sim
+        + 0.25 * filter_sim
+        + 0.15 * select_sim
+        + 0.15 * group_sim
+        + 0.08 * order_sim
+        + 0.07 * having_sim
+    )
+
+
+def _cte_step_similarity(cte1: RuntimeCteStep, cte2: RuntimeCteStep) -> float:
+    """
+    ``_base_similarity`` applied to two CTE bodies.
+
+    Args:
+
+        cte1: First step.
+        cte2: Second step.
+
+    Returns:
+
+        Score in ``[0, 1]``.
+    """
+    return _base_similarity(
+        cte1.tables or [],
+        cte2.tables or [],
+        cte1.select_cols or [],
+        cte2.select_cols or [],
+        cte1.group_by_cols or [],
+        cte2.group_by_cols or [],
+        cte1.order_by_cols or [],
+        cte2.order_by_cols or [],
+        cte1.filters_param or [],
+        cte2.filters_param or [],
+        cte1.having_param or [],
+        cte2.having_param or [],
+    )
+
+
+def intent_similarity(intent1: RuntimeIntent | ConcreteIntent, intent2: RuntimeIntent | ConcreteIntent) -> float:
+    """
+    Blend weighted main-body clause similarity with per-step CTE.
+
+    similarity (position-aligned). Main body uses
+
+    :func:`_base_similarity` (tables, filters, select, group, order,
+
+    having). It does not use :func:`aetherdialect._utils.intent_key`;
+
+    keys hash serialised clauses while similarity uses clause-wise
+
+    scores, so equal keys imply high similarity but the converse is not
+
+    guaranteed. Args: intent1: First intent. intent2: Second intent.
+
+    Returns:
+
+        Score in ``[0, 1]``.
+    """
+    base_sim = _base_similarity(
+        intent1.tables or [],
+        intent2.tables or [],
+        intent1.select_cols or [],
+        intent2.select_cols or [],
+        intent1.group_by_cols or [],
+        intent2.group_by_cols or [],
+        intent1.order_by_cols or [],
+        intent2.order_by_cols or [],
+        intent1.filters_param or [],
+        intent2.filters_param or [],
+        intent1.having_param or [],
+        intent2.having_param or [],
+    )
+    ctes1 = intent1.cte_steps or []
+    ctes2 = intent2.cte_steps or []
+    n_cte = max(len(ctes1), len(ctes2))
+    if n_cte == 0:
+        return base_sim
+    intent_weight = {1: 0.7, 2: 0.6}.get(n_cte, 0.4)
+    cte_total_weight = 1.0 - intent_weight
+    cte_per_weight = cte_total_weight / n_cte
+    cte_score = 0.0
+    for i in range(n_cte):
+        if i < len(ctes1) and i < len(ctes2):
+            s1, s2 = ctes1[i], ctes2[i]
+            if isinstance(s1, RuntimeCteStep) and isinstance(s2, RuntimeCteStep):
+                cte_score += cte_per_weight * _cte_step_similarity(s1, s2)
+    return intent_weight * base_sim + cte_score
+
+
+def _jaccard(set1: set[str], set2: set[str]) -> float:
+    """|intersection| / |union| for string sets; ``1.0`` when both. empty. Args: set1: First set. set2: Second set. Returns: Jaccard coefficient in ``[0, 1]``."""
+    if not set1 and not set2:
+        return 1.0
+    if not set1 or not set2:
+        return 0.0
+    intersection = set1 & set2
+    union = set1 | set2
+    return len(intersection) / len(union) if union else 1.0

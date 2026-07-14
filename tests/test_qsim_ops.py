@@ -1,7 +1,6 @@
 """Unit tests for aetherdialect._qsim_ops module."""
 
-from aetherdialect._contracts_base import QSimSkeleton, SkeletonPool
-from aetherdialect._contracts_core import QSimIntent
+from aetherdialect._contracts_schema import QSimIntent, QSimSkeleton
 from aetherdialect._qsim_ops import (
     _compute_skeleton_complexity_tier,
     _compute_table_set_richness,
@@ -11,7 +10,6 @@ from aetherdialect._qsim_ops import (
     _is_no_variance_skeleton,
     _normalize_qsim_intent,
     _parse_llm_response,
-    _select_next_skeleton,
     _validate_skeleton_constraints,
 )
 
@@ -91,11 +89,7 @@ class TestComputeSkeletonComplexityTier:
         assert _compute_skeleton_complexity_tier(skel) == "C"
 
     def test_tier_b_aggregation(self):
-        """
-        Aggregation alone gives score=3, not enough for B.
-
-        Add 1 filter: 3+2=5 -> B.
-        """
+        """Aggregation alone gives score=3, not enough for B. Add 1 filter: 3+2=5 -> B."""
         skel = _skeleton(has_aggregation=True, num_filters=1)
         assert _compute_skeleton_complexity_tier(skel) == "B"
 
@@ -116,11 +110,7 @@ class TestComputeSkeletonComplexityTier:
         assert tier == "A"
 
     def test_tier_a_score_boundary(self):
-        """
-        Score = 8 exactly -> tier A.
-
-        2 filters(4) + aggregation(3) + orderby(1) = 8.
-        """
+        """Score = 8 exactly -> tier A. 2 filters(4) + aggregation(3) + orderby(1) = 8."""
         skel = _skeleton(has_aggregation=True, num_filters=2, has_orderby=True)
         assert _compute_skeleton_complexity_tier(skel) == "A"
 
@@ -443,56 +433,3 @@ class TestComputeTableSetRichness:
         """Empty table list returns zero."""
         score = _compute_table_set_richness([], schema_graph, {})
         assert score == 0
-
-
-class TestSelectNextSkeleton:
-    """Tests for select_next_skeleton."""
-
-    def test_returns_none_on_empty_pool(self):
-        """Empty pool returns None."""
-        pool = SkeletonPool(
-            tier_a_by_table_set={},
-            tier_b_by_table_set={},
-            tier_c_by_table_set={},
-            table_set_keys=[],
-            tier_a_indices={},
-            tier_b_indices={},
-            tier_c_indices={},
-        )
-        result = _select_next_skeleton(pool, need_filters=False, need_having=False)
-        assert result is None
-
-    def test_returns_skeleton_from_tier_a(self):
-        """Pool with tier A skeleton returns it."""
-        skel = _skeleton(tables=["orders"], num_filters=1)
-        pool = SkeletonPool(
-            tier_a_by_table_set={"orders": [skel]},
-            tier_b_by_table_set={"orders": []},
-            tier_c_by_table_set={"orders": []},
-            table_set_keys=["orders"],
-            tier_a_indices={"orders": 0},
-            tier_b_indices={"orders": 0},
-            tier_c_indices={"orders": 0},
-        )
-        result = _select_next_skeleton(pool, need_filters=False, need_having=False)
-        assert result is not None
-        selected_skel, table_set = result
-        assert selected_skel.tables == ["orders"]
-
-    def test_need_filters_skips_non_filter(self):
-        """When need_filters=True, skeletons with 0 filters are skipped."""
-        no_filter = _skeleton(tables=["orders"], num_filters=0)
-        has_filter = _skeleton(tables=["orders"], num_filters=2)
-        pool = SkeletonPool(
-            tier_a_by_table_set={"orders": [no_filter, has_filter]},
-            tier_b_by_table_set={"orders": []},
-            tier_c_by_table_set={"orders": []},
-            table_set_keys=["orders"],
-            tier_a_indices={"orders": 0},
-            tier_b_indices={"orders": 0},
-            tier_c_indices={"orders": 0},
-        )
-        result = _select_next_skeleton(pool, need_filters=True, need_having=False)
-        assert result is not None
-        selected_skel, _ = result
-        assert selected_skel.num_filters > 0

@@ -1,8 +1,4 @@
-"""
-Databricks dialect-specific live tests.
-
-Exercises translate_to_spark behavior: concatenation (|| -> concat), date functions (strftime -> date_format, CURRENT_DATE -> current_date), and table qualification (catalog.schema.table).
-"""
+"""Databricks dialect-specific live tests. Exercises translate_to_spark behavior: concatenation (|| -> concat), date functions (strftime -> date_format, CURRENT_DATE -> current_date), and table qualification (catalog.schema.table)."""
 
 from __future__ import annotations
 
@@ -14,26 +10,22 @@ from pathlib import Path
 
 import pytest
 
+from aetherdialect import AetherEngine
 from aetherdialect._config import EngineConfig, QSimConfig
-from aetherdialect._contracts_base import SchemaContext
+from aetherdialect._contracts_base import EngineContext
 from aetherdialect._core_utils import write_gzip_json_atomic
-from aetherdialect._live_testing import (
-    Expected,
-    LiveTestRunner,
-    Scenario,
-    run_and_assert,
-)
+from aetherdialect._live_testing import LiveTestRunner, run_and_assert
 from aetherdialect._templates import (
     load_template_store,
     store_to_templates,
 )
-from aetherdialect.text2sql import Text2SQL
 
+from ._dialect_scenarios import dialect_databricks_scenarios
 from .conftest import (
     _domain_notes_path,
     _env_file,
     _instrument_runner,
-    _relax_dvdrental_selectability,
+    _relax_rental_shop_selectability,
     write_live_env_file_to_temp_config_toml,
 )
 
@@ -42,7 +34,7 @@ def _dbr_param(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
-def _redirect_to_livetest_dir(t2s: Text2SQL) -> str:
+def _redirect_to_livetest_dir(t2s: AetherEngine) -> str:
     original = t2s._artifacts_dir
     parent = os.path.dirname(original)
     folder = os.path.basename(original)
@@ -76,40 +68,17 @@ def _redirect_to_livetest_dir(t2s: Text2SQL) -> str:
     return live_dir
 
 
-def _dialect_scenarios() -> list[Scenario]:
-    return [
-        Scenario(
-            id="DBR-DIALECT-002",
-            question="show the year from the last rental date of each customer",
-            expected=Expected(
-                min_rows=1,
-                contains_group_by=True,
-            ),
-            category="databricks_dialect",
-        ),
-        Scenario(
-            id="DBR-DIALECT-003",
-            question="list film titles and their length in hours",
-            expected=Expected(
-                tables=["film"],
-                min_rows=1,
-            ),
-            category="databricks_dialect",
-        ),
-    ]
-
-
 @pytest.fixture(scope="module")
 def t2s():
-    schema = _dbr_param("DATABRICKS_SCHEMA", "dvdrental_new")
-    sql_file = _dbr_param("SQL_FILE", os.path.join("dev_workspace", "dvdrental.sql"))
+    schema = _dbr_param("DATABRICKS_SCHEMA", "rental_shop")
+    sql_file = _dbr_param("SQL_FILE", os.path.join("scripts", "data", "rental_shop.sql"))
 
     _notes = _domain_notes_path()
 
     cfg_path = write_live_env_file_to_temp_config_toml(_env_file(), {"AETHERDIALECT_ENGINE": "databricks"})
     try:
-        instance = Text2SQL(
-            SchemaContext(
+        instance = AetherEngine(
+            EngineContext(
                 notes_file=str(_notes) if _notes else None,
                 sql_file=sql_file,
             ),
@@ -119,7 +88,7 @@ def t2s():
 
         _redirect_to_livetest_dir(instance)
 
-        _relax_dvdrental_selectability(instance._schema_graph, schema)
+        _relax_rental_shop_selectability(instance._schema_graph, schema)
 
         fresh_store = load_template_store(instance._schema_graph.effective_structural_hash, instance._schema_graph)
         instance._store = fresh_store
@@ -170,10 +139,9 @@ def runner(schema, store, templates, rejected, schema_terms, t2s):
     return r
 
 
-_dialect_scenarios_list = _dialect_scenarios()
+_dialect_scenarios_list = dialect_databricks_scenarios()
 
 
-@pytest.mark.live
 @pytest.mark.parametrize(
     "scenario",
     _dialect_scenarios_list,

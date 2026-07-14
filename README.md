@@ -10,29 +10,37 @@ Teams need answers from relational data without shipping opaque generated SQL. A
 
 ```bash
 pip install aetherdialect
-pip install "aetherdialect[postgresql]"
-pip install "aetherdialect[databricks]"
-pip install "aetherdialect[postgresql,databricks]"
+pip install "aetherdialect[sqlite]"       # SQLite (stdlib driver)
+pip install "aetherdialect[duckdb]"       # DuckDB
+pip install "aetherdialect[mysql]"        # MySQL
+pip install "aetherdialect[mariadb]"      # MariaDB
+pip install "aetherdialect[sqlserver]"    # SQL Server (pyodbc)
+pip install "aetherdialect[postgresql]"   # PostgreSQL
+pip install "aetherdialect[redshift]"     # Amazon Redshift
+pip install "aetherdialect[databricks]"   # Databricks
+pip install "aetherdialect[snowflake]"    # Snowflake
+pip install "aetherdialect[bigquery]"     # Google BigQuery
+pip install "aetherdialect[duckdb,postgresql]"  # pick any subset
 ```
 
 Requires Python 3.10 or newer. Configure the LLM and database via a TOML `config_file` (recommended) and/or process environment; the full key list lives in the [API reference](https://github.com/dkecompany/aether-dialect/blob/main/docs/API_REFERENCE.md).
 
 ## Quick start
 
-```python
-from aetherdialect import SchemaContext, Text2SQL
+**New here?** Follow the [Getting started guide](docs/GETTING_STARTED.md): try the offline sandbox first, then wire any supported database with inlined TOML examples, first-run profiling expectations, and `run_interactive` vs `session()`.
 
-t2s = Text2SQL(
-    SchemaContext(),
-    artifacts_dir="./my_run",
-    config_file="./aetherdialect.toml",
-)
-t2s.run_interactive()
+**No database yet?** Try offline practice:
+
+```python
+from aetherdialect import AetherEngine
+
+with AetherEngine.offline_sandbox() as sb:
+    with sb.session() as session:
+        step = session.accept_until_done("How many films are there?")
+    print(step.sql)
 ```
 
-`run_interactive` prompts once per invocation; call it again for another question. For programmatic UIs, use `Text2SQL.session()` or `Text2SQL.asession()` and drive `SessionStep` objects — see the [Integrator guide](https://github.com/dkecompany/aether-dialect/blob/main/docs/INTEGRATOR_GUIDE.md).
-
-`dry_run_warmup` exercises a newline-delimited seed question file through validation and execution without persisting templates; see the [User guide — Seed warmup](https://github.com/dkecompany/aether-dialect/blob/main/docs/USER_GUIDE.md#seed-warmup).
+See the [Sandbox guide](docs/SANDBOX.md).
 
 ## What makes this different
 
@@ -46,16 +54,32 @@ t2s.run_interactive()
 
 - Reader / writer split is built in. Many readers can ask questions; the engine drains `write_queue.jsonl` at the **start of every writer-mode turn** under the artifacts lock so learning persists without readers touching the partitioned template store files. ([Integrator guide](https://github.com/dkecompany/aether-dialect/blob/main/docs/INTEGRATOR_GUIDE.md))
 
-## Documentation
+## At a glance
 
-| Doc                                                                                                 | When to read it                                                                                                                                                      |
-| --------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [User guide](https://github.com/dkecompany/aether-dialect/blob/main/docs/USER_GUIDE.md)             | Install, first run, asking questions, notes, overrides, migration, seed warmup and dry-run warmup, pitfalls.                                                         |
-| [Integrator guide](https://github.com/dkecompany/aether-dialect/blob/main/docs/INTEGRATOR_GUIDE.md) | Embedding patterns, sessions, multi-turn relay, threading, reader/writer split and queue, audit and diagnostics, cache reset.                                        |
-| [API reference](https://github.com/dkecompany/aether-dialect/blob/main/docs/API_REFERENCE.md)       | Types, `config_file` TOML schema, methods, schema overrides JSON, diagnostic codes, exceptions.                                                                      |
-| [How it works](https://github.com/dkecompany/aether-dialect/blob/main/docs/HOW_IT_WORKS.md)         | Architecture diagrams, schema build, engine storage, question pipeline, migration, overrides, validation, learning model, configuration, observability, warmup/QSim. |
-| [Security](https://github.com/dkecompany/aether-dialect/blob/main/docs/SECURITY.md)                 | Threat model, LLM context inventory, on-disk inventory, sensitivity model, deny lists, raw-SQL impossibility, EXPLAIN gate, network.                                 |
-| [Support matrix](https://github.com/dkecompany/aether-dialect/blob/main/docs/SUPPORT_MATRIX.md)     | Per-engine table, IR-unsupported constructs and reformulations.                                                                                                      |
+**Supported databases (11):** SQLite, DuckDB, MySQL, MariaDB, SQL Server, PostgreSQL, Amazon Redshift, Databricks, Snowflake, Google BigQuery, CSV/Excel (in-memory DuckDB). Install the matching PyPI extra per engine; set `[engine] selected` or `AETHERDIALECT_ENGINE` when more than one block is configured.
+
+**SQL we do not generate:** DML/DDL, set operations (`UNION`/`EXCEPT`/`INTERSECT`), `EXISTS`, lateral joins, recursive CTEs, correlated subqueries, `DISTINCT ON`, row-skipping `OFFSET`/`FETCH`, and several window/JSON constructs outside the IR whitelist. The intent parser is instructed to reformulate many of these (for example `EXCEPT` → anti-join). Full list: [Support matrix — IR-unsupported constructs](docs/SUPPORT_MATRIX.md#ir-unsupported-constructs-and-reformulations).
+
+**What reaches the LLM:** Prompt-safe schema metadata (visible table/column names, types, roles, descriptions, capped enum heads), the user question, bounded intent JSON, join-choice candidates, optional **notes file** and **DDL file** content when you configure them on `EngineContext`, and summarised failure feedback — not raw warehouse row dumps. Inventory: [Security — LLM context](docs/SECURITY.md#2-llm-context-inventory).
+
+**What “safe” means here:** `SELECT`-only enforcement, forbidden-SQL regex, dialect AST validation, schema alignment, and `EXPLAIN` before execution; sensitivity tiers and deny lists gate what appears in prompts. This complements your database IAM and network controls; it does not replace them. Detail: [Security — Threat model](docs/SECURITY.md#1-threat-model).
+
+**Production checklist:** least-privilege DB role; explicit stable `artifacts_dir` on durable storage; reviewed `notes_file` / `EngineContext.sql_file` content; `config_file` or env secrets not committed; one writer process per `artifacts_dir`; plan for `schema_migration_map.json` when the catalog changes.
+
+No warehouse or LLM keys yet? [Sandbox guide](docs/SANDBOX.md) → [Getting started](docs/GETTING_STARTED.md) → [User guide](docs/USER_GUIDE.md).
+
+## Documentation {#documentation}
+
+| Doc | When to read it |
+| --- | --- |
+| [Getting started](docs/GETTING_STARTED.md) | First run: offline sandbox or warehouse TOML, construction wait, `run_interactive` vs `session()`. |
+| [User guide](docs/USER_GUIDE.md) | Operator manual: scope, notes, overrides, asking questions, migration, warmup, pitfalls — minimal code. |
+| [Integrator guide](docs/INTEGRATOR_GUIDE.md) | Embedding: suspend/terminal steps, reader/writer queue, multi-user deployment, observability. |
+| [Sandbox guide](docs/SANDBOX.md) | Offline practice with mock LLM and rental shop; production-shaped session API. |
+| [API reference](docs/API_REFERENCE.md) | Exported types, TOML schema, methods, overrides JSON, diagnostics, exceptions. |
+| [How it works](docs/HOW_IT_WORKS.md) | Conceptual pipeline: schema build, storage, question phases, learning, write queue. |
+| [Security](docs/SECURITY.md) | Threat model, LLM disclosure inventory, sensitivity tiers, deny lists. |
+| [Support matrix](docs/SUPPORT_MATRIX.md) | Per-engine capabilities, IR-unsupported constructs, dialect notes. |
 
 ## License
 

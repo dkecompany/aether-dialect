@@ -4,38 +4,49 @@ from __future__ import annotations
 
 import math
 import random
+from dataclasses import asdict, replace
 from typing import Any
 
 from ._config import (
+    PolicyConfig,
+    QSimConfig,
+)
+from ._constants import (
     AGG_PATTERN,
+    QSIM_PHASE_B,
+    QSIM_PHASE_D,
+    QSIM_PHASE_E,
+    QSIM_PHASE_F,
+    QSIM_PHASE_G,
+    QSIM_PHASE_J,
     TABLE_COL_PATTERN,
     VALID_FILTER_VALUE_TYPES,
     VALID_HAVING_OPS,
     VALID_HAVING_VALUE_TYPES,
-    PolicyConfig,
-    QSimConfig,
 )
 from ._contracts_base import (
     QSIM_COMPLEXITY_TIER_SPECS,
     QSIM_SUPPORTED_ADVANCED_FEATURES,
+    ComplexityTier,
     DatabaseFeatureCapability,
     LlmJsonExhausted,
+    rebalance_complexity_target_proportions,
+)
+from ._contracts_core import feasible_features_for_capability
+from ._contracts_schema import (
+    QSimFilter,
+    QSimHaving,
+    QSimIntent,
     QSimSkeleton,
     RetryFailureContext,
     SchemaGraph,
     SkeletonPool,
-    rebalance_complexity_target_proportions,
-)
-from ._contracts_core import (
-    ComplexityTier,
-    QSimFilter,
-    QSimHaving,
-    QSimIntent,
     classify_qsim_intent_complexity,
     classify_qsim_skeleton_complexity,
     qsim_intent_matches_target_tier,
 )
-from ._core_utils import debug, llm_json
+from ._core_utils import debug
+from ._llm_provider import llm_json
 from ._qsim import (
     build_fk_adjacency,
     build_schema_context,
@@ -59,7 +70,7 @@ _QSIM_FILL_SYSTEM = (
     " Rules:"
     " 1. STRICTLY follow skeleton constraints for tables, aggregation presence, filter count, groupby count, having, orderby."
     " 2. Use ONLY columns from the provided schema in the specified tables."
-    " 3. For filters, choose columns with meaningful filter potential (status, category, date columns)."
+    " 3. For filters, choose columns with meaningful filter potential (categorical, boolean/flag, or temporal columns)."
     " 4. For aggregation, use COUNT/SUM/AVG/MIN/MAX wrapping table.column in select_cols; aggregate numeric columns only (not IDs or foreign keys); COUNT may use any column or *."
     " 5. For groupby, choose categorical or temporal columns that make semantic sense."
     " 6. Ensure all column references use table.column format from the specified tables."
@@ -73,20 +84,7 @@ _QSIM_FILL_SYSTEM = (
 
 
 def _allocate_tier_int_quotas(weights: dict[str, float], total: int) -> dict[str, int]:
-    """
-    Convert fractional tier weights into nonnegative integers summing to *total*.
-
-    Args:
-
-        weights: Normalized tier weights keyed by string tier names.
-
-        total: Total intents budget.
-
-    Returns:
-
-        Integer quota per tier key.
-    """
-
+    """Convert fractional tier weights into nonnegative integers. summing. to *total*."""
     keys = [
         ComplexityTier.SIMPLE.value,
         ComplexityTier.MODERATE.value,
@@ -103,36 +101,14 @@ def _allocate_tier_int_quotas(weights: dict[str, float], total: int) -> dict[str
 
 
 def _skeleton_bucket_lookup_key(target: ComplexityTier) -> str:
-    """
-    Map a sampled target tier to skeleton buckets derived from :func:`classify_qsim_skeleton_complexity`.
-
-    Args:
-
-        target: Tier quota chosen for this draw.
-
-    Returns:
-
-        Skeleton bucket key string (highly complex draws reuse complex skeleton shapes).
-    """
-
+    """Map a sampled target tier to skeleton buckets derived from. :func:`classify_qsim_skeleton_complexity`."""
     if target == ComplexityTier.HIGHLY_COMPLEX:
         return ComplexityTier.COMPLEX.value
-    return target.value
+    return str(target.value)
 
 
 def _tier_spec_lines(target: ComplexityTier) -> tuple[str, str]:
-    """
-    Resolve summary and example sketch strings for a tier target.
-
-    Args:
-
-        target: Sampled complexity tier.
-
-    Returns:
-
-        ``(summary, example_sketch)`` tuple for prompt insertion.
-    """
-
+    """Resolve summary and example sketch strings for a tier target."""
     for spec in QSIM_COMPLEXITY_TIER_SPECS:
         if spec.tier == target:
             return spec.summary, spec.example_sketch
@@ -140,48 +116,12 @@ def _tier_spec_lines(target: ComplexityTier) -> tuple[str, str]:
 
 
 def _advanced_feature_allowed(feature_id: str, cap: DatabaseFeatureCapability) -> bool:
-    """
-    Return whether an advanced feature remains plausible on this schema snapshot.
-
-    Args:
-
-        feature_id: Stable feature identifier from :data:`QSIM_SUPPORTED_ADVANCED_FEATURES`.
-
-        cap: Database capability snapshot.
-
-    Returns:
-
-        False when prerequisite columns or join depth are absent.
-    """
-
-    if feature_id in ("date_window_filter", "date_diff_shapes"):
-        return cap.has_date_columns
-    if feature_id == "unnest_array_column":
-        return cap.has_array_columns
-    if feature_id in ("multi_cte_chain", "scalar_cte_bridge", "self_join_via_cte"):
-        return cap.fk_edge_count >= 1 and cap.max_fk_chain_depth >= 1
-    if feature_id == "window_partition_order":
-        return cap.has_window_capable_table_sets
-    if feature_id == "case_when_select":
-        return cap.has_categorical_columns
-    if feature_id in ("having_aggregate_compare",):
-        return cap.has_numeric_measures
-    return True
+    """Return whether an advanced feature remains plausible on this schema snapshot."""
+    return feature_id in feasible_features_for_capability(cap)
 
 
 def _advanced_feature_prompt_block(cap: DatabaseFeatureCapability) -> str:
-    """
-    Format capability-filtered advanced feature bullets for the skeleton-fill prompt.
-
-    Args:
-
-        cap: Schema-derived feasibility snapshot.
-
-    Returns:
-
-        Bullet text listing allowed advanced shapes only.
-    """
-
+    """Format capability-filtered advanced feature bullets for the. skeleton-fill prompt."""
     lines: list[str] = []
     for spec in QSIM_SUPPORTED_ADVANCED_FEATURES:
         if not _advanced_feature_allowed(spec.feature_id, cap):
@@ -191,46 +131,78 @@ def _advanced_feature_prompt_block(cap: DatabaseFeatureCapability) -> str:
 
 
 def _sample_select_col_count_geometric(p: float, rng: random.Random, cap_cols: int = 12) -> int:
-    """
-    Sample a SELECT-column count biased toward small integers.
-
-    Args:
-
-        p: Success probability per Bernoulli trial tail.
-
-        rng: Deterministic RNG for reproducibility.
-
-        cap_cols: Upper bound on returned count.
-
-    Returns:
-
-        Positive integer column target.
-    """
-
+    """Sample a SELECT-column count biased toward small integers."""
     n = 1
     while n < cap_cols and rng.random() > p:
         n += 1
     return n
 
 
+def _skeleton_suitable_for_advanced(skeleton: QSimSkeleton, feature_id: str) -> bool:
+    """Return whether a base skeleton can host the requested advanced feature slot."""
+    if feature_id == "distinct_select":
+        return not skeleton.has_aggregation and skeleton.num_groupby == 0
+    if feature_id in ("window_partition_order", "case_when_select"):
+        return skeleton.has_aggregation and skeleton.num_groupby > 0
+    if feature_id in ("date_window_filter", "date_diff_shapes"):
+        return skeleton.num_filters > 0
+    if feature_id in ("scalar_cte_bridge", "multi_cte_chain", "self_join_via_cte"):
+        return skeleton.has_aggregation or skeleton.num_filters > 0
+    if feature_id == "unnest_array_column":
+        return skeleton.num_filters >= 0 and not skeleton.has_aggregation
+    return skeleton.num_filters > 0 or skeleton.has_aggregation
+
+
+def append_advanced_skeleton_variants(
+    skeletons: list[QSimSkeleton],
+    cap: DatabaseFeatureCapability,
+) -> list[QSimSkeleton]:
+    """Append skeleton clones tagged with schema-feasible advanced feature slots."""
+    qsim_ids = {spec.feature_id for spec in QSIM_SUPPORTED_ADVANCED_FEATURES}
+    feasible = feasible_features_for_capability(cap) & qsim_ids
+    if not feasible:
+        return skeletons
+    out = list(skeletons)
+    for feature_id in sorted(feasible):
+        base = next((s for s in skeletons if _skeleton_suitable_for_advanced(s, feature_id)), None)
+        if base is not None:
+            out.append(replace(base, advanced_slot=feature_id))
+    return out
+
+
+def _advanced_slot_prompt_line(skeleton: QSimSkeleton) -> str:
+    """Format a required advanced-feature instruction when the skeleton carries a slot."""
+    if not skeleton.advanced_slot:
+        return ""
+    label = skeleton.advanced_slot.replace("_", " ")
+    return (
+        f"REQUIRED ADVANCED FEATURE ({skeleton.advanced_slot}): "
+        f"The structured intent MUST implement {label}. "
+        "Use only columns and filters compatible with this skeleton."
+    )
+
+
+def _qsim_advanced_slot_detected(intent: QSimIntent, feature_id: str) -> bool:
+    """Heuristic compliance check for advanced slots on string-based QSim intents."""
+    if feature_id == "distinct_select":
+        return bool(intent.distinct)
+    if feature_id == "date_window_filter":
+        return any(
+            (f.value_type or "").lower() in ("temporal", "date", "datetime") or "date" in (f.column or "").lower()
+            for f in intent.filters_param
+        )
+    if feature_id == "date_diff_shapes":
+        return any("date" in (f.column or "").lower() and f.op in (">", "<", ">=", "<=") for f in intent.filters_param)
+    if feature_id in ("window_partition_order", "case_when_select"):
+        return bool(intent.having_param) or any("CASE" in sc.upper() for sc in intent.select_cols)
+    return bool(intent.filters_param or intent.having_param or intent.distinct)
+
+
 def _build_merged_tier_buckets(
     schema: SchemaGraph,
     column_roles: dict[str, str],
 ) -> dict[str, list[tuple[QSimSkeleton, list[str]]]]:
-    """
-    Flatten A/B/C skeleton tiers into complexity buckets for weighted sampling.
-
-    Args:
-
-        schema: Schema graph.
-
-        column_roles: Column role hints from profiling.
-
-    Returns:
-
-        Mapping tier value -> skeleton plus concrete table-set list.
-    """
-
+    """Flatten A/B/C skeleton tiers into complexity buckets for. weighted. sampling."""
     merged: dict[str, list[tuple[QSimSkeleton, list[str]]]] = {
         ComplexityTier.SIMPLE.value: [],
         ComplexityTier.MODERATE.value: [],
@@ -259,22 +231,7 @@ def _pop_matching_skeleton(
     need_filters: bool,
     need_having: bool,
 ) -> tuple[QSimSkeleton, list[str]] | None:
-    """
-    Pop the next skeleton from *bucket* honoring filter and HAVING coverage needs.
-
-    Args:
-
-        bucket: Mutable list of skeleton candidates.
-
-        need_filters: When True, require ``num_filters > 0``.
-
-        need_having: When True, require ``num_having > 0``.
-
-    Returns:
-
-        Removed skeleton entry, or None when no candidate matches.
-    """
-
+    """Pop the next skeleton from *bucket* honoring filter and HAVING. coverage needs."""
     for i, (sk, ts) in enumerate(bucket):
         if need_filters and sk.num_filters == 0:
             continue
@@ -286,20 +243,7 @@ def _pop_matching_skeleton(
 
 
 def _pick_weighted_tier(tier_remaining: dict[str, int], rng: random.Random) -> str | None:
-    """
-    Sample the next tier to fill using remaining quota counts as weights.
-
-    Args:
-
-        tier_remaining: Mutable tier quotas.
-
-        rng: Deterministic RNG.
-
-    Returns:
-
-        Tier key with positive remainder, or None when exhausted.
-    """
-
+    """Sample the next tier to fill using remaining quota counts as. weights."""
     active = [(k, v) for k, v in tier_remaining.items() if v > 0]
     if not active:
         return None
@@ -309,32 +253,12 @@ def _pick_weighted_tier(tier_remaining: dict[str, int], rng: random.Random) -> s
 
 
 def _has_aggregation(select_cols: list[str]) -> bool:
-    """
-    Return True if any select column string matches an aggregation pattern.
-
-    Args:
-
-        select_cols: SQL select-column strings to inspect.
-
-    Returns:
-
-        True if at least one string matches `AGG(...)`, else False.
-    """
+    """Return True if any select column string matches an aggregation. pattern."""
     return any(AGG_PATTERN.match(sc) for sc in select_cols)
 
 
 def _extract_agg_info(expr: str) -> tuple[str, str] | None:
-    """
-    Extract aggregation function and inner column from a SQL aggregation expression.
-
-    Args:
-
-        expr: Expression such as `COUNT(table.col)` or `SUM(table.amount)`.
-
-    Returns:
-
-        contents, or None if not an aggregation.
-    """
+    """Extract aggregation function and inner column from a SQL. aggregation expression."""
     m = AGG_PATTERN.match(expr.strip())
     if m:
         return (m.group(1).lower(), m.group(2).strip())
@@ -342,36 +266,13 @@ def _extract_agg_info(expr: str) -> tuple[str, str] | None:
 
 
 def _extract_tables_from_expr(expr: str) -> set[str]:
-    """
-    Extract table names from a SQL expression containing `table.column` references.
-
-    Args:
-
-        expr: SQL expression that may contain `table.column` tokens.
-
-    Returns:
-
-        Set of table names found in `expr`.
-    """
+    """Extract table names from a SQL expression containing. `table.column` references."""
     return {m.group(1) for m in TABLE_COL_PATTERN.finditer(expr)}
 
 
 def _validate_skeleton_constraints(response: dict[str, Any], skeleton: QSimSkeleton) -> tuple[bool, list[str]]:
-    """
-    Validate an LLM response dict against structural skeleton constraints.
-
-    Args:
-
-        response: Description.
-
-        skeleton: `QSimSkeleton` whose constraints the response must satisfy.
-
-    Returns:
-
-        constraint failures.
-    """
+    """Validate an LLM response dict against structural skeleton. constraints."""
     violations = []
-
     select_cols_raw = response.get("select_cols", [])
     has_agg = any(AGG_PATTERN.match(sc) for sc in select_cols_raw if isinstance(sc, str))
 
@@ -414,23 +315,8 @@ def _validate_skeleton_constraints(response: dict[str, Any], skeleton: QSimSkele
 
 
 def _build_retry_guidance(failure_ctx: RetryFailureContext, schema: SchemaGraph, column_roles: dict[str, str]) -> str:
-    """
-    Build retry guidance text for the LLM from a previous failure context.
-
-    Args:
-
-        failure_ctx: Description.
-
-        schema: Schema graph for suggesting columns on missing tables.
-
-        column_roles: Map of column key to role (reserved for extensions).
-
-    Returns:
-
-        Multi-line string to append to the fill prompt.
-    """
+    """Build retry guidance text for the LLM from a previous failure. context."""
     guidance_parts = []
-
     guidance_parts.append(f"\n\n    RETRY GUIDANCE (Attempt {failure_ctx.attempt_number + 2}):")
     guidance_parts.append(f"    Previous attempt failed: {failure_ctx.failure_type}")
     guidance_parts.append(f"    Required tables: {failure_ctx.required_tables}")
@@ -459,27 +345,7 @@ def _llm_fill_intent(
     select_col_target: int | None = None,
     advanced_feature_lines: str | None = None,
 ) -> QSimIntent | None:
-    """
-    Fill a structural skeleton via the LLM; validate and retry with guidance on failure.
-
-    Args:
-
-        skeleton: Description.
-
-        schema: Schema graph for columns and FK relationships.
-
-        column_roles: Map of `table.column` to role string.
-
-        target_tier: Optional sampled complexity band for conditioning and conformance checking.
-
-        select_col_target: Preferred SELECT-list cardinality from geometric sampling.
-
-        advanced_feature_lines: Capability-filtered advanced feature bullets.
-
-    Returns:
-
-        `QSimIntent` on success, or None after retries are exhausted.
-    """
+    """Fill a structural skeleton via the LLM; validate and retry with. guidance on failure."""
     context = build_schema_context(skeleton.tables, schema)
 
     all_filterable = []
@@ -565,6 +431,7 @@ def _llm_fill_intent(
         tsumm, tex = _tier_spec_lines(target_tier)
         sel_hint = int(select_col_target) if select_col_target is not None else 1
         feat_blk = advanced_feature_lines or ""
+        slot_line = _advanced_slot_prompt_line(skeleton)
         tier_extra = f"""
         TARGET COMPLEXITY BAND: {target_tier.value}
         BAND GUIDANCE: {tsumm}
@@ -573,6 +440,8 @@ def _llm_fill_intent(
         DATABASE-SUPPORTED ADVANCED SHAPES (only where compatible with this skeleton):
         {feat_blk}
         """
+        if slot_line:
+            tier_extra += f"\n        {slot_line}\n        "
 
     user_prompt = f"""
         Schema:
@@ -602,7 +471,7 @@ def _llm_fill_intent(
 
     last_failure_reason = None
     failure_context = None
-    for attempt in range(PolicyConfig.MAX_STAGE_B_REPAIRS + 1):
+    for attempt in range(PolicyConfig.MAX_ASK_COMPOSE_REPAIRS + 1):
         prompt_with_context = user_prompt
         if failure_context and attempt > 0:
             retry_guidance = _build_retry_guidance(failure_context, schema, column_roles)
@@ -616,12 +485,12 @@ def _llm_fill_intent(
             last_failure_reason = f"LLM returned no parseable JSON ({exc})"
             failure_context = None
             debug(
-                f"[qsim_ops.llm_fill_intent] attempt {attempt + 1}/{(PolicyConfig.MAX_STAGE_B_REPAIRS + 1)} exhausted: {last_failure_reason} for skeleton tables={skeleton.tables}"
+                f"[{QSIM_PHASE_E}] attempt {attempt + 1}/{(PolicyConfig.MAX_ASK_COMPOSE_REPAIRS + 1)} exhausted: {last_failure_reason} for skeleton tables={skeleton.tables}"
             )
             continue
 
         debug(
-            f"[qsim_ops.llm_fill_intent] attempt {attempt + 1} LLM returned: select_cols={len(result.get('select_cols', []))}, filters_count={len(result.get('filters', []))}, groupby_count={len(result.get('groupby_cols', []))}, having_count={len(result.get('having', []))}, expr_comparison={result.get('expr_comparison') or result.get('column_comparison')}, distinct={result.get('distinct')}"
+            f"[{QSIM_PHASE_E}] attempt {attempt + 1} LLM returned: select_cols={len(result.get('select_cols', []))}, filters_count={len(result.get('filters', []))}, groupby_count={len(result.get('groupby_cols', []))}, having_count={len(result.get('having', []))}, expr_comparison={result.get('expr_comparison') or result.get('column_comparison')}, distinct={result.get('distinct')}"
         )
 
         is_valid, violations = _validate_skeleton_constraints(result, skeleton)
@@ -629,7 +498,7 @@ def _llm_fill_intent(
             last_failure_reason = "; ".join(violations)
             failure_context = None
             debug(
-                f"[qsim_ops.llm_fill_intent] attempt {attempt + 1}/{(PolicyConfig.MAX_STAGE_B_REPAIRS + 1)} SKELETON_CONSTRAINT_VIOLATION: {violations}"
+                f"[{QSIM_PHASE_E}] attempt {attempt + 1}/{(PolicyConfig.MAX_ASK_COMPOSE_REPAIRS + 1)} SKELETON_CONSTRAINT_VIOLATION: {violations}"
             )
             continue
 
@@ -646,34 +515,34 @@ def _llm_fill_intent(
             )
             last_failure_reason = None
             debug(
-                f"[qsim_ops.llm_fill_intent] attempt {attempt + 1}/{(PolicyConfig.MAX_STAGE_B_REPAIRS + 1)} failed: {failure_type} for skeleton tables={skeleton.tables}, missing={missing_tables}"
+                f"[{QSIM_PHASE_E}] attempt {attempt + 1}/{(PolicyConfig.MAX_ASK_COMPOSE_REPAIRS + 1)} failed: {failure_type} for skeleton tables={skeleton.tables}, missing={missing_tables}"
             )
             continue
 
-        if parse_result:
+        if isinstance(parse_result, QSimIntent):
             if target_tier is not None:
                 classified = classify_qsim_intent_complexity(parse_result)
                 if not qsim_intent_matches_target_tier(classified, target_tier):
                     last_failure_reason = f"tier_conformance: classified={classified.value} target={target_tier.value}"
                     failure_context = None
                     debug(
-                        f"[qsim_ops.llm_fill_intent] attempt {attempt + 1}/{(PolicyConfig.MAX_STAGE_B_REPAIRS + 1)} "
+                        f"[{QSIM_PHASE_E}] attempt {attempt + 1}/{(PolicyConfig.MAX_ASK_COMPOSE_REPAIRS + 1)} "
                         f"TIER_MISMATCH classified={classified.value} target={target_tier.value}"
                     )
                     continue
             debug(
-                f"[qsim_ops.llm_fill_intent] SUCCESS: intent_id={parse_result.intent_id}, grain={parse_result.grain}, filters={len(parse_result.filters_param)}, groupby={len(parse_result.group_by_cols)}, distinct={parse_result.distinct}"
+                f"[{QSIM_PHASE_E}] SUCCESS: intent_id={parse_result.intent_id}, grain={parse_result.grain}, filters={len(parse_result.filters_param)}, groupby={len(parse_result.group_by_cols)}, distinct={parse_result.distinct}"
             )
             return parse_result
 
         last_failure_reason = "Response validation failed (filters/columns rejected)"
         failure_context = None
         debug(
-            f"[qsim_ops.llm_fill_intent] attempt {attempt + 1}/{(PolicyConfig.MAX_STAGE_B_REPAIRS + 1)} failed: parse_llm_response returned None for skeleton tables={skeleton.tables}, LLM response keys={list(result.keys())}"
+            f"[{QSIM_PHASE_E}] attempt {attempt + 1}/{(PolicyConfig.MAX_ASK_COMPOSE_REPAIRS + 1)} failed: parse_llm_response returned None for skeleton tables={skeleton.tables}, LLM response keys={list(result.keys())}"
         )
 
     debug(
-        f"[qsim_ops.llm_fill_intent] FINAL_FAILURE: exhausted {(PolicyConfig.MAX_STAGE_B_REPAIRS + 1)} attempts for skeleton tables={skeleton.tables}, has_agg={skeleton.has_aggregation}, num_filters={skeleton.num_filters}"
+        f"[{QSIM_PHASE_E}] FINAL_FAILURE: exhausted {(PolicyConfig.MAX_ASK_COMPOSE_REPAIRS + 1)} attempts for skeleton tables={skeleton.tables}, has_agg={skeleton.has_aggregation}, num_filters={skeleton.num_filters}"
     )
     return None
 
@@ -683,24 +552,8 @@ def _parse_llm_response(
     skeleton: QSimSkeleton,
     schema: SchemaGraph,
     column_roles: dict[str, str],
-) -> Any | None:
-    """
-    Parse and validate LLM JSON into a `QSimIntent` or retry context tuple.
-
-    Args:
-
-        response: Parsed LLM JSON with intent fields.
-
-        skeleton: Skeleton constraints the response must satisfy.
-
-        schema: Schema graph for existence and metadata checks.
-
-        column_roles: Map of `table.column` to role string.
-
-    Returns:
-
-        coverage retry.
-    """
+) -> QSimIntent | tuple[str, set[str], set[str]] | None:
+    """Parse and validate LLM JSON into a `QSimIntent` or retry context. tuple."""
     select_cols_raw = response.get("select_cols", [])
     filter_dicts = response.get("filters", [])
     groupby_cols = response.get("groupby_cols", [])
@@ -712,28 +565,24 @@ def _parse_llm_response(
     has_agg = _has_aggregation(select_cols_raw)
 
     if skeleton.has_aggregation and not has_agg:
-        debug("[qsim_ops.parse_llm_response] REJECTED: skeleton requires aggregation but none in select_cols")
+        debug(f"[{QSIM_PHASE_F}] REJECTED: skeleton requires aggregation but none in select_cols")
         return None
     if skeleton.num_filters > 0 and len(filter_dicts) == 0 and not skeleton.has_expr_comparison:
-        debug(
-            f"[qsim_ops.parse_llm_response] REJECTED: skeleton requires {skeleton.num_filters} filters but none provided"
-        )
+        debug(f"[{QSIM_PHASE_F}] REJECTED: skeleton requires {skeleton.num_filters} filters but none provided")
         return None
     if skeleton.num_groupby > 0 and len(groupby_cols) == 0:
-        debug(
-            f"[qsim_ops.parse_llm_response] REJECTED: skeleton requires {skeleton.num_groupby} groupby cols but none provided"
-        )
+        debug(f"[{QSIM_PHASE_F}] REJECTED: skeleton requires {skeleton.num_groupby} groupby cols but none provided")
         return None
 
     if skeleton.has_orderby and len(orderby_cols_raw) == 0:
-        debug("[qsim_ops.parse_llm_response] REJECTED: skeleton requires orderby but none provided")
+        debug(f"[{QSIM_PHASE_F}] REJECTED: skeleton requires orderby but none provided")
         return None
     if not skeleton.has_orderby and len(orderby_cols_raw) > 0:
-        debug("[qsim_ops.parse_llm_response] REJECTED: skeleton forbids orderby but orderby_cols provided")
+        debug(f"[{QSIM_PHASE_F}] REJECTED: skeleton forbids orderby but orderby_cols provided")
         return None
 
     if skeleton.has_distinct and skeleton.has_aggregation:
-        debug("[qsim_ops.parse_llm_response] REJECTED: DISTINCT not allowed with aggregation")
+        debug(f"[{QSIM_PHASE_F}] REJECTED: DISTINCT not allowed with aggregation")
         return None
 
     select_cols: list[str] = []
@@ -746,17 +595,17 @@ def _parse_llm_response(
             agg_func, agg_inner = agg_info
             if agg_inner != "*":
                 if not validate_column_exists(agg_inner, skeleton.tables, schema):
-                    debug(f"[qsim_ops.parse_llm_response] REJECTED_SELECT: {sc}, reason=agg_column_not_found")
+                    debug(f"[{QSIM_PHASE_F}] REJECTED_SELECT: {sc}, reason=agg_column_not_found")
                     continue
             select_cols.append(f"{agg_func.upper()}({agg_inner})")
         else:
             if not validate_column_exists(sc, skeleton.tables, schema):
-                debug(f"[qsim_ops.parse_llm_response] REJECTED_SELECT: {sc}, reason=column_not_found")
+                debug(f"[{QSIM_PHASE_F}] REJECTED_SELECT: {sc}, reason=column_not_found")
                 continue
             select_cols.append(sc)
 
     if not select_cols:
-        debug("[qsim_ops.parse_llm_response] REJECTED: no valid select_cols remaining")
+        debug(f"[{QSIM_PHASE_F}] REJECTED: no valid select_cols remaining")
         return None
 
     aggregated_tables: set[str] = set()
@@ -770,46 +619,42 @@ def _parse_llm_response(
     for _filter_idx, fd in enumerate(filter_dicts):
         col = fd.get("column", "")
         if not validate_column_exists(col, skeleton.tables, schema):
-            debug(f"[qsim_ops.parse_llm_response] REJECTED_FILTER: col={col}, reason=column_not_found")
+            debug(f"[{QSIM_PHASE_F}] REJECTED_FILTER: col={col}, reason=column_not_found")
             continue
 
         table, col_name = col.split(".", 1)
         col_meta = schema.tables[table].columns.get(col_name)
         if not col_meta or not col_meta.is_filterable or not col_meta.is_visible:
-            debug(f"[qsim_ops.parse_llm_response] REJECTED_FILTER: col={col}, reason=not_filterable")
+            debug(f"[{QSIM_PHASE_F}] REJECTED_FILTER: col={col}, reason=not_filterable")
             continue
 
         if col not in filter_columns_used and len(filter_columns_used) >= QSimConfig.MAX_FILTER_COLUMNS + 1:
             debug(
-                f"[qsim_ops.parse_llm_response] REJECTED_FILTER: col={col}, reason=max_filter_columns_exceeded (>{QSimConfig.MAX_FILTER_COLUMNS + 1})"
+                f"[{QSIM_PHASE_F}] REJECTED_FILTER: col={col}, reason=max_filter_columns_exceeded (>{QSimConfig.MAX_FILTER_COLUMNS + 1})"
             )
             continue
 
         if col not in filter_columns_used and len(filter_columns_used) >= QSimConfig.MAX_FILTER_COLUMNS:
             debug(
-                f"[qsim_ops.parse_llm_response] WARNING_FILTER: col={col}, using {len(filter_columns_used) + 1} distinct columns (preferred max={QSimConfig.MAX_FILTER_COLUMNS})"
+                f"[{QSIM_PHASE_F}] WARNING_FILTER: col={col}, using {len(filter_columns_used) + 1} distinct columns (preferred max={QSimConfig.MAX_FILTER_COLUMNS})"
             )
 
         op = fd.get("op", "=")
         valid_ops = col_meta.get_valid_filter_ops()
 
         if op not in valid_ops:
-            debug(f"[qsim_ops.parse_llm_response] REJECTED_FILTER: col={col}, reason=invalid_operator_{op}_for_type")
+            debug(f"[{QSIM_PHASE_F}] REJECTED_FILTER: col={col}, reason=invalid_operator_{op}_for_type")
             continue
 
         if has_agg and col_meta.is_foreign_key and op == "=":
             fk_target_table = col_meta.fk_target[0] if col_meta.fk_target else None
 
             if fk_target_table and fk_target_table in aggregated_tables:
-                debug(
-                    f"[qsim_ops.parse_llm_response] REJECTED_FILTER: col={col}, reason=circular_fk_to_aggregated_table"
-                )
+                debug(f"[{QSIM_PHASE_F}] REJECTED_FILTER: col={col}, reason=circular_fk_to_aggregated_table")
                 continue
 
             if table in aggregated_tables:
-                debug(
-                    f"[qsim_ops.parse_llm_response] REJECTED_FILTER: col={col}, reason=fk_filter_on_aggregated_source_table"
-                )
+                debug(f"[{QSIM_PHASE_F}] REJECTED_FILTER: col={col}, reason=fk_filter_on_aggregated_source_table")
                 continue
 
         value_type = fd.get("value_type", "categorical")
@@ -824,10 +669,10 @@ def _parse_llm_response(
         if op == "between":
             decomposed = decompose_between_filter(qf)
             filters.extend(decomposed)
-            debug(f"[qsim_ops.parse_llm_response] DECOMPOSED_BETWEEN: col={col} into >= and <=")
+            debug(f"[{QSIM_PHASE_F}] DECOMPOSED_BETWEEN: col={col} into >= and <=")
         else:
             filters.append(qf)
-            debug(f"[qsim_ops.parse_llm_response] ACCEPTED_FILTER: col={col}, op={op}, value_type={value_type}")
+            debug(f"[{QSIM_PHASE_F}] ACCEPTED_FILTER: col={col}, op={op}, value_type={value_type}")
 
     if skeleton.has_expr_comparison and expr_comparison_dict:
         left_col_full = expr_comparison_dict.get("left_column", "")
@@ -877,25 +722,25 @@ def _parse_llm_response(
                             )
                         )
                         debug(
-                            f"[qsim_ops.parse_llm_response] ACCEPTED_COLUMN_COMPARISON: {left_col_full} {cmp_op} {right_col_full}, roles={left_role}={right_role}"
+                            f"[{QSIM_PHASE_F}] ACCEPTED_COLUMN_COMPARISON: {left_col_full} {cmp_op} {right_col_full}, roles={left_role}={right_role}"
                         )
                     else:
                         debug(
-                            f"[qsim_ops.parse_llm_response] DISCARDED_EXPR_COMPARISON: {left_col_full} {cmp_op} {right_col_full}, reason={rejection_reason}"
+                            f"[{QSIM_PHASE_F}] DISCARDED_EXPR_COMPARISON: {left_col_full} {cmp_op} {right_col_full}, reason={rejection_reason}"
                         )
                 else:
-                    debug("[qsim_ops.parse_llm_response] DISCARDED_EXPR_COMPARISON: column metadata not found")
+                    debug(f"[{QSIM_PHASE_F}] DISCARDED_EXPR_COMPARISON: column metadata not found")
             else:
                 debug(
-                    f"[qsim_ops.parse_llm_response] DISCARDED_EXPR_COMPARISON: column validation failed left={left_valid} right={right_valid}"
+                    f"[{QSIM_PHASE_F}] DISCARDED_EXPR_COMPARISON: column validation failed left={left_valid} right={right_valid}"
                 )
         else:
-            debug("[qsim_ops.parse_llm_response] DISCARDED_EXPR_COMPARISON: invalid column format")
+            debug(f"[{QSIM_PHASE_F}] DISCARDED_EXPR_COMPARISON: invalid column format")
 
     total_filter_elements = len(filters)
     if skeleton.num_filters > 0 and total_filter_elements == 0:
         debug(
-            f"[qsim_ops.parse_llm_response] INSUFFICIENT_FILTERS: requested={skeleton.num_filters}, validated_filters={len(filters)}, rejecting_intent"
+            f"[{QSIM_PHASE_F}] INSUFFICIENT_FILTERS: requested={skeleton.num_filters}, validated_filters={len(filters)}, rejecting_intent"
         )
         return None
 
@@ -906,15 +751,15 @@ def _parse_llm_response(
                 _, agg_inner = agg_info
                 agg_inner_base = agg_inner.split(".")[-1] if "." in agg_inner else agg_inner
                 for gcol in groupby_cols:
-                    gcol_base = gcol.split(".")[-1] if "." in gcol else gcol
+                    gother_columnase = gcol.split(".")[-1] if "." in gcol else gcol
                     if agg_inner == gcol:
                         debug(
-                            f"[qsim_ops.parse_llm_response] REJECTED: agg_inner={agg_inner} matches groupby_col={gcol}, reason=exact_self_grouping"
+                            f"[{QSIM_PHASE_F}] REJECTED: agg_inner={agg_inner} matches groupby_col={gcol}, reason=exact_self_grouping"
                         )
                         return None
-                    if agg_inner_base == gcol_base:
+                    if agg_inner_base == gother_columnase:
                         debug(
-                            f"[qsim_ops.parse_llm_response] REJECTED: agg_inner={agg_inner} matches groupby_col={gcol}, reason=base_name_self_grouping"
+                            f"[{QSIM_PHASE_F}] REJECTED: agg_inner={agg_inner} matches groupby_col={gcol}, reason=base_name_self_grouping"
                         )
                         return None
 
@@ -931,28 +776,22 @@ def _parse_llm_response(
 
         h_agg_info = _extract_agg_info(h_expression)
         if not h_agg_info:
-            debug(
-                f"[qsim_ops.parse_llm_response] REJECTED_HAVING: expression={h_expression}, reason=no_aggregation_pattern"
-            )
+            debug(f"[{QSIM_PHASE_F}] REJECTED_HAVING: expression={h_expression}, reason=no_aggregation_pattern")
             continue
 
         h_agg_func, h_agg_inner = h_agg_info
         if h_agg_inner != "*" and not validate_column_exists(h_agg_inner, skeleton.tables, schema):
-            debug(f"[qsim_ops.parse_llm_response] REJECTED_HAVING: expression={h_expression}, reason=column_not_found")
+            debug(f"[{QSIM_PHASE_F}] REJECTED_HAVING: expression={h_expression}, reason=column_not_found")
             continue
 
         if right_expr:
             right_agg_info = _extract_agg_info(right_expr)
             if not right_agg_info:
-                debug(
-                    f"[qsim_ops.parse_llm_response] REJECTED_HAVING: right_expression={right_expr}, reason=no_aggregation_pattern"
-                )
+                debug(f"[{QSIM_PHASE_F}] REJECTED_HAVING: right_expression={right_expr}, reason=no_aggregation_pattern")
                 continue
             right_agg_func, right_agg_inner = right_agg_info
             if right_agg_inner != "*" and not validate_column_exists(right_agg_inner, skeleton.tables, schema):
-                debug(
-                    f"[qsim_ops.parse_llm_response] REJECTED_HAVING: right_expression={right_expr}, reason=column_not_found"
-                )
+                debug(f"[{QSIM_PHASE_F}] REJECTED_HAVING: right_expression={right_expr}, reason=column_not_found")
                 continue
             having.append(
                 QSimHaving(
@@ -976,7 +815,7 @@ def _parse_llm_response(
         if validate_column_exists(gcol, skeleton.tables, schema):
             validated_groupby.append(gcol)
         else:
-            debug(f"[qsim_ops.parse_llm_response] REJECTED_GROUPBY: col={gcol}, reason=column_not_found")
+            debug(f"[{QSIM_PHASE_F}] REJECTED_GROUPBY: col={gcol}, reason=column_not_found")
 
     order_by_cols: list[str] = []
     for ob in orderby_cols_raw:
@@ -992,12 +831,12 @@ def _parse_llm_response(
         if agg_info:
             agg_func, agg_inner = agg_info
             if agg_inner != "*" and not validate_column_exists(agg_inner, skeleton.tables, schema):
-                debug(f"[qsim_ops.parse_llm_response] REJECTED_ORDERBY: {ob}, reason=column_not_found")
+                debug(f"[{QSIM_PHASE_F}] REJECTED_ORDERBY: {ob}, reason=column_not_found")
                 continue
             order_by_cols.append(f"{agg_func.upper()}({agg_inner}) {direction}")
         else:
             if not validate_column_exists(ob_clean, skeleton.tables, schema):
-                debug(f"[qsim_ops.parse_llm_response] REJECTED_ORDERBY: {ob}, reason=column_not_found")
+                debug(f"[{QSIM_PHASE_F}] REJECTED_ORDERBY: {ob}, reason=column_not_found")
                 continue
             order_by_cols.append(f"{ob_clean} {direction}")
 
@@ -1009,13 +848,9 @@ def _parse_llm_response(
 
     if skeleton.has_distinct and not use_distinct:
         if not has_distinct:
-            debug(
-                "[qsim_ops.parse_llm_response] DISTINCT_REJECTED: LLM returned distinct=false despite skeleton.has_distinct=True"
-            )
+            debug("[{QSIM_PHASE_F}] DISTINCT_REJECTED: LLM returned distinct=false despite skeleton.has_distinct=True")
         elif grain != "row_level":
-            debug(
-                f"[qsim_ops.parse_llm_response] DISTINCT_REJECTED: grain={grain} incompatible with DISTINCT (requires row_level)"
-            )
+            debug(f"[{QSIM_PHASE_F}] DISTINCT_REJECTED: grain={grain} incompatible with DISTINCT (requires row_level)")
 
     if len(skeleton.tables) >= 3:
         tables_used: set[str] = set()
@@ -1033,7 +868,7 @@ def _parse_llm_response(
         missing_tables = set(skeleton.tables) - tables_used
         if missing_tables:
             debug(
-                f"[qsim_ops.parse_llm_response] REJECTED_THREE_TABLE: tables={skeleton.tables}, used={tables_used}, missing={missing_tables}"
+                f"[{QSIM_PHASE_F}] REJECTED_THREE_TABLE: tables={skeleton.tables}, used={tables_used}, missing={missing_tables}"
             )
             return ("three_table_violation", tables_used, missing_tables)
 
@@ -1064,19 +899,7 @@ def _parse_llm_response(
 
 
 def _generate_question_from_intent(intent: QSimIntent, schema: SchemaGraph) -> str | None:
-    """
-    Produce natural language for an intent using `generate_question`.
-
-    Args:
-
-        intent: Intent with filters, groupings, and param placeholders.
-
-        schema: Schema graph for the generator.
-
-    Returns:
-
-        Question string, or None if generation fails.
-    """
+    """Produce natural language for an intent using `generate_question`."""
     filter_descriptions = []
     for idx, f in enumerate(intent.filters_param):
         if f.is_expr_comparison:
@@ -1103,27 +926,21 @@ def _generate_question_from_intent(intent: QSimIntent, schema: SchemaGraph) -> s
     )
 
 
-def generate_all_questions(intents: list[QSimIntent], schema: SchemaGraph) -> list[QSimIntent]:
-    """
-    Return intents with generated NL `question` fields where generation succeeds.
-
-    Args:
-
-        intents: Intents to verbalize.
-
-        schema: Schema graph for question generation.
-
-    Returns:
-
-        are omitted.
-    """
-    debug(f"[qsim_ops.generate_all_questions] generating: {len(intents)} questions")
+def generate_all_questions(
+    intents: list[QSimIntent],
+    schema: SchemaGraph,
+    *,
+    trace_rows: list[dict[str, Any]] | None = None,
+    trace_summary: dict[str, Any] | None = None,
+) -> list[QSimIntent]:
+    """Return intents with generated NL `question` fields where. generation succeeds."""
+    debug(f"[{QSIM_PHASE_J}] generating: {len(intents)} questions")
 
     results: list[QSimIntent] = []
 
     for i, intent in enumerate(intents):
         if i > 0 and i % 10 == 0:
-            debug(f"[qsim_ops.generate_all_questions] progress: {i}/{len(intents)}")
+            debug(f"[{QSIM_PHASE_J}] progress: {i}/{len(intents)}")
 
         question = _generate_question_from_intent(intent, schema)
         if question:
@@ -1143,40 +960,51 @@ def generate_all_questions(intents: list[QSimIntent], schema: SchemaGraph) -> li
                 distinct=intent.distinct,
             )
             results.append(intent_with_question)
+            if trace_rows is not None:
+                trace_rows.append(
+                    {
+                        "stage": "question_generation",
+                        "status": "accepted",
+                        "intent_id": intent.intent_id,
+                        "variant_idx": intent.variant_idx,
+                        "question": question,
+                        "tables": list(intent.tables),
+                        "grain": intent.grain,
+                        "select_cols": list(intent.select_cols),
+                        "group_by_cols": list(intent.group_by_cols),
+                        "order_by_cols": list(intent.order_by_cols),
+                        "filters_param": [f.to_dict() for f in intent.filters_param],
+                        "having_param": [h.to_dict() for h in intent.having_param],
+                        "param_values": dict(intent.param_values),
+                        "distinct": intent.distinct,
+                    }
+                )
         else:
-            debug(f"[qsim_ops.generate_all_questions] failed: {intent.intent_id}")
+            debug(f"[{QSIM_PHASE_J}] failed: {intent.intent_id}")
+            if trace_rows is not None:
+                trace_rows.append(
+                    {
+                        "stage": "question_generation",
+                        "status": "failed",
+                        "intent_id": intent.intent_id,
+                        "variant_idx": intent.variant_idx,
+                    }
+                )
 
-    debug(f"[qsim_ops.generate_all_questions] complete: {len(results)} questions")
+    debug(f"[{QSIM_PHASE_J}] complete: {len(results)} questions")
+    if trace_summary is not None:
+        trace_summary["accepted_questions"] = len(results)
+        trace_summary["failed_questions"] = max(0, len(intents) - len(results))
     return results
 
 
 def _is_no_variance_skeleton(skeleton: QSimSkeleton) -> bool:
-    """
-    Return True if the skeleton has no filters and no HAVING (no value-sampling variance).
-
-    Args:
-
-        skeleton: Skeleton to inspect.
-
-    Returns:
-
-        True when ``num_filters == 0`` and ``num_having == 0``.
-    """
+    """Return True if the skeleton has no filters and no HAVING (no. value-sampling variance)."""
     return skeleton.num_filters == 0 and skeleton.num_having == 0
 
 
 def _compute_skeleton_complexity_tier(skeleton: QSimSkeleton) -> str:
-    """
-    Assign complexity tier A, B, or C from skeleton features for stratified pools.
-
-    Args:
-
-        skeleton: Skeleton to score.
-
-    Returns:
-
-        `"A"` (high), `"B"` (medium), or `"C"` (low) by composite score.
-    """
+    """Assign complexity tier A, B, or C from skeleton features for. stratified pools."""
     score = 0
     score += skeleton.num_filters * 2
     score += 3 if skeleton.has_aggregation else 0
@@ -1195,21 +1023,7 @@ def _compute_skeleton_complexity_tier(skeleton: QSimSkeleton) -> str:
 
 
 def _compute_table_set_richness(tables: list[str], schema: SchemaGraph, column_roles: dict[str, str]) -> int:
-    """
-    Score a table set from filterable, aggregatable, groupable, and comparable-column counts.
-
-    Args:
-
-        tables: Table names in the candidate set.
-
-        schema: Schema graph for column capabilities.
-
-        column_roles: Map of column key to role string.
-
-    Returns:
-
-        Integer score (weighted counts across tables and comparable pairs).
-    """
+    """Score a table set from filterable, aggregatable, groupable, and. comparable-column counts."""
     filterable_count = 0
     aggregatable_count = 0
     groupable_count = 0
@@ -1227,21 +1041,7 @@ def _compute_table_set_richness(tables: list[str], schema: SchemaGraph, column_r
 def _build_skeleton_pool(
     schema: SchemaGraph, column_roles: dict[str, str], num_tables: int | None = None
 ) -> SkeletonPool:
-    """
-    Build a tiered `SkeletonPool` from enumerated table sets and generated skeletons.
-
-    Args:
-
-        schema: Schema graph for skeleton generation and richness scoring.
-
-        column_roles: Map of column key to role string.
-
-        num_tables: If set, keep only table sets of this size.
-
-    Returns:
-
-        `SkeletonPool` with A/B/C tiers and shuffle state for selection.
-    """
+    """Build a tiered `SkeletonPool` from enumerated table sets and. generated skeletons."""
     table_sets = enumerate_table_sets(schema)
 
     if num_tables is not None:
@@ -1261,6 +1061,7 @@ def _build_skeleton_pool(
         tier_c_by_table_set[table_key] = []
 
         skeletons = generate_all_skeletons(table_set, schema, column_roles)
+        skeletons = append_advanced_skeleton_variants(skeletons, schema.database_feature_capability)
         for skel in skeletons:
             tier = _compute_skeleton_complexity_tier(skel)
             if tier == "A":
@@ -1284,7 +1085,7 @@ def _build_skeleton_pool(
     total_b = sum(len(v) for v in tier_b_by_table_set.values())
     total_c = sum(len(v) for v in tier_c_by_table_set.values())
 
-    debug(f"[qsim_ops.build_skeleton_pool] built pool: tier_a={total_a}, tier_b={total_b}, tier_c={total_c}")
+    debug(f"[{QSIM_PHASE_B}] built pool: tier_a={total_a}, tier_b={total_b}, tier_c={total_c}")
     return SkeletonPool(
         tier_a_by_table_set=tier_a_by_table_set,
         tier_b_by_table_set=tier_b_by_table_set,
@@ -1296,77 +1097,8 @@ def _build_skeleton_pool(
     )
 
 
-def _select_next_skeleton(
-    pool: SkeletonPool, need_filters: bool, need_having: bool
-) -> tuple[QSimSkeleton, list[str]] | None:
-    """
-    Select the next skeleton by round-robin table sets; prefer tier A, then B, then C.
-
-    Args:
-
-        pool: Pool with tier lists and iteration indices.
-
-        need_filters: If True, require `num_filters > 0`.
-
-        need_having: If True, require ``num_having > 0``.
-
-    Returns:
-
-        Tuple `(skeleton, table_set)`, or None if no skeleton matches.
-    """
-
-    def matches_needs(skel: QSimSkeleton) -> bool:
-        if need_filters and skel.num_filters == 0:
-            return False
-        if need_having and skel.num_having == 0:
-            return False
-        return True
-
-    start_idx = pool.current_table_idx
-    attempts = 0
-    max_attempts = len(pool.table_set_keys)
-
-    tiers = [
-        ("a", pool.tier_a_by_table_set, pool.tier_a_indices),
-        ("b", pool.tier_b_by_table_set, pool.tier_b_indices),
-        ("c", pool.tier_c_by_table_set, pool.tier_c_indices),
-    ]
-
-    while attempts < max_attempts:
-        table_idx = (start_idx + attempts) % len(pool.table_set_keys)
-        table_key = pool.table_set_keys[table_idx]
-        table_set = table_key.split("|")
-
-        for _tier_name, tier_dict, indices_dict in tiers:
-            skeletons = tier_dict[table_key]
-            current_idx = indices_dict[table_key]
-
-            for i in range(current_idx, len(skeletons)):
-                skel = skeletons[i]
-                if matches_needs(skel):
-                    indices_dict[table_key] = i + 1
-                    pool.current_table_idx = (table_idx + 1) % len(pool.table_set_keys)
-                    return skel, table_set
-
-        attempts += 1
-
-    return None
-
-
 def _normalize_qsim_intent(intent: QSimIntent, schema: SchemaGraph) -> QSimIntent:
-    """
-    Return a canonical `QSimIntent`: grain, deduped columns, pruned tables, new `intent_id`.
-
-    Args:
-
-        intent: Intent to normalize.
-
-        schema: Schema graph for FK connectivity.
-
-    Returns:
-
-        New normalized `QSimIntent`.
-    """
+    """Return a canonical `QSimIntent`: grain, deduped columns, pruned. tables, new `intent_id`."""
     grain = intent.grain
     has_agg = _has_aggregation(intent.select_cols)
 
@@ -1401,7 +1133,7 @@ def _normalize_qsim_intent(intent: QSimIntent, schema: SchemaGraph) -> QSimInten
         adj = build_fk_adjacency(schema)
         if is_connected(list(tables_used), adj):
             normalized_tables = sorted(tables_used)
-            debug(f"[qsim_ops.normalize_qsim_intent] removed unnecessary tables: {set(intent.tables) - tables_used}")
+            debug(f"[{QSIM_PHASE_G}] removed unnecessary tables: {set(intent.tables) - tables_used}")
 
     table_prefixed_group_by = []
     for col in intent.group_by_cols:
@@ -1445,25 +1177,10 @@ def generate_all_intents(
     num_intents: int | None = None,
     *,
     rng_seed: int | None = None,
+    trace_rows: list[dict[str, Any]] | None = None,
+    trace_summary: dict[str, Any] | None = None,
 ) -> list[QSimIntent]:
-    """
-    Generate diverse ``QSimIntent`` rows using tier-balanced skeleton sampling and coverage targets.
-
-    Args:
-
-        schema: Schema graph for pools and LLM filling.
-
-        column_roles: Map of column key to role string.
-
-        num_intents: Target count; defaults to ``QSimConfig.INTENT_TYPES``.
-
-        rng_seed: RNG seed for reproducible skeleton and geometric draws.
-
-    Returns:
-
-        Normalized, deduplicated intents up to ``num_intents``.
-    """
-
+    """Generate diverse ``QSimIntent`` rows using tier-balanced. skeleton. sampling and coverage targets."""
     seed_val = rng_seed if rng_seed is not None else QSimConfig.RANDOM_SEED
     random.seed(seed_val)
     rng = random.Random(seed_val)
@@ -1484,9 +1201,17 @@ def generate_all_intents(
     max_no_variance = int(num_intents * QSimConfig.MAX_NO_VARIANCE_RATIO)
 
     debug(
-        f"[qsim_ops.generate_all_intents] targeting {num_intents} intents tier_quotas={tier_remaining} "
+        f"[{QSIM_PHASE_D}] targeting {num_intents} intents tier_quotas={tier_remaining} "
         f"rebalanced_weights={weights} schema_tables={cap.table_count}",
     )
+    if trace_summary is not None:
+        trace_summary["requested_intents"] = num_intents
+        trace_summary["tier_quotas"] = dict(quotas)
+        trace_summary["rebalanced_weights"] = dict(weights)
+        trace_summary["min_with_filters"] = min_with_filters
+        trace_summary["min_with_having"] = min_with_having
+        trace_summary["min_three_table"] = min_three_table
+        trace_summary["max_no_variance"] = max_no_variance
 
     merged_buckets = _build_merged_tier_buckets(schema, column_roles)
 
@@ -1500,13 +1225,19 @@ def generate_all_intents(
 
     while len(intents) < num_intents:
         if consecutive_duplicates >= QSimConfig.MAX_CONSECUTIVE_DUPLICATES:
-            debug("[qsim_ops.generate_all_intents] EARLY_EXIT: consecutive duplicate cap")
+            debug(f"[{QSIM_PHASE_D}] EARLY_EXIT: consecutive duplicate cap")
+            if trace_summary is not None:
+                trace_summary["stop_reason"] = "consecutive_duplicate_cap"
             break
         if consecutive_failures >= QSimConfig.MAX_CONSECUTIVE_FAILURES:
-            debug("[qsim_ops.generate_all_intents] EARLY_EXIT: consecutive failure cap")
+            debug(f"[{QSIM_PHASE_D}] EARLY_EXIT: consecutive failure cap")
+            if trace_summary is not None:
+                trace_summary["stop_reason"] = "consecutive_failure_cap"
             break
         if sum(tier_remaining.values()) <= 0:
-            debug("[qsim_ops.generate_all_intents] STOP: tier quotas exhausted")
+            debug(f"[{QSIM_PHASE_D}] STOP: tier quotas exhausted")
+            if trace_summary is not None:
+                trace_summary["stop_reason"] = "tier_quotas_exhausted"
             break
 
         tier_key = _pick_weighted_tier(tier_remaining, rng)
@@ -1525,7 +1256,17 @@ def generate_all_intents(
         selection = _pop_matching_skeleton(bucket, need_filters, need_having)
         if selection is None:
             tier_remaining[str(tier_key)] = 0
-            debug(f"[qsim_ops.generate_all_intents] exhausted skeleton bucket for tier={tier_key}")
+            debug(f"[{QSIM_PHASE_D}] exhausted skeleton bucket for tier={tier_key}")
+            if trace_rows is not None:
+                trace_rows.append(
+                    {
+                        "stage": "intent_generation",
+                        "status": "bucket_exhausted",
+                        "target_tier": str(tier_key),
+                        "need_filters": need_filters,
+                        "need_having": need_having,
+                    }
+                )
             continue
 
         skeleton, table_set = selection
@@ -1533,8 +1274,18 @@ def generate_all_intents(
         if _is_no_variance_skeleton(skeleton) and no_variance_count >= max_no_variance:
             bucket.append((skeleton, table_set))
             debug(
-                f"[qsim_ops.generate_all_intents] SKIPPING: no-variance budget exceeded ({no_variance_count}/{max_no_variance})",
+                f"[{QSIM_PHASE_D}] SKIPPING: no-variance budget exceeded ({no_variance_count}/{max_no_variance})",
             )
+            if trace_rows is not None:
+                trace_rows.append(
+                    {
+                        "stage": "intent_generation",
+                        "status": "skipped_no_variance_budget",
+                        "target_tier": str(tier_key),
+                        "tables": list(table_set),
+                        "skeleton": asdict(skeleton),
+                    }
+                )
             continue
 
         sel_target = _sample_select_col_count_geometric(QSimConfig.SELECT_COL_GEOMETRIC_P, rng)
@@ -1551,20 +1302,63 @@ def generate_all_intents(
         if not intent:
             consecutive_failures += 1
             bucket.append((skeleton, table_set))
-            debug(f"[qsim_ops.generate_all_intents] LLM failed, consecutive_failures={consecutive_failures}")
+            debug(f"[{QSIM_PHASE_D}] LLM failed, consecutive_failures={consecutive_failures}")
+            if trace_rows is not None:
+                trace_rows.append(
+                    {
+                        "stage": "intent_generation",
+                        "status": "llm_fill_failed",
+                        "target_tier": str(tier_key),
+                        "tables": list(table_set),
+                        "skeleton": asdict(skeleton),
+                        "need_filters": need_filters,
+                        "need_having": need_having,
+                        "select_col_target": sel_target,
+                    }
+                )
             continue
 
         consecutive_failures = 0
 
         normalized = _normalize_qsim_intent(intent, schema)
 
+        if skeleton.advanced_slot and not _qsim_advanced_slot_detected(normalized, skeleton.advanced_slot):
+            consecutive_failures += 1
+            bucket.append((skeleton, table_set))
+            debug(
+                f"[{QSIM_PHASE_D}] advanced slot {skeleton.advanced_slot} not detected after fill; retrying",
+            )
+            if trace_rows is not None:
+                trace_rows.append(
+                    {
+                        "stage": "intent_generation",
+                        "status": "advanced_slot_rejected",
+                        "target_tier": str(tier_key),
+                        "tables": list(table_set),
+                        "advanced_slot_requested": skeleton.advanced_slot,
+                        "skeleton": asdict(skeleton),
+                    }
+                )
+            continue
+
         if normalized.intent_id in seen_ids:
             consecutive_duplicates += 1
             bucket.append((skeleton, table_set))
             debug(
-                f"[qsim_ops.generate_all_intents] DUPLICATE intent_id={normalized.intent_id}, "
+                f"[{QSIM_PHASE_D}] DUPLICATE intent_id={normalized.intent_id}, "
                 f"consecutive_duplicates={consecutive_duplicates}",
             )
+            if trace_rows is not None:
+                trace_rows.append(
+                    {
+                        "stage": "intent_generation",
+                        "status": "duplicate_intent",
+                        "target_tier": str(tier_key),
+                        "tables": list(table_set),
+                        "intent_id": normalized.intent_id,
+                        "skeleton": asdict(skeleton),
+                    }
+                )
             continue
 
         consecutive_duplicates = 0
@@ -1579,10 +1373,33 @@ def generate_all_intents(
         seen_ids.add(normalized.intent_id)
         tier_remaining[str(tier_key)] -= 1
         debug(
-            f"[qsim_ops.generate_all_intents] ADDED intent_id={normalized.intent_id}, tier={tier_key}, "
+            f"[{QSIM_PHASE_D}] ADDED intent_id={normalized.intent_id}, tier={tier_key}, "
             f"tables={normalized.tables}, filters={len(normalized.filters_param)}, "
             f"having={len(normalized.having_param)}, total={len(intents)}/{num_intents}",
         )
+        if trace_rows is not None:
+            trace_rows.append(
+                {
+                    "stage": "intent_generation",
+                    "status": "accepted",
+                    "target_tier": str(tier_key),
+                    "tables": list(table_set),
+                    "intent_id": normalized.intent_id,
+                    "grain": normalized.grain,
+                    "filters_count": len(normalized.filters_param),
+                    "having_count": len(normalized.having_param),
+                    "group_by_count": len(normalized.group_by_cols),
+                    "distinct": normalized.distinct,
+                    "skeleton": asdict(skeleton),
+                    "select_col_target": sel_target,
+                    "need_filters": need_filters,
+                    "need_having": need_having,
+                    "advanced_slot_requested": skeleton.advanced_slot,
+                    "advanced_slot_detected": skeleton.advanced_slot
+                    if skeleton.advanced_slot and _qsim_advanced_slot_detected(normalized, skeleton.advanced_slot)
+                    else None,
+                }
+            )
 
     final_with_filters = len([i for i in intents if i.filters_param])
     final_with_having = len([i for i in intents if i.having_param])
@@ -1591,17 +1408,31 @@ def generate_all_intents(
     three_count = len([i for i in intents if len(i.tables) >= 3])
 
     debug(
-        f"[qsim_ops.generate_all_intents] generated {len(intents)} intents: single={single_count}, two={two_count}, three={three_count}",
+        f"[{QSIM_PHASE_D}] generated {len(intents)} intents: single={single_count}, two={two_count}, three={three_count}",
     )
     debug(
-        f"[qsim_ops.generate_all_intents] coverage: with_filters={final_with_filters}/{min_with_filters}, "
+        f"[{QSIM_PHASE_D}] coverage: with_filters={final_with_filters}/{min_with_filters}, "
         f"with_having={final_with_having}/{min_with_having}, three_table={three_count}/{min_three_table}, "
         f"no_variance={no_variance_count}/{max_no_variance}",
     )
     debug(
-        f"[qsim_ops.generate_all_intents] table_set_usage: "
+        f"[{QSIM_PHASE_D}] table_set_usage: "
         f"{dict(sorted(table_set_usage.items(), key=lambda x: x[1], reverse=True)[:10])}",
     )
+    if trace_summary is not None:
+        trace_summary["generated_intents"] = len(intents)
+        trace_summary["final_with_filters"] = final_with_filters
+        trace_summary["final_with_having"] = final_with_having
+        trace_summary["single_count"] = single_count
+        trace_summary["two_count"] = two_count
+        trace_summary["three_count"] = three_count
+        trace_summary["no_variance_count"] = no_variance_count
+        trace_summary["table_set_usage_top10"] = dict(
+            sorted(table_set_usage.items(), key=lambda x: x[1], reverse=True)[:10]
+        )
+        trace_summary.setdefault(
+            "stop_reason", "requested_count_reached" if len(intents) >= num_intents else "natural_stop"
+        )
 
     return intents
 
@@ -1610,20 +1441,7 @@ def greedy_cover_indices_by_atoms(
     atoms_per_row: list[frozenset[str]],
     universe: frozenset[str],
 ) -> list[int]:
-    """
-    Greedy set-cover ordering of row indices over a discrete atom universe.
-
-    Args:
-
-        atoms_per_row: Coverage atom sets aligned to candidate row indices.
-
-        universe: Full atom set to cover (typically the union over feasible rows).
-
-    Returns:
-
-        Indices chosen in greedy marginal-gain order until exhaustion or stagnation.
-    """
-
+    """Greedy set-cover ordering of row indices over a discrete atom. universe."""
     uncovered = set(universe)
     picked: list[int] = []
     available = list(range(len(atoms_per_row)))

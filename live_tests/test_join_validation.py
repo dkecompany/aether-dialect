@@ -1,15 +1,9 @@
-"""
-Seeded-intent join-validation live tests.
-
-Each case seeds a ``RuntimeIntent`` that omits a required bridge table and asserts ``generate_join_candidates`` proposes a candidate covering the bridge, so the join-path resolver actually runs instead of being short-circuited by a successful NL parse.
-"""
+"""Seeded-intent join-validation live tests. Each case seeds a ``RuntimeIntent`` that omits a required bridge table and asserts ``generate_join_candidates`` proposes a candidate covering the bridge, so the join-path resolver actually runs instead of being short-circuited by a successful NL parse."""
 
 from __future__ import annotations
 
-import pytest
-
+from aetherdialect._contracts_base import NormalizedExpr
 from aetherdialect._contracts_core import (
-    NormalizedExpr,
     RuntimeIntent,
     SelectCol,
 )
@@ -33,8 +27,6 @@ def _candidate_tables(candidates: list[dict]) -> set[str]:
     return tables
 
 
-@pytest.mark.live
-@pytest.mark.live_no_llm
 def test_seeded_join_candidates_bridge_actor_film(schema) -> None:
     """``actor`` ↔ ``film`` requires the ``film_actor`` bridge to appear among candidates."""
     intent = RuntimeIntent(
@@ -55,10 +47,8 @@ def test_seeded_join_candidates_bridge_actor_film(schema) -> None:
     assert "film_actor" in _candidate_tables(candidates)
 
 
-@pytest.mark.live
-@pytest.mark.live_no_llm
-def test_seeded_join_candidates_bridge_film_category(schema) -> None:
-    """``film`` ↔ ``category`` requires the ``film_category`` bridge table."""
+def test_seeded_join_candidates_bridge_item_category(schema) -> None:
+    """``film`` ↔ ``category`` requires the ``item_category`` bridge table."""
     intent = RuntimeIntent(
         tables=["film", "category"],
         grain="row_level",
@@ -74,11 +64,9 @@ def test_seeded_join_candidates_bridge_film_category(schema) -> None:
     join_candidates, _cmap, _cte_hints = generate_join_candidates(intent, schema)
     candidates = join_candidates.get("candidates") or []
     assert candidates, "join candidates must exist for film/category"
-    assert "film_category" in _candidate_tables(candidates)
+    assert "item_category" in _candidate_tables(candidates)
 
 
-@pytest.mark.live
-@pytest.mark.live_no_llm
 def test_seeded_join_candidates_bridge_customer_country(schema) -> None:
     """``customer`` ↔ ``country`` goes through ``address`` and ``city``."""
     intent = RuntimeIntent(

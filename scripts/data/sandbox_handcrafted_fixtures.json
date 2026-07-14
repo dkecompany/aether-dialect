@@ -1,0 +1,188 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "question": "How many rentals happened on 2025-01-01?",
+      "task": "intent",
+      "stage": "interpret",
+      "response": {
+        "approach": "Count rentals by checkout date using the rental table only.",
+        "tables": [
+          "rental"
+        ],
+        "grounding": [
+          {
+            "ref": "rental",
+            "used_for": "table"
+          },
+          {
+            "ref": "rental.rental_date",
+            "used_for": "filter"
+          }
+        ]
+      }
+    },
+    {
+      "question": "How many rentals happened on 2025-01-01?",
+      "task": "intent",
+      "stage": "ground",
+      "response": {
+        "tables": [
+          "rental"
+        ],
+        "select": "count rental rows",
+        "filter": "keep only rows where rental.rental_date is in the single date literal 2025-01-01",
+        "group_by": "",
+        "having": "",
+        "order_by": "",
+        "limit": null,
+        "window": "",
+        "case": "",
+        "cte_steps": []
+      }
+    },
+    {
+      "question": "How many rentals happened on 2025-01-01?",
+      "task": "intent",
+      "stage": "compose",
+      "response": {
+        "tables": [
+          "rental"
+        ],
+        "grain": "scalar",
+        "select_cols": [
+          "count(rental.rental_id)"
+        ],
+        "group_by_cols": [],
+        "order_by_cols": [],
+        "filters_param": [
+          {
+            "left_expr": "rental.rental_date",
+            "op": "array contains",
+            "value_type": "date",
+            "value": "2025-01-01"
+          }
+        ],
+        "having_param": [],
+        "limit": null,
+        "natural_language": "Count rentals on the requested date."
+      }
+    },
+    {
+      "question": "How many rentals were made in total?",
+      "task": "intent",
+      "stage": "interpret",
+      "response": {
+        "approach": "Count film records in the catalog.",
+        "tables": [
+          "film"
+        ],
+        "grounding": [
+          {
+            "ref": "film",
+            "used_for": "table"
+          }
+        ]
+      }
+    },
+    {
+      "question": "How many rentals were made in total?",
+      "task": "intent",
+      "stage": "ground",
+      "response": {
+        "tables": [
+          "film"
+        ],
+        "select": "count film rows",
+        "filter": "",
+        "group_by": "",
+        "having": "",
+        "order_by": "",
+        "limit": null,
+        "window": "",
+        "case": "",
+        "cte_steps": []
+      }
+    },
+    {
+      "question": "How many rentals were made in total?",
+      "task": "intent",
+      "stage": "compose",
+      "response": {
+        "tables": [
+          "film"
+        ],
+        "grain": "scalar",
+        "select_cols": [
+          "count(film.item_id)"
+        ],
+        "group_by_cols": [],
+        "order_by_cols": [],
+        "filters_param": [],
+        "having_param": [],
+        "limit": null,
+        "natural_language": "Count all films."
+      }
+    },
+    {
+      "question": "Show payroll deductions by employee SSN.",
+      "task": "intent",
+      "stage": "interpret",
+      "response": {
+        "approach": "Return payroll deductions grouped by employee SSN from staff.",
+        "tables": [
+          "staff"
+        ],
+        "grounding": [
+          {
+            "ref": "staff.ssn",
+            "used_for": "employee identifier for grouping payroll deductions"
+          }
+        ]
+      }
+    },
+    {
+      "question": "Show payroll deductions by employee SSN.",
+      "task": "intent",
+      "stage": "ground",
+      "response": {
+        "tables": [
+          "staff"
+        ],
+        "select": "staff.ssn and payroll deduction totals per employee",
+        "filter": "",
+        "group_by": "staff.ssn",
+        "having": "",
+        "order_by": "",
+        "limit": null,
+        "window": "",
+        "case": "",
+        "cte_steps": []
+      }
+    },
+    {
+      "question": "Show payroll deductions by employee SSN.",
+      "task": "intent",
+      "stage": "compose",
+      "response": {
+        "tables": [
+          "staff"
+        ],
+        "grain": "grouped",
+        "select_cols": [
+          {
+            "expr": "staff.ssn"
+          }
+        ],
+        "group_by_cols": [
+          "staff.ssn"
+        ],
+        "order_by_cols": [],
+        "filters_param": [],
+        "having_param": [],
+        "limit": null,
+        "natural_language": "Payroll deductions grouped by employee SSN."
+      }
+    }
+  ]
+}

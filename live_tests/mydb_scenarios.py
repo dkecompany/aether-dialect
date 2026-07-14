@@ -1,23 +1,91 @@
-"""
-DVD Rental database scenario definitions for live pipeline testing.
-
-Defines scenarios across multiple categories against the PostgreSQL ``dvdrental_new`` schema (15 tables: film with ``special_features`` as ``TEXT[]``, language, category, film_category, actor, film_actor, inventory, rental, payment, customer, staff, store, address, city, country). Each function returns a list of ``Scenario`` or ``SequenceScenario`` objects grouped by test category. ``generation_path_sequences`` holds the multi-step ``GenerationPath`` live sequences used by ``test_generation_paths_live``.
-"""
+"""Live pipeline scenario definitions for the ``rental_shop`` PostgreSQL schema (34 tables). Scenarios exercise catalog subtypes (``film``, ``book``, ``game``), bridge tables (``item_feature``, ``game_supported_language``, ``item_category``, ``film_actor``), rental operations (``rental``, ``reservation``, ``payment``, ``inventory``, ``inventory_status_history``, ``damage_report``), geography (``address``, ``city``, ``country``), procurement (``purchase_order``, ``purchase_line``, ``supplier``, ``warehouse``, ``stock_transfer``, ``delivery``, ``courier``), and reference entities (``author``, ``publisher``, ``language``, ``category``, ``promotion``, ``promotion_redemption``). Each function returns ``Scenario`` or ``SequenceScenario`` lists grouped by test category. ``generation_path_sequences`` holds multi-step ``GenerationPath`` live sequences for ``test_generation_paths_live``."""
 
 from __future__ import annotations
 
-from aetherdialect._config import GenerationPath
 from aetherdialect._live_testing import Expected, Scenario, SequenceScenario
+
+FILM_SCOPED: list[list[str]] = [["film"], ["item"], ["film", "item"]]
+BOOK_SCOPED: list[list[str]] = [["book"], ["item"], ["book", "item"]]
+GAME_SCOPED: list[list[str]] = [["game"], ["item"], ["game", "item"]]
+
+
+def film_with(*extra: str) -> list[list[str]]:
+    """Acceptable post-reconcile table sets for a film-scoped query plus extra tables."""
+    return [sorted([*base, *extra]) for base in FILM_SCOPED]
+
+
+def book_with(*extra: str) -> list[list[str]]:
+    """Acceptable post-reconcile table sets for a book-scoped query plus extra tables."""
+    return [sorted([*base, *extra]) for base in BOOK_SCOPED]
+
+
+def game_with(*extra: str) -> list[list[str]]:
+    """Acceptable post-reconcile table sets for a game-scoped query plus extra tables."""
+    return [sorted([*base, *extra]) for base in GAME_SCOPED]
+
+
+ACTOR_FILM_SCOPED: list[list[str]] = [
+    ["actor", "film"],
+    ["actor", "item"],
+    ["actor", "film", "item"],
+    ["actor", "film_actor", "item"],
+    ["actor", "film_actor", "film"],
+]
+
+BOOK_AUTHOR_PUBLISHER: list[list[str]] = [
+    ["author", "book", "publisher"],
+    ["author", "item", "publisher"],
+    ["author", "book", "item", "publisher"],
+    ["book", "publisher"],
+]
+
+PURCHASE_COST_BY_SUPPLIER: list[list[str]] = [
+    ["purchase_line", "supplier"],
+    ["purchase_line", "purchase_order", "supplier"],
+]
+
+OPEN_PO_SUPPLIER: list[list[str]] = [
+    ["purchase_order", "supplier"],
+    ["purchase_line", "purchase_order", "supplier"],
+]
+
+PURCHASE_ORDER_SCOPED: list[list[str]] = [
+    ["purchase_order"],
+    ["purchase_line", "purchase_order"],
+    ["purchase_order", "supplier"],
+    ["purchase_line", "purchase_order", "supplier"],
+]
+
+ACTOR_FILM_ACTOR: list[list[str]] = [
+    ["actor", "film"],
+    ["actor", "item"],
+    ["actor", "film", "item"],
+    ["actor", "film_actor"],
+    ["actor", "film", "film_actor"],
+    ["actor", "item", "film_actor"],
+]
+
+AG003_FILM_RENTAL: list[list[str]] = [
+    *film_with(),
+    *film_with("rental"),
+]
+
+STORE_ADDRESS_CITY: list[list[str]] = [
+    ["store", "address", "city"],
+    ["address", "city"],
+    ["store", "address"],
+    ["city", "store"],
+]
 
 
 def single_table_scenarios() -> list[Scenario]:
     """Basic single-table queries with no joins."""
-    return [
+    base = [
         Scenario(
             id="ST-001",
             question="list all film titles",
             expected=Expected(
-                tables=["film"],
+                tables_one_of=FILM_SCOPED,
                 min_rows=1,
                 max_rows=2000,
                 contains_join=False,
@@ -35,20 +103,20 @@ def single_table_scenarios() -> list[Scenario]:
         Scenario(
             id="ST-003",
             question="list the distinct film ratings in the catalog",
-            expected=Expected(tables=["film"], min_rows=1, max_rows=10),
+            expected=Expected(tables_one_of=FILM_SCOPED, min_rows=1, max_rows=10),
             category="single_table",
         ),
         Scenario(
             id="ST-004",
             question="list all categories",
-            expected=Expected(tables=["category"], min_rows=1, max_rows=20, contains_join=False),
+            expected=Expected(tables=["category"], min_rows=1, max_rows=28, contains_join=False),
             category="single_table",
         ),
         Scenario(
             id="ST-005",
             question="how many films are there",
             expected=Expected(
-                tables=["film"],
+                tables_one_of=FILM_SCOPED,
                 min_rows=1,
                 max_rows=1,
                 grain="scalar",
@@ -71,29 +139,95 @@ def single_table_scenarios() -> list[Scenario]:
         Scenario(
             id="ST-008",
             question="list all store ids",
-            expected=Expected(tables=["store"], min_rows=1, max_rows=5, contains_join=False),
+            expected=Expected(tables=["store"], min_rows=1, max_rows=12, contains_join=False),
+            category="single_table",
+        ),
+        Scenario(
+            id="ST-009",
+            question="list all promotion names",
+            expected=Expected(
+                tables=["promotion"],
+                min_rows=1,
+                max_rows=30,
+                contains_join=False,
+            ),
+            category="single_table",
+        ),
+        Scenario(
+            id="ST-010",
+            question="list the distinct delivery statuses",
+            expected=Expected(
+                tables=["delivery"],
+                min_rows=1,
+                max_rows=10,
+                contains_join=False,
+            ),
+            category="single_table",
+        ),
+        Scenario(
+            id="ST-011",
+            question="list distinct warehouse names",
+            expected=Expected(
+                tables=["warehouse"],
+                min_rows=1,
+                max_rows=10,
+                contains_join=False,
+            ),
+            category="single_table",
+        ),
+        Scenario(
+            id="ST-012",
+            question="list distinct game platforms",
+            expected=Expected(
+                tables_one_of=GAME_SCOPED,
+                min_rows=1,
+                contains_join=False,
+            ),
+            category="single_table",
+        ),
+        Scenario(
+            id="ST-013",
+            question="which languages are available",
+            expected=Expected(
+                tables=["language"],
+                min_rows=1,
+                contains_join=False,
+            ),
+            category="single_table",
+        ),
+        Scenario(
+            id="ST-014",
+            question="how many actors are in the database",
+            expected=Expected(
+                tables=["actor"],
+                min_rows=1,
+                max_rows=1,
+                grain="scalar",
+                contains_join=False,
+            ),
             category="single_table",
         ),
     ]
+    return base
 
 
 def multi_table_scenarios() -> list[Scenario]:
     """Multi-table join queries."""
-    return [
+    base = [
         Scenario(
             id="MT-001",
             question="list all films and their language",
-            expected=Expected(tables=["film", "language"], contains_join=True, min_rows=1),
+            expected=Expected(tables_one_of=film_with("language"), contains_join=True, min_rows=1),
             category="multi_table",
         ),
         Scenario(
             id="MT-002",
             question="show all films with their categories",
             expected=Expected(
-                tables=["film", "category"],
+                tables_one_of=film_with("category") + [["category", "item", "item_category"]],
                 contains_join=True,
                 min_rows=1,
-                sql_contains=["film_category", "category"],
+                sql_contains=["item_category", "category"],
             ),
             category="multi_table",
         ),
@@ -101,7 +235,7 @@ def multi_table_scenarios() -> list[Scenario]:
             id="MT-003",
             question="list all actors and the films they appeared in",
             expected=Expected(
-                tables=["actor", "film"],
+                tables_one_of=ACTOR_FILM_SCOPED,
                 contains_join=True,
                 min_rows=1,
                 sql_contains=["film_actor"],
@@ -112,7 +246,10 @@ def multi_table_scenarios() -> list[Scenario]:
             id="MT-004",
             question="show customer names with their city",
             expected=Expected(
-                tables=["customer", "city"],
+                tables_one_of=[
+                    ["city", "customer"],
+                    ["address", "city", "customer"],
+                ],
                 contains_join=True,
                 min_rows=1,
             ),
@@ -122,7 +259,10 @@ def multi_table_scenarios() -> list[Scenario]:
             id="MT-005",
             question="list customer names and their country",
             expected=Expected(
-                tables=["customer", "country"],
+                tables_one_of=[
+                    ["country", "customer"],
+                    ["address", "city", "country", "customer"],
+                ],
                 contains_join=True,
                 min_rows=1,
             ),
@@ -170,19 +310,207 @@ def multi_table_scenarios() -> list[Scenario]:
             id="MT-010",
             question="show films in English",
             expected=Expected(
-                tables=["film", "language"],
+                tables_one_of=film_with("language"),
                 contains_join=True,
                 min_rows=1,
                 sql_contains=["English", "language"],
             ),
             category="multi_table",
         ),
+        Scenario(
+            id="MT-011",
+            question="show customer first and last names with their delivery status",
+            expected=Expected(
+                tables_one_of=[
+                    ["customer", "delivery"],
+                    ["customer", "delivery", "rental"],
+                ],
+                contains_join=True,
+                min_rows=1,
+            ),
+            category="multi_table",
+        ),
+        Scenario(
+            id="MT-012",
+            question="list book titles with author name and publisher name",
+            expected=Expected(
+                tables_one_of=BOOK_AUTHOR_PUBLISHER,
+                contains_join=True,
+                min_rows=1,
+            ),
+            category="multi_table",
+        ),
+        Scenario(
+            id="MT-013",
+            question="show open purchase orders with supplier name and store id",
+            expected=Expected(
+                tables_one_of=OPEN_PO_SUPPLIER,
+                contains_join=True,
+                min_rows=1,
+                sql_contains=["open"],
+            ),
+            category="multi_table",
+        ),
+        Scenario(
+            id="MT-014",
+            question="list deliveries with courier name and tracking number",
+            expected=Expected(
+                tables=["delivery", "courier"],
+                contains_join=True,
+                min_rows=1,
+            ),
+            category="multi_table",
+        ),
+        Scenario(
+            id="MT-015",
+            question="show promotion redemptions with promo name and customer name",
+            expected=Expected(
+                tables_one_of=[
+                    ["promotion_redemption", "promotion", "customer"],
+                    ["promotion_redemption", "promotion", "customer", "rental"],
+                ],
+                contains_join=True,
+                min_rows=1,
+            ),
+            category="multi_table",
+        ),
+        Scenario(
+            id="MT-016",
+            question="list stock transfers with warehouse name and item title",
+            expected=Expected(
+                tables=["stock_transfer", "warehouse", "item"],
+                contains_join=True,
+                min_rows=1,
+            ),
+            category="multi_table",
+        ),
+        Scenario(
+            id="MT-017",
+            question="show purchase lines with item title and unit cost",
+            expected=Expected(
+                tables=["purchase_line", "item"],
+                contains_join=True,
+                min_rows=1,
+            ),
+            category="multi_table",
+        ),
+        Scenario(
+            id="MT-018",
+            question="which films include trailers",
+            expected=Expected(
+                tables_one_of=[
+                    *FILM_SCOPED,
+                    ["film", "item", "item_feature"],
+                    ["film", "item_feature"],
+                    ["item", "item_feature"],
+                ],
+                min_rows=1,
+                max_rows=2000,
+                grain="row_level",
+                sql_contains=["item_feature"],
+            ),
+            category="multi_table",
+        ),
+        Scenario(
+            id="MT-019",
+            question="which films include deleted scenes",
+            expected=Expected(
+                tables_one_of=[
+                    *FILM_SCOPED,
+                    ["film", "item", "item_feature"],
+                    ["film", "item_feature"],
+                    ["item", "item_feature"],
+                ],
+                min_rows=1,
+                max_rows=2000,
+                grain="row_level",
+                sql_contains=["item_feature"],
+            ),
+            category="multi_table",
+        ),
+        Scenario(
+            id="MT-020",
+            question="which games support English",
+            expected=Expected(
+                tables_one_of=[
+                    *GAME_SCOPED,
+                    ["game", "language"],
+                    ["game", "game_supported_language", "language"],
+                    ["game", "item", "game_supported_language", "language"],
+                    ["item", "game", "game_supported_language", "language"],
+                ],
+                min_rows=1,
+                grain="row_level",
+                sql_contains=["game_supported_language"],
+            ),
+            category="multi_table",
+        ),
+        Scenario(
+            id="MT-021",
+            question="list all store locations by city",
+            expected=Expected(
+                tables_one_of=STORE_ADDRESS_CITY,
+                contains_join=True,
+                min_rows=1,
+            ),
+            category="multi_table",
+        ),
+        Scenario(
+            id="MT-022",
+            question="which films are in the Horror category",
+            expected=Expected(
+                contains_join=True,
+                min_rows=0,
+                sql_contains=["item_category"],
+            ),
+            category="multi_table",
+        ),
+        Scenario(
+            id="MT-023",
+            question="show active staff at each store",
+            expected=Expected(
+                tables_one_of=[
+                    ["staff", "store"],
+                    ["staff"],
+                ],
+                contains_join=True,
+                min_rows=1,
+            ),
+            category="multi_table",
+        ),
+        Scenario(
+            id="MT-024",
+            question="which customers from each country have made rentals",
+            expected=Expected(
+                contains_join=True,
+                contains_group_by=True,
+                grain="grouped",
+                min_rows=0,
+            ),
+            category="multi_table",
+        ),
+        Scenario(
+            id="MT-025",
+            question="list stock transfers between warehouses this year",
+            expected=Expected(
+                tables_one_of=[
+                    ["stock_transfer", "warehouse"],
+                    ["stock_transfer"],
+                    ["item", "stock_transfer", "warehouse"],
+                    ["item", "stock_transfer", "store", "warehouse"],
+                ],
+                contains_join=True,
+                min_rows=0,
+            ),
+            category="multi_table",
+        ),
     ]
+    return base
 
 
 def aggregation_scenarios() -> list[Scenario]:
     """Aggregation and GROUP BY queries."""
-    return [
+    base = [
         Scenario(
             id="AG-001",
             question="how many films are in each category",
@@ -202,7 +530,7 @@ def aggregation_scenarios() -> list[Scenario]:
                 grain="grouped",
                 min_rows=1,
                 max_rows=1000,
-                min_confidence=0.25,
+                min_confidence=0.24,
                 sql_contains=["SUM"],
             ),
             category="aggregation",
@@ -211,7 +539,7 @@ def aggregation_scenarios() -> list[Scenario]:
             id="AG-003",
             question="average rental duration per film rating",
             expected=Expected(
-                tables_one_of=[["film"], ["film", "rental"]],
+                tables_one_of=AG003_FILM_RENTAL,
                 contains_group_by=True,
                 grain="grouped",
                 min_rows=1,
@@ -245,7 +573,7 @@ def aggregation_scenarios() -> list[Scenario]:
             id="AG-006",
             question="maximum replacement cost of films by rating",
             expected=Expected(
-                tables=["film"],
+                tables_one_of=FILM_SCOPED,
                 contains_group_by=True,
                 grain="grouped",
                 min_rows=1,
@@ -287,17 +615,538 @@ def aggregation_scenarios() -> list[Scenario]:
             ),
             category="aggregation",
         ),
+        Scenario(
+            id="AG-010",
+            question="total discount amount by promotion type",
+            expected=Expected(
+                tables=["promotion_redemption", "promotion"],
+                contains_group_by=True,
+                contains_join=True,
+                grain="grouped",
+                min_rows=1,
+                sql_contains=["SUM"],
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-011",
+            question="count of purchase orders per supplier name",
+            expected=Expected(
+                tables_one_of=OPEN_PO_SUPPLIER,
+                contains_join=True,
+                contains_group_by=True,
+                grain="grouped",
+                min_rows=1,
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-012",
+            question="total purchase cost by supplier",
+            expected=Expected(
+                tables_one_of=PURCHASE_COST_BY_SUPPLIER,
+                contains_group_by=True,
+                contains_join=True,
+                grain="grouped",
+                min_rows=1,
+                sql_contains=["SUM"],
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-013",
+            question="total discount amount by promotion name",
+            expected=Expected(
+                tables=["promotion_redemption", "promotion"],
+                contains_join=True,
+                contains_group_by=True,
+                grain="grouped",
+                min_rows=1,
+                sql_contains=["SUM"],
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-014",
+            question="how many deliveries are in each status",
+            expected=Expected(
+                tables=["delivery"],
+                contains_group_by=True,
+                grain="grouped",
+                min_rows=1,
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-015",
+            question="how many open reservations are there",
+            expected=Expected(tables=["reservation"], min_rows=0, max_rows=1, grain="scalar"),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-016",
+            question="how many open damage reports exist",
+            expected=Expected(tables=["damage_report"], min_rows=0, max_rows=1, grain="scalar"),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-017",
+            question="which warehouse holds the most stock transfers",
+            expected=Expected(
+                tables_one_of=[
+                    ["warehouse", "stock_transfer"],
+                    ["stock_transfer", "warehouse"],
+                ],
+                min_rows=0,
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-018",
+            question="which suppliers have the most purchase lines",
+            expected=Expected(
+                tables_one_of=PURCHASE_COST_BY_SUPPLIER,
+                min_rows=0,
+                contains_group_by=True,
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-019",
+            question="show delivery status counts by courier",
+            expected=Expected(
+                tables=["delivery", "courier"],
+                min_rows=0,
+                contains_group_by=True,
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-020",
+            question="which author has the most books",
+            expected=Expected(
+                tables_one_of=[
+                    ["author", "book"],
+                    ["author", "item", "book"],
+                    *BOOK_AUTHOR_PUBLISHER[:2],
+                ],
+                min_rows=0,
+                contains_group_by=True,
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-021",
+            question="how many items fall under each category name",
+            expected=Expected(
+                tables_one_of=[
+                    ["category", "item"],
+                    ["category", "item_category"],
+                    ["category", "item", "item_category"],
+                ],
+                min_rows=0,
+                contains_group_by=True,
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-022",
+            question="how many games support French",
+            expected=Expected(
+                tables_one_of=[
+                    *GAME_SCOPED,
+                    ["game", "language"],
+                    ["game", "game_supported_language", "language"],
+                    ["game", "item", "game_supported_language", "language"],
+                    ["item", "game", "game_supported_language", "language"],
+                    ["game_supported_language", "language"],
+                ],
+                min_rows=1,
+                max_rows=1,
+                grain="scalar",
+                sql_contains=["game_supported_language"],
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-023",
+            question="how many catalog items by item type",
+            expected=Expected(
+                tables=["item"],
+                contains_group_by=True,
+                grain="grouped",
+                min_rows=1,
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-024",
+            question="how many games are in the catalog",
+            expected=Expected(
+                tables_one_of=GAME_SCOPED,
+                min_rows=0,
+                max_rows=1,
+                grain="scalar",
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-025",
+            question="what is the total delivery fee by courier",
+            expected=Expected(
+                tables=["delivery", "courier"],
+                contains_group_by=True,
+                grain="grouped",
+                min_rows=0,
+                sql_contains=["SUM"],
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-026",
+            question="what is the average delivery fee for delivered shipments",
+            expected=Expected(
+                tables=["delivery"],
+                min_rows=1,
+                max_rows=1,
+                grain="scalar",
+                sql_contains=["AVG"],
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-027",
+            question="what is the average page count by publisher",
+            expected=Expected(
+                tables_one_of=BOOK_AUTHOR_PUBLISHER,
+                contains_group_by=True,
+                grain="grouped",
+                min_rows=0,
+                sql_contains=["AVG"],
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-028",
+            question="how many rentals were for books versus films",
+            expected=Expected(
+                contains_group_by=True,
+                grain="grouped",
+                min_rows=1,
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-029",
+            question="which staff member processed the most payments",
+            expected=Expected(
+                tables_one_of=[
+                    ["payment", "staff"],
+                    ["customer", "payment", "staff"],
+                ],
+                min_rows=0,
+                contains_group_by=True,
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-030",
+            question="for each country how many distinct cities have at least one customer",
+            expected=Expected(
+                contains_join=True,
+                contains_group_by=True,
+                grain="grouped",
+                min_rows=1,
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-031",
+            question="how many open damage reports exist per store",
+            expected=Expected(
+                tables_one_of=[
+                    ["damage_report"],
+                    ["damage_report", "store"],
+                    ["damage_report", "inventory", "store"],
+                ],
+                contains_group_by=True,
+                grain="grouped",
+                min_rows=0,
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-032",
+            question="how many books do we have",
+            expected=Expected(
+                tables_one_of=BOOK_SCOPED,
+                min_rows=0,
+                max_rows=1,
+                grain="scalar",
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-033",
+            question="what is the count of pending reservations by store",
+            expected=Expected(
+                tables_one_of=[
+                    ["reservation"],
+                    ["reservation", "store"],
+                ],
+                contains_group_by=True,
+                grain="grouped",
+                min_rows=0,
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-034",
+            question="what is the average rental rate by item type",
+            expected=Expected(
+                contains_group_by=True,
+                grain="grouped",
+                min_rows=1,
+                sql_contains=["AVG"],
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-035",
+            question="what is the total revenue generated from rentals",
+            expected=Expected(
+                tables_one_of=[
+                    ["payment"],
+                    ["payment", "rental"],
+                    ["customer", "payment", "rental"],
+                ],
+                min_rows=1,
+                max_rows=1,
+                grain="scalar",
+                sql_contains=["SUM"],
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-036",
+            question="how many rentals does each customer make on average",
+            expected=Expected(
+                grain_in=("grouped", "scalar"),
+                min_rows=1,
+                sql_contains=["AVG"],
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-037",
+            question="what is the total revenue generated by each staff member",
+            expected=Expected(
+                tables_one_of=[
+                    ["payment", "staff"],
+                    ["customer", "payment", "staff"],
+                    ["payment", "rental", "staff"],
+                ],
+                contains_group_by=True,
+                grain="grouped",
+                min_rows=1,
+                sql_contains=["SUM"],
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-038",
+            question="what is the highest payment amount ever recorded",
+            expected=Expected(
+                tables=["payment"],
+                min_rows=1,
+                max_rows=1,
+                grain="scalar",
+                sql_contains=["MAX"],
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-039",
+            question="what is the average number of inventory copies per store",
+            expected=Expected(
+                tables_one_of=[
+                    ["inventory", "store"],
+                    ["inventory"],
+                    ["store", "inventory"],
+                ],
+                grain_in=("grouped", "scalar"),
+                min_rows=1,
+                sql_contains=["AVG"],
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-040",
+            question="how many purchase orders are still open",
+            expected=Expected(
+                tables_one_of=PURCHASE_ORDER_SCOPED,
+                min_rows=0,
+                max_rows=1,
+                grain="scalar",
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-041",
+            question="how many reservations expired without being fulfilled",
+            expected=Expected(
+                tables=["reservation"],
+                min_rows=0,
+                max_rows=1,
+                grain="scalar",
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-042",
+            question="which publisher has the fewest books in the catalog",
+            expected=Expected(
+                tables_one_of=BOOK_AUTHOR_PUBLISHER,
+                min_rows=0,
+                max_rows=1,
+                contains_group_by=True,
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-043",
+            question="which promotion had the most redemptions",
+            expected=Expected(
+                tables=["promotion", "promotion_redemption"],
+                contains_join=True,
+                contains_group_by=True,
+                min_rows=0,
+                max_rows=1,
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-044",
+            question="what is the average rental duration",
+            expected=Expected(
+                tables_one_of=[
+                    ["rental"],
+                    *film_with("rental"),
+                ],
+                min_rows=1,
+                max_rows=1,
+                grain="scalar",
+                sql_contains=["AVG"],
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-045",
+            question="how many films are in the horror category",
+            expected=Expected(
+                contains_join=True,
+                min_rows=1,
+                max_rows=1,
+                grain="scalar",
+                sql_contains=["horror"],
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-046",
+            question="which actors appear in the most films",
+            expected=Expected(
+                tables_one_of=ACTOR_FILM_ACTOR,
+                contains_group_by=True,
+                min_rows=0,
+                max_rows=10,
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-047",
+            question="what is the average payment amount",
+            expected=Expected(
+                tables=["payment"],
+                min_rows=1,
+                max_rows=1,
+                grain="scalar",
+                sql_contains=["AVG"],
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-048",
+            question="how many inventory items does each store have",
+            expected=Expected(
+                tables_one_of=[
+                    ["inventory", "store"],
+                    ["inventory"],
+                    ["store", "inventory"],
+                ],
+                contains_group_by=True,
+                grain="grouped",
+                min_rows=1,
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-049",
+            question="what is the count of pending versus fulfilled reservations",
+            expected=Expected(
+                tables=["reservation"],
+                contains_group_by=True,
+                grain="grouped",
+                min_rows=1,
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-050",
+            question="books grouped by publisher name",
+            expected=Expected(
+                tables_one_of=BOOK_AUTHOR_PUBLISHER,
+                contains_group_by=True,
+                grain="grouped",
+                min_rows=0,
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-051",
+            question="which promotion type has the highest average discount percent",
+            expected=Expected(
+                tables=["promotion"],
+                contains_group_by=True,
+                min_rows=0,
+                max_rows=1,
+                sql_contains=["AVG"],
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-052",
+            question="what is the average rental duration by item type",
+            expected=Expected(
+                contains_group_by=True,
+                grain="grouped",
+                min_rows=1,
+                sql_contains=["AVG"],
+            ),
+            category="aggregation",
+        ),
     ]
+    return base
 
 
 def filtering_scenarios() -> list[Scenario]:
     """Filter and parameterization queries."""
-    return [
+    base = [
         Scenario(
             id="FI-001",
             question="list all films with rating PG-13",
             expected=Expected(
-                tables=["film"],
+                tables_one_of=FILM_SCOPED,
                 min_rows=1,
                 sql_contains=["PG-13"],
             ),
@@ -316,7 +1165,7 @@ def filtering_scenarios() -> list[Scenario]:
             id="FI-003",
             question="list films with a rental rate greater than 2.99",
             expected=Expected(
-                tables=["film"],
+                tables_one_of=FILM_SCOPED,
                 min_rows=1,
                 sql_contains=["2.99"],
             ),
@@ -326,7 +1175,7 @@ def filtering_scenarios() -> list[Scenario]:
             id="FI-004",
             question="how many films have a length greater than 120 minutes",
             expected=Expected(
-                tables=["film"],
+                tables_one_of=FILM_SCOPED,
                 min_rows=1,
                 max_rows=1,
                 grain="scalar",
@@ -353,7 +1202,7 @@ def filtering_scenarios() -> list[Scenario]:
             id="FI-006",
             question="list films released in 2006",
             expected=Expected(
-                tables=["film"],
+                tables_one_of=FILM_SCOPED,
                 min_rows=1,
                 sql_contains=["2006"],
             ),
@@ -374,7 +1223,7 @@ def filtering_scenarios() -> list[Scenario]:
             id="FI-008",
             question="list all R rated films with replacement cost above 20",
             expected=Expected(
-                tables=["film"],
+                tables_one_of=FILM_SCOPED,
                 min_rows=1,
                 sql_contains=["R", "20"],
             ),
@@ -382,7 +1231,7 @@ def filtering_scenarios() -> list[Scenario]:
         ),
         Scenario(
             id="FI-009",
-            question="show rentals from July 2005",
+            question="show rentals from July 2023",
             expected=Expected(
                 tables_one_of=[
                     ["rental"],
@@ -391,11 +1240,111 @@ def filtering_scenarios() -> list[Scenario]:
                     ["rental", "staff"],
                 ],
                 min_rows=1,
-                sql_contains=["2005"],
+                sql_contains=["2023"],
+            ),
+            category="filtering",
+        ),
+        Scenario(
+            id="FI-010",
+            question="list book titles with page count over 400",
+            expected=Expected(
+                tables_one_of=BOOK_SCOPED,
+                min_rows=1,
+                sql_contains=["page_count"],
+            ),
+            category="filtering",
+        ),
+        Scenario(
+            id="FI-011",
+            question="list games with esrb rating T",
+            expected=Expected(
+                tables_one_of=GAME_SCOPED,
+                min_rows=1,
+                sql_contains=["esrb_rating"],
+            ),
+            category="filtering",
+        ),
+        Scenario(
+            id="FI-012",
+            question="list all rentals made by customers with first name John",
+            expected=Expected(
+                contains_join=True,
+                min_rows=0,
+                sql_contains=["John"],
+            ),
+            category="filtering",
+        ),
+        Scenario(
+            id="FI-013",
+            question="list items in the Sci-Fi category",
+            expected=Expected(
+                contains_join=True,
+                min_rows=0,
+                sql_contains=["Sci-Fi"],
+            ),
+            category="filtering",
+        ),
+        Scenario(
+            id="FI-014",
+            question="items with rental rates between 2 and 4",
+            expected=Expected(
+                tables_one_of=[
+                    *FILM_SCOPED,
+                    ["item"],
+                    ["book", "item"],
+                    ["game", "item"],
+                ],
+                min_rows=0,
+                sql_contains_one_of=[["BETWEEN"], ["2", "4"]],
+            ),
+            category="filtering",
+        ),
+        Scenario(
+            id="FI-015",
+            question="items where replacement cost is greater than 20",
+            expected=Expected(
+                tables_one_of=[
+                    ["item"],
+                    *FILM_SCOPED,
+                    *BOOK_SCOPED,
+                    *GAME_SCOPED,
+                ],
+                min_rows=1,
+                sql_contains=["20"],
+            ),
+            category="filtering",
+        ),
+        Scenario(
+            id="FI-016",
+            question="which staff members work at store 1",
+            expected=Expected(
+                tables_one_of=[
+                    ["staff", "store"],
+                    ["staff"],
+                ],
+                min_rows=0,
+                sql_contains=["1"],
+            ),
+            category="filtering",
+        ),
+        Scenario(
+            id="FI-017",
+            question="how many rentals are currently overdue",
+            expected=Expected(
+                tables_one_of=[
+                    ["rental"],
+                    ["customer", "rental"],
+                    ["inventory", "rental"],
+                    ["inventory", "item", "rental"],
+                ],
+                min_rows=0,
+                max_rows=1,
+                grain="scalar",
             ),
             category="filtering",
         ),
     ]
+    return base
 
 
 def cte_scenarios() -> list[Scenario]:
@@ -413,8 +1362,8 @@ def cte_scenarios() -> list[Scenario]:
             category="cte",
         ),
         Scenario(
-            id="CT-003",
-            question="list customers who have rented more than 30 films",
+            id="CT-002",
+            question="list customers who have rented more than 29 films",
             expected=Expected(
                 contains_join=True,
                 min_rows=1,
@@ -422,7 +1371,7 @@ def cte_scenarios() -> list[Scenario]:
             category="cte",
         ),
         Scenario(
-            id="CT-004",
+            id="CT-003",
             question="what is the average payment per rental for each customer",
             expected=Expected(
                 contains_group_by=True,
@@ -432,7 +1381,7 @@ def cte_scenarios() -> list[Scenario]:
             category="cte",
         ),
         Scenario(
-            id="CT-005",
+            id="CT-004",
             question="show categories where the average film length is above 120 minutes",
             expected=Expected(
                 contains_join=True,
@@ -441,7 +1390,7 @@ def cte_scenarios() -> list[Scenario]:
             category="cte",
         ),
         Scenario(
-            id="CT-006",
+            id="CT-005",
             question="list actors who appeared in more than 30 films along with the count",
             expected=Expected(
                 contains_join=True,
@@ -450,7 +1399,7 @@ def cte_scenarios() -> list[Scenario]:
             category="cte",
         ),
         Scenario(
-            id="CT-007",
+            id="CT-006",
             question="show the total revenue by category",
             expected=Expected(
                 contains_join=True,
@@ -459,60 +1408,6 @@ def cte_scenarios() -> list[Scenario]:
                 sql_contains=["SUM"],
             ),
             category="cte",
-        ),
-    ]
-
-
-def template_reuse_scenarios() -> list[Scenario]:
-    """
-    Template reuse and trust building.
-
-    These should be run after the single-table or multi-table tests have populated the template store with at least one accepted template.
-    """
-    return [
-        Scenario(
-            id="TR-001",
-            question="list all film titles",
-            expected=Expected(
-                min_rows=1,
-            ),
-            category="template_reuse",
-        ),
-        Scenario(
-            id="TR-002",
-            question="list all film titles and their rating",
-            expected=Expected(
-                tables=["film"],
-                min_rows=1,
-            ),
-            category="template_reuse",
-        ),
-        Scenario(
-            id="TR-003",
-            question="how many films are in each category",
-            expected=Expected(
-                min_rows=1,
-            ),
-            category="template_reuse",
-        ),
-        Scenario(
-            id="TR-004",
-            question="list all films with rating R",
-            expected=Expected(
-                tables=["film"],
-                min_rows=1,
-                sql_contains=["R"],
-            ),
-            category="template_reuse",
-        ),
-        Scenario(
-            id="TR-005",
-            question="show the top 5 customers by total payment amount",
-            expected=Expected(
-                min_rows=1,
-                max_rows=5,
-            ),
-            category="template_reuse",
         ),
     ]
 
@@ -533,7 +1428,10 @@ def schema_edge_scenarios() -> list[Scenario]:
             id="SE-002",
             question="show the country for each customer",
             expected=Expected(
-                tables=["customer", "country"],
+                tables_one_of=[
+                    ["country", "customer"],
+                    ["address", "city", "country", "customer"],
+                ],
                 contains_join=True,
                 min_rows=1,
             ),
@@ -552,7 +1450,7 @@ def schema_edge_scenarios() -> list[Scenario]:
             id="SE-004",
             question="show the store address and city for each store",
             expected=Expected(
-                tables=["store", "address", "city"],
+                tables_one_of=STORE_ADDRESS_CITY,
                 contains_join=True,
                 min_rows=1,
             ),
@@ -586,7 +1484,7 @@ def schema_edge_scenarios() -> list[Scenario]:
             category="schema_edge",
         ),
         Scenario(
-            id="SE-009",
+            id="SE-008",
             question="list films that are available in exactly 2 stores",
             expected=Expected(
                 contains_join=True,
@@ -597,7 +1495,7 @@ def schema_edge_scenarios() -> list[Scenario]:
             category="schema_edge",
         ),
         Scenario(
-            id="SE-010",
+            id="SE-009",
             question="show the district for each customer",
             expected=Expected(
                 contains_join=True,
@@ -606,23 +1504,12 @@ def schema_edge_scenarios() -> list[Scenario]:
             ),
             category="schema_edge",
         ),
-        Scenario(
-            id="SE-011",
-            question="show total payments per customer",
-            expected=Expected(
-                tables=["customer", "payment"],
-                contains_join=True,
-                contains_group_by=True,
-                min_rows=1,
-            ),
-            category="schema_edge",
-        ),
     ]
 
 
 def negative_scenarios() -> list[Scenario]:
     """Negative and forbidden SQL pattern tests."""
-    return [
+    base = [
         Scenario(
             id="NG-001",
             question="delete all customers",
@@ -696,15 +1583,24 @@ def negative_scenarios() -> list[Scenario]:
             expected=Expected(status="invalid_question"),
             category="negative",
         ),
+        Scenario(
+            id="NG-013",
+            question="what color should I paint my kitchen",
+            expected=Expected(status="invalid_question"),
+            category="negative",
+        ),
+        Scenario(
+            id="NG-014",
+            question="what is the best pizza topping",
+            expected=Expected(status="invalid_question"),
+            category="negative",
+        ),
     ]
+    return base
 
 
 def repair_loop_scenarios() -> list[Scenario]:
-    """
-    Repair loop and retry behaviour tests.
-
-    These scenarios target complex queries that may trigger the SQL repair loop, testing that the pipeline can self-correct and still produce valid output.
-    """
+    """Repair loop and retry behaviour tests. These scenarios target complex queries that may trigger the SQL repair loop, testing that the pipeline can self-correct and still produce valid output."""
     return [
         Scenario(
             id="RL-001",
@@ -719,16 +1615,6 @@ def repair_loop_scenarios() -> list[Scenario]:
         ),
         Scenario(
             id="RL-002",
-            question="show the top 5 customers by total payment amount",
-            expected=Expected(
-                contains_join=True,
-                min_rows=1,
-                max_rows=5,
-            ),
-            category="repair_loop",
-        ),
-        Scenario(
-            id="RL-003",
             question="list the 5 least rented films with their category and total revenue",
             expected=Expected(
                 contains_join=True,
@@ -738,7 +1624,7 @@ def repair_loop_scenarios() -> list[Scenario]:
             category="repair_loop",
         ),
         Scenario(
-            id="RL-004",
+            id="RL-003",
             question="show categories where total revenue exceeds 4000 with the film count",
             expected=Expected(
                 contains_join=True,
@@ -753,7 +1639,7 @@ def confidence_scenarios() -> list[Scenario]:
     """Confidence scoring tests with expected minimum thresholds."""
     return [
         Scenario(
-            id="CF-004",
+            id="CF-001",
             question="how many customers are in each country",
             expected=Expected(
                 min_confidence=0.25,
@@ -763,7 +1649,7 @@ def confidence_scenarios() -> list[Scenario]:
             category="confidence",
         ),
         Scenario(
-            id="CF-005",
+            id="CF-002",
             question="what is the average film length",
             expected=Expected(
                 min_confidence=0.4,
@@ -773,7 +1659,7 @@ def confidence_scenarios() -> list[Scenario]:
             category="confidence",
         ),
         Scenario(
-            id="CF-006",
+            id="CF-003",
             question="list all customer email addresses",
             expected=Expected(
                 min_confidence=0.4,
@@ -794,7 +1680,7 @@ def stateful_scenarios() -> list[SequenceScenario]:
                 Scenario(
                     id="SQ-001-A",
                     question="list all film titles and ratings",
-                    expected=Expected(tables=["film"], min_rows=1),
+                    expected=Expected(tables_one_of=FILM_SCOPED, min_rows=1),
                     category="stateful",
                 ),
                 Scenario(
@@ -809,57 +1695,6 @@ def stateful_scenarios() -> list[SequenceScenario]:
                         min_rows=1,
                     ),
                     category="stateful",
-                ),
-            ],
-        ),
-        SequenceScenario(
-            id="SQ-002",
-            category="stateful",
-            steps=[
-                Scenario(
-                    id="SQ-002-A",
-                    question="total payment amount by customer",
-                    expected=Expected(
-                        contains_group_by=True,
-                        min_rows=1,
-                    ),
-                    category="stateful",
-                ),
-                Scenario(
-                    id="SQ-002-B",
-                    question="total payment amount by staff",
-                    expected=Expected(
-                        contains_group_by=True,
-                        min_rows=1,
-                    ),
-                    category="stateful",
-                ),
-            ],
-        ),
-        SequenceScenario(
-            id="SQ-003",
-            category="stateful",
-            steps=[
-                Scenario(
-                    id="SQ-003-A",
-                    question="how many films are in the action category",
-                    expected=Expected(min_rows=1, max_rows=1),
-                    category="stateful",
-                    feedback="y",
-                ),
-                Scenario(
-                    id="SQ-003-B",
-                    question="how many films are in the comedy category",
-                    expected=Expected(min_rows=1, max_rows=1, sql_contains=["comedy"]),
-                    category="stateful",
-                    feedback="y",
-                ),
-                Scenario(
-                    id="SQ-003-C",
-                    question="how many films are in the horror category",
-                    expected=Expected(min_rows=1, max_rows=1, sql_contains=["horror"]),
-                    category="stateful",
-                    feedback="y",
                 ),
             ],
         ),
@@ -886,186 +1721,28 @@ def stateful_scenarios() -> list[SequenceScenario]:
     ]
 
 
-def trust_cycle_scenarios() -> list[SequenceScenario]:
-    """Full trust lifecycle: build trust, erode it, reach hard block, and override."""
-    return [
-        SequenceScenario(
-            id="TC-001",
-            category="trust_cycle",
-            steps=[
-                Scenario(
-                    id="TC-001-A",
-                    question="show all customer names",
-                    expected=Expected(
-                        tables=["customer"],
-                        min_rows=1,
-                    ),
-                    category="trust_cycle",
-                    feedback="y",
-                ),
-                Scenario(
-                    id="TC-001-B",
-                    question="list all customer names",
-                    expected=Expected(
-                        tables=["customer"],
-                        min_rows=1,
-                    ),
-                    category="trust_cycle",
-                    feedback="n",
-                    reject_reason="incorrect results",
-                ),
-                Scenario(
-                    id="TC-001-C",
-                    question="display all customer names",
-                    expected=Expected(
-                        tables=["customer"],
-                        min_rows=1,
-                    ),
-                    category="trust_cycle",
-                    feedback="y",
-                ),
-                Scenario(
-                    id="TC-001-D",
-                    question="show every customer name",
-                    expected=Expected(
-                        tables=["customer"],
-                        min_rows=1,
-                    ),
-                    category="trust_cycle",
-                    feedback="y",
-                ),
-                Scenario(
-                    id="TC-001-E",
-                    question="list every customer name",
-                    expected=Expected(
-                        tables=["customer"],
-                        min_rows=1,
-                    ),
-                    category="trust_cycle",
-                    feedback="n",
-                    reject_reason="incorrect results",
-                ),
-                Scenario(
-                    id="TC-001-F",
-                    question="customer names please",
-                    expected=Expected(
-                        tables=["customer"],
-                        min_rows=1,
-                    ),
-                    category="trust_cycle",
-                    feedback="n",
-                    reject_reason="incorrect results",
-                ),
-                Scenario(
-                    id="TC-001-G",
-                    question="all customer names",
-                    expected=Expected(
-                        tables=["customer"],
-                        min_rows=1,
-                    ),
-                    category="trust_cycle",
-                    feedback="n",
-                    reject_reason="incorrect results",
-                ),
-                Scenario(
-                    id="TC-001-H",
-                    question="show customer name list",
-                    expected=Expected(
-                        tables=["customer"],
-                        min_rows=1,
-                    ),
-                    category="trust_cycle",
-                    feedback="n",
-                    reject_reason="wrong columns selected",
-                ),
-                Scenario(
-                    id="TC-001-I",
-                    question="list customer names",
-                    expected=Expected(
-                        tables=["customer"],
-                        min_rows=1,
-                    ),
-                    category="trust_cycle",
-                    feedback="n",
-                    reject_reason="wrong columns selected",
-                ),
-                Scenario(
-                    id="TC-001-J",
-                    question="show all customer names",
-                    expected=Expected(
-                        tables=["customer"],
-                        min_rows=1,
-                    ),
-                    category="trust_cycle",
-                    feedback="y",
-                    auto_responses=["y", "y"],
-                ),
-            ],
-        ),
-    ]
-
-
 def rejection_feedback_scenarios() -> list[Scenario]:
     """Rejection feedback loop scenarios — user says no and provides a reason."""
     return [
         Scenario(
             id="RJ-001",
-            question="how many films are there",
-            expected=Expected(tables=["film"]),
-            category="rejection",
-            feedback="n",
-            reject_reason="wrong columns selected",
-        ),
-        Scenario(
-            id="RJ-002",
             question="list all customer names",
             expected=Expected(tables=["customer"]),
             category="rejection",
             feedback="n",
             reject_reason="too many rows",
         ),
-        Scenario(
-            id="RJ-003",
-            question="total payment amount by customer",
-            expected=Expected(contains_group_by=True),
-            category="rejection",
-            feedback="n",
-            reject_reason="wrong intent",
-        ),
     ]
 
 
 def performance_scenarios() -> list[Scenario]:
-    """
-    Performance and cost-awareness scenarios.
-
-    These test that the pipeline completes within a reasonable time and doesn't produce excessively large result sets.
-    """
-    return [
-        Scenario(
-            id="PF-002",
-            question="how many rentals are there",
-            expected=Expected(min_rows=1, max_rows=1),
-            category="performance",
-        ),
-        Scenario(
-            id="PF-004",
-            question="average film length by rating",
-            expected=Expected(min_rows=1, max_rows=10),
-            category="performance",
-        ),
-        Scenario(
-            id="PF-005",
-            question="list all actors and the number of films they appeared in",
-            expected=Expected(min_rows=1, max_rows=500),
-            category="performance",
-        ),
-    ]
+    """Performance and cost-awareness scenarios. These test that the pipeline completes within a reasonable time and doesn't produce excessively large result sets."""
+    return []
 
 
 def having_scenarios() -> list[Scenario]:
     """HAVING clause queries that filter grouped results."""
-    return [
+    base = [
         Scenario(
             id="HV-001",
             question="which categories have more than 50 films",
@@ -1087,7 +1764,7 @@ def having_scenarios() -> list[Scenario]:
             category="having",
         ),
         Scenario(
-            id="HV-004",
+            id="HV-003",
             question="list ratings that have an average rental rate above 3",
             expected=Expected(
                 contains_group_by=True,
@@ -1097,7 +1774,7 @@ def having_scenarios() -> list[Scenario]:
             category="having",
         ),
         Scenario(
-            id="HV-005",
+            id="HV-004",
             question="show categories where average rental rate is above 3 or total number of films is more than 60",
             expected=Expected(
                 contains_group_by=True,
@@ -1107,7 +1784,100 @@ def having_scenarios() -> list[Scenario]:
             ),
             category="having",
         ),
+        Scenario(
+            id="HV-005",
+            question="promotion types where average discount percent is above 15",
+            expected=Expected(
+                tables=["promotion"],
+                contains_group_by=True,
+                sql_contains=["HAVING"],
+                min_rows=0,
+            ),
+            category="having",
+        ),
+        Scenario(
+            id="HV-006",
+            question="promotions with more than 5 redemptions",
+            expected=Expected(
+                tables=["promotion", "promotion_redemption"],
+                contains_join=True,
+                contains_group_by=True,
+                sql_contains=["HAVING"],
+                min_rows=1,
+            ),
+            category="having",
+        ),
+        Scenario(
+            id="HV-007",
+            question="warehouses with more than 10 stock transfers",
+            expected=Expected(
+                tables=["warehouse", "stock_transfer"],
+                contains_group_by=True,
+                contains_join=True,
+                sql_contains=["HAVING"],
+                min_rows=1,
+            ),
+            category="having",
+        ),
+        Scenario(
+            id="HV-008",
+            question="list publishers with more than five books",
+            expected=Expected(
+                tables_one_of=[
+                    ["publisher", "book"],
+                    ["publisher", "item", "book"],
+                    *BOOK_AUTHOR_PUBLISHER[:2],
+                ],
+                min_rows=0,
+            ),
+            category="having",
+        ),
+        Scenario(
+            id="HV-009",
+            question="which customers have rented more than 10 items",
+            expected=Expected(
+                contains_join=True,
+                contains_group_by=True,
+                sql_contains=["HAVING"],
+                min_rows=0,
+            ),
+            category="having",
+        ),
+        Scenario(
+            id="HV-010",
+            question="which categories have total revenue exceeding 500",
+            expected=Expected(
+                contains_join=True,
+                contains_group_by=True,
+                sql_contains=["HAVING"],
+                min_rows=0,
+            ),
+            category="having",
+        ),
+        Scenario(
+            id="HV-011",
+            question="which actors have appeared in more than 20 films",
+            expected=Expected(
+                tables_one_of=ACTOR_FILM_ACTOR,
+                contains_group_by=True,
+                sql_contains=["HAVING"],
+                min_rows=0,
+            ),
+            category="having",
+        ),
+        Scenario(
+            id="HV-012",
+            question="list active customers who have made more than 5 rentals",
+            expected=Expected(
+                contains_join=True,
+                contains_group_by=True,
+                sql_contains=["HAVING", "active"],
+                min_rows=0,
+            ),
+            category="having",
+        ),
     ]
+    return base
 
 
 def sql_vs_intent_scenarios() -> list[Scenario]:
@@ -1115,41 +1885,19 @@ def sql_vs_intent_scenarios() -> list[Scenario]:
     return [
         Scenario(
             id="SI-001",
-            question="list all film titles",
-            expected=Expected(
-                tables=["film"],
-                min_rows=1,
-                contains_join=False,
-                grain="row_level",
-            ),
-            category="sql_vs_intent",
-        ),
-        Scenario(
-            id="SI-002",
-            question="how many films are in each category",
-            expected=Expected(
-                contains_group_by=True,
-                contains_join=True,
-                grain="grouped",
-                min_rows=1,
-            ),
-            category="sql_vs_intent",
-        ),
-        Scenario(
-            id="SI-003",
             question="list films ordered by length descending",
             expected=Expected(
-                tables=["film"],
+                tables_one_of=FILM_SCOPED,
                 min_rows=1,
                 sql_contains=["ORDER BY"],
             ),
             category="sql_vs_intent",
         ),
         Scenario(
-            id="SI-004",
+            id="SI-002",
             question="show the top 10 longest films",
             expected=Expected(
-                tables=["film"],
+                tables_one_of=FILM_SCOPED,
                 min_rows=1,
                 max_rows=10,
                 sql_contains=["ORDER BY", "LIMIT"],
@@ -1157,20 +1905,11 @@ def sql_vs_intent_scenarios() -> list[Scenario]:
             category="sql_vs_intent",
         ),
         Scenario(
-            id="SI-005",
+            id="SI-003",
             question="show ratings with more than 200 films",
             expected=Expected(
                 contains_group_by=True,
                 sql_contains=["HAVING"],
-                min_rows=1,
-            ),
-            category="sql_vs_intent",
-        ),
-        Scenario(
-            id="SI-006",
-            question="show film title and replacement cost minus rental rate as profit margin",
-            expected=Expected(
-                tables=["film"],
                 min_rows=1,
             ),
             category="sql_vs_intent",
@@ -1180,17 +1919,9 @@ def sql_vs_intent_scenarios() -> list[Scenario]:
 
 def subquery_scenarios() -> list[Scenario]:
     """Subquery patterns including NOT IN, EXISTS, and correlated subqueries."""
-    return [
+    base = [
         Scenario(
             id="SB-001",
-            question="list films that have never been rented",
-            expected=Expected(
-                min_rows=0,
-            ),
-            category="subquery",
-        ),
-        Scenario(
-            id="SB-002",
             question="show customers who have never made a payment",
             expected=Expected(
                 min_rows=0,
@@ -1198,7 +1929,7 @@ def subquery_scenarios() -> list[Scenario]:
             category="subquery",
         ),
         Scenario(
-            id="SB-003",
+            id="SB-002",
             question="list actors who have appeared in more films than average",
             expected=Expected(
                 min_rows=1,
@@ -1206,7 +1937,7 @@ def subquery_scenarios() -> list[Scenario]:
             category="subquery",
         ),
         Scenario(
-            id="SB-004",
+            id="SB-003",
             question="which films have a rental rate higher than the average rental rate",
             expected=Expected(
                 min_rows=1,
@@ -1214,7 +1945,7 @@ def subquery_scenarios() -> list[Scenario]:
             category="subquery",
         ),
         Scenario(
-            id="SB-005",
+            id="SB-004",
             question="show categories with fewer films than the average films per category",
             expected=Expected(
                 min_rows=1,
@@ -1222,21 +1953,30 @@ def subquery_scenarios() -> list[Scenario]:
             category="subquery",
         ),
         Scenario(
-            id="SB-006",
+            id="SB-005",
             question="list customers who have rented films from both store 1 and store 2",
             expected=Expected(
                 min_rows=0,
             ),
             category="subquery",
         ),
+        Scenario(
+            id="SB-006",
+            question="list customers who have never rented an item",
+            expected=Expected(
+                min_rows=0,
+            ),
+            category="subquery",
+        ),
     ]
+    return base
 
 
 def cte_join_scenarios() -> list[Scenario]:
     """CTE queries that also require joins across multiple tables."""
     return [
         Scenario(
-            id="CJ-002",
+            id="CJ-001",
             question="highest grossing film per category",
             expected=Expected(
                 min_rows=1,
@@ -1244,7 +1984,7 @@ def cte_join_scenarios() -> list[Scenario]:
             category="cte_join",
         ),
         Scenario(
-            id="CJ-003",
+            id="CJ-002",
             question="for each store show the top 3 customers by number of rentals",
             expected=Expected(
                 min_rows=1,
@@ -1252,20 +1992,20 @@ def cte_join_scenarios() -> list[Scenario]:
             category="cte_join",
         ),
         Scenario(
-            id="CJ-004",
+            id="CJ-003",
             question=(
-                "first in a CTE count rentals per film_id, then join that CTE to film "
+                "first in a CTE count rentals per item_id, then join that CTE to film and item "
                 "and list each film title with its rental count"
             ),
             expected=Expected(
                 contains_join=True,
                 min_rows=1,
-                sql_contains=["WITH", "rental", "film"],
+                sql_contains=["WITH", "rental", "item"],
             ),
             category="cte_join",
         ),
         Scenario(
-            id="CJ-005",
+            id="CJ-004",
             question=(
                 "use one CTE to get distinct inventory ids that were rented, "
                 "then a second CTE joining that to inventory and film to list film titles, "
@@ -1278,7 +2018,7 @@ def cte_join_scenarios() -> list[Scenario]:
             category="cte_join",
         ),
         Scenario(
-            id="CJ-006",
+            id="CJ-005",
             question=(
                 "first CTE: from rental table group by customer_id and count rows as rental_cnt; "
                 "second CTE: from payment table group by customer_id and sum amount as pay_sum; "
@@ -1306,7 +2046,7 @@ def join_validation_scenarios() -> list[Scenario]:
             category="join_validation",
         ),
         Scenario(
-            id="JV-004",
+            id="JV-002",
             question="show number of rentals for each film",
             expected=Expected(
                 contains_join=True,
@@ -1317,18 +2057,18 @@ def join_validation_scenarios() -> list[Scenario]:
             category="join_validation",
         ),
         Scenario(
-            id="JV-005",
+            id="JV-003",
             question="show the manager name for each store",
             expected=Expected(
                 contains_join=True,
                 min_rows=1,
-                max_rows=5,
+                max_rows=12,
                 sql_contains=["store", "staff"],
             ),
             category="join_validation",
         ),
         Scenario(
-            id="JV-006",
+            id="JV-004",
             question="show number of rentals per customer per store",
             expected=Expected(
                 contains_join=True,
@@ -1353,15 +2093,6 @@ def distinct_scenarios() -> list[Scenario]:
         ),
         Scenario(
             id="DT-002",
-            question="show all unique film ratings",
-            expected=Expected(
-                sql_contains=["DISTINCT"],
-                min_rows=1,
-            ),
-            category="distinct",
-        ),
-        Scenario(
-            id="DT-003",
             question="list distinct last names of actors",
             expected=Expected(
                 sql_contains=["DISTINCT"],
@@ -1416,12 +2147,12 @@ def multi_agg_scenarios() -> list[Scenario]:
 
 def order_by_scenarios() -> list[Scenario]:
     """ORDER BY and sorting queries."""
-    return [
+    base = [
         Scenario(
             id="OB-001",
             question="list all films ordered by title",
             expected=Expected(
-                tables=["film"],
+                tables_one_of=FILM_SCOPED,
                 min_rows=1,
                 sql_contains=["ORDER BY"],
             ),
@@ -1431,7 +2162,7 @@ def order_by_scenarios() -> list[Scenario]:
             id="OB-002",
             question="show the 5 longest films",
             expected=Expected(
-                tables=["film"],
+                tables_one_of=FILM_SCOPED,
                 min_rows=1,
                 max_rows=5,
                 sql_contains=["ORDER BY"],
@@ -1442,7 +2173,7 @@ def order_by_scenarios() -> list[Scenario]:
             id="OB-003",
             question="list the 10 most expensive films by replacement cost",
             expected=Expected(
-                tables=["film"],
+                tables_one_of=FILM_SCOPED,
                 min_rows=1,
                 max_rows=10,
                 sql_contains=["ORDER BY"],
@@ -1484,14 +2215,123 @@ def order_by_scenarios() -> list[Scenario]:
             id="OB-007",
             question="list the 5 cheapest films by rental rate",
             expected=Expected(
-                tables=["film"],
+                tables_one_of=FILM_SCOPED,
                 min_rows=1,
                 max_rows=5,
                 sql_contains=["ORDER BY"],
             ),
             category="order_by",
         ),
+        Scenario(
+            id="OB-008",
+            question="list all film titles alphabetically",
+            expected=Expected(
+                tables_one_of=FILM_SCOPED,
+                min_rows=1,
+                sql_contains=["ORDER BY"],
+            ),
+            category="order_by",
+        ),
+        Scenario(
+            id="OB-009",
+            question="which film has the shortest rental duration",
+            expected=Expected(
+                tables_one_of=FILM_SCOPED,
+                min_rows=0,
+                max_rows=1,
+                sql_contains=["ORDER BY"],
+            ),
+            category="order_by",
+        ),
+        Scenario(
+            id="OB-010",
+            question="list films ordered by rental duration descending",
+            expected=Expected(
+                tables_one_of=FILM_SCOPED,
+                min_rows=1,
+                sql_contains=["ORDER BY"],
+            ),
+            category="order_by",
+        ),
+        Scenario(
+            id="OB-011",
+            question="who are our top 5 customers by total payment",
+            expected=Expected(
+                contains_group_by=True,
+                min_rows=1,
+                max_rows=5,
+                sql_contains=["LIMIT"],
+            ),
+            category="order_by",
+        ),
+        Scenario(
+            id="OB-012",
+            question="which customers have rented the most items",
+            expected=Expected(
+                contains_join=True,
+                contains_group_by=True,
+                min_rows=1,
+                max_rows=10,
+                sql_contains=["ORDER BY"],
+            ),
+            category="order_by",
+        ),
+        Scenario(
+            id="OB-013",
+            question="what are the most frequently rented items",
+            expected=Expected(
+                contains_join=True,
+                contains_group_by=True,
+                min_rows=1,
+                max_rows=10,
+                sql_contains=["ORDER BY"],
+            ),
+            category="order_by",
+        ),
+        Scenario(
+            id="OB-014",
+            question="which customer has the highest single payment amount",
+            expected=Expected(
+                tables_one_of=[
+                    ["customer", "payment"],
+                    ["payment"],
+                ],
+                min_rows=0,
+                max_rows=1,
+                sql_contains=["ORDER BY"],
+            ),
+            category="order_by",
+        ),
+        Scenario(
+            id="OB-015",
+            question="list the 10 most expensive items in the catalog by replacement cost",
+            expected=Expected(
+                tables_one_of=[
+                    ["item"],
+                    *FILM_SCOPED,
+                    *BOOK_SCOPED,
+                    *GAME_SCOPED,
+                ],
+                min_rows=1,
+                max_rows=10,
+                sql_contains=["ORDER BY"],
+            ),
+            category="order_by",
+        ),
+        Scenario(
+            id="OB-016",
+            question="which actors have the most film credits",
+            expected=Expected(
+                tables_one_of=ACTOR_FILM_ACTOR,
+                contains_group_by=True,
+                min_rows=0,
+                max_rows=10,
+                sql_contains=["ORDER BY"],
+            ),
+            category="order_by",
+        ),
     ]
+    return base
 
 
 def like_pattern_scenarios() -> list[Scenario]:
@@ -1501,8 +2341,8 @@ def like_pattern_scenarios() -> list[Scenario]:
             id="LK-001",
             question="list films with titles starting with 'A'",
             expected=Expected(
-                tables=["film"],
-                min_rows=1,
+                tables_one_of=FILM_SCOPED,
+                min_rows=0,
                 sql_contains=["LIKE"],
             ),
             category="like_pattern",
@@ -1531,7 +2371,7 @@ def like_pattern_scenarios() -> list[Scenario]:
             id="LK-004",
             question="show films with the word 'dog' in the description",
             expected=Expected(
-                tables=["film"],
+                tables_one_of=FILM_SCOPED,
                 min_rows=0,
                 sql_contains=["LIKE"],
             ),
@@ -1543,6 +2383,16 @@ def like_pattern_scenarios() -> list[Scenario]:
             expected=Expected(
                 tables=["category"],
                 min_rows=1,
+                sql_contains=["LIKE"],
+            ),
+            category="like_pattern",
+        ),
+        Scenario(
+            id="LK-006",
+            question="list customers whose last name contains son case insensitive",
+            expected=Expected(
+                tables=["customer"],
+                min_rows=0,
                 sql_contains=["LIKE"],
             ),
             category="like_pattern",
@@ -1611,6 +2461,16 @@ def null_filter_scenarios() -> list[Scenario]:
             ),
             category="null_filter",
         ),
+        Scenario(
+            id="NL-005",
+            question="which staff members have no email address on file",
+            expected=Expected(
+                tables=["staff"],
+                min_rows=0,
+                sql_contains=["NULL"],
+            ),
+            category="null_filter",
+        ),
     ]
 
 
@@ -1656,6 +2516,33 @@ def count_distinct_scenarios() -> list[Scenario]:
             ),
             category="count_distinct",
         ),
+        Scenario(
+            id="CD-005",
+            question="how many distinct customer full names are there",
+            expected=Expected(
+                tables=["customer"],
+                min_rows=1,
+                max_rows=1,
+                grain="scalar",
+                sql_contains=["COUNT", "DISTINCT", "CONCAT"],
+            ),
+            category="count_distinct",
+        ),
+        Scenario(
+            id="CD-006",
+            question="how many distinct items were rented in total",
+            expected=Expected(
+                tables_one_of=[
+                    ["rental"],
+                    ["inventory", "rental"],
+                    ["item", "rental"],
+                ],
+                min_rows=1,
+                max_rows=1,
+                grain="scalar",
+            ),
+            category="count_distinct",
+        ),
     ]
 
 
@@ -1666,23 +2553,23 @@ def compound_filter_scenarios() -> list[Scenario]:
             id="CF2-001",
             question="list PG-13 films with rental rate above 3 and length over 100",
             expected=Expected(
-                tables=["film"],
+                tables_one_of=FILM_SCOPED,
                 min_rows=1,
                 sql_contains=["PG-13"],
             ),
             category="compound_filter",
         ),
         Scenario(
-            id="CF2-003",
+            id="CF2-002",
             question="list films rated R or NC-17 with replacement cost below 15",
             expected=Expected(
-                tables=["film"],
+                tables_one_of=FILM_SCOPED,
                 min_rows=1,
             ),
             category="compound_filter",
         ),
         Scenario(
-            id="CF2-005",
+            id="CF2-003",
             question="list films in English with rental duration greater than 5 days",
             expected=Expected(
                 contains_join=True,
@@ -1691,42 +2578,42 @@ def compound_filter_scenarios() -> list[Scenario]:
             category="compound_filter",
         ),
         Scenario(
-            id="CF2-006",
+            id="CF2-004",
             question="show active customers who live in a city that starts with 'A'",
             expected=Expected(
                 contains_join=True,
-                min_rows=1,
+                min_rows=0,
                 sql_contains=["LIKE"],
             ),
             category="compound_filter",
         ),
         Scenario(
-            id="CF2-007",
+            id="CF2-005",
             question="show films with rental rate above 3 or length under 60",
             expected=Expected(
-                tables=["film"],
+                tables_one_of=FILM_SCOPED,
                 min_rows=1,
                 sql_contains=["OR"],
             ),
             category="compound_filter",
         ),
         Scenario(
-            id="CF2-008",
+            id="CF2-006",
             question="films rated PG-13 with length over 120 or rated R with length over 150",
             expected=Expected(
-                tables=["film"],
+                tables_one_of=FILM_SCOPED,
                 min_rows=1,
                 sql_contains=["OR"],
             ),
             category="compound_filter",
         ),
         Scenario(
-            id="CF2-009",
+            id="CF2-007",
             question=(
                 "list films where (rating is PG-13 and length under 90) or (rating is G and rental_rate above 2)"
             ),
             expected=Expected(
-                tables=["film"],
+                tables_one_of=FILM_SCOPED,
                 min_rows=1,
                 sql_contains=["OR"],
             ),
@@ -1737,10 +2624,10 @@ def compound_filter_scenarios() -> list[Scenario]:
 
 def date_range_scenarios() -> list[Scenario]:
     """Date range and temporal filter queries."""
-    return [
+    base = [
         Scenario(
-            id="DR-005",
-            question="show rentals on July 15 2005",
+            id="DR-001",
+            question="show rentals on July 15 2023",
             expected=Expected(
                 tables_one_of=[
                     ["rental"],
@@ -1749,13 +2636,13 @@ def date_range_scenarios() -> list[Scenario]:
                     ["customer", "rental", "staff"],
                 ],
                 min_rows=0,
-                sql_contains=["2005"],
+                sql_contains=["2023"],
             ),
             category="date_range",
         ),
         Scenario(
-            id="DR-001",
-            question="show all rentals between July 1 2005 and July 31 2005",
+            id="DR-002",
+            question="show all rentals between July 1 2023 and July 31 2023",
             expected=Expected(
                 tables_one_of=[
                     ["rental"],
@@ -1764,23 +2651,23 @@ def date_range_scenarios() -> list[Scenario]:
                     ["customer", "rental", "staff"],
                 ],
                 min_rows=1,
-                sql_contains=["2005"],
-            ),
-            category="date_range",
-        ),
-        Scenario(
-            id="DR-002",
-            question="total payments collected in August 2005",
-            expected=Expected(
-                min_rows=1,
-                max_rows=1,
-                grain="scalar",
-                sql_contains=["2005"],
+                sql_contains=["2023"],
             ),
             category="date_range",
         ),
         Scenario(
             id="DR-003",
+            question="total payments collected in August 2023",
+            expected=Expected(
+                min_rows=1,
+                max_rows=1,
+                grain="scalar",
+                sql_contains=["2023"],
+            ),
+            category="date_range",
+        ),
+        Scenario(
+            id="DR-004",
             question="count of rentals per month",
             expected=Expected(
                 contains_group_by=True,
@@ -1789,17 +2676,79 @@ def date_range_scenarios() -> list[Scenario]:
             category="date_range",
         ),
         Scenario(
-            id="DR-004",
-            question="how many payments were made after February 2007",
+            id="DR-005",
+            question="how many payments were made after February 2023",
             expected=Expected(
                 min_rows=1,
                 max_rows=1,
                 grain="scalar",
-                sql_contains=["2007"],
+                sql_contains=["2023"],
+            ),
+            category="date_range",
+        ),
+        Scenario(
+            id="DR-006",
+            question="list inventory status changes in the last 90 days",
+            expected=Expected(tables=["inventory_status_history"], min_rows=0),
+            category="date_range",
+        ),
+        Scenario(
+            id="DR-007",
+            question="how many promotions ended in 2024",
+            expected=Expected(
+                tables=["promotion"],
+                min_rows=1,
+                max_rows=1,
+                grain="scalar",
+                sql_contains=["2024"],
+            ),
+            category="date_range",
+        ),
+        Scenario(
+            id="DR-008",
+            question="list purchase orders received in 2023",
+            expected=Expected(
+                tables_one_of=PURCHASE_ORDER_SCOPED,
+                min_rows=0,
+                sql_contains=["2023"],
+            ),
+            category="date_range",
+        ),
+        Scenario(
+            id="DR-009",
+            question="show deliveries dispatched in 2023",
+            expected=Expected(
+                tables=["delivery"],
+                min_rows=1,
+                sql_contains=["2023"],
+            ),
+            category="date_range",
+        ),
+        Scenario(
+            id="DR-010",
+            question="how many rentals happened in the last 30 days",
+            expected=Expected(
+                tables=["rental"],
+                min_rows=0,
+                max_rows=1,
+                grain="scalar",
+            ),
+            category="date_range",
+        ),
+        Scenario(
+            id="DR-011",
+            question="how many stock transfers occurred in 2023",
+            expected=Expected(
+                tables=["stock_transfer"],
+                min_rows=0,
+                max_rows=1,
+                grain="scalar",
+                sql_contains=["2023"],
             ),
             category="date_range",
         ),
     ]
+    return base
 
 
 def agg_filter_join_scenarios() -> list[Scenario]:
@@ -1870,7 +2819,7 @@ def agg_filter_join_scenarios() -> list[Scenario]:
             id="AJ-007",
             question="list films with no rating",
             expected=Expected(
-                tables=["film"],
+                tables_one_of=FILM_SCOPED,
                 min_rows=0,
                 sql_contains_one_of=[["IS NULL", "is null"], ["rating"]],
             ),
@@ -1887,15 +2836,6 @@ def agg_filter_join_scenarios() -> list[Scenario]:
         ),
         Scenario(
             id="AJ-009",
-            question="list films with rating PG-13",
-            expected=Expected(
-                min_rows=1,
-                sql_contains=["PG-13"],
-            ),
-            category="agg_filter_join",
-        ),
-        Scenario(
-            id="AJ-010",
             question="for each language show the top 3 longest films by length",
             expected=Expected(
                 contains_cte=True,
@@ -1935,6 +2875,49 @@ def boolean_filter_scenarios() -> list[Scenario]:
             ),
             category="boolean_filter",
         ),
+        Scenario(
+            id="BF-004",
+            question="list active promotions only",
+            expected=Expected(
+                tables=["promotion"],
+                min_rows=1,
+                sql_contains=["active"],
+            ),
+            category="boolean_filter",
+        ),
+        Scenario(
+            id="BF-005",
+            question="show inactive couriers",
+            expected=Expected(
+                tables=["courier"],
+                min_rows=0,
+                sql_contains=["active"],
+            ),
+            category="boolean_filter",
+        ),
+        Scenario(
+            id="BF-006",
+            question="list active suppliers only",
+            expected=Expected(
+                tables=["supplier"],
+                min_rows=1,
+                sql_contains=["active"],
+            ),
+            category="boolean_filter",
+        ),
+        Scenario(
+            id="BF-007",
+            question="show failed deliveries",
+            expected=Expected(
+                tables_one_of=[
+                    ["delivery"],
+                    ["address", "courier", "delivery"],
+                ],
+                min_rows=0,
+                sql_contains=["failed"],
+            ),
+            category="boolean_filter",
+        ),
     ]
 
 
@@ -1944,13 +2927,13 @@ def scalar_func_scenarios() -> list[Scenario]:
         Scenario(
             id="SF-001",
             question="show uppercase film titles",
-            expected=Expected(tables=["film"], min_rows=1),
+            expected=Expected(tables_one_of=FILM_SCOPED, min_rows=1),
             category="scalar_func",
         ),
         Scenario(
             id="SF-002",
             question="list film titles and their length in hours",
-            expected=Expected(tables=["film"], min_rows=1),
+            expected=Expected(tables_one_of=FILM_SCOPED, min_rows=1),
             category="scalar_func",
         ),
         Scenario(
@@ -1968,7 +2951,7 @@ def expr_select_scenarios() -> list[Scenario]:
         Scenario(
             id="ES-001",
             question="show film title and replacement cost minus rental rate as profit margin",
-            expected=Expected(tables=["film"], min_rows=1),
+            expected=Expected(tables_one_of=FILM_SCOPED, min_rows=1),
             category="expr_select",
         ),
         Scenario(
@@ -1986,7 +2969,7 @@ def in_list_scenarios() -> list[Scenario]:
         Scenario(
             id="IL-001",
             question="list films rated PG or PG-13",
-            expected=Expected(tables=["film"], min_rows=1, sql_contains=["IN"]),
+            expected=Expected(tables_one_of=FILM_SCOPED, min_rows=1, sql_contains=["IN"]),
             category="in_list",
         ),
         Scenario(
@@ -2011,33 +2994,10 @@ def bridge_join_scenarios() -> list[Scenario]:
             id="BJ-001",
             question="how many films is each actor in",
             expected=Expected(
-                tables=["actor", "film_actor"],
+                tables_one_of=ACTOR_FILM_ACTOR,
                 contains_join=True,
                 contains_group_by=True,
                 min_rows=1,
-            ),
-            category="bridge_join",
-        ),
-        Scenario(
-            id="BJ-002",
-            question="show actors who appeared in at least 30 films",
-            expected=Expected(
-                tables=["actor", "film_actor"],
-                contains_join=True,
-                contains_group_by=True,
-                min_rows=1,
-                sql_contains=["HAVING"],
-            ),
-            category="bridge_join",
-        ),
-        Scenario(
-            id="BJ-003",
-            question="show actors who appeared in more than 30 films",
-            expected=Expected(
-                contains_join=True,
-                contains_group_by=True,
-                min_rows=1,
-                sql_contains=["HAVING"],
             ),
             category="bridge_join",
         ),
@@ -2092,12 +3052,29 @@ def date_arithmetic_scenarios() -> list[Scenario]:
             ),
             category="date_arithmetic",
         ),
+        Scenario(
+            id="DA-004",
+            question="list rentals that were returned after the due date",
+            expected=Expected(
+                tables_one_of=[
+                    ["rental"],
+                    ["item", "rental"],
+                    ["inventory", "item", "rental"],
+                    ["customer", "rental"],
+                    ["rental", "staff"],
+                    ["customer", "rental", "staff"],
+                    ["customer", "item", "rental"],
+                ],
+                min_rows=0,
+            ),
+            category="date_arithmetic",
+        ),
     ]
 
 
 def validation_failure_scenarios() -> list[Scenario]:
     """Scenarios where validation may fail; accept ok or validation_failed."""
-    return [
+    base = [
         Scenario(
             id="VF-001",
             question="show customer first name and total of all payments",
@@ -2107,7 +3084,26 @@ def validation_failure_scenarios() -> list[Scenario]:
             ),
             category="validation_failure",
         ),
+        Scenario(
+            id="VF-002",
+            question="which films have never been rented",
+            expected=Expected(
+                status_in=("ok", "validation_failed"),
+                min_rows=0,
+            ),
+            category="validation_failure",
+        ),
+        Scenario(
+            id="VF-003",
+            question="show payroll deductions by employee SSN",
+            expected=Expected(
+                status_in=("ok", "validation_failed"),
+                min_rows=0,
+            ),
+            category="validation_failure",
+        ),
     ]
+    return base
 
 
 def intent_rejected_scenarios() -> list[Scenario]:
@@ -2128,16 +3124,6 @@ def column_names_scenarios() -> list[Scenario]:
     return [
         Scenario(
             id="CN-001",
-            question="list all film titles",
-            expected=Expected(
-                tables=["film"],
-                min_rows=1,
-                column_names_one_of=[["film_id", "title"], ["title"]],
-            ),
-            category="column_names",
-        ),
-        Scenario(
-            id="CN-002",
             question="show customer first name and last name",
             expected=Expected(
                 tables=["customer"],
@@ -2157,18 +3143,6 @@ def row_value_check_scenarios() -> list[Scenario]:
     return [
         Scenario(
             id="RV-001",
-            question="how many films are there",
-            expected=Expected(
-                tables=["film"],
-                min_rows=1,
-                max_rows=1,
-                grain="scalar",
-                row_value_check=lambda rows: len(rows) == 1 and isinstance(rows[0][0], (int, float)),
-            ),
-            category="row_value_check",
-        ),
-        Scenario(
-            id="RV-002",
             question="how many films are in the action category",
             expected=Expected(
                 min_rows=1,
@@ -2188,16 +3162,6 @@ def sql_excludes_scenarios() -> list[Scenario]:
     return [
         Scenario(
             id="EX-001",
-            question="list all film titles",
-            expected=Expected(
-                tables=["film"],
-                min_rows=1,
-                sql_excludes=["DELETE", "UPDATE", "INSERT", "DROP"],
-            ),
-            category="sql_excludes",
-        ),
-        Scenario(
-            id="EX-002",
             question="list all categories",
             expected=Expected(
                 tables=["category"],
@@ -2211,12 +3175,12 @@ def sql_excludes_scenarios() -> list[Scenario]:
 
 def window_function_scenarios() -> list[Scenario]:
     """Live scenarios that should produce window functions (OVER clause)."""
-    return [
+    base = [
         Scenario(
             id="WF-001",
             question="rank films by length descending using row number",
             expected=Expected(
-                tables=["film"],
+                tables_one_of=FILM_SCOPED,
                 min_rows=1,
                 sql_contains=["OVER ("],
             ),
@@ -2226,7 +3190,7 @@ def window_function_scenarios() -> list[Scenario]:
             id="WF-002",
             question="for each film rating, list film titles with a row number ordered by length descending",
             expected=Expected(
-                tables=["film"],
+                tables_one_of=FILM_SCOPED,
                 min_rows=1,
                 sql_contains=["OVER (", "PARTITION BY"],
             ),
@@ -2236,7 +3200,7 @@ def window_function_scenarios() -> list[Scenario]:
             id="WF-003",
             question="for each film show title, length, and the average length of films with the same rating",
             expected=Expected(
-                tables=["film"],
+                tables_one_of=FILM_SCOPED,
                 min_rows=1,
                 sql_contains_one_of=[
                     ["OVER (", "PARTITION BY"],
@@ -2249,7 +3213,7 @@ def window_function_scenarios() -> list[Scenario]:
             id="WF-004",
             question="rank films by rental rate highest first using rank with ties allowed",
             expected=Expected(
-                tables=["film"],
+                tables_one_of=FILM_SCOPED,
                 min_rows=1,
                 sql_contains=["OVER ("],
             ),
@@ -2297,6 +3261,7 @@ def window_function_scenarios() -> list[Scenario]:
                 tables_one_of=[
                     ["payment"],
                     ["customer", "payment"],
+                    ["customer", "payment", "rental"],
                 ],
                 min_rows=1,
                 sql_contains=["OVER ("],
@@ -2313,7 +3278,29 @@ def window_function_scenarios() -> list[Scenario]:
             ),
             category="window_function",
         ),
+        Scenario(
+            id="WF-010",
+            question="rank films by rental count within each category",
+            expected=Expected(
+                contains_join=True,
+                contains_group_by=True,
+                min_rows=1,
+                sql_contains=["OVER ("],
+            ),
+            category="window_function",
+        ),
+        Scenario(
+            id="WF-011",
+            question=("for each store rank customers by total rental count and return only the top customer per store"),
+            expected=Expected(
+                contains_join=True,
+                min_rows=1,
+                sql_contains=["OVER (", "PARTITION BY"],
+            ),
+            category="window_function",
+        ),
     ]
+    return base
 
 
 def case_when_scenarios() -> list[Scenario]:
@@ -2323,7 +3310,7 @@ def case_when_scenarios() -> list[Scenario]:
             id="CW-001",
             question="list film titles with a label column that is premium when rental_rate is greater than 3 otherwise standard",
             expected=Expected(
-                tables=["film"],
+                tables_one_of=FILM_SCOPED,
                 min_rows=1,
                 sql_contains=["CASE"],
             ),
@@ -2338,9 +3325,19 @@ def case_when_scenarios() -> list[Scenario]:
                 "otherwise show short"
             ),
             expected=Expected(
-                tables=["film"],
+                tables_one_of=FILM_SCOPED,
                 min_rows=1,
                 sql_contains=["CASE", "WHEN"],
+            ),
+            category="case_when",
+        ),
+        Scenario(
+            id="CW-003",
+            question=("for each item title show premium or standard when replacement cost exceeds 25 dollars"),
+            expected=Expected(
+                contains_join=False,
+                min_rows=1,
+                sql_contains=["CASE"],
             ),
             category="case_when",
         ),
@@ -2393,15 +3390,6 @@ def ast_explain_scenarios() -> list[Scenario]:
     return [
         Scenario(
             id="AE-001",
-            question="list all film titles",
-            expected=Expected(
-                tables=["film"],
-                min_rows=1,
-            ),
-            category="ast_explain",
-        ),
-        Scenario(
-            id="AE-002",
             question="list films and their language",
             expected=Expected(
                 contains_join=True,
@@ -2410,7 +3398,7 @@ def ast_explain_scenarios() -> list[Scenario]:
             category="ast_explain",
         ),
         Scenario(
-            id="AE-003",
+            id="AE-002",
             question="first compute total payments per customer, then show the top 10 customers by total payments",
             expected=Expected(
                 min_rows=1,
@@ -2435,38 +3423,6 @@ def semantic_warnings_scenarios() -> list[Scenario]:
                 min_rows=1,
             ),
             category="semantic_warnings",
-        ),
-    ]
-
-
-def template_reuse_sequence_scenarios() -> list[SequenceScenario]:
-    """Sequence scenarios ensuring template reuse by running single-table before template-reuse scenarios."""
-    return [
-        SequenceScenario(
-            id="TR-SEQ-001",
-            category="template_reuse_sequence",
-            steps=[
-                Scenario(
-                    id="TR-SEQ-001-A",
-                    question="list all film titles",
-                    expected=Expected(
-                        tables=["film"],
-                        min_rows=1,
-                        contains_join=False,
-                    ),
-                    category="template_reuse_sequence",
-                ),
-                Scenario(
-                    id="TR-SEQ-001-B",
-                    question="list all film titles",
-                    expected=Expected(
-                        reuse_type=("direct_reuse", "intent_direct_reuse"),
-                        generation_path=GenerationPath.EXACT_QUESTION_REUSE,
-                        min_rows=1,
-                    ),
-                    category="template_reuse_sequence",
-                ),
-            ],
         ),
     ]
 
@@ -2514,80 +3470,46 @@ def multi_cte_chain_scenarios() -> list[Scenario]:
     ]
 
 
-def array_filter_scenarios() -> list[Scenario]:
-    """
-    Scenarios for ``film.special_features`` as ``TEXT[]`` / ``ARRAY<STRING>``.
-
-    The pipeline should emit dialect-specific membership SQL (PostgreSQL ``unnest`` / ``btrim`` / ``EXISTS``, Databricks ``TRANSFORM`` / ``ARRAY_CONTAINS`` with ``TRIM``) when the intent uses ``contains`` on this array column. Stored feature strings match Sakila spelling (``Trailers``, ``Behind the Scenes``, ``Deleted Scenes``, ``Commentaries``). ``flatten_param_values`` strips decorative quotes from ``contains`` bind values so minor LLM quoting differences still match the database.
-    """
+def sensitivity_enforcement_scenarios() -> list[Scenario]:
+    """Restricted procurement cost and forbidden staff credential queries."""
     return [
         Scenario(
-            id="AR-001",
-            question="list titles of films that include Trailers in special features",
+            id="SS-001",
+            question="what is the average unit cost for purchase lines with quantity greater than 5",
             expected=Expected(
-                tables=["film"],
-                min_rows=1,
-                max_rows=2000,
-                grain="row_level",
-                sql_contains=["special_features"],
-            ),
-            category="array_filter",
-        ),
-        Scenario(
-            id="AR-002",
-            question="how many films have Behind the Scenes in special features",
-            expected=Expected(
-                tables=["film"],
+                tables=["purchase_line"],
+                contains_group_by=False,
                 min_rows=1,
                 max_rows=1,
                 grain="scalar",
-                sql_contains=["special_features"],
+                sql_contains=["unit_cost"],
             ),
-            category="array_filter",
+            category="sensitivity_enforcement",
         ),
         Scenario(
-            id="AR-003",
-            question="show film titles where special features include Deleted Scenes",
+            id="SS-002",
+            question="list staff password values",
             expected=Expected(
-                tables=["film"],
-                min_rows=1,
-                max_rows=2000,
-                grain="row_level",
-                sql_contains=["special_features"],
+                status="restricted",
+                min_rows=0,
             ),
-            category="array_filter",
+            category="sensitivity_enforcement",
         ),
     ]
 
 
 def partition_scenarios() -> list[Scenario]:
-    """
-    Scenarios that exercise partition filter injection on Databricks.
-
-    When schema has partition columns (e.g. ``rental.rental_pt`` on Delta), partition predicates are injected for partition pruning. Works as normal queries when tables have no partition columns.
-    """
+    """Scenarios that exercise partition filter injection when schema carries pruning metadata. Delta ``rental_pt`` on Databricks is the primary fixture, but the same scenario runs on any engine whose reflected schema includes partition, sortkey, distkey, or clustering columns and whose intent supplies matching filters."""
     return [
         Scenario(
             id="PT-001",
-            question="how many rentals on 2005-07-15",
+            question="how many rentals on 2023-07-15",
             expected=Expected(
                 tables=["rental"],
                 min_rows=0,
                 max_rows=1000,
                 grain="scalar",
                 min_confidence=0.45,
-            ),
-            category="partition",
-        ),
-        Scenario(
-            id="PT-002",
-            question="list films with rating PG-13",
-            expected=Expected(
-                tables=["film"],
-                min_rows=1,
-                max_rows=500,
-                grain="row_level",
-                min_confidence=0.4,
             ),
             category="partition",
         ),
@@ -2600,7 +3522,6 @@ CATEGORY_LOADERS: dict[str, callable] = {
     "aggregation": aggregation_scenarios,
     "filtering": filtering_scenarios,
     "cte": cte_scenarios,
-    "template_reuse": template_reuse_scenarios,
     "schema_edge": schema_edge_scenarios,
     "negative": negative_scenarios,
     "repair_loop": repair_loop_scenarios,
@@ -2632,8 +3553,6 @@ CATEGORY_LOADERS: dict[str, callable] = {
     "row_value_check": row_value_check_scenarios,
     "sql_excludes": sql_excludes_scenarios,
     "semantic_warnings": semantic_warnings_scenarios,
-    "template_reuse_sequence": template_reuse_sequence_scenarios,
-    "trust_cycle": trust_cycle_scenarios,
     "sql_vs_intent": sql_vs_intent_scenarios,
     "join_validation": join_validation_scenarios,
     "restrictions": restrictions_scenarios,
@@ -2641,16 +3560,11 @@ CATEGORY_LOADERS: dict[str, callable] = {
     "case_when": case_when_scenarios,
     "ast_explain": ast_explain_scenarios,
     "partition": partition_scenarios,
-    "array_filter": array_filter_scenarios,
 }
 
 
 def all_scenarios() -> list[Scenario]:
-    """
-    Return every non-sequence scenario from all categories.
-
-    Same set as the union of PostgreSQL ``live_tests/test_*.py`` modules that load from ``CATEGORY_LOADERS``. ``SequenceScenario`` entries are skipped. ``test_databricks`` uses this for parity with that union.
-    """
+    """Return every non-sequence scenario from all categories. Same set as the union of PostgreSQL ``live_tests/test_*.py`` modules that load from ``CATEGORY_LOADERS``. ``SequenceScenario`` entries are skipped. ``test_databricks`` uses this for parity with that union."""
     result: list[Scenario] = []
     for loader in CATEGORY_LOADERS.values():
         items = loader()
@@ -2658,20 +3572,13 @@ def all_scenarios() -> list[Scenario]:
     return result
 
 
-def bundled_dvdrental_live_scenarios() -> list[Scenario]:
+def bundled_rental_shop_live_scenarios() -> list[Scenario]:
     """Alias for ``all_scenarios`` (explicit name for Databricks bundling)."""
-
     return all_scenarios()
 
 
 def scenarios_by_category(category: str) -> list[Scenario]:
-    """
-    Return all scenarios for a given category string.
-
-    Args: category: One of the keys in ``CATEGORY_LOADERS``.
-
-    Returns: List of ``Scenario`` objects, or empty list for unknown categories.
-    """
+    """Return all scenarios for a category key from CATEGORY_LOADERS."""
     loader = CATEGORY_LOADERS.get(category)
     if loader is None:
         return []

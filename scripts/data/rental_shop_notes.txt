@@ -1,0 +1,9 @@
+The Rental Shop inventory system tracks films, books, and games through a unified catalog. Every media entry is represented by a central item record that contains common attributes like title, description, release year, and language. Specific details for each media type are stored in dedicated tables for films, books, and games. For films, we track physical length and ratings, while additional features like trailers or deleted scenes are managed as separate line items rather than being embedded in the main record.
+
+Rental tracking is based on strict date semantics. The rental date marks when an item was checked out, while the return date indicates when it was received back. If no return date is recorded, the item is still with the customer. Items have a defined rental duration in days; a rental is considered overdue if it hasn't been returned and the allowed duration has passed since the checkout date.
+
+Inventory is managed at the store level, where each record represents a specific physical copy of an item at a particular location. Status history allows us to track whether a copy is available, currently rented, undergoing repair, or lost. Payments are directly associated with these rental transactions.
+
+Our customer database includes contact information and employment status for staff members. We maintain strict privacy controls: sensitive staff credentials like passwords and social security numbers are completely hidden from the system and must never be included in any analysis or output.
+
+The system also handles advance reservations, damage reporting for returned items, and optional delivery services through various courier partners. Procurement and stock transfers between stores and warehouses ensure that inventory levels remain balanced. Promotions and loyalty rewards are applied to rentals using specific redemption codes and types like clearance or member specials.

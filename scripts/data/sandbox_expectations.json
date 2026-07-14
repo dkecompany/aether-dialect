@@ -1,0 +1,1712 @@
+{
+  "version": 1,
+  "slots": [
+    {
+      "slot_id": "owner_writer:default:questions:How many items are in the catalog by item type?",
+      "question": "How many items are in the catalog by item type?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:How many books do we have?",
+      "question": "How many books do we have?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:How many games are in the catalog?",
+      "question": "How many games are in the catalog?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:Which films include trailers?",
+      "question": "Which films include trailers?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:Which games support English?",
+      "question": "Which games support English?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [
+          "game_supported_language"
+        ],
+        "forbidden_sql_tokens": [],
+        "contains_join": true
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:How many open reservations are there?",
+      "question": "How many open reservations are there?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:Show active staff at each store.",
+      "question": "Show active staff at each store.",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:How many rentals happened in 2025?",
+      "question": "How many rentals happened in 2025?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:Who are our top 5 customers by total payment?",
+      "question": "Who are our top 5 customers by total payment?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:Rank films by rental count within each category.",
+      "question": "Rank films by rental count within each category.",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:What is the total delivery fee by courier?",
+      "question": "What is the total delivery fee by courier?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:What is the count of pending reservations by store?",
+      "question": "What is the count of pending reservations by store?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:What's the weather today?",
+      "question": "What's the weather today?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "invalid_question",
+        "sql_required": false,
+        "grain": "none",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": []
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:What is the best pizza topping?",
+      "question": "What is the best pizza topping?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "invalid_question",
+        "sql_required": false,
+        "grain": "none",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": []
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:List all store locations by city.",
+      "question": "List all store locations by city.",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:What is the average rental duration?",
+      "question": "What is the average rental duration?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:Which films have the highest replacement cost?",
+      "question": "Which films have the highest replacement cost?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:How many actors are in the database?",
+      "question": "How many actors are in the database?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:What are the film ratings available?",
+      "question": "What are the film ratings available?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:Which staff members work at store 1?",
+      "question": "Which staff members work at store 1?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:List customers who have never rented an item.",
+      "question": "List customers who have never rented an item.",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:What is the total revenue by store?",
+      "question": "What is the total revenue by store?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:How many films are in the Horror category?",
+      "question": "How many films are in the Horror category?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:Which languages are available?",
+      "question": "Which languages are available?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:Which city has the most customers?",
+      "question": "Which city has the most customers?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [
+          "city",
+          "customer"
+        ],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": true
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:How many customers are in each country?",
+      "question": "How many customers are in each country?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [
+          "country",
+          "customer"
+        ],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": true
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:Which actors appear in the most films?",
+      "question": "Which actors appear in the most films?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:Which actors have the most film credits?",
+      "question": "Which actors have the most film credits?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:Which films are in the Horror category?",
+      "question": "Which films are in the Horror category?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:What is the average payment amount?",
+      "question": "What is the average payment amount?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:How many rentals are currently overdue?",
+      "question": "How many rentals are currently overdue?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:List films released in 2006.",
+      "question": "List films released in 2006.",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:Which author has the most books?",
+      "question": "Which author has the most books?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:How many inventory items does each store have?",
+      "question": "How many inventory items does each store have?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:List publishers with more than five books.",
+      "question": "List publishers with more than five books.",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:Show purchase orders still open by supplier.",
+      "question": "Show purchase orders still open by supplier.",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:How many damage reports are open?",
+      "question": "How many damage reports are open?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:List inventory status changes in the last 90 days.",
+      "question": "List inventory status changes in the last 90 days.",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:Which warehouse holds the most stock?",
+      "question": "Which warehouse holds the most stock?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:List promotion redemptions by promotion name.",
+      "question": "List promotion redemptions by promotion name.",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:Show delivery status counts by courier.",
+      "question": "Show delivery status counts by courier.",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:List stock transfers between warehouses this year.",
+      "question": "List stock transfers between warehouses this year.",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:Which suppliers have the most purchase lines?",
+      "question": "Which suppliers have the most purchase lines?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:questions:What is the average page count by publisher?",
+      "question": "What is the average page count by publisher?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:validation_failures:Show payroll deductions by employee SSN.",
+      "question": "Show payroll deductions by employee SSN.",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "validation_failures",
+      "expect": {
+        "terminal_status": "error",
+        "sql_required": false,
+        "grain": "none",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "validation_failure": true
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:validation_failures:Show me all staff salaries.",
+      "question": "Show me all staff salaries.",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "validation_failures",
+      "expect": {
+        "terminal_status": "error",
+        "sql_required": false,
+        "grain": "none",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "validation_failure": true
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:validation_failures:How many rentals happened on 2025-01-01?",
+      "question": "How many rentals happened on 2025-01-01?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "validation_failures",
+      "expect": {
+        "terminal_status": "error",
+        "sql_required": false,
+        "grain": "none",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "validation_failure": true
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:validation_failures:How many rentals were made in total?",
+      "question": "How many rentals were made in total?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "validation_failures",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [
+          "film"
+        ],
+        "must_filter": [],
+        "sql_contains": [
+          "item_id"
+        ],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:How many items are in the catalog by item type?",
+      "question": "How many items are in the catalog by item type?",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:How many books do we have?",
+      "question": "How many books do we have?",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:How many games are in the catalog?",
+      "question": "How many games are in the catalog?",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:Which films include trailers?",
+      "question": "Which films include trailers?",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:Which games support English?",
+      "question": "Which games support English?",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [
+          "game_supported_language"
+        ],
+        "forbidden_sql_tokens": [],
+        "contains_join": true
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:How many open reservations are there?",
+      "question": "How many open reservations are there?",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:Show active staff at each store.",
+      "question": "Show active staff at each store.",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:How many rentals happened in 2025?",
+      "question": "How many rentals happened in 2025?",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:Who are our top 5 customers by total payment?",
+      "question": "Who are our top 5 customers by total payment?",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:Rank films by rental count within each category.",
+      "question": "Rank films by rental count within each category.",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:What is the total delivery fee by courier?",
+      "question": "What is the total delivery fee by courier?",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:What is the count of pending reservations by store?",
+      "question": "What is the count of pending reservations by store?",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:What's the weather today?",
+      "question": "What's the weather today?",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "invalid_question",
+        "sql_required": false,
+        "grain": "none",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": []
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:What is the best pizza topping?",
+      "question": "What is the best pizza topping?",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "invalid_question",
+        "sql_required": false,
+        "grain": "none",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": []
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:List all store locations by city.",
+      "question": "List all store locations by city.",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:What is the average rental duration?",
+      "question": "What is the average rental duration?",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:Which films have the highest replacement cost?",
+      "question": "Which films have the highest replacement cost?",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:How many actors are in the database?",
+      "question": "How many actors are in the database?",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:What are the film ratings available?",
+      "question": "What are the film ratings available?",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:Which staff members work at store 1?",
+      "question": "Which staff members work at store 1?",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:List customers who have never rented an item.",
+      "question": "List customers who have never rented an item.",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:What is the total revenue by store?",
+      "question": "What is the total revenue by store?",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:How many films are in the Horror category?",
+      "question": "How many films are in the Horror category?",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:Which languages are available?",
+      "question": "Which languages are available?",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:Which city has the most customers?",
+      "question": "Which city has the most customers?",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [
+          "city",
+          "customer"
+        ],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": true
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:How many customers are in each country?",
+      "question": "How many customers are in each country?",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [
+          "country",
+          "customer"
+        ],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": true
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:Which actors appear in the most films?",
+      "question": "Which actors appear in the most films?",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:Which actors have the most film credits?",
+      "question": "Which actors have the most film credits?",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:Which films are in the Horror category?",
+      "question": "Which films are in the Horror category?",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:What is the average payment amount?",
+      "question": "What is the average payment amount?",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:How many rentals are currently overdue?",
+      "question": "How many rentals are currently overdue?",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:List films released in 2006.",
+      "question": "List films released in 2006.",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:Which author has the most books?",
+      "question": "Which author has the most books?",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:How many inventory items does each store have?",
+      "question": "How many inventory items does each store have?",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:List publishers with more than five books.",
+      "question": "List publishers with more than five books.",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:Show purchase orders still open by supplier.",
+      "question": "Show purchase orders still open by supplier.",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:How many damage reports are open?",
+      "question": "How many damage reports are open?",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:List inventory status changes in the last 90 days.",
+      "question": "List inventory status changes in the last 90 days.",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:Which warehouse holds the most stock?",
+      "question": "Which warehouse holds the most stock?",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:List promotion redemptions by promotion name.",
+      "question": "List promotion redemptions by promotion name.",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:Show delivery status counts by courier.",
+      "question": "Show delivery status counts by courier.",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:List stock transfers between warehouses this year.",
+      "question": "List stock transfers between warehouses this year.",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:Which suppliers have the most purchase lines?",
+      "question": "Which suppliers have the most purchase lines?",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "consumer_reader:reader:consumer_reader:What is the average page count by publisher?",
+      "question": "What is the average page count by publisher?",
+      "kind": "question",
+      "profile": "consumer_reader",
+      "mode": "reader",
+      "tier": "consumer_reader",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "feedback:The intent is wrong, count distinct films only.",
+      "question": "The intent is wrong, count distinct films only.",
+      "kind": "feedback",
+      "profile": "feedback",
+      "mode": null,
+      "tier": "feedback",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": []
+      }
+    },
+    {
+      "slot_id": "owner_writer:default:spaces:catalog",
+      "question": "catalog",
+      "kind": "space",
+      "profile": "feedback",
+      "mode": null,
+      "tier": "spaces",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [],
+        "must_filter": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    }
+  ]
+}

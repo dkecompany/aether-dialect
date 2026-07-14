@@ -1,25 +1,21 @@
 """Tests for validation_agg module."""
 
 from aetherdialect._contracts_base import (
-    ColumnMetadata,
     ColumnRole,
-    CteOutputColumnMeta,
-    SchemaGraph,
-    TableMetadata,
-)
-from aetherdialect._contracts_core import (
     ExprValue,
     HavingParam,
     MulGroup,
     NormalizedExpr,
     OrderByCol,
-    SelectCol,
 )
-from aetherdialect._validation_agg import (
-    expr_has_arithmetic,
-    expr_result_is_numeric,
-    strip_function_wrappers,
-    term_result_is_numeric,
+from aetherdialect._contracts_core import SelectCol
+from aetherdialect._contracts_schema import (
+    ColumnMetadata,
+    CteOutputColumnMeta,
+    SchemaGraph,
+    TableMetadata,
+)
+from aetherdialect._validation_execute import (
     validate_column_types,
     validate_having_agg_per_role,
     validate_order_by_agg_per_role,
@@ -30,6 +26,10 @@ from aetherdialect._validation_agg import (
     validate_select_agg_per_role,
     validate_select_agg_semantics,
     validate_temporal_columns,
+)
+from aetherdialect._validation_schema import (
+    expr_has_arithmetic,
+    expr_result_is_numeric,
 )
 
 
@@ -957,106 +957,6 @@ class TestValidateScalarExpressionSemantics:
             ),
         )
         assert validate_scalar_expression_semantics([sc], typed_schema) == []
-
-
-class TestStripFunctionWrappers:
-    """Tests for strip_function_wrappers."""
-
-    def test_bare_column(self):
-        """Return bare column unchanged."""
-        assert strip_function_wrappers("table1.col1") == "table1.col1"
-
-    def test_single_wrapper(self):
-        """Strip single function wrapper."""
-        assert strip_function_wrappers("UPPER(table1.col1)") == "table1.col1"
-
-    def test_nested_wrappers(self):
-        """Strip nested function wrappers."""
-        assert strip_function_wrappers("ABS(SUM(table1.col1))") == "table1.col1"
-
-    def test_distinct_wrapper(self):
-        """Strip DISTINCT keyword inside wrapper."""
-        assert strip_function_wrappers("COUNT(DISTINCT table1.col1)") == "table1.col1"
-
-    def test_empty_string(self):
-        """Return empty string unchanged."""
-        assert strip_function_wrappers("") == ""
-
-    def test_star(self):
-        """Return star from COUNT(*)."""
-        assert strip_function_wrappers("COUNT(*)") == "*"
-
-    def test_whitespace_inside_parens_stripped(self):
-        """strip_function_wrappers strips inner whitespace."""
-        assert strip_function_wrappers("  ABS(  t.col  )  ") == "t.col"
-
-    def test_nested_scalar_and_agg(self):
-        """Outermost wrapper is peeled until a bare column remains."""
-        assert strip_function_wrappers("ROUND(UPPER(t.col))") == "t.col"
-
-
-class TestTermResultIsNumeric:
-    """Tests for term_result_is_numeric."""
-
-    def test_count_is_numeric(self):
-        """COUNT always returns numeric."""
-        assert term_result_is_numeric("COUNT(t.a)") is True
-
-    def test_sum_is_numeric(self):
-        """SUM always returns numeric."""
-        assert term_result_is_numeric("SUM(t.a)") is True
-
-    def test_avg_is_numeric(self):
-        """AVG always returns numeric."""
-        assert term_result_is_numeric("AVG(t.a)") is True
-
-    def test_abs_is_numeric(self):
-        """ABS always returns numeric."""
-        assert term_result_is_numeric("ABS(t.a)") is True
-
-    def test_round_is_numeric(self):
-        """ROUND always returns numeric."""
-        assert term_result_is_numeric("ROUND(t.a)") is True
-
-    def test_upper_not_numeric(self):
-        """UPPER does not return numeric."""
-        assert term_result_is_numeric("UPPER(t.a)") is False
-
-    def test_bare_column_not_numeric(self):
-        """Bare column is not guaranteed numeric."""
-        assert term_result_is_numeric("t.a") is False
-
-    def test_lower_returns_false(self):
-        """LOWER is not a numeric-result function."""
-        assert term_result_is_numeric("LOWER(t.col)") is False
-
-    def test_nested_numeric(self):
-        """ABS wrapping SUM is numeric."""
-        assert term_result_is_numeric("ABS(SUM(t.a))") is True
-
-    def test_min_not_guaranteed_numeric(self):
-        """MIN returns False - result type depends on column."""
-        assert term_result_is_numeric("MIN(t.amount)") is False
-
-    def test_non_function_pattern_returns_false(self):
-        """Term without function pattern returns False."""
-        assert term_result_is_numeric("plain_column") is False
-
-    def test_count_distinct_is_numeric(self):
-        """COUNT(DISTINCT ...) is still numeric."""
-        assert term_result_is_numeric("COUNT(DISTINCT t.a)") is True
-
-    def test_ceil_is_numeric(self):
-        """CEIL is a numeric-result scalar."""
-        assert term_result_is_numeric("CEIL(t.a)") is True
-
-    def test_whitespace_around_function(self):
-        """Leading whitespace does not break detection."""
-        assert term_result_is_numeric("  SUM( t.a )") is True
-
-    def test_empty_inner_returns_false(self):
-        """SUM() peels to empty and yields False."""
-        assert term_result_is_numeric("SUM()") is False
 
 
 class TestExprResultIsNumeric:

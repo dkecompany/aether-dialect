@@ -4,70 +4,444 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from enum import Enum
-from typing import Any
+from typing import Any, TypeVar
 
 import sqlglot
 from sqlglot import exp
 
-from ._config import NULL_CHECK_OPS, REVERSE_OP_MAP, normalize_value_type
+from ._constants import LITERAL_BEARING_CATEGORIES, NULL_CHECK_OPS, REGISTRY_TOKEN_PATTERN, REVERSE_OP_MAP
 from ._contracts_base import (
-    LITERAL_BEARING_CATEGORIES,
-    FailureCategory,
-    IntentIssue,
-    LogicalIntent,
-    SchemaGraph,
-    make_intent_issue,
-)
-from ._contracts_core import (
-    CaseRegistryStep,
-    CaseWhenBranch,
-    CaseWhenExpr,
-    ConcreteIntent,
     ExprValue,
+    FailureCategory,
     FilterParam,
     HavingParam,
+    LogicalIntent,
     MulGroup,
     NormalizedExpr,
     OrderByCol,
+    coerce_filter_group_list,
+    coerce_having_group_list,
+    expr_registry_ref,
+)
+from ._contracts_core import (
+    ConcreteIntent,
     RuntimeCteStep,
     RuntimeIntent,
     SelectCol,
-    WindowRegistryStep,
     effective_select_parts,
-    expr_registry_ref,
 )
-from ._core_utils import debug, normalize_op, pipeline_trace_lazy, stable_json
+from ._contracts_schema import (
+    CaseRegistryStep,
+    CaseWhenBranch,
+    CaseWhenExpr,
+    ColumnMetadata,
+    IntentIssue,
+    SchemaGraph,
+    WindowRegistryStep,
+    make_intent_issue,
+)
+from ._core_utils import (
+    debug,
+    normalize_op,
+    normalize_value_type,
+    pipeline_trace,
+    stable_json,
+)
 from ._intent_expr import (
     classify_cte_expr,
     concat_logical_intent_prose,
+    derive_cte_output_columns,
+    expr_canonical_key,
     extract_columns_from_expr,
     replace_refs_in_expr,
 )
 from ._intent_repair import (
+    apply_filters_to_main_and_ctes,
     best_descriptive_column,
     cols_from_named_registries,
     cols_from_select_col,
-    infer_cte_output_columns,
 )
 from ._sql_gen import render_expr_sql
 
 
+def _match_enum_value(raw_value: str, col_meta: ColumnMetadata, schema_graph: SchemaGraph) -> str | None:
+    """Case-insensitive match of *raw_value* to a DB enum literal for. *col_meta*."""
+    if not schema_graph.enum_values:
+        return None
+    dtype_lower = (col_meta.data_type or "").lower()
+    enum_vals = schema_graph.enum_values.get(dtype_lower)
+    if not enum_vals:
+        return None
+    raw_lower = raw_value.lower()
+    for ev in enum_vals:
+        if ev.lower() == raw_lower:
+            return ev
+    return None
+
+
+def _resolve_filter_list_cascade(
+    filters: list[FilterParam],
+    schema_graph: SchemaGraph,
+    question: str,
+) -> tuple[list[FilterParam], bool]:
+    """Enum-aware casing fix: DB enum literals first, else lowercase for LOWER() SQL."""
+    new_filters: list[FilterParam] = []
+    changed = False
+    for fp in filters:
+        if fp.raw_value is None or fp.value_type not in {"string", "enum"}:
+            new_filters.append(fp)
+            continue
+        col = fp.left_expr.primary_column
+        parts = col.split(".", 1) if "." in col else None
+        if not parts:
+            new_filters.append(fp)
+            continue
+        col_meta = schema_graph.get_column(parts[0], parts[1])
+        if not col_meta:
+            new_filters.append(fp)
+            continue
+
+        if isinstance(fp.raw_value, list):
+            new_vals: list[str | int | float] = []
+            list_changed = False
+            for v in fp.raw_value:
+                if not isinstance(v, str):
+                    new_vals.append(v)
+                    continue
+                enum_match = _match_enum_value(v, col_meta, schema_graph)
+                if enum_match is not None:
+                    if enum_match != v:
+                        list_changed = True
+                    new_vals.append(enum_match)
+                else:
+                    lowered = v.lower()
+                    if lowered != v:
+                        list_changed = True
+                    new_vals.append(lowered)
+            if list_changed:
+                new_filters.append(replace(fp, raw_value=new_vals))
+                changed = True
+                debug(f"[intent_repair.resolve_filter_list_cascade] resolved list values on {col}")
+            else:
+                new_filters.append(fp)
+            continue
+
+        if not isinstance(fp.raw_value, str):
+            new_filters.append(fp)
+            continue
+
+        enum_match = _match_enum_value(fp.raw_value, col_meta, schema_graph)
+        if enum_match is not None:
+            if enum_match != fp.raw_value:
+                new_filters.append(replace(fp, raw_value=enum_match))
+                changed = True
+                debug(f"[intent_repair.resolve_filter_list_cascade] enum {col}: '{fp.raw_value}' -> '{enum_match}'")
+            else:
+                new_filters.append(fp)
+            continue
+
+        lowered = fp.raw_value.lower()
+        if lowered != fp.raw_value:
+            new_filters.append(replace(fp, raw_value=lowered))
+            changed = True
+            debug(f"[intent_repair.resolve_filter_list_cascade] lower {col}: '{fp.raw_value}' -> '{lowered}'")
+        else:
+            new_filters.append(fp)
+    return new_filters, changed
+
+
+def resolve_filter_value_case(intent: RuntimeIntent, schema_graph: SchemaGraph, question: str) -> RuntimeIntent:
+    """Apply ``_resolve_filter_list_cascade`` to main and CTE filter. lists. Filter-only by design; HAVING literals are not resolved through this path."""
+
+    def process(filters: list[FilterParam]) -> tuple[list[FilterParam], bool]:
+        return _resolve_filter_list_cascade(filters, schema_graph, question)
+
+    return apply_filters_to_main_and_ctes(intent, process)
+
+
+def infer_cte_output_columns(cte: Any, *, include_agg_prefix: bool = True) -> list[str]:
+    """Infer CTE output column aliases from ``select_cols`` when. ``output_columns`` is empty."""
+    names: list[str] = []
+    for sc in cte.select_cols or []:
+        col = sc.expr.primary_column if sc.expr else ""
+        if not col:
+            continue
+        bare = col.split(".")[-1].strip().lower()
+        agg_fn = (getattr(sc.expr, "agg_func", None) or "").lower()
+        if not agg_fn and sc.expr:
+            for g in sc.expr.add_groups + sc.expr.sub_groups:
+                if g.agg_func:
+                    agg_fn = str(g.agg_func).lower()
+                    break
+        if include_agg_prefix and sc.is_aggregated and agg_fn:
+            bare = f"{agg_fn}_{bare}"
+        if bare and bare not in names:
+            names.append(bare)
+    return names
+
+
+def ensure_cte_output_columns_exposure(intent: RuntimeIntent) -> RuntimeIntent:
+    """Ensure each CTE ``output_columns`` list exposes every select column positionally."""
+    cte_steps = intent.cte_steps or []
+    if not cte_steps:
+        return intent
+    new_steps: list[RuntimeCteStep] = []
+    changed = False
+    for cte in cte_steps:
+        inferred = infer_cte_output_columns(cte, include_agg_prefix=True)
+        outputs = list(cte.output_columns or [])
+        if not outputs:
+            outputs = inferred
+            changed = True
+        else:
+            for idx, _sc in enumerate(cte.select_cols or []):
+                if idx >= len(outputs):
+                    token = inferred[idx] if idx < len(inferred) else ""
+                    if token:
+                        outputs.append(token)
+                        changed = True
+                elif not str(outputs[idx] or "").strip() and idx < len(inferred):
+                    outputs[idx] = inferred[idx]
+                    changed = True
+        new_steps.append(replace(cte, output_columns=outputs))
+    return replace(intent, cte_steps=new_steps) if changed else intent
+
+
+def _is_registry_token(term: str | None) -> bool:
+    """Return True when *term* is a bare window or case registry token. (wNN or cNN)."""
+    if not term or "." in term:
+        return False
+    stripped = term.strip().lower()
+    return bool(re.fullmatch(REGISTRY_TOKEN_PATTERN, stripped))
+
+
+def _qualify_term(term: str, output_to_cte: dict[str, str]) -> str:
+    """Qualify bare CTE output column tokens inside a single column. reference string."""
+    if _is_registry_token(term):
+        return term
+    for col_lower, cte_name in output_to_cte.items():
+        pat = re.compile(
+            r"(?<!\.)(?<![A-Za-z0-9_])" + re.escape(col_lower) + r"(?![A-Za-z0-9_])",
+            re.IGNORECASE,
+        )
+        if pat.search(term):
+            term = pat.sub(f"{cte_name}.{col_lower}", term)
+    return term
+
+
+def _qualify_expr(expr: NormalizedExpr, output_to_cte: dict[str, str]) -> NormalizedExpr:
+    """Apply ``_qualify_term`` to every leaf column_ref reachable from *expr*."""
+    return replace_refs_in_expr(expr, lambda ref: _qualify_term(ref, output_to_cte))
+
+
+def qualify_cte_output_columns(intent: RuntimeIntent) -> RuntimeIntent:
+    """Prefix references that match a CTE output column with that CTE. name. Covers the main query and each CTE body's filters, having clauses, window definitions, and CASE registries, not only select/group/order lists."""
+    cte_steps = intent.cte_steps or []
+    if not cte_steps:
+        return intent
+
+    output_to_cte: dict[str, str] = {}
+    for cte in cte_steps:
+        explicit_outputs = cte.output_columns or []
+        if not explicit_outputs:
+            explicit_outputs = infer_cte_output_columns(cte)
+        for oc in explicit_outputs:
+            bare = oc.split(".")[-1].strip().lower()
+            if bare:
+                output_to_cte[bare] = cte.cte_name
+    if not output_to_cte:
+        return intent
+
+    main_tables = {t.strip().lower() for t in (intent.tables or [])}
+
+    def _should_skip(term: str | None) -> bool:
+        """Return True when *term* is already qualified with a scope table name."""
+        if _is_registry_token(term):
+            return True
+        if not term or "." not in term:
+            return False
+        prefix = term.split(".", 1)[0].strip().lower()
+        return prefix in main_tables
+
+    def _should_skip_scoped(term: str | None, scope: set[str]) -> bool:
+        """Return True when *term* is qualified with a name in *scope*."""
+        if _is_registry_token(term):
+            return True
+        if not term or "." not in term:
+            return False
+        prefix = term.split(".", 1)[0].strip().lower()
+        return prefix in scope
+
+    def _qualify_expr_scoped(
+        expr: NormalizedExpr,
+        scope: set[str],
+    ) -> NormalizedExpr:
+        if _should_skip_scoped(expr.primary_column, scope):
+            return expr
+        return _qualify_expr(expr, output_to_cte)
+
+    def _qualify_filters(
+        fps: list[FilterParam],
+        scope: set[str],
+    ) -> list[FilterParam]:
+        out: list[FilterParam] = []
+        for fp in fps or []:
+            le = _qualify_expr_scoped(fp.left_expr, scope)
+            re = _qualify_expr_scoped(fp.right_expr, scope) if fp.right_expr is not None else None
+            out.append(replace(fp, left_expr=le, right_expr=re))
+        return out
+
+    def _qualify_having(
+        hps: list[HavingParam],
+        scope: set[str],
+    ) -> list[HavingParam]:
+        out: list[HavingParam] = []
+        for hp in hps or []:
+            le = _qualify_expr_scoped(hp.left_expr, scope)
+            re = _qualify_expr_scoped(hp.right_expr, scope) if hp.right_expr is not None else None
+            out.append(replace(hp, left_expr=le, right_expr=re))
+        return out
+
+    def _qualify_wr(
+        regs: list[WindowRegistryStep] | None,
+        scope: set[str],
+    ) -> list[WindowRegistryStep]:
+        steps: list[WindowRegistryStep] = []
+        for step in regs or []:
+            ws = step.window_spec
+            np = [_qualify_expr_scoped(e, scope) for e in (ws.partition_by or [])]
+            no = [replace(o, expr=_qualify_expr_scoped(o.expr, scope)) for o in (ws.order_by or [])]
+            na = _qualify_expr_scoped(ws.argument, scope) if ws.argument is not None else None
+            steps.append(
+                replace(
+                    step,
+                    window_spec=replace(ws, partition_by=np, order_by=no, argument=na),
+                )
+            )
+        return steps
+
+    def _qualify_cr(
+        regs: list[CaseRegistryStep] | None,
+        scope: set[str],
+    ) -> list[CaseRegistryStep]:
+        out_r: list[CaseRegistryStep] = []
+        for step in regs or []:
+            cw = step.case_when
+            new_branches: list[CaseWhenBranch] = []
+            for br in cw.branches or []:
+                cond = br.condition
+                new_cond = replace(
+                    cond,
+                    left_expr=_qualify_expr_scoped(cond.left_expr, scope),
+                    right_expr=(_qualify_expr_scoped(cond.right_expr, scope) if cond.right_expr is not None else None),
+                )
+                new_res = _qualify_expr_scoped(br.result, scope)
+                new_branches.append(CaseWhenBranch(condition=new_cond, result=new_res))
+            new_else = _qualify_expr_scoped(cw.else_result, scope) if cw.else_result is not None else None
+            out_r.append(
+                replace(
+                    step,
+                    case_when=replace(cw, branches=new_branches, else_result=new_else),
+                )
+            )
+        return out_r
+
+    new_select_cols = [
+        (replace(sc, expr=_qualify_expr(sc.expr, output_to_cte)) if not _should_skip(sc.expr.primary_column) else sc)
+        for sc in (intent.select_cols or [])
+    ]
+    new_group_by = [
+        _qualify_expr(g, output_to_cte) if not _should_skip(g.primary_column) else g
+        for g in (intent.group_by_cols or [])
+    ]
+    new_order_by = [
+        (
+            replace(obc, expr=_qualify_expr(obc.expr, output_to_cte))
+            if not _should_skip(obc.expr.primary_column)
+            else obc
+        )
+        for obc in (intent.order_by_cols or [])
+    ]
+    new_filters = _qualify_filters(intent.filters_param or [], main_tables)
+    new_having = _qualify_having(intent.having_param or [], main_tables)
+    new_wr = _qualify_wr(intent.window_registry, main_tables)
+    new_cr = _qualify_cr(intent.case_registry, main_tables)
+
+    prior_names_lower: list[str] = []
+    new_cte_steps: list[RuntimeCteStep] = []
+    for cte in cte_steps:
+        scope = {t.strip().lower() for t in (cte.tables or [])} | set(prior_names_lower)
+        c_sel = [
+            (
+                replace(sc, expr=_qualify_expr(sc.expr, output_to_cte))
+                if not _should_skip_scoped(sc.expr.primary_column, scope)
+                else sc
+            )
+            for sc in (cte.select_cols or [])
+        ]
+        c_gb = [
+            (_qualify_expr(g, output_to_cte) if not _should_skip_scoped(g.primary_column, scope) else g)
+            for g in (cte.group_by_cols or [])
+        ]
+        c_ob = [
+            (
+                replace(obc, expr=_qualify_expr(obc.expr, output_to_cte))
+                if not _should_skip_scoped(obc.expr.primary_column, scope)
+                else obc
+            )
+            for obc in (cte.order_by_cols or [])
+        ]
+        c_fp = _qualify_filters(cte.filters_param or [], scope)
+        c_hp = _qualify_having(cte.having_param or [], scope)
+        c_wr = _qualify_wr(cte.window_registry, scope)
+        c_cr = _qualify_cr(cte.case_registry, scope)
+        new_cte_steps.append(
+            replace(
+                cte,
+                select_cols=c_sel,
+                group_by_cols=c_gb,
+                order_by_cols=c_ob,
+                filters_param=c_fp,
+                having_param=c_hp,
+                window_registry=c_wr,
+                case_registry=c_cr,
+            )
+        )
+        prior_names_lower.append(cte.cte_name.strip().lower())
+
+    if (
+        new_select_cols == intent.select_cols
+        and new_group_by == intent.group_by_cols
+        and new_order_by == intent.order_by_cols
+        and new_filters == (intent.filters_param or [])
+        and new_having == (intent.having_param or [])
+        and new_wr == (intent.window_registry or [])
+        and new_cr == (intent.case_registry or [])
+        and new_cte_steps == cte_steps
+    ):
+        return intent
+
+    debug("[qualify_cte_output_columns] qualified unqualified CTE output references")
+    return replace(
+        intent,
+        select_cols=new_select_cols,
+        group_by_cols=new_group_by,
+        order_by_cols=new_order_by,
+        filters_param=new_filters,
+        having_param=new_having,
+        window_registry=new_wr,
+        case_registry=new_cr,
+        cte_steps=new_cte_steps,
+    )
+
+
 def normalize_count_star(intent: RuntimeIntent) -> RuntimeIntent:
-    """
-    Convert COUNT(1) references to COUNT(*) throughout an intent for consistency.
-
-    Args:
-
-        intent: RuntimeIntent to normalize.
-
-    Returns:
-
-        New RuntimeIntent with COUNT(1) rewritten as COUNT(*) in all expressions.
-    """
+    """Convert COUNT(1) references to COUNT(*) throughout an intent for. consistency."""
 
     def _normalize_group(g: MulGroup) -> MulGroup:
         new_multiply = [_normalize_expr(m) for m in g.multiply]
@@ -93,13 +467,11 @@ def normalize_count_star(intent: RuntimeIntent) -> RuntimeIntent:
         return replace(g, multiply=new_multiply, divide=new_divide)
 
     def _normalize_expr(expr: NormalizedExpr) -> NormalizedExpr:
-        if not isinstance(expr, NormalizedExpr):
-            return expr
         new_add = [_normalize_group(g) for g in expr.add_groups]
         new_sub = [_normalize_group(g) for g in expr.sub_groups]
         return replace(expr, add_groups=new_add, sub_groups=new_sub)
 
-    def _fix_filter_list(params):
+    def _fix_filter_list(params: list[FilterParam]) -> list[FilterParam]:
         return [
             replace(
                 fp,
@@ -109,16 +481,26 @@ def normalize_count_star(intent: RuntimeIntent) -> RuntimeIntent:
             for fp in params
         ]
 
+    def _fix_having_list(params: list[HavingParam]) -> list[HavingParam]:
+        return [
+            replace(
+                hp,
+                left_expr=_normalize_expr(hp.left_expr),
+                right_expr=(_normalize_expr(hp.right_expr) if hp.right_expr else None),
+            )
+            for hp in params
+        ]
+
     new_select_cols = [replace(sc, expr=_normalize_expr(sc.expr)) for sc in (intent.select_cols or [])]
     new_order_by_cols = [replace(obc, expr=_normalize_expr(obc.expr)) for obc in (intent.order_by_cols or [])]
     new_filters = _fix_filter_list(intent.filters_param or [])
-    new_having = _fix_filter_list(intent.having_param or [])
+    new_having = _fix_having_list(intent.having_param or [])
     new_cte_steps = []
     for cte in intent.cte_steps or []:
         cte_sc = [replace(sc, expr=_normalize_expr(sc.expr)) for sc in (cte.select_cols or [])]
         cte_obc = [replace(obc, expr=_normalize_expr(obc.expr)) for obc in (cte.order_by_cols or [])]
         cte_fp = _fix_filter_list(cte.filters_param or [])
-        cte_hp = _fix_filter_list(cte.having_param or [])
+        cte_hp = _fix_having_list(cte.having_param or [])
         new_cte_steps.append(
             replace(
                 cte,
@@ -140,7 +522,6 @@ def normalize_count_star(intent: RuntimeIntent) -> RuntimeIntent:
 
 def _is_row_count_count_mulgroup(group: MulGroup) -> bool:
     """Return True when *group* is a COUNT over all rows (``*`` or ``1``)."""
-
     if (group.agg_func or "").lower() != "count":
         return False
     if not group.multiply:
@@ -181,7 +562,6 @@ def _rewrite_row_count_count_in_expr(expr: NormalizedExpr, qualified_pk: str) ->
 
 def _first_primary_key_fq(schema_graph: SchemaGraph, table: str) -> str | None:
     """Return ``table.column`` for the first declared primary key column, if any."""
-
     meta = schema_graph.tables.get(table)
     if not meta:
         return None
@@ -191,42 +571,191 @@ def _first_primary_key_fq(schema_graph: SchemaGraph, table: str) -> str | None:
     return None
 
 
-def qualify_cte_count_star_mulgroups(intent: RuntimeIntent, schema_graph: SchemaGraph) -> RuntimeIntent:
-    """
-    Replace CTE SELECT row-count COUNT forms with COUNT(primary_key) for single-table CTEs.
-
-    Args:
-
-        intent: Runtime intent with optional ``cte_steps``.
-
-        schema_graph: Schema metadata for PK lookup.
-
-    Returns:
-
-        Intent with qualified COUNT arguments where applicable.
-    """
-
-    steps = intent.cte_steps or []
-    if not steps:
-        return intent
-    new_steps: list[RuntimeCteStep] = []
+def _qualify_having_count_star(having_param: list[HavingParam], pk_fq: str) -> tuple[list[HavingParam], bool]:
+    """Rewrite row-count COUNT forms inside HAVING parameters."""
     changed = False
-    for cte in steps:
-        base_tables = [t for t in (cte.tables or []) if t in schema_graph.tables]
-        if len(base_tables) != 1:
-            new_steps.append(cte)
-            continue
-        pk_fq = _first_primary_key_fq(schema_graph, base_tables[0])
-        if not pk_fq:
-            new_steps.append(cte)
-            continue
-        new_cols: list[SelectCol] = []
-        for sc in cte.select_cols or []:
-            new_expr = _rewrite_row_count_count_in_expr(sc.expr, pk_fq)
-            if new_expr != sc.expr:
+    out: list[HavingParam] = []
+    for hp in having_param or []:
+        new_left = _rewrite_row_count_count_in_expr(hp.left_expr, pk_fq)
+        new_right = _rewrite_row_count_count_in_expr(hp.right_expr, pk_fq) if hp.right_expr is not None else None
+        if new_left != hp.left_expr or new_right != hp.right_expr:
+            changed = True
+        out.append(replace(hp, left_expr=new_left, right_expr=new_right))
+    return out, changed
+
+
+def _qualify_window_registry_count_star(
+    window_registry: list[WindowRegistryStep] | None,
+    pk_fq: str,
+) -> tuple[list[WindowRegistryStep], bool]:
+    """Rewrite row-count COUNT forms inside window registry specs."""
+    changed = False
+    out: list[WindowRegistryStep] = []
+    for step in window_registry or []:
+        spec = step.window_spec
+        new_partition: list[NormalizedExpr] = []
+        for ex in spec.partition_by or []:
+            rewritten = _rewrite_row_count_count_in_expr(ex, pk_fq)
+            if rewritten != ex:
                 changed = True
-            new_cols.append(replace(sc, expr=new_expr))
-        new_steps.append(replace(cte, select_cols=new_cols))
+            new_partition.append(rewritten)
+        new_order: list[OrderByCol] = []
+        for ob in spec.order_by or []:
+            new_expr = _rewrite_row_count_count_in_expr(ob.expr, pk_fq)
+            if new_expr != ob.expr:
+                changed = True
+            new_order.append(replace(ob, expr=new_expr))
+        new_argument = _rewrite_row_count_count_in_expr(spec.argument, pk_fq) if spec.argument is not None else None
+        if new_argument != spec.argument:
+            changed = True
+        new_spec = replace(
+            spec,
+            partition_by=new_partition,
+            order_by=new_order,
+            argument=new_argument,
+        )
+        out.append(replace(step, window_spec=new_spec))
+    return out, changed
+
+
+def _qualify_case_registry_count_star(
+    case_registry: list[CaseRegistryStep] | None,
+    pk_fq: str,
+) -> tuple[list[CaseRegistryStep], bool]:
+    """Rewrite row-count COUNT forms inside case registry branch expressions."""
+    changed = False
+    out: list[CaseRegistryStep] = []
+    for step in case_registry or []:
+        case_when = step.case_when
+        new_branches: list[CaseWhenBranch] = []
+        for branch in case_when.branches or []:
+            new_cond_left = _rewrite_row_count_count_in_expr(branch.condition.left_expr, pk_fq)
+            new_cond_right = (
+                _rewrite_row_count_count_in_expr(branch.condition.right_expr, pk_fq)
+                if branch.condition.right_expr is not None
+                else None
+            )
+            new_result = _rewrite_row_count_count_in_expr(branch.result, pk_fq)
+            if (
+                new_cond_left != branch.condition.left_expr
+                or new_cond_right != branch.condition.right_expr
+                or new_result != branch.result
+            ):
+                changed = True
+            new_branches.append(
+                replace(
+                    branch,
+                    condition=replace(
+                        branch.condition,
+                        left_expr=new_cond_left,
+                        right_expr=new_cond_right,
+                    ),
+                    result=new_result,
+                )
+            )
+        new_else = (
+            _rewrite_row_count_count_in_expr(case_when.else_result, pk_fq)
+            if case_when.else_result is not None
+            else None
+        )
+        if new_else != case_when.else_result:
+            changed = True
+        out.append(
+            replace(
+                step,
+                case_when=replace(case_when, branches=new_branches, else_result=new_else),
+            )
+        )
+    return out, changed
+
+
+def _qualify_scope_count_star_mulgroups(
+    *,
+    tables: list[str],
+    select_cols: list[SelectCol],
+    having_param: list[HavingParam],
+    window_registry: list[WindowRegistryStep] | None,
+    case_registry: list[CaseRegistryStep] | None,
+    schema_graph: SchemaGraph,
+) -> tuple[list[SelectCol], list[HavingParam], list[WindowRegistryStep], list[CaseRegistryStep], bool]:
+    """Qualify row-count COUNT(*) mul-groups for a single physical-table scope."""
+    base_tables = [t for t in tables if t in schema_graph.tables]
+    if len(base_tables) != 1:
+        return (
+            select_cols,
+            having_param,
+            list(window_registry or []),
+            list(case_registry or []),
+            False,
+        )
+    pk_fq = _first_primary_key_fq(schema_graph, base_tables[0])
+    if not pk_fq:
+        return (
+            select_cols,
+            having_param,
+            list(window_registry or []),
+            list(case_registry or []),
+            False,
+        )
+    changed = False
+    new_cols: list[SelectCol] = []
+    for sc in select_cols or []:
+        new_expr = _rewrite_row_count_count_in_expr(sc.expr, pk_fq)
+        if new_expr != sc.expr:
+            changed = True
+        new_cols.append(replace(sc, expr=new_expr))
+    new_having, having_changed = _qualify_having_count_star(having_param or [], pk_fq)
+    changed = changed or having_changed
+    new_windows, window_changed = _qualify_window_registry_count_star(window_registry, pk_fq)
+    changed = changed or window_changed
+    new_cases, case_changed = _qualify_case_registry_count_star(case_registry, pk_fq)
+    changed = changed or case_changed
+    return new_cols, new_having, new_windows, new_cases, changed
+
+
+def qualify_count_star_mulgroups(intent: RuntimeIntent, schema_graph: SchemaGraph) -> RuntimeIntent:
+    """Replace row-count COUNT(*) / COUNT(1) with COUNT(primary_key) for single-table scopes."""
+    changed = False
+    main_cols, main_having, main_windows, main_cases, main_changed = _qualify_scope_count_star_mulgroups(
+        tables=list(intent.tables or []),
+        select_cols=list(intent.select_cols or []),
+        having_param=list(intent.having_param or []),
+        window_registry=intent.window_registry,
+        case_registry=intent.case_registry,
+        schema_graph=schema_graph,
+    )
+    if main_changed:
+        changed = True
+        intent = replace(
+            intent,
+            select_cols=main_cols,
+            having_param=main_having,
+            window_registry=main_windows,
+            case_registry=main_cases,
+        )
+    new_steps: list[RuntimeCteStep] = []
+    for cte in intent.cte_steps or []:
+        cte_cols, cte_having, cte_windows, cte_cases, cte_changed = _qualify_scope_count_star_mulgroups(
+            tables=list(cte.tables or []),
+            select_cols=list(cte.select_cols or []),
+            having_param=list(cte.having_param or []),
+            window_registry=cte.window_registry,
+            case_registry=cte.case_registry,
+            schema_graph=schema_graph,
+        )
+        if cte_changed:
+            changed = True
+            new_steps.append(
+                replace(
+                    cte,
+                    select_cols=cte_cols,
+                    having_param=cte_having,
+                    window_registry=cte_windows,
+                    case_registry=cte_cases,
+                )
+            )
+        else:
+            new_steps.append(cte)
     if not changed:
         return intent
     return replace(intent, cte_steps=new_steps)
@@ -237,15 +766,14 @@ def _build_registry_canonical_rename(
     case_registry: list[CaseRegistryStep] | None,
 ) -> dict[str, str]:
     """Return a rename map from declared registry ids to canonical ``w0N`` / ``c0N`` ids."""
-
     rename: dict[str, str] = {}
-    for idx, step in enumerate(window_registry or []):
-        old = (step.registry_id or "").strip()
+    for idx, win_step in enumerate(window_registry or []):
+        old = (win_step.registry_id or "").strip()
         new = f"w{idx + 1:02d}"
         if old and old != new and old not in rename:
             rename[old] = new
-    for idx, step in enumerate(case_registry or []):
-        old = (step.registry_id or "").strip()
+    for idx, case_step in enumerate(case_registry or []):
+        old = (case_step.registry_id or "").strip()
         new = f"c{idx + 1:02d}"
         if old and old != new and old not in rename:
             rename[old] = new
@@ -254,7 +782,6 @@ def _build_registry_canonical_rename(
 
 def _rename_filter_param_refs(fp: FilterParam, rename: dict[str, str]) -> FilterParam:
     """Apply *rename* to a `FilterParam`'s left and right exprs."""
-
     new_left = replace_refs_in_expr(fp.left_expr, lambda r: rename.get(r, r))
     new_right = replace_refs_in_expr(fp.right_expr, lambda r: rename.get(r, r)) if fp.right_expr is not None else None
     return replace(fp, left_expr=new_left, right_expr=new_right)
@@ -262,7 +789,6 @@ def _rename_filter_param_refs(fp: FilterParam, rename: dict[str, str]) -> Filter
 
 def _rename_having_param_refs(hp: HavingParam, rename: dict[str, str]) -> HavingParam:
     """Apply *rename* to a `HavingParam`'s left and right exprs."""
-
     new_left = replace_refs_in_expr(hp.left_expr, lambda r: rename.get(r, r))
     new_right = replace_refs_in_expr(hp.right_expr, lambda r: rename.get(r, r)) if hp.right_expr is not None else None
     return replace(hp, left_expr=new_left, right_expr=new_right)
@@ -270,7 +796,6 @@ def _rename_having_param_refs(hp: HavingParam, rename: dict[str, str]) -> Having
 
 def _rename_case_when_refs(cw: CaseWhenExpr | None, rename: dict[str, str]) -> CaseWhenExpr | None:
     """Apply *rename* to every condition and result expr inside *cw*."""
-
     if cw is None:
         return None
     new_branches: list[CaseWhenBranch] = []
@@ -287,16 +812,14 @@ def _rename_case_when_refs(cw: CaseWhenExpr | None, rename: dict[str, str]) -> C
 
 def _rename_select_col_refs(sc: SelectCol, rename: dict[str, str]) -> SelectCol:
     """Apply *rename* across a select column expression."""
-
     return replace(sc, expr=replace_refs_in_expr(sc.expr, lambda r: rename.get(r, r)))
 
 
-def _rename_window_registry_steps(
+def rename_window_registry_steps(
     regs: list[WindowRegistryStep],
     rename: dict[str, str],
 ) -> list[WindowRegistryStep]:
     """Apply *rename* to ``partition_by``, ``order_by``, and ``argument`` expressions."""
-
     out: list[WindowRegistryStep] = []
 
     def repl(r: str) -> str:
@@ -316,7 +839,6 @@ def _rename_case_registry_steps(
     rename: dict[str, str],
 ) -> list[CaseRegistryStep]:
     """Apply *rename* to each ``case_when`` subtree."""
-
     out: list[CaseRegistryStep] = []
     for step in regs or []:
         cw = _rename_case_when_refs(step.case_when, rename)
@@ -343,7 +865,6 @@ def _canonicalize_scope(
     list[CaseRegistryStep],
 ]:
     """Renumber registry ids in one query scope and apply the rename to all clause exprs."""
-
     rename = _build_registry_canonical_rename(window_registry, case_registry)
     new_window_registry = [
         replace(step, registry_id=f"w{idx + 1:02d}") for idx, step in enumerate(window_registry or [])
@@ -368,7 +889,7 @@ def _canonicalize_scope(
     new_order_by = [replace(obc, expr=replace_refs_in_expr(obc.expr, repl)) for obc in order_by_cols or []]
     new_filters = [_rename_filter_param_refs(fp, rename) for fp in filters_param or []]
     new_having = [_rename_having_param_refs(hp, rename) for hp in having_param or []]
-    wr_expr = _rename_window_registry_steps(window_registry or [], rename)
+    wr_expr = rename_window_registry_steps(window_registry or [], rename)
     cr_expr = _rename_case_registry_steps(case_registry or [], rename)
     new_window_registry = [replace(step, registry_id=f"w{idx + 1:02d}") for idx, step in enumerate(wr_expr)]
     new_case_registry = [replace(step, registry_id=f"c{idx + 1:02d}") for idx, step in enumerate(cr_expr)]
@@ -384,12 +905,7 @@ def _canonicalize_scope(
 
 
 def canonicalize_registry_ids(intent: RuntimeIntent) -> RuntimeIntent:
-    """
-    Renumber per-scope ``window_registry`` / ``case_registry`` ids to canonical ``w0N`` / ``c0N``.
-
-    The LLM may emit registry ids in arbitrary shapes (``w1``, ``myrank``, ``c_status``). This step rewrites each scope's registry ids in declaration order and applies the same rename to every reference (a bare ``column_ref`` matching an old id) inside the scope's select, group_by, order_by, filters, and having clauses, including nested expressions inside ``window_registry`` and ``case_registry`` rows. Real schema columns are qualified ``table.column`` tokens and never collide with old registry ids.
-    """
-
+    """Renumber per-scope ``window_registry`` / ``case_registry`` ids to canonical ``w0N`` / ``c0N``. The LLM may emit registry ids in arbitrary shapes (``w1``, ``myrank``, ``c_status``). This step rewrites each scope's registry ids in declaration order and applies the same rename to every reference (a bare ``column_ref`` matching an old id) inside the scope's select, group_by, order_by, filters, and having clauses, including nested expressions inside ``window_registry`` and ``case_registry`` rows. Real schema columns are qualified ``table.column`` tokens and never collide with old registry ids."""
     new_select, new_group, new_order, new_filters, new_having, new_wr, new_cr = _canonicalize_scope(
         intent.select_cols or [],
         intent.group_by_cols or [],
@@ -436,17 +952,7 @@ def canonicalize_registry_ids(intent: RuntimeIntent) -> RuntimeIntent:
 
 
 def sort_select_cols(cols: list[SelectCol]) -> list[SelectCol]:
-    """
-    Sort select columns so non-aggregated expressions come before aggregated ones and ties are broken by expression signature.
-
-    Args:
-
-        cols: List of SelectCol objects to sort.
-
-    Returns:
-
-        Sorted list of SelectCol objects.
-    """
+    """Sort select columns so non-aggregated expressions come before. aggregated ones and ties are broken by expression signature."""
 
     def key_fn(sc: SelectCol) -> tuple[int, str]:
         return (1 if sc.is_aggregated else 0, sc.signature_key)
@@ -455,46 +961,21 @@ def sort_select_cols(cols: list[SelectCol]) -> list[SelectCol]:
 
 
 def _filter_structural_key(fp: FilterParam) -> tuple[str, str, str, str]:
-    """
-    Return the structural sort key for a single FilterParam.
-
-    Args:
-
-        fp: FilterParam to compute the key for.
-
-    Returns:
-
-        Tuple of (left_sig, op, right_sig, value_type) with all components lowercased.
-    """
+    """Return the structural sort key for a single FilterParam."""
     left = fp.left_expr.signature_key if fp.left_expr else ""
     right = fp.right_expr.signature_key if fp.right_expr else ""
     return (left, fp.op.lower(), right, fp.value_type.lower())
 
 
 def _having_structural_key(hp: HavingParam) -> tuple[str, str, str, str]:
-    """
-    Return the structural sort key for a single HavingParam.
-
-    Args:
-
-        hp: HavingParam to compute the key for.
-
-    Returns:
-
-        Tuple of (left_sig, op, right_sig, value_type) with all components lowercased.
-    """
+    """Return the structural sort key for a single HavingParam."""
     left = hp.left_expr.signature_key if hp.left_expr else ""
     right = hp.right_expr.signature_key if hp.right_expr else ""
     return (left, hp.op.lower(), right, hp.value_type.lower())
 
 
 def _forward_links(items: Sequence[FilterParam | HavingParam]) -> list[str]:
-    """
-    Return the boolean connector after each item toward the next fragment.
-
-    For every index ``i < len(items) - 1`` the value is taken from ``items[i].bool_op`` (normalized to ``AND`` or ``OR``). The final entry is a sentinel ``AND`` for renderers that join fragments.
-    """
-
+    """Return the boolean connector after each item toward the next fragment. For every index ``i < len(items) - 1`` the value is taken from ``items[i].bool_op`` (normalized to ``AND`` or ``OR``). The final entry is a sentinel ``AND`` for renderers that join fragments."""
     n = len(items)
     if n == 0:
         return []
@@ -509,23 +990,14 @@ def _forward_links(items: Sequence[FilterParam | HavingParam]) -> list[str]:
     return out
 
 
+_ConditionItemT = TypeVar("_ConditionItemT", FilterParam, HavingParam)
+
+
 def _canonicalize_condition_order(
-    items: list,
-    structural_key_fn: Callable,
-) -> list:
-    """
-    Reorder AND/OR filter chains canonically and fix ``bool_op`` links.
-
-    Args:
-
-        items: Flat ``FilterParam`` or ``HavingParam`` list.
-
-        structural_key_fn: Sort key for one condition.
-
-    Returns:
-
-        Same items in canonical order with updated ``bool_op`` values.
-    """
+    items: list[_ConditionItemT],
+    structural_key_fn: Callable[[_ConditionItemT], Any],
+) -> list[_ConditionItemT]:
+    """Reorder AND/OR filter chains canonically and fix ``bool_op`` links."""
     if len(items) <= 1:
         return list(items)
     links = _forward_links(items)
@@ -533,8 +1005,8 @@ def _canonicalize_condition_order(
     trailing_norm = trailing.strip().upper()
     trailing_effective = trailing_norm if trailing_norm == "OR" else "AND"
     ops: list[str] = links[:-1]
-    chunks: list[list] = []
-    current_chunk: list = [items[0]]
+    chunks: list[list[_ConditionItemT]] = []
+    current_chunk: list[_ConditionItemT] = [items[0]]
     for i, op in enumerate(ops):
         if op == "OR":
             chunks.append(current_chunk)
@@ -542,11 +1014,11 @@ def _canonicalize_condition_order(
         else:
             current_chunk.append(items[i + 1])
     chunks.append(current_chunk)
-    sorted_chunks: list[list] = []
+    sorted_chunks: list[list[_ConditionItemT]] = []
     for chunk in chunks:
         sorted_chunks.append(sorted(chunk, key=structural_key_fn))
     sorted_chunks.sort(key=lambda ch: structural_key_fn(ch[0]))
-    result: list = []
+    result: list[_ConditionItemT] = []
     for ci, chunk in enumerate(sorted_chunks):
         for fi, item in enumerate(chunk):
             is_last_in_chunk = fi == len(chunk) - 1
@@ -564,18 +1036,7 @@ def _canonicalize_condition_order(
 def _shift_multi_group_representative_filters_forward(
     representatives: list[FilterParam],
 ) -> list[FilterParam]:
-    """
-    Convert backward ``bool_op`` on each group's last filter to forward links between representatives.
-
-    Args:
-
-        representatives: One representative per ``filter_group`` (already canonicalized within each group).
-
-    Returns:
-
-        Representatives with ``bool_op`` on item ``i`` meaning the connector after ``i`` toward ``i+1``.
-    """
-
+    """Convert backward ``bool_op`` on each group's last filter to. forward links between representatives."""
     if len(representatives) <= 1:
         return list(representatives)
     out: list[FilterParam] = []
@@ -595,7 +1056,6 @@ def _shift_multi_group_representative_having_forward(
     representatives: list[HavingParam],
 ) -> list[HavingParam]:
     """Same as ``_shift_multi_group_representative_filters_forward`` for ``HavingParam`` lists."""
-
     if len(representatives) <= 1:
         return list(representatives)
     out: list[HavingParam] = []
@@ -611,113 +1071,24 @@ def _shift_multi_group_representative_having_forward(
     return out
 
 
-def _clamp_negative_filter_group_filter(fp: FilterParam) -> FilterParam:
-    fg = fp.filter_group
-    if fg is not None and fg < 0:
-        return replace(fp, filter_group=None)
-    return fp
-
-
-def _clamp_negative_filter_group_having(hp: HavingParam) -> HavingParam:
-    fg = hp.filter_group
-    if fg is not None and fg < 0:
-        return replace(hp, filter_group=None)
-    return hp
-
-
-def _coerce_filter_group_list(filters: list[FilterParam]) -> list[FilterParam]:
-    if not filters:
-        return []
-    items = [_clamp_negative_filter_group_filter(fp) for fp in filters]
-
-    any_grouped = any(fp.filter_group is not None for fp in items)
-    if not any_grouped:
-        if len(items) <= 1:
-            return items
-        first_b = (items[0].bool_op or "AND").strip().upper()
-        rest_all_or = all((items[j].bool_op or "AND").strip().upper() == "OR" for j in range(1, len(items)))
-        # Backward-style LLM pattern: first row keeps default AND while every later row
-        # carries OR (meaning "OR with the previous row" in prompt terms). Promote to
-        # one disjunct per row so SQL matches A OR B OR C. Forward mixed AND/OR chains
-        # (OR only on some interior rows) stay flat — see combinatorial matrix §5.
-        if first_b == "AND" and rest_all_or:
-            return [replace(fp, filter_group=gid, bool_op="AND") for gid, fp in enumerate(items, start=1)]
-        return items
-
-    max_gid = max((fp.filter_group for fp in items if fp.filter_group is not None), default=-1)
-    next_gid = max_gid + 1
-    out: list[FilterParam] = []
-    for fp in items:
-        if fp.filter_group is None:
-            out.append(replace(fp, filter_group=next_gid, bool_op="AND"))
-            next_gid += 1
-        else:
-            out.append(replace(fp, bool_op="AND"))
-    return out
-
-
-def _coerce_having_group_list(having: list[HavingParam]) -> list[HavingParam]:
-    if not having:
-        return []
-    items = [_clamp_negative_filter_group_having(hp) for hp in having]
-
-    any_grouped = any(hp.filter_group is not None for hp in items)
-    if not any_grouped:
-        if len(items) <= 1:
-            return items
-        first_b = (items[0].bool_op or "AND").strip().upper()
-        rest_all_or = all((items[j].bool_op or "AND").strip().upper() == "OR" for j in range(1, len(items)))
-        if first_b == "AND" and rest_all_or:
-            return [replace(hp, filter_group=gid, bool_op="AND") for gid, hp in enumerate(items, start=1)]
-        return items
-
-    max_gid = max((hp.filter_group for hp in items if hp.filter_group is not None), default=-1)
-    next_gid = max_gid + 1
-    out: list[HavingParam] = []
-    for hp in items:
-        if hp.filter_group is None:
-            out.append(replace(hp, filter_group=next_gid, bool_op="AND"))
-            next_gid += 1
-        else:
-            out.append(replace(hp, bool_op="AND"))
-    return out
-
-
 def coerce_filter_group_mode(intent: RuntimeIntent) -> RuntimeIntent:
-    """
-    Normalise ``filter_group`` / ``bool_op`` wiring before ``normalize_filters_havings``.
-
-    Mixed grouped/``None`` rows assign fresh ``filter_group`` ids to ``None`` rows. Flat
-    bodies stay flat except for a backward-style pattern where the first row keeps
-    default ``AND`` and every following row carries ``OR`` (one disjunct per row).
-    Negative ``filter_group`` values clamp to ``None`` before those rules apply.
-    """
-
-    new_filters = _coerce_filter_group_list(list(intent.filters_param or []))
-    new_having = _coerce_having_group_list(list(intent.having_param or []))
+    """Normalise ``filter_group`` / ``bool_op`` wiring before ``normalize_filters_havings``. Mixed grouped/``None`` rows assign fresh ``filter_group`` ids to ``None`` rows. Flat bodies stay flat except for a backward-style pattern where the first row keeps default ``AND`` and every following row carries ``OR`` (one disjunct per row). Negative ``filter_group`` values clamp to ``None`` before those rules apply."""
+    new_filters = coerce_filter_group_list(list(intent.filters_param or []))
+    new_having = coerce_having_group_list(list(intent.having_param or []))
     new_ctes: list[RuntimeCteStep] = []
     for cte in intent.cte_steps or []:
-        nf = _coerce_filter_group_list(list(cte.filters_param or []))
-        nh = _coerce_having_group_list(list(cte.having_param or []))
+        nf = coerce_filter_group_list(list(cte.filters_param or []))
+        nh = coerce_having_group_list(list(cte.having_param or []))
         new_ctes.append(replace(cte, filters_param=nf, having_param=nh))
     return replace(intent, filters_param=new_filters, having_param=new_having, cte_steps=new_ctes)
 
 
 def sort_filters(filters: list[FilterParam]) -> list[FilterParam]:
-    """
-    Canonicalize ``filters_param`` ordering.
-
-    Flat mode (no ``filter_group``): preserve existing AND/OR chunk canonicalisation.
-
-    Grouped mode (any row has ``filter_group``): bucket by group id in first-seen order,
-    sort within each bucket structurally, and set ``bool_op`` to ``AND`` on every row
-    (renderers join disjuncts with OR between buckets).
-    """
-
+    """Canonicalize ``filters_param`` ordering. Flat mode (no ``filter_group``): preserve existing AND/OR chunk canonicalisation. Grouped mode (any row has ``filter_group``): bucket by group id in first-seen order, sort within each bucket structurally, and set ``bool_op`` to ``AND`` on every row (renderers join disjuncts with OR between buckets)."""
     if not filters:
         return []
     if any(fp.filter_group is not None for fp in filters):
-        filters = _coerce_filter_group_list(list(filters))
+        filters = coerce_filter_group_list(list(filters))
     grouped = any(fp.filter_group is not None for fp in filters)
     if not grouped:
         buckets: dict[int | None, list[FilterParam]] = defaultdict(list)
@@ -767,14 +1138,11 @@ def sort_filters(filters: list[FilterParam]) -> list[FilterParam]:
 
 
 def sort_having(having: list[HavingParam]) -> list[HavingParam]:
-    """
-    Same as :func:`sort_filters` but for ``HavingParam`` lists.
-    """
-
+    """Same as :func:`sort_filters` but for ``HavingParam`` lists."""
     if not having:
         return []
     if any(hp.filter_group is not None for hp in having):
-        having = _coerce_having_group_list(list(having))
+        having = coerce_having_group_list(list(having))
     grouped = any(hp.filter_group is not None for hp in having)
     if not grouped:
         buckets: dict[int | None, list[HavingParam]] = defaultdict(list)
@@ -843,7 +1211,6 @@ def _select_carries_aggregation(
     case_registry: list[CaseRegistryStep] | None,
 ) -> bool:
     """Return True when *sc* carries SQL aggregation that participates in GROUP BY mixing rules."""
-
     parts = effective_select_parts(sc, window_registry, case_registry)
     if parts.window_spec is not None:
         return False
@@ -852,20 +1219,75 @@ def _select_carries_aggregation(
     return parts.expr.has_aggregation
 
 
+def _col_ref_is_identifier(ref: str, schema_graph: SchemaGraph) -> bool:
+    """Return True when *ref* names a primary-key or foreign-key column."""
+    parts = ref.split(".", 1) if "." in ref else None
+    if not parts:
+        return False
+    tbl_meta = schema_graph.tables.get(parts[0])
+    col_meta = tbl_meta.columns.get(parts[1]) if tbl_meta else None
+    if not col_meta:
+        return False
+    return col_meta.is_primary_key or col_meta.is_foreign_key
+
+
+def _descriptive_peer_in_terms(ref: str, schema_graph: SchemaGraph, terms: set[str]) -> bool:
+    """Return True when a descriptive column for the entity grain of *ref* is already in *terms*."""
+    parts = ref.split(".", 1) if "." in ref else None
+    if not parts:
+        return False
+    tbl = parts[0]
+    desc = best_descriptive_column(tbl, schema_graph, set())
+    if desc and f"{tbl}.{desc}" in terms:
+        return True
+    tbl_meta = schema_graph.tables.get(tbl)
+    if not tbl_meta:
+        return False
+    for fk in tbl_meta.foreign_keys or []:
+        if parts[1] not in fk.src_cols:
+            continue
+        dst_desc = best_descriptive_column(fk.dst_table, schema_graph, set())
+        if dst_desc and f"{fk.dst_table}.{dst_desc}" in terms:
+            return True
+    return False
+
+
+def _intent_is_scalar_shaped(intent: RuntimeIntent) -> bool:
+    """Return True when the main query is a single aggregated result with no GROUP BY."""
+    if intent.group_by_cols:
+        return False
+    select_cols = list(intent.select_cols or [])
+    if len(select_cols) != 1:
+        return False
+    sc = select_cols[0]
+    return _select_carries_aggregation(sc, intent.window_registry, intent.case_registry)
+
+
+def strip_redundant_identifier_group_by(intent: RuntimeIntent, schema_graph: SchemaGraph) -> RuntimeIntent:
+    """Drop PK/FK group_by keys when a descriptive dimension for the same entity is already present."""
+    if not intent.group_by_cols:
+        return intent
+    select_terms = {sc.expr.primary_term for sc in (intent.select_cols or [])}
+    terms = {g.primary_term for g in intent.group_by_cols}
+    terms.update(select_terms)
+    kept = [
+        g
+        for g in intent.group_by_cols
+        if not (
+            g.primary_term not in select_terms
+            and _col_ref_is_identifier(g.primary_term, schema_graph)
+            and _descriptive_peer_in_terms(g.primary_term, schema_graph, terms)
+        )
+    ]
+    if len(kept) == len(intent.group_by_cols):
+        return intent
+    return replace(intent, group_by_cols=kept)
+
+
 def enforce_grain_consistency(intent: RuntimeIntent, schema_graph: SchemaGraph) -> RuntimeIntent:
-    """
-    Infer or extend ``group_by_cols`` when mixed agg/non-agg selects imply grouping.
-
-    Args:
-
-        intent: Intent to adjust.
-
-        schema_graph: Column roles and FK metadata.
-
-    Returns:
-
-        Intent with ``grain='grouped'`` and descriptive columns added when needed.
-    """
+    """Infer or extend ``group_by_cols`` when mixed agg/non-agg selects. imply grouping."""
+    if _intent_is_scalar_shaped(intent):
+        return intent
     group_by = list(intent.group_by_cols or [])
     select_cols = list(intent.select_cols or [])
     cte_steps = intent.cte_steps or []
@@ -951,7 +1373,7 @@ def enforce_grain_consistency(intent: RuntimeIntent, schema_graph: SchemaGraph) 
                 gb_terms.add(fq)
                 debug(f"[intent_resolve.enforce_grain_consistency] auto-added descriptive column {fq}")
             continue
-        if col_meta.is_foreign_key:
+        if col_meta.is_foreign_key and tbl_meta is not None:
             for fk in tbl_meta.foreign_keys or []:
                 if parts[1] not in fk.src_cols:
                     continue
@@ -976,19 +1398,75 @@ def enforce_grain_consistency(intent: RuntimeIntent, schema_graph: SchemaGraph) 
     )
 
 
+def _add_window_partition_cols_to_group_by(
+    group_by: list[NormalizedExpr],
+    window_registry: list[WindowRegistryStep] | None,
+    grain: str,
+) -> tuple[list[NormalizedExpr], bool]:
+    """Append missing window PARTITION BY columns to group_by when scope is grouped."""
+    grain = (grain or "row_level").strip().lower()
+    group_by = list(group_by or [])
+    if grain == "row_level" and not group_by:
+        return group_by, False
+    if not window_registry:
+        return group_by, False
+    gb_keys = {expr_canonical_key(g) for g in group_by}
+    gb_keys.update((g.primary_column or "").strip().lower() for g in group_by if g.primary_column)
+    changed = False
+    for wr in window_registry:
+        for pe in wr.window_spec.partition_by or []:
+            for cref in extract_columns_from_expr(pe):
+                new_expr = NormalizedExpr.from_column(cref)
+                key = expr_canonical_key(new_expr)
+                cref_low = cref.strip().lower()
+                if key in gb_keys or cref_low in gb_keys:
+                    continue
+                group_by.append(new_expr)
+                gb_keys.add(key)
+                gb_keys.add(cref_low)
+                changed = True
+    if changed:
+        group_by = sorted(group_by, key=lambda g: g.signature_key)
+    return group_by, changed
+
+
+def repair_window_partition_group_by_alignment(intent: RuntimeIntent, _schema_graph: SchemaGraph) -> RuntimeIntent:
+    """Add window PARTITION BY columns to group_by_cols at grouped scopes."""
+    main_gb, main_changed = _add_window_partition_cols_to_group_by(
+        intent.group_by_cols or [],
+        intent.window_registry,
+        intent.grain or "row_level",
+    )
+    new_ctes: list[RuntimeCteStep] = []
+    cte_changed = False
+    for cte in intent.cte_steps or []:
+        cte_gb, cc = _add_window_partition_cols_to_group_by(
+            cte.group_by_cols or [],
+            cte.window_registry,
+            cte.grain or "row_level",
+        )
+        if cc:
+            cte_changed = True
+            grain = "grouped" if cte_gb else (cte.grain or "row_level")
+            new_ctes.append(replace(cte, group_by_cols=cte_gb, grain=grain))
+        else:
+            new_ctes.append(cte)
+    if not main_changed and not cte_changed:
+        return intent
+    grain = "grouped" if main_gb else (intent.grain or "row_level")
+    out = replace(
+        intent,
+        group_by_cols=main_gb,
+        grain=grain,
+    )
+    if cte_changed:
+        out = replace(out, cte_steps=new_ctes)
+    debug("[intent_resolve.repair_window_partition_group_by_alignment] added partition columns to group_by")
+    return out
+
+
 def collect_column_refs_for_post_processing(intent: RuntimeIntent) -> list[str]:
-    """
-    Gather bare and qualified column tokens from a runtime intent for table resolution.
-
-    Args:
-
-        intent: Parsed intent before ``column_map`` is fully assigned.
-
-    Returns:
-
-        Column reference strings in deterministic walk order.
-    """
-
+    """Gather bare and qualified column tokens from a runtime intent. for. table resolution."""
     all_cols: list[str] = []
     for sc in intent.select_cols or []:
         all_cols.extend(cols_from_select_col(sc, intent.window_registry, intent.case_registry))
@@ -1009,18 +1487,7 @@ def collect_column_refs_for_post_processing(intent: RuntimeIntent) -> list[str]:
 
 
 def collect_column_refs_for_cte_step(cte: RuntimeCteStep) -> list[str]:
-    """
-    Gather column tokens from a CTE body for table resolution checks.
-
-    Args:
-
-        cte: CTE step whose expressions are scanned.
-
-    Returns:
-
-        Column reference strings in deterministic walk order.
-    """
-
+    """Gather column tokens from a CTE body for table resolution checks."""
     all_cols: list[str] = []
     for sc in cte.select_cols or []:
         all_cols.extend(cols_from_select_col(sc, cte.window_registry, cte.case_registry))
@@ -1041,20 +1508,7 @@ def collect_column_refs_for_cte_step(cte: RuntimeCteStep) -> list[str]:
 
 
 def prune_unused_cte_steps(intent: RuntimeIntent) -> RuntimeIntent:
-    """
-    Drop ``cte_steps`` entries not reachable from the main query via ``tables`` or column refs.
-
-    Preserves original step order for retained steps.
-
-    Args:
-
-        intent: Intent potentially carrying unused CTE definitions.
-
-    Returns:
-
-        Same intent when nothing is removed; otherwise a shallow-updated copy without orphan CTE rows.
-    """
-
+    """Drop ``cte_steps`` entries not reachable from the main query via. ``tables`` or column refs. Preserves original step order for retained steps."""
     steps = list(intent.cte_steps or [])
     if not steps:
         return intent
@@ -1106,18 +1560,7 @@ def _accumulate_cte_output_aliases_from_refs(
     cte_names_lower: set[str],
     used_aliases: dict[str, set[str]],
 ) -> None:
-    """
-    Record ``cte_name.output_alias`` references for downstream CTE output pruning.
-
-    Args:
-
-        refs: Qualified column reference strings from intent walks.
-
-        cte_names_lower: Lowercased CTE names eligible as qualifiers.
-
-        used_aliases: Mutable map ``cte_name_lower -> set of referenced output alias lower strings``.
-    """
-
+    """Record ``cte_name.output_alias`` references for downstream CTE. output pruning."""
     for ref in refs:
         if "." not in ref:
             continue
@@ -1131,33 +1574,7 @@ def prune_unused_cte_output_columns(
     intent: RuntimeIntent,
     schema_graph: SchemaGraph,
 ) -> RuntimeIntent:
-    """
-    Drop CTE select_cols and matching output_columns whose alias no downstream consumer references and whose select expression is not a base PK or FK passthrough.
-
-    Each CTE owns an ordered list of select_cols paired index-for-index with output_columns and an
-    output_column_metadata map keyed by alias. This pass narrows that triple per CTE.
-
-    A column is preserved when either (a) the main query or any strictly-downstream CTE references
-    the alias as cte_name.alias in any column-ref-bearing field, or (b) the select_col is a
-    passthrough of a base-table PK or FK column. Rule (b) exists because the JOIN engine derives
-    bridge predicates from PK / FK lineage rather than from intent column refs, so a CTE typically
-    projects a key column that nothing references explicitly but the engine still needs.
-
-    Internal references inside the producing CTE do not preserve an output entry: those references
-    read the underlying expression directly and never go through the alias.
-
-    Args:
-
-        intent: Intent after prune_unused_cte_steps has run.
-
-        schema_graph: Active schema graph used to classify base-table PK and FK columns.
-
-    Returns:
-
-        Intent with each surviving CTE narrowed to its referenced or PK / FK passthrough columns.
-        Returns the input intent unchanged when nothing is dropped.
-    """
-
+    """Drop CTE select_cols and matching output_columns whose alias no. downstream consumer references and whose select expression is not a base PK or FK passthrough. Each CTE owns an ordered list of select_cols paired index-for-index with output_columns and an output_column_metadata map keyed by alias. This pass narrows that triple per CTE. A column is preserved when either (a) the main query or any strictly-downstream CTE references the alias as cte_name.alias in any column-ref-bearing field, or (b) the select_col is a passthrough of a base-table PK or FK column. Rule (b) exists because the JOIN engine derives bridge predicates from PK / FK lineage rather than from intent column refs, so a CTE typically projects a key column that nothing references explicitly but the engine still needs. Internal references inside the producing CTE do not preserve an output entry: those references read the underlying expression directly and never go through the alias."""
     steps = list(intent.cte_steps or [])
     if not steps:
         return intent
@@ -1233,17 +1650,7 @@ def prune_unused_cte_output_columns(
 
 
 def enforce_cte_grain_consistency(cte: RuntimeCteStep) -> RuntimeCteStep:
-    """
-    Derive ``grain`` and sorted ``group_by_cols`` from CTE structure.
-
-    Args:
-
-        cte: CTE step to normalize.
-
-    Returns:
-
-        CTE with ``grouped`` or ``scalar`` grain as appropriate.
-    """
+    """Derive ``grain`` and sorted ``group_by_cols`` from CTE structure."""
 
     def _cte_select_counts_as_classical_agg(sc: SelectCol) -> bool:
         parts = effective_select_parts(sc, cte.window_registry, cte.case_registry)
@@ -1267,22 +1674,7 @@ def resolve_column_map(
     schema_graph: SchemaGraph,
     tables: list[str],
 ) -> tuple[dict[str, str], list[IntentIssue]]:
-    """
-    Map bare column names to owning tables (qualified refs checked against *tables*).
-
-    Args:
-
-        columns: Bare or qualified references seen in expressions.
-
-        schema_graph: Known columns per table.
-
-        tables: Allow-list of table names.
-
-    Returns:
-
-        ``(column_map, issues)`` where *column_map* is ``{bare_or_qualified_key: table}`` and *issues*
-        contains ``column_ambiguous`` errors when a bare name matches multiple tables.
-    """
+    """Map bare column names to owning tables (qualified refs checked. against *tables*)."""
     column_map: dict[str, str] = {}
     issues: list[IntentIssue] = []
     table_col_index: dict[str, set[str]] = {}
@@ -1319,7 +1711,7 @@ def resolve_column_map(
                         "qualify it as table.column."
                     ),
                     context={"column": col_stripped, "candidates": cand_sorted},
-                    responsible_stage="logical",
+                    responsible_stage="ground",
                 ),
             )
             debug(f"[intent_resolve.resolve_column_map] ambiguous column '{col_stripped}': {cand_sorted}")
@@ -1327,17 +1719,7 @@ def resolve_column_map(
 
 
 def resolve_cte_column_maps(cte_steps: list[RuntimeCteStep]) -> list[RuntimeCteStep]:
-    """
-    Fill each CTE's ``column_map`` using prior CTE outputs in order.
-
-    Args:
-
-        cte_steps: Ordered CTE chain.
-
-    Returns:
-
-        New steps with ``column_map`` set.
-    """
+    """Fill each CTE's ``column_map`` using prior CTE outputs in order."""
     cte_output_cols: dict[str, set[str]] = {}
     result = []
     for cte in cte_steps:
@@ -1386,25 +1768,7 @@ def _expr_lineage_signature(
     expr: NormalizedExpr,
     cte_meta_map: Mapping[str, Mapping[str, Any]],
 ) -> str:
-    """
-    Build a name-free signature for ``expr`` using physical lineage where available.
-
-    Replaces qualified column references ``alias.col`` with a lineage triple
-    ``(phys_table, phys_column, inherits_pk)`` when the alias is a CTE whose
-    output metadata is in ``cte_meta_map``; otherwise leaves the qualified
-    reference verbatim. CTE-name placeholders are stripped so the resulting
-    signature is invariant under CTE renaming.
-
-    Args:
-
-        expr: Expression to fingerprint.
-
-        cte_meta_map: ``cte_name -> {output_alias: CteOutputColumnMeta}``.
-
-    Returns:
-
-        Pipe-joined signature string.
-    """
+    """Build a name-free signature for ``expr`` using physical lineage. where available. Replaces qualified column references ``alias.col`` with a lineage triple ``(phys_table, phys_column, inherits_pk)`` when the alias is a CTE whose output metadata is in ``cte_meta_map``; otherwise leaves the qualified reference verbatim. CTE-name placeholders are stripped so the resulting signature is invariant under CTE renaming."""
 
     def _swap(token: str) -> str:
         if "." not in token:
@@ -1431,7 +1795,6 @@ def _output_column_lineage_tuples(
     cte: RuntimeCteStep,
 ) -> tuple[tuple[str, ...], ...]:
     """Return sorted lineage tuples for every output column of *cte*."""
-
     rows: list[tuple[str, ...]] = []
     for alias in cte.output_columns or []:
         meta = (cte.output_column_metadata or {}).get(alias)
@@ -1457,29 +1820,7 @@ def _compute_cte_structural_hash(
     sibling_hashes: Mapping[str, str],
     sibling_names: set[str],
 ) -> str:
-    """
-    Compute a CTE-name- and description- and grain-free structural hash.
-
-    Inter-CTE references in ``cte.tables`` are substituted with the recursively
-    computed structural hash of the referenced CTE; base-table names are kept
-    verbatim. Output column lineage tuples use the already-standardized output
-    column names, so the hash is stable under CTE renaming and free of any
-    LLM-chosen identifiers.
-
-    Args:
-
-        cte: CTE step (with output columns already normalized).
-
-        sibling_hashes: ``cte_name -> structural_hash`` for prior topo levels.
-
-        sibling_names: All CTE names in the intent (used to distinguish
-        inter-CTE refs from base tables in ``cte.tables``).
-
-    Returns:
-
-        SHA-256 hex digest truncated to 16 characters.
-    """
-
+    """Compute a CTE-name- and description- and grain-free structural. hash. Inter-CTE references in ``cte.tables`` are substituted with the recursively computed structural hash of the referenced CTE; base-table names are kept verbatim. Output column lineage tuples use the already-standardized output column names, so the hash is stable under CTE renaming and free of any LLM-chosen identifiers."""
     cte_meta_map: dict[str, dict[str, Any]] = {}
     for name in sibling_names:
         cte_meta_map[name] = {}
@@ -1537,24 +1878,7 @@ def _compute_cte_structural_hash(
 
 
 def reorder_cte_steps_by_dag(intent: RuntimeIntent) -> RuntimeIntent:
-    """
-    Topologically reorder ``cte_steps`` so dependencies precede consumers.
-
-    A CTE ``B`` depends on CTE ``A`` iff ``A.cte_name`` appears in ``B.tables``.
-    Within each topological level CTEs are sorted by their structural hash so
-    the order is deterministic and free of LLM-chosen identifiers. Cycles are
-    rejected. CTE-to-CTE references in ``tables`` are preserved verbatim and
-    rewritten later by :func:`normalize_cte_names`.
-
-    Args:
-
-        intent: Intent whose ``cte_steps`` should be reordered.
-
-    Returns:
-
-        Intent with ``cte_steps`` arranged in dependency order.
-    """
-
+    """Topologically reorder ``cte_steps`` so dependencies precede. consumers. A CTE ``B`` depends on CTE ``A`` iff ``A.cte_name`` appears in ``B.tables``. Within each topological level CTEs are sorted by their structural hash so the order is deterministic and free of LLM-chosen identifiers. Cycles are rejected. CTE-to-CTE references in ``tables`` are preserved verbatim and rewritten later by :func:`normalize_cte_names`."""
     cte_steps = list(intent.cte_steps or [])
     if len(cte_steps) < 2:
         return intent
@@ -1606,17 +1930,7 @@ def reorder_cte_steps_by_dag(intent: RuntimeIntent) -> RuntimeIntent:
 
 
 def normalize_cte_names(intent: RuntimeIntent) -> RuntimeIntent:
-    """
-    Rename CTEs to ``cte1``, ``cte2``, ... and rewrite all references.
-
-    Args:
-
-        intent: Intent whose ``cte_steps`` should be normalized.
-
-    Returns:
-
-        Intent with consistent CTE names across tables and expressions.
-    """
+    """Rename CTEs to ``cte1``, ``cte2``, ... and rewrite all. references."""
     cte_steps = intent.cte_steps or []
     if not cte_steps:
         return intent
@@ -1624,6 +1938,10 @@ def normalize_cte_names(intent: RuntimeIntent) -> RuntimeIntent:
     for i, cte in enumerate(cte_steps, start=1):
         new_name = f"cte{i}"
         old_to_new[cte.cte_name] = new_name
+    for i, planner_name in enumerate(intent.planner_cte_names or [], start=1):
+        pname = (planner_name or "").strip()
+        if pname and pname not in old_to_new:
+            old_to_new[pname] = f"cte{i}"
 
     old_to_new_ci: dict[str, str] = {k.lower(): v for k, v in old_to_new.items()}
 
@@ -1637,6 +1955,17 @@ def normalize_cte_names(intent: RuntimeIntent) -> RuntimeIntent:
 
     def _update_expr(expr: NormalizedExpr) -> NormalizedExpr:
         return replace_refs_in_expr(expr, replace_cte_refs)
+
+    def _map_wr(wr: list[WindowRegistryStep] | None) -> list[WindowRegistryStep]:
+        out: list[WindowRegistryStep] = []
+        for step in wr or []:
+            ws = step.window_spec
+            new_part = [_update_expr(p) for p in (ws.partition_by or [])]
+            new_orders = [replace(o, expr=_update_expr(o.expr)) for o in (ws.order_by or [])]
+            new_arg = _update_expr(ws.argument) if ws.argument is not None else None
+            new_ws = replace(ws, partition_by=new_part, order_by=new_orders, argument=new_arg)
+            out.append(replace(step, window_spec=new_ws))
+        return out
 
     new_cte_steps = []
     for cte in cte_steps:
@@ -1688,6 +2017,7 @@ def normalize_cte_names(intent: RuntimeIntent) -> RuntimeIntent:
             column_map=new_column_map,
             output_columns=new_output_columns,
             output_column_metadata=new_ocm,
+            window_registry=_map_wr(cte.window_registry),
         )
         new_cte_steps.append(new_cte)
 
@@ -1724,27 +2054,14 @@ def normalize_cte_names(intent: RuntimeIntent) -> RuntimeIntent:
         having_param=new_main_having,
         column_map=new_main_column_map,
         cte_steps=new_cte_steps,
+        window_registry=_map_wr(intent.window_registry),
     )
 
 
 def rewrite_main_query_refs_to_final_cte_columns(
     intent: RuntimeIntent,
 ) -> RuntimeIntent:
-    """
-    Align main-scope ``table.col`` references with each CTE's final ``output_columns`` aliases.
-
-    Bare tokens that match exactly one CTE output column name are prefixed with that CTE name. Covers
-    select/group/order, filters, having, window registries, and case registries on the main query.
-
-    Args:
-
-        intent: Runtime intent whose CTE list defines output shapes.
-
-    Returns:
-
-        Intent with ``replace_refs_in_expr`` applied to every main-scope expression carrier.
-    """
-
+    """Align main-scope ``table.col`` references with each CTE's final. ``output_columns`` aliases. Bare tokens that match exactly one CTE output column name are prefixed with that CTE name. Covers select/group/order, filters, having, window registries, and case registries on the main query."""
     cte_steps = intent.cte_steps or []
     if not cte_steps:
         return intent
@@ -1854,6 +2171,38 @@ def rewrite_main_query_refs_to_final_cte_columns(
                 right_expr=_up(hp.right_expr) if hp.right_expr else None,
             )
         )
+
+    def _remap_cte_step(cte: RuntimeCteStep) -> RuntimeCteStep:
+        cte_fp: list[FilterParam] = []
+        for fp in cte.filters_param or []:
+            cte_fp.append(
+                replace(
+                    fp,
+                    left_expr=_up(fp.left_expr),
+                    right_expr=_up(fp.right_expr) if fp.right_expr else None,
+                )
+            )
+        cte_hp: list[HavingParam] = []
+        for hp in cte.having_param or []:
+            cte_hp.append(
+                replace(
+                    hp,
+                    left_expr=_up(hp.left_expr),
+                    right_expr=_up(hp.right_expr) if hp.right_expr else None,
+                )
+            )
+        return replace(
+            cte,
+            select_cols=[_map_sc(sc) for sc in (cte.select_cols or [])],
+            group_by_cols=[_up(g) for g in (cte.group_by_cols or [])],
+            order_by_cols=[replace(obc, expr=_up(obc.expr)) for obc in (cte.order_by_cols or [])],
+            filters_param=cte_fp,
+            having_param=cte_hp,
+            window_registry=_map_wr(cte.window_registry),
+            case_registry=_map_cr(cte.case_registry),
+        )
+
+    new_cte_steps = [_remap_cte_step(cte) for cte in (intent.cte_steps or [])]
     return replace(
         intent,
         select_cols=new_select,
@@ -1863,47 +2212,106 @@ def rewrite_main_query_refs_to_final_cte_columns(
         having_param=new_hp,
         window_registry=_map_wr(intent.window_registry),
         case_registry=_map_cr(intent.case_registry),
+        cte_steps=new_cte_steps,
     )
 
 
 def _cte_output_alias_map(intent: RuntimeIntent) -> dict[str, str]:
-    """
-    Map ``cte.expr_form`` -> ``cte.output_alias`` including a normalized key variant.
-
-    Args:
-
-        intent: Intent with ``cte_steps`` and aligned ``output_columns``.
-
-    Returns:
-
-        Replacement map for downstream ref rewriting.
-    """
+    """Map ``cte.expr_form`` and inferred aliases to declared ``output_columns`` tokens."""
     alias_map: dict[str, str] = {}
-    for cte in intent.cte_steps or []:
+    for idx, cte in enumerate(intent.cte_steps or [], start=1):
         output_cols = cte.output_columns or []
+        inferred = infer_cte_output_columns(cte)
+        derived = derive_cte_output_columns(cte.select_cols or [], cte_ordinal=idx)
         for i, sc in enumerate(cte.select_cols or []):
             if i >= len(output_cols):
                 continue
             rendered = render_expr_sql(sc.expr)
-            from_ref = f"{cte.cte_name}.{rendered}"
             to_ref = f"{cte.cte_name}.{output_cols[i]}"
+            from_ref = f"{cte.cte_name}.{rendered}"
             if from_ref != to_ref:
                 alias_map[from_ref] = to_ref
+            for alt in (inferred[i] if i < len(inferred) else None, derived[i] if i < len(derived) else None):
+                if not alt:
+                    continue
+                alt_ref = f"{cte.cte_name}.{alt}"
+                if alt_ref != to_ref:
+                    alias_map[alt_ref] = to_ref
+            expr = sc.expr
+            agg_fn = (expr.agg_func or "").lower()
+            if not agg_fn and expr.add_groups:
+                agg_fn = (expr.add_groups[0].agg_func or "").lower()
+            base = (expr.primary_column or "").split(".")[-1].strip().lower()
+            if agg_fn == "count" and base:
+                for syn in (f"{base}_count", f"count_{base}", f"num_{base}", base):
+                    syn_ref = f"{cte.cte_name}.{syn}"
+                    if syn_ref != to_ref:
+                        alias_map[syn_ref] = to_ref
+                if base.endswith("_id"):
+                    stem = base[:-3]
+                    id_count_ref = f"{cte.cte_name}.{stem}_count"
+                    if id_count_ref != to_ref:
+                        alias_map[id_count_ref] = to_ref
     return alias_map
 
 
+def resolve_window_registry_filter_rhs(intent: RuntimeIntent) -> RuntimeIntent:
+    """Rewrite filter/having operands that name a window registry token into ``right_expr`` refs."""
+
+    def _registry_ids(wr: list[WindowRegistryStep] | None) -> set[str]:
+        return {s.registry_id for s in (wr or []) if s.registry_id}
+
+    def _fix_filter(fp: FilterParam, wr: list[WindowRegistryStep] | None) -> FilterParam:
+        if fp.right_expr is not None:
+            return fp
+        wr_ids = _registry_ids(wr)
+        tok = None
+        if isinstance(fp.raw_value, str):
+            tok = fp.raw_value.strip()
+        if tok and tok in wr_ids:
+            return replace(
+                fp,
+                right_expr=NormalizedExpr.from_column(tok),
+                raw_value=None,
+                param_key="",
+            )
+        return fp
+
+    def _fix_having(hp: HavingParam, wr: list[WindowRegistryStep] | None) -> HavingParam:
+        if hp.right_expr is not None:
+            return hp
+        wr_ids = _registry_ids(wr)
+        tok = None
+        if isinstance(hp.raw_value, str):
+            tok = hp.raw_value.strip()
+        if tok and tok in wr_ids:
+            return replace(
+                hp,
+                right_expr=NormalizedExpr.from_column(tok),
+                raw_value=None,
+                param_key="",
+            )
+        return hp
+
+    new_cte_steps: list[RuntimeCteStep] = []
+    for cte in intent.cte_steps or []:
+        new_cte_steps.append(
+            replace(
+                cte,
+                filters_param=[_fix_filter(fp, cte.window_registry) for fp in (cte.filters_param or [])],
+                having_param=[_fix_having(hp, cte.window_registry) for hp in (cte.having_param or [])],
+            )
+        )
+    return replace(
+        intent,
+        filters_param=[_fix_filter(fp, intent.window_registry) for fp in (intent.filters_param or [])],
+        having_param=[_fix_having(hp, intent.window_registry) for hp in (intent.having_param or [])],
+        cte_steps=new_cte_steps,
+    )
+
+
 def rewrite_cte_output_refs_to_aliases(intent: RuntimeIntent) -> RuntimeIntent:
-    """
-    Rewrite main/CTE refs from rendered expr form to declared ``output_columns`` aliases.
-
-    Args:
-
-        intent: Intent after CTE output lists are stable.
-
-    Returns:
-
-        Intent with consistent ``cteN.alias`` references.
-    """
+    """Rewrite main/CTE refs from rendered expr form to declared. ``output_columns`` aliases."""
     alias_map = _cte_output_alias_map(intent)
     if not alias_map:
         return intent
@@ -1943,6 +2351,7 @@ def rewrite_cte_output_refs_to_aliases(intent: RuntimeIntent) -> RuntimeIntent:
                 order_by_cols=new_order_by,
                 filters_param=new_filters,
                 having_param=new_having,
+                window_registry=rename_window_registry_steps(cte.window_registry, alias_map),
             )
         )
 
@@ -1972,37 +2381,63 @@ def rewrite_cte_output_refs_to_aliases(intent: RuntimeIntent) -> RuntimeIntent:
         order_by_cols=new_main_order_by,
         filters_param=new_main_filters,
         having_param=new_main_having,
+        window_registry=rename_window_registry_steps(intent.window_registry, alias_map),
+        case_registry=intent.case_registry,
         cte_steps=new_cte_steps,
     )
 
 
 def check_qualified_refs_exist(intent: RuntimeIntent, schema_graph: SchemaGraph) -> tuple[RuntimeIntent, list[str]]:
-    """
-    Check that qualified ``table.col`` references in an intent exist in the schema graph.
-
-    Returns a list of missing-reference messages; the intent is returned unchanged.
-
-    Args:
-
-        intent: RuntimeIntent to validate.
-
-        schema_graph: SchemaGraph providing the authoritative table/column set.
-
-    Returns:
-
-        Tuple of ``(intent, errors)`` where *errors* is a list of human-readable violation strings.
-    """
+    """Check that qualified ``table.col`` references in an intent exist. in the schema graph. Returns a list of missing-reference messages; the intent is returned unchanged."""
     errors: list[str] = []
     valid_tables = set(schema_graph.tables.keys())
     cte_names = {cte.cte_name for cte in (intent.cte_steps or [])}
+    cte_output_cols = {cte.cte_name: set(cte.output_columns or []) for cte in (intent.cte_steps or [])}
     for tbl in intent.tables or []:
         if tbl not in valid_tables and tbl not in cte_names:
             errors.append(f"Unknown table: {tbl}")
 
-    def _check_expr_cols(exprs: list, label: str) -> None:
+    def _check_cte_output_col(col: str, label: str) -> None:
+        if "." not in col:
+            return
+        tbl_ref, col_ref = col.split(".", 1)
+        outputs = cte_output_cols.get(tbl_ref)
+        if outputs is not None and col_ref not in outputs:
+            errors.append(f"Unknown {label} CTE output column: {col}")
+
+    def _check_window_registry(regs: list[WindowRegistryStep], label: str) -> None:
+        for step in regs or []:
+            ws = step.window_spec
+            for part in ws.partition_by or []:
+                for col in extract_columns_from_expr(part):
+                    _check_cte_output_col(col, f"{label} window partition_by")
+                    if "." in col:
+                        tbl_ref, col_ref = col.split(".", 1)
+                        if tbl_ref in valid_tables and col_ref not in schema_graph.tables[tbl_ref].columns:
+                            errors.append(f"Unknown {label} window partition_by column: {col}")
+            for ob in ws.order_by or []:
+                for col in extract_columns_from_expr(ob.expr):
+                    _check_cte_output_col(col, f"{label} window order_by")
+                    if "." in col:
+                        tbl_ref, col_ref = col.split(".", 1)
+                        if tbl_ref in valid_tables and col_ref not in schema_graph.tables[tbl_ref].columns:
+                            errors.append(f"Unknown {label} window order_by column: {col}")
+            if ws.argument is not None:
+                for col in extract_columns_from_expr(ws.argument):
+                    _check_cte_output_col(col, f"{label} window argument")
+                    if "." in col:
+                        tbl_ref, col_ref = col.split(".", 1)
+                        if tbl_ref in valid_tables and col_ref not in schema_graph.tables[tbl_ref].columns:
+                            errors.append(f"Unknown {label} window argument column: {col}")
+
+    def _check_expr_cols(exprs: list[SelectCol] | list[OrderByCol], label: str) -> None:
         for item in exprs:
-            expr = item.expr if hasattr(item, "expr") else item
+            if isinstance(item, SelectCol):
+                expr = item.expr
+            else:
+                expr = item.expr
             for col in extract_columns_from_expr(expr):
+                _check_cte_output_col(col, label)
                 if "." in col:
                     tbl_ref, col_ref = col.split(".", 1)
                     if tbl_ref in valid_tables:
@@ -2010,7 +2445,7 @@ def check_qualified_refs_exist(intent: RuntimeIntent, schema_graph: SchemaGraph)
                         if col_ref not in tbl_meta.columns:
                             errors.append(f"Unknown {label} column: {col}")
 
-    def _check_filter_cols(params: list, label: str) -> None:
+    def _check_filter_cols(params: list[FilterParam] | list[HavingParam], label: str) -> None:
         for fp in params:
             for col in extract_columns_from_expr(fp.left_expr):
                 if "." in col:
@@ -2028,7 +2463,7 @@ def check_qualified_refs_exist(intent: RuntimeIntent, schema_graph: SchemaGraph)
                             if col_ref not in tbl_meta.columns:
                                 errors.append(f"Unknown {label} column: {col}")
 
-    def _check_bare_cols(cols: list, label: str) -> None:
+    def _check_bare_cols(cols: list[NormalizedExpr], label: str) -> None:
         for g in cols:
             col = g.primary_term if hasattr(g, "primary_term") else str(g)
             if "." in col:
@@ -2043,6 +2478,7 @@ def check_qualified_refs_exist(intent: RuntimeIntent, schema_graph: SchemaGraph)
     _check_filter_cols(intent.filters_param or [], "filter")
     _check_filter_cols(intent.having_param or [], "having")
     _check_bare_cols(intent.group_by_cols or [], "group_by")
+    _check_window_registry(intent.window_registry or [], "main")
     for cte in intent.cte_steps or []:
         ctx = f"CTE '{cte.cte_name}'"
         for tbl in cte.tables or []:
@@ -2053,9 +2489,10 @@ def check_qualified_refs_exist(intent: RuntimeIntent, schema_graph: SchemaGraph)
         _check_filter_cols(cte.filters_param or [], f"{ctx} filter")
         _check_filter_cols(cte.having_param or [], f"{ctx} having")
         _check_bare_cols(cte.group_by_cols or [], f"{ctx} group_by")
+        _check_window_registry(cte.window_registry or [], ctx)
     if errors:
         debug(f"[intent_resolve.check_qualified_refs_exist] validation errors: {errors}")
-    pipeline_trace_lazy(
+    pipeline_trace(
         "intent_resolve.check_qualified_refs_exist.result",
         lambda: stable_json({"errors": errors, "intent": intent.to_dict()}),
     )
@@ -2063,24 +2500,7 @@ def check_qualified_refs_exist(intent: RuntimeIntent, schema_graph: SchemaGraph)
 
 
 def _simplify_expr(expr: NormalizedExpr, param_values: Mapping[str, Any] | None = None) -> NormalizedExpr:
-    """
-    Fold constants, combine like MulGroups, and normalize coefficients.
-
-    When ``param_values`` is provided, parameterized add/sub values whose bound value resolves
-    to ``0`` or ``0.0`` are folded out, and group coefficients whose ``coeff_param_key``
-    resolves to ``1`` or ``1.0`` have the key cleared so the renderer omits the multiplier.
-
-    Args:
-
-        expr: Expression tree to simplify.
-
-        param_values: Optional bound parameter map for resolving ``coeff_param_key`` and
-        parameterized identity values.
-
-    Returns:
-
-        Equivalent simplified ``NormalizedExpr``.
-    """
+    """Fold constants, combine like MulGroups, and normalize. coefficients. When ``param_values`` is provided, parameterized add/sub values whose bound value resolves to ``0`` or ``0.0`` are folded out, and group coefficients whose ``coeff_param_key`` resolves to ``1`` or ``1.0`` have the key cleared so the renderer omits the multiplier."""
     pv = param_values or {}
 
     def _is_zero_value(ev: ExprValue) -> bool:
@@ -2179,38 +2599,14 @@ def _simplify_expr(expr: NormalizedExpr, param_values: Mapping[str, Any] | None 
 
 
 def _simplify_filter(fp: FilterParam, param_values: Mapping[str, Any] | None = None) -> FilterParam:
-    """
-    Apply simplify_expr to both sides of a FilterParam.
-
-    Args:
-
-        fp: FilterParam to simplify.
-
-        param_values: Optional bound parameter map forwarded to ``_simplify_expr``.
-
-    Returns:
-
-        New FilterParam with simplified left_expr and right_expr.
-    """
+    """Apply simplify_expr to both sides of a FilterParam."""
     new_left = _simplify_expr(fp.left_expr, param_values)
     new_right = _simplify_expr(fp.right_expr, param_values) if fp.right_expr else None
     return replace(fp, left_expr=new_left, right_expr=new_right)
 
 
 def _simplify_having(hp: HavingParam, param_values: Mapping[str, Any] | None = None) -> HavingParam:
-    """
-    Apply simplify_expr to both sides of a HavingParam.
-
-    Args:
-
-        hp: HavingParam to simplify.
-
-        param_values: Optional bound parameter map forwarded to ``_simplify_expr``.
-
-    Returns:
-
-        New HavingParam with simplified left_expr and right_expr.
-    """
+    """Apply simplify_expr to both sides of a HavingParam."""
     new_left = _simplify_expr(hp.left_expr, param_values)
     new_right = _simplify_expr(hp.right_expr, param_values) if hp.right_expr else None
     return replace(hp, left_expr=new_left, right_expr=new_right)
@@ -2221,11 +2617,7 @@ def _raw_sql_opens_with_distinct(raw: str) -> bool:
 
 
 def _qualified_column_from_distinct_raw_sql(raw: str, schema_graph: SchemaGraph) -> str | None:
-    """
-    Parse a raw SQL fragment that may start with ``DISTINCT`` and return ``table.column`` when
-    the remainder is a single qualified column present in *schema_graph*.
-    """
-
+    """Parse a raw SQL fragment that may start with ``DISTINCT`` and return ``table.column`` when the remainder is a single qualified column present in *schema_graph*."""
     rs = (raw or "").strip()
     if not rs:
         return None
@@ -2266,11 +2658,7 @@ def _select_col_is_raw_sql_leaf(sc: SelectCol) -> bool:
 
 
 def lift_distinct_select_from_raw_sql(intent: RuntimeIntent, schema_graph: SchemaGraph) -> RuntimeIntent:
-    """
-    Promote ``DISTINCT table.column`` fragments stored as ``raw_sql`` into structured column refs.
-
-    The first lifted column index per scope is written to ``distinct_select_index`` when that scope's index is still ``-1`` and the fragment opened with the ``DISTINCT`` keyword.
-    """
+    """Promote ``DISTINCT table.column`` fragments stored as ``raw_sql`` into structured column refs. The first lifted column index per scope is written to ``distinct_select_index`` when that scope's index is still ``-1`` and the fragment opened with the ``DISTINCT`` keyword."""
 
     def process_scope(
         cols: list[SelectCol],
@@ -2315,20 +2703,7 @@ def _expr_is_simplified_to_empty(expr: NormalizedExpr) -> bool:
 
 
 def simplify_exprs(intent: RuntimeIntent) -> RuntimeIntent:
-    """
-    Apply algebraic simplification to every NormalizedExpr across all intent clauses.
-
-    Uses ``intent.param_values`` to fold parameterized identity values (``0``/``0.0``/``1``/``1.0``)
-    when the structural assignment pass has already bound them.
-
-    Args:
-
-        intent: RuntimeIntent whose expressions should be simplified.
-
-    Returns:
-
-        New RuntimeIntent with all expressions in simplified form.
-    """
+    """Apply algebraic simplification to every NormalizedExpr across. all. intent clauses. Uses ``intent.param_values`` to fold parameterized identity values (``0``/``0.0``/``1``/``1.0``) when the structural assignment pass has already bound them."""
     debug("[intent_resolve.simplify_exprs] simplifying all expressions")
     pv = intent.param_values or {}
     new_select: list[SelectCol] = []
@@ -2380,7 +2755,6 @@ def simplify_exprs(intent: RuntimeIntent) -> RuntimeIntent:
 
 def _column_is_aggregatable(qualified: str, schema_graph: SchemaGraph) -> bool:
     """Return ``True`` when ``qualified`` (``table.column``) maps to an aggregatable column."""
-
     if not qualified or "." not in qualified:
         return True
     tbl, col = qualified.split(".", 1)
@@ -2395,7 +2769,6 @@ def _column_is_aggregatable(qualified: str, schema_graph: SchemaGraph) -> bool:
 
 def _gate_expr_aggregatability(expr: NormalizedExpr, schema_graph: SchemaGraph) -> NormalizedExpr:
     """Strip identity offsets and unit coefficients on expressions whose primary column is non-aggregatable."""
-
     if _column_is_aggregatable(expr.primary_column, schema_graph):
         return expr
     new_groups: list[MulGroup] = []
@@ -2418,23 +2791,7 @@ def _gate_expr_aggregatability(expr: NormalizedExpr, schema_graph: SchemaGraph) 
 
 
 def apply_aggregatability_gate(intent: RuntimeIntent, schema_graph: SchemaGraph) -> RuntimeIntent:
-    """
-    Strip nonsensical numeric ornaments from expressions whose primary column is non-aggregatable.
-
-    For PK / FK / IDENTIFIER columns and any other column with ``is_aggregatable == False`` the
-    gate clears parameterized add/sub values and resets group coefficients to ``1.0``. Aggregatable
-    columns (``NUMERIC_MEASURE`` and overrides) are left untouched.
-
-    Args:
-
-        intent: RuntimeIntent to gate.
-
-        schema_graph: Schema lookup for column metadata.
-
-    Returns:
-
-        Gated RuntimeIntent.
-    """
+    """Strip nonsensical numeric ornaments from expressions whose. primary column is non-aggregatable. For PK / FK / IDENTIFIER columns and any other column with ``is_aggregatable == False`` the gate clears parameterized add/sub values and resets group coefficients to ``1.0``. Aggregatable columns (``NUMERIC_MEASURE`` and overrides) are left untouched."""
 
     def _gate_filter(fp: FilterParam) -> FilterParam:
         new_left = _gate_expr_aggregatability(fp.left_expr, schema_graph)
@@ -2488,19 +2845,7 @@ def apply_aggregatability_gate(intent: RuntimeIntent, schema_graph: SchemaGraph)
 
 
 def _normalize_filter_scalar_on_left(fp: FilterParam) -> FilterParam:
-    """
-    Swap sides when left is scalar and right is column, flipping the operator.
-
-    Ensures column or table.column expressions are on the left for validation and SQL generation.
-
-    Args:
-
-        fp: FilterParam to normalize.
-
-    Returns:
-
-        FilterParam with column on the left when applicable.
-    """
+    """Swap sides when left is scalar and right is column, flipping the. operator. Ensures column or table.column expressions are on the left for validation and SQL generation."""
     if not fp.right_expr:
         return fp
     left_cols = [c for c in extract_columns_from_expr(fp.left_expr) if "." in c]
@@ -2520,13 +2865,8 @@ def _normalize_filter_scalar_on_left(fp: FilterParam) -> FilterParam:
     )
 
 
-def _normalized_expr_is_absent(expr: NormalizedExpr) -> bool:
-    """
-    Return True when *expr* carries no structural content for canonical predicate normalization.
-
-    Treats bare ``column_ref`` and interval leaves as present; pure literals remain absent.
-    """
-
+def normalized_expr_is_absent(expr: NormalizedExpr) -> bool:
+    """Return True when *expr* carries no structural content for canonical predicate normalization. Treats bare ``column_ref`` and interval leaves as present; pure literals remain absent."""
     return (
         not expr.has_column_reference
         and not expr.add_groups
@@ -2540,20 +2880,8 @@ def _normalized_expr_is_absent(expr: NormalizedExpr) -> bool:
 
 
 def _normalize_filter_canonical(fp: FilterParam) -> FilterParam:
-    """
-    Normalize a filter to canonical form with a non-empty expression on the left.
-
-    When the left_expr is empty but right_expr is not, swaps the sides and reverses the comparison operator.
-
-    Args:
-
-        fp: FilterParam to normalize.
-
-    Returns:
-
-        FilterParam with the heavier side on the left.
-    """
-    if _normalized_expr_is_absent(fp.left_expr) and fp.right_expr:
+    """Normalize a filter to canonical form with a non-empty expression. on the left. When the left_expr is empty but right_expr is not, swaps the sides and reverses the comparison operator."""
+    if normalized_expr_is_absent(fp.left_expr) and fp.right_expr:
         new_op = REVERSE_OP_MAP.get(fp.op, fp.op)
         return FilterParam(
             left_expr=fp.right_expr,
@@ -2568,18 +2896,8 @@ def _normalize_filter_canonical(fp: FilterParam) -> FilterParam:
 
 
 def _normalize_having_canonical(hp: HavingParam) -> HavingParam:
-    """
-    Normalize a having condition to canonical form with a non-empty expression on the left.
-
-    Args:
-
-        hp: HavingParam to normalize.
-
-    Returns:
-
-        HavingParam with the heavier side on the left.
-    """
-    if _normalized_expr_is_absent(hp.left_expr) and hp.right_expr:
+    """Normalize a having condition to canonical form with a non-empty. expression on the left."""
+    if normalized_expr_is_absent(hp.left_expr) and hp.right_expr:
         new_op = REVERSE_OP_MAP.get(hp.op, hp.op)
         return HavingParam(
             left_expr=hp.right_expr,
@@ -2594,17 +2912,9 @@ def _normalize_having_canonical(hp: HavingParam) -> HavingParam:
 
 
 def _normalize_col_to_col_filter(fp: FilterParam) -> FilterParam:
-    """
-    Normalize an expr-vs-expr filter so the lexicographically smaller signature is on the left.
-
-    Args:
-
-        fp: FilterParam with a right_expr (col-vs-col filter).
-
-    Returns:
-
-        FilterParam with sides swapped and operator reversed if needed.
-    """
+    """Normalize an expr-vs-expr filter so the lexicographically. smaller. signature is on the left."""
+    if fp.value_type == "date_diff":
+        return fp
     if fp.right_expr and not fp.param_key:
         left_sig = fp.left_expr.signature_key
         right_sig = fp.right_expr.signature_key
@@ -2623,17 +2933,7 @@ def _normalize_col_to_col_filter(fp: FilterParam) -> FilterParam:
 
 
 def _normalize_agg_to_agg_having(hp: HavingParam) -> HavingParam:
-    """
-    Normalize an expr-vs-expr having condition so the lexicographically smaller signature is on the left.
-
-    Args:
-
-        hp: HavingParam with a right_expr (agg-vs-agg having).
-
-    Returns:
-
-        HavingParam with sides swapped and operator reversed if needed.
-    """
+    """Normalize an expr-vs-expr having condition so the. lexicographically smaller signature is on the left."""
     if hp.right_expr and not hp.param_key:
         left_sig = hp.left_expr.signature_key
         right_sig = hp.right_expr.signature_key
@@ -2652,19 +2952,7 @@ def _normalize_agg_to_agg_having(hp: HavingParam) -> HavingParam:
 
 
 def _normalize_filter(fp: FilterParam) -> FilterParam:
-    """
-    Apply all normalization steps to a single filter.
-
-    Runs scalar-on-left swap, canonical form, col-vs-col ordering, operator normalization, and value type normalization in sequence.
-
-    Args:
-
-        fp: FilterParam to normalize.
-
-    Returns:
-
-        Fully normalized FilterParam.
-    """
+    """Apply all normalization steps to a single filter. Runs scalar-on- left swap, canonical form, col-vs-col ordering, operator normalization, and value type normalization in sequence."""
     fp = _normalize_filter_scalar_on_left(fp)
     fp = _normalize_filter_canonical(fp)
     fp = _normalize_col_to_col_filter(fp)
@@ -2672,36 +2960,14 @@ def _normalize_filter(fp: FilterParam) -> FilterParam:
 
 
 def _normalize_having(hp: HavingParam) -> HavingParam:
-    """
-    Apply all normalization steps to a single having condition.
-
-    Runs canonical form, agg-vs-agg ordering, operator normalization, and value type normalization in sequence.
-
-    Args:
-
-        hp: HavingParam to normalize.
-
-    Returns:
-
-        Fully normalized HavingParam.
-    """
+    """Apply all normalization steps to a single having condition. Runs. canonical form, agg-vs-agg ordering, operator normalization, and value type normalization in sequence."""
     hp = _normalize_having_canonical(hp)
     hp = _normalize_agg_to_agg_having(hp)
     return replace(hp, op=normalize_op(hp.op), value_type=normalize_value_type(hp.value_type))
 
 
 def _dedup_filters(filters: list[FilterParam]) -> list[FilterParam]:
-    """
-    Remove duplicate filters that share an identical structural signature, bool_op, and filter_group.
-
-    Args:
-
-        filters: List of FilterParam objects to deduplicate.
-
-    Returns:
-
-        List with the first occurrence of each unique (signature_key, bool_op, filter_group) retained.
-    """
+    """Remove duplicate filters that share an identical structural. signature, bool_op, and filter_group."""
     seen: set[tuple[str, str, int | None]] = set()
     result: list[FilterParam] = []
     for fp in filters:
@@ -2715,17 +2981,7 @@ def _dedup_filters(filters: list[FilterParam]) -> list[FilterParam]:
 
 
 def _dedup_having(having: list[HavingParam]) -> list[HavingParam]:
-    """
-    Remove duplicate having conditions that share an identical structural signature, bool_op, and filter_group.
-
-    Args:
-
-        having: List of HavingParam objects to deduplicate.
-
-    Returns:
-
-        List with the first occurrence of each unique (signature_key, bool_op, filter_group) retained.
-    """
+    """Remove duplicate having conditions that share an identical. structural signature, bool_op, and filter_group."""
     seen: set[tuple[str, str, int | None]] = set()
     result: list[HavingParam] = []
     for hp in having:
@@ -2739,17 +2995,7 @@ def _dedup_having(having: list[HavingParam]) -> list[HavingParam]:
 
 
 def normalize_filters_havings(intent: RuntimeIntent) -> RuntimeIntent:
-    """
-    Apply all normalization, deduplication, and sorting rules to filters and having conditions.
-
-    Args:
-
-        intent: RuntimeIntent whose filters and having lists should be normalized.
-
-    Returns:
-
-        New RuntimeIntent with all filters and having conditions normalized, deduplicated, and sorted.
-    """
+    """Apply all normalization, deduplication, and sorting rules to. filters and having conditions."""
     new_filters = [_normalize_filter(fp) for fp in (intent.filters_param or [])]
     new_having = [_normalize_having(hp) for hp in (intent.having_param or [])]
     new_cte_steps = []
@@ -2772,7 +3018,6 @@ def _allocate_branch_param_keys_in_case_registry(
     next_idx: int,
 ) -> tuple[list[CaseRegistryStep], int]:
     """Ensure CASE registry branch conditions have ``param_key`` or ``right_expr`` when required."""
-
     if not case_registry:
         return list(case_registry or []), next_idx
     out: list[CaseRegistryStep] = []
@@ -2786,9 +3031,6 @@ def _allocate_branch_param_keys_in_case_registry(
         changed = False
         for branch in cw.branches:
             cond = branch.condition
-            if cond is None:
-                new_branches.append(branch)
-                continue
             if cond.op in NULL_CHECK_OPS or cond.right_expr is not None or cond.param_key:
                 new_branches.append(branch)
                 continue
@@ -2804,11 +3046,7 @@ def _allocate_branch_param_keys_in_case_registry(
 
 
 def enforce_case_branch_param_keys(intent: RuntimeIntent) -> RuntimeIntent:
-    """
-    Guarantee every CASE branch condition has a SQL-renderable binding.
-
-    For each branch whose operator is not a null-check, ensures either ``right_expr`` or ``param_key`` is set; allocates a fresh ``cb*`` ``param_key`` otherwise so :func:`_render_case_branch_sql` cannot raise.
-    """
+    """Guarantee every CASE branch condition has a SQL-renderable binding. For each branch whose operator is not a null-check, ensures either ``right_expr`` or ``param_key`` is set; allocates a fresh ``cb*`` ``param_key`` otherwise so :func:`_render_case_branch_sql` cannot raise."""
     next_idx = 1
     new_main_cr, next_idx = _allocate_branch_param_keys_in_case_registry(intent.case_registry, next_idx)
     new_cte_steps: list[RuntimeCteStep] = []
@@ -2819,147 +3057,26 @@ def enforce_case_branch_param_keys(intent: RuntimeIntent) -> RuntimeIntent:
 
 
 def literal_in_logical_prose(logical: LogicalIntent, token: str) -> bool:
-    """
-    Return whether a literal token appears as a case-insensitive substring in planner prose.
-
-    Args:
-
-        logical: Planner intent whose prose fields are searched.
-
-        token: Literal text such as a numeric string from a validation issue context.
-
-    Returns:
-
-        False when *token* is empty after stripping; otherwise substring membership in :func:`concat_logical_intent_prose`.
-    """
-
+    """Return whether a literal token appears as a case-insensitive. substring in planner prose."""
     needle = (token or "").strip()
     if not needle:
         return False
     return needle.lower() in concat_logical_intent_prose(logical).lower()
 
 
-def attribute_post_stage_b_issue(issue: IntentIssue, logical: LogicalIntent) -> IntentIssue:
-    """
-    Override ``responsible_stage`` for literal-bearing semantic issues using planner prose.
-
-    Args:
-
-        issue: Post-binding validation issue possibly in :data:`LITERAL_BEARING_CATEGORIES`.
-
-        logical: Planner intent whose prose decides whether the literal was planner-owned.
-
-    Returns:
-
-        The same issue when no override applies; otherwise a copy with ``logical`` or ``format`` stage.
-    """
-
-    if issue.category not in LITERAL_BEARING_CATEGORIES:
+def attribute_post_compose_issue(issue: IntentIssue, logical: LogicalIntent) -> IntentIssue:
+    """Override ``responsible_stage`` for literal-bearing semantic. issues using planner prose."""
+    if issue.category.value not in LITERAL_BEARING_CATEGORIES:
         return issue
     raw_ctx = issue.context.get("value", "")
     token = str(raw_ctx).strip() if raw_ctx is not None else ""
     if literal_in_logical_prose(logical, token):
-        return replace(issue, responsible_stage="format")
-    return replace(issue, responsible_stage="logical")
-
-
-def validate_tables_exist(tables: tuple[str, ...], schema: SchemaGraph) -> list[IntentIssue]:
-    """
-    Emit logical-stage issues for planner table tokens that are absent from the schema graph.
-
-    Args:
-
-        tables: Planner ``tables`` tuple from the top-level intent.
-
-        schema: Authoritative schema graph.
-
-    Returns:
-
-        One issue per unknown table name.
-    """
-
-    known = frozenset(schema.tables.keys())
-    out: list[IntentIssue] = []
-    for name in tables:
-        if name in known:
-            continue
-        out.append(
-            make_intent_issue(
-                issue_id=f"unknown_table_{name}",
-                category=FailureCategory.UNKNOWN_TABLE,
-                severity="error",
-                message=f"Unknown table {name!r} in planner tables list.",
-                context={"table": name},
-                responsible_stage="logical",
-            )
-        )
-    return out
-
-
-def validate_cte_dependencies(logical: LogicalIntent) -> list[IntentIssue]:
-    """
-    Validate CTE ``depends_on`` references against base tables and strictly prior CTE names.
-
-    Args:
-
-        logical: Planner intent including ordered ``cte_steps``.
-
-    Returns:
-
-        Logical-stage issues for empty names, duplicates, or illegal forward or unknown references.
-    """
-
-    issues: list[IntentIssue] = []
-    prior_names: set[str] = set()
-    seen_step_names: set[str] = set()
-    base_tables = frozenset(logical.tables)
-    for idx, step in enumerate(logical.cte_steps):
-        name = (step.name or "").strip()
-        if not name:
-            issues.append(
-                make_intent_issue(
-                    issue_id=f"cte_empty_name_{idx}",
-                    category=FailureCategory.CTE_TABLE_REFERENCE,
-                    severity="error",
-                    message="CTE step is missing a non-empty name.",
-                    context={"index": idx},
-                    responsible_stage="logical",
-                )
-            )
-            continue
-        if name in seen_step_names:
-            issues.append(
-                make_intent_issue(
-                    issue_id=f"cte_duplicate_name_{name}",
-                    category=FailureCategory.CTE_TABLE_REFERENCE,
-                    severity="error",
-                    message=f"Duplicate CTE name {name!r}.",
-                    context={"name": name},
-                    responsible_stage="logical",
-                )
-            )
-        seen_step_names.add(name)
-        allowed = set(base_tables) | prior_names
-        for dep in step.depends_on:
-            if dep in allowed:
-                continue
-            issues.append(
-                make_intent_issue(
-                    issue_id=f"cte_dep_invalid_{idx}_{dep}",
-                    category=FailureCategory.CTE_TABLE_REFERENCE,
-                    severity="error",
-                    message=f"CTE {name!r} depends_on entry {dep!r} is not a listed base table or a prior CTE.",
-                    context={"cte": name, "depends_on": dep},
-                    responsible_stage="logical",
-                )
-            )
-        prior_names.add(name)
-    return issues
+        return replace(issue, responsible_stage="compose")
+    return replace(issue, responsible_stage="ground")
 
 
 def _non_agg_select_signature_keys(select_cols: list[SelectCol] | None) -> set[str]:
     """Return signature_key values for non-aggregated select columns."""
-
     return {sc.signature_key for sc in select_cols or [] if not sc.is_aggregated}
 
 
@@ -2977,7 +3094,6 @@ def classify_union_merge_case(
     concrete: ConcreteIntent,
 ) -> UnionSelectColumnDelta:
     """Classify how runtime select keys differ from template concrete selects (non-aggregated only)."""
-
     i_keys = _non_agg_select_signature_keys(intent.select_cols)
     c_keys = _non_agg_select_signature_keys(concrete.select_cols)
     i_only = i_keys - c_keys
@@ -2993,13 +3109,11 @@ def classify_union_merge_case(
 
 def _join_path_signature_hash(layers: list[list[str]]) -> str:
     """SHA-256 hex of layered join path signatures (main then CTEs)."""
-
     return hashlib.sha256(stable_json(layers).encode("utf-8")).hexdigest()
 
 
 def join_path_key_runtime(intent: RuntimeIntent) -> str:
     """Stable join fingerprint for a runtime intent."""
-
     layers: list[list[str]] = [list(intent.chosen_join_path_signature or [])]
     for step in intent.cte_steps or []:
         layers.append(list(step.chosen_join_path_signature or []))
@@ -3008,7 +3122,6 @@ def join_path_key_runtime(intent: RuntimeIntent) -> str:
 
 def join_path_key_concrete(concrete: ConcreteIntent) -> str:
     """Stable join fingerprint for a concrete intent signature."""
-
     layers: list[list[str]] = [list(concrete.chosen_join_path_signature or [])]
     for step in concrete.cte_steps or []:
         layers.append(list(step.chosen_join_path_signature or []))
@@ -3019,20 +3132,7 @@ def compute_intent_union(
     intent: RuntimeIntent,
     concrete: ConcreteIntent,
 ) -> tuple[list[SelectCol], bool, UnionSelectColumnDelta]:
-    """
-    Merge selects by signature_key: concrete order first, then new keys from intent.
-
-    Args:
-
-        intent: Runtime intent.
-
-        concrete: Matched template intent.
-
-    Returns:
-
-        Tuple of union_cols, changed_vs_concrete flag, and merge_case classification.
-    """
-
+    """Merge selects by signature_key: concrete order first, then new keys from intent."""
     seen_keys: set[str] = set()
     union_cols: list[SelectCol] = []
     for sc in concrete.select_cols or []:

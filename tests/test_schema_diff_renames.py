@@ -11,24 +11,30 @@ import pytest
 
 from aetherdialect._config import EngineConfig
 from aetherdialect._contracts_base import (
+    EngineContext,
+)
+from aetherdialect._contracts_schema import (
     ColumnMetadata,
     FKEdge,
-    SchemaContext,
     SchemaGraph,
     TableMetadata,
 )
 from aetherdialect._dialect import Dialect
-from aetherdialect._schema import (
+from aetherdialect._schema_graph import (
     SchemaDiff,
     TableDiff,
-    _save_schema_to_cache,
-    apply_diff,
     assign_schema_graph_hashes,
-    build_schema_graph,
     diff_schemas,
     resolve_column_renames,
     resolve_table_renames,
 )
+from aetherdialect._schema_overrides import (
+    apply_diff,
+    build_schema_graph,
+    save_schema_to_cache,
+)
+
+pytestmark = pytest.mark.usefixtures("stub_schema_llm_classifier")
 
 
 class _ProfileStubDialect(Dialect):
@@ -47,14 +53,20 @@ class _ProfileStubDialect(Dialect):
         self.profile_schema_calls: list[list[str]] = []
         self.reflect_only_calls = 0
 
-    def compute_ddl_probe(self, schema_context: SchemaContext) -> str:
+    def compute_ddl_probe(self, engine_context: EngineContext) -> str:
         return self._probe_value
 
-    def reflect_only(self, schema_context: SchemaContext) -> SchemaGraph:
+    def reflect_only(self, engine_context: EngineContext) -> SchemaGraph:
         self.reflect_only_calls += 1
         return copy.deepcopy(self._reflected)
 
-    def reflect_schema_graph(self, *, include: Any = "tables", allow_objects: Any = None) -> SchemaGraph:
+    def reflect_schema_graph(
+        self,
+        *,
+        include: Any = "tables",
+        allow_objects: Any = None,
+        sql_file: Any = None,
+    ) -> SchemaGraph:
         raise AssertionError("reflect_schema_graph should not run on partial-rebuild path")
 
     def profile_schema(self, sg: SchemaGraph) -> None:
@@ -64,7 +76,7 @@ class _ProfileStubDialect(Dialect):
             for cname, c in t.columns.items():
                 vals = self._topk.get((tname, cname))
                 if vals is not None:
-                    c.top_k_values = list(vals)
+                    c.frequent_values = list(vals)
                     c.distinct_count = max(c.distinct_count, len(vals))
 
     def ast_validate(self, sql: str) -> tuple[bool, str]:
@@ -93,7 +105,7 @@ def _mk_table(
 
 
 def test_diff_classifies_value_type_changed() -> None:
-    """integer → varchar bumps both data_type AND value_type."""
+    """Integer → varchar bumps both data_type AND value_type."""
     cached = SchemaGraph(
         tables={"a": _mk_table("a", {"x": _mk_col("x", "integer")})},
         join_paths_multi={},
@@ -109,8 +121,7 @@ def test_diff_classifies_value_type_changed() -> None:
 
 
 def test_diff_value_type_unchanged_when_only_raw_type_changes() -> None:
-    """integer → bigint changes data_type but value_type stays 'integer' → redeclared, not retyped."""
-
+    """Integer → bigint changes data_type but value_type stays 'integer' → redeclared, not retyped."""
     cached = SchemaGraph(
         tables={"a": _mk_table("a", {"x": _mk_col("x", "integer")})},
         join_paths_multi={},
@@ -136,7 +147,7 @@ def test_resolve_column_renames_matches_by_topk_overlap() -> None:
                     "x": _mk_col(
                         "x",
                         "varchar",
-                        top_k_values=["alpha", "beta", "gamma"],
+                        frequent_values=["alpha", "beta", "gamma"],
                         distinct_count=3,
                     ),
                 },
@@ -171,7 +182,14 @@ def test_resolve_column_renames_skips_when_overlap_low() -> None:
         tables={
             "a": _mk_table(
                 "a",
-                {"x": _mk_col("x", "varchar", top_k_values=["alpha", "beta"], distinct_count=2)},
+                {
+                    "x": _mk_col(
+                        "x",
+                        "varchar",
+                        frequent_values=["alpha", "beta"],
+                        distinct_count=2,
+                    )
+                },
             ),
         },
         join_paths_multi={},
@@ -203,7 +221,7 @@ def test_apply_diff_renamed_columns_preserve_cached_profile() -> None:
                         "x",
                         "varchar",
                         role="categorical",
-                        top_k_values=["alpha", "beta"],
+                        frequent_values=["alpha", "beta"],
                         distinct_count=2,
                     ),
                 },
@@ -228,7 +246,7 @@ def test_apply_diff_renamed_columns_preserve_cached_profile() -> None:
     new_col = out.tables["a"].columns["y"]
     assert new_col.name == "y"
     assert new_col.role == "categorical"
-    assert new_col.top_k_values == ["alpha", "beta"]
+    assert new_col.frequent_values == ["alpha", "beta"]
     assert dialect.profile_schema_calls == []
 
 
@@ -238,7 +256,7 @@ def test_apply_diff_renamed_columns_with_retype_uses_new_data_type() -> None:
         tables={
             "a": _mk_table(
                 "a",
-                {"x": _mk_col("x", "integer", top_k_values=["1", "2"], distinct_count=2)},
+                {"x": _mk_col("x", "integer", frequent_values=["1", "2"], distinct_count=2)},
             ),
         },
         join_paths_multi={},
@@ -256,22 +274,28 @@ def test_apply_diff_renamed_columns_with_retype_uses_new_data_type() -> None:
     assert col.data_type == "varchar"
     assert col.value_type == "string"
 
-    assert col.top_k_values == ["1", "2"]
+    assert col.frequent_values == ["1", "2"]
 
 
 def test_resolve_table_renames_matches_by_column_overlap() -> None:
-    """
-    Dropped table + added table with overlapping profiles but DIFFERENT column names → rename.
-
-    Column-set differs (Phase 3's column-stable rename match doesn't fire), so Phase 5's profile-overlap matching is what catches the rename.
-    """
+    """Dropped table + added table with overlapping profiles but DIFFERENT column names → rename. Column-set differs (Phase 3's column-stable rename match doesn't fire), so Phase 5's profile-overlap matching is what catches the rename."""
     cached = SchemaGraph(
         tables={
             "old_t": _mk_table(
                 "old_t",
                 {
-                    "a": _mk_col("a", "varchar", top_k_values=["x", "y", "z"], distinct_count=3),
-                    "b": _mk_col("b", "integer", top_k_values=["1", "2", "3"], distinct_count=3),
+                    "a": _mk_col(
+                        "a",
+                        "varchar",
+                        frequent_values=["x", "y", "z"],
+                        distinct_count=3,
+                    ),
+                    "b": _mk_col(
+                        "b",
+                        "integer",
+                        frequent_values=["1", "2", "3"],
+                        distinct_count=3,
+                    ),
                 },
             ),
         },
@@ -317,11 +341,16 @@ def test_resolve_table_renames_with_partial_column_renames() -> None:
             "old_t": _mk_table(
                 "old_t",
                 {
-                    "a": _mk_col("a", "varchar", top_k_values=["x", "y", "z"], distinct_count=3),
+                    "a": _mk_col(
+                        "a",
+                        "varchar",
+                        frequent_values=["x", "y", "z"],
+                        distinct_count=3,
+                    ),
                     "b_old": _mk_col(
                         "b_old",
                         "integer",
-                        top_k_values=["1", "2", "3"],
+                        frequent_values=["1", "2", "3"],
                         distinct_count=3,
                     ),
                 },
@@ -359,16 +388,13 @@ def test_resolve_table_renames_with_partial_column_renames() -> None:
 
 
 def test_resolve_table_renames_skips_when_disjoint_profiles() -> None:
-    """
-    No column overlap → drop+add, not rename. Use differing column names so Phase 3's
-    column-set match also misses (forcing Phase 5 to be the decider).
-    """
+    """No column overlap → drop+add, not rename. Use differing column names so Phase 3's column-set match also misses (forcing Phase 5 to be the decider)."""
     cached = SchemaGraph(
         tables={
             "old_t": _mk_table(
                 "old_t",
                 {
-                    "a": _mk_col("a", "varchar", top_k_values=["x", "y"], distinct_count=2),
+                    "a": _mk_col("a", "varchar", frequent_values=["x", "y"], distinct_count=2),
                 },
             ),
         },
@@ -398,8 +424,8 @@ def test_resolve_table_renames_skips_when_column_count_differs() -> None:
             "old_t": _mk_table(
                 "old_t",
                 {
-                    "a": _mk_col("a", "varchar", top_k_values=["x"], distinct_count=1),
-                    "b": _mk_col("b", "integer", top_k_values=["1"], distinct_count=1),
+                    "a": _mk_col("a", "varchar", frequent_values=["x"], distinct_count=1),
+                    "b": _mk_col("b", "integer", frequent_values=["1"], distinct_count=1),
                 },
             ),
         },
@@ -425,11 +451,11 @@ def cache_path(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> str:
     return p
 
 
-def _save_with_probe(sg: SchemaGraph, ctx: SchemaContext, notes: str, probe: str, path: str) -> None:
+def _save_with_probe(sg: SchemaGraph, ctx: EngineContext, notes: str, probe: str, path: str) -> None:
     sg.notes_sha256 = hashlib.sha256(notes.encode("utf-8")).hexdigest()
     assign_schema_graph_hashes(sg, ctx, sg.notes_sha256)
     sg.ddl_probe_hash = probe
-    _save_schema_to_cache(sg, path)
+    save_schema_to_cache(sg, path)
 
 
 def test_build_schema_graph_detects_column_rename(
@@ -437,8 +463,8 @@ def test_build_schema_graph_detects_column_rename(
     cache_path: str,
 ) -> None:
     """Probe-mismatch + column rename inside customers → cached profile preserved."""
-    ctx = SchemaContext()
-    schema_graph.tables["customers"].columns["email"].top_k_values = [
+    ctx = EngineContext()
+    schema_graph.tables["customers"].columns["email"].frequent_values = [
         "a@x.com",
         "b@x.com",
         "c@x.com",
@@ -470,14 +496,10 @@ def test_build_schema_graph_detects_table_rename(
     schema_graph: SchemaGraph,
     cache_path: str,
 ) -> None:
-    """
-    Probe-mismatch + table renamed AND a column renamed → Phase 5 profile match.
-
-    The fixture's ``products.title`` column gets seeded with profile values; in the new structural graph products → items AND title → label, so column-set equality fails and profile overlap is the only signal available.
-    """
-    ctx = SchemaContext()
+    """Probe-mismatch + table renamed AND a column renamed → Phase 5 profile match. The fixture's ``products.title`` column gets seeded with profile values; in the new structural graph products → items AND title → label, so column-set equality fails and profile overlap is the only signal available."""
+    ctx = EngineContext()
     products = schema_graph.tables["products"]
-    products.columns["title"].top_k_values = ["alpha", "beta", "gamma"]
+    products.columns["title"].frequent_values = ["alpha", "beta", "gamma"]
     products.columns["title"].distinct_count = 3
     _save_with_probe(schema_graph, ctx, "n", probe="probe-OLD", path=cache_path)
 
@@ -491,7 +513,7 @@ def test_build_schema_graph_detects_table_rename(
         is_nullable=title_col.is_nullable,
     )
     for c in new_products.columns.values():
-        c.top_k_values = []
+        c.frequent_values = []
         c.distinct_count = 0
     new_struct.tables["items"] = new_products
     if "orders" in new_struct.tables:

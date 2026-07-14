@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "action": "remap",
+  "table_renames": [],
+  "column_renames": [
+    {
+      "table": "item",
+      "from": "title",
+      "to": "item_title"
+    }
+  ],
+  "dropped_tables": [],
+  "dropped_columns": [],
+  "added_tables": [],
+  "added_columns": []
+}

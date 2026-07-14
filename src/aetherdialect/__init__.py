@@ -1,63 +1,63 @@
-"""Stable import surface for the Text2SQL package."""
+"""Stable import surface for the AetherEngine package."""
 
-from importlib.metadata import PackageNotFoundError, version
-
-from ._config import LlmExecutionConfig
-from ._contracts_base import (
+from .aetherdialect import (
+    PERMISSION_DENIED_USER_MESSAGE,
+    AetherEngine,
+    AetherSpace,
+    AsyncPipelineSession,
     AuditEvent,
     ConfigError,
+    ConfigSnapshot,
     ConnectionError,
     DatabasePingFailed,
     Diagnostic,
+    EngineContext,
     LlmTransientFailure,
     MigrationPendingError,
     MigrationPreview,
-    RetryableError,
-    RuntimeConfig,
-    SchemaAccessError,
-    SchemaContext,
-    SessionActiveError,
-    SessionStep,
-    StatementTimeoutError,
-)
-from ._main_execution import PipelineSession
-from .text2sql import (
-    AsyncPipelineSession,
-    ConfigSnapshot,
+    MockFixtureMissingError,
+    OwnerOnlyOperationError,
+    ParameterBinding,
+    PipelineSession,
     QSimSummarySnapshot,
+    RetryableError,
+    SchemaAccessError,
     SchemaStatsSnapshot,
     SeedWarmupSummarySnapshot,
-    Text2SQL,
+    SessionActiveError,
+    SessionStep,
+    SpaceContext,
+    StatementTimeoutError,
+    __version__,
 )
 
-try:
-    __version__ = version("aetherdialect")
-except PackageNotFoundError:
-    __version__ = "0.0.0+dev"
-
 __all__ = [
+    "AetherSpace",
     "AsyncPipelineSession",
     "AuditEvent",
-    "PipelineSession",
     "ConfigError",
-    "ConnectionError",
     "ConfigSnapshot",
+    "ConnectionError",
     "DatabasePingFailed",
     "Diagnostic",
-    "LlmExecutionConfig",
     "LlmTransientFailure",
     "MigrationPendingError",
     "MigrationPreview",
+    "MockFixtureMissingError",
+    "OwnerOnlyOperationError",
+    "ParameterBinding",
+    "PERMISSION_DENIED_USER_MESSAGE",
+    "PipelineSession",
     "QSimSummarySnapshot",
     "RetryableError",
-    "RuntimeConfig",
     "SchemaAccessError",
-    "SchemaContext",
+    "EngineContext",
     "SchemaStatsSnapshot",
     "SeedWarmupSummarySnapshot",
     "SessionActiveError",
     "SessionStep",
+    "SpaceContext",
     "StatementTimeoutError",
-    "Text2SQL",
+    "AetherEngine",
     "__version__",
 ]

@@ -7,30 +7,51 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aetherdialect._dialect import (
+from aetherdialect._contracts_schema import ColumnMetadata
+from aetherdialect._dialect import Dialect, get_dialect, resolve_dialect
+from aetherdialect._dialect_postgres import PostgresDialect
+from aetherdialect._dialect_sqlglot_engines import (
+    BigQueryDialect,
     DatabricksDialect,
-    Dialect,
-    PostgresDialect,
-    get_dialect,
-    resolve_dialect,
+    DuckDBDialect,
+    MariaDBDialect,
+    MySQLDialect,
+    RedshiftDialect,
+    SnowflakeDialect,
+    SQLiteDialect,
+    SQLServerDialect,
+    databricks_normalize_datetrunc_sql,
 )
+from aetherdialect._dialect_sqlglot_helper import array_storage_kind, ast_structural_valid_sqlglot
 
 
 def _pg_uninit() -> PostgresDialect:
     """Return a ``PostgresDialect`` instance without running ``__init__`` (render-only tests)."""
-
     return PostgresDialect.__new__(PostgresDialect)
 
 
 def _dbr_uninit() -> DatabricksDialect:
     """Return a ``DatabricksDialect`` instance without running ``__init__`` (render-only tests)."""
-
     return DatabricksDialect.__new__(DatabricksDialect)
+
+
+def _mysql_uninit() -> MySQLDialect:
+    """Return a ``MySQLDialect`` instance without running ``__init__`` (render-only tests)."""
+    return MySQLDialect.__new__(MySQLDialect)
+
+
+def _snowflake_uninit() -> SnowflakeDialect:
+    """Return a ``SnowflakeDialect`` instance without running ``__init__`` (render-only tests)."""
+    return SnowflakeDialect.__new__(SnowflakeDialect)
+
+
+def _redshift_uninit() -> RedshiftDialect:
+    """Return a ``RedshiftDialect`` instance without running ``__init__`` (render-only tests)."""
+    return RedshiftDialect.__new__(RedshiftDialect)
 
 
 def test_resolve_dialect_accepts_name_or_instance() -> None:
     """``resolve_dialect`` returns the same dialect object or delegates to ``get_dialect`` for names."""
-
     d = _pg_uninit()
     assert resolve_dialect(d) is d
     with patch("aetherdialect._dialect.get_dialect", return_value=d) as m:
@@ -44,20 +65,17 @@ class TestPostgresPglastWalk:
     def test_finds_rangevars_under_cross_join(self) -> None:
         from pglast.parser import parse_sql
 
-        from aetherdialect._dialect import _pg_node_kind, _pg_walk_nodes
+        from aetherdialect._dialect_postgres import pg_node_kind, pg_walk_nodes
 
         sql = "WITH cte1 AS (SELECT 1 AS x), cte2 AS (SELECT 1 AS y FROM cte1) SELECT * FROM cte1 CROSS JOIN cte2"
         root = parse_sql(sql)[0].stmt
-        rels = {
-            n.relname for n in _pg_walk_nodes(root) if _pg_node_kind(n) == "RangeVar" and getattr(n, "relname", None)
-        }
+        rels = {n.relname for n in pg_walk_nodes(root) if pg_node_kind(n) == "RangeVar" and getattr(n, "relname", None)}
         assert "cte1" in rels
         assert "cte2" in rels
 
 
 def test_databricks_quote_table_column_backticks() -> None:
     """Databricks dialect uses backticks for reserved-word identifiers."""
-
     d = _dbr_uninit()
     assert d.quote_table_column("orders", "order") == "`orders`.`order`"
 
@@ -79,6 +97,55 @@ class TestRenderArrayContainsExpr:
         assert "LOWER(TRIM(CAST(_ac_x AS STRING)" in sql
         assert "LOWER(TRIM(CAST(:p2 AS STRING)" in sql
         assert "NOT `film`.`special_features` IS NULL" in sql
+
+    def test_mysql_lowercases_json_elements(self) -> None:
+        sql = _mysql_uninit().render_array_contains("film.special_features", "p1")
+        assert "LOCATE" in sql or "INSTR" in sql
+        assert "LOWER(CAST(film.special_features AS CHAR))" in sql
+        assert "LOWER(TRIM(BOTH '%' FROM CAST(:p1 AS CHAR)))" in sql
+        assert "JSON_SEARCH" not in sql
+
+    def test_snowflake_uses_transform_and_trim(self) -> None:
+        sql = _snowflake_uninit().render_array_contains("film.special_features", "p1")
+        assert "ARRAY_CONTAINS" in sql
+        assert "TRANSFORM(film.special_features" in sql
+        assert "LOWER(TRIM(CAST(:p1 AS VARCHAR)" in sql
+        assert "AS VARIANT" in sql
+        assert sql.index("ARRAY_CONTAINS") < sql.index("TRANSFORM")
+
+    def test_redshift_matches_json_elements_case_insensitively(self) -> None:
+        sql = _redshift_uninit().render_array_contains("film.special_features", "p1")
+        assert "STRPOS" in sql or "POSITION" in sql
+        assert "LOWER(CAST(film.special_features AS VARCHAR))" in sql
+        assert "REGEXP_INSTR" not in sql
+        assert "CONCAT('\"'" in sql or "CONCAT('\"" in sql or "\"' ||" in sql
+
+    def test_array_storage_kind_classifies_native_and_json_text(self) -> None:
+        native = ColumnMetadata(name="special_features", data_type="VARCHAR[]", element_type="string")
+        json_text = ColumnMetadata(
+            name="special_features",
+            data_type="VARCHAR",
+            element_type="string",
+            frequent_values=['["Trailers", "Commentaries"]'],
+        )
+        json_col = ColumnMetadata(name="special_features", data_type="JSON", element_type="string")
+        assert array_storage_kind(native) == "native_array"
+        assert array_storage_kind(json_text) == "json_text_array"
+        assert array_storage_kind(json_col) == "json_text_array"
+
+    def test_postgres_parse_select_does_not_raise(self) -> None:
+        d = _pg_uninit()
+        assert d.parse_select("SELECT film_id FROM film") is not None
+
+    def test_mysql_routes_by_column_meta(self) -> None:
+        json_meta = ColumnMetadata(name="special_features", data_type="JSON", element_type="string")
+        text_meta = ColumnMetadata(name="special_features", data_type="VARCHAR", element_type="string")
+        json_sql = _mysql_uninit().render_array_contains("film.special_features", "p1", column_meta=json_meta)
+        text_sql = _mysql_uninit().render_array_contains("film.special_features", "p1", column_meta=text_meta)
+        assert array_storage_kind(json_meta) == "json_text_array"
+        assert "LOCATE" in json_sql or "INSTR" in json_sql
+        assert "LOCATE" in text_sql or "INSTR" in text_sql
+        assert "JSON_CONTAINS" not in json_sql
 
 
 class TestRenderDateDiffExpr:
@@ -104,6 +171,18 @@ class TestRenderDateDiffExpr:
         """Databricks week unit multiplies by 7."""
         result = _dbr_uninit().render_date_diff("a - b", ">=", "week", 2)
         assert result == "(a - b) >= 14"
+
+    def test_snowflake_two_column_datediff(self):
+        """Snowflake uses DATEDIFF for two date columns."""
+        result = _snowflake_uninit().render_date_diff(
+            "rental.return_date - rental.rental_date",
+            ">",
+            "day",
+            7,
+            minuend_sql="rental.return_date",
+            subtrahend_sql="rental.rental_date",
+        )
+        assert "DATEDIFF(DAY, rental.rental_date, rental.return_date) > 7" in result
 
 
 class TestRenderDateWindowExprPostgresql:
@@ -235,7 +314,7 @@ class TestGetDialect:
     def test_unsupported_raises_value_error(self):
         """Unsupported dialect name should raise ValueError."""
         with pytest.raises(ValueError, match="Unsupported dialect"):
-            get_dialect("mysql", MagicMock())
+            get_dialect("nonexistent_engine", MagicMock())
 
     @patch("aetherdialect._dialect.EngineConfig")
     def test_none_engine_type_uses_config_type(self, mock_config):
@@ -298,19 +377,18 @@ class TestDialectBase:
         assert d._explain_disabled is False
         assert d.can_explain() is True
 
-    def test_quote_table_column_base_is_unquoted(self):
-        """Base dialect leaves identifiers unquoted."""
-
+    def test_quote_table_column_base_raises_not_implemented(self):
+        """Base dialect requires subclasses to implement quote_table_column."""
         d = Dialect(config=MagicMock())
-        assert d.quote_table_column("orders", "id") == "orders.id"
+        with pytest.raises(NotImplementedError):
+            d.quote_table_column("orders", "id")
 
 
 class TestPostgresExplainPermissionHandling:
-    """Tests for ``PostgresDialect.explain_sql`` permission-denied self-disable behaviour."""
+    """Tests for ``PostgresDialect.explain_sql`` permission-denied self- disable behaviour."""
 
     def _make_dialect(self):
         """Create a PostgresDialect bypassing ``create_engine`` for engine stubbing."""
-
         with patch("sqlalchemy.create_engine"):
             mock_runtime = SimpleNamespace(
                 HOST="localhost",
@@ -326,7 +404,6 @@ class TestPostgresExplainPermissionHandling:
 
     def test_permission_denied_returns_success_and_disables(self):
         """Permission-denied responses are masked as success and disable EXPLAIN."""
-
         d = self._make_dialect()
         bad_engine = MagicMock()
         cm = MagicMock()
@@ -343,7 +420,6 @@ class TestPostgresExplainPermissionHandling:
 
     def test_non_permission_error_still_fails(self):
         """A non-permission failure preserves the error and keeps EXPLAIN enabled."""
-
         d = self._make_dialect()
         bad_engine = MagicMock()
         mock_conn = MagicMock()
@@ -362,7 +438,6 @@ class TestPostgresExplainPermissionHandling:
 
     def test_quote_table_column_postgres(self):
         """Postgres dialect double-quotes identifiers."""
-
         d = self._make_dialect()
         assert d.quote_table_column("orders", "order") == '"orders"."order"'
 
@@ -373,7 +448,6 @@ class TestAstStructuralValid:
     @pytest.fixture
     def pg(self):
         """Uninitialized Postgres dialect for AST helpers."""
-
         return _pg_uninit()
 
     def test_simple_select_passes(self, pg):
@@ -468,59 +542,74 @@ class TestAstStructuralValid:
 
 
 class TestAstSparkStructuralValid:
-    """Tests for ``DatabricksDialect._ast_spark_structural_valid`` (sqlglot, parity with Postgres intent)."""
+    """Tests for shared sqlglot structural validation (Spark dialect string)."""
 
     @pytest.fixture
     def dbr(self):
-        """Uninitialized Databricks dialect for AST helpers."""
-
+        """Uninitialized Databricks dialect for validation-only tests."""
         return _dbr_uninit()
 
-    def test_simple_select_passes(self, dbr):
-        ok, err = dbr._ast_spark_structural_valid("SELECT customer_id, name FROM customers")
+    def test_simple_select_passes(self):
+        ok, err = ast_structural_valid_sqlglot(
+            "SELECT customer_id, name FROM customers",
+            sqlglot_dialect="spark",
+        )
         assert ok is True
         assert err == ""
 
-    def test_join_on_passes(self, dbr):
+    def test_join_on_passes(self):
         sql = "SELECT o.order_id, c.name FROM orders o JOIN customers c ON o.customer_id = c.customer_id"
-        ok, err = dbr._ast_spark_structural_valid(sql)
+        ok, err = ast_structural_valid_sqlglot(sql, sqlglot_dialect="spark")
         assert ok is True, err
 
-    def test_recursive_cte_rejected(self, dbr):
+    def test_recursive_cte_rejected(self):
         sql = "WITH RECURSIVE r AS (SELECT 1 AS n) SELECT * FROM r"
-        ok, err = dbr._ast_spark_structural_valid(sql)
+        ok, err = ast_structural_valid_sqlglot(sql, sqlglot_dialect="spark")
         assert ok is False
         assert err == "cte_recursive"
 
-    def test_cte_union_rejected(self, dbr):
+    def test_cte_union_rejected(self):
         sql = "WITH a AS (SELECT 1 UNION SELECT 2) SELECT * FROM a"
-        ok, err = dbr._ast_spark_structural_valid(sql)
+        ok, err = ast_structural_valid_sqlglot(sql, sqlglot_dialect="spark")
         assert ok is False
         assert err == "cte_contains_set_op"
 
-    def test_exists_rejected(self, dbr):
+    def test_exists_rejected(self):
         sql = "SELECT * FROM customers c WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.customer_id)"
-        ok, err = dbr._ast_spark_structural_valid(sql)
+        ok, err = ast_structural_valid_sqlglot(sql, sqlglot_dialect="spark")
         assert ok is False
         assert err == "exists_not_allowed"
 
-    def test_subquery_in_from_rejected(self, dbr):
-        ok, err = dbr._ast_spark_structural_valid("SELECT * FROM (SELECT 1 AS x) t")
+    def test_subquery_in_from_rejected(self):
+        ok, err = ast_structural_valid_sqlglot(
+            "SELECT * FROM (SELECT 1 AS x) t",
+            sqlglot_dialect="spark",
+        )
         assert ok is False
         assert err == "subquery_not_allowed"
 
-    def test_cross_join_rejected(self, dbr):
-        ok, err = dbr._ast_spark_structural_valid("SELECT * FROM a CROSS JOIN b")
+    def test_cross_join_rejected(self):
+        ok, err = ast_structural_valid_sqlglot(
+            "SELECT * FROM a CROSS JOIN b",
+            sqlglot_dialect="spark",
+        )
         assert ok is False
         assert err == "cross_join_not_allowed"
 
-    def test_cross_join_scalar_cte_allowed_when_whitelisted(self, dbr):
+    def test_cross_join_scalar_cte_allowed_when_whitelisted(self):
         sql = "WITH c AS (SELECT 1 AS x) SELECT * FROM customers CROSS JOIN c"
-        ok, err = dbr._ast_spark_structural_valid(sql, scalar_cte_names=frozenset({"c"}))
+        ok, err = ast_structural_valid_sqlglot(
+            sql,
+            sqlglot_dialect="spark",
+            scalar_cte_names=frozenset({"c"}),
+        )
         assert ok is True, err
 
-    def test_using_join_rejected(self, dbr):
-        ok, err = dbr._ast_spark_structural_valid("SELECT * FROM a JOIN b USING (id)")
+    def test_using_join_rejected(self):
+        ok, err = ast_structural_valid_sqlglot(
+            "SELECT * FROM a JOIN b USING (id)",
+            sqlglot_dialect="spark",
+        )
         assert ok is False
         assert err == "using_not_allowed"
 
@@ -538,86 +627,44 @@ class TestAstSparkStructuralValid:
         dbr.connection.cursor.assert_not_called()
 
 
-class TestPrepareForExecution:
-    """Tests for DatabricksDialect.prepare_for_execution."""
+class TestQualifyTablesForExecution:
+    """Tests for DatabricksDialect table qualification in finalize_render."""
 
     def _make_dialect(self):
         """Create a DatabricksDialect with mocked internals."""
-        mock_config = SimpleNamespace(CATALOG="dev", SCHEMA="dvdrental", DEBUG=False)
+        mock_config = SimpleNamespace(CATALOG="dev", SCHEMA="rental_shop", DEBUG=False)
         d = DatabricksDialect.__new__(DatabricksDialect)
         d.config = mock_config
+        d.sqlglot_dialect = "databricks"
         return d
 
     def test_qualifies_table_references(self):
-        """prepare_for_execution qualifies table references."""
+        """_qualify_tables_for_execution qualifies bare table references."""
         d = self._make_dialect()
-        result = d.prepare_for_execution("SELECT * FROM customers")
+        result = d._qualify_tables_for_execution("SELECT * FROM customers")
         assert "dev" in result
-        assert "dvdrental" in result
+        assert "rental_shop" in result
         assert "customers" in result
-
-
-class TestQualifyTableReferences:
-    """Tests for DatabricksDialect._qualify_table_references."""
-
-    def _make_dialect(self):
-        """Create a DatabricksDialect with mocked internals."""
-        mock_config = SimpleNamespace(CATALOG="dev", SCHEMA="dvdrental", DEBUG=False)
-        d = DatabricksDialect.__new__(DatabricksDialect)
-        d.config = mock_config
-        return d
-
-    def test_from_clause_qualified(self):
-        """Table in FROM should get catalog.schema prefix."""
-        d = self._make_dialect()
-        result = d._qualify_table_references("SELECT * FROM customers")
-        assert "dev" in result
-        assert "dvdrental" in result
-        assert "customers" in result
-
-    def test_join_clause_qualified(self):
-        """Table in JOIN should get catalog.schema prefix."""
-        d = self._make_dialect()
-        result = d._qualify_table_references("SELECT * FROM orders JOIN customers ON orders.id = customers.id")
-        assert result.count("dev") >= 2
-
-    def test_extract_from_max_not_catalog_qualified(self):
-        """Do not qualify MAX after EXTRACT(... FROM ...)."""
-        d = self._make_dialect()
-        sql = "SELECT EXTRACT(YEAR FROM MAX(rental.rental_date)) AS y FROM rental GROUP BY rental.customer_id"
-        result = d._qualify_table_references(sql)
-        assert "`dev`.`dvdrental`.`MAX`" not in result
-        assert "`dev`.`dvdrental`.`rental`" in result
-
-    def test_three_part_dotted_reference_not_double_wrapped(self):
-        """Leave ``catalog.schema.table`` dotted references qualified without double-wrapping."""
-        d = self._make_dialect()
-        sql = "SELECT title FROM dev.dvdrental.film"
-        result = d._qualify_table_references(sql)
-        assert "`dev`.`dvdrental`.`dev`" not in result
-        assert "dev.dvdrental.dev" not in result
-        assert "film" in result
-
-    def test_three_part_backticked_reference_not_double_wrapped(self):
-        """Leave fully backtick-qualified references qualified without double-wrapping."""
-        d = self._make_dialect()
-        sql = "SELECT title FROM `dev`.`dvdrental`.`film`"
-        result = d._qualify_table_references(sql)
-        assert "`dev`.`dvdrental`.`dev`" not in result
-        assert "dev.dvdrental.dev" not in result
-        assert "film" in result
 
 
 class TestDatabricksNormalizeDatetruncSql:
-    """``_databricks_normalize_datetrunc_sql`` normalizes Anonymous DATETRUNC call sites."""
+    """``databricks_normalize_datetrunc_sql`` normalizes Anonymous DATETRUNC call sites."""
 
     def test_rewrites_to_date_trunc_with_unit_first(self):
-        from aetherdialect._dialect import _databricks_normalize_datetrunc_sql
-
         sql = "SELECT DATETRUNC('MONTH', rental.created_at) AS m FROM rental"
-        out = _databricks_normalize_datetrunc_sql(sql)
+        out = databricks_normalize_datetrunc_sql(sql)
         assert "DATETRUNC(" not in out
         assert "DATE_TRUNC('MONTH'" in out
+
+
+class TestPostgresNormalizeDatetruncSql:
+    """``PostgresDialect.post_render_normalize`` rewrites DATETRUNC to DATE_TRUNC."""
+
+    def test_rewrites_datetrunc_to_date_trunc(self) -> None:
+        sql = "SELECT DATETRUNC(rental.created_at, 'MONTH') AS m FROM rental"
+        out = _pg_uninit().post_render_normalize(sql, stage="post_substitute")
+        assert "DATETRUNC(" not in out.upper()
+        assert "date_trunc('month'" in out.lower()
 
 
 class TestRenderDateWindowExprEdgeCases:
@@ -700,12 +747,8 @@ class TestDatabricksDialectInitFallback:
         assert d.spark is None
 
     @patch("aetherdialect._dialect.Dialect.__init__", return_value=None)
-    def test_connector_fails_with_warehouse_creds_raises(self, _super_init: MagicMock) -> None:
-        """
-        When warehouse credentials are configured and the connector raises, the dialect
-        surfaces the connector error instead of silently falling back to PySpark (which
-        could bind to an unrelated SPARK_REMOTE / Databricks Connect endpoint).
-        """
+    def test_connector_fails_falls_back_to_spark(self, _super_init: MagicMock) -> None:
+        """When warehouse connector fails, SQLAlchemy is attempted before PySpark."""
         mock_spark = MagicMock()
         dbr_parent, dbr_mod = self._dbr_sql_module(connect_side_effect=RuntimeError("bad token"))
         ps_parent, ps_mod = self._pyspark_modules(spark_rv=mock_spark)
@@ -718,10 +761,10 @@ class TestDatabricksDialectInitFallback:
                 "pyspark.sql": ps_mod,
             },
         ):
-            with pytest.raises(RuntimeError, match="databricks-sql-connector failed"):
-                DatabricksDialect(self._config(native=True))
+            d = DatabricksDialect(self._config(native=True))
 
-        assert ps_mod.SparkSession.builder.getOrCreate.call_count == 0
+        assert d.connection is None
+        assert d.spark is mock_spark
 
     @patch("aetherdialect._dialect.Dialect.__init__", return_value=None)
     def test_no_credentials_uses_spark(self, _super_init: MagicMock) -> None:
@@ -735,7 +778,9 @@ class TestDatabricksDialectInitFallback:
 
     @patch("aetherdialect._dialect.Dialect.__init__", return_value=None)
     def test_both_fail_raises(self, _super_init: MagicMock) -> None:
-        """When connector and PySpark both fail, RuntimeError is raised."""
+        """When connector, SQLAlchemy, and PySpark all fail, ConfigError is raised."""
+        from aetherdialect._config import ConfigError
+
         dbr_parent, dbr_mod = self._dbr_sql_module(connect_side_effect=RuntimeError("conn fail"))
         with patch.dict(
             "sys.modules",
@@ -746,12 +791,12 @@ class TestDatabricksDialectInitFallback:
                 "pyspark.sql": None,
             },
         ):
-            with pytest.raises(RuntimeError, match="databricks-sql-connector failed"):
+            with pytest.raises(ConfigError, match="Databricks requires"):
                 DatabricksDialect(self._config(native=True))
 
 
 class TestAttachExtraFromAndWhere:
-    """Tier-B semantic edge injection (FROM extension + WHERE AND-conjuncts)."""
+    """Tier-B semantic edge injection (FROM extension + WHERE AND- conjuncts)."""
 
     def _edge(self, left_tok: str, lc: str, right_tok: str, rc: str):
         from aetherdialect._dialect import JoinEdge
@@ -822,3 +867,391 @@ class TestAttachExtraFromAndWhere:
         out = dx.emit_sql(parsed).lower()
         assert "where" in out
         assert "`a`.`x`" in out and "`b`.`x`" in out
+
+
+def _mysql_uninit() -> MySQLDialect:
+    return MySQLDialect.__new__(MySQLDialect)
+
+
+def _redshift_uninit() -> RedshiftDialect:
+    return RedshiftDialect.__new__(RedshiftDialect)
+
+
+def _sqlserver_uninit() -> SQLServerDialect:
+    return SQLServerDialect.__new__(SQLServerDialect)
+
+
+def _snowflake_uninit() -> SnowflakeDialect:
+    return SnowflakeDialect.__new__(SnowflakeDialect)
+
+
+def _bigquery_uninit() -> BigQueryDialect:
+    return BigQueryDialect.__new__(BigQueryDialect)
+
+
+def _duckdb_uninit() -> DuckDBDialect:
+    return DuckDBDialect.__new__(DuckDBDialect)
+
+
+def _sqlite_uninit() -> SQLiteDialect:
+    return SQLiteDialect.__new__(SQLiteDialect)
+
+
+def _mariadb_uninit() -> MariaDBDialect:
+    return MariaDBDialect.__new__(MariaDBDialect)
+
+
+class TestMySQLDialect:
+    """Basic render and quote tests for MySQL dialect."""
+
+    def test_quote_table_column_backticks(self) -> None:
+        d = _mysql_uninit()
+        assert d.quote_table_column("orders", "order") == "`orders`.`order`"
+
+    def test_render_date_window_day_offset(self) -> None:
+        sql = _mysql_uninit().render_date_window("t.created", ">=", "day", 3)
+        assert "DATE_SUB" in sql
+        assert "t.created" in sql
+
+    def test_render_case_insensitive_wrap(self) -> None:
+        assert _mysql_uninit().render_case_insensitive_wrap("col") == "LOWER(col)"
+
+    def test_date_window_upper_bound_sql(self) -> None:
+        d = _mysql_uninit()
+        assert d.date_window_upper_bound_sql("day") == "CURRENT_DATE"
+        assert d.date_window_upper_bound_sql("hour") == "CURRENT_TIMESTAMP"
+
+
+class TestDuckDBDialect:
+    """Basic render and quote tests for DuckDB dialect."""
+
+    def test_in_memory_shared_native_and_sqlalchemy_handles(self) -> None:
+        duckdb = pytest.importorskip("duckdb")
+        from aetherdialect._config import DuckDBRuntimeConfig, EngineConfig
+        from aetherdialect._dialect import get_dialect
+        from aetherdialect._dialect_sqlglot_engines import extract_static_pool_connection
+
+        orig_path = EngineConfig.SCHEMA_JSON_PATH
+        orig_type = EngineConfig.TYPE
+        orig_runtime = EngineConfig.RUNTIME
+        try:
+            EngineConfig.SCHEMA_JSON_PATH = ""
+            EngineConfig.TYPE = "duckdb"
+            EngineConfig.RUNTIME = DuckDBRuntimeConfig
+            connection = duckdb.connect(":memory:")
+            connection.execute("CREATE TABLE shared_probe (id INTEGER)")
+            connection.execute("INSERT INTO shared_probe VALUES (7)")
+            dialect = get_dialect("duckdb", DuckDBRuntimeConfig, native_connection=connection)
+            pooled = extract_static_pool_connection(dialect.engine)
+            assert pooled is connection
+            graph = dialect.reflect_schema_graph(include="tables")
+            assert "shared_probe" in graph.tables
+            assert dialect.execute("SELECT id FROM shared_probe") == [(7,)]
+        finally:
+            EngineConfig.SCHEMA_JSON_PATH = orig_path
+            EngineConfig.TYPE = orig_type
+            EngineConfig.RUNTIME = orig_runtime
+
+    def test_quote_table_column_double_quotes(self) -> None:
+        d = _duckdb_uninit()
+        assert d.quote_table_column("orders", "order") == '"orders"."order"'
+
+    def test_supports_ilike_and_unnest(self) -> None:
+        d = _duckdb_uninit()
+        assert d.supports_ilike is True
+        assert d.supports_unnest_select_item is True
+
+    def test_render_array_contains(self) -> None:
+        sql = _duckdb_uninit().render_array_contains("film.special_features", "p0")
+        assert "array_contains" in sql.lower() or "list_contains" in sql.lower()
+
+    def test_render_date_diff(self) -> None:
+        sql = _duckdb_uninit().render_date_diff("t.d", ">", "day", 7)
+        assert "date_diff" in sql.lower()
+
+    def test_date_window_upper_bound_sql(self) -> None:
+        d = _duckdb_uninit()
+        assert d.date_window_upper_bound_sql("day") == "current_date"
+        assert d.date_window_upper_bound_sql("hour") == "current_timestamp"
+
+
+class TestSQLiteDialect:
+    """Basic render and quote tests for SQLite dialect."""
+
+    def test_quote_table_column_double_quotes(self) -> None:
+        d = _sqlite_uninit()
+        assert d.quote_table_column("orders", "order") == '"orders"."order"'
+
+    def test_supports_ilike_and_unnest_false(self) -> None:
+        d = _sqlite_uninit()
+        assert d.supports_ilike is False
+        assert d.supports_unnest_select_item is False
+
+    def test_render_array_contains(self) -> None:
+        sql = _sqlite_uninit().render_array_contains("film.special_features", "p0")
+        assert "instr" in sql.lower()
+        assert "EXISTS(" not in sql.upper()
+
+    def test_render_date_diff(self) -> None:
+        sql = _sqlite_uninit().render_date_diff("t.d", ">", "day", 7)
+        assert "julianday" in sql.lower()
+
+    def test_render_date_window(self) -> None:
+        sql = _sqlite_uninit().render_date_window("t.d", ">=", "day", 30)
+        assert "date('now'" in sql.lower()
+
+    def test_explain_row_estimate_none(self) -> None:
+        assert _sqlite_uninit().explain_row_estimate("SELECT 1") is None
+
+
+class TestMariaDBDialect:
+    """Basic render and quote tests for MariaDB dialect."""
+
+    def test_sqlglot_dialect_is_mysql(self) -> None:
+        assert _mariadb_uninit().sqlglot_dialect == "mysql"
+
+    def test_quote_table_column_backticks(self) -> None:
+        d = _mariadb_uninit()
+        assert d.quote_table_column("orders", "order") == "`orders`.`order`"
+
+    def test_render_array_contains(self) -> None:
+        sql = _mariadb_uninit().render_array_contains("film.special_features", "p0")
+        assert "LOCATE" in sql or "INSTR" in sql
+        assert "JSON_CONTAINS" not in sql.upper()
+
+    def test_render_date_diff(self) -> None:
+        sql = _mariadb_uninit().render_date_diff("t.end_date", ">", "day", 7)
+        assert "TIMESTAMPDIFF" in sql.upper()
+
+
+class TestRedshiftDialect:
+    """Basic render and quote tests for Redshift dialect."""
+
+    def test_quote_table_column_double_quotes(self) -> None:
+        d = _redshift_uninit()
+        assert d.quote_table_column("orders", "order") == '"orders"."order"'
+
+    def test_render_case_insensitive_wrap(self) -> None:
+        assert _redshift_uninit().render_case_insensitive_wrap("col") == "LOWER(col)"
+
+    def test_date_window_upper_bound_sql(self) -> None:
+        d = _redshift_uninit()
+        assert d.date_window_upper_bound_sql("day") == "CURRENT_DATE"
+        assert d.date_window_upper_bound_sql("hour") == "CURRENT_TIMESTAMP"
+
+
+class TestSQLServerDialect:
+    """Basic render and quote tests for SQL Server dialect."""
+
+    def test_quote_table_column_brackets(self) -> None:
+        d = _sqlserver_uninit()
+        assert d.quote_table_column("orders", "order") == "[orders].[order]"
+
+    def test_parse_select_emits_tsql(self) -> None:
+        parsed = _sqlserver_uninit().parse_select("SELECT 1 AS x FROM dbo.t")
+        assert parsed is not None
+        assert "SELECT" in _sqlserver_uninit().emit_sql(parsed).upper()
+
+    def test_render_case_insensitive_wrap(self) -> None:
+        assert _sqlserver_uninit().render_case_insensitive_wrap("col") == "LOWER(col)"
+
+    def test_date_window_upper_bound_sql(self) -> None:
+        d = _sqlserver_uninit()
+        assert "GETDATE()" in d.date_window_upper_bound_sql("hour")
+        assert "DATE" in d.date_window_upper_bound_sql("day")
+
+
+class TestSnowflakeDialect:
+    """Basic render and quote tests for Snowflake dialect."""
+
+    def test_quote_table_column_uppercase(self) -> None:
+        d = _snowflake_uninit()
+        assert d.quote_table_column("orders", "status") == "ORDERS.STATUS"
+
+    def test_render_case_insensitive_wrap(self) -> None:
+        assert _snowflake_uninit().render_case_insensitive_wrap("col") == "LOWER(col)"
+
+    def test_date_window_upper_bound_sql(self) -> None:
+        d = _snowflake_uninit()
+        assert d.date_window_upper_bound_sql("day") == "CURRENT_DATE()"
+        assert d.date_window_upper_bound_sql("hour") == "CURRENT_TIMESTAMP()"
+
+
+class TestBigQueryDialect:
+    """Basic render and quote tests for BigQuery dialect."""
+
+    def test_quote_table_column_backticks(self) -> None:
+        d = _bigquery_uninit()
+        assert d.quote_table_column("proj.dataset.table", "col") == "`proj.dataset.table`.`col`"
+
+    def test_pre_execute_rewrite_rewrites_placeholders(self) -> None:
+        d = _bigquery_uninit()
+        out = d.pre_execute_rewrite("SELECT :p1")
+        assert "@@p1" not in out
+        assert "@p1" in out
+
+    def test_render_date_window_inclusive_upper_wraps_date(self) -> None:
+        d = _bigquery_uninit()
+        upper = d.render_date_window_inclusive_upper("rental.rental_date", "day")
+        assert "DATE(rental.rental_date)" in upper
+        assert "CURRENT_DATE()" in upper
+
+    def test_date_window_upper_bound_sql(self) -> None:
+        d = _bigquery_uninit()
+        assert d.date_window_upper_bound_sql("day") == "CURRENT_DATE()"
+        assert d.date_window_upper_bound_sql("hour") == "CURRENT_TIMESTAMP()"
+
+
+class TestResultBackendKinds:
+    """Mocked result-backend kind selection for native engine paths."""
+
+    def test_databricks_connector_backend_fetch_rows(self) -> None:
+        from aetherdialect._dialect_sqlglot_engines import DatabricksConnectorBackend
+
+        class _Cursor:
+            def execute(self, _sql: str) -> None:
+                pass
+
+            def fetchall(self):
+                return [(1, "a")]
+
+            def close(self) -> None:
+                pass
+
+        class _Conn:
+            def cursor(self):
+                return _Cursor()
+
+        rows = DatabricksConnectorBackend(_Conn()).fetch_rows("SELECT 1")
+        assert rows == [(1, "a")]
+        assert DatabricksConnectorBackend.kind == "connector"
+
+    def test_databricks_result_reader_kind_from_backend(self) -> None:
+        from aetherdialect._dialect_sqlglot_engines import DatabricksConnectorBackend
+
+        d = _dbr_uninit()
+        d._backend = DatabricksConnectorBackend(object())
+        assert d.result_reader_kind == "connector"
+
+    def test_bigquery_storage_backend_kind(self) -> None:
+        from aetherdialect._dialect_sqlglot_engines import BigQueryStorageBackend
+
+        d = _bigquery_uninit()
+        d._backend = BigQueryStorageBackend(object(), object())
+        assert d.result_reader_kind == "bq_storage"
+        assert BigQueryStorageBackend.kind == "bq_storage"
+
+    def test_snowflake_arrow_backend_kind(self) -> None:
+        from aetherdialect._dialect_sqlglot_engines import SnowflakeArrowBackend
+
+        d = _snowflake_uninit()
+        d._backend = SnowflakeArrowBackend(snowpark=object())
+        assert d.result_reader_kind == "snowflake_arrow"
+
+    def test_bigquery_client_backend_kind_and_fetch_rows(self, monkeypatch) -> None:
+        from aetherdialect._dialect_sqlglot_engines import BigQueryClientBackend
+
+        class _Row:
+            def values(self):
+                return [1, "a"]
+
+        class _Job:
+            def result(self):
+                return [_Row()]
+
+        class _Client:
+            def query(self, _sql, job_config=None):
+                _ = job_config
+                return _Job()
+
+        monkeypatch.setattr(BigQueryClientBackend, "_job_config", lambda self, **kwargs: object())
+        rows = BigQueryClientBackend(_Client()).fetch_rows("SELECT 1")
+        assert rows == [(1, "a")]
+        assert BigQueryClientBackend.kind == "bq_client"
+
+    def test_bigquery_storage_backend_fetch_rows(self, monkeypatch) -> None:
+        from aetherdialect._dialect_sqlglot_engines import BigQueryStorageBackend
+
+        class _Row:
+            def values(self):
+                return [7]
+
+        class _Job:
+            def result(self, bqstorage_client=None):
+                _ = bqstorage_client
+                return [_Row()]
+
+        class _Client:
+            def query(self, _sql, job_config=None):
+                _ = job_config
+                return _Job()
+
+        from aetherdialect._dialect_sqlglot_engines import BigQueryClientBackend
+
+        monkeypatch.setattr(BigQueryClientBackend, "_job_config", lambda self, **kwargs: object())
+        backend = BigQueryStorageBackend(_Client(), object())
+        assert backend.fetch_rows("SELECT 7") == [(7,)]
+
+    def test_snowflake_arrow_backend_connector_fetch_rows(self) -> None:
+        from aetherdialect._dialect_sqlglot_engines import SnowflakeArrowBackend
+
+        class _Cursor:
+            def execute(self, _sql: str) -> None:
+                pass
+
+            def fetchall(self):
+                return [(3, "x")]
+
+            def close(self) -> None:
+                pass
+
+        class _Conn:
+            def cursor(self):
+                return _Cursor()
+
+        rows = SnowflakeArrowBackend(connection=_Conn()).fetch_rows("SELECT 3")
+        assert rows == [(3, "x")]
+
+
+class TestSnowflakeQualifyTablesForExecution:
+    """Snowflake qualifies bare tables with uppercase unquoted three- part names."""
+
+    def test_from_film_uppercases_table(self) -> None:
+        d = _snowflake_uninit()
+        d.config = SimpleNamespace(DATABASE="DVDRENTAL_NEW", SCHEMA="PUBLIC", DEBUG=False)
+        d.sqlglot_dialect = "snowflake"
+        result = d._qualify_tables_for_execution("SELECT title FROM film")
+        assert 'PUBLIC."film"' not in result
+        assert "DVDRENTAL_NEW.PUBLIC.FILM" in result.replace(" ", "")
+
+
+class TestPerEngineQualifyTablesForExecution:
+    """Each sqlglot engine dialect qualifies bare FROM tables for execution."""
+
+    @pytest.mark.parametrize(
+        ("factory", "dialect_name", "catalog_attr", "schema_attr"),
+        [
+            (lambda: PostgresDialect.__new__(PostgresDialect), "postgres", None, "public"),
+            (lambda: MySQLDialect.__new__(MySQLDialect), "mysql", None, None),
+            (lambda: _bigquery_uninit(), "bigquery", "PROJECT", "dataset"),
+            (lambda: _dbr_uninit(), "databricks", "CATALOG", "SCHEMA"),
+            (lambda: _sqlite_uninit(), "sqlite", None, "main"),
+            (lambda: _duckdb_uninit(), "duckdb", None, "main"),
+            (lambda: RedshiftDialect.__new__(RedshiftDialect), "redshift", None, "public"),
+            (lambda: _sqlserver_uninit(), "tsql", None, "dbo"),
+            (lambda: _snowflake_uninit(), "snowflake", "DATABASE", "SCHEMA"),
+        ],
+    )
+    def test_qualifies_bare_table(self, factory, dialect_name, catalog_attr, schema_attr) -> None:
+        d = factory()
+        cfg = {"DEBUG": False}
+        if catalog_attr:
+            cfg[catalog_attr] = "CAT"
+        if schema_attr:
+            cfg["SCHEMA"] = schema_attr
+        d.config = SimpleNamespace(**cfg)
+        d.sqlglot_dialect = dialect_name
+        if hasattr(d, "schema_name"):
+            pass
+        result = d._qualify_tables_for_execution("SELECT 1 FROM orders")
+        assert "orders" in result.lower()

@@ -11,21 +11,27 @@ import pytest
 
 from aetherdialect._config import EngineConfig
 from aetherdialect._contracts_base import (
+    EngineContext,
+)
+from aetherdialect._contracts_schema import (
     ColumnMetadata,
     FKEdge,
-    SchemaContext,
     SchemaGraph,
     TableMetadata,
 )
 from aetherdialect._core_utils import read_gzip_json
 from aetherdialect._dialect import Dialect
-from aetherdialect._schema import (
-    _save_schema_to_cache,
-    apply_diff,
+from aetherdialect._schema_graph import (
     assign_schema_graph_hashes,
-    build_schema_graph,
     diff_schemas,
 )
+from aetherdialect._schema_overrides import (
+    apply_diff,
+    build_schema_graph,
+    save_schema_to_cache,
+)
+
+pytestmark = pytest.mark.usefixtures("stub_schema_llm_classifier")
 
 
 class _PartialRebuildStubDialect(Dialect):
@@ -38,14 +44,20 @@ class _PartialRebuildStubDialect(Dialect):
         self.reflect_only_calls = 0
         self.profile_schema_calls: list[list[str]] = []
 
-    def compute_ddl_probe(self, schema_context: SchemaContext) -> str:
+    def compute_ddl_probe(self, engine_context: EngineContext) -> str:
         return self._probe_value
 
-    def reflect_only(self, schema_context: SchemaContext) -> SchemaGraph:
+    def reflect_only(self, engine_context: EngineContext) -> SchemaGraph:
         self.reflect_only_calls += 1
         return copy.deepcopy(self._reflected)
 
-    def reflect_schema_graph(self, *, include: Any = "tables", allow_objects: Any = None) -> SchemaGraph:
+    def reflect_schema_graph(
+        self,
+        *,
+        include: Any = "tables",
+        allow_objects: Any = None,
+        sql_file: Any = None,
+    ) -> SchemaGraph:
         raise AssertionError("reflect_schema_graph should not run on partial-rebuild path")
 
     def profile_schema(self, sg: SchemaGraph) -> None:
@@ -127,8 +139,7 @@ def test_diff_detects_added_and_dropped_columns() -> None:
 
 
 def test_diff_detects_redeclared_column_same_value_type() -> None:
-    """integer → bigint changes catalog type but normalized value_type stays integer."""
-
+    """Integer → bigint changes catalog type but normalized value_type stays integer."""
     old = SchemaGraph(
         tables={"a": _mk_table("a", {"x": _mk_col("x", "integer")})},
         join_paths_multi={},
@@ -313,11 +324,11 @@ def cache_path(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> str:
     return p
 
 
-def _save_with_probe(sg: SchemaGraph, ctx: SchemaContext, notes: str, probe: str, path: str) -> None:
+def _save_with_probe(sg: SchemaGraph, ctx: EngineContext, notes: str, probe: str, path: str) -> None:
     sg.notes_sha256 = hashlib.sha256(notes.encode("utf-8")).hexdigest()
     assign_schema_graph_hashes(sg, ctx, sg.notes_sha256)
     sg.ddl_probe_hash = probe
-    _save_schema_to_cache(sg, path)
+    save_schema_to_cache(sg, path)
 
 
 def test_build_schema_graph_partial_rebuild_on_probe_mismatch(
@@ -326,8 +337,7 @@ def test_build_schema_graph_partial_rebuild_on_probe_mismatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Probe-mismatch → reflect_only + apply_diff path; full reflect/profile NOT called."""
-
-    ctx = SchemaContext()
+    ctx = EngineContext()
     _save_with_probe(schema_graph, ctx, "notes", probe="probe-OLD", path=cache_path)
 
     new_struct = copy.deepcopy(schema_graph)
@@ -350,7 +360,7 @@ def test_build_schema_graph_partial_rebuild_dropped_table(
     schema_graph: SchemaGraph,
     cache_path: str,
 ) -> None:
-    ctx = SchemaContext()
+    ctx = EngineContext()
     _save_with_probe(schema_graph, ctx, "n", probe="probe-OLD", path=cache_path)
 
     new_struct = copy.deepcopy(schema_graph)

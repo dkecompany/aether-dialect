@@ -6,16 +6,20 @@ import re
 import pytest
 
 from aetherdialect._config import (
+    DatabricksRuntimeConfig,
+    EngineConfig,
+    PolicyConfig,
+    PostgresRuntimeConfig,
+    QSimConfig,
+    SeedWarmupConfig,
+)
+from aetherdialect._constants import (
     AGG_PATTERN,
     AGG_QUANTITY_RE,
     AGGREGATION_ALLOWED_COLUMN_TYPES,
-    BOOLEAN_FILTER_OPS,
-    CATEGORICAL_FILTER_OPS,
     COLUMN_TYPE_TO_VALUE_TYPE,
     ENGINE_STORAGE_PLACEHOLDER_DIR,
     INTENT_SCHEMA,
-    NUMERIC_CATEGORICAL_FILTER_OPS,
-    NUMERIC_FILTER_OPS,
     NUMERIC_ONLY_AGGREGATIONS,
     QSIM_QUESTIONS_PATTERN,
     REGISTRY_CASE_ID_RE,
@@ -45,18 +49,14 @@ from aetherdialect._config import (
     WINDOW_OFFSET_FUNCTIONS,
     WINDOW_RANKING_FUNCTIONS,
     WINDOW_VALUE_FUNCTIONS,
-    DatabricksRuntimeConfig,
-    EngineConfig,
-    PolicyConfig,
-    PostgresRuntimeConfig,
-    QSimConfig,
-    SeedWarmupConfig,
+)
+from aetherdialect._contracts_base import normalize_column_type
+from aetherdialect._core_utils import (
     diagnostic_debug_enabled,
     diagnostic_force_enter,
     diagnostic_force_exit,
     effective_explain_timeout_ms,
     effective_llm_timeout_ms,
-    normalize_column_type,
     normalize_value_type,
     seed_warmup_failure_code_from_validate_sql_error,
 )
@@ -109,8 +109,15 @@ class TestRoleValueTypeCompat:
 
     def test_boolean_role_accepts_boolean_integer_string_value_types(self):
         """Boolean column roles remain compatible with boolean-shaped physical storage kinds."""
-
         assert ROLE_VALUE_TYPE_COMPAT["boolean"] == frozenset({"boolean", "integer", "string"})
+
+    def test_temporal_role_accepts_date_and_integer(self):
+        """Temporal column roles accept calendar dates and integer day- count durations."""
+        assert ROLE_VALUE_TYPE_COMPAT["temporal"] == frozenset({"date", "integer"})
+
+    def test_audit_role_accepts_date_only(self):
+        """Audit column roles accept date and timestamp storage only."""
+        assert ROLE_VALUE_TYPE_COMPAT["audit"] == frozenset({"date"})
 
 
 class TestNormalizeValueType:
@@ -309,9 +316,8 @@ class TestRoleAllowedAggregations:
     def test_all_roles_are_subset_of_valid(self):
         """Every role's aggregations are subset of VALID_AGGREGATION_FUNCTIONS."""
         for role, aggs in ROLE_ALLOWED_AGGREGATIONS.items():
-            assert aggs.issubset(VALID_AGGREGATION_FUNCTIONS), (
-                f"{role} has invalid aggs: {aggs - VALID_AGGREGATION_FUNCTIONS}"
-            )
+            _invalid_aggs_msg = f"{role} has invalid aggs: {aggs - VALID_AGGREGATION_FUNCTIONS}"
+            assert aggs.issubset(VALID_AGGREGATION_FUNCTIONS), _invalid_aggs_msg
 
 
 class TestNumericOnlyAggregations:
@@ -383,9 +389,10 @@ class TestPolicyConfig:
         assert "sum" not in PolicyConfig.STOPWORDS
 
     def test_max_repair_loops_positive(self):
-        """PolicyConfig.MAX_STAGE_B_REPAIRS and MAX_FRESH_RESTARTS are non-negative integers with valid bounds."""
-        assert isinstance(PolicyConfig.MAX_STAGE_B_REPAIRS, int)
-        assert PolicyConfig.MAX_STAGE_B_REPAIRS >= 1
+        """PolicyConfig.MAX_ASK_COMPOSE_REPAIRS and MAX_FRESH_RESTARTS are non-negative integers with valid bounds."""
+        assert isinstance(PolicyConfig.MAX_ASK_COMPOSE_REPAIRS, int)
+        assert PolicyConfig.MAX_ASK_COMPOSE_REPAIRS >= 0
+        assert PolicyConfig.MAX_ASK_COMPOSE_REPAIRS <= 10
         assert isinstance(PolicyConfig.MAX_FRESH_RESTARTS, int)
         assert PolicyConfig.MAX_FRESH_RESTARTS >= 0
 
@@ -403,18 +410,9 @@ class TestPolicyConfig:
         """FINAL_SQL_AUTO_ACCEPT_THRESHOLD is in (0, 1]."""
         assert 0 < PolicyConfig.FINAL_SQL_AUTO_ACCEPT_THRESHOLD <= 1
 
-    def test_debug_and_verbose_are_bool(self):
-        """PolicyConfig.DEBUG and VERBOSE are booleans."""
+    def test_debug_is_bool(self):
+        """PolicyConfig.DEBUG gates developer tracing."""
         assert isinstance(PolicyConfig.DEBUG, bool)
-        assert isinstance(PolicyConfig.VERBOSE, bool)
-
-    def test_pipeline_trace_full_is_bool(self):
-        """PIPELINE_TRACE_FULL gates verbose pipeline tracing with DEBUG."""
-        assert isinstance(PolicyConfig.PIPELINE_TRACE_FULL, bool)
-
-    def test_live_deep_trace_is_bool(self):
-        """LIVE_DEEP_TRACE toggles live test deep tracing."""
-        assert isinstance(PolicyConfig.LIVE_DEEP_TRACE, bool)
 
     def test_regenerate_flags_are_bool(self):
         """REGENERATE flags are booleans."""
@@ -432,9 +430,9 @@ class TestPolicyConfig:
 
     def test_diagnostic_debug_policy_flag(self, monkeypatch):
         """PolicyConfig.DEBUG toggles diagnostic_debug_enabled when force depth is zero."""
-        import aetherdialect._config as cfg_mod
+        import aetherdialect._config
 
-        monkeypatch.setattr(cfg_mod, "_DIAGNOSTIC_FORCE_DEPTH", 0, raising=False)
+        monkeypatch.setattr(aetherdialect._config, "_DIAGNOSTIC_FORCE_DEPTH", 0, raising=False)
         prev_debug = PolicyConfig.DEBUG
         PolicyConfig.DEBUG = False
         try:
@@ -446,9 +444,9 @@ class TestPolicyConfig:
 
     def test_diagnostic_force_enter_exit(self, monkeypatch):
         """diagnostic_force_enter enables debug until diagnostic_force_exit."""
-        import aetherdialect._config as cfg_mod
+        import aetherdialect._config
 
-        monkeypatch.setattr(cfg_mod, "_DIAGNOSTIC_FORCE_DEPTH", 0, raising=False)
+        monkeypatch.setattr(aetherdialect._config, "_DIAGNOSTIC_FORCE_DEPTH", 0, raising=False)
         prev_debug = PolicyConfig.DEBUG
         PolicyConfig.DEBUG = False
         try:
@@ -521,10 +519,8 @@ class TestValidWindowFunctionsComposed:
 
     def test_union_equals_valid_window_functions(self):
         """Ranking, agg, offset, and value window sets compose the allowed window set."""
-        assert (
-            WINDOW_RANKING_FUNCTIONS | WINDOW_AGG_FUNCTIONS | WINDOW_OFFSET_FUNCTIONS | WINDOW_VALUE_FUNCTIONS
-            == VALID_WINDOW_FUNCTIONS
-        )
+        merged = WINDOW_RANKING_FUNCTIONS | WINDOW_AGG_FUNCTIONS | WINDOW_OFFSET_FUNCTIONS | WINDOW_VALUE_FUNCTIONS
+        assert merged == VALID_WINDOW_FUNCTIONS
 
 
 class TestPostgresRuntimeConfig:
@@ -541,6 +537,15 @@ class TestPostgresRuntimeConfig:
     def test_default_schema(self):
         """Default schema is public."""
         assert PostgresRuntimeConfig.SCHEMA == "public"
+
+    def test_apply_environment_defaults_user_to_postgres(self):
+        """apply_environment sets USER to postgres when unset."""
+        orig_user = PostgresRuntimeConfig.USER
+        try:
+            PostgresRuntimeConfig.apply_environment({})
+            assert PostgresRuntimeConfig.USER == "postgres"
+        finally:
+            PostgresRuntimeConfig.USER = orig_user
 
     def test_db_url_raises_without_password(self):
         """db_url raises ValueError when PASSWORD is not set."""
@@ -639,7 +644,6 @@ class TestEngineConfig:
 
     def test_schema_json_path(self):
         """SCHEMA_JSON_PATH is an absolute path under ENGINE_STORAGE_PLACEHOLDER_DIR."""
-
         assert isinstance(EngineConfig.SCHEMA_JSON_PATH, str)
         assert os.path.isabs(EngineConfig.SCHEMA_JSON_PATH)
         assert os.path.dirname(EngineConfig.SCHEMA_JSON_PATH) == ENGINE_STORAGE_PLACEHOLDER_DIR
@@ -647,7 +651,6 @@ class TestEngineConfig:
 
     def test_template_store_dir(self):
         """TEMPLATE_STORE_DIR is an absolute path under ENGINE_STORAGE_PLACEHOLDER_DIR."""
-
         assert isinstance(EngineConfig.TEMPLATE_STORE_DIR, str)
         assert os.path.isabs(EngineConfig.TEMPLATE_STORE_DIR)
         assert os.path.dirname(EngineConfig.TEMPLATE_STORE_DIR) == ENGINE_STORAGE_PLACEHOLDER_DIR
@@ -655,7 +658,6 @@ class TestEngineConfig:
 
     def test_skeletons_json_path(self):
         """QSimConfig.SKELETONS_JSON_PATH is an absolute path under ENGINE_STORAGE_PLACEHOLDER_DIR."""
-
         assert isinstance(QSimConfig.SKELETONS_JSON_PATH, str)
         assert os.path.isabs(QSimConfig.SKELETONS_JSON_PATH)
         assert os.path.dirname(QSimConfig.SKELETONS_JSON_PATH) == ENGINE_STORAGE_PLACEHOLDER_DIR
@@ -723,7 +725,6 @@ class TestSeedWarmupConfig:
 
     def test_realism_dropped_registered_as_failure_code(self) -> None:
         """Question realism gate uses a single canonical string in ``SEED_WARMUP_FAILURE_CODES``."""
-
         assert SEED_FAILURE_CODE_REALISM_DROPPED in SEED_WARMUP_FAILURE_CODES
 
     def test_max_expr_comparisons_positive(self):
@@ -750,30 +751,22 @@ class TestSeedWarmupFailureCodeFromValidateSqlError:
         assert seed_warmup_failure_code_from_validate_sql_error(msg) == "ast_validate_cte_error"
 
     def test_classified_explain_prefixes(self):
-        assert (
-            seed_warmup_failure_code_from_validate_sql_error("[explain_schema] relation x does not exist")
-            == "explain_schema"
-        )
-        assert (
-            seed_warmup_failure_code_from_validate_sql_error("[explain_transient] statement timeout")
-            == "explain_transient"
-        )
+        explain_schema = seed_warmup_failure_code_from_validate_sql_error("[explain_schema] relation x does not exist")
+        assert explain_schema == "explain_schema"
+        explain_transient = seed_warmup_failure_code_from_validate_sql_error("[explain_transient] statement timeout")
+        assert explain_transient == "explain_transient"
 
     def test_failure_category_execution_buckets(self):
-        assert (
-            seed_warmup_failure_code_from_validate_sql_error(
-                "x",
-                failure_category="execution_schema_error",
-            )
-            == "explain_schema"
+        schema_error = seed_warmup_failure_code_from_validate_sql_error(
+            "x",
+            failure_category="execution_schema_error",
         )
-        assert (
-            seed_warmup_failure_code_from_validate_sql_error(
-                "x",
-                failure_category="execution_timeout",
-            )
-            == "explain_transient"
+        assert schema_error == "explain_schema"
+        timeout_error = seed_warmup_failure_code_from_validate_sql_error(
+            "x",
+            failure_category="execution_timeout",
         )
+        assert timeout_error == "explain_transient"
 
 
 class TestIntentSchema:
@@ -835,11 +828,7 @@ class TestScalarFunctionSets:
         assert SCALAR_FUNCTIONS_STRING.issubset(VALID_SCALAR_FUNCTIONS)
 
     def test_numeric_subset_of_valid(self):
-        """
-        SCALAR_FUNCTIONS_NUMERIC is subset of VALID_SCALAR_FUNCTIONS.
-
-        The same set is what validation allows wrapping an aggregate (for example ``ROUND(SUM(...))``).
-        """
+        """SCALAR_FUNCTIONS_NUMERIC is subset of VALID_SCALAR_FUNCTIONS. The same set is what validation allows wrapping an aggregate (for example ``ROUND(SUM(...))``)."""
         assert SCALAR_FUNCTIONS_NUMERIC.issubset(VALID_SCALAR_FUNCTIONS)
 
     def test_temporal_subset_of_valid(self):
@@ -854,25 +843,36 @@ class TestScalarFunctionSets:
 class TestFilterOpSets:
     """Tests for per-role filter operator sets."""
 
+    _BOOLEAN_FILTER_OPS = frozenset({"=", "!=", "in", "not in", "is null", "is not null"})
+    _CATEGORICAL_FILTER_OPS = frozenset(
+        {"=", "!=", "like", "ilike", "not like", "not ilike", "in", "not in", "is null", "is not null"}
+    )
+    _NUMERIC_CATEGORICAL_FILTER_OPS = frozenset(
+        {"=", "!=", "<", "<=", ">", ">=", "in", "not in", "between", "is null", "is not null"}
+    )
+    _NUMERIC_FILTER_OPS = frozenset(
+        {"=", "!=", "<", "<=", ">", ">=", "in", "not in", "between", "is null", "is not null"}
+    )
+
     def test_boolean_ops_subset_of_valid(self):
-        """BOOLEAN_FILTER_OPS is subset of VALID_FILTER_OPS."""
-        assert BOOLEAN_FILTER_OPS.issubset(VALID_FILTER_OPS)
+        """Boolean role filter ops are subset of VALID_FILTER_OPS."""
+        assert self._BOOLEAN_FILTER_OPS.issubset(VALID_FILTER_OPS)
 
     def test_categorical_ops_subset_of_valid(self):
-        """CATEGORICAL_FILTER_OPS is subset of VALID_FILTER_OPS."""
-        assert CATEGORICAL_FILTER_OPS.issubset(VALID_FILTER_OPS)
+        """Categorical role filter ops are subset of VALID_FILTER_OPS."""
+        assert self._CATEGORICAL_FILTER_OPS.issubset(VALID_FILTER_OPS)
 
     def test_numeric_categorical_ops_subset_of_valid(self):
-        """NUMERIC_CATEGORICAL_FILTER_OPS is subset of VALID_FILTER_OPS."""
-        assert NUMERIC_CATEGORICAL_FILTER_OPS.issubset(VALID_FILTER_OPS)
+        """Numeric-categorical role filter ops are subset of VALID_FILTER_OPS."""
+        assert self._NUMERIC_CATEGORICAL_FILTER_OPS.issubset(VALID_FILTER_OPS)
 
     def test_numeric_ops_subset_of_valid(self):
-        """NUMERIC_FILTER_OPS is subset of VALID_FILTER_OPS."""
-        assert NUMERIC_FILTER_OPS.issubset(VALID_FILTER_OPS)
+        """Numeric role filter ops are subset of VALID_FILTER_OPS."""
+        assert self._NUMERIC_FILTER_OPS.issubset(VALID_FILTER_OPS)
 
     def test_boolean_no_like(self):
-        """BOOLEAN_FILTER_OPS does not include like."""
-        assert "like" not in BOOLEAN_FILTER_OPS
+        """Boolean role filter ops do not include like."""
+        assert "like" not in self._BOOLEAN_FILTER_OPS
 
 
 class TestMiscConstants:
@@ -915,25 +915,23 @@ class TestPromptNeutrality:
 
     def test_vocab_guidance_has_no_polarity_example_tokens(self):
         """QUESTION_NORMALIZE_VOCABULARY_GUIDANCE avoids enumerated polarity pairs."""
+        from aetherdialect._utils import _QUESTION_NORMALIZE_VOCABULARY_GUIDANCE
 
-        from aetherdialect._utils import QUESTION_NORMALIZE_VOCABULARY_GUIDANCE
-
-        low = QUESTION_NORMALIZE_VOCABULARY_GUIDANCE.lower()
+        low = _QUESTION_NORMALIZE_VOCABULARY_GUIDANCE.lower()
         assert "positive:" not in low
         assert "negative:" not in low
 
     def test_irregular_plurals_exclude_demographic_tokens(self):
         """IRREGULAR_PLURALS_MAP lists morphological irregulars only."""
-
-        from aetherdialect._config import IRREGULAR_PLURALS_MAP
+        from aetherdialect._constants import IRREGULAR_PLURALS_MAP
 
         assert "women" not in IRREGULAR_PLURALS_MAP
         assert "men" not in IRREGULAR_PLURALS_MAP
 
     def test_negation_tokens_not_in_stopwords(self):
         """Negators must remain available to the question normaliser."""
-
-        from aetherdialect._config import STOPWORDS_GRAMMATICAL_PARTICLES, PolicyConfig
+        from aetherdialect._config import PolicyConfig
+        from aetherdialect._constants import STOPWORDS_GRAMMATICAL_PARTICLES
 
         negators = ("not", "without", "except", "no", "never", "neither", "nor")
         for t in negators:
@@ -1000,7 +998,6 @@ class TestConfigFileFullCoverage:
                     'access_token = "tok"',
                     'catalog = "cat"',
                     'schema = "ds"',
-                    'cluster_id = "cid"',
                     "",
                     "[engine]",
                     'selected = "postgresql"',
@@ -1041,7 +1038,6 @@ class TestConfigFileFullCoverage:
             "DATABRICKS_ACCESS_TOKEN": "tok",
             "DATABRICKS_CATALOG": "cat",
             "DATABRICKS_SCHEMA": "ds",
-            "DATABRICKS_CLUSTER_ID": "cid",
             "AETHERDIALECT_ENGINE": "postgresql",
             "AETHERDIALECT_LLM_PROVIDER": "openai",
             "AETHERDIALECT_MAX_QUERY_COST_ROWS": "100",

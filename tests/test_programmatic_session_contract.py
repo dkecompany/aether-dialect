@@ -1,4 +1,4 @@
-"""Contract tests for the agent-shaped programmatic surface (session-only, no engine stdout)."""
+"""Contract tests for the agent-shaped programmatic surface (session- only, no engine stdout)."""
 
 from __future__ import annotations
 
@@ -8,9 +8,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import aetherdialect
-from aetherdialect import SessionStep
+from aetherdialect import AetherEngine, AsyncPipelineSession, SessionStep
 from aetherdialect._templates import empty_template_store
-from aetherdialect.text2sql import AsyncPipelineSession, Text2SQL
 
 
 def test_public_all_excludes_legacy_types() -> None:
@@ -20,13 +19,13 @@ def test_public_all_excludes_legacy_types() -> None:
     assert "IntentSummary" not in aetherdialect.__all__
 
 
-def test_text2sql_session_surface() -> None:
-    assert hasattr(Text2SQL, "session")
-    assert hasattr(Text2SQL, "asession")
-    assert not hasattr(Text2SQL, "pipeline_session")
-    assert not hasattr(Text2SQL, "apipeline_session")
-    assert not hasattr(Text2SQL, "ask")
-    assert not hasattr(Text2SQL, "aask")
+def test_aetherengine_session_surface() -> None:
+    assert hasattr(AetherEngine, "session")
+    assert hasattr(AetherEngine, "asession")
+    assert not hasattr(AetherEngine, "pipeline_session")
+    assert not hasattr(AetherEngine, "apipeline_session")
+    assert not hasattr(AetherEngine, "ask")
+    assert not hasattr(AetherEngine, "aask")
 
 
 @patch("aetherdialect._core_utils.diagnostic_debug_enabled", return_value=False)
@@ -70,7 +69,7 @@ def test_pipeline_session_ask_typeerror_non_str() -> None:
 
     sess = PipelineSession(_session_owner())
     with pytest.raises(TypeError, match="str"):
-        sess.ask(123)  # type: ignore[arg-type]
+        sess.ask(123)
 
 
 def test_pipeline_session_ask_blocked_emits_audit() -> None:
@@ -139,7 +138,7 @@ def test_ask_until_done_free_text_suspend_raises() -> None:
     ],
 )
 def test_suspend_reply_shape_by_kind(state_id: str, expected_reply: str) -> None:
-    from aetherdialect._config import (
+    from aetherdialect._constants import (
         PIPELINE_SUSPEND_ID_DIRECT_REUSE,
         PIPELINE_SUSPEND_ID_INTENT_CONFIRM,
         PIPELINE_SUSPEND_ID_INTENT_FEEDBACK,
@@ -164,8 +163,8 @@ def test_suspend_reply_shape_by_kind(state_id: str, expected_reply: str) -> None
 
 
 def test_run_interactive_stdout_smoke(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-    from aetherdialect import text2sql as tmod
-    from aetherdialect._config import SESSION_KIND_RESULT
+    import aetherdialect.aetherdialect
+    from aetherdialect._constants import SESSION_KIND_RESULT
 
     class _SessCM:
         def __init__(self) -> None:
@@ -186,11 +185,17 @@ def test_run_interactive_stdout_smoke(monkeypatch: pytest.MonkeyPatch, capsys: p
     cm = _SessCM()
     owner = MagicMock()
     owner._ensure_llm = MagicMock()
+    owner._resolve_aetherspace = MagicMock(
+        return_value=(MagicMock(), frozenset(), frozenset(), frozenset(), frozenset())
+    )
+    owner._runtime_config = MagicMock(engine_context=MagicMock())
+    owner._schema_graph = MagicMock()
+    owner._consumer_visible_objects = None
 
     monkeypatch.setattr("builtins.input", lambda *a, **k: "hello world")
 
-    with patch.object(tmod, "PipelineSession", return_value=cm):
-        Text2SQL.run_interactive(owner)
+    with patch.object(aetherdialect.aetherdialect, "PipelineSession", return_value=cm):
+        AetherEngine.run_interactive(owner)
 
     out = capsys.readouterr().out
     assert "Interactive mode" in out
@@ -198,7 +203,7 @@ def test_run_interactive_stdout_smoke(monkeypatch: pytest.MonkeyPatch, capsys: p
 
 
 def test_async_pipeline_session_ask_smoke() -> None:
-    from aetherdialect._config import SESSION_KIND_RESULT
+    from aetherdialect._constants import SESSION_KIND_RESULT
     from aetherdialect._main_execution import PipelineSession
 
     owner = _session_owner()
@@ -267,6 +272,74 @@ def test_async_pipeline_session_ask_typeerror() -> None:
     async def _run() -> None:
         ap = AsyncPipelineSession(inner)
         with pytest.raises(TypeError, match="str"):
-            await ap.ask(123)  # type: ignore[arg-type]
+            await ap.ask(123)
 
     asyncio.run(_run())
+
+
+def test_pipeline_session_accept_until_done_typeerror() -> None:
+    from aetherdialect._main_execution import PipelineSession
+
+    sess = PipelineSession(_session_owner())
+    with pytest.raises(TypeError, match="str"):
+        sess.accept_until_done(123)
+
+
+def test_async_pipeline_session_accept_until_done_delegates() -> None:
+    from aetherdialect._main_execution import PipelineSession
+
+    owner = _session_owner()
+    inner = PipelineSession(owner)
+    sentinel = SessionStep(
+        done=True,
+        prompt=None,
+        kind="ok",
+        sql="SELECT 1",
+        data=None,
+        message=None,
+        error=None,
+        diagnostics=(),
+        intent_summary=None,
+        status=None,
+        reply_shape=None,
+        semantic_warnings=(),
+    )
+
+    async def _run() -> None:
+        with patch.object(inner, "accept_until_done", return_value=sentinel) as mocked:
+            ap = AsyncPipelineSession(inner)
+            step = await ap.accept_until_done("how many films?")
+        mocked.assert_called_once_with("how many films?", on_yes_no="y", on_free_text="looks good")
+        assert step is sentinel
+
+    asyncio.run(_run())
+
+
+def test_async_sqlite_in_memory_execute_on_worker_thread() -> None:
+    import sqlite3
+
+    from aetherdialect._config import EngineConfig, SQLiteRuntimeConfig
+    from aetherdialect._dialect import get_dialect
+
+    connection = sqlite3.connect(":memory:", check_same_thread=False)
+    connection.execute("CREATE TABLE worker_probe (value INTEGER)")
+    connection.execute("INSERT INTO worker_probe VALUES (9)")
+    connection.commit()
+    orig_path = EngineConfig.SCHEMA_JSON_PATH
+    orig_type = EngineConfig.TYPE
+    orig_runtime = EngineConfig.RUNTIME
+    try:
+        EngineConfig.SCHEMA_JSON_PATH = ""
+        EngineConfig.TYPE = "sqlite"
+        EngineConfig.RUNTIME = SQLiteRuntimeConfig
+        dialect = get_dialect("sqlite", SQLiteRuntimeConfig, native_connection=connection)
+
+        async def _run() -> list[tuple]:
+            return await asyncio.to_thread(dialect.execute, "SELECT value FROM worker_probe")
+
+        rows = asyncio.run(_run())
+        assert rows == [(9,)]
+    finally:
+        EngineConfig.SCHEMA_JSON_PATH = orig_path
+        EngineConfig.TYPE = orig_type
+        EngineConfig.RUNTIME = orig_runtime

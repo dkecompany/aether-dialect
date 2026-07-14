@@ -1,22 +1,28 @@
-"""Tests for pair-targeted FK inference, override collapse, and join-path reachability validation."""
+"""Tests for pair-targeted FK inference, override collapse, and join- path reachability validation."""
 
 from __future__ import annotations
 
 from aetherdialect._contracts_base import (
-    ColumnMetadata,
     ColumnRole,
-    FKEdge,
     InferenceTag,
+    NormalizedExpr,
     OverrideSkip,
-    SchemaGraph,
-    TableMetadata,
     TableRole,
 )
-from aetherdialect._contracts_core import NormalizedExpr, RuntimeIntent, SelectCol
-from aetherdialect._schema import (
-    _collapse_redundant_inferences,
-    _infer_missing_fks,
-    _pair_targeted_fk_inference,
+from aetherdialect._contracts_core import (
+    RuntimeIntent,
+    SelectCol,
+)
+from aetherdialect._contracts_schema import (
+    ColumnMetadata,
+    FKEdge,
+    SchemaGraph,
+    TableMetadata,
+)
+from aetherdialect._schema_graph import (
+    collapse_redundant_inferences,
+    infer_missing_fks,
+    pair_targeted_fk_inference,
 )
 from aetherdialect._validation_schema import (
     validate_join_path_reachability,
@@ -59,7 +65,6 @@ class TestPairTargetedInference:
         self,
     ) -> None:
         """Regression: restrict_tables may contain one table for self-FK naming patterns."""
-
         t = _table(
             "node",
             {
@@ -68,7 +73,7 @@ class TestPairTargetedInference:
             },
             primary_key=["node_id"],
         )
-        edges = _infer_missing_fks({"node": t}, restrict_tables=frozenset({"node"}))
+        edges = infer_missing_fks({"node": t}, restrict_tables=frozenset({"node"}))
         assert len(edges) == 1
         assert edges[0].dst_table == "node"
         assert edges[0].inference_tag == InferenceTag.SELF
@@ -84,7 +89,7 @@ class TestPairTargetedInference:
             primary_key=["customer_id"],
         )
         sg = SchemaGraph(tables={"orders": ta, "customer": tb}, join_paths_multi={})
-        n = _pair_targeted_fk_inference(sg, blocked=frozenset())
+        n = pair_targeted_fk_inference(sg, blocked=frozenset())
         assert n >= 1
         fk_targets = [e.dst_table for e in ta.foreign_keys]
         assert "customer" in fk_targets
@@ -122,7 +127,7 @@ class TestCollapseRedundantInferences:
         ta.foreign_keys = [inferred, user_edge]
         sg = SchemaGraph(tables={"a": ta, "b": tb}, join_paths_multi={})
         skipped: list[OverrideSkip] = []
-        removed = _collapse_redundant_inferences(sg, skipped)
+        removed = collapse_redundant_inferences(sg, skipped)
         assert removed >= 1
         tags = [e.inference_tag for e in ta.foreign_keys]
         assert InferenceTag.SUFFIX not in tags

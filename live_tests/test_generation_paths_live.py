@@ -1,16 +1,15 @@
-"""
-Seeded live tests that pin each ``GenerationPath`` routing branch in isolation.
-
-Every test owns its own empty template store (``isolated_runner``) so path assertions cannot be contaminated by templates persisted on disk or seeded by earlier tests. The deterministic paths (``1``, ``2.1``, ``2.2``, ``5``) run end-to-end against the live database; the union / intent-direct paths (``3``, ``4.1``, ``4.2``, ``4.3``) still require the intent-parse LLM but their template fixtures are fully seeded so the only LLM work that matters is the parse itself.
-"""
+"""Seeded live tests that pin each ``GenerationPath`` routing branch in isolation. Every test owns its own empty template store (``isolated_runner``) so path assertions cannot be contaminated by templates persisted on disk or seeded by earlier tests. The deterministic paths (``1``, ``2.1``, ``2.2``, ``5``) run end-to-end against the live database; the union / intent-direct paths (``3``, ``4.1``, ``4.2``, ``4.3``) still require the intent-parse LLM but their template fixtures are fully seeded so the only LLM work that matters is the parse itself."""
 
 from __future__ import annotations
 
-import pytest
-
-from aetherdialect._config import GenerationPath
-from aetherdialect._contracts_core import NormalizedExpr, RuntimeIntent, SelectCol
+from aetherdialect._constants import GenerationPath
+from aetherdialect._contracts_base import NormalizedExpr
+from aetherdialect._contracts_core import (
+    RuntimeIntent,
+    SelectCol,
+)
 from aetherdialect._live_testing import Expected, Scenario, run_and_assert
+from live_tests.mydb_scenarios import FILM_SCOPED
 
 from ._seed_helpers import (
     deterministic_join_choice_patch,
@@ -22,7 +21,6 @@ from ._seed_helpers import (
 
 def _customer_names_intent_with_limit(limit_value: int) -> RuntimeIntent:
     """Build a row-level customer-names intent with a literal ``LIMIT :s1`` binding."""
-
     intent = RuntimeIntent(
         tables=["customer"],
         grain="row_level",
@@ -45,7 +43,6 @@ def _customer_names_intent_with_limit(limit_value: int) -> RuntimeIntent:
 
 def _scenario_for(question: str, path: GenerationPath, *, scenario_id: str) -> Scenario:
     """Build a minimal ``Scenario`` that asserts the final generation path code."""
-
     return Scenario(
         id=scenario_id,
         question=question,
@@ -54,10 +51,8 @@ def _scenario_for(question: str, path: GenerationPath, *, scenario_id: str) -> S
     )
 
 
-@pytest.mark.live
 def test_gp1_exact_qnorm_reuse(schema, schema_terms, t2s) -> None:
     """Seed one template; re-asking the exact normalised question returns path ``1``."""
-
     with seeded_runner(schema, schema_terms, t2s, label="gp1", kits=("cold_templates",)) as runner:
         run_and_assert(
             runner,
@@ -70,10 +65,8 @@ def test_gp1_exact_qnorm_reuse(schema, schema_terms, t2s) -> None:
         )
 
 
-@pytest.mark.live
 def test_gp2_1_fuzzy_literal_structural(schema, schema_terms, t2s) -> None:
     """Fuzzy variant with identical structural defaults routes to path ``2.1``."""
-
     with (
         seeded_runner(schema, schema_terms, t2s, label="gp2_1", kits=("cold_templates",)) as runner,
         deterministic_join_choice_patch(),
@@ -89,10 +82,8 @@ def test_gp2_1_fuzzy_literal_structural(schema, schema_terms, t2s) -> None:
         )
 
 
-@pytest.mark.live
 def test_gp2_2_fuzzy_full_params(schema, schema_terms, t2s) -> None:
     """Fuzzy variant where the history row's ``s1`` differs from defaults routes to ``2.2``."""
-
     seed_intent = _customer_names_intent_with_limit(5)
     with (
         isolated_runner(schema, schema_terms, t2s, label="gp2_2") as runner,
@@ -117,10 +108,8 @@ def test_gp2_2_fuzzy_full_params(schema, schema_terms, t2s) -> None:
         )
 
 
-@pytest.mark.live
 def test_gp3_intent_direct_match(schema, schema_terms, t2s) -> None:
     """Seed a trusted template; a differently-worded question parsing to the same intent returns ``3``."""
-
     with (
         seeded_runner(schema, schema_terms, t2s, label="gp3", kits=("baseline_templates",)) as runner,
         deterministic_join_choice_patch(),
@@ -141,10 +130,8 @@ def test_gp3_intent_direct_match(schema, schema_terms, t2s) -> None:
         run_and_assert(runner, scenario, header="[GP3-INTENT-DIRECT]")
 
 
-@pytest.mark.live
 def test_gp4_1_union_template_widen(schema, schema_terms, t2s) -> None:
     """Seed a single-column template; asking for a superset of columns routes to ``4.1``."""
-
     with (
         seeded_runner(schema, schema_terms, t2s, label="gp4_1", kits=("baseline_templates",)) as runner,
         deterministic_join_choice_patch(),
@@ -163,10 +150,8 @@ def test_gp4_1_union_template_widen(schema, schema_terms, t2s) -> None:
         run_and_assert(runner, scenario, header="[GP4_1-UNION-WIDEN]")
 
 
-@pytest.mark.live
 def test_gp4_2_union_template_and_runtime_widen(schema, schema_terms, t2s) -> None:
     """Seed a two-column template; asking for a partial-overlap column set routes to ``4.2``."""
-
     with (
         seeded_runner(schema, schema_terms, t2s, label="gp4_2", kits=("baseline_templates",)) as runner,
         deterministic_join_choice_patch(),
@@ -185,10 +170,8 @@ def test_gp4_2_union_template_and_runtime_widen(schema, schema_terms, t2s) -> No
         run_and_assert(runner, scenario, header="[GP4_2-BOTH-WIDEN]")
 
 
-@pytest.mark.live
 def test_gp4_3_runtime_subset_of_template(schema, schema_terms, t2s) -> None:
     """Seed a wider template; asking for a strict subset of its columns routes to ``4.3``."""
-
     with (
         seeded_runner(schema, schema_terms, t2s, label="gp4_3", kits=("baseline_templates",)) as runner,
         deterministic_join_choice_patch(),
@@ -208,17 +191,15 @@ def test_gp4_3_runtime_subset_of_template(schema, schema_terms, t2s) -> None:
         run_and_assert(runner, scenario, header="[GP4_3-RUNTIME-SUBSET]")
 
 
-@pytest.mark.live
 def test_gp5_fresh_generation(schema, schema_terms, t2s) -> None:
     """Empty store forces a fresh generation for every new question (path ``5``)."""
-
     with isolated_runner(schema, schema_terms, t2s, label="gp5") as runner:
         scenario = Scenario(
             id="GP5-FRESH",
             question="list film title rental rate and replacement cost for films limit fifty rows",
             expected=Expected(
                 generation_path=GenerationPath.FRESH.code,
-                tables=["film"],
+                tables_one_of=FILM_SCOPED,
                 min_rows=1,
             ),
             category="generation_path",

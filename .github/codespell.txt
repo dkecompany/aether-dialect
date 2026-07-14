@@ -1,0 +1,17 @@
+aetherdialect
+sqlglot
+QSim
+pglast
+psycopg
+psycopg2
+sqlalchemy
+duckdb
+mypy
+jsonschema
+submodular
+UNNEST
+CTE
+CTEs
+datasources
+dedupe
+deduped
