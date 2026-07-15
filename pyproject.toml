@@ -7,7 +7,7 @@ name = "aetherdialect"
 version = "0.1.8"
 description = "The deterministic Text-to-SQL engine"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = "MIT"
 authors = [{name = "Akul Ameya", email = "akul.ameya@armhub.com.au"}]
 dependencies = [
@@ -55,6 +55,7 @@ dev = [
     "pre-commit>=3.0",
     "docformatter>=1.7,<2",
     "codespell>=2.4",
+    "pip-audit>=2.7",
     "pandas-stubs>=2.0",
     "types-jsonschema>=4.0",
     "duckdb-engine>=0.13,<1",
@@ -147,7 +148,7 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "live_tests"]
-pythonpath = ["src", "scripts", "."]
+pythonpath = ["src", "scripts", ".github/scripts", "."]
 markers = [
     "fast: PR-loop tests; equals not requires_sandbox until data.zip passes sandbox_doctor(), then also quick sandbox corpus tests (excludes slow LLM matrix in test_sandbox_offline.py)",
     "requires_sandbox: needs bundled src/aetherdialect/sandbox/data.zip (offline_sandbox corpus)",

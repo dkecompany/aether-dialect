@@ -74,7 +74,6 @@ def test_package_all_matches_documented_exports() -> None:
         "MigrationPreview",
         "MockFixtureMissingError",
         "OwnerOnlyOperationError",
-        "ParameterBinding",
         "PERMISSION_DENIED_USER_MESSAGE",
         "PipelineSession",
         "QSimSummarySnapshot",
@@ -248,7 +247,7 @@ def test_no_cross_module_underscore_imports() -> None:
             self.in_function -= 1
 
         def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
-            if self.in_function and node.module and node.module.startswith("."):
+            if self.in_function and (node.level > 0 or (node.module and node.module.startswith("aetherdialect."))):
                 violations.append(f"{path.name}:{node.lineno} function-scoped import from {node.module}")
             self.generic_visit(node)
 
@@ -257,9 +256,13 @@ def test_no_cross_module_underscore_imports() -> None:
         tree = ast.parse(source, filename=str(path))
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
-                if node.module is None:
+                if node.module is None and node.level == 0:
                     continue
-                if not (node.module.startswith(".") or node.module.startswith("aetherdialect.")):
+                is_internal = node.level > 0 or (
+                    node.module is not None
+                    and (node.module == "aetherdialect" or node.module.startswith("aetherdialect."))
+                )
+                if not is_internal:
                     continue
                 for alias in node.names:
                     if alias.name.startswith("_") and not alias.name.startswith("__"):

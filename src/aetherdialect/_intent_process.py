@@ -209,9 +209,8 @@ def build_intent_interpret_prompt(
     domain_payload: str,
     prior_question_feedback: str,
     prior_user_corrections: tuple[str, ...],
-    prior_attempt_failures: tuple[str, ...] = (),
 ) -> str:
-    """Build the Interpret user JSON instructing the model to emit INTERPRET_PLAN_SCHEMA JSON. ``prior_attempt_failures`` carries hints from earlier interpret/ground attempts in the same ask. It is empty on the first attempt (so that prompt is unchanged) and non-empty on retries, which both informs the replan and gives each retry a distinct, deterministically replayable cache key - without it, a re-interpreted retry would reuse the first attempt's key while the live model resampled a different plan, making the recorded chain impossible to replay."""
+    """Build the Interpret user JSON instructing the model to emit INTERPRET_PLAN_SCHEMA JSON."""
     body: dict[str, Any] = {
         "task": "Read the question against the domain schema and produce a thinking pathway (interpret_plan).",
         "question": question,
@@ -223,8 +222,6 @@ def build_intent_interpret_prompt(
         body["prior_question_feedback"] = prior_question_feedback
     if prior_user_corrections:
         body["prior_user_corrections"] = list(prior_user_corrections)
-    if prior_attempt_failures:
-        body["prior_attempt_failures"] = list(prior_attempt_failures)
     return stable_json(body)
 
 
@@ -1717,7 +1714,6 @@ def full_intent_parse(
     answer_style_text = stable_json(list(LOGICAL_DECOMPOSITION_GUIDANCE))
     system_compose = INTENT_COMPOSE_SYSTEM
     prior_grounding_failures: tuple[str, ...] = ()
-    prior_attempt_failures: tuple[str, ...] = ()
     max_a_attempts = PolicyConfig.MAX_ASK_INTERPRET_GROUND_RETRIES + 1
     attempt_a = 0
     interpret_plan: InterpretPlan | None = None
@@ -1727,7 +1723,6 @@ def full_intent_parse(
             interpret_payload,
             prior_fb_text,
             prior_user_corrections,
-            prior_attempt_failures,
         )
         raw_interpret = llm_chat(INTENT_INTERPRET_SYSTEM, user_interpret, task="intent")
         llm_calls += 1
@@ -1760,9 +1755,6 @@ def full_intent_parse(
                 stage="intent",
                 code=DIAGNOSTIC_CODE_INTERPRET_GROUND_RETRY,
                 details=(("attempt", str(attempt_a + 1)),),
-            )
-            prior_attempt_failures = prior_attempt_failures + tuple(
-                _issue_to_planner_hint(iss) for iss in interpret_issues
             )
             attempt_a += 1
             continue
@@ -1818,9 +1810,9 @@ def full_intent_parse(
                 code=DIAGNOSTIC_CODE_INTERPRET_GROUND_RETRY,
                 details=(("attempt", str(attempt_a + 1)),),
             )
-            new_hints = tuple(_issue_to_planner_hint(iss) for iss in logical_issues)
-            prior_grounding_failures = prior_grounding_failures + new_hints
-            prior_attempt_failures = prior_attempt_failures + new_hints
+            prior_grounding_failures = prior_grounding_failures + tuple(
+                _issue_to_planner_hint(iss) for iss in logical_issues
+            )
             attempt_a += 1
             continue
 

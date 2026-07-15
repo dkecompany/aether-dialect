@@ -2275,9 +2275,6 @@ SANDBOX_MIN_INTENT_FIXTURE_COUNT = 50
 SANDBOX_SCHEMA_LITERALS_FILENAME = "schema_literals.json"
 SANDBOX_INTERPRET_DOMAIN_FILENAME = "schema_interpret_domain.json"
 MOCK_FIXTURE_STUB_SCHEMA_LITERALS: dict[str, str] = {"owner": "{}", "consumer": "{}"}
-MOCK_FIXTURE_RETRY_CONTEXT_KEYS: frozenset[str] = frozenset(
-    {"prior_attempt_failures", "prior_grounding_failures"},
-)
 
 CONSUMER_ALLOW_OBJECTS: frozenset[str] = frozenset(
     {

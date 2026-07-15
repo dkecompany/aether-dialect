@@ -49,10 +49,30 @@ scripts/**/*.sqlite
 scripts/**/*.duckdb
 scripts/**/*.duckdb.*
 scripts/logs/
-scripts/*.zip
 
 # Secrets (repo-local credentials; never commit)
 secrets/
+
+# dev_workspace generated (warmup / dev tooling)
+dev_workspace/warmup_artifacts/
+dev_workspace/corpus/
+dev_workspace/*.log
+dev_workspace/*_load.log
+dev_workspace/logs/*.log
+dev_workspace/*.err.log
+dev_workspace/pytest_*.txt
+dev_workspace/_pytest*.txt
+dev_workspace/_precommit*.txt
+dev_workspace/precommit_out*.txt
+dev_workspace/_tmp_*
+dev_workspace/_tmp_*.txt
+dev_workspace/_tmp_*.json
+dev_workspace/aether_artifacts*/
+dev_workspace/*.zip
+studio_demo/*
+studio_dev/*
+studio_dev/
+studio_demo/
 
 # live test output (private only)
 live_tests/results.txt
@@ -94,3 +114,7 @@ typings/
 # OS
 .DS_Store
 Thumbs.db
+
+# Backup files
+*.bak
+src/aetherdialect/sandbox/data.zip.bak

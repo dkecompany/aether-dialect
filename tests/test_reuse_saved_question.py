@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-from aetherdialect import ParameterBinding, SessionStep
-from aetherdialect._contracts_base import FilterParam, NormalizedExpr
+from aetherdialect import SessionStep
+from aetherdialect._contracts_base import FilterParam, NormalizedExpr, ParameterBinding
 from aetherdialect._contracts_core import ConcreteIntent, Template, ValueHistory
 from aetherdialect._contracts_schema import SQLShape, TemplateStats
 from aetherdialect._templates import (

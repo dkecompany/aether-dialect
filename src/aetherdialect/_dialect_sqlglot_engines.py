@@ -2034,8 +2034,6 @@ class BigQueryDialect(SqlglotEngineDialect):
                 location=str(bq_config.LOCATION or "US"),
             )
             try:
-                import importlib
-
                 bq_storage = importlib.import_module("google.cloud.bigquery_storage")
                 read_client_ctor: Any = bq_storage.BigQueryReadClient
                 self._bq_storage_client = read_client_ctor(credentials=credentials)

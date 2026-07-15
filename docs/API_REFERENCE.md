@@ -462,25 +462,12 @@ Methods marked **(master context only)** require `EngineContext.name == "master"
 | `step(response=None)`                         | `SessionStep`              | Supplies user text for a suspend.                              |
 | `ask_until_done(question, *, on_confirm="y")` | `SessionStep`              | Auto-answers yes-or-no suspends; `on_confirm` is `"y"` or `"n"`; raises on free-text suspends. |
 | `accept_until_done(question, *, on_yes_no="y", on_free_text="looks good")` | `SessionStep` | Auto-answers yes-or-no and free-text suspends until the turn ends or an unexpected `reply_shape` appears. |
-| `reuse_saved_question(question_old, question_new, new_values)` | `SessionStep` | Re-executes a stored template with caller-supplied bind values keyed by template handles; terminal step includes `parameters`. Raises `ConfigError` when no template matches or values are invalid. |
 | `awaiting_prompt()`                           | `bool`                     | `True` when the next input must go to `step`.                  |
 | `reset()`                                     | `None`                     | Clears suspend state, choice queues, and partial turn state.   |
 | `__enter__` / `__exit__`                      | `PipelineSession` / `None` | Exit calls `reset()`.                                          |
 
 
 `mode="reader"` skips durable template and feedback writes. `mode="writer"` is the default and serialises writer turns with a per-instance lock. Suspend `kind` values and the state machine are in the [Integrator guide](INTEGRATOR_GUIDE.md). Public terminal/suspend kind strings include `execute` (`SESSION_KIND_EXECUTE`) for the separated execute confirmation step after SQL generation.
-
-On terminal success, `step.parameters` is a tuple of frozen `ParameterBinding` rows — one per template handle referenced in the executed SQL — populated by `ask`, `ask_until_done`, `accept_until_done`, and `reuse_saved_question`:
-
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `handle` | `str` | Bind key (`p1`, `s1`, …); the key callers pass in `reuse_saved_question`'s `new_values`. |
-| `current_value` | `str \| int \| float \| bool \| list \| None` | Value bound for this execution. |
-| `display_name` | `str` | Short human-readable label for UI display (not a bind key). |
-| `upper_handle` | `str` | Optional companion handle for range upper bounds. |
-| `unit_handle` | `str` | Optional companion handle for date-window units. |
-
-Display names are resolved once per template and cached in the template store.
 
 ## `AsyncPipelineSession` methods
 
@@ -491,7 +478,6 @@ Display names are resolved once per template and cached in the template store.
 | `step(response=None)`                         | `SessionStep`                   | Delegates to `PipelineSession.step`.                          |
 | `ask_until_done(question, *, on_confirm="y")` | `SessionStep`                   | Delegates to `PipelineSession.ask_until_done`.                |
 | `accept_until_done(question, *, on_yes_no="y", on_free_text="looks good")` | `SessionStep` | Delegates to `PipelineSession.accept_until_done`.             |
-| `reuse_saved_question(question_old, question_new, new_values)` | `SessionStep` | Delegates to `PipelineSession.reuse_saved_question`.          |
 | `reset()`                                     | `None`                          | Delegates to `PipelineSession.reset` via `asyncio.to_thread`. |
 | `awaiting_prompt()`                           | `bool`                          | Delegates to `PipelineSession.awaiting_prompt`.               |
 | `__aenter__` / `__aexit__`                    | `AsyncPipelineSession` / `bool` | Async context manager forwarding to the inner session.        |

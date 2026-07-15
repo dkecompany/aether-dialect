@@ -71,17 +71,6 @@ def test_recording_slots_exclude_consumer_reader() -> None:
     assert len(recording) + len(consumer) >= 90
 
 
-def test_smoke_questions_include_flaky_practice_pair() -> None:
-    sc = importlib.import_module("sandbox_corpus")
-    smoke = sc.smoke_questions()
-    assert smoke["questions"] == [
-        sc.SMOKE_TOUR_QUESTION,
-        sc.SMOKE_FLAKY_QUESTION,
-    ]
-    assert smoke["validation_failures"]
-    assert smoke["feedback_samples"]
-
-
 def test_paraphrase_catalog_ready_requires_nonempty_pairs(tmp_path: Path) -> None:
     sc = importlib.import_module("sandbox_corpus")
     catalog_path = tmp_path / "sandbox_catalog.json"
@@ -94,25 +83,7 @@ def test_paraphrase_catalog_ready_requires_nonempty_pairs(tmp_path: Path) -> Non
     assert sc._paraphrase_catalog_ready(staging_dir=tmp_path) is True
 
 
-def test_paraphrase_gatekeeper_ready_detects_gatekeeper_row(tmp_path: Path) -> None:
-    sc = importlib.import_module("sandbox_corpus")
-    fixtures_path = tmp_path / "fixtures.json"
-    fixtures_path.write_text('{"version": 1, "fixtures": []}\n', encoding="utf-8")
-    corpus = sc.FixtureCorpus(fixtures_path)
-    paraphrase = "How many rentals happened in 2026?"
-    assert sc._paraphrase_gatekeeper_ready(corpus, paraphrase) is False
-    corpus.fixtures.append(
-        {
-            "task": "default",
-            "system": "You decide if user input is a database query request or not.",
-            "user": paraphrase,
-            "output_text": "{}",
-        },
-    )
-    assert sc._paraphrase_gatekeeper_ready(corpus, paraphrase) is True
-
-
-def test_reuse_fixtures_ready_requires_gatekeeper_and_reverse_rows(tmp_path: Path) -> None:
+def test_reuse_fixtures_ready_detects_reuse_fixture(tmp_path: Path) -> None:
     sc = importlib.import_module("sandbox_corpus")
     fixtures_path = tmp_path / "fixtures.json"
     fixtures_path.write_text('{"version": 1, "fixtures": []}\n', encoding="utf-8")
@@ -121,21 +92,12 @@ def test_reuse_fixtures_ready_requires_gatekeeper_and_reverse_rows(tmp_path: Pat
     corpus.fixtures.append(
         {
             "task": "default",
-            "system": "You decide if user input is a database query request or not.",
+            "system": "x",
             "user": "How many rentals happened in 2026?",
             "output_text": "{}",
         },
     )
-    assert sc._reuse_fixtures_ready(corpus) is False
-    corpus.fixtures.append(
-        {
-            "task": "default",
-            "system": sc.PARAM_EXTRACTION_SYSTEM_MARKER,
-            "user": '{"question":"how many rentals happened in 2025?"}',
-            "output_text": "{}",
-        },
-    )
-    assert sc._reuse_fixtures_ready(corpus) is False
+    assert sc._reuse_fixtures_ready(corpus) is True
 
 
 def test_migration_fixtures_ready_detects_schema_base(tmp_path: Path) -> None:
@@ -209,80 +171,78 @@ def test_recording_pipeline_ready_flags_incomplete(tmp_path: Path) -> None:
     assert reasons
 
 
-def test_committed_keys_seeded_from_loaded_corpus(tmp_path: Path) -> None:
-    sc = importlib.import_module("sandbox_corpus")
-    fixtures_path = tmp_path / "fixtures.json"
-    fixtures_path.write_text(
-        '{"version": 1, "fixtures": [{"task": "intent", "system": "s", "user": "u", "output_text": "o"}]}\n',
-        encoding="utf-8",
-    )
-    corpus = sc.FixtureCorpus(fixtures_path)
-    assert ("intent", "s", "u") in corpus.committed_keys
-
-
-def test_commit_slot_adds_new_keys_and_is_idempotent(tmp_path: Path) -> None:
+def test_merged_fixtures_for_verify_drops_stale_intent_for_slot(tmp_path: Path) -> None:
     sc = importlib.import_module("sandbox_corpus")
     fixtures_path = tmp_path / "fixtures.json"
     fixtures_path.write_text('{"version": 1, "fixtures": []}\n', encoding="utf-8")
     corpus = sc.FixtureCorpus(fixtures_path)
+    question = "Which actors appear in the most films?"
+    stale = {
+        "task": "intent",
+        "system": "You are the Ground stage.",
+        "user": f'{{"question":"{question}","interpret_plan":{{"approach":"stale"}}}}',
+        "output_text": "{}",
+    }
+    stale_ground_orphan = {
+        "task": "intent",
+        "system": "You are the Ground stage.",
+        "user": '{"interpret_plan":{"approach":"stale orphan ground without question label"}}',
+        "output_text": "{}",
+    }
+    shared = {
+        "task": "default",
+        "system": "gatekeeper",
+        "user": "shared",
+        "output_text": "{}",
+    }
+    corpus.fixtures.extend([dict(stale), dict(stale_ground_orphan), dict(shared)])
+    corpus.seen = {sc.fixture_key(row) for row in corpus.fixtures}
     corpus.start_slot()
-    corpus.record(task="intent", system="s", user_key="u", output_text="o")
-    corpus.commit_slot()
-    assert len(corpus.fixtures) == 1
-    assert ("intent", "s", "u") in corpus.committed_keys
-    corpus.start_slot()
-    corpus.record(task="intent", system="s", user_key="u", output_text="o")
-    corpus.commit_slot()
-    assert len(corpus.fixtures) == 1
+    fresh = {
+        "task": "intent",
+        "system": "You are the Ground stage.",
+        "user": f'{{"question":"{question}","interpret_plan":{{"approach":"fresh"}}}}',
+        "output_text": '{"tables":["actor"]}',
+    }
+    corpus.record(
+        task=fresh["task"],
+        system=fresh["system"],
+        user_key=fresh["user"],
+        output_text=fresh["output_text"],
+    )
+    merged = corpus.merged_fixtures_for_verify(slot_label=question)
+    intent_rows = [row for row in merged if row.get("task") == "intent"]
+    assert len(intent_rows) == 1
+    assert "fresh" in intent_rows[0]["user"]
+    assert any(row.get("task") == "default" for row in merged)
+    assert not any(row.get("task") == "intent" and "stale" in row.get("user", "") for row in merged)
 
 
-def test_commit_slot_frozen_shared_subcall_keeps_frozen_output(tmp_path: Path) -> None:
+def test_merged_fixtures_for_verify_keeps_other_question_intent(tmp_path: Path) -> None:
     sc = importlib.import_module("sandbox_corpus")
     fixtures_path = tmp_path / "fixtures.json"
-    fixtures_path.write_text(
-        '{"version": 1, "fixtures": [{"task": "intent", "system": "s", "user": "u", "output_text": "frozen"}]}\n',
-        encoding="utf-8",
-    )
+    fixtures_path.write_text('{"version": 1, "fixtures": []}\n', encoding="utf-8")
     corpus = sc.FixtureCorpus(fixtures_path)
-    corpus.start_slot()
-    corpus.record(task="intent", system="s", user_key="u", output_text="different")
-    corpus.commit_slot()
-    assert len(corpus.fixtures) == 1
-    assert corpus.fixtures[0]["output_text"] == "frozen"
-
-
-def test_commit_slot_allows_same_output_shared_subcall(tmp_path: Path) -> None:
-    sc = importlib.import_module("sandbox_corpus")
-    fixtures_path = tmp_path / "fixtures.json"
-    fixtures_path.write_text(
-        '{"version": 1, "fixtures": [{"task": "default", "system": "s", "user": "shared", "output_text": "o"}]}\n',
-        encoding="utf-8",
+    question = "Which actors appear in the most films?"
+    other = "How many books do we have?"
+    corpus.fixtures.append(
+        {
+            "task": "intent",
+            "system": "You are the Ground stage.",
+            "user": f'{{"question":"{other}","interpret_plan":{{"approach":"other"}}}}',
+            "output_text": "{}",
+        },
     )
-    corpus = sc.FixtureCorpus(fixtures_path)
+    corpus.seen = {sc.fixture_key(row) for row in corpus.fixtures}
     corpus.start_slot()
-    corpus.record(task="default", system="s", user_key="shared", output_text="o")
-    corpus.record(task="intent", system="s2", user_key="u2", output_text="o2")
-    corpus.commit_slot()
-    assert len(corpus.fixtures) == 2
-
-
-def test_snapshot_restore_undoes_tentative_merge(tmp_path: Path) -> None:
-    sc = importlib.import_module("sandbox_corpus")
-    fixtures_path = tmp_path / "fixtures.json"
-    fixtures_path.write_text(
-        '{"version": 1, "fixtures": [{"task": "intent", "system": "s", "user": "u", "output_text": "o"}]}\n',
-        encoding="utf-8",
+    corpus.record(
+        task="intent",
+        system="You are the Ground stage.",
+        user_key=f'{{"question":"{question}","interpret_plan":{{"approach":"fresh"}}}}',
+        output_text='{"tables":["actor"]}',
     )
-    corpus = sc.FixtureCorpus(fixtures_path)
-    snap = corpus.snapshot()
-    corpus.start_slot()
-    corpus.record(task="intent", system="s2", user_key="u2", output_text="o2")
-    corpus.commit_slot(freeze=False)
-    assert len(corpus.fixtures) == 2
-    assert ("intent", "s2", "u2") not in corpus.committed_keys
-    corpus.restore(snap)
-    assert len(corpus.fixtures) == 1
-    assert ("intent", "s2", "u2") not in corpus.seen
+    merged = corpus.merged_fixtures_for_verify(slot_label=question)
+    assert any(row.get("task") == "intent" and other in row.get("user", "") for row in merged)
 
 
 def test_mock_verify_targets_include_consumer_reader_for_practice_questions() -> None:
@@ -299,36 +259,110 @@ def test_mock_verify_targets_include_consumer_reader_for_practice_questions() ->
     assert sc._paraphrase_eligible_question("Show payroll deductions by employee SSN.", kind="question") is False
 
 
-def test_intent_system_label_maps_stages() -> None:
+def test_prune_orphan_intent_rows_keeps_active_chain(tmp_path: Path) -> None:
     sc = importlib.import_module("sandbox_corpus")
-    assert sc._intent_system_label(sc.INTENT_INTERPRET_SYSTEM) == "interpret"
-    assert sc._intent_system_label(sc.INTENT_GROUND_SYSTEM) == "ground"
-    assert sc._intent_system_label(sc.INTENT_COMPOSE_SYSTEM) == "compose"
-    assert sc._intent_system_label("some other system prompt") == "default"
-
-
-def test_append_replay_trace_flags_mock_miss(tmp_path: Path, monkeypatch) -> None:
-    sc = importlib.import_module("sandbox_corpus")
-    trace_path = tmp_path / "replay_trace.txt"
-    monkeypatch.setattr(sc, "SANDBOX_REPLAY_TRACE_PATH", trace_path)
-    sc._reset_replay_trace()
-    live_rows = [{"task": "intent", "system_id": "interpret", "user_sha": "abc", "user_head": "u", "result": "live:1"}]
-    mock_rows = [
-        {"task": "intent", "system_id": "interpret", "user_sha": "zzz", "user_head": "u", "result": "MISS:not found"},
+    question = "Which actors have the most film credits?"
+    interpret_user = '{"interpret_plan_schema":{},"question":"Which actors have the most film credits?"}'
+    active_interpret = {
+        "task": "intent",
+        "system": sc.INTENT_INTERPRET_SYSTEM,
+        "user": interpret_user,
+        "output_text": ('{"interpret_plan":{"approach":"active plan","tables":["actor"],"grounding":[]}}'),
+    }
+    active_ground = {
+        "task": "intent",
+        "system": sc.INTENT_GROUND_SYSTEM,
+        "user": (
+            '{"interpret_plan":{"approach":"active plan","tables":["actor"],"grounding":[]},"schema_literal_json":{}}'
+        ),
+        "output_text": '{"tables":["actor"]}',
+    }
+    stale_interpret = {
+        "task": "intent",
+        "system": sc.INTENT_INTERPRET_SYSTEM,
+        "user": (
+            '{"interpret_plan_schema":{},"question":"Which actors have the most film credits?",'
+            '"recording_slot":"stale"}'
+        ),
+        "output_text": ('{"interpret_plan":{"approach":"stale plan","tables":["actor"],"grounding":[]}}'),
+    }
+    stale_ground = {
+        "task": "intent",
+        "system": sc.INTENT_GROUND_SYSTEM,
+        "user": (
+            '{"interpret_plan":{"approach":"stale plan","tables":["actor"],"grounding":[]},"schema_literal_json":{}}'
+        ),
+        "output_text": '{"tables":["actor","film_actor"]}',
+    }
+    unrelated = {
+        "task": "default",
+        "system": "gatekeeper",
+        "user": "other question",
+        "output_text": "{}",
+    }
+    fixtures = [
+        dict(stale_interpret),
+        dict(stale_ground),
+        dict(active_interpret),
+        dict(active_ground),
+        dict(unrelated),
     ]
-    sc._append_replay_trace(
-        slot_id="questions:q",
-        label="q",
-        tier="questions",
-        attempt=1,
-        outcome="DETERMINISM-DIVERGENCE",
-        live_rows=live_rows,
-        mock_rows=mock_rows,
-        detail="boom",
+    keep_keys = sc._active_intent_keep_keys_for_question(fixtures, question)
+    pruned, removed = sc._prune_orphan_intent_rows(fixtures, question, keep_keys)
+    assert removed == 2
+    intent_rows = [row for row in pruned if row.get("task") == "intent"]
+    assert len(intent_rows) == 2
+    assert all(
+        "active plan" in row.get("user", "") or "active plan" in row.get("output_text", "") for row in intent_rows
     )
-    text = trace_path.read_text(encoding="utf-8")
-    assert "DETERMINISM-DIVERGENCE" in text
-    assert "LIVE record trace" in text
-    assert "MOCK replay trace" in text
-    assert "mock MISS" in text
-    assert "never produced" in text
+    assert any(row.get("task") == "default" for row in pruned)
+
+
+def test_commit_slot_prunes_orphan_intent_for_question(tmp_path: Path) -> None:
+    sc = importlib.import_module("sandbox_corpus")
+    fixtures_path = tmp_path / "fixtures.json"
+    fixtures_path.write_text('{"version": 1, "fixtures": []}\n', encoding="utf-8")
+    corpus = sc.FixtureCorpus(fixtures_path)
+    question = "How many rentals were made in total?"
+    stale = {
+        "task": "intent",
+        "system": sc.INTENT_GROUND_SYSTEM,
+        "user": (
+            '{"interpret_plan":{"approach":"old rentals total"},'
+            '"question":"How many rentals were made in total?",'
+            '"schema_literal_json":{}}'
+        ),
+        "output_text": "{}",
+    }
+    corpus.fixtures.append(dict(stale))
+    corpus.seen.add(sc.fixture_key(stale))
+    corpus.start_slot()
+    fresh_interpret = {
+        "task": "intent",
+        "system": sc.INTENT_INTERPRET_SYSTEM,
+        "user": f'{{"question":"{question}"}}',
+        "output_text": '{"interpret_plan":{"approach":"fresh rentals total"}}',
+    }
+    fresh_ground = {
+        "task": "intent",
+        "system": sc.INTENT_GROUND_SYSTEM,
+        "user": ('{"interpret_plan":{"approach":"fresh rentals total"},"schema_literal_json":{}}'),
+        "output_text": '{"tables":["rental"]}',
+    }
+    corpus.record(
+        task=fresh_interpret["task"],
+        system=fresh_interpret["system"],
+        user_key=fresh_interpret["user"],
+        output_text=fresh_interpret["output_text"],
+    )
+    corpus.record(
+        task=fresh_ground["task"],
+        system=fresh_ground["system"],
+        user_key=fresh_ground["user"],
+        output_text=fresh_ground["output_text"],
+    )
+    removed = corpus.commit_slot(prune_question=question)
+    assert removed == 1
+    intent_rows = [row for row in corpus.fixtures if row.get("task") == "intent"]
+    assert len(intent_rows) == 2
+    assert not any("old rentals total" in row.get("user", "") for row in intent_rows)

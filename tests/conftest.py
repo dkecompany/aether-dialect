@@ -59,22 +59,49 @@ _SLOW_SANDBOX_TESTS = frozenset(
         "test_playground_question",
         "test_paraphrase_question",
         "test_catalog_paraphrase_hits_direct_reuse_after_accept",
+        "test_rental_shop_category_film_emits_non_empty_join_path",
     }
 )
 
 _SLOW_SANDBOX_MODULES = frozenset(
     {
         "test_sandbox_scenarios.py",
+        "test_sandbox_recording_isolation.py",
     }
 )
+
+_SLOW_SANDBOX_OFFLINE_TESTS = frozenset(
+    {
+        "test_sandbox_question",
+        "test_validation_failure_question",
+        "test_practice_questions_have_mock_fixture_coverage",
+        "test_fixture_corpus_covers_consumer_reader_practice",
+        "test_assert_sandbox_complete_with_corpus",
+        "test_feedback_samples_rejection_flow",
+        "test_rank_films_question",
+        "test_direct_reuse_2025_2026_pair",
+        "test_recipe_chat_basics_produces_sql",
+        "test_recipe_rejections_completes",
+        "test_template_reuse_second_question",
+        "test_reader_writer_queue",
+        "test_recipe_validation_failures",
+        "test_recipe_full_session_completes",
+        "test_aetherspace_demo",
+        "test_restricted_consumer_permission_denied",
+        "test_deny_columns_column_security",
+        "test_consumer_reader_preset_first_question",
+        "test_owner_bundled_overrides",
+        "test_consumer_override_proposal_only",
+        "test_session_active_error",
+    }
+)
+
+_FAST_TEST_MAX_SECS = 25.0
 
 _SANDBOX_BUNDLE_MODULES = frozenset(
     {
         "test_sandbox_offline.py",
-        "test_sandbox_paraphrase_reuse.py",
         "test_sandbox_scenarios.py",
-        "test_aetherspace.py",
-        "test_doc_examples_smoke.py",
         "test_sandbox_corpus_helpers.py",
         "test_sandbox_corpus_validate.py",
         "test_sandbox_recording_isolation.py",
@@ -99,7 +126,13 @@ def _is_slow_sandbox_test(item: pytest.Item) -> bool:
         if mod in nodeid:
             return True
     base_name = item.name.split("[", 1)[0]
-    return base_name in _SLOW_SANDBOX_TESTS
+    if base_name in _SLOW_SANDBOX_TESTS:
+        return True
+    fspath = getattr(item, "path", None) or getattr(item, "fspath", None)
+    mod = fspath.name if fspath is not None else ""
+    if mod == "test_sandbox_offline.py":
+        return base_name in _SLOW_SANDBOX_OFFLINE_TESTS
+    return False
 
 
 def _is_live_test(item: pytest.Item) -> bool:
@@ -113,6 +146,8 @@ def _is_live_test(item: pytest.Item) -> bool:
 
 def _requires_sandbox_bundle(item: pytest.Item) -> bool:
     """Return True when the test needs bundled ``sandbox/data.zip`` (``offline_sandbox`` corpus)."""
+    if item.get_closest_marker("requires_sandbox") is not None:
+        return True
     fspath = getattr(item, "path", None) or getattr(item, "fspath", None)
     mod = fspath.name if fspath is not None else ""
     if mod in _SANDBOX_BUNDLE_MODULES:
@@ -164,6 +199,22 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 
 def pytest_configure(config: Any) -> None:
     config.addinivalue_line("markers", "integration: mocked multi-module pipeline slices")
+
+
+def pytest_runtest_logreport(report: pytest.TestReport) -> None:
+    """Warn when a ``fast`` test exceeds the per-test fast budget (marker drift guard)."""
+    if report.when != "call" or not report.passed:
+        return
+    duration = getattr(report, "duration", None)
+    if duration is None or duration <= _FAST_TEST_MAX_SECS:
+        return
+    keywords = getattr(report, "keywords", {})
+    if "fast" not in keywords:
+        return
+    print(
+        f"\nNOT FAST ({duration:.1f}s > {_FAST_TEST_MAX_SECS}s): {report.nodeid}",
+        flush=True,
+    )
 
 
 @pytest.fixture(autouse=True)

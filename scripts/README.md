@@ -7,11 +7,11 @@ Self-contained scripts to build the **rental_shop** CSV bundle (34-table multi-c
 | Section | Contents |
 | --- | --- |
 | [Quick start](#quick-start) | CSV bundle and engine load |
-| [source_rental_shop.py](#source_rental_shoppy) | Bundle generation |
+| [source_rental_shop.py](#source_rental_shoppypy) | Bundle generation |
 | [load_rental_shop_engines.py](#load_rental_shop_enginespy) | Multi-engine load |
 | [Data sources](#data-sources) | Lexicons and external feeds |
 | [Layout](#layout) | Paths and roles |
-| [Sandbox data model](#sandbox-data-model) | Maintainer JSON/notes inputs |
+| [Sandbox data model](#sandbox-data-model-four-files) | Four JSON/notes files |
 | [Sandbox corpus](#sandbox-corpus) | Recording and packaging |
 | [Maintainer publish](#maintainer-publish) | Azure bundle upload |
 
@@ -86,21 +86,20 @@ Activity anchor for generated dates: `2026-07-01` (`RENTAL_SHOP_AS_OF` env overr
 | `scripts/data/sandbox_questions.txt` | Offline sandbox question corpus (`# questions`, `# validation_failures`, `# feedback_samples`) |
 | `scripts/data/inputs.zip` | Frozen lexicons and name lists |
 | `scripts/sandbox_staging/` | Sandbox bundle staging (gitignored) |
-| `scripts/sandbox_staging.zip` | Smoke-build output only (gitignored; does not replace shipped `data.zip`) |
 | `scripts/<engine>/` | Per-engine load wrappers |
 
-## Sandbox data model
+## Sandbox data model (four files)
 
-Hand-maintained inputs under `scripts/data/` (distinct from `sandbox_questions.txt`):
+All four files under `scripts/data/` serve distinct roles — do not merge them with `sandbox_questions.txt`.
 
 | File | Role | Consumed by |
 | --- | --- | --- |
 | `sandbox_expectations.json` | Deterministic per-slot terminal outcomes (`terminal_status`, `must_tables`, `sql_contains`, faithfulness) for recording validation and `AetherEngine.assert_sandbox_complete()` | `sandbox_corpus.py`, package sandbox gate |
 | `sandbox_scenarios.json` | Non-standard recording flows: validation-failure mechanisms, feedback-sample anchor questions, allowed rejection text | `sandbox_corpus.py` recording router |
+| `sandbox_paraphrase_pairs.json` | **Maintainer-only** canonical↔paraphrase mapping for doc linking, shared expectation rules, optional `--record-reuse-pairs` | `sandbox_corpus.py` — **not** a public user API |
 | `sandbox_space_catalog_notes.txt` | Second AetherSpace notes file for catalog-space demo (inherited-then-refined descriptions) | Bundled into sandbox zip |
-| `sandbox_migration_demo.json` | Predetermined v1→v2 schema remap for migration fixture capture | `sandbox_corpus.py` tail capture |
 
-User-facing discovery ships as `sandbox_catalog.json` inside `data.zip` (paraphrase pairs plus feedback demo metadata, built from scenarios and recorded tail output).
+Metadata (`sandbox_expectations.json`, `sandbox_scenarios.json`) is **hand-maintained** under `scripts/data/` and copied into staging unchanged during builds. User-facing discovery ships as `sandbox_catalog.json` inside `data.zip` (built from scenarios + recorded paraphrase pairs).
 
 ## Maintainer publish
 
@@ -116,39 +115,33 @@ Rebuild the shipped offline bundle after DDL, notes, overrides, or question-corp
 ```text
 .venv\Scripts\python.exe scripts\sandbox_corpus.py
 .venv\Scripts\python.exe scripts\sandbox_corpus.py --repair
-.venv\Scripts\python.exe scripts\sandbox_corpus.py --smoke
-.venv\Scripts\python.exe scripts\sandbox_corpus.py --smoke --repair
 ```
 
-### Modes
+### Two modes
 
 | Flag | Behaviour |
 | --- | --- |
-| *(no flags)* | Full build: assemble staging, record fixtures, tail capture, validate, and pack `src/aetherdialect/sandbox/data.zip`. |
-| `--repair` | Re-record uncommitted fixture slots when staging fingerprint matches the last build, then validate and pack. |
-| `--smoke` | Same pipeline with two practice questions plus all validation, feedback, and space slots; writes `scripts/sandbox_staging.zip` only. |
-| `--smoke --repair` | Repair uncommitted smoke slots and repack `sandbox_staging.zip` without touching `data.zip`. |
+| *(no flags)* | Full build: assemble staging, build baseline, record fixtures, validate, and pack. |
+| `--repair` | Re-record failing fixture slots when staging fingerprint matches last build. |
+| `--smoke` | End-to-end pipeline with one practice question plus validation/feedback/scenario slots; writes `sandbox_staging.zip` only. |
 | `--record-reuse-pairs` | Record paraphrase pairs in the same warm session to capture reuse traces. |
 
 ### What full rebuild does
 
 1. Stages seed SQL, notes, overrides, baseline artifacts, and question lists under `scripts/sandbox_staging/`.
 2. Records mock LLM fixtures by driving `AetherEngine.offline_sandbox()` sessions against staged seed (in-memory DuckDB — not file-backed dev DuckDB).
-3. Tail capture after slots commit: paraphrase catalog (live LLM per eligible question), reuse parameter-extraction fixtures, AetherSpace snapshots, and migration demo fixtures.
-4. Validates staging (practice questions, consumer reader paths, feedback flows, direct-reuse pair, schema overrides demo, recipes).
-5. Packs `src/aetherdialect/sandbox/data.zip` only when recording, tail capture, and validation all pass.
-
-`--repair` retries only uncommitted recording slots (LLM variance). Other tail work is captured automatically when missing.
+3. Validates staging (practice questions, consumer reader paths, feedback flows, schema overrides demo).
+4. Packs `src/aetherdialect/sandbox/data.zip` only after validation passes.
 
 ### Recording policy
 
 | Control | Corpus build (`sandbox_corpus.py`) | User sandbox (`offline_sandbox()`) |
 | --- | --- | --- |
-| Template direct reuse | Off during slot recording — every slot gets a full LLM fixture trace | On — in-session fuzzy/direct reuse |
-| Template learning persistence | Fixtures only in zip; template learning disabled during recording | Learning in temp `artifacts_dir`; deleted on handle close |
-| Paraphrases on accept | Built in tail capture; not injected during slot recording | Bundled `sandbox_catalog.json` rows injected into value history on accept (mock replay, no live LLM) |
+| Template direct reuse | Off — every slot gets a full LLM fixture trace | On — in-session fuzzy/direct reuse |
+| Template learning persistence | Fixtures only in zip; no learned templates shipped | Learning in temp `artifacts_dir`; deleted on handle close |
+| Runtime paraphrase generation on accept | N/A at record time | Skipped under mock (no live LLM credentials) |
 
-Default recording runs **owner writer slots only** (~50 live LLM traces). Pack-time validation replays **both** owner and consumer reader paths against committed fixtures — consumer expectations stay in `sandbox_expectations.json` but are not re-recorded. Optional `--record-reuse-pairs` records mapped paraphrase pairs in the same warm session to capture reuse-specific traces. Inline copy rules for year-swap reuse (for example 2025→2026) live in `sandbox_corpus.py`.
+Default recording runs **owner writer slots only** (~50 live LLM traces). Pack-time validation replays **both** owner and consumer reader paths against committed fixtures — consumer expectations stay in `sandbox_expectations.json` but are not re-recorded. Optional `--record-reuse-pairs` records mapped paraphrase pairs in the same warm session to capture reuse-specific traces. Maintainer-only `fixture_copy_replacements` in `sandbox_paraphrase_pairs.json` is a last-resort hack for near-identical fixtures (for example year literal swaps).
 
 **DuckDB config split:** root `env.env` drives live tests and dev tooling with file-backed DuckDB (`DUCKDB_PATH=scripts/duckdb/rental_shop.duckdb`). Corpus build forces `:memory:` DuckDB seeded from staged `rental_shop_seed.sql`. LLM credentials come from `env.env`.
 

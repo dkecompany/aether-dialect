@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from aetherdialect._live_testing import Expected, Scenario, SequenceScenario
 
+# Post-reconcile table assertions for rental_shop item_id subtype pattern.
 FILM_SCOPED: list[list[str]] = [["film"], ["item"], ["film", "item"]]
 BOOK_SCOPED: list[list[str]] = [["book"], ["item"], ["book", "item"]]
 GAME_SCOPED: list[list[str]] = [["game"], ["item"], ["game", "item"]]
@@ -3578,7 +3579,13 @@ def bundled_rental_shop_live_scenarios() -> list[Scenario]:
 
 
 def scenarios_by_category(category: str) -> list[Scenario]:
-    """Return all scenarios for a category key from CATEGORY_LOADERS."""
+    """
+    Return all scenarios for a given category string.
+
+    Args: category: One of the keys in ``CATEGORY_LOADERS``.
+
+    Returns: List of ``Scenario`` objects, or empty list for unknown categories.
+    """
     loader = CATEGORY_LOADERS.get(category)
     if loader is None:
         return []

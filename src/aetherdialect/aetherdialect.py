@@ -47,7 +47,6 @@ from ._contracts_base import (
     OverrideReport,
     OverrideSkip,
     OwnerOnlyOperationError,
-    ParameterBinding,
     QSimSummarySnapshot,
     RetryableError,
     SchemaAccessError,
@@ -166,20 +165,6 @@ class AsyncPipelineSession:
             question,
             on_yes_no=on_yes_no,
             on_free_text=on_free_text,
-        )
-
-    async def reuse_saved_question(
-        self,
-        question_old: str,
-        question_new: str,
-        new_values: dict[str, Any],
-    ) -> SessionStep:
-        """Async wrapper around :meth:`PipelineSession.reuse_saved_question`."""
-        return await asyncio.to_thread(
-            self._inner.reuse_saved_question,
-            question_old,
-            question_new,
-            new_values,
         )
 
     async def __aenter__(self) -> AsyncPipelineSession:
@@ -1177,7 +1162,6 @@ _PUBLIC_API = (
     MigrationPreview,
     MockFixtureMissingError,
     OwnerOnlyOperationError,
-    ParameterBinding,
     PERMISSION_DENIED_USER_MESSAGE,
     PipelineSession,
     QSimSummarySnapshot,

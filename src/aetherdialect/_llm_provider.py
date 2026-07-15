@@ -20,7 +20,6 @@ from ._constants import (
     INTENT_GROUND_SYSTEM,
     INTENT_INTERPRET_SYSTEM,
     LLM_SENSITIVITY_STRIP_KEYS,
-    MOCK_FIXTURE_RETRY_CONTEXT_KEYS,
     MOCK_FIXTURE_STUB_SCHEMA_LITERALS,
     SANDBOX_INTERPRET_DOMAIN_FILENAME,
     SANDBOX_SCHEMA_LITERALS_FILENAME,
@@ -415,8 +414,7 @@ def _mock_fixture_user_key_body(text: str, *, stable: bool) -> str:
     except json.JSONDecodeError:
         return stripped
     if isinstance(body, dict):
-        collapsed = {key: value for key, value in body.items() if key not in MOCK_FIXTURE_RETRY_CONTEXT_KEYS}
-        return stable_json(collapsed)
+        return stable_json(body)
     return stripped
 
 

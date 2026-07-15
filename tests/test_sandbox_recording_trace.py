@@ -10,8 +10,6 @@ import pytest
 from aetherdialect._config import PolicyConfig
 from aetherdialect._core_utils import StepResult
 
-_REPO = Path(__file__).resolve().parents[1]
-
 
 def test_recording_max_attempts_is_two() -> None:
     corpus_mod = importlib.import_module("sandbox_corpus")

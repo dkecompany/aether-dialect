@@ -8,6 +8,7 @@ import io
 import json
 import os
 import re
+import sys
 import warnings
 from decimal import Decimal
 from pathlib import Path
@@ -17,21 +18,14 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 
-from aetherdialect._config import (
-    BigQueryRuntimeConfig,
-    DatabricksRuntimeConfig,
-    DuckDBRuntimeConfig,
-    MariaDBRuntimeConfig,
-    MySQLRuntimeConfig,
-    PostgresRuntimeConfig,
-    RedshiftRuntimeConfig,
-    SnowflakeRuntimeConfig,
-    SQLiteRuntimeConfig,
-    SQLServerRuntimeConfig,
-)
-
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _DATA = _REPO_ROOT / "scripts" / "data"
+_SRC = _REPO_ROOT / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+
+from pathlib import Path
 
 DEFAULT_ENV_FILE = _REPO_ROOT / "env.env"
 
@@ -231,6 +225,8 @@ def integer_columns_for_table(table: str, *, ddl_text: str | None = None) -> fro
             default_ddl_path().read_text(encoding="utf-8")
         )
     return _DDL_INTEGER_COLUMNS.get(table, frozenset())
+
+import re
 
 
 def _strip_defaults(sql: str) -> str:
@@ -524,6 +520,20 @@ def _json_object_cell(cell: object) -> str | None:
             return raw
     return raw
 
+
+import sys
+from pathlib import Path
+
+from aetherdialect._config import (
+    BigQueryRuntimeConfig,
+    DuckDBRuntimeConfig,
+    MariaDBRuntimeConfig,
+    MySQLRuntimeConfig,
+    RedshiftRuntimeConfig,
+    SnowflakeRuntimeConfig,
+    SQLiteRuntimeConfig,
+    SQLServerRuntimeConfig,
+)
 
 _MYSQL_FAMILY = frozenset({"mysql", "mariadb"})
 
@@ -1254,9 +1264,10 @@ def _load_sqlalchemy_engine(engine_name: str, args: argparse.Namespace) -> None:
     _log_progress(f"[load] {engine_name}: finished (schema/dataset={schema})")
 
 
-def _load_postgresql(args: argparse.Namespace) -> None:
-    from psycopg2 import sql
+from psycopg2 import sql
 
+
+def _load_postgresql(args: argparse.Namespace) -> None:
     load_env_file(args.env_file)
     if args.schema is None:
         args.schema = os.environ.get("POSTGRESQL_SCHEMA", "public")
@@ -1341,6 +1352,22 @@ def _load_postgresql(args: argparse.Namespace) -> None:
     conn.close()
     _log_progress(f"[load] postgresql: finished (schema={args.schema}, database={args.database})")
 
+
+import sys
+from pathlib import Path
+
+from aetherdialect._config import (
+    BigQueryRuntimeConfig,
+    DatabricksRuntimeConfig,
+    DuckDBRuntimeConfig,
+    MariaDBRuntimeConfig,
+    MySQLRuntimeConfig,
+    PostgresRuntimeConfig,
+    RedshiftRuntimeConfig,
+    SnowflakeRuntimeConfig,
+    SQLiteRuntimeConfig,
+    SQLServerRuntimeConfig,
+)
 
 _ENGINE_CONFIG = {
     "postgresql": PostgresRuntimeConfig,

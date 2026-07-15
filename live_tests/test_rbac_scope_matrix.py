@@ -35,6 +35,8 @@ class TestDenyColumnsOwner:
         """Owner with deny_columns cannot query hidden staff.ssn."""
         with t2s_deny_columns_owner.session(mode="reader") as session:
             step = _ask_until_settled(session, "List staff social security numbers")
+        # validate_question may classify SSN wording as restricted before intent parse;
+        # deny_columns scope may also yield permission_denied later in the pipeline.
         assert step.status in ("restricted", "permission_denied")
         if step.status == "permission_denied":
             assert PERMISSION_DENIED_USER_MESSAGE in (step.message or "")

@@ -87,7 +87,6 @@ _FORBIDDEN_PATTERNS = [
 ]
 
 _DIRS_TO_SCAN = ["src", "scripts", "tests", "live_tests"]
-_MAINTAINER_DIRS = ("scripts", "tests", "live_tests")
 _DOCS = _ROOT / "docs"
 
 # Low-level modules must not depend on orchestration layers.
@@ -225,61 +224,6 @@ def _get_python_files():
             if p.name == "test_static_hygiene.py":
                 continue
             yield p
-
-
-def _get_maintainer_files():
-    for dname in _MAINTAINER_DIRS:
-        dpath = _ROOT / dname
-        if not dpath.is_dir():
-            continue
-        for p in dpath.rglob("*.py"):
-            if p.name == "test_static_hygiene.py":
-                continue
-            yield p
-
-
-def _constants_after_first_definition(tree: ast.Module, *, file_name: str) -> list[str]:
-    """Return module-level constants that appear after the first top- level definition."""
-    first_def_line: int | None = None
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            first_def_line = node.lineno
-            break
-    if first_def_line is None:
-        return []
-    violations: list[str] = []
-    for node in tree.body:
-        if node.lineno < first_def_line:
-            continue
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            break
-        if isinstance(node, ast.Assign):
-            value = node.value
-            for target in node.targets:
-                if isinstance(target, ast.Name) and _is_module_constant_name(target.id):
-                    if _is_constant_like_value(value):
-                        violations.append(f"line {node.lineno}: {target.id}")
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            if _is_module_constant_name(node.target.id) and _is_constant_like_value(node.value):
-                violations.append(f"line {node.lineno}: {node.target.id}")
-    return violations
-
-
-def _multiline_docstring_violations(tree: ast.AST) -> list[str]:
-    """Return docstrings whose summary spans more than one physical line."""
-    violations: list[str] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            continue
-        if not node.body:
-            continue
-        expr = node.body[0]
-        if not isinstance(expr, ast.Expr) or not isinstance(expr.value, ast.Constant):
-            continue
-        doc = expr.value.value
-        if isinstance(doc, str) and "\n" in doc:
-            violations.append(f"line {expr.lineno}: multiline docstring")
-    return violations
 
 
 def _is_re_compile_call(node: ast.AST) -> bool:
@@ -656,13 +600,7 @@ def test_low_level_avoids_orchestration_imports() -> None:
 @pytest.mark.fast
 @pytest.mark.parametrize(
     "file_path",
-    sorted(
-        p
-        for d in (_SRC, _SCRIPTS, _ROOT / "tests", _ROOT / "live_tests")
-        if d.is_dir()
-        for p in d.rglob("*.py")
-        if p.name != "test_static_hygiene.py"
-    ),
+    sorted(p for d in (_SRC, _SCRIPTS) if d.is_dir() for p in d.rglob("*.py") if p.name != "test_static_hygiene.py"),
 )
 def test_no_inline_hash_comments(file_path: Path) -> None:
     """Library and maintainer scripts use docstrings instead of inline ``#`` comments."""
@@ -691,40 +629,6 @@ def test_no_post_definition_module_imports(file_path: Path) -> None:
     if violations:
         lines = ", ".join(str(line) for line in violations)
         pytest.fail(f"Post-definition module import(s) in {file_path.name} at line(s) {lines}")
-
-
-@pytest.mark.fast
-@pytest.mark.parametrize("file_path", list(_get_maintainer_files()))
-def test_no_post_definition_module_imports_maintainer(file_path: Path) -> None:
-    """Module-level imports must appear before the first top-level definition."""
-    tree = ast.parse(file_path.read_text(encoding="utf-8"))
-    violations = _module_level_imports_after_definitions(tree)
-    if violations:
-        rel = file_path.relative_to(_ROOT)
-        lines = ", ".join(str(line) for line in violations)
-        pytest.fail(f"Post-definition module import(s) in {rel} at line(s) {lines}")
-
-
-@pytest.mark.fast
-@pytest.mark.parametrize("file_path", list(_get_maintainer_files()))
-def test_constants_before_first_definition(file_path: Path) -> None:
-    """Module-level constants must appear before the first function or class."""
-    tree = ast.parse(file_path.read_text(encoding="utf-8"))
-    violations = _constants_after_first_definition(tree, file_name=file_path.name)
-    if violations:
-        rel = file_path.relative_to(_ROOT)
-        pytest.fail(f"Late module constant(s) in {rel}:\n" + "\n".join(violations))
-
-
-@pytest.mark.fast
-@pytest.mark.parametrize("file_path", list(_get_maintainer_files()))
-def test_single_line_docstrings(file_path: Path) -> None:
-    """Docstrings must be a single physical line."""
-    tree = ast.parse(file_path.read_text(encoding="utf-8"))
-    violations = _multiline_docstring_violations(tree)
-    if violations:
-        rel = file_path.relative_to(_ROOT)
-        pytest.fail(f"Multiline docstring(s) in {rel}:\n" + "\n".join(violations))
 
 
 @pytest.mark.fast

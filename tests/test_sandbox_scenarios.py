@@ -12,23 +12,29 @@ from aetherdialect._constants import (
 )
 
 
+@pytest.mark.fast
 @pytest.mark.requires_sandbox
 class TestSandboxScenarios:
     def test_reuse_2025_to_2026(self) -> None:
         """Verify 2025 -> 2026 reuse path works end-to-end."""
         with AetherEngine.offline_sandbox() as sb:
             with sb.engine.session() as session:
+                # Step 1: Run 2025
                 q2025 = "How many rentals happened in 2025?"
                 step = session.accept_until_done(q2025)
                 assert step.done
                 assert step.sql
                 assert "2025" in step.sql
 
+                # Step 2: Run 2026 (should trigger reuse)
                 q2026 = "How many rentals happened in 2026?"
                 step = session.ask(q2026)
+                # Reuse for different literals usually suspends for confirmation
                 assert step.kind == SESSION_KIND_AWAITING_SQL_CONFIRM
+                # The SQL should be updated with 2026
                 assert "2026" in step.sql
 
+                # Confirm and finish
                 step = session.step("y")
                 while not step.done:
                     if step.reply_shape == "yes_no":
@@ -45,17 +51,20 @@ class TestSandboxScenarios:
         """Verify 2026 -> 2025 reverse reuse path works end-to-end (proves reverse-fixture synthesis)."""
         with AetherEngine.offline_sandbox() as sb:
             with sb.engine.session() as session:
+                # Step 1: Run 2026
                 q2026 = "How many rentals happened in 2026?"
                 step = session.accept_until_done(q2026)
                 assert step.done
                 assert step.sql
                 assert "2026" in step.sql
 
+                # Step 2: Run 2025 (should trigger reuse)
                 q2025 = "How many rentals happened in 2025?"
                 step = session.ask(q2025)
                 assert step.kind == SESSION_KIND_AWAITING_SQL_CONFIRM
                 assert "2025" in step.sql
 
+                # Confirm and finish
                 step = session.step("y")
                 while not step.done:
                     if step.reply_shape == "yes_no":
@@ -83,8 +92,10 @@ class TestSandboxScenarios:
         question = "How many rentals were made in total?"
         with AetherEngine.offline_sandbox() as sb:
             with sb.engine.session() as session:
+                # Initial ask
                 step = session.ask(question)
 
+                # Advance to SQL confirmation
                 while not step.done and step.kind != SESSION_KIND_AWAITING_SQL_CONFIRM:
                     if step.reply_shape == "yes_no":
                         step = session.step("y")
@@ -94,9 +105,11 @@ class TestSandboxScenarios:
                         break
 
                 assert step.kind == SESSION_KIND_AWAITING_SQL_CONFIRM
+                # Handcrafted intent counts films, not rentals
                 assert step.sql is not None
                 assert "film" in step.sql.lower()
 
+                # Reject and provide feedback; refinement may require extra fixtures.
                 step = session.step("n")
                 if step.kind != SESSION_KIND_AWAITING_SQL_FEEDBACK:
                     return
@@ -120,19 +133,25 @@ class TestSandboxScenarios:
         """Verify session.reset() clears history and allows a fresh start in sandbox."""
         with AetherEngine.offline_sandbox() as sb:
             with sb.engine.session() as session:
+                # Run one question
                 session.accept_until_done("How many rentals happened in 2025?")
 
+                # Reset
                 session.reset()
 
+                # Step 2: Run 2026 (should NOT trigger reuse because history was cleared)
                 q2026 = "How many rentals happened in 2026?"
                 step = session.ask(q2026)
 
+                # After reset, reuse shortcuts should not trigger.
                 assert step.kind != INTERACTIVE_STAGE_DIRECT_REUSE
 
     def test_bundled_overrides_blocking_ssn(self) -> None:
         """Verify that applying bundled overrides blocks the SSN question."""
         question = "Show payroll deductions by employee SSN."
         with AetherEngine.offline_sandbox() as sb:
+            # First, check it fails or behaves normally without overrides (if it was live)
+            # but in sandbox, this specific question is tied to an override scenario.
             sb.apply_bundled_schema_overrides()
             with sb.engine.session() as session:
                 step = session.accept_until_done(question)
@@ -153,20 +172,24 @@ class TestSandboxScenarios:
         from aetherdialect._contracts_base import SpaceContext
 
         with AetherEngine.offline_sandbox() as sb:
+            # Define a 'catalog' space restricted to core media tables
             catalog = SpaceContext(
                 tables=frozenset({"item", "film", "category", "item_category"}),
             )
             sb.engine.aetherspace("catalog", space_context=catalog)
 
+            # 1. In-scope question
             with sb.engine.session(space="catalog") as session:
                 step = session.accept_until_done("Which films are in the Horror category?")
                 assert step.done
                 assert step.sql
                 assert "film" in step.sql.lower()
 
+            # 2. Out-of-scope question (about revenue/stores which are not in 'catalog')
             with sb.engine.session(space="catalog") as session:
                 step = session.accept_until_done("What is total revenue by store?")
                 assert step.done
+                # Should be blocked
                 assert step.sql is None or step.error
                 assert step.status in (
                     "restricted_question",
@@ -184,11 +207,14 @@ class TestSandboxScenarios:
 
         shared_dir = tempfile.mkdtemp(prefix="sandbox_test_queue_")
         try:
+            # 1. Start a reader session and provide feedback
             with AetherEngine.offline_sandbox(preset="consumer_reader", artifacts_dir=shared_dir) as reader:
                 reader.apply_bundled_schema_overrides()
                 with reader.engine.session(mode="reader") as session:
+                    # Ask a tour question
                     q = "How many books do we have?"
                     step = session.ask(q)
+                    # Advance to SQL confirmation (mock should provide one)
                     while not step.done and step.kind != SESSION_KIND_AWAITING_SQL_CONFIRM:
                         step = session.step("y")
 
@@ -203,17 +229,23 @@ class TestSandboxScenarios:
                         if step.error and "no mock fixture" in str(step.error).lower():
                             return
 
+            # 2. Start a writer session and verify it sees the feedback
             with AetherEngine.offline_sandbox(preset="owner_writer", artifacts_dir=shared_dir) as writer:
+                # The writer should have drained the queue upon initialization or session start
+                # We can check the internal write queue path is empty or was processed
                 queue_path = writer.engine.write_queue_path
                 if queue_path.exists():
                     with queue_path.open(encoding="utf-8") as f:
                         lines = f.readlines()
+                    # It might not be empty yet if not drained, but we can verify the file exists
                     assert len(lines) >= 0
         finally:
             shutil.rmtree(shared_dir, ignore_errors=True)
 
     def test_migration_demo_flow(self) -> None:
         """Verify the sandbox migration demo flow (rename reconciliation)."""
+        # This test replicates the core logic of the sandbox 'migration' recipe
+        # but as a unit test with assertions.
         import shutil
         import tempfile
         from pathlib import Path
@@ -226,7 +258,6 @@ class TestSandboxScenarios:
             _owner_writer_schema_context,
             _post_migration_seed_sql,
             _write_sandbox_toml,
-            sandbox_questions,
         )
 
         bundle_access = _open_data_bundle()
@@ -238,6 +269,7 @@ class TestSandboxScenarios:
             map_path = demo_root / "schema_migration_map.json"
             seed_path = extract / "rental_shop_seed.sql"
 
+            # 1. Prepare post-migration state
             post_sql = work / "rental_shop_post_migration.sql"
             post_sql.write_text(_post_migration_seed_sql(seed_path, map_path), encoding="utf-8")
 
@@ -255,6 +287,7 @@ class TestSandboxScenarios:
             )
             config_file = _write_sandbox_toml(fixtures_file=_fixtures_path(extract))
 
+            # 2. Verify initial engine init succeeds (soft refresh path; no hard migration gate).
             engine = AetherEngine(
                 schema_context,
                 artifacts_dir=artifacts_dir,
@@ -265,6 +298,7 @@ class TestSandboxScenarios:
             )
             assert engine is not None
 
+            # 3. Apply migration map
             t2s = AetherEngine.apply_migration_map(
                 str(map_path),
                 engine_context=schema_context,
@@ -276,11 +310,12 @@ class TestSandboxScenarios:
             )
             t2s._sandbox_mode = True
 
+            # 4. Verify post-migration question works
             with t2s.session() as session:
-                post_q = sandbox_questions()[0]
-                step = session.accept_until_done(post_q)
+                step = session.accept_until_done("How many books do we have?")
                 assert step.done
-                assert step.status != "invalid_question"
+                assert step.sql
+                assert step.error is None
         finally:
             shutil.rmtree(work, ignore_errors=True)
             if bundle_access.owns_cleanup:
@@ -288,18 +323,23 @@ class TestSandboxScenarios:
 
     def test_sandbox_reopen_isolation(self) -> None:
         """Verify that opening a new sandbox without closing the old one is isolated/reset."""
+        # 1. Open first sandbox and set some state (e.g. an aetherspace)
         sb1 = AetherEngine.offline_sandbox()
         from aetherdialect._contracts_base import SpaceContext
 
         catalog = SpaceContext(tables=frozenset({"item"}))
         sb1.engine.aetherspace("custom_catalog", space_context=catalog)
 
+        # 2. Open second sandbox without closing sb1
+        # It should create a fresh extraction and fresh engine state
         sb2 = AetherEngine.offline_sandbox()
         try:
+            # Verify sb2 does NOT have the custom space defined in sb1
             with pytest.raises(ValueError, match="unknown aetherspace 'custom_catalog'"):
                 with sb2.engine.session(space="custom_catalog") as session:
                     session.ask("test")
 
+            # Verify extraction directories are different
             assert sb1._extract_dir != sb2._extract_dir
         finally:
             sb1.close()
@@ -314,13 +354,19 @@ class TestSandboxScenarios:
 
         shared_dir = tempfile.mkdtemp(prefix="sandbox_shared_reset_")
         try:
+            # 1. Open sandbox and generate a session (which creates artifacts)
             with AetherEngine.offline_sandbox(artifacts_dir=shared_dir) as sb1:
                 with sb1.engine.session() as session:
                     session.accept_until_done("How many films are there?")
 
+                # Verify artifacts exist under the engine storage dir
                 assert (_sandbox_memory_engine_dir(shared_dir) / "schema_graph.json.gz").exists()
 
+            # 2. Re-open with same artifacts_dir.
+            # create_offline_sandbox should wipe the dir and re-seed from baseline.
             with AetherEngine.offline_sandbox(artifacts_dir=shared_dir) as sb2:
+                # If it reset correctly, the internal engine should be fresh
+                # We can verify by checking if a session still works (it will re-seed)
                 with sb2.engine.session() as session:
                     step = session.accept_until_done("How many games are in the catalog?")
                     assert step.done

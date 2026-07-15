@@ -2,22 +2,14 @@
 
 from __future__ import annotations
 
-import importlib.util
-from pathlib import Path
-
 import pytest
-
-_REPO = Path(__file__).resolve().parents[1]
-_ND_PATH = _REPO / ".github" / "scripts" / "normalize_docstrings.py"
-_ND_SPEC = importlib.util.spec_from_file_location("normalize_docstrings", _ND_PATH)
-assert _ND_SPEC is not None and _ND_SPEC.loader is not None
-_ND = importlib.util.module_from_spec(_ND_SPEC)
-_ND_SPEC.loader.exec_module(_ND)
-collapse_arg_paragraphs = _ND.collapse_arg_paragraphs
-indent_under_doc_sections = _ND.indent_under_doc_sections
-isolate_args_as_paragraphs = _ND.isolate_args_as_paragraphs
-normalize_docstring_text = _ND.normalize_docstring_text
-unwrap_summary_block = _ND.unwrap_summary_block
+from normalize_docstrings import (
+    collapse_arg_paragraphs,
+    indent_under_doc_sections,
+    isolate_args_as_paragraphs,
+    normalize_docstring_text,
+    unwrap_summary_block,
+)
 
 
 def test_unwrap_summary_joins_bad_agent_wraps() -> None:

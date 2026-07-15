@@ -89,7 +89,7 @@ Inside the pipeline, suspend points carry an internal `state_id`. Before returni
 | `error` | — | — | Terminal failure (`step.done == True`, `step.error` set). |
 | `idle` | — | — | Session reset / no active turn. |
 
-Direct template reuse during a normal `ask` turn suspends with `kind="awaiting_sql_confirm"` (same as a SQL preview). For orchestrators that already resolved new bind values, `reuse_saved_question` executes the stored template directly without fuzzy matching or parameter extraction.
+Direct template reuse suspends with `kind="awaiting_sql_confirm"` (same as a normal SQL preview) — there is no separate public reuse API or kind.
 
 ### SessionStep fields (embedding checklist)
 
@@ -101,7 +101,6 @@ Direct template reuse during a normal `ask` turn suspends with `kind="awaiting_s
 | `reply_shape` | `"yes_no"` vs `"free_text"` while suspended. |
 | `message` | Optional narrative (also printed by `run_interactive`). |
 | `sql` / `data` | Preview or final result. |
-| `parameters` | Tuple of `ParameterBinding` on terminal success (`handle`, `current_value`, `display_name`). |
 | `error` | Terminal error text. |
 | `diagnostics` | Turn-level tracing rows. |
 
@@ -138,24 +137,8 @@ Helper methods:
 
 - `session.ask_until_done(question, on_confirm="y")` — auto-answers **yes/no** suspends only; raises on free-text suspends.
 - `session.accept_until_done(question, ...)` — auto-answers both yes/no and free-text suspends until the turn ends.
-- `session.reuse_saved_question(question_old, question_new, new_values)` — re-executes a stored template when your orchestrator already knows the new bind values (`{"p1": ...}`). Returns a terminal step with SQL, data, and `parameters`.
 
 Pass `on_confirm` as `"y"` or `"n"` (string, not Python `or`).
-
-### Forced template reuse
-
-When an outer orchestrator has already rewritten natural-language questions and resolved new parameter values, call `reuse_saved_question` instead of `ask`:
-
-```python
-step = session.reuse_saved_question(
-    "count of item in category alpha",
-    "count of item in category beta",
-    {"p1": "beta"},
-)
-assert step.done and step.parameters[0].handle == "p1"
-```
-
-The engine locates the template that owns `question_old`, overlays `new_values` on the stored bind map, validates shape, executes, records the new question row, and returns bindings with display names. It does not run fuzzy reuse detection or LLM parameter extraction on this path.
 
 ---
 

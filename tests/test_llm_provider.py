@@ -92,12 +92,3 @@ def test_llm_json_parse_through_mock(tmp_path: Path) -> None:
     reset_mock_provider()
     parsed = llm_json("S", "U", task="default")
     assert parsed == {"value": 42}
-
-
-def test_mock_fixture_user_key_strips_retry_context() -> None:
-    base = '{"question":"q","prior_attempt_failures":["a"]}'
-    with_hints = '{"question":"q","prior_attempt_failures":["a","b"],"prior_grounding_failures":["c"]}'
-    from aetherdialect._llm_provider import mock_fixture_user_key
-
-    assert mock_fixture_user_key(base) == mock_fixture_user_key(with_hints)
-    assert mock_fixture_user_key('{"question":"q"}') == mock_fixture_user_key(base)

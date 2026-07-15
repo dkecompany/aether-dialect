@@ -2,24 +2,17 @@
 
 from __future__ import annotations
 
-import argparse
+import sys
+from pathlib import Path
+
+_SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
+
+from _engine_entry import run_rental_shop
 
 ENGINE = "sqlite"
 
-
-def main() -> None:
-    import sys
-    from pathlib import Path
-
-    scripts = Path(__file__).resolve().parents[1]
-    if str(scripts) not in sys.path:
-        sys.path.insert(0, str(scripts))
-    from load_rental_shop_engines import _cmd_ping, _cmd_verify
-
-    args = argparse.Namespace(engine=ENGINE, env_file=None, schema=None)
-    _cmd_ping(args)
-    _cmd_verify(args)
-
-
 if __name__ == "__main__":
-    main()
+    run_rental_shop(ENGINE, "ping")
+    run_rental_shop(ENGINE, "verify")

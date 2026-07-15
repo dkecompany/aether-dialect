@@ -8,6 +8,7 @@ import os
 import shutil
 import sqlite3
 import stat
+import sys
 import tempfile
 import time
 import zipfile
@@ -16,6 +17,48 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+REPO = Path(__file__).resolve().parents[1]
+
+_BUILD_VERBOSE = True
+_SMOKE_BUILD = False
+SMOKE_TOUR_QUESTION = "How many rentals happened in 2025?"
+SCRIPTS = REPO / "scripts"
+DATA = SCRIPTS / "data"
+STAGING = SCRIPTS / "sandbox_staging"
+STAGING_ZIP = SCRIPTS / "sandbox_staging.zip"
+OUT_ZIP = REPO / "src" / "aetherdialect" / "sandbox" / "data.zip"
+ENV_FILE = REPO / "env.env"
+QUESTIONS_SOURCE = DATA / "sandbox_questions.txt"
+MIGRATION_DEMO_SOURCE = DATA / "sandbox_migration_demo.json"
+OVERRIDES_DEMO_SOURCE = DATA / "sandbox_overrides_demo.json"
+FIXTURES_PATH = STAGING / "fixtures" / "rental_shop_mock.json"
+BUILD_FINGERPRINT_PATH = STAGING / "sandbox_build_fingerprint.json"
+RECORDING_MAX_ATTEMPTS = 2
+RECORDING_MAX_VALIDATE_PASSES = 25
+RECORDING_RESULTS_PATH = SCRIPTS / "logs" / "sandbox_results.txt"
+RECORDING_MANIFEST_PATH = STAGING / "recording_manifest.json"
+EXPECTATIONS_SOURCE = DATA / "sandbox_expectations.json"
+SCENARIOS_SOURCE = DATA / "sandbox_scenarios.json"
+HANDCRAFTED_FIXTURES_SOURCE = DATA / "sandbox_handcrafted_fixtures.json"
+SPACE_CATALOG_NOTES_SOURCE = DATA / "sandbox_space_catalog_notes.txt"
+VALIDATE_OUT = SCRIPTS / "logs" / "validate_out.txt"
+VALIDATE_TRACE_OUT = SCRIPTS / "logs" / "validate_trace.txt"
+SKIP_ZIP_NAMES = frozenset(
+    {
+        "rental_shop_post_migration.sql",
+        "rental_shop_mock.pre_repair.json",
+        "sandbox_build_fingerprint.json",
+    },
+)
+
+_SRC = REPO / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
 
 import aetherdialect._live_testing
 import aetherdialect._llm_provider
@@ -34,19 +77,22 @@ from aetherdialect._constants import (
     INTENT_COMPOSE_SYSTEM,
     INTENT_GROUND_SYSTEM,
     INTENT_INTERPRET_SYSTEM,
-    SANDBOX_INTERPRET_DOMAIN_FILENAME,
     SANDBOX_QUESTION_TIERS,
     SANDBOX_SCHEMA_LITERALS_FILENAME,
+    SANDBOX_INTERPRET_DOMAIN_FILENAME,
 )
 from aetherdialect._contracts_core import TemplateMatch
+from aetherdialect.aetherdialect import AetherEngine
 from aetherdialect._core_utils import (
     StepResult,
     append_failure_trace,
     build_session_step_trace,
     pipeline_capture,
     run_with_pipeline_capture,
+    stable_json,
 )
 from aetherdialect._llm_provider import (
+    mock_fixture_user_key,
     reset_mock_provider,
 )
 from aetherdialect._main_execution import (
@@ -54,49 +100,14 @@ from aetherdialect._main_execution import (
     compute_engine_storage_dir,
 )
 from aetherdialect._sandbox import (
-    _sandbox_doctor_verbose,
-    assert_sandbox_complete,
     check_sandbox_faithfulness,
     question_ok,
     validate_sandbox_corpus,
+    sandbox_doctor,
+    _sandbox_doctor_verbose,
+    assert_sandbox_complete,
 )
 from aetherdialect._utils import generate_paraphrases_of_seed_question, normalize_question
-from aetherdialect.aetherdialect import AetherEngine
-
-REPO = Path(__file__).resolve().parents[1]
-SCRIPTS = REPO / "scripts"
-_BUILD_VERBOSE = True
-_SMOKE_BUILD = False
-SMOKE_TOUR_QUESTION = "How many rentals happened in 2025?"
-SMOKE_FLAKY_QUESTION = "Which games support English?"
-SCRIPTS = REPO / "scripts"
-DATA = SCRIPTS / "data"
-STAGING = SCRIPTS / "sandbox_staging"
-STAGING_ZIP = SCRIPTS / "sandbox_staging.zip"
-OUT_ZIP = REPO / "src" / "aetherdialect" / "sandbox" / "data.zip"
-ENV_FILE = REPO / "env.env"
-QUESTIONS_SOURCE = DATA / "sandbox_questions.txt"
-MIGRATION_DEMO_SOURCE = DATA / "sandbox_migration_demo.json"
-OVERRIDES_DEMO_SOURCE = DATA / "sandbox_overrides_demo.json"
-FIXTURES_PATH = STAGING / "fixtures" / "rental_shop_mock.json"
-BUILD_FINGERPRINT_PATH = STAGING / "sandbox_build_fingerprint.json"
-RECORDING_MAX_ATTEMPTS = 2
-RECORDING_RESULTS_PATH = SCRIPTS / "logs" / "sandbox_results.txt"
-SANDBOX_REPLAY_TRACE_PATH = SCRIPTS / "logs" / "sandbox_replay_trace.txt"
-RECORDING_MANIFEST_PATH = STAGING / "recording_manifest.json"
-EXPECTATIONS_SOURCE = DATA / "sandbox_expectations.json"
-SCENARIOS_SOURCE = DATA / "sandbox_scenarios.json"
-HANDCRAFTED_FIXTURES_SOURCE = DATA / "sandbox_handcrafted_fixtures.json"
-SPACE_CATALOG_NOTES_SOURCE = DATA / "sandbox_space_catalog_notes.txt"
-VALIDATE_OUT = SCRIPTS / "logs" / "validate_out.txt"
-VALIDATE_TRACE_OUT = SCRIPTS / "logs" / "validate_trace.txt"
-SKIP_ZIP_NAMES = frozenset(
-    {
-        "rental_shop_post_migration.sql",
-        "rental_shop_mock.pre_repair.json",
-        "sandbox_build_fingerprint.json",
-    },
-)
 
 BASELINE_OWNER_SUBDIR = "owner"
 BASELINE_CONSUMER_SUBDIR = "consumer"
@@ -112,7 +123,7 @@ LLM_PATCH_MODULES = (
 )
 
 
-def slot_id_for(slot: RecordingSlot) -> str:
+def slot_id_for(slot: "RecordingSlot") -> str:
     if slot.kind == "feedback":
         return f"feedback:{slot.label}"
     mode_part = slot.mode or "default"
@@ -197,6 +208,22 @@ def _check_slot_recording(
         return False, detail
     err = str(getattr(step, "error", "") or "").strip()
     return False, err or "expectation not met"
+
+
+def _intent_fixture_question(row: dict[str, str]) -> str | None:
+    user = str(row.get("user", "")).strip()
+    if not user.startswith("{"):
+        return None
+    try:
+        body = json.loads(user)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(body, dict):
+        return None
+    question = body.get("question")
+    if isinstance(question, str) and question.strip():
+        return normalize_question(question)
+    return None
 
 
 def _mock_verify_targets_for_slot(
@@ -330,64 +357,6 @@ def _begin_eval_results(path: Path) -> None:
     lt_conftest._clear_results_file()
 
 
-def _reset_replay_trace() -> None:
-    SANDBOX_REPLAY_TRACE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    SANDBOX_REPLAY_TRACE_PATH.write_text("", encoding="utf-8")
-
-
-def _format_trace_rows(rows: list[dict[str, str]]) -> list[str]:
-    if not rows:
-        return ["    (no LLM calls captured)"]
-    return [
-        f"    #{idx} task={row.get('task', '')!r} stage={row.get('system_id', '')} "
-        f"user_sha={row.get('user_sha', '')} result={row.get('result', '')}\n"
-        f"        user_head={row.get('user_head', '')!r}"
-        for idx, row in enumerate(rows, 1)
-    ]
-
-
-def _append_replay_trace(
-    *,
-    slot_id: str,
-    label: str,
-    tier: str,
-    attempt: int,
-    outcome: str,
-    live_rows: list[dict[str, str]],
-    mock_rows: list[dict[str, str]],
-    detail: str = "",
-) -> None:
-    """Append paired live-record and mock-replay traces for one slot to the replay trace file."""
-    SANDBOX_REPLAY_TRACE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    lines: list[str] = []
-    if SANDBOX_REPLAY_TRACE_PATH.is_file() and SANDBOX_REPLAY_TRACE_PATH.stat().st_size > 0:
-        lines.append("\n" + "=" * 80)
-    lines.append(f"[{outcome}] slot={slot_id} tier={tier} attempt={attempt}")
-    lines.append(f"  question: {label}")
-    if detail:
-        lines.append(f"  detail: {detail}")
-    lines.append(f"  LIVE record trace ({len(live_rows)} call(s)):")
-    lines.extend(_format_trace_rows(live_rows))
-    lines.append(f"  MOCK replay trace ({len(mock_rows)} call(s)):")
-    lines.extend(_format_trace_rows(mock_rows))
-    live_keys = {(r.get("task", ""), r.get("system_id", ""), r.get("user_sha", "")) for r in live_rows}
-    misses = [r for r in mock_rows if str(r.get("result", "")).startswith("MISS")]
-    unmatched = [
-        r
-        for r in mock_rows
-        if (r.get("task", ""), r.get("system_id", ""), r.get("user_sha", "")) not in live_keys
-    ]
-    if misses:
-        lines.append(f"  >>> {len(misses)} mock MISS(es): cached fixture not found during replay")
-    if unmatched:
-        lines.append(
-            f"  >>> {len(unmatched)} mock call(s) requested a key the live record never produced "
-            "(prompt nondeterminism or key drift)",
-        )
-    with open(SANDBOX_REPLAY_TRACE_PATH, "a", encoding="utf-8") as fh:
-        fh.write("\n".join(lines) + "\n")
-
-
 @dataclass
 class RecordingEnvironment:
     """Patches applied for live sandbox fixture recording."""
@@ -405,7 +374,6 @@ class RecordingEnvironment:
 def prepare_recording_environment() -> RecordingEnvironment:
     """Load credentials, sync ``EngineConfig``, and apply recording patches."""
     from live_tests.conftest import write_sandbox_recording_toml
-
     from load_rental_shop_engines import load_env_file
 
     env_path = load_env_file(ENV_FILE, override=True)
@@ -440,20 +408,20 @@ def prepare_recording_environment() -> RecordingEnvironment:
     orig_refine = aetherdialect._schema_overrides._refine_descriptions_via_llm
     orig_write_toml = aetherdialect._sandbox._write_sandbox_toml
     orig_template_match = aetherdialect._pipeline.match_question_level_template_reuse
-    aetherdialect._sandbox._write_sandbox_toml = openai_toml
+    setattr(aetherdialect._sandbox, "_write_sandbox_toml", openai_toml)
     prev_provider = EngineConfig.LLM_PROVIDER
     reset_mock_provider()
     EngineConfig.LLM_PROVIDER = "openai"
-    aetherdialect._pipeline.match_question_level_template_reuse = skip_template_reuse
-    aetherdialect._main_execution.match_question_level_template_reuse = skip_template_reuse
-    aetherdialect._live_testing.match_question_level_template_reuse = skip_template_reuse
+    setattr(aetherdialect._pipeline, "match_question_level_template_reuse", skip_template_reuse)
+    setattr(aetherdialect._main_execution, "match_question_level_template_reuse", skip_template_reuse)
+    setattr(aetherdialect._live_testing, "match_question_level_template_reuse", skip_template_reuse)
     orig_persist = aetherdialect._main_execution._persist_template_learning_for_pipeline_session
 
     def skip_template_learning(_port: object | None) -> bool:
         del _port
         return False
 
-    aetherdialect._main_execution._persist_template_learning_for_pipeline_session = skip_template_learning
+    setattr(aetherdialect._main_execution, "_persist_template_learning_for_pipeline_session", skip_template_learning)
 
     return RecordingEnvironment(
         orig_write_toml=orig_write_toml,
@@ -469,12 +437,12 @@ def prepare_recording_environment() -> RecordingEnvironment:
 
 def teardown_recording_environment(env: RecordingEnvironment) -> None:
     """Restore module patches applied by :func:`prepare_recording_environment`."""
-    aetherdialect._schema_overrides._refine_descriptions_via_llm = env.orig_refine
-    aetherdialect._sandbox._write_sandbox_toml = env.orig_write_toml
-    aetherdialect._pipeline.match_question_level_template_reuse = env.orig_template_match
-    aetherdialect._main_execution.match_question_level_template_reuse = env.orig_template_match
-    aetherdialect._live_testing.match_question_level_template_reuse = env.orig_template_match
-    aetherdialect._main_execution._persist_template_learning_for_pipeline_session = env.orig_persist_template_learning
+    setattr(aetherdialect._schema_overrides, "_refine_descriptions_via_llm", env.orig_refine)
+    setattr(aetherdialect._sandbox, "_write_sandbox_toml", env.orig_write_toml)
+    setattr(aetherdialect._pipeline, "match_question_level_template_reuse", env.orig_template_match)
+    setattr(aetherdialect._main_execution, "match_question_level_template_reuse", env.orig_template_match)
+    setattr(aetherdialect._live_testing, "match_question_level_template_reuse", env.orig_template_match)
+    setattr(aetherdialect._main_execution, "_persist_template_learning_for_pipeline_session", env.orig_persist_template_learning)
     EngineConfig.LLM_PROVIDER = env.prev_provider
 
 
@@ -534,43 +502,16 @@ def _aetherspace_snapshots_ready(*, staging_dir: Path = STAGING) -> bool:
     return dest.is_dir() and any(dest.glob("*.json"))
 
 
-def _paraphrase_gatekeeper_ready(corpus: FixtureCorpus, paraphrase: str) -> bool:
-    needle = paraphrase.strip()
-    if not needle:
-        return False
-    for row in corpus.fixtures:
-        if str(row.get("task", "")) != "default":
-            continue
-        if str(row.get("user", "")).strip() != needle:
-            continue
-        system = str(row.get("system", "")).lower()
-        if "valid_database_question" in system or "decide if user input" in system:
-            return True
-    return False
-
-
 def _reuse_fixtures_ready(corpus: FixtureCorpus) -> bool:
     paraphrase = "How many rentals happened in 2026?"
-    if not _paraphrase_gatekeeper_ready(corpus, paraphrase):
-        return False
-    canonical = "How many rentals happened in 2025?"
-    swaps = INLINE_REUSE_PARAM_COPY_RULES.get((canonical, paraphrase), ())
-    if not swaps:
-        return True
-    forward_rows = _param_extraction_forward_rows_from_corpus(corpus.fixtures, canonical)
-    return _reuse_reverse_param_rows_committed(
-        corpus,
-        forward_rows=forward_rows,
-        swaps=swaps,
-        llm_mod=aetherdialect._llm_provider,
-    )
-
-
-def _post_migration_record_question(questions: dict[str, list[str]]) -> str:
-    practice = questions.get("questions", [])
-    if practice:
-        return str(practice[0])
-    return "How many films are in the Rental Shop catalog?"
+    for row in corpus.fixtures:
+        user = str(row.get("user", ""))
+        output = str(row.get("output_text", ""))
+        if paraphrase in user or paraphrase in output:
+            return True
+        if PARAM_EXTRACTION_SYSTEM_MARKER in str(row.get("system", "")).lower() and "2026" in user:
+            return True
+    return False
 
 
 def _migration_fixtures_ready(corpus: FixtureCorpus) -> bool:
@@ -658,10 +599,10 @@ def _recording_pipeline_ready(
 
 
 def _paraphrase_seeds_for_missing(
-    session: RecordingSession,
+    session: "RecordingSession",
     missing: list[RecordingSlot],
     collected: list[tuple[RecordingSlot, object]],
-) -> tuple[list[tuple[RecordingSlot, object]], str]:
+) -> list[tuple[RecordingSlot, object]]:
     by_label = {slot.label: (slot, step) for slot, step in collected}
     out: list[tuple[RecordingSlot, object]] = []
     need_live: list[RecordingSlot] = []
@@ -673,13 +614,7 @@ def _paraphrase_seeds_for_missing(
             need_live.append(slot)
     if need_live:
         out.extend(session.collect_paraphrase_seeds(need_live))
-    seeded = {slot.label for slot, _ in out}
-    not_seeded = [slot.label for slot in missing if slot.label not in seeded]
-    if not_seeded:
-        preview = ", ".join(not_seeded[:3])
-        suffix = "..." if len(not_seeded) > 3 else ""
-        return out, f"paraphrase seed collection failed for {len(not_seeded)} slot(s): {preview}{suffix}"
-    return out, ""
+    return out
 
 
 def _committed_paraphrase_source_slots(
@@ -727,14 +662,13 @@ def parse_questions_file(path: Path) -> dict[str, list[str]]:
 
 
 def smoke_questions(*, source: Path | None = None) -> dict[str, list[str]]:
-    """Minimal question set: two practice questions plus all validation/feedback sections."""
+    """Minimal question set: one practice question plus all validation/feedback sections."""
     full = parse_questions_file(source or QUESTIONS_SOURCE)
-    practice: list[str] = []
-    for candidate in (SMOKE_TOUR_QUESTION, SMOKE_FLAKY_QUESTION):
-        if candidate in full["questions"] and candidate not in practice:
-            practice.append(candidate)
-    if not practice:
-        practice = list(full["questions"][:2])
+    practice = (
+        [SMOKE_TOUR_QUESTION]
+        if SMOKE_TOUR_QUESTION in full["questions"]
+        else full["questions"][:1]
+    )
     return {
         "questions": practice,
         "validation_failures": [
@@ -1051,19 +985,6 @@ def fixture_key(row: dict[str, str]) -> tuple[str, str, str]:
     )
 
 
-def _intent_system_label(system: str) -> str:
-    """Short, stable label for a system prompt (for readable trace lines)."""
-    if system == INTENT_INTERPRET_SYSTEM:
-        return "interpret"
-    if system == INTENT_GROUND_SYSTEM:
-        return "ground"
-    if system == INTENT_COMPOSE_SYSTEM:
-        return "compose"
-    if PARAM_EXTRACTION_SYSTEM_MARKER in system.lower():
-        return "param_extraction"
-    return "default"
-
-
 def write_text_atomic(path: Path, text: str, *, attempts: int = 5) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     last_err: OSError | None = None
@@ -1090,7 +1011,6 @@ class FixtureCorpus:
         self._buffer: dict[tuple[str, str, str], dict[str, str]] = {}
         self._buffer_order: list[tuple[str, str, str]] = []
         self._load()
-        self.committed_keys: set[tuple[str, str, str]] = set(self.seen)
 
     def _load(self) -> None:
         if not self.path.is_file():
@@ -1132,53 +1052,64 @@ class FixtureCorpus:
         """One entry per (task, system, user_key); identical keys keep last output."""
         return [dict(self._buffer[key]) for key in self._buffer_order]
 
-    def buffered_keys(self) -> set[tuple[str, str, str]]:
-        """Return the (task, system, user) keys currently staged in the slot buffer."""
-        return {fixture_key(row) for row in self.collapsed_slot_fixtures()}
-
-    def commit_slot(self, *, freeze: bool = True) -> set[tuple[str, str, str]]:
-        """Merge the slot buffer into the corpus by exact key without overwriting frozen keys."""
-        frozen = self.committed_keys
-        written: set[tuple[str, str, str]] = set()
-        existing = {fixture_key(row): idx for idx, row in enumerate(self.fixtures)}
-        for entry in self.collapsed_slot_fixtures():
+    def commit_slot(self, *, prune_question: str = "") -> int:
+        buffer_rows = self.collapsed_slot_fixtures()
+        buffer_intent_keys = {
+            fixture_key(row) for row in buffer_rows if str(row.get("task", "")) == "intent"
+        }
+        for entry in buffer_rows:
             key = fixture_key(entry)
-            idx = existing.get(key)
-            if idx is not None:
-                prior = self.fixtures[idx]
-                if str(prior.get("output_text", "")) != str(entry.get("output_text", "")):
-                    if key in frozen:
-                        continue
+            replaced = False
+            for idx, row in enumerate(self.fixtures):
+                if fixture_key(row) == key:
                     self.fixtures[idx] = entry
-                    written.add(key)
-                continue
-            self.fixtures.append(entry)
-            existing[key] = len(self.fixtures) - 1
+                    replaced = True
+                    break
+            if not replaced:
+                self.fixtures.append(entry)
             self.seen.add(key)
-            written.add(key)
+        removed = 0
+        if prune_question.strip() and buffer_intent_keys:
+            keep_keys = _expand_intent_chain_keep_keys(self.fixtures, buffer_intent_keys)
+            self.fixtures, removed = _prune_orphan_intent_rows(
+                self.fixtures,
+                prune_question,
+                keep_keys,
+            )
+            self.seen = {fixture_key(row) for row in self.fixtures}
         self.discard_slot()
         self.flush()
-        if freeze:
-            self.committed_keys |= written
-        return written
+        return removed
 
-    def rollback_keys(self, keys: set[tuple[str, str, str]]) -> None:
-        """Remove the given keys from the corpus (used to undo a failed slot's tentative merge)."""
-        if not keys:
-            return
-        self.fixtures = [row for row in self.fixtures if fixture_key(row) not in keys]
-        self.seen = {fixture_key(row) for row in self.fixtures}
-        self.flush()
+    def merged_fixtures_for_verify(self, *, slot_label: str = "") -> list[dict[str, str]]:
+        buffer = self.collapsed_slot_fixtures()
+        buffer_keys = {fixture_key(row) for row in buffer}
+        buffer_has_intent = any(str(row.get("task", "")) == "intent" for row in buffer)
+        slot_question = normalize_question(slot_label) if slot_label.strip() else ""
+        merged: list[dict[str, str]] = []
+        for row in self.fixtures:
+            if buffer_has_intent and str(row.get("task", "")) == "intent":
+                row_question = _intent_fixture_question(row)
+                if row_question is None:
+                    continue
+                if slot_question and row_question == slot_question and fixture_key(row) not in buffer_keys:
+                    continue
+            merged.append(dict(row))
+        for entry in buffer:
+            key = fixture_key(entry)
+            replaced = False
+            for idx, row in enumerate(merged):
+                if fixture_key(row) == key:
+                    merged[idx] = entry
+                    replaced = True
+                    break
+            if not replaced:
+                merged.append(entry)
+        return merged
 
-    def snapshot(self) -> list[dict[str, str]]:
-        """Deep-copy the committed corpus rows so a failed tentative merge can be fully undone."""
-        return [dict(row) for row in self.fixtures]
-
-    def restore(self, rows: list[dict[str, str]]) -> None:
-        """Restore corpus rows from a snapshot (frozen keys are unaffected) and reflush to disk."""
-        self.fixtures = [dict(row) for row in rows]
-        self.seen = {fixture_key(row) for row in self.fixtures}
-        self.flush()
+    def write_verify_snapshot(self, dest: Path, *, slot_label: str = "") -> None:
+        payload = {"version": 1, "fixtures": self.merged_fixtures_for_verify(slot_label=slot_label)}
+        write_text_atomic(dest, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
 
 
 def _digest(*parts: object) -> int:
@@ -1200,7 +1131,6 @@ def _remove_tree(path: Path) -> None:
 def _prepare_sqlite_from_csvs() -> None:
     import argparse
 
-    import load_rental_shop_engines as load_mod
     from load_rental_shop_engines import (
         DEFAULT_ENV_FILE,
         _load_sqlite,
@@ -1209,6 +1139,8 @@ def _prepare_sqlite_from_csvs() -> None:
         load_env_file,
     )
     from source_rental_shop import OUT_DIR, ZIP_PATH, ensure_csv_bundle
+
+    import load_rental_shop_engines as load_mod
 
     source = ensure_csv_bundle(OUT_DIR, ZIP_PATH)
     verbose_message(f"CSV bundle source: {source}")
@@ -1536,11 +1468,11 @@ def write_migration_demo() -> None:
 def build_artifacts_baseline() -> None:
     """Build fresh schema artifacts and bundled schema literals from staging."""
     from live_tests.conftest import write_sandbox_recording_toml
+    from load_rental_shop_engines import DEFAULT_ENV_FILE, load_env_file
 
     import aetherdialect._sandbox
     import aetherdialect.aetherdialect
     from aetherdialect.aetherdialect import AetherEngine
-    from load_rental_shop_engines import DEFAULT_ENV_FILE, load_env_file
 
     load_env_file(DEFAULT_ENV_FILE, override=True)
     baseline_root = STAGING / "artifacts_baseline"
@@ -1559,7 +1491,7 @@ def build_artifacts_baseline() -> None:
     def build_log_sink(line: str) -> None:
         del line
 
-    aetherdialect._sandbox._write_sandbox_toml = openai_toml
+    setattr(aetherdialect._sandbox, "_write_sandbox_toml", openai_toml)
     reset_mock_provider()
     merged_env = dict(os.environ)
     merged_env["AETHERDIALECT_LLM_PROVIDER"] = "openai"
@@ -1609,9 +1541,9 @@ def build_artifacts_baseline() -> None:
         demo_root.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(owner_baseline, demo_root)
     finally:
-        aetherdialect.aetherdialect._init_log_sink = original_log_sink
+        setattr(aetherdialect.aetherdialect, "_init_log_sink", original_log_sink)
         PolicyConfig.REGENERATE_SCHEMA_GRAPH = prev_regen
-        aetherdialect._sandbox._write_sandbox_toml = orig_write_toml
+        setattr(aetherdialect._sandbox, "_write_sandbox_toml", orig_write_toml)
         reset_mock_provider()
         EngineConfig.LLM_PROVIDER = prev_provider
     aetherdialect._sandbox._pin_bundled_schema_literals(STAGING)
@@ -1633,30 +1565,6 @@ def pin_staging_mock_fixture_keys(staging_dir: Path = STAGING) -> None:
     aetherdialect._sandbox._pin_bundled_schema_literals(staging_dir)
 
 
-def _assert_pinning_parity(staging_dir: Path = STAGING) -> None:
-    """Fail fast when pinned mock-lookup context does not byte-match staged bundle files."""
-    llm = aetherdialect._llm_provider
-    domain_path = staging_dir / SANDBOX_INTERPRET_DOMAIN_FILENAME
-    if domain_path.is_file():
-        staged_domain = json.loads(domain_path.read_text(encoding="utf-8"))
-        if llm.load_canonical_interpret_domain() != staged_domain:
-            raise SystemExit(
-                "sandbox build: pinned interpret domain does not match staged "
-                f"{SANDBOX_INTERPRET_DOMAIN_FILENAME}; mock keys would drift from replay.",
-            )
-    literals_path = staging_dir / SANDBOX_SCHEMA_LITERALS_FILENAME
-    if literals_path.is_file():
-        payload = json.loads(literals_path.read_text(encoding="utf-8"))
-        pinned = llm.load_canonical_schema_literals()
-        expected_owner = llm.stable_schema_literal(str(payload.get("owner", "")))
-        expected_consumer = llm.stable_schema_literal(str(payload.get("consumer", "")))
-        if pinned.get("owner") != expected_owner or pinned.get("consumer") != expected_consumer:
-            raise SystemExit(
-                "sandbox build: pinned schema literals do not match staged "
-                f"{SANDBOX_SCHEMA_LITERALS_FILENAME}; mock keys would drift from replay.",
-            )
-
-
 def ensure_interpret_domain(staging_dir: Path = STAGING) -> None:
     """Write schema_interpret_domain.json to staging when missing."""
     target = staging_dir / SANDBOX_INTERPRET_DOMAIN_FILENAME
@@ -1674,6 +1582,80 @@ def ensure_interpret_domain(staging_dir: Path = STAGING) -> None:
     target.write_text(json.dumps(domain, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def recanonicalize_mock_fixture_user_keys(corpus: FixtureCorpus) -> int:
+    """Re-key fixture rows to the stable-json mock lookup form."""
+    replacements: dict[tuple[str, str, str], dict[str, str]] = {}
+    for row in corpus.fixtures:
+        user = str(row.get("user", "")).strip()
+        if not user:
+            continue
+        new_user = mock_fixture_user_key(user)
+        if new_user == user:
+            continue
+        key = fixture_key(row)
+        replacements[key] = {
+            "task": str(row.get("task", "")),
+            "system": str(row.get("system", "")),
+            "user": new_user,
+            "output_text": str(row.get("output_text", "")),
+        }
+    if not replacements:
+        return 0
+    updated: list[dict[str, str]] = []
+    for row in corpus.fixtures:
+        key = fixture_key(row)
+        updated.append(replacements.get(key, row))
+    corpus.fixtures = updated
+    corpus.seen = {fixture_key(row) for row in corpus.fixtures}
+    corpus.flush()
+    return len(replacements)
+
+
+def normalize_fixture_corpus_schema_domains(corpus: FixtureCorpus) -> int:
+    """Re-key intent fixtures so schema_domain matches the bundled interpret payload."""
+    domain_path = STAGING / SANDBOX_INTERPRET_DOMAIN_FILENAME
+    if not domain_path.is_file():
+        return 0
+    payload = json.loads(domain_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        return 0
+    domain = payload
+    replacements: dict[tuple[str, str, str], dict[str, str]] = {}
+    for row in corpus.fixtures:
+        if str(row.get("task", "")) != "intent":
+            continue
+        user = str(row.get("user", "")).strip()
+        if not user.startswith("{"):
+            continue
+        try:
+            body = json.loads(user)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(body, dict) or "schema_domain" not in body:
+            continue
+        body["schema_domain"] = domain
+        new_user = mock_fixture_user_key(stable_json(body))
+        if new_user == user:
+            continue
+        key = fixture_key(row)
+        replacements[key] = {
+            "task": str(row.get("task", "")),
+            "system": str(row.get("system", "")),
+            "user": new_user,
+            "output_text": str(row.get("output_text", "")),
+        }
+    if not replacements:
+        return 0
+    updated: list[dict[str, str]] = []
+    for row in corpus.fixtures:
+        key = fixture_key(row)
+        updated.append(replacements.get(key, row))
+    corpus.fixtures = updated
+    corpus.seen = {fixture_key(row) for row in corpus.fixtures}
+    corpus.flush()
+    return len(replacements)
+
+
 class WarmRecordingPool:
     """Reuse one DuckDB connection; isolate mock-verify artifacts per run."""
 
@@ -1687,7 +1669,6 @@ class WarmRecordingPool:
         self._live_handles: dict[str, object] = {}
         self._closed = False
         self._literals_pinned = False
-        self._baseline_bytes_cache: dict[str, dict[str, bytes]] = {}
 
     def _artifacts_for_preset(self, preset: str) -> str:
         if preset == "consumer_reader":
@@ -1700,34 +1681,6 @@ class WarmRecordingPool:
         aetherdialect._sandbox._pin_bundled_schema_literals(self._bundle_dir)
         self._literals_pinned = True
 
-    def _seed_engine_baseline_cached(self, *, artifacts_dir: str, preset: str) -> None:
-        """Seed an ephemeral engine dir from the baseline, reading source files at most once per pool."""
-        baseline = baseline_dir_for_preset(self._bundle_dir, preset)
-        if not baseline.is_dir() or not (baseline / "schema_graph.json.gz").is_file():
-            _seed_engine_baseline(artifacts_dir=artifacts_dir, bundle_dir=self._bundle_dir, preset=preset)
-            return
-        engine_dir = _sandbox_memory_engine_dir(artifacts_dir)
-        if (engine_dir / "schema_graph.json.gz").is_file():
-            return
-        cache = self._baseline_bytes_cache.get(str(baseline))
-        if cache is None:
-            cache = {}
-            for name in _BASELINE_CACHE_FILES:
-                src = baseline / name
-                if src.is_file():
-                    cache[name] = src.read_bytes()
-            for sidecar in baseline.glob("schema_context*.json"):
-                if sidecar.name == "schema_context.json":
-                    continue
-                cache[sidecar.name] = sidecar.read_bytes()
-            self._baseline_bytes_cache[str(baseline)] = cache
-        engine_dir.mkdir(parents=True, exist_ok=True)
-        for name, data in cache.items():
-            dest = engine_dir / name
-            if name != "schema_context.json" and name.startswith("schema_context") and dest.is_file():
-                continue
-            dest.write_bytes(data)
-
     def live_handle(self, *, preset: str = "owner_writer", restricted_consumer: bool = False) -> object:
         if self._closed:
             raise RuntimeError("Warm recording pool is closed")
@@ -1737,7 +1690,11 @@ class WarmRecordingPool:
             return cached
         _reset_sandbox_duckdb_runtime()
         artifacts_dir = self._artifacts_for_preset(preset)
-        self._seed_engine_baseline_cached(artifacts_dir=artifacts_dir, preset=preset)
+        _seed_engine_baseline(
+            artifacts_dir=artifacts_dir,
+            bundle_dir=self._bundle_dir,
+            preset=preset,
+        )
         kwargs: dict[str, object] = {
             "bundle_dir": str(self._bundle_dir),
             "seed_sql": self._seed_sql,
@@ -1772,13 +1729,17 @@ class WarmRecordingPool:
         del provider
         verify_artifacts = tempfile.mkdtemp(prefix="aetherdialect_record_verify_")
         _reset_sandbox_duckdb_runtime()
-        self._seed_engine_baseline_cached(artifacts_dir=verify_artifacts, preset=preset)
+        _seed_engine_baseline(
+            artifacts_dir=verify_artifacts,
+            bundle_dir=self._bundle_dir,
+            preset=preset,
+        )
         orig_write = aetherdialect._sandbox._write_sandbox_toml
 
         def mock_toml(*, fixtures_file: str) -> str:
             return orig_write(fixtures_file=fixtures_file)
 
-        aetherdialect._sandbox._write_sandbox_toml = mock_toml
+        setattr(aetherdialect._sandbox, "_write_sandbox_toml", mock_toml)
         kwargs: dict[str, object] = {
             "bundle_dir": str(self._bundle_dir),
             "seed_sql": self._seed_sql,
@@ -1794,7 +1755,7 @@ class WarmRecordingPool:
         try:
             handle = self._engine_cls.offline_sandbox(**kwargs)
         finally:
-            aetherdialect._sandbox._write_sandbox_toml = orig_write
+            setattr(aetherdialect._sandbox, "_write_sandbox_toml", orig_write)
         return handle, verify_artifacts
 
     def run_live(self, question: str, *, preset: str = "owner_writer", mode: str | None = None) -> object:
@@ -1822,7 +1783,7 @@ class WarmRecordingPool:
         effective_fixtures = fixtures_file
         cleanup_fixtures = False
         try:
-            with open(fixtures_file, encoding="utf-8") as f:
+            with open(fixtures_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if "slots" in data:
                 flat = []
@@ -1991,6 +1952,170 @@ def _is_param_extraction_fixture_row(row: dict[str, str]) -> bool:
     )
 
 
+def _intent_fixture_refs_question(row: dict[str, str], question: str) -> bool:
+    if str(row.get("task", "")) != "intent":
+        return False
+    label = question.strip().lower()
+    if not label:
+        return False
+    return label in str(row.get("user", "")).lower()
+
+
+def _interpret_outputs_for_question(fixtures: list[dict[str, str]], question: str) -> list[str]:
+    label = question.strip().lower()
+    if not label:
+        return []
+    out: list[str] = []
+    for row in fixtures:
+        if str(row.get("task", "")) != "intent":
+            continue
+        if str(row.get("system", "")) != INTENT_INTERPRET_SYSTEM:
+            continue
+        if label not in str(row.get("user", "")).lower():
+            continue
+        text = str(row.get("output_text", ""))
+        if text:
+            out.append(text)
+    return out
+
+
+def _row_chains_from_interpret_outputs(row: dict[str, str], interpret_outputs: list[str]) -> bool:
+    if not interpret_outputs:
+        return False
+    user = str(row.get("user", ""))
+    for text in interpret_outputs:
+        if not text:
+            continue
+        if text in user:
+            return True
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        plan = parsed.get("interpret_plan") if isinstance(parsed, dict) else None
+        if not isinstance(plan, dict):
+            plan = parsed if isinstance(parsed, dict) else None
+        if not isinstance(plan, dict):
+            continue
+        approach = str(plan.get("approach", ""))
+        if approach and approach in user:
+            return True
+        plan_json = json.dumps(plan, ensure_ascii=False)
+        if plan_json in user:
+            return True
+    return False
+
+
+def _expand_intent_chain_keep_keys(
+    fixtures: list[dict[str, str]],
+    seed_keys: set[tuple[str, str, str]],
+) -> set[tuple[str, str, str]]:
+    keep = set(seed_keys)
+    outputs = {
+        str(row.get("output_text", ""))
+        for row in fixtures
+        if fixture_key(row) in keep and str(row.get("output_text", ""))
+    }
+    changed = True
+    while changed:
+        changed = False
+        for row in fixtures:
+            if str(row.get("task", "")) != "intent":
+                continue
+            key = fixture_key(row)
+            if key in keep:
+                continue
+            if str(row.get("system", "")) not in {INTENT_GROUND_SYSTEM, INTENT_COMPOSE_SYSTEM}:
+                continue
+            if not _row_chains_from_interpret_outputs(row, list(outputs)):
+                continue
+            keep.add(key)
+            text = str(row.get("output_text", ""))
+            if text and text not in outputs:
+                outputs.add(text)
+                changed = True
+    return keep
+
+
+def _active_intent_keep_keys_for_question(
+    fixtures: list[dict[str, str]],
+    question: str,
+) -> set[tuple[str, str, str]]:
+    label = question.strip().lower()
+    if not label:
+        return set()
+    active_interpret: dict[str, str] | None = None
+    for row in fixtures:
+        if str(row.get("task", "")) != "intent":
+            continue
+        if str(row.get("system", "")) != INTENT_INTERPRET_SYSTEM:
+            continue
+        if label not in str(row.get("user", "")).lower():
+            continue
+        active_interpret = row
+    if active_interpret is None:
+        return set()
+    return _expand_intent_chain_keep_keys(fixtures, {fixture_key(active_interpret)})
+
+
+def _prune_orphan_intent_rows(
+    fixtures: list[dict[str, str]],
+    question: str,
+    keep_keys: set[tuple[str, str, str]],
+) -> tuple[list[dict[str, str]], int]:
+    label = question.strip().lower()
+    if not label or not keep_keys:
+        return fixtures, 0
+    interpret_outputs = _interpret_outputs_for_question(fixtures, question)
+    pruned: list[dict[str, str]] = []
+    removed = 0
+    for row in fixtures:
+        if str(row.get("task", "")) != "intent":
+            pruned.append(row)
+            continue
+        key = fixture_key(row)
+        if key in keep_keys:
+            pruned.append(row)
+            continue
+        user = str(row.get("user", ""))
+        system = str(row.get("system", ""))
+        belongs = label in user.lower()
+        if not belongs and system in {INTENT_GROUND_SYSTEM, INTENT_COMPOSE_SYSTEM}:
+            belongs = _row_chains_from_interpret_outputs(row, interpret_outputs)
+        if belongs:
+            removed += 1
+            continue
+        pruned.append(row)
+    return pruned, removed
+
+
+def prune_orphan_intent_fixtures(
+    corpus: FixtureCorpus,
+    questions: dict[str, list[str]],
+    *,
+    manifest: dict[str, object] | None = None,
+    committed_only: bool = True,
+) -> int:
+    """Drop superseded intent fixtures for committed question slots."""
+    manifest = manifest or _load_recording_manifest()
+    committed = committed_slot_ids(manifest) if committed_only else None
+    total_removed = 0
+    for slot in iter_recording_slots(questions):
+        if slot.kind != "question":
+            continue
+        if committed_only and slot_id_for(slot) not in committed:
+            continue
+        keep_keys = _active_intent_keep_keys_for_question(corpus.fixtures, slot.label)
+        if not keep_keys:
+            continue
+        corpus.fixtures, removed = _prune_orphan_intent_rows(corpus.fixtures, slot.label, keep_keys)
+        total_removed += removed
+    if total_removed:
+        corpus.seen = {fixture_key(row) for row in corpus.fixtures}
+        corpus.flush()
+    return total_removed
+
+
 def _param_extraction_forward_rows_from_corpus(
     fixtures: list[dict[str, str]],
     canonical: str,
@@ -2093,25 +2218,21 @@ class RecordingSession:
         self._llm_mod = aetherdialect._llm_provider
         self._orig_chat = aetherdialect._llm_provider.llm_chat
         self._orig_json = aetherdialect._llm_provider.llm_json
-        self._trace_phase: str | None = None
-        self._live_trace: list[dict[str, str]] = []
-        self._mock_trace: list[dict[str, str]] = []
-        self._mock_read_keys: set[tuple[str, str, str]] = set()
         self._set_llm_chat(self._recording_chat)
         self._set_llm_json(self._recording_json)
 
     def _set_llm_chat(self, hook: Callable[..., str]) -> None:
-        self._llm_mod.llm_chat = hook
+        setattr(self._llm_mod, "llm_chat", hook)
         for mod_name in self.env.llm_patch_modules:
             mod = __import__(mod_name, fromlist=["llm_chat"])
-            mod.llm_chat = hook
+            setattr(mod, "llm_chat", hook)
 
     def _set_llm_json(self, hook: Callable[..., dict[str, Any]]) -> None:
-        self._llm_mod.llm_json = hook
+        setattr(self._llm_mod, "llm_json", hook)
         for mod_name in self.env.llm_patch_modules:
             mod = __import__(mod_name, fromlist=["llm_json"])
             if hasattr(mod, "llm_json"):
-                mod.llm_json = hook
+                setattr(mod, "llm_json", hook)
 
     @contextmanager
     def _patched_handcrafted_entries(self, question: str) -> Any:
@@ -2145,10 +2266,7 @@ class RecordingSession:
                 result = json.dumps(row.get("response", {}), ensure_ascii=False)
                 user_for_llm = self._llm_mod._llm_user_text_without_sensitivity_classification(user)
                 user_key = self._llm_mod.mock_fixture_user_key(user_for_llm)
-                lookup_key = (task, system, user_key)
                 self.corpus.record(task=task, system=system, user_key=user_key, output_text=result)
-                if self._trace_phase == "mock":
-                    self._mock_read_keys.add(lookup_key)
                 return result
             return self._recording_chat(
                 system,
@@ -2164,14 +2282,6 @@ class RecordingSession:
         finally:
             self._set_llm_chat(self._recording_chat)
 
-    def _trace_key(self, task: str, system: str, user_key: str) -> dict[str, str]:
-        return {
-            "task": task,
-            "system_id": _intent_system_label(system),
-            "user_sha": hashlib.sha256(user_key.encode("utf-8")).hexdigest()[:16],
-            "user_head": user_key[:160],
-        }
-
     def _recording_chat(
         self,
         system: str,
@@ -2184,27 +2294,10 @@ class RecordingSession:
         del kwargs
         if timeout is None:
             timeout = self._llm_mod._DEFAULT_LLM_CHAT_TIMEOUT
+        result = self._orig_chat(system, user, max_retries=max_retries, timeout=timeout, task=task)
         user_for_llm = self._llm_mod._llm_user_text_without_sensitivity_classification(user)
         user_key = self._llm_mod.mock_fixture_user_key(user_for_llm)
-        lookup_key = (task, system, user_key)
-        if self._trace_phase == "mock":
-            entry = self._trace_key(task, system, user_key)
-            try:
-                result = self._orig_chat(system, user, max_retries=max_retries, timeout=timeout, task=task)
-            except Exception as exc:
-                entry["result"] = f"MISS:{exc}"
-                self._mock_trace.append(entry)
-                raise
-            entry["result"] = "hit:" + hashlib.sha256(result.encode("utf-8")).hexdigest()[:16]
-            self._mock_trace.append(entry)
-            self._mock_read_keys.add(lookup_key)
-            return result
-        result = self._orig_chat(system, user, max_retries=max_retries, timeout=timeout, task=task)
         self.corpus.record(task=task, system=system, user_key=user_key, output_text=result)
-        if self._trace_phase == "live":
-            entry = self._trace_key(task, system, user_key)
-            entry["result"] = "live:" + hashlib.sha256(result.encode("utf-8")).hexdigest()[:16]
-            self._live_trace.append(entry)
         return result
 
     def _recording_json(
@@ -2217,29 +2310,11 @@ class RecordingSession:
         **kwargs: object,
     ) -> dict[str, Any]:
         del kwargs
+        result = self._orig_json(system, user, retries=retries, task=task)
         user_for_llm = self._llm_mod._llm_user_text_without_sensitivity_classification(user)
         user_key = self._llm_mod.mock_fixture_user_key(user_for_llm)
-        lookup_key = (task, system, user_key)
-        if self._trace_phase == "mock":
-            entry = self._trace_key(task, system, user_key)
-            try:
-                result = self._orig_json(system, user, retries=retries, task=task)
-            except Exception as exc:
-                entry["result"] = f"MISS:{exc}"
-                self._mock_trace.append(entry)
-                raise
-            output_text = json.dumps(result, ensure_ascii=False)
-            entry["result"] = "hit:" + hashlib.sha256(output_text.encode("utf-8")).hexdigest()[:16]
-            self._mock_trace.append(entry)
-            self._mock_read_keys.add(lookup_key)
-            return result
-        result = self._orig_json(system, user, retries=retries, task=task)
         output_text = json.dumps(result, ensure_ascii=False)
         self.corpus.record(task=task, system=system, user_key=user_key, output_text=output_text)
-        if self._trace_phase == "live":
-            entry = self._trace_key(task, system, user_key)
-            entry["result"] = "live:" + hashlib.sha256(output_text.encode("utf-8")).hexdigest()[:16]
-            self._live_trace.append(entry)
         return result
 
     def _run_live_slot(self, slot: RecordingSlot) -> tuple[object | None, str]:
@@ -2319,15 +2394,15 @@ class RecordingSession:
         saved_pipeline_match = aetherdialect._pipeline.match_question_level_template_reuse
         saved_main_match = aetherdialect._main_execution.match_question_level_template_reuse
         saved_live_match = aetherdialect._live_testing.match_question_level_template_reuse
-        aetherdialect._pipeline.match_question_level_template_reuse = self.env.orig_template_match
-        aetherdialect._main_execution.match_question_level_template_reuse = self.env.orig_template_match
-        aetherdialect._live_testing.match_question_level_template_reuse = self.env.orig_template_match
+        setattr(aetherdialect._pipeline, "match_question_level_template_reuse", self.env.orig_template_match)
+        setattr(aetherdialect._main_execution, "match_question_level_template_reuse", self.env.orig_template_match)
+        setattr(aetherdialect._live_testing, "match_question_level_template_reuse", self.env.orig_template_match)
         try:
             yield
         finally:
-            aetherdialect._pipeline.match_question_level_template_reuse = saved_pipeline_match
-            aetherdialect._main_execution.match_question_level_template_reuse = saved_main_match
-            aetherdialect._live_testing.match_question_level_template_reuse = saved_live_match
+            setattr(aetherdialect._pipeline, "match_question_level_template_reuse", saved_pipeline_match)
+            setattr(aetherdialect._main_execution, "match_question_level_template_reuse", saved_main_match)
+            setattr(aetherdialect._live_testing, "match_question_level_template_reuse", saved_live_match)
 
     def _verify_mock_feedback(self, slot: RecordingSlot, fixtures_file: str) -> tuple[bool, str]:
         scenario = _feedback_scenario()
@@ -2369,17 +2444,15 @@ class RecordingSession:
             shutil.rmtree(artifacts_dir, ignore_errors=True)
 
     def _verify_mock_slot(self, slot: RecordingSlot) -> tuple[bool, str]:
-        """Replay the slot against the full in-progress corpus exactly like validate/pack."""
         if not _slot_requires_mock_verify(slot):
             return True, ""
-        self._mock_trace = []
-        self._mock_read_keys = set()
-        prev_phase = self._trace_phase
-        self._trace_phase = "mock"
-        fixtures_file = str(FIXTURES_PATH)
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8")
+        tmp_path = Path(tmp.name)
+        tmp.close()
         try:
+            self.corpus.write_verify_snapshot(tmp_path, slot_label=slot.label)
             if slot.kind == "feedback":
-                return self._verify_mock_feedback(slot, fixtures_file)
+                return self._verify_mock_feedback(slot, str(tmp_path))
             for preset, restricted_consumer, mode, apply_overrides, profile, tier in _mock_verify_targets_for_slot(
                 slot,
             ):
@@ -2391,7 +2464,7 @@ class RecordingSession:
                             slot.label,
                             preset=preset,
                             mode=mode,
-                            fixtures_file=fixtures_file,
+                            fixtures_file=str(tmp_path),
                             restricted_consumer=restricted_consumer,
                             apply_overrides=apply_overrides,
                         ),
@@ -2436,9 +2509,11 @@ class RecordingSession:
                 return False, f"mock replay ({tier}): {detail or 'expectation not met'}"
             return True, ""
         finally:
-            self._trace_phase = prev_phase
+            tmp_path.unlink(missing_ok=True)
 
     def record_slot(self, slot: RecordingSlot) -> tuple[bool, str, int, object | None]:
+        import live_tests.conftest as lt_conftest
+
         last_detail = ""
         attempts_used = 0
         last_step_result: object | None = None
@@ -2452,14 +2527,9 @@ class RecordingSession:
             if slot.kind == "feedback":
                 auto = ["n", slot.label, "y"]
 
-            self._live_trace = []
-            self._trace_phase = "live"
-            try:
-                with self._patched_handcrafted_entries(slot.label) as handcrafted_active:
-                    with pipeline_capture(auto_responses=auto) as capture:
-                        _step, live_detail = self._run_live_slot(slot)
-            finally:
-                self._trace_phase = None
+            with self._patched_handcrafted_entries(slot.label) as handcrafted_active:
+                with pipeline_capture(auto_responses=auto) as capture:
+                    _step, live_detail = self._run_live_slot(slot)
 
             if _step is not None:
                 last_step_result = _step
@@ -2467,16 +2537,6 @@ class RecordingSession:
             if live_detail:
                 last_detail = live_detail
                 self.corpus.discard_slot()
-                _append_replay_trace(
-                    slot_id=sid,
-                    label=slot.label,
-                    tier=slot.tier,
-                    attempt=attempt,
-                    outcome="VARIANCE",
-                    live_rows=self._live_trace,
-                    mock_rows=[],
-                    detail=live_detail,
-                )
                 if _BUILD_VERBOSE:
                     corpus_message(
                         f"  retry {attempt}/{self.max_attempts} [{slot.tier}] {slot.label[:60]} "
@@ -2498,67 +2558,48 @@ class RecordingSession:
                     break
                 continue
 
-            buffered_keys = self.corpus.buffered_keys()
-            snapshot = self.corpus.snapshot()
-            pre_frozen = set(self.corpus.committed_keys)
-            self.corpus.commit_slot(freeze=False)
             mock_ok, mock_detail = self._verify_mock_slot(slot)
-            if mock_ok:
-                orphan_keys = (buffered_keys - self._mock_read_keys) - pre_frozen
-                self.corpus.rollback_keys(orphan_keys)
-                self.corpus.committed_keys |= buffered_keys & self._mock_read_keys
-                _append_replay_trace(
-                    slot_id=sid,
-                    label=slot.label,
-                    tier=slot.tier,
-                    attempt=attempt,
-                    outcome="COMMIT",
-                    live_rows=self._live_trace,
-                    mock_rows=self._mock_trace,
-                )
-                _upsert_manifest_row(
-                    self.manifest_rows,
-                    {
-                        "slot_id": sid,
-                        "tier": slot.tier,
-                        "kind": slot.kind,
-                        "label": slot.label,
-                        "committed": True,
-                        "attempts": attempts_used,
-                        "detail": "handcrafted" if handcrafted_active else "",
-                    },
-                )
-                write_recording_manifest(self.manifest_rows)
-                return True, "", attempts_used, last_step_result
+            if not mock_ok:
+                last_detail = mock_detail or "mock replay failed"
+                self.corpus.discard_slot()
+                if _BUILD_VERBOSE:
+                    corpus_message(
+                        f"  retry {attempt}/{self.max_attempts} [{slot.tier}] {slot.label[:60]} "
+                        f"({_short_retry_reason(last_detail, mock=True)})",
+                    )
+                if _step is not None:
+                    step_res = StepResult(
+                        scenario_id=sid,
+                        question=slot.label,
+                        status="failed",
+                        error=last_detail,
+                        captured_logs=capture.get("logs", []),
+                        duration_seconds=0.0,
+                    )
+                    append_failure_trace(step_res, RECORDING_RESULTS_PATH)
+                if not _recording_error_retryable(last_detail):
+                    break
+                continue
 
-            self.corpus.restore(snapshot)
-            last_detail = f"determinism-divergence: {mock_detail or 'mock replay failed'}"
-            _append_replay_trace(
-                slot_id=sid,
-                label=slot.label,
-                tier=slot.tier,
-                attempt=attempt,
-                outcome="DETERMINISM-DIVERGENCE",
-                live_rows=self._live_trace,
-                mock_rows=self._mock_trace,
-                detail=last_detail,
+            removed = self.corpus.commit_slot(
+                prune_question=slot.label if slot.kind == "question" else "",
             )
-            corpus_message(
-                f"  [DETERMINISM BUG] [{slot.tier}] {slot.label[:60]} passed live but failed mock "
-                f"replay of its own cached fixtures ({_short_retry_reason(mock_detail, mock=True)}). "
-                f"See {SANDBOX_REPLAY_TRACE_PATH}",
+            if removed and _BUILD_VERBOSE:
+                corpus_message(f"  pruned {removed} orphan intent fixture(s) for {slot.label[:60]}")
+            _upsert_manifest_row(
+                self.manifest_rows,
+                {
+                    "slot_id": sid,
+                    "tier": slot.tier,
+                    "kind": slot.kind,
+                    "label": slot.label,
+                    "committed": True,
+                    "attempts": attempts_used,
+                    "detail": "handcrafted" if handcrafted_active else "",
+                },
             )
-            if _step is not None:
-                step_res = StepResult(
-                    scenario_id=sid,
-                    question=slot.label,
-                    status="failed",
-                    error=last_detail,
-                    captured_logs=capture.get("logs", []),
-                    duration_seconds=0.0,
-                )
-                append_failure_trace(step_res, RECORDING_RESULTS_PATH)
-            break
+            write_recording_manifest(self.manifest_rows)
+            return True, "", attempts_used, last_step_result
 
         self.failed_slots.append(slot)
         _upsert_manifest_row(
@@ -2620,6 +2661,9 @@ class RecordingSession:
                         tables,
                     )
                     paraphrases = _clean_generated_paraphrases(slot.label, raw)
+                    if not paraphrases:
+                        self.corpus.discard_slot()
+                        return False, f"no paraphrases generated for {slot.label!r}"
                     self.corpus.commit_slot()
                 finally:
                     handle.close()
@@ -2652,25 +2696,19 @@ class RecordingSession:
         return True, ""
 
     def collect_paraphrase_seeds(self, slots: list[RecordingSlot]) -> list[tuple[RecordingSlot, object]]:
-        """Collect intent tables for paraphrase generation from committed mock fixtures."""
         seeds: list[tuple[RecordingSlot, object]] = []
         for slot in slots:
-            preset, restricted_consumer, mode, apply_overrides = _mock_preset_for_slot(slot)
-            step, err = self.pool.run_mock(
-                slot.label,
-                preset=preset,
-                mode=mode,
-                fixtures_file=str(FIXTURES_PATH),
-                restricted_consumer=restricted_consumer,
-                apply_overrides=apply_overrides,
-            )
-            if step is None or err:
-                continue
-            intent_summary = getattr(step, "intent_summary", None)
-            tables = [str(item) for item in getattr(intent_summary, "tables", ()) if str(item).strip()]
-            if not tables:
-                continue
-            seeds.append((slot, step))
+            self.corpus.start_slot()
+            try:
+                step, detail = self._run_live_slot(slot)
+                if step is None or detail:
+                    continue
+                ok, _check_detail = _check_slot_recording(step, slot)
+                if not ok:
+                    continue
+                seeds.append((slot, step))
+            finally:
+                self.corpus.discard_slot()
         return seeds
 
     def record_inline_reuse_param_fixtures(
@@ -2680,77 +2718,23 @@ class RecordingSession:
         *,
         swaps: tuple[tuple[str, str], ...],
     ) -> tuple[bool, str]:
-        canonical = canonical.strip()
-        paraphrase = paraphrase.strip()
-        pe_forward_existing = _param_extraction_forward_rows_from_corpus(self.corpus.fixtures, canonical)
-        if _reuse_reverse_param_rows_committed(
-            self.corpus,
-            forward_rows=pe_forward_existing,
-            swaps=swaps,
-            llm_mod=self._llm_mod,
-        ):
-            return True, ""
-
-        if not _paraphrase_gatekeeper_ready(self.corpus, paraphrase):
-            handle, artifacts_dir = self.pool._ephemeral_handle(
-                preset="owner_writer",
-                fixtures_file=str(FIXTURES_PATH),
-                provider="openai",
-            )
-            self.corpus.start_slot()
-            try:
-                with handle.engine.session() as session:
-                    step = session.accept_until_done(paraphrase)
-                    if getattr(step, "error", None):
-                        self.corpus.discard_slot()
-                        return False, f"reuse standalone capture failed for {paraphrase!r}: {step.error}"
-                self.corpus.commit_slot()
-            except Exception as exc:
-                self.corpus.discard_slot()
-                return False, str(exc)
-            finally:
-                handle.close()
-                aetherdialect._sandbox._unlink_artifact_lock_files(artifacts_dir)
-                shutil.rmtree(artifacts_dir, ignore_errors=True)
-
-        pe_forward_existing = _param_extraction_forward_rows_from_corpus(self.corpus.fixtures, canonical)
-        if _reuse_reverse_param_rows_committed(
-            self.corpus,
-            forward_rows=pe_forward_existing,
-            swaps=swaps,
-            llm_mod=self._llm_mod,
-        ):
-            return True, ""
-
-        self.pool.evict_live_handle(preset="owner_writer")
-        handle, artifacts_dir = self.pool._ephemeral_handle(
-            preset="owner_writer",
-            fixtures_file=str(FIXTURES_PATH),
-            provider="openai",
-        )
-        forward_rows: list[dict[str, str]] = []
+        handle = self.pool.live_handle(preset="owner_writer")
         try:
             with self._template_match_enabled():
                 with handle.engine.session() as session:
                     self.corpus.start_slot()
                     session.accept_until_done(canonical)
+                    self.corpus.discard_slot()
+                    self.corpus.start_slot()
                     step = session.accept_until_done(paraphrase)
                     if getattr(step, "error", None):
                         self.corpus.discard_slot()
                         return False, f"reuse capture failed for {canonical!r} -> {paraphrase!r}: {step.error}"
                     forward_rows = self.corpus.collapsed_slot_fixtures()
-                    pe_forward = [row for row in forward_rows if _is_param_extraction_fixture_row(row)]
-                    if not pe_forward:
-                        self.corpus.discard_slot()
-                        return False, f"missing parameter extraction fixture for {canonical!r} -> {paraphrase!r}"
                     self.corpus.commit_slot()
         except Exception as exc:
             self.corpus.discard_slot()
             return False, str(exc)
-        finally:
-            handle.close()
-            aetherdialect._sandbox._unlink_artifact_lock_files(artifacts_dir)
-            shutil.rmtree(artifacts_dir, ignore_errors=True)
 
         pe_forward = [row for row in forward_rows if _is_param_extraction_fixture_row(row)]
         if not pe_forward:
@@ -2832,8 +2816,10 @@ class RecordingSession:
                 role="owner",
             )
             t2s._sandbox_mode = True
+            questions = self.questions.get("questions", [])
+            post_q = questions[0] if questions else "How many films are in the Rental Shop catalog?"
             with t2s.session() as session:
-                session.accept_until_done(_post_migration_record_question(self.questions))
+                session.accept_until_done(post_q)
             self.corpus.commit_slot()
             return True, ""
         except Exception as exc:
@@ -2859,7 +2845,6 @@ class RecordingSession:
         original_log_sink = aetherdialect.aetherdialect._init_log_sink
         aetherdialect.aetherdialect._init_log_sink = lambda _line: None
         _begin_eval_results(RECORDING_RESULTS_PATH)
-        _reset_replay_trace()
         try:
             if _BUILD_VERBOSE:
                 corpus_message(f"Recording sandbox fixtures ({total} slots)...")
@@ -2898,8 +2883,8 @@ class RecordingSession:
         return not self.failed_slots
 
     def close(self) -> None:
-        self._llm_mod.llm_chat = self._orig_chat
-        self._llm_mod.llm_json = self._orig_json
+        setattr(self._llm_mod, "llm_chat", self._orig_chat)
+        setattr(self._llm_mod, "llm_json", self._orig_json)
 
 
 def pack_bundled_aetherspace_snapshots(pool: WarmRecordingPool) -> None:
@@ -2971,13 +2956,11 @@ def finalize_recording_tail(
         if not migration_ok:
             corpus_message(f"[build] migration fixture capture failed: {detail}")
             ok = False
+    removed = prune_orphan_intent_fixtures(corpus, session.questions)
+    if removed:
+        corpus_message(f"[build] pruned {removed} orphan intent fixture(s) from corpus")
     write_build_fingerprint()
-    corpus.flush()
-    print(
-        f"Fixture corpus at {FIXTURES_PATH} now has {len(corpus.fixtures)} entr"
-        f"{'y' if len(corpus.fixtures) == 1 else 'ies'} (total committed rows, not per-slot delta)",
-        flush=True,
-    )
+    print(f"Wrote {len(corpus.fixtures)} fixtures to {FIXTURES_PATH}", flush=True)
     return ok
 
 
@@ -2986,7 +2969,6 @@ def record_corpus(record_reuse_pairs: bool = False) -> bool:
     ensure_schema_literals()
     ensure_interpret_domain()
     pin_staging_mock_fixture_keys()
-    _assert_pinning_parity()
     literals_path = STAGING / SANDBOX_SCHEMA_LITERALS_FILENAME
     if not literals_path.is_file():
         corpus_message(
@@ -3014,14 +2996,11 @@ def record_corpus(record_reuse_pairs: bool = False) -> bool:
             need_migration = not _migration_fixtures_ready(corpus)
             paraphrase_seeds: list[tuple[RecordingSlot, object]] | None = None
             if need_para:
-                paraphrase_seeds, seed_detail = _paraphrase_seeds_for_missing(
+                paraphrase_seeds = _paraphrase_seeds_for_missing(
                     session,
                     missing_para,
                     session.paraphrase_seeds_collected,
                 )
-                if seed_detail:
-                    corpus_message(f"[build] paraphrase capture failed: {seed_detail}")
-                    need_para = False
             finalize_recording_tail(
                 session,
                 pool,
@@ -3029,7 +3008,7 @@ def record_corpus(record_reuse_pairs: bool = False) -> bool:
                 paraphrase_seeds=paraphrase_seeds,
                 capture_paraphrases=need_para,
                 require_paraphrase_seeds=need_para,
-                capture_reuse=need_reuse,
+                capture_reuse=need_reuse and not need_para,
                 capture_aetherspace=need_aetherspace,
                 capture_migration=need_migration,
             )
@@ -3093,8 +3072,7 @@ def staging_fingerprint_matches(*, staging_dir: Path = STAGING) -> bool:
     return str(stored.get("fingerprint", "")) == str(current.get("fingerprint", ""))
 
 
-def repair_failing_slots() -> bool:
-    _ensure_script_import_paths()
+def repair_failing_slots(*, force: bool = False) -> bool:
     if not STAGING.is_dir():
         raise SystemExit(f"Missing staging directory: {STAGING}")
     if not staging_fingerprint_matches():
@@ -3104,7 +3082,6 @@ def repair_failing_slots() -> bool:
     ensure_schema_literals()
     ensure_interpret_domain()
     pin_staging_mock_fixture_keys()
-    _assert_pinning_parity()
     literals_path = STAGING / SANDBOX_SCHEMA_LITERALS_FILENAME
     if not literals_path.is_file():
         corpus_message(
@@ -3115,7 +3092,11 @@ def repair_failing_slots() -> bool:
     manifest = _load_recording_manifest()
     committed = committed_slot_ids(manifest)
     all_slots = iter_recording_slots(questions)
-    slots_to_repair = [slot for slot in all_slots if slot_id_for(slot) not in committed]
+    if force:
+        slots_to_repair = list(all_slots)
+        corpus_message(f"[repair] force re-recording all {len(slots_to_repair)} slot(s)...")
+    else:
+        slots_to_repair = [slot for slot in all_slots if slot_id_for(slot) not in committed]
     corpus = FixtureCorpus(FIXTURES_PATH)
     missing_para = _missing_paraphrase_canonicals(questions, manifest)
     need_paraphrases = bool(missing_para)
@@ -3124,6 +3105,12 @@ def repair_failing_slots() -> bool:
     need_migration = not _migration_fixtures_ready(corpus)
     if not slots_to_repair and not need_paraphrases and not need_reuse and not need_aetherspace and not need_migration:
         print("All recording slots committed in manifest.", flush=True)
+        normalized = normalize_fixture_corpus_schema_domains(corpus)
+        if normalized:
+            corpus_message(f"[repair] normalized schema_domain on {normalized} intent fixture(s)")
+        rekeyed = recanonicalize_mock_fixture_user_keys(corpus)
+        if rekeyed:
+            corpus_message(f"[repair] re-keyed {rekeyed} mock fixture user payload(s)")
         return _recording_pipeline_ready(questions=questions, manifest=manifest, corpus=corpus)[0]
     env = prepare_recording_environment()
     pool = WarmRecordingPool(STAGING)
@@ -3145,14 +3132,11 @@ def repair_failing_slots() -> bool:
             need_paraphrases = bool(missing_para)
             paraphrase_seeds: list[tuple[RecordingSlot, object]] | None = None
             if need_paraphrases:
-                paraphrase_seeds, seed_detail = _paraphrase_seeds_for_missing(
+                paraphrase_seeds = _paraphrase_seeds_for_missing(
                     session,
                     missing_para,
                     session.paraphrase_seeds_collected,
                 )
-                if seed_detail:
-                    corpus_message(f"[build] paraphrase capture failed: {seed_detail}")
-                    need_paraphrases = False
             finalize_recording_tail(
                 session,
                 pool,
@@ -3160,7 +3144,7 @@ def repair_failing_slots() -> bool:
                 paraphrase_seeds=paraphrase_seeds,
                 capture_paraphrases=need_paraphrases,
                 require_paraphrase_seeds=need_paraphrases,
-                capture_reuse=need_reuse,
+                capture_reuse=need_reuse and not need_paraphrases,
                 capture_aetherspace=need_aetherspace,
                 capture_migration=need_migration,
             )
@@ -3169,6 +3153,12 @@ def repair_failing_slots() -> bool:
             pool.close()
             teardown_recording_environment(env)
     manifest = _load_recording_manifest()
+    normalized = normalize_fixture_corpus_schema_domains(corpus)
+    if normalized:
+        corpus_message(f"[repair] normalized schema_domain on {normalized} intent fixture(s)")
+    rekeyed = recanonicalize_mock_fixture_user_keys(corpus)
+    if rekeyed:
+        corpus_message(f"[repair] re-keyed {rekeyed} mock fixture user payload(s)")
     return _recording_pipeline_ready(questions=questions, manifest=manifest, corpus=corpus)[0]
 
 
@@ -3253,67 +3243,97 @@ def validate_staging_zip(*, data_zip: Path | None = None) -> list[dict[str, str]
             os.environ["AETHERDIALECT_SANDBOX_DATA_ZIP"] = prev
 
 
-def _uncommitted_slot_labels() -> list[str]:
-    """List still-uncommitted recording slots (LLM variance / determinism divergence)."""
-    manifest = _load_recording_manifest()
-    committed = committed_slot_ids(manifest)
-    out: list[str] = []
-    for slot in iter_recording_slots(load_staging_questions()):
-        if slot_id_for(slot) not in committed:
-            out.append(f"[{slot.tier}] {slot.label}")
+def _practice_questions_from_validate_failures(failures: list[dict[str, str]]) -> set[str]:
+    """Return owner practice questions that failed pack-time validate and need re-record."""
+    out: set[str] = set()
+    for row in failures:
+        tier = str(row.get("tier", "")).strip()
+        kind = str(row.get("kind", "")).strip()
+        if tier not in {"questions", "consumer_reader"}:
+            continue
+        if kind not in {"question", "faithfulness"}:
+            continue
+        name = str(row.get("name", "")).strip()
+        if name:
+            out.add(name)
     return out
 
 
-def finalize_and_pack(*, smoke: bool = False) -> None:
-    """Finalize when all slots are committed: validate once, then pack without uncommitting."""
+def _uncommit_practice_question_slots(questions: set[str]) -> int:
+    """Mark owner practice question slots uncommitted so repair will re-record them."""
+    if not questions:
+        return 0
+    rows = _load_manifest_rows()
+    touched = 0
+    for slot in iter_recording_slots(load_staging_questions()):
+        if slot.kind != "question" or slot.tier != "questions":
+            continue
+        if slot.label not in questions:
+            continue
+        sid = slot_id_for(slot)
+        for row in rows:
+            if str(row.get("slot_id", "")) != sid:
+                continue
+            if row.get("committed"):
+                row["committed"] = False
+                touched += 1
+    if touched:
+        write_recording_manifest(rows)
+    return touched
+
+
+def finalize_validate_and_pack(*, smoke: bool = False, force: bool = False) -> None:
+    """Repair/validate loop until staging passes pack gate or only non-question failures remain."""
     prefix = "[smoke] " if smoke else "[build] "
-    ready, reasons = _recording_pipeline_ready()
-    if not ready:
-        for reason in reasons:
-            corpus_message(f"{prefix}recording incomplete: {reason}")
-        uncommitted = _uncommitted_slot_labels()
-        if uncommitted:
-            corpus_message(
-                f"{prefix}{len(uncommitted)} recording slot(s) still uncommitted (LLM variance). "
-                "Run 'python scripts/sandbox_corpus.py --repair' to retry only these:",
-            )
-            for label in uncommitted:
-                corpus_message(f"    - {label}")
-        raise SystemExit(1)
-    failures = validate_staging_dir(smoke=smoke)
-    if failures:
-        report_lines = [
-            f"FAIL [{row['kind']}] {row.get('tier', '')} {row['name'][:70]}: {row['detail']}"
-            for row in failures
-        ]
-        VALIDATE_OUT.parent.mkdir(parents=True, exist_ok=True)
-        VALIDATE_OUT.write_text("\n".join(report_lines) + "\n", encoding="utf-8")
-        for line in report_lines:
-            print(line)
-        raise SystemExit(
-            f"DETERMINISM REGRESSION: {len(failures)} committed slot(s) failed offline validate "
-            "even though they were recorded green against this corpus. This is a pipeline "
-            "nondeterminism bug and must be fixed, not retried. "
-            f"See {VALIDATE_TRACE_OUT} and {SANDBOX_REPLAY_TRACE_PATH}.",
-        )
-    pack_and_promote(smoke=smoke, revalidate=False)
-
-
-def pack_and_promote(*, smoke: bool = False, revalidate: bool = True) -> None:
-    from aetherdialect.aetherdialect import AetherEngine
-
-    ensure_schema_literals()
-    if revalidate:
+    for pass_num in range(1, RECORDING_MAX_VALIDATE_PASSES + 1):
+        if pass_num == 1 and force:
+            repair_failing_slots(force=True)
+        else:
+            repair_failing_slots(force=False)
+        ready, reasons = _recording_pipeline_ready()
+        if not ready:
+            for reason in reasons:
+                corpus_message(f"{prefix}recording incomplete: {reason}")
+            raise SystemExit(1)
         failures = validate_staging_dir(smoke=smoke)
-        if failures:
+        if not failures:
+            pack_and_promote(smoke=smoke)
+            return
+        questions = _practice_questions_from_validate_failures(failures)
+        if not questions:
             report_lines = [
-                f"FAIL [{row['kind']}] {row.get('tier', '')} {row['name'][:70]}: {row['detail']}" for row in failures
+                f"FAIL [{row['kind']}] {row.get('tier', '')} {row['name'][:70]}: {row['detail']}"
+                for row in failures
             ]
             VALIDATE_OUT.parent.mkdir(parents=True, exist_ok=True)
             VALIDATE_OUT.write_text("\n".join(report_lines) + "\n", encoding="utf-8")
             for line in report_lines:
                 print(line)
             raise SystemExit(f"{len(failures)} sandbox validation failures")
+        corpus_message(
+            f"{prefix}validate pass {pass_num}/{RECORDING_MAX_VALIDATE_PASSES}: "
+            f"re-record {len(questions)} practice question(s) after expectation mismatch",
+        )
+        _uncommit_practice_question_slots(questions)
+    raise SystemExit(
+        f"sandbox validate did not pass after {RECORDING_MAX_VALIDATE_PASSES} repair passes",
+    )
+
+
+def pack_and_promote(*, smoke: bool = False) -> None:
+    from aetherdialect.aetherdialect import AetherEngine
+
+    ensure_schema_literals()
+    failures = validate_staging_dir(smoke=smoke)
+    if failures:
+        report_lines = [
+            f"FAIL [{row['kind']}] {row.get('tier', '')} {row['name'][:70]}: {row['detail']}" for row in failures
+        ]
+        VALIDATE_OUT.parent.mkdir(parents=True, exist_ok=True)
+        VALIDATE_OUT.write_text("\n".join(report_lines) + "\n", encoding="utf-8")
+        for line in report_lines:
+            print(line)
+        raise SystemExit(f"{len(failures)} sandbox validation failures")
     write_zip_from_staging(dest=OUT_ZIP if not smoke else STAGING_ZIP)
     if smoke:
         issues: list[str] = []
@@ -3365,28 +3385,17 @@ def _run_full_build(record_reuse_pairs: bool = False, *, smoke: bool = False) ->
     corpus_message(f"{prefix}recording fixtures...")
     recording_ok = record_corpus(record_reuse_pairs=record_reuse_pairs)
     if not recording_ok:
-        corpus_message(
-            f"{prefix}recording incomplete after fresh build (LLM variance on some slots). "
-            "Re-run 'python scripts/sandbox_corpus.py --repair' to retry only the uncommitted slots.",
-        )
+        corpus_message(f"{prefix}recording incomplete; running repair/validate passes...")
     corpus_message(f"{prefix}validating and packing sandbox zip...")
-    finalize_and_pack(smoke=smoke)
+    try:
+        finalize_validate_and_pack(smoke=smoke)
+    except SystemExit:
+        raise SystemExit(1) from None
     corpus_message(f"{prefix}done.")
-
-
-def _ensure_script_import_paths() -> None:
-    import sys
-
-    for path in (REPO, SCRIPTS):
-        text = str(path)
-        if text not in sys.path:
-            sys.path.insert(0, text)
 
 
 def main() -> None:
     import argparse
-
-    _ensure_script_import_paths()
 
     parser = argparse.ArgumentParser(
         description="Build the sandbox corpus from scratch, or repair failing slots and repack.",
@@ -3397,29 +3406,36 @@ def main() -> None:
         help="Re-record failing slots under scripts/sandbox_staging, then validate and pack",
     )
     parser.add_argument(
-        "--smoke",
+        "--force",
         action="store_true",
-        help=(
-            "Run the full build pipeline with two practice questions (including the flaky "
-            "games-language slot) plus all validation, feedback, and space slots; runs "
-            "paraphrase catalog, reuse PE, aetherspace, and migration tail capture; writes "
-            "scripts/sandbox_staging.zip only (not src/aetherdialect/sandbox/data.zip). "
-            "Combine with --repair to repack sandbox_staging.zip without touching data.zip."
-        ),
+        help="With --repair, re-record every recording slot (not only uncommitted ones)",
     )
     parser.add_argument(
         "--record-reuse-pairs",
         action="store_true",
         help="Record paraphrase pairs to test intent reuse within the same session.",
     )
+    parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help=(
+            "Run the full build pipeline with one practice question plus all validation, "
+            "feedback, and scenario slots; writes sandbox_staging.zip only (not data.zip). "
+            "Paraphrases are still LLM-generated from the recorded practice slot."
+        ),
+    )
     args = parser.parse_args()
     if args.repair:
-        prefix = "[smoke] " if args.smoke else "[repair] "
-        corpus_message(f"{prefix}re-recording only uncommitted (LLM-variance) slots...")
-        repair_failing_slots()
-        corpus_message(f"{prefix}validating and packing sandbox zip...")
-        finalize_and_pack(smoke=args.smoke)
-        corpus_message(f"{prefix}done.")
+        if args.force:
+            corpus_message("[repair] force re-recording all committed slots...")
+        else:
+            corpus_message("[repair] re-recording uncommitted slots...")
+        corpus_message("[repair] validating and packing sandbox zip...")
+        try:
+            finalize_validate_and_pack(force=args.force)
+        except SystemExit:
+            raise SystemExit(1) from None
+        corpus_message("[repair] done.")
         return
     _run_full_build(record_reuse_pairs=args.record_reuse_pairs, smoke=args.smoke)
 

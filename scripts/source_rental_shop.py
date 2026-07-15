@@ -19,12 +19,16 @@ from datetime import datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 
-from aetherdialect._config import DEFAULT_RANDOM_SEED
-from load_rental_shop_engines import DEFAULT_ENV_FILE, load_env_file
-
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SCRIPTS = Path(__file__).resolve().parent
 _DATA = _REPO_ROOT / "scripts" / "data"
+_SRC = _REPO_ROOT / "src"
+for path in (_SRC, _SCRIPTS):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
+
+from load_rental_shop_engines import DEFAULT_ENV_FILE, load_env_file
+from aetherdialect._config import DEFAULT_RANDOM_SEED
 
 STORE_COUNT = 12
 STAFF_COUNT = 24
@@ -829,7 +833,7 @@ def enforce_inventory_rental_sequence(rentals: list[dict[str, str]]) -> list[dic
         start = _parse_ts(row["rental_date"])
         end = _parse_ts(row["return_date"]) if str(row.get("return_date") or "").strip() else None
         by_inventory.setdefault(inv, []).append((idx, start, end))
-    for _inv, spans in by_inventory.items():
+    for inv, spans in by_inventory.items():
         spans.sort(key=lambda t: t[1])
         prev_end: datetime | None = None
         for idx, start, end in spans:
@@ -1805,7 +1809,7 @@ def generate_books_games(
     book_category_ids = list(BOOK_CATEGORY_IDS)
     game_category_ids = list(GAME_CATEGORY_IDS)
     publisher_names = synth.load_publisher_names()
-    language_ids = [int(lang["language_id"]) for lang in languages]
+    language_ids = [int(l["language_id"]) for l in languages]
     book_subtype_rows: list[dict[str, object]] = []
     game_subtype_rows: list[dict[str, object]] = []
     game_lang_rows: list[dict[str, object]] = []
@@ -2107,6 +2111,7 @@ def apply_benchmark_patterns(
         if (OUT_DIR / "item.csv").is_file():
             items_by_id = {int(r["item_id"]): r for r in _read_csv("item")}
         inv_to_item = {r["inventory_id"]: int(r["item_id"]) for r in _read_csv("inventory")}
+        films_by_item = {int(r["item_id"]): r for r in _read_csv("film")} if (OUT_DIR / "film.csv").is_file() else {}
         for idx in sorted(open_indices, key=lambda i: _digest(i, "close"))[:excess]:
             rental_date = _parse_ts(rentals[idx]["rental_date"])
             item_id = inv_to_item.get(rentals[idx]["inventory_id"])
@@ -3615,16 +3620,16 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.enrich_llm and not args.generate:
+        parser.error("--enrich-llm requires --generate")
+    if args.download and args.enrich_llm:
+        parser.error("--enrich-llm cannot be used with --download")
+
     env_path = Path(args.env_file)
     if env_path.is_file():
         load_env_file(env_path, override=bool(args.enrich_llm))
     elif args.enrich_llm:
         raise SystemExit(f"env file not found for --enrich-llm: {env_path}")
-
-    if args.enrich_llm and not args.generate:
-        parser.error("--enrich-llm requires --generate")
-    if args.download and args.enrich_llm:
-        parser.error("--enrich-llm cannot be used with --download")
 
     if args.pack and not args.generate and not args.download:
         pack_csv_bundle(OUT_DIR, ZIP_PATH)
