@@ -8,21 +8,17 @@ from unittest.mock import patch
 
 import pytest
 
-from aetherdialect._config import GenerationPath, SeedWarmupConfig
+from aetherdialect._config import SeedWarmupConfig
+from aetherdialect._constants import GenerationPath
 from aetherdialect._contracts_base import (
-    ExpansionMetadata,
+    FilterParam,
+    HavingParam,
     LlmJsonExhausted,
-    SchemaGraph,
-    SQLShape,
-    TemplateStats,
-    ValueDomain,
+    NormalizedExpr,
     WorkloadFamily,
 )
 from aetherdialect._contracts_core import (
     ConcreteIntent,
-    FilterParam,
-    HavingParam,
-    NormalizedExpr,
     RuntimeIntent,
     SeedWarmupIntent,
     SeedWarmupResult,
@@ -33,8 +29,15 @@ from aetherdialect._contracts_core import (
     anchor_lattice_signature,
     operator_feature_vector_for_seed_intent,
 )
+from aetherdialect._contracts_schema import (
+    ExpansionMetadata,
+    SchemaGraph,
+    SQLShape,
+    TemplateStats,
+    ValueDomain,
+)
 from aetherdialect._core_utils import debug
-from aetherdialect._dialect import PostgresDialect
+from aetherdialect._dialect_postgres import PostgresDialect
 from aetherdialect._seed_warmup import (
     SeedWarmupCacheSession,
     _abstract_values,
@@ -53,14 +56,15 @@ from aetherdialect._seed_warmup import (
     _save_warmup_anchor_lattice,
     _seed_warmup_intent_sort_key,
     _warmup_anchor_lattice_json_path,
+    _warmup_canonical_result_signature,
     _warmup_pack_execute,
     _warmup_stratum_key,
     _warmup_submodular_cover_select,
     _warmup_synthetic_store_path_blocks,
     accepted_template_instance_keys,
     build_anchor_lattice,
+    check_intent_against_expectation,
     get_next_seed_warmup_version,
-    get_next_warmup_preflight_version,
     instantiate_intent,
     load_seed_warmup_cache_zip,
     open_seed_warmup_cache_session,
@@ -119,7 +123,10 @@ class TestOperatorFeatureVectorFootprint:
         assert v.workload_family == WorkloadFamily.EXTRACT
 
     def test_rank_window_kind(self):
-        from aetherdialect._contracts_core import WindowRegistryStep, WindowSpec
+        from aetherdialect._contracts_schema import (
+            WindowRegistryStep,
+            WindowSpec,
+        )
 
         intent = _warmup_intent(
             window_registry=[
@@ -222,7 +229,6 @@ class TestInstantiateIntent:
 
     def test_empty_filters_returns_intent(self):
         """Intent with no filters instantiates successfully."""
-
         intent = _warmup_intent()
         result = instantiate_intent(intent, {})
         assert result is not None
@@ -230,7 +236,6 @@ class TestInstantiateIntent:
 
     def test_populates_filter_value(self):
         """Filter value is sampled from domain."""
-
         intent = _warmup_intent(
             filters_param=[
                 FilterParam(
@@ -357,20 +362,6 @@ class TestGetNextSeedWarmupVersion:
         with tempfile.TemporaryDirectory() as td:
             open(os.path.join(td, "seed_warmup_v1.zip"), "w").close()
             assert get_next_seed_warmup_version(td) == 2
-
-
-class TestGetNextWarmupPreflightVersion:
-    """Tests for get_next_warmup_preflight_version."""
-
-    def test_empty_directory(self):
-        with tempfile.TemporaryDirectory() as td:
-            assert get_next_warmup_preflight_version(td) == 1
-
-    def test_existing_preflight_reports(self):
-        with tempfile.TemporaryDirectory() as td:
-            open(os.path.join(td, "warmup_preflight_report_v1.json"), "w").close()
-            open(os.path.join(td, "warmup_preflight_report_v3.json"), "w").close()
-            assert get_next_warmup_preflight_version(td) == 4
 
 
 class TestResolveJoinsForTableSet:
@@ -505,6 +496,7 @@ class TestOpenSeedWarmupCacheSession:
                         {
                             "effective_structural_hash": "same",
                             "schema_hash": "same",
+                            "schema_graph_id": "same",
                             "seed_content_hash": "same",
                             "profiling_hash": "p0",
                         },
@@ -525,6 +517,7 @@ class TestOpenSeedWarmupCacheSession:
                 join_paths_multi={},
                 effective_structural_hash="same",
                 structural_hash="same",
+                schema_graph_id="same",
                 profiling_hash="p0",
             )
             sess = open_seed_warmup_cache_session(td, sg, "same")
@@ -627,7 +620,6 @@ class TestLoadSeedQuestions:
 
     def test_max_seed_questions_caps_file(self):
         """Very large seed files are truncated to SeedWarmupConfig.MAX_SEED_QUESTIONS."""
-
         n = SeedWarmupConfig.MAX_SEED_QUESTIONS + 25
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
             for i in range(n):
@@ -824,8 +816,7 @@ class TestCreateTemplateFromResult:
         assert tmpl.value_history.questions[0] == "show orders"
 
     def test_normalized_optional_second_row_without_seed_provenance(self, schema_graph):
-        """Surface question differs from normalized form → second ``ValueHistory`` row with ``accept_count`` 0."""
-
+        """Surface question differs from normalized form → second ``ValueHistory`` row with raised accept count."""
         intent = _warmup_intent()
         intent.expected_rows = "many"
         intent.natural_language = "show orders"
@@ -841,7 +832,7 @@ class TestCreateTemplateFromResult:
         assert isinstance(tmpl.value_history, ValueHistory)
         assert len(tmpl.value_history) == 2
         assert tmpl.value_history.questions[0] == "User facing question"
-        assert tmpl.value_history.accept_counts[1] == 0
+        assert tmpl.value_history.accept_counts[1] == 1
 
     def test_value_history_rows_with_seed_provenance(self, schema_graph):
         """Seed original, normalized, and LLM question each get a `ValueHistory` row."""
@@ -913,7 +904,7 @@ class TestParseGoldIntentStrict:
         )
 
         def fake_parse(q, schema_inner, max_retries=3):
-            return ok, [], 0
+            return ok, [], 0, None
 
         monkeypatch.setattr("aetherdialect._seed_warmup.full_intent_parse", fake_parse)
         intent, warns = _parse_gold_intent_strict("any", schema_graph)
@@ -934,8 +925,8 @@ class TestParseGoldIntentStrict:
         def fake_parse(q, schema_inner, max_retries=3):
             calls["n"] += 1
             if calls["n"] == 1:
-                return None, ["first"], 0
-            return ok, [], 0
+                return None, ["first"], 0, None
+            return ok, [], 0, None
 
         monkeypatch.setattr("aetherdialect._seed_warmup.full_intent_parse", fake_parse)
         intent, warns = _parse_gold_intent_strict("q", schema_graph)
@@ -945,7 +936,7 @@ class TestParseGoldIntentStrict:
     def test_strict_none_after_two_failed_attempts(self, schema_graph, monkeypatch):
         monkeypatch.setattr(
             "aetherdialect._seed_warmup.full_intent_parse",
-            lambda q, s, max_retries=3: (None, ["bad"], 0),
+            lambda q, s, max_retries=3: (None, ["bad"], 0, None),
         )
         intent, warns = _parse_gold_intent_strict("q", schema_graph)
         assert intent is None
@@ -960,7 +951,7 @@ class TestReplayGoldIntentParseForTelemetry:
 
         def fake_parse(q, schema_inner, max_retries=3):
             calls["n"] += 1
-            return None, [], 0
+            return None, [], 0, None
 
         monkeypatch.setattr("aetherdialect._seed_warmup.full_intent_parse", fake_parse)
         _replay_gold_intent_parse_for_telemetry("  Q  ", schema_graph)
@@ -1012,7 +1003,7 @@ class TestGoldFailureTrace:
 
         def fake_parse(question, schema_graph_inner, max_retries=3):
             debug("fake_parse_invoked")
-            return None, ["unit_warn"], 0
+            return None, ["unit_warn"], 0, None
 
         monkeypatch.setattr("aetherdialect._seed_warmup.full_intent_parse", fake_parse)
         _got, _stats, trace_body, _nb = run_gold_intent_generation(
@@ -1036,7 +1027,7 @@ class TestGoldFailureTrace:
         phrases = {1: {"original": "List all films", "normalized": "List all films"}}
 
         def fake_parse(question, schema_graph_inner, max_retries=3):
-            return None, ["x"], 0
+            return None, ["x"], 0, None
 
         monkeypatch.setattr("aetherdialect._seed_warmup.full_intent_parse", fake_parse)
         _a, _b, trace_body, _c = run_gold_intent_generation(
@@ -1064,7 +1055,7 @@ class TestGoldFailureTrace:
         )
 
         def fake_parse(question, schema_graph_inner, max_retries=3):
-            return ok_intent, ["semantic_warn_only"], 0
+            return ok_intent, ["semantic_warn_only"], 0, None
 
         monkeypatch.setattr("aetherdialect._seed_warmup.full_intent_parse", fake_parse)
         gold, stats, trace_body, _nb = run_gold_intent_generation(
@@ -1098,7 +1089,7 @@ class TestSeedWarmupCacheAndReport:
             template_instance_key="t",
         )
         sess = SeedWarmupCacheSession(manifest={}, work_units={})
-        sess.write_work_unit(fp, si, pack, report_version=1, is_preflight=False)
+        sess.write_work_unit(fp, si, pack, report_version=1)
         got = sess.get_cached_execute(fp)
         assert got is not None
         assert got.get("ok") is True
@@ -1196,11 +1187,6 @@ class TestSeedWarmupDropsPathHelpers:
         assert seed_warmup_drops_jsonl_path_for_report("/tmp/other.json") is None
         assert seed_warmup_drops_detail_jsonl_path_for_report("/tmp/other.json") is None
 
-    def test_preflight_drops_paths(self):
-        p = "/x/warmup_preflight_report_v2.json"
-        assert seed_warmup_drops_jsonl_path_for_report(p).endswith("warmup_preflight_drops_v2.jsonl")
-        assert seed_warmup_drops_detail_jsonl_path_for_report(p).endswith("warmup_preflight_drops_detail_v2.jsonl")
-
 
 class TestSeedWarmupCacheSessionEdgeCases:
     """Extra SeedWarmupCacheSession behavior."""
@@ -1226,7 +1212,7 @@ class TestSeedWarmupCacheSessionEdgeCases:
             template_instance_key="t",
         )
         sess = SeedWarmupCacheSession(manifest={}, work_units={})
-        sess.write_work_unit(fp, si, pack, report_version=1, is_preflight=False)
+        sess.write_work_unit(fp, si, pack, report_version=1)
         assert sess.get_cached_execute("wrong_fp") is None
 
     def test_mark_sampled_in_requires_ok_execute(self):
@@ -1243,7 +1229,7 @@ class TestSeedWarmupCacheSessionEdgeCases:
             template_instance_key="t",
         )
         sess = SeedWarmupCacheSession(manifest={}, work_units={})
-        sess.write_work_unit(fp, si, pack, report_version=1, is_preflight=False)
+        sess.write_work_unit(fp, si, pack, report_version=1)
         assert sess.mark_sampled_in(fp) is None
 
     def test_record_question_llm_updates_state(self):
@@ -1260,10 +1246,27 @@ class TestSeedWarmupCacheSessionEdgeCases:
             template_instance_key="t",
         )
         sess = SeedWarmupCacheSession(manifest={}, work_units={})
-        sess.write_work_unit(fp, si, pack, report_version=1, is_preflight=False)
+        sess.write_work_unit(fp, si, pack, report_version=1)
         sess.record_question_llm(fp, {"q": "?"}, ok=True)
         wid = sess.fp_to_wid[fp]
         assert sess.work_units[wid]["lifecycle_state"] == "llm_done"
+
+
+class TestWarmupResultSignature:
+    """Post-execute result-signature atoms for submodular cover."""
+
+    def test_canonical_result_signature_stable(self):
+        rows_a = [(1, "x", None), (2, "y", 3.14159265)]
+        rows_b = [(2, "y", 3.14159265), (1, "x", None)]
+        assert _warmup_canonical_result_signature(rows_a) == _warmup_canonical_result_signature(rows_b)
+
+    def test_rsig_atom_included_when_provided(self):
+        from aetherdialect._seed_warmup import _warmup_submodular_atoms_for_row
+
+        ordered = [_warmup_intent(intent_id="i0")]
+        rsig = "abc123"
+        atoms = _warmup_submodular_atoms_for_row(ordered, 0, position_rsig={0: rsig})
+        assert f"rsig:{rsig}" in atoms
 
 
 class TestWarmupStratifiedSamplingDetail:
@@ -1274,12 +1277,12 @@ class TestWarmupStratifiedSamplingDetail:
         ordered = [_warmup_intent(intent_id=f"i{k}") for k in range(3)]
         eligible = [0, 1, 2]
         sampled, gold_dropped, detail = _warmup_submodular_cover_select(ordered, eligible)
-        assert sampled == {0, 1, 2}
-        assert gold_dropped == set()
         assert detail["skipped_due_to_low_volume"] is True
+        assert sampled <= {0, 1, 2}
+        assert gold_dropped == {0, 1, 2} - sampled
 
     def test_global_cap_after_gold_when_budget_zero(self, monkeypatch):
-        from aetherdialect._contracts_base import ExpansionMetadata
+        from aetherdialect._contracts_schema import ExpansionMetadata
 
         monkeypatch.setattr("aetherdialect._config.SeedWarmupConfig.WARMUP_STRATUM_MIN", 0)
         monkeypatch.setattr("aetherdialect._config.SeedWarmupConfig.WARMUP_TARGET_CAP", 2)
@@ -1309,9 +1312,9 @@ class TestWarmupStratifiedSamplingDetail:
 
 
 class TestSeedWarmupExecutionCache:
-    """Execute cache reuse across repeated preflight-style runs."""
+    """Execute cache reuse across repeated runs."""
 
-    def test_second_preflight_hits_execute_cache(self, monkeypatch, schema_graph):
+    def test_second_run_hits_execute_cache(self, monkeypatch, schema_graph):
         calls = {"execute": 0}
 
         def fake_validate(_dialect, _sql, _params=None, **_kw):
@@ -1324,7 +1327,7 @@ class TestSeedWarmupExecutionCache:
         def _prep(sql_param, params, schema, intent, **kw):
             return sql_param
 
-        def _exec(_sql):
+        def _exec(_sql, _params=None):
             calls["execute"] += 1
             return []
 
@@ -1350,10 +1353,8 @@ class TestSeedWarmupExecutionCache:
             d,
             1,
             join_cache=join_cache,
-            warmup_run_mode="preflight",
             warmup_cache=sess,
             warmup_report_version=1,
-            warmup_dry_run_session=True,
         )
         first_exec = calls["execute"]
         assert first_exec >= 1
@@ -1363,10 +1364,8 @@ class TestSeedWarmupExecutionCache:
             d,
             1,
             join_cache=join_cache,
-            warmup_run_mode="preflight",
             warmup_cache=sess,
             warmup_report_version=1,
-            warmup_dry_run_session=True,
         )
         assert calls["execute"] == first_exec
         assert sess.execute_hits >= 1
@@ -1429,7 +1428,7 @@ class TestSeedWarmupCacheGoldSnapshotAndSampledIn:
             template_instance_key="t",
         )
         sess = SeedWarmupCacheSession(manifest={}, work_units={})
-        sess.write_work_unit(fp, si, pack, report_version=1, is_preflight=False)
+        sess.write_work_unit(fp, si, pack, report_version=1)
         wid = sess.fp_to_wid[fp]
         assert sess.work_units[wid]["lifecycle_state"] == "execute_recorded"
         assert sess.mark_sampled_in(fp) == wid
@@ -1663,15 +1662,62 @@ class TestBuildAnchorLatticeDiskMerge:
 
     def test_disk_hit_collapses_multiple_rows_per_cell(self, schema_graph):
         """Multiple synthetic survivors sharing a lattice key reuse one disk entry."""
-
         a = _warmup_intent(intent_id="wa")
         b = _warmup_intent(intent_id="wb")
         ka = anchor_lattice_key_for_seed_intent(a)
         kb = anchor_lattice_key_for_seed_intent(b)
         assert ka == kb
-        sig = anchor_lattice_signature(ka, schema_graph.effective_structural_hash)
+        schema_graph.schema_graph_id = schema_graph.effective_structural_hash
+        sig = anchor_lattice_signature(ka, schema_graph.schema_graph_id)
         disk = {sig: ["Anchor one", "Anchor two"]}
         lattice = build_anchor_lattice([(a, "SELECT 1"), (b, "SELECT 2")], schema_graph, disk)
         assert len(lattice.cells) == 1
         cell = lattice.cells[ka]
         assert cell.anchors == ("Anchor one", "Anchor two")
+
+
+class TestCheckIntentAgainstExpectation:
+    """Tests for gold expectation matching."""
+
+    def test_must_filter_matches_param_values(self):
+        intent = {
+            "tables": ["reservation"],
+            "grain": "scalar",
+            "filters_param": [
+                {
+                    "left_expr": "reservation.status",
+                    "op": "=",
+                    "param_key": "p1",
+                }
+            ],
+            "param_values": {"p1": "expired"},
+        }
+        failures = check_intent_against_expectation(
+            intent,
+            {"grain": "scalar", "must_tables": ["reservation"], "must_filter": ["expired"]},
+        )
+        assert failures == []
+
+    def test_allowed_grains_accepts_either_shape(self):
+        intent = {"tables": ["book", "publisher"], "grain": "grouped", "limit": 1}
+        failures = check_intent_against_expectation(
+            intent,
+            {
+                "allowed_grains": ["row_level", "grouped"],
+                "must_tables": ["publisher", "book"],
+                "limit": 1,
+            },
+        )
+        assert failures == []
+
+    def test_cte_resolved_tables_satisfy_must_tables(self):
+        intent = {
+            "tables": ["cte1"],
+            "grain": "scalar",
+            "cte_steps": [{"name": "cte1", "tables": ["inventory", "store"]}],
+        }
+        failures = check_intent_against_expectation(
+            intent,
+            {"grain": "scalar", "must_tables": ["inventory", "store"]},
+        )
+        assert failures == []

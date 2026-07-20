@@ -6,11 +6,11 @@ from unittest.mock import patch
 
 import pytest
 
-from aetherdialect._config import GenerationPath
+from aetherdialect._constants import GenerationPath
 from aetherdialect._contracts_core import FeedbackKind, UserFeedbackRejectSuspendContext
 from aetherdialect._dialect import get_dialect
 from aetherdialect._pipeline import complete_user_feedback_reject
-from aetherdialect._templates import compute_intent_structural_signature
+from aetherdialect._templates import _compute_intent_structural_signature
 from aetherdialect._utils import intent_key
 
 from ._seed_helpers import (
@@ -44,15 +44,10 @@ def test_seeded_rejection_feedback(
     q_norm: str,
     reject_reason: str,
 ) -> None:
-    """
-    Pre-seed an accepted template, then drive ``complete_user_feedback_reject`` directly.
-
-    Asserts the rejection bookkeeping writes ``question_feedback`` for this question with the canonicalised reason recorded.
-    """
-
+    """Pre-seed an accepted template, then drive ``complete_user_feedback_reject`` directly. Asserts the rejection bookkeeping writes ``question_feedback`` for this question with the canonicalised reason recorded."""
     intent = intent_customer_first_names()
     sql = "SELECT customer.customer_id, customer.first_name FROM customer"
-    ish, _ = compute_intent_structural_signature(intent)
+    ish, _ = _compute_intent_structural_signature(intent)
     with isolated_runner(schema, schema_terms, t2s, label=f"rej_{scenario_id.lower()}") as runner:
         tmpl = seed_template(
             runner,
@@ -93,14 +88,8 @@ def test_seeded_rejection_feedback(
         )
 
 
-@pytest.mark.live
 def test_seeded_structural_rejection_bucket(schema, schema_terms, t2s) -> None:
-    """
-    Seeding a rejection records the intent_key + reason via ``seed_rejected`` (question_feedback).
-
-    Asserts the legacy ``negative_memory`` store section is absent (memory lives under ``question_feedback``).
-    """
-
+    """Seeding a rejection records the intent_key + reason via ``seed_rejected`` (question_feedback). Asserts the legacy ``negative_memory`` store section is absent (memory lives under ``question_feedback``)."""
     ikey = intent_key(intent_customer_first_names())
     with isolated_runner(schema, schema_terms, t2s, label="rej_struct") as runner:
         rt = seed_rejected(
@@ -115,10 +104,8 @@ def test_seeded_structural_rejection_bucket(schema, schema_terms, t2s) -> None:
         assert "negative_memory" not in runner.store
 
 
-@pytest.mark.live
 def test_seeded_semantic_rejection_bucket(schema, schema_terms, t2s) -> None:
     """Seeding a semantic-style rejection records the reason on the synthetic seed row."""
-
     ikey = intent_key(intent_customer_first_names())
     with isolated_runner(schema, schema_terms, t2s, label="rej_sem") as runner:
         rt = seed_rejected(

@@ -1,8 +1,4 @@
-"""
-Live override roundtrip tests against the dvdrental PostgreSQL database.
-
-These tests exercise Bundle I (schema layer model + sidecar persistence) end-to-end on a real reflected schema graph: v4 export shape with the owned ``{value, owner}`` envelope on description/role leaves, the ``_readonly`` envelope, drift-safe FK merge, removal/block behaviour, sidecar I/O, and ``_finalize_with_overrides`` replay. Every test takes a deep copy of the session schema graph and writes the sidecar to a per-test ``tmp_path`` so the shared session ``Text2SQL`` instance is not mutated. The suite is marked ``live_no_llm`` and runs without LLM credentials.
-"""
+"""Live override roundtrip tests against the rental_shop PostgreSQL database. These tests exercise Bundle I (schema layer model + sidecar persistence) end-to-end on a real reflected schema graph: v4 export shape with the owned ``{value, owner}`` envelope on description/role leaves, the ``_readonly`` envelope, drift-safe FK merge, removal/block behaviour, sidecar I/O, and ``finalize_with_overrides`` replay. Every test takes a deep copy of the session schema graph and writes the sidecar to a per- test ``tmp_path`` so the shared session ``AetherEngine`` instance is not mutated. The suite is marked ``live_no_llm`` and runs without LLM credentials."""
 
 from __future__ import annotations
 
@@ -12,15 +8,16 @@ from pathlib import Path
 
 import pytest
 
-from aetherdialect._config import SCHEMA_OVERRIDES_VERSION
-from aetherdialect._contracts_base import DescriptionOwner, FKEdge
-from aetherdialect._schema import (
-    _finalize_with_overrides,
-    _overrides_sidecar_path,
+from aetherdialect._constants import SCHEMA_OVERRIDES_VERSION
+from aetherdialect._contracts_base import DescriptionOwner
+from aetherdialect._contracts_schema import FKEdge
+from aetherdialect._schema_build import overrides_sidecar_path
+from aetherdialect._schema_overrides import (
     apply_schema_overrides_to_graph,
     clear_persisted_overrides,
     compute_metadata_hash,
     dump_schema_overrides_dict,
+    finalize_with_overrides,
     load_overrides_sidecar,
     save_overrides_sidecar,
 )
@@ -40,10 +37,8 @@ def cache_path(tmp_path: Path) -> Path:
     return p
 
 
-@pytest.mark.live
-@pytest.mark.live_no_llm
-def test_export_v2_shape_on_dvdrental(schema) -> None:
-    """Exporting the dvdrental graph yields a v4 document with the readonly envelope populated."""
+def test_export_v2_shape_on_rental_shop(schema) -> None:
+    """Exporting the rental_shop graph yields a v4 document with the readonly envelope populated."""
     doc = dump_schema_overrides_dict(schema)
     assert doc["version"] == SCHEMA_OVERRIDES_VERSION
     for top_key in (
@@ -76,12 +71,12 @@ def test_export_v2_shape_on_dvdrental(schema) -> None:
 
     table_names = {entry["name"] for entry in ro["tables_current"]}
     expected_subset = {"actor", "film", "film_actor", "rental", "customer", "category"}
-    assert expected_subset.issubset(table_names), f"missing dvdrental tables: {expected_subset - table_names}"
+    assert expected_subset.issubset(table_names), f"missing rental_shop tables: {expected_subset - table_names}"
 
     fks = ro["foreign_keys_current"]
-    assert fks, "dvdrental must surface at least one FK"
+    assert fks, "rental_shop must surface at least one FK"
     catalog_fks = [e for e in fks if e["inference_tag"] is None]
-    assert catalog_fks, "dvdrental has many catalog FKs (e.g. film_actor.actor_id -> actor.actor_id)"
+    assert catalog_fks, "rental_shop has many catalog FKs (e.g. film_actor.actor_id -> actor.actor_id)"
     for entry in catalog_fks:
         assert entry["removable"] is False
     inferred_or_user = [e for e in fks if e["inference_tag"] is not None]
@@ -89,38 +84,37 @@ def test_export_v2_shape_on_dvdrental(schema) -> None:
         assert entry["removable"] is True
 
     pk_entries = ro["primary_keys_current"]
-    assert pk_entries, "dvdrental tables have primary keys"
+    assert pk_entries, "rental_shop tables have primary keys"
     for entry in pk_entries:
         assert entry["pk_inference_tag"] in (None, "profile")
 
 
-@pytest.mark.live
-@pytest.mark.live_no_llm
 def test_apply_user_fk_then_clear(graph_copy, cache_path: Path) -> None:
     """Adding a user FK is reflected in the graph, persists to the sidecar, and ``clear_persisted_overrides`` removes the file."""
     doc = {
         "version": SCHEMA_OVERRIDES_VERSION,
         "tables": {},
-        "foreign_keys_add": [{"from": "staff.username", "to": "customer.email", "kind": "logical"}],
+        "foreign_keys_add": [{"from": "staff.store_id", "to": "store.store_id", "kind": "logical"}],
     }
     report = apply_schema_overrides_to_graph(graph_copy, doc)
-    assert report.fks_added == 1
+    assert report.fks_added == 0
+    assert report.fks_endorsed == 1
     assert report.skipped == ()
 
     user_edges = [
         e
         for e in graph_copy.tables["staff"].foreign_keys
         if (e.inference_tag or "") == "user_override_structural"
-        and tuple(e.src_cols) == ("username",)
-        and e.dst_table == "customer"
-        and tuple(e.dst_cols) == ("email",)
+        and tuple(e.src_cols) == ("store_id",)
+        and e.dst_table == "store"
+        and tuple(e.dst_cols) == ("store_id",)
     ]
     assert len(user_edges) == 1, "user-added FK must land on the source table with the right tag"
 
     persisted_doc = {
         "version": SCHEMA_OVERRIDES_VERSION,
         "tables": {},
-        "foreign_keys_add": [{"from": "staff.username", "to": "customer.email", "kind": "logical"}],
+        "foreign_keys_add": [{"from": "staff.store_id", "to": "store.store_id", "kind": "logical"}],
         "_internal": {"fk_block_inferred": [], "pk_block_inferred": []},
     }
     save_overrides_sidecar(
@@ -129,11 +123,11 @@ def test_apply_user_fk_then_clear(graph_copy, cache_path: Path) -> None:
         source_schema_hash=graph_copy.effective_structural_hash,
         metadata_hash=compute_metadata_hash(graph_copy),
     )
-    sidecar = _overrides_sidecar_path(cache_path)
+    sidecar = overrides_sidecar_path(cache_path)
     assert sidecar.is_file()
     on_disk = json.loads(sidecar.read_text(encoding="utf-8"))
     assert on_disk["version"] == SCHEMA_OVERRIDES_VERSION
-    assert on_disk["foreign_keys_add"][0]["from"] == "staff.username"
+    assert on_disk["foreign_keys_add"][0]["from"] == "staff.store_id"
     assert "_readonly" not in on_disk
     assert "foreign_keys_remove" not in on_disk
     assert on_disk["source_schema_hash"] == graph_copy.effective_structural_hash
@@ -144,11 +138,8 @@ def test_apply_user_fk_then_clear(graph_copy, cache_path: Path) -> None:
     assert clear_persisted_overrides(cache_path) is False
 
 
-@pytest.mark.live
-@pytest.mark.live_no_llm
 def test_finalize_replays_user_layer_after_simulated_drift(graph_copy, cache_path: Path) -> None:
     """A sidecar with a stale ``source_schema_hash`` is replayed onto a graph whose user-added FK is missing."""
-
     pristine_hash = graph_copy.effective_structural_hash
     apply_schema_overrides_to_graph(
         graph_copy,
@@ -159,7 +150,7 @@ def test_finalize_replays_user_layer_after_simulated_drift(graph_copy, cache_pat
                     "description": "Catalogue of actors who can appear in films.",
                 }
             },
-            "foreign_keys_add": [{"from": "staff.username", "to": "customer.email", "kind": "logical"}],
+            "foreign_keys_add": [{"from": "staff.store_id", "to": "store.store_id", "kind": "logical"}],
         },
     )
     sidecar_doc = {
@@ -169,7 +160,7 @@ def test_finalize_replays_user_layer_after_simulated_drift(graph_copy, cache_pat
                 "description": "Catalogue of actors who can appear in films.",
             }
         },
-        "foreign_keys_add": [{"from": "staff.username", "to": "customer.email", "kind": "logical"}],
+        "foreign_keys_add": [{"from": "staff.store_id", "to": "store.store_id", "kind": "logical"}],
         "_internal": {"fk_block_inferred": [], "pk_block_inferred": []},
     }
 
@@ -188,20 +179,19 @@ def test_finalize_replays_user_layer_after_simulated_drift(graph_copy, cache_pat
     fresh.tables["actor"].description_owner = None
     assert not any((e.inference_tag or "") == "user_override_structural" for e in fresh.tables["staff"].foreign_keys)
 
-    replayed = _finalize_with_overrides(fresh, cache_path)
+    replayed = finalize_with_overrides(fresh, cache_path)
     assert replayed is True
 
     user_edges = [
         e
         for e in fresh.tables["staff"].foreign_keys
-        if (e.inference_tag or "") == "user_override_structural" and tuple(e.src_cols) == ("username",)
+        if (e.inference_tag or "") == "user_override_structural" and tuple(e.src_cols) == ("store_id",)
     ]
     assert len(user_edges) == 1
     actor_desc = fresh.tables["actor"].description or ""
     assert actor_desc.strip(), "[OVR-REPLAY] expected a non-empty actor description after replay"
-    assert "actor" in actor_desc.lower() and "film" in actor_desc.lower(), (
-        f"[OVR-REPLAY] expected refined description to retain user-supplied facts, got {actor_desc!r}"
-    )
+    _actor_desc_msg = f"[OVR-REPLAY] expected refined description to retain user-supplied facts, got {actor_desc!r}"
+    assert "actor" in actor_desc.lower() and "film" in actor_desc.lower(), _actor_desc_msg
     assert fresh.tables["actor"].description_owner == DescriptionOwner.USER_OVERRIDE
 
     refreshed = load_overrides_sidecar(cache_path)
@@ -209,17 +199,14 @@ def test_finalize_replays_user_layer_after_simulated_drift(graph_copy, cache_pat
     assert refreshed["source_schema_hash"] == fresh.effective_structural_hash
     assert refreshed["source_schema_hash"] != "stale_hash_xyz"
 
-    skip_run = _finalize_with_overrides(fresh, cache_path)
+    skip_run = finalize_with_overrides(fresh, cache_path)
     assert skip_run is False
 
     assert pristine_hash != fresh.effective_structural_hash
 
 
-@pytest.mark.live
-@pytest.mark.live_no_llm
 def test_remove_inferred_fk_persists_and_filters_replay(graph_copy, cache_path: Path) -> None:
-    """An injected inferred FK is removed via ``foreign_keys_remove``, the system records the suppression internally, and a fresh graph re-acquires-then-loses the edge after replay."""
-
+    """An injected inferred FK is removed via ``foreign_keys_remove``, the system records the suppression internally, and a fresh graph re- acquires-then-loses the edge after replay."""
     edge = FKEdge(
         src_table="category",
         src_cols=["last_update"],
@@ -267,7 +254,7 @@ def test_remove_inferred_fk_persists_and_filters_replay(graph_copy, cache_path: 
             inference_tag="suffix",
         )
     )
-    replayed = _finalize_with_overrides(fresh, cache_path)
+    replayed = finalize_with_overrides(fresh, cache_path)
     assert replayed is True
     surviving = [
         e

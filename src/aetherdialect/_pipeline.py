@@ -8,11 +8,23 @@ from collections import Counter
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal, cast
 
 import pandas
 
 from ._config import (
+    ConfigError,
+    EngineConfig,
+    PolicyConfig,
+    llm_credentials_configured,
+)
+from ._constants import (
+    ASK_PHASE_A,
+    ASK_PHASE_B,
+    ASK_PHASE_H,
+    ASK_PHASE_I,
+    ASK_PHASE_J,
+    ASK_PHASE_L,
     DIAGNOSTIC_CODE_ENGINE_INFO,
     DIAGNOSTIC_CODE_REUSE_HIT,
     DIAGNOSTIC_CODE_REUSE_MISS,
@@ -26,26 +38,20 @@ from ._config import (
     PIPELINE_SUSPEND_ID_USER_FEEDBACK_REJECT,
     SHAPE_QUESTION_INDEX_KEY,
     SOFT_DIAGNOSTIC_CODES,
-    SUPPORTED_ENGINES,
+    SQL_BIND_TOKEN_RE,
     TEMPLATE_INTENT_KEY_INDEX_KEY,
     TEMPLATE_QUESTION_TOKEN_INDEX_KEY,
     TEMPLATE_UNION_FAMILY_INDEX_KEY,
-    EngineConfig,
     GenerationPath,
-    PolicyConfig,
-    diagnostic_debug_enabled,
-    diagnostic_pipeline_trace_full_enabled,
-    is_structural_param_key,
-    llm_credentials_configured,
 )
 from ._contracts_base import (
     AccessError,
+    EngineContext,
     FailureCategory,
     JoinInjectionAlignmentError,
     JoinInjectionFailedError,
     NoJoinPathError,
     PipelineSuspended,
-    SchemaGraph,
     SqlDiagnostic,
     WriteQueueEvent,
 )
@@ -53,6 +59,7 @@ from ._contracts_core import (
     DirectReuseSuspendContext,
     FeedbackKind,
     InteractiveTailSnapshot,
+    InterpretPlan,
     QuestionFormStorage,
     RefinementContext,
     RefinementRetry,
@@ -60,7 +67,6 @@ from ._contracts_core import (
     RuntimeIntent,
     SelectCol,
     SqlGenerationOutcome,
-    SQLShape,
     Template,
     TemplateMatch,
     UserFeedbackRejectSuspendContext,
@@ -69,22 +75,29 @@ from ._contracts_core import (
     concrete_intent_to_runtime_skeleton,
     runtime_intent_to_concrete,
 )
+from ._contracts_schema import (
+    SchemaGraph,
+    SQLShape,
+)
 from ._core_utils import (
     InteractiveChoicePort,
     RephraseHint,
+    bind_params_for_sql,
     debug,
     emit_write_queue_event,
     interactive_yes_no,
     invalid_input,
-    llm_chat,
-    log,
+    is_structural_param_key,
+    normalize_question,
+    note_interactive_turn,
     notify,
-    pipeline_trace_lazy,
+    pipeline_trace,
     print_info,
     print_query_result,
     print_rephrase_hint,
     progress,
     prompt,
+    reconcile_execute_bind_params,
     reduce_structural_sql_placeholders,
     safe_json_loads,
     stable_json,
@@ -96,6 +109,7 @@ from ._dialect import (
     compute_sql_fp,
     finalize_executable_sql,
     get_dialect,
+    list_engines,
     sql_outer_select_aliases,
 )
 from ._intent_expr import (
@@ -105,16 +119,18 @@ from ._intent_expr import (
     structural_s_key_assignment_order,
 )
 from ._intent_process import (
-    _invoke_intent_parse_with_hints,
     find_trusted_template_match,
+    invoke_intent_parse_with_hints,
     list_union_match_candidates,
     pick_union_match_for_runtime_join,
     reconcile_template_store_until_stable,
     resolve_sql_path,
     structural_compare,
 )
-from ._intent_repair import apply_diagnostic_repairs, collect_referenced_tables
+from ._intent_repair import apply_diagnostic_repairs, collect_referenced_tables, expand_shared_pk_tables_for_refs
 from ._intent_resolve import join_path_key_concrete, prune_unused_cte_steps
+from ._llm_provider import llm_chat
+from ._schema_graph import assert_consumer_intent_in_scope, assert_intent_in_scope
 from ._sql_gen import (
     ScopeClass,
     build_deterministic_sql,
@@ -125,19 +141,23 @@ from ._sql_gen import (
     get_join_choice_from_llm,
     inject_join_into_deterministic_sql,
     join_candidate_map,
+    join_candidate_spans_tables,
     join_choice_scope_key_cte,
     join_hints_multi,
     join_scope_pass1_plan,
     join_scope_pass2_llm_scopes,
     merge_join_hints_for_na_scopes,
+    render_feedback_sql,
     render_select_col_sql,
     select_col_prefers_llm_display_alias,
     tables_in_join_scope,
 )
 from ._templates import (
     TemplateStoreView,
+    artifacts_dir_for_template_store,
     compute_question_feedback_penalty,
     delete_rejected_templates_matching_question,
+    handles_referenced_in_sql_param,
     has_any_rejection_history_for_question,
     insert_template,
     join_fingerprint_from_concrete_intent,
@@ -151,6 +171,7 @@ from ._templates import (
     record_template_feedback,
     record_value_history_on_accept,
     reject_out_per_question,
+    resolve_template_for_question,
     save_template_store,
     should_auto_accept_for_question,
     summarize_failure_for_memory,
@@ -164,11 +185,26 @@ from ._utils import (
     sql_shape,
 )
 from ._validation_execute import (
-    bind_params_for_sql,
     canonicalize_rejection_reason,
     compute_confidence,
     validate_sql,
 )
+
+
+def _execution_scope_gate_active(
+    schema_context: EngineContext | None,
+    execution_visible_objects: frozenset[str] | None,
+    schema_role: str,
+) -> bool:
+    """Return True when the execution-time context/RBAC gate should run."""
+    if schema_role == "consumer":
+        return True
+    ctx = schema_context if schema_context is not None else EngineContext()
+    if getattr(ctx, "name", "master") != "master":
+        return True
+    if ctx.allow_objects or ctx.deny_objects or ctx.deny_columns or ctx.allow_columns:
+        return True
+    return execution_visible_objects is not None
 
 
 def _row_structural_values_match_defaults(
@@ -177,7 +213,6 @@ def _row_structural_values_match_defaults(
     sql_param: str,
 ) -> bool:
     """Return True when every ``:s`` referenced in SQL matches structural defaults in *row_params*."""
-
     sd = structural_defaults or {}
     s_keys = set(re.findall(r":(s\d+)", sql_param))
     for sk in s_keys:
@@ -197,23 +232,7 @@ def extract_fuzzy_reuse_params(
     history_index: int,
     literal_structural_only: bool,
 ) -> dict[str, Any]:
-    """
-    Extract p- and s-parameter values from a question for fuzzy template reuse via one LLM call.
-
-    Args:
-
-        q_norm: Normalised user question.
-
-        template: Template providing example SQL and prior param values.
-
-        history_index: ``value_history`` row to use as the exemplar for matched question text.
-
-        literal_structural_only: When True, only ``p*`` keys are sent to the LLM; structural defaults fill ``s*``.
-
-    Returns:
-
-        Param key to value mapping, or empty dict on LLM/parse failure.
-    """
+    """Extract p- and s-parameter values from a question for fuzzy. template reuse via one LLM call."""
     sql_param = template.sql_param or ""
     p_keys = sorted(set(re.findall(r":p\d+", sql_param)))
     s_keys = sorted(set(re.findall(r":s\d+", sql_param)))
@@ -265,7 +284,7 @@ def extract_fuzzy_reuse_params(
         raw2 = llm_chat(system, user, task="default")
         parsed = safe_json_loads(raw2)
     if not parsed or not isinstance(parsed, dict):
-        debug("[pipeline.extract_fuzzy_reuse_params] JSON parse failed")
+        debug(f"[{ASK_PHASE_A}] JSON parse failed")
         return {}
     pv_raw = parsed.get("param_values", {})
     result: dict[str, Any] = {}
@@ -285,7 +304,7 @@ def extract_fuzzy_reuse_params(
         for sk in s_key_names:
             if sk in prev_pv:
                 result[sk] = prev_pv[sk]
-    debug(f"[pipeline.extract_fuzzy_reuse_params] extracted {len(result)}/{len(all_keys)} params")
+    debug(f"[{ASK_PHASE_A}] extracted {len(result)}/{len(all_keys)} params")
     return result
 
 
@@ -296,7 +315,6 @@ def _extract_reuse_params_literal_only(
     history_index: int,
 ) -> dict[str, Any]:
     """Paths ``2.1``: LLM fills ``p*`` only; structural ``s*`` come from the exemplar row and defaults."""
-
     return extract_fuzzy_reuse_params(q_norm, template, history_index=history_index, literal_structural_only=True)
 
 
@@ -307,42 +325,25 @@ def _extract_reuse_params_full(
     history_index: int,
 ) -> dict[str, Any]:
     """Paths ``2.2``: LLM fills both ``p*`` and ``s*`` keys present in template SQL."""
-
     return extract_fuzzy_reuse_params(q_norm, template, history_index=history_index, literal_structural_only=False)
 
 
 def load_pipeline_resources(
-    schema: SchemaGraph = None,
+    schema: SchemaGraph | None = None,
     store: Any = None,
-    templates: list = None,
-    rejected: list = None,
-    schema_terms: set[str] = None,
-) -> tuple:
-    """
-    Validate inputs, build dialect, and return pipeline resource bundle.
-
-    Args:
-
-        schema: Loaded `SchemaGraph` (required).
-
-        store: Template store dict (required).
-
-        templates: Accepted templates dict (required).
-
-        rejected: Rejected templates dict (required).
-
-        schema_terms: Schema term set (required).
-
-    Returns:
-
-        `(dialect, schema, store, templates, rejected, schema_terms)`.
-    """
+    templates: dict[str, Any] | None = None,
+    rejected: dict[str, Any] | None = None,
+    schema_terms: set[str] | None = None,
+    dialect: Dialect | None = None,
+) -> tuple[Dialect, SchemaGraph, Any, dict[str, Any], dict[str, Any], set[str]]:
+    """Validate inputs, build dialect, and return pipeline resource. bundle."""
     if not llm_credentials_configured():
         raise RuntimeError("No OpenAI/Azure OpenAI API key configured")
 
-    log("loading schema")
-    dialect = get_dialect(EngineConfig.TYPE, EngineConfig.RUNTIME)
-    if EngineConfig.TYPE not in SUPPORTED_ENGINES:
+    debug("loading schema")
+    if dialect is None:
+        dialect = get_dialect(EngineConfig.TYPE, EngineConfig.RUNTIME)
+    if EngineConfig.TYPE not in list_engines():
         raise ValueError(f"Unsupported engine type: {EngineConfig.TYPE}")
 
     if schema is None:
@@ -356,9 +357,9 @@ def load_pipeline_resources(
     if schema_terms is None:
         raise RuntimeError("Schema terms must be provided to load_pipeline_resources")
 
-    log(f"templates_loaded={len(templates)}")
-    debug(f"[pipeline.load_pipeline_resources] templates: {len(templates)} approved, {len(rejected)} rejected")
-    debug(f"[pipeline.load_pipeline_resources] schema_terms: {len(schema_terms)} terms")
+    debug(f"templates_loaded={len(templates)}")
+    debug(f"[{ASK_PHASE_A}] templates: {len(templates)} approved, {len(rejected)} rejected")
+    debug(f"[{ASK_PHASE_A}] schema_terms: {len(schema_terms)} terms")
 
     return dialect, schema, store, templates, rejected, schema_terms
 
@@ -370,27 +371,8 @@ def match_question_level_template_reuse(
     template_store: dict[str, Any] | TemplateStoreView | None = None,
     candidate_intent: RuntimeIntent | None = None,
 ) -> TemplateMatch:
-    """
-    Detect fuzzy question match against trusted template ``value_history`` for direct SQL reuse.
-
-    Args:
-
-        candidate_question: User question text; normalization runs inside the reuse matcher.
-
-        templates: Accepted templates (dict or list of values).
-
-        template_store: Optional full template-store dict holding persisted matcher indexes
-        (``shape_question_index``, ``question_token_index``, ``intent_key_index``, ``union_family_index``).
-
-        candidate_intent: When provided together with ``intent_key_index`` and ``union_family_index``
-        on the store, templates are narrowed by union-family buckets intersected with the intent-key
-        bucket before fuzzy history matching.
-
-    Returns:
-
-        `TemplateMatch` with `direct_reuse` and score 1.0, or `none`.
-    """
-    debug("[pipeline.match_question_level_template_reuse] checking exact fuzzy match")
+    """Detect fuzzy question match against trusted template. ``value_history`` for direct SQL reuse."""
+    debug(f"[{ASK_PHASE_A}] checking exact fuzzy match")
     templates_list = list(templates.values()) if isinstance(templates, dict) else templates
     idx: dict[str, list[str]] | None = None
     qtok_idx: dict[str, list[Any]] | None = None
@@ -422,10 +404,8 @@ def match_question_level_template_reuse(
     if hit is not None:
         ref_tmpl = hit.template
         reuse_hit = hit.reuse_hit
-        log("exact question match found (trust>=1, score=1.0)")
-        debug(
-            f"[pipeline.match_question_level_template_reuse] AUTO-DECISION: fuzzy question match for template '{ref_tmpl.id}'"
-        )
+        debug("exact question match found (trust>=1, score=1.0)")
+        debug(f"[{ASK_PHASE_A}] AUTO-DECISION: fuzzy question match for template '{ref_tmpl.id}'")
         return TemplateMatch(
             intent=None,
             best_template=ref_tmpl,
@@ -454,7 +434,7 @@ def build_interactive_tail_snapshot(
     q_norm: str,
     intent: RuntimeIntent,
     schema: SchemaGraph,
-    store: dict[str, Any],
+    store: dict[str, Any] | TemplateStoreView,
     templates: dict[str, Any],
     rejected: dict[str, Any],
     schema_terms: set[str],
@@ -470,15 +450,9 @@ def build_interactive_tail_snapshot(
     union_sql_path: GenerationPath | None = None,
     union_candidate_template_ids: Sequence[str] | None = None,
     form_storage: QuestionFormStorage | None = None,
+    interpretation: InterpretPlan | None = None,
 ) -> InteractiveTailSnapshot:
-    """
-    Freeze the interactive bundle needed to resume after intent or hard-block prompts.
-
-    Returns:
-
-        Immutable snapshot for ``PipelineSession`` suspend payloads.
-    """
-
+    """Freeze the interactive bundle needed to resume after intent or. hard-block prompts."""
     uc = tuple(union_select_cols) if union_select_cols is not None else None
     st = tuple(structural_match_templates)
     sw = tuple(semantic_warnings) if semantic_warnings else ()
@@ -487,7 +461,7 @@ def build_interactive_tail_snapshot(
         q_norm=q_norm,
         intent=intent,
         schema=schema,
-        store=store,
+        store=cast(dict[str, Any], store),
         templates=templates,
         rejected=rejected,
         schema_terms=set(schema_terms),
@@ -503,6 +477,7 @@ def build_interactive_tail_snapshot(
         union_sql_path=union_sql_path,
         union_candidate_template_ids=ucid,
         form_storage=form_storage,
+        interpretation=interpretation,
     )
 
 
@@ -511,15 +486,13 @@ def _refinement_ctx_for_feedback(
     refinement_ctx: RefinementContext | None,
 ) -> RefinementContext | None:
     """Resolve optional refinement state from an explicit argument or an attached interactive session."""
-
     if refinement_ctx is not None:
         return refinement_ctx
     return getattr(choice_port, "_refinement_ctx", None)
 
 
-def _refinement_retry_available(ctx: RefinementContext | None) -> bool:
+def refinement_retry_available(ctx: RefinementContext | None) -> bool:
     """Return True when another silent refinement parse may run after recording rejection."""
-
     if ctx is None:
         return False
     if ctx.block_further_refinement:
@@ -531,8 +504,8 @@ def _refinement_retry_available(ctx: RefinementContext | None) -> bool:
 
 def _artifact_dir_for_template_store(store: Any) -> str:
     if isinstance(store, TemplateStoreView):
-        return os.path.dirname(os.path.abspath(store._store_dir))
-    return os.path.dirname(os.path.abspath(EngineConfig.TEMPLATE_STORE_DIR))
+        return artifacts_dir_for_template_store(store._store_dir)
+    return artifacts_dir_for_template_store(EngineConfig.TEMPLATE_STORE_DIR)
 
 
 def _emit_reader_write_queue_event(store: Any, event: WriteQueueEvent) -> None:
@@ -549,32 +522,10 @@ def parse_intent_via_llm(
     extra_user_feedback: list[str] | None = None,
     refinement_ctx: RefinementContext | None = None,
     persist_template_learning: bool = True,
-) -> tuple[RuntimeIntent | None, list[dict[str, Any]], int]:
-    """
-    Parse intent with :func:`aetherdialect._intent_process._invoke_intent_parse_with_hints` and optional user confirmation on schema-invalid paths.
-
-    Args:
-
-        q_norm: Normalised user question.
-
-        schema: Schema graph.
-
-        templates: Unused; signature compatibility.
-
-        store: Template store (persisted if user declines).
-
-        choice_port: Optional programmatic prompts for schema-invalid continuation.
-
-        extra_user_feedback: Optional in-turn user rejection reasons merged into prior-question feedback rows.
-
-        refinement_ctx: Optional explicit refinement bag when not attached on *choice_port*.
-
-    Returns:
-
-        `(intent_or_none, semantic_warnings, llm_calls)`.
-    """
-    log("intent via LLM")
-    debug("[pipeline.parse_intent_via_llm] calling _invoke_intent_parse_with_hints")
+) -> tuple[RuntimeIntent | None, list[str], int, InterpretPlan | None]:
+    """Parse intent with. :func:`aetherdialect._intent_process._invoke_in. tent_parse_with_hints` and optional user confirmation on schema- invalid paths."""
+    debug("intent via LLM")
+    debug(f"[{ASK_PHASE_B}] calling invoke_intent_parse_with_hints")
     resolved_ctx = _refinement_ctx_for_feedback(choice_port, refinement_ctx)
     conv_corr: tuple[str, ...] = ()
     if resolved_ctx is not None:
@@ -585,16 +536,23 @@ def parse_intent_via_llm(
         seed_lines = list(resolved_ctx.accumulated_reasons)
     else:
         seed_lines = list(extra_user_feedback or [])
-    intent, semantic_warnings, llm_calls = _invoke_intent_parse_with_hints(
+    intent, semantic_warnings, llm_calls, interpret_plan = invoke_intent_parse_with_hints(
         q_norm,
         schema,
-        store=store,
+        store=cast(dict[str, Any] | None, store),
         extra_user_feedback=seed_lines if seed_lines else None,
         prior_user_corrections=conv_corr,
         persist_template_learning=persist_template_learning,
+        visible_objects=getattr(choice_port, "visible_objects", None) if choice_port is not None else None,
+        allowed_columns=getattr(choice_port, "space_columns", None) if choice_port is not None else None,
+        deny_objects=getattr(choice_port, "space_deny_objects", None) if choice_port is not None else None,
+        deny_columns=getattr(choice_port, "space_deny_columns", None) if choice_port is not None else None,
+        description_overlay=getattr(choice_port, "space_description_overlay", None)
+        if choice_port is not None
+        else None,
     )
-    if intent is not None and diagnostic_debug_enabled() and diagnostic_pipeline_trace_full_enabled():
-        pipeline_trace_lazy(
+    if intent is not None:
+        pipeline_trace(
             "pipeline.parse_intent_via_llm.intent_complete",
             lambda: stable_json(intent.to_dict()),
         )
@@ -603,32 +561,20 @@ def parse_intent_via_llm(
         print_rephrase_hint(RephraseHint.INTENT_PARSE_FAILED)
         if persist_template_learning and isinstance(store, TemplateStoreView):
             save_template_store(store)
-        return None, semantic_warnings, llm_calls
+        return None, semantic_warnings, llm_calls, interpret_plan
 
     if semantic_warnings:
-        log(f"Semantic warnings after repair: {len(semantic_warnings)} remaining")
+        debug(f"Semantic warnings after repair: {len(semantic_warnings)} remaining")
 
-    debug(f"[pipeline.parse_intent_via_llm] tables={intent.tables}, grain={intent.grain}")
-    return intent, semantic_warnings, llm_calls
+    debug(f"[{ASK_PHASE_B}] tables={intent.tables}, grain={intent.grain}")
+    return intent, semantic_warnings, llm_calls, interpret_plan
 
 
 def generate_join_candidates(
     intent: RuntimeIntent, schema: SchemaGraph
 ) -> tuple[dict[str, Any], dict[str, list[str]], dict[str, dict[str, Any]]]:
-    """
-    Build join hint payloads for the main query and each multi-table CTE.
-
-    Args:
-
-        intent: Runtime intent with tables and CTE steps.
-
-        schema: Schema graph.
-
-    Returns:
-
-        `(join_candidates, cmap, cte_join_hints)` for main and per-CTE ranking.
-    """
-    debug("[pipeline.generate_join_candidates] generating join candidates")
+    """Build join hint payloads for the main query and each multi-table. CTE."""
+    debug(f"[{ASK_PHASE_I}] generating join candidates")
     virtual_specs = build_virtual_table_specs(intent, schema)
 
     def _scope_only_j00(hint_dict: dict[str, Any]) -> bool:
@@ -652,9 +598,9 @@ def generate_join_candidates(
             include_semantic=True,
         )
     cmap = join_candidate_map(join_candidates)
-    debug(f"[pipeline.generate_join_candidates] {len(join_candidates.get('candidates', []))} join candidates")
+    debug(f"[{ASK_PHASE_I}] {len(join_candidates.get('candidates', []))} join candidates")
     for c in join_candidates.get("candidates", []):
-        debug(f"[pipeline.generate_join_candidates] {c.get('candidate_id')}: {c.get('join_path_signature', [])}")
+        debug(f"[{ASK_PHASE_I}] {c.get('candidate_id')}: {c.get('join_path_signature', [])}")
 
     cte_join_hints: dict[str, dict[str, Any]] = {}
     cte_steps = intent.cte_steps or []
@@ -681,7 +627,7 @@ def generate_join_candidates(
                 )
             cte_join_hints[cte_name] = cte_hints
             debug(
-                f"[pipeline.generate_join_candidates] CTE '{cte_name}': {len(cte_hints.get('candidates', []))} candidates (CTE-specific ranking)"
+                f"[{ASK_PHASE_I}] CTE '{cte_name}': {len(cte_hints.get('candidates', []))} candidates (CTE-specific ranking)"
             )
         else:
             cte_join_hints[cte_name] = {
@@ -697,9 +643,9 @@ def generate_join_candidates(
                     }
                 ]
             }
-            debug(f"[pipeline.generate_join_candidates] CTE '{cte_name}': single table, J00 assigned")
+            debug(f"[{ASK_PHASE_I}] CTE '{cte_name}': single table, J00 assigned")
 
-    pipeline_trace_lazy(
+    pipeline_trace(
         "pipeline.generate_join_candidates.full",
         lambda: stable_json(
             {
@@ -720,7 +666,6 @@ def _sql_phase_join_resources(
     union_sql_path: GenerationPath | None,
 ) -> tuple[dict[str, Any], dict[str, list[str]], dict[str, dict[str, Any]]]:
     """Produce join candidate payloads for the SQL phase (always fully enumerated)."""
-
     jc, cmap, hints = generate_join_candidates(intent, schema)
     if matched_template is not None and union_sql_path == GenerationPath.INTENT_DIRECT_MATCH:
         conc = matched_template.intent_signature
@@ -742,7 +687,6 @@ def _sql_phase_join_resources(
 
 def _join_matches_template_intent(matched: Template | None, intent: RuntimeIntent) -> bool | None:
     """Compare stored template join fingerprint to the runtime intent join fingerprint."""
-
     if matched is None:
         return None
     return join_fingerprint_from_concrete_intent(matched.intent_signature) == join_fingerprint_from_runtime_intent(
@@ -750,7 +694,7 @@ def _join_matches_template_intent(matched: Template | None, intent: RuntimeInten
     )
 
 
-def resolve_joins_for_intent_placeholder(
+def _resolve_joins_for_intent_placeholder(
     q_norm: str,
     intent: RuntimeIntent,
     schema: SchemaGraph,
@@ -759,14 +703,9 @@ def resolve_joins_for_intent_placeholder(
     cmap: dict[str, list[str]],
     cte_join_hints: dict[str, dict[str, Any]] | None,
     structural_defaults_src: dict[str, Any] | None = None,
-    store: dict[str, Any] | None = None,
+    store: dict[str, Any] | TemplateStoreView | None = None,
 ) -> None:
-    """
-    Populate runtime join fields from deterministic SQL before pinning a union template.
-
-    Paths touched: ``3``, ``4.x`` when multiple stored join fingerprints require an LLM join choice.
-    """
-
+    """Populate runtime join fields from deterministic SQL before pinning a union template. Paths touched: ``3``, ``4.x`` when multiple stored join fingerprints require an LLM join choice."""
     intent = prune_unused_cte_steps(intent)
     join_candidates, cmap, cte_join_hints = generate_join_candidates(intent, schema)
 
@@ -803,7 +742,7 @@ def prepare_union_match_join_phase(
     schema: SchemaGraph,
     dialect: Any,
     templates: dict[str, Any],
-    store: dict[str, Any] | None = None,
+    store: dict[str, Any] | TemplateStoreView | None = None,
 ) -> tuple[
     Template | None,
     list[SelectCol] | None,
@@ -814,12 +753,7 @@ def prepare_union_match_join_phase(
     dict[str, list[str]],
     dict[str, dict[str, Any]],
 ]:
-    """
-    Resolve union-template reuse versus join LLM when body matches span multiple join fingerprints.
-
-    Paths touched: ``3``, ``4.1``, ``4.2``, ``4.3`` for interactive and live runners.
-    """
-
+    """Resolve union-template reuse versus join LLM when body matches span multiple join fingerprints. Paths touched: ``3``, ``4.1``, ``4.2``, ``4.3`` for interactive and live runners."""
     candidates = list_union_match_candidates(intent, templates)
     if not candidates:
         jc, cmap, hints = generate_join_candidates(intent, schema)
@@ -856,7 +790,7 @@ def prepare_union_match_join_phase(
             hints,
         )
     jc, cmap, hints = generate_join_candidates(intent, schema)
-    resolve_joins_for_intent_placeholder(
+    _resolve_joins_for_intent_placeholder(
         q_norm,
         intent,
         schema,
@@ -867,15 +801,15 @@ def prepare_union_match_join_phase(
         structural_defaults_src=None,
         store=store,
     )
-    chosen = pick_union_match_for_runtime_join(intent, candidates)
-    if chosen is None:
+    union_chosen = pick_union_match_for_runtime_join(intent, candidates)
+    if union_chosen is None:
         return None, None, False, None, False, jc, cmap, hints
-    jc2, cmap2, hints2 = _sql_phase_join_resources(intent, schema, chosen.template, chosen.union_sql_path)
+    jc2, cmap2, hints2 = _sql_phase_join_resources(intent, schema, union_chosen.template, union_chosen.union_sql_path)
     return (
-        chosen.template,
-        chosen.union_cols,
-        chosen.cols_changed,
-        chosen.union_sql_path,
+        union_chosen.template,
+        union_chosen.union_cols,
+        union_chosen.cols_changed,
+        union_chosen.union_sql_path,
         True,
         jc2,
         cmap2,
@@ -883,13 +817,8 @@ def prepare_union_match_join_phase(
     )
 
 
-def template_effective_sql_display_param(tmpl: Template, dialect: Dialect) -> str:
-    """
-    Return user-facing display SQL for a template row, recomputing when storage omits it.
-
-    Paths touched: ``1``, ``2.1``, ``2.2`` direct reuse and any reader after storage trim.
-    """
-
+def _template_effective_sql_display_param(tmpl: Template, dialect: Dialect) -> str:
+    """Return user-facing display SQL for a template row, recomputing when storage omits it. Paths touched: ``1``, ``2.1``, ``2.2`` direct reuse and any reader after storage trim."""
     rt = concrete_intent_to_runtime_skeleton(tmpl.intent_signature)
     return build_display_sql(
         tmpl.sql_param,
@@ -905,12 +834,7 @@ def enriched_display_alias_map(
     disp: RuntimeIntent,
     base: dict[str, str] | None,
 ) -> dict[str, str]:
-    """
-    Merge persisted ``display_alias_map`` with LLM-suggested headers for complex select columns.
-
-    Simple columns use deterministic aliases only (no LLM). Paths touched: ``3``, ``4.1``, ``4.2``, ``4.3``, ``5``.
-    """
-
+    """Merge persisted ``display_alias_map`` with LLM-suggested headers for complex select columns. Simple columns use deterministic aliases only (no LLM). Paths touched: ``3``, ``4.1``, ``4.2``, ``4.3``, ``5``."""
     out = dict(base or ())
     cols = list(disp.select_cols or [])
     if not cols:
@@ -960,39 +884,43 @@ def enriched_display_alias_map(
     return out
 
 
+def _validation_sql_for_explain(
+    sql: str,
+    intent: RuntimeIntent,
+    dialect: Any,
+) -> str:
+    """Choose canonical parameterized SQL for validation before execution rewrites."""
+    param_sql = (intent.sql_param or "").strip()
+    if param_sql and SQL_BIND_TOKEN_RE.search(param_sql):
+        base = param_sql
+    else:
+        base = sql
+    if dialect is None:
+        return base
+    explain_fn = getattr(dialect, "explain_validation_sql", None)
+    if not callable(explain_fn):
+        return base
+    return cast(str, explain_fn(base, dict(intent.param_values or {})))
+
+
 def _run_sql_validation_cascade(
     sql: str,
     intent: RuntimeIntent,
     dialect: Any,
     schema: SchemaGraph | None = None,
 ) -> tuple[bool, str, FailureCategory | None, list[SqlDiagnostic]]:
-    """
-    Run `validate_sql` (AST plus optional EXPLAIN).
-
-    Args:
-
-        sql: Parameter-substituted SQL.
-
-        intent: Intent supplying bind values.
-
-        dialect: Active dialect.
-
-        schema: Optional schema graph forwarded to ``explain_sql`` when the dialect aligns ``EXPLAIN`` with execution.
-
-    Returns:
-
-        ``(ok, err, failure_category, diagnostics)`` with empty ``err`` on success and ``failure_category`` only set on failure. ``diagnostics`` may include soft EXPLAIN findings even when ``ok`` is True.
-    """
+    """Run `validate_sql` (AST plus optional EXPLAIN)."""
+    validation_sql = _validation_sql_for_explain(sql, intent, dialect)
     ok, err, cat, diags = validate_sql(
         dialect,
-        sql,
-        bind_params_for_sql(sql, intent.param_values),
+        validation_sql,
+        bind_params_for_sql(validation_sql, intent.param_values),
         schema=schema,
         intent=intent,
     )
     out_err = "" if ok and err is None else (err or "")
-    debug(f"[pipeline._run_sql_validation_cascade] validate_sql ok={ok}, err={out_err}, diagnostics={len(diags)}")
-    pipeline_trace_lazy(
+    debug(f"[{ASK_PHASE_J}] validate_sql ok={ok}, err={out_err}, diagnostics={len(diags)}")
+    pipeline_trace(
         "pipeline._run_sql_validation_cascade.result",
         lambda: stable_json(
             {
@@ -1013,7 +941,6 @@ def other_template_owns_question_string(
     q_norm: str,
 ) -> bool:
     """Return True when another accepted template already lists *q_norm* in value history."""
-
     for tid, tmpl in templates.items():
         if tid == exclude_id:
             continue
@@ -1031,28 +958,7 @@ def _maybe_record_value_history_accept(
     form_storage: QuestionFormStorage | None,
     schema: SchemaGraph,
 ) -> None:
-    """
-    Record accepted question form(s) on *tmpl* when no other template already claims the keys.
-
-    Args:
-
-        templates: Live accepted-template map.
-
-        tmpl: Template receiving the new history row.
-
-        intent: Current intent (parameters and natural language).
-
-        q_norm: Fingerprint key for feedback metadata when *form_storage* is absent.
-
-        form_storage: Optional corrected and canonical question bundle from the active turn.
-
-        schema: Live schema graph for optional runtime paraphrase generation.
-
-    Returns:
-
-        None.
-    """
-
+    """Record accepted question form(s) on *tmpl* when no other. template. already claims the keys."""
     all_pv = flatten_param_values(intent)
     nl = intent.natural_language or ""
     pq = form_storage.corrected if form_storage is not None else q_norm
@@ -1073,20 +979,7 @@ def _maybe_record_value_history_accept(
 
 
 def best_accepted_template_similarity(intent: RuntimeIntent, templates: dict[str, Any]) -> float:
-    """
-    Return the highest structural similarity between *intent* and any accepted template signature.
-
-    Args:
-
-        intent: Parsed runtime intent.
-
-        templates: Accepted template id to ``Template`` map.
-
-    Returns:
-
-        Score in ``[0, 1]``, or ``0.0`` when there are no templates.
-    """
-
+    """Return the highest structural similarity between *intent* and. any. accepted template signature."""
     if not templates:
         return 0.0
     scores: list[float] = []
@@ -1097,32 +990,20 @@ def best_accepted_template_similarity(intent: RuntimeIntent, templates: dict[str
     return max(scores, default=0.0)
 
 
+def clear_planner_schema_invalid_after_user_accept(intent: RuntimeIntent) -> None:
+    """Drop the ephemeral planner schema-invalid hint after the user accepts intent confirmation."""
+    if intent.schema_invalid:
+        intent.schema_invalid = False
+        debug("[pipeline] cleared planner schema_invalid after user accepted intent confirmation")
+
+
 def should_skip_intent_confirmation(
     intent: RuntimeIntent,
     store: dict[str, Any] | None,
     q_norm: str | None,
     semantic_warnings: list[Any] | None,
 ) -> bool:
-    """
-    Return True when intent confirmation may be skipped.
-
-    Returns False when the parsed intent is schema-invalid, when there are semantic warnings, or when the same canonicalised question has any prior rejection recorded in ``question_feedback``.
-
-    Args:
-
-        intent: Current intent.
-
-        store: Optional template store for rejection-history lookup.
-
-        q_norm: Normalised question key.
-
-        semantic_warnings: Optional parser warning payloads.
-
-    Returns:
-
-        True if the pipeline should auto-proceed past intent confirmation.
-    """
-
+    """Return True when intent confirmation may be skipped. Returns. False when the parsed intent is schema-invalid, when there are semantic warnings, or when the same canonicalised question has any prior rejection recorded in ``question_feedback``."""
     if getattr(intent, "schema_invalid", False):
         return False
     if semantic_warnings:
@@ -1134,7 +1015,6 @@ def should_skip_intent_confirmation(
 
 def _should_prompt_direct_reuse_user(
     ref_tmpl: Template,
-    is_exact_question: bool,
     _rejected: dict[str, Any],
     intent: RuntimeIntent,
     q_norm: str,
@@ -1142,7 +1022,6 @@ def _should_prompt_direct_reuse_user(
     reuse_history_index: int,
 ) -> bool:
     """Return True when direct SQL reuse must ask the user instead of auto-accepting."""
-
     return not should_auto_accept_for_question(
         ref_tmpl,
         q_norm,
@@ -1164,7 +1043,6 @@ class PathSelectionState:
 
 def _choose_generation_path(state: PathSelectionState) -> GenerationPath:
     """Return the SQL generation branch: template-driven paths ``3``/``4`` when a template is in play, else ``5`` (fresh)."""
-
     if not state.has_matched_template:
         return GenerationPath.FRESH
     return state.resolved_union_path or GenerationPath.FRESH
@@ -1175,20 +1053,7 @@ def align_template_to_widened_intent(
     intent: RuntimeIntent,
     dialect: Any,
 ) -> None:
-    """
-    Copy widened SQL artefacts and identity fields from *intent* onto *template*.
-
-    Used after union paths ``4.1`` and ``4.2`` so execution SQL caches match widened projections.
-
-    Args:
-
-        template: Accepted template row being updated after user acceptance or generation alignment.
-
-        intent: Runtime intent whose ``sql_param`` and display SQL reflect the union projection.
-
-        dialect: Active dialect for refreshing prepared execution SQL on *template*.
-    """
-
+    """Copy widened SQL artifacts and identity fields from *intent* onto. *template*. Used after union paths ``4.1`` and ``4.2`` so execution SQL caches match widened projections."""
     all_pv = dict(flatten_param_values(intent))
     template.sql_param = intent.sql_param or template.sql_param
     sig_id = (
@@ -1215,7 +1080,7 @@ def generate_and_validate_sql(
     join_candidates: dict[str, Any],
     cmap: dict[str, list[str]],
     dialect: Any,
-    store: dict[str, Any],
+    store: dict[str, Any] | TemplateStoreView,
     cte_join_hints: dict[str, dict[str, Any]] | None = None,
     matched_template: Template | None = None,
     union_select_cols: list[SelectCol] | None = None,
@@ -1223,62 +1088,62 @@ def generate_and_validate_sql(
     structural_match_templates: list[Template] | None = None,
     union_sql_path: GenerationPath | None = None,
     persist_template_learning: bool = True,
+    schema_context: EngineContext | None = None,
+    visible_objects: frozenset[str] | None = None,
+    schema_role: str = "owner",
+    space_allowed_tables: frozenset[str] | None = None,
+    space_allowed_columns: frozenset[str] | None = None,
 ) -> SqlGenerationOutcome:
-    """
-    Generate SQL from template reuse or deterministic build, then validate once.
-
-    Args:
-
-        q_norm: Normalised question.
-
-        intent: Validated runtime intent.
-
-        schema: Schema graph.
-
-        join_candidates: Main-query join hints.
-
-        cmap: Candidate id to signature map.
-
-        dialect: Database dialect.
-
-        store: Template store for persistence on hard failure.
-
-        cte_join_hints: Per-CTE join hints.
-
-        matched_template: Union-matched template, or None.
-
-        union_select_cols: Merged select list when template matched.
-
-        cols_changed: Whether union changed projected columns.
-
-        structural_match_templates: Same-intent-key structural twins for path-5 insert merge.
-
-        union_sql_path: Resolved template reuse path from :func:`match_template_for_union` when applicable.
-
-    Returns:
-
-        ``SqlGenerationOutcome`` with SQL, success flag, ``generation_path``, and matched template if any.
-
-    When SQL validation fails once, :func:`apply_diagnostic_repairs` may rebuild SQL and revalidate; diagnostics refer to that retry phase as ``B.3`` and it is not a separate routing generation path.
-
-    For ``INTENT_DIRECT_MATCH`` and ``RUNTIME_SUBSET_TEMPLATE_WIDE``, join fingerprint comparisons in the returned outcome are evaluated after fresh join resolution and before any template widening alignment mutates stored template fingerprints.
-
-    For union widen paths ``4.1`` and ``4.2``, :func:`align_template_to_widened_intent` runs only when the resolved runtime join fingerprint already equals the matched template fingerprint; the outcome field ``join_matches_template`` records that pre-alignment comparison so downstream feedback can fork a new template row when the join choice diverges.
-    """
+    """Generate SQL from template reuse or deterministic build, then. validate once."""
     intent = prune_unused_cte_steps(intent)
-    join_candidates, cmap, cte_join_hints = generate_join_candidates(intent, schema)
-    log("sql generation")
+    intent = expand_shared_pk_tables_for_refs(intent, schema)
     structural_tpl = tuple(structural_match_templates or ())
-    debug(f"[pipeline.generate_and_validate_sql] tables={intent.tables or []}")
-    debug(f"[pipeline.generate_and_validate_sql] grain={intent.grain or 'unknown'}")
-    debug(
-        f"[pipeline.generate_and_validate_sql] select_cols={[s.expr.primary_term for s in (intent.select_cols or [])]}"
-    )
-    debug(f"[pipeline.generate_and_validate_sql] filters_param={len(intent.filters_param or [])}")
-    debug(f"[pipeline.generate_and_validate_sql] having_param={len(intent.having_param or [])}")
-    debug(
-        f"[pipeline.generate_and_validate_sql] cte_join_hints={list(cte_join_hints.keys()) if cte_join_hints else None}"
-    )
+    if getattr(intent, "schema_invalid", False):
+        print_rephrase_hint(RephraseHint.SCHEMA_INVALID_DECLINED)
+        if persist_template_learning:
+            save_template_store(store)
+        return SqlGenerationOutcome(
+            "",
+            False,
+            GenerationPath.INTENT_DIRECT_MATCH,
+            None,
+            structural_tpl,
+            sql_validation_error="intent schema_invalid",
+            error_kind=FailureCategory.INTENT_SCHEMA_INVALID_ABORT.value,
+        )
+    space_tables = frozenset(space_allowed_tables or ())
+    space_columns = frozenset(space_allowed_columns or ())
+    if space_tables or space_columns:
+        if not assert_intent_in_scope(intent, space_tables, space_columns, schema):
+            return SqlGenerationOutcome(
+                "",
+                False,
+                GenerationPath.INTENT_DIRECT_MATCH,
+                None,
+                structural_tpl,
+                sql_validation_error="intent out of aetherspace scope",
+                error_kind=FailureCategory.DENIED_REFERENCE.value,
+            )
+    scope_ctx = schema_context if schema_context is not None else EngineContext()
+    if _execution_scope_gate_active(scope_ctx, visible_objects, schema_role):
+        if not assert_consumer_intent_in_scope(intent, scope_ctx, schema, visible_objects):
+            return SqlGenerationOutcome(
+                "",
+                False,
+                GenerationPath.INTENT_DIRECT_MATCH,
+                None,
+                structural_tpl,
+                sql_validation_error="intent out of execution scope",
+                error_kind=FailureCategory.ACCESS_POLICY.value,
+            )
+    join_candidates, cmap, cte_join_hints = generate_join_candidates(intent, schema)
+    debug("sql generation")
+    debug(f"[{ASK_PHASE_J}] tables={intent.tables or []}")
+    debug(f"[{ASK_PHASE_J}] grain={intent.grain or 'unknown'}")
+    debug(f"[{ASK_PHASE_J}] select_cols={[s.expr.primary_term for s in (intent.select_cols or [])]}")
+    debug(f"[{ASK_PHASE_J}] filters_param={len(intent.filters_param or [])}")
+    debug(f"[{ASK_PHASE_J}] having_param={len(intent.having_param or [])}")
+    debug(f"[{ASK_PHASE_J}] cte_join_hints={list(cte_join_hints.keys()) if cte_join_hints else None}")
     resolved_union_path = resolve_sql_path(
         matched_template=matched_template,
         cols_changed=cols_changed,
@@ -1295,7 +1160,7 @@ def generate_and_validate_sql(
         )
     )
     active_path = routing
-    debug(f"[pipeline.generate_and_validate_sql] generation path={active_path}")
+    debug(f"[{ASK_PHASE_J}] generation path={active_path}")
 
     structural_defaults_src: dict[str, Any] | None = None
     if matched_template:
@@ -1303,9 +1168,9 @@ def generate_and_validate_sql(
         structural_defaults_src = tmpl_sd if tmpl_sd else None
 
     params = dict(flatten_param_values(intent))
-    debug(f"[pipeline.generate_and_validate_sql] params={params}")
+    debug(f"[{ASK_PHASE_J}] params={params}")
 
-    prior_join_fb = lookup_join_feedback_for_question(store, q_norm)
+    prior_join_fb = lookup_join_feedback_for_question(cast(dict[str, Any], store), q_norm)
 
     generation_path_label = active_path
     matched_for_outcome: Template | None = None
@@ -1336,11 +1201,10 @@ def generate_and_validate_sql(
             join_signature_for_from_anchor=anchor_main if anchor_main else None,
             cte_join_signatures_for_from_anchor=anchor_cte if anchor_cte else None,
         )
-        if diagnostic_debug_enabled() and diagnostic_pipeline_trace_full_enabled():
-            pipeline_trace_lazy(
-                "pipeline.generate_and_validate_sql.deterministic_sql.path_3",
-                lambda: deterministic_sql,
-            )
+        pipeline_trace(
+            "pipeline.generate_and_validate_sql.deterministic_sql.path_3",
+            lambda: deterministic_sql,
+        )
         try:
             sql_param, _cte_join_ids = _resolve_joins_fresh(
                 deterministic_sql,
@@ -1359,7 +1223,7 @@ def generate_and_validate_sql(
             JoinInjectionAlignmentError,
             JoinInjectionFailedError,
         ) as exc:
-            debug(f"[pipeline.generate_and_validate_sql] {exc}")
+            debug(f"[{ASK_PHASE_J}] {exc}")
             print_rephrase_hint(RephraseHint.SQL_VALIDATION_FAILED)
             if persist_template_learning:
                 save_template_store(store)
@@ -1381,7 +1245,7 @@ def generate_and_validate_sql(
             params=subs_params,
         )
         jm3 = _join_matches_template_intent(matched_template, intent)
-        debug("[pipeline.generate_and_validate_sql] path 3: deterministic sql with fresh joins")
+        debug(f"[{ASK_PHASE_J}] path 3: deterministic sql with fresh joins")
         path_3_payload = {
             "chosen_join_candidate_id": intent.chosen_join_candidate_id,
             "chosen_join_path_signature": intent.chosen_join_path_signature,
@@ -1390,7 +1254,7 @@ def generate_and_validate_sql(
             "sql_substituted": sql,
             "join_matches_template": jm3,
         }
-        pipeline_trace_lazy(
+        pipeline_trace(
             "pipeline.generate_and_validate_sql.path_3",
             lambda: stable_json(path_3_payload),
         )
@@ -1408,7 +1272,7 @@ def generate_and_validate_sql(
                 sum(1 for d in diags_c if d.code.value in SOFT_DIAGNOSTIC_CODES),
             )
         debug(
-            f"[pipeline.generate_and_validate_sql] template path {resolved_union_path.code} "
+            f"[{ASK_PHASE_J}] template path {resolved_union_path.code} "
             f"SQL validation failed: {err_c}; terminating without fresh fallback"
         )
         if persist_template_learning:
@@ -1448,11 +1312,10 @@ def generate_and_validate_sql(
             join_signature_for_from_anchor=anchor_main if anchor_main else None,
             cte_join_signatures_for_from_anchor=anchor_cte if anchor_cte else None,
         )
-        if diagnostic_debug_enabled() and diagnostic_pipeline_trace_full_enabled():
-            pipeline_trace_lazy(
-                "pipeline.generate_and_validate_sql.deterministic_sql.path_4",
-                lambda: deterministic_sql,
-            )
+        pipeline_trace(
+            "pipeline.generate_and_validate_sql.deterministic_sql.path_4",
+            lambda: deterministic_sql,
+        )
         try:
             sql_param, _cte_join_ids = _resolve_joins_fresh(
                 deterministic_sql,
@@ -1471,7 +1334,7 @@ def generate_and_validate_sql(
             JoinInjectionAlignmentError,
             JoinInjectionFailedError,
         ) as exc:
-            debug(f"[pipeline.generate_and_validate_sql] {exc}")
+            debug(f"[{ASK_PHASE_J}] {exc}")
             print_rephrase_hint(RephraseHint.SQL_VALIDATION_FAILED)
             if persist_template_learning:
                 save_template_store(store)
@@ -1493,14 +1356,14 @@ def generate_and_validate_sql(
             structural_defaults_src=structural_defaults_src,
             params=dict(params),
         )
-        debug("[pipeline.generate_and_validate_sql] path 4: rebuilt deterministic SQL with union cols")
+        debug(f"[{ASK_PHASE_J}] path 4: rebuilt deterministic SQL with union cols")
         path_4_final = {
             "chosen_join_candidate_id": intent.chosen_join_candidate_id,
             "chosen_join_path_signature": intent.chosen_join_path_signature,
             "sql_param": sql_param,
             "sql_substituted": sql,
         }
-        pipeline_trace_lazy(
+        pipeline_trace(
             "pipeline.generate_and_validate_sql.path_4.final",
             lambda: stable_json(path_4_final),
         )
@@ -1519,11 +1382,10 @@ def generate_and_validate_sql(
             join_signature_for_from_anchor=anchor_main if anchor_main else None,
             cte_join_signatures_for_from_anchor=anchor_cte if anchor_cte else None,
         )
-        if diagnostic_debug_enabled() and diagnostic_pipeline_trace_full_enabled():
-            pipeline_trace_lazy(
-                "pipeline.generate_and_validate_sql.deterministic_sql.path_5",
-                lambda: deterministic_sql,
-            )
+        pipeline_trace(
+            "pipeline.generate_and_validate_sql.deterministic_sql.path_5",
+            lambda: deterministic_sql,
+        )
         try:
             sql_param, cte_join_ids = _resolve_joins_fresh(
                 deterministic_sql,
@@ -1542,7 +1404,7 @@ def generate_and_validate_sql(
             JoinInjectionAlignmentError,
             JoinInjectionFailedError,
         ) as exc:
-            debug(f"[pipeline.generate_and_validate_sql] {exc}")
+            debug(f"[{ASK_PHASE_J}] {exc}")
             print_rephrase_hint(RephraseHint.SQL_VALIDATION_FAILED)
             if persist_template_learning:
                 save_template_store(store)
@@ -1556,32 +1418,31 @@ def generate_and_validate_sql(
                 join_matches_template=None,
                 error_kind=None,
             )
-        if diagnostic_debug_enabled() and diagnostic_pipeline_trace_full_enabled():
-            pipeline_trace_lazy(
-                "pipeline.generate_and_validate_sql.after_resolve_joins_fresh",
-                lambda: stable_json(
-                    {
-                        "chosen_join_candidate_id": intent.chosen_join_candidate_id,
-                        "chosen_join_path_signature": intent.chosen_join_path_signature,
-                        "cte_join_ids": cte_join_ids,
-                        "sql_param_before_normalize": sql_param,
-                    }
-                ),
-            )
+        pipeline_trace(
+            "pipeline.generate_and_validate_sql.after_resolve_joins_fresh",
+            lambda: stable_json(
+                {
+                    "chosen_join_candidate_id": intent.chosen_join_candidate_id,
+                    "chosen_join_path_signature": intent.chosen_join_path_signature,
+                    "cte_join_ids": cte_join_ids,
+                    "sql_param_before_normalize": sql_param,
+                }
+            ),
+        )
         intent.sql_param = sql_param
         sql = finalize_substitute_sql(
             intent,
             structural_defaults_src=structural_defaults_src,
             params=params,
         )
-        debug("[pipeline.generate_and_validate_sql] path 5: fresh deterministic SQL")
+        debug(f"[{ASK_PHASE_J}] path 5: fresh deterministic SQL")
         path_5_final = {
             "chosen_join_candidate_id": intent.chosen_join_candidate_id,
             "chosen_join_path_signature": intent.chosen_join_path_signature,
             "sql_param": sql_param,
             "sql_substituted": sql,
         }
-        pipeline_trace_lazy(
+        pipeline_trace(
             "pipeline.generate_and_validate_sql.path_5.final",
             lambda: stable_json(path_5_final),
         )
@@ -1625,7 +1486,7 @@ def generate_and_validate_sql(
                     sql_r, repaired_intent, dialect, schema=schema
                 )
                 if ok_r:
-                    debug("[pipeline.generate_and_validate_sql] B.3 diagnostic repair succeeded on retry")
+                    debug(f"[{ASK_PHASE_J}] B.3 diagnostic repair succeeded on retry")
                     intent = repaired_intent
                     sql = sql_r
                     vdiags = vdiags_r
@@ -1633,7 +1494,7 @@ def generate_and_validate_sql(
                     err = err_r
                     vcat = vcat_r
                 else:
-                    debug(f"[pipeline.generate_and_validate_sql] B.3 retry still failed: {err_r}")
+                    debug(f"[{ASK_PHASE_J}] B.3 retry still failed: {err_r}")
             except (
                 NoJoinPathError,
                 JoinInjectionAlignmentError,
@@ -1642,7 +1503,7 @@ def generate_and_validate_sql(
                 KeyError,
                 TypeError,
             ) as exc:
-                debug(f"[pipeline.generate_and_validate_sql] B.3 retry rebuild raised: {exc}")
+                debug(f"[{ASK_PHASE_J}] B.3 retry rebuild raised: {exc}")
 
     if not ok:
         print_rephrase_hint(RephraseHint.SQL_VALIDATION_FAILED)
@@ -1690,7 +1551,6 @@ def _join_signatures_for_deterministic_from_anchor(
     intent: RuntimeIntent,
 ) -> tuple[list[str], dict[str, list[str]]]:
     """Return join-path signatures when exactly one non-``J00`` candidate exists per scope."""
-
     main_sig: list[str] = []
     cte_sigs: dict[str, list[str]] = {}
     tbls = intent.tables or []
@@ -1725,11 +1585,7 @@ def _build_per_carrier_join_payloads(
     multi_table: bool,
     multi_table_candidates: dict[str, list[str]],
 ) -> tuple[list[list[str]], list[list[str]], str]:
-    """
-    Build ``join_sigs_ordered`` and ``edge_kinds_ordered`` aligned with ``intent.cte_steps`` plus one main slot.
-
-    Invariant: ``len(join_sigs_ordered) == len(intent.cte_steps or []) + 1``. Scalar-subquery CTEs contribute empty signatures; multi-table CTEs use ``cte_join_hints``. May update *cte_join_ids* and *candidate_id* when resolving fallbacks.
-    """
+    """Build ``join_sigs_ordered`` and ``edge_kinds_ordered`` aligned with ``intent.cte_steps`` plus one main slot. Invariant: ``len(join_sigs_ordered) == len(intent.cte_steps or []) + 1``. Scalar-subquery CTEs contribute empty signatures; multi-table CTEs use ``cte_join_hints``. May update *cte_join_ids* and *candidate_id* when resolving fallbacks."""
     join_sigs_ordered: list[list[str]] = []
     edge_kinds_ordered: list[list[str]] = []
     for cte in intent.cte_steps or []:
@@ -1778,17 +1634,21 @@ def _build_per_carrier_join_payloads(
                             main_kinds = list(cand.get("edge_kinds", []) or [])
                             break
                     debug(
-                        "[pipeline._build_per_carrier_join_payloads] empty join signature for "
+                        f"[{ASK_PHASE_I}] empty join signature for "
                         f"prior choice — using fallback candidate_id={out_candidate_id}"
                     )
-                    pipeline_trace_lazy(
-                        "pipeline._build_per_carrier_join_payloads.main_join_fallback",
-                        lambda cid=out_candidate_id, sig=main_sig: stable_json(
+
+                    def _main_join_fallback_trace(cid: str = out_candidate_id, sig: list[Any] = main_sig) -> str:
+                        return stable_json(
                             {
                                 "candidate_id": cid,
                                 "join_path_signature": sig,
                             }
-                        ),
+                        )
+
+                    pipeline_trace(
+                        "pipeline._build_per_carrier_join_payloads.main_join_fallback",
+                        _main_join_fallback_trace,
                     )
                     break
     join_sigs_ordered.append(main_sig)
@@ -1808,35 +1668,7 @@ def _resolve_joins_fresh(
     dialect: Any | None = None,
     prior_join_feedback: list[str] | None = None,
 ) -> tuple[str, dict[str, str]]:
-    """
-    Choose join candidate(s) and inject join SQL into deterministic SQL.
-
-    Args:
-
-        deterministic_sql: SQL produced by :func:`build_deterministic_sql`.
-
-        intent: Runtime intent; updated with chosen join ids and signatures.
-
-        cmap: Candidate id to join path signature.
-
-        cte_join_hints: Per-CTE candidate payloads.
-
-        q_norm: Normalised question for LLM disambiguation.
-
-        join_candidates: Full main-query candidate list.
-
-        schema: Optional schema for injection.
-
-        structural_defaults: Optional template defaults for join-LLM prompt reduction of ``:sN``.
-
-        dialect: Optional engine dialect for sqlglot-based join injection and emit.
-
-        prior_join_feedback: Summaries from earlier wrong-table/join rejections for this question.
-
-    Returns:
-
-        `(sql_param, cte_join_ids)` after injection and intent mutation.
-    """
+    """Choose join candidate(s) and inject join SQL into deterministic. SQL."""
     cte_join_ids: dict[str, str] = {}
 
     main_needs_join = bool(intent.tables) and len(intent.tables) > 1
@@ -1848,7 +1680,7 @@ def _resolve_joins_fresh(
         sql_param = deterministic_sql
         intent.chosen_join_candidate_id = "J00"
         intent.chosen_join_path_signature = []
-        pipeline_trace_lazy(
+        pipeline_trace(
             "pipeline._resolve_joins_fresh.no_join_required",
             lambda: stable_json(
                 {
@@ -1890,7 +1722,7 @@ def _resolve_joins_fresh(
         }
         if not (cte_cids - {"J00"}):
             debug(
-                f"[pipeline._resolve_joins_fresh] CTE '{cte.cte_name}' has no FK or semantic join path → NoJoinPathError",
+                f"[{ASK_PHASE_I}] CTE '{cte.cte_name}' has no FK or semantic join path → NoJoinPathError",
             )
             raise NoJoinPathError(f"CTE '{cte.cte_name}'", list(cte.tables))
 
@@ -2012,7 +1844,7 @@ def _resolve_joins_fresh(
         if sc != ScopeClass.semantic_only:
             continue
         if sk == JOIN_CHOICE_SCOPE_MAIN:
-            vid_final = candidate_id
+            vid_final: str | None = candidate_id
             err_label = "main query"
             err_tables = list(main_tables_list)
         elif sk.startswith("cte:"):
@@ -2025,12 +1857,53 @@ def _resolve_joins_fresh(
         if vid_final in (None, "", "NA"):
             raise NoJoinPathError(err_label, err_tables)
 
+    if multi_table and len(main_tables_list) >= 2:
+        chosen_cand = next(
+            (c for c in main_candidates if c.get("candidate_id") == candidate_id),
+            None,
+        )
+        if chosen_cand is not None and not join_candidate_spans_tables(chosen_cand, main_tables_list):
+            for fid in sorted(multi_table_candidates.keys()):
+                alt_cand = next(
+                    (c for c in main_candidates if c.get("candidate_id") == fid),
+                    None,
+                )
+                if alt_cand is not None and join_candidate_spans_tables(alt_cand, main_tables_list):
+                    candidate_id = fid
+                    break
+
+    def _validate_scope_span(scope_key: str, chosen_id: str, scope_tables: list[str], hints: dict[str, Any]) -> None:
+        if not scope_tables or len(scope_tables) < 2:
+            return
+        if chosen_id in (None, "", "NA", "J00"):
+            return
+        cand = next(
+            (c for c in hints.get("candidates", []) if c.get("candidate_id") == chosen_id),
+            None,
+        )
+        if cand is None:
+            return
+        if not join_candidate_spans_tables(cand, scope_tables):
+            raise NoJoinPathError(
+                scope_key if scope_key != JOIN_CHOICE_SCOPE_MAIN else "main query",
+                list(scope_tables),
+            )
+
+    _validate_scope_span(JOIN_CHOICE_SCOPE_MAIN, candidate_id, main_tables_list, join_candidates)
+    if cte_join_hints:
+        for cname, hints_c in cte_join_hints.items():
+            sk = join_choice_scope_key_cte(cname)
+            if sk not in merged_scope:
+                continue
+            tbls = list(next((t for n, t, _ in cte_scopes if n == cname), []))
+            _validate_scope_span(sk, merged_scope.get(sk, "J00"), tbls, hints_c)
+
     if not multi_table:
-        debug("[pipeline._resolve_joins_fresh] single-table intent → J00")
+        debug(f"[{ASK_PHASE_I}] single-table intent → J00")
     elif len(multi_table_candidates) == 1 and candidate_id != "J00":
-        debug(f"[pipeline._resolve_joins_fresh] resolved candidate_id={candidate_id}")
+        debug(f"[{ASK_PHASE_I}] resolved candidate_id={candidate_id}")
     elif pass1_llm:
-        debug(f"[pipeline._resolve_joins_fresh] LLM chose candidate_id={candidate_id}")
+        debug(f"[{ASK_PHASE_I}] LLM chose candidate_id={candidate_id}")
 
     join_sigs_ordered, edge_kinds_ordered, candidate_id = _build_per_carrier_join_payloads(
         intent,
@@ -2066,7 +1939,7 @@ def _resolve_joins_fresh(
                             )
                             break
 
-    pipeline_trace_lazy(
+    pipeline_trace(
         "pipeline._resolve_joins_fresh.resolved",
         lambda: stable_json(
             {
@@ -2088,12 +1961,7 @@ def finalize_substitute_sql(
     structural_defaults_src: dict[str, Any] | None,
     params: dict[str, Any],
 ) -> str:
-    """
-    Substitute bound parameters into ``intent.sql_param`` and return the executable SQL.
-
-    ``intent.sql_param`` is already canonical because the compositional SQL builder emits column-left predicates from the intent layer; no post-SQL normalization is applied. Ensures ``intent.sql_param`` is non-empty when present.
-    """
-
+    """Substitute bound parameters into ``intent.sql_param`` and return the executable SQL. ``intent.sql_param`` is already canonical because the compositional SQL builder emits column-left predicates from the intent layer; no post-SQL normalization is applied. Ensures ``intent.sql_param`` is non-empty when present."""
     sql_param = intent.sql_param or ""
     intent.sql_param = sql_param
     return finalize_executable_sql(
@@ -2110,35 +1978,11 @@ def compute_final_metrics(
     schema: SchemaGraph,
     templates: dict[str, Any],
     join_candidates: dict[str, Any],
-    store: dict[str, Any],
+    store: dict[str, Any] | TemplateStoreView,
     q_norm: str = "",
     explain_soft_diagnostics: int = 0,
 ) -> float:
-    """
-    Compute final confidence from similarity, shape drift, negative memory, and EXPLAIN soft diagnostics.
-
-    Args:
-
-        sql: Executed SQL text.
-
-        intent: Runtime intent; `sql_shape` is set on exit.
-
-        schema: Schema graph.
-
-        templates: Accepted templates for similarity gap.
-
-        join_candidates: Join hints used for the run.
-
-        store: Template store including negative memory.
-
-        q_norm: Normalized question string for negative-memory lookup.
-
-        explain_soft_diagnostics: Count of soft EXPLAIN findings (sequential scans on indexed columns, zero-row estimates) collected during validation; each contributes a fixed quantum to ``explain_pen``.
-
-    Returns:
-
-        Confidence in `[0, 1]`.
-    """
+    """Compute final confidence from similarity, shape drift, negative. memory, and EXPLAIN soft diagnostics."""
     known_tables = sorted(schema.tables.keys())
     sql_tables = extract_tables_from_sql(sql, known_tables, sqlglot_dialect=active_sqlglot_dialect())
     ref_tables = collect_referenced_tables(
@@ -2176,7 +2020,7 @@ def compute_final_metrics(
 
     num_cte_pen = float(abs(predicted_num_cte - actual_shape.num_cte))
 
-    neg_pen = compute_question_feedback_penalty(store, q_norm, schema.effective_structural_hash)
+    neg_pen = compute_question_feedback_penalty(cast(dict[str, Any], store), q_norm, schema.schema_graph_id)
 
     conf = compute_confidence(
         best_score,
@@ -2191,9 +2035,9 @@ def compute_final_metrics(
 
     intent.sql_shape = actual_shape
 
-    log(f"confidence={round(conf, 3)}")
-    log(f"sql_tables={sql_tables}")
-    log(f"shape={actual_shape}")
+    debug(f"confidence={round(conf, 3)}")
+    debug(f"sql_tables={sql_tables}")
+    debug(f"shape={actual_shape}")
 
     return conf
 
@@ -2208,11 +2052,10 @@ def complete_user_feedback_reject(
     persist_template_learning: bool = True,
 ) -> dict[str, str] | None:
     """Persist user SQL rejection feedback into templates, rejected store, and negative memory."""
-
     intent = ctx.intent
     sql = ctx.sql
     schema = ctx.schema
-    store = ctx.store
+    store: dict[str, Any] | TemplateStoreView = ctx.store
     templates = ctx.templates
     q_norm = ctx.q_norm
     matched_template = ctx.matched_template
@@ -2241,7 +2084,7 @@ def complete_user_feedback_reject(
                 accept=False,
                 path=path_bucket_value,
             )
-            pair_removed, template_deleted = reject_out_per_question(templates, feedback_template, q_norm)
+            _, template_deleted = reject_out_per_question(templates, feedback_template, q_norm)
             entry_fb = summarize_failure_for_memory(
                 question=q_norm,
                 intent=intent,
@@ -2286,6 +2129,7 @@ def complete_user_feedback_reject(
         }
         ev = WriteQueueEvent(
             kind="template_reject",
+            schema_graph_id=str(schema.schema_graph_id or ""),
             schema_hash=str(schema.effective_structural_hash or ""),
             produced_at=datetime.now(timezone.utc).isoformat(),
             payload=(("ctx_json", stable_json(ctx_doc)),),
@@ -2294,7 +2138,7 @@ def complete_user_feedback_reject(
         last_bucket = RejectionBucket.OTHER.value
     ctx_ref = _refinement_ctx_for_feedback(choice_port, refinement_ctx)
     reason_line = ((reject_reason or "").strip() if needs_reason else "") or norm_reason
-    if ctx_ref is not None and _refinement_retry_available(ctx_ref):
+    if ctx_ref is not None and refinement_retry_available(ctx_ref):
         ctx_ref.accumulated_reasons.append(reason_line)
         ctx_ref.pending_retry = True
         raise RefinementRetry
@@ -2324,7 +2168,7 @@ def handle_user_feedback(
     intent: RuntimeIntent,
     sql: str,
     schema: SchemaGraph,
-    store: dict[str, Any],
+    store: dict[str, Any] | TemplateStoreView,
     templates: dict[str, Any],
     rejected: dict[str, Any],
     q_norm: str,
@@ -2338,47 +2182,7 @@ def handle_user_feedback(
     form_storage: QuestionFormStorage | None = None,
     persist_template_learning: bool = True,
 ) -> dict[str, str] | None:
-    """
-    Persist accept/reject feedback into templates, rejected store, and negative memory.
-
-    Accept and reject paths use *matched_template* as the sole accepted- template target when applicable; there is no ``intent_key`` re- resolution of templates.
-
-    Args:
-
-        choice: `y` accept or `n` reject.
-
-        intent: Intent for this query.
-
-        sql: Generated SQL.
-
-        schema: Schema graph.
-
-        store: Mutable template store.
-
-        templates: Accepted templates dict.
-
-        rejected: Rejected templates dict.
-
-        q_norm: Normalised question.
-
-        generation_path: Pipeline path label: canonical :class:`GenerationPath` code strings.
-
-        matched_template: Template used for union or direct-intent reuse, when applicable.
-
-        matched_rejected_template: Similarity-matched rejected template, if any.
-
-        dialect: Optional dialect for template insertion.
-
-        structural_match_templates: Structural twin list for path-5 ``insert_template`` merge.
-
-        join_matches_template: When false after SQL generation, accept persists a new template row instead of updating the matched row.
-
-        form_storage: Optional typo-corrected vs canonical bundle for ``ValueHistory`` updates on accept.
-
-    Returns:
-
-        On reject, dict with ``category`` (rejection bucket string), ``normalized_reason``, and ``reject_reason``; otherwise ``None``.
-    """
+    """Persist accept/reject feedback into templates, rejected store, and negative memory. Accept and reject paths use *matched_template* as the sole accepted- template target when applicable; there is no ``intent_key`` re- resolution of templates."""
     if choice not in ("y", "n"):
         invalid_input("Invalid choice — please answer y or n.")
         if persist_template_learning:
@@ -2406,23 +2210,24 @@ def handle_user_feedback(
     if choice == "y":
         promoted = False
         if persist_template_learning:
-            delete_rejected_templates_matching_question(store, q_norm)
+            delete_rejected_templates_matching_question(cast(dict[str, Any], store), q_norm)
 
             if matched_rejected_template is not None:
                 new_tmpl = promote_rejected_to_template(
-                    store,
+                    cast(dict[str, Any], store),
                     templates,
                     q_norm,
                     intent,
                     sql,
-                    schema.effective_structural_hash,
+                    schema.schema_graph_id,
+                    effective_structural_hash=schema.effective_structural_hash,
                     form_storage=form_storage,
                 )
-                log(f"promoted prior-negative-memory path to template {new_tmpl.id}")
+                debug(f"promoted prior-negative-memory path to template {new_tmpl.id}")
                 promoted = True
 
             if not promoted and resolved_path == GenerationPath.FRESH:
-                debug("[pipeline.handle_user_feedback] insert_template path 5")
+                debug(f"[{ASK_PHASE_L}] insert_template path 5")
                 sm_list = list(structural_match_templates or [])
                 insert_template(
                     store,
@@ -2434,6 +2239,7 @@ def handle_user_feedback(
                     dialect=dialect,
                     structural_match_templates=sm_list,
                     form_storage=form_storage,
+                    record_accept=True,
                 )
             elif not promoted and matched_template is not None and resolved_path == GenerationPath.EXACT_QUESTION_REUSE:
                 tmpl = matched_template
@@ -2484,6 +2290,7 @@ def handle_user_feedback(
                         dialect=dialect,
                         structural_match_templates=sm_list,
                         form_storage=form_storage,
+                        record_accept=True,
                     )
                 else:
                     tmpl = matched_template
@@ -2516,6 +2323,7 @@ def handle_user_feedback(
                         dialect=dialect,
                         structural_match_templates=sm_list,
                         form_storage=form_storage,
+                        record_accept=True,
                     )
                 else:
                     tmpl = matched_template
@@ -2544,6 +2352,7 @@ def handle_user_feedback(
                         dialect=dialect,
                         structural_match_templates=sm_list,
                         form_storage=form_storage,
+                        record_accept=True,
                     )
                 else:
                     tmpl = matched_template
@@ -2585,6 +2394,7 @@ def handle_user_feedback(
                         dialect=dialect,
                         structural_match_templates=sm_list,
                         form_storage=form_storage,
+                        record_accept=True,
                     )
                 else:
                     tmpl = matched_template
@@ -2627,6 +2437,7 @@ def handle_user_feedback(
             }
             ev = WriteQueueEvent(
                 kind="template_accept",
+                schema_graph_id=str(schema.schema_graph_id or ""),
                 schema_hash=str(schema.effective_structural_hash or ""),
                 produced_at=datetime.now(timezone.utc).isoformat(),
                 payload=(("replay_json", stable_json(replay)),),
@@ -2641,7 +2452,7 @@ def handle_user_feedback(
             intent=intent,
             sql=sql,
             schema=schema,
-            store=store,
+            store=cast(dict[str, Any], store),
             templates=templates,
             rejected=rejected,
             q_norm=q_norm,
@@ -2677,7 +2488,7 @@ def handle_user_feedback(
                 terminated()
                 if persist_template_learning:
                     save_template_store(store)
-                return
+                return None
             if not reject_reason:
                 invalid_input()
                 if persist_template_learning:
@@ -2699,18 +2510,8 @@ def handle_user_feedback(
         )
 
 
-def _most_frequent_natural_language(vh) -> str:
-    """
-    Get the most frequently occurring natural_language from a ValueHistory.
-
-    Args:
-
-        vh: A ValueHistory object with a `natural_language` list.
-
-    Returns:
-
-        The most common non-empty natural language string, or empty string if none.
-    """
+def _most_frequent_natural_language(vh: ValueHistory) -> str:
+    """Get the most frequently occurring natural_language from a. ValueHistory."""
     if not vh.natural_language:
         return ""
     non_empty = [nl for nl in vh.natural_language if nl]
@@ -2721,18 +2522,22 @@ def _most_frequent_natural_language(vh) -> str:
 
 
 def extract_column_headers(sql: str) -> list[str]:
-    """
-    Parse the outermost ``SELECT`` projection list and return display column names / aliases via AST.
-
-    Args:
-
-        sql: SQL whose outer ``SELECT`` clause may use ``AS`` aliases.
-
-    Returns:
-
-        Header strings in select-list order.
-    """
+    """Parse the outermost ``SELECT`` projection list and return. display. column names / aliases via AST."""
     return sql_outer_select_aliases(sql, sqlglot_dialect=active_sqlglot_dialect())
+
+
+def result_columns_for_session(
+    sql: str | None,
+    rows: list[tuple[Any, ...]] | None,
+) -> tuple[str, ...] | None:
+    """Derive display column names for programmatic ``SessionStep`` consumers."""
+    if not rows:
+        return None
+    n = len(rows[0])
+    hdrs = extract_column_headers(sql or "")
+    if hdrs and len(hdrs) == n:
+        return tuple(hdrs)
+    return tuple(f"c{i}" for i in range(n))
 
 
 def _structural_key_remap_from_assignment_order(
@@ -2740,7 +2545,6 @@ def _structural_key_remap_from_assignment_order(
     new_intent: RuntimeIntent,
 ) -> dict[str, str]:
     """Map old structural ``s*`` keys to new keys when assignment sequences align in length."""
-
     old_seq = structural_s_key_assignment_order(old_intent)
     new_seq = structural_s_key_assignment_order(new_intent)
     if len(old_seq) != len(new_seq):
@@ -2753,7 +2557,6 @@ def _remap_value_history_structural_keys(
     key_remap: dict[str, str],
 ) -> None:
     """Rewrite structural keys in *history* rows using *key_remap* (dict-only, deterministic)."""
-
     if not key_remap:
         return
     for i, row in enumerate(history.param_values):
@@ -2769,23 +2572,7 @@ def merge_structural_defaults_for_reuse(
     new_params: dict[str, Any],
     structural_defaults: dict[str, Any] | None,
 ) -> int:
-    """
-    Fill missing structural keys referenced as ``:sN`` in param SQL from template defaults.
-
-    Used by direct SQL reuse and by path 3 (``INTENT_DIRECT_MATCH``).
-
-    Args:
-
-        sql_param: Parameterized SQL (Postgres-style placeholders).
-
-        new_params: Mutable map to augment.
-
-        structural_defaults: Template ``s*`` defaults; may be empty.
-
-    Returns:
-
-        Count of keys added.
-    """
+    """Fill missing structural keys referenced as ``:sN`` in param SQL. from template defaults. Used by direct SQL reuse and by path 3 (``INTENT_DIRECT_MATCH``)."""
     sd = structural_defaults or {}
     s_keys = set(re.findall(r":(s\d+)", sql_param))
     added = 0
@@ -2803,20 +2590,7 @@ def complete_direct_sql_reuse_user_choice(
     choice_port: InteractiveChoicePort | None = None,
     persist_template_learning: bool = True,
 ) -> SqlGenerationOutcome:
-    """
-    Apply the user's confirmation after a deferred direct-reuse prompt.
-
-    Args:
-
-        ctx: Frozen context from the suspend payload.
-
-        choice: ``"y"`` to accept, otherwise treated as decline.
-
-    Returns:
-
-        ``SqlGenerationOutcome`` for the completed direct-reuse path (always ``success=True`` here).
-    """
-
+    """Apply the user's confirmation after a deferred direct-reuse. prompt."""
     ref_tmpl = ctx.ref_tmpl
     q_norm = ctx.q_norm
     store = ctx.store
@@ -2830,7 +2604,7 @@ def complete_direct_sql_reuse_user_choice(
 
     normalised = "y" if choice == "y" else "n"
     if normalised == "y":
-        debug("[pipeline.complete_direct_sql_reuse_user_choice] user_accepted_reuse")
+        debug(f"[{ASK_PHASE_A}] user_accepted_reuse")
         if intent.grain != "scalar":
             dfw = build_result_dataframe(
                 rows,
@@ -2842,8 +2616,18 @@ def complete_direct_sql_reuse_user_choice(
             )
             if dfw is not None:
                 save_result_csv(dfw)
+        row_tuples = [tuple(r) for r in rows]
+        cols = result_columns_for_session(sql, row_tuples)
+        note_interactive_turn(
+            choice_port,
+            outcome="success",
+            sql=sql,
+            rows=row_tuples,
+            columns=cols,
+            intent=intent,
+        )
     else:
-        debug("[pipeline.complete_direct_sql_reuse_user_choice] user_rejected_reuse")
+        debug(f"[{ASK_PHASE_A}] user_rejected_reuse")
     handle_user_feedback(
         normalised,
         intent,
@@ -2875,114 +2659,91 @@ def complete_direct_sql_reuse_user_choice(
     )
 
 
-def handle_direct_sql_reuse(
+def execute_reuse_with_params(
     q_norm: str,
     ref_tmpl: Template,
+    new_params: dict[str, Any],
     dialect: Any,
-    store: dict[str, Any],
+    store: dict[str, Any] | TemplateStoreView,
     templates: dict[str, Any],
     rejected: dict[str, Any],
     schema: SchemaGraph,
+    *,
     existing_nl: str | None = None,
     choice_port: InteractiveChoicePort | None = None,
-    reuse_history_index: int | None = None,
+    reuse_row_idx: int = 0,
+    reuse_path: GenerationPath,
+    matched_idx: int = -1,
+    literal_structural_only: bool = False,
     form_storage: QuestionFormStorage | None = None,
     persist_template_learning: bool = True,
+    schema_context: EngineContext | None = None,
+    visible_objects: frozenset[str] | None = None,
+    schema_role: str = "owner",
+    space_allowed_tables: frozenset[str] | None = None,
+    space_allowed_columns: frozenset[str] | None = None,
+    prompt: bool = True,
+    record_question: str | None = None,
+    on_param_incomplete: Literal["return_none", "raise"] = "return_none",
 ) -> SqlGenerationOutcome | None:
     """
-    Reuse a template’s SQL: extract params, validate, execute, and record feedback.
+    Bind *new_params* to *ref_tmpl*, validate, execute, and record feedback.
 
     Args:
 
-        q_norm: Normalised question.
-
-        ref_tmpl: Matched template.
-
-        dialect: Dialect for validation and execution.
-
-        store: Mutable template store.
-
-        templates: Accepted templates dict.
-
-        rejected: Rejected templates dict.
-
-        schema: Schema graph.
-
-        existing_nl: Optional fixed natural-language string.
-
-        choice_port: Optional programmatic yes/no port; may trigger ``PipelineSuspended``.
-
-        reuse_history_index: Fuzzy-match row in ``value_history`` when ``matched_idx < 0``.
-
-        form_storage: Optional typo-corrected vs canonical bundle for accept-time ``ValueHistory`` rows.
+        q_norm: Normalized question text for scope and display.
+        ref_tmpl: Trusted template whose SQL is reused.
+        new_params: Complete bind map after overlay and structural defaults.
+        dialect: Active dialect runner.
+        store: Template store backing persistence.
+        templates: In-memory template map.
+        rejected: Rejected-template memory map.
+        schema: Schema graph for validation.
+        existing_nl: Optional natural-language label for the intent skeleton.
+        choice_port: Optional programmatic session receiving turn outcomes.
+        reuse_row_idx: History row used for trust and auto-accept heuristics.
+        reuse_path: Generation path recorded on acceptance.
+        matched_idx: Exact history index when wording matched a stored row.
+        literal_structural_only: Whether structural params stayed at defaults.
+        form_storage: Optional question-form metadata for history recording.
+        persist_template_learning: Whether writer mode may persist learning.
+        schema_context: Engine execution context for consumer scope gates.
+        visible_objects: Consumer-visible object set.
+        schema_role: ``owner`` or ``consumer``.
+        space_allowed_tables: AetherSpace table allow-list.
+        space_allowed_columns: AetherSpace column allow-list.
+        prompt: When False, skip the direct-reuse confirmation prompt.
+        record_question: When set, normalized text stored in value history.
+        on_param_incomplete: ``return_none`` or ``raise`` when bind map is incomplete.
 
     Returns:
 
-        ``SqlGenerationOutcome`` when direct reuse completes, or ``None`` to fall through to intent parsing.
+        :class:`SqlGenerationOutcome` on success, ``None`` when reuse aborts quietly.
+
+    Raises:
+
+        ConfigError: When *on_param_incomplete* is ``raise`` and bind slots are missing.
     """
-    vh = ref_tmpl.value_history
-    matched_idx = -1
-    for i, hist_q in enumerate(vh.questions):
-        if hist_q and q_norm == hist_q:
-            matched_idx = i
-            break
-
-    literal_structural_only = False
-    reuse_row_idx = 0
-    if matched_idx >= 0:
-        new_params = dict(vh.param_values[matched_idx])
-        debug(f"[pipeline.handle_direct_sql_reuse] zero_distance_match: index={matched_idx}")
-        reuse_row_idx = matched_idx
-    else:
-        hi = reuse_history_index
-        if hi is None:
-            if vh.questions:
-                freq_q = Counter(vh.questions).most_common(1)[0][0]
-                hi = vh.questions.index(freq_q)
-            else:
-                hi = 0
-        reuse_row_idx = hi
-        prev_row = vh.param_values[hi] if hi < len(vh.param_values) else {}
-        literal_structural_only = _row_structural_values_match_defaults(
-            prev_row,
-            getattr(ref_tmpl, "structural_defaults", None),
-            ref_tmpl.sql_param or "",
-        )
-        new_params = (
-            _extract_reuse_params_literal_only(q_norm, ref_tmpl, history_index=hi)
-            if literal_structural_only
-            else _extract_reuse_params_full(q_norm, ref_tmpl, history_index=hi)
-        )
-        debug(f"[pipeline.handle_direct_sql_reuse] llm_reuse_extraction: {len(new_params)} params")
-
     n_bf = merge_structural_defaults_for_reuse(
         ref_tmpl.sql_param,
         new_params,
         getattr(ref_tmpl, "structural_defaults", None),
     )
     if n_bf:
-        debug(f"[pipeline.handle_direct_sql_reuse] backfilled_structural_from_sql_param: {n_bf} keys")
+        debug(f"[{ASK_PHASE_A}] backfilled_structural_from_sql_param: {n_bf} keys")
 
-    p_count = len(re.findall(r":p\d+", ref_tmpl.sql_param))
-    s_count = len(re.findall(r":s\d+", ref_tmpl.sql_param))
+    p_count = len(re.findall(r":p\d+", ref_tmpl.sql_param or ""))
+    s_count = len(re.findall(r":s\d+", ref_tmpl.sql_param or ""))
     expected_param_count = p_count + s_count
 
     if len(new_params) < expected_param_count:
-        debug(
-            f"[pipeline.handle_direct_sql_reuse] param_extraction_incomplete: {len(new_params)}/{expected_param_count}"
-        )
+        msg = f"parameter bind map incomplete: {len(new_params)}/{expected_param_count}"
+        debug(f"[{ASK_PHASE_A}] param_extraction_incomplete: {msg}")
+        if on_param_incomplete == "raise":
+            raise ConfigError(msg)
         return None
 
     sd_reuse = getattr(ref_tmpl, "structural_defaults", None)
-    sql = finalize_executable_sql(
-        ref_tmpl.sql_param,
-        new_params,
-        sd_reuse,
-        sqlglot_dialect=dialect.sqlglot_dialect,
-    )
-    debug(f"[pipeline.handle_direct_sql_reuse] params_substituted: {new_params}")
-    debug(f"[pipeline.handle_direct_sql_reuse] final_sql: {sql}")
-
     reuse_nl = existing_nl if existing_nl else _most_frequent_natural_language(ref_tmpl.value_history)
     concrete_cte_steps = ref_tmpl.intent_signature.cte_steps or []
     runtime_cte_steps = [concrete_cte_to_runtime(c) for c in concrete_cte_steps]
@@ -3013,15 +2774,50 @@ def handle_direct_sql_reuse(
         chosen_join_path_signature=ref_tmpl.chosen_join_path_signature or [],
     )
 
-    ok, err, _vcat, _vdiags = validate_sql(
-        dialect,
-        sql,
-        bind_params_for_sql(sql, intent.param_values),
+    intent.sql_param = ref_tmpl.sql_param or ""
+    exec_sql = dialect.finalize_render(
+        ref_tmpl.sql_param or "",
+        new_params,
         schema=schema,
         intent=intent,
+        execution_sql_override=None,
+        structural_defaults=sd_reuse,
     )
+    debug(f"[{ASK_PHASE_A}] params_substituted: {new_params}")
+    debug(f"[{ASK_PHASE_A}] final_sql: {exec_sql}")
+
+    space_tables = frozenset(space_allowed_tables or ())
+    space_columns = frozenset(space_allowed_columns or ())
+    if space_tables or space_columns:
+        if not assert_intent_in_scope(intent, space_tables, space_columns, schema):
+            debug(f"[{ASK_PHASE_A}] intent out of aetherspace scope")
+            return SqlGenerationOutcome(
+                "",
+                False,
+                GenerationPath.INTENT_DIRECT_MATCH,
+                ref_tmpl,
+                (),
+                sql_validation_error="intent out of aetherspace scope",
+                error_kind=FailureCategory.DENIED_REFERENCE.value,
+            )
+    scope_ctx = schema_context if schema_context is not None else EngineContext()
+    if _execution_scope_gate_active(scope_ctx, visible_objects, schema_role):
+        if not assert_consumer_intent_in_scope(intent, scope_ctx, schema, visible_objects):
+            debug(f"[{ASK_PHASE_A}] intent out of execution scope")
+            return SqlGenerationOutcome(
+                "",
+                False,
+                GenerationPath.INTENT_DIRECT_MATCH,
+                ref_tmpl,
+                (),
+                sql_validation_error="intent out of execution scope",
+                error_kind=FailureCategory.ACCESS_POLICY.value,
+            )
+    ok, err, _vcat, _vdiags = _run_sql_validation_cascade(exec_sql, intent, dialect, schema=schema)
     if not ok:
-        debug(f"[pipeline.handle_direct_sql_reuse] validation_failed: {err}")
+        debug(f"[{ASK_PHASE_A}] validation_failed: {err}")
+        if on_param_incomplete == "raise":
+            raise ConfigError(str(err or "SQL validation failed"))
         return None
 
     notify(
@@ -3030,22 +2826,19 @@ def handle_direct_sql_reuse(
         code=DIAGNOSTIC_CODE_REUSE_HIT,
     )
 
-    exec_sql = dialect.finalize_render(
-        ref_tmpl.sql_param,
-        new_params,
-        schema=schema,
-        intent=intent,
-        execution_sql_override=None,
-        structural_defaults=sd_reuse,
-    )
     try:
         progress("Executing SQL...")
-        rows = dialect.execute(exec_sql)
+        rows = dialect.execute(
+            exec_sql,
+            reconcile_execute_bind_params(exec_sql, new_params),
+        )
     except AccessError:
-        debug("[pipeline.handle_direct_sql_reuse] execute permission denied — continuing to intent parse")
+        debug(f"[{ASK_PHASE_A}] execute permission denied — continuing to intent parse")
+        if on_param_incomplete == "raise":
+            raise ConfigError("execute permission denied") from None
         return None
 
-    display_base = template_effective_sql_display_param(ref_tmpl, dialect=dialect)
+    display_base = _template_effective_sql_display_param(ref_tmpl, dialect=dialect)
     display_sql = (
         finalize_executable_sql(
             display_base,
@@ -3054,23 +2847,13 @@ def handle_direct_sql_reuse(
             sqlglot_dialect=dialect.sqlglot_dialect,
         )
         if display_base and new_params
-        else (display_base or sql)
+        else (display_base or exec_sql)
     )
 
-    is_exact = matched_idx >= 0
-    reuse_path = (
-        GenerationPath.EXACT_QUESTION_REUSE
-        if is_exact
-        else (
-            GenerationPath.FUZZY_REUSE_LITERAL_STRUCTURAL
-            if literal_structural_only
-            else GenerationPath.FUZZY_REUSE_FULL_PARAMS
-        )
-    )
-
-    if _should_prompt_direct_reuse_user(
+    record_q = record_question if record_question is not None else q_norm
+    normalised_choice = "y"
+    if prompt and _should_prompt_direct_reuse_user(
         ref_tmpl,
-        is_exact,
         rejected,
         intent,
         q_norm,
@@ -3083,16 +2866,16 @@ def handle_direct_sql_reuse(
             q_norm=q_norm,
             ref_tmpl=ref_tmpl,
             dialect=dialect,
-            store=store,
+            store=cast(dict[str, Any], store),
             templates=templates,
             rejected=rejected,
             schema=schema,
             intent=intent,
-            sql=sql,
+            sql=exec_sql,
             rows=tuple(tuple(r) for r in rows),
             display_sql=display_sql,
             headers=tuple(hdr) if hdr else None,
-            is_exact=is_exact,
+            is_exact=matched_idx >= 0,
             reuse_path=reuse_path,
             sd_reuse=sd_reuse,
             form_storage=form_storage,
@@ -3111,20 +2894,19 @@ def handle_direct_sql_reuse(
         )
         normalised_choice = "y" if choice == "y" else "n"
         if normalised_choice == "y":
-            debug("[pipeline.handle_direct_sql_reuse] user_accepted_reuse")
+            debug(f"[{ASK_PHASE_A}] user_accepted_reuse")
         else:
-            debug("[pipeline.handle_direct_sql_reuse] user_rejected_reuse")
+            debug(f"[{ASK_PHASE_A}] user_rejected_reuse")
     else:
         if choice_port is None:
             print_query_result(rows, display_sql, headers=extract_column_headers(display_sql))
-        debug("[pipeline.handle_direct_sql_reuse] auto_accepted")
-        normalised_choice = "y"
+        debug(f"[{ASK_PHASE_A}] auto_accepted")
 
     if normalised_choice == "y" and intent.grain != "scalar":
         dfw = build_result_dataframe(
             rows,
             intent,
-            sql,
+            exec_sql,
             structural_defaults=sd_reuse,
             q_norm=q_norm,
             template_display_alias_map=getattr(ref_tmpl, "display_alias_map", None),
@@ -3135,12 +2917,12 @@ def handle_direct_sql_reuse(
     handle_user_feedback(
         normalised_choice,
         intent,
-        sql,
+        exec_sql,
         schema,
         store,
         templates,
         rejected,
-        q_norm,
+        record_q,
         reuse_path,
         ref_tmpl,
         matched_rejected_template=None,
@@ -3151,8 +2933,21 @@ def handle_direct_sql_reuse(
         form_storage=form_storage,
         persist_template_learning=persist_template_learning,
     )
+    if normalised_choice == "y":
+        row_tuples = [tuple(r) for r in rows]
+        cols = result_columns_for_session(exec_sql, row_tuples)
+        note_interactive_turn(
+            choice_port,
+            outcome="success",
+            sql=exec_sql,
+            rows=row_tuples,
+            columns=cols,
+            intent=intent,
+            matched_template=ref_tmpl,
+            template_history_index=reuse_row_idx,
+        )
     return SqlGenerationOutcome(
-        sql,
+        exec_sql,
         True,
         reuse_path,
         ref_tmpl,
@@ -3163,9 +2958,194 @@ def handle_direct_sql_reuse(
     )
 
 
+def force_reuse_saved_question(
+    question_old: str,
+    question_new: str,
+    new_values: dict[str, Any],
+    dialect: Any,
+    store: dict[str, Any] | TemplateStoreView,
+    templates: dict[str, Any],
+    rejected: dict[str, Any],
+    schema: SchemaGraph,
+    *,
+    choice_port: InteractiveChoicePort | None = None,
+    persist_template_learning: bool = True,
+    schema_context: EngineContext | None = None,
+    visible_objects: frozenset[str] | None = None,
+    schema_role: str = "owner",
+    space_allowed_tables: frozenset[str] | None = None,
+    space_allowed_columns: frozenset[str] | None = None,
+) -> SqlGenerationOutcome:
+    """
+    Re-execute a stored template with caller-supplied bind values and a new question row.
+
+    Args:
+
+        question_old: Prior question text that identifies the stored template.
+        question_new: New natural-language question recorded in value history.
+        new_values: Changed bind values keyed by template handles (``p1``, ``s1``, …).
+        dialect: Active dialect runner.
+        store: Template store backing persistence.
+        templates: In-memory template map.
+        rejected: Rejected-template memory map.
+        schema: Schema graph for validation.
+        choice_port: Optional programmatic session receiving turn outcomes.
+        persist_template_learning: Whether writer mode may persist learning.
+        schema_context: Engine execution context for consumer scope gates.
+        visible_objects: Consumer-visible object set.
+        schema_role: ``owner`` or ``consumer``.
+        space_allowed_tables: AetherSpace table allow-list.
+        space_allowed_columns: AetherSpace column allow-list.
+
+    Returns:
+
+        :class:`SqlGenerationOutcome` for the executed query.
+
+    Raises:
+
+        ConfigError: When no template matches *question_old* or bind values are invalid.
+    """
+    resolved = resolve_template_for_question(question_old, templates, template_store=store)
+    if resolved is None:
+        raise ConfigError(f"No stored template matches question {question_old!r}")
+    ref_tmpl, hist_idx = resolved
+    q_new_norm = normalize_question(question_new)
+    expected_handles = set(handles_referenced_in_sql_param(ref_tmpl.sql_param or ""))
+    for key in new_values:
+        if key not in expected_handles:
+            raise ConfigError(f"Unknown parameter handle {key!r} for template {ref_tmpl.id}")
+    base_row = (
+        dict(ref_tmpl.value_history.param_values[hist_idx])
+        if ref_tmpl.value_history.param_values and hist_idx < len(ref_tmpl.value_history.param_values)
+        else {}
+    )
+    merged = dict(base_row)
+    merged.update(new_values)
+    outcome = execute_reuse_with_params(
+        q_new_norm,
+        ref_tmpl,
+        merged,
+        dialect,
+        store,
+        templates,
+        rejected,
+        schema,
+        choice_port=choice_port,
+        reuse_row_idx=hist_idx,
+        reuse_path=GenerationPath.EXACT_QUESTION_REUSE,
+        matched_idx=-1,
+        literal_structural_only=False,
+        form_storage=QuestionFormStorage(corrected=question_new.strip()),
+        persist_template_learning=persist_template_learning,
+        schema_context=schema_context,
+        visible_objects=visible_objects,
+        schema_role=schema_role,
+        space_allowed_tables=space_allowed_tables,
+        space_allowed_columns=space_allowed_columns,
+        prompt=False,
+        record_question=q_new_norm,
+        on_param_incomplete="raise",
+    )
+    if outcome is None or not outcome.success:
+        raise ConfigError("Forced template reuse failed validation or execution")
+    return outcome
+
+
+def handle_direct_sql_reuse(
+    q_norm: str,
+    ref_tmpl: Template,
+    dialect: Any,
+    store: dict[str, Any] | TemplateStoreView,
+    templates: dict[str, Any],
+    rejected: dict[str, Any],
+    schema: SchemaGraph,
+    existing_nl: str | None = None,
+    choice_port: InteractiveChoicePort | None = None,
+    reuse_history_index: int | None = None,
+    form_storage: QuestionFormStorage | None = None,
+    persist_template_learning: bool = True,
+    schema_context: EngineContext | None = None,
+    visible_objects: frozenset[str] | None = None,
+    schema_role: str = "owner",
+    space_allowed_tables: frozenset[str] | None = None,
+    space_allowed_columns: frozenset[str] | None = None,
+) -> SqlGenerationOutcome | None:
+    """Reuse a template’s SQL: extract params, validate, execute, and. record feedback."""
+    vh = ref_tmpl.value_history
+    matched_idx = -1
+    for i, hist_q in enumerate(vh.questions):
+        if hist_q and q_norm == hist_q:
+            matched_idx = i
+            break
+
+    literal_structural_only = False
+    reuse_row_idx = 0
+    if matched_idx >= 0:
+        new_params = dict(vh.param_values[matched_idx])
+        debug(f"[{ASK_PHASE_A}] zero_distance_match: index={matched_idx}")
+        reuse_row_idx = matched_idx
+    else:
+        hi = reuse_history_index
+        if hi is None:
+            if vh.questions:
+                freq_q = Counter(vh.questions).most_common(1)[0][0]
+                hi = vh.questions.index(freq_q)
+            else:
+                hi = 0
+        reuse_row_idx = hi
+        prev_row = vh.param_values[hi] if hi < len(vh.param_values) else {}
+        literal_structural_only = _row_structural_values_match_defaults(
+            prev_row,
+            getattr(ref_tmpl, "structural_defaults", None),
+            ref_tmpl.sql_param or "",
+        )
+        new_params = (
+            _extract_reuse_params_literal_only(q_norm, ref_tmpl, history_index=hi)
+            if literal_structural_only
+            else _extract_reuse_params_full(q_norm, ref_tmpl, history_index=hi)
+        )
+        debug(f"[{ASK_PHASE_A}] llm_reuse_extraction: {len(new_params)} params")
+
+    reuse_path = (
+        GenerationPath.EXACT_QUESTION_REUSE
+        if matched_idx >= 0
+        else (
+            GenerationPath.FUZZY_REUSE_LITERAL_STRUCTURAL
+            if literal_structural_only
+            else GenerationPath.FUZZY_REUSE_FULL_PARAMS
+        )
+    )
+    return execute_reuse_with_params(
+        q_norm,
+        ref_tmpl,
+        new_params,
+        dialect,
+        store,
+        templates,
+        rejected,
+        schema,
+        existing_nl=existing_nl,
+        choice_port=choice_port,
+        reuse_row_idx=reuse_row_idx,
+        reuse_path=reuse_path,
+        matched_idx=matched_idx,
+        literal_structural_only=literal_structural_only,
+        form_storage=form_storage,
+        persist_template_learning=persist_template_learning,
+        schema_context=schema_context,
+        visible_objects=visible_objects,
+        schema_role=schema_role,
+        space_allowed_tables=space_allowed_tables,
+        space_allowed_columns=space_allowed_columns,
+        prompt=True,
+        record_question=None,
+        on_param_incomplete="return_none",
+    )
+
+
 def _intent_decline_feedback_bucket(
     intent: RuntimeIntent,
-    store: dict[str, Any],
+    store: dict[str, Any] | TemplateStoreView,
     q_norm: str,
     schema: SchemaGraph | None,
     choice_port: InteractiveChoicePort | None,
@@ -3175,7 +3155,6 @@ def _intent_decline_feedback_bucket(
     persist_template_learning: bool = True,
 ) -> str | None:
     """Collect optional decline text, persist intent rejection feedback, and return the bucket label."""
-
     if not q_norm or schema is None:
         return None
     if getattr(intent, "schema_invalid", False):
@@ -3209,7 +3188,7 @@ def _intent_decline_feedback_bucket(
         kind=FeedbackKind.INTENT_REJECTED,
         schema_hash=schema.effective_structural_hash,
         user_reason=feedback or default_user_reason,
-        sql=None,
+        sql=render_feedback_sql(intent, schema),
     )
     if persist_template_learning:
         record_question_feedback(store, q_norm, entry)
@@ -3217,6 +3196,7 @@ def _intent_decline_feedback_bucket(
     else:
         ev = WriteQueueEvent(
             kind="feedback_record",
+            schema_graph_id=str(schema.schema_graph_id or ""),
             schema_hash=str(schema.effective_structural_hash or ""),
             produced_at=datetime.now(timezone.utc).isoformat(),
             payload=(
@@ -3227,7 +3207,7 @@ def _intent_decline_feedback_bucket(
         _emit_reader_write_queue_event(store, ev)
     ctx_ref = _refinement_ctx_for_feedback(choice_port, refinement_ctx)
     reason_line = (feedback or "").strip() or default_user_reason
-    if ctx_ref is not None and _refinement_retry_available(ctx_ref):
+    if ctx_ref is not None and refinement_retry_available(ctx_ref):
         ctx_ref.accumulated_reasons.append(reason_line)
         ctx_ref.pending_retry = True
         raise RefinementRetry
@@ -3238,7 +3218,6 @@ def compose_intent_confirm_session_message(
     intent: RuntimeIntent, semantic_warnings: list[Any] | None
 ) -> tuple[str, tuple[str, ...]]:
     """Build the multi-line intent-confirmation body and parallel structured warning strings."""
-
     parts: list[str] = []
     warn_out: list[str] = []
     if getattr(intent, "schema_invalid", False):
@@ -3263,7 +3242,7 @@ def compose_intent_confirm_session_message(
 
 def confirm_intent_with_user(
     intent: RuntimeIntent,
-    store: dict[str, Any],
+    store: dict[str, Any] | TemplateStoreView,
     semantic_warnings: list[Any] | None = None,
     similarity_score: float = 0.0,
     has_union_match: bool = False,
@@ -3278,51 +3257,14 @@ def confirm_intent_with_user(
     persist_template_learning: bool = True,
     force_intent_confirm: bool = False,
 ) -> bool:
-    """
-    Prompt for intent confirmation or auto-proceed from similarity and warnings.
-
-    Args:
-
-        intent: Intent to show the user.
-
-        store: Template store; saved if user declines.
-
-        semantic_warnings: Optional warning strings or dict payloads from the parser.
-
-        similarity_score: Score for auto-proceed when no union match.
-
-        has_union_match: Whether a union template match exists.
-
-        cols_changed: True when path 4 changed select columns vs template.
-
-        rejected: Rejected templates for negative-memory gating; optional for legacy callers.
-
-        q_norm: Normalised question for failure-memory logging on decline.
-
-        schema: Schema graph for failure-memory logging on decline.
-
-        choice_port: Optional programmatic yes/no port.
-
-        suspend_tail: Snapshot required to resume after a programmatic suspend.
-
-        intent_already_confirmed: When True, the user already answered the consolidated prompt on resume.
-
-        refinement_ctx: Optional turn-local refinement bag for stdin declines without a suspended prompt.
-
-        persist_template_learning: When False, skip ``save_template_store`` on certain decline paths.
-
-        force_intent_confirm: When True, always prompt (or consume ``choice_port``) instead of auto-proceed via skip rules.
-
-    Returns:
-
-        True if user confirms or auto-proceed applies; False if declined.
-    """
-
+    """Prompt for intent confirmation or auto-proceed from similarity. and warnings."""
     if intent_already_confirmed:
         return True
-    if not force_intent_confirm and should_skip_intent_confirmation(intent, store, q_norm or "", semantic_warnings):
+    if not force_intent_confirm and should_skip_intent_confirmation(
+        intent, cast(dict[str, Any] | None, store), q_norm or "", semantic_warnings
+    ):
         debug(
-            f"[pipeline.confirm_intent_with_user] auto_proceed: similarity={similarity_score:.3f} "
+            f"[{ASK_PHASE_H}] auto_proceed: similarity={similarity_score:.3f} "
             f"has_union={has_union_match} cols_changed={cols_changed}"
         )
         return True
@@ -3342,7 +3284,7 @@ def confirm_intent_with_user(
         choice_port=choice_port,
     )
     if intent_choice is None or intent_choice != "y":
-        debug("[pipeline.confirm_intent_with_user] user_rejected_intent")
+        debug(f"[{ASK_PHASE_H}] user_rejected_intent")
         if getattr(intent, "schema_invalid", False):
             if persist_template_learning:
                 save_template_store(store)
@@ -3363,9 +3305,8 @@ def confirm_intent_with_user(
             save_template_store(store)
         print_rephrase_hint(RephraseHint.USER_REJECTED_INTENT, rejection_bucket=rejection_bucket)
         return False
-    debug("[pipeline.confirm_intent_with_user] user_confirmed_intent")
-    if getattr(intent, "schema_invalid", False):
-        intent.schema_invalid = False
+    debug(f"[{ASK_PHASE_H}] user_confirmed_intent")
+    clear_planner_schema_invalid_after_user_accept(intent)
     return True
 
 
@@ -3378,7 +3319,6 @@ def _final_display_sql_for_results(
     template_display_alias_map: dict[str, str] | None = None,
 ) -> str:
     """Resolve executable display SQL for printing or CSV export."""
-
     if intent.expected_rows == "one":
         display_param = intent.sql_param or ""
     elif not (intent.select_cols or []):
@@ -3414,7 +3354,7 @@ def _final_display_sql_for_results(
 
 
 def build_result_dataframe(
-    rows: list[tuple],
+    rows: list[tuple[Any, ...]],
     intent: RuntimeIntent,
     sql: str,
     structural_defaults: dict[str, Any] | None = None,
@@ -3423,7 +3363,6 @@ def build_result_dataframe(
     template_display_alias_map: dict[str, str] | None = None,
 ) -> pandas.DataFrame | None:
     """Build a row-level ``DataFrame`` for programmatic session steps, or ``None`` for scalar grain."""
-
     if intent.grain == "scalar":
         return None
     display_sql = _final_display_sql_for_results(
@@ -3443,13 +3382,12 @@ def display_final_results_to_stdout(
     q_norm: str,
     intent: RuntimeIntent,
     sql: str,
-    rows: list[tuple],
+    rows: list[tuple[Any, ...]],
     structural_defaults: dict[str, Any] | None = None,
     *,
     template_display_alias_map: dict[str, str] | None = None,
 ) -> None:
     """Print result rows to stdout using the resolved display SQL."""
-
     display_sql = _final_display_sql_for_results(
         intent,
         sql,
@@ -3460,51 +3398,15 @@ def display_final_results_to_stdout(
     print_query_result(rows, display_sql, headers=extract_column_headers(display_sql))
 
 
-def display_final_results(
-    q_norm: str,
-    intent: RuntimeIntent,
-    sql: str,
-    rows: list[tuple],
-    structural_defaults: dict[str, Any] | None = None,
-    *,
-    emit_print: bool = True,
-    template_display_alias_map: dict[str, str] | None = None,
-) -> None:
-    """Optionally print rows using the resolved display SQL."""
-
-    if emit_print:
-        display_sql = _final_display_sql_for_results(
-            intent,
-            sql,
-            structural_defaults,
-            q_norm=q_norm,
-            template_display_alias_map=template_display_alias_map,
-        )
-        print_query_result(rows, display_sql, headers=extract_column_headers(display_sql))
-
-
 def save_result_csv(df: pandas.DataFrame) -> None:
     """Write *df* to ``results.csv`` in the process working directory."""
-
     output_path = os.path.join(os.getcwd(), "results.csv")
     df.to_csv(output_path, index=False)
-    log(f"results saved to {output_path}")
+    debug(f"results saved to {output_path}")
 
 
 def _shape_distance(a: SQLShape, b: SQLShape) -> float:
-    """
-    Compute distance between two SQL shapes.
-
-    Args:
-
-        a: Expected `SQLShape`.
-
-        b: Actual `SQLShape`.
-
-    Returns:
-
-        Float in [0, 1] combining normalised join-count difference, group-by mismatch, and aggregation mismatch, each weighted by 1/3.
-    """
+    """Compute distance between two SQL shapes."""
     d = 0.0
     d += (1.0 / 3.0) * min(1.0, abs(a.num_joins - b.num_joins) / 4.0)
     d += (1.0 / 3.0) * (0.0 if a.has_group_by == b.has_group_by else 1.0)

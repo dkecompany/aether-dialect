@@ -7,31 +7,33 @@ from unittest import mock
 import pytest
 
 from aetherdialect._config import EngineConfig
-from aetherdialect._config import ExpansionOperatorId as Op
+from aetherdialect._constants import ExpansionOperatorId
 from aetherdialect._contracts_base import (
-    ColumnMetadata,
     ColumnRole,
-    ExpansionMetadata,
-    FKEdge,
-    SchemaGraph,
-    TableMetadata,
-    TableRole,
-)
-from aetherdialect._contracts_core import (
-    CaseRegistryStep,
-    CaseWhenBranch,
-    CaseWhenExpr,
     ExprValue,
     FilterParam,
     HavingParam,
     NormalizedExpr,
     OrderByCol,
+    TableRole,
+    expr_registry_ref,
+)
+from aetherdialect._contracts_core import (
     RuntimeCteStep,
     SeedWarmupIntent,
     SelectCol,
+)
+from aetherdialect._contracts_schema import (
+    CaseRegistryStep,
+    CaseWhenBranch,
+    CaseWhenExpr,
+    ColumnMetadata,
+    ExpansionMetadata,
+    FKEdge,
+    SchemaGraph,
+    TableMetadata,
     WindowRegistryStep,
     WindowSpec,
-    expr_registry_ref,
 )
 from aetherdialect._expansion_ops import (
     _add_expansion_metadata,
@@ -87,13 +89,17 @@ from aetherdialect._expansion_ops import (
     _window_sum_partition_add,
     expand_gold_intents,
 )
-from aetherdialect._schema import assign_column_ops
+from aetherdialect._schema_catalog import assign_column_ops
 from aetherdialect._utils import intent_key
 
 
 def _all_operator_id_strings() -> set[str]:
-    """Return every public string constant on `ExpansionOperatorId`."""
-    return {getattr(Op, name) for name in dir(Op) if not name.startswith("_") and isinstance(getattr(Op, name), str)}
+    """Return every public string constant on ``ExpansionOperatorId``."""
+    return {
+        getattr(ExpansionOperatorId, name)
+        for name in dir(ExpansionOperatorId)
+        if not name.startswith("_") and isinstance(getattr(ExpansionOperatorId, name), str)
+    }
 
 
 def _warmup_intent(**overrides) -> SeedWarmupIntent:
@@ -121,37 +127,37 @@ class TestAddExpansionMetadata:
     def test_first_expansion(self):
         """First expansion sets depth=1 and single-element path."""
         intent = _warmup_intent()
-        _add_expansion_metadata(intent, Op.FILTER_ADD)
+        _add_expansion_metadata(intent, ExpansionOperatorId.FILTER_ADD)
         meta = intent.expansion_metadata
         assert meta is not None
-        assert meta.operator == Op.FILTER_ADD
+        assert meta.operator == ExpansionOperatorId.FILTER_ADD
         assert meta.depth == 1
-        assert meta.expansion_path == [Op.FILTER_ADD]
+        assert meta.expansion_path == [ExpansionOperatorId.FILTER_ADD]
 
     def test_second_expansion(self):
         """Second expansion increments depth and appends to path."""
         intent = _warmup_intent()
-        _add_expansion_metadata(intent, Op.FILTER_ADD)
-        _add_expansion_metadata(intent, Op.GROUPBY_ADD)
+        _add_expansion_metadata(intent, ExpansionOperatorId.FILTER_ADD)
+        _add_expansion_metadata(intent, ExpansionOperatorId.GROUPBY_ADD)
         meta = intent.expansion_metadata
         assert meta.depth == 2
-        assert meta.expansion_path == [Op.FILTER_ADD, Op.GROUPBY_ADD]
-        assert meta.operator == Op.GROUPBY_ADD
+        assert meta.expansion_path == [ExpansionOperatorId.FILTER_ADD, ExpansionOperatorId.GROUPBY_ADD]
+        assert meta.operator == ExpansionOperatorId.GROUPBY_ADD
 
     def test_parent_intent_id_propagated(self):
         """Second expansion inherits intent_id as parent when first parent is empty."""
         intent = _warmup_intent()
-        _add_expansion_metadata(intent, Op.FILTER_ADD)
+        _add_expansion_metadata(intent, ExpansionOperatorId.FILTER_ADD)
         assert intent.expansion_metadata.parent_intent_id == ""
-        _add_expansion_metadata(intent, Op.AGG_CHANGE)
+        _add_expansion_metadata(intent, ExpansionOperatorId.AGG_CHANGE)
         assert intent.expansion_metadata.parent_intent_id == "test_001"
 
     def test_third_expansion(self):
         """Three-deep expansion has correct depth and path length."""
         intent = _warmup_intent()
-        _add_expansion_metadata(intent, Op.FILTER_ADD)
-        _add_expansion_metadata(intent, Op.FILTER_EXPR_ADD)
-        _add_expansion_metadata(intent, Op.JOIN_DIMENSION_ADD)
+        _add_expansion_metadata(intent, ExpansionOperatorId.FILTER_ADD)
+        _add_expansion_metadata(intent, ExpansionOperatorId.FILTER_EXPR_ADD)
+        _add_expansion_metadata(intent, ExpansionOperatorId.JOIN_DIMENSION_ADD)
         meta = intent.expansion_metadata
         assert meta.depth == 3
         assert len(meta.expansion_path) == 3
@@ -161,12 +167,12 @@ class TestAddExpansionMetadata:
         intent = _warmup_intent(
             expansion_metadata=ExpansionMetadata(
                 parent_intent_id="original_parent",
-                operator=Op.FILTER_ADD,
+                operator=ExpansionOperatorId.FILTER_ADD,
                 depth=1,
-                expansion_path=[Op.FILTER_ADD],
+                expansion_path=[ExpansionOperatorId.FILTER_ADD],
             )
         )
-        _add_expansion_metadata(intent, Op.JOIN_DIMENSION_ADD)
+        _add_expansion_metadata(intent, ExpansionOperatorId.JOIN_DIMENSION_ADD)
         assert intent.expansion_metadata.parent_intent_id == "original_parent"
         assert intent.expansion_metadata.depth == 2
 
@@ -394,7 +400,6 @@ class TestGroupbyAdd:
 
     def test_adds_groupby(self, schema_graph):
         """Adds groupable columns."""
-
         intent = _warmup_intent(
             tables=["orders"],
             select_cols=[
@@ -483,7 +488,7 @@ class TestIncludeGold:
         intent = _warmup_intent(tables=["orders"])
         cm = _build_column_metadata(schema_graph)
         results = _include_gold(intent, schema_graph, cm)
-        assert results[0].expansion_metadata.operator == Op.INCLUDE_GOLD
+        assert results[0].expansion_metadata.operator == ExpansionOperatorId.INCLUDE_GOLD
 
 
 class TestTempExtractGroupby:

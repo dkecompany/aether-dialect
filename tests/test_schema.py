@@ -2,48 +2,55 @@
 
 from __future__ import annotations
 
-from aetherdialect._config import SCHEMA_OVERRIDES_VERSION, EngineConfig, PolicyConfig
+import pytest
+
+from aetherdialect._config import PolicyConfig
+from aetherdialect._constants import SCHEMA_OVERRIDES_VERSION
 from aetherdialect._contracts_base import (
-    ColumnMetadata,
     ColumnRole,
-    FKEdge,
+    EngineContext,
     SchemaAccessError,
-    SchemaContext,
-    SchemaGraph,
-    SchemaLimits,
-    SensitivityClassification,
-    TableMetadata,
     TableRole,
 )
+from aetherdialect._contracts_schema import (
+    ColumnMetadata,
+    FKEdge,
+    SchemaGraph,
+    SchemaLimits,
+    TableMetadata,
+)
 from aetherdialect._core_utils import schema_hash_fp
-from aetherdialect._schema import (
+from aetherdialect._schema_build import (
+    fingerprint_tables_after_document_round_trip,
+    first_table_where_stable_json_differs,
+    load_or_create_schema_postgresql,
+    merge_ddl_foreign_keys_into_schema_graph,
+    resolve_graph_table_name,
+    schema_cache_json_blob,
+    tables_meta_to_schema_graph,
+    tables_payload_through_model_round_trip,
+)
+from aetherdialect._schema_graph import (
     _analyze_fk_path_topology,
-    _apply_schema_context_allow_columns,
-    _edge_key,
-    _fingerprint_tables_after_document_round_trip,
-    _first_table_where_stable_json_differs,
-    _infer_missing_fks,
-    _infer_missing_pks_from_profile,
-    _mark_canonical_duplicates,
     _normalize_fk_path,
-    _notes_content_sha256,
-    _promote_semantic_edges_to_fks,
-    _recompute_join_paths_multi,
-    _resolve_graph_table_name,
     _reverse_fk_path,
-    _schema_cache_json_blob,
     _select_inferred_pk_candidate,
-    _strip_schema_context_denied_columns,
-    _table_from_dict,
-    _table_to_dict,
-    _tables_meta_to_schema_graph,
-    _tables_payload_through_model_round_trip,
-    _validate_scope_against_graph,
+    apply_schema_context_allow_columns,
     assign_schema_graph_hashes,
     compute_schema_limits,
     compute_schema_stats,
-    load_or_create_schema_postgresql,
-    merge_ddl_foreign_keys_into_schema_graph,
+    edge_key,
+    infer_missing_fks,
+    infer_missing_pks_from_profile,
+    mark_canonical_duplicates,
+    notes_content_sha256,
+    promote_cross_component_semantic_edges,
+    promote_same_component_semantic_edges,
+    recompute_join_paths_multi,
+    strip_schema_context_denied_columns,
+    table_from_dict,
+    table_to_dict,
+    validate_scope_against_graph,
 )
 
 
@@ -81,7 +88,6 @@ def _table(name, columns, **overrides) -> TableMetadata:
 
 def _ov_doc(**kwargs) -> dict:
     """Minimal valid v4 overrides document for :func:`apply_schema_overrides_to_graph` tests."""
-
     base: dict = {
         "version": SCHEMA_OVERRIDES_VERSION,
         "tables": {},
@@ -96,13 +102,11 @@ def _ov_doc(**kwargs) -> dict:
 
 def _odesc(text: str) -> str:
     """Editable description value (bare string)."""
-
     return text
 
 
 def _orole(value: str | None) -> str | None:
     """Editable role value (bare token or null)."""
-
     return value
 
 
@@ -191,27 +195,27 @@ class TestComputeSchemaLimits:
 
 
 class TestNotesContentSha256:
-    """Tests for _notes_content_sha256."""
+    """Tests for notes_content_sha256."""
 
     def test_none_is_empty_digest(self):
         """None notes hash the same as empty string."""
-        assert _notes_content_sha256(None) == _notes_content_sha256("")
+        assert notes_content_sha256(None) == notes_content_sha256("")
 
     def test_utf8_bytes(self):
         """Unicode notes use UTF-8 encoding for the digest."""
-        h = _notes_content_sha256("café")
+        h = notes_content_sha256("café")
         assert len(h) == 64
-        assert h != _notes_content_sha256("cafe")
+        assert h != notes_content_sha256("cafe")
 
 
 class TestTableDictRoundtrip:
-    """Tests for _table_to_dict / _table_from_dict roundtrip."""
+    """Tests for table_to_dict / table_from_dict roundtrip."""
 
     def test_roundtrip_preserves_name(self):
         """Table name should survive serialization roundtrip."""
         t = _table("orders", {"id": _col(name="id", is_primary_key=True)}, primary_key=["id"])
-        d = _table_to_dict(t)
-        restored = _table_from_dict(d)
+        d = table_to_dict(t)
+        restored = table_from_dict(d)
         assert restored.name == "orders"
 
     def test_roundtrip_preserves_columns(self):
@@ -223,8 +227,8 @@ class TestTableDictRoundtrip:
                 "b": _col(name="b", data_type="varchar"),
             },
         )
-        d = _table_to_dict(t)
-        restored = _table_from_dict(d)
+        d = table_to_dict(t)
+        restored = table_from_dict(d)
         assert set(restored.columns.keys()) == {"a", "b"}
         assert restored.columns["a"].data_type == "integer"
 
@@ -232,23 +236,23 @@ class TestTableDictRoundtrip:
         """Foreign keys should survive roundtrip."""
         fk = FKEdge(src_table="o", src_cols=["uid"], dst_table="u", dst_cols=["id"])
         t = _table("o", {"uid": _col(name="uid")}, foreign_keys=[fk])
-        d = _table_to_dict(t)
-        restored = _table_from_dict(d)
+        d = table_to_dict(t)
+        restored = table_from_dict(d)
         assert len(restored.foreign_keys) == 1
         assert restored.foreign_keys[0].dst_table == "u"
 
     def test_roundtrip_preserves_role(self):
         """Table role should survive roundtrip."""
         t = _table("t", {"c": _col(name="c")}, role=TableRole.FACT.value)
-        d = _table_to_dict(t)
-        restored = _table_from_dict(d)
+        d = table_to_dict(t)
+        restored = table_from_dict(d)
         assert restored.role == TableRole.FACT.value
 
     def test_roundtrip_preserves_row_count(self):
         """Row count should survive roundtrip."""
         t = _table("t", {"c": _col(name="c")}, row_count=42)
-        d = _table_to_dict(t)
-        restored = _table_from_dict(d)
+        d = table_to_dict(t)
+        restored = table_from_dict(d)
         assert restored.row_count == 42
 
 
@@ -424,7 +428,7 @@ class TestInferMissingFks:
                 primary_key=["customer_id"],
             ),
         }
-        inferred = _infer_missing_fks(tables)
+        inferred = infer_missing_fks(tables)
         assert len(inferred) == 1
         assert inferred[0].src_table == "orders"
         assert inferred[0].dst_table == "customer"
@@ -450,7 +454,7 @@ class TestInferMissingFks:
                 primary_key=["customer_id"],
             ),
         }
-        inferred = _infer_missing_fks(tables)
+        inferred = infer_missing_fks(tables)
         assert len(inferred) == 0
 
     def test_skips_pk_column(self):
@@ -464,7 +468,7 @@ class TestInferMissingFks:
                 primary_key=["customer_id"],
             ),
         }
-        inferred = _infer_missing_fks(tables)
+        inferred = infer_missing_fks(tables)
         assert len(inferred) == 0
 
     def test_no_match_returns_empty(self):
@@ -473,7 +477,7 @@ class TestInferMissingFks:
             "alpha": _table("alpha", {"foo": _col(name="foo")}),
             "beta": _table("beta", {"bar": _col(name="bar")}),
         }
-        inferred = _infer_missing_fks(tables)
+        inferred = infer_missing_fks(tables)
         assert inferred == []
 
     def test_suffix_infer_self_referential_parent_node_id(self):
@@ -488,7 +492,7 @@ class TestInferMissingFks:
                 primary_key=["node_id"],
             ),
         }
-        inferred = _infer_missing_fks(tables)
+        inferred = infer_missing_fks(tables)
         assert len(inferred) == 1
         assert inferred[0].src_table == "node"
         assert inferred[0].dst_table == "node"
@@ -513,7 +517,7 @@ class TestInferMissingFks:
                 primary_key=["id"],
             ),
         }
-        inferred = _infer_missing_fks(tables)
+        inferred = infer_missing_fks(tables)
         assert any(e.src_table == "event" and e.dst_table == "session" for e in inferred)
 
     def test_skips_when_target_has_no_primary_key(self):
@@ -526,7 +530,7 @@ class TestInferMissingFks:
                 primary_key=[],
             ),
         }
-        assert _infer_missing_fks(tables) == []
+        assert infer_missing_fks(tables) == []
 
     def test_suffix_match_case_insensitive_table_and_column(self):
         """Mixed-case table keys and column names still resolve suffix FKs."""
@@ -547,7 +551,7 @@ class TestInferMissingFks:
                 primary_key=["CustomerID"],
             ),
         }
-        inferred = _infer_missing_fks(tables)
+        inferred = infer_missing_fks(tables)
         assert len(inferred) == 1
         assert inferred[0].src_table == "Orders"
         assert inferred[0].src_cols == ["CustomerID"]
@@ -574,7 +578,7 @@ class TestInferMissingFks:
                 primary_key=["order_id", "line_no"],
             ),
         }
-        assert _infer_missing_fks(tables) == []
+        assert infer_missing_fks(tables) == []
 
     def test_view_as_fk_target_with_single_column_pk(self):
         """Views participate in suffix FK inference like tables when they expose a single PK column."""
@@ -593,7 +597,7 @@ class TestInferMissingFks:
             primary_key=["id"],
         )
         tables = {"customer_v": customer_v, "order_line": order_line}
-        inferred = _infer_missing_fks(tables)
+        inferred = infer_missing_fks(tables)
         assert any(e.src_table == "order_line" and e.dst_table == "customer_v" for e in inferred)
 
     def test_same_name_column_without_suffix_does_not_infer(self):
@@ -615,7 +619,7 @@ class TestInferMissingFks:
                 primary_key=["id"],
             ),
         }
-        assert _infer_missing_fks(tables) == []
+        assert infer_missing_fks(tables) == []
 
     def test_suffix_skips_when_profiled_types_incompatible(self):
         """Suffix heuristic skips when both columns have incompatible value_type."""
@@ -645,7 +649,7 @@ class TestInferMissingFks:
                 primary_key=["customer_id"],
             ),
         }
-        assert _infer_missing_fks(tables) == []
+        assert infer_missing_fks(tables) == []
 
 
 class TestInferMissingFksLongestPrefixAndOverlap:
@@ -673,7 +677,7 @@ class TestInferMissingFksLongestPrefixAndOverlap:
                 primary_key=["order_id"],
             ),
         }
-        inferred = _infer_missing_fks(tables)
+        inferred = infer_missing_fks(tables)
         assert len(inferred) == 1
         assert inferred[0].dst_table == "customers"
 
@@ -694,7 +698,7 @@ class TestInferMissingFksLongestPrefixAndOverlap:
                 primary_key=["order_id"],
             ),
         }
-        inferred = _infer_missing_fks(tables)
+        inferred = infer_missing_fks(tables)
         assert len(inferred) == 1
         assert inferred[0].dst_table == "customers"
 
@@ -709,7 +713,7 @@ class TestInferMissingFksLongestPrefixAndOverlap:
                     "customer_id": _col(
                         name="customer_id",
                         is_primary_key=True,
-                        top_k_values=dst_samples,
+                        value_overlap_sample=dst_samples,
                     )
                 },
                 primary_key=["customer_id"],
@@ -718,12 +722,12 @@ class TestInferMissingFksLongestPrefixAndOverlap:
                 "orders",
                 {
                     "order_id": _col(name="order_id", is_primary_key=True),
-                    "customer_id": _col(name="customer_id", top_k_values=src_samples),
+                    "customer_id": _col(name="customer_id", value_overlap_sample=src_samples),
                 },
                 primary_key=["order_id"],
             ),
         }
-        assert _infer_missing_fks(tables) == []
+        assert infer_missing_fks(tables) == []
 
     def test_overlap_validate_accepts_overlapping_samples(self):
         """Inferred FK should be retained when sampled values overlap above the threshold."""
@@ -735,7 +739,7 @@ class TestInferMissingFksLongestPrefixAndOverlap:
                     "customer_id": _col(
                         name="customer_id",
                         is_primary_key=True,
-                        top_k_values=shared,
+                        value_overlap_sample=shared,
                     )
                 },
                 primary_key=["customer_id"],
@@ -744,12 +748,12 @@ class TestInferMissingFksLongestPrefixAndOverlap:
                 "orders",
                 {
                     "order_id": _col(name="order_id", is_primary_key=True),
-                    "customer_id": _col(name="customer_id", top_k_values=shared),
+                    "customer_id": _col(name="customer_id", value_overlap_sample=shared),
                 },
                 primary_key=["order_id"],
             ),
         }
-        inferred = _infer_missing_fks(tables)
+        inferred = infer_missing_fks(tables)
         assert len(inferred) == 1
         assert inferred[0].dst_table == "customer"
 
@@ -770,11 +774,11 @@ class TestInferMissingFksLongestPrefixAndOverlap:
                 primary_key=["order_id"],
             ),
         }
-        inferred = _infer_missing_fks(tables)
+        inferred = infer_missing_fks(tables)
         assert len(inferred) == 1
 
     def test_string_int_compatible_when_string_samples_are_digits(self):
-        """String↔integer FK inference should be allowed when string-side samples are digit strings."""
+        """String↔integer FK inference should be allowed when string- side samples are digit strings."""
         digit_strs = [str(i) for i in range(1, 11)]
         tables = {
             "customer": _table(
@@ -785,7 +789,7 @@ class TestInferMissingFksLongestPrefixAndOverlap:
                         data_type="integer",
                         value_type="integer",
                         is_primary_key=True,
-                        top_k_values=digit_strs,
+                        frequent_values=digit_strs,
                     )
                 },
                 primary_key=["customer_id"],
@@ -798,13 +802,13 @@ class TestInferMissingFksLongestPrefixAndOverlap:
                         name="customer_id",
                         data_type="varchar",
                         value_type="string",
-                        top_k_values=digit_strs,
+                        frequent_values=digit_strs,
                     ),
                 },
                 primary_key=["order_id"],
             ),
         }
-        inferred = _infer_missing_fks(tables)
+        inferred = infer_missing_fks(tables)
         assert len(inferred) == 1
         assert inferred[0].dst_table == "customer"
 
@@ -819,7 +823,7 @@ class TestInferMissingFksLongestPrefixAndOverlap:
                         data_type="integer",
                         value_type="integer",
                         is_primary_key=True,
-                        top_k_values=["1", "2", "3"],
+                        frequent_values=["1", "2", "3"],
                     )
                 },
                 primary_key=["customer_id"],
@@ -832,13 +836,13 @@ class TestInferMissingFksLongestPrefixAndOverlap:
                         name="customer_id",
                         data_type="varchar",
                         value_type="string",
-                        top_k_values=["abc", "def", "ghi"],
+                        frequent_values=["abc", "def", "ghi"],
                     ),
                 },
                 primary_key=["order_id"],
             ),
         }
-        assert _infer_missing_fks(tables) == []
+        assert infer_missing_fks(tables) == []
 
 
 class TestInferMissingFksComposite:
@@ -866,7 +870,7 @@ class TestInferMissingFksComposite:
                 primary_key=["shipment_id"],
             ),
         }
-        inferred = _infer_missing_fks(tables)
+        inferred = infer_missing_fks(tables)
         composite = [e for e in inferred if e.inference_tag == "composite"]
         assert len(composite) == 1
         e = composite[0]
@@ -895,7 +899,7 @@ class TestInferMissingFksComposite:
                 primary_key=["shipment_id"],
             ),
         }
-        composite = [e for e in _infer_missing_fks(tables) if e.inference_tag == "composite"]
+        composite = [e for e in infer_missing_fks(tables) if e.inference_tag == "composite"]
         assert composite == []
 
     def test_skips_when_per_column_types_incompatible(self):
@@ -932,13 +936,13 @@ class TestInferMissingFksComposite:
                         name="line_no",
                         data_type="varchar",
                         value_type="string",
-                        top_k_values=["alpha", "beta"],
+                        frequent_values=["alpha", "beta"],
                     ),
                 },
                 primary_key=["shipment_id"],
             ),
         }
-        composite = [e for e in _infer_missing_fks(tables) if e.inference_tag == "composite"]
+        composite = [e for e in infer_missing_fks(tables) if e.inference_tag == "composite"]
         assert composite == []
 
     def test_skips_when_column_already_used_by_suffix_inference(self):
@@ -967,7 +971,7 @@ class TestInferMissingFksComposite:
                 primary_key=["shipment_id"],
             ),
         }
-        edges = _infer_missing_fks(tables)
+        edges = infer_missing_fks(tables)
         composite = [e for e in edges if e.inference_tag == "composite"]
         assert composite == []
         suffix = [e for e in edges if e.inference_tag == "suffix"]
@@ -986,12 +990,12 @@ class TestInferMissingFksComposite:
                 primary_key=["left_id", "right_id"],
             ),
         }
-        composite = [e for e in _infer_missing_fks(tables) if e.inference_tag == "composite"]
+        composite = [e for e in infer_missing_fks(tables) if e.inference_tag == "composite"]
         assert composite == []
 
 
 class TestTablesMetaToSchemaGraph:
-    """Tests for _tables_meta_to_schema_graph."""
+    """Tests for tables_meta_to_schema_graph."""
 
     def test_builds_tables(self):
         """Should create TableMetadata for each entry."""
@@ -1003,7 +1007,7 @@ class TestTablesMetaToSchemaGraph:
                 "foreign_keys": [],
             },
         }
-        sg = _tables_meta_to_schema_graph(meta)
+        sg = tables_meta_to_schema_graph(meta)
         assert "users" in sg.tables
         assert "user_id" in sg.tables["users"].columns
         assert sg.tables["users"].columns["user_id"].is_primary_key is True
@@ -1021,7 +1025,7 @@ class TestTablesMetaToSchemaGraph:
                 "column_is_nullable": [True, False],
             },
         }
-        sg = _tables_meta_to_schema_graph(meta)
+        sg = tables_meta_to_schema_graph(meta)
         assert sg.tables["t"].columns["id"].is_nullable is False
         assert sg.tables["t"].columns["note"].is_nullable is False
 
@@ -1035,7 +1039,7 @@ class TestTablesMetaToSchemaGraph:
                 "foreign_keys": [],
             },
         }
-        sg = _tables_meta_to_schema_graph(meta)
+        sg = tables_meta_to_schema_graph(meta)
         assert sg.tables["t"].columns["id"].is_nullable is False
         assert sg.tables["t"].columns["name"].is_nullable is True
 
@@ -1061,7 +1065,7 @@ class TestTablesMetaToSchemaGraph:
                 "foreign_keys": [],
             },
         }
-        sg = _tables_meta_to_schema_graph(meta)
+        sg = tables_meta_to_schema_graph(meta)
         assert "orders" in sg.join_paths_multi
         assert "users" in sg.join_paths_multi["orders"]
         assert len(sg.join_paths_multi["orders"]["users"]) >= 1
@@ -1076,7 +1080,7 @@ class TestTablesMetaToSchemaGraph:
                 "foreign_keys": [],
             },
         }
-        sg = _tables_meta_to_schema_graph(meta)
+        sg = tables_meta_to_schema_graph(meta)
         assert sg.join_paths_multi["t"]["t"] == [[]]
 
     def test_schema_hash_is_set(self):
@@ -1089,7 +1093,7 @@ class TestTablesMetaToSchemaGraph:
                 "foreign_keys": [],
             },
         }
-        sg = _tables_meta_to_schema_graph(meta)
+        sg = tables_meta_to_schema_graph(meta)
         assert sg.schema_hash
         assert isinstance(sg.schema_hash, str)
 
@@ -1115,7 +1119,7 @@ class TestTablesMetaToSchemaGraph:
                 "foreign_keys": [],
             },
         }
-        sg = _tables_meta_to_schema_graph(meta)
+        sg = tables_meta_to_schema_graph(meta)
         assert sg.tables["orders"].columns["user_id"].is_foreign_key is True
         assert sg.tables["orders"].columns["user_id"].fk_target == ("users", "uid")
 
@@ -1135,7 +1139,7 @@ class TestTablesMetaToSchemaGraph:
                 ],
             },
         }
-        sg = _tables_meta_to_schema_graph(meta)
+        sg = tables_meta_to_schema_graph(meta)
         assert "film" in sg.tables
         assert sg.join_paths_multi["film"]["film"] == [[]]
 
@@ -1151,35 +1155,35 @@ class TestTablesMetaToSchemaGraph:
                 "partition_columns": ["dt"],
             },
         }
-        sg = _tables_meta_to_schema_graph(meta)
+        sg = tables_meta_to_schema_graph(meta)
         t = sg.tables["parted"]
         assert t.partition_columns == ["dt"]
         assert t.columns["dt"].is_unique is True
 
 
 class TestEdgeKey:
-    """Tests for _edge_key."""
+    """Tests for edge_key."""
 
     def test_produces_stable_tuple(self):
-        """_edge_key returns stable sortable tuple."""
+        """edge_key returns stable sortable tuple."""
         e = FKEdge(
             src_table="orders",
             src_cols=["customer_id"],
             dst_table="customers",
             dst_cols=["id"],
         )
-        key = _edge_key(e)
+        key = edge_key(e)
         assert key == ("orders", ("customer_id",), "customers", ("id",))
 
     def test_composite_key(self):
-        """_edge_key handles composite src and dst cols."""
+        """edge_key handles composite src and dst cols."""
         e = FKEdge(
             src_table="t1",
             src_cols=["a", "b"],
             dst_table="t2",
             dst_cols=["x", "y"],
         )
-        key = _edge_key(e)
+        key = edge_key(e)
         assert key[1] == ("a", "b")
         assert key[3] == ("x", "y")
 
@@ -1206,7 +1210,7 @@ class TestComputeSchemaStatsEdgeCases:
                 "foreign_keys": [],
             },
         }
-        sg = _tables_meta_to_schema_graph(meta)
+        sg = tables_meta_to_schema_graph(meta)
         assert sg.tables["wide"].columns["b"].data_type == "UNKNOWN"
 
 
@@ -1245,7 +1249,7 @@ class TestMergeDdlForeignKeys:
                 "foreign_keys": [],
             },
         }
-        sg = _tables_meta_to_schema_graph(tables_meta)
+        sg = tables_meta_to_schema_graph(tables_meta)
         assert sg.join_paths_multi["child"]["parent"] == []
         ddl = {
             "child": {
@@ -1273,7 +1277,7 @@ class TestMergeDdlForeignKeys:
                 "foreign_keys": [],
             },
         }
-        sg = _tables_meta_to_schema_graph(meta)
+        sg = tables_meta_to_schema_graph(meta)
         h_before = sg.schema_hash
         merge_ddl_foreign_keys_into_schema_graph(sg, {})
         assert sg.schema_hash == h_before
@@ -1298,7 +1302,7 @@ class TestMergeDdlForeignKeys:
                 "foreign_keys": [],
             },
         }
-        sg = _tables_meta_to_schema_graph(meta)
+        sg = tables_meta_to_schema_graph(meta)
         ddl = {
             "child": {
                 "foreign_keys": [
@@ -1335,7 +1339,7 @@ class TestMergeDdlForeignKeys:
                 "foreign_keys": [],
             },
         }
-        sg = _tables_meta_to_schema_graph(meta)
+        sg = tables_meta_to_schema_graph(meta)
         n = len(sg.tables["child"].foreign_keys)
         merge_ddl_foreign_keys_into_schema_graph(
             sg,
@@ -1369,7 +1373,7 @@ class TestMergeDdlForeignKeys:
                 "foreign_keys": [],
             },
         }
-        sg = _tables_meta_to_schema_graph(meta)
+        sg = tables_meta_to_schema_graph(meta)
         merge_ddl_foreign_keys_into_schema_graph(
             sg,
             {
@@ -1402,7 +1406,7 @@ class TestMergeDdlForeignKeys:
                 "foreign_keys": [],
             },
         }
-        sg = _tables_meta_to_schema_graph(meta)
+        sg = tables_meta_to_schema_graph(meta)
         merge_ddl_foreign_keys_into_schema_graph(
             sg,
             {
@@ -1426,8 +1430,6 @@ class TestLoadOrCreateSchemaPostgresqlDdlMerge:
     def test_merges_ddl_after_successful_reflect(self, monkeypatch, tmp_path):
         sql_path = tmp_path / "schema.sql"
         sql_path.write_text("-- stub\n", encoding="utf-8")
-        monkeypatch.setattr(EngineConfig.RUNTIME, "SQL_FILE_PATH", str(sql_path), raising=False)
-
         tables_meta = {
             "child": {
                 "column_names_original": ["id", "parent_id"],
@@ -1442,10 +1444,10 @@ class TestLoadOrCreateSchemaPostgresqlDdlMerge:
                 "foreign_keys": [],
             },
         }
-        baseline = _tables_meta_to_schema_graph(tables_meta)
+        baseline = tables_meta_to_schema_graph(tables_meta)
 
         monkeypatch.setattr(
-            "aetherdialect._schema._reflect_schema",
+            "aetherdialect._schema_build._reflect_schema",
             lambda *a, **k: baseline,
         )
 
@@ -1460,28 +1462,54 @@ class TestLoadOrCreateSchemaPostgresqlDdlMerge:
                 ]
             }
         }
-        monkeypatch.setattr("aetherdialect._schema.parse_sql_file", lambda _p, **_kw: ddl)
+        monkeypatch.setattr("aetherdialect._schema_build.parse_sql_file", lambda _p, **_kw: ddl)
 
-        sg = load_or_create_schema_postgresql(None, include="tables")
+        sg = load_or_create_schema_postgresql(None, include="tables", sql_file=str(sql_path))
         assert len(sg.tables["child"].foreign_keys) == 1
         assert sg.tables["child"].foreign_keys[0].dst_table == "parent"
 
+    def test_merges_partition_columns_from_ddl(self, monkeypatch, tmp_path):
+        sql_path = tmp_path / "schema.sql"
+        sql_path.write_text("-- stub\n", encoding="utf-8")
+        tables_meta = {
+            "events": {
+                "column_names_original": ["id", "dt"],
+                "column_types": ["INTEGER", "DATE"],
+                "primary_keys": ["id"],
+                "foreign_keys": [],
+            },
+        }
+        baseline = tables_meta_to_schema_graph(tables_meta)
+        monkeypatch.setattr(
+            "aetherdialect._schema_build._reflect_schema",
+            lambda *a, **k: baseline,
+        )
+        monkeypatch.setattr(
+            "aetherdialect._schema_build.enrich_postgresql_partition_columns",
+            lambda *a, **k: None,
+        )
+        ddl = {"events": {"partition_columns": ["dt"]}}
+        monkeypatch.setattr("aetherdialect._schema_build.parse_sql_file", lambda _p, **_kw: ddl)
+
+        sg = load_or_create_schema_postgresql(None, include="tables", sql_file=str(sql_path))
+        assert sg.tables["events"].partition_columns == ["dt"]
+
 
 class TestResolveGraphTableName:
-    """Tests for _resolve_graph_table_name."""
+    """Tests for resolve_graph_table_name."""
 
     def test_exact_match(self):
-        assert _resolve_graph_table_name("orders", {"orders", "users"}) == "orders"
+        assert resolve_graph_table_name("orders", {"orders", "users"}) == "orders"
 
     def test_case_insensitive_fallback(self):
-        assert _resolve_graph_table_name("ORDERS", {"orders"}) == "orders"
+        assert resolve_graph_table_name("ORDERS", {"orders"}) == "orders"
 
     def test_unknown_returns_none(self):
-        assert _resolve_graph_table_name("missing", {"a"}) is None
+        assert resolve_graph_table_name("missing", {"a"}) is None
 
 
 class TestRecomputeJoinPathsMulti:
-    """Tests for _recompute_join_paths_multi."""
+    """Tests for recompute_join_paths_multi."""
 
     def test_matches_tables_meta_graph_paths(self):
         """Recompute from the same FK set yields consistent reachability."""
@@ -1499,8 +1527,8 @@ class TestRecomputeJoinPathsMulti:
                 "foreign_keys": [],
             },
         }
-        sg = _tables_meta_to_schema_graph(meta)
-        jp = _recompute_join_paths_multi(sg.tables)
+        sg = tables_meta_to_schema_graph(meta)
+        jp = recompute_join_paths_multi(sg.tables)
         assert jp["a"]["b"]
         assert jp["b"]["a"]
 
@@ -1509,30 +1537,30 @@ class TestSchemaCacheHelpers:
     """Pure JSON / fingerprint helpers used when writing schema cache."""
 
     def test_schema_cache_json_blob_sorted_keys(self):
-        blob = _schema_cache_json_blob({"z": 1, "a": 2})
+        blob = schema_cache_json_blob({"z": 1, "a": 2})
         assert blob.index('"a"') < blob.index('"z"')
 
     def test_tables_payload_round_trip_stable(self):
         tables = {
-            "t": _table_to_dict(_table("t", {"c": _col(name="c")})),
+            "t": table_to_dict(_table("t", {"c": _col(name="c")})),
         }
-        out = _tables_payload_through_model_round_trip(tables)
+        out = tables_payload_through_model_round_trip(tables)
         assert out["t"]["name"] == "t"
         assert "c" in out["t"]["columns"]
 
     def test_first_table_where_stable_json_differs(self):
         left = {"t": {"name": "t", "columns": {}}}
         right = {"t": {"name": "t", "columns": {"x": {}}}}
-        assert _first_table_where_stable_json_differs(left, right) == "t"
+        assert first_table_where_stable_json_differs(left, right) == "t"
 
     def test_first_table_where_stable_json_differs_none(self):
         t = {"name": "x"}
-        assert _first_table_where_stable_json_differs({"a": t}, {"a": t}) is None
+        assert first_table_where_stable_json_differs({"a": t}, {"a": t}) is None
 
     def test_fingerprint_tables_matches_direct_fp_when_json_stable(self):
         """Full-document JSON round-trip should not change tables fingerprint."""
         tables = {
-            "t": _table_to_dict(
+            "t": table_to_dict(
                 _table(
                     "t",
                     {"id": _col(name="id", is_primary_key=True)},
@@ -1549,12 +1577,12 @@ class TestSchemaCacheHelpers:
             "schema_stats": {},
             "notes_sha256": "",
         }
-        assert _fingerprint_tables_after_document_round_trip(cache_data) == schema_hash_fp(tables)
+        assert fingerprint_tables_after_document_round_trip(cache_data) == schema_hash_fp(tables)
 
     def test_first_table_differs_when_only_one_side_has_table(self):
         """Missing table on one side yields a slot mismatch for that name."""
         only_left = {"name": "only", "columns": {}}
-        assert _first_table_where_stable_json_differs({"t": only_left}, {}) == "t"
+        assert first_table_where_stable_json_differs({"t": only_left}, {}) == "t"
 
 
 def _pk_col(
@@ -1603,12 +1631,12 @@ class TestSelectInferredPkCandidate:
 
 
 class TestInferMissingPksFromProfile:
-    """Tests for _infer_missing_pks_from_profile."""
+    """Tests for infer_missing_pks_from_profile."""
 
     def test_single_candidate_with_arbitrary_name(self):
         cols = {"weird_uid": _pk_col("weird_uid")}
         tbl = _table("companies", cols, row_count=100)
-        result = _infer_missing_pks_from_profile({"companies": tbl})
+        result = infer_missing_pks_from_profile({"companies": tbl})
         assert result == [("companies", "weird_uid")]
         assert tbl.primary_key == ["weird_uid"]
         assert tbl.columns["weird_uid"].is_primary_key is True
@@ -1616,7 +1644,7 @@ class TestInferMissingPksFromProfile:
     def test_multiple_candidates_picks_id(self):
         cols = {"weird_uid": _pk_col("weird_uid"), "id": _pk_col("id")}
         tbl = _table("companies", cols, row_count=100)
-        result = _infer_missing_pks_from_profile({"companies": tbl})
+        result = infer_missing_pks_from_profile({"companies": tbl})
         assert result == [("companies", "id")]
         assert tbl.primary_key == ["id"]
 
@@ -1624,14 +1652,14 @@ class TestInferMissingPksFromProfile:
         cols = {"id": _pk_col("id", distinct=10)}
         tbl = _table("t", cols, row_count=10)
         assert int(PolicyConfig.INFERRED_PK_MIN_ROW_COUNT) > 10
-        result = _infer_missing_pks_from_profile({"t": tbl})
+        result = infer_missing_pks_from_profile({"t": tbl})
         assert result == []
         assert tbl.primary_key == []
 
     def test_declared_pk_preserved(self):
         cols = {"x": _pk_col("x"), "id": _pk_col("id")}
         tbl = _table("t", cols, primary_key=["x"], row_count=100)
-        result = _infer_missing_pks_from_profile({"t": tbl})
+        result = infer_missing_pks_from_profile({"t": tbl})
         assert result == []
         assert tbl.primary_key == ["x"]
         assert cols["id"].is_primary_key is False
@@ -1639,25 +1667,25 @@ class TestInferMissingPksFromProfile:
     def test_nullable_column_with_nulls_rejected(self):
         cols = {"id": _pk_col("id", is_nullable=True, null_ratio=0.1)}
         tbl = _table("t", cols, row_count=100)
-        result = _infer_missing_pks_from_profile({"t": tbl})
+        result = infer_missing_pks_from_profile({"t": tbl})
         assert result == []
 
     def test_value_type_filter_rejects_boolean(self):
         cols = {"id": _pk_col("id", value_type="boolean")}
         tbl = _table("t", cols, row_count=100)
-        result = _infer_missing_pks_from_profile({"t": tbl})
+        result = infer_missing_pks_from_profile({"t": tbl})
         assert result == []
 
     def test_distinct_count_must_equal_row_count(self):
         cols = {"id": _pk_col("id", distinct=99)}
         tbl = _table("t", cols, row_count=100)
-        result = _infer_missing_pks_from_profile({"t": tbl})
+        result = infer_missing_pks_from_profile({"t": tbl})
         assert result == []
 
     def test_sample_distinct_without_dialect_skips_inference(self):
         cols = {"id": _pk_col("id", distinct_from_sample=True)}
         tbl = _table("t", cols, row_count=100)
-        assert _infer_missing_pks_from_profile({"t": tbl}) == []
+        assert infer_missing_pks_from_profile({"t": tbl}) == []
 
     def test_sample_distinct_confirmed_by_dialect_infers_pk(self):
         cols = {"id": _pk_col("id", distinct_from_sample=True)}
@@ -1667,11 +1695,11 @@ class TestInferMissingPksFromProfile:
             def refresh_full_table_distinct_for_pk_inference(self, *_a, **_k):
                 return (100, 100, 0.0)
 
-        assert _infer_missing_pks_from_profile({"t": tbl}, dialect=_D()) == [("t", "id")]
+        assert infer_missing_pks_from_profile({"t": tbl}, dialect=_D()) == [("t", "id")]
 
 
 class TestInferMissingFksAfterPkInference:
-    """The FK suffix inferer must produce edges against PKs created by _infer_missing_pks_from_profile."""
+    """The FK suffix inferer must produce edges against PKs created by infer_missing_pks_from_profile."""
 
     def test_suffix_fk_inferred_after_pk_inference(self):
         parent_cols = {"customer_id": _pk_col("customer_id")}
@@ -1682,10 +1710,10 @@ class TestInferMissingFksAfterPkInference:
         }
         child = _table("orders", child_cols, row_count=100)
         tables = {"customer": parent, "orders": child}
-        before = _infer_missing_fks(tables)
+        before = infer_missing_fks(tables)
         assert before == []
-        _infer_missing_pks_from_profile(tables)
-        after = _infer_missing_fks(tables)
+        infer_missing_pks_from_profile(tables)
+        after = infer_missing_fks(tables)
         assert len(after) == 1
         edge = after[0]
         assert edge.src_table == "orders"
@@ -1695,10 +1723,14 @@ class TestInferMissingFksAfterPkInference:
 
 
 class TestPromoteSemanticEdgesToFks:
-    """Tests for _promote_semantic_edges_to_fks."""
+    """Tests for cross-component and same-component semantic FK promotion."""
 
     def _graph(self, tables: dict[str, TableMetadata]) -> SchemaGraph:
         return SchemaGraph(tables=tables, join_paths_multi={}, effective_structural_hash="x")
+
+    @staticmethod
+    def _promote_all(sg: SchemaGraph) -> int:
+        return promote_cross_component_semantic_edges(sg) + promote_same_component_semantic_edges(sg)
 
     def test_one_side_pk_promotes_correctly(self):
         a_cols = {
@@ -1716,7 +1748,7 @@ class TestPromoteSemanticEdgesToFks:
         a = _table("a", a_cols)
         b = _table("b", b_cols, primary_key=["id"])
         sg = self._graph({"a": a, "b": b})
-        promoted = _promote_semantic_edges_to_fks(sg)
+        promoted = self._promote_all(sg)
         assert promoted == 1
         assert len(a.foreign_keys) == 1
         edge = a.foreign_keys[0]
@@ -1739,7 +1771,7 @@ class TestPromoteSemanticEdgesToFks:
         a = _table("a", a_cols)
         b = _table("b", b_cols)
         sg = self._graph({"a": a, "b": b})
-        assert _promote_semantic_edges_to_fks(sg) == 0
+        assert self._promote_all(sg) == 0
         assert a.foreign_keys == []
         assert b.foreign_keys == []
         assert a_cols["x"].semantic_join_neighbors == [("b", "y")]
@@ -1770,7 +1802,7 @@ class TestPromoteSemanticEdgesToFks:
         a = _table("a", a_cols, primary_key=["b_id"])
         b = _table("b", b_cols, primary_key=["a_id"])
         sg = self._graph({"a": a, "b": b})
-        promoted = _promote_semantic_edges_to_fks(sg)
+        promoted = self._promote_all(sg)
         assert promoted == 1
         assert len(a.foreign_keys) == 1
         edge = a.foreign_keys[0]
@@ -1785,7 +1817,7 @@ class TestPromoteSemanticEdgesToFks:
         a = _table("a", a_cols)
         b = _table("b", b_cols, primary_key=["id"])
         sg = self._graph({"a": a, "b": b})
-        assert _promote_semantic_edges_to_fks(sg) == 0
+        assert self._promote_all(sg) == 0
         assert a.foreign_keys == []
         assert a_cols["x"].semantic_join_neighbors == [("b", "id")]
 
@@ -1805,7 +1837,7 @@ class TestPromoteSemanticEdgesToFks:
         a = _table("a", a_cols)
         b = _table("b", b_cols, primary_key=["id"])
         sg = self._graph({"a": a, "b": b})
-        promoted = _promote_semantic_edges_to_fks(sg)
+        promoted = self._promote_all(sg)
         assert promoted == 1
         assert len(a.foreign_keys) == 1
         edge = a.foreign_keys[0]
@@ -1832,7 +1864,7 @@ class TestPromoteSemanticEdgesToFks:
         a = _table("a", a_cols)
         b = _table("b", b_cols, primary_key=["id"])
         sg = self._graph({"a": a, "b": b})
-        promoted = _promote_semantic_edges_to_fks(sg)
+        promoted = self._promote_all(sg)
         assert promoted == 1
         assert len(a.foreign_keys) == 1
         assert a.foreign_keys[0].src_cols == ["b_id"]
@@ -1849,9 +1881,9 @@ class TestSchemaHashInvarianceForInferredPk:
             tbl = _table("t", cols, row_count=100)
         tables = {"t": tbl}
         if not declared:
-            _infer_missing_pks_from_profile(tables)
+            infer_missing_pks_from_profile(tables)
         sg = SchemaGraph(tables=tables, join_paths_multi={}, effective_structural_hash="")
-        ctx = SchemaContext()
+        ctx = EngineContext()
         assign_schema_graph_hashes(sg, ctx, notes_sha256="")
         return sg
 
@@ -1865,7 +1897,7 @@ class TestSchemaHashInvarianceForInferredPk:
 
 
 class TestStripSchemaContextDeniedColumns:
-    """Tests for :func:`_strip_schema_context_denied_columns` removing denied columns from the graph."""
+    """Tests for :func:`strip_schema_context_denied_columns` removing denied columns from the graph."""
 
     def _build(self) -> SchemaGraph:
         contacts_cols = {
@@ -1888,31 +1920,31 @@ class TestStripSchemaContextDeniedColumns:
 
     def test_qualified_removes_only_named_table_column(self):
         sg = self._build()
-        ctx = SchemaContext(deny_columns=frozenset({"contacts.email"}))
-        _strip_schema_context_denied_columns(sg, ctx)
+        ctx = EngineContext(deny_columns=frozenset({"contacts.email"}))
+        strip_schema_context_denied_columns(sg, ctx)
         assert sg.deny_columns == {}
         assert "email" not in sg.tables["contacts"].columns
         assert "email" in sg.tables["companies"].columns
 
     def test_glob_removes_column_across_tables(self):
         sg = self._build()
-        ctx = SchemaContext(deny_columns=frozenset({"*.email"}))
-        _strip_schema_context_denied_columns(sg, ctx)
+        ctx = EngineContext(deny_columns=frozenset({"*.email"}))
+        strip_schema_context_denied_columns(sg, ctx)
         assert "email" not in sg.tables["contacts"].columns
         assert "email" not in sg.tables["companies"].columns
         assert "name" in sg.tables["contacts"].columns
 
     def test_mixed_glob_and_qualified(self):
         sg = self._build()
-        ctx = SchemaContext(deny_columns=frozenset({"*.email", "contacts.name"}))
-        _strip_schema_context_denied_columns(sg, ctx)
+        ctx = EngineContext(deny_columns=frozenset({"*.email", "contacts.name"}))
+        strip_schema_context_denied_columns(sg, ctx)
         assert "email" not in sg.tables["contacts"].columns
         assert "name" not in sg.tables["contacts"].columns
         assert "name" in sg.tables["companies"].columns
 
 
 class TestValidateScopeAgainstGraph:
-    """Tests for _validate_scope_against_graph rejecting unknown deny entries."""
+    """Tests for validate_scope_against_graph rejecting unknown deny entries."""
 
     def _build(self) -> SchemaGraph:
         cols = {
@@ -1927,9 +1959,9 @@ class TestValidateScopeAgainstGraph:
 
     def test_qualified_unknown_table_raises(self):
         sg = self._build()
-        ctx = SchemaContext(deny_columns=frozenset({"orders.id"}))
+        ctx = EngineContext(deny_columns=frozenset({"orders.id"}))
         try:
-            _validate_scope_against_graph(sg, ctx)
+            validate_scope_against_graph(sg, ctx)
         except SchemaAccessError as e:
             assert "unknown table" in str(e)
         else:
@@ -1937,9 +1969,9 @@ class TestValidateScopeAgainstGraph:
 
     def test_qualified_unknown_column_raises(self):
         sg = self._build()
-        ctx = SchemaContext(deny_columns=frozenset({"contacts.zzz"}))
+        ctx = EngineContext(deny_columns=frozenset({"contacts.zzz"}))
         try:
-            _validate_scope_against_graph(sg, ctx)
+            validate_scope_against_graph(sg, ctx)
         except SchemaAccessError as e:
             assert "unknown column" in str(e)
         else:
@@ -1947,9 +1979,9 @@ class TestValidateScopeAgainstGraph:
 
     def test_glob_no_match_raises(self):
         sg = self._build()
-        ctx = SchemaContext(deny_columns=frozenset({"*.zzz"}))
+        ctx = EngineContext(deny_columns=frozenset({"*.zzz"}))
         try:
-            _validate_scope_against_graph(sg, ctx)
+            validate_scope_against_graph(sg, ctx)
         except SchemaAccessError as e:
             assert "matches no column" in str(e)
         else:
@@ -1957,13 +1989,13 @@ class TestValidateScopeAgainstGraph:
 
     def test_glob_match_accepted(self):
         sg = self._build()
-        ctx = SchemaContext(deny_columns=frozenset({"*.email"}))
-        _validate_scope_against_graph(sg, ctx)
+        ctx = EngineContext(deny_columns=frozenset({"*.email"}))
+        validate_scope_against_graph(sg, ctx)
 
     def test_qualified_match_accepted(self):
         sg = self._build()
-        ctx = SchemaContext(deny_columns=frozenset({"contacts.email"}))
-        _validate_scope_against_graph(sg, ctx)
+        ctx = EngineContext(deny_columns=frozenset({"contacts.email"}))
+        validate_scope_against_graph(sg, ctx)
 
 
 class TestValidateScopeAgainstGraphAllowColumns:
@@ -1982,9 +2014,9 @@ class TestValidateScopeAgainstGraphAllowColumns:
 
     def test_qualified_unknown_table_raises(self):
         sg = self._build()
-        ctx = SchemaContext(allow_columns=frozenset({"orders.id"}))
+        ctx = EngineContext(allow_columns=frozenset({"orders.id"}))
         try:
-            _validate_scope_against_graph(sg, ctx)
+            validate_scope_against_graph(sg, ctx)
         except SchemaAccessError as e:
             assert "allow_columns references unknown table" in str(e)
         else:
@@ -1992,9 +2024,9 @@ class TestValidateScopeAgainstGraphAllowColumns:
 
     def test_qualified_unknown_column_raises(self):
         sg = self._build()
-        ctx = SchemaContext(allow_columns=frozenset({"contacts.zzz"}))
+        ctx = EngineContext(allow_columns=frozenset({"contacts.zzz"}))
         try:
-            _validate_scope_against_graph(sg, ctx)
+            validate_scope_against_graph(sg, ctx)
         except SchemaAccessError as e:
             assert "allow_columns references unknown column" in str(e)
         else:
@@ -2002,9 +2034,9 @@ class TestValidateScopeAgainstGraphAllowColumns:
 
     def test_glob_no_match_raises(self):
         sg = self._build()
-        ctx = SchemaContext(allow_columns=frozenset({"*.zzz"}))
+        ctx = EngineContext(allow_columns=frozenset({"*.zzz"}))
         try:
-            _validate_scope_against_graph(sg, ctx)
+            validate_scope_against_graph(sg, ctx)
         except SchemaAccessError as e:
             assert "allow_columns glob" in str(e)
         else:
@@ -2012,8 +2044,8 @@ class TestValidateScopeAgainstGraphAllowColumns:
 
     def test_glob_match_accepted(self):
         sg = self._build()
-        ctx = SchemaContext(allow_columns=frozenset({"*.email"}))
-        _validate_scope_against_graph(sg, ctx)
+        ctx = EngineContext(allow_columns=frozenset({"*.email"}))
+        validate_scope_against_graph(sg, ctx)
 
 
 class TestApplySchemaContextAllowColumns:
@@ -2047,8 +2079,8 @@ class TestApplySchemaContextAllowColumns:
 
     def test_empty_allow_columns_is_noop(self):
         sg = self._build()
-        ctx = SchemaContext(allow_columns=frozenset())
-        _apply_schema_context_allow_columns(sg, ctx)
+        ctx = EngineContext(allow_columns=frozenset())
+        apply_schema_context_allow_columns(sg, ctx)
         assert set(sg.tables["contacts"].columns) == {
             "id",
             "company_id",
@@ -2059,22 +2091,22 @@ class TestApplySchemaContextAllowColumns:
 
     def test_qualified_keeps_listed_and_pk_fk(self):
         sg = self._build()
-        ctx = SchemaContext(allow_columns=frozenset({"contacts.email", "companies.name"}))
-        _apply_schema_context_allow_columns(sg, ctx)
+        ctx = EngineContext(allow_columns=frozenset({"contacts.email", "companies.name"}))
+        apply_schema_context_allow_columns(sg, ctx)
         assert set(sg.tables["contacts"].columns) == {"id", "company_id", "email"}
         assert set(sg.tables["companies"].columns) == {"id", "name"}
 
     def test_glob_applies_to_every_table_with_column(self):
         sg = self._build()
-        ctx = SchemaContext(allow_columns=frozenset({"*.name"}))
-        _apply_schema_context_allow_columns(sg, ctx)
+        ctx = EngineContext(allow_columns=frozenset({"*.name"}))
+        apply_schema_context_allow_columns(sg, ctx)
         assert set(sg.tables["companies"].columns) == {"id", "name"}
         assert set(sg.tables["contacts"].columns) == {"id", "company_id"}
 
     def test_pk_and_fk_always_retained(self):
         sg = self._build()
-        ctx = SchemaContext(allow_columns=frozenset({"contacts.notes"}))
-        _apply_schema_context_allow_columns(sg, ctx)
+        ctx = EngineContext(allow_columns=frozenset({"contacts.notes"}))
+        apply_schema_context_allow_columns(sg, ctx)
         assert "id" in sg.tables["contacts"].columns
         assert "company_id" in sg.tables["contacts"].columns
         assert "notes" in sg.tables["contacts"].columns
@@ -2083,30 +2115,30 @@ class TestApplySchemaContextAllowColumns:
 
     def test_fk_destination_columns_retained(self):
         sg = self._build()
-        ctx = SchemaContext(allow_columns=frozenset({"contacts.email"}))
-        _apply_schema_context_allow_columns(sg, ctx)
+        ctx = EngineContext(allow_columns=frozenset({"contacts.email"}))
+        apply_schema_context_allow_columns(sg, ctx)
         assert "id" in sg.tables["companies"].columns
 
 
 class TestSchemaContextAllowColumnsParser:
-    """SchemaContext normalizes and rejects malformed allow_columns entries."""
+    """EngineContext normalizes and rejects malformed allow_columns entries."""
 
     def test_normalization_lowercases(self):
-        ctx = SchemaContext(allow_columns=frozenset({"Contacts.Email", "*.name"}))
+        ctx = EngineContext(allow_columns=frozenset({"Contacts.Email", "*.name"}))
         assert ctx.allow_columns == frozenset({"contacts.email", "*.name"})
 
     def test_too_many_dots_raises(self):
-        from aetherdialect._contracts_base import ConfigError
+        from aetherdialect._config import ConfigError
 
         try:
-            SchemaContext(allow_columns=frozenset({"a.b.c"}))
+            EngineContext(allow_columns=frozenset({"a.b.c"}))
         except ConfigError as e:
             assert "allow_columns" in str(e)
         else:
             raise AssertionError("expected ConfigError")
 
     def test_qualified_and_glob_helpers(self):
-        ctx = SchemaContext(allow_columns=frozenset({"contacts.email", "*.name"}))
+        ctx = EngineContext(allow_columns=frozenset({"contacts.email", "*.name"}))
         assert ctx.qualified_allows() == frozenset({("contacts", "email")})
         assert ctx.glob_column_allows() == frozenset({"name"})
         assert ctx.bare_allows() == frozenset()
@@ -2129,7 +2161,7 @@ class TestColumnMetadataIsDeniedRoundTrip:
 
 
 class TestMarkCanonicalDuplicates:
-    """Tests for _mark_canonical_duplicates: PK > most-distinct > lex tie-break."""
+    """Tests for mark_canonical_duplicates: PK > most-distinct > lex tie-break."""
 
     def _sg_two_tables(self, t1_cols, t2_cols, *, t1_pk=None, t2_pk=None):
         t1 = _table("alpha", t1_cols, primary_key=t1_pk or [])
@@ -2144,7 +2176,7 @@ class TestMarkCanonicalDuplicates:
         a = {"id": _col(name="id", is_primary_key=True, distinct_count=10)}
         b = {"id": _col(name="id", is_primary_key=False, distinct_count=999)}
         sg = self._sg_two_tables(a, b, t1_pk=["id"])
-        demoted = _mark_canonical_duplicates(sg)
+        demoted = mark_canonical_duplicates(sg)
         assert demoted == 1
         assert sg.tables["alpha"].columns["id"].is_canonical_duplicate is True
         assert sg.tables["beta"].columns["id"].is_canonical_duplicate is False
@@ -2153,7 +2185,7 @@ class TestMarkCanonicalDuplicates:
         a = {"email": _col(name="email", distinct_count=50)}
         b = {"email": _col(name="email", distinct_count=200)}
         sg = self._sg_two_tables(a, b)
-        _mark_canonical_duplicates(sg)
+        mark_canonical_duplicates(sg)
         assert sg.tables["beta"].columns["email"].is_canonical_duplicate is True
         assert sg.tables["alpha"].columns["email"].is_canonical_duplicate is False
 
@@ -2161,7 +2193,7 @@ class TestMarkCanonicalDuplicates:
         a = {"name": _col(name="name", distinct_count=100)}
         b = {"name": _col(name="name", distinct_count=100)}
         sg = self._sg_two_tables(a, b)
-        _mark_canonical_duplicates(sg)
+        mark_canonical_duplicates(sg)
         assert sg.tables["alpha"].columns["name"].is_canonical_duplicate is True
         assert sg.tables["beta"].columns["name"].is_canonical_duplicate is False
 
@@ -2169,7 +2201,7 @@ class TestMarkCanonicalDuplicates:
         a = {"only_here": _col(name="only_here", distinct_count=1)}
         b = {"other": _col(name="other", distinct_count=1)}
         sg = self._sg_two_tables(a, b)
-        demoted = _mark_canonical_duplicates(sg)
+        demoted = mark_canonical_duplicates(sg)
         assert demoted == 0
         assert sg.tables["alpha"].columns["only_here"].is_canonical_duplicate is True
         assert sg.tables["beta"].columns["other"].is_canonical_duplicate is True
@@ -2196,7 +2228,7 @@ class TestMarkCanonicalDuplicates:
             join_paths_multi={},
             effective_structural_hash="x",
         )
-        _mark_canonical_duplicates(sg)
+        mark_canonical_duplicates(sg)
         assert sg.tables["customers"].columns["customer_id"].is_canonical_duplicate is True
         assert sg.tables["orders"].columns["customer_id"].is_canonical_duplicate is False
         assert sg.tables["returns"].columns["customer_id"].is_canonical_duplicate is False
@@ -2206,9 +2238,9 @@ class TestSchemaOverrideNullSkipAndPrune:
     """Null description/role keys are dropped from the overrides document; invalid roles notify and prune."""
 
     def test_null_column_description_and_role_removed_from_document(self, schema_graph, monkeypatch):
-        from aetherdialect._schema import apply_schema_overrides_to_graph
+        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
         doc = _ov_doc(
             tables={"orders": {"columns": {"amount": {"description": None, "role": None}}}},
         )
@@ -2216,9 +2248,9 @@ class TestSchemaOverrideNullSkipAndPrune:
         assert "orders" not in (doc.get("tables") or {})
 
     def test_invalid_table_role_pruned(self, schema_graph, monkeypatch):
-        from aetherdialect._schema import apply_schema_overrides_to_graph
+        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
         prev = schema_graph.tables["orders"].role
         doc = _ov_doc(tables={"orders": {"role": "not_a_table_role"}})
         report = apply_schema_overrides_to_graph(schema_graph, doc)
@@ -2229,14 +2261,14 @@ class TestSchemaOverrideNullSkipAndPrune:
     def test_save_sidecar_reflects_pruned_document(self, schema_graph, monkeypatch, tmp_path):
         import json
 
-        from aetherdialect._config import SCHEMA_OVERRIDES_SIDECAR_FILENAME
-        from aetherdialect._schema import (
+        from aetherdialect._constants import SCHEMA_OVERRIDES_SIDECAR_FILENAME
+        from aetherdialect._schema_overrides import (
             apply_schema_overrides_to_graph,
             compute_metadata_hash,
             save_overrides_sidecar,
         )
 
-        monkeypatch.setattr("aetherdialect._schema.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
         cache_path = tmp_path / "schema.json.gz"
         cache_path.write_bytes(b"x")
         doc = _ov_doc(
@@ -2259,11 +2291,8 @@ class TestSchemaOverrides:
     """JSON-roundtrip user editing of the built schema graph."""
 
     def test_dump_dict_round_trips_current_state(self, schema_graph):
-        from aetherdialect._config import (
-            SCHEMA_OVERRIDES_EXPORT_DEFAULT_OWNER,
-            SCHEMA_OVERRIDES_VERSION,
-        )
-        from aetherdialect._schema import dump_schema_overrides_dict
+        from aetherdialect._constants import SCHEMA_OVERRIDES_EXPORT_DEFAULT_OWNER, SCHEMA_OVERRIDES_VERSION
+        from aetherdialect._schema_overrides import dump_schema_overrides_dict
 
         d = dump_schema_overrides_dict(schema_graph)
         assert d["version"] == SCHEMA_OVERRIDES_VERSION
@@ -2284,7 +2313,7 @@ class TestSchemaOverrides:
         assert d["foreign_keys_add"] == []
 
     def test_dump_to_path_replaces_existing_atomically(self, schema_graph, tmp_path):
-        from aetherdialect._schema import dump_schema_overrides_to_path
+        from aetherdialect._schema_overrides import dump_schema_overrides_to_path
 
         target = tmp_path / "ov.json"
         first = dump_schema_overrides_to_path(schema_graph, target)
@@ -2294,41 +2323,41 @@ class TestSchemaOverrides:
         assert second.is_file()
 
     def test_load_validates_version(self, tmp_path):
-        import json as _json
+        import json as json
 
         import pytest
 
-        from aetherdialect._schema import load_schema_overrides_file
+        from aetherdialect._schema_overrides import load_schema_overrides_file
 
         path = tmp_path / "bad.json"
-        path.write_text(_json.dumps({"version": 999, "tables": {}, "foreign_keys_add": []}))
+        path.write_text(json.dumps({"version": 999, "tables": {}, "foreign_keys_add": []}))
         with pytest.raises(ValueError, match="version"):
             load_schema_overrides_file(path)
 
     def test_load_rejects_unknown_top_level_key(self, tmp_path):
-        import json as _json
+        import json as json
 
         import pytest
 
-        from aetherdialect._config import SCHEMA_OVERRIDES_VERSION
-        from aetherdialect._schema import load_schema_overrides_file
+        from aetherdialect._constants import SCHEMA_OVERRIDES_VERSION
+        from aetherdialect._schema_overrides import load_schema_overrides_file
 
         path = tmp_path / "bad.json"
-        path.write_text(_json.dumps({"version": SCHEMA_OVERRIDES_VERSION, "tables": {}, "synonyms": {}}))
+        path.write_text(json.dumps({"version": SCHEMA_OVERRIDES_VERSION, "tables": {}, "synonyms": {}}))
         with pytest.raises(ValueError, match="unsupported top-level"):
             load_schema_overrides_file(path)
 
     def test_load_rejects_bad_role_enum(self, tmp_path):
-        import json as _json
+        import json as json
 
         import pytest
 
-        from aetherdialect._config import SCHEMA_OVERRIDES_VERSION
-        from aetherdialect._schema import load_schema_overrides_file
+        from aetherdialect._constants import SCHEMA_OVERRIDES_VERSION
+        from aetherdialect._schema_overrides import load_schema_overrides_file
 
         path = tmp_path / "bad.json"
         path.write_text(
-            _json.dumps(
+            json.dumps(
                 {
                     "version": SCHEMA_OVERRIDES_VERSION,
                     "tables": {
@@ -2348,16 +2377,16 @@ class TestSchemaOverrides:
             load_schema_overrides_file(path)
 
     def test_load_rejects_description_owner_key(self, tmp_path):
-        import json as _json
+        import json as json
 
         import pytest
 
-        from aetherdialect._config import SCHEMA_OVERRIDES_VERSION
-        from aetherdialect._schema import load_schema_overrides_file
+        from aetherdialect._constants import SCHEMA_OVERRIDES_VERSION
+        from aetherdialect._schema_overrides import load_schema_overrides_file
 
         path = tmp_path / "bad.json"
         path.write_text(
-            _json.dumps(
+            json.dumps(
                 {
                     "version": SCHEMA_OVERRIDES_VERSION,
                     "tables": {
@@ -2377,9 +2406,10 @@ class TestSchemaOverrides:
 
     def test_apply_accepts_bare_string_description_and_envelope_value_only(self, schema_graph, monkeypatch):
         from aetherdialect._contracts_base import DescriptionOwner
-        from aetherdialect._schema import apply_schema_overrides_to_graph
+        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._config.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
 
         apply_schema_overrides_to_graph(
             schema_graph,
@@ -2395,16 +2425,16 @@ class TestSchemaOverrides:
         assert schema_graph.tables["orders"].description == "Envelope without owner."
 
     def test_load_rejects_bad_sensitivity(self, tmp_path):
-        import json as _json
+        import json as json
 
         import pytest
 
-        from aetherdialect._config import SCHEMA_OVERRIDES_VERSION
-        from aetherdialect._schema import load_schema_overrides_file
+        from aetherdialect._constants import SCHEMA_OVERRIDES_VERSION
+        from aetherdialect._schema_overrides import load_schema_overrides_file
 
         path = tmp_path / "bad.json"
         path.write_text(
-            _json.dumps(
+            json.dumps(
                 {
                     "version": SCHEMA_OVERRIDES_VERSION,
                     "tables": {"customers": {"columns": {"email": {"sensitivity": "secret"}}}},
@@ -2415,27 +2445,49 @@ class TestSchemaOverrides:
         with pytest.raises(ValueError, match="sensitivity"):
             load_schema_overrides_file(path)
 
-    def test_apply_sensitivity_pii_marks_unselectable(self, schema_graph, monkeypatch):
-        from aetherdialect._schema import apply_schema_overrides_to_graph
+    def test_apply_sensitivity_pii_value_is_rejected(self, schema_graph, monkeypatch):
+        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+        prev_sensitivity = schema_graph.tables["customers"].columns["email"].sensitivity
         report = apply_schema_overrides_to_graph(
             schema_graph,
             _ov_doc(
                 tables={"customers": {"columns": {"email": {"sensitivity": "pii"}}}},
             ),
         )
-        assert report.column_edits == 1
+        assert report.column_edits == 0
         col = schema_graph.tables["customers"].columns["email"]
-        assert col.sensitivity == SensitivityClassification.STRICT
-        assert col.is_selectable is False
+        assert col.sensitivity == prev_sensitivity
+        assert col.is_selectable is True
         assert len(report.skipped) == 1
-        assert report.skipped[0].code == "hidden_column_override"
+        assert report.skipped[0].reason == "invalid sensitivity value"
+
+    def test_apply_legacy_pii_key_is_rejected(self, tmp_path):
+        import json as json
+
+        import pytest
+
+        from aetherdialect._constants import SCHEMA_OVERRIDES_VERSION
+        from aetherdialect._schema_overrides import load_schema_overrides_file
+
+        path = tmp_path / "bad.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "version": SCHEMA_OVERRIDES_VERSION,
+                    "tables": {"customers": {"columns": {"email": {"pii": True}}}},
+                    "foreign_keys_add": [],
+                }
+            )
+        )
+        with pytest.raises(ValueError, match=r"unsupported keys.*'pii'"):
+            load_schema_overrides_file(path)
 
     def test_apply_role_override(self, schema_graph, monkeypatch):
-        from aetherdialect._schema import apply_schema_overrides_to_graph
+        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
         report = apply_schema_overrides_to_graph(
             schema_graph,
             _ov_doc(
@@ -2449,10 +2501,9 @@ class TestSchemaOverrides:
 
     def test_user_role_override_incompatible_with_value_type_is_discarded(self, schema_graph, monkeypatch):
         """Invalid role vs ``value_type`` is skipped with notify; graph and persisted doc omit the role key."""
+        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 
-        from aetherdialect._schema import apply_schema_overrides_to_graph
-
-        monkeypatch.setattr("aetherdialect._schema.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
         prev_role = schema_graph.tables["orders"].columns["amount"].role
         doc = _ov_doc(
             tables={
@@ -2469,17 +2520,17 @@ class TestSchemaOverrides:
         )
 
     def test_apply_rejects_unselectable_override_key(self, schema_graph, monkeypatch, tmp_path):
-        import json as _json
+        import json as json
 
         import pytest
 
-        from aetherdialect._config import SCHEMA_OVERRIDES_VERSION
-        from aetherdialect._schema import load_schema_overrides_file
+        from aetherdialect._constants import SCHEMA_OVERRIDES_VERSION
+        from aetherdialect._schema_overrides import load_schema_overrides_file
 
-        monkeypatch.setattr("aetherdialect._schema.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
         path = tmp_path / "bad.json"
         path.write_text(
-            _json.dumps(
+            json.dumps(
                 {
                     "version": SCHEMA_OVERRIDES_VERSION,
                     "tables": {"customers": {"columns": {"customer_id": {"is_selectable": False}}}},
@@ -2487,13 +2538,13 @@ class TestSchemaOverrides:
                 }
             )
         )
-        with pytest.raises(ValueError, match="system-derived"):
+        with pytest.raises(ValueError, match=r"unsupported keys.*'is_selectable'"):
             load_schema_overrides_file(path)
 
     def test_apply_unknown_table_and_column_skipped(self, schema_graph, monkeypatch):
-        from aetherdialect._schema import apply_schema_overrides_to_graph
+        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
         report = apply_schema_overrides_to_graph(
             schema_graph,
             _ov_doc(
@@ -2508,17 +2559,48 @@ class TestSchemaOverrides:
         assert "unknown column" in reasons
 
     def test_apply_fk_add_valid_creates_edge(self, schema_graph, monkeypatch):
-        from aetherdialect._schema import apply_schema_overrides_to_graph
+        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema.llm_credentials_configured", lambda: False)
+        schema_graph.tables["store"] = TableMetadata(
+            name="store",
+            columns={
+                "store_id": ColumnMetadata(
+                    name="store_id",
+                    data_type="integer",
+                    value_type="integer",
+                    is_primary_key=True,
+                    role=ColumnRole.IDENTIFIER.value,
+                    distinct_count=5,
+                    distinct_ratio=1.0,
+                    row_count=5,
+                ),
+            },
+            primary_key=["store_id"],
+            foreign_keys=[],
+            role=TableRole.DIMENSION.value,
+            row_count=5,
+        )
+        store_col = ColumnMetadata(
+            name="store_id",
+            data_type="integer",
+            value_type="integer",
+            role=ColumnRole.IDENTIFIER.value,
+            distinct_count=5,
+            distinct_ratio=0.05,
+            row_count=100,
+        )
+        store_col._owner_table = schema_graph.tables["customers"]
+        schema_graph.tables["customers"].columns["store_id"] = store_col
+
+        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
         before = len(schema_graph.tables["customers"].foreign_keys)
         report = apply_schema_overrides_to_graph(
             schema_graph,
             _ov_doc(
                 foreign_keys_add=[
                     {
-                        "from": "customers.customer_id",
-                        "to": "products.product_id",
+                        "from": "customers.store_id",
+                        "to": "store.store_id",
                         "kind": "structural",
                     }
                 ],
@@ -2527,14 +2609,14 @@ class TestSchemaOverrides:
         assert report.fks_added == 1
         assert len(schema_graph.tables["customers"].foreign_keys) == before + 1
         edge = schema_graph.tables["customers"].foreign_keys[-1]
-        assert edge.dst_table == "products"
+        assert edge.dst_table == "store"
         assert edge.inference_tag == "user_override_structural"
-        assert schema_graph.tables["customers"].columns["customer_id"].is_foreign_key is True
+        assert schema_graph.tables["customers"].columns["store_id"].is_foreign_key is True
 
     def test_apply_fk_add_unknown_endpoint_skipped(self, schema_graph, monkeypatch):
-        from aetherdialect._schema import apply_schema_overrides_to_graph
+        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
         report = apply_schema_overrides_to_graph(
             schema_graph,
             _ov_doc(
@@ -2551,15 +2633,15 @@ class TestSchemaOverrides:
         assert any("unknown destination table" in s.reason for s in report.skipped)
 
     def test_apply_description_uses_llm_when_enabled(self, schema_graph, monkeypatch):
-        import json as _json
+        import json as json
 
-        from aetherdialect._schema import apply_schema_overrides_to_graph
+        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema.llm_credentials_configured", lambda: True)
+        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: True)
 
-        def _fake_llm_chat(*, system, user, task):
+        def _fake_llm_chat(system, user, task):
             assert task == "schema"
-            return _json.dumps(
+            return json.dumps(
                 {
                     "items": [
                         {
@@ -2570,7 +2652,7 @@ class TestSchemaOverrides:
                 }
             )
 
-        monkeypatch.setattr("aetherdialect._schema.llm_chat", _fake_llm_chat)
+        monkeypatch.setattr("aetherdialect._schema_overrides.llm_chat", _fake_llm_chat)
         report = apply_schema_overrides_to_graph(
             schema_graph,
             _ov_doc(
@@ -2584,17 +2666,17 @@ class TestSchemaOverrides:
         assert schema_graph.tables["orders"].description == "REFINED text for orders."
 
     def test_round_trip_dump_and_apply_no_changes(self, schema_graph, monkeypatch, tmp_path):
-        from aetherdialect._schema import (
+        from aetherdialect._schema_overrides import (
             apply_schema_overrides_to_graph,
             dump_schema_overrides_dict,
             load_schema_overrides_file,
         )
 
-        monkeypatch.setattr("aetherdialect._schema.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
         path = tmp_path / "ov.json"
-        import json as _json
+        import json as json
 
-        path.write_text(_json.dumps(dump_schema_overrides_dict(schema_graph)))
+        path.write_text(json.dumps(dump_schema_overrides_dict(schema_graph)))
         loaded = load_schema_overrides_file(path)
         report = apply_schema_overrides_to_graph(schema_graph, loaded)
         assert report.table_edits == 0
@@ -2603,11 +2685,12 @@ class TestSchemaOverrides:
         assert report.skipped == ()
 
 
+@pytest.mark.usefixtures("stub_schema_llm_classifier")
 class TestBundleI:
     """Bundle I — schema layer model: drift-safe FK merge, sidecar, denylists, readonly snapshot."""
 
     def test_dump_includes_readonly_envelope_and_denylists(self, schema_graph):
-        from aetherdialect._schema import dump_schema_overrides_dict
+        from aetherdialect._schema_overrides import dump_schema_overrides_dict
 
         d = dump_schema_overrides_dict(schema_graph)
         assert "_readonly" in d
@@ -2632,21 +2715,20 @@ class TestBundleI:
     def test_apply_diff_preserves_user_override_fk_when_catalog_changes(self, schema_graph, monkeypatch):
         import copy
 
-        from aetherdialect._schema import (
-            apply_diff,
-            apply_schema_overrides_to_graph,
+        from aetherdialect._schema_graph import (
             diff_schemas,
         )
+        from aetherdialect._schema_overrides import apply_diff, apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
 
         report = apply_schema_overrides_to_graph(
             schema_graph,
             _ov_doc(
                 foreign_keys_add=[
                     {
-                        "from": "customers.customer_id",
-                        "to": "products.product_id",
+                        "from": "orders.amount",
+                        "to": "customers.customer_id",
                         "kind": "structural",
                     }
                 ],
@@ -2656,7 +2738,7 @@ class TestBundleI:
 
         new_sg = copy.deepcopy(schema_graph)
 
-        new_sg.tables["customers"].foreign_keys = []
+        new_sg.tables["orders"].foreign_keys = []
 
         diff = diff_schemas(schema_graph, new_sg)
 
@@ -2675,20 +2757,19 @@ class TestBundleI:
         merged = apply_diff(schema_graph, new_sg, diff, _FakeDialect(), notes_content=None)
 
         user_edges = [
-            e for e in merged.tables["customers"].foreign_keys if (e.inference_tag or "").startswith("user_override_")
+            e for e in merged.tables["orders"].foreign_keys if (e.inference_tag or "").startswith("user_override_")
         ]
         assert len(user_edges) == 1, "user-override FK was wiped by apply_diff"
 
     def test_apply_diff_drops_user_override_fk_when_endpoint_disappears(self, schema_graph, monkeypatch):
         import copy
 
-        from aetherdialect._schema import (
-            apply_diff,
-            apply_schema_overrides_to_graph,
+        from aetherdialect._schema_graph import (
             diff_schemas,
         )
+        from aetherdialect._schema_overrides import apply_diff, apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
         apply_schema_overrides_to_graph(
             schema_graph,
             _ov_doc(
@@ -2726,10 +2807,10 @@ class TestBundleI:
         assert user_edges == []
 
     def test_block_inferred_fk_removes_edge_and_persists(self, schema_graph, monkeypatch):
-        from aetherdialect._contracts_base import FKEdge
-        from aetherdialect._schema import apply_schema_overrides_to_graph
+        from aetherdialect._contracts_schema import FKEdge
+        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
         edge = FKEdge(
             src_table="orders",
             src_cols=["order_date"],
@@ -2750,10 +2831,10 @@ class TestBundleI:
         assert len(schema_graph.tables["orders"].foreign_keys) == before - 1
 
     def test_remove_inferred_fk_writes_denylist(self, schema_graph, monkeypatch):
-        from aetherdialect._contracts_base import FKEdge
-        from aetherdialect._schema import apply_schema_overrides_to_graph
+        from aetherdialect._contracts_schema import FKEdge
+        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
         edge = FKEdge(
             src_table="orders",
             src_cols=["order_date"],
@@ -2772,9 +2853,9 @@ class TestBundleI:
         assert len(doc["_internal"]["fk_block_inferred"]) == 1
 
     def test_block_inferred_pk_demotes_column(self, schema_graph, monkeypatch):
-        from aetherdialect._schema import apply_schema_overrides_to_graph
+        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
 
         col = schema_graph.tables["orders"].columns["amount"]
         col.pk_inference_tag = "profile"
@@ -2792,9 +2873,9 @@ class TestBundleI:
         assert "amount" not in schema_graph.tables["orders"].primary_key
 
     def test_block_catalog_pk_skipped(self, schema_graph, monkeypatch):
-        from aetherdialect._schema import apply_schema_overrides_to_graph
+        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
 
         report = apply_schema_overrides_to_graph(
             schema_graph,
@@ -2807,28 +2888,35 @@ class TestBundleI:
 
     def test_primary_keys_add_user_promotes_unique_column(self, schema_graph, monkeypatch):
         from aetherdialect._contracts_base import PkInferenceTag
-        from aetherdialect._schema import apply_schema_overrides_to_graph
+        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
 
-        col = schema_graph.tables["customers"].columns["email"]
+        tbl = schema_graph.tables["orders"]
+        tbl.primary_key = []
+        col = tbl.columns["order_id"]
         col.is_unique = True
+        col.distinct_count = 500
+        col.row_count = 500
 
         report = apply_schema_overrides_to_graph(
             schema_graph,
             _ov_doc(
-                primary_keys_add=[{"table": "customers", "column": "email"}],
+                primary_keys_add=[{"table": "orders", "column": "order_id"}],
             ),
         )
         assert report.pks_added == 1
         assert col.is_primary_key is True
         assert col.pk_inference_tag == PkInferenceTag.USER_OVERRIDE
-        assert "email" in schema_graph.tables["customers"].primary_key
+        assert "order_id" in schema_graph.tables["orders"].primary_key
 
     def test_primary_keys_add_rejects_non_unique_column(self, schema_graph, monkeypatch):
-        from aetherdialect._schema import apply_schema_overrides_to_graph
+        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+
+        tbl = schema_graph.tables["orders"]
+        tbl.primary_key = []
 
         report = apply_schema_overrides_to_graph(
             schema_graph,
@@ -2841,12 +2929,12 @@ class TestBundleI:
 
     def test_primary_keys_add_endorses_profile_inferred_pk(self, schema_graph, monkeypatch):
         from aetherdialect._contracts_base import PkInferenceTag
-        from aetherdialect._schema import (
+        from aetherdialect._schema_overrides import (
             apply_schema_overrides_to_graph,
             dump_schema_overrides_dict,
         )
 
-        monkeypatch.setattr("aetherdialect._schema.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
 
         col = schema_graph.tables["orders"].columns["amount"]
         col.pk_inference_tag = PkInferenceTag.PROFILE
@@ -2868,12 +2956,12 @@ class TestBundleI:
 
     def test_primary_keys_add_endorses_catalog_pk(self, schema_graph, monkeypatch):
         from aetherdialect._contracts_base import PkInferenceTag
-        from aetherdialect._schema import (
+        from aetherdialect._schema_overrides import (
             apply_schema_overrides_to_graph,
             dump_schema_overrides_dict,
         )
 
-        monkeypatch.setattr("aetherdialect._schema.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
 
         col = schema_graph.tables["customers"].columns["customer_id"]
         assert col.pk_inference_tag is None
@@ -2893,9 +2981,9 @@ class TestBundleI:
 
     def test_primary_keys_add_idempotent_when_already_user_override(self, schema_graph, monkeypatch):
         from aetherdialect._contracts_base import PkInferenceTag
-        from aetherdialect._schema import apply_schema_overrides_to_graph
+        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
 
         col = schema_graph.tables["customers"].columns["customer_id"]
         col.pk_inference_tag = PkInferenceTag.USER_OVERRIDE
@@ -2912,9 +3000,9 @@ class TestBundleI:
         assert not any("endorsement" in s.reason for s in report.skipped)
 
     def test_primary_keys_remove_blocked_when_would_empty(self, schema_graph, monkeypatch):
-        from aetherdialect._schema import apply_schema_overrides_to_graph
+        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
 
         col = schema_graph.tables["orders"].columns["amount"]
         col.pk_inference_tag = "profile"
@@ -2931,8 +3019,8 @@ class TestBundleI:
         assert "amount" in schema_graph.tables["orders"].primary_key
 
     def test_sidecar_round_trip(self, schema_graph, tmp_path, monkeypatch):
-        from aetherdialect._schema import (
-            _overrides_sidecar_path,
+        from aetherdialect._schema_build import overrides_sidecar_path
+        from aetherdialect._schema_overrides import (
             load_overrides_sidecar,
             save_overrides_sidecar,
         )
@@ -2965,7 +3053,7 @@ class TestBundleI:
             source_schema_hash="abc123",
             metadata_hash="0" * 64,
         )
-        assert path == _overrides_sidecar_path(cache_path)
+        assert path == overrides_sidecar_path(cache_path)
         loaded = load_overrides_sidecar(cache_path)
         assert loaded is not None
         assert loaded["source_schema_hash"] == "abc123"
@@ -2973,21 +3061,21 @@ class TestBundleI:
         assert loaded["_internal"]["fk_block_inferred"] == [{"from": "a.x", "to": "b.y"}]
 
     def test_sidecar_corrupt_returns_none(self, tmp_path):
-        from aetherdialect._schema import (
-            _overrides_sidecar_path,
+        from aetherdialect._schema_build import overrides_sidecar_path
+        from aetherdialect._schema_overrides import (
             load_overrides_sidecar,
         )
 
         cache_path = tmp_path / "schema.json.gz"
         cache_path.write_bytes(b"")
-        sidecar = _overrides_sidecar_path(cache_path)
+        sidecar = overrides_sidecar_path(cache_path)
         sidecar.parent.mkdir(parents=True, exist_ok=True)
         sidecar.write_text("{not valid json")
         assert load_overrides_sidecar(cache_path) is None
 
     def test_clear_persisted_overrides(self, tmp_path):
-        from aetherdialect._schema import (
-            _overrides_sidecar_path,
+        from aetherdialect._schema_build import overrides_sidecar_path
+        from aetherdialect._schema_overrides import (
             clear_persisted_overrides,
             save_overrides_sidecar,
         )
@@ -3000,19 +3088,19 @@ class TestBundleI:
             source_schema_hash="x",
             metadata_hash="1" * 64,
         )
-        assert _overrides_sidecar_path(cache_path).is_file()
+        assert overrides_sidecar_path(cache_path).is_file()
         assert clear_persisted_overrides(cache_path) is True
         assert clear_persisted_overrides(cache_path) is False
 
     def test_load_validates_new_top_level_keys(self, tmp_path):
-        import json as _json
+        import json as json
 
-        from aetherdialect._config import SCHEMA_OVERRIDES_VERSION
-        from aetherdialect._schema import load_schema_overrides_file
+        from aetherdialect._constants import SCHEMA_OVERRIDES_VERSION
+        from aetherdialect._schema_overrides import load_schema_overrides_file
 
         path = tmp_path / "ov.json"
         path.write_text(
-            _json.dumps(
+            json.dumps(
                 {
                     "version": SCHEMA_OVERRIDES_VERSION,
                     "tables": {},
@@ -3028,8 +3116,8 @@ class TestBundleI:
         assert loaded["primary_keys_remove"][0]["table"] == "t"
 
     def test_inferred_pk_sets_provenance_tag(self):
-        from aetherdialect._contracts_base import ColumnMetadata, TableMetadata
-        from aetherdialect._schema import _infer_missing_pks_from_profile
+        from aetherdialect._contracts_schema import ColumnMetadata, TableMetadata
+        from aetherdialect._schema_graph import infer_missing_pks_from_profile
 
         col = ColumnMetadata(
             name="id",
@@ -3046,13 +3134,13 @@ class TestBundleI:
             primary_key=[],
             foreign_keys=[],
         )
-        out = _infer_missing_pks_from_profile({"t": tbl})
+        out = infer_missing_pks_from_profile({"t": tbl})
         assert out == [("t", "id")]
         assert tbl.columns["id"].pk_inference_tag == "profile"
 
     def test_infer_pks_respects_blocked(self):
-        from aetherdialect._contracts_base import ColumnMetadata, TableMetadata
-        from aetherdialect._schema import _infer_missing_pks_from_profile
+        from aetherdialect._contracts_schema import ColumnMetadata, TableMetadata
+        from aetherdialect._schema_graph import infer_missing_pks_from_profile
 
         col = ColumnMetadata(
             name="id",
@@ -3069,17 +3157,17 @@ class TestBundleI:
             primary_key=[],
             foreign_keys=[],
         )
-        out = _infer_missing_pks_from_profile({"t": tbl}, blocked=frozenset({("t", "id")}))
+        out = infer_missing_pks_from_profile({"t": tbl}, blocked=frozenset({("t", "id")}))
         assert out == []
         assert tbl.columns["id"].is_primary_key is False
         assert tbl.columns["id"].pk_inference_tag is None
 
 
 class TestRelaxDvdrentalSelectability:
-    """``_relax_dvdrental_selectability`` gates used by live dvdrental-shaped fixtures."""
+    """``_relax_rental_shop_selectability`` gates used by live rental_shop- shaped fixtures."""
 
     def test_restores_visibility_after_sentinel_profile(self):
-        from live_tests.conftest import _relax_dvdrental_selectability
+        from live_tests.conftest import _relax_rental_shop_selectability
 
         col = ColumnMetadata(
             name="release_year",
@@ -3100,7 +3188,7 @@ class TestRelaxDvdrentalSelectability:
         )
         sg = SchemaGraph(tables={"film": tbl}, join_paths_multi={}, effective_structural_hash="h")
         assert col.is_visible is False
-        _relax_dvdrental_selectability(sg, "dvdrental_new")
+        _relax_rental_shop_selectability(sg, "rental_shop")
         assert col.distinct_count >= 2
         assert col.null_ratio == 0.0
         assert col.mode_frequency_ratio == 0.0

@@ -9,32 +9,32 @@ from unittest.mock import patch
 import pytest
 
 from aetherdialect._config import (
+    EngineConfig,
+    PolicyConfig,
+)
+from aetherdialect._constants import (
     SHAPE_QUESTION_INDEX_KEY,
     TEMPLATE_INTENT_KEY_INDEX_KEY,
     TEMPLATE_QUESTION_TOKEN_INDEX_KEY,
     TEMPLATE_UNION_FAMILY_INDEX_KEY,
-    EngineConfig,
-    PolicyConfig,
 )
-from aetherdialect._contracts_base import SchemaGraph, SQLShape, TableMetadata
+from aetherdialect._contracts_base import NormalizedExpr
 from aetherdialect._contracts_core import (
     ConcreteIntent,
     FeedbackKind,
-    NormalizedExpr,
     QuestionFeedbackEntry,
     RejectionBucket,
     RuntimeIntent,
     SelectCol,
     Template,
-    TemplateStats,
     ValueHistory,
 )
+from aetherdialect._contracts_schema import SchemaGraph, SQLShape, TableMetadata, TemplateStats
 from aetherdialect._core_utils import read_gzip_json, write_gzip_json_atomic
 from aetherdialect._templates import (
     TemplateStoreView,
     collect_question_feedback_for_prompt,
     compute_question_feedback_penalty,
-    demote_template_to_rejected,
     empty_template_store,
     join_fingerprint_from_concrete_intent,
     join_fingerprint_from_runtime_intent,
@@ -45,6 +45,7 @@ from aetherdialect._templates import (
     template_is_live,
     template_partition_number,
     template_schema_refs,
+    template_store_dir_for_space,
     templates_to_store,
 )
 from aetherdialect._utils import intent_key, question_token_fingerprint_from_raw
@@ -74,6 +75,7 @@ def _minimal_template(tid: str = "T0001") -> Template:
     return Template(
         id=tid,
         effective_structural_hash="h",
+        schema_graph_id="sg_test000000000001__abcd1234",
         intent_signature=ci,
         intent_key=intent_key(_minimal_intent()),
         tables_used=["t"],
@@ -275,36 +277,6 @@ class TestComputeQuestionFeedbackPenalty:
         assert pen == pytest.approx(2 * PolicyConfig.PEN_BY_THREE_SOURCE_UNIT)
 
 
-class TestDemoteTemplateToRejected:
-    @patch("aetherdialect._templates.summarize_failure_for_memory")
-    def test_removes_template_and_records_feedback(self, mock_sum):
-        mock_sum.return_value = QuestionFeedbackEntry(
-            summary="x",
-            buckets=(RejectionBucket.WRONG_AGGREGATION,),
-            kind=FeedbackKind.INTENT_REJECTED,
-            effective_structural_hash="sh1",
-            intent_structural_hash="ih",
-            intent_payload="{}",
-            created_at="t",
-            updated_at="t",
-        )
-        tmpl = _minimal_template()
-        templates = {tmpl.id: tmpl}
-        store = empty_template_store("sh1")
-        demote_template_to_rejected(
-            store,
-            templates,
-            tmpl,
-            _tiny_schema(),
-            _minimal_intent(),
-            "SELECT 1",
-            "q1",
-            "bad template",
-        )
-        assert tmpl.id not in templates
-        assert "q1" in store.get("question_feedback", {})
-
-
 class TestJoinFingerprints:
     def test_runtime_deterministic(self):
         ri = _minimal_intent()
@@ -378,13 +350,16 @@ class TestLoadTemplateStoreIndexes:
         os.makedirs(store_dir, exist_ok=True)
         monkeypatch.setattr(EngineConfig, "TEMPLATE_STORE_DIR", store_dir)
         tmpl = _minimal_template()
-        eff = tmpl.effective_structural_hash
+        eff = tmpl.schema_graph_id
         store = empty_template_store(eff)
         templates_to_store(store, {tmpl.id: tmpl})
         save_template_store(store)
-        from aetherdialect._config import TEMPLATE_STORE_HEADER_FILENAME
+        from aetherdialect._constants import TEMPLATE_STORE_HEADER_FILENAME
 
-        hdr_path = os.path.join(store_dir, TEMPLATE_STORE_HEADER_FILENAME)
+        hdr_path = os.path.join(
+            template_store_dir_for_space(str(tmp_path), "master"),
+            TEMPLATE_STORE_HEADER_FILENAME,
+        )
         header = read_gzip_json(hdr_path)
         assert isinstance(header, dict)
         for k in (
@@ -422,7 +397,7 @@ class TestPartitionedTemplateStore:
         os.makedirs(sd, exist_ok=True)
         monkeypatch.setattr(EngineConfig, "TEMPLATE_STORE_DIR", sd)
         tmpl = _minimal_template()
-        eff = tmpl.effective_structural_hash
+        eff = tmpl.schema_graph_id
         v = empty_template_store(eff)
         templates_to_store(v, {tmpl.id: tmpl})
         save_template_store(v)
@@ -437,7 +412,7 @@ class TestPartitionedTemplateStore:
         os.makedirs(sd, exist_ok=True)
         monkeypatch.setattr(EngineConfig, "TEMPLATE_STORE_DIR", sd)
         tmpl = _minimal_template()
-        eff = tmpl.effective_structural_hash
+        eff = tmpl.schema_graph_id
         v = empty_template_store(eff)
         templates_to_store(v, {tmpl.id: tmpl})
         save_template_store(v)

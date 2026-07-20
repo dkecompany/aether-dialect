@@ -2,15 +2,23 @@
 
 from __future__ import annotations
 
+import copy
+import itertools
 import random
 import re
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, cast
 
 from ._config import (
+    PolicyConfig,
+    SeedWarmupConfig,
+    llm_credentials_configured,
+)
+from ._constants import (
     AGG_PATTERN,
     DO_NOT_LEMMATIZE,
     IRREGULAR_PLURALS_MAP,
+    NORMALIZATION_ALLOWED_INTRODUCED_TOKENS,
     NORMALIZATION_JACCARD_FLOOR,
     QUESTION_STARTS_AGG,
     QUESTION_STARTS_GROUP,
@@ -25,31 +33,29 @@ from ._config import (
     VALID_FILTER_OPS,
     VALID_GRAINS,
     VALID_HAVING_OPS,
-    PolicyConfig,
-    SeedWarmupConfig,
 )
 from ._contracts_base import (
-    CteOutputColumnMeta,
+    FilterParam,
+    HavingParam,
     LlmJsonExhausted,
-    SchemaGraph,
-    SQLShape,
-    SurfaceTemplateSpec,
+    NormalizedExpr,
+    OrderByCol,
 )
 from ._contracts_core import (
     ConcreteIntent,
-    FilterParam,
-    HavingParam,
-    NormalizedExpr,
-    OrderByCol,
     RuntimeCteStep,
     RuntimeIntent,
     SelectCol,
     Template,
     concrete_intent_to_runtime_skeleton,
 )
+from ._contracts_schema import (
+    CteOutputColumnMeta,
+    SchemaGraph,
+    SQLShape,
+)
 from ._core_utils import (
     debug,
-    llm_json,
     normalize_array_contains_param_value,
     normalize_question,
     sha256,
@@ -63,16 +69,14 @@ from ._dialect import (
     sql_tables_referenced,
 )
 from ._intent_resolve import sort_filters, sort_having
+from ._llm_provider import llm_json
 
-NORMALIZATION_ALLOWED_INTRODUCED_TOKENS: frozenset[str] = frozenset(
-    {"list", "count", "sum", "average", "max", "min", "total", "of"},
-)
-REALISM_CATEGORY_LIST: str = ", ".join(sorted(REALISM_DROP_REASON_CATEGORIES))
+_REALISM_CATEGORY_LIST: str = ", ".join(sorted(REALISM_DROP_REASON_CATEGORIES))
 
-QUESTION_NORMALIZE_VOCABULARY_HEADING: str = (
+_QUESTION_NORMALIZE_VOCABULARY_HEADING: str = (
     "Vocabulary preferences (apply only when context fits; preserve logical negation and constraints):"
 )
-QUESTION_NORMALIZE_VOCABULARY_GUIDANCE: str = (
+_QUESTION_NORMALIZE_VOCABULARY_GUIDANCE: str = (
     "Verb phrasing: prefer concise analytic wording over vague conversational fillers whenever the question intent is unchanged. "
     "Aggregation: align stated aggregation language with the grain implied by the question. "
     "Temporal: when any time scope appears, state it explicitly enough for deterministic routing. "
@@ -134,17 +138,7 @@ _QUESTION_NORMALIZE_SYSTEM = (
 
 
 def validate_question(question: str) -> tuple[bool, str, str]:
-    """
-    LLM gate: data question vs chitchat; typo fix; allowed vs restricted.
-
-    Args:
-
-        question: Raw user text.
-
-    Returns:
-
-        ``(ok, kind, corrected)``: ``ok`` True only for allowed reads; ``kind`` is ``allowed``, ``restricted``, or ``invalid``.
-    """
+    """LLM gate: data question vs chitchat; typo fix; allowed vs restricted."""
     try:
         result = llm_json(_QUESTION_VALIDATION_SYSTEM, question, task="default")
     except LlmJsonExhausted as exc:
@@ -161,10 +155,7 @@ def validate_question(question: str) -> tuple[bool, str, str]:
 
 
 def _suffix_lemmatize_token(token: str) -> str:
-    """
-    Apply conservative English plural-to-singular heuristics when the token is not in ``DO_NOT_LEMMATIZE``.
-    """
-
+    """Apply conservative English plural-to-singular heuristics when the token is not in ``DO_NOT_LEMMATIZE``."""
     if token in DO_NOT_LEMMATIZE:
         return token
     if len(token) > 3 and token.endswith("ies"):
@@ -184,7 +175,6 @@ def _suffix_lemmatize_token(token: str) -> str:
 
 def _token_jaccard(tokens_a: list[str], tokens_b: list[str]) -> float:
     """Return the Jaccard similarity between two token multisets treated as sets."""
-
     sa = set(tokens_a)
     sb = set(tokens_b)
     if not sa and not sb:
@@ -195,9 +185,8 @@ def _token_jaccard(tokens_a: list[str], tokens_b: list[str]) -> float:
     return len(sa & sb) / len(u)
 
 
-def compute_shape_form(question: str) -> str:
+def _compute_shape_form(question: str) -> str:
     """Mask numbers, dates, and quoted strings into placeholder tokens for coarse matching."""
-
     s = question.lower()
     s = SHAPE_FORM_NUM_REGEX.sub("<num>", s)
     s = SHAPE_FORM_DATE_REGEX.sub("<date>", s)
@@ -207,34 +196,18 @@ def compute_shape_form(question: str) -> str:
 
 def build_shape_question_index(templates: list[Template]) -> dict[str, list[str]]:
     """Map shape-form strings to template identifiers that carry matching history questions."""
-
     buckets: dict[str, set[str]] = {}
     for tpl in templates:
         for hq in tpl.value_history.questions:
             if not hq or not str(hq).strip():
                 continue
-            sf = compute_shape_form(str(hq))
+            sf = _compute_shape_form(str(hq))
             buckets.setdefault(sf, set()).add(tpl.id)
     return {sf: sorted(ids) for sf, ids in buckets.items()}
 
 
 def _enforce_normalization_guard(corrected: str, normalized: str, *, raw_original: str) -> tuple[bool, str]:
-    """
-    Validate LLM-normalized text against *corrected* and reject unsafe expansions.
-
-    Args:
-
-        corrected: Typo-corrected user question.
-
-        normalized: Candidate canonical question string.
-
-        raw_original: Original casing slice used for capital-token preservation checks.
-
-    Returns:
-
-        ``(accept, reason_code)`` where *accept* is False when the normalized form must be discarded.
-    """
-
+    """Validate LLM-normalized text against *corrected* and reject. unsafe expansions."""
     nstrip = normalized.strip()
     if not nstrip or len(nstrip) < 2:
         return False, "empty_short"
@@ -274,22 +247,9 @@ def _enforce_normalization_guard(corrected: str, normalized: str, *, raw_origina
 
 
 def normalize_question_via_llm(corrected: str, *, raw_original: str | None = None) -> str:
-    """
-    Canonicalize *corrected* via a dedicated LLM call separate from typo validation.
-
-    Args:
-
-        corrected: Typo-corrected question text.
-
-        raw_original: Original user question casing reference for guard checks; defaults to *corrected*.
-
-    Returns:
-
-        Canonical question string, or *corrected* when the model output fails validation.
-    """
-
+    """Canonicalize *corrected* via a dedicated LLM call separate from. typo validation."""
     raw_use = raw_original if raw_original is not None else corrected
-    vocab_block = QUESTION_NORMALIZE_VOCABULARY_HEADING + "\n" + QUESTION_NORMALIZE_VOCABULARY_GUIDANCE
+    vocab_block = _QUESTION_NORMALIZE_VOCABULARY_HEADING + "\n" + _QUESTION_NORMALIZE_VOCABULARY_GUIDANCE
     user_obj: dict[str, Any] = {
         "question": corrected,
         "normalization_preferences": vocab_block,
@@ -308,21 +268,7 @@ def normalize_question_via_llm(corrected: str, *, raw_original: str | None = Non
 
 
 def sql_shape(sql: str, intent: RuntimeIntent, *, sqlglot_dialect: str) -> SQLShape:
-    """
-    Count joins, CTEs, filters, having, and structural flags from *sql* and *intent* via AST.
-
-    Args:
-
-        sql: Generated SQL.
-
-        intent: Intent (main + CTE filter/having lists).
-
-        sqlglot_dialect: sqlglot dialect token (``"postgres"`` or ``"spark"``).
-
-    Returns:
-
-        ``SQLShape`` with structural counts and booleans.
-    """
+    """Count joins, CTEs, filters, having, and structural flags from. *sql* and *intent* via AST."""
     num_filters = len(intent.filters_param or [])
     num_having = len(intent.having_param or [])
     for cte in intent.cte_steps or []:
@@ -340,24 +286,12 @@ def sql_shape(sql: str, intent: RuntimeIntent, *, sqlglot_dialect: str) -> SQLSh
 
 
 def _levenshtein_distance(s1: str, s2: str) -> int:
-    """
-    Levenshtein edit distance between *s1* and *s2*.
-
-    Args:
-
-        s1: First string.
-
-        s2: Second string.
-
-    Returns:
-
-        Minimum insert/delete/replace steps.
-    """
+    """Levenshtein edit distance between *s1* and *s2*."""
     if len(s1) < len(s2):
         return _levenshtein_distance(s2, s1)
     if len(s2) == 0:
         return len(s1)
-    previous_row = range(len(s2) + 1)
+    previous_row: list[int] = list(range(len(s2) + 1))
     for i, c1 in enumerate(s1):
         current_row = [i + 1]
         for j, c2 in enumerate(s2):
@@ -370,18 +304,7 @@ def _levenshtein_distance(s1: str, s2: str) -> int:
 
 
 def _tokenize(q: str) -> list[str]:
-    """
-    Lowercase ``[a-z0-9_]+`` tokens from *q*, suffix-lemmatized except for ``DO_NOT_LEMMATIZE``, stripped of ``PolicyConfig.STOPWORDS``, then sorted for multiset comparison.
-
-    Args:
-
-        q: Question text (typically already passed through ``normalize_question``).
-
-    Returns:
-
-        Sorted token list (repeated content words appear repeatedly).
-    """
-
+    """Lowercase ``[a-z0-9_]+`` tokens from *q*, suffix-lemmatized. except for ``DO_NOT_LEMMATIZE``, stripped of ``PolicyConfig.STOPWORDS``, then sorted for multiset comparison."""
     out: list[str] = []
     for raw in re.findall(r"[a-z0-9_]+", q.lower()):
         if not raw:
@@ -394,25 +317,18 @@ def _tokenize(q: str) -> list[str]:
     return sorted(out)
 
 
-def question_token_fingerprint_from_normalized(norm: str) -> str:
+def _question_token_fingerprint_from_normalized(norm: str) -> str:
     """Sorted multiset fingerprint of stopword-stripped question tokens (see :func:`_tokenize`)."""
-
     return "\0".join(_tokenize(norm))
 
 
 def question_token_fingerprint_from_raw(raw: str) -> str:
     """Fingerprint for a raw question string after :func:`aetherdialect._core_utils.normalize_question`."""
+    return _question_token_fingerprint_from_normalized(normalize_question(raw))
 
-    return question_token_fingerprint_from_normalized(normalize_question(raw))
 
-
-def neighboring_question_token_fingerprint_norms(norm: str) -> frozenset[str]:
-    """
-    Fingerprints for inverted-index lookup: the exact multiset plus neighbors from one in-token substitution.
-
-    Bounded by :data:`PolicyConfig.QUESTION_TOKEN_INDEX_NEIGHBOR_CAP` for determinism.
-    """
-
+def _neighboring_question_token_fingerprint_norms(norm: str) -> frozenset[str]:
+    """Fingerprints for inverted-index lookup: the exact multiset plus neighbors from one in-token substitution. Bounded by :data:`PolicyConfig.QUESTION_TOKEN_INDEX_NEIGHBOR_CAP` for determinism."""
     toks = _tokenize(norm)
     base = "\0".join(toks)
     out: set[str] = {base}
@@ -444,24 +360,7 @@ def _fuzzy_question_tokens_match_pair(
     max_distance: int,
     debug_label: str,
 ) -> tuple[bool, int]:
-    """
-    Return whether stopword-stripped token lists align with summed per-token edit distance within *max_distance*.
-
-    Args:
-
-        q1_norm: First question already passed through ``normalize_question``.
-
-        q2_norm: Second question already passed through ``normalize_question``.
-
-        max_distance: Maximum summed Levenshtein distance across aligned token pairs.
-
-        debug_label: Suffix for ``debug`` log lines (may be empty).
-
-    Returns:
-
-        ``(matched, total_edit_distance)`` where *total_edit_distance* is defined only when lengths match.
-    """
-
+    """Return whether stopword-stripped token lists align with summed. per-token edit distance within *max_distance*."""
     base = "[utils.exact_question_match]"
     tag = f"{base} {debug_label}".strip() if debug_label else base
     tokens1 = _tokenize(q1_norm)
@@ -499,7 +398,6 @@ class QuestionReuseMatch:
     @property
     def is_exact_string_reuse(self) -> bool:
         """True when normalized candidate text equals the stored normalized history string (generation path 1)."""
-
         return self.candidate_normalized == self.stored_normalized_text
 
 
@@ -511,36 +409,12 @@ def match_question_against_template_history(
     shape_question_index: dict[str, list[str]] | None = None,
     question_token_index: dict[str, list[Any]] | None = None,
 ) -> QuestionReuseMatch | None:
-    """
-    Find the best trusted template whose stored question fuzzy-matches the candidate.
-
-    Normalizes the candidate once, optionally narrows templates via a shape-form index, then scores every
-    trusted history row using token edit distance with lexicographic ties broken by per-row accepts,
-    template accepts, and template id.
-
-    Args:
-
-        candidate_raw: User or corrected question text.
-
-        templates: Templates to scan in list order; entries with ``trust_level < 1`` are skipped.
-
-        max_token_edit_distance: Per-call override for summed token edit budget; defaults to policy.
-
-        shape_question_index: Optional coarse map from ``compute_shape_form`` to candidate template ids.
-
-        question_token_index: Optional inverted index from :func:`question_token_fingerprint_from_raw` keys to
-            ``[template_id, history_index]`` rows.
-
-    Returns:
-
-        ``QuestionReuseMatch`` for the best hit, or ``None``.
-    """
-
+    """Find the best trusted template whose stored question fuzzy- matches the candidate. Normalizes the candidate once, optionally narrows templates via a shape-form index, then scores every trusted history row using token edit distance with lexicographic ties broken by per-row accepts, template accepts, and template id."""
     budget = max_token_edit_distance if max_token_edit_distance is not None else PolicyConfig.FUZZY_MATCH_MAX_DISTANCE
     candidate_normalized = normalize_question(candidate_raw)
     scan_templates = templates
     if shape_question_index:
-        cand_sf = compute_shape_form(candidate_raw)
+        cand_sf = _compute_shape_form(candidate_raw)
         allowed_ids = shape_question_index.get(cand_sf)
         if allowed_ids:
             allow_set = frozenset(allowed_ids)
@@ -549,7 +423,7 @@ def match_question_against_template_history(
                 scan_templates = narrowed
     pair_filter: set[tuple[str, int]] | None = None
     if question_token_index:
-        cand_fps = neighboring_question_token_fingerprint_norms(candidate_normalized)
+        cand_fps = _neighboring_question_token_fingerprint_norms(candidate_normalized)
         acc: set[tuple[str, int]] = set()
         for fp in cand_fps:
             rows = question_token_index.get(fp)
@@ -609,24 +483,7 @@ def exact_question_match(
     max_distance: int = PolicyConfig.FUZZY_MATCH_MAX_DISTANCE,
     label: str = "",
 ) -> bool:
-    """
-    True if normalised token sequences match 1:1 with summed edit distance ≤ *max_distance*.
-
-    Args:
-
-        q1: First question.
-
-        q2: Second question.
-
-        max_distance: Max sum of per-token Levenshtein distances.
-
-        label: Optional tag for ``debug`` logs.
-
-    Returns:
-
-        True when token counts match and total distance is within budget.
-    """
-
+    """True if normalised token sequences match 1:1 with summed edit. distance ≤ *max_distance*."""
     q1_norm = normalize_question(q1)
     q2_norm = normalize_question(q2)
     ok, _ = _fuzzy_question_tokens_match_pair(q1_norm, q2_norm, max_distance, label)
@@ -635,22 +492,11 @@ def exact_question_match(
 
 def is_exact_question_text_match(q1: str, q2: str) -> bool:
     """Return True when *q1* and *q2* share the same normalised question string."""
-
     return normalize_question(q1) == normalize_question(q2)
 
 
 def _normalize_filters(filters: list[Any]) -> list[FilterParam]:
-    """
-    Coerce dicts / ``FilterParam`` to ``FilterParam`` and ``sort_filters``.
-
-    Args:
-
-        filters: LLM dicts or instances.
-
-    Returns:
-
-        Sorted list for stable keys.
-    """
+    """Coerce dicts / ``FilterParam`` to ``FilterParam`` and. ``sort_filters``."""
     if not filters:
         return []
     out = []
@@ -694,17 +540,7 @@ def _normalize_filters(filters: list[Any]) -> list[FilterParam]:
 
 
 def _normalize_having_conditions(conditions: list[Any]) -> list[HavingParam]:
-    """
-    Coerce dicts / ``HavingParam``; clamp ops to ``VALID_HAVING_OPS``; ``sort_having``.
-
-    Args:
-
-        conditions: LLM dicts or instances.
-
-    Returns:
-
-        Sorted list for stable keys.
-    """
+    """Coerce dicts / ``HavingParam``; clamp ops to. ``VALID_HAVING_OPS``; ``sort_having``."""
     if not conditions:
         return []
     out = []
@@ -751,19 +587,7 @@ def _normalize_having_conditions(conditions: list[Any]) -> list[HavingParam]:
 
 
 def _normalize_cte_steps(steps: Any, available_ctes: dict[str, list[str]] | None = None) -> list[RuntimeCteStep]:
-    """
-    Parse CTE steps from dicts or models; infer ``column_map`` and output metadata.
-
-    Args:
-
-        steps: List of steps, or non-list → ``[]``.
-
-        available_ctes: CTE name → output columns; mutated as steps are appended.
-
-    Returns:
-
-        ``RuntimeCteStep`` list in input order.
-    """
+    """Parse CTE steps from dicts or models; infer ``column_map`` and. output metadata."""
     if not isinstance(steps, list):
         return []
     if available_ctes is None:
@@ -860,8 +684,6 @@ def _normalize_cte_steps(steps: Any, available_ctes: dict[str, list[str]] | None
         for sc in select_cols:
             if isinstance(sc, SelectCol):
                 all_cols_raw.append(sc.expr.primary_column)
-            elif isinstance(sc, str):
-                all_cols_raw.append(sc)
         for col in all_cols_raw:
             if "." in col:
                 parts = col.split(".", 1)
@@ -894,7 +716,11 @@ def _normalize_cte_steps(steps: Any, available_ctes: dict[str, list[str]] | None
         normalized_select_cols = (
             select_cols
             if select_cols and isinstance(select_cols[0], SelectCol)
-            else ([SelectCol(expr=NormalizedExpr.from_column(c)) for c in select_cols] if select_cols else [])
+            else (
+                [SelectCol(expr=NormalizedExpr.from_column(c) if isinstance(c, str) else c.expr) for c in select_cols]
+                if select_cols
+                else []
+            )
         )
         normalized_order_by = (
             order_by_cols
@@ -946,31 +772,21 @@ def _normalize_cte_steps(steps: Any, available_ctes: dict[str, list[str]] | None
 
 
 def _normalize_cte_steps_for_key(steps: list[RuntimeCteStep]) -> list[dict[str, Any]]:
-    """
-    Projection of CTE steps to signature strings for ``intent_key`` JSON.
-
-    Args:
-
-        steps: Normalised ``RuntimeCteStep`` instances.
-
-    Returns:
-
-        List of plain dicts safe for ``stable_json``.
-    """
+    """Projection of CTE steps to signature strings for ``intent_key`` JSON."""
     result = []
     for cte in steps:
-        select_sigs = []
-        for sc in cte.select_cols or []:
+        select_sigs: list[str] = []
+        for sc in cast(list[Any], cte.select_cols or []):
             if isinstance(sc, SelectCol):
                 select_sigs.append(sc.signature_key)
             elif isinstance(sc, str):
-                select_sigs.append(sc)
-        order_sigs = []
-        for obc in cte.order_by_cols or []:
+                select_sigs.append(sc.strip())
+        order_sigs: list[str] = []
+        for obc in cast(list[Any], cte.order_by_cols or []):
             if isinstance(obc, OrderByCol):
                 order_sigs.append(obc.signature_key)
             elif isinstance(obc, str):
-                order_sigs.append(obc)
+                order_sigs.append(obc.strip())
         cte_dict = {
             "cte_name": cte.cte_name,
             "tables": sorted(cte.tables or []),
@@ -1024,19 +840,7 @@ def _contains_filter_param_keys(intent: RuntimeIntent) -> set[str]:
 
 
 def flatten_param_values(intent: RuntimeIntent) -> dict[str, Any]:
-    """
-    Merge CTE ``param_values`` then main; main overrides duplicate keys.
-
-    Applies:func:`core_utils.normalize_array_contains_param_value` to keys for ``filters_param`` rows with ``op == "contains"``. Dialect SQL for those filters also normalizes stored array elements at execution time.
-
-    Args:
-
-        intent: Runtime intent with optional CTE steps.
-
-    Returns:
-
-        Single map for execution/substitution.
-    """
+    """Merge CTE ``param_values`` then main; main overrides duplicate. keys. Applies:func:`core_utils.normalize_array_contains_param_value` to keys for ``filters_param`` rows with ``op == "contains"``. Dialect SQL for those filters also normalizes stored array elements at execution time."""
     merged = {}
     for cte in intent.cte_steps or []:
         merged.update(cte.param_values or {})
@@ -1052,19 +856,7 @@ def flatten_param_values(intent: RuntimeIntent) -> dict[str, Any]:
 
 
 def intent_key(intent: RuntimeIntent) -> str:
-    """
-    SHA-256 of normalised structural intent: tables, selects, filters, group/order/having, CTEs.
-
-    Omits ``grain``, ``limit``, and raw param values; uses normalised filter/having dicts and CTE key skeletons. Differs from :func:`aetherdialect._intent_process.intent_similarity`, which scores overlap via weighted clause similarity (including a separate CTE blend) rather than a single hash.
-
-    Args:
-
-        intent: Intent to fingerprint.
-
-    Returns:
-
-        64-character hex digest.
-    """
+    """SHA-256 of normalised structural intent: tables, selects, filters, group/order/having, CTEs. Omits ``grain``, ``limit``, and raw param values; uses normalised filter/having dicts and CTE key skeletons. Differs from :func:`aetherdialect._intent_process.intent_similarity`, which scores overlap via weighted clause similarity (including a separate CTE blend) rather than a single hash."""
     select_cols = intent.select_cols or []
 
     grain = intent.grain or "row_level"
@@ -1108,57 +900,28 @@ def intent_key(intent: RuntimeIntent) -> str:
 
 def body_similarity_key(intent: RuntimeIntent) -> str:
     """Structural body fingerprint excluding grain, limit, column_map, join path, and param values."""
-
     return intent_key(intent)
 
 
 def body_similarity_key_for_concrete(concrete: ConcreteIntent) -> str:
     """``body_similarity_key`` for a stored ``ConcreteIntent``."""
-
     return body_similarity_key(concrete_intent_to_runtime_skeleton(concrete))
 
 
 def template_instance_key_from_parts(body_key: str, join_fp: str, sql_fp_val: str) -> str:
     """Stable key for an executable template row: body + join fingerprint + parameterized SQL fingerprint."""
-
     return sha256(stable_json({"b": body_key, "j": join_fp, "s": sql_fp_val}))
 
 
 def extract_tables_from_sql(sql: str, known_tables: list[str], *, sqlglot_dialect: str) -> list[str]:
-    """
-    Subset of *known_tables* referenced as physical tables in *sql* via AST inspection.
-
-    CTE definition names are excluded by :func:`aetherdialect._dialect.sql_tables_referenced`.
-
-    Args:
-
-        sql: SQL text.
-
-        known_tables: Candidate physical table names.
-
-        sqlglot_dialect: sqlglot dialect token (``"postgres"`` or ``"spark"``).
-
-    Returns:
-
-        Sorted unique hits.
-    """
+    """Subset of *known_tables* referenced as physical tables in *sql* via AST inspection. CTE definition names are excluded by :func:`aetherdialect._dialect.sql_tables_referenced`."""
     referenced = sql_tables_referenced(sql, sqlglot_dialect=sqlglot_dialect)
     hits = [t for t in known_tables if t.lower() in referenced]
     return sorted(set(hits))
 
 
 def _describe_operation(select_terms: list[str]) -> str:
-    """
-    First ``AGG_PATTERN`` aggregation name in *select_terms*, else ``list``.
-
-    Args:
-
-        select_terms: SELECT list item strings.
-
-    Returns:
-
-        Lowercase agg name or ``"list"``.
-    """
+    """First ``AGG_PATTERN`` aggregation name in *select_terms*, else. ``list``."""
     for sc in select_terms:
         m = AGG_PATTERN.match(sc)
         if m:
@@ -1166,20 +929,8 @@ def _describe_operation(select_terms: list[str]) -> str:
     return "list"
 
 
-def _pick_question_style(select_terms: list[str], has_grouping: bool) -> str:
-    """
-    Random NL question opener from structure (group / agg / list).
-
-    Args:
-
-        select_terms: SELECT strings for agg detection.
-
-        has_grouping: Whether GROUP BY is present.
-
-    Returns:
-
-        Phrase the generated question must start with (e.g. ``How many``).
-    """
+def pick_question_style(select_terms: list[str], has_grouping: bool) -> str:
+    """Random NL question opener from structure (group / agg / list)."""
     agg_funcs = []
     for sc in select_terms:
         m = AGG_PATTERN.match(sc)
@@ -1211,27 +962,7 @@ def generate_question(
     having_descriptions: list[dict[str, str]],
     schema: SchemaGraph,
 ) -> str | None:
-    """
-    LLM: intent JSON → one sentence; must start with chosen style prefix.
-
-    Args:
-
-        tables: Intent tables.
-
-        select_terms: SELECT expression strings.
-
-        filter_descriptions: ``column`` / ``condition`` entries.
-
-        group_by_terms: GROUP BY strings.
-
-        having_descriptions: HAVING ``column`` / ``condition`` entries.
-
-        schema: For semantic context in the prompt.
-
-    Returns:
-
-        Question text, or ``None`` if LLM fails or prefix check fails.
-    """
+    """LLM: intent JSON → one sentence; must start with chosen style prefix."""
     semantics = {}
     for table in tables:
         table_ir = schema.tables.get(table)
@@ -1265,7 +996,7 @@ def generate_question(
         "having": having_descriptions if having_descriptions else None,
     }
 
-    selected_style = _pick_question_style(select_terms, bool(group_by_terms))
+    selected_style = pick_question_style(select_terms, bool(group_by_terms))
 
     system = (
         "You are a natural language question generator for database queries. Convert structured query intent to conversational questions.\n\n"
@@ -1341,42 +1072,37 @@ _QUESTION_FROM_SQL_SYSTEM = (
     '"questions" (array of strings), "question" (string, optional legacy), '
     '"is_realistic" (boolean), "drop_reason" (string or null), and optionally '
     '"drop_reason_category" (string) when is_realistic is false. '
-    f"If present, drop_reason_category must be one of: {REALISM_CATEGORY_LIST}.\n"
+    f"If present, drop_reason_category must be one of: {_REALISM_CATEGORY_LIST}.\n"
 )
 
-_QUESTION_FROM_SQL_SYSTEM_WARMUP_STYLED = (
-    _QUESTION_FROM_SQL_SYSTEM + "\n"
-    "- When style_slots is present in the input JSON, produce exactly three strings in "
-    "questions[0], questions[1], and questions[2] aligned to each slot in order; "
-    "question must equal questions[0]. Each question follows its slot style and guidance.\n"
-)
 
-_PARAPHRASE_SEED_QUESTION_SYSTEM = (
-    "You rephrase one analyst question into alternative natural-language wordings. "
-    "Preserve entities, filters, metrics, grouping, ordering, and limits implied by the seed text. "
+_WARMUP_PARAPHRASES_BY_STYLE_SYSTEM = (
+    "Generate natural-language analyst questions grouped by stylistic palette slots. "
+    "Preserve entities, filters, metrics, grouping, ordering, and limits implied by the SQL or seed question. "
     "Use schema descriptions only for terminology consistency. "
-    "Do not answer the question. "
-    "Do not output SQL, identifiers, numbered steps, or JOIN recipes.\n\n"
-    "Output ONLY valid JSON with fields questions (array of strings), "
-    "length equal to style_slots, each entry matching the corresponding slot style and guidance."
+    "Do not answer the question. Do not output SQL, identifiers, numbered steps, or JOIN recipes. "
+    "For each style slot you may return zero paraphrases when that style does not fit; never force a poor match. "
+    "Output ONLY valid JSON with field paraphrases_by_style mapping each style name to an array of strings."
 )
+
+
+def schema_table_descriptions_for_tables(schema: SchemaGraph, tables: list[str]) -> str:
+    """Render table names and optional table descriptions for warmup NL prompts."""
+    blocks: list[str] = []
+    for table in tables:
+        table_meta = schema.tables.get(table)
+        if not table_meta:
+            continue
+        lines: list[str] = [f"TABLE {table}"]
+        td = getattr(table_meta, "description", "") or ""
+        if str(td).strip():
+            lines.append(f"  table_description: {str(td).strip()}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
 
 
 def schema_context_enriched_lines_for_tables(schema: SchemaGraph, tables: list[str]) -> str:
-    """
-    Render table descriptions plus column roles and optional column descriptions for prompts.
-
-    Args:
-
-        schema: Live schema graph.
-
-        tables: Table names to include in document order.
-
-    Returns:
-
-        Multi-table text block without sample values.
-    """
-
+    """Render table descriptions plus column roles and optional column. descriptions for prompts."""
     blocks: list[str] = []
     for table in tables:
         table_meta = schema.tables.get(table)
@@ -1403,127 +1129,135 @@ def schema_context_enriched_lines_for_tables(schema: SchemaGraph, tables: list[s
     return "\n\n".join(blocks)
 
 
-def select_three_warmup_styles(seed_index: int, intent_id: str) -> tuple[str, str, str]:
-    """
-    Deterministically pick three distinct warmup question styles for synthetic NL diversity.
-
-    Args:
-
-        seed_index: Expansion batch row index or zero when absent.
-
-        intent_id: Stable intent identifier mixed into the digest.
-
-    Returns:
-
-        Three entries drawn from :attr:`SeedWarmupConfig.WARMUP_QUESTION_STYLES` without replacement.
-    """
-
-    styles = SeedWarmupConfig.WARMUP_QUESTION_STYLES
-    digest = sha256(
-        f"warmup_styles:{SeedWarmupConfig.WARMUP_SAMPLING_POLICY_VERSION}:{seed_index}:{intent_id}",
-    )
-    used: set[int] = set()
-    chosen: list[str] = []
-    for i in range(0, len(digest) - 1, 2):
-        if len(chosen) >= 3:
-            break
-        slot = int(digest[i : i + 2], 16) % len(styles)
-        if slot in used:
-            continue
-        used.add(slot)
-        chosen.append(styles[slot])
-    k = 0
-    while len(chosen) < 3:
-        while k in used:
-            k = (k + 1) % len(styles)
-        used.add(k)
-        chosen.append(styles[k])
-        k += 1
-    return chosen[0], chosen[1], chosen[2]
+def _phrase_jaccard_tokens(text: str) -> frozenset[str]:
+    """Token set for paraphrase diversity scoring."""
+    words = re.findall(r"[a-z0-9]+", normalize_question(text))
+    return frozenset(words)
 
 
-_NLG_SURFACE_BANK: tuple[SurfaceTemplateSpec, ...] = (
-    SurfaceTemplateSpec(
-        "grain_overview",
-        (
-            "Summarize {tables} at {grain} grain.",
-            "What picture emerges for {tables} at {grain} grain?",
-            "Give an analyst-facing overview of {tables} with {grain} grain.",
-        ),
-    ),
-    SurfaceTemplateSpec(
-        "filters",
-        (
-            "Show rows from {tables} narrowed by {n_filters} filter conditions.",
-            "Which records in {tables} satisfy the current filters?",
-        ),
-    ),
-    SurfaceTemplateSpec(
-        "shape",
-        (
-            "Break down {tables} for reporting.",
-            "List the figures implied over {tables}.",
-        ),
-    ),
-)
+def _phrase_jaccard_similarity(a: frozenset[str], b: frozenset[str]) -> float:
+    """Jaccard similarity between two phrase token sets."""
+    if not a and not b:
+        return 1.0
+    union_n = len(a | b)
+    if union_n == 0:
+        return 0.0
+    return len(a & b) / union_n
 
 
-def generate_bulk_anchors(
-    intent: RuntimeIntent,
-    _schema: SchemaGraph,
-    count: int,
-) -> tuple[str, ...]:
-    """
-    Emit deterministic natural-language anchors from intent shape without LLM calls.
-
-    Args:
-
-        intent: Executable runtime intent after warmup substitution.
-
-        _schema: Schema graph reserved for richer entity labeling in future realizations.
-
-        count: Maximum anchors to return after deduplication.
-
-    Returns:
-
-        Distinct question-shaped strings bounded by *count*.
-    """
-
-    tables_label = ", ".join(intent.tables or []) or "the scoped tables"
-    grain = intent.grain or "row_level"
-    n_filters = len(intent.filters_param or [])
-    flat_forms: list[str] = []
-    for spec in _NLG_SURFACE_BANK:
-        flat_forms.extend(spec.surface_forms)
-    if not flat_forms or count <= 0:
-        return ()
-
-    base = sha256(
-        stable_json(
-            {
-                "tables": intent.tables,
-                "grain": intent.grain,
-                "nf": n_filters,
-                "ng": len(intent.group_by_cols or []),
-                "cte": len(intent.cte_steps or []),
-            },
-        ),
-    )
-    out: list[str] = []
+def select_diverse_paraphrases(
+    candidates: list[str],
+    *,
+    max_count: int,
+    lambda_mmr: float | None = None,
+) -> list[str]:
+    """Pick up to *max_count* paraphrases with maximum marginal relevance over token Jaccard similarity."""
+    uniq: list[str] = []
     seen: set[str] = set()
-    for i in range(max(count * 8, count)):
-        if len(out) >= count:
-            break
-        pos = (i * 2) % max(len(base) - 1, 1)
-        mix = int(base[pos : pos + 2], 16)
-        form_idx = (mix + i) % len(flat_forms)
-        raw_form = flat_forms[form_idx]
-        text = raw_form.format(tables=tables_label, grain=grain, n_filters=n_filters)
-        nn = normalize_question(text)
-        if nn and nn not in seen:
+    for cand in candidates:
+        nn = normalize_question(cand)
+        text = str(cand).strip()
+        if not nn or not text or nn in seen:
+            continue
+        seen.add(nn)
+        uniq.append(text)
+    if len(uniq) <= max_count:
+        return uniq
+    sigs = {i: _phrase_jaccard_tokens(t) for i, t in enumerate(uniq)}
+    remaining = set(range(len(uniq)))
+    first = 0
+    selected: list[int] = [first]
+    remaining.remove(first)
+    lam = float(lambda_mmr if lambda_mmr is not None else SeedWarmupConfig.WARMUP_MMR_LAMBDA)
+    while remaining and len(selected) < max_count:
+        best_i = -1
+        best_score = -1e9
+        for i in remaining:
+            max_sim = 0.0
+            for j in selected:
+                max_sim = max(max_sim, _phrase_jaccard_similarity(sigs[i], sigs[j]))
+            novelty = 1.0 - max_sim
+            score = lam * novelty - (1.0 - lam) * max_sim
+            if score > best_score:
+                best_score = score
+                best_i = i
+        if best_i < 0:
+            best_i = min(remaining)
+        selected.append(best_i)
+        remaining.remove(best_i)
+    return [uniq[i] for i in selected]
+
+
+def generate_warmup_paraphrases_by_style(
+    schema: SchemaGraph,
+    tables: list[str],
+    *,
+    sql: str | None = None,
+    seed_question: str | None = None,
+) -> dict[str, list[str]] | None:
+    """LLM paraphrases grouped by every configured warmup style (up to policy max per style)."""
+    if not llm_credentials_configured():
+        return None
+    if not sql and not seed_question:
+        return None
+    styles = SeedWarmupConfig.WARMUP_QUESTION_STYLES
+    gu = SeedWarmupConfig.WARMUP_QUESTION_STYLE_GUIDANCE
+    per_max = SeedWarmupConfig.WARMUP_PARAPHRASES_PER_STYLE_MAX
+    slots = [{"style": s, "guidance": gu.get(s, ""), "max_count": per_max} for s in styles]
+    body: dict[str, Any] = {
+        "schema": schema_table_descriptions_for_tables(schema, tables),
+        "style_slots": slots,
+        "output_format": {"paraphrases_by_style": {s: ["string"] for s in styles}},
+    }
+    if sql:
+        body["sql"] = sql
+    if seed_question:
+        body["seed_question"] = seed_question
+    try:
+        response = llm_json(
+            _WARMUP_PARAPHRASES_BY_STYLE_SYSTEM,
+            stable_json(body),
+            retries=1,
+            task="default",
+        )
+    except (TypeError, ValueError, LlmJsonExhausted):
+        return None
+    raw = response.get("paraphrases_by_style")
+    if not isinstance(raw, dict):
+        return None
+    out: dict[str, list[str]] = {}
+    for style in styles:
+        vals = raw.get(style)
+        phrases: list[str] = []
+        if isinstance(vals, list):
+            for item in vals:
+                if isinstance(item, str) and item.strip():
+                    phrases.append(item.strip())
+                if len(phrases) >= per_max:
+                    break
+        out[style] = select_diverse_paraphrases(phrases, max_count=per_max)
+    if not any(out.values()):
+        return None
+    return out
+
+
+def flatten_warmup_paraphrases_by_style(by_style: dict[str, list[str]]) -> list[str]:
+    """Flatten per-style paraphrase buckets into one deduplicated list preserving style order."""
+    flat: list[str] = []
+    seen: set[str] = set()
+    per_max = SeedWarmupConfig.WARMUP_PARAPHRASES_PER_STYLE_MAX
+    for style in SeedWarmupConfig.WARMUP_QUESTION_STYLES:
+        for phrase in by_style.get(style) or []:
+            nn = normalize_question(phrase)
+            if not nn or nn in seen:
+                continue
             seen.add(nn)
-            out.append(text.strip())
-    return tuple(out[:count])
+            flat.append(phrase)
+            if len([p for p in flat if normalize_question(p)]) >= per_max * len(
+                SeedWarmupConfig.WARMUP_QUESTION_STYLES
+            ):
+                break
+    return flat
 
 
 def generate_paraphrases_of_seed_question(
@@ -1531,113 +1265,77 @@ def generate_paraphrases_of_seed_question(
     schema: SchemaGraph,
     tables: list[str],
     *,
-    style_pair: tuple[str, str],
+    style_pair: tuple[str, str] | None = None,
 ) -> list[str] | None:
-    """
-    LLM paraphrases of an existing seed question (not SQL-derived), aligned to two style slots.
-
-    Args:
-
-        seed_question: Gold seed text to rephrase.
-
-        schema: Table and column metadata for terminology grounding.
-
-        tables: Tables referenced by the intent.
-
-        style_pair: Two distinct style keys from :attr:`SeedWarmupConfig.WARMUP_QUESTION_STYLES`.
-
-    Returns:
-
-        Zero to two non-empty paraphrase strings, or ``None`` when the call fails to yield usable text.
-    """
-
-    gu = SeedWarmupConfig.WARMUP_QUESTION_STYLE_GUIDANCE
-    s0, s1 = style_pair
-    slots = [
-        {"style": s0, "guidance": gu.get(s0, "")},
-        {"style": s1, "guidance": gu.get(s1, "")},
-    ]
-    user_prompt = stable_json(
-        {
-            "seed_question": seed_question,
-            "schema": schema_context_enriched_lines_for_tables(schema, tables),
-            "style_slots": slots,
-            "output_format": {"questions": ["", ""]},
-        }
+    """LLM paraphrases of an existing seed question grouped by warmup styles."""
+    del style_pair
+    by_style = generate_warmup_paraphrases_by_style(
+        schema,
+        tables,
+        seed_question=seed_question,
     )
-    try:
-        response = llm_json(
-            _PARAPHRASE_SEED_QUESTION_SYSTEM,
-            user_prompt,
-            retries=1,
-            task="default",
-        )
-    except (TypeError, ValueError, LlmJsonExhausted):
+    if not by_style:
         return None
-    raw_list = response.get("questions")
+    return flatten_warmup_paraphrases_by_style(by_style)
+
+
+_WARMUP_FREEFORM_QUESTIONS_SYSTEM = (
+    "You write natural-language analyst questions that faithfully describe what a SQL query computes. "
+    "Use schema table descriptions only for business terminology. "
+    "Do not output SQL, identifiers, numbered steps, or JOIN recipes. "
+    "Return 1–3 concise questions in a JSON object with field questions as an array of strings."
+)
+
+
+def generate_warmup_questions_freeform(
+    schema: SchemaGraph,
+    tables: list[str],
+    *,
+    sql: str | None = None,
+    seed_question: str | None = None,
+) -> list[str] | None:
+    """Single-call NL question generation when styled paraphrase buckets are empty."""
+    if not llm_credentials_configured():
+        return None
+    if not sql and not seed_question:
+        return None
+    body: dict[str, Any] = {
+        "schema": schema_table_descriptions_for_tables(schema, tables),
+        "output_format": {"questions": ["string"]},
+    }
+    if sql:
+        body["sql"] = sql
+    if seed_question:
+        body["seed_question"] = seed_question
+    try:
+        response = llm_json(_WARMUP_FREEFORM_QUESTIONS_SYSTEM, stable_json(body), retries=0, task="default")
+    except LlmJsonExhausted:
+        return None
+    raw = response.get("questions")
+    if not isinstance(raw, list):
+        q0 = response.get("question")
+        raw = [q0] if isinstance(q0, str) and q0.strip() else []
     out: list[str] = []
-    if isinstance(raw_list, list):
-        for x in raw_list:
-            if isinstance(x, str) and x.strip():
-                out.append(x.strip())
-            if len(out) >= 2:
-                break
-    return out if out else None
-
-
-def schema_context_lines_for_tables(schema: SchemaGraph, tables: list[str]) -> str:
-    """
-    Render table and column role lines for prompt context.
-
-    Args:
-
-        schema: Live schema graph.
-
-        tables: Table names to include.
-
-    Returns:
-
-        One line per table listing columns with types and roles.
-    """
-
-    col_descriptions: list[str] = []
-    for table in tables:
-        table_meta = schema.tables.get(table)
-        if not table_meta:
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, str) or not item.strip():
             continue
-        cols = []
-        for col_name, col_meta in table_meta.columns.items():
-            desc = f"{col_name} ({col_meta.data_type or 'unknown'})"
-            if col_meta.role:
-                desc += f" [{col_meta.role}]"
-            cols.append(desc)
-        col_descriptions.append(f"TABLE {table}: {', '.join(cols)}")
-    return "\n".join(col_descriptions)
+        nn = normalize_question(item)
+        if not nn or nn in seen:
+            continue
+        seen.add(nn)
+        out.append(item.strip())
+        if len(out) >= 3:
+            break
+    return out or None
 
 
 def select_best_question_via_judge(
     sql: str,
-    schema_context: str,
+    engine_context: str,
     candidates: list[str],
 ) -> int:
-    """
-    Pick the candidate NL question that best matches *sql* given *schema_context*.
-
-    Uses a JSON-mode judge call with ``task=\"judge\"``. On parse failure or any invalid index, returns ``0``.
-
-    Args:
-
-        sql: Executable or literal SQL text shown to the judge.
-
-        schema_context: Concatenated table and column descriptions.
-
-        candidates: Non-empty paraphrase strings in display order.
-
-    Returns:
-
-        Index into *candidates*.
-    """
-
+    """Pick the candidate NL question that best matches *sql* given. *schema_context*. Uses a JSON-mode judge call with ``task="judge"``. On parse failure or any invalid index, returns ``0``."""
     if not candidates:
         return 0
     if len(candidates) == 1:
@@ -1650,7 +1348,7 @@ def select_best_question_via_judge(
     payload = stable_json(
         {
             "sql": sql,
-            "schema_context": schema_context,
+            "schema_context": engine_context,
             "candidates": [{"index": i, "text": t} for i, t in enumerate(candidates)],
             "instructions": (
                 "chosen_index must be the zero-based index of the single best candidate. "
@@ -1687,69 +1385,25 @@ def generate_question_from_sql(
     schema: SchemaGraph,
     tables: list[str],
     *,
-    warmup_style_triple: tuple[str, str, str] | None = None,
     intent_source: str | None = None,
 ) -> dict[str, Any] | None:
-    """
-    LLM: *sql* plus column context yields NL questions and a realism flag.
-
-    Args:
-
-        sql: Executable or literal SQL.
-
-        schema: Table and column metadata for the prompt.
-
-        tables: Tables to describe in the prompt.
-
-        warmup_style_triple: When set, uses enriched descriptions and three ordered style slots for synthetic warmup.
-
-        intent_source: When ``sql_history``, executed-SQL provenance bypasses the realism rejection gate.
-
-    Returns:
-
-        Dict with ``question``, ``is_realistic``, ``drop_reason``, optional ``drop_reason_category`` when unrealistic, or ``None`` on error.
-    """
-
-    if warmup_style_triple is None:
-        schema_context = schema_context_lines_for_tables(schema, tables)
-        system = _QUESTION_FROM_SQL_SYSTEM
-        user_body: dict[str, Any] = {
-            "sql": sql,
-            "schema": schema_context,
-            "output_format": {
-                "questions": ["string"],
-                "question": "natural language question or empty string",
-                "is_realistic": True,
-                "drop_reason": None,
-                "drop_reason_category": "other",
-            },
-        }
-    else:
-        schema_context = schema_context_enriched_lines_for_tables(schema, tables)
-        system = _QUESTION_FROM_SQL_SYSTEM_WARMUP_STYLED
-        gu = SeedWarmupConfig.WARMUP_QUESTION_STYLE_GUIDANCE
-        s0, s1, s2 = warmup_style_triple
-        user_body = {
-            "sql": sql,
-            "schema": schema_context,
-            "style_slots": [
-                {"style": s0, "guidance": gu.get(s0, "")},
-                {"style": s1, "guidance": gu.get(s1, "")},
-                {"style": s2, "guidance": gu.get(s2, "")},
-            ],
-            "output_format": {
-                "questions": ["string", "string", "string"],
-                "question": "natural language question or empty string",
-                "is_realistic": True,
-                "drop_reason": None,
-                "drop_reason_category": "other",
-            },
-        }
-
+    """LLM: *sql* plus column context yields NL questions and a realism flag."""
+    schema_context = schema_table_descriptions_for_tables(schema, tables)
+    user_body: dict[str, Any] = {
+        "sql": sql,
+        "schema": schema_context,
+        "output_format": {
+            "questions": ["string"],
+            "question": "natural language question or empty string",
+            "is_realistic": True,
+            "drop_reason": None,
+            "drop_reason_category": "other",
+        },
+    }
     user_prompt = stable_json(user_body)
 
     response = llm_json(
-        system,
+        _QUESTION_FROM_SQL_SYSTEM,
         user_prompt,
         retries=1,
         task="default",
@@ -1778,24 +1432,22 @@ def generate_question_from_sql(
     if not is_realistic and intent_source == "sql_history":
         debug("[utils.generate_question_from_sql] sql_history provenance; parsing LLM output despite realism=false")
 
-    nmax = SeedWarmupConfig.WARMUP_QUESTIONS_MAX
-    raw_list = response.get("questions")
+    by_style = generate_warmup_paraphrases_by_style(schema, tables, sql=sql)
     phrases: list[str] = []
-    if isinstance(raw_list, list):
-        for x in raw_list:
-            if isinstance(x, str) and x.strip():
-                phrases.append(x.strip())
-            if len(phrases) >= nmax + 8:
-                break
-    if len(phrases) > nmax:
-        debug(f"[utils.generate_question_from_sql] truncating questions to {nmax}")
-        phrases = phrases[:nmax]
+    if by_style:
+        phrases = flatten_warmup_paraphrases_by_style(by_style)
     if not phrases:
-        q0 = response.get("question", "")
-        if isinstance(q0, str) and q0.strip():
-            phrases = [q0.strip()]
-    if not phrases and isinstance(question, str) and question.strip():
-        phrases = [question.strip()]
+        raw_list = response.get("questions")
+        if isinstance(raw_list, list):
+            for x in raw_list:
+                if isinstance(x, str) and x.strip():
+                    phrases.append(x.strip())
+        if not phrases:
+            q0 = response.get("question", "")
+            if isinstance(q0, str) and q0.strip():
+                phrases = [q0.strip()]
+            elif isinstance(question, str) and question.strip():
+                phrases = [question.strip()]
     out_phrases: list[str] = []
     seen_norm: set[str] = set()
     for p in phrases:
@@ -1816,4 +1468,230 @@ def generate_question_from_sql(
         "is_realistic": True,
         "drop_reason": None,
         "drop_reason_category": None,
+        "paraphrases_by_style": by_style or {},
     }
+
+
+def _merge_intent_param_values(intent: RuntimeIntent) -> dict[str, Any]:
+    """Merge CTE and main param value maps with main overriding duplicate keys."""
+    merged: dict[str, Any] = {}
+    for cte in intent.cte_steps or []:
+        merged.update(cte.param_values or {})
+    merged.update(intent.param_values or {})
+    return merged
+
+
+def _parse_qualified_column_ref(left_expr: Any) -> tuple[str, str] | None:
+    """Return ``(table, column)`` when *left_expr* is a qualified column reference."""
+    term = (getattr(left_expr, "column_ref", None) or left_expr.primary_term or "").strip()
+    if "." not in term:
+        return None
+    table, column = term.split(".", 1)
+    table = table.strip()
+    column = column.strip()
+    if not table or not column:
+        return None
+    return table, column
+
+
+def _filter_equality_literal(filter_param: FilterParam, param_values: dict[str, Any]) -> str | None:
+    """Return a string literal for an equality filter when one is present."""
+    if filter_param.op not in ("=", "=="):
+        return None
+    if filter_param.right_expr is not None:
+        return None
+    value_type = (filter_param.value_type or "string").strip().lower()
+    if value_type not in ("string", "categorical", "free_text"):
+        return None
+    if filter_param.param_key and filter_param.param_key in param_values:
+        raw = param_values[filter_param.param_key]
+    elif filter_param.raw_value is not None:
+        raw = filter_param.raw_value
+    else:
+        return None
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    return text or None
+
+
+def column_cached_distinct_values(schema: SchemaGraph, table: str, column: str) -> list[str]:
+    """Return cached distinct sample values for a schema column when profiling stored them."""
+    table_meta = schema.tables.get(table)
+    if table_meta is None:
+        return []
+    column_meta = table_meta.columns.get(column)
+    if column_meta is None:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for source in (column_meta.value_overlap_sample or [], column_meta.frequent_values or []):
+        for value in source:
+            text = str(value).strip()
+            key = text.lower()
+            if not text or key in seen:
+                continue
+            seen.add(key)
+            out.append(text)
+    return out
+
+
+def _morph_plural_candidates(token: str) -> list[str]:
+    """Return plural-form candidates for a single lowercase token."""
+    candidates: list[str] = []
+    if token.endswith("y") and len(token) > 1 and token[-2] not in "aeiou":
+        candidates.append(token[:-1] + "ies")
+    if token.endswith("um"):
+        candidates.append(token[:-2] + "a")
+    if token.endswith("us"):
+        candidates.append(token[:-2] + "i")
+    candidates.append(token + "s")
+    candidates.append(token + "es")
+    if token.endswith(("s", "x", "z")) or token.endswith("ch") or token.endswith("sh"):
+        extra = token + "es"
+        if extra not in candidates:
+            candidates.append(extra)
+    return [candidate for candidate in candidates if candidate != token]
+
+
+def _morph_singular_candidates(token: str) -> list[str]:
+    """Return singular-form candidates for a single lowercase token."""
+    candidates: list[str] = []
+    if token.endswith("ies") and len(token) > 3:
+        candidates.append(token[:-3] + "y")
+    if token.endswith("a") and len(token) > 1:
+        candidates.append(token[:-1] + "um")
+    if token.endswith("i") and len(token) > 1:
+        candidates.append(token[:-1] + "us")
+    if token.endswith("es") and len(token) > 2:
+        candidates.append(token[:-2])
+    if token.endswith("s") and len(token) > 1:
+        candidates.append(token[:-1])
+    return [candidate for candidate in candidates if candidate != token]
+
+
+def morph_variants(token: str) -> list[str]:
+    """Return morphological variants for a single token including the original spelling."""
+    base = token.strip()
+    if not base:
+        return []
+    lower = base.lower()
+    seen: set[str] = {lower}
+    ordered: list[str] = [base]
+    for candidate in _morph_plural_candidates(lower) + _morph_singular_candidates(lower):
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        ordered.append(candidate)
+    return ordered
+
+
+def _cache_canonical_index(cached: list[str]) -> dict[str, str]:
+    """Map lowercase cached values to their canonical profiling spellings."""
+    return {value.lower(): value for value in cached}
+
+
+def zero_row_filter_remediation_candidates(literal: str, cached: list[str]) -> list[str]:
+    """Build ordered filter literal candidates from cached distinct values for zero-row remediation."""
+    text = literal.strip()
+    if not text or not cached:
+        return []
+    canonical = _cache_canonical_index(cached)
+    cache_keys = set(canonical)
+    original_key = text.lower()
+    seen_keys: set[str] = {original_key}
+    candidates: list[str] = []
+
+    def add_candidate(raw: str) -> None:
+        key = raw.lower()
+        if key in seen_keys or key not in cache_keys:
+            return
+        seen_keys.add(key)
+        candidates.append(canonical[key])
+
+    if " " in text:
+        add_candidate(text.replace(" ", "_"))
+    if "_" in text:
+        add_candidate(text.replace("_", " "))
+
+    tokens = re.split(r"[ _]+", text)
+    if len(tokens) >= 2:
+        variant_lists = [morph_variants(token) for token in tokens]
+        for join_char in (" ", "_"):
+            for combo in itertools.product(*variant_lists):
+                add_candidate(join_char.join(combo))
+
+    if " " not in text:
+        for variant in morph_variants(text):
+            add_candidate(variant)
+
+    return candidates
+
+
+def _filter_param_matches(left: FilterParam, right: FilterParam) -> bool:
+    """Return True when two filter params refer to the same equality slot."""
+    if left.param_key and right.param_key and left.param_key == right.param_key:
+        return True
+    left_ref = _parse_qualified_column_ref(left.left_expr)
+    right_ref = _parse_qualified_column_ref(right.left_expr)
+    return left_ref is not None and left_ref == right_ref
+
+
+def patch_filter_literal_on_intent(
+    intent: RuntimeIntent,
+    filter_param: FilterParam,
+    canonical_value: str,
+) -> RuntimeIntent:
+    """Return a deep copy of *intent* with one equality filter literal replaced."""
+    patched = copy.deepcopy(intent)
+    for candidate in patched.filters_param or []:
+        if not _filter_param_matches(candidate, filter_param):
+            continue
+        candidate.raw_value = canonical_value
+        if candidate.param_key:
+            patched.param_values[candidate.param_key] = canonical_value
+        break
+    return patched
+
+
+def enumerate_zero_row_equality_filters(
+    intent: RuntimeIntent,
+    schema: SchemaGraph,
+) -> list[tuple[FilterParam, str, str, list[str]]]:
+    """List equality filters whose literals are absent from cached distinct values."""
+    param_values = _merge_intent_param_values(intent)
+    targets: list[tuple[FilterParam, str, str, list[str]]] = []
+    for filter_param in intent.filters_param or []:
+        literal = _filter_equality_literal(filter_param, param_values)
+        if literal is None:
+            continue
+        ref = _parse_qualified_column_ref(filter_param.left_expr)
+        if ref is None:
+            continue
+        table, column = ref
+        cached = column_cached_distinct_values(schema, table, column)
+        if not cached:
+            continue
+        if literal.lower() in {value.lower() for value in cached}:
+            continue
+        targets.append((filter_param, literal, column, cached))
+    return targets
+
+
+def zero_row_filter_suggestions(intent: RuntimeIntent, schema: SchemaGraph) -> list[str]:
+    """Suggest cached distinct-value corrections for equality filters after a zero-row execute."""
+    suggestions: list[str] = []
+    for _filter_param, literal, column, cached in enumerate_zero_row_equality_filters(intent, schema):
+        best: str | None = None
+        best_distance: int | None = None
+        for value in cached:
+            distance = _levenshtein_distance(literal.lower(), value.lower())
+            if best_distance is None or distance < best_distance:
+                best_distance = distance
+                best = value
+        if best is None or best_distance is None:
+            continue
+        if best_distance > PolicyConfig.ZERO_ROW_FILTER_FUZZY_MAX_DISTANCE:
+            continue
+        suggestions.append(f"No rows for {column}={literal!r}. Did you mean {best!r}?")
+    return suggestions

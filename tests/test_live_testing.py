@@ -7,28 +7,28 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aetherdialect._config import GenerationPath
-from aetherdialect._contracts_base import SQLShape, TemplateStats
+from aetherdialect._constants import GenerationPath
+from aetherdialect._contracts_base import NormalizedExpr
 from aetherdialect._contracts_core import (
     ConcreteIntent,
-    NormalizedExpr,
+    RuntimeCteStep,
     RuntimeIntent,
     SelectCol,
     SqlGenerationOutcome,
     Template,
     ValueHistory,
 )
+from aetherdialect._contracts_schema import SQLShape, TemplateStats
+from aetherdialect._core_utils import StepResult, _make_input_responder, _make_prompt_responders
 from aetherdialect._live_testing import (
     Expected,
     Scenario,
     SequenceScenario,
     SoftAssert,
     SoftFailure,
-    StepResult,
     _assert_scenario,
+    _assertion_table_names,
     _build_reuse_intent,
-    _make_input_responder,
-    _make_prompt_responders,
     _run_pipeline_core,
     run_and_assert,
     run_sequence_and_assert,
@@ -466,8 +466,8 @@ class TestAssertScenario:
 
     def test_column_names_pass(self):
         """Column names assertion should pass when matching."""
+        from aetherdialect._contracts_base import NormalizedExpr
         from aetherdialect._contracts_core import (
-            NormalizedExpr,
             RuntimeIntent,
             SelectCol,
         )
@@ -489,8 +489,8 @@ class TestAssertScenario:
 
     def test_column_names_fail(self):
         """Column names mismatch should record failure."""
+        from aetherdialect._contracts_base import NormalizedExpr
         from aetherdialect._contracts_core import (
-            NormalizedExpr,
             RuntimeIntent,
             SelectCol,
         )
@@ -512,8 +512,8 @@ class TestAssertScenario:
 
     def test_column_names_one_of_multi_option_pass(self):
         """When multiple column sets allowed, matching one passes."""
+        from aetherdialect._contracts_base import NormalizedExpr
         from aetherdialect._contracts_core import (
-            NormalizedExpr,
             RuntimeIntent,
             SelectCol,
         )
@@ -957,7 +957,7 @@ class TestRunPipelineCoreUnionPreview:
             ),
             patch(
                 "aetherdialect._live_testing.parse_intent_via_llm",
-                return_value=(intent, [], 1),
+                return_value=(intent, [], 1, None),
             ),
             patch(
                 "aetherdialect._live_testing.match_template_for_union",
@@ -1007,3 +1007,50 @@ class TestRunPipelineCoreUnionPreview:
         mock_mtf.assert_called_once()
         assert captured.get("has_union_match") is True
         assert captured.get("cols_changed") is True
+
+
+class TestAssertionTableNames:
+    """CTE table assertions exclude normalized CTE alias names."""
+
+    def test_excludes_cte_aliases_and_keeps_base_tables(self):
+        intent = RuntimeIntent(
+            tables=["cte2"],
+            grain="row_level",
+            select_cols=[SelectCol(expr=NormalizedExpr.from_column("cte2.line_count"))],
+            group_by_cols=[],
+            order_by_cols=[],
+            filters_param=[],
+            cte_steps=[
+                RuntimeCteStep(
+                    cte_name="cte1",
+                    tables=["tbl_a", "tbl_b"],
+                    select_cols=[SelectCol(expr=NormalizedExpr.from_column("tbl_a.id"))],
+                ),
+                RuntimeCteStep(
+                    cte_name="cte2",
+                    tables=["cte1"],
+                    select_cols=[SelectCol(expr=NormalizedExpr.from_column("cte1.id"))],
+                ),
+            ],
+            planner_cte_names=["cte1", "cte2"],
+        )
+        sql = (
+            'WITH cte1 AS (SELECT "tbl_a"."id" FROM "tbl_a" INNER JOIN "tbl_b" ON "tbl_a"."id" = "tbl_b"."id") '
+            'SELECT "cte1"."id" FROM cte1'
+        )
+        names = _assertion_table_names(intent, sql)
+        assert "cte1" not in names
+        assert "cte2" not in names
+        assert "tbl_a" in names
+        assert "tbl_b" in names
+
+    def test_without_cte_steps_uses_intent_tables(self):
+        intent = RuntimeIntent(
+            tables=["tbl_a", "tbl_b"],
+            grain="row_level",
+            select_cols=[SelectCol(expr=NormalizedExpr.from_column("tbl_a.id"))],
+            group_by_cols=[],
+            order_by_cols=[],
+            filters_param=[],
+        )
+        assert _assertion_table_names(intent, None) == ["tbl_a", "tbl_b"]

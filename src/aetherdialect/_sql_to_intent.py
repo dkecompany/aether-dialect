@@ -1,69 +1,41 @@
-"""SQL to RuntimeIntent conversion plus query-log fetching for SQL-history warmup."""
+"""SQL to RuntimeIntent conversion plus query-log fetching for SQL- history warmup."""
 
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import re
 from dataclasses import dataclass, field, replace
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 import sqlglot
-from sqlglot import exp as sqlglot_exp
-
-try:
-    import pglast
-    from pglast.ast import (
-        A_Const,
-        A_Expr,
-        Alias,
-        BoolExpr,
-        CaseExpr,
-        CaseWhen,
-        CoalesceExpr,
-        ColumnRef,
-        CommonTableExpr,
-        FuncCall,
-        Integer,
-        JoinExpr,
-        NullTest,
-        RangeSubselect,
-        RangeVar,
-        RawStmt,
-        ResTarget,
-        SelectStmt,
-        SortBy,
-        SQLValueFunction,
-        SubLink,
-        TypeCast,
-    )
-    from pglast.enums import (
-        A_Expr_Kind,
-        BoolExprType,
-        JoinType,
-        NullTestType,
-        SetOperation,
-        SortByDir,
-        SQLValueFunctionOp,
-    )
-except ImportError:
-    pglast = None
-
-from sqlalchemy import text
 
 from ._config import (
+    EngineConfig,
+    SeedWarmupConfig,
+)
+from ._constants import (
+    BIGQUERY_QUERY_LOG_AVAILABILITY_SQL,
+    BIGQUERY_QUERY_LOG_FETCH_SQL,
+    MYSQL_QUERY_LOG_AVAILABILITY_SQL,
+    MYSQL_QUERY_LOG_FETCH_SQL,
     PG_LAST_WINDOW_FRAME_OPTIONS_INLINE_DEFAULT,
     PG_LAST_WINDOW_FRAME_OPTIONS_RANGE_UNBOUNDED_CURRENT,
     PG_LAST_WINDOW_FRAME_OPTIONS_ROWS_OFFSET_CURRENT,
     PG_LAST_WINDOW_FRAME_OPTIONS_ROWS_UNBOUNDED_PAIR,
+    REDSHIFT_QUERY_LOG_AVAILABILITY_SQL,
+    REDSHIFT_QUERY_LOG_FETCH_SQL,
     SELF_JOIN_CTE_NAME_PREFIX,
+    SNOWFLAKE_QUERY_LOG_AVAILABILITY_SQL,
+    SNOWFLAKE_QUERY_LOG_FETCH_SQL,
     SQL_TO_INTENT_LIMIT_OFFSET_PARAM_KEY,
     SQL_TO_INTENT_LITERAL_PLACEHOLDER_NUM,
     SQL_TO_INTENT_LITERAL_PLACEHOLDER_STR,
     SQL_TO_INTENT_PARAM_KEY_PREFIX,
-    SQLGLOT_DIALECT_BY_ENGINE,
-    WARMUP_PARAPHRASE_COUNT_FROM_SQL,
+    SQLSERVER_QUERY_LOG_AVAILABILITY_SQL,
+    SQLSERVER_QUERY_LOG_FETCH_SQL,
+    SQLSERVER_QUERY_STORE_AVAILABILITY_SQL,
+    SQLSERVER_QUERY_STORE_FETCH_SQL,
     WARMUP_ROUND_TRIP_CARDINALITY_TOLERANCE,
     WARMUP_ROUND_TRIP_LIMIT,
     WINDOW_DEFAULT_FRAME_END_WITH_ORDER,
@@ -72,60 +44,208 @@ from ._config import (
     WINDOW_DEFAULT_FRAME_KIND_WITHOUT_ORDER,
     WINDOW_DEFAULT_FRAME_START_WITH_ORDER,
     WINDOW_DEFAULT_FRAME_START_WITHOUT_ORDER,
-    SeedWarmupConfig,
 )
-from ._contracts_base import SchemaGraph
-from ._contracts_core import (
-    CaseRegistryStep,
-    CaseWhenBranch,
-    CaseWhenExpr,
+
+pglast: Any = None
+SubLinkType: Any = None
+A_Const: Any = object
+A_Expr: Any = object
+Alias: Any = object
+BoolExpr: Any = object
+CaseExpr: Any = object
+CaseWhen: Any = object
+CoalesceExpr: Any = object
+ColumnRef: Any = object
+CommonTableExpr: Any = object
+FuncCall: Any = object
+Integer: Any = object
+JoinExpr: Any = object
+NullTest: Any = object
+RangeSubselect: Any = object
+RangeVar: Any = object
+RawStmt: Any = object
+ResTarget: Any = object
+SelectStmt: Any = object
+SortBy: Any = object
+SQLValueFunction: Any = object
+SubLink: Any = object
+TypeCast: Any = object
+A_Expr_Kind: Any = object
+BoolExprType: Any = object
+JoinType: Any = object
+NullTestType: Any = object
+SetOperation: Any = object
+SortByDir: Any = object
+SQLValueFunctionOp: Any = object
+
+try:
+    import pglast as _pglast_mod
+    from pglast.ast import (
+        A_Const as _A_Const,
+    )
+    from pglast.ast import (
+        A_Expr as _A_Expr,
+    )
+    from pglast.ast import (
+        Alias as _Alias,
+    )
+    from pglast.ast import (
+        BoolExpr as _BoolExpr,
+    )
+    from pglast.ast import (
+        CaseExpr as _CaseExpr,
+    )
+    from pglast.ast import (
+        CaseWhen as _CaseWhen,
+    )
+    from pglast.ast import (
+        CoalesceExpr as _CoalesceExpr,
+    )
+    from pglast.ast import (
+        ColumnRef as _ColumnRef,
+    )
+    from pglast.ast import (
+        CommonTableExpr as _CommonTableExpr,
+    )
+    from pglast.ast import (
+        FuncCall as _FuncCall,
+    )
+    from pglast.ast import (
+        Integer as _Integer,
+    )
+    from pglast.ast import (
+        JoinExpr as _JoinExpr,
+    )
+    from pglast.ast import (
+        NullTest as _NullTest,
+    )
+    from pglast.ast import (
+        RangeSubselect as _RangeSubselect,
+    )
+    from pglast.ast import (
+        RangeVar as _RangeVar,
+    )
+    from pglast.ast import (
+        RawStmt as _RawStmt,
+    )
+    from pglast.ast import (
+        ResTarget as _ResTarget,
+    )
+    from pglast.ast import (
+        SelectStmt as _SelectStmt,
+    )
+    from pglast.ast import (
+        SortBy as _SortBy,
+    )
+    from pglast.ast import (
+        SQLValueFunction as _SQLValueFunction,
+    )
+    from pglast.ast import (
+        SubLink as _SubLink,
+    )
+    from pglast.ast import (
+        TypeCast as _TypeCast,
+    )
+    from pglast.enums import (
+        A_Expr_Kind as _A_Expr_Kind,
+    )
+    from pglast.enums import (
+        BoolExprType as _BoolExprType,
+    )
+    from pglast.enums import (
+        JoinType as _JoinType,
+    )
+    from pglast.enums import (
+        NullTestType as _NullTestType,
+    )
+    from pglast.enums import (
+        SetOperation as _SetOperation,
+    )
+    from pglast.enums import (
+        SortByDir as _SortByDir,
+    )
+    from pglast.enums import (
+        SQLValueFunctionOp as _SQLValueFunctionOp,
+    )
+    from pglast.enums.primnodes import SubLinkType as _SubLinkType
+
+    pglast = _pglast_mod
+    SubLinkType = _SubLinkType
+    A_Const = _A_Const
+    A_Expr = _A_Expr
+    Alias = _Alias
+    BoolExpr = _BoolExpr
+    CaseExpr = _CaseExpr
+    CaseWhen = _CaseWhen
+    CoalesceExpr = _CoalesceExpr
+    ColumnRef = _ColumnRef
+    CommonTableExpr = _CommonTableExpr
+    FuncCall = _FuncCall
+    Integer = _Integer
+    JoinExpr = _JoinExpr
+    NullTest = _NullTest
+    RangeSubselect = _RangeSubselect
+    RangeVar = _RangeVar
+    RawStmt = _RawStmt
+    ResTarget = _ResTarget
+    SelectStmt = _SelectStmt
+    SortBy = _SortBy
+    SQLValueFunction = _SQLValueFunction
+    SubLink = _SubLink
+    TypeCast = _TypeCast
+    A_Expr_Kind = _A_Expr_Kind
+    BoolExprType = _BoolExprType
+    JoinType = _JoinType
+    NullTestType = _NullTestType
+    SetOperation = _SetOperation
+    SortByDir = _SortByDir
+    SQLValueFunctionOp = _SQLValueFunctionOp
+except ImportError:
+    pglast = None
+    SubLinkType = None
+
+
+from ._contracts_base import (
     FilterParam,
     HavingParam,
     MulGroup,
     NormalizedExpr,
     OrderByCol,
+    WindowFrameKind,
+)
+from ._contracts_core import (
     RuntimeCteStep,
     RuntimeIntent,
     SeedWarmupIntent,
     SelectCol,
-    WindowRegistryStep,
-    WindowSpec,
     runtime_intent_to_concrete,
 )
-from ._core_utils import sha256, stable_json
-from ._dialect import (
-    DatabricksDialect,
-    PostgresDialect,
-    _pg_columnref_to_pair,
-    _pg_funcname,
+from ._contracts_schema import (
+    CaseRegistryStep,
+    CaseWhenBranch,
+    CaseWhenExpr,
+    SchemaGraph,
+    WindowRegistryStep,
+    WindowSpec,
 )
+from ._core_utils import sha256, stable_json
+from ._dialect import get_dialect_class
+from ._dialect_postgres import pg_columnref_to_pair, pg_funcname
 from ._intent_process import (
+    apply_deterministic_repairs,
     cte_structural_signature,
     union_runtime_concrete_compatibility,
 )
+from ._intent_resolve import check_qualified_refs_exist
 from ._sql_gen import build_deterministic_sql
+from ._sql_to_intent_sqlglot import convert_sql_via_sqlglot
 from ._utils import body_similarity_key, sql_shape
+from ._validation_execute import curated_warmup_semantic_issues
 
 
 @dataclass
-class PgExtra:
-    """
-    Per-select conversion scratch space for qualifier swaps and registry emission.
-
-    Args:
-
-        qual_swap: Maps an original range alias to the qualifier introduced when a self-join branch is lifted into a CTE.
-
-        case_registry: Collected CASE registry rows emitted while converting projections.
-
-        window_registry: Collected window registry rows emitted while converting projections.
-
-        case_counter: Monotonic counter used for deterministic ``cNN`` identifiers.
-
-        window_counter: Monotonic counter used for deterministic ``wNN`` identifiers.
-
-        self_join_steps: ``RuntimeCteStep`` rows emitted when a repeated physical table is lifted before parsing the body.
-    """
+class _PgExtra:
+    """Per-select conversion scratch space for qualifier swaps and. registry emission."""
 
     qual_swap: dict[str, str] = field(default_factory=dict)
     case_registry: list[CaseRegistryStep] = field(default_factory=list)
@@ -136,42 +256,29 @@ class PgExtra:
 
     def next_case_id(self) -> str:
         """Reserve the next sequential CASE registry identifier."""
-
         self.case_counter += 1
         return f"c{self.case_counter:02d}"
 
     def next_window_id(self) -> str:
         """Reserve the next sequential window registry identifier."""
-
         self.window_counter += 1
         return f"w{self.window_counter:02d}"
 
 
 def _normalize_window_spec_ansi_defaults(ws: WindowSpec) -> WindowSpec:
-    """
-    Fill ANSI-equivalent explicit ROWS bounds when the frame was omitted.
-
-    Args:
-
-        ws: Parsed window specification.
-
-    Returns:
-
-        Updated spec when ``frame_kind`` was ``none``; otherwise *ws* unchanged.
-    """
-
+    """Fill ANSI-equivalent explicit ROWS bounds when the frame was. omitted."""
     if ws.frame_kind != "none":
         return ws
     if ws.order_by:
         return replace(
             ws,
-            frame_kind=WINDOW_DEFAULT_FRAME_KIND_WITH_ORDER,
+            frame_kind=cast(WindowFrameKind, WINDOW_DEFAULT_FRAME_KIND_WITH_ORDER),
             frame_start=WINDOW_DEFAULT_FRAME_START_WITH_ORDER,
             frame_end=WINDOW_DEFAULT_FRAME_END_WITH_ORDER,
         )
     return replace(
         ws,
-        frame_kind=WINDOW_DEFAULT_FRAME_KIND_WITHOUT_ORDER,
+        frame_kind=cast(WindowFrameKind, WINDOW_DEFAULT_FRAME_KIND_WITHOUT_ORDER),
         frame_start=WINDOW_DEFAULT_FRAME_START_WITHOUT_ORDER,
         frame_end=WINDOW_DEFAULT_FRAME_END_WITHOUT_ORDER,
     )
@@ -179,20 +286,17 @@ def _normalize_window_spec_ansi_defaults(ws: WindowSpec) -> WindowSpec:
 
 def _normalize_window_registry_step(w: WindowRegistryStep) -> WindowRegistryStep:
     """Apply ANSI default frames to one window registry row."""
-
     return replace(w, window_spec=_normalize_window_spec_ansi_defaults(w.window_spec))
 
 
 def _normalize_runtime_cte_step_windows(step: RuntimeCteStep) -> RuntimeCteStep:
     """Normalise window frames on a single CTE branch."""
-
     wr = [_normalize_window_registry_step(x) for x in (step.window_registry or [])]
     return replace(step, window_registry=wr)
 
 
 def _cte_body_shell_key(step: RuntimeCteStep) -> str:
     """Structural CTE body fingerprint excluding SELECT projections (matches union clustering)."""
-
     parts: list[str] = [
         step.grain or "row_level",
         ",".join(sorted(step.tables or [])),
@@ -208,7 +312,6 @@ def _cte_body_shell_key(step: RuntimeCteStep) -> str:
 
 def _runtime_intent_from_cte_step(step: RuntimeCteStep) -> RuntimeIntent:
     """Project a CTE body onto a runtime intent shell for union eligibility checks."""
-
     return RuntimeIntent(
         tables=list(step.tables or []),
         grain=step.grain or "row_level",
@@ -234,7 +337,6 @@ def _merge_union_compatible_cte_cluster(
     cluster: list[RuntimeCteStep],
 ) -> list[RuntimeCteStep]:
     """Greedy union-merge of CTE steps sharing :func:`_cte_body_shell_key`."""
-
     if len(cluster) <= 1:
         return list(cluster)
     pending = list(cluster)
@@ -266,18 +368,7 @@ def _merge_union_compatible_cte_cluster(
 
 
 def _dedup_cte_steps(intent: RuntimeIntent) -> RuntimeIntent:
-    """
-    Group CTE steps by structural family and union-merge where the bare-only diff rule passes.
-
-    Args:
-
-        intent: Intent possibly carrying duplicate CTE families.
-
-    Returns:
-
-        Intent with merged CTE steps when partitions qualify under union policy.
-    """
-
+    """Group CTE steps by structural family and union-merge where the. bare-only diff rule passes."""
     steps_in = list(intent.cte_steps or [])
     if not steps_in:
         return intent
@@ -300,18 +391,7 @@ def _dedup_cte_steps(intent: RuntimeIntent) -> RuntimeIntent:
 
 
 def _dedup_window_registry(intent: RuntimeIntent) -> RuntimeIntent:
-    """
-    Normalise omitted window frames to ANSI defaults before deduplicating registry rows.
-
-    Args:
-
-        intent: Intent carrying window registry entries.
-
-    Returns:
-
-        Intent with normalised frames and de-duplicated ``window_registry``.
-    """
-
+    """Normalise omitted window frames to ANSI defaults before. deduplicating registry rows."""
     wr_in = list(intent.window_registry or [])
     wr = [_normalize_window_registry_step(w) for w in wr_in]
     if not wr:
@@ -328,18 +408,7 @@ def _dedup_window_registry(intent: RuntimeIntent) -> RuntimeIntent:
 
 
 def _dedup_case_registry(intent: RuntimeIntent) -> RuntimeIntent:
-    """
-    Strict-equality deduplication of CASE registry entries by canonical signature keys.
-
-    Args:
-
-        intent: Intent carrying case registry entries.
-
-    Returns:
-
-        Intent with duplicate CASE registry rows removed.
-    """
-
+    """Strict-equality deduplication of CASE registry entries by. canonical signature keys."""
     cr = list(intent.case_registry or [])
     if len(cr) < 2:
         return intent
@@ -357,7 +426,7 @@ def _dedup_case_registry(intent: RuntimeIntent) -> RuntimeIntent:
 
 
 @dataclass(frozen=True)
-class ConverterResult:
+class _ConverterResult:
     """One SQL string converted to a RuntimeIntent or a structured failure."""
 
     sql_hash: str
@@ -368,138 +437,61 @@ class ConverterResult:
 
 def _hash_sql(sql: str) -> str:
     """Return a stable hexadecimal digest for *sql*."""
-
     return hashlib.sha256(sql.encode("utf-8")).hexdigest()
 
 
 def _infer_sqlglot_read(dialect: Any) -> str:
-    """
-    Map a live :class:`~aetherdialect._dialect.Dialect` instance to a sqlglot ``read`` dialect name.
-
-    Args:
-
-        dialect: Active dialect wrapper.
-
-    Returns:
-
-        Lowercase sqlglot reader key.
-    """
-
-    if isinstance(dialect, PostgresDialect):
-        return str(SQLGLOT_DIALECT_BY_ENGINE.get("postgresql", "postgres"))
-    if isinstance(dialect, DatabricksDialect):
-        return str(SQLGLOT_DIALECT_BY_ENGINE.get("databricks", "spark"))
-    return "postgres"
+    """Map a live :class:`~aetherdialect._dialect.Dialect` instance to. a. sqlglot ``read`` dialect name."""
+    return str(getattr(dialect, "sqlglot_dialect", "") or "postgres")
 
 
-def _expr_from_sqlglot_projection(
-    node: sqlglot_exp.Expression,
-) -> NormalizedExpr | None:
-    """
-    Build a minimal :class:`NormalizedExpr` leaf from a sqlglot SELECT projection.
-
-    Args:
-
-        node: Projection expression (possibly wrapped in Alias).
-
-    Returns:
-
-        Normalised expression when a plain column or star-free literal leaf is recognised.
-    """
-
-    if isinstance(node, sqlglot_exp.Alias):
-        node = node.this
-    if isinstance(node, sqlglot_exp.Column):
-        qual = f"{node.table}.{node.name}" if node.table else str(node.name)
-        return NormalizedExpr.from_column(qual)
-    if isinstance(node, sqlglot_exp.Literal):
-        return NormalizedExpr(string_literal=str(node.this))
-    return None
+def reformulate_imported_intent(
+    intent: RuntimeIntent,
+    schema: SchemaGraph,
+    dialect: Any,
+) -> RuntimeIntent:
+    """Apply intent-level reformulations shared by pglast and sqlglot extractors."""
+    del schema, dialect
+    return intent
 
 
-def _collect_tables_from_select(sel: sqlglot_exp.Select) -> list[str]:
-    """
-    Collect base table names referenced by a sqlglot SELECT (best-effort, unqualified names).
-
-    Args:
-
-        sel: Parsed SELECT root.
-
-    Returns:
-
-        Sorted unique physical table identifiers.
-    """
-
-    names: set[str] = set()
-    for t in sel.find_all(sqlglot_exp.Table):
-        if t.name:
-            names.add(str(t.name))
-    return sorted(names)
-
-
-def _runtime_from_sqlglot_select(sel: sqlglot_exp.Select, schema: SchemaGraph) -> RuntimeIntent | None:
-    """
-    Materialise a :class:`RuntimeIntent` from a sqlglot SELECT when projections are simple columns or literals.
-
-    Args:
-
-        sel: Parsed SELECT.
-
-        schema: Schema graph for reference validation.
-
-    Returns:
-
-        Intent or ``None`` when constructs are not supported in this conversion tier.
-    """
-
-    if sel.find(sqlglot_exp.Union):
-        return None
-    if sel.find(sqlglot_exp.With):
-        return None
-    for sq in sel.find_all(sqlglot_exp.Subquery):
-        if sq.parent and isinstance(sq.parent, (sqlglot_exp.From, sqlglot_exp.Join)):
-            return None
-    tables = _collect_tables_from_select(sel)
-    for t in tables:
-        if t not in schema.tables:
-            return None
-    select_cols: list[SelectCol] = []
-    for proj in sel.expressions:
-        ex = _expr_from_sqlglot_projection(proj)
-        if ex is None:
-            return None
-        select_cols.append(SelectCol(expr=ex))
-    grain = "row_level"
-    limit_val = None
-    if sel.args.get("limit"):
-        lim = sel.args["limit"]
-        if isinstance(lim, sqlglot_exp.Limit) and isinstance(lim.expression, sqlglot_exp.Literal):
-            try:
-                limit_val = int(str(lim.expression.this))
-            except (TypeError, ValueError):
-                limit_val = None
-    return RuntimeIntent(
-        tables=tables,
-        grain=grain,
-        select_cols=select_cols,
-        group_by_cols=[],
-        order_by_cols=[],
-        filters_param=[],
-        having_param=[],
-        param_values={},
-        cte_steps=[],
-        natural_language="",
-        limit=limit_val,
-    )
+def normalize_imported_intent(
+    intent: RuntimeIntent,
+    schema: SchemaGraph,
+    dialect: Any,
+    *,
+    strict_semantic: bool = False,
+) -> tuple[RuntimeIntent | None, str | None, str]:
+    """Run post-extract normalization: reformulation, dedup, repairs, semantic gate."""
+    preserved_main = list(intent.tables or [])
+    preserved_cte = {c.cte_name: list(c.tables or []) for c in (intent.cte_steps or [])}
+    intent = reformulate_imported_intent(intent, schema, dialect)
+    intent = _dedup_cte_steps(intent)
+    intent = _dedup_window_registry(intent)
+    intent = _dedup_case_registry(intent)
+    postprocess = getattr(dialect, "postprocess_imported_intent", None)
+    if callable(postprocess):
+        intent = postprocess(intent, schema)
+    intent = apply_deterministic_repairs(intent, schema, "")
+    merged_main = sorted(set(intent.tables or []) | set(preserved_main))
+    new_ctes: list[RuntimeCteStep] = []
+    for cte in intent.cte_steps or []:
+        orig = preserved_cte.get(cte.cte_name, [])
+        merged_cte_tables = sorted(set(cte.tables or []) | set(orig))
+        new_ctes.append(replace(cte, tables=merged_cte_tables))
+    intent = replace(intent, tables=merged_main, cte_steps=new_ctes)
+    if strict_semantic:
+        _, qerr = check_qualified_refs_exist(intent, schema)
+        if qerr:
+            return None, "SEMANTIC_REJECT", "; ".join(qerr)
+        sem_msgs = curated_warmup_semantic_issues(intent, schema)
+        if sem_msgs:
+            return None, "SEMANTIC_REJECT", "; ".join(sem_msgs)
+    return intent, None, ""
 
 
 def _runtime_from_pglast_sql(sql: str, schema: SchemaGraph) -> RuntimeIntent | None:
-    """
-    Best-effort :mod:`pglast` SELECT → :class:`RuntimeIntent` extraction.
-
-    Unsupported constructs return ``None`` so callers can fall back to sqlglot.
-    """
-
+    """Best-effort :mod:`pglast` SELECT → :class:`RuntimeIntent` extraction. Unsupported constructs return ``None`` so callers can fall back to sqlglot."""
     if pglast is None:
         return None
 
@@ -541,7 +533,6 @@ def _pg_convert_pg_statement(
     next_lit_key: Any,
 ) -> tuple[RuntimeIntent, list[RuntimeCteStep]] | None:
     """Dispatch top-level ``SELECT`` (optionally wrapped in ``WITH``)."""
-
     if not isinstance(stmt, SelectStmt):
         return None
     return _pg_convert_select_stmt(stmt, schema, param_store, next_lit_key)
@@ -556,7 +547,6 @@ def _pg_convert_select_stmt(
     outer_allowed_cte: frozenset[str] | None = None,
 ) -> tuple[RuntimeIntent, list[RuntimeCteStep]] | None:
     """Convert one ``SelectStmt``, recursively stripping ``WITH`` into ``RuntimeCteStep`` rows."""
-
     allowed_cte = set(outer_allowed_cte or ())
     cte_steps: list[RuntimeCteStep] = []
     if getattr(sel, "withClause", None):
@@ -580,7 +570,7 @@ def _pg_convert_select_stmt(
         allowed_cte = allowed_cte | prior
 
     body_pair = _pg_runtime_intent_body_from_select(
-        sel, schema, param_store, next_lit_key, frozenset(allowed_cte), PgExtra()
+        sel, schema, param_store, next_lit_key, frozenset(allowed_cte), _PgExtra()
     )
     body, sj_body = body_pair
     if body is None:
@@ -596,15 +586,9 @@ def _pg_materialize_cte_body(
     next_lit_key: Any,
     allowed_cte: frozenset[str],
 ) -> list[RuntimeCteStep] | None:
-    """
-    Flatten a CTE body ``SelectStmt`` into ordered ``RuntimeCteStep`` rows.
-
-    Nested non-recursive ``WITH`` inside the body is expanded into preceding steps, then the named CTE shell.
-    """
-
+    """Flatten a CTE body ``SelectStmt`` into ordered ``RuntimeCteStep`` rows. Nested non-recursive ``WITH`` inside the body is expanded into preceding steps, then the named CTE shell."""
     if not isinstance(sel, SelectStmt):
         return None
-
     nested_steps: list[RuntimeCteStep] = []
     allowed_here: set[str] = set(allowed_cte)
 
@@ -626,7 +610,7 @@ def _pg_materialize_cte_body(
         allowed_here |= prior
 
     body_pair = _pg_runtime_intent_body_from_select(
-        sel, schema, param_store, next_lit_key, frozenset(allowed_here), PgExtra()
+        sel, schema, param_store, next_lit_key, frozenset(allowed_here), _PgExtra()
     )
     body, sj_local = body_pair
     if body is None:
@@ -637,7 +621,6 @@ def _pg_materialize_cte_body(
 
 def _pg_runtime_cte_step_from_body(sel: Any, body: RuntimeIntent, cte_name: str) -> RuntimeCteStep:
     """Wrap a converted CTE ``RuntimeIntent`` fragment as ``RuntimeCteStep``."""
-
     output_columns = _pg_infer_output_columns(sel)
     return RuntimeCteStep(
         cte_name=cte_name,
@@ -658,7 +641,6 @@ def _pg_runtime_cte_step_from_body(sel: Any, body: RuntimeIntent, cte_name: str)
 
 def _pg_infer_output_columns(sel: Any) -> list[str]:
     """Derive snake_case-ish output names from ``ResTarget`` aliases."""
-
     names: list[str] = []
     for i, rt in enumerate(sel.targetList or ()):
         nm = getattr(rt, "name", None)
@@ -674,22 +656,7 @@ def _pg_collect_range_bindings(
     schema_tables: set[str],
     allowed_cte: frozenset[str],
 ) -> list[tuple[str, str]] | None:
-    """
-    Collect ordered ``(alias, relation_target)`` pairs from a ``FROM`` clause.
-
-    Args:
-
-        from_clause: ``SelectStmt.fromClause`` sequence.
-
-        schema_tables: Known physical relation identifiers.
-
-        allowed_cte: CTE names visible in this scope.
-
-    Returns:
-
-        Binding list or ``None`` when an unsupported join construct appears.
-    """
-
+    """Collect ordered ``(alias, relation_target)`` pairs from a. ``FROM`` clause."""
     allowed_joins = frozenset(
         {
             JoinType.JOIN_INNER,
@@ -728,7 +695,6 @@ def _pg_collect_range_bindings(
 
 def _pg_bindings_to_alias_map(bindings: list[tuple[str, str]]) -> dict[str, str]:
     """Materialise a plain alias→target map from ordered bindings."""
-
     out: dict[str, str] = {}
     for alias, target in bindings:
         out[alias] = target
@@ -736,26 +702,13 @@ def _pg_bindings_to_alias_map(bindings: list[tuple[str, str]]) -> dict[str, str]
 
 
 def _pg_count_alias_refs(sel: Any, alias: str) -> int:
-    """
-    Count ``ColumnRef`` qualifiers equal to *alias* anywhere under *sel*.
-
-    Args:
-
-        sel: ``SelectStmt`` subtree.
-
-        alias: Table or range alias to score.
-
-    Returns:
-
-        Non-negative hit count.
-    """
-
+    """Count ``ColumnRef`` qualifiers equal to *alias* anywhere under. *sel*."""
     n = 0
 
     def visit(node: Any) -> None:
         nonlocal n
         if isinstance(node, ColumnRef):
-            pr = _pg_columnref_to_pair(node)
+            pr = pg_columnref_to_pair(node)
             if pr and pr[0] == alias:
                 n += 1
 
@@ -784,24 +737,7 @@ def _pg_rewrite_rangevar_to_cte(
     physical: str,
     cte_name: str,
 ) -> bool:
-    """
-    Rewrite the lifted ``RangeVar`` so it references the synthetic CTE name.
-
-    Args:
-
-        from_clause: ``SelectStmt.fromClause`` sequence.
-
-        lift_alias: Alias chosen for the lifted branch.
-
-        physical: Physical relation being duplicated.
-
-        cte_name: Synthetic ``WITH`` identifier.
-
-    Returns:
-
-        True when a matching range was rewritten.
-    """
-
+    """Rewrite the lifted ``RangeVar`` so it references the synthetic. CTE name."""
     allowed_joins = frozenset(
         {
             JoinType.JOIN_INNER,
@@ -828,7 +764,7 @@ def _pg_rewrite_rangevar_to_cte(
             if al == lift_alias and rel == physical:
                 node.relname = cte_name
                 node.schemaname = None
-                node.alias = Alias(aliasname=cte_name)
+                node.alias = cast(Any, Alias)(aliasname=cte_name)
                 changed = True
 
     for item in from_clause or ():
@@ -836,25 +772,77 @@ def _pg_rewrite_rangevar_to_cte(
     return changed
 
 
-def _pg_try_lift_self_join(sel: Any, schema_tables: set[str], allowed_cte: frozenset[str], pgx: PgExtra) -> bool:
-    """
-    Detect a two-alias self-join on one physical table and lift the lighter branch into a CTE step.
+def _pg_try_lift_from_subqueries(
+    sel: Any,
+    schema: SchemaGraph,
+    allowed_cte: frozenset[str],
+    pgx: _PgExtra,
+    param_store: dict[str, Any],
+    next_lit_key: Any,
+) -> bool:
+    """Lift ``FROM`` subselects into ``RuntimeCteStep`` rows and rewrite them as CTE table refs."""
+    if not isinstance(sel, SelectStmt) or not getattr(sel, "fromClause", None):
+        return True
+    allowed_joins = frozenset(
+        {
+            JoinType.JOIN_INNER,
+            JoinType.JOIN_LEFT,
+            JoinType.JOIN_RIGHT,
+            JoinType.JOIN_FULL,
+        }
+    )
+    sq_idx = [0]
 
-    Args:
+    def rewrite(node: Any) -> Any | None:
+        if isinstance(node, JoinExpr):
+            if node.jointype not in allowed_joins:
+                return None
+            left = rewrite(node.larg)
+            right = rewrite(node.rarg)
+            if left is None or right is None:
+                return None
+            node.larg = left
+            node.rarg = right
+            return node
+        if isinstance(node, RangeSubselect):
+            sub = node.subquery
+            if not isinstance(sub, SelectStmt):
+                return None
+            alias = ""
+            if node.alias and getattr(node.alias, "aliasname", None):
+                alias = str(node.alias.aliasname).strip()
+            if not alias:
+                sq_idx[0] += 1
+                alias = f"sq_{sq_idx[0]}"
+            cte_name = f"from_{alias}"
+            if cte_name in allowed_cte:
+                return None
+            chunk = _pg_materialize_cte_body(sub, schema, cte_name, param_store, next_lit_key, allowed_cte)
+            if chunk is None:
+                return None
+            pgx.self_join_steps.extend(chunk)
+            return cast(Any, RangeVar)(
+                relname=cte_name,
+                inh=False,
+                relpersistence="p",
+                alias=cast(Any, Alias)(aliasname=alias),
+            )
+        if isinstance(node, RangeVar):
+            return node
+        return None
 
-        sel: ``SelectStmt`` being converted.
+    new_clause: list[Any] = []
+    for item in sel.fromClause:
+        rewritten = rewrite(item)
+        if rewritten is None:
+            return False
+        new_clause.append(rewritten)
+    sel.fromClause = tuple(new_clause)
+    return True
 
-        schema_tables: Known physical tables.
 
-        allowed_cte: Visible CTE identifiers.
-
-        pgx: Mutable conversion scratch space.
-
-    Returns:
-
-        False when the statement must be rejected at the pglast tier.
-    """
-
+def _pg_try_lift_self_join(sel: Any, schema_tables: set[str], allowed_cte: frozenset[str], pgx: _PgExtra) -> bool:
+    """Detect a two-alias self-join on one physical table and lift the. lighter branch into a CTE step."""
     if not isinstance(sel, SelectStmt) or not getattr(sel, "fromClause", None):
         return True
     bindings = _pg_collect_range_bindings(sel.fromClause, schema_tables, allowed_cte)
@@ -901,10 +889,9 @@ def _pg_runtime_intent_body_from_select(
     param_store: dict[str, Any],
     next_lit_key: Any,
     allowed_cte: frozenset[str],
-    pg_extra: PgExtra | None = None,
+    pg_extra: _PgExtra | None = None,
 ) -> tuple[RuntimeIntent | None, list[RuntimeCteStep]]:
     """Convert ``SelectStmt`` core fields when ``WITH`` was already lifted."""
-
     if not isinstance(sel, SelectStmt):
         return None, []
     if sel.op != SetOperation.SETOP_NONE:
@@ -914,7 +901,9 @@ def _pg_runtime_intent_body_from_select(
     if getattr(sel, "intoClause", None):
         return None, []
     schema_tables = set(schema.tables.keys())
-    pgx = pg_extra if pg_extra is not None else PgExtra()
+    pgx = pg_extra if pg_extra is not None else _PgExtra()
+    if not _pg_try_lift_from_subqueries(sel, schema, allowed_cte, pgx, param_store, next_lit_key):
+        return None, []
     if not _pg_try_lift_self_join(sel, schema_tables, allowed_cte, pgx):
         return None, []
     extra_allowed = frozenset(set(allowed_cte) | {s.cte_name for s in pgx.self_join_steps})
@@ -944,7 +933,9 @@ def _pg_runtime_intent_body_from_select(
 
     filters: list[FilterParam] = []
     if getattr(sel, "whereClause", None):
-        fp = _pg_where_to_filters(sel.whereClause, alias_map, single_alias, param_store, next_lit_key, pgx)
+        fp = _pg_where_to_filters(
+            sel.whereClause, alias_map, single_alias, param_store, next_lit_key, pgx, extra_allowed, schema
+        )
         if fp is None:
             return None, []
         filters = fp
@@ -1025,28 +1016,14 @@ def _pg_runtime_intent_body_from_select(
     return intent, list(pgx.self_join_steps)
 
 
-def _pg_build_alias_map(
-    from_clause: Any,
-    schema_tables: set[str],
-    allowed_cte: frozenset[str],
-) -> dict[str, str] | None:
-    """Map ``RangeVar`` qualifier → underlying relation name (physical table or CTE id)."""
-
-    bindings = _pg_collect_range_bindings(from_clause, schema_tables, allowed_cte)
-    if bindings is None:
-        return None
-    return _pg_bindings_to_alias_map(bindings)
-
-
 def _pg_qual_column_name(
     colref: Any,
     alias_map: dict[str, str],
     single_alias: str | None,
-    pgx: PgExtra | None = None,
+    pgx: _PgExtra | None = None,
 ) -> str | None:
     """Turn ``ColumnRef`` into ``qual.col`` using FROM aliases."""
-
-    pair = _pg_columnref_to_pair(colref)
+    pair = pg_columnref_to_pair(colref)
     if pair is None:
         return None
     pre, col = pair
@@ -1063,7 +1040,6 @@ def _pg_qual_column_name(
 
 def _pg_map_where_scalar_op(op_raw: str | None) -> str | None:
     """Map pg ``A_Expr`` operator token strings to normalized ``FilterParam`` / ``HavingParam`` ops."""
-
     if op_raw is None:
         return None
     key = str(op_raw).strip().lower()
@@ -1088,10 +1064,9 @@ def _pg_distinct_select_index(
     alias_map: dict[str, str],
     single_alias: str | None,
     select_cols: list[SelectCol],
-    pgx: PgExtra | None = None,
+    pgx: _PgExtra | None = None,
 ) -> int:
     """Derive ``distinct_select_index`` from ``distinctClause`` when parsable."""
-
     dc = getattr(sel, "distinctClause", None)
     if not dc:
         return -1
@@ -1117,10 +1092,9 @@ def _pg_having_to_params(
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Any,
-    pgx: PgExtra | None = None,
+    pgx: _PgExtra | None = None,
 ) -> list[HavingParam] | None:
     """Extract ``HavingParam`` rows from ``HAVING`` (``AND`` chains; aggregate left, literal/column right)."""
-
     if isinstance(having, BoolExpr) and having.boolop != BoolExprType.AND_EXPR:
         return None
     parts = _pg_flatten_bool_and(having)
@@ -1226,25 +1200,22 @@ def _pg_having_to_params(
 
 def _pg_const_int_only(node: Any) -> int | None:
     """Parse ``A_Const`` integer literal."""
-
     if not isinstance(node, A_Const) or getattr(node, "isnull", False):
         return None
     v = node.val
     if isinstance(v, Integer):
+        ival = getattr(v, "ival", None)
+        if ival is None:
+            return None
         try:
-            return int(v.ival)
-        except (TypeError, ValueError, AttributeError):
+            return int(ival)
+        except (TypeError, ValueError):
             return None
     return None
 
 
 def _pg_const_payload(node: Any) -> tuple[Any, str, str] | None:
-    """
-    Return ``(raw_value, value_type, placeholder_expr)`` for literal masking.
-
-    ``placeholder_expr`` is one of the SQL_TO_INTENT_LITERAL_PLACEHOLDER_* tokens stored in ``NormalizedExpr.string_literal``.
-    """
-
+    """Return ``(raw_value, value_type, placeholder_expr)`` for literal masking. ``placeholder_expr`` is one of the SQL_TO_INTENT_LITERAL_PLACEHOLDER_* tokens stored in ``NormalizedExpr.string_literal``."""
     if not isinstance(node, A_Const) or getattr(node, "isnull", False):
         return None
     v = node.val
@@ -1273,10 +1244,9 @@ def _pg_expr_leaf(
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Any,
-    pgx: PgExtra | None = None,
+    pgx: _PgExtra | None = None,
 ) -> NormalizedExpr | None:
     """Recognise column refs or literals for projections / predicates."""
-
     if isinstance(node, ColumnRef):
         qn = _pg_qual_column_name(node, alias_map, single_alias, pgx)
         if qn is None:
@@ -1297,7 +1267,6 @@ def _pg_expr_leaf(
 
 def _pg_typename_cast_str(type_name: Any) -> str | None:
     """Render a ``TypeName`` chain as a SQL type string."""
-
     if type_name is None:
         return None
     names = getattr(type_name, "names", None) or ()
@@ -1314,7 +1283,6 @@ def _pg_typename_cast_str(type_name: Any) -> str | None:
 
 def _pg_interval_magnitude_unit_from_string(raw: str) -> tuple[float, str] | None:
     """Parse ``INTERVAL`` text payload into magnitude and unit."""
-
     t = (raw or "").strip()
     if not t:
         return None
@@ -1334,10 +1302,11 @@ def _pg_interval_magnitude_unit_from_string(raw: str) -> tuple[float, str] | Non
 
 def _pg_sql_value_function_keyword(node: Any) -> str | None:
     """Map ``SQLValueFunction`` to ``NormalizedExpr.keyword``."""
-
     if not isinstance(node, SQLValueFunction):
         return None
     op = getattr(node, "op", None)
+    if not isinstance(op, SQLValueFunctionOp):
+        return None
     mapping = {
         SQLValueFunctionOp.SVFOP_CURRENT_DATE: "current_date",
         SQLValueFunctionOp.SVFOP_CURRENT_TIME: "current_time",
@@ -1350,7 +1319,6 @@ def _pg_sql_value_function_keyword(node: Any) -> str | None:
 
 def _pg_collect_product_factors(expr: NormalizedExpr) -> list[NormalizedExpr]:
     """Flatten a pure multiplicative chain into factor leaves."""
-
     if (
         expr.add_groups
         and len(expr.add_groups) == 1
@@ -1375,7 +1343,6 @@ def _pg_collect_product_factors(expr: NormalizedExpr) -> list[NormalizedExpr]:
 
 def _pg_merge_product_exprs(left: NormalizedExpr, right: NormalizedExpr) -> NormalizedExpr:
     """Build ``NormalizedExpr`` for ``left * right``."""
-
     lf = _pg_collect_product_factors(left)
     rf = _pg_collect_product_factors(right)
     return NormalizedExpr(add_groups=[MulGroup(multiply=lf + rf)])
@@ -1383,7 +1350,6 @@ def _pg_merge_product_exprs(left: NormalizedExpr, right: NormalizedExpr) -> Norm
 
 def _pg_merge_ratio_exprs(left: NormalizedExpr, right: NormalizedExpr) -> NormalizedExpr:
     """Build ``NormalizedExpr`` for ``left / right``."""
-
     lf = _pg_collect_product_factors(left)
     rf = _pg_collect_product_factors(right)
     return NormalizedExpr(add_groups=[MulGroup(multiply=lf, divide=rf)])
@@ -1391,13 +1357,11 @@ def _pg_merge_ratio_exprs(left: NormalizedExpr, right: NormalizedExpr) -> Normal
 
 def _pg_wrap_mul_term(expr: NormalizedExpr) -> MulGroup:
     """Promote *expr* to a single multiplicative term."""
-
     return MulGroup(multiply=[expr])
 
 
 def _pg_expr_sql_token(expr: NormalizedExpr) -> str:
     """Serialize a simple expression as a trailing scalar-function token."""
-
     if expr.column_ref:
         return str(expr.column_ref)
     if expr.string_literal:
@@ -1413,10 +1377,9 @@ def _pg_window_partition_exprs(
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Any,
-    pgx: PgExtra | None,
+    pgx: _PgExtra | None,
 ) -> list[NormalizedExpr] | None:
     """Convert ``PARTITION BY`` expressions."""
-
     out: list[NormalizedExpr] = []
     for n in nodes or ():
         ex = _pg_expr_full(
@@ -1443,15 +1406,15 @@ def _pg_window_sort_clause(
     param_store: dict[str, Any],
     next_lit_key: Any,
     select_cols: list[SelectCol],
-    pgx: PgExtra | None,
+    pgx: _PgExtra | None,
 ) -> list[OrderByCol] | None:
     """Convert ``ORDER BY`` inside ``OVER``."""
-
     out: list[OrderByCol] = []
     for sb in nodes or ():
         if not isinstance(sb, SortBy):
             return None
         node = sb.node
+        ex: NormalizedExpr | None
         if isinstance(node, A_Const):
             ord_i = _pg_const_int_only(node)
             if ord_i is None or ord_i < 1 or ord_i > len(select_cols):
@@ -1469,8 +1432,8 @@ def _pg_window_sort_clause(
                 allow_window=False,
                 select_cols=select_cols,
             )
-            if ex is None:
-                return None
+        if ex is None:
+            return None
         direnum = getattr(sb, "sortby_dir", SortByDir.SORTBY_DEFAULT)
         direction = "DESC" if direnum == SortByDir.SORTBY_DESC else "ASC"
         out.append(OrderByCol(expr=ex, direction=direction))
@@ -1485,17 +1448,16 @@ def _pg_window_def_to_spec(
     param_store: dict[str, Any],
     next_lit_key: Any,
     select_cols: list[SelectCol],
-    pgx: PgExtra | None,
+    pgx: _PgExtra | None,
 ) -> WindowSpec | None:
     """Build ``WindowSpec`` from an inline ``WindowDef``."""
-
     if wdef is None:
         return None
     if getattr(wdef, "refname", None):
         return None
     if not isinstance(fn, FuncCall):
         return None
-    raw = (_pg_funcname(fn) or "").strip().lower()
+    raw = (pg_funcname(fn) or "").strip().lower()
     fn_name = raw.split(".")[-1] if raw else ""
     if not fn_name:
         return None
@@ -1530,7 +1492,7 @@ def _pg_window_def_to_spec(
         if arg_expr is None:
             return None
     fo = int(getattr(wdef, "frameOptions", 0) or 0)
-    frame_kind: str = "none"
+    frame_kind: WindowFrameKind = "none"
     frame_start: str | None = None
     frame_end: str | None = None
     frame_start_offset: int | None = None
@@ -1560,7 +1522,7 @@ def _pg_window_def_to_spec(
         partition_by=part,
         order_by=order,
         argument=arg_expr,
-        frame_kind=frame_kind,  # type: ignore[arg-type]
+        frame_kind=frame_kind,
         frame_start=frame_start,
         frame_end=frame_end,
         frame_start_offset=frame_start_offset,
@@ -1576,10 +1538,9 @@ def _pg_funcall_with_over_to_registry_step(
     param_store: dict[str, Any],
     next_lit_key: Any,
     select_cols: list[SelectCol],
-    pgx: PgExtra,
+    pgx: _PgExtra,
 ) -> NormalizedExpr | None:
     """Emit ``WindowRegistryStep`` for ``FuncCall`` with ``OVER``."""
-
     if not isinstance(fn, FuncCall) or not getattr(fn, "over", None):
         return None
     ws = _pg_window_def_to_spec(
@@ -1605,10 +1566,9 @@ def _pg_caseexpr_to_registry_step(
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Any,
-    pgx: PgExtra,
+    pgx: _PgExtra,
 ) -> NormalizedExpr | None:
     """Emit ``CaseRegistryStep`` for ``CaseExpr``."""
-
     if not isinstance(node, CaseExpr):
         return None
     branches: list[CaseWhenBranch] = []
@@ -1664,10 +1624,9 @@ def _pg_coalesce_to_expr(
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Any,
-    pgx: PgExtra | None,
+    pgx: _PgExtra | None,
 ) -> NormalizedExpr | None:
     """Map ``CoalesceExpr`` to ``NormalizedExpr``."""
-
     if not isinstance(node, CoalesceExpr):
         return None
     args = list(node.args or ())
@@ -1731,14 +1690,13 @@ def _pg_expr_full(
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Any,
-    pgx: PgExtra | None = None,
+    pgx: _PgExtra | None = None,
     *,
     allow_aggregate: bool = True,
     allow_window: bool = True,
     select_cols: list[SelectCol] | None = None,
 ) -> NormalizedExpr | None:
     """Parse PostgreSQL expression trees into ``NormalizedExpr`` or registry references."""
-
     leaf = _pg_expr_leaf(node, alias_map, single_alias, param_store, next_lit_key, pgx)
     if leaf is not None:
         return leaf
@@ -1769,7 +1727,7 @@ def _pg_expr_full(
             agg = _pg_aggregate_funcall_to_expr(node, alias_map, single_alias, param_store, next_lit_key, pgx)
             if agg is not None:
                 return agg
-        raw = (_pg_funcname(node) or "").strip().lower()
+        raw = (pg_funcname(node) or "").strip().lower()
         fn_name = raw.split(".")[-1] if raw else ""
         if fn_name == "extract":
             parts = list(node.args or ())
@@ -1942,19 +1900,18 @@ def _pg_aggregate_funcall_to_expr(
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Any,
-    pgx: PgExtra | None = None,
+    pgx: _PgExtra | None = None,
 ) -> NormalizedExpr | None:
     """Map aggregate ``FuncCall`` nodes to ``NormalizedExpr``."""
-
     if not isinstance(fn, FuncCall):
         return None
-    raw = (_pg_funcname(fn) or "").strip().lower()
+    raw = (pg_funcname(fn) or "").strip().lower()
     fn_name = raw.split(".")[-1] if raw else ""
     if fn_name not in _PG_SIMPLE_AGG_NAMES:
         return None
     if getattr(fn, "agg_star", False):
         return NormalizedExpr.from_agg(fn_name, "*")
-    args = fn.args or ()
+    args = list(fn.args or ())
     if len(args) != 1:
         return None
     inner = _pg_expr_full(
@@ -1984,11 +1941,10 @@ def _pg_res_target_to_expr(
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Any,
-    pgx: PgExtra | None = None,
+    pgx: _PgExtra | None = None,
     select_cols: list[SelectCol] | None = None,
 ) -> NormalizedExpr | None:
     """Convert ``ResTarget.val`` including arithmetic, CASE, windows, and aggregates."""
-
     return _pg_expr_full(
         rt.val,
         alias_map,
@@ -2004,7 +1960,6 @@ def _pg_res_target_to_expr(
 
 def _pg_flatten_bool_and(node: Any) -> list[Any]:
     """Flatten nested ``AND`` ``BoolExpr`` chains."""
-
     if isinstance(node, BoolExpr) and node.boolop == BoolExprType.AND_EXPR:
         out: list[Any] = []
         for a in node.args or ():
@@ -2015,7 +1970,6 @@ def _pg_flatten_bool_and(node: Any) -> list[Any]:
 
 def _pg_where_literal_payload(node: Any) -> tuple[Any, str] | None:
     """Extract typed literal for WHERE RHS without masking SELECT placeholders."""
-
     if isinstance(node, A_Const):
         p = _pg_const_payload(node)
         return (p[0], p[1]) if p else None
@@ -2027,7 +1981,6 @@ def _pg_where_literal_payload(node: Any) -> tuple[Any, str] | None:
 
 def _pg_collect_in_literal_values(rexpr: Any) -> tuple[list[Any], str] | None:
     """Homogeneous literal list for ``IN`` / ``NOT IN`` right-hand sides."""
-
     seq = rexpr if isinstance(rexpr, (list, tuple)) else (rexpr,)
     out: list[Any] = []
     vt: str | None = None
@@ -2041,9 +1994,104 @@ def _pg_collect_in_literal_values(rexpr: Any) -> tuple[list[Any], str] | None:
         elif vt != t:
             return None
         out.append(val)
-    if not out:
+    if not out or vt is None:
         return None
     return out, vt
+
+
+def _pg_sublink_to_filter(
+    p: Any,
+    alias_map: dict[str, str],
+    single_alias: str | None,
+    param_store: dict[str, Any],
+    next_lit_key: Any,
+    pgx: _PgExtra,
+    allowed_cte: frozenset[str],
+    schema: SchemaGraph,
+) -> FilterParam | None:
+    """Reformulate ``SubLink`` predicates into CTE-backed filters where supported."""
+    if SubLinkType is None or not isinstance(p, SubLink):
+        return None
+    sub = getattr(p, "subselect", None)
+    if not isinstance(sub, SelectStmt):
+        return None
+    sl_type = p.subLinkType
+    cte_name = f"sq_{len(pgx.self_join_steps) + 1}"
+    if sl_type == SubLinkType.EXISTS_SUBLINK:
+        chunk = _pg_materialize_cte_body(sub, schema, cte_name, param_store, next_lit_key, allowed_cte)
+        if chunk is None or not chunk:
+            return None
+        pgx.self_join_steps.extend(chunk)
+        outs = _pg_infer_output_columns(sub)
+        probe = f"{cte_name}.{outs[0]}" if outs else f"{cte_name}.col_0"
+        test = getattr(p, "testexpr", None)
+        is_not = isinstance(test, BoolExpr) and test.boolop == BoolExprType.NOT_EXPR
+        op_n = "is null" if is_not else "is not null"
+        return FilterParam(left_expr=NormalizedExpr.from_column(probe), op=op_n, value_type="null")
+    if sl_type == SubLinkType.ANY_SUBLINK:
+        chunk = _pg_materialize_cte_body(sub, schema, cte_name, param_store, next_lit_key, allowed_cte)
+        if chunk is None or not chunk:
+            return None
+        pgx.self_join_steps.extend(chunk)
+        outs = _pg_infer_output_columns(sub)
+        probe = f"{cte_name}.{outs[0]}" if outs else f"{cte_name}.col_0"
+        left_e = _pg_expr_full(
+            getattr(p, "testexpr", None),
+            alias_map,
+            single_alias,
+            param_store,
+            next_lit_key,
+            pgx,
+            allow_aggregate=False,
+            allow_window=False,
+            select_cols=None,
+        )
+        if left_e is None:
+            return None
+        op_raw = ""
+        names = getattr(p, "operName", None) or ()
+        if names:
+            op_raw = str(getattr(names[0], "sval", "") or "").strip().lower()
+        op_in = "not in" if op_raw in ("<>", "!=") else "in"
+        return FilterParam(
+            left_expr=left_e,
+            op=op_in,
+            right_expr=NormalizedExpr.from_column(probe),
+            value_type="column",
+        )
+    if sl_type == SubLinkType.EXPR_SUBLINK:
+        chunk = _pg_materialize_cte_body(sub, schema, cte_name, param_store, next_lit_key, allowed_cte)
+        if chunk is None or not chunk:
+            return None
+        scalar_step = replace(chunk[-1], grain="scalar")
+        pgx.self_join_steps.extend(chunk[:-1] + [scalar_step])
+        outs = _pg_infer_output_columns(sub)
+        probe = f"{cte_name}.{outs[0]}" if outs else f"{cte_name}.col_0"
+        left_e = _pg_expr_full(
+            getattr(p, "testexpr", None),
+            alias_map,
+            single_alias,
+            param_store,
+            next_lit_key,
+            pgx,
+            allow_aggregate=False,
+            allow_window=False,
+            select_cols=None,
+        )
+        if left_e is None:
+            return None
+        op_raw = ""
+        names = getattr(p, "operName", None) or ()
+        if names:
+            op_raw = str(getattr(names[0], "sval", "") or "").strip().lower()
+        mapped = _pg_map_where_scalar_op(op_raw) or "="
+        return FilterParam(
+            left_expr=left_e,
+            op=mapped,
+            right_expr=NormalizedExpr.from_column(probe),
+            value_type="column",
+        )
+    return None
 
 
 def _pg_single_predicate_to_filter(
@@ -2052,12 +2100,16 @@ def _pg_single_predicate_to_filter(
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Any,
-    pgx: PgExtra | None = None,
+    pgx: _PgExtra | None = None,
+    *,
+    allowed_cte: frozenset[str] | None = None,
+    schema: SchemaGraph | None = None,
 ) -> FilterParam | None:
     """Convert one ``WHERE`` predicate leaf (no nested ``BoolExpr``)."""
-
     if isinstance(p, SubLink):
-        return None
+        if pgx is None or allowed_cte is None or schema is None:
+            return None
+        return _pg_sublink_to_filter(p, alias_map, single_alias, param_store, next_lit_key, pgx, allowed_cte, schema)
     if isinstance(p, NullTest):
         left_e = _pg_expr_full(
             p.arg,
@@ -2138,7 +2190,7 @@ def _pg_single_predicate_to_filter(
         )
         if left_e is None:
             return None
-        names = getattr(p, "name", None) or ()
+        names = list(getattr(p, "name", None) or ())
         not_in = len(names) == 1 and getattr(names[0], "sval", None) == "<>"
         op_in = "not in" if not_in else "in"
         collected = _pg_collect_in_literal_values(rexpr)
@@ -2218,20 +2270,7 @@ def _pg_single_predicate_to_filter(
 
 
 def _pg_bool_nesting_too_deep(node: Any, depth: int) -> bool:
-    """
-    Reject boolean trees deeper than two levels of ``AND``/``OR``.
-
-    Args:
-
-        node: Predicate subtree.
-
-        depth: Current depth counter.
-
-    Returns:
-
-        True when the subtree violates the depth bound.
-    """
-
+    """Reject boolean trees deeper than two levels of ``AND``/``OR``."""
     if depth > 2:
         return True
     if isinstance(node, BoolExpr):
@@ -2249,30 +2288,11 @@ def _pg_walk_bool_to_filter_groups(
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Any,
-    pgx: PgExtra | None = None,
+    pgx: _PgExtra | None = None,
+    allowed_cte: frozenset[str] | None = None,
+    schema: SchemaGraph | None = None,
 ) -> list[FilterParam] | None:
-    """
-    Map ``WHERE`` boolean trees to ``FilterParam`` rows with optional ``filter_group`` ids.
-
-    Args:
-
-        where: ``WHERE`` clause root.
-
-        alias_map: Range alias map.
-
-        single_alias: Sole alias shortcut when exactly one range exists.
-
-        param_store: Literal binding targets.
-
-        next_lit_key: Generator for bind keys.
-
-        pgx: Optional qualifier swap context.
-
-    Returns:
-
-        Filters or ``None`` when the shape is outside the supported OR-of-AND tier.
-    """
-
+    """Map ``WHERE`` boolean trees to ``FilterParam`` rows with. optional. ``filter_group`` ids."""
     if _pg_bool_nesting_too_deep(where, 0):
         return None
     if isinstance(where, BoolExpr) and where.boolop == BoolExprType.NOT_EXPR:
@@ -2286,7 +2306,16 @@ def _pg_walk_bool_to_filter_groups(
                 sub = _pg_flatten_bool_and(arg)
                 first_arm = True
                 for subp in sub:
-                    fp = _pg_single_predicate_to_filter(subp, alias_map, single_alias, param_store, next_lit_key, pgx)
+                    fp = _pg_single_predicate_to_filter(
+                        subp,
+                        alias_map,
+                        single_alias,
+                        param_store,
+                        next_lit_key,
+                        pgx,
+                        allowed_cte=allowed_cte,
+                        schema=schema,
+                    )
                     if fp is None:
                         return None
                     bo = "AND"
@@ -2298,7 +2327,16 @@ def _pg_walk_bool_to_filter_groups(
                     out_or.append(fp)
                 gid += 1
                 continue
-            fp = _pg_single_predicate_to_filter(arg, alias_map, single_alias, param_store, next_lit_key, pgx)
+            fp = _pg_single_predicate_to_filter(
+                arg,
+                alias_map,
+                single_alias,
+                param_store,
+                next_lit_key,
+                pgx,
+                allowed_cte=allowed_cte,
+                schema=schema,
+            )
             if fp is None:
                 return None
             fp = replace(fp, filter_group=gid, bool_op="AND")
@@ -2311,7 +2349,16 @@ def _pg_walk_bool_to_filter_groups(
     parts = _pg_flatten_bool_and(where)
     out: list[FilterParam] = []
     for p in parts:
-        fp = _pg_single_predicate_to_filter(p, alias_map, single_alias, param_store, next_lit_key, pgx)
+        fp = _pg_single_predicate_to_filter(
+            p,
+            alias_map,
+            single_alias,
+            param_store,
+            next_lit_key,
+            pgx,
+            allowed_cte=allowed_cte,
+            schema=schema,
+        )
         if fp is None:
             return None
         out.append(fp)
@@ -2324,17 +2371,19 @@ def _pg_where_to_filters(
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Any,
-    pgx: PgExtra | None = None,
+    pgx: _PgExtra | None = None,
+    allowed_cte: frozenset[str] | None = None,
+    schema: SchemaGraph | None = None,
 ) -> list[FilterParam] | None:
-    """Extract ``FilterParam`` rows from ``WHERE`` using grouped OR-of-AND semantics."""
-
-    return _pg_walk_bool_to_filter_groups(where, alias_map, single_alias, param_store, next_lit_key, pgx)
+    """Extract ``FilterParam`` rows from ``WHERE`` using grouped OR-of- AND semantics."""
+    return _pg_walk_bool_to_filter_groups(
+        where, alias_map, single_alias, param_store, next_lit_key, pgx, allowed_cte, schema
+    )
 
 
 def _pg_a_expr_op_name(expr: Any) -> str | None:
     """Lowercase operator name from ``A_Expr.name``."""
-
-    names = getattr(expr, "name", None) or ()
+    names = list(getattr(expr, "name", None) or ())
     if len(names) != 1:
         return None
     sval = getattr(names[0], "sval", None)
@@ -2348,10 +2397,9 @@ def _pg_group_clause(
     select_cols: list[SelectCol],
     param_store: dict[str, Any],
     next_lit_key: Any,
-    pgx: PgExtra | None = None,
+    pgx: _PgExtra | None = None,
 ) -> list[NormalizedExpr] | None:
     """Convert ``GROUP BY`` list: columns, ordinals, or leaf expressions."""
-
     out: list[NormalizedExpr] = []
     for n in nodes or ():
         if isinstance(n, ColumnRef):
@@ -2389,15 +2437,15 @@ def _pg_sort_clause(
     param_store: dict[str, Any],
     next_lit_key: Any,
     select_cols: list[SelectCol],
-    pgx: PgExtra | None = None,
+    pgx: _PgExtra | None = None,
 ) -> list[OrderByCol] | None:
     """Convert ``ORDER BY`` using column refs, ordinals, or leaf expressions."""
-
     out: list[OrderByCol] = []
     for sb in nodes or ():
         if not isinstance(sb, SortBy):
             return None
         node = sb.node
+        ex: NormalizedExpr | None
         if isinstance(node, A_Const):
             ord_i = _pg_const_int_only(node)
             if ord_i is None or ord_i < 1 or ord_i > len(select_cols):
@@ -2415,87 +2463,21 @@ def _pg_sort_clause(
                 allow_window=False,
                 select_cols=select_cols,
             )
-            if ex is None:
-                return None
+        if ex is None:
+            return None
         direnum = getattr(sb, "sortby_dir", SortByDir.SORTBY_DEFAULT)
         direction = "DESC" if direnum == SortByDir.SORTBY_DESC else "ASC"
         out.append(OrderByCol(expr=ex, direction=direction))
     return out
 
 
-def _convert_sqlglot(sql: str, schema: SchemaGraph, sqlglot_read: str) -> RuntimeIntent:
-    """
-    sqlglot-based SQL to RuntimeIntent for dialects using the sqlglot reader *sqlglot_read*.
-
-    Prefers transpiling warehouse-specific syntax to PostgreSQL-shaped SQL and reusing the
-    pglast extraction path when available so Spark/Databricks SELECT shapes match the Postgres
-    converter coverage. Falls back to the minimal sqlglot tier when transpilation or pglast
-    extraction yields nothing.
-
-    Args:
-
-        sql: Raw SQL text.
-
-        schema: Active schema graph.
-
-        sqlglot_read: sqlglot ``read=`` dialect name.
-
-    Returns:
-
-        Parsed runtime intent.
-
-    Raises:
-
-        ValueError: When parsing or structural extraction fails.
-    """
-
-    transpiled: list[str] = []
-    try:
-        transpiled = sqlglot.transpile(sql, read=sqlglot_read, write="postgres")
-    except Exception:
-        transpiled = []
-    pglast_available = False
-    if pglast is not None:
-        try:
-            pglast.parse_sql("SELECT 1")
-            pglast_available = True
-        except Exception:
-            pglast_available = False
-    if pglast_available and transpiled:
-        for tx in transpiled:
-            rt_try = _runtime_from_pglast_sql(tx, schema)
-            if rt_try is not None:
-                rt_try = _dedup_cte_steps(rt_try)
-                rt_try = _dedup_window_registry(rt_try)
-                rt_try = _dedup_case_registry(rt_try)
-                return rt_try
-    try:
-        tree = sqlglot.parse_one(sql, read=sqlglot_read)
-    except Exception as exc:
-        raise ValueError(str(exc)) from exc
-    if not isinstance(tree, sqlglot_exp.Select):
-        sel = tree.find(sqlglot_exp.Select)
-        if sel is None:
-            raise ValueError("expected SELECT")
-    else:
-        sel = tree
-    rt = _runtime_from_sqlglot_select(sel, schema)
-    if rt is None:
-        raise ValueError("unsupported SELECT shape for sqlglot conversion tier")
-    rt = _dedup_cte_steps(rt)
-    rt = _dedup_window_registry(rt)
-    rt = _dedup_case_registry(rt)
-    return rt
+def _convert_sqlglot(sql: str, schema: SchemaGraph, dialect: Any) -> RuntimeIntent:
+    """Sqlglot-based SQL to RuntimeIntent for dialects using the sqlglot reader."""
+    return convert_sql_via_sqlglot(sql, schema, dialect)
 
 
-def _convert_postgres(sql: str, schema: SchemaGraph) -> RuntimeIntent:
-    """
-    PostgreSQL SQL → :class:`RuntimeIntent`.
-
-    When :mod:`pglast` is installed, validates parseability then prefers AST extraction; falls back to sqlglot when AST extraction yields ``None``.
-    """
-
-    sqlglot_read = str(SQLGLOT_DIALECT_BY_ENGINE.get("postgresql", "postgres"))
+def _convert_postgres(sql: str, schema: SchemaGraph, dialect: Any) -> RuntimeIntent:
+    """PostgreSQL SQL → :class:`RuntimeIntent`. When:mod:`pglast` is installed, validates parseability then prefers AST extraction; falls back to sqlglot when AST extraction yields ``None``."""
     pg_ok = False
     if pglast is not None:
         try:
@@ -2504,14 +2486,16 @@ def _convert_postgres(sql: str, schema: SchemaGraph) -> RuntimeIntent:
         except Exception as exc:
             raise ValueError(f"postgres parse rejected SQL: {exc}") from exc
 
+    raw: RuntimeIntent | None = None
     if pg_ok:
-        rt = _runtime_from_pglast_sql(sql, schema)
-        if rt is not None:
-            rt = _dedup_cte_steps(rt)
-            rt = _dedup_window_registry(rt)
-            rt = _dedup_case_registry(rt)
-            return rt
-    return _convert_sqlglot(sql, schema, sqlglot_read)
+        raw = _runtime_from_pglast_sql(sql, schema)
+    if raw is None:
+        raw = _convert_sqlglot(sql, schema, dialect)
+    normalized, fail_code, fail_detail = normalize_imported_intent(raw, schema, dialect, strict_semantic=False)
+    if fail_code is not None:
+        raise ValueError(fail_detail or fail_code)
+    assert normalized is not None
+    return normalized
 
 
 def _check_round_trip_shape(
@@ -2521,26 +2505,7 @@ def _check_round_trip_shape(
     dialect: Any,
     sqlglot_read: str,
 ) -> bool:
-    """
-    Layer 1: structural SQL shape parity between the original text and the inferred intent.
-
-    Args:
-
-        original_sql: User SQL.
-
-        intent: Converted intent.
-
-        schema: Schema graph.
-
-        dialect: Active dialect instance.
-
-        sqlglot_read: sqlglot reader key for :func:`sql_shape`.
-
-    Returns:
-
-        True when shapes align sufficiently for this tier.
-    """
-
+    """Layer 1: structural SQL shape parity between the original text and the inferred intent."""
     try:
         a = sql_shape(original_sql, intent, sqlglot_dialect=sqlglot_read)
         round_sql = sqlglot.transpile(original_sql, read=sqlglot_read, write=sqlglot_read)[0]
@@ -2550,50 +2515,8 @@ def _check_round_trip_shape(
     return a.num_joins == b.num_joins and a.has_group_by == b.has_group_by and a.has_agg == b.has_agg
 
 
-def _pg_plan_rows_from_explain_payload(payload: Any) -> float | None:
-    """
-    Extract the top-level ``Plan Rows`` estimate from a PostgreSQL JSON ``EXPLAIN`` payload.
-
-    Args:
-
-        payload: Raw ``EXPLAIN`` cell value or JSON text.
-
-    Returns:
-
-        Floating estimate when present.
-    """
-
-    if payload is None:
-        return None
-    if isinstance(payload, str):
-        try:
-            payload = json.loads(payload)
-        except Exception:
-            return None
-    if isinstance(payload, list) and payload:
-        root = payload[0]
-        if isinstance(root, dict):
-            plan = root.get("Plan")
-            if isinstance(plan, dict):
-                pr = plan.get("Plan Rows")
-                if isinstance(pr, (int, float)):
-                    return float(pr)
-    return None
-
-
-def _databricks_plan_rows_from_explain_text(payload: str) -> float | None:
-    """
-    Extract a coarse row-count estimate from Spark/Databricks ``EXPLAIN COST`` text.
-
-    Args:
-
-        payload: Concatenated plan lines.
-
-    Returns:
-
-        First plausible numeric rows estimate, or ``None`` when none match.
-    """
-
+def databricks_plan_rows_from_explain_text(payload: str) -> float | None:
+    """Extract a coarse row-count estimate from Spark/Databricks. ``EXPLAIN COST`` text."""
     if not payload:
         return None
     for pat in (
@@ -2617,24 +2540,7 @@ def _check_round_trip_intent_parity(
     dialect: Any,
     sqlglot_read: str,
 ) -> bool:
-    """
-    Layer 2: structural presence gate before deeper regeneration probes run elsewhere.
-
-    Args:
-
-        intent: Converted intent.
-
-        schema: Schema graph (unused at this tier).
-
-        dialect: Active dialect (unused at this tier).
-
-        sqlglot_read: Reader token (unused at this tier).
-
-    Returns:
-
-        True when tables and projections exist on the converted intent.
-    """
-
+    """Layer 2: structural presence gate before deeper regeneration probes run elsewhere."""
     del schema, dialect, sqlglot_read
     return bool(intent.tables) and bool(intent.select_cols)
 
@@ -2647,80 +2553,15 @@ def _check_round_trip_execute(
     *,
     limit: int = WARMUP_ROUND_TRIP_LIMIT,
 ) -> bool:
-    """
-    Layer 3: compare planner cardinality estimates between original and regenerated SQL.
-
-    Args:
-
-        original_sql: User SQL.
-
-        intent: Converted intent.
-
-        schema: Schema graph.
-
-        dialect: Active dialect.
-
-        limit: Unused placeholder retained for API symmetry with execution caps.
-
-    Returns:
-
-        True when estimates agree within tolerance, when EXPLAIN is unavailable, or when binding fails softly.
-    """
-
+    """Layer 3: compare planner cardinality estimates between original and regenerated SQL."""
     del limit
-    finalize = getattr(dialect, "finalize_render", None)
-    if not callable(finalize):
-        return True
     tol = float(WARMUP_ROUND_TRIP_CARDINALITY_TOLERANCE)
-
-    def explain_rows_postgres(sql_text: str) -> float | None:
-        eng = getattr(dialect, "engine", None)
-        if eng is None:
-            return None
-        try:
-            finalized = finalize(sql_text, {}, schema=schema, intent=intent)
-            explain_sql = f"EXPLAIN (FORMAT JSON, COSTS true) {finalized}"
-            with eng.connect() as conn:
-                rows = conn.execute(text(explain_sql), {}).fetchall()
-            payload = rows[0][0] if rows else None
-            return _pg_plan_rows_from_explain_payload(payload)
-        except Exception:
-            return None
-
-    def explain_rows_databricks(sql_text: str) -> float | None:
-        if not isinstance(dialect, DatabricksDialect):
-            return None
-        try:
-            finalized = finalize(sql_text, {}, schema=schema, intent=intent)
-            explain_sql = f"EXPLAIN COST {finalized}"
-            text_payload = ""
-            eng = getattr(dialect, "engine", None)
-            if eng is not None:
-                with eng.connect() as conn:
-                    rows = conn.execute(text(explain_sql)).fetchall()
-                text_payload = "\n".join(str(r[0]) for r in rows if r and r[0] is not None)
-            elif getattr(dialect, "connection", None) is not None:
-                cursor = dialect.connection.cursor()
-                try:
-                    cursor.execute(explain_sql)
-                    rows = cursor.fetchall() or []
-                finally:
-                    cursor.close()
-                text_payload = "\n".join(str(r[0]) for r in rows if r and r[0] is not None)
-            elif getattr(dialect, "spark", None) is not None:
-                explain_df = dialect.spark.sql(explain_sql)
-                rows = explain_df.collect()
-                text_payload = "\n".join(str(r[0]) for r in rows if r and len(r) > 0)
-            return _databricks_plan_rows_from_explain_text(text_payload)
-        except Exception:
-            return None
+    estimate = getattr(dialect, "explain_row_estimate", None)
+    if not callable(estimate):
+        return True
 
     def explain_rows(sql_text: str) -> float | None:
-        if isinstance(dialect, PostgresDialect):
-            return explain_rows_postgres(sql_text)
-        if isinstance(dialect, DatabricksDialect):
-            return explain_rows_databricks(sql_text)
-        return None
+        return cast(float | None, estimate(sql_text, schema=schema, intent=intent))
 
     try:
         det = build_deterministic_sql(intent, None, schema, dialect)
@@ -2740,58 +2581,55 @@ def convert_sql_to_intent(
     dialect: Any,
     *,
     verify_via_execute: bool = True,
-) -> ConverterResult:
-    """
-    Convert one SQL statement to a RuntimeIntent and validate the round trip.
-
-    Args:
-
-        sql: Single SQL statement text.
-
-        schema: Active schema graph.
-
-        dialect: Live dialect instance (PostgreSQL or Databricks).
-
-        verify_via_execute: When True, attempt layer-3 execution validation when wired.
-
-    Returns:
-
-        :class:`ConverterResult` with intent or a failure code drawn from ``SQL_TO_INTENT_FAILURE_CODES``.
-    """
-
+) -> _ConverterResult:
+    """Convert one SQL statement to a RuntimeIntent and validate the. round trip."""
     h = _hash_sql(sql)
     sqlglot_read = _infer_sqlglot_read(dialect)
+    intent: RuntimeIntent | None
     try:
-        if isinstance(dialect, PostgresDialect):
-            intent = _convert_postgres(sql, schema)
+        if getattr(dialect, "parse_backend", "sqlglot") == "pglast":
+            intent = _convert_postgres(sql, schema, dialect)
         else:
-            intent = _convert_sqlglot(sql, schema, sqlglot_read)
+            try:
+                raw = _convert_sqlglot(sql, schema, dialect)
+            except Exception as exc:
+                return _ConverterResult(h, None, "SQL_PARSE_FAILED", str(exc))
+            intent, fail_code, fail_detail = normalize_imported_intent(
+                raw, schema, dialect, strict_semantic=verify_via_execute
+            )
+            if fail_code is not None:
+                return _ConverterResult(h, None, fail_code, fail_detail)
+            if intent is None:
+                return _ConverterResult(h, None, "SQL_PARSE_FAILED", "empty intent")
     except Exception as exc:
-        return ConverterResult(h, None, "SQL_PARSE_FAILED", str(exc))
+        msg = str(exc)
+        code = "SQL_PARSE_FAILED"
+        if any(
+            token in msg.lower()
+            for token in (
+                "grain",
+                "temporal",
+                "qualified",
+                "aggregation",
+                "frame",
+                "window",
+            )
+        ):
+            code = "SEMANTIC_REJECT"
+        return _ConverterResult(h, None, code, msg)
     if not _check_round_trip_shape(sql, intent, schema, dialect, sqlglot_read):
-        return ConverterResult(h, None, "ROUND_TRIP_SHAPE_MISMATCH", "shape gate failed")
+        return _ConverterResult(h, None, "ROUND_TRIP_SHAPE_MISMATCH", "shape gate failed")
     if not _check_round_trip_intent_parity(intent, schema, dialect, sqlglot_read):
-        return ConverterResult(h, None, "ROUND_TRIP_INTENT_DRIFT", "intent parity gate failed")
+        return _ConverterResult(h, None, "ROUND_TRIP_INTENT_DRIFT", "intent parity gate failed")
     if verify_via_execute and not _check_round_trip_execute(
         sql, intent, schema, dialect, limit=WARMUP_ROUND_TRIP_LIMIT
     ):
-        return ConverterResult(h, None, "ROUND_TRIP_EXECUTE_MISMATCH", "execute oracle gate failed")
-    return ConverterResult(h, intent, None, "")
+        return _ConverterResult(h, None, "ROUND_TRIP_EXECUTE_MISMATCH", "execute verification gate failed")
+    return _ConverterResult(h, intent, None, "")
 
 
 def _union_merge_bucket_key(intent: RuntimeIntent) -> str:
-    """
-    Structural shell excluding SELECT projections so union-compatible intents cluster.
-
-    Args:
-
-        intent: Runtime intent whose non-projection body defines the bucket.
-
-    Returns:
-
-        Hex digest stable under deterministic ordering of nested signature keys.
-    """
-
+    """Structural shell excluding SELECT projections so union- compatible. intents cluster."""
     fp = {
         "tables": sorted(intent.tables or []),
         "grain": intent.grain or "row_level",
@@ -2810,18 +2648,7 @@ def _union_merge_bucket_key(intent: RuntimeIntent) -> str:
 def _merge_union_compatible_intents(
     cluster: list[RuntimeIntent],
 ) -> list[RuntimeIntent]:
-    """
-    Pairwise-merge compatible intents using the same union rules as template matching.
-
-    Args:
-
-        cluster: Intents sharing :func:`_union_merge_bucket_key`.
-
-    Returns:
-
-        Surviving intents after greedy merges; incompatible peers remain distinct.
-    """
-
+    """Pairwise-merge compatible intents using the same union rules as. template matching."""
     if len(cluster) <= 1:
         return list(cluster)
     pending = list(cluster)
@@ -2846,21 +2673,7 @@ def _merge_union_compatible_intents(
 
 
 def dedup_runtime_intents(intents: list[RuntimeIntent]) -> list[RuntimeIntent]:
-    """
-    Cluster intents by structural shell (excluding projections), then union-merge selects.
-
-    Pairwise merges use :func:`~aetherdialect._intent_process.union_runtime_concrete_compatibility`
-    so aggregate symmetry and bare-column difference caps match template union policy.
-
-    Args:
-
-        intents: Candidate intents from SQL history.
-
-    Returns:
-
-        Deduped list stable under deterministic ordering by :func:`~aetherdialect._utils.body_similarity_key`.
-    """
-
+    """Cluster intents by structural shell (excluding projections), then. union-merge selects. Pairwise merges use :func:`~aetherdialect._inte nt_process.union_runtime_concrete_compatibility` so aggregate symmetry and bare-column difference caps match template union policy."""
     if not intents:
         return []
     buckets: dict[str, list[RuntimeIntent]] = {}
@@ -2879,7 +2692,6 @@ def dedup_runtime_intents(intents: list[RuntimeIntent]) -> list[RuntimeIntent]:
 
 def compute_sql_history_content_hash(statements: list[str]) -> str:
     """Return SHA-256 hex over sorted unique non-empty SQL statement texts."""
-
     dedup = sorted({s.strip() for s in statements if s.strip()})
     payload = "\n".join(dedup).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
@@ -2887,7 +2699,6 @@ def compute_sql_history_content_hash(statements: list[str]) -> str:
 
 def load_sql_history_statements(filepath: str) -> list[str]:
     """Load SQL statements from a text file using the same line conventions as seed question files."""
-
     if not os.path.exists(filepath):
         raise FileNotFoundError(f"SQL history file not found: {filepath}")
 
@@ -2939,7 +2750,6 @@ def seed_warmup_intent_from_runtime_intent(
     seed_index: int,
 ) -> SeedWarmupIntent:
     """Materialize a seed-warmup intent row from a converted runtime intent for SQL-history warmup."""
-
     return SeedWarmupIntent(
         intent_id=intent_id,
         tables=list(rt.tables),
@@ -2961,12 +2771,11 @@ def seed_warmup_intent_from_runtime_intent(
     )
 
 
-class QueryLogSource(Protocol):
+class _QueryLogSource(Protocol):
     """Read-only fetcher of historical SQL statements."""
 
     def is_available(self, conn: Any) -> bool:
         """Return True when the source can run against *conn*."""
-
         ...
 
     def fetch(
@@ -2979,23 +2788,11 @@ class QueryLogSource(Protocol):
         user_filter: str | None,
     ) -> list[str]:
         """Return distinct SQL texts newest-first within policy caps."""
-
         ...
 
 
 def _stable_sql_text_for_history(sql_text: str) -> str:
-    """
-    Replace inline numeric and single-quoted literals so hashed snapshots stay stable.
-
-    Args:
-
-        sql_text: Raw SQL string.
-
-    Returns:
-
-        Masked text suitable for cross-run digesting.
-    """
-
+    """Replace inline numeric and single-quoted literals so hashed. snapshots stay stable."""
     s = re.sub(r"\b\d+\.\d+\b", "<num>", sql_text)
     s = re.sub(r"\b\d+\b", "<num>", s)
     s = re.sub(r"'(?:[^']|'')*'", "<str>", s)
@@ -3003,27 +2800,13 @@ def _stable_sql_text_for_history(sql_text: str) -> str:
 
 
 @dataclass(frozen=True)
-class PostgresQueryLogSource:
-    """pg_stat_statements-backed query log."""
+class NoOpQueryLogSource:
+    """Query-log source that reports unavailable and returns no historical SQL."""
 
     def is_available(self, conn: Any) -> bool:
-        """Return True when *conn* exposes PostgreSQL and ``pg_stat_statements`` is installed."""
-
-        if conn is None:
-            return False
-        try:
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements' LIMIT 1",
-            )
-            row = cur.fetchone()
-            try:
-                cur.close()
-            except Exception:
-                pass
-            return row is not None
-        except Exception:
-            return False
+        """Return False because the engine has no query-history catalog."""
+        _ = conn
+        return False
 
     def fetch(
         self,
@@ -3034,48 +2817,9 @@ class PostgresQueryLogSource:
         min_runs: int,
         user_filter: str | None,
     ) -> list[str]:
-        """Fetch recent statements when pg_stat_statements is installed."""
-
-        del lookback_days
-        try:
-            cur = conn.cursor()
-        except Exception:
-            return []
-        parts = [
-            "SELECT query",
-            "FROM pg_stat_statements",
-            "WHERE calls >= %s",
-        ]
-        bind: list[Any] = [int(min_runs)]
-        if user_filter:
-            parts.append("AND userid = (SELECT oid FROM pg_roles WHERE rolname = %s LIMIT 1)")
-            bind.append(str(user_filter))
-        parts.append("ORDER BY calls DESC NULLS LAST")
-        parts.append("LIMIT %s")
-        bind.append(int(max_queries))
-        stmt = " ".join(parts)
-        try:
-            cur.execute(stmt, tuple(bind))
-            rows = cur.fetchall() or []
-        except Exception:
-            try:
-                cur.close()
-            except Exception:
-                pass
-            return []
-        try:
-            cur.close()
-        except Exception:
-            pass
-        out: list[str] = []
-        for row in rows:
-            if not row:
-                continue
-            raw_q = row[0]
-            if raw_q is None:
-                continue
-            out.append(_stable_sql_text_for_history(str(raw_q)))
-        return out
+        """Return an empty list because query history is not supported."""
+        _ = conn, lookback_days, max_queries, min_runs, user_filter
+        return []
 
 
 @dataclass(frozen=True)
@@ -3084,7 +2828,6 @@ class DatabricksQueryLogSource:
 
     def is_available(self, conn: Any) -> bool:
         """Return True when a Databricks session handle is present."""
-
         del conn
         return True
 
@@ -3098,7 +2841,6 @@ class DatabricksQueryLogSource:
         user_filter: str | None,
     ) -> list[str]:
         """Fetch SQL texts from system tables when permitted."""
-
         del min_runs
         try:
             cur = conn.cursor()
@@ -3141,6 +2883,236 @@ class DatabricksQueryLogSource:
         return out
 
 
+def _bind_int_named_params(sql: str, params: dict[str, int]) -> str:
+    """Substitute ``:name`` placeholders with integer literals for driver-agnostic execution."""
+    out = sql
+    for key, val in params.items():
+        out = out.replace(f":{key}", str(int(val)))
+    return out
+
+
+def _query_log_fetch_rows(conn: Any, stmt: str) -> list[tuple[Any, ...]]:
+    """Execute *stmt* on *conn* and return rows, swallowing driver errors."""
+    try:
+        cur = conn.cursor()
+    except Exception:
+        return []
+    try:
+        cur.execute(stmt)
+        rows = cur.fetchall() or []
+    except Exception:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        return []
+    try:
+        cur.close()
+    except Exception:
+        pass
+    return list(rows)
+
+
+def _query_log_sql_texts(rows: list[tuple[Any, ...]]) -> list[str]:
+    """Extract and stabilize SQL text from the first column of each row."""
+    out: list[str] = []
+    for row in rows:
+        if not row:
+            continue
+        raw_q = row[0]
+        if raw_q is None:
+            continue
+        out.append(_stable_sql_text_for_history(str(raw_q)))
+    return out
+
+
+@dataclass(frozen=True)
+class MySQLQueryLogSource:
+    """MySQL performance_schema-backed query log."""
+
+    def is_available(self, conn: Any) -> bool:
+        """Return True when ``events_statements_history`` consumer is enabled."""
+        if conn is None:
+            return False
+        rows = _query_log_fetch_rows(conn, MYSQL_QUERY_LOG_AVAILABILITY_SQL)
+        return bool(rows)
+
+    def fetch(
+        self,
+        conn: Any,
+        *,
+        lookback_days: int,
+        max_queries: int,
+        min_runs: int,
+        user_filter: str | None,
+    ) -> list[str]:
+        """Fetch recent statement digests from performance_schema."""
+        del min_runs, user_filter
+        lookback_microseconds = int(lookback_days) * 86400 * 1_000_000
+        stmt = _bind_int_named_params(
+            MYSQL_QUERY_LOG_FETCH_SQL,
+            {
+                "lookback_microseconds": lookback_microseconds,
+                "max_queries": int(max_queries),
+            },
+        )
+        return _query_log_sql_texts(_query_log_fetch_rows(conn, stmt))
+
+
+@dataclass(frozen=True)
+class RedshiftQueryLogSource:
+    """Redshift ``svl_qlog`` query log."""
+
+    def is_available(self, conn: Any) -> bool:
+        """Return True when ``stl_query`` is readable."""
+        if conn is None:
+            return False
+        rows = _query_log_fetch_rows(conn, REDSHIFT_QUERY_LOG_AVAILABILITY_SQL)
+        return bool(rows)
+
+    def fetch(
+        self,
+        conn: Any,
+        *,
+        lookback_days: int,
+        max_queries: int,
+        min_runs: int,
+        user_filter: str | None,
+    ) -> list[str]:
+        """Fetch recent query texts from ``svl_qlog``."""
+        del min_runs, user_filter
+        stmt = _bind_int_named_params(
+            REDSHIFT_QUERY_LOG_FETCH_SQL,
+            {"lookback_days": int(lookback_days), "max_queries": int(max_queries)},
+        )
+        return _query_log_sql_texts(_query_log_fetch_rows(conn, stmt))
+
+
+@dataclass(frozen=True)
+class SQLServerQueryLogSource:
+    """SQL Server Query Store or ``sys.dm_exec_query_stats`` query log."""
+
+    def _query_store_available(self, conn: Any) -> bool:
+        """Return True when Query Store is enabled for the current database."""
+        if conn is None:
+            return False
+        try:
+            cur = conn.cursor()
+            cur.execute(SQLSERVER_QUERY_STORE_AVAILABILITY_SQL)
+            rows = cur.fetchall() or []
+            cur.close()
+            return bool(rows)
+        except Exception:
+            return False
+
+    def is_available(self, conn: Any) -> bool:
+        """Return True when Query Store or DMVs are readable."""
+        if conn is None:
+            return False
+        if self._query_store_available(conn):
+            return True
+        try:
+            cur = conn.cursor()
+            cur.execute(SQLSERVER_QUERY_LOG_AVAILABILITY_SQL)
+            cur.close()
+            return True
+        except Exception:
+            return False
+
+    def fetch(
+        self,
+        conn: Any,
+        *,
+        lookback_days: int,
+        max_queries: int,
+        min_runs: int,
+        user_filter: str | None,
+    ) -> list[str]:
+        """Fetch recent statement texts from Query Store, falling back to DMVs."""
+        del min_runs, user_filter
+        if self._query_store_available(conn):
+            stmt = _bind_int_named_params(
+                SQLSERVER_QUERY_STORE_FETCH_SQL.replace(
+                    "SELECT DISTINCT",
+                    f"SELECT DISTINCT TOP ({int(max_queries)})",
+                    1,
+                ),
+                {"lookback_days": int(lookback_days)},
+            )
+            return _query_log_sql_texts(_query_log_fetch_rows(conn, stmt))
+        dmv_stmt = SQLSERVER_QUERY_LOG_FETCH_SQL.replace(
+            "SELECT DISTINCT",
+            f"SELECT DISTINCT TOP ({int(max_queries)})",
+            1,
+        )
+        return _query_log_sql_texts(_query_log_fetch_rows(conn, dmv_stmt))
+
+
+@dataclass(frozen=True)
+class SnowflakeQueryLogSource:
+    """Snowflake ``INFORMATION_SCHEMA.QUERY_HISTORY`` fetcher."""
+
+    def is_available(self, conn: Any) -> bool:
+        """Return True when query history is readable."""
+        if conn is None:
+            return False
+        rows = _query_log_fetch_rows(conn, SNOWFLAKE_QUERY_LOG_AVAILABILITY_SQL)
+        return bool(rows)
+
+    def fetch(
+        self,
+        conn: Any,
+        *,
+        lookback_days: int,
+        max_queries: int,
+        min_runs: int,
+        user_filter: str | None,
+    ) -> list[str]:
+        """Fetch successful query texts from Snowflake query history."""
+        del min_runs, user_filter
+        stmt = _bind_int_named_params(
+            SNOWFLAKE_QUERY_LOG_FETCH_SQL,
+            {"lookback_days": int(lookback_days), "max_queries": int(max_queries)},
+        )
+        return _query_log_sql_texts(_query_log_fetch_rows(conn, stmt))
+
+
+@dataclass(frozen=True)
+class BigQueryQueryLogSource:
+    """BigQuery ``INFORMATION_SCHEMA.JOBS`` query log."""
+
+    def is_available(self, conn: Any) -> bool:
+        """Return True when the project jobs view is readable."""
+        if conn is None:
+            return False
+        project = str(getattr(EngineConfig.RUNTIME, "PROJECT", None) or "").strip()
+        if not project:
+            return False
+        stmt = BIGQUERY_QUERY_LOG_AVAILABILITY_SQL.format(project=project)
+        rows = _query_log_fetch_rows(conn, stmt)
+        return bool(rows)
+
+    def fetch(
+        self,
+        conn: Any,
+        *,
+        lookback_days: int,
+        max_queries: int,
+        min_runs: int,
+        user_filter: str | None,
+    ) -> list[str]:
+        """Fetch completed job query texts from ``INFORMATION_SCHEMA.JOBS``."""
+        del min_runs, user_filter
+        project = str(getattr(EngineConfig.RUNTIME, "PROJECT", None) or "").strip()
+        if not project:
+            return []
+        stmt = _bind_int_named_params(
+            BIGQUERY_QUERY_LOG_FETCH_SQL.format(project=project),
+            {"lookback_days": int(lookback_days), "max_queries": int(max_queries)},
+        )
+        return _query_log_sql_texts(_query_log_fetch_rows(conn, stmt))
+
+
 def fetch_query_log(
     dialect_name: str,
     conn: Any,
@@ -3150,47 +3122,25 @@ def fetch_query_log(
     min_runs: int,
     user_filter: str | None,
 ) -> list[str]:
-    """
-    Dispatch to the dialect-appropriate :class:`QueryLogSource` implementation.
-
-    Args:
-
-        dialect_name: ``postgresql`` or ``databricks``.
-
-        conn: Live driver session.
-
-        lookback_days: Rolling window in days.
-
-        max_queries: Upper bound on rows returned.
-
-        min_runs: Minimum execution count filter when supported.
-
-        user_filter: Optional subject filter.
-
-    Returns:
-
-        SQL strings sorted for deterministic hashing by callers.
-    """
-
+    """Dispatch to the dialect-appropriate :class:`_QueryLogSource` implementation."""
     dn = str(dialect_name).strip().lower()
-    if dn == "postgresql":
-        src: QueryLogSource = PostgresQueryLogSource()
-    elif dn == "databricks":
-        src = DatabricksQueryLogSource()
-    else:
+    try:
+        dialect_cls = get_dialect_class(dn)
+    except ValueError:
+        return []
+    probe = dialect_cls.__new__(dialect_cls)
+    src = probe.query_log_source()
+    if src is None:
         return []
     if not src.is_available(conn):
         return []
-    return src.fetch(
-        conn,
-        lookback_days=lookback_days,
-        max_queries=max_queries,
-        min_runs=min_runs,
-        user_filter=user_filter,
+    return cast(
+        list[str],
+        src.fetch(
+            conn,
+            lookback_days=lookback_days,
+            max_queries=max_queries,
+            min_runs=min_runs,
+            user_filter=user_filter,
+        ),
     )
-
-
-def sql_history_paraphrase_budget() -> int:
-    """Return configured paraphrase count for SQL-history warmup."""
-
-    return int(WARMUP_PARAPHRASE_COUNT_FROM_SQL)

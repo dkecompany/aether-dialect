@@ -7,24 +7,26 @@ from dataclasses import replace
 import pytest
 
 from aetherdialect._contracts_base import (
-    ColumnMetadata,
     ColumnRole,
-    SchemaGraph,
-    TableMetadata,
-)
-from aetherdialect._contracts_core import (
-    CaseRegistryStep,
-    CaseWhenBranch,
-    CaseWhenExpr,
     ExprValue,
     FilterParam,
     HavingParam,
     MulGroup,
     NormalizedExpr,
     OrderByCol,
+)
+from aetherdialect._contracts_core import (
     RuntimeCteStep,
     RuntimeIntent,
     SelectCol,
+)
+from aetherdialect._contracts_schema import (
+    CaseRegistryStep,
+    CaseWhenBranch,
+    CaseWhenExpr,
+    ColumnMetadata,
+    SchemaGraph,
+    TableMetadata,
     registry_render_scope,
 )
 from aetherdialect._core_utils import substitute_params
@@ -42,7 +44,6 @@ from aetherdialect._intent_expr import (
     _strip_angle_brackets,
     _strip_order_direction,
     _tag_single_expr,
-    _validate_intent_schema,
     assign_param_keys,
     build_cte_output_metadata,
     canonicalize_temporal_unit_args,
@@ -164,11 +165,7 @@ class TestAssignParamKeys:
     """Tests for assign_param_keys."""
 
     def test_sequential_keys(self):
-        """
-        Assign p1, p2, ...
-
-        sequentially to filters.
-        """
+        """Assign p1, p2, ... sequentially to filters."""
         fp1 = FilterParam(left_expr=NormalizedExpr.from_column("t.a"), op="=", value_type="string")
         fp2 = FilterParam(left_expr=NormalizedExpr.from_column("t.b"), op=">", value_type="integer")
         new_fp, new_hp, new_cte, _, idx = assign_param_keys([fp1, fp2], [])
@@ -214,7 +211,6 @@ class TestAssignParamKeys:
 
     def test_case_registry_branch_conditions_get_param_keys(self):
         """Literals in ``case_registry`` CASE branches receive ``p*`` keys."""
-
         cond = FilterParam(
             left_expr=NormalizedExpr.from_column("film.rental_rate"),
             op=">",
@@ -284,7 +280,6 @@ class TestDecomposeBetweenFilters:
 
 def _make_intent_with_case(branches, group_by=None, cte=False):
     """Build a minimal RuntimeIntent (or one with a CTE) holding CASE in ``case_registry``."""
-
     cw = CaseWhenExpr(branches=list(branches), else_result=NormalizedExpr.from_column("'other'"))
     step = CaseRegistryStep(registry_id="c01", case_when=cw)
     sc = SelectCol(expr=NormalizedExpr.from_column("c01"))
@@ -1637,6 +1632,19 @@ class TestParseIntentResponse:
         assert result.tables == ["orders"]
         assert len(result.select_cols) == 1
 
+    def test_concat_select_col_stays_single_concat_scalar(self):
+        """CONCAT in select_cols must not split into multiple select columns."""
+        raw = (
+            '{"tables": ["customer"], "grain": "row_level", '
+            '"select_cols": [{"expr": "CONCAT(customer.first_name, \' \', customer.last_name)"}]}'
+        )
+        result = parse_intent_response(raw, "customer names")
+        assert result is not None
+        assert len(result.select_cols) == 1
+        group = result.select_cols[0].expr.add_groups[0]
+        assert group.scalar_func == "concat"
+        assert len(group.multiply) == 3
+
     def test_returns_none_for_garbage(self):
         """Returns None for unparseable text."""
         assert parse_intent_response("not json at all", "q") is None
@@ -2503,6 +2511,30 @@ class TestRepairMisclassifiedDateDiff:
         result = repair_misclassified_date_diff(intent)
         assert result.filters_param[0].value_type == "date_diff"
 
+    def test_right_expr_date_diff_not_reclassified(self):
+        """date_diff with column RHS stays date_diff even when LHS is a plain column."""
+        fp = FilterParam(
+            left_expr=NormalizedExpr.from_column("rental.rental_date"),
+            op=">",
+            right_expr=NormalizedExpr.from_column("rental.return_date"),
+            value_type="date_diff",
+            raw_value={"unit": "day", "amount": 7},
+        )
+        intent = RuntimeIntent(
+            tables=["rental"],
+            grain="row_level",
+            select_cols=[],
+            group_by_cols=[],
+            order_by_cols=[],
+            filters_param=[fp],
+            natural_language="test",
+        )
+        result = repair_misclassified_date_diff(intent)
+        kept = result.filters_param[0]
+        assert kept.value_type == "date_diff"
+        assert kept.right_expr is not None
+        assert kept.raw_value == {"unit": "day", "amount": 7}
+
     def test_non_dict_raw_value_unchanged(self):
         """Non-dict raw_value does not trigger reclassification."""
         fp = FilterParam(
@@ -2601,19 +2633,6 @@ class TestReplaceRefsInExpr:
         assert out.raw_sql
         low = out.raw_sql.lower()
         assert "cte1" in low and "rate" in low
-
-
-class TestValidateIntentSchema:
-    """Tests for _validate_intent_schema."""
-
-    def test_valid_minimal(self):
-        assert _validate_intent_schema({"tables": ["t"]}) is True
-
-    def test_missing_tables(self):
-        assert _validate_intent_schema({"select_cols": ["t.x"]}) is False
-
-    def test_invalid_limit_type_string(self):
-        assert _validate_intent_schema({"tables": ["t"], "limit": "10"}) is False
 
 
 class TestParseIntentResponseExtended:
@@ -3541,6 +3560,32 @@ class TestParseIntentResponseLikely:
         assert r is not None
 
 
+class TestSanitizeComposeIntentJson:
+    """Pre-schema sanitize for compose JSON edge cases."""
+
+    def test_parse_intent_response_accepts_having_bool_op_null(self) -> None:
+        raw = json.dumps(
+            {
+                "tables": ["orders"],
+                "select_cols": ["orders.order_id"],
+                "having_param": [
+                    {
+                        "left_expr": "COUNT(other_table.other_column)",
+                        "op": ">",
+                        "value": 3,
+                        "value_type": "integer",
+                        "bool_op": None,
+                    }
+                ],
+            }
+        )
+        result = parse_intent_response(raw, "q")
+        assert result is not None
+        assert len(result.having_param) == 1
+        assert result.having_param[0].bool_op == "AND"
+        assert result.having_param[0].left_expr.add_groups[0].agg_func == "count"
+
+
 class TestTagExprNumericLikely:
     """Expressions outside select list are tagged in real intents."""
 
@@ -3950,3 +3995,61 @@ class TestClassifyCteEmission:
             cte_steps=[cte],
         )
         assert classify_cte_emission(cte, intent, None) == "scalar_subquery"
+
+
+class TestGenerationPathDistinctGate:
+    def test_distinct_blocks_template_only_extra_widen(self) -> None:
+        from aetherdialect._constants import GenerationPath
+        from aetherdialect._intent_process import generation_path_for_eligible_union
+        from aetherdialect._intent_resolve import UnionSelectColumnDelta
+
+        path = generation_path_for_eligible_union(
+            cols_changed=False,
+            select_equal=True,
+            delta=UnionSelectColumnDelta.TEMPLATE_ONLY_EXTRA,
+            distinct_select_index=0,
+        )
+        assert path == GenerationPath.INTENT_DIRECT_MATCH
+
+
+class TestNaturalLanguageRefusalValidator:
+    def test_runtime_intent_has_refusal_natural_language(self) -> None:
+        from aetherdialect._intent_process import runtime_intent_has_refusal_natural_language
+
+        intent = RuntimeIntent(
+            tables=["customer"],
+            grain="row_level",
+            select_cols=[SelectCol(expr=NormalizedExpr.from_column("customer.email"))],
+            group_by_cols=[],
+            order_by_cols=[],
+            filters_param=[],
+            natural_language="Permission denied for payroll data.",
+        )
+        assert runtime_intent_has_refusal_natural_language(intent) is True
+
+
+class TestDateDiffNormalizationGuards:
+    def test_date_diff_filter_survives_normalize_filters_havings(self) -> None:
+        from aetherdialect._intent_resolve import normalize_filters_havings
+
+        right = NormalizedExpr.from_column("rental.return_date")
+        left = NormalizedExpr.from_column("rental.rental_date")
+        fp = FilterParam(
+            left_expr=left,
+            op=">",
+            right_expr=right,
+            value_type="date_diff",
+            raw_value={"unit": "day", "amount": 7},
+        )
+        intent = RuntimeIntent(
+            tables=["rental"],
+            grain="row_level",
+            select_cols=[SelectCol(expr=NormalizedExpr.from_column("rental.rental_id"))],
+            group_by_cols=[],
+            order_by_cols=[],
+            filters_param=[fp],
+        )
+        out = normalize_filters_havings(intent)
+        kept = out.filters_param[0]
+        assert kept.value_type == "date_diff"
+        assert kept.right_expr is right

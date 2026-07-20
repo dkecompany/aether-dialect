@@ -3,26 +3,30 @@
 import pytest
 
 from aetherdialect._contracts_base import (
-    ColumnMetadata,
     ColumnRole,
-    FKEdge,
-    SchemaGraph,
-    SqlDiagnostic,
-    SqlDiagnosticCode,
-    TableMetadata,
-)
-from aetherdialect._contracts_core import (
-    CaseRegistryStep,
-    CaseWhenBranch,
-    CaseWhenExpr,
     FilterParam,
     HavingParam,
     MulGroup,
     NormalizedExpr,
     OrderByCol,
+    SqlDiagnostic,
+    SqlDiagnosticCode,
+)
+from aetherdialect._contracts_core import (
     RuntimeCteStep,
     RuntimeIntent,
     SelectCol,
+)
+from aetherdialect._contracts_schema import (
+    CaseRegistryStep,
+    CaseWhenBranch,
+    CaseWhenExpr,
+    ColumnMetadata,
+    FKEdge,
+    SchemaGraph,
+    TableMetadata,
+    WindowRegistryStep,
+    WindowSpec,
 )
 from aetherdialect._intent_expr import parse_expr_string
 from aetherdialect._intent_repair import (
@@ -32,9 +36,6 @@ from aetherdialect._intent_repair import (
     _is_impossible_having,
     _is_null_value,
     _is_pk_column,
-    _match_enum_value,
-    _qualify_term,
-    _resolve_filter_list_cascade,
     _strip_distinct_prefix,
     _tables_from_columns,
     align_filter_value_type_to_exprs,
@@ -45,29 +46,37 @@ from aetherdialect._intent_repair import (
     collect_referenced_tables,
     decompose_in_not_in_filters,
     dedup_contradictory_filters,
+    dedup_extract_year_vs_column_literal,
     dedup_value_vs_right_expr,
     drop_invalid_case_registry_entries,
     enforce_sensitivity_policy_intent,
     expand_fk_select_to_descriptive,
-    infer_cte_output_columns,
     intent_text_has_leakable_placeholder,
     normalize_boolean_filter_values,
     normalize_in_filter_types,
     normalize_null_filter_values,
     normalize_pk_distinct,
-    qualify_cte_output_columns,
+    promote_temporal_keyword_rhs,
     reconcile_tables,
     repair_array_filters_intent,
     repair_case_when_intent,
     repair_fk_filter_type_mismatch,
     repair_intent_placeholder_tokens,
     repair_null_equality_filters,
-    resolve_filter_value_case,
     runtime_intent_has_instructional_placeholders,
     sanitize_table_names,
     strip_impossible_having,
     strip_join_conditions,
     strip_spurious_group_by,
+)
+from aetherdialect._intent_resolve import (
+    _match_enum_value,
+    _qualify_term,
+    _resolve_filter_list_cascade,
+    infer_cte_output_columns,
+    qualify_cte_output_columns,
+    repair_window_partition_group_by_alignment,
+    resolve_filter_value_case,
 )
 
 
@@ -103,7 +112,7 @@ class TestEnforceSensitivityPolicyIntent:
     """Tests for enforce_sensitivity_policy_intent."""
 
     def test_keeps_aggregated_count_on_non_selectable_pk(self):
-        """COUNT on a PII PK remains in select_cols."""
+        """COUNT on a sensitive PK remains in select_cols."""
         schema = SchemaGraph(
             tables={
                 "customer": TableMetadata(
@@ -114,7 +123,7 @@ class TestEnforceSensitivityPolicyIntent:
                             data_type="integer",
                             value_type="integer",
                             is_primary_key=True,
-                            sensitivity="pii",
+                            sensitivity="restricted",
                         ),
                     },
                     primary_key=["customer_id"],
@@ -136,8 +145,8 @@ class TestEnforceSensitivityPolicyIntent:
         out = enforce_sensitivity_policy_intent(intent, schema)
         assert len(out.select_cols or []) == 1
 
-    def test_drops_bare_non_selectable_projection(self):
-        """When every main select column resolves to a hidden-sensitivity field, the policy raises SENSITIVITY_ALL_SELECT_DROPPED."""
+    def test_drops_bare_hidden_projection(self):
+        """When every main select column resolves to a hidden sensitivity field, the policy raises SENSITIVITY_ALL_SELECT_DROPPED."""
         schema = SchemaGraph(
             tables={
                 "customer": TableMetadata(
@@ -148,7 +157,7 @@ class TestEnforceSensitivityPolicyIntent:
                             data_type="integer",
                             value_type="integer",
                             is_primary_key=True,
-                            sensitivity="pii",
+                            sensitivity="hidden",
                         ),
                     },
                     primary_key=["customer_id"],
@@ -170,6 +179,40 @@ class TestEnforceSensitivityPolicyIntent:
         with pytest.raises(ValueError, match="sensitivity_all_select_dropped"):
             enforce_sensitivity_policy_intent(intent, schema)
 
+    def test_keeps_bare_restricted_projection(self):
+        """When a select column is restricted, it remains in the select list (to be masked during render)."""
+        schema = SchemaGraph(
+            tables={
+                "customer": TableMetadata(
+                    name="customer",
+                    columns={
+                        "customer_id": ColumnMetadata(
+                            name="customer_id",
+                            data_type="integer",
+                            value_type="integer",
+                            is_primary_key=True,
+                            sensitivity="restricted",
+                        ),
+                    },
+                    primary_key=["customer_id"],
+                    foreign_keys=[],
+                ),
+            },
+            join_paths_multi={},
+            effective_structural_hash="h",
+        )
+        bare = SelectCol(expr=NormalizedExpr.from_column("customer.customer_id"))
+        intent = RuntimeIntent(
+            tables=["customer"],
+            grain="row_level",
+            select_cols=[bare],
+            group_by_cols=[],
+            order_by_cols=[],
+            filters_param=[],
+        )
+        out = enforce_sensitivity_policy_intent(intent, schema)
+        assert len(out.select_cols or []) == 1
+
     def test_keeps_sum_on_non_selectable_column(self):
         schema = SchemaGraph(
             tables={
@@ -180,7 +223,7 @@ class TestEnforceSensitivityPolicyIntent:
                             name="email",
                             data_type="varchar",
                             value_type="string",
-                            sensitivity="pii",
+                            sensitivity="restricted",
                         ),
                     },
                     primary_key=[],
@@ -212,7 +255,7 @@ class TestEnforceSensitivityPolicyIntent:
                             name="email",
                             data_type="varchar",
                             value_type="string",
-                            sensitivity="pii",
+                            sensitivity="restricted",
                         ),
                     },
                     primary_key=[],
@@ -1321,6 +1364,19 @@ class TestStripSpuriousGroupBy:
         assert result.group_by_cols == []
         assert result.grain == "scalar"
 
+    def test_single_group_by_stripped_sets_distinct_select_index(self):
+        intent = RuntimeIntent(
+            tables=["customer"],
+            grain="grouped",
+            select_cols=[SelectCol(expr=NormalizedExpr.from_column("customer.email"))],
+            group_by_cols=[NormalizedExpr.from_column("customer.email")],
+            order_by_cols=[],
+            filters_param=[],
+        )
+        result = strip_spurious_group_by(intent)
+        assert result.group_by_cols == []
+        assert result.distinct_select_index == 0
+
 
 class TestStripSpuriousGroupByCte:
     """CTE parity tests for strip_spurious_group_by."""
@@ -1676,7 +1732,7 @@ class TestResolveFilterListCascade:
                     data_type="mpaa_rating",
                     value_type="string",
                     role=ColumnRole.CATEGORICAL.value,
-                    top_k_values=["G", "PG", "PG-13", "R", "NC-17"],
+                    frequent_values=["G", "PG", "PG-13", "R", "NC-17"],
                 ),
             },
             foreign_keys=[],
@@ -1752,7 +1808,7 @@ class TestResolveFilterValueCase:
                     data_type="mpaa_rating",
                     value_type="string",
                     role=ColumnRole.CATEGORICAL.value,
-                    top_k_values=["G", "PG", "PG-13", "R", "NC-17"],
+                    frequent_values=["G", "PG", "PG-13", "R", "NC-17"],
                 ),
             },
             foreign_keys=[],
@@ -3094,6 +3150,27 @@ class TestRepairNullEqualityFilters:
         assert result.filters_param[0].op == "="
         assert result.filters_param[0].raw_value == "active"
 
+    def test_expr_vs_expr_equality_not_converted_to_is_null(self):
+        intent = RuntimeIntent(
+            tables=["a", "b"],
+            grain="row_level",
+            select_cols=[],
+            group_by_cols=[],
+            order_by_cols=[],
+            filters_param=[
+                FilterParam(
+                    left_expr=NormalizedExpr.from_column("a.fk_id"),
+                    op="=",
+                    right_expr=NormalizedExpr.from_column("b.id"),
+                    value_type="number",
+                    raw_value=None,
+                ),
+            ],
+        )
+        result = repair_null_equality_filters(intent)
+        assert result.filters_param[0].op == "="
+        assert result.filters_param[0].right_expr is not None
+
     def test_cte_filters_also_repaired(self):
         """Null equality filters inside CTE steps are also repaired."""
         intent = RuntimeIntent(
@@ -3332,7 +3409,7 @@ class TestPruneKeepsAggregationTables:
         )
 
     def test_payment_kept_for_total_revenue_per_country(self, revenue_schema):
-        """payment table with SUM(amount) is not pruned even though 'payment' is not in the question."""
+        """Payment table with SUM(amount) is not pruned even though 'payment' is not in the question."""
         intent = RuntimeIntent(
             tables=["country", "payment"],
             grain="grouped",
@@ -3427,7 +3504,7 @@ class TestPruneColumnComponentSuppression:
         )
 
     def test_rental_table_kept_when_referenced_in_select(self, rental_schema):
-        """rental is kept because COUNT(rental.rental_id) references it; inventory pruned as genuinely unreferenced.  The old cosmetic column-component prune was removed (Fix 1)."""
+        """Rental is kept because COUNT(rental.rental_id) references it; inventory pruned as genuinely unreferenced. The old cosmetic column-component prune was removed (Fix 1)."""
         intent = RuntimeIntent(
             tables=["film", "inventory", "rental"],
             grain="grouped",
@@ -3503,7 +3580,7 @@ class TestPruneUnreferencedKeepsExplicitSelectCol:
         )
 
     def test_language_kept_when_explicitly_in_select_cols(self, language_schema):
-        """language table is NOT pruned when a non-aggregated language.name is in select_cols and language appears in the question."""
+        """Language table is NOT pruned when a non-aggregated language.name is in select_cols and language appears in the question."""
         intent = RuntimeIntent(
             tables=["film", "language"],
             grain="row_level",
@@ -3526,7 +3603,6 @@ class TestRepairIntentPlaceholderTokens:
     @staticmethod
     def _film_schema() -> SchemaGraph:
         """Minimal single-table graph for placeholder repair."""
-
         film = TableMetadata(
             name="film",
             columns={
@@ -3545,7 +3621,6 @@ class TestRepairIntentPlaceholderTokens:
 
     def test_maps_table_1_prefix_for_single_table(self):
         """``table_1.col`` rewrites to the sole intent table."""
-
         expr = NormalizedExpr(
             add_groups=[MulGroup(multiply=["table_1.special_features"], agg_func="count")],
         )
@@ -3571,13 +3646,11 @@ class TestRepairIntentPlaceholderTokens:
 
     def test_intent_text_detects_angle_placeholder(self):
         """Angle-bracket instructional tokens are detectable before repair."""
-
         assert intent_text_has_leakable_placeholder("<table_1>.col")
         assert not intent_text_has_leakable_placeholder("film.title")
 
     def test_runtime_intent_detects_table_n_in_select(self):
         """Structured scan finds instructional table_N tokens in select expr."""
-
         intent = RuntimeIntent(
             tables=["film"],
             grain="row_level",
@@ -3590,7 +3663,6 @@ class TestRepairIntentPlaceholderTokens:
 
     def test_runtime_intent_clean_after_deterministic_placeholder_repair(self):
         """Deterministic placeholder repair clears instructional tokens for scan."""
-
         expr = NormalizedExpr(
             add_groups=[MulGroup(multiply=["table_1.film_id"], agg_func="count")],
         )
@@ -4635,7 +4707,7 @@ class TestCaseBranchRepairCoverage:
         assert isinstance(rv, list) and rv == [10, 20] or rv == ["10", "20"]
 
     def test_apply_filters_to_main_and_ctes_walks_registry_case_filter_branch(self):
-        from aetherdialect._intent_repair import _apply_filters_to_main_and_ctes
+        from aetherdialect._intent_repair import apply_filters_to_main_and_ctes
 
         intent = self._make_intent_with_registry_case_between()
         intent.case_registry[0].case_when.branches[0].condition.raw_value = " HELLO "
@@ -4653,11 +4725,11 @@ class TestCaseBranchRepairCoverage:
                     out.append(f)
             return out, changed
 
-        out = _apply_filters_to_main_and_ctes(intent, lower_strip)
+        out = apply_filters_to_main_and_ctes(intent, lower_strip)
         assert out.case_registry[0].case_when.branches[0].condition.raw_value == "hello"
 
     def test_apply_having_to_main_and_ctes_walks_having_scope_branch_only(self):
-        from aetherdialect._intent_repair import _apply_having_to_main_and_ctes
+        from aetherdialect._intent_repair import apply_having_to_main_and_ctes
 
         cond = FilterParam(
             left_expr=NormalizedExpr.from_agg("count", "t.id"),
@@ -4705,7 +4777,7 @@ class TestCaseBranchRepairCoverage:
                 changed = True
             return new, changed
 
-        out = _apply_having_to_main_and_ctes(intent, bump_value)
+        out = apply_having_to_main_and_ctes(intent, bump_value)
         having_branch_val = out.case_registry[0].case_when.branches[0].condition.raw_value
         filter_branch_val = out.case_registry[1].case_when.branches[0].condition.raw_value
         assert having_branch_val == 6
@@ -5099,3 +5171,147 @@ def test_align_filter_coerces_boolean_bindings_to_int_for_integer_column() -> No
     out = align_filter_value_type_to_exprs(intent, schema)
     assert out.filters_param[0].value_type == "number"
     assert out.param_values["p1"] == 1
+
+
+def test_promote_temporal_keyword_rhs_binds_current_timestamp_as_keyword() -> None:
+    fp = FilterParam(
+        left_expr=NormalizedExpr.from_column("tbl_a.col_date"),
+        op="<",
+        value_type="temporal",
+        raw_value="CURRENT_TIMESTAMP",
+    )
+    intent = RuntimeIntent(
+        tables=["tbl_a"],
+        grain="row_level",
+        select_cols=[SelectCol(expr=NormalizedExpr.from_column("tbl_a.col_date"))],
+        group_by_cols=[],
+        order_by_cols=[],
+        filters_param=[fp],
+    )
+    out = promote_temporal_keyword_rhs(intent)
+    promoted = out.filters_param[0]
+    assert promoted.right_expr is not None
+    assert promoted.right_expr.keyword == "current_timestamp"
+    assert promoted.raw_value is None
+    assert promoted.param_key == ""
+
+
+def test_dedup_preserves_keyword_right_expr_with_duplicate_raw_value() -> None:
+    fp = FilterParam(
+        left_expr=NormalizedExpr.from_column("tbl_a.col_date"),
+        op="<",
+        value_type="temporal",
+        right_expr=NormalizedExpr(keyword="current_timestamp"),
+        raw_value="CURRENT_TIMESTAMP",
+    )
+    out, changed = _dedup_value_vs_right_expr_filters([fp])
+    assert not changed
+    assert out[0].right_expr is not None
+    assert out[0].right_expr.keyword == "current_timestamp"
+
+
+def test_dedup_extract_year_drops_redundant_equality() -> None:
+    filters = [
+        FilterParam(
+            left_expr=NormalizedExpr(
+                add_groups=[MulGroup(multiply=[NormalizedExpr.from_column("tbl_a.date_a")])],
+                scalar_func="extract",
+                scalar_func_args=["year", "tbl_a.date_a"],
+            ),
+            op="=",
+            raw_value="2026",
+            value_type="integer",
+        ),
+        FilterParam(
+            left_expr=NormalizedExpr.from_column("tbl_a.date_a"),
+            op="=",
+            raw_value="2026",
+            value_type="integer",
+        ),
+    ]
+    out, changed = dedup_extract_year_vs_column_literal(filters)
+    assert changed
+    assert len(out) == 1
+    assert out[0].left_expr.scalar_func == "extract"
+
+
+def test_dedup_extract_year_drops_redundant_comparison_ops() -> None:
+    filters = [
+        FilterParam(
+            left_expr=NormalizedExpr(
+                add_groups=[MulGroup(multiply=[NormalizedExpr.from_column("tbl_a.date_a")])],
+                scalar_func="extract",
+                scalar_func_args=["year", "tbl_a.date_a"],
+            ),
+            op="=",
+            raw_value="2026",
+            value_type="integer",
+        ),
+        FilterParam(
+            left_expr=NormalizedExpr.from_column("tbl_a.date_a"),
+            op=">=",
+            raw_value="2025",
+            value_type="integer",
+        ),
+    ]
+    out, changed = dedup_extract_year_vs_column_literal(filters)
+    assert changed
+    assert len(out) == 1
+
+
+def test_repair_window_partition_adds_missing_group_by_col() -> None:
+    schema = SchemaGraph(join_paths_multi={}, effective_structural_hash="h", tables={})
+    ws = WindowSpec(
+        function="row_number",
+        partition_by=[NormalizedExpr.from_column("tbl_a.col_k")],
+        order_by=[OrderByCol(expr=NormalizedExpr.from_column("tbl_a.col_a"), direction="asc")],
+    )
+    intent = RuntimeIntent(
+        tables=["tbl_a"],
+        grain="grouped",
+        select_cols=[
+            SelectCol(expr=NormalizedExpr.from_column("tbl_a.col_a")),
+            SelectCol(expr=NormalizedExpr(column_ref="w01")),
+        ],
+        group_by_cols=[NormalizedExpr.from_column("tbl_a.col_a")],
+        order_by_cols=[],
+        filters_param=[],
+        window_registry=[WindowRegistryStep(registry_id="w01", window_spec=ws)],
+    )
+    result = repair_window_partition_group_by_alignment(intent, schema)
+    gb_terms = {g.primary_column for g in result.group_by_cols or []}
+    assert "tbl_a.col_k" in gb_terms
+
+
+def test_repair_window_partition_skips_row_level_outer_cte() -> None:
+    schema = SchemaGraph(join_paths_multi={}, effective_structural_hash="h", tables={})
+    inner_ws = WindowSpec(
+        function="row_number",
+        partition_by=[NormalizedExpr.from_column("tbl_a.col_k")],
+        order_by=[OrderByCol(expr=NormalizedExpr.from_column("tbl_a.col_a"), direction="asc")],
+    )
+    inner = RuntimeCteStep(
+        cte_name="cte_inner",
+        grain="grouped",
+        group_by_cols=[NormalizedExpr.from_column("tbl_a.col_k")],
+        select_cols=[SelectCol(expr=NormalizedExpr.from_column("tbl_a.col_a"))],
+        window_registry=[WindowRegistryStep(registry_id="w01", window_spec=inner_ws)],
+    )
+    outer_ws = WindowSpec(
+        function="row_number",
+        partition_by=[NormalizedExpr.from_column("cte_inner.col_k")],
+        order_by=[OrderByCol(expr=NormalizedExpr.from_column("cte_inner.col_a"), direction="asc")],
+    )
+    intent = RuntimeIntent(
+        tables=["cte_inner"],
+        grain="row_level",
+        select_cols=[SelectCol(expr=NormalizedExpr(column_ref="w02"))],
+        group_by_cols=[],
+        order_by_cols=[],
+        filters_param=[],
+        cte_steps=[inner],
+        window_registry=[WindowRegistryStep(registry_id="w02", window_spec=outer_ws)],
+    )
+    result = repair_window_partition_group_by_alignment(intent, schema)
+    assert result.grain == "row_level"
+    assert result.group_by_cols == []

@@ -1,26 +1,28 @@
 """Tests for validation_semantic module."""
 
-from aetherdialect._config import COMPATIBLE_TYPE_PAIRS
+from aetherdialect._constants import COMPATIBLE_TYPE_PAIRS
 from aetherdialect._contracts_base import (
-    ColumnMetadata,
     FailureCategory,
-    LogicalIntent,
-    SchemaGraph,
-    SensitivityClassification,
-    TableMetadata,
-)
-from aetherdialect._contracts_core import (
-    CaseRegistryStep,
-    CaseWhenBranch,
-    CaseWhenExpr,
     FilterParam,
     HavingParam,
+    LogicalIntent,
     MulGroup,
     NormalizedExpr,
     OrderByCol,
+    SensitivityClassification,
+)
+from aetherdialect._contracts_core import (
     RuntimeCteStep,
     RuntimeIntent,
     SelectCol,
+)
+from aetherdialect._contracts_schema import (
+    CaseRegistryStep,
+    CaseWhenBranch,
+    CaseWhenExpr,
+    ColumnMetadata,
+    SchemaGraph,
+    TableMetadata,
     WindowRegistryStep,
     WindowSpec,
 )
@@ -38,7 +40,6 @@ from aetherdialect._validation_semantic import (
     _term_has_aggregation,
     _validate_concat_group,
     _validate_single_expr_types,
-    _word_is_column_component,
     validate_agg_vs_agg_having,
     validate_arith_expression_semantics,
     validate_case_branch_aggregation_consistency,
@@ -62,15 +63,14 @@ from aetherdialect._validation_semantic import (
     validate_no_nested_aggregation,
     validate_order_by_aggregation_context,
     validate_order_by_expr_types,
-    validate_pii_group_by,
-    validate_pii_order_by,
     validate_predicate_sidedness,
     validate_question_agg_keyword_coverage,
     validate_question_distinct_hint,
-    validate_question_table_mentions,
     validate_select_expr_types,
     validate_select_group_by_membership,
     validate_semantic_contradictions,
+    validate_sensitivity_group_by,
+    validate_sensitivity_order_by,
     validate_threshold_missing_having,
 )
 
@@ -263,6 +263,64 @@ class TestValidateExprVsExprFilters:
         type_issues = [i for i in issues if "mismatch" in i.message.lower()]
         assert len(type_issues) == 0
 
+    def test_date_subtraction_vs_integer_duration_no_type_mismatch(self):
+        """Date subtraction compared to an integer duration column is valid."""
+        from aetherdialect._contracts_base import ColumnRole
+        from aetherdialect._contracts_schema import (
+            ColumnMetadata,
+            SchemaGraph,
+            TableMetadata,
+        )
+
+        schema = SchemaGraph(
+            join_paths_multi={},
+            effective_structural_hash="",
+            tables={
+                "rental": TableMetadata(
+                    name="rental",
+                    columns={
+                        "return_date": ColumnMetadata(
+                            name="return_date",
+                            data_type="date",
+                            value_type="date",
+                            role=ColumnRole.TEMPORAL.value,
+                        ),
+                        "rental_date": ColumnMetadata(
+                            name="rental_date",
+                            data_type="date",
+                            value_type="date",
+                            role=ColumnRole.TEMPORAL.value,
+                        ),
+                    },
+                    foreign_keys=[],
+                    primary_key="",
+                ),
+                "item": TableMetadata(
+                    name="item",
+                    columns={
+                        "rental_duration": ColumnMetadata(
+                            name="rental_duration",
+                            data_type="integer",
+                            value_type="integer",
+                            role=ColumnRole.NUMERIC_MEASURE.value,
+                        ),
+                    },
+                    foreign_keys=[],
+                    primary_key="",
+                ),
+            },
+        )
+        from aetherdialect._intent_expr import parse_expr_string
+
+        fp = FilterParam(
+            left_expr=parse_expr_string("rental.return_date - rental.rental_date"),
+            op=">",
+            right_expr=parse_expr_string("item.rental_duration"),
+        )
+        issues = validate_expr_vs_expr_filters([fp], schema)
+        type_issues = [i for i in issues if "mismatch" in i.message.lower() and i.severity == "error"]
+        assert len(type_issues) == 0
+
 
 class TestValidateFilterNoAggregation:
     """Tests for validate_filter_no_aggregation."""
@@ -321,8 +379,8 @@ class TestValidatePredicateSidedness:
     """Tests for validate_predicate_sidedness."""
 
     def test_clean_column_left_literal_right(self):
-        """No issues when left is column-bearing and right is literal-only."""
-        from aetherdialect._contracts_core import ExprValue
+        """No issues when left is column-bearing and right is literal- only."""
+        from aetherdialect._contracts_base import ExprValue
 
         fp = FilterParam(
             left_expr=NormalizedExpr.from_column("orders.amount"),
@@ -334,7 +392,7 @@ class TestValidatePredicateSidedness:
 
     def test_flags_mutated_literal_left_column_right(self):
         """Error when a filter's sides are mutated so literal-only ends up on the left."""
-        from aetherdialect._contracts_core import ExprValue
+        from aetherdialect._contracts_base import ExprValue
 
         fp = FilterParam(
             left_expr=NormalizedExpr.from_column("orders.amount"),
@@ -350,7 +408,7 @@ class TestValidatePredicateSidedness:
 
     def test_flags_mutated_literal_left_agg_right_in_having(self):
         """Error when HAVING sides are mutated so literal-only ends up on the left."""
-        from aetherdialect._contracts_core import ExprValue
+        from aetherdialect._contracts_base import ExprValue
 
         hp = HavingParam(
             left_expr=NormalizedExpr.from_agg("count", "orders.order_id"),
@@ -528,10 +586,16 @@ class TestValidateSelectGroupByMembership:
     """Tests for validate_select_group_by_membership."""
 
     def test_non_agg_not_in_group_by_errors(self):
-        """validate_select_group_by_membership errors for non-agg select not in group_by."""
-        sc = SelectCol(expr=NormalizedExpr.from_column("customers.name"))
+        """validate_select_group_by_membership errors for non-agg select not in group_by when mixed aggregation is present."""
+        sc_name = SelectCol(expr=NormalizedExpr.from_column("customers.name"))
+        sc_count = SelectCol(
+            expr=NormalizedExpr(
+                agg_func="count",
+                add_groups=[MulGroup(coefficient=1.0, multiply=["customers.id"])],
+            ),
+        )
         gb = [NormalizedExpr.from_column("customers.id")]
-        issues = validate_select_group_by_membership([sc], gb, grain="grouped")
+        issues = validate_select_group_by_membership([sc_name, sc_count], gb, grain="grouped")
         assert len(issues) >= 1
 
     def test_agg_select_passes(self):
@@ -547,10 +611,23 @@ class TestValidateSelectGroupByMembership:
         assert len(issues) == 0
 
     def test_non_grouped_grain_passes(self):
-        """validate_select_group_by_membership passes for row_level grain."""
+        """validate_select_group_by_membership passes for row_level grain without mixed aggregation."""
         sc = SelectCol(expr=NormalizedExpr.from_column("customers.name"))
         issues = validate_select_group_by_membership([sc], [], grain="row_level")
         assert len(issues) == 0
+
+    def test_mixed_aggregation_errors_when_identifier_missing_from_group_by(self):
+        """Mixed agg/non-agg select triggers membership even when grain is not grouped."""
+        sc_agg = SelectCol(
+            expr=NormalizedExpr(
+                agg_func="count",
+                add_groups=[MulGroup(coefficient=1.0, multiply=["customers.id"])],
+            ),
+        )
+        sc_id = SelectCol(expr=NormalizedExpr.from_column("customers.id"))
+        gb = [NormalizedExpr.from_column("customers.name")]
+        issues = validate_select_group_by_membership([sc_id, sc_agg], gb, grain="row_level")
+        assert len(issues) == 1
 
 
 class TestTermHasAggregation:
@@ -1271,7 +1348,7 @@ class TestValidateCteDependencyGrains:
         assert len(issues) == 0
 
     def test_main_row_level_with_grouped_final_cte_no_warning(self):
-        """Main row_level with a grouped final CTE does not emit a main-query grain warning."""
+        """Main row_level with a grouped final CTE does not emit a main- query grain warning."""
         cte1 = RuntimeCteStep(cte_name="cte1", grain="grouped")
         issues = validate_cte_dependency_grains([cte1], "row_level")
         assert not any("Main query" in i.message for i in issues)
@@ -1813,256 +1890,6 @@ class TestForEachGroupingAggKeywordSkip:
         assert len(issues) == 1
 
 
-class TestValidateQuestionTableMentionsSeverity:
-    """Tests for validate_question_table_mentions severity."""
-
-    @staticmethod
-    def _make_schema():
-        return SchemaGraph(
-            tables={
-                "customer": TableMetadata(
-                    name="customer",
-                    columns={
-                        "customer_id": ColumnMetadata(
-                            name="customer_id",
-                            data_type="integer",
-                            value_type="integer",
-                            is_primary_key=True,
-                        ),
-                    },
-                    foreign_keys=[],
-                    primary_key="customer_id",
-                ),
-                "film": TableMetadata(
-                    name="film",
-                    columns={
-                        "film_id": ColumnMetadata(
-                            name="film_id",
-                            data_type="integer",
-                            value_type="integer",
-                            is_primary_key=True,
-                        ),
-                    },
-                    foreign_keys=[],
-                    primary_key="film_id",
-                ),
-            },
-            join_paths_multi={},
-            effective_structural_hash="",
-        )
-
-    def test_missing_table_produces_error(self):
-        """Missing table mention produces severity='warning'."""
-        schema = self._make_schema()
-        issues = validate_question_table_mentions(
-            "show all customer films",
-            ["customer"],
-            schema,
-        )
-        assert len(issues) == 1
-        assert issues[0].severity == "warning"
-        assert issues[0].category == "missing_scoping_table"
-
-    def test_no_issue_when_table_present(self):
-        """No issue when all mentioned tables are in intent."""
-        schema = self._make_schema()
-        issues = validate_question_table_mentions(
-            "show all customer films",
-            ["customer", "film"],
-            schema,
-        )
-        assert issues == []
-
-    def test_no_issue_when_question_has_no_table_words(self):
-        """No issue when question text does not match any table."""
-        schema = self._make_schema()
-        issues = validate_question_table_mentions(
-            "show all data",
-            ["customer"],
-            schema,
-        )
-        assert issues == []
-
-
-class TestWordIsColumnComponent:
-    """Tests for _word_is_column_component suppression helper."""
-
-    @staticmethod
-    def _make_schema() -> SchemaGraph:
-        """Schema with film table having a rental_duration column."""
-        return SchemaGraph(
-            tables={
-                "film": TableMetadata(
-                    name="film",
-                    columns={
-                        "film_id": ColumnMetadata(
-                            name="film_id",
-                            data_type="integer",
-                            value_type="integer",
-                            is_primary_key=True,
-                        ),
-                        "rental_duration": ColumnMetadata(
-                            name="rental_duration",
-                            data_type="integer",
-                            value_type="integer",
-                        ),
-                        "rating": ColumnMetadata(
-                            name="rating",
-                            data_type="varchar",
-                            value_type="string",
-                        ),
-                    },
-                    foreign_keys=[],
-                    primary_key="film_id",
-                ),
-            },
-            join_paths_multi={},
-            effective_structural_hash="",
-        )
-
-    def test_word_in_column_prefix_returns_true(self):
-        """'rental' is a component of 'rental_duration' on film."""
-        schema = self._make_schema()
-        assert _word_is_column_component("rental", {"film"}, schema) is True
-
-    def test_word_in_column_suffix_returns_true(self):
-        """'duration' is a component of 'rental_duration' on film."""
-        schema = self._make_schema()
-        assert _word_is_column_component("duration", {"film"}, schema) is True
-
-    def test_unrelated_word_returns_false(self):
-        """'payment' does not appear in any column component."""
-        schema = self._make_schema()
-        assert _word_is_column_component("payment", {"film"}, schema) is False
-
-    def test_table_not_in_intent_returns_false(self):
-        """Even if the word matches, returns False when table is not in the intent set."""
-        schema = self._make_schema()
-        assert _word_is_column_component("rental", set(), schema) is False
-
-    def test_exact_column_name_returns_true(self):
-        """'rating' is a single-token column name on film."""
-        schema = self._make_schema()
-        assert _word_is_column_component("rating", {"film"}, schema) is True
-
-
-class TestTableMentionsSuppression:
-    """Tests validate_question_table_mentions with column-component suppression."""
-
-    @staticmethod
-    def _make_schema() -> SchemaGraph:
-        """Schema with film (rental_duration) and rental tables."""
-        return SchemaGraph(
-            tables={
-                "film": TableMetadata(
-                    name="film",
-                    columns={
-                        "film_id": ColumnMetadata(
-                            name="film_id",
-                            data_type="integer",
-                            value_type="integer",
-                            is_primary_key=True,
-                        ),
-                        "rental_duration": ColumnMetadata(
-                            name="rental_duration",
-                            data_type="integer",
-                            value_type="integer",
-                        ),
-                        "rental_rate": ColumnMetadata(
-                            name="rental_rate",
-                            data_type="numeric",
-                            value_type="float",
-                        ),
-                    },
-                    foreign_keys=[],
-                    primary_key="film_id",
-                ),
-                "rental": TableMetadata(
-                    name="rental",
-                    columns={
-                        "rental_id": ColumnMetadata(
-                            name="rental_id",
-                            data_type="integer",
-                            value_type="integer",
-                            is_primary_key=True,
-                        ),
-                    },
-                    foreign_keys=[],
-                    primary_key="rental_id",
-                ),
-            },
-            join_paths_multi={},
-            effective_structural_hash="",
-        )
-
-    def test_rental_in_column_concept_is_suppressed(self):
-        """'rental duration' does not trigger the rental table when film is already in the intent and film has rental_duration."""
-        schema = self._make_schema()
-        issues = validate_question_table_mentions(
-            "average rental duration per film rating",
-            ["film"],
-            schema,
-        )
-        assert issues == []
-
-    def test_rental_table_fires_when_no_column_match(self):
-        """'rental' in the question fires when the intent table has no column whose name contains 'rental' as a component."""
-        schema = SchemaGraph(
-            tables={
-                "customer": TableMetadata(
-                    name="customer",
-                    columns={
-                        "customer_id": ColumnMetadata(
-                            name="customer_id",
-                            data_type="integer",
-                            value_type="integer",
-                            is_primary_key=True,
-                        ),
-                        "first_name": ColumnMetadata(
-                            name="first_name",
-                            data_type="varchar",
-                            value_type="string",
-                        ),
-                    },
-                    foreign_keys=[],
-                    primary_key="customer_id",
-                ),
-                "rental": TableMetadata(
-                    name="rental",
-                    columns={
-                        "rental_id": ColumnMetadata(
-                            name="rental_id",
-                            data_type="integer",
-                            value_type="integer",
-                            is_primary_key=True,
-                        ),
-                    },
-                    foreign_keys=[],
-                    primary_key="rental_id",
-                ),
-            },
-            join_paths_multi={},
-            effective_structural_hash="",
-        )
-        issues = validate_question_table_mentions(
-            "show all rentals",
-            ["customer"],
-            schema,
-        )
-        assert len(issues) == 1
-        assert issues[0].context["table"] == "rental"
-
-    def test_rental_rate_column_also_suppresses(self):
-        """'rate' is suppressed because it is a component of 'rental_rate' on film."""
-        schema = self._make_schema()
-        issues = validate_question_table_mentions(
-            "show average rental rate",
-            ["film"],
-            schema,
-        )
-        assert issues == []
-
-
 class TestValidateQuestionAggKeywordCoverage:
     """Tests for validate_question_agg_keyword_coverage."""
 
@@ -2348,7 +2175,7 @@ class TestValidateSemanticContradictionsExtended:
         assert not any(i.issue_id.startswith("nl_contradiction") for i in issues)
 
     def test_scalar_grain_with_few_expected_rows(self):
-        """scalar + expected_rows 'few' is treated like a contradiction."""
+        """Scalar + expected_rows 'few' is treated like a contradiction."""
         sc = SelectCol(expr=NormalizedExpr.from_agg("count", "orders.id"))
         issues = validate_semantic_contradictions([sc], "count", "scalar", "few")
         assert any("scalar" in i.message and "few" in i.message for i in issues)
@@ -2813,41 +2640,6 @@ class TestValidateForEachGroupingExtended:
         assert issues[0].context.get("table") == "customer"
 
 
-class TestValidateQuestionTableMentionsExtended:
-    def test_empty_nl_or_none_schema_returns_empty(self):
-        schema = SchemaGraph(tables={}, join_paths_multi={}, effective_structural_hash="")
-        assert validate_question_table_mentions("", ["t"], schema) == []
-        assert validate_question_table_mentions("customers", [], None) == []
-
-    def test_plural_table_name_in_question(self):
-        schema = SchemaGraph(
-            tables={
-                "customer": TableMetadata(
-                    name="customer",
-                    columns={
-                        "customer_id": ColumnMetadata(
-                            name="customer_id",
-                            data_type="integer",
-                            value_type="integer",
-                            is_primary_key=True,
-                        ),
-                    },
-                    foreign_keys=[],
-                    primary_key="customer_id",
-                ),
-            },
-            join_paths_multi={},
-            effective_structural_hash="",
-        )
-        issues = validate_question_table_mentions(
-            "list all customers",
-            [],
-            schema,
-        )
-        assert len(issues) == 1
-        assert issues[0].context["table"] == "customer"
-
-
 class TestTermHasAggregationExtended:
     def test_agg_with_leading_whitespace(self):
         assert _term_has_aggregation("  COUNT(t.a)") is True
@@ -3067,8 +2859,8 @@ class TestValidateDeniedReferences:
         assert validate_denied_references(intent, schema) == []
 
 
-class TestValidatePiiGroupBy:
-    """PII columns may not be grouped on; WHERE / aggregates remain permitted."""
+class TestValidateSensitiveGroupBy:
+    """Sensitive columns may not be grouped on; WHERE / aggregates remain permitted."""
 
     def _schema_with_sensitivity(self, sensitivity: SensitivityClassification) -> SchemaGraph:
         return SchemaGraph(
@@ -3092,8 +2884,8 @@ class TestValidatePiiGroupBy:
             effective_structural_hash="h",
         )
 
-    def test_pii_in_group_by_rejected(self):
-        schema = self._schema_with_sensitivity(SensitivityClassification.STRICT)
+    def test_sensitive_in_group_by_rejected(self):
+        schema = self._schema_with_sensitivity(SensitivityClassification.RESTRICTED)
         intent = RuntimeIntent(
             tables=["users"],
             grain="grouped",
@@ -3103,12 +2895,12 @@ class TestValidatePiiGroupBy:
             filters_param=[],
             having_param=[],
         )
-        issues = validate_pii_group_by(intent, schema)
+        issues = validate_sensitivity_group_by(intent, schema)
         assert len(issues) == 1
         assert issues[0].category == FailureCategory.SENSITIVE_GROUP_BY
 
     def test_hygiene_in_group_by_allowed(self):
-        schema = self._schema_with_sensitivity(SensitivityClassification.HYGIENE)
+        schema = self._schema_with_sensitivity(SensitivityClassification.NONE)
         intent = RuntimeIntent(
             tables=["users"],
             grain="grouped",
@@ -3118,10 +2910,10 @@ class TestValidatePiiGroupBy:
             filters_param=[],
             having_param=[],
         )
-        assert validate_pii_group_by(intent, schema) == []
+        assert validate_sensitivity_group_by(intent, schema) == []
 
-    def test_pii_in_filter_allowed_by_this_validator(self):
-        schema = self._schema_with_sensitivity(SensitivityClassification.STRICT)
+    def test_sensitive_in_filter_allowed_by_this_validator(self):
+        schema = self._schema_with_sensitivity(SensitivityClassification.RESTRICTED)
         intent = RuntimeIntent(
             tables=["users"],
             grain="row_level",
@@ -3138,10 +2930,10 @@ class TestValidatePiiGroupBy:
             ],
             having_param=[],
         )
-        assert validate_pii_group_by(intent, schema) == []
+        assert validate_sensitivity_group_by(intent, schema) == []
 
-    def test_pii_in_order_by_rejected(self):
-        schema = self._schema_with_sensitivity(SensitivityClassification.STRICT)
+    def test_sensitive_in_order_by_rejected(self):
+        schema = self._schema_with_sensitivity(SensitivityClassification.RESTRICTED)
         intent = RuntimeIntent(
             tables=["users"],
             grain="row_level",
@@ -3151,12 +2943,13 @@ class TestValidatePiiGroupBy:
             filters_param=[],
             having_param=[],
         )
-        issues = validate_pii_order_by(intent, schema)
+        issues = validate_sensitivity_order_by(intent, schema)
         assert len(issues) == 1
         assert issues[0].category == FailureCategory.ORDER_BY_VALIDITY
 
-    def test_forbidden_in_order_by_allowed(self):
-        schema = self._schema_with_sensitivity(SensitivityClassification.FORBIDDEN)
+    def test_forbidden_in_order_by_blocked(self):
+        """Hidden or restricted columns are blocked in ORDER BY."""
+        schema = self._schema_with_sensitivity(SensitivityClassification.HIDDEN)
         intent = RuntimeIntent(
             tables=["users"],
             grain="row_level",
@@ -3166,10 +2959,12 @@ class TestValidatePiiGroupBy:
             filters_param=[],
             having_param=[],
         )
-        assert validate_pii_order_by(intent, schema) == []
+        issues = validate_sensitivity_order_by(intent, schema)
+        assert len(issues) == 1
+        assert "sensitive column users.email cannot be used in ORDER BY" in issues[0].message
 
-    def test_pii_in_cte_order_by_rejected(self):
-        schema = self._schema_with_sensitivity(SensitivityClassification.STRICT)
+    def test_sensitive_in_cte_order_by_rejected(self):
+        schema = self._schema_with_sensitivity(SensitivityClassification.RESTRICTED)
         cte = RuntimeCteStep(
             cte_name="base",
             grain="row_level",
@@ -3187,7 +2982,7 @@ class TestValidatePiiGroupBy:
             having_param=[],
             cte_steps=[cte],
         )
-        issues = validate_pii_order_by(intent, schema)
+        issues = validate_sensitivity_order_by(intent, schema)
         assert len(issues) == 1
         assert issues[0].category == FailureCategory.ORDER_BY_VALIDITY
 

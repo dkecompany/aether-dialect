@@ -6,10 +6,13 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
-from ._config import (
+from ._constants import (
     AGGREGATION_ALLOWED_COLUMN_TYPES,
     ARITHMETIC_ROLES,
+    DATE_FRIENDLY_VALUE_TYPES,
     DISALLOWED_EXTRACT_UNITS,
+    NUMERIC_RESULT_AGGS,
+    NUMERIC_RESULT_SCALARS,
     REGISTRY_CASE_ID_RE,
     REGISTRY_WINDOW_ID_RE,
     SCALAR_FUNCTIONS_TEMPORAL,
@@ -25,67 +28,54 @@ from ._config import (
     WINDOW_OFFSET_FUNCTIONS,
     WINDOW_RANKING_FUNCTIONS,
     WINDOW_VALUE_FUNCTIONS,
+    YEAR_LITERAL_COMPARISON_OPS,
+    YEAR_LITERAL_RE,
 )
 from ._contracts_base import (
-    ColumnMetadata,
-    CteOutputColumnMeta,
     FailureCategory,
-    IntentIssue,
-    SchemaGraph,
-    make_intent_issue,
-)
-from ._contracts_core import (
-    CaseRegistryStep,
-    CaseWhenExpr,
     FilterParam,
     HavingParam,
     MulGroup,
     NormalizedExpr,
     OrderByCol,
+    column_sensitivity_from_dict,
+    expr_registry_ref,
+)
+from ._contracts_core import (
     RuntimeCteStep,
     RuntimeIntent,
     SelectCol,
+    effective_select_parts,
+)
+from ._contracts_schema import (
+    CaseRegistryStep,
+    CaseWhenExpr,
+    ColumnMetadata,
+    CteOutputColumnMeta,
+    IntentIssue,
+    SchemaGraph,
     WindowRegistryStep,
     WindowSpec,
-    effective_select_parts,
-    expr_registry_ref,
+    make_intent_issue,
 )
 from ._core_utils import debug
+from ._dialect_sqlglot_helper import array_storage_kind
 from ._intent_expr import (
+    expr_canonical_key,
     extract_columns_from_expr,
     strip_leading_distinct_from_column_ref,
 )
 
 
 def _strip_distinct_prefix(col: str) -> str:
-    """
-    Remove a leading `DISTINCT` keyword from a column reference string.
-
-    Args:
-
-        col: Column expression that may start with `DISTINCT`.
-
-    Returns:
-
-        The same expression with a leading `DISTINCT` removed, or `col` unchanged.
-    """
+    """Remove a leading `DISTINCT` keyword from a column reference. string."""
     if col and col.upper().startswith("DISTINCT "):
         return col[9:].strip()
     return col
 
 
 def extract_col_from_scalar_wrapper(col_expr: str) -> str:
-    """
-    Strip a scalar wrapper and leading `DISTINCT`, returning the inner column expression.
-
-    Args:
-
-        col_expr: Column expression, optionally wrapped in a scalar function and/or `DISTINCT`.
-
-    Returns:
-
-        The inner column reference, or `col_expr` if no recognised scalar wrapper applies.
-    """
+    """Strip a scalar wrapper and leading `DISTINCT`, returning the. inner column expression."""
     if not col_expr:
         return col_expr
     match = re.match(r"^\s*(\w+)\s*\(\s*(.+)\s*\)\s*$", col_expr, re.IGNORECASE)
@@ -98,7 +88,6 @@ def extract_col_from_scalar_wrapper(col_expr: str) -> str:
 
 def _resolve_col_meta_from_expr(col_expr: str | None, schema: Any) -> Any | None:
     """Return ColumnMetadata for a qualified ``table.column`` expression, or None when unresolvable."""
-
     if not col_expr:
         return None
     actual = extract_col_from_scalar_wrapper(col_expr)
@@ -118,24 +107,8 @@ def _validate_scalar_func_valid(
     location: str,
     col_meta: Any | None = None,
 ) -> list[IntentIssue]:
-    """
-    Validate that a scalar function name is allowed.
-
-    Args:
-
-        scalar_func: Scalar function name to validate, or `None`.
-
-        context: Short label for the field (for example `select_0`).
-
-        location: Human-readable location for error messages.
-
-        col_meta: Optional resolved ColumnMetadata for the wrapped column. When provided, temporal scalar functions (``date_trunc``, ``date_part``, ``extract``, ``year``, ``month``, ``day``) are rejected if the column's ``value_type`` is not ``date``.
-
-    Returns:
-
-        `IntentIssue` instances; empty if valid or if `scalar_func` is `None`.
-    """
-    issues = []
+    """Validate that a scalar function name is allowed."""
+    issues: list[IntentIssue] = []
     if not scalar_func:
         return issues
     func_lower = scalar_func.lower()
@@ -183,36 +156,14 @@ def _validate_scalar_func_valid(
 
 
 def _first_arg_lower(args: list[Any]) -> str:
-    """
-    Return the first scalar argument lowercased, or an empty string.
-
-    Args:
-
-    args: Scalar argument list from an expression.
-
-    Returns:
-
-        Lowercased first argument, or `""` if `args` is empty.
-    """
+    """Return the first scalar argument lowercased, or an empty string."""
     if not args:
         return ""
     return str(args[0]).strip().lower()
 
 
 def _is_extract_epoch(func: str | None, args: list[Any]) -> bool:
-    """
-    Return whether `func` is `extract` with a disallowed unit such as epoch.
-
-    Args:
-
-        func: Function name, or `None`.
-
-    args: Argument list whose first entry is treated as the extract unit.
-
-    Returns:
-
-        `True` if the unit is disallowed; otherwise `False`.
-    """
+    """Return whether `func` is `extract` with a disallowed unit such. as. epoch."""
     if not func or func.lower() != "extract":
         return False
     unit = _first_arg_lower(args)
@@ -224,21 +175,7 @@ def validate_expr_no_extract_epoch(
     context: str,
     location: str,
 ) -> list[IntentIssue]:
-    """
-    Flag `EXTRACT(EPOCH FROM ...)` in expressions because EPOCH is not supported.
-
-    Args:
-
-        expr: Normalized expression tree to walk (including add/sub groups).
-
-        context: Label for issue identifiers.
-
-        location: Human-readable location for messages.
-
-    Returns:
-
-        One `IntentIssue` per disallowed extract occurrence.
-    """
+    """Flag `EXTRACT(EPOCH FROM ...)` in expressions because EPOCH is. not supported."""
     issues: list[IntentIssue] = []
     if _is_extract_epoch(expr.scalar_func, expr.scalar_func_args or []):
         issues.append(
@@ -297,22 +234,8 @@ def validate_expr_no_extract_epoch(
 
 
 def _validate_agg_func_valid(agg_func: str | None, context: str, location: str) -> list[IntentIssue]:
-    """
-    Validate that an aggregation function name is allowed.
-
-    Args:
-
-        agg_func: Aggregation function name to validate, or `None`.
-
-        context: Short label for the field being validated.
-
-        location: Human-readable location for error messages.
-
-    Returns:
-
-        `IntentIssue` instances; empty if valid or if `agg_func` is `None`.
-    """
-    issues = []
+    """Validate that an aggregation function name is allowed."""
+    issues: list[IntentIssue] = []
     if not agg_func:
         return issues
     func_lower = agg_func.lower()
@@ -336,13 +259,11 @@ def _validate_agg_func_valid(agg_func: str | None, context: str, location: str) 
 
 def _expr_has_registry_ref(expr: NormalizedExpr) -> bool:
     """Return True when *expr* is a bare registry-id reference."""
-
     return expr_registry_ref(expr) is not None
 
 
 def _window_spec_has_registry_ref(ws: WindowSpec) -> bool:
     """Return True when any window sub-expression carries ``registry_ref``."""
-
     for e in ws.partition_by:
         if _expr_has_registry_ref(e):
             return True
@@ -356,7 +277,6 @@ def _window_spec_has_registry_ref(ws: WindowSpec) -> bool:
 
 def _case_when_has_registry_ref(cw: CaseWhenExpr) -> bool:
     """Return True when any CASE branch carries ``registry_ref``."""
-
     for br in cw.branches:
         if _filter_param_has_registry_ref(br.condition):
             return True
@@ -369,7 +289,6 @@ def _case_when_has_registry_ref(cw: CaseWhenExpr) -> bool:
 
 def _filter_param_has_registry_ref(fp: FilterParam) -> bool:
     """Return True when a filter row references a registry id on an expression."""
-
     if _expr_has_registry_ref(fp.left_expr):
         return True
     if fp.right_expr is not None and _expr_has_registry_ref(fp.right_expr):
@@ -388,32 +307,7 @@ def validate_scope_registries(
     filters_param: list[FilterParam],
     having_param: list[HavingParam],
 ) -> list[IntentIssue]:
-    """
-    Validate per-scope window/case registry definitions and ``registry_ref`` uses.
-
-    Args:
-
-        context: Label for issue messages.
-
-        window_registry: Window definitions for this scope.
-
-        case_registry: Case definitions for this scope.
-
-        select_cols: SELECT list for this scope.
-
-        group_by_cols: GROUP BY expressions.
-
-        order_by_cols: ORDER BY columns.
-
-        filters_param: WHERE filters.
-
-        having_param: HAVING clauses.
-
-    Returns:
-
-        Collected ``IntentIssue`` instances.
-    """
-
+    """Validate per-scope window/case registry definitions and. ``registry_ref`` uses."""
     issues: list[IntentIssue] = []
     win_ids = [s.registry_id for s in window_registry or []]
     case_ids = [s.registry_id for s in case_registry or []]
@@ -439,8 +333,8 @@ def validate_scope_registries(
         )
     win_by = {s.registry_id: s for s in window_registry or []}
     case_by = {s.registry_id: s for s in case_registry or []}
-    for s in window_registry or []:
-        rid = s.registry_id
+    for win_step in window_registry or []:
+        rid = win_step.registry_id
         if not REGISTRY_WINDOW_ID_RE.match(rid):
             issues.append(
                 make_intent_issue(
@@ -451,7 +345,7 @@ def validate_scope_registries(
                     context={"registry_id": rid, "location": context},
                 )
             )
-        if _window_spec_has_registry_ref(s.window_spec):
+        if _window_spec_has_registry_ref(win_step.window_spec):
             issues.append(
                 make_intent_issue(
                     issue_id=f"registry_recursion_window_{context}_{rid}",
@@ -461,8 +355,8 @@ def validate_scope_registries(
                     context={"registry_id": rid, "location": context},
                 )
             )
-    for s in case_registry or []:
-        rid = s.registry_id
+    for case_step in case_registry or []:
+        rid = case_step.registry_id
         if not REGISTRY_CASE_ID_RE.match(rid):
             issues.append(
                 make_intent_issue(
@@ -473,7 +367,7 @@ def validate_scope_registries(
                     context={"registry_id": rid, "location": context},
                 )
             )
-        if _case_when_has_registry_ref(s.case_when):
+        if _case_when_has_registry_ref(case_step.case_when):
             issues.append(
                 make_intent_issue(
                     issue_id=f"registry_recursion_case_{context}_{rid}",
@@ -554,18 +448,7 @@ def validate_scope_registries(
 
 
 def runtime_scope_registry_error_messages(rt: RuntimeIntent) -> list[str]:
-    """
-    Collect error-level scope-registry validation strings for the main query and each CTE scope.
-
-    Args:
-
-        rt: Fully scoped runtime intent.
-
-    Returns:
-
-        De-duplicated human-readable messages for registry consistency failures.
-    """
-
+    """Collect error-level scope-registry validation strings for the. main query and each CTE scope."""
     msgs: list[str] = []
     for iss in validate_scope_registries(
         context="main query",
@@ -606,26 +489,8 @@ def validate_select_cols_schema(
     window_registry: list[WindowRegistryStep] | None = None,
     case_registry: list[CaseRegistryStep] | None = None,
 ) -> list[IntentIssue]:
-    """
-    Validate `SelectCol` entries for column existence and qualification.
-
-    Args:
-
-        select_cols: `SelectCol` instances to validate.
-
-        schema: Schema graph for base tables.
-
-        allowed_tables: Table names permitted in this query context.
-
-        cte_outputs: CTE name to output column metadata for cross-CTE lookup.
-
-        context: Label for issue IDs and messages (for example `main`).
-
-    Returns:
-
-        Collected `IntentIssue` instances.
-    """
-    issues = []
+    """Validate `SelectCol` entries for column existence and. qualification."""
+    issues: list[IntentIssue] = []
     if not select_cols:
         issues.append(
             make_intent_issue(
@@ -738,26 +603,8 @@ def validate_order_by_cols_schema(
     cte_outputs: dict[str, dict[str, CteOutputColumnMeta]] | None = None,
     context: str = "main",
 ) -> list[IntentIssue]:
-    """
-    Validate `OrderByCol` entries for column existence and sort direction.
-
-    Args:
-
-        order_by_cols: `OrderByCol` instances to validate.
-
-        schema: Schema graph for base tables.
-
-        allowed_tables: Table names permitted in this query context.
-
-        cte_outputs: CTE name to output column metadata.
-
-        context: Label for issue IDs and messages.
-
-    Returns:
-
-        Collected `IntentIssue` instances.
-    """
-    issues = []
+    """Validate `OrderByCol` entries for column existence and sort. direction."""
+    issues: list[IntentIssue] = []
     if not order_by_cols:
         return []
     cte_outputs = cte_outputs or {}
@@ -846,6 +693,9 @@ def validate_order_by_cols_schema(
         issues.extend(_validate_agg_func_valid(obc_agg, f"order_by_{idx}", context))
         issues.extend(_validate_scalar_func_valid(obc_scalar, f"order_by_{idx}", context, col_meta=col_meta))
         issues.extend(validate_expr_no_extract_epoch(obc.expr, f"order_by_{idx}", context))
+        issues.extend(
+            _selectability_issues_for_normalized_expr(obc.expr, schema, cte_outputs, context, f"order_by[{idx}]")
+        )
     debug(f"[validation_schema.validate_order_by_cols_schema] {len(issues)} issues in {context}")
     return issues
 
@@ -857,26 +707,8 @@ def validate_group_by_cols_schema(
     cte_outputs: dict[str, dict[str, CteOutputColumnMeta]] | None = None,
     context: str = "main",
 ) -> list[IntentIssue]:
-    """
-    Validate `group_by_cols` against the schema and column groupability.
-
-    Args:
-
-        group_by_cols: `NormalizedExpr` instances to validate.
-
-        schema: Schema graph for base tables.
-
-        allowed_tables: Table names permitted in this query context.
-
-        cte_outputs: CTE name to output column metadata.
-
-        context: Label for issue IDs and messages.
-
-    Returns:
-
-        Collected `IntentIssue` instances.
-    """
-    issues = []
+    """Validate `group_by_cols` against the schema and column. groupability."""
+    issues: list[IntentIssue] = []
     if not group_by_cols:
         return []
     cte_outputs = cte_outputs or {}
@@ -970,8 +802,17 @@ def validate_group_by_cols_schema(
                         },
                     )
                 )
+        issues.extend(_selectability_issues_for_normalized_expr(g, schema, cte_outputs, context, "group_by"))
     debug(f"[validation_schema.validate_group_by_cols_schema] {len(issues)} issues in {context}")
     return issues
+
+
+def _expr_is_temporal_keyword_leaf(expr: NormalizedExpr | None) -> bool:
+    """Return True when *expr* is a bare SQL temporal keyword leaf."""
+    if expr is None:
+        return False
+    kw = (expr.keyword or "").strip().lower()
+    return kw in ("current_timestamp", "current_date", "localtimestamp", "localtime", "sysdate")
 
 
 def _validate_filter_col(
@@ -983,30 +824,8 @@ def _validate_filter_col(
     side: str,
     param_key: str,
 ) -> list[IntentIssue]:
-    """
-    Validate one filter column reference (left or right of a `FilterParam`).
-
-    Args:
-
-        col_expr: Column expression string to validate.
-
-        schema: Schema graph for base tables.
-
-        allowed_tables: Table names permitted in this context.
-
-        cte_outputs: CTE name to output column metadata.
-
-        context: Label for issue IDs and messages.
-
-        side: `left_col` or `right_col`.
-
-        param_key: `FilterParam.param_key` for issue IDs.
-
-    Returns:
-
-        Collected `IntentIssue` instances.
-    """
-    issues = []
+    """Validate one filter column reference (left or right of a. `FilterParam`)."""
+    issues: list[IntentIssue] = []
     if not col_expr:
         return issues
     actual_col = extract_col_from_scalar_wrapper(col_expr)
@@ -1107,45 +926,31 @@ def validate_filters_schema(
     *,
     param_values: Mapping[str, Any] | None = None,
 ) -> list[IntentIssue]:
-    """
-    Validate `FilterParam` entries against the schema and allowed operators.
-
-    Args:
-
-        filters_param: `FilterParam` instances to validate.
-
-        schema: Schema graph for base tables.
-
-        allowed_tables: Table names permitted in this context.
-
-        cte_outputs: CTE name to output column metadata.
-
-        context: Label for issue IDs and messages.
-
-        param_values: Bound literals for this scope; used when ``raw_value`` was cleared after hoisting.
-
-    Returns:
-
-        Collected `IntentIssue` instances.
-    """
-    issues = []
+    """Validate `FilterParam` entries against the schema and allowed. operators."""
+    issues: list[IntentIssue] = []
     if not filters_param:
         return []
     cte_outputs = cte_outputs or {}
     for fp in filters_param:
         param_key = fp.param_key or "unknown"
+        if not _expr_is_temporal_keyword_leaf(fp.left_expr):
+            issues.extend(
+                _validate_filter_col(
+                    fp.left_expr.primary_column,
+                    schema,
+                    allowed_tables,
+                    cte_outputs,
+                    context,
+                    "left_col",
+                    param_key,
+                )
+            )
         issues.extend(
-            _validate_filter_col(
-                fp.left_expr.primary_column,
-                schema,
-                allowed_tables,
-                cte_outputs,
-                context,
-                "left_col",
-                param_key,
+            _selectability_issues_for_normalized_expr(
+                fp.left_expr, schema, cte_outputs, context, f"filter {param_key} (left)"
             )
         )
-        if fp.right_expr:
+        if fp.right_expr and not _expr_is_temporal_keyword_leaf(fp.right_expr):
             issues.extend(
                 _validate_filter_col(
                     fp.right_expr.primary_column,
@@ -1155,6 +960,11 @@ def validate_filters_schema(
                     context,
                     "right_col",
                     param_key,
+                )
+            )
+            issues.extend(
+                _selectability_issues_for_normalized_expr(
+                    fp.right_expr, schema, cte_outputs, context, f"filter {param_key} (right)"
                 )
             )
         if fp.op not in VALID_FILTER_OPS:
@@ -1203,6 +1013,29 @@ def validate_filters_schema(
                         },
                     )
                 )
+        if fp.op == "=" and fp.value_type == "string" and not fp.right_expr:
+            val = fp.resolved_value(param_values)
+            if isinstance(val, str) and re.fullmatch(r"(19|20)\d{2}", val.strip()):
+                meta = _resolve_col_meta_from_expr(fp.left_expr.primary_column, schema)
+                if meta and getattr(meta, "role", "") == "temporal":
+                    issues.append(
+                        make_intent_issue(
+                            issue_id=f"filter_temporal_year_literal_{context}_{param_key}",
+                            category=FailureCategory.FILTER_VALIDITY,
+                            severity="error",
+                            message=(
+                                f"Filter parameter '{param_key}' compares temporal column '{fp.left_expr.primary_column}' "
+                                f"to a four-digit year literal '{val}' using equality. "
+                                "Use EXTRACT(year FROM column) = <year> or a full date string instead."
+                            ),
+                            context={
+                                "param_key": param_key,
+                                "column": fp.left_expr.primary_column,
+                                "value": val,
+                                "location": context,
+                            },
+                        )
+                    )
         fp_left_scalar, _ = extract_functions_from_term(fp.left_expr.primary_term)
         fp_right_scalar, _ = extract_functions_from_term(fp.right_expr.primary_term) if fp.right_expr else (None, None)
         fp_left_meta = _resolve_col_meta_from_expr(fp.left_expr.primary_column, schema)
@@ -1244,18 +1077,8 @@ def validate_filters_schema(
     return issues
 
 
-def extract_agg_col(agg_expr: str) -> tuple:
-    """
-    Parse `(func, target, has_distinct)` from an aggregation expression string.
-
-    Args:
-
-        agg_expr: Aggregation expression such as `COUNT(DISTINCT t.c)`.
-
-    Returns:
-
-        `(func, target, has_distinct)`, or `(None, None, False)` if the pattern does not match.
-    """
+def extract_agg_col(agg_expr: str) -> tuple[str | None, str | None, bool]:
+    """Parse `(func, target, has_distinct)` from an aggregation. expression string."""
     if not agg_expr:
         return (None, None, False)
     match = re.match(r"^\s*(\w+)\s*\(\s*(.*)\s*\)\s*$", agg_expr, re.IGNORECASE)
@@ -1272,18 +1095,46 @@ def extract_agg_col(agg_expr: str) -> tuple:
     return (func, actual_target, has_distinct)
 
 
+def _split_sql_comma_args(arg_str: str) -> list[str]:
+    """Split comma-separated SQL args respecting single-quoted string literals."""
+    parts: list[str] = []
+    cur: list[str] = []
+    in_quote = False
+    for ch in arg_str:
+        if ch == "'" and not in_quote:
+            in_quote = True
+            cur.append(ch)
+        elif ch == "'" and in_quote:
+            in_quote = False
+            cur.append(ch)
+        elif ch == "," and not in_quote:
+            part = "".join(cur).strip()
+            if part:
+                parts.append(part)
+            cur = []
+        else:
+            cur.append(ch)
+    tail = "".join(cur).strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def extract_concat_agg_targets(target: str) -> list[str] | None:
+    """Return CONCAT argument strings when *target* is a CONCAT expression or unwrap residue."""
+    stripped = (target or "").strip()
+    if not stripped:
+        return None
+    concat_match = re.match(r"^\s*CONCAT\s*\(\s*(.*)\s*\)\s*$", stripped, re.IGNORECASE | re.DOTALL)
+    if concat_match:
+        return _split_sql_comma_args(concat_match.group(1))
+    if "," in stripped and not re.match(r"^\s*\w+\s*\(", stripped):
+        return _split_sql_comma_args(stripped)
+    return None
+
+
 def extract_functions_from_term(term: str) -> tuple[str | None, str | None]:
-    """
-    Extract outer scalar and inner aggregation function names from a term.
-
-    Args:
-
-        term: Expression term string (possibly nested calls).
-
-    Returns:
-
-        `(scalar_func, agg_func)` as lowercase names, each `None` if absent.
-    """
+    """Extract outer scalar and inner aggregation function names from a. term."""
     result = extract_agg_col(term)
     if len(result) != 3 or not result[0]:
         return None, None
@@ -1305,30 +1156,8 @@ def _validate_having_agg(
     side: str,
     param_key: str,
 ) -> list[IntentIssue]:
-    """
-    Validate one HAVING aggregation expression (left or right side).
-
-    Args:
-
-        agg_expr: Aggregation string (for example `COUNT(t.c)`).
-
-        schema: Schema graph for base tables.
-
-        allowed_tables: Table names permitted in this context.
-
-        cte_outputs: CTE name to output column metadata.
-
-        context: Label for issue IDs and messages.
-
-        side: `left_agg` or `right_agg`.
-
-        param_key: `HavingParam.param_key` for issue IDs.
-
-    Returns:
-
-        Collected `IntentIssue` instances.
-    """
-    issues = []
+    """Validate one HAVING aggregation expression (left or right side)."""
+    issues: list[IntentIssue] = []
     if not agg_expr:
         return issues
     cte_col_match = re.match(r"^\s*(\w+)\s*\.\s*(\w+)\s*$", agg_expr.strip())
@@ -1342,22 +1171,6 @@ def _validate_having_agg(
         if col_meta and (col_meta.source == "aggregation" or (col_meta.agg_func or "").strip()):
             return issues
     result = extract_agg_col(agg_expr)
-    if len(result) != 3:
-        issues.append(
-            make_intent_issue(
-                issue_id=f"having_{side}_invalid_format_{context}",
-                category=FailureCategory.HAVING_VALIDITY,
-                severity="error",
-                message=f"Invalid aggregation format in HAVING {side}: '{agg_expr}' in {context}",
-                context={
-                    "aggregation": agg_expr,
-                    "side": side,
-                    "param_key": param_key,
-                    "location": context,
-                },
-            )
-        )
-        return issues
     func, actual_target, has_distinct = result
     if not func:
         issues.append(
@@ -1425,6 +1238,103 @@ def _validate_having_agg(
                 )
             )
         return issues
+    if func == "count" and has_distinct and actual_target:
+        concat_args = extract_concat_agg_targets(actual_target)
+        if concat_args is not None:
+            for arg in concat_args:
+                arg_target = extract_col_from_scalar_wrapper(arg.strip())
+                if not arg_target or arg_target.startswith("'") or arg_target.startswith('"'):
+                    continue
+                if "." not in arg_target:
+                    issues.append(
+                        make_intent_issue(
+                            issue_id=f"having_{side}_unqualified_{context}_{arg_target}",
+                            category=FailureCategory.HAVING_VALIDITY,
+                            severity="error",
+                            message=(
+                                f"HAVING COUNT(DISTINCT CONCAT(...)) argument must be qualified as "
+                                f"table.column, got '{arg_target}' in {context}"
+                            ),
+                            context={
+                                "target": arg_target,
+                                "side": side,
+                                "param_key": param_key,
+                                "location": context,
+                            },
+                        )
+                    )
+                    continue
+                table_name, col_name = arg_target.rsplit(".", 1)
+                if table_name in cte_outputs:
+                    if col_name.lower() not in [c.lower() for c in cte_outputs[table_name]]:
+                        issues.append(
+                            make_intent_issue(
+                                issue_id=f"having_{side}_cte_col_not_found_{context}_{table_name}_{col_name}",
+                                category=FailureCategory.HAVING_VALIDITY,
+                                severity="error",
+                                message=f"Column '{col_name}' not in CTE '{table_name}' outputs for HAVING {side} in {context}",
+                                context={
+                                    "table": table_name,
+                                    "column": col_name,
+                                    "side": side,
+                                    "param_key": param_key,
+                                    "location": context,
+                                },
+                            )
+                        )
+                    continue
+                if table_name not in allowed_tables:
+                    issues.append(
+                        make_intent_issue(
+                            issue_id=f"having_{side}_table_not_allowed_{context}_{table_name}",
+                            category=FailureCategory.HAVING_VALIDITY,
+                            severity="error",
+                            message=f"Table '{table_name}' not in allowed tables for HAVING {side} in {context}",
+                            context={
+                                "table": table_name,
+                                "side": side,
+                                "param_key": param_key,
+                                "location": context,
+                            },
+                        )
+                    )
+                    continue
+                if table_name in schema.tables:
+                    table_meta = schema.tables[table_name]
+                    table_col_meta = table_meta.columns.get(col_name) or table_meta.columns.get(col_name.lower())
+                    if not table_col_meta:
+                        issues.append(
+                            make_intent_issue(
+                                issue_id=f"having_{side}_col_not_found_{context}_{table_name}_{col_name}",
+                                category=FailureCategory.HAVING_VALIDITY,
+                                severity="error",
+                                message=f"Column '{col_name}' not in table '{table_name}' for HAVING {side} in {context}",
+                                context={
+                                    "table": table_name,
+                                    "column": col_name,
+                                    "side": side,
+                                    "param_key": param_key,
+                                    "location": context,
+                                },
+                            )
+                        )
+            return issues
+    if not actual_target:
+        issues.append(
+            make_intent_issue(
+                issue_id=f"having_{side}_missing_target_{context}",
+                category=FailureCategory.HAVING_VALIDITY,
+                severity="error",
+                message=f"HAVING aggregation target is missing in {context}",
+                context={
+                    "aggregation": agg_expr,
+                    "side": side,
+                    "param_key": param_key,
+                    "location": context,
+                },
+            )
+        )
+        return issues
     if "." not in actual_target:
         issues.append(
             make_intent_issue(
@@ -1478,8 +1388,8 @@ def _validate_having_agg(
         return issues
     if table_name in schema.tables:
         table_meta = schema.tables[table_name]
-        col_meta = table_meta.columns.get(col_name) or table_meta.columns.get(col_name.lower())
-        if not col_meta:
+        table_col_meta = table_meta.columns.get(col_name) or table_meta.columns.get(col_name.lower())
+        if not table_col_meta:
             issues.append(
                 make_intent_issue(
                     issue_id=f"having_{side}_col_not_found_{context}_{table_name}_{col_name}",
@@ -1496,7 +1406,7 @@ def _validate_having_agg(
                 )
             )
         elif func != "count":
-            value_type = col_meta.value_type or "string"
+            value_type = table_col_meta.value_type or "string"
             allowed_types = AGGREGATION_ALLOWED_COLUMN_TYPES.get(func, [])
             if value_type not in allowed_types:
                 issues.append(
@@ -1504,11 +1414,11 @@ def _validate_having_agg(
                         issue_id=f"having_{side}_type_mismatch_{context}_{func}_{col_name}",
                         category=FailureCategory.HAVING_VALIDITY,
                         severity="error",
-                        message=f"Cannot use {func.upper()} on column '{actual_target}' of type '{col_meta.data_type}' in HAVING {side} for {context}",
+                        message=f"Cannot use {func.upper()} on column '{actual_target}' of type '{table_col_meta.data_type}' in HAVING {side} for {context}",
                         context={
                             "function": func,
                             "column": actual_target,
-                            "column_type": col_meta.data_type,
+                            "column_type": table_col_meta.data_type,
                             "side": side,
                             "param_key": param_key,
                             "location": context,
@@ -1519,17 +1429,7 @@ def _validate_having_agg(
 
 
 def _reconstruct_agg_expr(expr: NormalizedExpr) -> str:
-    """
-    Rebuild an aggregation expression string from a `NormalizedExpr`.
-
-    Args:
-
-        expr: `NormalizedExpr` from one side of a `HavingParam`.
-
-    Returns:
-
-        Canonical `FUNC(column)` text for `_validate_having_agg`, or `primary_term` if there is no aggregation.
-    """
+    """Rebuild an aggregation expression string from a `NormalizedExpr`."""
     agg_func = expr.agg_func
     if not agg_func and expr.add_groups:
         agg_func = expr.add_groups[0].agg_func
@@ -1548,28 +1448,8 @@ def validate_having_schema(
     *,
     param_values: Mapping[str, Any] | None = None,
 ) -> list[IntentIssue]:
-    """
-    Validate `HavingParam` entries against the schema and allowed operators.
-
-    Args:
-
-        having_param: `HavingParam` instances to validate.
-
-        schema: Schema graph for base tables.
-
-        allowed_tables: Table names permitted in this context.
-
-        cte_outputs: CTE name to output column metadata.
-
-        context: Label for issue IDs and messages.
-
-        param_values: Bound literals for this scope; used when ``raw_value`` was cleared after hoisting.
-
-    Returns:
-
-        Collected `IntentIssue` instances.
-    """
-    issues = []
+    """Validate `HavingParam` entries against the schema and allowed. operators."""
+    issues: list[IntentIssue] = []
     if not having_param:
         return []
     cte_outputs = cte_outputs or {}
@@ -1691,28 +1571,14 @@ def validate_filter_ops_per_column(
     cte_outputs: dict[str, dict[str, CteOutputColumnMeta]] | None = None,
     context: str = "main",
 ) -> list[IntentIssue]:
-    """
-    Validate filter operators against each column's data type and role.
-
-    Args:
-
-        filters_param: `FilterParam` instances to validate.
-
-        schema: Schema graph for base tables.
-
-        cte_outputs: CTE name to output column metadata.
-
-        context: Label for issue IDs and messages.
-
-    Returns:
-
-        Collected `IntentIssue` instances.
-    """
-    issues = []
+    """Validate filter operators against each column's data type and. role."""
+    issues: list[IntentIssue] = []
     if not filters_param:
         return []
     cte_outputs = cte_outputs or {}
     for fp in filters_param:
+        if fp.value_type == "date_diff":
+            continue
         col_expr = fp.left_expr.primary_column
         if not col_expr:
             continue
@@ -1806,23 +1672,7 @@ def validate_having_ops_per_column(
     cte_outputs: dict[str, dict[str, CteOutputColumnMeta]] | None = None,
     context: str = "main",
 ) -> list[IntentIssue]:
-    """
-    Validate HAVING operators against each column's type and role.
-
-    Args:
-
-        having_param: `HavingParam` instances to validate.
-
-        schema: Schema graph for base tables.
-
-        cte_outputs: CTE name to output column metadata.
-
-        context: Label for issue IDs and messages.
-
-    Returns:
-
-        Collected `IntentIssue` instances.
-    """
+    """Validate HAVING operators against each column's type and role."""
     issues: list[IntentIssue] = []
     if not having_param:
         return []
@@ -1830,22 +1680,10 @@ def validate_having_ops_per_column(
     for hp in having_param:
 
         def _check_expr(term: str, _hp: Any = hp) -> None:
-            """
-            Append issues if `_hp.op` is invalid for columns referenced in `term`.
-
-            Args:
-
-                term: Aggregation or column term from a HAVING side.
-
-                _hp: `HavingParam` bound from the enclosing loop.
-
-            Returns:
-
-                None.
-            """
+            """Append issues if `_hp.op` is invalid for columns. referenced in `term`. Args: term: Aggregation or column term from a HAVING side. _hp: `HavingParam` bound from the enclosing loop. Returns: None."""
             result = extract_agg_col(term)
-            if len(result) == 3 and result[0] and result[1] and "." in result[1]:
-                _, actual_target, _ = result
+            actual_target = result[1]
+            if result[0] and actual_target and "." in actual_target:
                 table_name, col_name = actual_target.rsplit(".", 1)
             else:
                 col = extract_col_from_scalar_wrapper(term)
@@ -1914,23 +1752,7 @@ def validate_date_window_units(
     *,
     scope_param_values: Mapping[str, Any] | None = None,
 ) -> list[IntentIssue]:
-    """
-    Validate `date_window` filters use an allowed relative-date unit.
-
-    Args:
-
-        filters_param: Main-query `FilterParam` list.
-
-        cte_steps: Optional CTE steps whose filters are also checked.
-
-        context: Label for issue IDs and messages.
-
-        scope_param_values: Bound literals for ``filters_param`` when ``raw_value`` was hoisted.
-
-    Returns:
-
-        `IntentIssue` instances for invalid `date_window` units.
-    """
+    """Validate `date_window` filters use an allowed relative-date unit."""
     issues: list[IntentIssue] = []
     cte_steps = cte_steps or []
 
@@ -1941,9 +1763,7 @@ def validate_date_window_units(
         Args:
 
             fp: Filter to inspect.
-
             loc: Location label for the message.
-
             pv: Parameter map for resolving hoisted window payloads.
 
         Returns:
@@ -1996,37 +1816,17 @@ def validate_date_diff_units(
     *,
     scope_param_values: Mapping[str, Any] | None = None,
 ) -> list[IntentIssue]:
-    """
-    Validate `date_diff` filters for allowed units and numeric amounts.
-
-    Args:
-
-        filters_param: Main-query `FilterParam` list.
-
-        cte_steps: Optional CTE steps whose filters are also checked.
-
-        context: Label for issue IDs and messages.
-
-        scope_param_values: Bound literals for ``filters_param`` when ``raw_value`` was hoisted.
-
-    Returns:
-
-        `IntentIssue` instances for invalid `date_diff` configuration.
-    """
+    """Validate `date_diff` filters for allowed units and numeric. amounts."""
     issues: list[IntentIssue] = []
     cte_steps = cte_steps or []
 
     def check(fp: FilterParam, loc: str, pv: Mapping[str, Any] | None) -> None:
         """
-        Record issues for invalid `date_diff` unit or non-numeric amount.
+        Record issues for invalid `date_diff` unit or non-numeric.
 
-        Args:
+        amount. Args: fp: Filter to inspect. loc: Location label for the
 
-            fp: Filter to inspect.
-
-            loc: Location label for the message.
-
-            pv: Parameter map for resolving hoisted diff payloads.
+        message. pv: Parameter map for resolving hoisted diff payloads.
 
         Returns:
 
@@ -2088,18 +1888,12 @@ def validate_date_diff_left_expr_is_subtraction(
     cte_steps: list[RuntimeCteStep] | None = None,
     context: str = "main",
 ) -> list[IntentIssue]:
-    """
-    Reject ``date_diff`` filters whose ``left_expr`` is not a subtraction.
-
-    A ``date_diff`` filter must compare a duration to a numeric amount, so its ``left_expr`` is required to be a subtraction such as ``end_date - start_date`` or ``end_date - INTERVAL '1 day'``. A plain column reference is not a subtraction; the deterministic repair pipeline rewrites that case to ``date_window``. Anything that survives both repair and rewrite without containing ``sub_groups`` or ``sub_values`` is structurally invalid and is reported with :attr:`FailureCategory.DATE_DIFF`.
-    """
-
+    """Reject ``date_diff`` filters whose ``left_expr`` is not a subtraction. A ``date_diff`` filter compares elapsed time to a scalar amount or to an integer duration column via ``right_expr``. Its ``left_expr`` must be a subtraction such as ``end_date - start_date`` or ``current_date - start_date``. A plain column reference is rewritten to ``date_window`` by the repair pipeline."""
     issues: list[IntentIssue] = []
     cte_steps = cte_steps or []
 
     def check(fp: FilterParam, loc: str) -> None:
         """Append an issue when *fp* is a ``date_diff`` whose ``left_expr`` lacks subtraction."""
-
         if fp.value_type != "date_diff":
             return
         expr = fp.left_expr
@@ -2112,9 +1906,9 @@ def validate_date_diff_left_expr_is_subtraction(
                 category=FailureCategory.DATE_DIFF,
                 severity="error",
                 message=(
-                    f"{loc}: date_diff filter on '{col}' must have left_expr as a subtraction "
-                    "(e.g. end_date - start_date or end_date - INTERVAL '1 day'); use date_window "
-                    "for relative date-window filters on a single date column"
+                    f"{loc}: date_diff filter on '{col}' must have left_expr as a date subtraction "
+                    "between two date columns; use date_window for relative date-window filters "
+                    "on a single date column"
                 ),
                 context={"column": col, "location": context},
             )
@@ -2136,22 +1930,8 @@ def validate_null_filters(
     cte_steps: list[RuntimeCteStep] | None = None,
     context: str = "main",
 ) -> list[IntentIssue]:
-    """
-    Validate `IS NULL` / `IS NOT NULL` filters use `value_type` `null` or empty.
-
-    Args:
-
-        filters_param: Main-query `FilterParam` list.
-
-        cte_steps: Optional CTE steps whose filters are also checked.
-
-        context: Label for issue IDs and messages.
-
-    Returns:
-
-        `IntentIssue` instances when `value_type` disagrees with null semantics.
-    """
-    issues = []
+    """Validate `IS NULL` / `IS NOT NULL` filters use `value_type` `null` or empty."""
+    issues: list[IntentIssue] = []
     cte_steps = cte_steps or []
 
     def check_filter(fp: FilterParam, loc: str) -> IntentIssue | None:
@@ -2161,7 +1941,6 @@ def validate_null_filters(
         Args:
 
             fp: Filter to inspect.
-
             loc: Location label for the message.
 
         Returns:
@@ -2211,25 +1990,7 @@ def validate_filter_value_type_alignment(
     *,
     param_values: Mapping[str, Any] | None = None,
 ) -> list[IntentIssue]:
-    """
-    Warn when string or enum filter values target numeric FK or CTE columns.
-
-    Args:
-
-        filters_param: `FilterParam` instances to scan.
-
-        schema: Schema graph for base tables.
-
-        context: Label for issue IDs and messages.
-
-        cte_outputs: CTE name to output column metadata.
-
-        param_values: Bound literals for this scope when ``raw_value`` was hoisted.
-
-    Returns:
-
-        Collected `IntentIssue` instances (warnings only when applicable).
-    """
+    """Warn when string or enum filter values target numeric FK or CTE. columns."""
     issues: list[IntentIssue] = []
     cte_outputs = cte_outputs or {}
     for fp in filters_param:
@@ -2290,21 +2051,7 @@ def validate_no_between_ops(
     having_param: list[HavingParam],
     context: str = "main query",
 ) -> list[IntentIssue]:
-    """
-    Flag surviving `BETWEEN` operators that should have been decomposed.
-
-    Args:
-
-        filters_param: Filter conditions to inspect.
-
-        having_param: HAVING conditions to inspect.
-
-        context: Query scope description for issue messages.
-
-    Returns:
-
-        One `IntentIssue` per remaining `BETWEEN` operator.
-    """
+    """Flag surviving `BETWEEN` operators that should have been. decomposed."""
     issues: list[IntentIssue] = []
     for fp in filters_param:
         if fp.op.lower() == "between":
@@ -2342,17 +2089,7 @@ def validate_no_between_ops(
 
 
 def _refs_from_filter_param(fp: FilterParam) -> list[str]:
-    """
-    Collect qualified column references from both sides of a filter.
-
-    Args:
-
-        fp: `FilterParam` whose expressions are scanned.
-
-    Returns:
-
-        List of column reference strings.
-    """
+    """Collect qualified column references from both sides of a filter."""
     refs = extract_columns_from_expr(fp.left_expr)
     if fp.right_expr:
         refs.extend(extract_columns_from_expr(fp.right_expr))
@@ -2360,17 +2097,7 @@ def _refs_from_filter_param(fp: FilterParam) -> list[str]:
 
 
 def _refs_from_having_param(hp: HavingParam) -> list[str]:
-    """
-    Collect qualified column references from both sides of a HAVING clause.
-
-    Args:
-
-        hp: `HavingParam` whose expressions are scanned.
-
-    Returns:
-
-        List of column reference strings.
-    """
+    """Collect qualified column references from both sides of a HAVING. clause."""
     refs = extract_columns_from_expr(hp.left_expr)
     if hp.right_expr:
         refs.extend(extract_columns_from_expr(hp.right_expr))
@@ -2383,22 +2110,7 @@ def _refs_from_select_col_extended(
     window_registry: list[WindowRegistryStep] | None = None,
     case_registry: list[CaseRegistryStep] | None = None,
 ) -> list[str]:
-    """
-    Collect column refs from a select column, window spec, and CASE.
-
-    Args:
-
-        sc: `SelectCol` including resolved registry payloads via ``effective_select_parts``.
-
-        window_registry: Optional window registry for resolving ``registry_ref``.
-
-        case_registry: Optional case registry for resolving ``registry_ref``.
-
-    Returns:
-
-        List of column reference strings.
-    """
-
+    """Collect column refs from a select column, window spec, and CASE."""
     parts = effective_select_parts(sc, window_registry, case_registry)
     refs = extract_columns_from_expr(parts.expr)
     if parts.window_spec:
@@ -2418,76 +2130,13 @@ def _refs_from_select_col_extended(
     return refs
 
 
-def collect_column_refs_for_access_policy(
-    select_cols: list[SelectCol],
-    group_by_cols: list[NormalizedExpr],
-    order_by_cols: list[OrderByCol],
-    filters_param: list[FilterParam],
-    having_param: list[HavingParam],
-    *,
-    window_registry: list[WindowRegistryStep] | None = None,
-    case_registry: list[CaseRegistryStep] | None = None,
-) -> list[str]:
-    """
-    Collect qualified column references for deny-column policy checks.
-
-    Args:
-
-        select_cols: SELECT list (may be empty).
-
-        group_by_cols: GROUP BY expressions (may be empty).
-
-        order_by_cols: ORDER BY columns (may be empty).
-
-        filters_param: Filter list (may be empty).
-
-        having_param: HAVING list (may be empty).
-
-        window_registry: Optional window registry for resolving select ``registry_ref`` values.
-
-        case_registry: Optional case registry for resolving select ``registry_ref`` values.
-
-    Returns:
-
-        Every column reference found across the intent parts, in traversal order.
-    """
-    refs: list[str] = []
-    for sc in select_cols or []:
-        refs.extend(_refs_from_select_col_extended(sc, window_registry=window_registry, case_registry=case_registry))
-    for g in group_by_cols or []:
-        refs.extend(extract_columns_from_expr(g))
-    for ob in order_by_cols or []:
-        refs.extend(extract_columns_from_expr(ob.expr))
-    for fp in filters_param or []:
-        refs.extend(_refs_from_filter_param(fp))
-    for hp in having_param or []:
-        refs.extend(_refs_from_having_param(hp))
-    return refs
-
-
 def validate_contains_array_filters(
     filters_param: list[FilterParam],
     schema: SchemaGraph,
     cte_outputs: dict[str, dict[str, CteOutputColumnMeta]] | None,
     context: str,
 ) -> list[IntentIssue]:
-    """
-    Ensure `contains` is only used on array columns with `element_type` set.
-
-    Args:
-
-        filters_param: Filters to scan for `contains`.
-
-        schema: Schema graph for base tables.
-
-        cte_outputs: CTE name to output column metadata.
-
-        context: Label for issue messages.
-
-    Returns:
-
-        `IntentIssue` instances when `contains` targets a non-array column.
-    """
+    """Ensure `contains` is only used on array columns with. `element_type` set."""
     issues: list[IntentIssue] = []
     cte_outputs = cte_outputs or {}
     for i, fp in enumerate(filters_param or []):
@@ -2499,7 +2148,7 @@ def validate_contains_array_filters(
         meta = get_col_meta(cols[0], schema, cte_outputs)
         if meta is None:
             continue
-        if not getattr(meta, "element_type", None):
+        if array_storage_kind(meta) == "unknown":
             issues.append(
                 make_intent_issue(
                     issue_id=f"contains_non_array_{context}_{i}",
@@ -2521,23 +2170,7 @@ def validate_window_spec_schema(
     window_registry: list[WindowRegistryStep] | None = None,
     case_registry: list[CaseRegistryStep] | None = None,
 ) -> list[IntentIssue]:
-    """
-    Validate window function specifications on `SelectCol` entries.
-
-    Args:
-
-        select_cols: SELECT list entries that may carry `window_spec`.
-
-        schema: Schema graph for base tables.
-
-        cte_outputs: CTE name to output column metadata.
-
-        context: Label for issue messages.
-
-    Returns:
-
-        Collected `IntentIssue` instances.
-    """
+    """Validate window function specifications on `SelectCol` entries."""
     issues: list[IntentIssue] = []
     cte_outputs = cte_outputs or {}
     for idx, sc in enumerate(select_cols or []):
@@ -2695,22 +2328,108 @@ def validate_window_spec_schema(
     return issues
 
 
+def _group_by_column_keys(group_by_cols: list[NormalizedExpr]) -> frozenset[str]:
+    keys: set[str] = set()
+    for g in group_by_cols or []:
+        keys.add(expr_canonical_key(g))
+        col = (g.primary_column or "").strip().lower()
+        if col:
+            keys.add(col)
+    return frozenset(keys)
+
+
+def validate_window_partition_group_by_alignment(
+    *,
+    grain: str,
+    group_by_cols: list[NormalizedExpr],
+    window_registry: list[WindowRegistryStep] | None,
+    context: str,
+) -> list[IntentIssue]:
+    """Require window PARTITION BY columns in GROUP BY when the scope is grouped."""
+    issues: list[IntentIssue] = []
+    grain = (grain or "row_level").strip().lower()
+    group_by = list(group_by_cols or [])
+    if grain == "row_level" and not group_by:
+        return issues
+    if not window_registry:
+        return issues
+    gb_keys = _group_by_column_keys(group_by)
+    for wr_idx, wr in enumerate(window_registry):
+        ws = wr.window_spec
+        for part_idx, pe in enumerate(ws.partition_by or []):
+            for cref in extract_columns_from_expr(pe):
+                cref_key = expr_canonical_key(NormalizedExpr.from_column(cref))
+                if cref_key in gb_keys or cref.lower() in gb_keys:
+                    continue
+                issues.append(
+                    make_intent_issue(
+                        issue_id=f"window_partition_column_missing_{context}_{wr_idx}_{part_idx}_{cref}",
+                        category=FailureCategory.GROUP_BY_MEMBERSHIP,
+                        severity="error",
+                        message=(
+                            f"{context}: window PARTITION BY column '{cref}' must appear in "
+                            "group_by_cols when grain is grouped or GROUP BY is present"
+                        ),
+                        context={
+                            "column": cref,
+                            "location": context,
+                            "registry_id": wr.registry_id,
+                        },
+                    )
+                )
+    return issues
+
+
+def validate_redundant_extract_year_column_literals(
+    filters_param: list[FilterParam],
+    cte_steps: list[RuntimeCteStep] | None = None,
+    context: str = "main",
+) -> list[IntentIssue]:
+    """Reject bare four-digit year comparisons on a column that already has an EXTRACT(year FROM col) filter."""
+    issues: list[IntentIssue] = []
+    cte_steps = cte_steps or []
+
+    def check_scope(filters: list[FilterParam], loc: str) -> None:
+        extract_cols: set[str] = set()
+        for fp in filters or []:
+            if fp.left_expr.scalar_func == "extract" and fp.left_expr.scalar_func_args:
+                if str(fp.left_expr.scalar_func_args[0]).lower() == "year":
+                    ref = fp.left_expr.primary_column
+                    if ref:
+                        extract_cols.add(ref.lower())
+        if not extract_cols:
+            return
+        for fp in filters or []:
+            if fp.op not in YEAR_LITERAL_COMPARISON_OPS or fp.raw_value is None or fp.right_expr:
+                continue
+            val = str(fp.raw_value).strip()
+            if not YEAR_LITERAL_RE.fullmatch(val):
+                continue
+            if fp.left_expr.scalar_func or fp.left_expr.agg_func or fp.left_expr.inner_scalar_func:
+                continue
+            ref = fp.left_expr.primary_column
+            if ref and ref.lower() in extract_cols:
+                issues.append(
+                    make_intent_issue(
+                        issue_id=f"redundant_extract_year_literal_{loc}_{ref}",
+                        category=FailureCategory.FILTER_SEMANTIC,
+                        severity="error",
+                        message=(
+                            f"{loc}: bare year literal comparison on '{ref}' is redundant with an "
+                            "existing EXTRACT(year FROM column) filter on the same column"
+                        ),
+                        context={"column": ref, "location": loc},
+                    )
+                )
+
+    check_scope(filters_param, f"{context} filter")
+    for cte in cte_steps:
+        check_scope(cte.filters_param or [], f"CTE '{cte.cte_name}' filter")
+    return issues
+
+
 def filter_param_to_having_param(fp: FilterParam) -> HavingParam:
-    """
-    Convert a `FilterParam` into a `HavingParam` carrying the same predicate fields.
-
-    Used when a `CaseWhenBranch` declares ``condition_scope == "having"`` so that
-    HAVING-shaped validators can be applied to its filter-shaped condition.
-
-    Args:
-
-        fp: Source filter parameter to translate.
-
-    Returns:
-
-        A ``HavingParam`` with matching `left_expr`, `op`, `right_expr`, `value_type`,
-        `param_key`, `raw_value`, `bool_op`, and `filter_group` fields.
-    """
+    """Convert a `FilterParam` into a `HavingParam` carrying the same. predicate fields. Used when a `CaseWhenBranch` declares ``condition_scope == "having"`` so that HAVING-shaped validators can be applied to its filter-shaped condition."""
     return HavingParam(
         left_expr=fp.left_expr,
         op=fp.op,
@@ -2729,28 +2448,7 @@ def iterate_case_branch_conditions(
     window_registry: list[WindowRegistryStep] | None,
     location_prefix: str,
 ) -> list[tuple[FilterParam, str, str]]:
-    """
-    Enumerate every CASE branch condition reachable from a query body.
-
-    Collects conditions from ``case_registry`` entries referenced by bare ``cNN`` tokens in
-    ``select_cols`` and from orphan registry rows not referenced by any select column.
-
-    Args:
-
-        select_cols: SELECT list entries that may reference CASE definitions via ``cNN``.
-
-        case_registry: Standalone CASE registry steps for the same query body.
-
-        window_registry: Window registry passed to ``effective_select_parts``.
-
-        location_prefix: Scope label such as ``"main query"`` or
-        ``"cte 'orders_agg'"``.
-
-    Returns:
-
-        A list of ``(FilterParam, str, str)`` tuples covering every branch in both
-        the registry-driven layout.
-    """
+    """Enumerate every CASE branch condition reachable from a query. body. Collects conditions from ``case_registry`` entries referenced by bare ``cNN`` tokens in ``select_cols`` and from orphan registry rows not referenced by any select column."""
     out: list[tuple[FilterParam, str, str]] = []
     seen_registry_ids: set[str] = set()
     for _, sc in enumerate(select_cols or []):
@@ -2791,27 +2489,7 @@ def validate_case_when_schema(
     case_registry: list[CaseRegistryStep] | None = None,
     param_values: Mapping[str, Any] | None = None,
 ) -> list[IntentIssue]:
-    """
-    Validate CASE expressions for branch filters and result column references.
-
-    Args:
-
-        select_cols: SELECT list entries that reference CASE definitions via ``cNN`` when applicable.
-
-        schema: Schema graph for base tables.
-
-        allowed_tables: Table names permitted in this context.
-
-        cte_outputs: CTE name to output column metadata.
-
-        context: Label for issue messages.
-
-        param_values: Bound literals for the owning query body (branch filters share main or CTE scope).
-
-    Returns:
-
-        Collected `IntentIssue` instances.
-    """
+    """Validate CASE expressions for branch filters and result column. references."""
     issues: list[IntentIssue] = []
     cte_outputs = cte_outputs or {}
     for sc in select_cols or []:
@@ -2901,18 +2579,7 @@ def validate_case_when_schema(
 
 
 def _qualified_refs_under_aggregate_mulgroup(g: MulGroup) -> set[str]:
-    """
-    Collect qualified ``table.column`` refs that are direct arguments of an allowed aggregate.
-
-    Args:
-
-        g: Multiplicative group that may carry ``agg_func``.
-
-    Returns:
-
-        Qualified names for non-``COUNT(*)`` aggregate arguments, including ``COUNT(DISTINCT col)``.
-    """
-
+    """Collect qualified ``table.column`` refs that are direct. arguments. of an allowed aggregate."""
     af = (g.agg_func or "").lower()
     if af not in VALID_AGGREGATION_FUNCTIONS:
         return set()
@@ -2932,7 +2599,6 @@ def _qualified_refs_under_aggregate_mulgroup(g: MulGroup) -> set[str]:
 
 def _mul_group_is_count_star(g: MulGroup) -> bool:
     """Return True when *g* is a row-count ``COUNT`` with no column reference."""
-
     if (g.agg_func or "").lower() != "count":
         return False
     if not g.multiply:
@@ -2956,20 +2622,7 @@ def selectability_exempt_qualified_refs(
     expr: NormalizedExpr,
     schema: SchemaGraph,
 ) -> set[str]:
-    """
-    Return qualified refs that appear only as arguments to allowed aggregate functions.
-
-    Args:
-
-        expr: SELECT-side expression for one column.
-
-        schema: Base-table metadata (unused; kept for call-site stability).
-
-    Returns:
-
-        ``table.column`` names permitted inside ``COUNT`` (including ``DISTINCT``), ``SUM``, ``AVG``, ``MIN``, ``MAX``.
-    """
-
+    """Return qualified refs that appear only as arguments to allowed. aggregate functions."""
     _ = schema
     exempt: set[str] = set()
     for g in expr.add_groups + expr.sub_groups:
@@ -2984,26 +2637,7 @@ def _selectability_issues_for_normalized_expr(
     context: str,
     detail: str,
 ) -> list[IntentIssue]:
-    """
-    Build access-policy issues for bare non-selectable columns in one normalised expression.
-
-    Args:
-
-        expr: Expression to scan (SELECT fragment, partition, window argument, CASE branch).
-
-        schema: Base tables.
-
-        cte_outputs: CTE output column metadata for qualified names.
-
-        context: Outer validation label.
-
-        detail: Sublocation (for example ``select_cols[0]`` or ``window partition[1]``).
-
-    Returns:
-
-        ``IntentIssue`` list for disallowed bare sensitive columns.
-    """
-
+    """Build access-policy issues for bare non-selectable columns in. one. normalised expression."""
     issues: list[IntentIssue] = []
     col_refs = set(extract_columns_from_expr(expr))
     exempt = selectability_exempt_qualified_refs(expr, schema)
@@ -3039,8 +2673,7 @@ def validate_join_path_reachability_for_tables(
     *,
     extra_tables: set[str] | None = None,
 ) -> list[IntentIssue]:
-    """Emit issues when two or more physical tables used together have no shortest-path join in ``join_paths_multi``."""
-
+    """Emit issues when two or more physical tables used together have no join path via FK or semantic neighbors."""
     combined: set[str] = set(tables or [])
     if extra_tables:
         combined |= extra_tables
@@ -3056,6 +2689,22 @@ def validate_join_path_reachability_for_tables(
         fwd = (jpm.get(root) or {}).get(t) or []
         back = (jpm.get(t) or {}).get(root) or []
         if fwd or back:
+            continue
+        sem_linked = False
+        for tbl in (root, t):
+            tbl_meta = schema.tables.get(tbl)
+            if tbl_meta is None:
+                continue
+            for _cn, col in tbl_meta.columns.items():
+                for nt, _nc in col.semantic_join_neighbors:
+                    if nt in physical:
+                        sem_linked = True
+                        break
+                if sem_linked:
+                    break
+            if sem_linked:
+                break
+        if sem_linked:
             continue
         issues.append(
             make_intent_issue(
@@ -3078,7 +2727,6 @@ def validate_join_path_reachability(
     context: str,
 ) -> list[IntentIssue]:
     """Like :func:`validate_join_path_reachability_for_tables` using ``intent.tables`` and ``intent.extra_tables``."""
-
     extra = getattr(intent, "extra_tables", None)
     et = set(extra) if extra else None
     return validate_join_path_reachability_for_tables(
@@ -3098,27 +2746,7 @@ def validate_selectability(
     window_registry: list[WindowRegistryStep] | None = None,
     case_registry: list[CaseRegistryStep] | None = None,
 ) -> list[IntentIssue]:
-    """
-    Reject bare non-selectable columns in SELECT expressions, window partitions, and CASE results.
-
-    Args:
-
-        select_cols: SELECT list entries to inspect.
-
-        schema: Schema graph for base tables.
-
-        cte_outputs: CTE name to output column metadata.
-
-        context: Label for issue messages.
-
-        window_registry: Registry used to resolve bare ``wNN`` tokens on select expressions.
-
-        case_registry: Registry used to resolve bare ``cNN`` tokens on select expressions.
-
-    Returns:
-
-        `IntentIssue` instances for each disallowed bare sensitive column.
-    """
+    """Reject bare non-selectable columns in SELECT expressions, window. partitions, and CASE results."""
     issues: list[IntentIssue] = []
     cte_outputs = cte_outputs or {}
     for idx, sc in enumerate(select_cols or []):
@@ -3177,21 +2805,7 @@ def get_col_type(
     schema: SchemaGraph,
     cte_outputs: dict[str, dict[str, CteOutputColumnMeta]],
 ) -> str | None:
-    """
-    Resolve a column's `value_type` from the schema or CTE outputs.
-
-    Args:
-
-        col_expr: Column reference, optionally wrapped in scalar calls.
-
-        schema: Schema graph with table and column metadata.
-
-        cte_outputs: CTE name to column output metadata.
-
-    Returns:
-
-        The `value_type` string, or `None` if the column cannot be resolved.
-    """
+    """Resolve a column's `value_type` from the schema or CTE outputs."""
     actual_col = extract_col_from_scalar_wrapper(col_expr)
     if "." not in actual_col:
         return None
@@ -3213,21 +2827,7 @@ def get_col_meta(
     schema: SchemaGraph,
     cte_outputs: dict[str, dict[str, CteOutputColumnMeta]],
 ) -> Any | None:
-    """
-    Resolve `ColumnMetadata` from the schema graph or synthesise it from CTE outputs.
-
-    Args:
-
-        col_expr: Column reference, optionally wrapped in scalar calls.
-
-        schema: Schema graph with table and column metadata.
-
-        cte_outputs: CTE name to column output metadata.
-
-    Returns:
-
-        A `ColumnMetadata` instance (real or synthetic), or `None` if unresolved.
-    """
+    """Resolve `ColumnMetadata` from the schema graph or synthesise it. from CTE outputs."""
     actual_col = extract_col_from_scalar_wrapper(col_expr)
     if "." not in actual_col:
         return None
@@ -3246,7 +2846,7 @@ def get_col_meta(
             valid_filter_ops=list(cte_meta.valid_filter_ops or []),
             valid_aggregations=list(cte_meta.valid_aggregations or []),
             valid_having_ops=list(cte_meta.valid_having_ops or []),
-            sensitivity=cte_meta.sensitivity,
+            sensitivity=column_sensitivity_from_dict({"sensitivity": cte_meta.sensitivity}),
         )
     if table_name not in schema.tables:
         return None
@@ -3259,21 +2859,7 @@ def is_col_numeric(
     schema: SchemaGraph,
     cte_outputs: dict[str, dict[str, CteOutputColumnMeta]],
 ) -> bool | None:
-    """
-    Return whether a column's value type is numeric.
-
-    Args:
-
-        col_ref: Qualified reference `table.column`.
-
-        schema: Schema graph with column type information.
-
-        cte_outputs: CTE name to column output metadata.
-
-    Returns:
-
-        `True` if numeric, `False` if known non-numeric, or `None` if unresolved.
-    """
+    """Return whether a column's value type is numeric."""
     col_type = get_col_type(col_ref, schema, cte_outputs)
     if col_type is None:
         return None
@@ -3285,21 +2871,7 @@ def is_col_arithmetic_role(
     schema: SchemaGraph,
     cte_outputs: dict[str, dict[str, CteOutputColumnMeta]],
 ) -> bool | None:
-    """
-    Return whether a column's role allows use in arithmetic expressions.
-
-    Args:
-
-        col_ref: Qualified reference `table.column`.
-
-        schema: Schema graph with column role information.
-
-        cte_outputs: CTE name to column output metadata.
-
-    Returns:
-
-        `True` or `False` from role membership in `ARITHMETIC_ROLES`, or `None` if unresolved.
-    """
+    """Return whether a column's role allows use in arithmetic. expressions."""
     meta = get_col_meta(col_ref, schema, cte_outputs)
     if meta and meta.role:
         return meta.role in ARITHMETIC_ROLES
@@ -3311,3 +2883,148 @@ def is_col_arithmetic_role(
             if cte_meta and cte_meta.role:
                 return cte_meta.role in ARITHMETIC_ROLES
     return None
+
+
+def expr_has_arithmetic(expr: NormalizedExpr) -> bool:
+    """Return `True` if a `NormalizedExpr` contains arithmetic. operations."""
+    if len(expr.add_groups) + len(expr.sub_groups) > 1:
+        return True
+    if expr.add_values or expr.sub_values:
+        return True
+    for g in expr.add_groups + expr.sub_groups:
+        if (g.scalar_func or "").lower() == "concat":
+            continue
+        if g.coefficient != 1.0 or g.divide or len(g.multiply) > 1:
+            return True
+    return False
+
+
+def expr_result_is_numeric(
+    expr: NormalizedExpr,
+    schema: SchemaGraph,
+    cte_outputs: dict[str, dict[str, CteOutputColumnMeta]],
+) -> bool | None:
+    """Return whether the result of a `NormalizedExpr` is numeric."""
+    if expr.agg_func and expr.agg_func in NUMERIC_RESULT_AGGS:
+        return True
+    if expr.scalar_func and expr.scalar_func in NUMERIC_RESULT_SCALARS:
+        return True
+    if expr.inner_scalar_func and expr.inner_scalar_func in NUMERIC_RESULT_SCALARS:
+        return True
+    if is_date_integer_day_arithmetic(expr, schema, cte_outputs):
+        return False
+    if expr_has_arithmetic(expr):
+        return True
+    if expr.add_values or expr.sub_values:
+        return True
+    for g in expr.add_groups + expr.sub_groups:
+        if g.agg_func and g.agg_func in NUMERIC_RESULT_AGGS:
+            return True
+        if g.scalar_func and g.scalar_func in NUMERIC_RESULT_SCALARS:
+            return True
+        if g.inner_scalar_func and g.inner_scalar_func in NUMERIC_RESULT_SCALARS:
+            return True
+    if expr.has_aggregation:
+        primary = expr.primary_term
+        result = extract_agg_col(primary)
+        if len(result) == 3 and result[0] in {"count", "sum", "avg"}:
+            return True
+    col = expr.primary_column
+    if col:
+        return is_col_numeric(col, schema, cte_outputs)
+    return None
+
+
+def group_is_simple_integer_column(
+    group: MulGroup,
+    schema: SchemaGraph,
+    cte_outputs: dict[str, dict[str, CteOutputColumnMeta]],
+) -> bool:
+    """Return True when *group* is a bare integer column reference."""
+    if group.divide or group.coefficient != 1.0 or len(group.multiply) != 1:
+        return False
+    term = group.multiply[0]
+    if term.add_groups or term.sub_groups or term.add_values or term.sub_values:
+        return False
+    col = term.primary_column
+    if not col:
+        return False
+    col_type = get_col_type(col, schema, cte_outputs) or ""
+    return col_type in {"integer", "int", "bigint", "smallint", "tinyint", "long", "short"}
+
+
+def group_is_simple_date_column(
+    group: MulGroup,
+    schema: SchemaGraph,
+    cte_outputs: dict[str, dict[str, CteOutputColumnMeta]],
+) -> bool:
+    """Return True when *group* is a bare date or timestamp column reference."""
+    if group.divide or group.coefficient != 1.0 or len(group.multiply) != 1:
+        return False
+    term = group.multiply[0]
+    if term.add_groups or term.sub_groups or term.add_values or term.sub_values:
+        return False
+    col = term.primary_column
+    if not col:
+        return False
+    col_type = get_col_type(col, schema, cte_outputs) or ""
+    return col_type in DATE_FRIENDLY_VALUE_TYPES
+
+
+def _extract_date_integer_day_base_column(
+    expr: NormalizedExpr,
+    schema: SchemaGraph,
+    cte_outputs: dict[str, dict[str, CteOutputColumnMeta]],
+) -> str | None:
+    """Return the date column when *expr* is ``date_col +/- integer days``."""
+    for group in expr.add_groups + expr.sub_groups:
+        if group_is_simple_date_column(group, schema, cte_outputs):
+            return group.multiply[0].primary_column
+    return None
+
+
+def _has_integer_day_offset(
+    expr: NormalizedExpr,
+    schema: SchemaGraph,
+    cte_outputs: dict[str, dict[str, CteOutputColumnMeta]],
+) -> bool:
+    """Return True when *expr* carries an integer day offset via literal or column."""
+    if _extract_date_integer_day_base_column(expr, schema, cte_outputs) is None:
+        return False
+    if expr.add_values or expr.sub_values:
+        return len(expr.add_groups) + len(expr.sub_groups) == 1
+    int_groups = [
+        g for g in expr.add_groups + expr.sub_groups if group_is_simple_integer_column(g, schema, cte_outputs)
+    ]
+    return len(int_groups) == 1 and len(expr.add_groups) + len(expr.sub_groups) == 2
+
+
+def is_date_column_subtraction(
+    expr: NormalizedExpr,
+    schema: SchemaGraph,
+    cte_outputs: dict[str, dict[str, CteOutputColumnMeta]],
+) -> bool:
+    """Return True when *expr* subtracts one date column from another."""
+    if not (expr.sub_groups and expr.add_groups):
+        return False
+    if expr.add_values or expr.sub_values:
+        return False
+    if any(group_is_simple_integer_column(g, schema, cte_outputs) for g in expr.sub_groups):
+        return False
+    if any(group_is_simple_integer_column(g, schema, cte_outputs) for g in expr.add_groups):
+        return False
+    groups = expr.add_groups + expr.sub_groups
+    return len(groups) == 2 and all(group_is_simple_date_column(g, schema, cte_outputs) for g in groups)
+
+
+def is_date_integer_day_arithmetic(
+    expr: NormalizedExpr,
+    schema: SchemaGraph,
+    cte_outputs: dict[str, dict[str, CteOutputColumnMeta]],
+) -> bool:
+    """Return True when *expr* evaluates to a date via date-column +/- integer days."""
+    if expr.agg_func or expr.scalar_func or expr.inner_scalar_func:
+        return False
+    return _extract_date_integer_day_base_column(expr, schema, cte_outputs) is not None and _has_integer_day_offset(
+        expr, schema, cte_outputs
+    )

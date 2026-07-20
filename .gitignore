@@ -38,8 +38,59 @@ dmypy.json
 # Docs build
 site/
 
-# Local live-test env files
-live_tests/*.txt
+# scripts/ generated data (private dev pipeline)
+scripts/data/rental_shop_csvs/
+scripts/data/rental_shop.zip
+scripts/data/_llm_cache/
+scripts/data/_downloads/
+scripts/sandbox_staging/
+scripts/sandbox_staging.zip
+scripts/**/*.sqlite
+scripts/**/*.duckdb
+scripts/**/*.duckdb.*
+scripts/logs/
+
+# Secrets (repo-local credentials; never commit)
+secrets/
+
+# dev_workspace generated (warmup / dev tooling)
+dev_workspace/warmup_artifacts/
+dev_workspace/corpus/
+dev_workspace/*.log
+dev_workspace/*_load.log
+dev_workspace/logs/*.log
+dev_workspace/*.err.log
+dev_workspace/pytest_*.txt
+dev_workspace/_pytest*.txt
+dev_workspace/_precommit*.txt
+dev_workspace/precommit_out*.txt
+dev_workspace/_tmp_*
+dev_workspace/_tmp_*.txt
+dev_workspace/_tmp_*.json
+dev_workspace/aether_artifacts*/
+dev_workspace/*.zip
+studio_demo/*
+studio_dev/*
+studio_dev/
+studio_demo/
+
+# live test output (private only)
+live_tests/results.txt
+
+# Pipeline cwd artifacts (pytest / sandbox recipes use Path.cwd())
+results.csv
+schema_overrides.json
+schema_overrides.applied.json
+schema_overrides.applied.schema.json
+schema_overrides.applied.*.json
+
+# Accidental sandbox zip extract (data.zip itself is package data)
+src/aetherdialect/sandbox/data/
+
+# Local schema-migration workflow (cwd-relative)
+schema_migration_map.json
+schema_migration_map.applied.json
+schema_migration_map.*.json
 
 # Jupyter
 .ipynb_checkpoints/
@@ -49,6 +100,21 @@ live_tests/*.txt
 .env.*
 env.env
 
+# Databricks
+.databricks/
+databricks.yml
+typings/
+
+# IDE
+.vscode/
+.cursor/
+.trae/
+.idea/
+
 # OS
 .DS_Store
 Thumbs.db
+
+# Backup files
+*.bak
+src/aetherdialect/sandbox/data.zip.bak

@@ -13,7 +13,6 @@ from aetherdialect._core_utils import artifact_lock, write_gzip_json_atomic
 
 def test_artifact_lock_reentrant_same_thread(tmp_path):
     """Nested ``with artifact_lock(d):`` in one thread does not deadlock."""
-
     d = str(tmp_path)
     with artifact_lock(d):
         with artifact_lock(d):
@@ -23,7 +22,6 @@ def test_artifact_lock_reentrant_same_thread(tmp_path):
 
 def test_artifact_lock_serializes_threads(tmp_path):
     """Two threads contending the same dir lock execute their critical sections serially."""
-
     d = str(tmp_path)
     in_section = 0
     max_concurrent = 0
@@ -50,7 +48,6 @@ def test_artifact_lock_serializes_threads(tmp_path):
 
 def test_artifact_lock_timeout_raises(tmp_path):
     """If another holder never releases, ``artifact_lock`` raises ``TimeoutError``."""
-
     d = str(tmp_path)
     holder_acquired = threading.Event()
     release_holder = threading.Event()

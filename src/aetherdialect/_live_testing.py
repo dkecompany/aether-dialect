@@ -1,21 +1,13 @@
-"""
-Live pipeline tests: scenarios, soft asserts, I/O patching, and runners against real LLM/DB.
-
-Absolute ``import aetherdialect._*`` names exist only so ``unittest.mock.patch`` can target stable module paths; production code uses relative imports.
-
-Fixtures stay caller-specific.
-"""
+"""Live pipeline tests: scenarios, soft asserts, I/O patching, and runners against real LLM/DB. Absolute ``import aetherdialect._*`` names exist only so ``unittest.mock.patch`` can target stable module paths; production code uses relative imports. Fixtures stay caller-specific."""
 
 from __future__ import annotations
 
-import os
 import re
 import time
 import traceback
 from collections.abc import Callable
-from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 from unittest.mock import patch
 
@@ -30,20 +22,27 @@ import aetherdialect._main_execution
 import aetherdialect._pipeline
 import aetherdialect._qsim
 import aetherdialect._qsim_ops
-import aetherdialect._schema
-import aetherdialect._schema_profiling
+import aetherdialect._schema_build
+import aetherdialect._schema_catalog
+import aetherdialect._schema_graph
+import aetherdialect._schema_overrides
 import aetherdialect._seed_warmup
 import aetherdialect._sql_gen
 import aetherdialect._templates
 import aetherdialect._utils
-import aetherdialect._validation_agg
 import aetherdialect._validation_execute
 import aetherdialect._validation_schema
 import aetherdialect._validation_semantic
 
-from ._config import GenerationPath, PolicyConfig
+from ._config import PolicyConfig
+from ._constants import GenerationPath
 from ._contracts_core import QuestionFormStorage, RuntimeIntent, SqlGenerationOutcome
-from ._core_utils import debug, normalize_question, substitute_params
+from ._core_utils import (
+    StepResult,
+    debug,
+    pipeline_capture,
+    substitute_params,
+)
 from ._dialect import (
     Dialect,
     active_sqlglot_dialect,
@@ -54,6 +53,7 @@ from ._intent_process import (
     collect_structural_match_templates,
     match_template_for_union,
 )
+from ._main_execution import try_zero_row_filter_remediation
 from ._pipeline import (
     best_accepted_template_similarity,
     build_result_dataframe,
@@ -88,16 +88,8 @@ def deterministic_generate_validate_execute(
     schema: Any,
     dialect: str | Dialect,
     store: dict[str, Any] | TemplateStoreView | None = None,
-) -> tuple[SqlGenerationOutcome, list[tuple] | None]:
-    """
-    Build SQL from a fixed ``RuntimeIntent`` (join candidates + ``generate_and_validate_sql``), then execute.
-
-    Skips NL intent parsing entirely. A join-choice LLM may still run when the graph yields ambiguous join candidates; callers that require zero LLM traffic should patch ``get_join_choice_from_llm`` in tests.
-
-    Args:
-
-        dialect: Engine name (for example ``"postgresql"``) or a concrete ``Dialect`` instance from the registry.
-    """
+) -> tuple[SqlGenerationOutcome, list[tuple[Any, ...]] | None]:
+    """Build SQL from a fixed ``RuntimeIntent`` (join candidates + ``generate_and_validate_sql``), then execute. Skips NL intent parsing entirely. A join-choice LLM may still run when the graph yields ambiguous join candidates; callers that require zero LLM traffic should patch ``get_join_choice_from_llm`` in tests."""
     if store is None:
         store = {"next_id": 1, "templates": {}, "question_feedback": {}}
     dialect_obj = resolve_dialect(dialect)
@@ -126,19 +118,24 @@ def deterministic_generate_validate_execute(
         execution_sql_override=None,
         structural_defaults=tmpl_sd,
     )
-    rows = dialect_obj.execute(exec_sql)
-    return gen_out, rows
+    rows = dialect_obj.execute(exec_sql, params)
+    row_list = [tuple(row) for row in rows] if rows else []
+    if len(row_list) == 0:
+        fixed_intent, fixed_rows = try_zero_row_filter_remediation(
+            intent,
+            schema,
+            dialect_obj,
+            tmpl_sd,
+        )
+        if fixed_rows is not None:
+            intent = fixed_intent
+            row_list = [tuple(row) for row in fixed_rows]
+    return gen_out, row_list
 
 
 @dataclass
 class PendingFeedback:
-    """
-    Deferred feedback payload for post-assertion commit.
-
-    Attributes:
-
-        canned_reject_reason: Text supplied to ``input()`` when persisting a deferred ``n`` answer.
-    """
+    """Deferred feedback payload for post-assertion commit."""
 
     choice: str
     intent: RuntimeIntent
@@ -159,11 +156,7 @@ class PendingFeedback:
 
 @dataclass
 class Expected:
-    """
-    Optional checks for one run; `None` or defaults skip the corresponding assertion.
-
-    When ``reuse_type`` is checked, values align with pipeline routing: ``direct_reuse`` (question match, ``GenerationPath`` 1–2), ``intent_direct_reuse`` (union, same columns, path 3), ``intent_reuse`` (union, columns changed, path 4).
-    """
+    """Optional checks for one run; `None` or defaults skip the corresponding assertion. When ``reuse_type`` is checked, values align with pipeline routing: ``direct_reuse`` (question match, ``GenerationPath`` 1–2), ``intent_direct_reuse`` (union, same columns, path 3), ``intent_reuse`` (union, columns changed, path 4)."""
 
     tables: list[str] | None = None
     tables_one_of: list[list[str]] | None = None
@@ -181,7 +174,7 @@ class Expected:
     grain: str | tuple[str, ...] | None = None
     should_fail_validation: bool = False
     column_names_one_of: list[list[str]] | None = None
-    row_value_check: Callable[[list[tuple]], bool] | None = None
+    row_value_check: Callable[[list[tuple[Any, ...]]], bool] | None = None
     min_semantic_warnings: int | None = None
     status: str | None = None
     status_in: tuple[str, ...] | None = None
@@ -223,45 +216,11 @@ class SoftFailure:
     message: str
 
 
-@dataclass
-class StepResult:
-    """Mutable capture of pipeline outputs, metrics, and logs for one scenario run."""
-
-    scenario_id: str
-    question: str
-    status: str = "unknown"
-    intent: RuntimeIntent | None = None
-    sql: str | None = None
-    rows: list[tuple] | None = None
-    confidence: float | None = None
-    reuse_type: str | None = None
-    template_id: str | None = None
-    validation_failed: bool = False
-    feedback: str | None = None
-    error: str | None = None
-    duration_seconds: float = 0.0
-    captured_logs: list[str] = field(default_factory=list)
-    semantic_warnings: list[str] = field(default_factory=list)
-    soft_warnings: list[str] = field(default_factory=list)
-    llm_calls: int = 0
-    reject_reason_actual: str | None = None
-    classified_category: str | None = None
-    classified_reason: str | None = None
-    generation_path: str | None = None
-    pending_feedback: PendingFeedback | None = None
-
-
 class SoftAssert:
     """Collect soft assertion failures; call `report()` to raise one combined error."""
 
     def __init__(self) -> None:
-        """
-        Initialize an empty failure list.
-
-        Returns:
-
-            None.
-        """
+        """Initialize an empty failure list."""
         self.failures: list[SoftFailure] = []
 
     def check(
@@ -272,52 +231,18 @@ class SoftAssert:
         actual: Any,
         message: str = "",
     ) -> None:
-        """
-        Append a `SoftFailure` when `condition` is false.
-
-        Args:
-
-            condition: Assertion predicate.
-
-            field_name: Field label for reporting.
-
-            expected: Expected value for reporting.
-
-            actual: Observed value for reporting.
-
-            message: Optional explanation.
-
-        Returns:
-
-            None.
-        """
+        """Append a `SoftFailure` when `condition` is false."""
         if not condition:
             msg = message or f"{field_name}: expected {expected!r}, got {actual!r}"
             self.failures.append(SoftFailure(field=field_name, expected=expected, actual=actual, message=msg))
 
     @property
     def passed(self) -> bool:
-        """
-        True if no failures were recorded.
-
-        Returns:
-
-            Whether the collector has no recorded failures.
-        """
+        """True if no failures were recorded."""
         return len(self.failures) == 0
 
     def report(self, header: str = "") -> None:
-        """
-        Raise `AssertionError` with all failures, or return if `passed`.
-
-        Args:
-
-            header: Optional first line of the error text.
-
-        Returns:
-
-            None.
-        """
+        """Raise `AssertionError` with all failures, or return if. `passed`."""
         if self.passed:
             return
         lines = [header] if header else []
@@ -326,225 +251,8 @@ class SoftAssert:
         raise AssertionError("\n".join(lines))
 
 
-def _make_prompt_responders(
-    responses: list[str],
-) -> tuple[Callable[..., Any], Callable[..., Any]]:
-    """
-    Build FIFO auto-responders for ``ask_user_choice`` and ``interactive_yes_no`` sharing one queue.
-
-    Args:
-
-        responses: FIFO list of ``y`` / ``n`` strings.
-
-    Returns:
-
-        ``(ask_user_choice_replacement, interactive_yes_no_replacement)``.
-    """
-
-    queue = list(responses)
-
-    def _ask_user_choice(prompt: str, options: list[str], silent_no: bool = False) -> str | None:
-        if queue:
-            return queue.pop(0)
-        return "y"
-
-    def _interactive_yes_no(
-        stage: str,
-        prompt: str,
-        options: list[str],
-        silent_no: bool = False,
-        *,
-        choice_port: Any = None,
-    ) -> str | None:
-        if choice_port is not None:
-            if queue:
-                return queue.pop(0)
-            return "y"
-        if queue:
-            return queue.pop(0)
-        return "y"
-
-    return _ask_user_choice, _interactive_yes_no
-
-
-def _make_input_responder(reject_reason: str = "incorrect results") -> Callable:
-    """
-    Build a replacement for `builtins.input` that supplies canned text.
-
-    The first call returns `reject_reason`; later calls return `n` to stop further prompts.
-
-    Args:
-
-        reject_reason: Text returned on the first `input()` call.
-
-    Returns:
-
-        Callable replacing the built-in `input`.
-    """
-    call_count = {"n": 0}
-
-    def _fake_input(prompt: str = "") -> str:
-        """Return canned rejection text once, then `n`."""
-        call_count["n"] += 1
-        if call_count["n"] == 1:
-            return reject_reason
-        return "n"
-
-    return _fake_input
-
-
-@contextmanager
-def _pipeline_capture(
-    auto_responses: list[str],
-    reject_reason: str = "incorrect results",
-    csv_dir: str = "",
-):
-    """
-    Patch interactive I/O for programmatic pipeline runs.
-
-    Replaces ``ask_user_choice`` / ``interactive_yes_no`` on ``core_utils`` and ``interactive_yes_no`` on ``pipeline`` and ``main_execution`` with FIFO auto-responders (shared queue), and ``builtins.input`` with canned text so the pipeline does not block on stdin. When ``csv_dir`` is set, redirects ``save_result_csv`` so CSV output lands in that directory.
-
-    Args:
-
-        auto_responses: FIFO list of ``y`` / ``n`` strings for interactive prompts.
-
-        reject_reason: Canned rejection reason for `input()` prompts.
-
-        csv_dir: If non-empty, redirect `results.csv` writes into this directory.
-
-    Yields:
-
-        Dict with key ``logs`` listing captured log lines during the run.
-    """
-    capture: dict[str, Any] = {"logs": []}
-    ask_uc, iyn = _make_prompt_responders(auto_responses)
-    input_responder = _make_input_responder(reject_reason)
-
-    original_log = aetherdialect._core_utils.log
-    original_debug = aetherdialect._core_utils.debug
-
-    def _capturing_log(msg: str) -> None:
-        """Append a log line to capture and forward to the original logger."""
-        capture["logs"].append(f"[LOG] {msg}")
-        original_log(msg)
-
-    def _capturing_debug(msg: str) -> None:
-        """Append a debug line to capture and forward to the original `debug`."""
-        capture["logs"].append(f"[DEBUG] {msg}")
-        original_debug(msg)
-
-    _debug_modules = [
-        aetherdialect._core_utils,
-        aetherdialect._pipeline,
-        aetherdialect._sql_gen,
-        aetherdialect._validation_agg,
-        aetherdialect._validation_execute,
-        aetherdialect._validation_schema,
-        aetherdialect._validation_semantic,
-        aetherdialect._intent_expr,
-        aetherdialect._intent_process,
-        aetherdialect._intent_repair,
-        aetherdialect._intent_resolve,
-        aetherdialect._dialect,
-        aetherdialect._expansion_ops,
-        aetherdialect._utils,
-        aetherdialect._templates,
-        aetherdialect._schema,
-        aetherdialect._schema_profiling,
-        aetherdialect._qsim,
-        aetherdialect._qsim_ops,
-        aetherdialect._main_execution,
-        aetherdialect._seed_warmup,
-    ]
-    _log_modules = [
-        aetherdialect._core_utils,
-        aetherdialect._pipeline,
-        aetherdialect._main_execution,
-        aetherdialect._expansion_ops,
-        aetherdialect._seed_warmup,
-    ]
-
-    extra_patches: list[Any] = []
-    for mod in _debug_modules:
-        if hasattr(mod, "debug"):
-            extra_patches.append(patch.object(mod, "debug", _capturing_debug))
-    for mod in _log_modules:
-        if hasattr(mod, "log"):
-            extra_patches.append(patch.object(mod, "log", _capturing_log))
-
-    _pt_orig = aetherdialect._core_utils.pipeline_trace
-
-    def _capturing_pipeline_trace(heading: str, body: str) -> None:
-        capture["logs"].append(f"[PIPELINE_TRACE] {heading}\n{body}")
-        _pt_orig(heading, body)
-
-    _ptl_orig = aetherdialect._core_utils.pipeline_trace_lazy
-
-    def _capturing_pipeline_trace_lazy(heading: str, body_factory: Callable[[], str]) -> None:
-        body = body_factory()
-        capture["logs"].append(f"[PIPELINE_TRACE] {heading}\n{body}")
-        _ptl_orig(heading, lambda: body)
-
-    _trace_patch_modules = (
-        aetherdialect._core_utils,
-        aetherdialect._pipeline,
-        aetherdialect._intent_process,
-        aetherdialect._sql_gen,
-        aetherdialect._validation_execute,
-        aetherdialect._intent_resolve,
-        aetherdialect._dialect,
-        aetherdialect._intent_repair,
-    )
-    for mod in _trace_patch_modules:
-        if hasattr(mod, "pipeline_trace"):
-            extra_patches.append(patch.object(mod, "pipeline_trace", _capturing_pipeline_trace))
-        if hasattr(mod, "pipeline_trace_lazy"):
-            extra_patches.append(patch.object(mod, "pipeline_trace_lazy", _capturing_pipeline_trace_lazy))
-
-    if csv_dir:
-        _original_save = aetherdialect._pipeline.save_result_csv
-
-        def _redirected_save(df: Any) -> None:
-            orig_cwd = os.getcwd()
-            try:
-                os.chdir(csv_dir)
-                _original_save(df)
-            finally:
-                os.chdir(orig_cwd)
-
-        extra_patches.append(patch.object(aetherdialect._pipeline, "save_result_csv", _redirected_save))
-        extra_patches.append(patch(__name__ + ".save_result_csv", _redirected_save))
-
-    with (
-        patch.object(aetherdialect._core_utils, "ask_user_choice", ask_uc),
-        patch.object(aetherdialect._core_utils, "interactive_yes_no", iyn),
-        patch.object(aetherdialect._pipeline, "interactive_yes_no", iyn),
-        patch.object(aetherdialect._main_execution, "interactive_yes_no", iyn),
-        patch("builtins.input", input_responder),
-    ):
-        for p in extra_patches:
-            p.start()
-        try:
-            yield capture
-        finally:
-            for p in extra_patches:
-                p.stop()
-
-
 def _extract_reuse_sql(tmpl: Any, q_norm: str) -> str:
-    """
-    Reconstruct the final SQL that `handle_direct_sql_reuse` would produce.
-
-    Args:
-
-        tmpl: Template with `value_history` and SQL fields.
-
-        q_norm: Normalized question string.
-
-    Returns:
-
-        Substituted parameterized SQL when params match; otherwise ``tmpl.sql_param``.
-    """
+    """Reconstruct the final SQL that `handle_direct_sql_reuse` would. produce."""
     vh = tmpl.value_history
     matched_params: dict[str, str] = {}
     for i, hq in enumerate(vh.questions):
@@ -558,21 +266,12 @@ def _extract_reuse_sql(tmpl: Any, q_norm: str) -> str:
             getattr(tmpl, "structural_defaults", None),
         )
         return substitute_params(tmpl.sql_param, matched_params)
-    return tmpl.sql_param
+    sql_param = getattr(tmpl, "sql_param", "")
+    return sql_param if isinstance(sql_param, str) else str(sql_param)
 
 
 def _build_reuse_intent(tmpl: Any) -> RuntimeIntent:
-    """
-    Build a lightweight `RuntimeIntent` from a template's intent signature.
-
-    Args:
-
-        tmpl: Template carrying `intent_signature`.
-
-    Returns:
-
-        Populated `RuntimeIntent` for direct-reuse display and checks.
-    """
+    """Build a lightweight `RuntimeIntent` from a template's intent. signature."""
     sig = tmpl.intent_signature
     return RuntimeIntent(
         tables=sig.tables or [],
@@ -590,14 +289,7 @@ def _build_reuse_intent(tmpl: Any) -> RuntimeIntent:
 
 
 def _scenario_requires_intent_prompt(scenario: Scenario) -> bool:
-    """
-    Return True when the scenario expects an intent decline on the first canned response.
-
-    Returns:
-
-        True when ``expected.status`` is ``intent_rejected`` and the first auto-response is ``n``.
-    """
-
+    """Return True when the scenario expects an intent decline on the. first canned response."""
     if scenario.expected.status != "intent_rejected":
         return False
     ar = scenario.auto_responses
@@ -610,52 +302,21 @@ def _run_pipeline_core(
     question: str,
     schema: Any,
     store: dict[str, Any],
-    templates: dict,
-    rejected: dict,
+    templates: dict[str, Any],
+    rejected: dict[str, Any],
     schema_terms: set[str],
     feedback: str,
     captured_logs: list[str],
     reject_reason: str = "",
     feedback_mode: FeedbackMode = "live",
     force_intent_confirm: bool = False,
+    dialect: Any | None = None,
 ) -> StepResult:
-    """
-    Execute pipeline steps for one question and return captured state.
-
-    Mirrors `interactive_run_once` control flow with programmatic arguments and a `StepResult` instead of printing.
-
-    Args:
-
-        question: Natural-language question string.
-
-        schema: Loaded `SchemaGraph`.
-
-        store: Mutable template store dict.
-
-        templates: Accepted templates dict.
-
-        rejected: Rejected templates dict.
-
-        schema_terms: Set of schema term tokens.
-
-        feedback: Predetermined `y` / `n` feedback value.
-
-        captured_logs: Mutable list to append log lines into.
-
-        reject_reason: When feedback is `n`, canned reason recorded on ``StepResult``.
-
-        feedback_mode: ``live`` applies feedback immediately; ``deferred_test`` records ``PendingFeedback``.
-
-        force_intent_confirm: When True, intent confirmation is not skipped by similarity or empty warnings.
-
-    Returns:
-
-        Populated `StepResult`.
-    """
+    """Execute pipeline steps for one question and return captured. state. Mirrors `interactive_run_once` control flow with programmatic arguments and a `StepResult` instead of printing."""
     result = StepResult(scenario_id="", question=question, captured_logs=captured_logs)
 
     dialect, schema, store, templates, rejected, schema_terms = load_pipeline_resources(
-        schema, store, templates, rejected, schema_terms
+        schema, store, templates, rejected, schema_terms, dialect=dialect
     )
 
     raw_question = question
@@ -663,27 +324,32 @@ def _run_pipeline_core(
     tmpl_pre = match_question_level_template_reuse(raw_question, templates, template_store=store)
     result.reuse_type = tmpl_pre.reuse_type
     if tmpl_pre.reuse_type == "direct_reuse":
-        result.template_id = tmpl_pre.best_template.id if tmpl_pre.best_template else None
-        assert tmpl_pre.reuse_candidate_normalized is not None
-        reuse_pre = handle_direct_sql_reuse(
-            tmpl_pre.reuse_candidate_normalized,
-            tmpl_pre.best_template,
-            dialect,
-            store,
-            templates,
-            rejected,
-            schema,
-            existing_nl=None,
-            reuse_history_index=tmpl_pre.reuse_history_index,
-            form_storage=QuestionFormStorage(corrected=raw_question.strip()),
-        )
-        if reuse_pre is not None:
-            result.generation_path = reuse_pre.generation_path.code if reuse_pre.generation_path is not None else None
-        if reuse_pre is not None and reuse_pre.success:
-            result.status = "ok"
-            result.sql = _extract_reuse_sql(tmpl_pre.best_template, tmpl_pre.reuse_candidate_normalized)
-            result.intent = _build_reuse_intent(tmpl_pre.best_template)
-            return result
+        best_template = tmpl_pre.best_template
+        result.template_id = best_template.id if best_template else None
+        if best_template is None or tmpl_pre.reuse_candidate_normalized is None:
+            debug("[live_testing] direct_reuse candidate missing template/candidate; continuing")
+        else:
+            reuse_pre = handle_direct_sql_reuse(
+                tmpl_pre.reuse_candidate_normalized,
+                best_template,
+                dialect,
+                store,
+                templates,
+                rejected,
+                schema,
+                existing_nl=None,
+                reuse_history_index=tmpl_pre.reuse_history_index,
+                form_storage=QuestionFormStorage(corrected=raw_question.strip()),
+            )
+            if reuse_pre is not None:
+                result.generation_path = (
+                    reuse_pre.generation_path.code if reuse_pre.generation_path is not None else None
+                )
+            if reuse_pre is not None and reuse_pre.success:
+                result.status = "ok"
+                result.sql = _extract_reuse_sql(best_template, tmpl_pre.reuse_candidate_normalized)
+                result.intent = _build_reuse_intent(best_template)
+                return result
 
     valid, query_type, corrected = validate_question(raw_question)
     if not valid:
@@ -697,27 +363,32 @@ def _run_pipeline_core(
 
     if tmpl_typo.reuse_type == "direct_reuse":
         result.reuse_type = "direct_reuse"
-        result.template_id = tmpl_typo.best_template.id if tmpl_typo.best_template else None
-        assert tmpl_typo.reuse_candidate_normalized is not None
-        reuse_out = handle_direct_sql_reuse(
-            tmpl_typo.reuse_candidate_normalized,
-            tmpl_typo.best_template,
-            dialect,
-            store,
-            templates,
-            rejected,
-            schema,
-            existing_nl=None,
-            reuse_history_index=tmpl_typo.reuse_history_index,
-            form_storage=QuestionFormStorage(corrected=corrected_text),
-        )
-        if reuse_out is not None:
-            result.generation_path = reuse_out.generation_path.code if reuse_out.generation_path is not None else None
-        if reuse_out is not None and reuse_out.success:
-            result.status = "ok"
-            result.sql = _extract_reuse_sql(tmpl_typo.best_template, tmpl_typo.reuse_candidate_normalized)
-            result.intent = _build_reuse_intent(tmpl_typo.best_template)
-            return result
+        best_template = tmpl_typo.best_template
+        result.template_id = best_template.id if best_template else None
+        if best_template is None or tmpl_typo.reuse_candidate_normalized is None:
+            debug("[live_testing] typo direct_reuse candidate missing template/candidate; continuing")
+        else:
+            reuse_out = handle_direct_sql_reuse(
+                tmpl_typo.reuse_candidate_normalized,
+                best_template,
+                dialect,
+                store,
+                templates,
+                rejected,
+                schema,
+                existing_nl=None,
+                reuse_history_index=tmpl_typo.reuse_history_index,
+                form_storage=QuestionFormStorage(corrected=corrected_text),
+            )
+            if reuse_out is not None:
+                result.generation_path = (
+                    reuse_out.generation_path.code if reuse_out.generation_path is not None else None
+                )
+            if reuse_out is not None and reuse_out.success:
+                result.status = "ok"
+                result.sql = _extract_reuse_sql(best_template, tmpl_typo.reuse_candidate_normalized)
+                result.intent = _build_reuse_intent(best_template)
+                return result
 
     neg_drop = False
     normalized_canonical = normalize_question_via_llm(corrected_text, raw_original=raw_question)
@@ -730,32 +401,37 @@ def _run_pipeline_core(
         tmpl_norm = match_question_level_template_reuse(normalized_canonical, templates, template_store=store)
         if tmpl_norm.reuse_type == "direct_reuse":
             result.reuse_type = "direct_reuse"
-            result.template_id = tmpl_norm.best_template.id if tmpl_norm.best_template else None
-            assert tmpl_norm.reuse_candidate_normalized is not None
-            reuse_n = handle_direct_sql_reuse(
-                tmpl_norm.reuse_candidate_normalized,
-                tmpl_norm.best_template,
-                dialect,
-                store,
-                templates,
-                rejected,
-                schema,
-                existing_nl=None,
-                reuse_history_index=tmpl_norm.reuse_history_index,
-                form_storage=QuestionFormStorage(
-                    corrected=corrected_text,
-                    normalized_optional=normalized_canonical,
-                    normalized_negative_memory_dropped=neg_drop,
-                    accept_via_normalized_lookup_only=True,
-                ),
-            )
-            if reuse_n is not None:
-                result.generation_path = reuse_n.generation_path.code if reuse_n.generation_path is not None else None
-            if reuse_n is not None and reuse_n.success:
-                result.status = "ok"
-                result.sql = _extract_reuse_sql(tmpl_norm.best_template, tmpl_norm.reuse_candidate_normalized)
-                result.intent = _build_reuse_intent(tmpl_norm.best_template)
-                return result
+            best_template = tmpl_norm.best_template
+            result.template_id = best_template.id if best_template else None
+            if best_template is None or tmpl_norm.reuse_candidate_normalized is None:
+                debug("[live_testing] normalized direct_reuse missing template/candidate; continuing")
+            else:
+                reuse_n = handle_direct_sql_reuse(
+                    tmpl_norm.reuse_candidate_normalized,
+                    best_template,
+                    dialect,
+                    store,
+                    templates,
+                    rejected,
+                    schema,
+                    existing_nl=None,
+                    reuse_history_index=tmpl_norm.reuse_history_index,
+                    form_storage=QuestionFormStorage(
+                        corrected=corrected_text,
+                        normalized_optional=normalized_canonical,
+                        normalized_negative_memory_dropped=neg_drop,
+                        accept_via_normalized_lookup_only=True,
+                    ),
+                )
+                if reuse_n is not None:
+                    result.generation_path = (
+                        reuse_n.generation_path.code if reuse_n.generation_path is not None else None
+                    )
+                if reuse_n is not None and reuse_n.success:
+                    result.status = "ok"
+                    result.sql = _extract_reuse_sql(best_template, tmpl_norm.reuse_candidate_normalized)
+                    result.intent = _build_reuse_intent(best_template)
+                    return result
 
     norm_opt = normalized_canonical if normalized_canonical != corrected_text else None
     form_storage_turn = QuestionFormStorage(
@@ -765,9 +441,9 @@ def _run_pipeline_core(
         accept_via_normalized_lookup_only=False,
     )
 
-    q_norm = normalize_question(corrected_text)
+    q_norm = normalized_canonical
 
-    parsed_intent, semantic_warnings, llm_calls = parse_intent_via_llm(
+    parsed_intent, semantic_warnings, llm_calls, _ = parse_intent_via_llm(
         corrected_text,
         schema,
         templates,
@@ -784,7 +460,7 @@ def _run_pipeline_core(
 
     result.intent = intent
 
-    result.semantic_warnings = [w.get("message", "") if isinstance(w, dict) else str(w) for w in semantic_warnings]
+    result.semantic_warnings = [str(w) for w in semantic_warnings]
 
     union_result = match_template_for_union(intent, templates)
     structural_match_templates = collect_structural_match_templates(intent, templates)
@@ -862,18 +538,34 @@ def _run_pipeline_core(
 
     tmpl_sd = getattr(gen_out.matched_template, "structural_defaults", None) if gen_out.matched_template else None
 
+    exec_params = dict(flatten_param_values(intent))
     exec_sql = dialect.finalize_render(
         intent.sql_param or "",
-        dict(flatten_param_values(intent)),
+        exec_params,
         schema=schema,
         intent=intent,
         execution_sql_override=None,
         structural_defaults=tmpl_sd,
     )
-    rows = dialect.execute(exec_sql)
+    rows = dialect.execute(
+        exec_sql,
+        aetherdialect._core_utils.reconcile_execute_bind_params(exec_sql, exec_params),
+    )
+    row_list = [tuple(row) for row in rows] if rows else []
+    if len(row_list) == 0:
+        fixed_intent, fixed_rows = try_zero_row_filter_remediation(
+            intent,
+            schema,
+            dialect,
+            tmpl_sd,
+        )
+        if fixed_rows is not None:
+            intent = fixed_intent
+            result.intent = intent
+            row_list = [tuple(row) for row in fixed_rows]
     result.sql = sql
-    result.rows = rows
-    debug(f"[live_testing] SQL generated ({result.generation_path}): rows={len(rows) if rows else 0}")
+    result.rows = row_list
+    debug(f"[live_testing] SQL generated ({result.generation_path}): rows={len(row_list)}")
     if result.generation_path == GenerationPath.FRESH.code:
         debug(
             f"[live_testing.path5_trace] q_norm={q_norm!r} sql_param={(intent.sql_param or '')!r} substituted={sql!r}"
@@ -895,7 +587,7 @@ def _run_pipeline_core(
         q_norm,
         intent,
         sql,
-        rows,
+        row_list,
         structural_defaults=tmpl_sd,
         template_display_alias_map=(
             getattr(gen_out.matched_template, "display_alias_map", None) if gen_out.matched_template else None
@@ -919,7 +611,7 @@ def _run_pipeline_core(
 
     if effective_feedback == "y" and intent.grain != "scalar":
         df_out = build_result_dataframe(
-            rows,
+            row_list,
             intent,
             sql,
             structural_defaults=tmpl_sd,
@@ -983,70 +675,36 @@ def _run_pipeline_core(
 
 
 class LiveTestRunner:
-    """
-    Orchestrate single-scenario and sequence-scenario execution against the live pipeline.
-
-    Holds pre-loaded resources; `run` / `run_deferred` wrap the pipeline in a capture context and return `StepResult` values for assertions (multi-step flows use `run_sequence_and_assert`).
-    """
+    """Orchestrate single-scenario and sequence-scenario execution against the live pipeline. Holds pre-loaded resources; `run` / `run_deferred` wrap the pipeline in a capture context and return `StepResult` values for assertions (multi-step flows use `run_sequence_and_assert`)."""
 
     def __init__(
         self,
         schema: Any,
         store: dict[str, Any],
-        templates: dict,
-        rejected: dict,
+        templates: dict[str, Any],
+        rejected: dict[str, Any],
         schema_terms: set[str],
         csv_dir: str = "",
+        dialect: Any | None = None,
     ) -> None:
-        """
-        Initialize runner state from loaded pipeline resources.
-
-        Args:
-
-            schema: Profiled `SchemaGraph`.
-
-            store: Mutable template store dict.
-
-            templates: Accepted templates dict.
-
-            rejected: Rejected templates dict.
-
-            schema_terms: Set of schema term tokens.
-
-            csv_dir: Directory for `results.csv` output; empty uses the current working directory.
-
-        Returns:
-
-            None.
-        """
+        """Initialize runner state from loaded pipeline resources."""
         self.schema = schema
         self.store = store
         self.templates = templates
         self.rejected = rejected
         self.schema_terms = schema_terms
         self.csv_dir = csv_dir
+        self.dialect = dialect
 
-    def run(self, scenario: Scenario, retries: int = 0) -> StepResult:
-        """
-        Execute a single scenario against the live pipeline.
-
-        Args:
-
-            scenario: The `Scenario` to execute.
-
-            retries: Additional attempts on failure; `0` means a single try.
-
-        Returns:
-
-            `StepResult` from the last attempt.
-        """
+    def run(self, scenario: Scenario, retries: int = 0) -> StepResult | None:
+        """Execute a single scenario against the live pipeline."""
         auto = scenario.auto_responses if scenario.auto_responses is not None else ["y", "y", "y"]
         last_result: StepResult | None = None
 
         for _ in range(1 + retries):
             t0 = time.monotonic()
             try:
-                with _pipeline_capture(list(auto), scenario.reject_reason, csv_dir=self.csv_dir) as cap:
+                with pipeline_capture(list(auto), scenario.reject_reason, csv_dir=self.csv_dir) as cap:
                     step = _run_pipeline_core(
                         question=scenario.question,
                         schema=self.schema,
@@ -1059,6 +717,7 @@ class LiveTestRunner:
                         reject_reason=scenario.reject_reason,
                         feedback_mode="live",
                         force_intent_confirm=_scenario_requires_intent_prompt(scenario),
+                        dialect=self.dialect,
                     )
             except Exception:
                 step = StepResult(
@@ -1078,14 +737,14 @@ class LiveTestRunner:
 
         return last_result
 
-    def run_deferred(self, scenario: Scenario, retries: int = 0) -> StepResult:
+    def run_deferred(self, scenario: Scenario, retries: int = 0) -> StepResult | None:
         """Execute one scenario while deferring feedback persistence."""
         auto = scenario.auto_responses if scenario.auto_responses is not None else ["y", "y", "y"]
         last_result: StepResult | None = None
         for _ in range(1 + retries):
             t0 = time.monotonic()
             try:
-                with _pipeline_capture(list(auto), scenario.reject_reason, csv_dir=self.csv_dir) as cap:
+                with pipeline_capture(list(auto), scenario.reject_reason, csv_dir=self.csv_dir) as cap:
                     step = _run_pipeline_core(
                         question=scenario.question,
                         schema=self.schema,
@@ -1098,6 +757,7 @@ class LiveTestRunner:
                         reject_reason=scenario.reject_reason,
                         feedback_mode="deferred_test",
                         force_intent_confirm=_scenario_requires_intent_prompt(scenario),
+                        dialect=self.dialect,
                     )
             except Exception:
                 step = StepResult(
@@ -1123,6 +783,7 @@ class LiveTestRunner:
             rejected=deepcopy(self.rejected),
             schema_terms=set(self.schema_terms),
             csv_dir=self.csv_dir,
+            dialect=self.dialect,
         )
 
     def adopt_state_from(self, other: LiveTestRunner) -> None:
@@ -1136,19 +797,7 @@ class LiveTestRunner:
 def commit_pending_feedback(
     result: StepResult,
 ) -> None:
-    """
-    Persist deferred accept/reject feedback and clear ``pending_feedback`` on *result*.
-
-    When the pending choice is ``n``, ``builtins.input`` is patched so classification receives ``canned_reject_reason`` outside the original pipeline capture context.
-
-    Args:
-
-        result: Step output that may hold ``pending_feedback`` from a deferred run.
-
-    Returns:
-
-        None.
-    """
+    """Persist deferred accept/reject feedback and clear. ``pending_feedback`` on *result*. When the pending choice is ``n``, ``builtins.input`` is patched so classification receives ``canned_reject_reason`` outside the original pipeline capture context."""
     pending = result.pending_feedback
     if pending is None:
         return
@@ -1189,18 +838,12 @@ def commit_pending_feedback(
 
 
 def _live_sql_has_join_clause(sql: str) -> bool:
-    """
-    Return whether *sql* uses an explicit JOIN or a comma-separated multi-relation FROM in the outer SELECT.
-
-    Implemented via the dialect-agnostic AST helper :func:`aetherdialect._dialect.sql_outer_has_join_or_comma_from`.
-    """
-
+    """Return whether *sql* uses an explicit JOIN or a comma-separated multi-relation FROM in the outer SELECT. Implemented via the dialect-agnostic AST helper :func:`aetherdialect._dialect.sql_outer_has_join_or_comma_from`."""
     return sql_outer_has_join_or_comma_from(sql, sqlglot_dialect=active_sqlglot_dialect())
 
 
 def _step_result_indicates_join(result: StepResult) -> bool:
-    """Return True when rendered SQL or resolved intent shows a multi-table join."""
-
+    """Return True when rendered SQL or resolved intent shows a multi- table join."""
     if result.sql and _live_sql_has_join_clause(result.sql):
         return True
     it = result.intent
@@ -1221,7 +864,6 @@ def _step_result_indicates_join(result: StepResult) -> bool:
 
 def _internal_failure_log_offenders(captured_logs: list[str]) -> list[str]:
     """Return log lines that must not appear on a run whose final status is ``ok``."""
-
     offenders: list[str] = []
     for line in captured_logs or []:
         if "enforce_select_only FAILED" in line:
@@ -1235,30 +877,34 @@ def _internal_failure_log_offenders(captured_logs: list[str]) -> list[str]:
 
 def _normalize_sql_for_match(sql: str) -> str:
     """Uppercase SQL with bracket/backtick/quote characters stripped for substring checks."""
-
     s = (sql or "").upper()
     s = re.sub(r"[`\"\[\]]", "", s)
     return re.sub(r"\s+", " ", s).strip()
 
 
+def _assertion_table_names(intent: RuntimeIntent, sql: str | None) -> list[str]:
+    """Return base schema table names used for live-test table assertions when CTEs are present."""
+    cte_steps = intent.cte_steps or []
+    if not cte_steps:
+        return sorted(intent.tables or [])
+    cte_aliases = {(step.cte_name or "").strip() for step in cte_steps if (step.cte_name or "").strip()}
+    cte_aliases.update(str(name).strip() for name in (intent.planner_cte_names or []) if str(name).strip())
+    base_from_ctes: set[str] = set()
+    for step in cte_steps:
+        base_from_ctes.update(t for t in (step.tables or []) if t and t not in cte_aliases)
+    main_base = {t for t in (intent.tables or []) if t and t not in cte_aliases}
+    names: set[str] = set(base_from_ctes) | set(main_base)
+    if sql:
+        sql_tables = aetherdialect._dialect.sql_tables_referenced(
+            sql,
+            sqlglot_dialect=aetherdialect._dialect.active_sqlglot_dialect(),
+        )
+        names.update(t for t in sql_tables if t and t not in cte_aliases)
+    return sorted(names)
+
+
 def _assert_scenario(result: StepResult, expected: Expected, soft: SoftAssert | None = None) -> SoftAssert:
-    """
-    Evaluate a `StepResult` against an `Expected` specification.
-
-    When `soft` is `None`, a new `SoftAssert` is created. Applicable checks run and failures accumulate on the returned instance.
-
-    Args:
-
-        result: The `StepResult` from a pipeline run.
-
-        expected: The `Expected` to assert against.
-
-        soft: Optional existing `SoftAssert` to append to.
-
-    Returns:
-
-        The `SoftAssert` instance (same object when one was passed in).
-    """
+    """Evaluate a `StepResult` against an `Expected` specification. When. `soft` is `None`, a new `SoftAssert` is created. Applicable checks run and failures accumulate on the returned instance."""
     if soft is None:
         soft = SoftAssert()
 
@@ -1304,7 +950,7 @@ def _assert_scenario(result: StepResult, expected: Expected, soft: SoftAssert | 
         )
 
     if result.intent is not None:
-        actual_tables = sorted(result.intent.tables or [])
+        actual_tables = _assertion_table_names(result.intent, result.sql if result.intent.cte_steps else None)
         if expected.tables_one_of is not None:
             allowed = [sorted(t) for t in expected.tables_one_of]
             soft.check(
@@ -1520,31 +1166,18 @@ def run_and_assert(
     max_attempts: int = 2,
     retries: int = 1,
 ) -> None:
-    """
-    Run a scenario and assert expectations, retrying from scratch on failure.
-
-    On the first attempt the pipeline runs and assertions are checked. When any assertion fails and `max_attempts` > 1, the pipeline is re- run from scratch and assertions are re-evaluated.
-
-    Args:
-
-        runner: `LiveTestRunner` configured for the target database.
-
-        scenario: The `Scenario` to execute.
-
-        header: Label used in the `AssertionError` message.
-
-        max_attempts: Total attempts including the initial run.
-
-        retries: Per-attempt pipeline retry count passed to `runner.run`.
-
-    Returns:
-
-        None.
-    """
+    """Run a scenario and assert expectations, retrying from scratch on. failure. On the first attempt the pipeline runs and assertions are checked. When any assertion fails and `max_attempts` > 1, the pipeline is re- run from scratch and assertions are re-evaluated."""
     last_soft: SoftAssert | None = None
     for _ in range(max_attempts):
         attempt_runner = runner.clone()
         result = attempt_runner.run_deferred(scenario, retries=retries)
+        if result is None:
+            result = StepResult(
+                scenario_id=scenario.id,
+                question=scenario.question,
+                status="error",
+                error="runner returned no result",
+            )
         last_soft = _assert_scenario(result, scenario.expected)
         if last_soft.passed:
             commit_pending_feedback(result)
@@ -1560,25 +1193,7 @@ def run_sequence_and_assert(
     max_attempts: int = 2,
     retries: int = 1,
 ) -> None:
-    """
-    Run a sequence of scenarios and assert each step, retrying on failure.
-
-    When any step's assertions fail and `max_attempts` > 1, the entire sequence is re-executed from scratch.
-
-    Args:
-
-        runner: `LiveTestRunner` configured for the target database.
-
-        seq: The `SequenceScenario` whose steps run in order.
-
-        max_attempts: Total attempts including the initial run.
-
-        retries: Per-step pipeline retry count passed to `runner.run`.
-
-    Returns:
-
-        None.
-    """
+    """Run a sequence of scenarios and assert each step, retrying on. failure. When any step's assertions fail and `max_attempts` > 1, the entire sequence is re-executed from scratch."""
     last_soft: SoftAssert | None = None
     for _ in range(max_attempts):
         attempt_runner = runner.clone()
@@ -1586,6 +1201,13 @@ def run_sequence_and_assert(
         for step_scenario in seq.steps:
             step_with_seq = replace(step_scenario, sequence_id=seq.id)
             result = attempt_runner.run_deferred(step_with_seq, retries=retries)
+            if result is None:
+                result = StepResult(
+                    scenario_id=step_with_seq.id,
+                    question=step_with_seq.question,
+                    status="error",
+                    error="runner returned no result",
+                )
             _assert_scenario(result, step_scenario.expected, soft=last_soft)
             if not last_soft.passed:
                 break
@@ -1604,17 +1226,11 @@ def run_seeded_schema_semantic_repair(
     *,
     max_retries: int | None = None,
 ) -> tuple[RuntimeIntent | None, list[str], int]:
-    """
-    Run schema and semantic repair from a pre-built intent (live and harness entrypoint).
-
-    Forwards the seed intent to :func:`aetherdialect._intent_process._run_schema_semantic_repair_loop` with
-    no template store and no in-turn summary rows.
-    """
-
-    mr = PolicyConfig.MAX_STAGE_B_REPAIRS if max_retries is None else max_retries
+    """Run schema and semantic repair from a pre-built intent (live and harness entrypoint). Forwards the seed intent to :func:`aetherdialect._intent_process._run_schema_semantic_repair_loop` with no template store and no in-turn summary rows."""
+    mr = PolicyConfig.MAX_ASK_COMPOSE_REPAIRS if max_retries is None else max_retries
     table_list = sorted(schema_graph.tables.keys())
     schema_literal_json = schema_graph.schema_literal_json
-    system, _ = aetherdialect._intent_process._build_intent_parse_prompt(
+    system, _ = aetherdialect._intent_process.build_intent_parse_prompt(
         question,
         schema_literal_json,
         table_list,

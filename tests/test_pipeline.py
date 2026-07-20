@@ -10,6 +10,10 @@ from unittest.mock import MagicMock, patch
 import pytest as _pt
 
 from aetherdialect._config import (
+    EngineConfig,
+    PolicyConfig,
+)
+from aetherdialect._constants import (
     JOIN_CHOICE_SCOPE_MAIN,
     PIPELINE_SUSPEND_ID_DIRECT_REUSE,
     PIPELINE_SUSPEND_ID_INTENT_CONFIRM,
@@ -22,18 +26,14 @@ from aetherdialect._config import (
     TEMPLATE_INTENT_KEY_INDEX_KEY,
     TEMPLATE_QUESTION_TOKEN_INDEX_KEY,
     TEMPLATE_UNION_FAMILY_INDEX_KEY,
-    EngineConfig,
     GenerationPath,
-    PolicyConfig,
 )
 from aetherdialect._contracts_base import (
     FailureCategory,
     NoJoinPathError,
+    NormalizedExpr,
     PipelineSuspended,
-    SchemaGraph,
     SessionActiveError,
-    SQLShape,
-    TemplateStats,
 )
 from aetherdialect._contracts_core import (
     ConcreteIntent,
@@ -41,7 +41,6 @@ from aetherdialect._contracts_core import (
     FeedbackCounts,
     FeedbackKind,
     InteractiveTailSnapshot,
-    NormalizedExpr,
     QuestionFeedbackEntry,
     RefinementContext,
     RefinementRetry,
@@ -55,7 +54,12 @@ from aetherdialect._contracts_core import (
     UserFeedbackRejectSuspendContext,
     ValueHistory,
 )
-from aetherdialect._core_utils import diagnostic_print_listener
+from aetherdialect._contracts_schema import (
+    SchemaGraph,
+    SQLShape,
+    TemplateStats,
+)
+from aetherdialect._core_utils import bind_params_for_sql, diagnostic_print_listener
 from aetherdialect._dialect import Dialect
 from aetherdialect._intent_process import TrustedTemplateHit
 from aetherdialect._main_execution import PipelineSession
@@ -64,7 +68,6 @@ from aetherdialect._pipeline import (
     _choose_generation_path,
     _join_signatures_for_deterministic_from_anchor,
     _most_frequent_natural_language,
-    _refinement_retry_available,
     _remap_value_history_structural_keys,
     _resolve_joins_fresh,
     _run_sql_validation_cascade,
@@ -79,7 +82,7 @@ from aetherdialect._pipeline import (
     complete_user_feedback_reject,
     compute_final_metrics,
     confirm_intent_with_user,
-    display_final_results,
+    display_final_results_to_stdout,
     enriched_display_alias_map,
     extract_column_headers,
     generate_and_validate_sql,
@@ -92,6 +95,7 @@ from aetherdialect._pipeline import (
     other_template_owns_question_string,
     parse_intent_via_llm,
     prepare_union_match_join_phase,
+    refinement_retry_available,
     save_result_csv,
     should_skip_intent_confirmation,
 )
@@ -101,7 +105,6 @@ from aetherdialect._templates import (
     empty_template_store,
 )
 from aetherdialect._utils import QuestionReuseMatch, intent_key
-from aetherdialect._validation_execute import bind_params_for_sql
 
 
 class TestChooseGenerationPath:
@@ -667,13 +670,12 @@ class TestGenerateJoinCandidates:
         assert mock_jh.call_args[0][1] == ["customer", "payment", "cte1"]
 
 
-class TestDisplayFinalResults:
-    """Tests for display_final_results."""
+class TestDisplayFinalResultsToStdout:
+    """Tests for display_final_results_to_stdout."""
 
     @patch("aetherdialect._pipeline.print_query_result")
-    def test_prints_when_emit_true(self, mock_print):
-        """Invokes ``print_query_result`` when ``emit_print`` is true."""
-
+    def test_prints_result_rows(self, mock_print):
+        """Invokes ``print_query_result`` with resolved display SQL."""
         intent = RuntimeIntent(
             tables=["orders"],
             grain="row_level",
@@ -682,29 +684,8 @@ class TestDisplayFinalResults:
             order_by_cols=[],
             filters_param=[],
         )
-        display_final_results("show orders", intent, "SELECT * FROM orders", [(1,)])
+        display_final_results_to_stdout("show orders", intent, "SELECT * FROM orders", [(1,)])
         mock_print.assert_called_once()
-
-    @patch("aetherdialect._pipeline.print_query_result")
-    def test_skips_print_when_emit_false(self, mock_print):
-        """Does not invoke ``print_query_result`` when ``emit_print`` is false."""
-
-        intent = RuntimeIntent(
-            tables=["orders"],
-            grain="row_level",
-            select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
-            group_by_cols=[],
-            order_by_cols=[],
-            filters_param=[],
-        )
-        display_final_results(
-            "show orders",
-            intent,
-            "SELECT order_id FROM orders",
-            [(1,)],
-            emit_print=False,
-        )
-        mock_print.assert_not_called()
 
 
 class TestComputeFinalMetrics:
@@ -1428,7 +1409,6 @@ class TestConfirmIntentWithUser:
     @patch("aetherdialect._pipeline.interactive_yes_no", return_value="y")
     def test_low_similarity_user_confirms(self, mock_choice, mock_save):
         """Low similarity without warnings or schema issues skips confirmation (gate returns True)."""
-
         result = confirm_intent_with_user(
             self._make_intent(),
             self._make_store(),
@@ -1442,7 +1422,6 @@ class TestConfirmIntentWithUser:
     @patch("aetherdialect._pipeline.interactive_yes_no", return_value="n")
     def test_low_similarity_user_declines(self, mock_choice, mock_save):
         """Same gate skips the decline path when confirmation is not offered."""
-
         result = confirm_intent_with_user(
             self._make_intent(),
             self._make_store(),
@@ -1482,7 +1461,6 @@ class TestConfirmIntentWithUser:
     @patch("aetherdialect._pipeline.interactive_yes_no", return_value="y")
     def test_fallback_nl_summary(self, mock_choice, mock_save):
         """Empty natural_language still auto-skips confirmation when the gate applies."""
-
         intent = self._make_intent(nl="")
         result = confirm_intent_with_user(
             intent,
@@ -1589,7 +1567,7 @@ class TestResolveJoinsFresh:
             ],
         }
         det = "SELECT title FROM film\nWHERE 1=1"
-        from aetherdialect._dialect import PostgresDialect as _PgDialect
+        from aetherdialect._dialect_postgres import PostgresDialect
 
         sql_param, _ = _resolve_joins_fresh(
             det,
@@ -1599,13 +1577,13 @@ class TestResolveJoinsFresh:
             "list films and language",
             join_candidates,
             schema=None,
-            dialect=_PgDialect.__new__(_PgDialect),
+            dialect=PostgresDialect.__new__(PostgresDialect),
         )
         assert intent.chosen_join_candidate_id == "J02"
         assert "language" in sql_param.lower()
 
     def test_resolve_joins_fresh_aligns_signatures_for_each_cte_carrier(self):
-        from aetherdialect._dialect import PostgresDialect as _PgDialect
+        from aetherdialect._dialect_postgres import PostgresDialect
 
         cte_multi = RuntimeCteStep(
             cte_name="cte1",
@@ -1666,7 +1644,7 @@ class TestResolveJoinsFresh:
                 "q",
                 join_candidates,
                 schema=None,
-                dialect=_PgDialect.__new__(_PgDialect),
+                dialect=PostgresDialect.__new__(PostgresDialect),
             )
         assert len(captured) == 1
         sigs = captured[0]
@@ -1699,7 +1677,11 @@ class TestPrepareUnionMatchJoinPhase:
 class TestEnrichedDisplayAliasMap:
     """Tests for enriched_display_alias_map."""
 
-    def test_simple_select_skips_llm_returns_base_copy(self):
+    @patch(
+        "aetherdialect._pipeline.llm_chat",
+        return_value='{"aliases":{"col=t.a":"column_a"}}',
+    )
+    def test_simple_select_uses_llm_for_scalar_column(self, _mock_llm):
         intent = RuntimeIntent(
             tables=["t"],
             grain="row_level",
@@ -1708,9 +1690,9 @@ class TestEnrichedDisplayAliasMap:
             order_by_cols=[],
             filters_param=[],
         )
-        base = {"k1": "foo"}
+        base: dict[str, str] = {}
         m = enriched_display_alias_map("q", "SELECT t.a FROM t", intent, base)
-        assert m == base
+        assert m.get("col=t.a") == "column_a"
 
 
 class TestGeneratePath43RuntimeSubset:
@@ -2197,8 +2179,8 @@ class TestParseIntentViaLlmMocked:
 
     @patch("aetherdialect._pipeline.save_template_store")
     @patch(
-        "aetherdialect._pipeline._invoke_intent_parse_with_hints",
-        return_value=(None, ["w"], 4),
+        "aetherdialect._pipeline.invoke_intent_parse_with_hints",
+        return_value=(None, ["w"], 4, None),
     )
     def test_none_intent_records_failure(self, mock_full, mock_save):
         schema = MagicMock(schema_hash="sh", effective_structural_hash="sh")
@@ -2207,7 +2189,7 @@ class TestParseIntentViaLlmMocked:
             os.makedirs(sd, exist_ok=True)
             with patch.object(EngineConfig, "TEMPLATE_STORE_DIR", sd):
                 store = empty_template_store("sh")
-                intent, warns, calls = parse_intent_via_llm("question", schema, {}, store)
+                intent, warns, calls, _plan = parse_intent_via_llm("question", schema, {}, store)
         assert intent is None
         assert warns == ["w"]
         assert calls == 4
@@ -2251,10 +2233,10 @@ class TestParseIntentViaLlmMocked:
         port = MagicMock()
         port.has_pending_choice.return_value = False
         with patch(
-            "aetherdialect._pipeline._invoke_intent_parse_with_hints",
-            return_value=(bad, [], 0),
+            "aetherdialect._pipeline.invoke_intent_parse_with_hints",
+            return_value=(bad, [], 0, None),
         ):
-            intent, _, _ = parse_intent_via_llm("q", MagicMock(schema_hash="h"), {}, {}, choice_port=port)
+            intent, _, _, _ = parse_intent_via_llm("q", MagicMock(schema_hash="h"), {}, {}, choice_port=port)
         assert intent is not None
         assert intent.schema_invalid is True
 
@@ -2286,9 +2268,9 @@ class TestCaptureParsePromptRecordsInvoke:
     """``_invoke_intent_parse_with_hints`` forwards ``in_turn_seed`` into ``full_intent_parse``."""
 
     def test_invoke_forwards_in_turn_seed(self):
-        from aetherdialect import _intent_process as intent_process
+        import aetherdialect._intent_process
 
-        stub = (None, [], 0)
+        stub = (None, [], 0, None)
         seed = [
             {
                 "kind": "validation_failure",
@@ -2299,8 +2281,8 @@ class TestCaptureParsePromptRecordsInvoke:
                 "is_post_restart": "False",
             }
         ]
-        with patch.object(intent_process, "full_intent_parse", return_value=stub) as mock_fp:
-            intent_process._invoke_intent_parse_with_hints(
+        with patch.object(aetherdialect._intent_process, "full_intent_parse", return_value=stub) as mock_fp:
+            aetherdialect._intent_process.invoke_intent_parse_with_hints(
                 "how many rows?",
                 MagicMock(schema_hash="sh"),
                 store={},
@@ -2406,7 +2388,6 @@ class TestBestAcceptedSimilarityAndSkipConfirmation:
 
     def test_should_skip_false_when_prior_non_join_feedback(self):
         """Any recorded rejection for the same question forces intent confirmation."""
-
         intent = RuntimeIntent(
             tables=["t"],
             grain="row_level",
@@ -2437,15 +2418,15 @@ class TestUserRefinementBudget:
     def test_refinement_retry_available_respects_budget(self):
         """Exhausted refinement charges disable another retry."""
         ctx = RefinementContext("question text")
-        assert _refinement_retry_available(ctx) is True
+        assert refinement_retry_available(ctx) is True
         ctx.refinement_rounds_executed = PolicyConfig.MAX_USER_REFINEMENTS
-        assert _refinement_retry_available(ctx) is False
+        assert refinement_retry_available(ctx) is False
 
     def test_refinement_retry_available_false_when_blocked(self):
         """Same-intent guard sets ``block_further_refinement`` to stop silent retries."""
         ctx = RefinementContext("question text")
         ctx.block_further_refinement = True
-        assert _refinement_retry_available(ctx) is False
+        assert refinement_retry_available(ctx) is False
 
     def test_complete_user_feedback_reject_raises_refinement_retry(self):
         """When budget remains, SQL rejection records memory then requests an in-turn re-parse."""
@@ -2545,7 +2526,7 @@ class TestOtherTemplateOwnsQuestionString:
 
 
 class TestJoinSignatureHelpers:
-    """``_join_signatures_for_deterministic_from_anchor`` CTE and main-scope behavior."""
+    """``_join_signatures_for_deterministic_from_anchor`` CTE and main- scope behavior."""
 
     def test_main_sig_empty_when_multiple_non_j00(self):
         intent = RuntimeIntent(
@@ -2703,12 +2684,13 @@ class TestCompleteDirectSqlReuseUserChoice:
         assert tmpl.stats.reject == 1
         mock_reject_out.assert_called_once_with({}, tmpl, "q")
 
+    @patch("aetherdialect._pipeline.llm_chat", return_value='{"aliases":{}}')
     @patch("aetherdialect._pipeline.save_template_store")
     @patch("aetherdialect._pipeline.templates_to_store", side_effect=lambda s, t: s)
     @patch("aetherdialect._pipeline.delete_rejected_templates_matching_question")
     @patch("aetherdialect._pipeline.save_result_csv")
     @patch("aetherdialect._pipeline.promote_trust")
-    def test_accept_saves_csv_and_promotes(self, mock_promote, mock_csv, mock_del, mock_tts, mock_save):
+    def test_accept_saves_csv_and_promotes(self, mock_promote, mock_csv, mock_del, mock_tts, mock_save, _mock_llm):
         tmpl = _make_pipeline_template(trust_level=2)
         intent = RuntimeIntent(
             tables=["orders"],
@@ -2745,6 +2727,7 @@ class TestCompleteDirectSqlReuseUserChoice:
 class TestHandleDirectSqlReuseMocked:
     """``handle_direct_sql_reuse`` without DB or extraction LLM."""
 
+    @patch("aetherdialect._pipeline.llm_chat", return_value='{"aliases":{}}')
     @patch("aetherdialect._pipeline.save_template_store")
     @patch("aetherdialect._pipeline.templates_to_store", side_effect=lambda s, t: s)
     @patch("aetherdialect._pipeline.delete_rejected_templates_matching_question")
@@ -2761,6 +2744,7 @@ class TestHandleDirectSqlReuseMocked:
         mock_del,
         mock_tts,
         mock_save,
+        _mock_llm,
     ):
         concrete = ConcreteIntent(
             intent_id="id",
@@ -2792,6 +2776,7 @@ class TestHandleDirectSqlReuseMocked:
         )
         dialect = MagicMock()
         dialect.finalize_render.return_value = "EXEC"
+        dialect.explain_validation_sql = lambda sql, _pv: sql
         dialect.execute.return_value = [("row",)]
         store: dict = {"templates": {"T1": tmpl}}
         result = handle_direct_sql_reuse(
@@ -2809,6 +2794,7 @@ class TestHandleDirectSqlReuseMocked:
         mock_csv.assert_called_once()
         mock_promote.assert_called_once_with(tmpl, "norm_q")
 
+    @patch("aetherdialect._pipeline.llm_chat", return_value='{"aliases":{}}')
     @patch("aetherdialect._pipeline.save_template_store")
     @patch("aetherdialect._pipeline.templates_to_store", side_effect=lambda s, t: s)
     @patch("aetherdialect._pipeline.delete_rejected_templates_matching_question")
@@ -2830,6 +2816,7 @@ class TestHandleDirectSqlReuseMocked:
         mock_del,
         mock_tts,
         mock_save,
+        _mock_llm,
     ):
         """Fuzzy question with exemplar structural ``s`` matching defaults → path ``2.1``."""
         concrete = ConcreteIntent(
@@ -2863,6 +2850,7 @@ class TestHandleDirectSqlReuseMocked:
         )
         dialect = MagicMock()
         dialect.finalize_render.return_value = "EXEC"
+        dialect.explain_validation_sql = lambda sql, _pv: sql
         dialect.execute.return_value = [("row",)]
         store: dict = {"templates": {"T1": tmpl}}
         result = handle_direct_sql_reuse(
@@ -2880,6 +2868,7 @@ class TestHandleDirectSqlReuseMocked:
         mock_extract.assert_called_once()
         assert mock_extract.call_args.kwargs.get("literal_structural_only") is True
 
+    @patch("aetherdialect._pipeline.llm_chat", return_value='{"aliases":{}}')
     @patch("aetherdialect._pipeline.save_template_store")
     @patch("aetherdialect._pipeline.templates_to_store", side_effect=lambda s, t: s)
     @patch("aetherdialect._pipeline.delete_rejected_templates_matching_question")
@@ -2901,6 +2890,7 @@ class TestHandleDirectSqlReuseMocked:
         mock_del,
         mock_tts,
         mock_save,
+        _mock_llm,
     ):
         """Fuzzy question with exemplar structural ``s`` differing from defaults → path ``2.2``."""
         concrete = ConcreteIntent(
@@ -2934,6 +2924,7 @@ class TestHandleDirectSqlReuseMocked:
         )
         dialect = MagicMock()
         dialect.finalize_render.return_value = "EXEC"
+        dialect.explain_validation_sql = lambda sql, _pv: sql
         dialect.execute.return_value = [("row",)]
         store: dict = {"templates": {"T1": tmpl}}
         result = handle_direct_sql_reuse(
@@ -2959,7 +2950,7 @@ class TestLoadPipelineResourcesMore:
     @patch("aetherdialect._pipeline.EngineConfig")
     @patch("aetherdialect._pipeline.get_dialect", return_value=SimpleNamespace(engine="e"))
     def test_unsupported_engine_type(self, mock_gd, mock_ec, _lc):
-        mock_ec.TYPE = "mysql"
+        mock_ec.TYPE = "bogus_engine"
         mock_ec.RUNTIME = SimpleNamespace(db_url=lambda: "mysql://x")
         with _pt.raises(ValueError, match="Unsupported engine"):
             load_pipeline_resources(
@@ -3230,8 +3221,7 @@ class TestResolveJoinsFreshNoPlaceholder:
 
 
 def _session_owner() -> MagicMock:
-    """Build a mock ``Text2SQL`` owner for :class:`PipelineSession` tests."""
-
+    """Build a mock ``AetherEngine`` owner for :class:`PipelineSession` tests."""
     owner = MagicMock()
     owner._schema_graph = MagicMock()
     owner._schema_graph.effective_structural_hash = "test_hash"
@@ -3245,7 +3235,6 @@ def _session_owner() -> MagicMock:
 @_pt.fixture
 def bare_session() -> PipelineSession:
     """Minimal session with mock owner."""
-
     return PipelineSession(_session_owner())
 
 
@@ -3446,6 +3435,9 @@ class _StubDialect(Dialect):
     def explain_sql(self, sql: str, params=None, **kwargs) -> tuple[bool, str]:
         return True, ""
 
+    def quote_table_column(self, table: str, column: str) -> str:
+        return f'"{table}"."{column}"'
+
 
 def _single_table_intent(table: str, col: str) -> RuntimeIntent:
     return RuntimeIntent(
@@ -3504,3 +3496,159 @@ def test_bind_params_for_sql_no_placeholders_returns_none() -> None:
 @_pt.mark.integration
 def test_bind_params_for_sql_returns_map_when_tokens_present() -> None:
     assert bind_params_for_sql("SELECT :p1", {"p1": 1}) == {"p1": 1}
+
+
+def test_bind_params_for_sql_returns_map_for_dollar_tokens() -> None:
+    assert bind_params_for_sql("SELECT * FROM t WHERE id = $p1", {"p1": 1}) == {"p1": 1}
+
+
+def test_bigquery_pre_execute_rewrite_single_at_prefix() -> None:
+    from aetherdialect._dialect_sqlglot_engines import BigQueryDialect
+
+    d = BigQueryDialect.__new__(BigQueryDialect)
+    out = d.pre_execute_rewrite("SELECT :p1 FROM t WHERE id = :p2")
+    assert "@@" not in out
+    assert "@p1" in out
+
+
+def test_run_sql_validation_cascade_uses_canonical_sql(monkeypatch) -> None:
+    from aetherdialect._pipeline import _run_sql_validation_cascade
+
+    captured: list[str] = []
+
+    def _fake_validate(_dialect, sql: str, *_a, **_k):
+        captured.append(sql)
+        return True, "", None, []
+
+    monkeypatch.setattr("aetherdialect._pipeline.validate_sql", _fake_validate)
+    intent = RuntimeIntent(
+        tables=["film"],
+        grain="row_level",
+        select_cols=[],
+        group_by_cols=[],
+        order_by_cols=[],
+        filters_param=[],
+        sql_param="SELECT title FROM film WHERE rating = :p1",
+        param_values={"p1": "PG"},
+    )
+    dialect = SimpleNamespace(explain_validation_sql=lambda sql, _pv: sql)
+    ok, _, _, _ = _run_sql_validation_cascade(
+        "SELECT title FROM film WHERE rating = @p1",
+        intent,
+        dialect,
+        schema=SchemaGraph(tables={}, join_paths_multi={}, effective_structural_hash="h"),
+    )
+    assert ok is True
+    assert captured and ":p1" in captured[0]
+
+
+def test_generate_and_validate_sql_aborts_on_schema_invalid() -> None:
+    from aetherdialect._contracts_base import FailureCategory
+    from aetherdialect._pipeline import generate_and_validate_sql
+
+    intent = RuntimeIntent(
+        tables=["film"],
+        grain="row_level",
+        select_cols=[],
+        group_by_cols=[],
+        order_by_cols=[],
+        filters_param=[],
+        schema_invalid=True,
+    )
+    dialect = MagicMock()
+    out = generate_and_validate_sql(
+        "q",
+        intent,
+        SchemaGraph(tables={}, join_paths_multi={}, effective_structural_hash="h"),
+        {},
+        {},
+        dialect,
+        {},
+        persist_template_learning=False,
+    )
+    assert out.success is False
+    assert out.error_kind == FailureCategory.INTENT_SCHEMA_INVALID_ABORT.value
+
+
+def test_finalize_planner_schema_invalid_trusts_interpret() -> None:
+    from aetherdialect._contracts_base import NormalizedExpr
+    from aetherdialect._contracts_core import (
+        InterpretPlan,
+        SelectCol,
+    )
+    from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
+    from aetherdialect._intent_process import finalize_planner_schema_invalid_flag
+
+    schema = SchemaGraph(
+        tables={
+            "staff": TableMetadata(
+                name="staff",
+                columns={"staff_id": ColumnMetadata(name="staff_id", data_type="INTEGER")},
+                primary_key=["staff_id"],
+                foreign_keys=[],
+            ),
+        },
+        join_paths_multi={},
+        effective_structural_hash="h",
+    )
+    plan = InterpretPlan(
+        approach="staff ids for active employees",
+        tables=("staff",),
+        schema_invalid=True,
+    )
+    intent = RuntimeIntent(
+        tables=["staff"],
+        grain="row_level",
+        select_cols=[SelectCol(expr=NormalizedExpr.from_column("staff.staff_id"))],
+        group_by_cols=[],
+        order_by_cols=[],
+        filters_param=[],
+        schema_invalid=False,
+    )
+    finalized = finalize_planner_schema_invalid_flag(intent, plan, schema)
+    assert finalized.schema_invalid is True
+
+
+def test_clear_planner_schema_invalid_after_user_accept() -> None:
+    from aetherdialect._pipeline import clear_planner_schema_invalid_after_user_accept
+
+    intent = RuntimeIntent(
+        tables=["film"],
+        grain="row_level",
+        select_cols=[],
+        group_by_cols=[],
+        order_by_cols=[],
+        filters_param=[],
+        schema_invalid=True,
+    )
+    clear_planner_schema_invalid_after_user_accept(intent)
+    assert intent.schema_invalid is False
+
+
+def test_select_col_prefers_llm_for_single_agg() -> None:
+    from aetherdialect._contracts_base import MulGroup
+    from aetherdialect._contracts_core import SelectCol
+    from aetherdialect._sql_gen import select_col_prefers_llm_display_alias
+
+    sc = SelectCol(
+        expr=NormalizedExpr(
+            add_groups=[MulGroup(multiply=["film.film_id"], agg_func="count")],
+        )
+    )
+    assert select_col_prefers_llm_display_alias(sc) is True
+
+
+def test_select_col_prefers_deterministic_for_arithmetic() -> None:
+    from aetherdialect._contracts_base import MulGroup
+    from aetherdialect._contracts_core import SelectCol
+    from aetherdialect._sql_gen import select_col_prefers_llm_display_alias
+
+    sc = SelectCol(
+        expr=NormalizedExpr(
+            add_groups=[
+                MulGroup(multiply=["payment.amount"]),
+                MulGroup(multiply=["payment.tax"]),
+            ]
+        )
+    )
+    assert select_col_prefers_llm_display_alias(sc) is False

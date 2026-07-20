@@ -1,36 +1,41 @@
-"""
-QSim: skeleton cache, schema context, and value sampling for simulated intents.
-
-When ``QSimSkeleton`` fields or enumeration rules change, invalidate the on-disk cache (``QSimConfig.SKELETONS_JSON_PATH``) or set ``PolicyConfig.REGENERATE_SKELETON_CACHE`` so loaded skeletons match the current code.
-"""
+"""QSim: skeleton cache, schema context, and value sampling for simulated intents. When ``QSimSkeleton`` fields or enumeration rules change, invalidate the on-disk cache (``QSimConfig.SKELETONS_JSON_PATH``) or set ``PolicyConfig.REGENERATE_SKELETON_CACHE`` so loaded skeletons match the current code."""
 
 from __future__ import annotations
 
+import json
 import os
 import random
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta
 from itertools import combinations
-from typing import Any
+from typing import Any, cast
 
 from ._config import (
-    AGG_PATTERN,
-    HAVING_COUNT_VALUES,
-    HAVING_MIN_MAX_VALUES,
-    HAVING_SUM_AVG_VALUES,
     PolicyConfig,
     QSimConfig,
     SeedWarmupConfig,
 )
+from ._constants import (
+    AGG_PATTERN,
+    HAVING_COUNT_VALUES,
+    HAVING_MIN_MAX_VALUES,
+    HAVING_SUM_AVG_VALUES,
+    QSIM_PHASE_B,
+    QSIM_PHASE_C,
+    QSIM_PHASE_H,
+)
 from ._contracts_base import (
     ColumnRole,
+)
+from ._contracts_schema import (
+    QSimFilter,
+    QSimHaving,
+    QSimIntent,
     QSimSkeleton,
     SchemaGraph,
     SkeletonLimits,
     ValueDomain,
-    data_type_to_value_type,
 )
-from ._contracts_core import QSimFilter, QSimHaving, QSimIntent
 from ._core_utils import (
     artifact_lock,
     debug,
@@ -43,17 +48,7 @@ _SKELETON_CACHE: dict[frozenset[str], list[QSimSkeleton]] = {}
 
 
 def build_fk_adjacency(schema: SchemaGraph) -> dict[str, set[str]]:
-    """
-    Build an undirected FK adjacency map for tables in the schema.
-
-    Args:
-
-        schema: Schema graph whose foreign-key definitions are traversed.
-
-    Returns:
-
-        relationship with (bidirectional).
-    """
+    """Build an undirected FK adjacency map for tables in the schema."""
     adj: dict[str, set[str]] = {t: set() for t in schema.tables}
 
     for table in schema.tables.values():
@@ -65,19 +60,7 @@ def build_fk_adjacency(schema: SchemaGraph) -> dict[str, set[str]]:
 
 
 def is_connected(tables: list[str], adj: dict[str, set[str]]) -> bool:
-    """
-    Return whether all given tables are mutually reachable via FK edges.
-
-    Args:
-
-        tables: List of table names to test for connectivity.
-
-        adj: Undirected FK adjacency map from `build_fk_adjacency`.
-
-    Returns:
-
-        has zero or one entry.
-    """
+    """Return whether all given tables are mutually reachable via FK. edges."""
     if len(tables) <= 1:
         return True
 
@@ -98,20 +81,8 @@ def is_connected(tables: list[str], adj: dict[str, set[str]]) -> bool:
     return visited == table_set
 
 
-def enumerate_table_sets(schema: SchemaGraph, max_tables: int = None) -> list[list[str]]:
-    """
-    Enumerate all valid FK-connected table combinations up to max_tables tables.
-
-    Args:
-
-        schema: Schema graph to derive tables and FK adjacency from.
-
-        max_tables: Maximum tables per combination; defaults to `QSimConfig.MAX_TABLES_PER_INTENT`.
-
-    Returns:
-
-        List of table-name lists for each valid set.
-    """
+def enumerate_table_sets(schema: SchemaGraph, max_tables: int | None = None) -> list[list[str]]:
+    """Enumerate all valid FK-connected table combinations up to. max_tables tables."""
     if max_tables is None:
         max_tables = QSimConfig.MAX_TABLES_PER_INTENT
 
@@ -128,22 +99,12 @@ def enumerate_table_sets(schema: SchemaGraph, max_tables: int = None) -> list[li
             if is_connected(combo_list, adj):
                 valid_sets.append(combo_list)
 
-    debug(f"[qsim_struct.enumerate_table_sets] found {len(valid_sets)} valid table combinations")
+    debug(f"[{QSIM_PHASE_C}] enumerate_table_sets found {len(valid_sets)} valid table combinations")
     return valid_sets
 
 
 def _is_excluded_filter_column(col_name: str) -> bool:
-    """
-    Return whether a column name matches any excluded filter pattern.
-
-    Args:
-
-        col_name: Column name string to test.
-
-    Returns:
-
-        case-insensitive substring of col_name.
-    """
+    """Return whether a column name matches any excluded filter pattern."""
     for pattern in QSimConfig.EXCLUDED_FILTER_PATTERNS:
         if pattern in col_name.lower():
             return True
@@ -151,22 +112,8 @@ def _is_excluded_filter_column(col_name: str) -> bool:
 
 
 def get_filterable_columns(table: str, schema: SchemaGraph, column_roles: dict[str, str]) -> list[tuple[str, str]]:
-    """
-    Return filterable columns for a table, excluding audit and system columns.
-
-    Args:
-
-        table: Table name to inspect.
-
-        schema: Schema graph containing column metadata.
-
-        column_roles: Map of `table.column` keys to role strings.
-
-    Returns:
-
-        matching excluded patterns.
-    """
-    result = []
+    """Return filterable columns for a table, excluding audit and. system. columns."""
+    result: list[tuple[str, str]] = []
     table_ir = schema.tables.get(table)
     if not table_ir:
         return result
@@ -182,22 +129,8 @@ def get_filterable_columns(table: str, schema: SchemaGraph, column_roles: dict[s
 
 
 def get_aggregatable_columns(table: str, schema: SchemaGraph, column_roles: dict[str, str]) -> list[str]:
-    """
-    Return column keys that can be aggregated with SUM, AVG, MIN, or MAX.
-
-    Args:
-
-        table: Table name to inspect.
-
-        schema: Schema graph containing column metadata.
-
-        column_roles: Map of `table.column` keys to role strings.
-
-    Returns:
-
-        List of `table.column` keys with `NUMERIC_MEASURE` role.
-    """
-    result = []
+    """Return column keys that can be aggregated with SUM, AVG, MIN, or. MAX."""
+    result: list[str] = []
     table_ir = schema.tables.get(table)
     if not table_ir:
         return result
@@ -212,22 +145,8 @@ def get_aggregatable_columns(table: str, schema: SchemaGraph, column_roles: dict
 
 
 def get_groupable_columns(table: str, schema: SchemaGraph, column_roles: dict[str, str]) -> list[str]:
-    """
-    Return column keys usable in GROUP BY clauses.
-
-    Args:
-
-        table: Table name to inspect.
-
-        schema: Schema graph containing column metadata.
-
-        column_roles: Map of `table.column` keys to role strings.
-
-    Returns:
-
-        `NUMERIC_CATEGORICAL` role.
-    """
-    result = []
+    """Return column keys usable in GROUP BY clauses."""
+    result: list[str] = []
     table_ir = schema.tables.get(table)
     if not table_ir:
         return result
@@ -248,21 +167,7 @@ def get_groupable_columns(table: str, schema: SchemaGraph, column_roles: dict[st
 def get_comparable_column_pairs(
     table_set: list[str], schema: SchemaGraph, column_roles: dict[str, str]
 ) -> list[tuple[str, str, str, str, str]]:
-    """
-    Return cross-table column pairs that can be semantically compared.
-
-    Args:
-
-        table_set: List of table names to consider.
-
-        schema: Schema graph containing column metadata.
-
-        column_roles: Map of `table.column` keys to role strings.
-
-    Returns:
-
-        comparable pair.
-    """
+    """Return cross-table column pairs that can be semantically. compared."""
     comparable_pairs = []
 
     numeric_roles = {
@@ -299,22 +204,8 @@ def get_comparable_column_pairs(
     return comparable_pairs
 
 
-def compute_skeleton_limits(tables: list[str], schema: SchemaGraph, column_roles: dict[str, str]) -> SkeletonLimits:
-    """
-    Compute schema-derived limits for skeleton enumeration.
-
-    Args:
-
-        tables: List of table names in the intent.
-
-        schema: Schema graph for column metadata.
-
-        column_roles: Map of `table.column` keys to role strings.
-
-    Returns:
-
-        derived from column capabilities and config caps.
-    """
+def _compute_skeleton_limits(tables: list[str], schema: SchemaGraph, column_roles: dict[str, str]) -> SkeletonLimits:
+    """Compute schema-derived limits for skeleton enumeration."""
     all_filterable = []
     all_groupable = []
     all_aggregatable = []
@@ -333,17 +224,7 @@ def compute_skeleton_limits(tables: list[str], schema: SchemaGraph, column_roles
 
 
 def compute_intent_id(intent_dict: dict[str, Any]) -> str:
-    """
-    Compute a hash-based intent ID from structural intent fields.
-
-    Args:
-
-        intent_dict: Description.
-
-    Returns:
-
-        Short hash string suitable as a deduplicated intent identifier.
-    """
+    """Compute a hash-based intent ID from structural intent fields."""
     structural = {
         "tables": sorted(intent_dict.get("tables", [])),
         "grain": intent_dict.get("grain", "row_level"),
@@ -362,29 +243,15 @@ def compute_intent_id(intent_dict: dict[str, Any]) -> str:
 
 
 def generate_all_skeletons(tables: list[str], schema: SchemaGraph, column_roles: dict[str, str]) -> list[QSimSkeleton]:
-    """
-    Generate all valid structural `QSimSkeleton` instances for a table set.
-
-    Args:
-
-        tables: Ordered list of table names defining the skeleton table set.
-
-        schema: Schema graph for filterable, groupable, and aggregatable columns.
-
-        column_roles: Map of `table.column` keys to role strings.
-
-    Returns:
-
-        results are cached in `_SKELETON_CACHE`.
-    """
+    """Generate all valid structural `QSimSkeleton` instances for a. table set."""
     global _SKELETON_CACHE
 
     table_key = frozenset(tables)
     if table_key in _SKELETON_CACHE:
-        debug(f"[qsim_struct.generate_all_skeletons] cache_hit: {len(_SKELETON_CACHE[table_key])} skeletons")
+        debug(f"[{QSIM_PHASE_B}]  cache_hit: {len(_SKELETON_CACHE[table_key])} skeletons")
         return _SKELETON_CACHE[table_key]
 
-    limits = compute_skeleton_limits(tables, schema, column_roles)
+    limits = _compute_skeleton_limits(tables, schema, column_roles)
     max_filters = limits.max_filters
     max_groupby = limits.max_groupby
     max_having = limits.max_having
@@ -426,7 +293,7 @@ def generate_all_skeletons(tables: list[str], schema: SchemaGraph, column_roles:
     _SKELETON_CACHE[table_key] = skeletons
 
     debug(
-        f"[qsim_struct.generate_all_skeletons] created {len(skeletons)} skeletons for tables={tables}, max_filters={max_filters}, max_groupby={max_groupby}, max_having={max_having}"
+        f"[{QSIM_PHASE_B}]  created {len(skeletons)} skeletons for tables={tables}, max_filters={max_filters}, max_groupby={max_groupby}, max_having={max_having}"
     )
     return skeletons
 
@@ -434,19 +301,7 @@ def generate_all_skeletons(tables: list[str], schema: SchemaGraph, column_roles:
 def load_or_create_skeletons(
     schema: SchemaGraph, column_roles: dict[str, str]
 ) -> dict[frozenset[str], list[QSimSkeleton]]:
-    """
-    Load the skeleton cache from disk or generate and persist it.
-
-    Args:
-
-        schema: Description.
-
-        column_roles: Map of `table.column` keys to role strings.
-
-    Returns:
-
-        stored in `_SKELETON_CACHE`).
-    """
+    """Load the skeleton cache from disk or generate and persist it."""
     global _SKELETON_CACHE
 
     skeleton_path = QSimConfig.SKELETONS_JSON_PATH
@@ -461,7 +316,6 @@ def _load_or_create_skeletons_locked(
     skeleton_path: str,
 ) -> dict[frozenset[str], list[QSimSkeleton]]:
     """Body of :func:`load_or_create_skeletons` executed under the artifacts-dir lock."""
-
     global _SKELETON_CACHE
 
     if not PolicyConfig.REGENERATE_SKELETON_CACHE and os.path.exists(skeleton_path):
@@ -471,7 +325,7 @@ def _load_or_create_skeletons_locked(
             cached_hash = cache_data.get("structural_hash", cache_data.get("schema_hash", ""))
             if cached_hash != schema.structural_hash:
                 debug(
-                    f"[qsim_struct.load_or_create_skeletons] structural_hash mismatch: {cached_hash} != {schema.structural_hash}, attempting surgical prune"
+                    f"[{QSIM_PHASE_B}]  structural_hash mismatch: {cached_hash} != {schema.structural_hash}, attempting surgical prune"
                 )
                 skeletons_data = cache_data.get("skeletons", {})
                 live_tables = set(schema.tables.keys())
@@ -496,6 +350,7 @@ def _load_or_create_skeletons_locked(
                                 "has_expr_comparison",
                                 s.get("has_column_comparison", False),
                             ),
+                            advanced_slot=s.get("advanced_slot"),
                         )
                         for s in skel_list
                     ]
@@ -506,11 +361,11 @@ def _load_or_create_skeletons_locked(
                         "skeletons": {"|".join(sorted(k)): [asdict(s) for s in v] for k, v in _SKELETON_CACHE.items()},
                     }
                     debug(
-                        f"[qsim_struct.load_or_create_skeletons] surgical prune retained {len(_SKELETON_CACHE)} table sets; rewriting cache"
+                        f"[{QSIM_PHASE_B}]  surgical prune retained {len(_SKELETON_CACHE)} table sets; rewriting cache"
                     )
                     write_gzip_json_atomic(skeleton_path, cache_data, sort_keys=True)
                     return _SKELETON_CACHE
-                debug("[qsim_struct.load_or_create_skeletons] surgical prune empty; full regeneration")
+                debug(f"[{QSIM_PHASE_B}]  surgical prune empty; full regeneration")
             else:
                 skeletons_data = cache_data.get("skeletons", {})
                 for table_key_str, skel_list in skeletons_data.items():
@@ -532,15 +387,16 @@ def _load_or_create_skeletons_locked(
                                 "has_expr_comparison",
                                 s.get("has_column_comparison", False),
                             ),
+                            advanced_slot=s.get("advanced_slot"),
                         )
                         for s in skel_list
                     ]
-                debug(f"[qsim_struct.load_or_create_skeletons] loaded {len(_SKELETON_CACHE)} table sets from cache")
+                debug(f"[{QSIM_PHASE_B}]  loaded {len(_SKELETON_CACHE)} table sets from cache")
                 return _SKELETON_CACHE
         except Exception as e:
-            debug(f"[qsim_struct.load_or_create_skeletons] cache_load_failed: {e}")
+            debug(f"[{QSIM_PHASE_B}]  cache_load_failed: {e}")
 
-    debug("[qsim_struct.load_or_create_skeletons] generating new skeletons")
+    debug(f"[{QSIM_PHASE_B}]  generating new skeletons")
     table_sets = enumerate_table_sets(schema, QSimConfig.MAX_TABLES_PER_INTENT)
 
     for table_set in table_sets:
@@ -552,24 +408,14 @@ def _load_or_create_skeletons_locked(
         "skeletons": {"|".join(sorted(k)): [asdict(s) for s in v] for k, v in _SKELETON_CACHE.items()},
     }
 
-    debug(f"[qsim_struct.load_or_create_skeletons] saving {len(_SKELETON_CACHE)} table sets to cache")
+    debug(f"[{QSIM_PHASE_B}]  saving {len(_SKELETON_CACHE)} table sets to cache")
     write_gzip_json_atomic(skeleton_path, cache_data, sort_keys=True)
 
     return _SKELETON_CACHE
 
 
 def decompose_between_filter(f: QSimFilter) -> list[QSimFilter]:
-    """
-    Decompose a `BETWEEN` `QSimFilter` into `>=` and `<=` filters.
-
-    Args:
-
-        f: Filter to decompose.
-
-    Returns:
-
-        one-element list with `f` unchanged.
-    """
+    """Decompose a `BETWEEN` `QSimFilter` into `>=` and `<=` filters."""
     if f.op != "between":
         return [f]
     return [
@@ -579,54 +425,35 @@ def decompose_between_filter(f: QSimFilter) -> list[QSimFilter]:
 
 
 def build_schema_context(tables: list[str], schema: SchemaGraph) -> str:
-    """
-    Build a schema context string for LLM prompts.
-
-    Columns whose ``is_visible`` is false are omitted so the LLM never sees audit-only, near-empty, single-value, denied, or hidden-sensitivity columns; primary and foreign key columns remain visible only when not denied and not tagged as hidden sensitivity.
-
-    Args:
-
-        tables: Ordered list of table names to include.
-
-        schema: Schema graph with table and column metadata.
-
-    Returns:
-
-        blank lines.
-    """
-    context_parts = []
-
+    """Build a schema context string for LLM prompts using the Compose field set under master scope."""
+    payload = json.loads(schema.schema_payload_compose(tables, owner_master_scope=True))
+    context_parts: list[str] = []
     for table in tables:
-        table_ir = schema.tables.get(table)
-        if not table_ir:
+        table_body = payload.get(table)
+        if not isinstance(table_body, dict):
             continue
-
-        col_descriptions = []
-        for col_name, col_meta in table_ir.columns.items():
-            if not col_meta.is_visible:
+        col_map = table_body.get("columns") or {}
+        col_descriptions: list[str] = []
+        for col_name, col_obj in sorted(col_map.items()):
+            if not isinstance(col_obj, dict):
                 continue
-            col_type = (col_meta.value_type or "").strip() or (
-                data_type_to_value_type(col_meta.data_type) if col_meta.data_type else "unknown"
-            )
+            col_type = str(col_obj.get("type") or "unknown")
             col_desc = f"{col_name} ({col_type})"
-            if col_meta.is_primary_key:
+            if col_obj.get("pk"):
                 col_desc += " [PK]"
-            if col_meta.is_foreign_key:
-                fk_target = f"{col_meta.fk_target[0]}.{col_meta.fk_target[1]}" if col_meta.fk_target else "?"
-                col_desc += f" [FK -> {fk_target}]"
-            if col_meta.is_filterable:
-                col_desc += " [filter]"
+            if col_obj.get("fk"):
+                col_desc += f" [FK -> {col_obj['fk']}]"
+            role = col_obj.get("role")
+            if role:
+                col_desc += f" [{role}]"
             col_descriptions.append(col_desc)
-
-        table_desc = table_ir.description or f"{table} table"
+        table_desc = table_body.get("description") or f"{table} table"
         context_parts.append(f"TABLE {table} ({table_desc}):\n  " + "\n  ".join(col_descriptions))
-
     return "\n\n".join(context_parts)
 
 
 def _domain_prefers_integer_samples(domain: ValueDomain) -> bool:
-    """Return whether numeric samples for *domain* should use integer-like literals."""
-
+    """Return whether numeric samples for *domain* should use integer- like literals."""
     vt = (domain.value_type or "").strip().lower()
     if vt == "integer":
         return True
@@ -638,21 +465,7 @@ def _domain_prefers_integer_samples(domain: ValueDomain) -> bool:
 
 
 def validate_column_exists(col_ref: str, tables: list[str], schema: SchemaGraph) -> bool:
-    """
-    Return whether a `table.column` reference is valid for the given tables.
-
-    Args:
-
-        col_ref: Fully qualified reference in `table.column` form.
-
-        tables: Allowed table names; the reference table must be in this list.
-
-        schema: Schema graph for column existence.
-
-    Returns:
-
-        otherwise.
-    """
+    """Return whether a `table.column` reference is valid for the given. tables."""
     if "." not in col_ref:
         return False
     table, col = col_ref.split(".", 1)
@@ -665,17 +478,7 @@ def validate_column_exists(col_ref: str, tables: list[str], schema: SchemaGraph)
 
 
 def _is_integer_type(data_type: str | None) -> bool:
-    """
-    Return whether `data_type` is an integer-like column type.
-
-    Args:
-
-        data_type: Declared SQL type string, or None.
-
-    Returns:
-
-        True if treated as integer; otherwise False.
-    """
+    """Return whether `data_type` is an integer-like column type."""
     if not data_type:
         return False
     dtype_lower = data_type.lower()
@@ -696,17 +499,7 @@ def _is_integer_type(data_type: str | None) -> bool:
 
 
 def _parse_date(val: str) -> datetime | None:
-    """
-    Parse a date substring from `val` into a datetime.
-
-    Args:
-
-        val: Date or datetime string.
-
-    Returns:
-
-        Parsed date at midnight, or None if no format matches.
-    """
+    """Parse a date substring from `val` into a datetime."""
     if "T" in val:
         val = val.split("T")[0]
     elif " " in val:
@@ -721,32 +514,12 @@ def _parse_date(val: str) -> datetime | None:
 
 
 def _format_date(dt: datetime) -> str:
-    """
-    Format `dt` as an ISO date string.
-
-    Args:
-
-        dt: Datetime to format.
-
-    Returns:
-
-        `YYYY-MM-DD` string.
-    """
+    """Format `dt` as an ISO date string."""
     return dt.strftime("%Y-%m-%d")
 
 
 def _extract_date_part(val: str) -> str:
-    """
-    Return the calendar-date portion of `val`.
-
-    Args:
-
-        val: Datetime or date string.
-
-    Returns:
-
-        Date part before `T` or first space, or `val` unchanged.
-    """
+    """Return the calendar-date portion of `val`."""
     if "T" in val:
         return val.split("T")[0]
     if " " in val:
@@ -755,19 +528,7 @@ def _extract_date_part(val: str) -> str:
 
 
 def _sample_categorical(domain: ValueDomain, variant_idx: int) -> str | None:
-    """
-    Pick a categorical value from `domain` by `variant_idx`.
-
-    Args:
-
-        domain: Column value domain.
-
-        variant_idx: Deterministic variant index.
-
-    Returns:
-
-        Sampled string, or None.
-    """
+    """Pick a categorical value from `domain` by `variant_idx`."""
     values_list = domain.values
     if values_list:
         base = hash(tuple(values_list)) % len(values_list)
@@ -786,29 +547,17 @@ def _sample_categorical(domain: ValueDomain, variant_idx: int) -> str | None:
 
 
 def _sample_boolean(domain: ValueDomain, variant_idx: int) -> str | None:
-    """
-    Pick a boolean literal string from `domain` or defaults.
-
-    Args:
-
-        domain: Column value domain.
-
-        variant_idx: Deterministic variant index.
-
-    Returns:
-
-        `"true"` or `"false"`.
-    """
+    """Pick a boolean literal string from `domain` or defaults."""
     values_list = domain.values
     if values_list:
-        normalized = []
-        for v in values_list:
+        normalized: list[str] = []
+        for v in cast(list[Any], values_list):
             if isinstance(v, bool):
                 normalized.append("true" if v else "false")
-            elif isinstance(v, str):
-                normalized.append(v.lower() if v.lower() in ("true", "false") else v)
-            else:
-                normalized.append(str(v))
+                continue
+            s = str(v)
+            low = s.lower()
+            normalized.append(low if low in ("true", "false") else s)
         idx = variant_idx % len(normalized)
         return normalized[idx]
     default_bools = ["true", "false"]
@@ -817,24 +566,12 @@ def _sample_boolean(domain: ValueDomain, variant_idx: int) -> str | None:
 
 
 def _sample_numeric_categorical(domain: ValueDomain, variant_idx: int) -> str | None:
-    """
-    Pick a discrete numeric string from `domain`.
-
-    Args:
-
-        domain: Column value domain.
-
-        variant_idx: Deterministic variant index.
-
-    Returns:
-
-        Integer-like string, or None.
-    """
+    """Pick a discrete numeric string from `domain`."""
     values_list = domain.values
     if values_list:
         idx = variant_idx % len(values_list)
         val = values_list[idx]
-        return str(int(float(val))) if isinstance(val, int | float) else str(val)
+        return str(int(float(val)))
     if domain.min_val is not None and domain.max_val is not None:
         try:
             min_v = int(float(domain.min_val))
@@ -848,27 +585,14 @@ def _sample_numeric_categorical(domain: ValueDomain, variant_idx: int) -> str | 
 
 
 def _sample_numeric(domain: ValueDomain, op: str, variant_idx: int) -> str | None:
-    """
-    Sample a numeric literal suited to comparison operator `op`.
-
-    Args:
-
-        domain: Column value domain.
-
-        op: Filter operator (`=`, `>`, etc.).
-
-        variant_idx: Deterministic variant index.
-
-    Returns:
-
-        Numeric string, list element, or None.
-    """
+    """Sample a numeric literal suited to comparison operator `op`."""
     if domain.min_val is not None and domain.max_val is not None:
         try:
             min_v = float(domain.min_val)
             max_v = float(domain.max_val)
             range_size = max_v - min_v
             is_integer = _domain_prefers_integer_samples(domain)
+            value: int | float
 
             if op == "=":
                 if is_integer:
@@ -909,21 +633,7 @@ def _sample_numeric(domain: ValueDomain, op: str, variant_idx: int) -> str | Non
 
 
 def _sample_temporal(domain: ValueDomain, op: str, variant_idx: int) -> str | None:
-    """
-    Sample a date string suited to comparison operator `op`.
-
-    Args:
-
-        domain: Column value domain.
-
-        op: Filter operator.
-
-        variant_idx: Deterministic variant index.
-
-    Returns:
-
-        Date string, or None.
-    """
+    """Sample a date string suited to comparison operator `op`."""
     if domain.min_val is not None and domain.max_val is not None:
         try:
             min_dt = _parse_date(str(domain.min_val))
@@ -958,21 +668,7 @@ def _sample_temporal(domain: ValueDomain, op: str, variant_idx: int) -> str | No
 
 
 def _sample_in_values(domain: ValueDomain, value_type: str, variant_idx: int) -> str | None:
-    """
-    Build a comma-separated literal list for `in` / `not in`.
-
-    Args:
-
-        domain: Column value domain.
-
-        value_type: Semantic type (`categorical`, `numeric`, etc.).
-
-        variant_idx: Deterministic variant index.
-
-    Returns:
-
-        SQL fragment of values, or None.
-    """
+    """Build a comma-separated literal list for `in` / `not in`."""
     if value_type == "categorical":
         values_list = domain.values
         if values_list:
@@ -987,7 +683,7 @@ def _sample_in_values(domain: ValueDomain, value_type: str, variant_idx: int) ->
             n_values = min(3 + (variant_idx % 3), len(values_list))
             start_idx = variant_idx % max(1, len(values_list) - n_values + 1)
             values = values_list[start_idx : start_idx + n_values]
-            int_values = [str(int(float(v))) if isinstance(v, int | float) else str(v) for v in values]
+            int_values = [str(int(float(v))) for v in values]
             return ",".join(int_values)
         if domain.min_val is not None and domain.max_val is not None:
             try:
@@ -1006,29 +702,22 @@ def _sample_in_values(domain: ValueDomain, value_type: str, variant_idx: int) ->
     elif value_type == "boolean":
         values_list = domain.values
         if values_list:
-            normalized = []
-            for v in values_list:
-                if isinstance(v, bool):
-                    normalized.append("true" if v else "false")
-                elif isinstance(v, str):
-                    normalized.append(v.lower() if v.lower() in ("true", "false") else v)
-                else:
-                    normalized.append(str(v))
+            normalized = [v.lower() if v.lower() in ("true", "false") else v for v in values_list]
             return ",".join(normalized)
         return "true,false"
 
     elif value_type in ("numeric", "temporal"):
         if domain.min_val is not None and domain.max_val is not None:
             try:
-                min_v = float(domain.min_val)
-                max_v = float(domain.max_val)
-                range_size = max_v - min_v
+                min_bound = float(domain.min_val)
+                max_bound = float(domain.max_val)
+                float_range = max_bound - min_bound
                 is_integer = _domain_prefers_integer_samples(domain)
                 n_values = 2 + (variant_idx % 3)
                 values = []
                 for i in range(n_values):
                     segment = ((variant_idx + i) % 10) / 10.0
-                    val = min_v + segment * range_size
+                    val: int | float = min_bound + segment * float_range
                     val = int(round(val)) if is_integer else (round(val, 2) if abs(val) >= 1 else round(val, 4))
                     values.append(str(val))
                 return ",".join(values)
@@ -1039,23 +728,7 @@ def _sample_in_values(domain: ValueDomain, value_type: str, variant_idx: int) ->
 
 
 def sample_value_from_domain(domain: ValueDomain, value_type: str, op: str = "=", variant_idx: int = 0) -> str | None:
-    """
-    Sample one concrete filter value from `domain`.
-
-    Args:
-
-        domain: Column value domain.
-
-        value_type: Semantic type (`categorical`, `numeric`, etc.).
-
-        op: Filter operator.
-
-        variant_idx: Deterministic variant index.
-
-    Returns:
-
-        Literal string, or None for null predicates.
-    """
+    """Sample one concrete filter value from `domain`."""
     if value_type == "null" or op in ("is null", "is not null"):
         return None
 
@@ -1081,17 +754,7 @@ def sample_value_from_domain(domain: ValueDomain, value_type: str, op: str = "="
 
 
 def _identify_range_pairs(filters: list[QSimFilter]) -> dict[str, dict[str, int]]:
-    """
-    Find columns with both lower and upper bound filters.
-
-    Args:
-
-        filters: Decomposed filter list.
-
-    Returns:
-
-        Map column key to indices `lower_idx` and `upper_idx`.
-    """
+    """Find columns with both lower and upper bound filters."""
     column_ops: dict[str, dict[str, int]] = {}
     for idx, f in enumerate(filters):
         if f.is_expr_comparison:
@@ -1104,19 +767,7 @@ def _identify_range_pairs(filters: list[QSimFilter]) -> dict[str, dict[str, int]
 
 
 def _sample_numeric_range(domain: ValueDomain, variant_idx: int) -> tuple[str | None, str | None]:
-    """
-    Sample a consistent lower and upper numeric bound pair.
-
-    Args:
-
-        domain: Column value domain.
-
-        variant_idx: Deterministic variant index.
-
-    Returns:
-
-        `(lower, upper)` strings, or `(None, None)` if unavailable.
-    """
+    """Sample a consistent lower and upper numeric bound pair."""
     if domain.min_val is None or domain.max_val is None:
         return None, None
 
@@ -1150,19 +801,7 @@ def _sample_numeric_range(domain: ValueDomain, variant_idx: int) -> tuple[str | 
 
 
 def _sample_temporal_range(domain: ValueDomain, variant_idx: int) -> tuple[str | None, str | None]:
-    """
-    Sample a consistent lower and upper date bound pair.
-
-    Args:
-
-        domain: Column value domain.
-
-        variant_idx: Deterministic variant index.
-
-    Returns:
-
-        `(lower, upper)` date strings, or `(None, None)` on failure.
-    """
+    """Sample a consistent lower and upper date bound pair."""
     if domain.min_val is None or domain.max_val is None:
         return None, None
 
@@ -1194,21 +833,7 @@ def _sample_temporal_range(domain: ValueDomain, variant_idx: int) -> tuple[str |
 
 
 def sample_coordinated_range(domain: ValueDomain, value_type: str, variant_idx: int) -> tuple[str | None, str | None]:
-    """
-    Sample coordinated lower and upper values for range filters.
-
-    Args:
-
-        domain: Column value domain.
-
-        value_type: `numeric` or `temporal`.
-
-        variant_idx: Deterministic variant index.
-
-    Returns:
-
-        Bound pair, or `(None, None)` if type unsupported.
-    """
+    """Sample coordinated lower and upper values for range filters."""
     if value_type not in ("numeric", "temporal"):
         return None, None
 
@@ -1222,22 +847,9 @@ def sample_coordinated_range(domain: ValueDomain, value_type: str, variant_idx: 
 
 
 def deterministic_having_value(agg_func: str, variant_idx: int, having_idx: int = 0) -> str:
-    """
-    Pick a HAVING threshold from built-in pools.
-
-    Args:
-
-        agg_func: Aggregate name (`count`, `sum`, etc.).
-
-        variant_idx: Variant offset.
-
-        having_idx: Index within HAVING clauses.
-
-    Returns:
-
-        Threshold string.
-    """
+    """Pick a HAVING threshold from built-in pools."""
     offset = variant_idx * 3 + having_idx
+    value: int | float
 
     if agg_func == "count":
         value = HAVING_COUNT_VALUES[offset % len(HAVING_COUNT_VALUES)]
@@ -1256,19 +868,7 @@ def deterministic_having_value(agg_func: str, variant_idx: int, having_idx: int 
 
 
 def _compute_intent_variance(intent: QSimIntent, value_domains: dict[str, ValueDomain]) -> int:
-    """
-    Score how much sampling diversity an intent allows.
-
-    Args:
-
-        intent: Intent skeleton.
-
-        value_domains: Column key to domain map.
-
-    Returns:
-
-        Non-negative variance score.
-    """
+    """Score how much sampling diversity an intent allows."""
     variance_score = 0
 
     for f in intent.filters_param:
@@ -1293,21 +893,7 @@ def _compute_intent_variance(intent: QSimIntent, value_domains: dict[str, ValueD
 def _instantiate_intent(
     intent: QSimIntent, value_domains: dict[str, ValueDomain], variant_idx: int = 0
 ) -> QSimIntent | None:
-    """
-    Fill `param_values` for filters and HAVING from domains.
-
-    Args:
-
-        intent: Intent skeleton.
-
-        value_domains: Column key to domain map.
-
-        variant_idx: Variant index for sampling.
-
-    Returns:
-
-        New `QSimIntent` with values and empty `question`.
-    """
+    """Fill `param_values` for filters and HAVING from domains."""
     decomposed_filters: list[QSimFilter] = []
     for f in intent.filters_param:
         decomposed_filters.extend(decompose_between_filter(f))
@@ -1326,14 +912,14 @@ def _instantiate_intent(
             range_values[col_key] = (lower_val, upper_val)
 
     new_filters: list[QSimFilter] = []
-    new_param_values: dict[str, any] = {}
+    new_param_values: dict[str, Any] = {}
 
     for filter_idx, f in enumerate(decomposed_filters):
         param_key = f"f{filter_idx}"
 
         if f.is_expr_comparison:
             new_filters.append(f)
-            debug(f"[qsim_sample.instantiate_intent] expr_comparison: {f.column} {f.op} {f.right_column}")
+            debug(f"[{QSIM_PHASE_H}]  expr_comparison: {f.column} {f.op} {f.right_column}")
             continue
 
         col_key = f.column
@@ -1342,15 +928,16 @@ def _instantiate_intent(
 
         if value_type == "null" or op in ("is null", "is not null"):
             new_filters.append(replace(f, value_type="null"))
-            debug(f"[qsim_sample.instantiate_intent] null_filter: {col_key} {op}")
+            debug(f"[{QSIM_PHASE_H}]  null_filter: {col_key} {op}")
             continue
 
         domain = value_domains.get(col_key)
 
         if domain is None:
-            debug(f"[qsim_sample.instantiate_intent] no_domain_skip_variant: {col_key}")
+            debug(f"[{QSIM_PHASE_H}]  no_domain_skip_variant: {col_key}")
             return None
 
+        value: str | None
         if col_key in range_values:
             lower_val, upper_val = range_values[col_key]
             if f.op in (">", ">="):
@@ -1403,22 +990,10 @@ def instantiate_all(
     num_questions: int | None = None,
     *,
     rng_seed: int | None = None,
+    trace_rows: list[dict[str, Any]] | None = None,
+    trace_summary: dict[str, Any] | None = None,
 ) -> list[QSimIntent]:
-    """
-    Instantiate intents with proportional variant counts.
-
-    Args:
-
-        intents: Intent skeletons.
-
-        schema: Schema graph for column domains.
-
-        num_questions: Target count; defaults to `QSimConfig.QUESTIONS_COUNT`.
-
-    Returns:
-
-        List of instantiated intents, possibly truncated or shuffled.
-    """
+    """Instantiate intents with proportional variant counts."""
     if num_questions is None:
         num_questions = QSimConfig.QUESTIONS_COUNT
 
@@ -1427,7 +1002,7 @@ def instantiate_all(
     avg_variants = num_questions / len(intents) if intents else 0
     if avg_variants < QSimConfig.MIN_AVG_VARIANTS_PER_INTENT:
         debug(
-            f"[qsim_sample.instantiate_all] WARNING: avg_variants={avg_variants:.2f} below MIN={QSimConfig.MIN_AVG_VARIANTS_PER_INTENT}"
+            f"[{QSIM_PHASE_H}]  WARNING: avg_variants={avg_variants:.2f} below MIN={QSimConfig.MIN_AVG_VARIANTS_PER_INTENT}"
         )
     if avg_variants > QSimConfig.MAX_AVG_VARIANTS_PER_INTENT:
         raise ValueError(
@@ -1448,13 +1023,13 @@ def instantiate_all(
                 )
                 continue
             value_domains[col_key] = ValueDomain(
-                values=col_meta.top_k_values or [],
+                values=col_meta.frequent_values or [],
                 min_val=col_meta.min_val,
                 max_val=col_meta.max_val,
                 data_type=col_meta.data_type,
                 value_type=col_meta.value_type or "",
             )
-    debug(f"[qsim_sample.instantiate_all] value_domains: {len(value_domains)} columns")
+    debug(f"[{QSIM_PHASE_H}]  value_domains: {len(value_domains)} columns")
 
     variances: dict[str, float] = {}
     for intent in intents:
@@ -1475,26 +1050,65 @@ def instantiate_all(
                 share = v / total_variance
                 allocations[intent.intent_id] = max(1, round(num_questions * share))
 
-    debug(
-        f"[qsim_sample.instantiate_all] total_variance={total_variance:.2f}, allocations_sum={sum(allocations.values())}"
-    )
+    debug(f"[{QSIM_PHASE_H}]  total_variance={total_variance:.2f}, allocations_sum={sum(allocations.values())}")
+    if trace_summary is not None:
+        trace_summary["avg_variants"] = avg_variants
+        trace_summary["total_variance"] = total_variance
+        trace_summary["allocations_sum"] = sum(allocations.values())
 
     instantiated: list[QSimIntent] = []
 
     for intent in intents:
         max_variants = allocations[intent.intent_id]
+        if trace_rows is not None:
+            trace_rows.append(
+                {
+                    "stage": "instantiation_plan",
+                    "intent_id": intent.intent_id,
+                    "tables": list(intent.tables),
+                    "filters_count": len(intent.filters_param),
+                    "having_count": len(intent.having_param),
+                    "allocated_variants": max_variants,
+                    "variance_score": variances[intent.intent_id],
+                }
+            )
         for variant_idx in range(max_variants):
             result = _instantiate_intent(intent, value_domains, variant_idx)
             if result is not None:
                 instantiated.append(result)
+                if trace_rows is not None:
+                    trace_rows.append(
+                        {
+                            "stage": "instantiation_variant",
+                            "status": "accepted",
+                            "intent_id": intent.intent_id,
+                            "variant_idx": variant_idx,
+                            "param_keys": sorted(result.param_values.keys()),
+                        }
+                    )
+            elif trace_rows is not None:
+                trace_rows.append(
+                    {
+                        "stage": "instantiation_variant",
+                        "status": "failed",
+                        "intent_id": intent.intent_id,
+                        "variant_idx": variant_idx,
+                    }
+                )
 
     if len(instantiated) > num_questions:
         random.shuffle(instantiated)
         instantiated = instantiated[:num_questions]
-        debug(f"[qsim_sample.instantiate_all] truncated: {len(instantiated)}/{num_questions}")
+        debug(f"[{QSIM_PHASE_H}]  truncated: {len(instantiated)}/{num_questions}")
+        if trace_summary is not None:
+            trace_summary["truncated_to_num_questions"] = True
     elif len(instantiated) < num_questions:
-        debug(f"[qsim_sample.instantiate_all] limit_reached: {len(instantiated)}/{num_questions}")
+        debug(f"[{QSIM_PHASE_H}]  limit_reached: {len(instantiated)}/{num_questions}")
     else:
-        debug(f"[qsim_sample.instantiate_all] created: {len(instantiated)} intents")
+        debug(f"[{QSIM_PHASE_H}]  created: {len(instantiated)} intents")
+
+    if trace_summary is not None:
+        trace_summary["produced_variants"] = len(instantiated)
+        trace_summary["requested_questions"] = num_questions
 
     return instantiated

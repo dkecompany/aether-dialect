@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from unittest.mock import MagicMock, patch
 
-from aetherdialect._config import (
+from aetherdialect._constants import (
     SESSION_KIND_AWAITING_INTENT_CONFIRM,
     SESSION_KIND_AWAITING_INTENT_FEEDBACK,
     SESSION_KIND_AWAITING_SQL_CONFIRM,
@@ -14,24 +14,28 @@ from aetherdialect._config import (
     SESSION_KIND_RESULT,
 )
 from aetherdialect._contracts_base import (
-    ColumnMetadata,
     CteIntent,
     LogicalIntent,
-    SchemaGraph,
-    TableMetadata,
 )
 from aetherdialect._contracts_core import (
     FeedbackKind,
+    InterpretPlan,
     QuestionFeedbackEntry,
     RefinementContext,
     RejectionBucket,
 )
-from aetherdialect._core_utils import _azure_deployment_for_model, llm_execution_scope
-from aetherdialect._intent_process import (
-    _build_intent_logical_prompt,
-    _logical_intent_to_serialisable,
-    _parse_logical_intent_response,
+from aetherdialect._contracts_schema import (
+    ColumnMetadata,
+    SchemaGraph,
+    TableMetadata,
 )
+from aetherdialect._core_utils import llm_execution_scope
+from aetherdialect._intent_process import (
+    build_intent_ground_prompt,
+    logical_intent_to_serialisable,
+    parse_logical_intent_response,
+)
+from aetherdialect._llm_provider import _azure_deployment_for_model
 from aetherdialect._main_execution import (
     PIPELINE_SUSPEND_ID_INTENT_CONFIRM,
     PipelineSuspended,
@@ -42,13 +46,15 @@ from aetherdialect._templates import (
 )
 
 
-class TestStageALogicalPromptAndRoundTrip:
-    """Stage A JSON shape, vocabulary rules, and logical parse round-trip."""
+class TestInterpretGroundLogicalPromptAndRoundTrip:
+    """Interpret and Ground phase JSON shape, vocabulary rules, and logical parse round- trip."""
 
     def test_logical_prompt_includes_prior_user_corrections(self) -> None:
+        plan = InterpretPlan(approach="count rows", tables=("tbl_a",))
         payload = json.loads(
-            _build_intent_logical_prompt(
+            build_intent_ground_prompt(
                 "q",
+                plan,
                 "{}",
                 "",
                 "[]",
@@ -59,7 +65,8 @@ class TestStageALogicalPromptAndRoundTrip:
         assert payload.get("prior_user_corrections") == ["turn rejected bad filter"]
 
     def test_logical_prompt_contains_no_union_rule(self) -> None:
-        raw = _build_intent_logical_prompt("union all sales and returns", "{}", "", "[]", (), ())
+        plan = InterpretPlan(approach="combine two sets", tables=("tbl_a",))
+        raw = build_intent_ground_prompt("union all sales and returns", plan, "{}", "", "[]", (), ())
         assert "UNION" in raw.upper()
         rules = json.loads(raw).get("logical_schema_rules", [])
         assert any("UNION" in str(r).upper() for r in rules)
@@ -94,7 +101,6 @@ class TestStageALogicalPromptAndRoundTrip:
         )
         cte = CteIntent(
             name="per_customer",
-            depends_on=("orders",),
             tables=("orders",),
             select="order_id and customer_id",
             window="row_number partitioned by customers.id order by orders.order_date descending as rn",
@@ -108,8 +114,8 @@ class TestStageALogicalPromptAndRoundTrip:
             window="same ranking as per_customer step",
             cte_steps=(cte,),
         )
-        raw = json.dumps(_logical_intent_to_serialisable(li), separators=(",", ":"), sort_keys=True)
-        out, issues = _parse_logical_intent_response(raw, sg)
+        raw = json.dumps(logical_intent_to_serialisable(li), separators=(",", ":"), sort_keys=True)
+        out, issues = parse_logical_intent_response(raw, sg)
         assert not issues
         assert out is not None
         assert out.tables == li.tables
@@ -119,7 +125,7 @@ class TestStageALogicalPromptAndRoundTrip:
 
 
 class TestRefinementContextConversationHints:
-    """RefinementContext carries conversation rejection hints for Stage A."""
+    """RefinementContext carries conversation rejection hints for the Interpret phase."""
 
     def test_default_empty_hints(self) -> None:
         ctx = RefinementContext("q")
@@ -133,9 +139,9 @@ class TestRefinementContextConversationHints:
 class TestParseIntentPassesConversationHints:
     """``parse_intent_via_llm`` forwards conversation rejection hints into intent parse."""
 
-    @patch("aetherdialect._pipeline._invoke_intent_parse_with_hints")
+    @patch("aetherdialect._pipeline.invoke_intent_parse_with_hints")
     def test_prior_user_corrections_from_refinement_context(self, mock_invoke: MagicMock) -> None:
-        from aetherdialect._contracts_base import (
+        from aetherdialect._contracts_schema import (
             ColumnMetadata,
             SchemaGraph,
             TableMetadata,
@@ -156,7 +162,7 @@ class TestParseIntentPassesConversationHints:
             join_paths_multi={},
             effective_structural_hash="h",
         )
-        mock_invoke.return_value = (None, [], 0)
+        mock_invoke.return_value = (None, [], 0, None)
         ctx = RefinementContext("q", conversation_rejection_hints=("sql dropped region",))
         parse_intent_via_llm("q", sg, {}, {}, refinement_ctx=ctx)
         _kwargs = mock_invoke.call_args[1]
@@ -241,9 +247,9 @@ class TestPipelineSuspendedIntentSummary:
     """Suspended intent-confirm steps carry intent summary when payload exposes intent."""
 
     def test_intent_confirm_suspend_gets_summary(self) -> None:
+        from aetherdialect._contracts_base import NormalizedExpr
         from aetherdialect._contracts_core import (
             InteractiveTailSnapshot,
-            NormalizedExpr,
             RuntimeIntent,
             SelectCol,
         )
@@ -286,10 +292,10 @@ class TestPipelineSuspendedIntentSummary:
 
 
 class TestEmitRuntimeConfigOverrideDiagnostics:
-    """Runtime TOML-over-env diagnostics match ``initialize_text2sql`` behaviour."""
+    """Runtime TOML-over-env diagnostics match ``initialize_aether_engine`` behaviour."""
 
     def test_emits_one_diagnostic_per_key(self) -> None:
-        from aetherdialect._config import DIAGNOSTIC_CODE_CONFIG_FILE_VALUE_APPLIED
+        from aetherdialect._constants import DIAGNOSTIC_CODE_CONFIG_FILE_VALUE_APPLIED
         from aetherdialect._core_utils import (
             reset_diagnostic_collector,
             set_diagnostic_collector,
@@ -313,20 +319,18 @@ class TestMakeIntentIssueStageAttribution:
     """``STAGE_ATTRIBUTION_TABLE`` keys set ``responsible_stage`` on issues from :func:`make_intent_issue`."""
 
     def test_known_issue_ids(self) -> None:
-        from aetherdialect._contracts_base import (
-            STAGE_ATTRIBUTION_TABLE,
-            FailureCategory,
-            make_intent_issue,
-        )
+        from aetherdialect._constants import STAGE_ATTRIBUTION_TABLE
+        from aetherdialect._contracts_base import FailureCategory
+        from aetherdialect._contracts_schema import make_intent_issue
 
-        for issue_id, expected in STAGE_ATTRIBUTION_TABLE.items():
-            issue = make_intent_issue(
-                issue_id=f"prefix_{issue_id}_suffix",
-                category=FailureCategory.OTHER,
+        for issue_id, environment in STAGE_ATTRIBUTION_TABLE.items():
+            iss = make_intent_issue(
+                issue_id=issue_id,
+                category=FailureCategory.UNKNOWN_COLUMN,
                 severity="error",
                 message="m",
             )
-            assert issue.responsible_stage == expected
+            assert iss.responsible_stage == environment
 
 
 class TestRefinementContinuationTerminalError:
@@ -370,11 +374,8 @@ class TestLlmTaskDeploymentMatrix:
 
     def test_all_task_labels_resolve(self) -> None:
         from aetherdialect._config import LlmExecutionConfig
-        from aetherdialect._core_utils import (
-            _azure_deployment_for_model,
-            _task_model_for_profile,
-            llm_execution_scope,
-        )
+        from aetherdialect._core_utils import llm_execution_scope
+        from aetherdialect._llm_provider import _azure_deployment_for_model, _task_model_for_profile
 
         cfg = LlmExecutionConfig(
             azure_endpoint="x",
@@ -409,7 +410,7 @@ class TestLlmTaskDeploymentMatrix:
 
 
 class TestHandBuiltSqlShapeHints:
-    """Illustrative IR/SQL shape checks aligned with Step 26 structural-pattern bullets (static strings)."""
+    """Illustrative IR/SQL shape checks aligned with Step 26 structural- pattern bullets (static strings)."""
 
     def test_inner_join_distinct_avoids_exists_token(self) -> None:
         sql = "SELECT DISTINCT c.id FROM customers c INNER JOIN orders o ON o.customer_id = c.id"
@@ -444,42 +445,42 @@ class TestHandBuiltSqlShapeHints:
 
 
 class TestDiagnosticConstantsSurface:
-    """All Step-1 diagnostic string constants remain defined and non-empty."""
+    """All Step-1 diagnostic string constants remain defined and non- empty."""
 
     def test_all_diagnostic_codes_non_empty(self) -> None:
-        import aetherdialect._config as cfg
+        import aetherdialect._constants
 
-        names = [n for n in dir(cfg) if n.startswith("DIAGNOSTIC_CODE_") and n.isupper()]
+        names = [n for n in dir(aetherdialect._constants) if n.startswith("DIAGNOSTIC_CODE_") and n.isupper()]
         assert len(names) >= 10
         for n in names:
-            val = getattr(cfg, n)
+            val = getattr(aetherdialect._constants, n)
             assert isinstance(val, str) and val.strip()
 
 
-class TestFullIntentParseStageARetryDiagnostic:
-    """``full_intent_parse`` emits Stage A retry diagnostic after a failed logical parse."""
+class TestFullIntentParseInterpretGroundRetryDiagnostic:
+    """``full_intent_parse`` emits Interpret/Ground retry diagnostic after a failed logical parse."""
 
-    def test_stage_a_retry_diagnostic_then_success(self) -> None:
+    def test_interpret_ground_retry_diagnostic_then_success(self) -> None:
         import json
 
-        from aetherdialect._config import DIAGNOSTIC_CODE_STAGE_A_RETRY
-        from aetherdialect._contracts_base import (
+        from aetherdialect._constants import DIAGNOSTIC_CODE_INTERPRET_GROUND_RETRY
+        from aetherdialect._contracts_base import NormalizedExpr
+        from aetherdialect._contracts_core import (
+            RuntimeIntent,
+            SelectCol,
+        )
+        from aetherdialect._contracts_schema import (
             ColumnMetadata,
             SchemaGraph,
             TableMetadata,
-        )
-        from aetherdialect._contracts_core import (
-            NormalizedExpr,
-            RuntimeIntent,
-            SelectCol,
         )
         from aetherdialect._core_utils import (
             reset_diagnostic_collector,
             set_diagnostic_collector,
         )
         from aetherdialect._intent_process import (
-            _logical_intent_to_serialisable,
             full_intent_parse,
+            logical_intent_to_serialisable,
         )
 
         col = ColumnMetadata(
@@ -496,9 +497,10 @@ class TestFullIntentParseStageARetryDiagnostic:
             join_paths_multi={},
             effective_structural_hash="h",
         )
-        bad_stage_a = '{"tables":["t"],"select":""}'
+        bad_ground = '{"tables":["t"],"select":""}'
         li = LogicalIntent(tables=("t",), select="id column")
-        good_stage_a = json.dumps(_logical_intent_to_serialisable(li), separators=(",", ":"), sort_keys=True)
+        good_ground = json.dumps(logical_intent_to_serialisable(li), separators=(",", ":"), sort_keys=True)
+        interpret_ok = '{"approach":"count rows on t","tables":["t"]}'
         stub_intent = RuntimeIntent(
             tables=["t"],
             grain="row_level",
@@ -508,7 +510,7 @@ class TestFullIntentParseStageARetryDiagnostic:
             filters_param=[],
             natural_language="nl",
         )
-        llm_seq = [bad_stage_a, good_stage_a, "{}"]
+        llm_seq = [interpret_ok, bad_ground, interpret_ok, good_ground, "{}"]
         buf: list = []
         tok = set_diagnostic_collector(buf)
         try:
@@ -523,8 +525,8 @@ class TestFullIntentParseStageARetryDiagnostic:
                     return_value=(stub_intent, [], 99, None),
                 ),
             ):
-                out, _warns, _calls = full_intent_parse("count rows", sg, store=None)
+                out, _warns, _calls, _plan = full_intent_parse("count rows", sg, store=None)
         finally:
             reset_diagnostic_collector(tok)
         assert out is stub_intent
-        assert DIAGNOSTIC_CODE_STAGE_A_RETRY in [getattr(d, "code", "") for d in buf]
+        assert DIAGNOSTIC_CODE_INTERPRET_GROUND_RETRY in [getattr(d, "code", "") for d in buf]

@@ -5,55 +5,30 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from aetherdialect._config import ROLE_ALLOWED_AGGREGATIONS, VALID_AGGREGATION_FUNCTIONS
+from aetherdialect._config import ConfigError
+from aetherdialect._constants import ROLE_ALLOWED_AGGREGATIONS, VALID_AGGREGATION_FUNCTIONS
 from aetherdialect._contracts_base import (
-    ColumnMetadata,
     ColumnRole,
     ComplexityTier,
-    ConfigError,
-    CteOutputColumnMeta,
-    ExpansionMetadata,
+    EngineContext,
+    ExprValue,
     FailureCategory,
-    FKEdge,
-    IntentIssue,
-    IntentValidationResult,
-    QSimSkeleton,
-    QSimSummary,
-    RejectedTemplateInfo,
-    RetryFailureContext,
-    SchemaContext,
-    SchemaGraph,
-    SchemaLimits,
-    SeedWarmupSummary,
+    FilterParam,
+    HavingParam,
+    MulGroup,
+    NormalizedExpr,
+    OrderByCol,
     SensitivityClassification,
-    SkeletonPool,
-    SQLShape,
-    TableMetadata,
-    TemplateInfo,
-    TemplateStats,
-    ValueDomain,
     data_type_to_value_type,
     is_date_type,
     is_numeric_type,
     is_string_type,
 )
 from aetherdialect._contracts_core import (
-    CaseRegistryStep,
-    CaseWhenBranch,
-    CaseWhenExpr,
     ConcreteCteStep,
     ConcreteIntent,
-    ExprValue,
     FeedbackCounts,
     FeedbackKind,
-    FilterParam,
-    HavingParam,
-    MulGroup,
-    NormalizedExpr,
-    OrderByCol,
-    QSimFilter,
-    QSimHaving,
-    QSimIntent,
     QuestionFeedbackEntry,
     RejectionBucket,
     RuntimeCteStep,
@@ -64,8 +39,6 @@ from aetherdialect._contracts_core import (
     Template,
     TemplateMatch,
     ValueHistory,
-    WindowRegistryStep,
-    WindowSpec,
     _runtime_cte_to_concrete,
     anchor_lattice_key_for_seed_intent,
     anchor_lattice_signature,
@@ -73,6 +46,33 @@ from aetherdialect._contracts_core import (
     concrete_cte_to_runtime,
     concrete_intent_to_runtime_skeleton,
     runtime_intent_to_concrete,
+)
+from aetherdialect._contracts_schema import (
+    CaseRegistryStep,
+    CaseWhenBranch,
+    CaseWhenExpr,
+    ColumnMetadata,
+    CteOutputColumnMeta,
+    ExpansionMetadata,
+    FKEdge,
+    IntentIssue,
+    IntentValidationResult,
+    QSimFilter,
+    QSimHaving,
+    QSimIntent,
+    QSimSkeleton,
+    QSimSummary,
+    RetryFailureContext,
+    SchemaGraph,
+    SchemaLimits,
+    SeedWarmupSummary,
+    SkeletonPool,
+    SQLShape,
+    TableMetadata,
+    TemplateStats,
+    ValueDomain,
+    WindowRegistryStep,
+    WindowSpec,
 )
 
 
@@ -653,7 +653,6 @@ class TestConcreteIntentToRuntimeSkeleton:
 
     def test_clears_values(self, minimal_intent: RuntimeIntent) -> None:
         """Skeleton mirrors concrete shape with empty param_values."""
-
         concrete = runtime_intent_to_concrete(minimal_intent, "id_sk")
         skel = concrete_intent_to_runtime_skeleton(concrete)
         assert skel.param_values == {}
@@ -804,7 +803,7 @@ class TestQuestionFeedbackEntry:
             updated_at="t",
         )
         with pytest.raises(FrozenInstanceError):
-            e.summary = "x"  # type: ignore[misc]
+            e.summary = "x"
 
 
 class TestFeedbackKind:
@@ -1456,7 +1455,6 @@ class TestClassifySeedWarmupComplexity:
 
     def test_single_table_no_agg_is_simple(self):
         """One bare dimension path maps to SIMPLE."""
-
         si = SeedWarmupIntent(
             intent_id="x",
             tables=["t1"],
@@ -1471,7 +1469,6 @@ class TestClassifySeedWarmupComplexity:
 
     def test_two_tables_at_least_moderate(self):
         """Two referenced tables lift tier to MODERATE or above."""
-
         si = SeedWarmupIntent(
             intent_id="y",
             tables=["a", "b"],
@@ -1705,7 +1702,6 @@ class TestSchemaGraphMethods:
 
     def test_schema_literal_json_unique_marker(self):
         """schema_literal_json marks single-column unique non-PK columns."""
-
         col = ColumnMetadata(
             name="email",
             data_type="varchar",
@@ -1827,7 +1823,6 @@ class TestSchemaGraphMethods:
 
     def test_schema_literal_json_enriched_roles(self):
         """schema_literal_json includes table role, description, column role, and description."""
-
         t1 = TableMetadata(
             name="payment",
             role="fact",
@@ -2027,25 +2022,25 @@ class TestColumnMetadataRoundTrip:
         assert cm.is_usable is True
         assert cm.is_visible is False
 
-    def test_is_visible_pii_hidden(self):
-        """Strict sensitivity hides the column from LLM context."""
+    def test_is_visible_restricted_stays_visible(self):
+        """Restricted sensitivity remains in LLM context when usable."""
         cm = ColumnMetadata(
             name="email",
             data_type="text",
             distinct_count=50,
             row_count=100,
-            sensitivity=SensitivityClassification.STRICT,
+            sensitivity=SensitivityClassification.RESTRICTED,
         )
-        assert cm.is_visible is False
+        assert cm.is_visible is True
 
-    def test_is_visible_restricted_hidden(self):
-        """Forbidden sensitivity hides the column from LLM context."""
+    def test_is_visible_hidden(self):
+        """Hidden sensitivity omits the column from LLM context."""
         cm = ColumnMetadata(
             name="ssn",
             data_type="text",
             distinct_count=50,
             row_count=100,
-            sensitivity=SensitivityClassification.FORBIDDEN,
+            sensitivity=SensitivityClassification.HIDDEN,
         )
         assert cm.is_visible is False
 
@@ -2510,38 +2505,6 @@ class TestQSimSummary:
         assert rebuilt.seed == 42
 
 
-class TestTemplateInfo:
-    """Tests for TemplateInfo."""
-
-    def test_fields(self):
-        """TemplateInfo stores user-facing fields."""
-        ti = TemplateInfo(
-            id="T1",
-            natural_language="total orders",
-            example_question="how many orders",
-            trust_level="trusted",
-            source="human",
-        )
-        assert ti.id == "T1"
-        assert ti.trust_level == "trusted"
-
-
-class TestRejectedTemplateInfo:
-    """Tests for RejectedTemplateInfo."""
-
-    def test_fields(self):
-        """RejectedTemplateInfo stores user-facing fields."""
-        rti = RejectedTemplateInfo(
-            id="RT1",
-            natural_language="bad query",
-            example_question="q",
-            rejection_category="wrong_intent",
-            rejection_count=3,
-        )
-        assert rti.rejection_category == "wrong_intent"
-        assert rti.rejection_count == 3
-
-
 class TestSeedWarmupSummary:
     """Tests for SeedWarmupSummary."""
 
@@ -2624,9 +2587,8 @@ class TestWindowCaseRegistry:
     """Tests for window/case registry serialization on intents."""
 
     def test_runtime_intent_registry_round_trip_dict(self, minimal_intent: RuntimeIntent) -> None:
-        """to_dict/from_dict preserves window_registry and the bare-registry-id select column."""
-
-        from aetherdialect._contracts_core import expr_registry_ref
+        """to_dict/from_dict preserves window_registry and the bare- registry-id select column."""
+        from aetherdialect._contracts_base import expr_registry_ref
 
         ob = OrderByCol(expr=NormalizedExpr.from_column("orders.amount"), direction="ASC")
         wspec = WindowSpec(function="row_number", order_by=[ob])
@@ -2654,7 +2616,6 @@ class TestWindowCaseRegistry:
 
     def test_duplicate_case_registry_id_emits_issue(self) -> None:
         """validate_scope_registries flags duplicate case ids."""
-
         from aetherdialect._validation_schema import validate_scope_registries
 
         cr = CaseRegistryStep(
@@ -2677,7 +2638,6 @@ class TestWindowCaseRegistry:
 
     def test_case_registry_from_dict_accepts_list_case_when(self) -> None:
         """``case_when`` may be a bare branch list (LLM shorthand)."""
-
         step = CaseRegistryStep.from_dict(
             {
                 "registry_id": "c01",
@@ -2740,20 +2700,20 @@ class TestCaseWhenStringResultExpr:
         br = CaseWhenBranch.from_dict(
             {
                 "condition": FilterParam.prompt_example_dict(),
-                "result": "tbl_a.col_a",
+                "result": "table.column",
             }
         )
-        assert br.result.column_ref == "tbl_a.col_a"
+        assert br.result.column_ref == "table.column"
         assert not br.result.string_literal
 
     def test_branch_dict_result_unchanged(self) -> None:
         br = CaseWhenBranch.from_dict(
             {
                 "condition": FilterParam.prompt_example_dict(),
-                "result": {"column_ref": "tbl_a.col_b"},
+                "result": {"column_ref": "table.other_column"},
             }
         )
-        assert br.result.column_ref == "tbl_a.col_b"
+        assert br.result.column_ref == "table.other_column"
 
     def test_branch_literal_string_wins_over_result(self) -> None:
         br = CaseWhenBranch.from_dict(
@@ -2787,46 +2747,104 @@ class TestCaseWhenStringResultExpr:
 
 
 class TestSchemaContextDenyParsing:
-    """Tests for SchemaContext deny_columns parsing (``table.column`` and ``*.column`` entries only)."""
+    """Tests for EngineContext deny_columns parsing (``table.column`` and ``*.column`` entries only)."""
 
     def test_qualified_entry_normalized(self):
-        ctx = SchemaContext(deny_columns=frozenset({"Contacts.Email"}))
+        ctx = EngineContext(deny_columns=frozenset({"Contacts.Email"}))
         assert ctx.deny_columns == frozenset({"contacts.email"})
         assert ctx.qualified_denies() == frozenset({("contacts", "email")})
         assert ctx.glob_column_denies() == frozenset()
 
     def test_glob_entry_normalized(self):
-        ctx = SchemaContext(deny_columns=frozenset({"*.Email"}))
+        ctx = EngineContext(deny_columns=frozenset({"*.Email"}))
         assert ctx.deny_columns == frozenset({"*.email"})
         assert ctx.qualified_denies() == frozenset()
         assert ctx.glob_column_denies() == frozenset({"email"})
 
     def test_mixed_qualified_and_glob(self):
-        ctx = SchemaContext(deny_columns=frozenset({"*.email", "contacts.ssn"}))
+        ctx = EngineContext(deny_columns=frozenset({"*.email", "contacts.ssn"}))
         assert ctx.qualified_denies() == frozenset({("contacts", "ssn")})
         assert ctx.glob_column_denies() == frozenset({"email"})
 
     def test_bare_token_rejected(self):
         with pytest.raises(ConfigError):
-            SchemaContext(deny_columns=frozenset({"email"}))
+            EngineContext(deny_columns=frozenset({"email"}))
 
     def test_too_many_dots_rejected(self):
         with pytest.raises(ConfigError):
-            SchemaContext(deny_columns=frozenset({"public.contacts.email"}))
+            EngineContext(deny_columns=frozenset({"public.contacts.email"}))
 
     def test_empty_entry_rejected(self):
         try:
-            SchemaContext(deny_columns=frozenset({""}))
+            EngineContext(deny_columns=frozenset({""}))
         except (ConfigError, ValueError):
             return
         raise AssertionError("expected ConfigError")
 
     def test_allow_objects_collision_only_for_qualified(self):
         with pytest.raises(ConfigError):
-            SchemaContext(
+            EngineContext(
                 allow_objects=frozenset({"contacts"}),
                 deny_columns=frozenset({"contacts.email"}),
             )
-        ctx = SchemaContext(allow_objects=frozenset({"contacts"}), deny_columns=frozenset({"*.email"}))
+        ctx = EngineContext(allow_objects=frozenset({"contacts"}), deny_columns=frozenset({"*.email"}))
         assert "contacts" in ctx.allow_objects
         assert ctx.glob_column_denies() == frozenset({"email"})
+
+
+class TestPipelineFeatureTags:
+    def test_pipeline_feature_tags_include_qsim_and_expansion_only(self) -> None:
+        from aetherdialect._contracts_core import PIPELINE_FEATURE_TAGS
+
+        assert "multi_cte_chain" in PIPELINE_FEATURE_TAGS
+        assert "in_list" in PIPELINE_FEATURE_TAGS
+        assert "cte_wrap" in PIPELINE_FEATURE_TAGS
+
+    def test_feasible_features_respects_date_columns(self) -> None:
+        from aetherdialect._contracts_base import DatabaseFeatureCapability
+        from aetherdialect._contracts_core import feasible_features_for_capability
+
+        cap_no_dates = DatabaseFeatureCapability(
+            table_count=2,
+            fk_edge_count=1,
+            has_numeric_measures=True,
+            has_date_columns=False,
+            has_array_columns=False,
+            has_categorical_columns=True,
+            max_tables_on_any_join_path=2,
+            max_fk_chain_depth=1,
+            has_self_referential_fk=False,
+            tables_supporting_self_join=frozenset(),
+            has_window_capable_table_sets=True,
+            aggregatable_columns_by_table={},
+            date_columns_by_table={},
+            array_columns_by_table={},
+        )
+        feasible = feasible_features_for_capability(cap_no_dates)
+        assert "date_window_filter" not in feasible
+        assert "in_list" in feasible
+
+    def test_detect_intent_features_finds_having_and_distinct(self) -> None:
+        from aetherdialect._contracts_core import SeedWarmupIntent, detect_intent_features
+
+        intent = SeedWarmupIntent.from_dict(
+            {
+                "intent_id": "feat_test",
+                "tables": ["t1"],
+                "grain": "grouped",
+                "select_cols": [{"expr": "count(*)", "is_aggregated": True}],
+                "group_by_cols": ["t1.id"],
+                "having_param": [
+                    {
+                        "left_expr": "count(*)",
+                        "op": ">",
+                        "value_type": "number",
+                        "param_key": "p1",
+                    }
+                ],
+                "distinct_select_index": 0,
+            }
+        )
+        tags = detect_intent_features(intent)
+        assert "having_aggregate_compare" in tags
+        assert "distinct_select" in tags

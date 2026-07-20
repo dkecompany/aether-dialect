@@ -1,38 +1,37 @@
 """Tests for sql_gen module: join topology, rendering, normalization."""
 
-import re
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aetherdialect._config import (
-    JOIN_CHOICE_SCOPE_MAIN,
-)
+from aetherdialect._constants import JOIN_CHOICE_SCOPE_MAIN
 from aetherdialect._contracts_base import (
-    ColumnMetadata,
     ColumnRole,
+    ExprValue,
+    FilterParam,
+    HavingParam,
     JoinInjectionAlignmentError,
     JoinInjectionFailedError,
     LlmJsonExhausted,
+    MulGroup,
+    NormalizedExpr,
+    OrderByCol,
+)
+from aetherdialect._contracts_core import (
+    RuntimeCteStep,
+    RuntimeIntent,
+    SelectCol,
+)
+from aetherdialect._contracts_schema import (
+    CaseRegistryStep,
+    CaseWhenBranch,
+    CaseWhenExpr,
+    ColumnMetadata,
     SchemaGraph,
     TableMetadata,
     VirtualColumnSpec,
     VirtualTableSpec,
-)
-from aetherdialect._contracts_core import (
-    CaseRegistryStep,
-    CaseWhenBranch,
-    CaseWhenExpr,
-    ExprValue,
-    FilterParam,
-    HavingParam,
-    MulGroup,
-    NormalizedExpr,
-    OrderByCol,
-    RuntimeCteStep,
-    RuntimeIntent,
-    SelectCol,
     WindowRegistryStep,
     WindowSpec,
     registry_render_scope,
@@ -41,11 +40,9 @@ from aetherdialect._core_utils import (
     _format_scalar_for_structural_sql_inline,
     reduce_structural_sql_placeholders,
 )
-from aetherdialect._dialect import (
-    DatabricksDialect,
-    PostgresDialect,
-    finalize_executable_sql,
-)
+from aetherdialect._dialect import finalize_executable_sql
+from aetherdialect._dialect_postgres import PostgresDialect
+from aetherdialect._dialect_sqlglot_engines import DatabricksDialect
 from aetherdialect._sql_gen import (
     JOIN_PRIOR_FEEDBACK_HEADING,
     ScopeClass,
@@ -53,7 +50,6 @@ from aetherdialect._sql_gen import (
     _build_deterministic_select_block,
     _candidate_join_paths_for_tables,
     _join_choice_payload_valid_final,
-    _join_clause_from_signature,
     _join_clause_parts_with_bool_op,
     _join_kind_for_edge,
     _join_path_signature_for_path,
@@ -66,8 +62,6 @@ from aetherdialect._sql_gen import (
     _render_window_over_sql,
     _serialize_join_candidate_row,
     _try_ast_inject_joins,
-    _valid_cte_join_candidate_ids,
-    _valid_main_join_candidate_ids,
     _wrap_for_case_insensitive,
     build_deterministic_sql,
     build_join_choice_prompt,
@@ -85,19 +79,18 @@ from aetherdialect._sql_gen import (
     render_expr_sql,
     render_select_col_sql,
     select_col_prefers_llm_display_alias,
+    sql_gen_type_scope,
     tables_in_join_scope,
 )
 
 
 def _pg_render() -> PostgresDialect:
     """Uninitialized Postgres dialect for deterministic SQL rendering tests."""
-
     return PostgresDialect.__new__(PostgresDialect)
 
 
 def _dbr_render() -> DatabricksDialect:
     """Uninitialized Databricks dialect for Spark-style ``OVER`` rendering tests."""
-
     return DatabricksDialect.__new__(DatabricksDialect)
 
 
@@ -318,6 +311,70 @@ class TestRenderGroupSql:
         assert "'" in result or '"' in result
 
 
+def _shape_a_count_distinct_concat_expr() -> NormalizedExpr:
+    concat_group = MulGroup(
+        multiply=[
+            NormalizedExpr.from_column("customer.first_name"),
+            NormalizedExpr.from_column("customer.last_name"),
+        ],
+        scalar_func="concat",
+    )
+    count_group = MulGroup(
+        multiply=[NormalizedExpr(add_groups=[concat_group])],
+        agg_func="count",
+        distinct=True,
+    )
+    return NormalizedExpr(add_groups=[count_group])
+
+
+class TestCountDistinctConcatShapeA:
+    """COUNT(DISTINCT CONCAT(a, b)) renders as Shape A across dialects."""
+
+    @pytest.mark.parametrize("engine", ["postgresql", "duckdb", "databricks", "mysql"])
+    def test_render_per_dialect(self, engine: str) -> None:
+        from aetherdialect._dialect import get_dialect_class
+
+        dialect_cls = get_dialect_class(engine)
+        dialect = dialect_cls.__new__(dialect_cls)
+        if engine == "databricks":
+            dialect.config = SimpleNamespace(CATALOG="test_catalog", SCHEMA="test_schema")
+        expr = _shape_a_count_distinct_concat_expr()
+        sql = render_expr_sql(expr, dialect)
+        upper = sql.upper()
+        assert "COUNT" in upper and "DISTINCT" in upper and "CONCAT" in upper
+        assert "FIRST_NAME" in upper
+        assert "LAST_NAME" in upper
+
+    def test_parse_validate_repair_round_trip_preserves_distinct(self, simple_schema) -> None:
+        from aetherdialect._intent_expr import parse_expr_string
+        from aetherdialect._intent_repair import normalize_pk_distinct
+        from aetherdialect._validation_semantic import validate_concat_mulgroups_in_runtime
+
+        parsed = parse_expr_string(
+            "COUNT(DISTINCT CONCAT(customers.name, customers.email))",
+        )
+        intent = RuntimeIntent(
+            tables=["customers"],
+            grain="grouped",
+            select_cols=[SelectCol(expr=parsed)],
+            group_by_cols=[NormalizedExpr.from_column("customers.id")],
+            order_by_cols=[],
+            filters_param=[],
+        )
+        issues = validate_concat_mulgroups_in_runtime(intent, "main query")
+        assert not issues
+        repaired = normalize_pk_distinct(intent, simple_schema)
+        expr = repaired.select_cols[0].expr
+        count_group = expr.add_groups[0]
+        assert count_group.distinct is True
+        assert count_group.agg_func == "count"
+        inner = count_group.multiply[0].add_groups[0]
+        assert inner.scalar_func == "concat"
+        sql = render_expr_sql(expr, _pg_render())
+        upper = sql.upper()
+        assert "COUNT" in upper and "DISTINCT" in upper and "CONCAT" in upper
+
+
 class TestRenderExprSql:
     """Tests for render_expr_sql."""
 
@@ -342,6 +399,111 @@ class TestRenderExprSql:
         )
         result = render_expr_sql(expr)
         assert "-" in result
+
+    def test_date_minus_date_avoids_interval_rendering(self):
+        schema = SchemaGraph(
+            tables={
+                "rental": TableMetadata(
+                    name="rental",
+                    columns={
+                        "return_date": ColumnMetadata(
+                            name="return_date",
+                            data_type="date",
+                            value_type="date",
+                        ),
+                        "rental_date": ColumnMetadata(
+                            name="rental_date",
+                            data_type="date",
+                            value_type="date",
+                        ),
+                    },
+                    primary_key=[],
+                    foreign_keys=[],
+                ),
+            },
+            join_paths_multi={},
+            effective_structural_hash="h",
+        )
+        expr = NormalizedExpr(
+            add_groups=[MulGroup(multiply=[NormalizedExpr.from_column("rental.return_date")])],
+            sub_groups=[MulGroup(multiply=[NormalizedExpr.from_column("rental.rental_date")])],
+        )
+        with sql_gen_type_scope(schema):
+            result = render_expr_sql(expr, _pg_render())
+        assert "interval" not in result.lower()
+
+    def test_numeric_minus_numeric_avoids_interval_rendering(self):
+        schema = SchemaGraph(
+            tables={
+                "item": TableMetadata(
+                    name="item",
+                    columns={
+                        "replacement_cost": ColumnMetadata(
+                            name="replacement_cost",
+                            data_type="numeric",
+                            value_type="number",
+                        ),
+                        "rental_rate": ColumnMetadata(
+                            name="rental_rate",
+                            data_type="numeric",
+                            value_type="number",
+                        ),
+                    },
+                    primary_key=[],
+                    foreign_keys=[],
+                ),
+            },
+            join_paths_multi={},
+            effective_structural_hash="h",
+        )
+        expr = NormalizedExpr(
+            add_groups=[MulGroup(multiply=[NormalizedExpr.from_column("item.replacement_cost")])],
+            sub_groups=[MulGroup(multiply=[NormalizedExpr.from_column("item.rental_rate")])],
+        )
+        with sql_gen_type_scope(schema):
+            result = render_expr_sql(expr, _pg_render())
+        assert "interval" not in result.lower()
+
+    def test_date_plus_integer_days_uses_interval_rendering(self):
+        schema = SchemaGraph(
+            tables={
+                "rental": TableMetadata(
+                    name="rental",
+                    columns={
+                        "rental_date": ColumnMetadata(
+                            name="rental_date",
+                            data_type="date",
+                            value_type="date",
+                        ),
+                    },
+                    primary_key=[],
+                    foreign_keys=[],
+                ),
+                "item": TableMetadata(
+                    name="item",
+                    columns={
+                        "rental_duration": ColumnMetadata(
+                            name="rental_duration",
+                            data_type="integer",
+                            value_type="integer",
+                        ),
+                    },
+                    primary_key=[],
+                    foreign_keys=[],
+                ),
+            },
+            join_paths_multi={},
+            effective_structural_hash="h",
+        )
+        expr = NormalizedExpr(
+            add_groups=[
+                MulGroup(multiply=[NormalizedExpr.from_column("item.rental_duration")]),
+                MulGroup(multiply=[NormalizedExpr.from_column("rental.rental_date")]),
+            ],
+        )
+        with sql_gen_type_scope(schema):
+            result = render_expr_sql(expr, _pg_render())
+        assert "interval" in result.lower()
 
 
 class TestExprGuidePlaceholders:
@@ -1057,109 +1219,6 @@ class TestBuildDeterministicSql:
         assert "PARTITION BY" in sql.upper()
 
 
-class TestJoinClauseFromSignature:
-    """Tests for _join_clause_from_signature."""
-
-    def test_single_edge(self):
-        """One segment produces one JOIN clause."""
-        sig = ["a.fk->b.pk"]
-        out = _join_clause_from_signature(sig)
-        assert "JOIN b ON" in out
-        assert "a.fk = b.pk" in out
-
-    def test_multiple_edges(self):
-        """Multiple segments produce multiple JOINs."""
-        sig = ["a.x->b.x", "b.y->c.y"]
-        out = _join_clause_from_signature(sig)
-        assert "JOIN b ON" in out
-        assert "JOIN c ON" in out
-        assert "a.x = b.x" in out
-        assert "b.y = c.y" in out
-
-    def test_empty_returns_empty(self):
-        """Empty signature returns empty string."""
-        assert _join_clause_from_signature([]) == ""
-
-    def test_multi_column_edge(self):
-        """Segment with comma-separated columns produces AND terms."""
-        sig = ["a.c1,c2->b.c1,c2"]
-        out = _join_clause_from_signature(sig)
-        assert "JOIN b ON" in out
-        assert "a.c1 = b.c1" in out
-        assert "a.c2 = b.c2" in out
-        assert " AND " in out
-
-    def test_skips_redundant_join_when_table_already_in_chain(self):
-        """Do not emit a second JOIN to a table already present in the chain."""
-        sig = ["language.lang_id->film.lang_id", "film.title_id->language.lang_id"]
-        out = _join_clause_from_signature(sig, from_table="language", schema=None)
-        assert out.count("JOIN film") == 1
-
-    def test_frontier_from_rental_joins_category_before_category_dot_on(self):
-        """Long paths from rental emit JOIN category before any bare category. column ON term."""
-        sig = [
-            "rental.inventory_id->inventory.inventory_id",
-            "inventory.film_id->film.film_id",
-            "film.film_id->film_category.film_id",
-            "category.category_id->film_category.category_id",
-        ]
-        clause = _join_clause_from_signature(sig, "rental", schema=None)
-        jc = clause.find("JOIN category")
-        assert jc != -1
-        cat_dot = re.search(r"(?<![\w_])category\.", clause)
-        assert cat_dot is not None
-        assert jc < cat_dot.start()
-
-    def test_dimension_join_target_is_inner_when_fk_not_nullable(self):
-        """Dimension role does not bias join kind; INNER is used unless FK source column is nullable."""
-        schema = SchemaGraph(
-            tables={
-                "orders": TableMetadata(
-                    name="orders",
-                    columns={
-                        "id": ColumnMetadata(
-                            name="id",
-                            data_type="integer",
-                            value_type="integer",
-                        ),
-                    },
-                    primary_key=["id"],
-                    foreign_keys=[],
-                    role="fact",
-                ),
-                "customers": TableMetadata(
-                    name="customers",
-                    columns={
-                        "id": ColumnMetadata(
-                            name="id",
-                            data_type="integer",
-                            value_type="integer",
-                        ),
-                    },
-                    primary_key=["id"],
-                    foreign_keys=[],
-                    role="dimension",
-                ),
-            },
-            join_paths_multi={},
-            effective_structural_hash="h",
-        )
-        sig = ["orders.cid->customers.id"]
-        out = _join_clause_from_signature(sig, from_table="orders", schema=schema)
-        assert "INNER JOIN" in out.upper()
-        assert "LEFT JOIN" not in out.upper()
-        assert "customers" in out
-
-    def test_self_join_emits_second_alias(self):
-        """Same-table edge from an existing row adds ``JOIN tbl AS tbl__sjN``."""
-        sig = ["film.parent_film_id->film.film_id"]
-        out = _join_clause_from_signature(sig, from_table="film", schema=None)
-        assert "JOIN film AS film__sj2" in out
-        assert "film__sj2" in out
-        assert "film.parent_film_id" in out
-        assert "film__sj2.film_id" in out
-
-
 class TestBuildJoinAstFromSignature:
     """Dialect adapter ``attach_joins`` reproduces the string join clause."""
 
@@ -1376,7 +1435,6 @@ class TestInjectJoinDeterministicSqlMixed:
 
     def test_parse_failure_raises_join_injection_failed(self):
         """When the dialect cannot parse deterministic SQL, injection fails loudly."""
-
         dialect = PostgresDialect.__new__(PostgresDialect)
         with pytest.raises(JoinInjectionFailedError) as exc_info:
             inject_join_into_deterministic_sql("NOT SQL", [["t1.fk->t2.pk"]], dialect=dialect)
@@ -1403,8 +1461,7 @@ class TestInjectJoinDeterministicSqlMixed:
         assert "cte1.x = other.y" in low
 
     def test_cte_alias_then_main_join_self_fk_target(self):
-        """Main query joins a CTE alias to the base table for a self-referential FK."""
-
+        """Main query joins a CTE alias to the base table for a self- referential FK."""
         det_sql = "WITH emp_mgr AS (SELECT id, manager_id FROM employee)\nSELECT emp_mgr.id\nFROM emp_mgr"
         sigs = [[], ["emp_mgr.manager_id->employee.id"]]
         dialect = PostgresDialect.__new__(PostgresDialect)
@@ -1500,84 +1557,6 @@ class TestJoinClauseKindAndSyntheticPaths:
         s1 = tuple(sorted(_join_path_signature_for_path([e1, e2])))
         s2 = tuple(sorted(_join_path_signature_for_path([e2, e1])))
         assert s1 == s2
-
-    def test_nullable_fk_source_uses_left_join(self):
-        schema = SchemaGraph(
-            tables={
-                "orders": TableMetadata(
-                    name="orders",
-                    columns={
-                        "id": ColumnMetadata(
-                            name="id",
-                            data_type="int",
-                            is_primary_key=True,
-                            value_type="integer",
-                        ),
-                    },
-                    primary_key=["id"],
-                    foreign_keys=[],
-                ),
-                "lines": TableMetadata(
-                    name="lines",
-                    columns={
-                        "oid": ColumnMetadata(
-                            name="oid",
-                            data_type="int",
-                            is_foreign_key=True,
-                            fk_target=("orders", "id"),
-                            is_nullable=True,
-                            value_type="integer",
-                        ),
-                    },
-                    primary_key=[],
-                    foreign_keys=[],
-                ),
-            },
-            join_paths_multi={},
-            effective_structural_hash="h",
-        )
-        sig = ["orders.id->lines.oid"]
-        clause = _join_clause_from_signature(sig, "orders", schema)
-        assert "LEFT JOIN lines" in clause
-
-    def test_non_nullable_fk_uses_inner_when_not_dimension(self):
-        schema = SchemaGraph(
-            tables={
-                "orders": TableMetadata(
-                    name="orders",
-                    columns={
-                        "id": ColumnMetadata(
-                            name="id",
-                            data_type="int",
-                            is_primary_key=True,
-                            value_type="integer",
-                        ),
-                    },
-                    primary_key=["id"],
-                    foreign_keys=[],
-                ),
-                "lines": TableMetadata(
-                    name="lines",
-                    columns={
-                        "oid": ColumnMetadata(
-                            name="oid",
-                            data_type="int",
-                            is_foreign_key=True,
-                            fk_target=("orders", "id"),
-                            is_nullable=False,
-                            value_type="integer",
-                        ),
-                    },
-                    primary_key=[],
-                    foreign_keys=[],
-                ),
-            },
-            join_paths_multi={},
-            effective_structural_hash="h",
-        )
-        sig = ["orders.id->lines.oid"]
-        clause = _join_clause_from_signature(sig, "orders", schema)
-        assert "INNER JOIN lines" in clause
 
     def test_virtual_pk_bridge_via_join_hints(self):
         film_cols = {
@@ -2332,7 +2311,6 @@ class TestRenderSelectColCaseAndWindow:
 
     def test_spark_window_sum_strips_table_qualifiers_on_agg_arg_only(self) -> None:
         """Databricks drops table qualifiers on the aggregate argument inside ``OVER``; partition/order stay qualified."""
-
         ws = WindowSpec(
             function="sum",
             argument=NormalizedExpr.from_column("tbl.amount"),
@@ -2524,16 +2502,6 @@ class TestJoinChoicePromptAndValidation:
         assert "wrong dimension" in system
         assert "scopes" in user
 
-    def test_valid_main_candidate_ids(self) -> None:
-        assert _valid_main_join_candidate_ids(
-            {"candidates": [{"candidate_id": " J01 "}, {"candidate_id": ""}]}
-        ) == frozenset({"J01"})
-
-    def test_valid_cte_join_candidate_ids(self) -> None:
-        got = _valid_cte_join_candidate_ids({"a": {"candidates": [{"candidate_id": "J01"}]}, "b": {"candidates": []}})
-        assert got["a"] == frozenset({"J01"})
-        assert got["b"] == frozenset()
-
     def test_parse_join_choice_payload(self) -> None:
         got = _parse_join_choice_payload(
             {
@@ -2623,7 +2591,7 @@ class TestVirtualFkShadowPath:
 
     def test_shadow_fk_when_target_out_of_scope(self) -> None:
         """A CTE FK to an out-of-scope table is emitted as ``virtual_fk_shadow_path`` when it bridges a real path."""
-        from aetherdialect._contracts_base import FKEdge
+        from aetherdialect._contracts_schema import FKEdge
 
         inventory_cols = {
             "inventory_id": ColumnMetadata(
@@ -2847,8 +2815,19 @@ class TestGenerateColAlias:
 class TestSelectColPrefersLlmDisplayAlias:
     """``select_col_prefers_llm_display_alias`` heuristics."""
 
-    def test_simple_column_false(self) -> None:
+    def test_simple_column_true(self) -> None:
         sc = SelectCol(expr=NormalizedExpr.from_column("t.id"))
+        assert select_col_prefers_llm_display_alias(sc) is True
+
+    def test_multi_agg_false(self) -> None:
+        sc = SelectCol(
+            expr=NormalizedExpr(
+                add_groups=[
+                    MulGroup(multiply=["t.a"], agg_func="sum"),
+                    MulGroup(multiply=["t.b"], agg_func="count"),
+                ],
+            )
+        )
         assert select_col_prefers_llm_display_alias(sc) is False
 
     def test_agg_true(self) -> None:
@@ -2939,15 +2918,19 @@ class TestCandidateJoinPathsBridgeFallback:
         assert any(len(s) == 2 for s in sigs)
 
 
-class TestJoinClauseFromSignatureSkipsMalformed:
-    """Invalid signature segments are skipped."""
+class TestJoinHintsMultiCategoryFilm:
+    """M:N category–film scope must emit a substantive join candidate on rental_shop schema."""
 
-    def test_skips_segment_without_arrow(self) -> None:
-        assert _join_clause_from_signature(["noarrow", "a.x->b.y"], from_table="a") != ""
-        assert "JOIN b" in _join_clause_from_signature(["noarrow", "a.x->b.y"], from_table="a")
+    def test_rental_shop_category_film_emits_non_empty_join_path(self) -> None:
+        pytest.importorskip("duckdb")
+        from aetherdialect import AetherEngine
 
-    def test_skips_segment_without_dot(self) -> None:
-        assert _join_clause_from_signature(["a->b.y"], from_table="a") == ""
+        with AetherEngine.offline_sandbox() as sb:
+            schema = sb.engine._schema_graph
+        hints = join_hints_multi(schema, ["category", "film"])
+        substantive = [c for c in hints.get("candidates", []) if c.get("join_path_signature")]
+        assert substantive, hints
+        assert substantive[0]["candidate_id"] != "J00" or substantive[0].get("edge_count", 0) > 0
 
 
 class TestRegistrySqlParity:
@@ -2978,11 +2961,7 @@ class TestRegistrySqlParity:
 
 
 class TestPromotedSemanticEdgeFlowsThroughJoinHints:
-    """
-    Integration: semantic→FK promotion + two-pass disambiguation surfaces.
-
-    Verifies the Turn A promotion path so the existing two-pass LLM join machinery (pass 1 base FKs, pass 2 with semantics) sees promoted edges as first-class FK candidates and only falls back to semantic candidates for genuinely non-promotable edges.
-    """
+    """Integration: semantic→FK promotion + two-pass disambiguation surfaces. Verifies the Turn A promotion path so the existing two-pass LLM join machinery (pass 1 base FKs, pass 2 with semantics) sees promoted edges as first-class FK candidates and only falls back to semantic candidates for genuinely non-promotable edges."""
 
     def _build_pair(
         self,
@@ -2990,7 +2969,6 @@ class TestPromotedSemanticEdgeFlowsThroughJoinHints:
         right_is_pk: bool,
     ) -> SchemaGraph:
         """Build a two-table schema with a semantic neighbor pair."""
-
         left_cols = {
             "right_tbl_id": ColumnMetadata(
                 name="right_tbl_id",
@@ -3045,18 +3023,19 @@ class TestPromotedSemanticEdgeFlowsThroughJoinHints:
 
     def test_promoted_edge_appears_as_base_fk_candidate(self):
         """A semantic neighbor anchored on a PK is promoted and surfaces as catalog_fk in pass 1."""
-        from aetherdialect._schema import (
-            _promote_semantic_edges_to_fks,
-            _recompute_join_paths_multi,
+        from aetherdialect._schema_graph import (
+            promote_cross_component_semantic_edges,
+            promote_same_component_semantic_edges,
+            recompute_join_paths_multi,
         )
 
         sg = self._build_pair(right_is_pk=True)
-        promoted = _promote_semantic_edges_to_fks(sg)
+        promoted = promote_cross_component_semantic_edges(sg) + promote_same_component_semantic_edges(sg)
         assert promoted == 1
         assert sg.tables["left_tbl"].columns["right_tbl_id"].semantic_join_neighbors == []
         assert sg.tables["right_tbl"].columns["id"].semantic_join_neighbors == []
 
-        sg.join_paths_multi = _recompute_join_paths_multi(sg.tables)
+        sg.join_paths_multi = recompute_join_paths_multi(sg.tables)
         hints = join_hints_multi(
             sg,
             ["left_tbl", "right_tbl"],
@@ -3071,17 +3050,18 @@ class TestPromotedSemanticEdgeFlowsThroughJoinHints:
 
     def test_non_promotable_edge_only_visible_in_pass2(self):
         """A semantic neighbor with no PK endpoint is NOT promoted; pass 1 has no candidate, pass 2 surfaces it."""
-        from aetherdialect._schema import (
-            _promote_semantic_edges_to_fks,
-            _recompute_join_paths_multi,
+        from aetherdialect._schema_graph import (
+            promote_cross_component_semantic_edges,
+            promote_same_component_semantic_edges,
+            recompute_join_paths_multi,
         )
 
         sg = self._build_pair(right_is_pk=False)
-        promoted = _promote_semantic_edges_to_fks(sg)
+        promoted = promote_cross_component_semantic_edges(sg) + promote_same_component_semantic_edges(sg)
         assert promoted == 0
         assert sg.tables["left_tbl"].columns["right_tbl_id"].semantic_join_neighbors == [("right_tbl", "other")]
 
-        sg.join_paths_multi = _recompute_join_paths_multi(sg.tables)
+        sg.join_paths_multi = recompute_join_paths_multi(sg.tables)
         pass1 = join_hints_multi(
             sg,
             ["left_tbl", "right_tbl"],
@@ -3105,14 +3085,16 @@ class TestPromotedSemanticEdgeFlowsThroughJoinHints:
 
     def test_promoted_edge_canonicalized_via_full_pipeline_helpers(self):
         """End-to-end: profile→promote→recompute yields a stable J01 with catalog_fk edge_kind."""
-        from aetherdialect._schema import (
-            _promote_semantic_edges_to_fks,
-            _recompute_join_paths_multi,
+        from aetherdialect._schema_graph import (
+            promote_cross_component_semantic_edges,
+            promote_same_component_semantic_edges,
+            recompute_join_paths_multi,
         )
 
         sg = self._build_pair(right_is_pk=True)
-        _promote_semantic_edges_to_fks(sg)
-        sg.join_paths_multi = _recompute_join_paths_multi(sg.tables)
+        promote_cross_component_semantic_edges(sg)
+        promote_same_component_semantic_edges(sg)
+        sg.join_paths_multi = recompute_join_paths_multi(sg.tables)
         hints = join_hints_multi(
             sg,
             ["left_tbl", "right_tbl"],
@@ -3168,7 +3150,7 @@ class TestVisibilityFilterInJoinPaths:
                 row_count=50,
             ),
         }
-        from aetherdialect._contracts_base import FKEdge
+        from aetherdialect._contracts_schema import FKEdge
 
         fk = FKEdge(
             src_table="orders",
@@ -3236,9 +3218,9 @@ class TestVisibilityFilterInJoinPaths:
         paths = enumerate_join_paths_base(["orders", "customers"], sg, virtual_specs={})
         assert paths == [[]]
 
-    def test_pii_sensitivity_fk_column_filtered(self) -> None:
-        """sensitivity in HIDDEN_SENSITIVITIES on FK source column drops the path."""
-        sg = self._build_two_tables(fk_sensitivity="pii")
+    def test_sensitive_hidden_fk_column_filtered(self) -> None:
+        """Sensitivity in HIDDEN_SENSITIVITIES on FK source column drops the path."""
+        sg = self._build_two_tables(fk_sensitivity="hidden")
         paths = enumerate_join_paths_base(["orders", "customers"], sg, virtual_specs={})
         assert paths == [[]]
 

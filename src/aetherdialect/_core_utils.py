@@ -14,64 +14,76 @@ import tempfile
 import threading
 import time
 
-if sys.platform == "win32":
-    import msvcrt
-else:
-    import fcntl
-
-from collections import Counter, defaultdict
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
-from contextvars import ContextVar
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from decimal import Decimal
-from enum import Enum
-from importlib.metadata import PackageNotFoundError, version
-from itertools import permutations, product
-from typing import Any, Protocol
-
-from openai import AzureOpenAI, OpenAI
-from packaging.version import InvalidVersion, Version
-
 from ._config import (
+    LlmExecutionConfig,
+    PolicyConfig,
+)
+from ._constants import (
+    AETHERDIALECT_LOG_PERMISSION_DENIED_DETAIL_ENV,
     ARTIFACT_FORMAT_VERSION,
     ARTIFACT_LOCK_FILENAME,
     ARTIFACT_LOCK_POLL_INTERVAL_SECONDS,
     ARTIFACT_LOCK_TIMEOUT_SECONDS,
     ARTIFACT_MANIFEST_FILENAME,
+    AZURE_OPENAI_ENV_DEPLOYMENT_HEAVY,
+    AZURE_OPENAI_ENV_DEPLOYMENT_LIGHT,
+    AZURE_OPENAI_ENV_DEPLOYMENT_MEDIUM,
     DIAGNOSTIC_CODE_ENGINE_INFO,
     JSON_COMPACT_SEPARATORS,
     LEGACY_ARTIFACT_FILENAMES,
     LEGACY_ARTIFACT_GLOBS,
     MIGRATION_DATA_OVERLAP_MIN,
     MIN_COMPATIBLE_PACKAGE_VERSION,
-    PROFILING_TOP_K,
+    QUERY_RESULTS_HEADER,
+    REPHRASE_HINT_MESSAGES,
+    SQL_BIND_TOKEN_RE,
     STRUCTURAL_IDENTITY_VALUES,
     STRUCTURAL_INLINE_SQL_LITERAL_LIST_RE,
     STRUCTURAL_SQL_PLACEHOLDER_PARAM_RE,
     TEMPLATE_STORE_SEGMENT,
+    UNBOUND_PYFORMAT_PLACEHOLDER_RE,
+    USER_ERROR_PREFIX,
+    USER_INVALID_INPUT_LINE,
+    USER_REJECTED_RESULT_BUCKET_TIPS,
+    USER_TERMINATED_LINE,
+    VALID_VALUE_TYPES,
+    VALUE_TYPE_NORMALIZATION,
     WRITE_QUEUE_FILENAME,
-    EngineConfig,
-    LlmExecutionConfig,
-    diagnostic_debug_enabled,
-    diagnostic_force_enter,
-    diagnostic_force_exit,
-    diagnostic_pipeline_trace_full_enabled,
-    diagnostic_verbose_enabled,
-    effective_llm_timeout_ms,
 )
+
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
+
+from collections import Counter, defaultdict
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from decimal import Decimal
+from enum import Enum
+from importlib.metadata import PackageNotFoundError, version
+from itertools import permutations, product
+from pathlib import Path
+from typing import Any, Literal, Protocol, cast
+from unittest.mock import patch
+
+from packaging.version import InvalidVersion, Version
+
 from ._contracts_base import (
-    ColumnMetadata,
     Diagnostic,
-    FKEdge,
-    LlmJsonExhausted,
-    LlmTransientFailure,
+    EngineContext,
     MigrationTier,
-    SchemaContext,
+    WriteQueueEvent,
+)
+from ._contracts_core import RuntimeIntent
+from ._contracts_schema import (
+    ColumnMetadata,
+    FKEdge,
     SchemaGraph,
     TableMetadata,
-    WriteQueueEvent,
 )
 
 _DIAGNOSTIC_COLLECTOR: ContextVar[list[Diagnostic] | None] = ContextVar(
@@ -86,106 +98,123 @@ _DIAGNOSTIC_PRINT_LISTENER: ContextVar[Callable[[str], None] | None] = ContextVa
     default=None,
 )
 
-_LLM_EXECUTION_CONTEXT: ContextVar[LlmExecutionConfig | None] = ContextVar(
+LLM_EXECUTION_CONTEXT: ContextVar[LlmExecutionConfig | None] = ContextVar(
     "aetherdialect_llm_execution",
     default=None,
 )
 
-_TASK_MODEL_TO_DEPLOYMENT_FIELD: dict[str, str] = {
-    "gpt-4o-mini": "deployment_light",
-    "gpt-4.1-mini": "deployment_medium",
-    "gpt-5.4-mini": "deployment_heavy",
-}
+
+def is_structural_param_key(key: str) -> bool:
+    """Return True when *key* is a structural bind name (``s`` followed by digits)."""
+    return len(key) >= 2 and key[0] == "s" and key[1:].isdigit()
 
 
-REPHRASE_HINT_MESSAGES: dict[str, str] = {
-    "intent_parse_failed": (
-        "Please rephrase your question.\n"
-        "Tips: mention specific tables or columns, keep filters simple, "
-        "and avoid ambiguous references."
-    ),
-    "schema_invalid_declined": (
-        "Please rephrase your question.\n"
-        "Tips: use tables and columns that exist in this database, "
-        "or ask about a related concept."
-    ),
-    "sql_validation_failed": (
-        "Please rephrase or retry.\n"
-        "Tips: simplify filters, be explicit about columns, "
-        "or split a complex question into smaller ones."
-    ),
-    "user_rejected_intent": (
-        "Please rephrase your question.\n"
-        "Tips: be more specific about which columns, filters, grouping, "
-        "or time range you want."
-    ),
-    "user_rejected_result": (
-        "Please retry or rephrase your question.\n"
-        "Tips: be more specific about columns, filters, grouping, or time range."
-    ),
-    "restricted_question": (
-        "This question references columns or tables outside the visible schema. Try rephrasing using only "
-        "the table and column names you see in the schema notes, or update `deny_columns` / `allow_columns` "
-        "if you want them in scope."
-    ),
-    "vague_question": (
-        "I could not pin this question to specific tables or columns. Try naming the entity (a table or "
-        "business object), the metric you want, and any filter (date range, status, region) so I have "
-        "something concrete to map."
-    ),
-}
+def effective_explain_timeout_ms() -> int | None:
+    """Statement timeout for ``EXPLAIN`` paths only. Prefers:data:`PolicyConfig.EXPLAIN_TIMEOUT_MS` when set and positive; otherwise uses :data:`PolicyConfig.STATEMENT_TIMEOUT_MS`. Returns ``None`` when neither bound is active."""
+    explain_tm = PolicyConfig.EXPLAIN_TIMEOUT_MS
+    if cost_cap_active(explain_tm) and explain_tm is not None:
+        return int(explain_tm)
+    statement_tm = PolicyConfig.STATEMENT_TIMEOUT_MS
+    if cost_cap_active(statement_tm) and statement_tm is not None:
+        return int(statement_tm)
+    return None
 
-USER_REJECTED_RESULT_BUCKET_TIPS: dict[str, str] = {
-    "MISSING_FILTER": ("Tips: name the filter or dimension you care about (time range, status, category)."),
-    "WRONG_GROUPING": ("Tips: say whether you want totals per entity, per period, or overall."),
-    "WRONG_AGGREGATION": ("Tips: specify sum, average, count, or another metric clearly."),
-    "WRONG_TIME_RANGE": ("Tips: give an explicit date range or relative window."),
-    "WRONG_TABLES_OR_JOINS": ("Tips: name the tables or relationships that should connect your answer."),
-    "WRONG_SORT_OR_LIMIT": ("Tips: say how results should be ordered or how many rows you need."),
-    "OTHER": ("Tips: be more specific about columns, filters, grouping, or time range."),
-}
 
-QUERY_RESULTS_HEADER: str = "Query Results"
+def effective_llm_timeout_ms() -> int:
+    """Resolved HTTP timeout for OpenAI-compatible clients and :func:`aetherdialect._llm_provider.llm_chat`. Uses:data:`PolicyConfig.LLM_TIMEOUT_MS` when positive; otherwise ``60_000`` ms."""
+    tm = PolicyConfig.LLM_TIMEOUT_MS
+    if cost_cap_active(tm) and tm is not None:
+        return int(tm)
+    return 60_000
 
-USER_ERROR_PREFIX: str = "Error: "
-USER_WARN_PREFIX: str = "! "
-USER_TERMINATED_LINE: str = "\nUser terminated."
-USER_INVALID_INPUT_LINE: str = "\nInvalid input."
+
+def seed_warmup_failure_code_from_validate_sql_error(
+    message: str | None,
+    *,
+    failure_category: str | None = None,
+) -> str:
+    """Map ``validate_sql`` outcome to a seed-warmup validation failure code."""
+    if failure_category:
+        exec_bucket = {
+            "execution_explain_failed": "explain_failed",
+            "execution_timeout": "explain_transient",
+            "execution_cost_exceeded": "explain_failed",
+            "execution_schema_error": "explain_schema",
+            "execution_semantic_error": "explain_semantic",
+            "execution_other_error": "explain_failed",
+        }
+        hit = exec_bucket.get(failure_category)
+        if hit is not None:
+            return hit
+        if failure_category == "schema" and (message or "").strip() == "not_select":
+            return "ast_validate_unsupported_construct"
+        if failure_category == "other" and (message or "").strip() == "forbidden_sql":
+            return "ast_validate_other"
+        if failure_category == "unbound_placeholder":
+            return "ast_validate_unbound_placeholder"
+
+    if not message:
+        return "ast_validate_other"
+    m = message.strip()
+    for tag in (
+        "explain_schema",
+        "explain_semantic",
+        "explain_transient",
+        "explain_failed",
+    ):
+        if m.startswith(f"[{tag}]"):
+            return tag
+    if m == "not_select":
+        return "ast_validate_unsupported_construct"
+    if m == "forbidden_sql":
+        return "ast_validate_other"
+    if m == "unbound_placeholder":
+        return "ast_validate_unbound_placeholder"
+    low = m.lower()
+    if "sql structure error:" in low:
+        tail = m.split("SQL structure error:", 1)[-1].strip().lower()
+        if "cte" in tail or "with " in tail:
+            return "ast_validate_cte_error"
+        if "from" in tail and ("missing" in tail or "no from" in tail):
+            return "ast_validate_missing_from_clause"
+        if "column" in tail and ("not exist" in tail or "undefined" in tail or "bad" in tail):
+            return "ast_validate_bad_identifier"
+        if "syntax" in tail or "parse" in tail:
+            return "ast_validate_pglast_syntax"
+        return "ast_validate_other"
+    if "syntax" in low or "parse" in low:
+        return "ast_validate_pglast_syntax"
+    return "ast_validate_other"
 
 
 @contextmanager
 def llm_execution_scope(cfg: LlmExecutionConfig) -> Iterator[None]:
     """Bind *cfg* as the active :class:`LlmExecutionConfig` for nested LLM calls."""
-
-    tok = _LLM_EXECUTION_CONTEXT.set(cfg)
+    tok = LLM_EXECUTION_CONTEXT.set(cfg)
     try:
         yield
     finally:
-        _LLM_EXECUTION_CONTEXT.reset(tok)
+        LLM_EXECUTION_CONTEXT.reset(tok)
 
 
 def diagnostic_segment() -> list[Diagnostic]:
     """Return a new collector list and bind it as the active diagnostic buffer (call :func:`reset_diagnostic_collector` when done)."""
-
     buf: list[Diagnostic] = []
     return buf
 
 
 def set_diagnostic_collector(buf: list[Diagnostic] | None) -> Any:
     """Bind *buf* as the active diagnostic collector; returns a token for :func:`reset_diagnostic_collector`."""
-
     return _DIAGNOSTIC_COLLECTOR.set(buf)
 
 
 def reset_diagnostic_collector(token: Any) -> None:
     """Restore the previous diagnostic collector."""
-
     _DIAGNOSTIC_COLLECTOR.reset(token)
 
 
 def take_and_clear_orphan_diagnostics() -> tuple[Diagnostic, ...]:
     """Drain diagnostics emitted before any collector was bound (for example during construction)."""
-
     out = tuple(_ORPHAN_DIAGNOSTICS)
     _ORPHAN_DIAGNOSTICS.clear()
     return out
@@ -194,7 +223,6 @@ def take_and_clear_orphan_diagnostics() -> tuple[Diagnostic, ...]:
 @contextmanager
 def diagnostic_print_listener(fn: Callable[[str], None] | None) -> Iterator[None]:
     """Bind *fn* to receive human-readable copies of notify lines (used by ``run_interactive``)."""
-
     tok = _DIAGNOSTIC_PRINT_LISTENER.set(fn)
     try:
         yield
@@ -204,7 +232,6 @@ def diagnostic_print_listener(fn: Callable[[str], None] | None) -> Iterator[None
 
 def drain_diagnostic_collector() -> tuple[Diagnostic, ...]:
     """Extract and clear diagnostics from the active collector (used when building :class:`SessionStep`)."""
-
     buf = _DIAGNOSTIC_COLLECTOR.get()
     if not buf:
         return ()
@@ -223,7 +250,6 @@ def notify(
     details: tuple[tuple[str, str], ...] = (),
 ) -> None:
     """Append a diagnostic to the active collector and optionally mirror the line to a print listener."""
-
     eff_stage = stage or "notify"
     diag = Diagnostic(
         stage=eff_stage,
@@ -238,6 +264,8 @@ def notify(
         buf.append(diag)
     else:
         _ORPHAN_DIAGNOSTICS.append(diag)
+    if prev_suppress:
+        return
     fn = _DIAGNOSTIC_PRINT_LISTENER.get()
     if fn is not None:
         fn(message)
@@ -259,7 +287,6 @@ _progress_depth = 0
 
 def progress(message: str) -> None:
     """Emit a progress diagnostic when :func:`progress_enabled` is active and mirror it to a print listener."""
-
     if _progress_depth <= 0:
         return
     notify(message, stage="progress", code=DIAGNOSTIC_CODE_ENGINE_INFO)
@@ -268,7 +295,6 @@ def progress(message: str) -> None:
 @contextmanager
 def progress_enabled() -> Iterator[None]:
     """Enable :func:`progress` writes for the duration of the block (supports nesting)."""
-
     global _progress_depth
     _progress_depth += 1
     try:
@@ -277,16 +303,14 @@ def progress_enabled() -> Iterator[None]:
         _progress_depth -= 1
 
 
-def running_in_jupyter() -> bool:
+def _running_in_jupyter() -> bool:
     """Return True when the current process runs inside a Jupyter or IPython kernel front-end."""
-
     return "ipykernel" in sys.modules
 
 
 def echo_yes_no_answer(raw: str) -> None:
     """Echo ``Yes`` or ``No`` for *raw* input answer; emit nothing for invalid tokens or in a TTY terminal."""
-
-    if not running_in_jupyter():
+    if not _running_in_jupyter():
         return
     token = raw.strip().lower()
     if token in {"y", "yes"}:
@@ -297,49 +321,33 @@ def echo_yes_no_answer(raw: str) -> None:
 
 def echo_user_text(raw: str) -> None:
     """Echo *raw* on its own line for Jupyter front-ends (terminal already shows what the user typed)."""
-
-    if not running_in_jupyter() or not raw:
+    if not _running_in_jupyter() or not raw:
         return
     print(raw, flush=True)
 
 
-def result(message: str) -> None:
-    """Emit a query-result line through :func:`notify` (mirrored to the diagnostic print listener when bound)."""
-
+def _result(message: str) -> None:
+    """Emit a query-_result line through :func:`notify` (mirrored to the diagnostic print listener when bound)."""
     notify(message, stage="user_result", code=DIAGNOSTIC_CODE_ENGINE_INFO, level="info")
-
-
-def warn(message: str) -> None:
-    """Emit a non-fatal warning through :func:`notify`, prefixed with ``! ``."""
-
-    notify(
-        f"{USER_WARN_PREFIX}{message}",
-        stage="user_warn",
-        code=DIAGNOSTIC_CODE_ENGINE_INFO,
-        level="warn",
-    )
 
 
 def error(message: str) -> None:
     """Emit an error line through :func:`notify`, prefixed with ``Error: ``."""
-
     notify(
         f"{USER_ERROR_PREFIX}{message}",
         stage="user_error",
         code=DIAGNOSTIC_CODE_ENGINE_INFO,
-        level="error",
+        level="_error",
     )
 
 
 def prompt(message: str) -> str:
     """Display ``message``, read one line from stdin, and return it stripped."""
-
     return input(message).strip()
 
 
 def terminated() -> None:
     """Emit the canonical user-termination line through :func:`notify`."""
-
     notify(
         USER_TERMINATED_LINE,
         stage="user_terminated",
@@ -350,7 +358,6 @@ def terminated() -> None:
 
 def invalid_input(detail: str | None = None) -> None:
     """Emit the canonical invalid-input line through :func:`notify`, or *detail* when provided."""
-
     if detail:
         notify(
             detail.strip(),
@@ -379,45 +386,37 @@ class InteractiveChoicePort(Protocol):
         ...
 
 
-_clients: dict[tuple[str, int], OpenAI | AzureOpenAI] = {}
+def note_interactive_turn(
+    choice_port: InteractiveChoicePort | None,
+    *,
+    outcome: str,
+    error: str | None = None,
+    sql: str | None = None,
+    rows: list[tuple[Any, ...]] | None = None,
+    columns: tuple[str, ...] | None = None,
+    rejection_bucket: str | None = None,
+    intent: RuntimeIntent | None = None,
+    matched_template: Any | None = None,
+    template_history_index: int | None = None,
+) -> None:
+    """Record turn outcome on *choice_port* when it implements ``note_turn_outcome``."""
+    fn = getattr(choice_port, "note_turn_outcome", None)
+    if callable(fn):
+        fn(
+            outcome=outcome,
+            error=error,
+            sql=sql,
+            rows=rows,
+            columns=columns,
+            rejection_bucket=rejection_bucket,
+            intent=intent,
+            matched_template=matched_template,
+            template_history_index=template_history_index,
+        )
 
 
-def clear_llm_clients() -> None:
-    """Remove cached OpenAI clients so a new environment configuration takes effect."""
-
-    _clients.clear()
-
-
-def _azure_deployment_for_model(model_id: str) -> str:
-    """Return the Azure deployment name for *model_id* using the active execution config or environment."""
-
-    mid = str(model_id).strip()
-    runtime_llm = _LLM_EXECUTION_CONTEXT.get()
-    if runtime_llm is not None:
-        field = _TASK_MODEL_TO_DEPLOYMENT_FIELD.get(mid)
-        if field:
-            dep = getattr(runtime_llm, field, "")
-            if isinstance(dep, str) and dep.strip():
-                return dep.strip()
-        return mid
-    env_triples: tuple[tuple[str, tuple[str, ...]], ...] = (
-        ("gpt-5.4-mini", ("AZURE_OPENAI_DEPLOYMENT_HEAVY",)),
-        ("gpt-4.1-mini", ("AZURE_OPENAI_DEPLOYMENT_MEDIUM",)),
-        ("gpt-4o-mini", ("AZURE_OPENAI_DEPLOYMENT_LIGHT",)),
-    )
-    for known_id, env_keys in env_triples:
-        if known_id != mid:
-            continue
-        for key in env_keys:
-            value = (os.environ.get(key) or "").strip()
-            if value:
-                return value
-        return mid
-    return mid
-
-
-_telemetry_sink: list[str] | None = None
-_telemetry_suppress_console: bool = False
+prev_sink: list[str] | None = None
+prev_suppress: bool = False
 
 
 @contextmanager
@@ -426,144 +425,30 @@ def telemetry_capture(
     suppress_console: bool = False,
     force_diagnostic_flags: bool = False,
 ) -> Iterator[list[str]]:
-    """
-    Collect ``log`` / ``debug`` / ``pipeline_trace`` / ``pipeline_trace_lazy`` lines into a buffer.
-
-    Args:
-
-        suppress_console: When true, ``log`` / ``debug`` / ``pipeline_trace`` / ``pipeline_trace_lazy`` skip ``print`` even when flags are on (lines still append to the buffer).
-
-        force_diagnostic_flags: When true, temporarily enables diagnostic output (nested ``diagnostic_force_enter`` / ``diagnostic_force_exit``) so the pipeline emits into the capture buffer while the block runs.
-
-    Yields:
-
-        The list that receives captured lines (same object for the whole block).
-    """
-    global _telemetry_sink, _telemetry_suppress_console
+    """Collect ``debug`` / ``pipeline_trace`` lines into a buffer."""
+    global prev_sink, prev_suppress
     buf: list[str] = []
-    prev_sink = _telemetry_sink
-    prev_suppress = _telemetry_suppress_console
+    saved_sink = prev_sink
+    saved_suppress = prev_suppress
     if force_diagnostic_flags:
         diagnostic_force_enter()
-    _telemetry_sink = buf
-    _telemetry_suppress_console = suppress_console
+    prev_sink = buf
+    prev_suppress = suppress_console
     try:
         yield buf
     finally:
-        _telemetry_sink = prev_sink
-        _telemetry_suppress_console = prev_suppress
+        prev_sink = saved_sink
+        prev_suppress = saved_suppress
         if force_diagnostic_flags:
             diagnostic_force_exit()
 
 
-def _provider_order() -> list[str]:
-    """Return the single resolved provider stored on :class:`EngineConfig`."""
-    if EngineConfig.LLM_PROVIDER in {"openai", "azure"}:
-        return [EngineConfig.LLM_PROVIDER]
-    return ["openai"]
-
-
-def _provider_is_configured(provider: str) -> bool:
-    """Return whether a provider has required credentials configured."""
-    if provider == "openai":
-        return bool(EngineConfig.API_TOKEN and EngineConfig.OPENAI_BASE_URL)
-    if provider == "azure":
-        has_token = bool(EngineConfig.AZURE_API_TOKEN or EngineConfig.API_TOKEN)
-        has_endpoint = bool(EngineConfig.AZURE_OPENAI_ENDPOINT or EngineConfig.AZURE_OPENAI_BASE_URL)
-        has_version = bool((EngineConfig.AZURE_OPENAI_API_VERSION or "").strip())
-        return has_token and has_endpoint and has_version
-    return False
-
-
-def _resolve_llm_timeout_ms() -> int:
-    """Return HTTP timeout milliseconds from the active execution config or policy defaults."""
-
-    llm = _LLM_EXECUTION_CONTEXT.get()
-    if llm is not None and isinstance(llm.llm_timeout_ms, int) and llm.llm_timeout_ms > 0:
-        return int(llm.llm_timeout_ms)
-    return effective_llm_timeout_ms()
-
-
-def _build_client(provider: str) -> OpenAI | AzureOpenAI:
-    """Build and cache an OpenAI-compatible client for *provider*."""
-    llm = _LLM_EXECUTION_CONTEXT.get()
-    timeout_ms = _resolve_llm_timeout_ms()
-    timeout_s = timeout_ms / 1000.0
-    endpoint_sig = ""
-    if llm is not None and isinstance(llm.azure_endpoint, str) and llm.azure_endpoint.strip():
-        endpoint_sig = llm.azure_endpoint.strip()
-    cache_key = (provider, timeout_ms, endpoint_sig)
-    if cache_key in _clients:
-        return _clients[cache_key]
-    if provider == "openai":
-        client: OpenAI | AzureOpenAI = OpenAI(
-            api_key=EngineConfig.API_TOKEN,
-            base_url=EngineConfig.OPENAI_BASE_URL,
-            timeout=timeout_s,
-        )
-        _clients[cache_key] = client
-        return client
-    if provider == "azure":
-        if llm is not None and llm.azure_endpoint.strip():
-            endpoint = llm.azure_endpoint.strip()
-            api_version = (llm.azure_api_version or "").strip()
-            api_key = (llm.azure_api_key or EngineConfig.AZURE_API_TOKEN or EngineConfig.API_TOKEN or "").strip()
-        else:
-            endpoint = EngineConfig.AZURE_OPENAI_ENDPOINT or EngineConfig.AZURE_OPENAI_BASE_URL
-            api_version = (EngineConfig.AZURE_OPENAI_API_VERSION or "").strip()
-            api_key = EngineConfig.AZURE_API_TOKEN or EngineConfig.API_TOKEN
-        if not endpoint:
-            raise RuntimeError("Azure OpenAI requires AZURE_OPENAI_ENDPOINT or AZURE_OPENAI_BASE_URL")
-        if not api_version:
-            raise RuntimeError("Azure OpenAI requires AZURE_OPENAI_API_VERSION")
-        client = AzureOpenAI(
-            api_key=api_key,
-            azure_endpoint=endpoint,
-            api_version=api_version,
-            timeout=timeout_s,
-        )
-        _clients[cache_key] = client
-        return client
-    raise RuntimeError(f"Unsupported LLM provider: {provider}")
-
-
-def log(msg: str) -> None:
-    """
-    Print ``[LOG]`` + *msg* when ``PolicyConfig.VERBOSE`` or verbose diagnostics are on (see ``diagnostic_verbose_enabled``).
-
-    Args:
-
-        msg: Text to print.
-
-    Returns:
-
-        None.
-    """
-    line = f"[LOG] {msg}"
-    if _telemetry_sink is not None:
-        _telemetry_sink.append(line)
-    if _telemetry_suppress_console:
-        return
-    if diagnostic_verbose_enabled():
-        print(line)
-
-
 def debug(msg: str) -> None:
-    """
-    Print ``[DEBUG]`` + *msg* when ``PolicyConfig.DEBUG`` or debug diagnostics are on (see ``diagnostic_debug_enabled``).
-
-    Args:
-
-        msg: Text to print.
-
-    Returns:
-
-        None.
-    """
+    """Print ``[DEBUG]`` + *msg* when ``PolicyConfig.DEBUG`` or debug. diagnostics are on (see ``diagnostic_debug_enabled``)."""
     line = f"[DEBUG] {msg}"
-    if _telemetry_sink is not None:
-        _telemetry_sink.append(line)
-    if _telemetry_suppress_console:
+    if prev_sink is not None:
+        prev_sink.append(line)
+    if prev_suppress:
         return
     if diagnostic_debug_enabled():
         print(line)
@@ -574,82 +459,35 @@ def debug(msg: str) -> None:
         )
 
 
-def pipeline_trace(heading: str, body: str) -> None:
-    """
-    Print a full ``[PIPELINE_TRACE]`` block when debug + full trace are on.
+def _format_pipeline_trace_block(heading: str, body: str) -> str:
+    """Format a pipeline-trace block without performing I/O."""
+    return f"[PIPELINE_TRACE] {heading}\n{body}"
 
-    Args:
 
-        heading: Event label.
-
-        body: Untruncated payload (SQL, JSON, prompts, etc.).
-
-    Returns:
-
-        None.
-    """
-    block = f"[PIPELINE_TRACE] {heading}\n{body}"
-    if _telemetry_sink is not None:
-        _telemetry_sink.append(block)
-    if _telemetry_suppress_console:
+def pipeline_trace(heading: str, body: str | Callable[[], str]) -> None:
+    """Emit a ``[PIPELINE_TRACE]`` block when ``PolicyConfig.DEBUG`` or diagnostic capture is active."""
+    sink_on = prev_sink is not None
+    console_on = not prev_suppress and diagnostic_debug_enabled()
+    if not sink_on and not console_on:
         return
-    if not (diagnostic_debug_enabled() and diagnostic_pipeline_trace_full_enabled()):
+    resolved = body() if callable(body) else body
+    block = _format_pipeline_trace_block(heading, resolved)
+    if prev_sink is not None:
+        prev_sink.append(block)
+    if prev_suppress:
+        return
+    if not diagnostic_debug_enabled():
         return
     print(block)
 
 
-def pipeline_trace_lazy(heading: str, body_factory: Callable[[], str]) -> None:
-    """
-    Like :func:`pipeline_trace`, but *body_factory* runs only when output is needed.
-
-    Args:
-
-        heading: Event label.
-
-        body_factory: Callable returning the trace body (often ``lambda: stable_json(...)``).
-
-    Returns:
-
-        None.
-    """
-
-    sink_on = _telemetry_sink is not None
-    console_on = (
-        not _telemetry_suppress_console and diagnostic_debug_enabled() and diagnostic_pipeline_trace_full_enabled()
-    )
-    if not sink_on and not console_on:
-        return
-    pipeline_trace(heading, body_factory())
-
-
 def sha256(s: str) -> str:
-    """
-    SHA-256 hex digest of UTF-8 *s*.
-
-    Args:
-
-        s: String to hash.
-
-    Returns:
-
-        64-character hex string.
-    """
-
+    """SHA-256 hex digest of UTF-8 *s*."""
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
 def _strip_fences(s: str) -> str:
-    """
-    Strip leading/trailing ``` fences and surrounding whitespace.
-
-    Args:
-
-        s: Possibly fenced text.
-
-    Returns:
-
-        Inner content, stripped.
-    """
+    """Strip leading/trailing ``` fences and surrounding whitespace."""
     s = s.strip()
     if s.startswith("```"):
         s = re.sub(r"^```[a-zA-Z]*\s*", "", s)
@@ -658,17 +496,7 @@ def _strip_fences(s: str) -> str:
 
 
 def canonicalize_sql(sql: str) -> str:
-    """
-    Normalize SQL whitespace, formatting, and join equality operand order.
-
-    Args:
-
-        sql: Raw SQL string, possibly with extra whitespace or markdown fences.
-
-    Returns:
-
-        Canonicalized SQL string with consistent spacing and canonical operand order in equality conditions.
-    """
+    """Normalize SQL whitespace, formatting, and join equality operand. order."""
     s = _strip_fences(sql).strip()
     s = s.rstrip(";").strip()
     s = re.sub(r"^EXPLAIN\s+(?:ANALYZE\s+)?", "", s, flags=re.IGNORECASE)
@@ -679,7 +507,7 @@ def canonicalize_sql(sql: str) -> str:
     s = re.sub(r"(?<![><!=])=(?![>=])", " = ", s)
     s = re.sub(r"\s+", " ", s).strip()
 
-    def normalize_equality(m: re.Match) -> str:
+    def normalize_equality(m: re.Match[str]) -> str:
         left, right = m.group(1).strip(), m.group(2).strip()
         if left > right:
             left, right = right, left
@@ -690,85 +518,32 @@ def canonicalize_sql(sql: str) -> str:
 
 
 def stable_json(o: Any) -> str:
-    """
-    ``json.dumps`` with sorted keys and minimal separators.
-
-    Args:
-
-        o: JSON-serialisable value.
-
-    Returns:
-
-        Deterministic compact JSON string.
-    """
+    """``json.dumps`` with sorted keys and minimal separators."""
     return json.dumps(o, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
 def colmap_signature(column_map: dict[str, str]) -> str:
-    """
-    SHA-256 of stable JSON for sorted ``column_map`` items.
-
-    Args:
-
-        column_map: Bare column -> table name.
-
-    Returns:
-
-        Hex digest string.
-    """
+    """SHA-256 of stable JSON for sorted ``column_map`` items."""
     return sha256(stable_json(sorted(column_map.items())))
 
 
 def intent_id(d: dict[str, Any]) -> str:
-    """
-    Short intent id: first 16 hex chars of ``stable_json(d)`` hash.
-
-    Args:
-
-        d: Canonical intent dict.
-
-    Returns:
-
-        16-character prefix of SHA-256 hex.
-    """
+    """Short intent id: first 16 hex chars of ``stable_json(d)`` hash."""
     return sha256(stable_json(d))[:16]
 
 
 def structural_hash_fp(tables_payload: dict[str, Any]) -> str:
-    """
-    Fingerprint DDL-stable table payloads (kinds, columns, keys, FK edges).
-
-    Args:
-
-        tables_payload: Mapping of table name to structural column/table dicts.
-
-    Returns:
-
-        Hex digest string.
-    """
-
+    """Fingerprint DDL-stable table payloads (kinds, columns, keys, FK. edges)."""
     return sha256(stable_json({"tables": tables_payload}))
 
 
 def profiling_hash_fp(tables_payload: dict[str, Any]) -> str:
-    """
-    Fingerprint profiling-only payloads (counts, roles, top values, semantics).
-
-    Args:
-
-        tables_payload: Mapping of table name to profiling dicts.
-
-    Returns:
-
-        Hex digest string.
-    """
-
+    """Fingerprint profiling-only payloads (counts, roles, top values, semantics)."""
     return sha256(stable_json({"tables": tables_payload}))
 
 
 def _schema_scope_file_content_sha256(path: str | None) -> str:
-    """Return a SHA-256 hex digest of the UTF-8 file at *path*, or ``\"\"`` when the path is missing or not a readable file."""
-
+    """Return a SHA-256 hex digest of the UTF-8 file at *path*, or ``""`` when the path is missing or not a readable file."""
     if path is None or not str(path).strip():
         return ""
     expanded = os.path.expanduser(str(path).strip())
@@ -778,23 +553,13 @@ def _schema_scope_file_content_sha256(path: str | None) -> str:
         return sha256(fh.read())
 
 
-def scope_hash_fp(schema_context: SchemaContext) -> str:
-    """
-    Fingerprint scope inputs: include mode, allow list, deny lists, and inlined DDL or notes file contents.
-
-    Args:
-
-        schema_context: Frozen schema scope descriptor.
-
-    Returns:
-
-        Hex digest string.
-    """
-
+def scope_hash_fp(schema_context: EngineContext) -> str:
+    """Fingerprint scope inputs: include mode, allow list, deny lists, and inlined DDL or notes file contents. ``EngineContext.name`` is intentionally excluded so master and named subset contexts share one graph id."""
     deny_cols = sorted(schema_context.deny_columns)
     allow_cols = sorted(schema_context.allow_columns)
     payload = {
         "allow_objects": sorted(schema_context.allow_objects),
+        "deny_objects": sorted(schema_context.deny_objects),
         "deny_columns": deny_cols,
         "allow_columns": allow_cols,
         "include": schema_context.include,
@@ -806,38 +571,22 @@ def scope_hash_fp(schema_context: SchemaContext) -> str:
 
 def effective_structural_hash_fp(structural_hash: str, scope_hash: str) -> str:
     """Combine structural and scope fingerprints into the template-store key."""
-
     return sha256(structural_hash + "|" + scope_hash)
 
 
 def schema_hash_fp(tables_dict: dict[str, Any]) -> str:
-    """
-    Legacy SHA-256 of ``{"tables": tables_dict}`` JSON.
-
-    Used by cache diagnostics and tests that pass arbitrary table-shaped dicts.
-    """
-
+    """Legacy SHA-256 of ``{"tables": tables_dict}`` JSON. Used by cache diagnostics and tests that pass arbitrary table-shaped dicts."""
     return sha256(stable_json({"tables": tables_dict}))
 
 
 def normalize_question(q: str) -> str:
-    """
-    Lowercase and clean *q*; restore single-quoted spans to original case.
-
-    Args:
-
-        q: Raw user question.
-
-    Returns:
-
-        Normalised string for fuzzy matching.
-    """
+    """Lowercase and clean *q*; restore single-quoted spans to original. case."""
     q = q.strip()
     q = re.sub(r"[\u2018\u2019\u201c\u201d]", "'", q)
 
     quoted_values = []
 
-    def preserve_quoted(m):
+    def preserve_quoted(m: re.Match[str]) -> str:
         quoted_values.append(m.group(1))
         return f"__QUOTED_{len(quoted_values) - 1}__"
 
@@ -854,17 +603,7 @@ def normalize_question(q: str) -> str:
 
 
 def _extract_first_json_object(s: str) -> str | None:
-    """
-    First top-level ``{...}`` substring via brace depth (after fence strip).
-
-    Args:
-
-        s: Text that may embed JSON.
-
-    Returns:
-
-        JSON object substring, or ``None``.
-    """
+    """First top-level ``{...}`` substring via brace depth (after fence. strip)."""
     s = _strip_fences(s)
     start = s.find("{")
     if start == -1:
@@ -881,17 +620,7 @@ def _extract_first_json_object(s: str) -> str | None:
 
 
 def safe_json_loads(s: str) -> Any | None:
-    """
-    Try ``json.loads``; on failure, parse first ``{...}`` fragment.
-
-    Args:
-
-        s: Raw model or file text.
-
-    Returns:
-
-        Parsed object, or ``None``.
-    """
+    """Try ``json.loads``; on failure, parse first ``{...}`` fragment."""
     s = s.strip()
     try:
         return json.loads(s)
@@ -906,59 +635,6 @@ def safe_json_loads(s: str) -> Any | None:
     return None
 
 
-def _task_model_for_profile(task: str) -> str:
-    """Return the configured logical model name for *task* from ``EngineConfig``."""
-
-    if task == "intent":
-        return str(EngineConfig.OPENAI_MODEL_INTENT)
-    if task == "feedback":
-        return str(EngineConfig.OPENAI_MODEL_INTENT)
-    if task == "schema":
-        return str(EngineConfig.OPENAI_MODEL_SCHEMA)
-    if task == "schema_base":
-        return str(EngineConfig.OPENAI_MODEL_SCHEMA_BASE)
-    if task == "ddl":
-        return str(EngineConfig.OPENAI_MODEL_DDL)
-    if task == "join":
-        return str(EngineConfig.OPENAI_MODEL_JOIN)
-    if task == "judge":
-        return str(EngineConfig.OPENAI_MODEL_JOIN)
-    if task == "conversation":
-        return str(EngineConfig.OPENAI_MODEL_INTENT)
-    return str(EngineConfig.OPENAI_MODEL)
-
-
-_TASK_PROFILES: dict[str, dict[str, Any]] = {
-    "intent": {
-        "reasoning": {"effort": "medium", "summary": "concise"},
-    },
-    "feedback": {
-        "reasoning": {"effort": "low", "summary": "concise"},
-    },
-    "schema": {
-        "reasoning": {"effort": "low", "summary": "concise"},
-    },
-    "schema_base": {
-        "temperature": 0,
-    },
-    "ddl": {
-        "temperature": 0,
-    },
-    "join": {
-        "reasoning": {"effort": "low", "summary": "concise"},
-    },
-    "judge": {
-        "reasoning": {"effort": "low", "summary": "concise"},
-    },
-    "conversation": {
-        "reasoning": {"effort": "low", "summary": "concise"},
-    },
-    "default": {
-        "temperature": 0,
-    },
-}
-
-
 def _reconfigure_console_streams_to_utf8() -> None:
     """Force ``sys.stdout`` / ``sys.stderr`` to UTF-8 with replacement on undefined glyphs."""
     for _stream in (sys.stdout, sys.stderr):
@@ -966,38 +642,19 @@ def _reconfigure_console_streams_to_utf8() -> None:
             continue
         if getattr(_stream, "encoding", "").lower() == "utf-8":
             continue
-        try:
-            _stream.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:
-            pass
+        reconfigure = getattr(_stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
 
 
 _reconfigure_console_streams_to_utf8()
 
-_DEFAULT_LLM_CHAT_TIMEOUT = object()
-
-
-def _llm_error_likely_transient(exc: BaseException) -> bool:
-    """Heuristic for HTTP/network overload signals suitable for :class:`LlmTransientFailure`."""
-
-    s = str(exc).lower()
-    needles = (
-        "429",
-        "rate limit",
-        "too many requests",
-        "timeout",
-        "timed out",
-        "connection reset",
-        "temporarily unavailable",
-        "503",
-        "502",
-    )
-    return any(n in s for n in needles)
-
 
 def engine_connect_likely_transient(exc: BaseException) -> bool:
     """Heuristic for cold-start or transport failures suitable for :class:`DatabasePingFailed`."""
-
     s = str(exc).lower()
     needles = (
         "timeout",
@@ -1027,159 +684,8 @@ def engine_connect_likely_transient(exc: BaseException) -> bool:
     return False
 
 
-_LLM_SENSITIVITY_STRIP_KEYS: frozenset[str] = frozenset({"sensitivity", "pii"})
-
-
-def _omit_sensitivity_classification_for_llm_json(value: Any) -> Any:
-    """Return a copy with sensitivity tier keys removed for outbound LLM user payloads."""
-
-    if isinstance(value, dict):
-        return {
-            k: _omit_sensitivity_classification_for_llm_json(v)
-            for k, v in value.items()
-            if str(k) not in _LLM_SENSITIVITY_STRIP_KEYS
-        }
-    if isinstance(value, list):
-        return [_omit_sensitivity_classification_for_llm_json(v) for v in value]
-    if isinstance(value, tuple):
-        return tuple(_omit_sensitivity_classification_for_llm_json(v) for v in value)
-    return value
-
-
-def _llm_user_text_without_sensitivity_classification(user: str) -> str:
-    """When *user* parses as JSON, strip sensitivity classification keys recursively."""
-
-    s = user.strip()
-    if not s or s[0] not in "{[":
-        return user
-    try:
-        parsed: Any = json.loads(s)
-    except json.JSONDecodeError:
-        return user
-    if isinstance(parsed, (dict, list)):
-        return stable_json(_omit_sensitivity_classification_for_llm_json(parsed))
-    return user
-
-
-def llm_chat(
-    system: str,
-    user: str,
-    max_retries: int = 3,
-    timeout: Any = _DEFAULT_LLM_CHAT_TIMEOUT,
-    task: str = "default",
-) -> str:
-    """
-    JSON-mode chat completion with task-based model profile and retries.
-
-    Args:
-
-        system: System prompt.
-
-        user: User message.
-
-        max_retries: Attempts before raising.
-
-        timeout: Seconds per request; when left as the default, resolved from :data:`PolicyConfig.LLM_TIMEOUT_MS`.
-
-        task: ``intent`` / ``feedback`` / ``join`` / ``judge`` / ``schema`` / ``schema_base`` / ``ddl`` / ``conversation`` / ``default``.
-
-    Returns:
-
-        Stripped model text.
-    """
-    if timeout is _DEFAULT_LLM_CHAT_TIMEOUT:
-        timeout = _resolve_llm_timeout_ms() / 1000.0
-    profile = _TASK_PROFILES.get(task, _TASK_PROFILES["default"])
-    model = _task_model_for_profile(task)
-    api_model = _azure_deployment_for_model(model) if EngineConfig.LLM_PROVIDER == "azure" else model
-    user_for_llm = _llm_user_text_without_sensitivity_classification(user)
-
-    kwargs: dict[str, Any] = {
-        "model": api_model,
-        "input": [
-            {
-                "role": "system",
-                "content": [{"type": "input_text", "text": system}],
-            },
-            {"role": "user", "content": [{"type": "input_text", "text": user_for_llm}]},
-        ],
-        "timeout": timeout,
-        "text": {"format": {"type": "json_object"}},
-    }
-
-    if "reasoning" in profile:
-        kwargs["reasoning"] = profile["reasoning"]
-    else:
-        kwargs["temperature"] = profile.get("temperature", 0)
-
-    debug(f"[core_utils.llm_chat] task={task} system_len={len(system)} user_len={len(user_for_llm)}")
-    pipeline_trace_lazy(f"llm_chat.request task={task} system_message", lambda: system)
-    pipeline_trace_lazy(f"llm_chat.request task={task} user_message", lambda: user_for_llm)
-
-    providers = [p for p in _provider_order() if _provider_is_configured(p)]
-    if not providers:
-        raise RuntimeError("No configured OpenAI/Azure OpenAI provider found")
-
-    for attempt in range(max_retries):
-        last_error: Exception | None = None
-        for provider in providers:
-            client = _build_client(provider)
-            try:
-                start = time.time()
-                r = client.responses.create(**kwargs)
-                elapsed = time.time() - start
-                output = r.output_text.strip()
-                debug(f"[core_utils.llm_chat] provider={provider} RAW OUTPUT:\n{output}")
-                pipeline_trace_lazy(
-                    f"llm_chat.response task={task} attempt={attempt + 1}",
-                    lambda out=output: out,
-                )
-                usage = getattr(r, "usage", None)
-                in_tok = getattr(usage, "input_tokens", None)
-                out_tok = getattr(usage, "output_tokens", None)
-                tot_tok = getattr(usage, "total_tokens", None)
-                tok_str = f" tokens(in={in_tok},out={out_tok},total={tot_tok})" if usage is not None else ""
-                debug(
-                    f"[core_utils.llm_chat] provider={provider} model={api_model} task={task} "
-                    f"completed in {elapsed:.1f}s (attempt {attempt + 1}/{max_retries}){tok_str}"
-                )
-                return output
-            except Exception as e:
-                elapsed = time.time() - start
-                last_error = e
-                err_full = str(e)
-                log(
-                    f"[core_utils.llm_chat] provider={provider} timeout or error after {elapsed:.1f}s "
-                    f"(attempt {attempt + 1}/{max_retries}): "
-                    f"{err_full if diagnostic_pipeline_trace_full_enabled() else err_full[:100]}"
-                )
-                pipeline_trace_lazy(
-                    f"llm_chat.error task={task} provider={provider} attempt={attempt + 1}",
-                    lambda err=err_full: err,
-                )
-        if attempt < max_retries - 1:
-            wait = 2**attempt
-            log(f"[core_utils.llm_chat] retrying in {wait}s...")
-            time.sleep(wait)
-        else:
-            msg = f"LLM call failed after {max_retries} attempts: {str(last_error)}"
-            if last_error is not None and _llm_error_likely_transient(last_error):
-                raise LlmTransientFailure(msg) from last_error
-            raise RuntimeError(msg) from last_error
-
-
-def normalize_sql_operator_spaces(sql: str) -> str:
-    """
-    Merge split operators: ``> =``, ``< =``, ``! =`` → ``>=``, ``<=``, ``!=``.
-
-    Args:
-
-        sql: Raw SQL.
-
-    Returns:
-
-        Same string with operator tokens fixed, or unchanged if empty.
-    """
+def _normalize_sql_operator_spaces(sql: str) -> str:
+    """Merge split operators: ``> =``, ``< =``, ``! =`` → ``>=``, ``<=``, ``!=``."""
     if not sql or not sql.strip():
         return sql
     s = sql.replace("> =", ">=").replace("< =", "<=").replace("! =", "!=")
@@ -1187,18 +693,8 @@ def normalize_sql_operator_spaces(sql: str) -> str:
 
 
 def normalize_sql(sql: str) -> str:
-    """
-    After ``canonicalize_sql``, append default ``ASC`` where ORDER BY lacks direction.
-
-    Args:
-
-        sql: Raw SQL.
-
-    Returns:
-
-        SQL with explicit ``ASC``/``DESC`` on each ORDER BY item.
-    """
-    s = normalize_sql_operator_spaces(canonicalize_sql(sql))
+    """After ``canonicalize_sql``, append default ``ASC`` where ORDER. BY. lacks direction."""
+    s = _normalize_sql_operator_spaces(canonicalize_sql(sql))
     if not s:
         return s
 
@@ -1235,110 +731,29 @@ def normalize_sql(sql: str) -> str:
     return s
 
 
-def llm_json(system: str, user: str, retries: int = 1, task: str = "default") -> dict[str, Any]:
-    """
-    Call ``llm_chat`` and parse JSON; retry with format hint; wrap bare SELECT.
-
-    Raises ``LlmJsonExhausted`` when no attempt produces valid JSON (or a bare
-    SQL SELECT that we wrap); callers are responsible for deciding whether
-    exhaustion is recoverable or terminal.
-
-    Args:
-
-        system: System prompt.
-
-        user: User payload.
-
-        retries: Extra attempts after the initial call (minimum zero).
-
-        task: Profile key for ``llm_chat``.
-
-    Returns:
-
-        Parsed dict payload on success.
-    """
-    total_attempts = 1 + max(0, retries)
-    raw = llm_chat(system, user, task=task)
-    parsed = safe_json_loads(raw)
-    if isinstance(parsed, dict):
-        debug(f"[core_utils.llm_json] parsed keys={list(parsed.keys())}")
-        return parsed
-
-    if raw.strip().upper().startswith("SELECT"):
-        debug("[core_utils.llm_json] raw_sql_detected wrapping")
-        sql_statement = raw.strip()
-        return {"sql": sql_statement, "chosen_join_candidate_id": "J00"}
-
-    debug("[core_utils.llm_json] parse_failed: retrying")
-    for attempt in range(max(0, retries)):
-        debug(f"[core_utils.llm_json] retry: {attempt + 1}")
-        raw = llm_chat(
-            system,
-            user + "\n\nFORMAT_ERROR: Output ONLY valid JSON that matches the required schema. Do NOT output raw SQL.",
-            task=task,
-        )
-        parsed = safe_json_loads(raw)
-        if isinstance(parsed, dict):
-            debug(f"[core_utils.llm_json] retry_success: keys={list(parsed.keys())}")
-            return parsed
-
-        if raw.strip().upper().startswith("SELECT"):
-            debug("[core_utils.llm_json] retry_sql_detected: wrapping")
-            sql_statement = raw.strip()
-            return {"sql": sql_statement, "chosen_join_candidate_id": "J00"}
-
-    debug("[core_utils.llm_json] all_retries_failed")
-    raise LlmJsonExhausted(task=task, attempts=total_attempts)
-
-
 def normalize_array_contains_param_value(value: Any) -> Any:
-    """
-    Strip whitespace and redundant surrounding quotes from array ``contains`` operands.
-
-    Keeps bind values free of decorative quotes; SQL generation also normalizes stored array elements per dialect so membership stays stable across data encodings.
-
-    Args:
-
-        value: Bound parameter value (typically a string).
-
-    Returns:
-
-        Normalized value; non-strings returned unchanged.
-    """
+    """Strip whitespace and redundant surrounding quotes from array. ``contains`` operands. Keeps bind values free of decorative quotes; SQL generation also normalizes stored array elements per dialect so membership stays stable across data encodings."""
     if not isinstance(value, str):
         return value
     s = value.strip()
     while len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
         s = s[1:-1].strip()
+    s = s.strip("%")
     return s
 
 
 def _escape_sql_single_quoted_literal(value: str) -> str:
     """Escape a UTF-8 string for safe use inside single-quoted SQL literals."""
-
     return value.replace("'", "''")
 
 
 def substitute_params(sql_param: str, params: dict[str, Any]) -> str:
-    """
-    Replace ``:key`` placeholders with formatted parameter values.
-
-    Args:
-
-        sql_param: SQL with ``:pN`` style keys.
-
-        params: Key -> value map.
-
-    Returns:
-
-        SQL with all ``:key`` placeholders substituted.
-    """
-    result = sql_param
+    """Replace ``:key``, ``@key``, and ``$key`` placeholders with formatted parameter values."""
+    _result = sql_param
     for key in sorted(params.keys(), key=lambda k: -len(k)):
         val = params[key]
         if not key:
             continue
-        placeholder = f":{key}"
         if isinstance(val, list):
             formatted_items = []
             for item in val:
@@ -1346,24 +761,29 @@ def substitute_params(sql_param: str, params: dict[str, Any]) -> str:
                     formatted_items.append(f"'{_escape_sql_single_quoted_literal(item)}'")
                 else:
                     formatted_items.append(str(item))
-            result = result.replace(placeholder, ", ".join(formatted_items))
+            formatted = ", ".join(formatted_items)
         elif isinstance(val, bool):
-            result = result.replace(placeholder, "TRUE" if val else "FALSE")
+            formatted = "TRUE" if val else "FALSE"
         elif isinstance(val, str):
+            if not val.strip():
+                raise ValueError("unbound_placeholder")
             if val.startswith("'") and val.endswith("'") and "','" in val:
-                result = result.replace(placeholder, val)
+                formatted = val
             elif re.match(r"^-?\d+(?:\.\d+)?(?:,\s*-?\d+(?:\.\d+)?)*$", val):
-                result = result.replace(placeholder, val)
+                formatted = val
             else:
-                result = result.replace(placeholder, f"'{_escape_sql_single_quoted_literal(val)}'")
+                formatted = f"'{_escape_sql_single_quoted_literal(val)}'"
         else:
-            result = result.replace(placeholder, str(val))
-    return result
+            formatted = str(val)
+        for prefix in (":", "$", "@"):
+            _result = _result.replace(f"{prefix}{key}", formatted)
+    if SQL_BIND_TOKEN_RE.search(_result) or UNBOUND_PYFORMAT_PLACEHOLDER_RE.search(_result):
+        raise ValueError("unbound_placeholder")
+    return _result
 
 
 def _format_scalar_for_structural_sql_inline(val: Any) -> str:
     """Format a single bind value for structural placeholder inlining."""
-
     if isinstance(val, bool):
         return "TRUE" if val else "FALSE"
     if isinstance(val, str):
@@ -1380,12 +800,7 @@ def reduce_structural_sql_placeholders(
     params: dict[str, Any],
     structural_defaults: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any]]:
-    """
-    Inline ``:sN`` placeholders when values match defaults or identity structural values.
-
-    Returns the reduced SQL string and the parameter map with structural keys removed.
-    """
-
+    """Inline ``:sN`` placeholders when values match defaults or identity structural values. Returns the reduced SQL string and the parameter map with structural keys removed."""
     sd = structural_defaults or {}
     keys_in_sql = sorted(
         set(STRUCTURAL_SQL_PLACEHOLDER_PARAM_RE.findall(sql_param)),
@@ -1409,18 +824,8 @@ def reduce_structural_sql_placeholders(
     return reduced, remaining
 
 
-def _format_cell(v) -> str:
-    """
-    String for one result cell: ``NULL``, decimals, or ``str(v)``.
-
-    Args:
-
-        v: Driver cell value.
-
-    Returns:
-
-        Display string.
-    """
+def _format_cell(v: object) -> str:
+    """String for one _result cell: ``NULL``, decimals, or ``str(v)``."""
     if v is None:
         return "NULL"
     if isinstance(v, Decimal):
@@ -1431,28 +836,13 @@ def _format_cell(v) -> str:
 
 
 def print_query_result(
-    rows: list[tuple],
+    rows: list[tuple[Any, ...]],
     sql: str,
     *,
     headers: list[str] | None = None,
 ) -> None:
-    """
-    Emit SQL and scalar answer or up to five aligned rows through :func:`notify`.
-
-    Args:
-
-        rows: Result tuples from the driver.
-
-        sql: Query text.
-
-        headers: Optional column names (padded with ``colN``).
-
-    Returns:
-
-        None.
-    """
+    """Emit SQL and scalar answer or up to five aligned rows through. :func:`notify`."""
     out_lines: list[str] = [f"\n{QUERY_RESULTS_HEADER}\n", f"SQL:\n  {sql}\n"]
-
     if len(rows) == 1 and len(rows[0]) == 1:
         val = rows[0][0]
         out_lines.append(f"Answer: {_format_cell(val)}\n")
@@ -1487,7 +877,6 @@ def print_query_result(
 
 def dataframe_to_row_tuples(df: Any) -> list[tuple[Any, ...]]:
     """Convert a pandas ``DataFrame`` to plain row tuples for :func:`print_query_result`."""
-
     if df is None:
         return []
     return [tuple(row) for row in df.values]
@@ -1501,47 +890,14 @@ def interactive_yes_no(
     *,
     choice_port: InteractiveChoicePort | None = None,
 ) -> str | None:
-    """
-    Resolve a yes/no prompt via an optional session port or stdin.
-
-    Args:
-
-        stage: Stable stage label for session mapping (ignored for stdin).
-
-        prompt: User-facing prompt line.
-
-        options: Allowed token labels such as ``"y"`` and ``"n"``.
-
-        silent_no: Forwarded to ``ask_user_choice`` when using stdin.
-
-        choice_port: When set, delegates to the port (may raise ``PipelineSuspended``).
-
-    Returns:
-
-        ``"y"``, ``"n"``, or ``None`` when cancelled.
-    """
-
+    """Resolve a yes/no prompt via an optional session port or stdin."""
     if choice_port is not None:
         return choice_port.take_yes_no(stage, prompt, options, silent_no)
     return ask_user_choice(prompt, options, silent_no)
 
 
 def ask_user_choice(prompt: str, options: list[str], silent_no: bool = False) -> str | None:
-    """
-    Interactive ``input()`` for yes/no style choices (y/n/yes/no).
-
-    Args:
-
-        prompt: Line printed before the bracketed options.
-
-        options: Shown as ``opt1/opt2/...`` in the prompt.
-
-        silent_no: If True, skip "User terminated." on ``n``.
-
-    Returns:
-
-        ``"y"``, ``"n"``, or ``None`` on EOF/invalid.
-    """
+    """Interactive ``input()`` for yes/no style choices (y/n/yes/no)."""
     options_display = "/".join(options)
     notify(
         f"{prompt} ({options_display}): ",
@@ -1584,11 +940,7 @@ def ask_user_choice(prompt: str, options: list[str], silent_no: bool = False) ->
 
 
 class RephraseHint(Enum):
-    """
-    User-facing rephrase hint categories printed when the pipeline cannot continue.
-
-    Each value maps to a short, non-technical, suggestive message intended to help the user produce a better question without exposing internal validation output.
-    """
+    """User-facing rephrase hint categories printed when the pipeline cannot continue. Each value maps to a short, non-technical, suggestive message intended to help the user produce a better question without exposing internal validation output."""
 
     INTENT_PARSE_FAILED = "intent_parse_failed"
     SCHEMA_INVALID_DECLINED = "schema_invalid_declined"
@@ -1604,11 +956,7 @@ def print_rephrase_hint(
     *,
     rejection_bucket: str | None = None,
 ) -> None:
-    """
-    Print a tiered, suggestive rephrase hint for *reason*.
-
-    Uses a fixed catalogue of short non-technical messages; never exposes validation logs or repair-loop internals to the user.
-    """
+    """Print a tiered, suggestive rephrase hint for *reason*. Uses a fixed catalogue of short non-technical messages; never exposes validation logs or repair-loop internals to the user."""
     if rejection_bucket and reason in (
         RephraseHint.USER_REJECTED_RESULT,
         RephraseHint.USER_REJECTED_INTENT,
@@ -1633,21 +981,7 @@ def print_rephrase_hint(
 
 
 def print_info(title: str, items: dict[str, Any] | None = None, footer: str | None = None) -> None:
-    """
-    Emit *title*, optional indented *items*, and optional *footer* through :func:`notify`.
-
-    Args:
-
-        title: Heading line.
-
-        items: Key/value lines (lists joined with commas).
-
-        footer: Trailing paragraph.
-
-    Returns:
-
-        None.
-    """
+    """Emit *title*, optional indented *items*, and optional *footer* through :func:`notify`."""
     lines: list[str] = [f"\n{title}"]
     if items:
         for key, val in items.items():
@@ -1664,33 +998,8 @@ def print_info(title: str, items: dict[str, Any] | None = None, footer: str | No
     )
 
 
-def join_sig_string(sig: list[str]) -> str:
-    """
-    Join path segments with ``|`` for stable keys.
-
-    Args:
-
-        sig: Ordered join signature parts.
-
-    Returns:
-
-        Single string, e.g. ``a.b|c.d``.
-    """
-    return "|".join(sig)
-
-
 def normalize_op(op: str) -> str:
-    """
-    Lowercase/whitespace-trim *op*; map ``==``, ``gte``, etc. to SQL ops.
-
-    Args:
-
-        op: LLM filter/having operator token.
-
-    Returns:
-
-        Canonical operator string (e.g. ``=``, ``!=``, ``>=``).
-    """
+    """Lowercase/whitespace-trim *op*; map ``==``, ``gte``, etc. to SQL. ops."""
     op_lower = re.sub(r"\s+", " ", op.lower().strip())
     mapping = {
         "==": "=",
@@ -1708,37 +1017,13 @@ def normalize_op(op: str) -> str:
 
 
 def read_gzip_json(path: str) -> Any:
-    """
-    Load a JSON value from a UTF-8 document stored as gzip.
-
-    Args:
-
-        path: Filesystem path to the `.json.gz` file.
-
-    Returns:
-
-        The parsed JSON value.
-    """
+    """Load a JSON value from a UTF-8 document stored as gzip."""
     with gzip.open(path, "rb") as fh:
         return json.loads(fh.read().decode("utf-8"))
 
 
 def write_gzip_json_atomic(path: str, obj: Any, *, sort_keys: bool) -> None:
-    """
-    Serialize ``obj`` to compact UTF-8 JSON, gzip it, and replace ``path`` atomically.
-
-    Args:
-
-        path: Destination path for the gzip JSON artifact.
-
-        obj: JSON-serializable value.
-
-        sort_keys: Passed to ``json.dumps`` for deterministic key order.
-
-    Returns:
-
-        None.
-    """
+    """Serialize ``obj`` to compact UTF-8 JSON, gzip it, and replace. ``path`` atomically."""
     raw = json.dumps(obj, ensure_ascii=False, separators=JSON_COMPACT_SEPARATORS, sort_keys=sort_keys).encode("utf-8")
     compressed = gzip.compress(raw)
     abs_path = os.path.abspath(path)
@@ -1771,12 +1056,7 @@ def _get_reentry_map() -> dict[str, int]:
 
 @contextmanager
 def _file_lock(lock_path: str, *, timeout: float) -> Iterator[None]:
-    """
-    Acquire an exclusive OS-level lock on ``lock_path`` for the duration of the context.
-
-    Blocks up to ``timeout`` seconds, raising ``TimeoutError`` if the lock cannot be acquired. Works on both POSIX (``fcntl.flock``) and Windows (``msvcrt.locking``) without external dependencies.
-    """
-
+    """Acquire an exclusive OS-level lock on ``lock_path`` for the duration of the context. Blocks up to ``timeout`` seconds, raising ``TimeoutError`` if the lock cannot be acquired. Works on both POSIX (``fcntl.flock``) and Windows (``msvcrt.locking``) without external dependencies."""
     os.makedirs(os.path.dirname(os.path.abspath(lock_path)) or ".", exist_ok=True)
     fh = open(lock_path, "a+b")
     try:
@@ -1828,16 +1108,7 @@ def artifact_lock(
     *,
     timeout: float = ARTIFACT_LOCK_TIMEOUT_SECONDS,
 ) -> Iterator[None]:
-    """
-    Reentrant per-``artifacts_dir`` lock covering load, mutate, and save sequences for template learning.
-
-    The lock file path joins *artifacts_dir* with :data:`ARTIFACT_LOCK_FILENAME` from ``aetherdialect._config``.
-
-    Nested ``with artifact_lock`` blocks on the same directory bump a per-thread refcount without deadlocking.
-
-    Cross-thread and cross-process callers serialize at the OS level.
-    """
-
+    """Reentrant per-``artifacts_dir`` lock covering load, mutate, and save sequences for template learning. The lock file path joins *artifacts_dir* with :data:`ARTIFACT_LOCK_FILENAME` from ``aetherdialect._config``. Nested ``with artifact_lock`` blocks on the same directory bump a per-thread refcount without deadlocking. Cross-thread and cross- process callers serialize at the OS level."""
     abs_dir = os.path.abspath(artifacts_dir)
     os.makedirs(abs_dir, exist_ok=True)
     lock_path = os.path.join(abs_dir, ARTIFACT_LOCK_FILENAME)
@@ -1864,22 +1135,19 @@ def artifact_lock(
 
 
 def _artifact_package_version_string() -> str:
-    for dist_name in ("aetherdialect", "text2sql"):
-        try:
-            return version(dist_name)
-        except PackageNotFoundError:
-            continue
-    return "0.0.0+dev"
+    try:
+        return version("aetherdialect")
+    except PackageNotFoundError:
+        return "0.0.0+dev"
 
 
-def manifest_path(artifacts_dir: str) -> str:
+def _manifest_path(artifacts_dir: str) -> str:
     """Return the absolute path to ``artifact_manifest.json`` under ``artifacts_dir``."""
-
     return os.path.join(artifacts_dir, ARTIFACT_MANIFEST_FILENAME)
 
 
 @dataclass(frozen=True, slots=True)
-class ArtifactManifest:
+class _ArtifactManifest:
     """Typed view of ``artifact_manifest.json`` fields used by migration checks."""
 
     artifact_format_version: int = 0
@@ -1891,50 +1159,46 @@ class ArtifactManifest:
     profiling_hash: str = ""
     scope_hash: str = ""
     effective_structural_hash: str = ""
+    schema_graph_id: str = ""
     notes_hash: str = ""
     semantic_edges_hash: str = ""
     last_migration_tier: str = ""
     last_migration_at: str = ""
 
 
-def read_artifact_manifest(artifacts_dir: str) -> ArtifactManifest | None:
-    """
-    Load artifact manifest JSON if present.
-
-    Returns:
-
-        Parsed manifest, or ``None`` when missing or invalid.
-    """
-
-    path = manifest_path(artifacts_dir)
-    if not os.path.isfile(path):
-        return None
-    try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    try:
-        ver = int(data.get("artifact_format_version", 0) or 0)
-    except (TypeError, ValueError):
-        ver = 0
-    return ArtifactManifest(
-        artifact_format_version=ver,
-        created_with_package_version=str(data.get("created_with_package_version", "") or ""),
-        min_compatible_package_version=str(data.get("min_compatible_package_version", "") or ""),
-        last_action=str(data.get("last_action", "") or ""),
-        last_action_at=str(data.get("last_action_at", "") or ""),
-        structural_hash=str(data.get("structural_hash", "") or ""),
-        profiling_hash=str(data.get("profiling_hash", "") or ""),
-        scope_hash=str(data.get("scope_hash", "") or ""),
-        effective_structural_hash=str(data.get("effective_structural_hash", "") or ""),
-        notes_hash=str(data.get("notes_hash", "") or ""),
-        semantic_edges_hash=str(data.get("semantic_edges_hash", "") or ""),
-        last_migration_tier=str(data.get("last_migration_tier", "") or ""),
-        last_migration_at=str(data.get("last_migration_at", "") or ""),
-    )
+def read_artifact_manifest(artifacts_dir: str) -> _ArtifactManifest | None:
+    """Load artifact manifest JSON if present."""
+    path = _manifest_path(artifacts_dir)
+    with artifact_lock(artifacts_dir):
+        if not os.path.isfile(path):
+            return None
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        try:
+            ver = int(data.get("artifact_format_version", 0) or 0)
+        except (TypeError, ValueError):
+            ver = 0
+        return _ArtifactManifest(
+            artifact_format_version=ver,
+            created_with_package_version=str(data.get("created_with_package_version", "") or ""),
+            min_compatible_package_version=str(data.get("min_compatible_package_version", "") or ""),
+            last_action=str(data.get("last_action", "") or ""),
+            last_action_at=str(data.get("last_action_at", "") or ""),
+            structural_hash=str(data.get("structural_hash", "") or ""),
+            profiling_hash=str(data.get("profiling_hash", "") or ""),
+            scope_hash=str(data.get("scope_hash", "") or ""),
+            effective_structural_hash=str(data.get("effective_structural_hash", "") or ""),
+            schema_graph_id=str(data.get("schema_graph_id", "") or ""),
+            notes_hash=str(data.get("notes_hash", "") or ""),
+            semantic_edges_hash=str(data.get("semantic_edges_hash", "") or ""),
+            last_migration_tier=str(data.get("last_migration_tier", "") or ""),
+            last_migration_at=str(data.get("last_migration_at", "") or ""),
+        )
 
 
 def write_artifact_manifest(
@@ -1944,6 +1208,7 @@ def write_artifact_manifest(
     profiling_hash: str = "",
     scope_hash: str = "",
     effective_structural_hash: str = "",
+    schema_graph_id: str = "",
     notes_hash: str = "",
     semantic_edges_hash: str = "",
     last_migration_tier: str = "",
@@ -1951,18 +1216,9 @@ def write_artifact_manifest(
     last_action: str = "compat_wipe",
     last_corruption_at: str = "",
 ) -> None:
-    """
-    Write manifest with format version, package version, optional hashes, and last action.
-
-    Persists atomically via a temporary file in *artifacts_dir* followed by ``os.replace``.
-
-    Returns:
-
-        None.
-    """
-
+    """Write manifest with format version, package version, optional. hashes, and last action. Persists atomically via a temporary file in *artifacts_dir* followed by ``os.replace``."""
     os.makedirs(artifacts_dir, exist_ok=True)
-    path = manifest_path(artifacts_dir)
+    path = _manifest_path(artifacts_dir)
     mig_at = last_migration_at if last_migration_at is not None else ""
     if last_migration_tier and not mig_at:
         mig_at = datetime.now(timezone.utc).isoformat()
@@ -1976,6 +1232,7 @@ def write_artifact_manifest(
         "profiling_hash": profiling_hash,
         "scope_hash": scope_hash,
         "effective_structural_hash": effective_structural_hash,
+        "schema_graph_id": schema_graph_id,
         "notes_hash": notes_hash,
         "semantic_edges_hash": semantic_edges_hash,
         "last_migration_tier": last_migration_tier,
@@ -2008,23 +1265,23 @@ def write_artifact_manifest(
 
 def emit_write_queue_event(artifacts_dir: str, event: WriteQueueEvent) -> None:
     """Append one JSON line representing a deferred writer event to the artifact write queue."""
-
     path = os.path.join(artifacts_dir, WRITE_QUEUE_FILENAME)
-    os.makedirs(artifacts_dir, exist_ok=True)
     obj = {
         "kind": event.kind,
+        "schema_graph_id": event.schema_graph_id,
         "schema_hash": event.schema_hash,
         "produced_at": event.produced_at,
         "payload": [list(pair) for pair in event.payload],
     }
     line = json.dumps(obj, separators=(",", ":"), ensure_ascii=False) + "\n"
-    with open(path, "a", encoding="utf-8") as fh:
-        fh.write(line)
+    with artifact_lock(artifacts_dir):
+        os.makedirs(artifacts_dir, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line)
 
 
 def decode_write_queue_event(obj: dict[str, Any]) -> WriteQueueEvent | None:
     """Parse one write-queue JSON object into a :class:`WriteQueueEvent`, or return ``None`` when invalid."""
-
     kinds = {
         "template_accept",
         "template_reject",
@@ -2035,8 +1292,11 @@ def decode_write_queue_event(obj: dict[str, Any]) -> WriteQueueEvent | None:
     kind = str(obj.get("kind") or "")
     if kind not in kinds:
         return None
+    schema_graph_id = str(obj.get("schema_graph_id") or "")
     schema_hash = str(obj.get("schema_hash") or "")
     produced_at = str(obj.get("produced_at") or "")
+    if not schema_graph_id:
+        return None
     raw_pl = obj.get("payload")
     if not isinstance(raw_pl, list):
         return None
@@ -2045,17 +1305,27 @@ def decode_write_queue_event(obj: dict[str, Any]) -> WriteQueueEvent | None:
         if not isinstance(row, (list, tuple)) or len(row) != 2:
             continue
         pairs.append((str(row[0]), str(row[1])))
+    write_kind = cast(
+        Literal[
+            "template_accept",
+            "template_reject",
+            "paraphrase_emit",
+            "override_proposal",
+            "feedback_record",
+        ],
+        kind,
+    )
     return WriteQueueEvent(
-        kind=kind,  # type: ignore[arg-type]
+        kind=write_kind,
+        schema_graph_id=schema_graph_id,
         schema_hash=schema_hash,
         produced_at=produced_at,
         payload=tuple(pairs),
     )
 
 
-def _wipe_filenames(artifacts_dir: str, names: tuple[str, ...]) -> int:
+def wipe_filenames(artifacts_dir: str, names: tuple[str, ...]) -> int:
     """Remove named files directly under *artifacts_dir*; return count removed."""
-
     removed = 0
     for name in names:
         fp = os.path.join(artifacts_dir, name)
@@ -2065,9 +1335,8 @@ def _wipe_filenames(artifacts_dir: str, names: tuple[str, ...]) -> int:
     return removed
 
 
-def _wipe_globs(artifacts_dir: str, patterns: tuple[str, ...]) -> int:
+def wipe_globs(artifacts_dir: str, patterns: tuple[str, ...]) -> int:
     """Remove files matching glob patterns relative to *artifacts_dir*; return count removed."""
-
     removed = 0
     for pattern in patterns:
         for fp in glob.glob(os.path.join(artifacts_dir, pattern)):
@@ -2079,35 +1348,15 @@ def _wipe_globs(artifacts_dir: str, patterns: tuple[str, ...]) -> int:
 
 def wipe_versioned_artifacts(artifacts_dir: str) -> None:
     """Remove on-disk template and simulation cache files under *artifacts_dir*."""
-
-    _wipe_filenames(artifacts_dir, LEGACY_ARTIFACT_FILENAMES)
-    _wipe_globs(artifacts_dir, LEGACY_ARTIFACT_GLOBS)
+    wipe_filenames(artifacts_dir, LEGACY_ARTIFACT_FILENAMES)
+    wipe_globs(artifacts_dir, LEGACY_ARTIFACT_GLOBS)
     partitioned = os.path.join(artifacts_dir, TEMPLATE_STORE_SEGMENT)
     if os.path.isdir(partitioned):
         shutil.rmtree(partitioned, ignore_errors=True)
 
 
 def detect_legacy_artifacts(artifacts_dir: str) -> list[str]:
-    """
-    Return artifact filenames suggesting a pre-manifest install populated this directory.
-
-    A directory is considered "legacy" when at least one versioned artifact (schema graph
-    snapshot, template store, qsim run, seed warmup cache) is present *but* no
-    ``artifact_manifest.json`` exists alongside it. Such artifacts were produced by an
-    earlier release of this package whose on-disk format predates the migration manifest,
-    and they cannot be safely loaded by the current code path.
-
-    Args:
-
-        artifacts_dir: Directory to inspect. Missing or non-directory paths return ``[]``.
-
-    Returns:
-
-        Sorted list of basenames of legacy artifacts found. Empty when the directory does
-        not exist, is empty, contains only user-supplied non-versioned files (notes,
-        ``.env``, raw SQL), or already contains an ``artifact_manifest.json``.
-    """
-
+    """Return artifact filenames suggesting a pre-manifest install. populated this directory. A directory is considered "legacy" when at least one versioned artifact (schema graph snapshot, template store, qsim run, seed warmup cache) is present *but* no ``artifact_manifest.json`` exists alongside it. Such artifacts were produced by an earlier release of this package whose on-disk format predates the migration manifest, and they cannot be safely loaded by the current code path."""
     if not artifacts_dir or not os.path.isdir(artifacts_dir):
         return []
     if os.path.isfile(os.path.join(artifacts_dir, ARTIFACT_MANIFEST_FILENAME)):
@@ -2129,10 +1378,14 @@ def _fk_edge_key(fk: FKEdge) -> tuple[str, tuple[str, ...], str, tuple[str, ...]
 
 def _all_fk_multiset(
     sg: SchemaGraph,
+    *,
+    catalog_only: bool = False,
 ) -> Counter[tuple[str, tuple[str, ...], str, tuple[str, ...]]]:
     ctr: Counter[tuple[str, tuple[str, ...], str, tuple[str, ...]]] = Counter()
     for tm in sg.tables.values():
         for fk in tm.foreign_keys:
+            if catalog_only and fk.inference_tag is not None:
+                continue
             ctr[_fk_edge_key(fk)] += 1
     return ctr
 
@@ -2176,15 +1429,15 @@ def _prof_jaccard_sets(a: frozenset[str], b: frozenset[str]) -> float:
     return len(a & b) / u
 
 
-def _col_topk_frozen(col: ColumnMetadata) -> frozenset[str]:
-    vals = col.top_k_values or []
+def _col_value_overlap_frozen(col: ColumnMetadata) -> frozenset[str]:
+    vals = col.value_overlap_sample or []
     cleaned = {str(v).strip() for v in vals if v is not None and str(v).strip() != ""}
-    return frozenset(sorted(cleaned)[:PROFILING_TOP_K])
+    cap = PolicyConfig.VALUE_OVERLAP_SAMPLE_LIMIT
+    return frozenset(sorted(cleaned)[:cap])
 
 
-def profiling_value_overlap(older: SchemaGraph, newer: SchemaGraph) -> float:
-    """Aggregate Jaccard overlap of profiling Top-K sets on shared ``(table, column)`` keys."""
-
+def _profiling_value_overlap(older: SchemaGraph, newer: SchemaGraph) -> float:
+    """Aggregate Jaccard overlap of value-overlap samples on shared ``(table, column)`` keys."""
     inter = 0
     union = 0
     for t in older.tables:
@@ -2195,8 +1448,8 @@ def profiling_value_overlap(older: SchemaGraph, newer: SchemaGraph) -> float:
         for c in ot.columns:
             if c not in nt.columns:
                 continue
-            a = _col_topk_frozen(ot.columns[c])
-            b = _col_topk_frozen(nt.columns[c])
+            a = _col_value_overlap_frozen(ot.columns[c])
+            b = _col_value_overlap_frozen(nt.columns[c])
             u = len(a | b)
             if u == 0:
                 continue
@@ -2237,7 +1490,7 @@ def _match_columns_between_tables(old_t: TableMetadata, new_t: TableMetadata) ->
                 if ncn in used:
                     continue
                 ncol = new_t.columns[ncn]
-                sc = _prof_jaccard_sets(_col_topk_frozen(ocol), _col_topk_frozen(ncol))
+                sc = _prof_jaccard_sets(_col_value_overlap_frozen(ocol), _col_value_overlap_frozen(ncol))
                 if sc > best_score:
                     best_score = sc
                     best = ncn
@@ -2284,8 +1537,8 @@ def _fk_maps_consistent(
     tmap: dict[str, str],
     colmap: dict[str, dict[str, str]],
 ) -> bool:
-    old_ctr = _all_fk_multiset(old)
-    new_ctr = _all_fk_multiset(new)
+    old_ctr = _all_fk_multiset(old, catalog_only=True)
+    new_ctr = _all_fk_multiset(new, catalog_only=True)
     mapped: Counter[tuple[str, tuple[str, ...], str, tuple[str, ...]]] = Counter()
     for k, v in old_ctr.items():
         mapped[_map_fk_key_full(k, tmap, colmap)] += v
@@ -2297,7 +1550,6 @@ def try_rename_migration_plan(
     new: SchemaGraph,
 ) -> tuple[tuple[tuple[str, str], ...], tuple[tuple[str, str, str], ...]] | None:
     """Return ``(renamed_tables, renamed_columns)`` when *old* maps to *new* by renames only."""
-
     for tmap in _enumerate_tmap_candidates(old, new):
         colmap: dict[str, dict[str, str]] = {}
         col_renames: list[tuple[str, str, str]] = []
@@ -2324,7 +1576,10 @@ def try_rename_migration_plan(
     return None
 
 
-def _manifest_matches_schema(manifest: ArtifactManifest, schema: SchemaGraph) -> bool:
+def _manifest_matches_schema(manifest: _ArtifactManifest, schema: SchemaGraph) -> bool:
+    if manifest.schema_graph_id and schema.schema_graph_id:
+        if manifest.schema_graph_id != schema.schema_graph_id:
+            return False
     return (
         manifest.structural_hash == schema.structural_hash
         and manifest.profiling_hash == schema.profiling_hash
@@ -2337,7 +1592,6 @@ def _manifest_matches_schema(manifest: ArtifactManifest, schema: SchemaGraph) ->
 
 def _schema_diff_implies_remap(schema_diff: Any) -> bool:
     """True when a non-empty structural diff carries rename signals (tables or columns)."""
-
     if schema_diff is None:
         return False
     if getattr(schema_diff, "is_empty", True):
@@ -2346,29 +1600,42 @@ def _schema_diff_implies_remap(schema_diff: Any) -> bool:
     return bool(impl()) if callable(impl) else False
 
 
+def artifact_manifest_incompatible_with_package(manifest: _ArtifactManifest | None) -> bool:
+    """Return True when the manifest requires a newer package or unknown artifact format."""
+    if manifest is None:
+        return False
+    fmt = manifest.artifact_format_version
+    if fmt not in (0, ARTIFACT_FORMAT_VERSION):
+        return True
+    min_cv = (manifest.min_compatible_package_version or "").strip()
+    if not min_cv:
+        return False
+    try:
+        return Version(_artifact_package_version_string()) < Version(min_cv)
+    except (InvalidVersion, TypeError, ValueError):
+        return True
+
+
 def classify_migration_tier(
-    manifest: ArtifactManifest | None,
+    manifest: _ArtifactManifest | None,
     schema: SchemaGraph,
     *,
     previous_schema: SchemaGraph | None = None,
     schema_diff: Any | None = None,
 ) -> MigrationTier:
     """Compare stored manifest fingerprints to the live schema graph."""
-
-    if manifest is None or not manifest.effective_structural_hash:
+    if manifest is None:
+        return MigrationTier.NO_CHANGE
+    man_id = str(manifest.schema_graph_id or "")
+    live_id = str(schema.schema_graph_id or "")
+    if man_id and live_id and man_id == live_id and _manifest_matches_schema(manifest, schema):
+        return MigrationTier.NO_CHANGE
+    if not manifest.effective_structural_hash and not man_id:
         return MigrationTier.NO_CHANGE
     if _manifest_matches_schema(manifest, schema):
         return MigrationTier.NO_CHANGE
-    fmt = manifest.artifact_format_version
-    if fmt not in (0, ARTIFACT_FORMAT_VERSION):
+    if artifact_manifest_incompatible_with_package(manifest):
         return MigrationTier.DESTRUCTIVE
-    min_cv = (manifest.min_compatible_package_version or "").strip()
-    if min_cv:
-        try:
-            if Version(_artifact_package_version_string()) < Version(min_cv):
-                return MigrationTier.DESTRUCTIVE
-        except (InvalidVersion, TypeError, ValueError):
-            return MigrationTier.DESTRUCTIVE
     same_effective = manifest.effective_structural_hash == schema.effective_structural_hash
     if same_effective:
         if (manifest.notes_hash or "") != (schema.notes_hash or ""):
@@ -2378,7 +1645,7 @@ def classify_migration_tier(
         if manifest.profiling_hash != schema.profiling_hash:
             if previous_schema is None:
                 return MigrationTier.DESTRUCTIVE
-            if profiling_value_overlap(previous_schema, schema) >= MIGRATION_DATA_OVERLAP_MIN:
+            if _profiling_value_overlap(previous_schema, schema) >= MIGRATION_DATA_OVERLAP_MIN:
                 return MigrationTier.SOFT_REFRESH
             return MigrationTier.DESTRUCTIVE
         return MigrationTier.SOFT_REFRESH
@@ -2389,3 +1656,508 @@ def classify_migration_tier(
     ):
         return MigrationTier.REMAP
     return MigrationTier.DESTRUCTIVE
+
+
+@dataclass
+class StepResult:
+    """Mutable capture of pipeline outputs, metrics, and logs for one scenario run."""
+
+    scenario_id: str
+    question: str
+    status: str = "unknown"
+    intent: RuntimeIntent | None = None
+    sql: str | None = None
+    rows: list[tuple[Any, ...]] | None = None
+    confidence: float | None = None
+    reuse_type: str | None = None
+    template_id: str | None = None
+    validation_failed: bool = False
+    feedback: str | None = None
+    error: str | None = None
+    duration_seconds: float = 0.0
+    captured_logs: list[str] = field(default_factory=list)
+    semantic_warnings: list[str] = field(default_factory=list)
+    soft_warnings: list[str] = field(default_factory=list)
+    llm_calls: int = 0
+    reject_reason_actual: str | None = None
+    classified_category: str | None = None
+    classified_reason: str | None = None
+    generation_path: str | None = None
+    pending_feedback: Any | None = None
+    diagnostics: tuple[Any, ...] = ()
+    kind: str | None = None
+
+
+def format_failure_trace(step: StepResult | list[StepResult] | object) -> str:
+    """Format a step result or list of results into a diagnostic string for results.txt."""
+    if isinstance(step, list):
+        parts = [format_failure_trace(s) for s in step]
+        return "\n\n".join(p for p in parts if p)
+    lines: list[str] = []
+    question = getattr(step, "question", None)
+    if question:
+        lines.append(f"question: {question}")
+    error = getattr(step, "error", None)
+    if error:
+        lines.extend(str(error).strip().splitlines())
+    intent = getattr(step, "intent", None)
+    if intent is None:
+        summary = getattr(step, "intent_summary", None)
+        if summary is not None:
+            tables = getattr(summary, "tables", None)
+            if tables:
+                lines.append(f"tables: {list(tables)}")
+            grain = getattr(summary, "grain", None)
+            if grain:
+                lines.append(f"grain: {grain}")
+    elif intent:
+        it = intent
+        lines.append(f"tables: {it.tables}")
+        lines.append(f"grain: {it.grain}")
+        gb_terms = [getattr(g, "primary_term", str(g)) for g in (it.group_by_cols or [])]
+        if gb_terms:
+            lines.append(f"group_by: {gb_terms}")
+        agg_cols = [
+            getattr(sc.expr, "primary_term", str(sc.expr))
+            for sc in (it.select_cols or [])
+            if getattr(sc, "is_aggregated", False)
+        ]
+        if agg_cols:
+            lines.append(f"agg_select: {agg_cols}")
+    sql = getattr(step, "sql", None)
+    if sql:
+        lines.append("sql:")
+        lines.extend(str(sql).splitlines())
+    llm_calls = getattr(step, "llm_calls", None)
+    if llm_calls is not None:
+        lines.append(f"llm_calls: {llm_calls}")
+    status = getattr(step, "status", None)
+    kind = getattr(step, "kind", None)
+    if status is not None or kind is not None:
+        lines.append(f"status: {status!r} kind: {kind!r}")
+    captured_logs = getattr(step, "captured_logs", None)
+    if captured_logs:
+        for ln in captured_logs:
+            lines.append(str(ln))
+    diagnostics = getattr(step, "diagnostics", None)
+    if diagnostics:
+        for diag in diagnostics:
+            code = getattr(diag, "code", None)
+            message = getattr(diag, "message", None)
+            if code or message:
+                lines.append(f"diagnostic: {code}: {message}")
+    return "\n".join(lines)
+
+
+def append_failure_trace(step: StepResult | list[StepResult] | object | None, path: str | os.PathLike[str]) -> None:
+    """Append a formatted failure trace to the specified results file."""
+    if step is None:
+        return
+    text = format_failure_trace(step)
+    if not text:
+        return
+    p = Path(path)
+    needs_sep = p.is_file() and p.stat().st_size > 0
+    with open(path, "a", encoding="utf-8") as fh:
+        if needs_sep:
+            fh.write("\n\n" + "=" * 80 + "\n\n")
+        fh.write(text)
+        if not text.endswith("\n"):
+            fh.write("\n")
+
+
+def build_session_step_trace(
+    *,
+    scenario_id: str,
+    question: str,
+    step: object | None,
+    error: str | None = None,
+    captured_logs: list[str] | None = None,
+) -> StepResult:
+    status = "failed"
+    if step is not None and getattr(step, "done", False) and not error:
+        status = str(getattr(step, "status", None) or "ok")
+    intent = getattr(step, "intent", None) if step is not None else None
+    sql = getattr(step, "sql", None) if step is not None else None
+    step_error = error
+    if not step_error and step is not None:
+        step_error = getattr(step, "error", None) or getattr(step, "message", None)
+    diagnostics = getattr(step, "diagnostics", ()) if step is not None else ()
+    return StepResult(
+        scenario_id=scenario_id,
+        question=question,
+        status=status,
+        intent=intent if isinstance(intent, RuntimeIntent) else None,
+        sql=str(sql) if sql else None,
+        error=str(step_error).strip() if step_error else None,
+        captured_logs=list(captured_logs or []),
+        diagnostics=tuple(diagnostics) if diagnostics else (),
+        kind=str(getattr(step, "kind", "") or "") or None,
+    )
+
+
+def run_with_pipeline_capture(
+    fn: Callable[[], tuple[object | None, str]],
+    *,
+    auto_responses: list[str] | None = None,
+) -> tuple[object | None, str, list[str]]:
+    responses = ["y"] if auto_responses is None else auto_responses
+    with pipeline_capture(auto_responses=responses) as capture:
+        step, err = fn()
+    return step, err, list(capture.get("logs", []))
+
+
+def _make_prompt_responders(
+    responses: list[str],
+) -> tuple[Callable[..., Any], Callable[..., Any]]:
+    """Build FIFO auto-responders for ``ask_user_choice`` and ``interactive_yes_no`` sharing one queue."""
+    queue = list(responses)
+
+    def _ask_user_choice(prompt: str, options: list[str], silent_no: bool = False) -> str | None:
+        if queue:
+            return queue.pop(0)
+        return "y"
+
+    def _interactive_yes_no(
+        stage: str,
+        prompt: str,
+        options: list[str],
+        silent_no: bool = False,
+        *,
+        choice_port: Any = None,
+    ) -> str | None:
+        if choice_port is not None:
+            if queue:
+                return queue.pop(0)
+            return "y"
+        if queue:
+            return queue.pop(0)
+        return "y"
+
+    return _ask_user_choice, _interactive_yes_no
+
+
+def _make_input_responder(reject_reason: str = "incorrect results") -> Callable[[str], str]:
+    """Build a replacement for ``builtins.input`` that supplies canned text."""
+    call_count = {"n": 0}
+
+    def _fake_input(prompt: str = "") -> str:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return reject_reason
+        return "n"
+
+    return _fake_input
+
+
+@contextmanager
+def pipeline_capture(
+    auto_responses: list[str],
+    reject_reason: str = "incorrect results",
+    csv_dir: str = "",
+) -> Iterator[dict[str, Any]]:
+    """Patch interactive I/O for programmatic pipeline runs."""
+    import importlib
+
+    capture: dict[str, Any] = {"logs": []}
+    ask_uc, iyn = _make_prompt_responders(auto_responses)
+    input_responder = _make_input_responder(reject_reason)
+
+    def _import_mod(short: str) -> Any:
+        return importlib.import_module(f"aetherdialect.{short}")
+
+    def _capturing_debug(msg: str) -> None:
+        capture["logs"].append(f"[DEBUG] {msg}")
+
+    _debug_module_names = (
+        "_core_utils",
+        "_pipeline",
+        "_sql_gen",
+        "_validation_execute",
+        "_validation_schema",
+        "_validation_semantic",
+        "_intent_expr",
+        "_intent_process",
+        "_intent_repair",
+        "_intent_resolve",
+        "_dialect",
+        "_expansion_ops",
+        "_utils",
+        "_templates",
+        "_schema_graph",
+        "_schema_catalog",
+        "_qsim",
+        "_qsim_ops",
+        "_main_execution",
+        "_seed_warmup",
+        "_llm_provider",
+    )
+    extra_patches: list[Any] = []
+    for short in _debug_module_names:
+        mod = _import_mod(short)
+        if hasattr(mod, "debug"):
+            extra_patches.append(patch.object(mod, "debug", _capturing_debug))
+
+    def _capturing_pipeline_trace(heading: str, body: str | Callable[[], str]) -> None:
+        resolved = body() if callable(body) else body
+        capture["logs"].append(f"[PIPELINE_TRACE] {heading}\n{resolved}")
+
+    _trace_module_names = (
+        "_core_utils",
+        "_pipeline",
+        "_intent_process",
+        "_sql_gen",
+        "_validation_execute",
+        "_intent_resolve",
+        "_dialect",
+        "_intent_repair",
+        "_llm_provider",
+    )
+    for short in _trace_module_names:
+        mod = _import_mod(short)
+        if hasattr(mod, "pipeline_trace"):
+            extra_patches.append(patch.object(mod, "pipeline_trace", _capturing_pipeline_trace))
+
+    core_utils_mod = _import_mod("_core_utils")
+    pipeline_mod = _import_mod("_pipeline")
+    main_exec_mod = _import_mod("_main_execution")
+
+    if csv_dir:
+        _original_save = pipeline_mod.save_result_csv
+
+        def _redirected_save(df: Any) -> None:
+            orig_cwd = os.getcwd()
+            try:
+                os.chdir(csv_dir)
+                _original_save(df)
+            finally:
+                os.chdir(orig_cwd)
+
+        extra_patches.append(patch.object(pipeline_mod, "save_result_csv", _redirected_save))
+        live_testing_mod = _import_mod("_live_testing")
+        if hasattr(live_testing_mod, "save_result_csv"):
+            extra_patches.append(patch.object(live_testing_mod, "save_result_csv", _redirected_save))
+
+    with (
+        patch.object(core_utils_mod, "ask_user_choice", ask_uc),
+        patch.object(core_utils_mod, "interactive_yes_no", iyn),
+        patch.object(pipeline_mod, "interactive_yes_no", iyn),
+        patch.object(main_exec_mod, "interactive_yes_no", iyn),
+        patch("builtins.input", input_responder),
+    ):
+        for p in extra_patches:
+            p.start()
+        try:
+            yield capture
+        finally:
+            for p in extra_patches:
+                p.stop()
+
+
+_structural_migration_handler: Callable[..., None] | None = None
+
+
+def register_structural_migration_handler(handler: Callable[..., None]) -> None:
+    """Register the owner-side structural migration callback."""
+    global _structural_migration_handler
+    _structural_migration_handler = handler
+
+
+def apply_structural_migration_to_persisted_scopes(
+    engine_dir: str,
+    *,
+    dropped_tables: tuple[str, ...] = (),
+    dropped_columns: tuple[str, ...] = (),
+    table_renames: tuple[tuple[str, str], ...] = (),
+    column_renames: tuple[tuple[str, str, str], ...] = (),
+) -> None:
+    """Apply table/column migration to persisted aetherspace and named context specs."""
+    if _structural_migration_handler is None:
+        raise RuntimeError("structural migration handler is not registered")
+    _structural_migration_handler(
+        engine_dir,
+        dropped_tables=dropped_tables,
+        dropped_columns=dropped_columns,
+        table_renames=table_renames,
+        column_renames=column_renames,
+    )
+
+
+def bind_params_for_sql(sql: str, param_values: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return bind map for EXPLAIN only when *sql* still contains ``:pN`` / ``@pN`` / ``$pN`` placeholders."""
+    if not param_values:
+        return None
+    return param_values if SQL_BIND_TOKEN_RE.search(sql) else None
+
+
+def reconcile_execute_bind_params(
+    sql: str,
+    param_values: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Filter *param_values* to tokens present in *sql* and fail when any bind token lacks a value."""
+    if not SQL_BIND_TOKEN_RE.search(sql) and not UNBOUND_PYFORMAT_PLACEHOLDER_RE.search(sql):
+        return None
+    bind_map = bind_params_for_sql(sql, param_values) or {}
+    required: set[str] = set()
+    for match in SQL_BIND_TOKEN_RE.finditer(sql):
+        required.add(match.group(1))
+    for match in re.finditer(r"%\((\w+)\)s", sql):
+        required.add(match.group(1))
+    missing = sorted(required - set(bind_map.keys()))
+    if missing:
+        raise ValueError(f"unbound_placeholder: {', '.join(missing)}")
+    return bind_map if bind_map else None
+
+
+def cost_cap_active(v: float | int | None) -> bool:
+    """True when *v* is a positive finite bound; ``None``, ``0``, and negatives disable the cap."""
+    if v is None:
+        return False
+    try:
+        return float(v) > 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+_DIAGNOSTIC_FORCE_DEPTH: int = 0
+
+
+def diagnostic_debug_enabled() -> bool:
+    """True when ``PolicyConfig.DEBUG`` or diagnostic capture (``telemetry_capture`` depth) is active."""
+    return _DIAGNOSTIC_FORCE_DEPTH > 0 or PolicyConfig.DEBUG
+
+
+def diagnostic_pipeline_trace_full_enabled() -> bool:
+    """True when full pipeline trace logging is enabled."""
+    return diagnostic_debug_enabled()
+
+
+def diagnostic_force_enter() -> None:
+    """Increment nested diagnostic capture depth (used by ``telemetry_capture``)."""
+    global _DIAGNOSTIC_FORCE_DEPTH
+    _DIAGNOSTIC_FORCE_DEPTH += 1
+
+
+def diagnostic_force_exit() -> None:
+    """Decrement nested diagnostic capture depth."""
+    global _DIAGNOSTIC_FORCE_DEPTH
+    if _DIAGNOSTIC_FORCE_DEPTH > 0:
+        _DIAGNOSTIC_FORCE_DEPTH -= 1
+
+
+def permission_denied_detail_logging_enabled() -> bool:
+    """Return whether permission-denied failures may log SQL and driver detail at DEBUG."""
+    raw = os.environ.get(AETHERDIALECT_LOG_PERMISSION_DENIED_DETAIL_ENV, "")
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def normalize_value_type(value_type: str) -> str:
+    """Map a raw value-type string onto a canonical pipeline type."""
+    if not value_type:
+        return "string"
+    vt_lower = value_type.lower().strip()
+    if vt_lower in VALUE_TYPE_NORMALIZATION:
+        return VALUE_TYPE_NORMALIZATION[vt_lower]
+    if vt_lower in VALID_VALUE_TYPES:
+        return vt_lower
+    return "string"
+
+
+def load_runtime_config(
+    *,
+    merged_env: Mapping[str, str],
+) -> LlmExecutionConfig:
+    """
+    Merge built-in defaults with a caller-supplied environment.
+
+    snapshot into one frozen LLM execution config. Resolution order is defaults first, then the environment layer keyed by the canonical Azure OpenAI and execution-limit variable names. Args: merged_env: Mapping of effective environment strings used for the environment merge layer. Returns: The frozen :class:`LlmExecutionConfig`.
+
+    Raises: ValueError: When numeric fields are negative after merge.
+    """
+
+    def _env_text(name: str) -> str:
+        return str(merged_env.get(name, "") or "").strip()
+
+    defaults: dict[str, Any] = {
+        "azure_endpoint": "",
+        "azure_api_key": "",
+        "azure_api_version": "",
+        "deployment_light": "",
+        "deployment_medium": "",
+        "deployment_heavy": "",
+        "max_query_cost_rows": 50_000_000,
+        "max_query_cost_bytes": 50_000_000_000,
+        "statement_timeout_ms": 30_000,
+        "llm_timeout_ms": 60_000,
+        "profile_timeout_ms": 120_000,
+        "explain_timeout_ms": None,
+    }
+    env_map: dict[str, str] = {
+        "azure_endpoint": "AZURE_OPENAI_ENDPOINT",
+        "azure_api_key": "AZURE_OPENAI_API_KEY",
+        "azure_api_version": "AZURE_OPENAI_API_VERSION",
+        "deployment_light": AZURE_OPENAI_ENV_DEPLOYMENT_LIGHT,
+        "deployment_medium": AZURE_OPENAI_ENV_DEPLOYMENT_MEDIUM,
+        "deployment_heavy": AZURE_OPENAI_ENV_DEPLOYMENT_HEAVY,
+        "max_query_cost_rows": "AETHERDIALECT_MAX_QUERY_COST_ROWS",
+        "max_query_cost_bytes": "AETHERDIALECT_MAX_QUERY_COST_BYTES",
+        "statement_timeout_ms": "AETHERDIALECT_STATEMENT_TIMEOUT_MS",
+        "llm_timeout_ms": "AETHERDIALECT_LLM_TIMEOUT_MS",
+        "profile_timeout_ms": "AETHERDIALECT_PROFILE_TIMEOUT_MS",
+        "explain_timeout_ms": "AETHERDIALECT_EXPLAIN_TIMEOUT_MS",
+    }
+    merged: dict[str, Any] = dict(defaults)
+    for canon, env_name in env_map.items():
+        raw = _env_text(env_name)
+        if not raw:
+            continue
+        if canon in {
+            "max_query_cost_rows",
+            "max_query_cost_bytes",
+            "statement_timeout_ms",
+            "llm_timeout_ms",
+            "profile_timeout_ms",
+        }:
+            try:
+                iv = int(raw, 10)
+            except ValueError:
+                continue
+            if iv < 0:
+                raise ValueError(f"Invalid non-negative integer for {env_name}")
+            merged[canon] = iv
+        elif canon == "explain_timeout_ms":
+            try:
+                iv = int(raw, 10)
+            except ValueError:
+                continue
+            merged[canon] = None if iv <= 0 else iv
+        else:
+            merged[canon] = raw
+    for name in (
+        "max_query_cost_rows",
+        "max_query_cost_bytes",
+        "statement_timeout_ms",
+        "llm_timeout_ms",
+        "profile_timeout_ms",
+    ):
+        v = merged.get(name)
+        if not isinstance(v, int) or v < 0:
+            raise ValueError(f"Invalid runtime config for {name}")
+    exm = merged.get("explain_timeout_ms")
+    if exm is not None and (not isinstance(exm, int) or exm < 0):
+        raise ValueError("Invalid runtime config for explain_timeout_ms")
+    cfg = LlmExecutionConfig(
+        azure_endpoint=str(merged.get("azure_endpoint") or ""),
+        azure_api_key=str(merged.get("azure_api_key") or ""),
+        azure_api_version=str(merged.get("azure_api_version") or ""),
+        deployment_light=str(merged.get("deployment_light") or ""),
+        deployment_medium=str(merged.get("deployment_medium") or ""),
+        deployment_heavy=str(merged.get("deployment_heavy") or ""),
+        max_query_cost_rows=int(merged["max_query_cost_rows"]),
+        max_query_cost_bytes=int(merged["max_query_cost_bytes"]),
+        statement_timeout_ms=int(merged["statement_timeout_ms"]),
+        llm_timeout_ms=int(merged["llm_timeout_ms"]),
+        profile_timeout_ms=int(merged["profile_timeout_ms"]),
+        explain_timeout_ms=merged.get("explain_timeout_ms"),
+    )
+    return cfg

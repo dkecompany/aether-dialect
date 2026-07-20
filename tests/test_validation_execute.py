@@ -6,29 +6,33 @@ from unittest.mock import MagicMock
 
 from aetherdialect._contracts_base import (
     FailureCategory,
-    SchemaGraph,
+    FilterParam,
+    MulGroup,
+    NormalizedExpr,
     SqlDiagnostic,
     SqlDiagnosticCode,
 )
 from aetherdialect._contracts_core import (
-    CaseRegistryStep,
-    CaseWhenBranch,
-    CaseWhenExpr,
-    FilterParam,
-    MulGroup,
-    NormalizedExpr,
     RuntimeCteStep,
     RuntimeIntent,
     SelectCol,
 )
-from aetherdialect._dialect import DatabricksDialect, Dialect, PostgresDialect
+from aetherdialect._contracts_schema import (
+    CaseRegistryStep,
+    CaseWhenBranch,
+    CaseWhenExpr,
+    SchemaGraph,
+)
+from aetherdialect._core_utils import bind_params_for_sql
+from aetherdialect._dialect import Dialect
+from aetherdialect._dialect_postgres import PostgresDialect
+from aetherdialect._dialect_sqlglot_engines import DatabricksDialect
 from aetherdialect._validation_execute import (
     _enforce_select_only,
     _validate_case_branches_for_scope,
     _validate_cte_cardinality,
     _validate_cte_output_types,
     _validate_main_query_cte_usage,
-    bind_params_for_sql,
     canonicalize_rejection_reason,
     compute_confidence,
     validate_semantics,
@@ -95,6 +99,10 @@ class TestBindParamsForSql:
     def test_returns_map_when_sql_has_s_placeholder(self):
         params = {"s1": "x"}
         assert bind_params_for_sql("SELECT * FROM t WHERE name = :s1", params) is params
+
+    def test_returns_map_when_sql_has_dollar_p_placeholder(self):
+        params = {"p1": "horror"}
+        assert bind_params_for_sql('SELECT * FROM t WHERE LOWER("name") = $p1', params) is params
 
     def test_no_placeholder_returns_none_even_with_params(self):
         params = {"p1": 1}
@@ -525,7 +533,7 @@ class TestValidateMainQueryCteUsage:
         assert col_errors == []
 
     def test_cte_outputs_key_case_must_match_for_column_lookup(self):
-        """CTE output keys and column refs are matched case-insensitively via canonical lookup."""
+        """CTE output keys and column refs are matched case- insensitively via canonical lookup."""
         intent = RuntimeIntent(
             tables=["cte1"],
             grain="row_level",
@@ -945,7 +953,7 @@ class TestValidateSemantics:
 
     def test_merge_cte_projection_columns_into_outputs_adds_missing_keys(self):
         """Sparse ``output_column_metadata`` is augmented from ``output_columns``."""
-        from aetherdialect._contracts_base import CteOutputColumnMeta
+        from aetherdialect._contracts_schema import CteOutputColumnMeta
         from aetherdialect._validation_execute import (
             _merge_cte_projection_columns_into_outputs,
         )

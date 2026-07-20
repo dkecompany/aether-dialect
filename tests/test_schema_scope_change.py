@@ -10,21 +10,23 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from aetherdialect import _schema as schema_mod
+import aetherdialect._schema_overrides
 from aetherdialect._config import EngineConfig
-from aetherdialect._contracts_base import SchemaContext, SchemaGraph
+from aetherdialect._contracts_base import EngineContext
+from aetherdialect._contracts_schema import SchemaGraph
 from aetherdialect._core_utils import read_gzip_json
 from aetherdialect._dialect import Dialect
-from aetherdialect._schema import (
-    _filter_schema_graph_by_scope,
-    _save_schema_to_cache,
+from aetherdialect._schema_graph import (
     assign_schema_graph_hashes,
-    build_schema_graph,
     classify_scope_change,
     compute_dialect_probe,
+    filter_schema_graph_by_scope,
     schema_context_from_descriptor,
     scope_descriptor_for,
 )
+from aetherdialect._schema_overrides import build_schema_graph, save_schema_to_cache
+
+pytestmark = pytest.mark.usefixtures("stub_schema_llm_classifier")
 
 
 class _ProbeStubDialect(Dialect):
@@ -36,10 +38,16 @@ class _ProbeStubDialect(Dialect):
         self.reflect_calls = 0
         self.profile_calls = 0
 
-    def compute_ddl_probe(self, schema_context: SchemaContext) -> str:
+    def compute_ddl_probe(self, engine_context: EngineContext) -> str:
         return self._probe_value
 
-    def reflect_schema_graph(self, *, include: Any = "tables", allow_objects: Any = None) -> SchemaGraph:
+    def reflect_schema_graph(
+        self,
+        *,
+        include: Any = "tables",
+        allow_objects: Any = None,
+        sql_file: Any = None,
+    ) -> SchemaGraph:
         self.reflect_calls += 1
         raise AssertionError("reflect_schema_graph should not run in this test")
 
@@ -62,7 +70,7 @@ def cache_path(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> str:
 
 def _save_with_probe(
     sg: SchemaGraph,
-    ctx: SchemaContext,
+    ctx: EngineContext,
     notes_content: str,
     probe_hash: str,
     cache_path: str,
@@ -70,59 +78,59 @@ def _save_with_probe(
     sg.notes_sha256 = hashlib.sha256((notes_content or "").encode("utf-8")).hexdigest()
     assign_schema_graph_hashes(sg, ctx, sg.notes_sha256)
     sg.ddl_probe_hash = probe_hash
-    _save_schema_to_cache(sg, cache_path)
+    save_schema_to_cache(sg, cache_path)
 
 
 def test_classify_identical_when_all_fields_match() -> None:
-    a = SchemaContext(deny_columns=frozenset({"customers.email"}))
-    b = SchemaContext(deny_columns=frozenset({"customers.email"}))
+    a = EngineContext(deny_columns=frozenset({"customers.email"}))
+    b = EngineContext(deny_columns=frozenset({"customers.email"}))
     assert classify_scope_change(a, b) == "identical"
 
 
 def test_classify_subset_when_new_adds_deny() -> None:
-    old = SchemaContext()
-    new = SchemaContext(deny_columns=frozenset({"customers.email"}))
+    old = EngineContext()
+    new = EngineContext(deny_columns=frozenset({"customers.email"}))
     assert classify_scope_change(old, new) == "subset"
 
 
 def test_classify_superset_when_new_removes_deny() -> None:
-    old = SchemaContext(deny_columns=frozenset({"customers.email"}))
-    new = SchemaContext()
+    old = EngineContext(deny_columns=frozenset({"customers.email"}))
+    new = EngineContext()
     assert classify_scope_change(old, new) == "superset"
 
 
 def test_classify_subset_when_new_narrows_allow_objects() -> None:
-    old = SchemaContext(allow_objects=frozenset({"a", "b", "c"}))
-    new = SchemaContext(allow_objects=frozenset({"a", "b"}))
+    old = EngineContext(allow_objects=frozenset({"a", "b", "c"}))
+    new = EngineContext(allow_objects=frozenset({"a", "b"}))
     assert classify_scope_change(old, new) == "subset"
 
 
 def test_classify_superset_when_old_universal_new_universal_deny_removed() -> None:
-    old = SchemaContext(deny_columns=frozenset({"orders.status", "customers.email"}))
-    new = SchemaContext(deny_columns=frozenset({"orders.status"}))
+    old = EngineContext(deny_columns=frozenset({"orders.status", "customers.email"}))
+    new = EngineContext(deny_columns=frozenset({"orders.status"}))
     assert classify_scope_change(old, new) == "superset"
 
 
 def test_classify_orthogonal_when_different_denies() -> None:
-    old = SchemaContext(deny_columns=frozenset({"customers.email"}))
-    new = SchemaContext(deny_columns=frozenset({"orders.status"}))
+    old = EngineContext(deny_columns=frozenset({"customers.email"}))
+    new = EngineContext(deny_columns=frozenset({"orders.status"}))
     assert classify_scope_change(old, new) == "orthogonal"
 
 
 def test_classify_subset_include_lattice_tables_into_both() -> None:
-    old = SchemaContext(include="both")
-    new = SchemaContext(include="tables")
+    old = EngineContext(include="both")
+    new = EngineContext(include="tables")
     assert classify_scope_change(old, new) == "subset"
 
 
 def test_classify_orthogonal_include_tables_vs_views() -> None:
-    old = SchemaContext(include="tables")
-    new = SchemaContext(include="views")
+    old = EngineContext(include="tables")
+    new = EngineContext(include="views")
     assert classify_scope_change(old, new) == "orthogonal"
 
 
 def test_scope_descriptor_round_trip() -> None:
-    ctx = SchemaContext(
+    ctx = EngineContext(
         allow_objects=frozenset({"customers", "orders"}),
         deny_columns=frozenset({"products.price"}),
         allow_columns=frozenset({"*.name"}),
@@ -136,16 +144,22 @@ def test_scope_descriptor_round_trip() -> None:
     assert rebuilt.include == ctx.include
 
 
-def test_filter_drops_unallowed_tables(schema_graph: SchemaGraph) -> None:
-    new_ctx = SchemaContext(allow_objects=frozenset({"customers"}))
-    filtered = _filter_schema_graph_by_scope(schema_graph, new_ctx)
+def test_filter_drops_deny_objects(schema_graph: SchemaGraph) -> None:
+    new_ctx = EngineContext(deny_objects=frozenset({"orders", "products"}))
+    filtered = filter_schema_graph_by_scope(schema_graph, new_ctx)
     assert set(filtered.tables) == {"customers"}
     assert "orders" in schema_graph.tables
 
 
+def test_filter_does_not_narrow_allow_objects(schema_graph: SchemaGraph) -> None:
+    new_ctx = EngineContext(allow_objects=frozenset({"customers"}))
+    filtered = filter_schema_graph_by_scope(schema_graph, new_ctx)
+    assert set(filtered.tables) == set(schema_graph.tables)
+
+
 def test_filter_strips_denied_columns(schema_graph: SchemaGraph) -> None:
-    new_ctx = SchemaContext(deny_columns=frozenset({"customers.email"}))
-    filtered = _filter_schema_graph_by_scope(schema_graph, new_ctx)
+    new_ctx = EngineContext(deny_columns=frozenset({"customers.email"}))
+    filtered = filter_schema_graph_by_scope(schema_graph, new_ctx)
     assert "email" not in filtered.tables["customers"].columns
     assert "email" in schema_graph.tables["customers"].columns
 
@@ -155,19 +169,19 @@ def test_cache_subset_path_filters_in_memory_no_reflect(
     cache_path: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    ctx_saved = SchemaContext()
+    ctx_saved = EngineContext()
     dialect = _ProbeStubDialect()
     probe = compute_dialect_probe(dialect, ctx_saved)
     _save_with_probe(schema_graph, ctx_saved, "notes", probe, cache_path)
 
     classify_calls: list[Any] = []
     monkeypatch.setattr(
-        schema_mod,
+        aetherdialect._schema_overrides,
         "apply_column_roles_llm",
         lambda sg, notes_content=None, **kwargs: classify_calls.append(notes_content),
     )
 
-    new_ctx = SchemaContext(deny_columns=frozenset({"customers.email"}))
+    new_ctx = EngineContext(deny_columns=frozenset({"customers.email"}))
     out = build_schema_graph(dialect, new_ctx, notes_content="notes")
 
     assert dialect.reflect_calls == 0
@@ -183,7 +197,7 @@ def test_cache_subset_path_with_notes_change_reruns_classifier(
     cache_path: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    ctx_saved = SchemaContext()
+    ctx_saved = EngineContext()
     dialect = _ProbeStubDialect()
     probe = compute_dialect_probe(dialect, ctx_saved)
     _save_with_probe(schema_graph, ctx_saved, "notes-OLD", probe, cache_path)
@@ -191,17 +205,15 @@ def test_cache_subset_path_with_notes_change_reruns_classifier(
     classify_calls: list[Any] = []
     boolean_calls: list[int] = []
     monkeypatch.setattr(
-        schema_mod,
-        "apply_column_roles_llm",
+        "aetherdialect._schema_graph.apply_column_roles_llm",
         lambda sg, notes_content=None, **kwargs: classify_calls.append(notes_content),
     )
     monkeypatch.setattr(
-        schema_mod,
-        "apply_boolean_coercion_pass",
+        "aetherdialect._schema_graph.apply_boolean_coercion_pass",
         lambda sg: boolean_calls.append(1),
     )
 
-    new_ctx = SchemaContext(deny_columns=frozenset({"customers.email"}))
+    new_ctx = EngineContext(deny_columns=frozenset({"customers.email"}))
     out = build_schema_graph(dialect, new_ctx, notes_content="notes-NEW")
 
     assert dialect.reflect_calls == 0
@@ -210,16 +222,16 @@ def test_cache_subset_path_with_notes_change_reruns_classifier(
     assert out.notes_sha256 == hashlib.sha256(b"notes-NEW").hexdigest()
 
 
-def test_cache_subset_via_allow_objects(
+def test_cache_subset_via_deny_objects(
     schema_graph: SchemaGraph,
     cache_path: str,
 ) -> None:
-    ctx_saved = SchemaContext()
+    ctx_saved = EngineContext()
     dialect = _ProbeStubDialect()
     probe = compute_dialect_probe(dialect, ctx_saved)
     _save_with_probe(schema_graph, ctx_saved, "n", probe, cache_path)
 
-    new_ctx = SchemaContext(allow_objects=frozenset({"customers", "orders"}))
+    new_ctx = EngineContext(deny_objects=frozenset({"products"}))
     out = build_schema_graph(dialect, new_ctx, notes_content="n")
 
     assert dialect.reflect_calls == 0
@@ -233,8 +245,7 @@ def test_legacy_cache_without_scope_descriptor_skips_subset_path(
     cache_path: str,
 ) -> None:
     """Legacy caches lacking ``scope_descriptor`` cannot use the subset path → fall to legacy validation."""
-
-    ctx_saved = SchemaContext()
+    ctx_saved = EngineContext()
     dialect = _ProbeStubDialect()
     probe = compute_dialect_probe(dialect, ctx_saved)
     _save_with_probe(schema_graph, ctx_saved, "n", probe, cache_path)
@@ -245,7 +256,7 @@ def test_legacy_cache_without_scope_descriptor_skips_subset_path(
 
     write_gzip_json_atomic(cache_path, raw, sort_keys=True)
 
-    new_ctx = SchemaContext(deny_columns=frozenset({"customers.email"}))
+    new_ctx = EngineContext(deny_columns=frozenset({"customers.email"}))
     with pytest.raises(AssertionError):
         build_schema_graph(dialect, new_ctx, notes_content="n")
 
@@ -262,7 +273,13 @@ def test_full_rebuild_profiles_only_columns_after_scope_trim(
     reflect_kw: list[tuple[Any, Any]] = []
 
     class _ReflectDialect(_ProbeStubDialect):
-        def reflect_schema_graph(self, *, include: Any = "tables", allow_objects: Any = None) -> SchemaGraph:
+        def reflect_schema_graph(
+            self,
+            *,
+            include: Any = "tables",
+            allow_objects: Any = None,
+            sql_file: Any = None,
+        ) -> SchemaGraph:
             self.reflect_calls += 1
             reflect_kw.append((include, allow_objects))
             return deepcopy(template)
@@ -272,7 +289,7 @@ def test_full_rebuild_profiles_only_columns_after_scope_trim(
             profiled_snapshots.append(sum(len(t.columns) for t in sg.tables.values()))
 
     dialect = _ReflectDialect()
-    ctx = SchemaContext(
+    ctx = EngineContext(
         allow_objects=frozenset({"customers"}),
         allow_columns=frozenset({"customers.customer_id"}),
     )

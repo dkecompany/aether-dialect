@@ -4,10 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-import pytest
-
-from aetherdialect._contracts_base import TemplateStats
-from aetherdialect._live_testing import run_sequence_and_assert
+from aetherdialect._contracts_schema import TemplateStats
 from aetherdialect._templates import (
     load_template_store,
     save_template_store,
@@ -24,29 +21,11 @@ from ._seed_helpers import (
     seed_template,
     seeded_runner,
 )
-from .mydb_scenarios import stateful_scenarios
-
-_sequences = [seq for seq in stateful_scenarios() if seq.id in {"SQ-001", "SQ-002"}]
 
 
-@pytest.mark.live
-@pytest.mark.parametrize("seq", _sequences, ids=[s.id for s in _sequences])
-def test_stateful_sequence(runner, seq):
-    """Run a sequence of scenarios sharing template state and assert each step."""
-
-    run_sequence_and_assert(runner, seq)
-
-
-@pytest.mark.live
 @patch("aetherdialect._templates.llm_credentials_configured", return_value=False)
 def test_store_persistence_roundtrip(_mock_no_llm, schema, schema_terms, t2s) -> None:
-    """
-    Seed a full-shape store on disk, then reload it and assert every section survives.
-
-    Covers accepted templates and ``question_feedback`` rows (rejections, validation failures, penalties)
-    so regressions in ``save_template_store`` / ``load_template_store`` are caught at the live layer.
-    """
-
+    """Seed a full-shape store on disk, then reload it and assert every section survives. Covers accepted templates and ``question_feedback`` rows (rejections, validation failures, penalties) so regressions in ``save_template_store`` / ``load_template_store`` are caught at the live layer."""
     with isolated_runner(schema, schema_terms, t2s, label="persist_rt") as runner:
         accepted = seed_template(
             runner,
@@ -102,12 +81,7 @@ def test_store_persistence_roundtrip(_mock_no_llm, schema, schema_terms, t2s) ->
 
 
 def test_seeded_per_pair_state_survives_save_load(schema, schema_terms, t2s) -> None:
-    """
-    The ``multi_pair_template`` kit's per-pair feedback dict survives a save/load round-trip.
-
-    Asserts every seeded ``feedback_by_question`` entry — including pairs with zero accepts — comes back identical after the store is persisted and reloaded.
-    """
-
+    """The ``multi_pair_template`` kit's per-pair feedback dict survives a save/load round-trip. Asserts every seeded ``feedback_by_question`` entry — including pairs with zero accepts — comes back identical after the store is persisted and reloaded."""
     with seeded_runner(
         schema,
         schema_terms,
@@ -125,13 +99,11 @@ def test_seeded_per_pair_state_survives_save_load(schema, schema_terms, t2s) -> 
         reloaded = load_template_store(runner.schema.effective_structural_hash, runner.schema)
         reloaded_templates = store_to_templates(reloaded)
 
-        assert tid in reloaded_templates, (
-            f"[PER-PAIR] template {tid!r} missing after reload; got {sorted(reloaded_templates)!r}"
-        )
+        _missing_template_msg = f"[PER-PAIR] template {tid!r} missing after reload; got {sorted(reloaded_templates)!r}"
+        assert tid in reloaded_templates, _missing_template_msg
         reloaded_pairs = {
             qn: (fc.accepts, fc.rejects, fc.last_path)
             for qn, fc in reloaded_templates[tid].feedback_by_question.items()
         }
-        assert reloaded_pairs == seeded_pairs, (
-            f"[PER-PAIR] feedback_by_question diverged: seeded={seeded_pairs!r} reloaded={reloaded_pairs!r}"
-        )
+        _diverged_msg = f"[PER-PAIR] feedback_by_question diverged: seeded={seeded_pairs!r} reloaded={reloaded_pairs!r}"
+        assert reloaded_pairs == seeded_pairs, _diverged_msg

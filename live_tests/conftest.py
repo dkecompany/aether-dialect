@@ -1,12 +1,9 @@
-"""
-Pytest fixtures for live pipeline tests against a real database.
-
-Bootstraps a ``Text2SQL`` instance using a temporary TOML file built from the live ``KEY=value`` env file, redirects artifact storage to a ``livetest_`` prefixed directory (separate from interactive artifacts), wipes only the template store at the start of every session so each run starts clean, and builds a ``LiveTestRunner``.
-"""
+"""Pytest fixtures for live pipeline tests against a real database. Bootstraps a ``AetherEngine`` instance using a temporary TOML file built from the live ``KEY=value`` env file, redirects artifact storage to a ``livetest_`` prefixed directory (separate from interactive artifacts), wipes only the template store at the start of every session so each run starts clean, and builds a ``LiveTestRunner``."""
 
 from __future__ import annotations
 
-import datetime
+import copy
+import glob
 import json
 import os
 import re
@@ -18,58 +15,52 @@ from typing import Any
 
 import pytest
 
+from aetherdialect import AetherEngine
 from aetherdialect._config import (
     EngineConfig,
-    GenerationPath,
     PolicyConfig,
     PostgresRuntimeConfig,
     QSimConfig,
 )
-from aetherdialect._contracts_base import SchemaContext, SensitivityClassification
-from aetherdialect._core_utils import write_gzip_json_atomic
-from aetherdialect._live_testing import LiveTestRunner, StepResult
+from aetherdialect._contracts_base import EngineContext, SensitivityClassification
+from aetherdialect._core_utils import (
+    StepResult,
+    append_failure_trace,
+)
+from aetherdialect._live_testing import LiveTestRunner
+from aetherdialect._main_execution import load_schema_context_cache, write_schema_context_cache
+from aetherdialect._schema_overrides import (
+    apply_schema_overrides_to_graph,
+    load_schema_overrides_file,
+)
 from aetherdialect._templates import (
     load_template_store,
     store_to_templates,
 )
-from aetherdialect.text2sql import Text2SQL
+
+_RENTAL_SHOP_OVERRIDES = Path(__file__).resolve().parent.parent / "scripts" / "data" / "rental_shop_overrides.json"
 
 _RESULTS_FILE = Path(__file__).parent / "results.txt"
 
-_collected_results: list[dict[str, Any]] = []
 _step_results: dict[str, StepResult] = {}
 _NODEID_SCENARIO_IDS: dict[str, list[str]] = {}
 _CURRENT_TEST_NODEID: str | None = None
-_SESSION_SCHEMA_ARTIFACTS: list[dict[str, Any]] = []
-_saved_policy_diagnostics: tuple[bool, bool, bool, bool] | None = None
+_results_trace_pending_sep = False
+
+
+def _clear_results_file() -> None:
+    _RESULTS_FILE.write_text("", encoding="utf-8")
+
+
+def _append_failure_trace(step: StepResult | list[StepResult] | object | None) -> None:
+    append_failure_trace(step, _RESULTS_FILE)
 
 
 def pytest_sessionstart(session: pytest.Session) -> None:
-    """Save diagnostic ClassVars, then enable ``LIVE_DEEP_TRACE`` for live-test ``results.txt`` sections."""
-
-    global _saved_policy_diagnostics
-    _saved_policy_diagnostics = (
-        PolicyConfig.DEBUG,
-        PolicyConfig.VERBOSE,
-        PolicyConfig.PIPELINE_TRACE_FULL,
-        PolicyConfig.LIVE_DEEP_TRACE,
-    )
-    PolicyConfig.LIVE_DEEP_TRACE = True
-
-
-def _restore_saved_policy_diagnostics() -> None:
-    """Restore ``PolicyConfig`` diagnostic flags saved at session start."""
-
-    global _saved_policy_diagnostics
-    if _saved_policy_diagnostics is None:
-        return
-    (
-        PolicyConfig.DEBUG,
-        PolicyConfig.VERBOSE,
-        PolicyConfig.PIPELINE_TRACE_FULL,
-        PolicyConfig.LIVE_DEEP_TRACE,
-    ) = _saved_policy_diagnostics
-    _saved_policy_diagnostics = None
+    global _results_trace_pending_sep
+    _ = session
+    _results_trace_pending_sep = False
+    _clear_results_file()
 
 
 def _is_databricks_live_nodeid(nodeid: str) -> bool:
@@ -78,21 +69,24 @@ def _is_databricks_live_nodeid(nodeid: str) -> bool:
     return "test_databricks.py::" in path or "test_databricks_dialect.py::" in path
 
 
+def _is_engine_specific_nodeid(nodeid: str) -> bool:
+    """Return True when the test lives under a non-PostgreSQL engine- specific live module."""
+    from ._engine_live import ENGINE_MODULE_FRAGMENTS
+
+    path = nodeid.replace("\\", "/")
+    return any(f"{fragment}" in path for fragment in ENGINE_MODULE_FRAGMENTS)
+
+
 def pytest_collection_modifyitems(config: pytest.Config, items: list[Any]) -> None:
-    """Order collected items so non-Databricks live modules run before Databricks."""
-    databricks_items = [it for it in items if _is_databricks_live_nodeid(it.nodeid)]
-    rest = [it for it in items if it not in databricks_items]
-    items[:] = rest + databricks_items
+    """Order engine-specific live items last (live tests are never tagged ``fast``)."""
+    _ = config
+    engine_items = [it for it in items if _is_engine_specific_nodeid(it.nodeid)]
+    rest = [it for it in items if it not in engine_items]
+    items[:] = rest + engine_items
 
 
 def pytest_runtest_setup(item: Any) -> None:
-    """Log dialect and runtime for each live-marked test."""
-    if item.get_closest_marker("live") is None and item.get_closest_marker("live_no_llm") is None:
-        return
-    from aetherdialect._core_utils import log
-
-    runtime_name = getattr(EngineConfig.RUNTIME, "__name__", str(EngineConfig.RUNTIME))
-    log(f"[live_tests] dialect={EngineConfig.TYPE!r} runtime={runtime_name} nodeid={item.nodeid}")
+    _ = item
 
 
 @pytest.fixture(autouse=True)
@@ -105,9 +99,9 @@ def _bind_live_step_nodeid(request: pytest.FixtureRequest) -> Any:
     _CURRENT_TEST_NODEID = previous
 
 
-def _relax_dvdrental_selectability(schema: Any, database_name: str) -> None:
-    """Mark every non-selectable column as selectable and clear PII/restricted sensitivity for dvdrental-shaped live databases."""
-    if "dvdrental" not in (database_name or "").lower():
+def _relax_rental_shop_selectability(schema: Any, database_name: str) -> None:
+    """Mark every non-selectable column as selectable and clear restricted/hidden sensitivity for rental_shop-shaped live databases."""
+    if "rental_shop" not in (database_name or "").lower():
         return
     for table in schema.tables.values():
         for column in table.columns.values():
@@ -121,14 +115,8 @@ def _relax_dvdrental_selectability(schema: Any, database_name: str) -> None:
             column.mode_frequency_ratio = 0.0
 
 
-def append_live_session_schema_artifact(engine: str, schema: Any) -> None:
-    """Record a full schema graph JSON for inclusion in ``results.txt`` (PostgreSQL / Databricks first init)."""
-    _SESSION_SCHEMA_ARTIFACTS.append({"engine": engine, "schema_graph": schema.to_dict()})
-
-
 def _parse_live_env_file(path: str) -> dict[str, str]:
     """Parse a UTF-8 ``KEY=value`` environment file into a flat mapping of configuration keys."""
-
     raw = Path(path).read_text(encoding="utf-8")
     if raw.startswith("\ufeff"):
         raw = raw[1:]
@@ -229,10 +217,145 @@ def _flat_live_env_to_nested_document(flat: dict[str, str]) -> dict[str, Any]:
         dbx["catalog"] = v
     if v := flat.get("DATABRICKS_SCHEMA"):
         dbx["schema"] = v
-    if v := flat.get("DATABRICKS_CLUSTER_ID"):
-        dbx["cluster_id"] = v
     if dbx:
         doc["databricks"] = dbx
+    mysql: dict[str, str] = {}
+    if v := _first_nonempty("MYSQL_HOST", "MYSQL_SERVER", "MYSQL_HOSTNAME"):
+        mysql["host"] = v
+    if v := _first_nonempty("MYSQL_PORT"):
+        mysql["port"] = v
+    if v := _first_nonempty("MYSQL_USER"):
+        mysql["user"] = v
+    if v := _first_nonempty("MYSQL_PASSWORD"):
+        mysql["password"] = v
+    if v := _first_nonempty("MYSQL_DATABASE"):
+        mysql["database"] = v
+    if mysql:
+        doc["mysql"] = mysql
+    mariadb: dict[str, str] = {}
+    if v := _first_nonempty("MARIADB_HOST", "MARIADB_SERVER"):
+        mariadb["host"] = v
+    if v := _first_nonempty("MARIADB_PORT"):
+        mariadb["port"] = v
+    if v := _first_nonempty("MARIADB_USER", "MARIADB_USERNAME"):
+        mariadb["user"] = v
+    if v := _first_nonempty("MARIADB_PASSWORD", "MARIADB_PWD"):
+        mariadb["password"] = v
+    if v := _first_nonempty("MARIADB_DATABASE", "MARIADB_DB"):
+        mariadb["database"] = v
+    if mariadb:
+        doc["mariadb"] = mariadb
+    duckdb_doc: dict[str, str] = {}
+    if v := _first_nonempty(
+        "DUCKDB_PATH",
+        "DUCKDB_DATABASE",
+        "DUCKDB_DATABASE_PATH",
+        "DUCKDB_FILE",
+        "DUCKDB_DB",
+        "DUCKDB_DSN",
+    ):
+        duckdb_doc["path"] = v
+    if v := _first_nonempty("DUCKDB_SCHEMA", "DUCKDB_DEFAULT_SCHEMA"):
+        duckdb_doc["schema"] = v
+    if duckdb_doc:
+        doc["duckdb"] = duckdb_doc
+    sqlite_doc: dict[str, str] = {}
+    if v := _first_nonempty(
+        "SQLITE_PATH",
+        "SQLITE_DATABASE",
+        "SQLITE_DATABASE_PATH",
+        "SQLITE_FILE",
+        "SQLITE_DB",
+        "SQLITE_DSN",
+        "SQLITE3_DATABASE",
+    ):
+        sqlite_doc["path"] = v
+    if sqlite_doc:
+        doc["sqlite"] = sqlite_doc
+    sqlserver: dict[str, str] = {}
+    if v := _first_nonempty("SQLSERVER_HOST", "MSSQL_HOST"):
+        sqlserver["host"] = v
+    if v := _first_nonempty("SQLSERVER_PORT", "MSSQL_PORT"):
+        sqlserver["port"] = v
+    if v := _first_nonempty("SQLSERVER_USER", "MSSQL_USER"):
+        sqlserver["user"] = v
+    if v := _first_nonempty("SQLSERVER_PASSWORD", "MSSQL_PASSWORD"):
+        sqlserver["password"] = v
+    if v := _first_nonempty("SQLSERVER_DATABASE", "MSSQL_DATABASE"):
+        sqlserver["database"] = v
+    if v := _first_nonempty("SQLSERVER_SCHEMA", "MSSQL_SCHEMA"):
+        sqlserver["schema"] = v
+    if v := _first_nonempty("SQLSERVER_DRIVER", "MSSQL_DRIVER"):
+        sqlserver["driver"] = v
+    if v := _first_nonempty("SQLSERVER_AUTH_MODE", "MSSQL_AUTH_MODE"):
+        sqlserver["auth_mode"] = v
+    if v := flat.get("SQLSERVER_TENANT_ID"):
+        sqlserver["tenant_id"] = v
+    if v := flat.get("SQLSERVER_CLIENT_ID"):
+        sqlserver["client_id"] = v
+    if v := flat.get("SQLSERVER_CLIENT_SECRET"):
+        sqlserver["client_secret"] = v
+    if sqlserver:
+        doc["sqlserver"] = sqlserver
+    snowflake: dict[str, str] = {}
+    if v := flat.get("SNOWFLAKE_ACCOUNT"):
+        snowflake["account"] = v
+    if v := flat.get("SNOWFLAKE_USER"):
+        snowflake["user"] = v
+    if v := flat.get("SNOWFLAKE_PASSWORD"):
+        snowflake["password"] = v
+    if v := flat.get("SNOWFLAKE_DATABASE"):
+        snowflake["database"] = v
+    if v := flat.get("SNOWFLAKE_SCHEMA"):
+        snowflake["schema"] = v
+    if v := flat.get("SNOWFLAKE_WAREHOUSE"):
+        snowflake["warehouse"] = v
+    if v := flat.get("SNOWFLAKE_ROLE"):
+        snowflake["role"] = v
+    if v := flat.get("SNOWFLAKE_PRIVATE_KEY_PATH"):
+        snowflake["private_key_path"] = v
+    if v := flat.get("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE"):
+        snowflake["private_key_passphrase"] = v
+    if v := flat.get("SNOWFLAKE_AUTHENTICATOR"):
+        snowflake["authenticator"] = v
+    if v := flat.get("SNOWFLAKE_OAUTH_TOKEN"):
+        snowflake["oauth_token"] = v
+    if snowflake:
+        doc["snowflake"] = snowflake
+    bigquery: dict[str, str] = {}
+    if v := _first_nonempty("BIGQUERY_PROJECT", "GOOGLE_CLOUD_PROJECT", "GCP_PROJECT"):
+        bigquery["project"] = v
+    if v := flat.get("BIGQUERY_DATASET"):
+        bigquery["dataset"] = v
+    if v := _first_nonempty("BIGQUERY_CREDENTIALS_PATH", "GOOGLE_APPLICATION_CREDENTIALS"):
+        bigquery["credentials_path"] = v
+    if v := flat.get("BIGQUERY_LOCATION"):
+        bigquery["location"] = v
+    if bigquery:
+        doc["bigquery"] = bigquery
+    redshift: dict[str, str] = {}
+    if v := _first_nonempty("REDSHIFT_HOST", "REDSHIFT_SERVER"):
+        redshift["host"] = v
+    if v := _first_nonempty("REDSHIFT_PORT", "REDSHIFT_TCP_PORT"):
+        redshift["port"] = v
+    if v := _first_nonempty("REDSHIFT_USER", "REDSHIFT_USERNAME"):
+        redshift["user"] = v
+    if v := _first_nonempty("REDSHIFT_PASSWORD", "REDSHIFT_PWD"):
+        redshift["password"] = v
+    if v := _first_nonempty("REDSHIFT_DATABASE", "REDSHIFT_DB"):
+        redshift["database"] = v
+    if v := _first_nonempty("REDSHIFT_SCHEMA"):
+        redshift["schema"] = v
+    if v := _first_nonempty("REDSHIFT_USE_IAM", "REDSHIFT_IAM"):
+        redshift["use_iam"] = v
+    if v := _first_nonempty("REDSHIFT_CLUSTER_IDENTIFIER", "REDSHIFT_CLUSTER_ID"):
+        redshift["cluster_identifier"] = v
+    if v := _first_nonempty("REDSHIFT_WORKGROUP", "REDSHIFT_SERVERLESS_WORKGROUP"):
+        redshift["workgroup"] = v
+    if v := _first_nonempty("REDSHIFT_REGION", "REDSHIFT_AWS_REGION"):
+        redshift["region"] = v
+    if redshift:
+        doc["redshift"] = redshift
     engine: dict[str, str] = {}
     if v := flat.get("AETHERDIALECT_ENGINE"):
         engine["selected"] = v
@@ -266,6 +389,14 @@ def _nested_document_to_toml_str(doc: Mapping[str, Any]) -> str:
         "azure_openai",
         "postgresql",
         "databricks",
+        "mysql",
+        "mariadb",
+        "duckdb",
+        "sqlite",
+        "sqlserver",
+        "snowflake",
+        "bigquery",
+        "redshift",
         "engine",
         "llm",
         "execution",
@@ -277,12 +408,7 @@ def _nested_document_to_toml_str(doc: Mapping[str, Any]) -> str:
 
 
 def write_live_env_file_to_temp_config_toml(env_path: str, extra_flat: dict[str, str] | None = None) -> str:
-    """
-    Materialise a ``KEY=value`` live env file as a temporary TOML file understood by :func:`_load_config_file`.
-
-    Callers must delete the returned path when finished.
-    """
-
+    """Materialise a ``KEY=value`` live env file as a temporary TOML file understood by :func:`_load_config_file`. Callers must delete the returned path when finished."""
     flat = _parse_live_env_file(env_path)
     if extra_flat:
         flat = {**flat, **extra_flat}
@@ -293,8 +419,21 @@ def write_live_env_file_to_temp_config_toml(env_path: str, extra_flat: dict[str,
     return path
 
 
+def write_sandbox_recording_toml(env_path: str) -> str:
+    """Materialise sandbox corpus recording config: LLM creds from *env_path*, in-memory DuckDB."""
+    return write_live_env_file_to_temp_config_toml(
+        env_path,
+        {
+            "AETHERDIALECT_ENGINE": "duckdb",
+            "AETHERDIALECT_LLM_PROVIDER": "openai",
+            "DUCKDB_PATH": ":memory:",
+            "DUCKDB_SCHEMA": "main",
+        },
+    )
+
+
 def _env_file() -> str:
-    raw = os.environ.get("LIVE_ENV_FILE", os.path.join("dev_workspace", "env.env"))
+    raw = os.environ.get("LIVE_ENV_FILE", "env.env")
     p = Path(raw)
     if not p.is_absolute():
         p = Path(__file__).resolve().parent.parent / raw
@@ -302,8 +441,11 @@ def _env_file() -> str:
 
 
 def _domain_notes_path() -> Path | None:
-    """Schema-graph domain notes next to ``env.env`` (``dev_workspace/dvdrental_notes.txt`` by default)."""
-    raw = os.environ.get("LIVE_DOMAIN_NOTES_FILE", os.path.join("dev_workspace", "dvdrental_notes.txt"))
+    """Schema-graph domain notes (``scripts/data/rental_shop_notes.txt`` by default)."""
+    raw = os.environ.get(
+        "LIVE_DOMAIN_NOTES_FILE",
+        os.path.join("scripts", "data", "rental_shop_notes.txt"),
+    )
     p = Path(raw)
     if not p.is_absolute():
         p = Path(__file__).resolve().parent.parent / raw
@@ -314,14 +456,182 @@ def _pg_param(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
-def _redirect_to_livetest_dir(t2s: Text2SQL) -> str:
-    """
-    Swap artifact paths from ``artifacts_...`` to ``livetest_...``.
+_RENTAL_SHOP_CONSUMER_ALLOW_OBJECTS = frozenset(
+    {
+        "actor",
+        "address",
+        "category",
+        "city",
+        "country",
+        "customer",
+        "film",
+        "film_actor",
+        "item",
+        "item_category",
+        "inventory",
+        "language",
+        "payment",
+        "rental",
+        "store",
+    }
+)
 
-    Creates the livetest directory if it doesn't exist.  Copies a fresh ``schema_graph.json.gz`` from the real artifacts dir when present, else builds it from legacy ``schema_graph.json``.  Wipes only the template store so every session starts with a clean slate for templates while keeping schema.
+_CONSUMER_CREDENTIALS_SKIP_REASON = "Set PGUSER2 and PGPASSWORD2 in the live env file for permission live tests."
+_POSTGRES_SKIP_REASON = "Set PGHOST, PGUSER, PGPASSWORD, and PGDATABASE in the live env file for PostgreSQL live tests."
 
-    Returns: The absolute path to the livetest artifacts directory.
-    """
+
+def _consumer_credentials_from_env() -> tuple[str, str]:
+    """Read restricted consumer Postgres credentials from the live env file or process environment."""
+    flat = _parse_live_env_file(_env_file())
+    user = (flat.get("PGUSER2") or os.environ.get("PGUSER2") or "").strip()
+    password = (flat.get("PGPASSWORD2") or os.environ.get("PGPASSWORD2") or "").strip()
+    return user, password
+
+
+def _consumer_credentials_configured() -> bool:
+    """Return True when both PGUSER2 and PGPASSWORD2 are available for consumer initialization."""
+    user, password = _consumer_credentials_from_env()
+    return bool(user and password)
+
+
+def _postgres_credentials_configured() -> bool:
+    """Return True when primary PostgreSQL credentials are present in the live env file."""
+    flat = _parse_live_env_file(_env_file())
+    for key in ("PGUSER", "PGPASSWORD", "PGHOST", "PGDATABASE"):
+        if not (flat.get(key) or os.environ.get(key) or "").strip():
+            return False
+    return True
+
+
+def _rbac_consumer_configured() -> bool:
+    """Return True when both owner and consumer PostgreSQL credentials are configured."""
+    return _postgres_credentials_configured() and _consumer_credentials_configured()
+
+
+def _owner_engine_context(
+    *, allow_objects: frozenset[str] | None = None, deny_columns: frozenset[str] | None = None
+) -> EngineContext:
+    """Build a master EngineContext for rental_shop owner live fixtures."""
+    notes = _domain_notes_path()
+    kwargs: dict[str, Any] = {
+        "notes_file": str(notes) if notes else None,
+        "sql_file": _pg_param("SQL_FILE", os.path.join("scripts", "data", "rental_shop.sql")),
+    }
+    if allow_objects is not None:
+        kwargs["allow_objects"] = allow_objects
+    if deny_columns is not None:
+        kwargs["deny_columns"] = deny_columns
+    return EngineContext(**kwargs)
+
+
+def _consumer_engine_context() -> EngineContext:
+    """Build the restricted EngineContext aligned with pguser2 database grants."""
+    return _owner_engine_context(allow_objects=_RENTAL_SHOP_CONSUMER_ALLOW_OBJECTS)
+
+
+def _copy_session_schema_cache(source_artifacts_dir: str, dest_artifacts_dir: str) -> None:
+    """Copy a built schema graph cache into a fresh RBAC artifacts dir (skip full reflect)."""
+    os.makedirs(dest_artifacts_dir, exist_ok=True)
+    for name in ("schema_graph.json.gz", "artifact_manifest.json", "schema_context.json"):
+        src = os.path.join(source_artifacts_dir, name)
+        dst = os.path.join(dest_artifacts_dir, name)
+        if os.path.isfile(src):
+            shutil.copy2(src, dst)
+    src_dir = source_artifacts_dir
+    for sidecar in glob.glob(os.path.join(src_dir, "schema_context*.json")):
+        base = os.path.basename(sidecar)
+        if base == "schema_context.json":
+            continue
+        dst = os.path.join(dest_artifacts_dir, base)
+        if not os.path.isfile(dst):
+            shutil.copy2(sidecar, dst)
+
+
+def _build_rbac_owner_engine(
+    *,
+    engine_context: EngineContext | None = None,
+    relax_sensitivity: bool = True,
+    config_file: str | None = None,
+    schema_cache_source: str | None = None,
+) -> AetherEngine:
+    """Construct an owner ``AetherEngine`` for RBAC live tests."""
+    ctx = engine_context or _owner_engine_context()
+    owns_config = config_file is None
+    if config_file is None:
+        config_file = write_live_env_file_to_temp_config_toml(
+            _env_file(),
+            {"AETHERDIALECT_ENGINE": "postgresql"},
+        )
+    seed_cache = schema_cache_source is not None
+    try:
+        artifacts_dir = tempfile.mkdtemp(prefix="live_rbac_owner_")
+        if seed_cache:
+            _copy_session_schema_cache(schema_cache_source, artifacts_dir)
+        prev_regen_graph = PolicyConfig.REGENERATE_SCHEMA_GRAPH
+        if seed_cache:
+            PolicyConfig.REGENERATE_SCHEMA_GRAPH = False
+        try:
+            instance = AetherEngine(
+                ctx,
+                artifacts_dir=artifacts_dir,
+                config_file=config_file,
+                role="owner",
+            )
+        finally:
+            PolicyConfig.REGENERATE_SCHEMA_GRAPH = prev_regen_graph
+        _redirect_to_livetest_dir(instance)
+        master_ctx = instance._runtime_config.engine_context
+        if load_schema_context_cache(str(instance._artifacts_dir)) is None:
+            write_schema_context_cache(str(instance._artifacts_dir), master_ctx)
+        if relax_sensitivity:
+            _relax_rental_shop_selectability(
+                instance._schema_graph,
+                _pg_param("PGDATABASE", "rental_shop"),
+            )
+        return instance
+    finally:
+        if owns_config:
+            Path(config_file).unlink(missing_ok=True)
+
+
+def _build_rbac_consumer_engine(
+    owner: AetherEngine,
+    *,
+    engine_context: EngineContext | str | None = None,
+    config_file: str | None = None,
+) -> AetherEngine:
+    """Construct a consumer ``AetherEngine`` sharing the owner artifact directory."""
+    pguser2, pgpassword2 = _consumer_credentials_from_env()
+    owns_config = config_file is None
+    if config_file is None:
+        config_file = write_live_env_file_to_temp_config_toml(
+            _env_file(),
+            {
+                "AETHERDIALECT_ENGINE": "postgresql",
+                "PGUSER": pguser2,
+                "PGPASSWORD": pgpassword2,
+            },
+        )
+    ctx = engine_context if engine_context is not None else _consumer_engine_context()
+    try:
+        instance = AetherEngine(
+            ctx,
+            artifacts_dir=str(owner._artifacts_dir),
+            config_file=config_file,
+            role="consumer",
+        )
+        _relax_rental_shop_selectability(
+            instance._schema_graph,
+            _pg_param("PGDATABASE", "rental_shop"),
+        )
+        return instance
+    finally:
+        if owns_config:
+            Path(config_file).unlink(missing_ok=True)
+
+
+def _redirect_to_livetest_dir(t2s: AetherEngine) -> str:
+    """Swap artifact paths to the livetest directory and return its absolute path."""
     original = t2s._artifacts_dir
     parent = os.path.dirname(original)
     folder = os.path.basename(original)
@@ -330,17 +640,14 @@ def _redirect_to_livetest_dir(t2s: Text2SQL) -> str:
         live_folder = f"livetest_{folder}"
     live_dir = os.path.join(parent, live_folder)
 
-    os.makedirs(live_dir, exist_ok=True)
+    if os.path.isdir(original):
+        if os.path.isdir(live_dir):
+            shutil.rmtree(live_dir, ignore_errors=True)
+        shutil.copytree(original, live_dir, dirs_exist_ok=True)
+    else:
+        os.makedirs(live_dir, exist_ok=True)
 
     schema_dst = os.path.join(live_dir, "schema_graph.json.gz")
-    schema_src_gz = os.path.join(original, "schema_graph.json.gz")
-    schema_src_json = os.path.join(original, "schema_graph.json")
-    if os.path.exists(schema_src_gz) and os.path.normpath(schema_src_gz) != os.path.normpath(schema_dst):
-        shutil.copy2(schema_src_gz, schema_dst)
-    elif os.path.exists(schema_src_json):
-        with open(schema_src_json, encoding="utf-8") as sf:
-            schema_payload = json.load(sf)
-        write_gzip_json_atomic(schema_dst, schema_payload, sort_keys=True)
 
     template_store_dir = os.path.join(live_dir, "intent_templates")
     if os.path.isdir(template_store_dir):
@@ -354,17 +661,15 @@ def _redirect_to_livetest_dir(t2s: Text2SQL) -> str:
     return live_dir
 
 
-@pytest.fixture(scope="session")
-def t2s() -> Text2SQL:
-    """Session-scoped ``Text2SQL`` instance with a clean livetest artifact dir."""
-    _notes = _domain_notes_path()
-
+def _build_live_aether_engine(*, relax_sensitivity: bool) -> AetherEngine:
+    """Construct a session ``AetherEngine`` instance for rental_shop live tests."""
+    notes = _domain_notes_path()
     cfg_path = write_live_env_file_to_temp_config_toml(_env_file(), {"AETHERDIALECT_ENGINE": "postgresql"})
     try:
-        instance = Text2SQL(
-            SchemaContext(
-                notes_file=str(_notes) if _notes else None,
-                sql_file=_pg_param("SQL_FILE", os.path.join("dev_workspace", "dvdrental.sql")),
+        instance = AetherEngine(
+            EngineContext(
+                notes_file=str(notes) if notes else None,
+                sql_file=_pg_param("SQL_FILE", os.path.join("scripts", "data", "rental_shop.sql")),
             ),
             artifacts_dir=tempfile.mkdtemp(prefix="live_pg_artifacts_"),
             config_file=cfg_path,
@@ -372,55 +677,117 @@ def t2s() -> Text2SQL:
 
         _redirect_to_livetest_dir(instance)
 
+        prev_regen_graph = PolicyConfig.REGENERATE_SCHEMA_GRAPH
+        prev_regen_skeleton = PolicyConfig.REGENERATE_SKELETON_CACHE
+        PolicyConfig.REGENERATE_SCHEMA_GRAPH = True
+        PolicyConfig.REGENERATE_SKELETON_CACHE = True
+        try:
+            print("Live tests: building schema graph from PostgreSQL...", flush=True)
+            schema_graph = instance._schema_graph
+            table_count = len(schema_graph.tables)
+            column_count = sum(len(table.columns) for table in schema_graph.tables.values())
+            print(
+                f"Live tests: schema graph ready ({table_count} tables, {column_count} columns)",
+                flush=True,
+            )
+        finally:
+            PolicyConfig.REGENERATE_SCHEMA_GRAPH = prev_regen_graph
+            PolicyConfig.REGENERATE_SKELETON_CACHE = prev_regen_skeleton
+
         fresh_store = load_template_store(instance._schema_graph.effective_structural_hash, instance._schema_graph)
         instance._store = fresh_store
         instance._templates = store_to_templates(fresh_store)
         instance._rejected = {}
 
-        append_live_session_schema_artifact("postgresql", instance._schema_graph)
-
-        _relax_dvdrental_selectability(instance._schema_graph, _pg_param("PGDATABASE", "dvdrental_new"))
+        if relax_sensitivity:
+            _relax_rental_shop_selectability(instance._schema_graph, _pg_param("PGDATABASE", "rental_shop"))
+        elif _RENTAL_SHOP_OVERRIDES.is_file():
+            apply_schema_overrides_to_graph(
+                instance._schema_graph,
+                load_schema_overrides_file(_RENTAL_SHOP_OVERRIDES),
+            )
 
         return instance
     finally:
         Path(cfg_path).unlink(missing_ok=True)
 
 
-@pytest.fixture(autouse=True)
-def _enforce_postgresql_dialect(request: pytest.FixtureRequest) -> None:
-    """Restore ``EngineConfig.TYPE`` and ``EngineConfig.RUNTIME`` to PostgreSQL before each test so that module-scoped Databricks fixtures cannot leak into subsequent PostgreSQL test modules."""
-    if "test_databricks" not in request.node.nodeid:
-        EngineConfig.TYPE = "postgresql"
-        EngineConfig.RUNTIME = PostgresRuntimeConfig
+@pytest.fixture(scope="session")
+def t2s() -> AetherEngine:
+    """Session-scoped ``AetherEngine`` instance with a clean livetest artifact dir."""
+    return _build_live_aether_engine(relax_sensitivity=True)
+
+
+def _derive_enforce_sensitivity_engine(t2s: AetherEngine) -> AetherEngine:
+    """Derive a session engine with bundled sensitivity overrides from the primary ``t2s`` build."""
+    enforced_graph = copy.deepcopy(t2s._schema_graph)
+    if _RENTAL_SHOP_OVERRIDES.is_file():
+        apply_schema_overrides_to_graph(
+            enforced_graph,
+            load_schema_overrides_file(_RENTAL_SHOP_OVERRIDES),
+        )
+    derived = object.__new__(AetherEngine)
+    for slot in AetherEngine.__slots__:
+        setattr(derived, slot, getattr(t2s, slot))
+    derived._schema_graph = enforced_graph
+    derived._store = load_template_store(enforced_graph.effective_structural_hash, enforced_graph)
+    derived._templates = store_to_templates(derived._store)
+    derived._rejected = {}
+    return derived
 
 
 @pytest.fixture(scope="session")
-def schema(t2s: Text2SQL) -> Any:
-    """Profiled ``SchemaGraph`` from the session ``Text2SQL`` instance."""
+def t2s_enforce_sensitivity(t2s: AetherEngine) -> AetherEngine:
+    """Session ``AetherEngine`` with bundled sensitivity overrides and no selectability relax."""
+    return _derive_enforce_sensitivity_engine(t2s)
+
+
+@pytest.fixture(autouse=True)
+def _enforce_postgresql_dialect(request: pytest.FixtureRequest) -> None:
+    """Restore PostgreSQL engine config and owner credentials before each non-engine-module test."""
+    from ._engine_live import ENGINE_MODULE_FRAGMENTS
+
+    if any(fragment in request.node.nodeid for fragment in ENGINE_MODULE_FRAGMENTS):
+        return
+    EngineConfig.TYPE = "postgresql"
+    EngineConfig.RUNTIME = PostgresRuntimeConfig
+    flat = _parse_live_env_file(_env_file())
+    pg_env = {
+        k: flat[k]
+        for k in ("PGUSER", "PGPASSWORD", "PGHOST", "PGPORT", "PGDATABASE")
+        if k in flat and str(flat[k]).strip()
+    }
+    if pg_env:
+        PostgresRuntimeConfig.apply_environment(pg_env)
+
+
+@pytest.fixture(scope="session")
+def schema(t2s: AetherEngine) -> Any:
+    """Profiled ``SchemaGraph`` from the session ``AetherEngine`` instance."""
     return t2s._schema_graph
 
 
 @pytest.fixture(scope="session")
-def store(t2s: Text2SQL) -> dict[str, Any]:
-    """Template store dict from the session ``Text2SQL`` instance."""
+def store(t2s: AetherEngine) -> dict[str, Any]:
+    """Template store dict from the session ``AetherEngine`` instance."""
     return t2s._store
 
 
 @pytest.fixture(scope="session")
-def templates(t2s: Text2SQL) -> dict:
-    """Accepted templates dict from the session ``Text2SQL`` instance."""
+def templates(t2s: AetherEngine) -> dict:
+    """Accepted templates dict from the session ``AetherEngine`` instance."""
     return t2s._templates
 
 
 @pytest.fixture(scope="session")
-def rejected(t2s: Text2SQL) -> dict:
-    """Rejected templates dict from the session ``Text2SQL`` instance."""
+def rejected(t2s: AetherEngine) -> dict:
+    """Rejected templates dict from the session ``AetherEngine`` instance."""
     return t2s._rejected
 
 
 @pytest.fixture(scope="session")
-def schema_terms(t2s: Text2SQL) -> set[str]:
-    """Schema term tokens from the session ``Text2SQL`` instance."""
+def schema_terms(t2s: AetherEngine) -> set[str]:
+    """Schema term tokens from the session ``AetherEngine`` instance."""
     return t2s._schema_terms
 
 
@@ -434,6 +801,137 @@ def runner(schema, store, templates, rejected, schema_terms, t2s) -> LiveTestRun
         rejected=rejected,
         schema_terms=schema_terms,
         csv_dir=t2s._artifacts_dir,
+        dialect=t2s._dialect,
+    )
+    _instrument_runner(r)
+    return r
+
+
+@pytest.fixture(scope="session")
+def schema_enforce_sensitivity(t2s_enforce_sensitivity: AetherEngine) -> Any:
+    """Profiled schema graph with bundled sensitivity overrides applied."""
+    return t2s_enforce_sensitivity._schema_graph
+
+
+@pytest.fixture(scope="session")
+def store_enforce_sensitivity(t2s_enforce_sensitivity: AetherEngine) -> dict[str, Any]:
+    return t2s_enforce_sensitivity._store
+
+
+@pytest.fixture(scope="session")
+def templates_enforce_sensitivity(t2s_enforce_sensitivity: AetherEngine) -> dict:
+    return t2s_enforce_sensitivity._templates
+
+
+@pytest.fixture(scope="session")
+def rejected_enforce_sensitivity(t2s_enforce_sensitivity: AetherEngine) -> dict:
+    return t2s_enforce_sensitivity._rejected
+
+
+@pytest.fixture(scope="session")
+def schema_terms_enforce_sensitivity(t2s_enforce_sensitivity: AetherEngine) -> set[str]:
+    return t2s_enforce_sensitivity._schema_terms
+
+
+@pytest.fixture(scope="session")
+def runner_enforce_sensitivity(
+    schema_enforce_sensitivity,
+    store_enforce_sensitivity,
+    templates_enforce_sensitivity,
+    rejected_enforce_sensitivity,
+    schema_terms_enforce_sensitivity,
+    t2s_enforce_sensitivity,
+) -> LiveTestRunner:
+    """Live runner that keeps rental_shop sensitivity tiers enforced."""
+    r = LiveTestRunner(
+        schema=schema_enforce_sensitivity,
+        store=store_enforce_sensitivity,
+        templates=templates_enforce_sensitivity,
+        rejected=rejected_enforce_sensitivity,
+        schema_terms=schema_terms_enforce_sensitivity,
+        csv_dir=t2s_enforce_sensitivity._artifacts_dir,
+        dialect=t2s_enforce_sensitivity._dialect,
+    )
+    _instrument_runner(r)
+    return r
+
+
+@pytest.fixture(scope="session")
+def rbac_postgres_config_path() -> str:
+    """Session-persistent TOML config for RBAC PostgreSQL live tests."""
+    if not _postgres_credentials_configured():
+        pytest.skip(_POSTGRES_SKIP_REASON)
+    path = write_live_env_file_to_temp_config_toml(
+        _env_file(),
+        {"AETHERDIALECT_ENGINE": "postgresql"},
+    )
+    yield path
+    Path(path).unlink(missing_ok=True)
+
+
+@pytest.fixture(scope="session")
+def rbac_consumer_config_path() -> str:
+    """Session-persistent TOML config for pguser2 consumer live tests."""
+    if not _consumer_credentials_configured():
+        pytest.skip(_CONSUMER_CREDENTIALS_SKIP_REASON)
+    pguser2, pgpassword2 = _consumer_credentials_from_env()
+    path = write_live_env_file_to_temp_config_toml(
+        _env_file(),
+        {
+            "AETHERDIALECT_ENGINE": "postgresql",
+            "PGUSER": pguser2,
+            "PGPASSWORD": pgpassword2,
+        },
+    )
+    yield path
+    Path(path).unlink(missing_ok=True)
+
+
+@pytest.fixture(scope="session")
+def t2s_rbac_owner(t2s: AetherEngine, rbac_postgres_config_path: str) -> AetherEngine:
+    """Session-scoped owner ``AetherEngine`` for RBAC live tests (full master context)."""
+    return _build_rbac_owner_engine(
+        config_file=rbac_postgres_config_path,
+        schema_cache_source=str(t2s._artifacts_dir),
+    )
+
+
+@pytest.fixture(scope="session")
+def t2s_deny_columns_owner(
+    t2s: AetherEngine,
+    rbac_postgres_config_path: str,
+) -> AetherEngine:
+    """Session-scoped owner ``AetherEngine`` with ``deny_columns`` on hidden staff columns."""
+    return _build_rbac_owner_engine(
+        engine_context=_owner_engine_context(
+            deny_columns=frozenset({"staff.ssn", "staff.password"}),
+        ),
+        relax_sensitivity=False,
+        config_file=rbac_postgres_config_path,
+        schema_cache_source=str(t2s._artifacts_dir),
+    )
+
+
+@pytest.fixture(scope="session")
+def t2s_consumer_pguser2(
+    t2s_rbac_owner: AetherEngine,
+    rbac_consumer_config_path: str,
+) -> AetherEngine:
+    """Session-scoped consumer ``AetherEngine`` using PGUSER2/PGPASSWORD2 database grants."""
+    return _build_rbac_consumer_engine(t2s_rbac_owner, config_file=rbac_consumer_config_path)
+
+
+@pytest.fixture(scope="session")
+def runner_consumer_pguser2(t2s_consumer_pguser2: AetherEngine) -> LiveTestRunner:
+    """``LiveTestRunner`` wired to the restricted pguser2 consumer engine."""
+    r = LiveTestRunner(
+        schema=t2s_consumer_pguser2._schema_graph,
+        store=t2s_consumer_pguser2._store,
+        templates=t2s_consumer_pguser2._templates,
+        rejected=t2s_consumer_pguser2._rejected,
+        schema_terms=t2s_consumer_pguser2._schema_terms,
+        csv_dir=t2s_consumer_pguser2._artifacts_dir,
+        dialect=t2s_consumer_pguser2._dialect,
     )
     _instrument_runner(r)
     return r
@@ -492,107 +990,12 @@ def _resolve_scenario_ids(nodeid: str) -> list[str]:
     return [match.group(1)] if match else []
 
 
-_LOG_PATTERNS = re.compile(
-    r"intent_parse|semantic.?repair|group.?by|grain|join|strip_spurious|expand_fk|enforce_grain|repair_grouped|raw_llm|validate_sql|over_join|bridge.?table|validation.?iteration|error.?count|repeated.?identical",
-    re.IGNORECASE,
-)
-
-
-def _format_single_step_diagnostic(step: StepResult) -> list[str]:
-    """Build diagnostic lines for one StepResult."""
-    diag: list[str] = []
-    diag.append(f"    scenario_id: {step.scenario_id}")
-    diag.append(f"    duration_seconds: {step.duration_seconds:.2f}")
-    if step.template_id is not None:
-        diag.append(f"    template_id: {step.template_id}")
-    diag.append(f"    status: {step.status}")
-    if step.generation_path is not None:
-        try:
-            path = GenerationPath.parse(step.generation_path)
-            diag.append(f"    generation_path: {path.code} ({path.label})")
-        except ValueError:
-            diag.append(f"    generation_path: {step.generation_path}")
-    if getattr(step, "reject_reason_actual", None) is not None:
-        diag.append(f"    reject_reason_actual: {step.reject_reason_actual}")
-    if getattr(step, "classified_category", None) is not None:
-        diag.append(f"    classified_category: {step.classified_category}")
-    if getattr(step, "classified_reason", None) is not None:
-        diag.append(f"    classified_reason: {step.classified_reason}")
-    if step.error:
-        err_lines = step.error.strip().splitlines()
-        diag.append(f"    error: {err_lines[-1] if err_lines else step.error[:200]}")
-        for ln in err_lines[-5:]:
-            diag.append(f"      {ln}")
-    if step.intent:
-        it = step.intent
-        diag.append(f"    tables: {it.tables}")
-        diag.append(f"    grain:  {it.grain}")
-        gb_terms = [g.primary_term for g in (it.group_by_cols or [])]
-        if gb_terms:
-            diag.append(f"    group_by: {gb_terms}")
-        agg_cols = [sc.expr.primary_term for sc in (it.select_cols or []) if sc.is_aggregated]
-        if agg_cols:
-            diag.append(f"    agg_select: {agg_cols}")
-    if step.sql:
-        if PolicyConfig.LIVE_DEEP_TRACE:
-            diag.append("    sql (full):")
-            for sql_ln in step.sql.splitlines():
-                diag.append(f"      {sql_ln}")
-        else:
-            sql_display = step.sql.replace("\n", " ")
-            if len(sql_display) > 200:
-                sql_display = sql_display[:200] + " ..."
-            diag.append(f"    sql: {sql_display}")
-    if step.confidence is not None:
-        diag.append(f"    confidence: {step.confidence:.3f}")
-    diag.append(f"    llm_calls: {step.llm_calls}")
-    if PolicyConfig.LIVE_DEEP_TRACE and step.captured_logs:
-        diag.append(f"    captured_logs: {len(step.captured_logs)} lines (see PER-TEST FULL CAPTURED LOGS section)")
-    elif step.llm_calls > 2:
-        diag.append("    *** >2 LLM calls — full captured logs:")
-        for ln in step.captured_logs:
-            diag.append(f"      {ln}")
-    if step.semantic_warnings:
-        diag.append(f"    semantic_warnings: {step.semantic_warnings}")
-    if not PolicyConfig.LIVE_DEEP_TRACE:
-        relevant_logs = [ln for ln in step.captured_logs if _LOG_PATTERNS.search(ln)]
-        if relevant_logs:
-            diag.append("    relevant logs:")
-            for ln in relevant_logs[-15:]:
-                diag.append(f"      {ln}")
-    return diag
-
-
-def _format_step_diagnostic(step: StepResult | list[StepResult] | None) -> list[str]:
-    """
-    Build concise diagnostic lines for inclusion in results.txt.
-
-    When step is a list (sequence run), formats each step with a header.
-    """
-    if step is None:
-        return []
-    if isinstance(step, list):
-        lines: list[str] = []
-        for i, s in enumerate(step):
-            if i > 0:
-                lines.append("")
-            lines.append(f"    --- step {i + 1}: {s.scenario_id} ---")
-            lines.extend(_format_single_step_diagnostic(s))
-        return lines
-    return _format_single_step_diagnostic(step)
-
-
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item, call):
     outcome = yield
     report = outcome.get_result()
-    if report.when != "call":
+    if report.when != "call" or report.outcome != "failed":
         return
-    entry: dict[str, Any] = {
-        "nodeid": report.nodeid,
-        "outcome": report.outcome,
-        "duration": round(report.duration, 2),
-    }
     scenario_ids = _resolve_scenario_ids(report.nodeid)
     step: StepResult | list[StepResult] | None = None
     if scenario_ids:
@@ -611,106 +1014,4 @@ def pytest_runtest_makereport(item, call):
             step = ordered_steps[0]
         elif len(ordered_steps) > 1:
             step = ordered_steps
-    entry["step_diagnostic"] = _format_step_diagnostic(step) if step else []
-    entry["full_logs"] = []
-    if PolicyConfig.LIVE_DEEP_TRACE and step:
-        if isinstance(step, list):
-            entry["full_logs"] = [ln for s in step for ln in (s.captured_logs or [])]
-        else:
-            entry["full_logs"] = list(step.captured_logs or [])
-    elif report.failed and step:
-        if isinstance(step, list):
-            entry["full_logs"] = [ln for s in step for ln in (s.captured_logs or [])]
-        else:
-            entry["full_logs"] = list(step.captured_logs) if step.captured_logs else []
-
-    if report.failed:
-        assertion_lines: list[str] = []
-        for raw_line in str(report.longrepr).splitlines():
-            stripped = raw_line.strip()
-            if stripped.startswith("E ") or stripped.startswith("["):
-                assertion_lines.append(f"    {stripped}")
-        entry["assertion_lines"] = assertion_lines
-    _collected_results.append(entry)
-
-
-def pytest_sessionfinish(session, exitstatus):
-    if not _collected_results:
-        _restore_saved_policy_diagnostics()
-        return
-
-    passed = [r for r in _collected_results if r["outcome"] == "passed"]
-    failed = [r for r in _collected_results if r["outcome"] == "failed"]
-    skipped = [r for r in _collected_results if r["outcome"] == "skipped"]
-    total = len(_collected_results)
-    total_dur = sum(r["duration"] for r in _collected_results)
-
-    lines: list[str] = []
-    lines.append(f"Live Test Results  —  {datetime.datetime.now():%Y-%m-%d %H:%M:%S}")
-    lines.append("=" * 72)
-    lines.append(
-        f"Total: {total}  |  Passed: {len(passed)}  |  "
-        f"Failed: {len(failed)}  |  Skipped: {len(skipped)}  |  "
-        f"Duration: {total_dur:.1f}s"
-    )
-    lines.append("")
-
-    if _SESSION_SCHEMA_ARTIFACTS:
-        lines.append("-" * 72)
-        lines.append("SESSION SCHEMA GRAPH SNAPSHOTS (PostgreSQL session + Databricks module init)")
-        lines.append("-" * 72)
-        for i, art in enumerate(_SESSION_SCHEMA_ARTIFACTS):
-            lines.append("")
-            lines.append(f"  [{i + 1}] engine={art['engine']}")
-            dumped = json.dumps(art["schema_graph"], indent=2, ensure_ascii=False, default=str)
-            for jl in dumped.splitlines():
-                lines.append(f"  {jl}")
-        lines.append("")
-
-    if failed:
-        lines.append("-" * 72)
-        lines.append("FAILURES")
-        lines.append("-" * 72)
-        for r in failed:
-            lines.append("")
-            lines.append(f">>> {r['nodeid']}  ({r['duration']}s)")
-            for al in r.get("assertion_lines", []):
-                lines.append(al)
-            diag = r.get("step_diagnostic", [])
-            if diag:
-                lines.append("")
-                for dl in diag:
-                    lines.append(dl)
-            full_logs = r.get("full_logs", [])
-            if full_logs and not PolicyConfig.LIVE_DEEP_TRACE:
-                lines.append("")
-                lines.append("    Full logs:")
-                for ln in full_logs:
-                    lines.append(f"      {ln}")
-        lines.append("")
-
-    lines.append("-" * 72)
-    lines.append("ALL RESULTS")
-    lines.append("-" * 72)
-    for r in _collected_results:
-        tag = r["outcome"].upper()
-        diag = r.get("step_diagnostic", [])
-        llm_line = next((d for d in diag if "llm_calls:" in d), None)
-        llm_suffix = f"  llm_calls={llm_line.split(':')[1].strip()}" if llm_line else ""
-        lines.append(f"  [{tag:>7}]  {r['nodeid']}  ({r['duration']}s){llm_suffix}")
-
-    if PolicyConfig.LIVE_DEEP_TRACE:
-        lines.append("")
-        lines.append("-" * 72)
-        lines.append("PER-TEST FULL CAPTURED LOGS (LIVE_DEEP_TRACE)")
-        lines.append("-" * 72)
-        for r in _collected_results:
-            fl = r.get("full_logs") or []
-            lines.append("")
-            lines.append(f">>> {r['nodeid']}  ({r['outcome']})  ({r['duration']}s)")
-            for ln in fl:
-                lines.append(f"  {ln}")
-
-    lines.append("")
-    _RESULTS_FILE.write_text("\n".join(lines), encoding="utf-8")
-    _restore_saved_policy_diagnostics()
+    _append_failure_trace(step)

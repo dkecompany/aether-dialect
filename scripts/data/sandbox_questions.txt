@@ -1,0 +1,54 @@
+# questions
+How many items are in the catalog by item type?
+How many books do we have?
+How many games are in the catalog?
+Which films include trailers?
+Which games support English?
+How many open reservations are there?
+Show active staff at each store.
+How many rentals happened in 2025?
+Who are our top 5 customers by total payment?
+Rank films by rental count within each category.
+What is the total delivery fee by courier?
+What is the count of pending reservations by store?
+What's the weather today?
+What is the best pizza topping?
+List all store locations by city.
+What is the average rental duration?
+Which films have the highest replacement cost?
+How many actors are in the database?
+What are the film ratings available?
+Which staff members work at store 1?
+List customers who have never rented an item.
+What is the total revenue by store?
+How many films are in the Horror category?
+Which languages are available?
+Which city has the most customers?
+How many customers are in each country?
+Which actors appear in the most films?
+Which actors have the most film credits?
+Which films are in the Horror category?
+What is the average payment amount?
+How many rentals are currently overdue?
+List films released in 2006.
+Which author has the most books?
+How many inventory items does each store have?
+List publishers with more than five books.
+Show purchase orders still open by supplier.
+How many damage reports are open?
+List inventory status changes in the last 90 days.
+Which warehouse holds the most stock?
+List promotion redemptions by promotion name.
+Show delivery status counts by courier.
+List stock transfers between warehouses this year.
+Which suppliers have the most purchase lines?
+What is the average page count by publisher?
+
+# validation_failures
+Show payroll deductions by employee SSN.
+Show me all staff salaries.
+How many rentals happened on 2025-01-01?
+How many rentals were made in total?
+
+# feedback_samples
+The intent is wrong, count distinct films only.

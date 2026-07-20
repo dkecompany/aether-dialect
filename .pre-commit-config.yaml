@@ -1,0 +1,97 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: ^(scripts/sandbox_staging/|dev_workspace/aether_artifacts/)
+      - id: end-of-file-fixer
+        exclude: ^(scripts/sandbox_staging/|dev_workspace/aether_artifacts/)
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ["--maxkb=10240"]
+        exclude: ^(src/aetherdialect/sandbox/data\.zip$|scripts/sandbox_staging/)
+
+  - repo: local
+    hooks:
+      - id: actionlint
+        name: actionlint
+        entry: python .github/scripts/run_actionlint.py
+        language: system
+        pass_filenames: false
+        files: ^\.github/workflows/.*\.ya?ml$
+
+  - repo: local
+    hooks:
+      - id: format-docstrings
+        name: format docstrings
+        entry: python .github/scripts/format_docstrings.py
+        language: system
+        pass_filenames: false
+        files: ^(src|tests|live_tests)/
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.9
+    hooks:
+      - id: ruff-format
+        files: ^(src|tests|live_tests)/
+      - id: ruff-check
+        files: ^(src|tests|live_tests)/
+
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.4.1
+    hooks:
+      - id: codespell
+        files: ^(README\.md|docs/)
+        args: ["--ignore-words", ".github/codespell.txt"]
+
+  - repo: https://github.com/PyCQA/bandit
+    rev: 1.8.3
+    hooks:
+      - id: bandit
+        args: ["-c", "pyproject.toml", "-r", "src/"]
+
+  - repo: local
+    hooks:
+      - id: vulture
+        name: vulture
+        entry: python -m vulture src/aetherdialect
+        language: system
+        pass_filenames: false
+      - id: mypy
+        name: mypy
+        entry: python -m mypy src/aetherdialect
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: pip-audit
+        name: pip-audit
+        entry: python -m pip_audit
+        args: [".", "--strict"]
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: build-package
+        name: python build
+        entry: python -m build
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: pytest-fast-cov
+        name: pytest fast + coverage
+        entry: python -m pytest
+        args:
+          - tests/
+          - -m
+          - fast
+          - -q
+          - --tb=short
+          - --cov=src/aetherdialect
+          - --cov-report=term-missing:skip-covered
+          - --cov-fail-under=68
+          - -p
+          - no:cacheprovider
+        language: system
+        pass_filenames: false
+        always_run: true

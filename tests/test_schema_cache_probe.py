@@ -8,18 +8,18 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from aetherdialect import _schema as schema_mod
+import aetherdialect._schema_overrides
 from aetherdialect._config import EngineConfig
-from aetherdialect._contracts_base import SchemaContext, SchemaGraph
+from aetherdialect._contracts_base import EngineContext
+from aetherdialect._contracts_schema import SchemaGraph
 from aetherdialect._core_utils import read_gzip_json
 from aetherdialect._dialect import Dialect
-from aetherdialect._schema import (
-    _save_schema_to_cache,
+from aetherdialect._schema_graph import (
     _sql_file_content_sha256,
     assign_schema_graph_hashes,
-    build_schema_graph,
     compute_dialect_probe,
 )
+from aetherdialect._schema_overrides import build_schema_graph, save_schema_to_cache
 
 
 class _ProbeStubDialect(Dialect):
@@ -41,13 +41,19 @@ class _ProbeStubDialect(Dialect):
         self.profile_calls = 0
         self.probe_calls = 0
 
-    def compute_ddl_probe(self, schema_context: SchemaContext) -> str:
+    def compute_ddl_probe(self, engine_context: EngineContext) -> str:
         self.probe_calls += 1
         if self._raise_in_probe:
             raise RuntimeError("boom")
         return self._probe_value
 
-    def reflect_schema_graph(self, *, include: Any = "tables", allow_objects: Any = None) -> SchemaGraph:
+    def reflect_schema_graph(
+        self,
+        *,
+        include: Any = "tables",
+        allow_objects: Any = None,
+        sql_file: Any = None,
+    ) -> SchemaGraph:
         self.reflect_calls += 1
         if self._reflect_result is None:
             raise AssertionError("reflect_schema_graph should not be called in this test")
@@ -66,7 +72,6 @@ class _ProbeStubDialect(Dialect):
 @pytest.fixture
 def cache_path(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> str:
     """Redirect ``EngineConfig.SCHEMA_JSON_PATH`` to a temp gz file for the test."""
-
     p = str(tmp_path / "schema_graph.json.gz")
     monkeypatch.setattr(EngineConfig, "SCHEMA_JSON_PATH", p)
     return p
@@ -74,17 +79,16 @@ def cache_path(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> str:
 
 def _save_with_probe(
     sg: SchemaGraph,
-    schema_context: SchemaContext,
+    engine_context: EngineContext,
     notes_content: str,
     probe_hash: str,
     cache_path: str,
 ) -> None:
     """Stamp hashes + probe on *sg* and persist to *cache_path*."""
-
     sg.notes_sha256 = hashlib.sha256((notes_content or "").encode("utf-8")).hexdigest()
-    assign_schema_graph_hashes(sg, schema_context, sg.notes_sha256)
+    assign_schema_graph_hashes(sg, engine_context, sg.notes_sha256)
     sg.ddl_probe_hash = probe_hash
-    _save_schema_to_cache(sg, cache_path)
+    save_schema_to_cache(sg, cache_path)
 
 
 def test_ddl_probe_hash_round_trips_to_dict(schema_graph: SchemaGraph) -> None:
@@ -96,7 +100,7 @@ def test_ddl_probe_hash_round_trips_to_dict(schema_graph: SchemaGraph) -> None:
 
 
 def test_ddl_probe_hash_persists_in_cache_file(schema_graph: SchemaGraph, cache_path: str) -> None:
-    ctx = SchemaContext()
+    ctx = EngineContext()
     _save_with_probe(
         schema_graph,
         ctx,
@@ -116,8 +120,8 @@ def test_compute_dialect_probe_changes_with_sql_file_content(
     f1.write_text("SELECT 1;", encoding="utf-8")
     f2.write_text("SELECT 2;", encoding="utf-8")
     dialect = _ProbeStubDialect(probe_value="DIALECT_DIGEST")
-    ctx1 = SchemaContext(sql_file=str(f1))
-    ctx2 = SchemaContext(sql_file=str(f2))
+    ctx1 = EngineContext(sql_file=str(f1))
+    ctx2 = EngineContext(sql_file=str(f2))
     p1 = compute_dialect_probe(dialect, ctx1)
     p2 = compute_dialect_probe(dialect, ctx2)
     assert p1 and p2
@@ -126,12 +130,12 @@ def test_compute_dialect_probe_changes_with_sql_file_content(
 
 def test_compute_dialect_probe_returns_empty_when_dialect_returns_empty() -> None:
     dialect = _ProbeStubDialect(probe_value="")
-    assert compute_dialect_probe(dialect, SchemaContext()) == ""
+    assert compute_dialect_probe(dialect, EngineContext()) == ""
 
 
 def test_compute_dialect_probe_swallows_dialect_exception() -> None:
     dialect = _ProbeStubDialect(raise_in_probe=True)
-    assert compute_dialect_probe(dialect, SchemaContext()) == ""
+    assert compute_dialect_probe(dialect, EngineContext()) == ""
 
 
 def test_sql_file_content_sha256_missing_file_returns_empty_digest(
@@ -147,7 +151,7 @@ def test_cache_hit_via_probe_skips_reflect_and_profile(
     cache_path: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    ctx = SchemaContext()
+    ctx = EngineContext()
     dialect = _ProbeStubDialect(probe_value="DIALECT_DIGEST")
     combined_probe = compute_dialect_probe(dialect, ctx)
     _save_with_probe(
@@ -160,7 +164,7 @@ def test_cache_hit_via_probe_skips_reflect_and_profile(
 
     classify_calls = []
     monkeypatch.setattr(
-        schema_mod,
+        aetherdialect._schema_overrides,
         "apply_column_roles_llm",
         lambda sg, notes_content=None, **kwargs: classify_calls.append(notes_content),
     )
@@ -179,7 +183,7 @@ def test_notes_only_refresh_reruns_classifier_only(
     cache_path: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    ctx = SchemaContext()
+    ctx = EngineContext()
     dialect = _ProbeStubDialect(probe_value="DIALECT_DIGEST")
     combined_probe = compute_dialect_probe(dialect, ctx)
     _save_with_probe(
@@ -193,13 +197,11 @@ def test_notes_only_refresh_reruns_classifier_only(
     classify_calls: list[str | None] = []
     boolean_calls: list[int] = []
     monkeypatch.setattr(
-        schema_mod,
-        "apply_column_roles_llm",
+        "aetherdialect._schema_graph.apply_column_roles_llm",
         lambda sg, notes_content=None, **kwargs: classify_calls.append(notes_content),
     )
     monkeypatch.setattr(
-        schema_mod,
-        "apply_boolean_coercion_pass",
+        "aetherdialect._schema_graph.apply_boolean_coercion_pass",
         lambda sg: boolean_calls.append(1),
     )
 
@@ -223,8 +225,7 @@ def test_probe_match_with_scope_mismatch_does_not_take_fast_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When probe matches but scope is *orthogonal* (neither subset nor superset), legacy validation runs."""
-
-    ctx_saved = SchemaContext(deny_columns=frozenset({"customers.email"}))
+    ctx_saved = EngineContext(deny_columns=frozenset({"customers.email"}))
     dialect = _ProbeStubDialect(probe_value="DIALECT_DIGEST")
     combined_probe = compute_dialect_probe(dialect, ctx_saved)
     _save_with_probe(
@@ -237,12 +238,12 @@ def test_probe_match_with_scope_mismatch_does_not_take_fast_path(
 
     classify_calls: list[Any] = []
     monkeypatch.setattr(
-        schema_mod,
+        aetherdialect._schema_overrides,
         "apply_column_roles_llm",
         lambda sg, notes_content=None, **kwargs: classify_calls.append(notes_content),
     )
 
-    ctx_new = SchemaContext(deny_columns=frozenset({"orders.status"}))
+    ctx_new = EngineContext(deny_columns=frozenset({"orders.status"}))
     with pytest.raises(AssertionError):
         build_schema_graph(dialect, ctx_new, notes_content="n")
     assert classify_calls == []
@@ -253,7 +254,7 @@ def test_legacy_cache_without_probe_falls_to_legacy_branch_and_backfills(
     cache_path: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    ctx = SchemaContext()
+    ctx = EngineContext()
     _save_with_probe(schema_graph, ctx, notes_content="n", probe_hash="", cache_path=cache_path)
     raw_before = read_gzip_json(cache_path)
     assert raw_before["ddl_probe_hash"] == ""
@@ -274,7 +275,7 @@ def test_dialect_with_empty_probe_uses_legacy_branch(
     schema_graph: SchemaGraph,
     cache_path: str,
 ) -> None:
-    ctx = SchemaContext()
+    ctx = EngineContext()
     _save_with_probe(schema_graph, ctx, notes_content="n", probe_hash="", cache_path=cache_path)
     dialect = _ProbeStubDialect(probe_value="")
 
@@ -298,7 +299,13 @@ def test_base_dialect_compute_ddl_probe_returns_empty(
         def __init__(self) -> None:
             super().__init__(MagicMock())
 
-        def reflect_schema_graph(self, *, include: Any = "tables", allow_objects: Any = None) -> SchemaGraph:
+        def reflect_schema_graph(
+            self,
+            *,
+            include: Any = "tables",
+            allow_objects: Any = None,
+            sql_file: Any = None,
+        ) -> SchemaGraph:
             raise NotImplementedError
 
         def profile_schema(self, sg: SchemaGraph) -> None:
@@ -311,4 +318,4 @@ def test_base_dialect_compute_ddl_probe_returns_empty(
             return True, ""
 
     d = _Bare()
-    assert d.compute_ddl_probe(SchemaContext()) == ""
+    assert d.compute_ddl_probe(EngineContext()) == ""

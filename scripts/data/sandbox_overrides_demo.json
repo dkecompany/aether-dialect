@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "tables": {
+    "staff": {
+      "columns": {
+        "ssn": {
+          "sensitivity": "hidden"
+        },
+        "password": {
+          "sensitivity": "hidden"
+        }
+      }
+    },
+    "film": {
+      "description": "Sandbox demo override: Rental Shop film catalog.",
+      "role": null
+    }
+  },
+  "foreign_keys_add": [],
+  "foreign_keys_remove": [],
+  "primary_keys_add": [],
+  "primary_keys_remove": []
+}

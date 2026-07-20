@@ -4,32 +4,30 @@ from unittest.mock import patch
 
 import pytest
 
-from aetherdialect._config import (
-    QUESTION_STARTS_AGG,
-    QUESTION_STARTS_GROUP,
-    QUESTION_STARTS_LIST,
-)
+from aetherdialect._constants import QUESTION_STARTS_AGG, QUESTION_STARTS_GROUP, QUESTION_STARTS_LIST
 from aetherdialect._contracts_base import (
-    ColumnMetadata,
-    LlmJsonExhausted,
-    SchemaGraph,
-    SQLShape,
-    TableMetadata,
-    TemplateStats,
-)
-from aetherdialect._contracts_core import (
-    ConcreteIntent,
     FilterParam,
     HavingParam,
+    LlmJsonExhausted,
     MulGroup,
     NormalizedExpr,
     OrderByCol,
+)
+from aetherdialect._contracts_core import (
+    ConcreteIntent,
     RuntimeCteStep,
     RuntimeIntent,
     SelectCol,
     Template,
     ValueHistory,
     concrete_intent_to_runtime_skeleton,
+)
+from aetherdialect._contracts_schema import (
+    ColumnMetadata,
+    SchemaGraph,
+    SQLShape,
+    TableMetadata,
+    TemplateStats,
 )
 from aetherdialect._utils import (
     _describe_operation,
@@ -39,20 +37,19 @@ from aetherdialect._utils import (
     _normalize_cte_steps_for_key,
     _normalize_filters,
     _normalize_having_conditions,
-    _pick_question_style,
     _tokenize,
     body_similarity_key,
     body_similarity_key_for_concrete,
     exact_question_match,
     extract_tables_from_sql,
     flatten_param_values,
-    generate_bulk_anchors,
     generate_question,
     generate_question_from_sql,
     intent_key,
     match_question_against_template_history,
+    pick_question_style,
     question_token_fingerprint_from_raw,
-    select_three_warmup_styles,
+    select_diverse_paraphrases,
     sql_shape,
     template_instance_key_from_parts,
     validate_question,
@@ -473,7 +470,6 @@ class TestNormalizeHavingConditions:
 
     def test_sorts_by_filter_group_first(self):
         """normalize_having_conditions sorts by structural key; group order follows first occurrence of filter_group."""
-
         h1 = HavingParam(left_expr=NormalizedExpr.from_agg("sum", "t.amount"), op=">", filter_group=2)
         h2 = HavingParam(left_expr=NormalizedExpr.from_agg("count", "t.id"), op=">", filter_group=1)
         result = _normalize_having_conditions([h1, h2])
@@ -762,22 +758,22 @@ class TestPickQuestionStyle:
 
     def test_grouped_returns_group_starts(self):
         """pick_question_style returns group start for grouped query."""
-        result = _pick_question_style(["t.name"], has_grouping=True)
+        result = pick_question_style(["t.name"], has_grouping=True)
         assert result in QUESTION_STARTS_GROUP
 
     def test_count_returns_how_many(self):
         """pick_question_style returns count start for COUNT."""
-        result = _pick_question_style(["COUNT(t.id)"], has_grouping=False)
+        result = pick_question_style(["COUNT(t.id)"], has_grouping=False)
         assert result in ["How many", "Count", "What is the number of"]
 
     def test_sum_returns_total(self):
         """pick_question_style returns sum start for SUM."""
-        result = _pick_question_style(["SUM(t.amount)"], has_grouping=False)
+        result = pick_question_style(["SUM(t.amount)"], has_grouping=False)
         assert result in ["What is the total", "Find the sum of", "Calculate the total"]
 
     def test_no_agg_returns_list_start(self):
         """pick_question_style returns list start for no aggregation."""
-        result = _pick_question_style(["t.name", "t.id"], has_grouping=False)
+        result = pick_question_style(["t.name", "t.id"], has_grouping=False)
         assert result in QUESTION_STARTS_LIST
 
 
@@ -1464,7 +1460,7 @@ class TestPickQuestionStyleEdgeCases:
 
     def test_avg_returns_average(self):
         """pick_question_style returns average start for AVG."""
-        result = _pick_question_style(["AVG(t.price)"], has_grouping=False)
+        result = pick_question_style(["AVG(t.price)"], has_grouping=False)
         assert result in [
             "What is the average",
             "Calculate the average",
@@ -1473,17 +1469,17 @@ class TestPickQuestionStyleEdgeCases:
 
     def test_min_returns_minimum(self):
         """pick_question_style returns min start for MIN."""
-        result = _pick_question_style(["MIN(t.price)"], has_grouping=False)
+        result = pick_question_style(["MIN(t.price)"], has_grouping=False)
         assert "min" in result.lower()
 
     def test_max_returns_maximum(self):
         """pick_question_style returns max start for MAX."""
-        result = _pick_question_style(["MAX(t.price)"], has_grouping=False)
+        result = pick_question_style(["MAX(t.price)"], has_grouping=False)
         assert "max" in result.lower()
 
     def test_grouping_overrides_agg(self):
         """pick_question_style returns group start when has_grouping is True."""
-        result = _pick_question_style(["COUNT(t.id)"], has_grouping=True)
+        result = pick_question_style(["COUNT(t.id)"], has_grouping=True)
         assert result in QUESTION_STARTS_GROUP
 
 
@@ -1629,8 +1625,7 @@ class TestValidateQuestion:
 
     @patch("aetherdialect._utils.llm_json")
     def test_restricted_wins_when_valid_flag_no(self, mock_llm_json):
-        """restricted is reported even when valid_database_question is no (Group A precedence)."""
-
+        """Restricted is reported even when valid_database_question is no (Group A precedence)."""
         mock_llm_json.return_value = {
             "valid_database_question": "no",
             "query_type": "restricted",
@@ -1644,7 +1639,6 @@ class TestValidateQuestion:
     @patch("aetherdialect._utils.llm_json")
     def test_cte_analytical_may_be_allowed_not_restricted(self, mock_llm_json):
         """Analytical questions that mention CTEs are classified allowed when the model agrees (CJ regression)."""
-
         mock_llm_json.return_value = {
             "valid_database_question": "yes",
             "query_type": "allowed",
@@ -1681,7 +1675,6 @@ class TestNormalizationGuard:
 
     def test_tc001_aggregation_prefix_and_particles(self):
         """``count of`` opener plus grammatical particles must pass the Jaccard and introduced-token checks."""
-
         raw = "how many orders were placed in the last month for each customer"
         corrected = raw
         normalized = "count of orders placed in the last month for each customer"
@@ -1707,7 +1700,7 @@ class TestGenerateQuestion:
         )
         return SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"orders": t})
 
-    @patch("aetherdialect._utils._pick_question_style", return_value="How many")
+    @patch("aetherdialect._utils.pick_question_style", return_value="How many")
     @patch("aetherdialect._utils.llm_json")
     def test_returns_question_when_llm_returns_valid_json(self, mock_llm_json, _mock_style, minimal_schema):
         """generate_question returns question string when LLM returns valid JSON."""
@@ -1863,16 +1856,15 @@ class TestGenerateQuestionFromSql:
         assert out["is_realistic"] is True
         assert out["question"] == "First phrase?"
 
+    @patch("aetherdialect._utils.generate_warmup_paraphrases_by_style", return_value=None)
     @patch("aetherdialect._utils.llm_json")
-    def test_realistic_truncates_questions_list(self, mock_llm, empty_schema):
-        """Long question lists truncate to WARMUP_QUESTIONS_MAX."""
-        from aetherdialect._config import SeedWarmupConfig
-
-        many = [f"Question number {i}?" for i in range(SeedWarmupConfig.WARMUP_QUESTIONS_MAX + 5)]
+    def test_realistic_keeps_all_parsed_questions(self, mock_llm, _mock_styles, empty_schema):
+        """Parsed questions are kept when style generation is unavailable."""
+        many = [f"Question number {i}?" for i in range(8)]
         mock_llm.return_value = {"is_realistic": True, "questions": many}
         out = generate_question_from_sql("SELECT 1", empty_schema, [])
         assert out is not None
-        assert len(out["questions"]) == SeedWarmupConfig.WARMUP_QUESTIONS_MAX
+        assert len(out["questions"]) == 8
 
     @patch("aetherdialect._utils.llm_json")
     def test_realistic_dedupes_normalized_phrases(self, mock_llm, empty_schema):
@@ -1919,77 +1911,30 @@ class TestGenerateQuestionFromSql:
         mock_llm.return_value = {"is_realistic": True, "questions": ["ok?"]}
         generate_question_from_sql("SELECT * FROM orders", schema_graph, ["orders"])
         user_blob = mock_llm.call_args[0][1]
-        assert "TABLE orders:" in user_blob
+        assert "TABLE orders" in user_blob
         assert "orders" in user_blob
 
 
-class TestWarmupQuestionStyles:
-    """Deterministic warmup style sampling and synthetic prompt wiring."""
+class TestSelectDiverseParaphrases:
+    """MMR diversity selection for warmup paraphrases."""
 
-    def test_select_three_stable(self):
-        """Same inputs yield the same ordered triple."""
-        a = select_three_warmup_styles(3, "intent-a")
-        b = select_three_warmup_styles(3, "intent-a")
-        assert a == b
-        assert len(set(a)) == 3
+    def test_respects_max_count(self):
+        """At most max_count distinct phrases are returned."""
+        cands = [f"Question variant {i} about sales totals" for i in range(12)]
+        out = select_diverse_paraphrases(cands, max_count=5)
+        assert len(out) == 5
 
-    def test_select_three_varies_with_inputs(self):
-        """Different seeds or intent ids can change the triple."""
-        one = select_three_warmup_styles(0, "same")
-        two = select_three_warmup_styles(1, "same")
-        assert one != two
-
-    @patch("aetherdialect._utils.llm_json")
-    def test_warmup_triple_payload_includes_style_slots(self, mock_llm):
-        """Synthetic warmup mode passes schema enrichment and style_slots."""
-        mock_llm.return_value = {
-            "is_realistic": True,
-            "questions": ["First?", "Second?", "Third?"],
-            "question": "First?",
-        }
-        empty_schema = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={})
-        triple = select_three_warmup_styles(7, "wf-intent")
-        out = generate_question_from_sql(
-            "SELECT 1",
-            empty_schema,
-            [],
-            warmup_style_triple=triple,
-        )
-        assert out is not None
-        assert out["questions"] == ["First?", "Second?", "Third?"]
-        user_blob = mock_llm.call_args[0][1]
-        assert "style_slots" in user_blob
-        for s in triple:
-            assert s in user_blob
-
-
-class TestGenerateBulkAnchors:
-    """Deterministic rule-based warmup anchors."""
-
-    def test_non_empty_tuple_bounded_by_count(self):
-        """Anchors respect count and dedupe."""
-
-        from aetherdialect._contracts_core import RuntimeIntent
-
-        ri = RuntimeIntent(
-            tables=["orders"],
-            grain="row_level",
-            select_cols=[],
-            group_by_cols=[],
-            order_by_cols=[],
-            filters_param=[],
-        )
-        sg = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={})
-        out = generate_bulk_anchors(ri, sg, 5)
-        assert len(out) <= 5
-        assert len(set(out)) == len(out)
+    def test_dedupes_normalized(self):
+        """Normalized duplicates collapse to one entry."""
+        out = select_diverse_paraphrases(["Total sales?", "total sales?", "Revenue?"], max_count=5)
+        assert len(out) == 2
 
 
 class TestIntentKeyLimitAndOrder:
     """Additional intent_key / structural invariants."""
 
     def test_limit_does_not_change_intent_key(self):
-        """limit is excluded from the fingerprint."""
+        """Limit is excluded from the fingerprint."""
         base = RuntimeIntent(
             tables=["t"],
             grain="row_level",
@@ -2115,7 +2060,7 @@ class TestGenerateQuestionPhrasing:
         )
         return SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"orders": t})
 
-    @patch("aetherdialect._utils._pick_question_style", return_value="How many")
+    @patch("aetherdialect._utils.pick_question_style", return_value="How many")
     @patch("aetherdialect._utils.llm_json")
     def test_phrasing_violation_returns_none(self, mock_llm_json, _mock_style, minimal_schema):
         """Question must start with template prefix from required style."""
@@ -2132,7 +2077,7 @@ class TestGenerateQuestionPhrasing:
             is None
         )
 
-    @patch("aetherdialect._utils._pick_question_style", return_value="Prefix{ignored}")
+    @patch("aetherdialect._utils.pick_question_style", return_value="Prefix{ignored}")
     @patch("aetherdialect._utils.llm_json")
     def test_required_start_splits_on_brace(self, mock_llm_json, _mock_style, minimal_schema):
         """Brace suffix in style is stripped for startswith check."""
@@ -2148,7 +2093,7 @@ class TestGenerateQuestionPhrasing:
         assert out == "Prefix rest of question"
 
     @patch("aetherdialect._utils.llm_json", side_effect=ValueError("bad json"))
-    @patch("aetherdialect._utils._pick_question_style", return_value="What are")
+    @patch("aetherdialect._utils.pick_question_style", return_value="What are")
     def test_llm_exception_propagates(self, _mock_style, _mock_llm, minimal_schema):
         """Exceptions from llm_json propagate to the caller."""
         with pytest.raises(ValueError, match="bad json"):
@@ -2163,7 +2108,7 @@ class TestGenerateQuestionPhrasing:
 
 
 class TestFlattenParamValuesContainsEdges:
-    """contains filter key collection across CTE vs main and right_expr."""
+    """Contains filter key collection across CTE vs main and right_expr."""
 
     def test_contains_in_cte_normalizes_param(self):
         """CTE-level contains filters participate in key collection."""

@@ -1,29 +1,32 @@
 """Shared fixtures for aetherdialect test suite."""
 
+import os
 from typing import Any
 
 import pytest
 
 from aetherdialect._contracts_base import (
-    ColumnMetadata,
     ColumnRole,
-    FKEdge,
-    SchemaGraph,
-    SQLShape,
-    TableMetadata,
-    TableRole,
-    TemplateStats,
-)
-from aetherdialect._contracts_core import (
     FilterParam,
     NormalizedExpr,
+    TableRole,
+)
+from aetherdialect._contracts_core import (
     RuntimeIntent,
     SelectCol,
     Template,
     ValueHistory,
     runtime_intent_to_concrete,
 )
-from aetherdialect._schema_profiling import assign_column_ops
+from aetherdialect._contracts_schema import (
+    ColumnMetadata,
+    FKEdge,
+    SchemaGraph,
+    SQLShape,
+    TableMetadata,
+    TemplateStats,
+)
+from aetherdialect._schema_catalog import assign_column_ops
 
 
 def _term_str(term: Any) -> str:
@@ -50,8 +53,190 @@ def term_strs(terms: Any) -> list[str]:
     return [_term_str(t) for t in (terms or [])]
 
 
+_SLOW_SANDBOX_TESTS = frozenset(
+    {
+        "test_tour_question",
+        "test_playground_question",
+        "test_paraphrase_question",
+        "test_catalog_paraphrase_hits_direct_reuse_after_accept",
+        "test_rental_shop_category_film_emits_non_empty_join_path",
+    }
+)
+
+_SLOW_SANDBOX_MODULES = frozenset(
+    {
+        "test_sandbox_scenarios.py",
+        "test_sandbox_recording_isolation.py",
+    }
+)
+
+_SLOW_SANDBOX_OFFLINE_TESTS = frozenset(
+    {
+        "test_sandbox_question",
+        "test_validation_failure_question",
+        "test_practice_questions_have_mock_fixture_coverage",
+        "test_fixture_corpus_covers_consumer_reader_practice",
+        "test_assert_sandbox_complete_with_corpus",
+        "test_feedback_samples_rejection_flow",
+        "test_rank_films_question",
+        "test_direct_reuse_2025_2026_pair",
+        "test_recipe_chat_basics_produces_sql",
+        "test_recipe_rejections_completes",
+        "test_template_reuse_second_question",
+        "test_reader_writer_queue",
+        "test_recipe_validation_failures",
+        "test_recipe_full_session_completes",
+        "test_aetherspace_demo",
+        "test_restricted_consumer_permission_denied",
+        "test_deny_columns_column_security",
+        "test_consumer_reader_preset_first_question",
+        "test_owner_bundled_overrides",
+        "test_consumer_override_proposal_only",
+        "test_session_active_error",
+    }
+)
+
+_FAST_TEST_MAX_SECS = 25.0
+
+_SANDBOX_BUNDLE_MODULES = frozenset(
+    {
+        "test_sandbox_offline.py",
+        "test_sandbox_scenarios.py",
+        "test_sandbox_corpus_helpers.py",
+        "test_sandbox_corpus_validate.py",
+        "test_sandbox_recording_isolation.py",
+        "test_sandbox_recording_toml.py",
+        "test_sandbox_recording_trace.py",
+        "test_sandbox_tail_capture.py",
+    }
+)
+
+_EXECUTE_STEP_SANDBOX_TESTS = frozenset(
+    {
+        "test_happy_path_returns_rows",
+        "test_forbidden_statement_rejected_before_execute",
+        "test_consumer_out_of_scope_blocked",
+    }
+)
+
+
+def _is_slow_sandbox_test(item: pytest.Item) -> bool:
+    nodeid = item.nodeid.replace("\\", "/")
+    for mod in _SLOW_SANDBOX_MODULES:
+        if mod in nodeid:
+            return True
+    base_name = item.name.split("[", 1)[0]
+    if base_name in _SLOW_SANDBOX_TESTS:
+        return True
+    fspath = getattr(item, "path", None) or getattr(item, "fspath", None)
+    mod = fspath.name if fspath is not None else ""
+    if mod == "test_sandbox_offline.py":
+        return base_name in _SLOW_SANDBOX_OFFLINE_TESTS
+    return False
+
+
+def _is_live_test(item: pytest.Item) -> bool:
+    """Return True when the test lives under ``live_tests/`` (real engine connections)."""
+    fspath = getattr(item, "path", None) or getattr(item, "fspath", None)
+    if fspath is None:
+        return "live_tests/" in item.nodeid.replace("\\", "/")
+    parts = fspath.parts
+    return "live_tests" in parts
+
+
+def _requires_sandbox_bundle(item: pytest.Item) -> bool:
+    """Return True when the test needs bundled ``sandbox/data.zip`` (``offline_sandbox`` corpus)."""
+    if item.get_closest_marker("requires_sandbox") is not None:
+        return True
+    fspath = getattr(item, "path", None) or getattr(item, "fspath", None)
+    mod = fspath.name if fspath is not None else ""
+    if mod in _SANDBOX_BUNDLE_MODULES:
+        return True
+    base_name = item.name.split("[", 1)[0]
+    if mod == "test_execute_step.py" and base_name in _EXECUTE_STEP_SANDBOX_TESTS:
+        return True
+    return mod == "test_sql_gen.py" and base_name == "test_rental_shop_category_film_emits_non_empty_join_path"
+
+
+def _sandbox_bundle_ready() -> bool:
+    """Return True when bundled ``sandbox/data.zip`` is present and passes ``sandbox_doctor()``."""
+    from aetherdialect._sandbox import data_zip_path, sandbox_doctor
+
+    if not data_zip_path().is_file():
+        return False
+    try:
+        return sandbox_doctor() == []
+    except Exception:
+        return False
+
+
+@pytest.fixture
+def stub_schema_llm_classifier(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No-op ``apply_column_roles_llm`` for schema diff and partial- rebuild unit tests."""
+
+    def _noop(schema: Any, notes_content: str | None = None, **kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr("aetherdialect._schema_overrides.apply_column_roles_llm", _noop)
+    monkeypatch.setattr("aetherdialect._schema_graph.apply_column_roles_llm", _noop)
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    sandbox_ready = _sandbox_bundle_ready()
+    skip_sandbox = pytest.mark.skip(reason="sandbox data.zip not ready")
+    for item in items:
+        if _is_live_test(item):
+            continue
+        if _requires_sandbox_bundle(item):
+            item.add_marker(pytest.mark.requires_sandbox)
+            if not sandbox_ready:
+                item.add_marker(skip_sandbox)
+            elif not _is_slow_sandbox_test(item):
+                item.add_marker(pytest.mark.fast)
+        elif not _is_slow_sandbox_test(item):
+            item.add_marker(pytest.mark.fast)
+
+
 def pytest_configure(config: Any) -> None:
     config.addinivalue_line("markers", "integration: mocked multi-module pipeline slices")
+
+
+def pytest_runtest_logreport(report: pytest.TestReport) -> None:
+    """Warn when a ``fast`` test exceeds the per-test fast budget (marker drift guard)."""
+    if report.when != "call" or not report.passed:
+        return
+    duration = getattr(report, "duration", None)
+    if duration is None or duration <= _FAST_TEST_MAX_SECS:
+        return
+    keywords = getattr(report, "keywords", {})
+    if "fast" not in keywords:
+        return
+    print(
+        f"\nNOT FAST ({duration:.1f}s > {_FAST_TEST_MAX_SECS}s): {report.nodeid}",
+        flush=True,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _reset_engine_config_after_test() -> None:
+    """Sandbox and init paths mutate class-level engine storage; restore defaults after each test."""
+    yield
+    from aetherdialect._config import (
+        EngineConfig,
+        PostgresRuntimeConfig,
+        QSimConfig,
+    )
+    from aetherdialect._constants import ENGINE_STORAGE_PLACEHOLDER_DIR, TEMPLATE_STORE_SEGMENT
+    from aetherdialect._llm_provider import reset_mock_provider
+
+    EngineConfig.TYPE = "postgresql"
+    EngineConfig.RUNTIME = PostgresRuntimeConfig
+    EngineConfig.SCHEMA_JSON_PATH = os.path.join(ENGINE_STORAGE_PLACEHOLDER_DIR, "schema_graph.json.gz")
+    EngineConfig.TEMPLATE_STORE_DIR = os.path.join(ENGINE_STORAGE_PLACEHOLDER_DIR, TEMPLATE_STORE_SEGMENT)
+    EngineConfig.LLM_PROVIDER = "openai"
+    EngineConfig.MOCK_FIXTURES_FILE = ""
+    reset_mock_provider()
+    QSimConfig.SKELETONS_JSON_PATH = os.path.join(ENGINE_STORAGE_PLACEHOLDER_DIR, "qsim_skeletons.json.gz")
 
 
 @pytest.fixture
@@ -96,7 +281,7 @@ def schema_graph() -> SchemaGraph:
                 distinct_count=2,
                 distinct_ratio=0.02,
                 row_count=100,
-                top_k_values=["true", "false"],
+                frequent_values=["true", "false"],
             ),
             "created_at": ColumnMetadata(
                 name="created_at",
@@ -154,7 +339,7 @@ def schema_graph() -> SchemaGraph:
                 distinct_count=5,
                 distinct_ratio=0.01,
                 row_count=500,
-                top_k_values=[
+                frequent_values=[
                     "pending",
                     "shipped",
                     "delivered",
@@ -240,7 +425,7 @@ def schema_graph() -> SchemaGraph:
                 distinct_count=10,
                 distinct_ratio=0.2,
                 row_count=50,
-                top_k_values=["electronics", "books", "clothing", "food", "toys"],
+                frequent_values=["electronics", "books", "clothing", "food", "toys"],
             ),
         },
         primary_key=["product_id"],

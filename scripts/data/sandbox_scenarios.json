@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "scenarios": [
+    {
+      "id": "hidden_column",
+      "question": "Show payroll deductions by employee SSN.",
+      "mechanism": "bundled_overrides_hide_staff_ssn"
+    },
+    {
+      "id": "schema_invalid",
+      "question": "Show me all staff salaries.",
+      "mechanism": "schema_validation_failure"
+    },
+    {
+      "id": "fail_everywhere",
+      "question": "How many rentals happened on 2025-01-01?",
+      "mechanism": "schema_validation_failure"
+    },
+    {
+      "id": "pass_but_wrong",
+      "question": "How many rentals were made in total?"
+    },
+    {
+      "id": "feedback_demo",
+      "kind": "feedback",
+      "anchor_question": "How many books do we have?",
+      "allowed_rejection_text": "The intent is wrong, count distinct films only.",
+      "flow": "reject_then_accept"
+    }
+  ]
+}

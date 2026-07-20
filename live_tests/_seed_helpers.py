@@ -1,8 +1,4 @@
-"""
-Shared infrastructure for seeded live tests.
-
-Exposes a function-scoped ``isolated_runner`` context manager that redirects ``EngineConfig.TEMPLATE_STORE_DIR`` to a unique subdirectory so every test starts with a guaranteed-empty template store. Adds intent builders for the canonical ``dvdrental`` shapes reused across multiple seeded live tests, plus thin wrappers for seeding templates and question-level feedback (rejections and structural validation rows). ``capture_parse_prompt`` records prior question feedback passed to ``_build_intent_parse_prompt`` so tests can assert which memory reaches the LLM.
-"""
+"""Shared infrastructure for seeded live tests. Exposes a function-scoped ``isolated_runner`` context manager that redirects ``EngineConfig.TEMPLATE_STORE_DIR`` to a unique subdirectory so every test starts with a guaranteed-empty template store. Adds intent builders for the canonical ``rental_shop`` shapes reused across multiple seeded live tests, plus thin wrappers for seeding templates and question-level feedback (rejections and structural validation rows). ``capture_parse_prompt`` records prior question feedback passed to ``_build_intent_parse_prompt`` so tests can assert which memory reaches the LLM."""
 
 from __future__ import annotations
 
@@ -16,16 +12,18 @@ from typing import Any
 from unittest.mock import patch
 
 from aetherdialect._config import EngineConfig
-from aetherdialect._contracts_base import TemplateStats
-from aetherdialect._contracts_core import (
-    FeedbackKind,
+from aetherdialect._contracts_base import (
     FilterParam,
     NormalizedExpr,
+)
+from aetherdialect._contracts_core import (
+    FeedbackKind,
     RuntimeIntent,
     SelectCol,
     Template,
     ValueHistory,
 )
+from aetherdialect._contracts_schema import TemplateStats
 from aetherdialect._live_testing import LiveTestRunner
 from aetherdialect._templates import (
     empty_template_store,
@@ -52,33 +50,12 @@ def _question_feedback_entry_count(store: dict[str, Any]) -> int:
 
 def empty_store(effective_structural_hash: str):
     """Return a fresh empty partitioned template store (alias for :func:`empty_template_store`)."""
-
     return empty_template_store(effective_structural_hash)
 
 
 @contextmanager
 def isolated_runner(schema: Any, schema_terms: set[str], t2s: Any, *, label: str) -> Iterator[LiveTestRunner]:
-    """
-    Yield an instrumented ``LiveTestRunner`` with an isolated on-disk store.
-
-    ``EngineConfig.TEMPLATE_STORE_DIR`` is redirected to a unique directory inside
-    ``t2s._artifacts_dir`` and removed on teardown so residual state cannot leak.
-
-    Args:
-
-        schema: Profiled ``SchemaGraph`` shared across live tests.
-
-        schema_terms: Schema term tokens for the runner.
-
-        t2s: Session ``Text2SQL`` instance for the artifacts directory.
-
-        label: Short identifier embedded in the isolated directory name.
-
-    Yields:
-
-        A ``LiveTestRunner`` bound to the fresh store.
-    """
-
+    """Yield an instrumented ``LiveTestRunner`` with an isolated on- disk. store. ``EngineConfig.TEMPLATE_STORE_DIR`` is redirected to a unique directory inside ``t2s._artifacts_dir`` and removed on teardown so residual state cannot leak. Args: schema: Profiled ``SchemaGraph`` shared across live tests. schema_terms: Schema term tokens for the runner. t2s: Session ``AetherEngine`` instance for the artifacts directory. label: Short identifier embedded in the isolated directory name. Yields: A ``LiveTestRunner`` bound to the fresh store."""
     original_dir = EngineConfig.TEMPLATE_STORE_DIR
     isolated_dir = os.path.join(
         str(t2s._artifacts_dir),
@@ -108,7 +85,6 @@ def isolated_runner(schema: Any, schema_terms: set[str], t2s: Any, *, label: str
 
 def intent_rental_count_by_store() -> RuntimeIntent:
     """Grouped rental count per ``inventory.store_id``."""
-
     return RuntimeIntent(
         tables=["rental", "inventory"],
         grain="grouped",
@@ -126,7 +102,6 @@ def intent_rental_count_by_store() -> RuntimeIntent:
 
 def intent_payment_sum_by_staff() -> RuntimeIntent:
     """Grouped sum of ``payment.amount`` per ``payment.staff_id``."""
-
     return RuntimeIntent(
         tables=["payment"],
         grain="grouped",
@@ -144,7 +119,6 @@ def intent_payment_sum_by_staff() -> RuntimeIntent:
 
 def intent_customer_first_names() -> RuntimeIntent:
     """Row-level select of ``customer.customer_id`` and ``customer.first_name``."""
-
     return RuntimeIntent(
         tables=["customer"],
         grain="row_level",
@@ -162,7 +136,6 @@ def intent_customer_first_names() -> RuntimeIntent:
 
 def intent_customer_full_names() -> RuntimeIntent:
     """Row-level select of customer id, first name, and last name."""
-
     return RuntimeIntent(
         tables=["customer"],
         grain="row_level",
@@ -181,7 +154,6 @@ def intent_customer_full_names() -> RuntimeIntent:
 
 def intent_customer_emails_only() -> RuntimeIntent:
     """Row-level select of ``customer.customer_id`` and ``customer.email``."""
-
     return RuntimeIntent(
         tables=["customer"],
         grain="row_level",
@@ -199,7 +171,6 @@ def intent_customer_emails_only() -> RuntimeIntent:
 
 def intent_store_staff_by_work() -> RuntimeIntent:
     """Row-level ``store`` + ``staff`` join on the ``staff.store_id`` FK edge."""
-
     return RuntimeIntent(
         tables=["store", "staff"],
         grain="row_level",
@@ -221,7 +192,6 @@ def intent_store_staff_by_work() -> RuntimeIntent:
 
 def intent_store_manager() -> RuntimeIntent:
     """Row-level ``store`` + ``staff`` join on the ``store.manager_staff_id`` FK edge."""
-
     return RuntimeIntent(
         tables=["store", "staff"],
         grain="row_level",
@@ -239,13 +209,12 @@ def intent_store_manager() -> RuntimeIntent:
 
 
 def intent_film_in_category(category_name: str) -> RuntimeIntent:
-    """Row-level ``film`` title filtered by ``film_category``/``category`` join."""
-
+    """Row-level ``film`` title filtered by ``item_category``/``category`` join (via ``item``)."""
     return RuntimeIntent(
-        tables=["film", "film_category", "category"],
+        tables=["film", "item", "item_category", "category"],
         grain="row_level",
         select_cols=[
-            SelectCol(expr=NormalizedExpr.from_column("film.title")),
+            SelectCol(expr=NormalizedExpr.from_column("item.title")),
         ],
         group_by_cols=[],
         order_by_cols=[],
@@ -275,39 +244,7 @@ def seed_template(
     structural_override: dict[str, Any] | None = None,
     template_source: str = "human",
 ) -> Template:
-    """
-    Insert one template into *runner*'s store.
-
-    When *structural_override* is non-empty, each key replaces the matching
-    entry in ``Template.structural_defaults`` after insertion so the stored
-    value_history row differs from the structural default (the lever that
-    routes fuzzy reuse through ``GenerationPath.FUZZY_REUSE_FULL_PARAMS``).
-
-    Args:
-
-        runner: Target ``LiveTestRunner`` whose store/templates are mutated.
-
-        q_norm: Normalised seed question stored in ``value_history.questions``.
-
-        intent: Seed intent whose ``param_values`` feed structural defaults.
-
-        sql: Seed SQL (canonicalised + parameterised by ``insert_template``).
-
-        trust_level: Stored ``Template.trust_level``; default is 1.
-
-        stats: Optional ``TemplateStats``; default is ``accept=3, reject=0``.
-
-        value_history: Optional pre-built history; default is a single row.
-
-        structural_override: Optional ``s*`` overrides applied post-insert.
-
-        template_source: Stored ``Template.source`` marker.
-
-    Returns:
-
-        The newly inserted or merged ``Template``.
-    """
-
+    """Insert one template into *runner*'s store. When. *structural_override* is non-empty, each key replaces the matching entry in ``Template.structural_defaults`` after insertion so the stored value_history row differs from the structural default (the lever that routes fuzzy reuse through ``GenerationPath.FUZZY_REUSE_FULL_PARAMS``). Args: runner: Target ``LiveTestRunner`` whose store/templates are mutated. q_norm: Normalised seed question stored in ``value_history.questions``. intent: Seed intent whose ``param_values`` feed structural defaults. sql: Seed SQL (canonicalised + parameterised by ``insert_template``). trust_level: Stored ``Template.trust_level``; default is 1. stats: Optional ``TemplateStats``; default is ``accept=3, reject=0``. value_history: Optional pre-built history; default is a single row. structural_override: Optional ``s*`` overrides applied post-insert. template_source: Stored ``Template.source`` marker. Returns: The newly inserted or merged ``Template``."""
     if stats is None:
         stats = TemplateStats(accept=3, reject=0)
     template = insert_template(
@@ -337,7 +274,6 @@ def seed_rejected(
     reason: str = "seeded rejection",
 ) -> SimpleNamespace:
     """Insert one ``INTENT_REJECTED`` question-feedback row into *runner*'s store."""
-
     ent = summarize_failure_for_memory(
         question=q_norm,
         intent=intent,
@@ -363,15 +299,7 @@ def seed_negative_memory(
     repeats: int = 1,
     q_norm: str | None = None,
 ) -> dict[str, str]:
-    """
-    Seed validation-failure feedback rows for *intent* (penalty / hint paths).
-
-    Each repeat appends one ``question_feedback`` row scoped to the runner schema so
-    :func:`aetherdialect._templates.compute_question_feedback_penalty` observes the seed.
-
-    Returns the computed keys (``ikey``, ``sql_fp``, ``colmap_sig``, ``q_norm``) for assertions.
-    """
-
+    """Seed validation-failure feedback rows for *intent* (penalty / hint paths). Each repeat appends one ``question_feedback`` row scoped to the runner schema so :func:`aetherdialect._templates.compute_question_feedback_penalty` observes the seed. Returns the computed keys (``ikey``, ``sql_fp``, ``colmap_sig``, ``q_norm``) for assertions."""
     from aetherdialect._core_utils import (
         canonicalize_sql,
         colmap_signature,
@@ -406,20 +334,13 @@ def seed_negative_memory(
 
 @contextmanager
 def capture_parse_prompt() -> Iterator[list[dict[str, Any]]]:
-    """
-    Record calls into intent-parse prompt construction and forward them through.
-
-    The captured list includes entries from ``_build_intent_parse_prompt`` (with
-    ``prior_question_feedback``) and a slim record for each ``full_intent_parse`` /
-    ``_invoke_intent_parse_with_hints`` call (``store`` / ``in_turn_seed`` / ``budget``).
-    """
-
-    import aetherdialect._intent_process as intent_process
+    """Record calls into intent-parse prompt construction and forward them through. The captured list includes entries from ``_build_intent_parse_prompt`` (with ``prior_question_feedback``) and a slim record for each ``full_intent_parse`` / ``_invoke_intent_parse_with_hints`` call (``store`` / ``in_turn_seed`` / ``budget``)."""
+    import aetherdialect._intent_process
 
     calls: list[dict[str, Any]] = []
-    original_parse = intent_process.full_intent_parse
-    original_invoke = intent_process._invoke_intent_parse_with_hints
-    original_build = intent_process._build_intent_parse_prompt
+    original_parse = aetherdialect._intent_process.full_intent_parse
+    original_invoke = aetherdialect._intent_process._invoke_intent_parse_with_hints
+    original_build = aetherdialect._intent_process._build_intent_parse_prompt
 
     def _recording_build(
         question: str,
@@ -490,18 +411,19 @@ def capture_parse_prompt() -> Iterator[list[dict[str, Any]]]:
             budget=budget,
         )
 
-    with patch.object(intent_process, "_build_intent_parse_prompt", _recording_build):
-        with patch.object(intent_process, "full_intent_parse", _recording_parse):
-            with patch.object(intent_process, "_invoke_intent_parse_with_hints", _recording_invoke):
-                yield calls
+    try:
+        aetherdialect._intent_process.full_intent_parse = _recording_parse
+        aetherdialect._intent_process._invoke_intent_parse_with_hints = _recording_invoke
+        aetherdialect._intent_process._build_intent_parse_prompt = _recording_build
+        yield calls
+    finally:
+        aetherdialect._intent_process.full_intent_parse = original_parse
+        aetherdialect._intent_process._invoke_intent_parse_with_hints = original_invoke
+        aetherdialect._intent_process._build_intent_parse_prompt = original_build
 
 
 def deterministic_join_choice_patch() -> Any:
-    """
-    Patch ``aetherdialect._sql_gen.get_join_choice_from_llm`` to pick the first candidate.
-
-    Use this inside seeded generation-path tests where the specific join edge is irrelevant and the assertion is about the generation path code. Matches the keyword-only join-choice API and returns a scope-to-id dict merged with any preset choices.
-    """
+    """Patch ``aetherdialect._sql_gen.get_join_choice_from_llm`` to pick the first candidate. Use this inside seeded generation-path tests where the specific join edge is irrelevant and the assertion is about the generation path code. Matches the keyword-only join-choice API and returns a scope- to-id dict merged with any preset choices."""
 
     def _first_candidate(
         q_norm: str,
@@ -528,11 +450,7 @@ def deterministic_join_choice_patch() -> Any:
 def forced_join_choice_patch(
     predicate: Callable[[list[dict[str, Any]]], str],
 ) -> Any:
-    """
-    Patch ``aetherdialect._sql_gen.get_join_choice_from_llm`` to choose by *predicate*.
-
-    *predicate* receives the raw main-query candidate list (as produced by ``join_hints_multi``) and must return one of the ``id`` strings in that list. Raises ``RuntimeError`` when *predicate* picks an id that is not valid so tests fail fast on fixture mistakes.
-    """
+    """Patch ``aetherdialect._sql_gen.get_join_choice_from_llm`` to choose by *predicate*. *predicate* receives the raw main-query candidate list (as produced by ``join_hints_multi``) and must return one of the ``id`` strings in that list. Raises ``RuntimeError`` when *predicate* picks an id that is not valid so tests fail fast on fixture mistakes."""
 
     def _forced(
         q_norm: str,
@@ -561,12 +479,7 @@ def forced_join_choice_patch(
 
 
 def capture_join_candidates() -> Any:
-    """
-    Capture arguments passed to ``aetherdialect._sql_gen.get_join_choice_from_llm``.
-
-    Returns a ``patch`` context whose ``side_effect`` records ``q_norm`` and ``llm_scopes`` on the shared ``calls`` list. The patched callable still forwards to the real implementation so join choice proceeds as-is.
-    """
-
+    """Capture arguments passed to ``aetherdialect._sql_gen.get_join_choice_from_llm``. Returns a ``patch`` context whose ``side_effect`` records ``q_norm`` and ``llm_scopes`` on the shared ``calls`` list. The patched callable still forwards to the real implementation so join choice proceeds as-is."""
     import aetherdialect._sql_gen
 
     calls: list[dict[str, Any]] = []
@@ -598,18 +511,12 @@ def capture_join_candidates() -> Any:
 
 def rejected_for_intent(runner: LiveTestRunner, intent: RuntimeIntent) -> None:
     """Deprecated live-test helper: legacy rejected map is empty; use ``question_feedback`` instead."""
-
     _ = (runner, intent)
     return None
 
 
 def _kit_baseline_templates(runner: LiveTestRunner) -> dict[str, str]:
-    """
-    Seed four trust=2 templates with realistic per-pair feedback counts.
-
-    Returns a dict mapping a short alias to the inserted template id so callers can reference seeded rows in assertions.
-    """
-
+    """Seed four trust=2 templates with realistic per-pair feedback counts. Returns a dict mapping a short alias to the inserted template id so callers can reference seeded rows in assertions."""
     from aetherdialect._contracts_core import FeedbackCounts
 
     out: dict[str, str] = {}
@@ -656,7 +563,6 @@ def _kit_baseline_templates(runner: LiveTestRunner) -> dict[str, str]:
 
 def _kit_cold_templates(runner: LiveTestRunner) -> dict[str, str]:
     """Seed two trust=1 templates with stats=(1, 0) for promotion-gate tests."""
-
     out: dict[str, str] = {}
     for alias, q_norm, intent, sql in (
         (
@@ -685,8 +591,7 @@ def _kit_cold_templates(runner: LiveTestRunner) -> dict[str, str]:
 
 
 def _kit_rejected_aggregations(runner: LiveTestRunner) -> dict[str, str]:
-    """Seed two ``INTENT_REJECTED`` feedback rows representing wrong-aggregation feedback."""
-
+    """Seed two ``INTENT_REJECTED`` feedback rows representing wrong- aggregation feedback."""
     out: dict[str, str] = {}
     rt_a = seed_rejected(
         runner,
@@ -710,8 +615,7 @@ def _kit_rejected_aggregations(runner: LiveTestRunner) -> dict[str, str]:
 
 
 def _kit_rejected_join_paths(runner: LiveTestRunner) -> dict[str, str]:
-    """Seed two ``INTENT_REJECTED`` feedback rows representing wrong-join-edge feedback."""
-
+    """Seed two ``INTENT_REJECTED`` feedback rows representing wrong- join-edge feedback."""
     work_intent = intent_store_staff_by_work()
     work_intent.chosen_join_candidate_id = "J99"
     work_intent.chosen_join_path_signature = ["store.manager_staff_id->staff.staff_id"]
@@ -742,7 +646,6 @@ def _kit_rejected_join_paths(runner: LiveTestRunner) -> dict[str, str]:
 
 def _kit_intent_failures(runner: LiveTestRunner) -> dict[str, str]:
     """Seed distinct structural validation rows scoped to the runner's schema."""
-
     from aetherdialect._core_utils import normalize_question
 
     seed_negative_memory(
@@ -781,13 +684,7 @@ def _kit_intent_failures(runner: LiveTestRunner) -> dict[str, str]:
 
 
 def _kit_negative_memory_full(runner: LiveTestRunner) -> dict[str, str]:
-    """
-    Seed all three negative-memory sources for one canonical template/intent.
-
-    Inserts the accepted template, a matching intent-level rejection for the same shape,
-    and one validation row keyed to the same q_norm so ``compute_question_feedback_penalty`` observes stacked feedback.
-    """
-
+    """Seed all three negative-memory sources for one canonical template/intent. Inserts the accepted template, a matching intent-level rejection for the same shape, and one validation row keyed to the same q_norm so ``compute_question_feedback_penalty`` observes stacked feedback."""
     intent = intent_rental_count_by_store()
     sql = (
         "SELECT inventory.store_id, COUNT(rental.rental_id) FROM rental "
@@ -822,12 +719,7 @@ def _kit_negative_memory_full(runner: LiveTestRunner) -> dict[str, str]:
 
 
 def _kit_multi_pair_template(runner: LiveTestRunner) -> dict[str, str]:
-    """
-    Seed one trust=1 template with three distinct ``feedback_by_question`` pairs.
-
-    Pair A: accepts=2, rejects=0 (eligible for promotion). Pair B: accepts=0, rejects=1 (mid-rejection). Pair C: accepts=1, rejects=0 (single accept).
-    """
-
+    """Seed one trust=1 template with three distinct ``feedback_by_question`` pairs. Pair A: accepts=2, rejects=0 (eligible for promotion). Pair B: accepts=0, rejects=1 (mid-rejection). Pair C: accepts=1, rejects=0 (single accept)."""
     from aetherdialect._contracts_core import FeedbackCounts
 
     tmpl = seed_template(
@@ -864,12 +756,7 @@ def seeded_runner(
     label: str,
     kits: tuple[str, ...] = (),
 ) -> Iterator[LiveTestRunner]:
-    """
-    Yield an isolated ``LiveTestRunner`` pre-populated by the requested *kits*.
-
-    Each kit name in ``kits`` is applied in order against the fresh runner. Unknown kit names raise ``KeyError`` immediately so fixture typos surface at test setup time. The mapping ``runner.seeded_ids`` is attached so tests can look up artefact ids by alias (e.g. ``runner.seeded_ids["baseline_templates"]["first_names"]``).
-    """
-
+    """Yield an isolated ``LiveTestRunner`` pre-populated by the requested *kits*. Each kit name in ``kits`` is applied in order against the fresh runner. Unknown kit names raise ``KeyError`` immediately so fixture typos surface at test setup time. The mapping ``runner.seeded_ids`` is attached so tests can look up artifact ids by alias (e.g. ``runner.seeded_ids["baseline_templates"]["first_names"]``)."""
     with isolated_runner(schema, schema_terms, t2s, label=label) as runner:
         seeded_ids: dict[str, dict[str, str]] = {}
         for kit_name in kits:
@@ -881,12 +768,7 @@ def seeded_runner(
 
 
 def snapshot_store(runner: LiveTestRunner) -> dict[str, Any]:
-    """
-    Return a structural snapshot of *runner*'s store sections for before/after diffing.
-
-    The snapshot captures id sets, per-template trust level, per-template stats, and per-template feedback_by_question dict so tests can pinpoint which row changed.
-    """
-
+    """Return a structural snapshot of *runner*'s store sections for before/after diffing. The snapshot captures id sets, per-template trust level, per- template stats, and per-template feedback_by_question dict so tests can pinpoint which row changed."""
     return {
         "template_ids": frozenset(runner.templates),
         "rejected_ids": frozenset(),
@@ -905,13 +787,10 @@ def snapshot_store(runner: LiveTestRunner) -> dict[str, Any]:
 
 def assert_template_unchanged(before: dict[str, Any], after: dict[str, Any], template_id: str) -> None:
     """Assert *template_id*'s trust_level, stats, and feedback_by_question are unchanged."""
-
-    assert template_id in before["trust_by_id"], (
-        f"[assert_template_unchanged] template {template_id!r} missing from before snapshot"
-    )
-    assert template_id in after["trust_by_id"], (
-        f"[assert_template_unchanged] template {template_id!r} was deleted between snapshots"
-    )
+    _before_missing = f"[assert_template_unchanged] template {template_id!r} missing from before snapshot"
+    assert template_id in before["trust_by_id"], _before_missing
+    _after_missing = f"[assert_template_unchanged] template {template_id!r} was deleted between snapshots"
+    assert template_id in after["trust_by_id"], _after_missing
     assert before["trust_by_id"][template_id] == after["trust_by_id"][template_id], (
         f"[assert_template_unchanged] trust changed for {template_id!r}: "
         f"{before['trust_by_id'][template_id]} -> {after['trust_by_id'][template_id]}"
@@ -929,7 +808,6 @@ def assert_template_unchanged(before: dict[str, Any], after: dict[str, Any], tem
 
 def assert_new_template_forked(before: dict[str, Any], after: dict[str, Any]) -> set[str]:
     """Assert at least one new template id appeared; return the set of new ids."""
-
     new_ids = set(after["template_ids"]) - set(before["template_ids"])
     assert new_ids, (
         f"[assert_new_template_forked] no new templates inserted; "
@@ -940,7 +818,6 @@ def assert_new_template_forked(before: dict[str, Any], after: dict[str, Any]) ->
 
 def assert_new_rejected_template(before: dict[str, Any], after: dict[str, Any]) -> set[str]:
     """Assert at least one new ``question_feedback`` row appeared (compat name for rejection tests)."""
-
     b = int(before.get("question_feedback_total_entries", 0))
     a = int(after.get("question_feedback_total_entries", 0))
     assert a > b, f"[assert_new_rejected_template] no new question_feedback rows; before_count={b!r} after_count={a!r}"

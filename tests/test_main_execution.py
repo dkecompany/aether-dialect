@@ -10,23 +10,22 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-import aetherdialect._main_execution as main_execution_module
+import aetherdialect._main_execution
 from aetherdialect._config import (
-    ARTIFACT_DIRECTORY_SEGMENT,
+    ConfigError,
     DatabricksRuntimeConfig,
     EngineConfig,
     PostgresRuntimeConfig,
 )
-from aetherdialect._contracts_base import (
-    ConfigError,
+from aetherdialect._constants import ARTIFACT_DIRECTORY_SEGMENT
+from aetherdialect._contracts_base import EngineContext
+from aetherdialect._contracts_schema import (
     QSimSummary,
-    SchemaContext,
     SeedWarmupSummary,
 )
 from aetherdialect._main_execution import (
     _activate_engine,
-    _apply_databricks_env,
-    _apply_postgres_env,
+    _apply_runtime_environments,
     _select_engine_name,
     compute_connection_storage_slug,
     compute_engine_storage_dir,
@@ -40,7 +39,6 @@ from aetherdialect._main_execution import (
 
 def _snapshot_os_environ() -> dict[str, str]:
     """Return a string copy of ``os.environ`` for passing into configure helpers."""
-
     return {str(k): str(v) for k, v in os.environ.items()}
 
 
@@ -50,7 +48,7 @@ class TestComputeEngineStorageDir:
     def test_custom_root_joins_aetherdialect_and_slug(self) -> None:
         root = tempfile.mkdtemp()
         merged = {"PGDATABASE": "mydb", "PGUSER": "u", "PGPASSWORD": "p"}
-        _apply_postgres_env(merged)
+        _apply_runtime_environments(merged)
         path = compute_engine_storage_dir(root, "postgresql")
         slug = compute_connection_storage_slug("postgresql")
         assert path == os.path.join(os.path.abspath(root), ARTIFACT_DIRECTORY_SEGMENT, slug)
@@ -59,7 +57,7 @@ class TestComputeEngineStorageDir:
         from platformdirs import user_data_dir
 
         merged = {"PGDATABASE": "mydb", "PGUSER": "u", "PGPASSWORD": "p"}
-        _apply_postgres_env(merged)
+        _apply_runtime_environments(merged)
         path = compute_engine_storage_dir(None, "postgresql")
         parent = user_data_dir(appname="aetherdialect", appauthor=False)
         slug = compute_connection_storage_slug("postgresql")
@@ -103,7 +101,6 @@ class TestLoadConfigFile:
                     'access_token = "tok"',
                     'catalog = "cat"',
                     'schema = "ds"',
-                    'cluster_id = "cid"',
                     "",
                     "[engine]",
                     'selected = "postgresql"',
@@ -122,7 +119,7 @@ class TestLoadConfigFile:
             ),
             encoding="utf-8",
         )
-        got, claimed = main_execution_module._load_config_file(str(path))
+        got, claimed = aetherdialect._main_execution._load_config_file(str(path))
         expected = {
             "OPENAI_API_KEY": "oak",
             "OPENAI_BASE_URL": "https://example-openai/v1",
@@ -144,7 +141,6 @@ class TestLoadConfigFile:
             "DATABRICKS_ACCESS_TOKEN": "tok",
             "DATABRICKS_CATALOG": "cat",
             "DATABRICKS_SCHEMA": "ds",
-            "DATABRICKS_CLUSTER_ID": "cid",
             "AETHERDIALECT_ENGINE": "postgresql",
             "AETHERDIALECT_LLM_PROVIDER": "openai",
             "AETHERDIALECT_MAX_QUERY_COST_ROWS": "100",
@@ -163,7 +159,7 @@ def test_load_config_file_claims_empty_openai_api_key_without_flat_value(
 ) -> None:
     path = tmp_path / "empty_key.toml"
     path.write_text('[openai]\napi_key = ""\n', encoding="utf-8")
-    flat, claimed = main_execution_module._load_config_file(str(path))
+    flat, claimed = aetherdialect._main_execution._load_config_file(str(path))
     assert flat == {}
     assert "OPENAI_API_KEY" in claimed
 
@@ -173,13 +169,13 @@ def test_merge_configuration_environment_precedence(
 ) -> None:
     monkeypatch.setenv("POSTGRES_HOST", "from_os")
     config_values = {"POSTGRES_HOST": "from_toml"}
-    merged, _keys = main_execution_module._merge_configuration_environment(config_values)
+    merged, _keys = aetherdialect._main_execution._merge_configuration_environment(config_values)
     assert merged["POSTGRES_HOST"] == "from_toml"
 
 
 def test_merge_toml_diagnostic_when_toml_wins(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("POSTGRES_HOST", "os_host")
-    merged, keys = main_execution_module._merge_configuration_environment({"POSTGRES_HOST": "toml_host"})
+    merged, keys = aetherdialect._main_execution._merge_configuration_environment({"POSTGRES_HOST": "toml_host"})
     assert merged["POSTGRES_HOST"] == "toml_host"
     assert "POSTGRES_HOST" in keys
 
@@ -188,7 +184,7 @@ def test_merge_configuration_environment_ssot_clears_claimed_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "from_env")
-    merged, _diag = main_execution_module._merge_configuration_environment(
+    merged, _diag = aetherdialect._main_execution._merge_configuration_environment(
         {},
         toml_claimed_keys=frozenset({"OPENAI_API_KEY"}),
     )
@@ -199,7 +195,7 @@ def test_merge_configuration_environment_ssot_toml_wins(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("POSTGRES_HOST", "from_os")
-    merged, keys = main_execution_module._merge_configuration_environment(
+    merged, keys = aetherdialect._main_execution._merge_configuration_environment(
         {"POSTGRES_HOST": "from_toml"},
         toml_claimed_keys=frozenset({"POSTGRES_HOST"}),
     )
@@ -208,7 +204,7 @@ def test_merge_configuration_environment_ssot_toml_wins(
 
 
 class TestPrepareSchemaContextForInit:
-    """Tests for :func:`aetherdialect._main_execution._prepare_schema_context_for_init`."""
+    """Tests for :func:`aetherdialect._main_execution._prepare_schema_co ntext_for_init`."""
 
     def test_reuses_cached_sql_when_missing_in_explicit_context(self, tmp_path) -> None:
         from aetherdialect._main_execution import (
@@ -220,9 +216,9 @@ class TestPrepareSchemaContextForInit:
         sql.write_text("SELECT 1;", encoding="utf-8")
         engine_dir = str(tmp_path / "engine")
         os.makedirs(engine_dir, exist_ok=True)
-        write_schema_context_cache(engine_dir, SchemaContext(sql_file=str(sql)))
+        write_schema_context_cache(engine_dir, EngineContext(sql_file=str(sql)))
         logs: list[str] = []
-        out = _prepare_schema_context_for_init(SchemaContext(), engine_dir, logs.append)
+        out = _prepare_schema_context_for_init(EngineContext(), engine_dir, logs.append)
         assert out.sql_file is not None
         assert os.path.isfile(out.sql_file)
 
@@ -278,7 +274,7 @@ class TestLoadQsimSummaries:
 
 
 class TestFindLatestSeedWarmupSummary:
-    """Tests for :func:`aetherdialect._main_execution.find_latest_seed_warmup_summary`."""
+    """Tests for :func:`aetherdialect._main_execution.find_latest_seed_w armup_summary`."""
 
     def test_empty_dir_returns_none(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -324,6 +320,10 @@ def _import_module_side_effect_pg_only(name: str):
         raise ImportError()
     if name == "psycopg":
         return object()
+    if name in ("duckdb", "openpyxl"):
+        return object()
+    if name.startswith("aetherdialect._dialect"):
+        return object()
     return importlib.import_module(name)
 
 
@@ -332,11 +332,19 @@ def _import_module_side_effect_dbx_only(name: str):
         raise ImportError()
     if name == "databricks.sql":
         return object()
+    if name in ("duckdb", "openpyxl"):
+        return object()
+    if name.startswith("aetherdialect._dialect"):
+        return object()
     return importlib.import_module(name)
 
 
 def _import_module_side_effect_both(name: str):
     if name in ("psycopg2", "psycopg", "databricks.sql"):
+        return object()
+    if name in ("duckdb", "openpyxl"):
+        return object()
+    if name.startswith("aetherdialect._dialect"):
         return object()
     return importlib.import_module(name)
 
@@ -346,7 +354,7 @@ class TestSelectEngineFromEnvironment:
 
     def test_postgresql_from_libpq_without_pghost(self) -> None:
         env = {
-            "PGDATABASE": "dvdrental",
+            "PGDATABASE": "rental_shop",
             "PGUSER": "postgres",
             "PGPASSWORD": "secret",
         }
@@ -355,7 +363,7 @@ class TestSelectEngineFromEnvironment:
 
     def test_postgresql_from_postgres_docker_style_names(self) -> None:
         env = {
-            "POSTGRES_DB": "dvdrental",
+            "POSTGRES_DB": "rental_shop",
             "POSTGRES_USER": "postgres",
             "POSTGRES_PASSWORD": "secret",
         }
@@ -398,7 +406,7 @@ class TestSelectEngineFromEnvironment:
 class TestSelectEngineExplicit:
     def test_explicit_databricks_when_both_envs_present(self) -> None:
         env = {
-            "PGDATABASE": "dvdrental",
+            "PGDATABASE": "rental_shop",
             "PGUSER": "postgres",
             "PGPASSWORD": "secret",
             "DATABRICKS_HOST": "adb-1.azuredatabricks.net",
@@ -413,7 +421,7 @@ class TestSelectEngineExplicit:
 
     def test_explicit_postgresql_when_both_envs_present(self) -> None:
         env = {
-            "PGDATABASE": "dvdrental",
+            "PGDATABASE": "rental_shop",
             "PGUSER": "postgres",
             "PGPASSWORD": "secret",
             "DATABRICKS_HOST": "adb-1.azuredatabricks.net",
@@ -428,7 +436,7 @@ class TestSelectEngineExplicit:
 
     def test_both_drivers_and_both_env_without_explicit_raises(self) -> None:
         env = {
-            "PGDATABASE": "dvdrental",
+            "PGDATABASE": "rental_shop",
             "PGUSER": "postgres",
             "PGPASSWORD": "secret",
             "DATABRICKS_HOST": "adb-1.azuredatabricks.net",
@@ -443,7 +451,7 @@ class TestSelectEngineExplicit:
 
     def test_explicit_databricks_with_missing_env_raises(self) -> None:
         env = {
-            "PGDATABASE": "dvdrental",
+            "PGDATABASE": "rental_shop",
             "PGUSER": "postgres",
             "PGPASSWORD": "secret",
             "AETHERDIALECT_ENGINE": "databricks",
@@ -454,7 +462,7 @@ class TestSelectEngineExplicit:
 
     def test_invalid_aether_engine_raises(self) -> None:
         with pytest.raises(ConfigError, match="Unsupported AETHERDIALECT_ENGINE"):
-            _select_engine_name({"AETHERDIALECT_ENGINE": "mysql"})
+            _select_engine_name({"AETHERDIALECT_ENGINE": "not_a_registered_engine"})
 
 
 class TestApplyDatabaseEnv:
@@ -465,7 +473,7 @@ class TestApplyDatabaseEnv:
         snap_pg = {k: getattr(PostgresRuntimeConfig, k) for k in pg_fields}
         eng_type, eng_rt = EngineConfig.TYPE, EngineConfig.RUNTIME
         try:
-            _apply_postgres_env(
+            _apply_runtime_environments(
                 {
                     "POSTGRES_HOST": "10.0.0.1",
                     "POSTGRES_PORT": "5433",
@@ -500,7 +508,7 @@ class TestApplyDatabaseEnv:
         snap_dbx = {k: getattr(DatabricksRuntimeConfig, k) for k in dbx_fields}
         eng_type, eng_rt = EngineConfig.TYPE, EngineConfig.RUNTIME
         try:
-            _apply_databricks_env(
+            _apply_runtime_environments(
                 {
                     "DATABRICKS_SERVER_HOSTNAME": "adb-1.azuredatabricks.net",
                     "DATABRICKS_WAREHOUSE_HTTP_PATH": "/sql/1.0/warehouses/x",
@@ -537,7 +545,7 @@ class TestApplyDatabaseEnv:
 
     def test_activate_engine_rejects_unknown_name(self) -> None:
         with pytest.raises(ConfigError, match="Unsupported engine activation"):
-            _activate_engine("mysql")
+            _activate_engine("bogus_engine")
 
 
 class TestDatabricksEngineSelectionPySpark:
@@ -549,7 +557,7 @@ class TestDatabricksEngineSelectionPySpark:
             "SPARK_DEFAULT_SCHEMA": "default",
         }
         with patch.object(importlib, "import_module", side_effect=_import_module_side_effect_dbx_only):
-            with patch.object(main_execution_module, "_pyspark_session_reachable", return_value=True):
+            with patch.object(DatabricksRuntimeConfig, "pyspark_session_reachable", return_value=True):
                 assert _select_engine_name(env) == "databricks"
 
     def test_raises_when_catalog_schema_only_and_no_pyspark(self) -> None:
@@ -558,7 +566,7 @@ class TestDatabricksEngineSelectionPySpark:
             "DATABRICKS_SCHEMA": "dbo",
         }
         with patch.object(importlib, "import_module", side_effect=_import_module_side_effect_dbx_only):
-            with patch.object(main_execution_module, "_pyspark_session_reachable", return_value=False):
+            with patch.object(DatabricksRuntimeConfig, "pyspark_session_reachable", return_value=False):
                 with pytest.raises(ConfigError, match="Cannot select database engine"):
                     _select_engine_name(env)
 
@@ -600,7 +608,7 @@ class TestConfigureRuntimeFromEnvironment:
                 "import_module",
                 side_effect=_import_module_side_effect_pg_only,
             ):
-                configure_runtime_from_environment(SchemaContext(), _snapshot_os_environ())
+                configure_runtime_from_environment(EngineContext(), _snapshot_os_environ())
             assert EngineConfig.LLM_PROVIDER == "openai"
             assert EngineConfig.OPENAI_MODEL == "gpt-4o-mini"
             assert EngineConfig.OPENAI_MODEL_JOIN == "gpt-5.4-mini"
@@ -645,8 +653,8 @@ class TestConfigureRuntimeFromEnvironment:
                 "import_module",
                 side_effect=_import_module_side_effect_pg_only,
             ):
-                configure_runtime_from_environment(SchemaContext(), _snapshot_os_environ())
-            from aetherdialect._core_utils import _azure_deployment_for_model
+                configure_runtime_from_environment(EngineContext(), _snapshot_os_environ())
+            from aetherdialect._llm_provider import _azure_deployment_for_model
 
             assert EngineConfig.LLM_PROVIDER == "azure"
             assert _azure_deployment_for_model("gpt-4o-mini") == "dep-a"
@@ -685,7 +693,7 @@ class TestConfigureRuntimeFromEnvironment:
         snap_pg = {
             k: getattr(PostgresRuntimeConfig, k) for k in ("HOST", "PORT", "USER", "PASSWORD", "DATABASE", "SCHEMA")
         }
-        from aetherdialect._contracts_base import ConfigError as _CE
+        from aetherdialect._config import ConfigError
 
         try:
             with patch.object(
@@ -693,8 +701,8 @@ class TestConfigureRuntimeFromEnvironment:
                 "import_module",
                 side_effect=_import_module_side_effect_pg_only,
             ):
-                with pytest.raises(_CE, match="AETHERDIALECT_LLM_PROVIDER"):
-                    configure_runtime_from_environment(SchemaContext(), _snapshot_os_environ())
+                with pytest.raises(ConfigError, match="AETHERDIALECT_LLM_PROVIDER"):
+                    configure_runtime_from_environment(EngineContext(), _snapshot_os_environ())
         finally:
             for k, v in snap_eng.items():
                 setattr(EngineConfig, k, v)
@@ -735,7 +743,7 @@ class TestConfigureRuntimeFromEnvironment:
                 "import_module",
                 side_effect=_import_module_side_effect_pg_only,
             ):
-                configure_runtime_from_environment(SchemaContext(), _snapshot_os_environ())
+                configure_runtime_from_environment(EngineContext(), _snapshot_os_environ())
             assert EngineConfig.LLM_PROVIDER == "openai"
         finally:
             for k, v in snap_eng.items():
@@ -745,7 +753,7 @@ class TestConfigureRuntimeFromEnvironment:
 
 
 class TestSchemaContextCache:
-    """Tests for write/load helpers on the persisted SchemaContext."""
+    """Tests for write/load helpers on the persisted EngineContext."""
 
     def test_write_inlines_sql_and_notes(self, tmp_path) -> None:
         sql_path = tmp_path / "ddl.sql"
@@ -754,17 +762,17 @@ class TestSchemaContextCache:
         notes_file.write_text("hello notes", encoding="utf-8")
         adir = str(tmp_path / "artifacts")
         os.makedirs(adir, exist_ok=True)
-        ctx = SchemaContext(
+        ctx = EngineContext(
             allow_objects=frozenset({"public.t"}),
             deny_columns=frozenset({"t.secret"}),
             sql_file=str(sql_path),
             notes_file=str(notes_file),
         )
-        out = main_execution_module.write_schema_context_cache(adir, ctx)
+        out = aetherdialect._main_execution.write_schema_context_cache(adir, ctx)
         assert os.path.exists(out)
         with open(out, encoding="utf-8") as f:
             data = json.load(f)
-        assert data["version"] == main_execution_module.SCHEMA_CONTEXT_CACHE_VERSION
+        assert data["version"] == aetherdialect._main_execution.SCHEMA_CONTEXT_CACHE_VERSION
         assert data["sql_text"] == "CREATE TABLE t (id INT);\n"
         assert data["notes_text"] == "hello notes"
         assert "public.t" in data["allow_objects"]
@@ -775,12 +783,12 @@ class TestSchemaContextCache:
         sql_path.write_text("SELECT 1;", encoding="utf-8")
         adir = str(tmp_path / "artifacts")
         os.makedirs(adir, exist_ok=True)
-        ctx = SchemaContext(
+        ctx = EngineContext(
             allow_objects=frozenset({"public.t"}),
             sql_file=str(sql_path),
         )
-        main_execution_module.write_schema_context_cache(adir, ctx)
-        loaded = main_execution_module.load_schema_context_cache(adir)
+        aetherdialect._main_execution.write_schema_context_cache(adir, ctx)
+        loaded = aetherdialect._main_execution.load_schema_context_cache(adir)
         assert loaded is not None
         assert "public.t" in loaded.allow_objects
         assert loaded.sql_file is not None
@@ -789,22 +797,22 @@ class TestSchemaContextCache:
             assert f.read() == "SELECT 1;"
 
     def test_load_missing_returns_none(self, tmp_path) -> None:
-        loaded = main_execution_module.load_schema_context_cache(str(tmp_path))
+        loaded = aetherdialect._main_execution.load_schema_context_cache(str(tmp_path))
         assert loaded is None
 
     def test_load_bad_version_returns_none(self, tmp_path) -> None:
         adir = str(tmp_path)
-        path = os.path.join(adir, main_execution_module.SCHEMA_CONTEXT_CACHE_NAME)
+        path = os.path.join(adir, aetherdialect._main_execution.SCHEMA_CONTEXT_CACHE_NAME)
         with open(path, "w", encoding="utf-8") as f:
             json.dump({"version": 999}, f)
-        assert main_execution_module.load_schema_context_cache(adir) is None
+        assert aetherdialect._main_execution.load_schema_context_cache(adir) is None
 
 
 class TestPipelineSessionSuspendToStep:
     """Tests for :meth:`PipelineSession._suspend_to_step` prompt and payload assembly."""
 
     def test_sql_feedback_suspend_populates_message_prompt(self) -> None:
-        from aetherdialect._config import PIPELINE_SUSPEND_ID_SQL, GenerationPath
+        from aetherdialect._constants import PIPELINE_SUSPEND_ID_SQL, GenerationPath
         from aetherdialect._contracts_base import PipelineSuspended
         from aetherdialect._contracts_core import (
             InteractiveTailSnapshot,
@@ -869,10 +877,7 @@ class TestPipelineSessionSuspendToStep:
         assert step.data is None
 
     def test_direct_reuse_suspend_populates_sql_data_message(self) -> None:
-        from aetherdialect._config import (
-            PIPELINE_SUSPEND_ID_DIRECT_REUSE,
-            GenerationPath,
-        )
+        from aetherdialect._constants import PIPELINE_SUSPEND_ID_DIRECT_REUSE, GenerationPath
         from aetherdialect._contracts_base import PipelineSuspended
         from aetherdialect._contracts_core import (
             DirectReuseSuspendContext,
@@ -916,7 +921,7 @@ class TestPipelineSessionSuspendToStep:
         assert step.data.iloc[0, 0] == 42
 
     def test_user_feedback_reject_suspend_reason_prompt(self) -> None:
-        from aetherdialect._config import PIPELINE_SUSPEND_ID_USER_FEEDBACK_REJECT
+        from aetherdialect._constants import PIPELINE_SUSPEND_ID_USER_FEEDBACK_REJECT
         from aetherdialect._contracts_base import PipelineSuspended
         from aetherdialect._main_execution import SESSION_PROMPT_REASON, PipelineSession
 
@@ -975,10 +980,8 @@ def test_reader_mode_does_not_save_templates(monkeypatch: pytest.MonkeyPatch, tm
 def test_writer_drain_applies_reader_event(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     from datetime import datetime, timezone
 
-    from aetherdialect._config import (
-        AUDIT_EVENT_WRITE_QUEUE_FEEDBACK_RECORD,
-        EngineConfig,
-    )
+    from aetherdialect._config import EngineConfig
+    from aetherdialect._constants import AUDIT_EVENT_WRITE_QUEUE_FEEDBACK_RECORD
     from aetherdialect._contracts_base import WriteQueueEvent
     from aetherdialect._contracts_core import (
         FeedbackKind,
@@ -997,6 +1000,7 @@ def test_writer_drain_applies_reader_event(monkeypatch: pytest.MonkeyPatch, tmp_
     templates = store_to_templates(store)
     owner = MagicMock()
     owner._schema_graph = MagicMock()
+    owner._schema_graph.schema_graph_id = "h1"
     owner._schema_graph.effective_structural_hash = "h1"
     owner._store = store
     owner._templates = templates
@@ -1018,6 +1022,7 @@ def test_writer_drain_applies_reader_event(monkeypatch: pytest.MonkeyPatch, tmp_
     )
     ev = WriteQueueEvent(
         kind="feedback_record",
+        schema_graph_id="h1",
         schema_hash="h1",
         produced_at=ts,
         payload=(("q_norm", "q1"), ("entry_json", json.dumps(entry.to_dict()))),
