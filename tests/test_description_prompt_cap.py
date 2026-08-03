@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import json
 
-from aetherdialect._contracts_base import EngineContext
 from aetherdialect._constants import (
     SCHEMA_DESCRIPTION_PROMPT_COUNT_CAP,
     SCHEMA_DESCRIPTION_PROMPT_MAX_CHARS,
 )
+from aetherdialect._contracts_base import EngineContext
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._core_utils import (
     descriptions_hash_fp,

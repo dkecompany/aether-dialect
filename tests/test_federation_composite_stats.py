@@ -25,9 +25,7 @@ def _member_graph(
     distinct_ratio: float | None = None,
     join_key: str = "id",
 ) -> SchemaGraph:
-    ratio = distinct_ratio if distinct_ratio is not None else (
-        distinct_count / row_count if row_count > 0 else 0.0
-    )
+    ratio = distinct_ratio if distinct_ratio is not None else (distinct_count / row_count if row_count > 0 else 0.0)
     col = ColumnMetadata(
         name=join_key,
         data_type="integer",

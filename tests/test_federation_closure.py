@@ -16,12 +16,12 @@ from aetherdialect._core_utils import (
 )
 from aetherdialect._federation import (
     FederationConfigError,
+    _resolve_composite_table_names,
     compose_composite_graph,
     derive_table_namespace,
     parse_federation_manifest,
     parse_federation_mappings,
     probe_federation_member_connections,
-    _resolve_composite_table_names,
 )
 from aetherdialect._schema_graph import recompute_join_paths_multi
 

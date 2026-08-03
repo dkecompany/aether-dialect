@@ -31,8 +31,6 @@ from ._constants import (
     EXPR_TABLE_COLUMN_REF_RE,
     FEDERATION_COMPOSE_SUPPORTED_CAPABILITIES,
     FEDERATION_ENUM_PROMPT_CAP,
-    SCHEMA_DESCRIPTION_PROMPT_COUNT_CAP,
-    SCHEMA_DESCRIPTION_PROMPT_MAX_CHARS,
     FORMAT_REPAIR_PROMPT_KEY_ORDER,
     FORMAT_STRUCTURAL_GUIDANCE,
     GROUND_PROMPT_KEY_ORDER,
@@ -67,6 +65,8 @@ from ._constants import (
     PLANNER_PROSE_FIELDS,
     REGISTRY_TOKEN_PATTERN,
     REPAIR_INSTRUCTIONS,
+    SCHEMA_DESCRIPTION_PROMPT_COUNT_CAP,
+    SCHEMA_DESCRIPTION_PROMPT_MAX_CHARS,
     SEMANTIC_REPAIR_PROMPT_KEY_ORDER,
     TEMPLATE_UNION_FAMILY_INDEX_KEY,
     VALID_HAVING_OPS,
@@ -229,7 +229,6 @@ from ._utils import (
     intent_key,
     match_question_against_template_history,
     template_instance_key_for_concrete,
-    template_instance_key_from_parts,
 )
 from ._validation_execute import validate_cte_emission_reclassification, validate_semantics
 

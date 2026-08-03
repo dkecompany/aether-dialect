@@ -11,6 +11,7 @@ from aetherdialect._contracts_base import EngineContext, SpaceContext
 from aetherdialect._contracts_core import NormalizedExpr, RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaDiff, SchemaGraph, TableDiff, TableMetadata
 from aetherdialect._main_execution import (
+    apply_structural_migration_to_aetherspace_snapshots,
     load_aetherspace_snapshot,
     save_aetherspace_snapshot,
     space_allowed_sets_from_snapshot,
@@ -18,7 +19,6 @@ from aetherdialect._main_execution import (
     subset_graph_for_space,
 )
 from aetherdialect._schema_graph import assert_consumer_sql_in_scope, assert_intent_in_scope
-from aetherdialect._main_execution import apply_structural_migration_to_aetherspace_snapshots
 from aetherdialect._templates import apply_structural_migration_from_schema_diff
 
 

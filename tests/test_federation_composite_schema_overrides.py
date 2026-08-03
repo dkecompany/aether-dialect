@@ -15,7 +15,6 @@ from aetherdialect._federation import (
     FederationMappings,
     apply_federation_composite_overrides,
     compose_composite_graph,
-    export_federation_composite_overrides,
     federation_artifact_paths,
     finalize_federation_composite_overrides,
     parse_federation_manifest,

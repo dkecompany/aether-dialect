@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from aetherdialect._constants import INTERPRET_FIELDS, SCHEMA_FIELD_DESCRIPTION
+from aetherdialect._constants import INTERPRET_FIELDS
 from aetherdialect._contracts_base import (
     DescriptionOwner,
     FederationMemberUnprofilableError,

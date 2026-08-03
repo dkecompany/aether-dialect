@@ -14,12 +14,12 @@ from aetherdialect._constants import CONSUMER_ALLOW_OBJECTS
 from aetherdialect._contracts_base import ConfigError, MigrationPreview, RuntimeConfig
 from aetherdialect._main_execution import load_runtime_config
 from aetherdialect._sandbox import (
+    Sandbox,
     _apply_sandbox_consumer_execution_scope,
     _baseline_dir_for_preset,
     _consumer_reader_schema_context,
     _owner_writer_schema_context,
     _sandbox_memory_engine_dir,
-    Sandbox,
 )
 
 _EXPECTED_UNEXERCISED_PRODUCTION_STAGES: frozenset[str] = frozenset(

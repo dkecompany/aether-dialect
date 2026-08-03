@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 import pytest
@@ -99,9 +98,7 @@ def test_support_matrix_refused_constructs_listed_once() -> None:
     """Refused constructs appear in one canonical section, not repeated across the document."""
     text = _matrix_text()
     present = [heading for heading in _REFUSED_CONSTRUCT_HEADINGS if heading in text]
-    assert present == ["## Refused constructs"], (
-        f"expected exactly one refused-constructs section; found {present!r}"
-    )
+    assert present == ["## Refused constructs"], f"expected exactly one refused-constructs section; found {present!r}"
 
 
 @pytest.mark.fast
@@ -133,9 +130,7 @@ def test_support_matrix_self_comparison_user_guidance() -> None:
         and not line.strip().startswith("Each refusal")
         and not line.strip().startswith("---")
     ]
-    assert len(guidance_lines) == 1, (
-        f"expected one user-guidance sentence after refused table; got {guidance_lines!r}"
-    )
+    assert len(guidance_lines) == 1, f"expected one user-guidance sentence after refused table; got {guidance_lines!r}"
 
 
 @pytest.mark.fast

@@ -37,7 +37,6 @@ from ._contracts_base import (
     where_leaves,
 )
 from ._contracts_core import RuntimeCteStep, RuntimeIntent, SelectCol
-from ._intent_repair import validate_table_scope_repairs
 from ._contracts_schema import (
     CaseRegistryStep,
     CteOutputColumnMeta,
@@ -50,6 +49,7 @@ from ._contracts_schema import (
 from ._core_utils import debug, pipeline_trace, reconcile_execute_bind_params, stable_json
 from ._dialect import Dialect
 from ._intent_expr import extract_columns_from_expr
+from ._intent_repair import validate_table_scope_repairs
 from ._intent_resolve import (
     check_qualified_refs_exist,
     collect_column_refs_for_cte_step,
@@ -65,6 +65,7 @@ from ._validation_schema import (
     extract_col_from_scalar_wrapper,
     extract_functions_from_term,
     get_col_type,
+    intent_join_reachability_tables,
     iterate_case_branch_conditions,
     multiplying_edges_for_table,
     phys_table_key,
@@ -83,7 +84,6 @@ from ._validation_schema import (
     validate_having_schema,
     validate_join_path_reachability,
     validate_join_path_reachability_for_tables,
-    intent_join_reachability_tables,
     validate_no_between_ops,
     validate_null_filters,
     validate_order_by_cols_schema,

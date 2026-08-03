@@ -56,6 +56,7 @@ from ._contracts_base import (
     FederationIneligibleError,
     FederationInvariantError,
     FederationMappings,
+    FederationMappingSuggestion,
     FederationRuntimeError,
     LlmTransientFailure,
     MigrationPendingError,
@@ -64,7 +65,9 @@ from ._contracts_base import (
     OverrideReport,
     OverrideSkip,
     OwnerOnlyOperationError,
+    PersistedFederationInspection,
     PhaseProgressEvent,
+    PlanPreviewResult,
     QSimSummarySnapshot,
     RetryableError,
     SchemaAccessError,
@@ -79,9 +82,7 @@ from ._contracts_base import (
     StoredTemplateSummary,
     TablePreviewResult,
     TemplateExecutionResult,
-    PlanPreviewResult,
     WriteQueueEvent,
-    FederationMappingSuggestion,
 )
 from ._contracts_core import FederatedPrepareOutcome
 from ._contracts_schema import CsvSourceSelection, UploadIngestResult
@@ -95,11 +96,9 @@ from ._core_utils import (
     error,
     notify,
     pop_construction_phase_callback,
-    pop_ask_phase_callback,
     print_query_result,
     progress_enabled,
     push_construction_phase_callback,
-    push_ask_phase_callback,
     stable_json,
     terminated,
 )
@@ -123,17 +122,17 @@ from ._federation import (
 from ._main_execution import (
     PipelineSession,
     aetherspace_descriptor_from_snapshot,
+    apply_aetherspace_json,
     build_master_space_descriptor,
     clear_federation_template_stores,
     clear_simulation_caches_only,
     clear_template_store_only,
+    delete_aetherspace_snapshot,
     describe_federation_config,
     describe_runtime_config,
     dispose_federation_source_runtimes,
     drain_write_queue,
     enrich_space_snapshot_with_notes,
-    apply_aetherspace_json,
-    delete_aetherspace_snapshot,
     export_aetherspace_json,
     export_named_schema_context_json,
     federation_stores_by_source,
@@ -165,6 +164,11 @@ from ._main_execution import (
     validate_space_context_against_graph,
     validate_space_subset_of_execution_context,
 )
+from ._pipeline import (
+    execute_stored_template_by_ref,
+    preview_plan_on_engine,
+    preview_plan_on_federation,
+)
 from ._sandbox import (
     Sandbox,
     SandboxHandle,
@@ -182,11 +186,6 @@ from ._schema_overrides import (
     apply_overrides_and_persist,
     clear_persisted_overrides,
     dump_schema_overrides_to_path,
-)
-from ._pipeline import (
-    execute_stored_template_by_ref,
-    preview_plan_on_engine,
-    preview_plan_on_federation,
 )
 from ._templates import (
     build_stored_template_detail,

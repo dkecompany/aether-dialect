@@ -9,11 +9,10 @@ import pytest
 
 from aetherdialect._contracts_core import FederatedPlan, RuntimeIntent, SourceStep
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import plan_federated_intent, resolve_federated_combine
-from aetherdialect._federation import parse_federation_manifest
+from aetherdialect._dialect import get_dialect
+from aetherdialect._federation import parse_federation_manifest, plan_federated_intent, resolve_federated_combine
 from aetherdialect._pipeline import _federation_batch_member_join_presets
 from aetherdialect._sql_gen import build_join_choice_prompt
-from aetherdialect._dialect import get_dialect
 from tests.federation_helpers import build_two_member_federation
 
 

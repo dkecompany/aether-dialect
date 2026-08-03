@@ -7,7 +7,7 @@ import pytest
 from aetherdialect._contracts_base import NormalizedExpr, WhereParam, predicate_group_from_list
 from aetherdialect._contracts_core import RuntimeCteStep, RuntimeIntent
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import FederationMappings, plan_federated_intent, parse_federation_manifest
+from aetherdialect._federation import FederationMappings, parse_federation_manifest, plan_federated_intent
 from aetherdialect._schema_graph import recompute_join_paths_multi
 
 

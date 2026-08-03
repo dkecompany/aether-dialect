@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from aetherdialect._contracts_base import WhereParam, FederationConfigError, predicate_group_from_list
+from aetherdialect._contracts_base import FederationConfigError, WhereParam, predicate_group_from_list
 from aetherdialect._contracts_core import RuntimeIntent
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._federation import (

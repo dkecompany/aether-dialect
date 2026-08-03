@@ -6,9 +6,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._contracts_base import LogicalColumnMapping
 from aetherdialect._constants import FEDERATION_MAPPINGS_VERSION
+from aetherdialect._contracts_base import LogicalColumnMapping
+from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._federation import (
     FederationDeclarationError,
     FederationMappings,

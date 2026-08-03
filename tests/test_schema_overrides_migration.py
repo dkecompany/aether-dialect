@@ -12,8 +12,8 @@ import pytest
 from aetherdialect._config import EngineConfig
 from aetherdialect._constants import SCHEMA_OVERRIDES_VERSION
 from aetherdialect._contracts_base import DescriptionOwner, EngineContext, MigrationTier, RoleOwner
-from aetherdialect._core_utils import ArtifactManifest
 from aetherdialect._contracts_schema import FKEdge, SchemaGraph, TableMetadata
+from aetherdialect._core_utils import ArtifactManifest
 from aetherdialect._dialect import Dialect
 from aetherdialect._schema_graph import (
     SchemaDiff,

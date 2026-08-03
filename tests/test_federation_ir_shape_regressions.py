@@ -47,7 +47,6 @@ from aetherdialect._federation import (
 )
 from aetherdialect._intent_process import NormalizedExpr
 from aetherdialect._main_execution import _build_federation_source_runtimes, _federation_single_source_sql_context
-from tests.conftest import duckdb_engine_identity
 from aetherdialect._pipeline import generate_and_validate_sql, prepare_federated_sql_plan
 from aetherdialect._schema_graph import recompute_join_paths_multi
 from aetherdialect._sql_gen import (
@@ -63,6 +62,7 @@ from aetherdialect._validation_schema import (
     validate_predicate_nesting_depth,
     validate_preserve_tables,
 )
+from tests.conftest import duckdb_engine_identity
 from tests.federation_helpers import build_two_member_federation
 from tests.join_test_helpers import catalog_edge_kinds_for_signatures
 from tests.test_distinct_on import _distinct_on_intent, _pg_render

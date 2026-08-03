@@ -18,8 +18,8 @@ from aetherdialect._contracts_schema import (
 )
 from aetherdialect._intent_repair import sanitize_table_names
 from aetherdialect._validation_semantic import (
-    validate_deny_bare_select,
     validate_denied_references,
+    validate_deny_bare_select,
     validate_logical_intent_numeric_coverage,
 )
 

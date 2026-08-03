@@ -9,8 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aetherdialect import AetherFederation
-from aetherdialect import _main_execution
+from aetherdialect import AetherFederation, _main_execution
 from aetherdialect._constants import FEDERATION_MIGRATION_MAP_FILENAME
 from aetherdialect._contracts_base import (
     FederationContext,

@@ -6,6 +6,7 @@ import os
 
 import pytest
 
+from aetherdialect._config import EngineConfig
 from aetherdialect._contracts_base import ColumnRole, MigrationTier
 from aetherdialect._contracts_core import ConcreteIntent, NormalizedExpr, SelectCol, Template, ValueHistory
 from aetherdialect._contracts_schema import (
@@ -18,7 +19,6 @@ from aetherdialect._contracts_schema import (
     TableMetadata,
     TemplateStats,
 )
-from aetherdialect._config import EngineConfig
 from aetherdialect._core_utils import write_artifact_manifest
 from aetherdialect._schema_graph import diff_schemas
 from aetherdialect._templates import (

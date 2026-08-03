@@ -48,7 +48,6 @@ from aetherdialect._core_utils import (
 from aetherdialect._dialect import finalize_executable_sql
 from aetherdialect._dialect_postgres import PostgresDialect
 from aetherdialect._dialect_sqlglot_engines import DatabricksDialect
-from aetherdialect._templates import lookup_join_feedback_for_question, record_question_feedback
 from aetherdialect._sql_gen import (
     JOIN_PRIOR_FEEDBACK_HEADING,
     ScopeClass,
@@ -89,6 +88,7 @@ from aetherdialect._sql_gen import (
     sql_gen_type_scope,
     tables_in_join_scope,
 )
+from aetherdialect._templates import lookup_join_feedback_for_question, record_question_feedback
 from tests.join_test_helpers import catalog_edge_kinds_for_signatures
 
 

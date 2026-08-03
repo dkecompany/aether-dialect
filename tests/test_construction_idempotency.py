@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 
 from aetherdialect._config import EngineConfig
+from aetherdialect._contracts_base import EngineContext
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._schema_catalog import (
     _load_schema_classification_cache,
@@ -16,7 +17,6 @@ from aetherdialect._schema_catalog import (
     schema_classification_content_hash,
 )
 from aetherdialect._schema_graph import assign_schema_graph_hashes, recompute_join_paths_multi
-from aetherdialect._contracts_base import EngineContext
 
 
 def _graph() -> SchemaGraph:

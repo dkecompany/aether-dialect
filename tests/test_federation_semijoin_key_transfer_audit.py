@@ -9,8 +9,8 @@ import pandas as pd
 import pytest
 
 from aetherdialect._constants import AUDIT_EVENT_FEDERATION_SEMIJOIN_KEY_TRANSFER
-from aetherdialect._contracts_core import FederationExecutionContext, RuntimeIntent, SelectCol, SourceStep
 from aetherdialect._contracts_base import NormalizedExpr
+from aetherdialect._contracts_core import FederationExecutionContext, RuntimeIntent, SelectCol, SourceStep
 from aetherdialect._core_utils import pop_federation_execution_context, push_federation_execution_context
 from aetherdialect._federation import member_stage_for_source, plan_federated_intent
 from aetherdialect._pipeline import _execute_federation_source_step

@@ -6,7 +6,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aetherdialect._contracts_base import Diagnostic
 from aetherdialect._core_utils import notify
 from aetherdialect._main_execution import (
     PIPELINE_SUSPEND_ID_INTENT_CONFIRM,

@@ -3,25 +3,23 @@
 from __future__ import annotations
 
 import re
+from unittest.mock import patch
 
 import pytest
 
 from aetherdialect._constants import anti_join_presence_column
-from aetherdialect._contracts_base import coerce_cte_emission
+from aetherdialect._contracts_base import ProbeCtePlacementError, coerce_cte_emission
 from aetherdialect._contracts_core import RuntimeCteStep, RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
+from aetherdialect._dialect_postgres import PostgresDialect
 from aetherdialect._intent_process import NormalizedExpr
+from aetherdialect._pipeline import _resolve_joins_fresh
 from aetherdialect._schema_graph import recompute_join_paths_multi
 from aetherdialect._sql_gen import (
     _join_kind_for_edge,
     build_deterministic_sql,
     inject_join_into_deterministic_sql,
 )
-from unittest.mock import patch
-
-from aetherdialect._contracts_base import ProbeCtePlacementError
-from aetherdialect._dialect_postgres import PostgresDialect
-from aetherdialect._pipeline import _resolve_joins_fresh
 from aetherdialect._validation_execute import (
     enforce_probe_cte_anchor_placement_post_resolution,
     validate_cte_emission_reclassification,

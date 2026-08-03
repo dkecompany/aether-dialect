@@ -7,10 +7,10 @@ import pytest
 from aetherdialect._contracts_base import WhereParam, predicate_group_from_list
 from aetherdialect._contracts_core import RuntimeIntent
 from aetherdialect._federation import (
+    _federation_unsupported_operator_reason,
     federation_ineligible_answerable_hint,
     federation_ineligible_reason_code,
     parse_federation_manifest,
-    _federation_unsupported_operator_reason,
 )
 from aetherdialect._intent_process import NormalizedExpr
 

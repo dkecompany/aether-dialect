@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from aetherdialect._contracts_base import CteIntent, LogicalIntent
 from aetherdialect._contracts_core import NormalizedExpr, RuntimeCteStep, RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata

@@ -49,8 +49,7 @@ class _FreshnessStubDialect(Dialect):
     def compute_row_count_probe(self, sg: SchemaGraph) -> str:
         self.row_count_probe_calls += 1
         payload = {
-            name: int(self._live_row_counts.get(name, sg.tables[name].row_count or 0))
-            for name in sorted(sg.tables)
+            name: int(self._live_row_counts.get(name, sg.tables[name].row_count or 0)) for name in sorted(sg.tables)
         }
         return hashlib.sha256(stable_json(payload).encode()).hexdigest()
 

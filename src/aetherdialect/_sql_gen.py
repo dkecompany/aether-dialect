@@ -8,18 +8,18 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
-from typing import Any, Literal, cast
+from typing import Any, Literal
 
 from sqlglot import exp, parse_one
 
 from ._config import PolicyConfig
 from ._constants import (
     CANONICAL_FEEDBACK_DIALECT,
+    DETERMINISTIC_PROBE_EDGE_KINDS,
     DIAGNOSTIC_CODE_JOIN_CANDIDATE_CAP,
     DIAGNOSTIC_CODE_JOIN_ORPHAN_RATE_HIGH,
     DIAGNOSTIC_CODE_JOIN_PATH_TIE_CEILING_EXCEEDED,
     DIAGNOSTIC_CODE_SEMANTIC_PROFILE_WHERE_EDGE,
-    DETERMINISTIC_PROBE_EDGE_KINDS,
     DISTINCT_ON_CTE_NAME_PREFIX,
     DISTINCT_ON_RANK_COLUMN,
     JOIN_CHOICE_PROMPT_KEY_ORDER,
@@ -35,13 +35,13 @@ from ._constants import (
 )
 from ._contracts_base import (
     PROBE_CTE_EMISSION_KINDS,
+    ClauseWidenedRowsetError,
     CteEmissionKind,
     HavingParam,
     JoinColumnCountMismatchError,
     JoinInjectionAlignmentError,
     JoinInjectionFailedError,
     JoinPathTieCapExceededError,
-    ClauseWidenedRowsetError,
     LlmJsonExhausted,
     MulGroup,
     NoJoinPathError,

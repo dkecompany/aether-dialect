@@ -44,11 +44,7 @@ def _load_loader_module():
 def _sandbox_corpus_function_names() -> set[str]:
     source = (_SCRIPTS / "sandbox_corpus.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
-    return {
-        node.name
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
+    return {node.name for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
 
 
 def _gitignore_lines() -> list[str]:

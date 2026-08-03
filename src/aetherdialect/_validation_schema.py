@@ -8,7 +8,6 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from ._config import PolicyConfig
-from ._refusal_diagnostics import emit_session_refusal_diagnostic, refusal_diagnostic_code_for_intent_issue
 from ._constants import (
     AGGREGATION_ALLOWED_COLUMN_TYPES,
     ANTI_JOIN_PRESENCE_COLUMN_SUFFIX,
@@ -73,11 +72,11 @@ from ._core_utils import (
     cte_join_reachability_tables,
     debug,
     intent_join_reachability_tables,
-    join_resolved_scope_tables,
     notify,
 )
 from ._dialect_sqlglot_helper import array_storage_kind
 from ._intent_expr import expr_canonical_key, extract_columns_from_expr, strip_leading_distinct_from_column_ref
+from ._refusal_diagnostics import emit_session_refusal_diagnostic, refusal_diagnostic_code_for_intent_issue
 from ._schema_graph import fk_infer_value_types_compatible
 
 

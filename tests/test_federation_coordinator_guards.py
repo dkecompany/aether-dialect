@@ -11,7 +11,6 @@ from aetherdialect._contracts_core import (
     NormalizedExpr,
     RuntimeIntent,
     SelectCol,
-    SourceStep,
 )
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._federation import (

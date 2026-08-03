@@ -5,8 +5,8 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from aetherdialect._contracts_base import ConfigError, Diagnostic, IntentSummary, SessionStep
 from aetherdialect._constants import SESSION_PERSISTENCE_FORMAT_VERSION
+from aetherdialect._contracts_base import ConfigError, Diagnostic, IntentSummary, SessionStep
 from aetherdialect._main_execution import (
     deserialize_session_step,
     deserialize_suspended_state,

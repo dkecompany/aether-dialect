@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import inspect
 import threading
-import time
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -17,7 +16,6 @@ from aetherdialect._contracts_core import (
     FederatedPreparedStep,
     FederatedPrepareOutcome,
     FederatedStage,
-    FederationExecutionContext,
     JoinSpec,
     RuntimeIntent,
     SourceStep,

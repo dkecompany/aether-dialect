@@ -410,8 +410,7 @@ def test_federation_executor_emits_phase_for_derived_wave_stages() -> None:
     waves = federation_stage_execution_waves(plan, order_federation_execution_steps(plan))
     expected_derived = {wave.stage.kind for wave in waves if wave.stage.kind != "member"}
     assert expected_derived <= set(emitted_stage_kinds), (
-        f"executor never emitted phases for derived wave stages: "
-        f"{sorted(expected_derived - set(emitted_stage_kinds))}"
+        f"executor never emitted phases for derived wave stages: {sorted(expected_derived - set(emitted_stage_kinds))}"
     )
 
 

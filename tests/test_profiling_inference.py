@@ -153,7 +153,10 @@ def test_profile_schema_visits_tables_in_sorted_order() -> None:
     dialect = DuckDBDialect.__new__(DuckDBDialect)
     visited: list[str] = []
 
-    with patch("aetherdialect._schema_catalog._profile_table", side_effect=lambda _d, _e, table, **_k: visited.append(table.name)):
+    with patch(
+        "aetherdialect._schema_catalog._profile_table",
+        side_effect=lambda _d, _e, table, **_k: visited.append(table.name),
+    ):
         profile_schema(engine, schema, dialect)
     assert visited == ["Alpha", "middle", "zebra"]
 

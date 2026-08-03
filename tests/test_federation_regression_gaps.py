@@ -29,11 +29,11 @@ from aetherdialect._federation import (
 )
 from aetherdialect._intent_process import NormalizedExpr
 from aetherdialect._main_execution import _build_federation_source_runtimes, _federation_single_source_sql_context
-from tests.conftest import duckdb_engine_identity
 from aetherdialect._pipeline import generate_and_validate_sql, prepare_federated_sql_plan
 from aetherdialect._schema_graph import recompute_join_paths_multi
 from aetherdialect._sql_gen import build_deterministic_sql
 from aetherdialect._templates import empty_template_store
+from tests.conftest import duckdb_engine_identity
 from tests.federation_helpers import build_two_member_federation, enriched_manifest, federation_member_graph
 from tests.test_federation_single_source import (
     _composed_manifest,

@@ -101,9 +101,16 @@ def test_bigquery_empty_catalog_fk_emits_join_inference_warning() -> None:
     try:
         with pytest.MonkeyPatch.context() as monkeypatch:
             monkeypatch.setattr("aetherdialect._schema_overrides.apply_column_roles_llm", lambda *args, **kwargs: None)
-            monkeypatch.setattr("aetherdialect._schema_overrides.run_fk_inference_if_disconnected", lambda *args, **kwargs: 0)
-            monkeypatch.setattr("aetherdialect._schema_overrides.infer_missing_pks_from_profile", lambda *args, **kwargs: None)
-            monkeypatch.setattr("aetherdialect._schema_overrides.load_inference_block_lists", lambda *args, **kwargs: (frozenset(), frozenset()))
+            monkeypatch.setattr(
+                "aetherdialect._schema_overrides.run_fk_inference_if_disconnected", lambda *args, **kwargs: 0
+            )
+            monkeypatch.setattr(
+                "aetherdialect._schema_overrides.infer_missing_pks_from_profile", lambda *args, **kwargs: None
+            )
+            monkeypatch.setattr(
+                "aetherdialect._schema_overrides.load_inference_block_lists",
+                lambda *args, **kwargs: (frozenset(), frozenset()),
+            )
             _add_profiling_data(dialect, graph, notes_content=None)
         diags = drain_diagnostic_collector()
     finally:

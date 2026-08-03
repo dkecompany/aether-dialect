@@ -16,23 +16,21 @@ from aetherdialect._contracts_core import (
     RuntimeCteStep,
     RuntimeIntent,
     SelectCol,
+    SqlGenerationOutcome,
     Template,
     TemplateStats,
     ValueHistory,
-    SqlGenerationOutcome,
 )
 from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, SQLShape, TableMetadata
 from aetherdialect._core_utils import colmap_signature, stable_json
 from aetherdialect._federation import (
-    federation_plan_matches_template,
     federation_plan_residual_hash,
-    federation_plan_step_fingerprints,
 )
 from aetherdialect._intent_process import (
     NormalizedExpr,
     collect_structural_match_templates,
-    list_union_match_candidates,
     join_path_key_concrete,
+    list_union_match_candidates,
     predicate_group_from_list,
 )
 from aetherdialect._pipeline import (
@@ -201,7 +199,7 @@ def test_join_preset_scope_from_concrete_pins_main_and_cte() -> None:
         chosen_join_candidate_id="J03",
         chosen_join_path_signature=["child.parent_id->parent.id"],
     )
-    from aetherdialect._contracts_core import ConcreteCteStep, _runtime_cte_to_concrete
+    from aetherdialect._contracts_core import _runtime_cte_to_concrete
 
     concrete = replace(concrete, cte_steps=[_runtime_cte_to_concrete(cte)])
     preset = _join_preset_scope_from_concrete(concrete)

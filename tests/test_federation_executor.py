@@ -21,10 +21,10 @@ from aetherdialect._federation import (
     revalidate_prepared_federation_plan,
 )
 from aetherdialect._main_execution import _build_federation_source_runtimes
-from tests.conftest import duckdb_engine_identity
 from aetherdialect._pipeline import execute_federated_prepare
 from aetherdialect._schema_graph import recompute_join_paths_multi
 from aetherdialect._utils import intent_key
+from tests.conftest import duckdb_engine_identity
 
 
 def _graph(table: str) -> SchemaGraph:

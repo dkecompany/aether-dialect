@@ -18,11 +18,6 @@ from typing import Any, Literal, TypeVar, cast
 import pandas
 
 from ._config import EngineConfig, PolicyConfig, llm_credentials_configured
-from ._refusal_diagnostics import (
-    emit_session_refusal_diagnostic,
-    refusal_diagnostic_code_for_exception,
-    refusal_message_for_exception,
-)
 from ._constants import (
     ASK_PHASE_A,
     ASK_PHASE_B,
@@ -32,6 +27,7 @@ from ._constants import (
     ASK_PHASE_L,
     ASK_PHASE_M,
     ASK_PHASE_N,
+    AUDIT_EVENT_FEDERATION_SEMIJOIN_KEY_TRANSFER,
     DIAGNOSTIC_CODE_ENGINE_INFO,
     DIAGNOSTIC_CODE_FEDERATION_COORDINATOR_EXECUTED,
     DIAGNOSTIC_CODE_FEDERATION_JOIN_CANDIDATE_CAP,
@@ -41,7 +37,6 @@ from ._constants import (
     DIAGNOSTIC_CODE_FEDERATION_PLAN_REPLAY,
     DIAGNOSTIC_CODE_FEDERATION_SEMIJOIN_SKIPPED,
     DIAGNOSTIC_CODE_FEDERATION_TURN_CANCELLED,
-    AUDIT_EVENT_FEDERATION_SEMIJOIN_KEY_TRANSFER,
     DIAGNOSTIC_CODE_REUSE_HIT,
     DIAGNOSTIC_CODE_REUSE_MISS,
     DISPLAY_ALIAS_PROMPT_KEY_ORDER,
@@ -51,20 +46,20 @@ from ._constants import (
     INTERACTIVE_STAGE_DIRECT_REUSE,
     INTERACTIVE_STAGE_INTENT_CONFIRM,
     JOIN_CHOICE_SCOPE_MAIN,
+    MASTER_AETHERSPACE_NAME,
     PERMISSION_DENIED_USER_MESSAGE,
     PIPELINE_BUG_SQL_VALIDATION,
-    PLAN_PREVIEW_INTENT_PARSE_FAILED,
     PIPELINE_SUSPEND_ID_DIRECT_REUSE,
     PIPELINE_SUSPEND_ID_INTENT_CONFIRM,
     PIPELINE_SUSPEND_ID_INTENT_FEEDBACK,
     PIPELINE_SUSPEND_ID_USER_FEEDBACK_REJECT,
+    PLAN_PREVIEW_INTENT_PARSE_FAILED,
     SHAPE_QUESTION_INDEX_KEY,
     SOFT_DIAGNOSTIC_CODES,
     SQL_BIND_TOKEN_RE,
     TEMPLATE_INTENT_KEY_INDEX_KEY,
     TEMPLATE_QUESTION_TOKEN_INDEX_KEY,
     TEMPLATE_UNION_FAMILY_INDEX_KEY,
-    MASTER_AETHERSPACE_NAME,
 )
 from ._contracts_base import (
     AccessError,
@@ -75,9 +70,9 @@ from ._contracts_base import (
     EngineContext,
     EngineIdentity,
     FailureCategory,
+    FederationCoordinatorConfig,
     FederationManifest,
     FederationMappings,
-    FederationCoordinatorConfig,
     FederationMemberExecutionError,
     FederationPartialFailureError,
     FederationPlanTemplate,
@@ -85,14 +80,14 @@ from ._contracts_base import (
     JoinInjectionAlignmentError,
     JoinInjectionFailedError,
     NoJoinPathError,
-    ProbeCtePlacementError,
     PipelineSuspended,
+    PlanPreviewResult,
+    ProbeCtePlacementError,
     RetryableError,
     SpaceContext,
     SqlDiagnostic,
     StatementTimeoutError,
     TemplateExecutionResult,
-    PlanPreviewResult,
     WriteQueueEvent,
     expr_registry_ref,
     having_leaves,
@@ -194,8 +189,8 @@ from ._federation import (
     dialect_streams_arrow_to_coordinator,
     distinct_semijoin_keys,
     effective_union_specs,
-    execute_federation_coordinator,
     enforce_federation_plan_timeout,
+    execute_federation_coordinator,
     federation_coordinator_spill_dir,
     federation_member_execution_batches,
     federation_member_parallelism_cap,
@@ -204,12 +199,12 @@ from ._federation import (
     federation_member_timeout_error,
     federation_plan_combine_hash,
     federation_plan_combine_kind,
-    federation_plan_timeout_deadline,
     federation_plan_is_degenerate,
     federation_plan_matches_template,
     federation_plan_residual_hash,
     federation_plan_sql_shape,
     federation_plan_step_fingerprints,
+    federation_plan_timeout_deadline,
     federation_plan_topology_identity,
     federation_residual_column_headers,
     federation_scaled_join_candidate_cap,
@@ -222,11 +217,13 @@ from ._federation import (
     lookup_federation_plan_template_for_question,
     member_feedback_q_norm,
     member_frame_column_names,
+    member_guard_limit_kwargs,
     member_schema_slice,
     member_stage_for_source,
     order_federation_execution_steps,
     plan_federated_intent,
     record_federation_join_feedback,
+    reducing_edge_allowed_for_target,
     render_federation_glue,
     resolve_federated_member_schema,
     resolve_source_column_table,
@@ -238,11 +235,9 @@ from ._federation import (
     semijoin_key_passes_distinct_floor,
     source_by_table_from_schema,
     source_row_cap_for_source,
-    reducing_edge_allowed_for_target,
-    split_qualified_column,
     source_semijoin_enabled,
     source_timeout_for_source,
-    member_guard_limit_kwargs,
+    split_qualified_column,
     stamp_federation_member_template,
     template_is_federation_plan_fragment,
     validate_federated_sub_intent,
@@ -273,6 +268,11 @@ from ._intent_repair import (
 )
 from ._intent_resolve import join_path_key_concrete, prune_unused_cte_steps
 from ._llm_provider import llm_chat
+from ._refusal_diagnostics import (
+    emit_session_refusal_diagnostic,
+    refusal_diagnostic_code_for_exception,
+    refusal_message_for_exception,
+)
 from ._schema_graph import assert_consumer_intent_in_scope, assert_consumer_sql_in_scope, assert_intent_in_scope
 from ._sql_gen import (
     ScopeClass,
@@ -337,9 +337,9 @@ from ._validation_execute import (
     enforce_probe_cte_anchor_placement_post_resolution,
     execute_guarded_arrow_table,
     execute_guarded_sql,
+    temporary_dialect_member_limits,
     validate_aggregate_join_fan_out,
     validate_sql,
-    temporary_dialect_member_limits,
 )
 from ._validation_schema import (
     validate_clause_widened_rowset,
@@ -4913,12 +4913,18 @@ def _federation_batch_member_join_presets(
             forbid_na=False,
         )
         step_scope_ids: dict[str, str] = {}
+        step_source_id = step.source_id
 
-        def _prefix_step_scope(local: str) -> str:
-            if local not in step_scope_ids:
-                step_scope_ids[local] = _federation_batch_join_scope_key(scope_counter)
-                scope_to_member[step_scope_ids[local]] = (step.source_id, local)
-            return step_scope_ids[local]
+        def _prefix_step_scope(
+            local: str,
+            *,
+            _ids: dict[str, str] = step_scope_ids,
+            _source_id: str = step_source_id,
+        ) -> str:
+            if local not in _ids:
+                _ids[local] = _federation_batch_join_scope_key(scope_counter)
+                scope_to_member[_ids[local]] = (_source_id, local)
+            return _ids[local]
 
         for scope_key, choice in step_preset.items():
             preset[_prefix_step_scope(scope_key)] = choice

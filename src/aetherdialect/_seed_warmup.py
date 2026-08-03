@@ -85,7 +85,6 @@ from ._intent_process import (
 from ._intent_repair import apply_diagnostic_repairs
 from ._intent_resolve import (
     check_qualified_refs_exist,
-    join_path_key_concrete,
     join_path_key_runtime,
     prune_unused_cte_steps,
 )
@@ -96,8 +95,12 @@ from ._pipeline import (
     other_template_owns_question_string,
     persist_federated_warmup_learning,
 )
-from ._qsim import deterministic_having_value, sample_coordinated_range, sample_value_from_domain
-from ._qsim import greedy_cover_indices_by_atoms
+from ._qsim import (
+    deterministic_having_value,
+    greedy_cover_indices_by_atoms,
+    sample_coordinated_range,
+    sample_value_from_domain,
+)
 from ._sql_gen import (
     build_deterministic_sql,
     edge_kinds_for_join_candidate,
@@ -110,7 +113,6 @@ from ._sql_gen import (
 from ._templates import insert_template, template_is_live, warmup_work_unit_schema_refs
 from ._utils import (
     body_similarity_key,
-    body_similarity_key_for_concrete,
     exact_question_match,
     flatten_warmup_paraphrases_by_style,
     generate_warmup_paraphrases_by_style,
@@ -118,7 +120,6 @@ from ._utils import (
     intent_key,
     template_instance_key_for_concrete,
     template_instance_key_for_runtime,
-    template_instance_key_from_parts,
 )
 from ._validation_execute import curated_warmup_post_binding_issues, curated_warmup_semantic_issues, validate_sql
 

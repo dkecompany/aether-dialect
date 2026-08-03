@@ -6,7 +6,6 @@ from unittest.mock import patch
 
 import pytest
 
-from aetherdialect import AetherEngine, AetherFederation
 from aetherdialect._contracts_base import FederationMappingSuggestion, PlanPreviewResult
 from aetherdialect._contracts_core import FederatedPlan, RuntimeIntent, SourceStep
 from aetherdialect._pipeline import build_plan_preview_from_intent
@@ -69,12 +68,15 @@ def test_preview_plan_marks_federation_when_applicable() -> None:
         ),
         combine=(),
     )
-    with patch(
-        "aetherdialect._pipeline.invoke_intent_parse_with_hints",
-        return_value=(intent, [], 1, None),
-    ), patch(
-        "aetherdialect._pipeline.plan_federated_intent",
-        return_value=federated_plan,
+    with (
+        patch(
+            "aetherdialect._pipeline.invoke_intent_parse_with_hints",
+            return_value=(intent, [], 1, None),
+        ),
+        patch(
+            "aetherdialect._pipeline.plan_federated_intent",
+            return_value=federated_plan,
+        ),
     ):
         preview = fed.preview_plan("join left and right")
     assert preview.federates is True

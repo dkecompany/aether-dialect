@@ -101,7 +101,6 @@ def test_raise_if_descriptions_name_federation_sources_rejects_member_text() -> 
 @pytest.mark.fast
 def test_fk_enrich_description_sanitized_with_forbidden_tokens() -> None:
     from aetherdialect._federation import _resolve_composite_table_names
-    from aetherdialect._schema_catalog import _enrich_fk_column_descriptions
 
     legacy_customer = TableMetadata(
         name="legacy_customer",

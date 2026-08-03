@@ -20,9 +20,8 @@ from aetherdialect._contracts_base import (
     FailureCategory,
     NoJoinPathError,
 )
-from aetherdialect._contracts_schema import IntentIssue
 from aetherdialect._contracts_core import GenerationPath, RuntimeIntent, SelectCol
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
+from aetherdialect._contracts_schema import ColumnMetadata, IntentIssue, SchemaGraph, TableMetadata
 from aetherdialect._core_utils import (
     reset_diagnostic_collector,
     set_diagnostic_collector,

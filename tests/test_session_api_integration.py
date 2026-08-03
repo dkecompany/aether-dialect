@@ -2,17 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
 
-from aetherdialect._contracts_base import Diagnostic, SessionNotice, SessionStep
-from aetherdialect._main_execution import PipelineSession, SESSION_KIND_RESULT
+from aetherdialect._contracts_base import SessionNotice, SessionStep, SpaceContext
+from aetherdialect._main_execution import SESSION_KIND_RESULT, PipelineSession
 from aetherdialect._pipeline import PIPELINE_SUSPEND_ID_INTENT_CONFIRM, PipelineSuspended
 from aetherdialect._templates import empty_template_store
-from aetherdialect._contracts_base import SpaceContext
 
 
 def _session_owner() -> MagicMock:

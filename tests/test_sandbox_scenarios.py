@@ -203,9 +203,8 @@ class TestSandboxScenarios:
         import shutil
         import tempfile
 
-        from aetherdialect._contracts_base import MockFixtureMissingError
-
         from aetherdialect import Sandbox
+        from aetherdialect._contracts_base import MockFixtureMissingError
 
         shared_dir = tempfile.mkdtemp(prefix="sandbox_test_queue_")
         try:

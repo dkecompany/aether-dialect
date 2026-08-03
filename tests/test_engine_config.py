@@ -9,7 +9,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from aetherdialect._config import EngineConfig
-from aetherdialect._contracts_base import EngineIdentity
 from aetherdialect._core_utils import active_engine_identity
 from tests.test_aetherdialect import _make_aether_stub
 

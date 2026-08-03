@@ -116,8 +116,7 @@ def _assert_finalize_before_assign(order: list[str]) -> None:
     assert finalize_positions, f"expected finalize_with_overrides in call order, got {order!r}"
     assert assign_positions, f"expected assign_schema_graph_hashes in call order, got {order!r}"
     assert min(finalize_positions) < min(assign_positions), (
-        "finalize_with_overrides must run before assign_schema_graph_hashes; got "
-        f"{order!r}"
+        f"finalize_with_overrides must run before assign_schema_graph_hashes; got {order!r}"
     )
 
 

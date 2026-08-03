@@ -114,7 +114,9 @@ def test_additive_column_tier_matches_policy(tmp_path) -> None:
 
 @pytest.mark.fast
 def test_additive_table_tier_matches_policy(tmp_path) -> None:
-    old = _schema({"orders": _table("orders", {"order_id": _col("order_id", pk=True)})}, structural="s_old", effective="eff_old")
+    old = _schema(
+        {"orders": _table("orders", {"order_id": _col("order_id", pk=True)})}, structural="s_old", effective="eff_old"
+    )
     new = _schema(
         {
             "orders": _table("orders", {"order_id": _col("order_id", pk=True)}),

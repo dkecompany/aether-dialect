@@ -7,14 +7,13 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-import sqlglot
 from sqlglot import exp
 
 import aetherdialect._sql_gen
-from aetherdialect import _dialect_sqlglot_engines
-from aetherdialect import _federation
+from aetherdialect import _dialect_sqlglot_engines, _federation
 from aetherdialect._constants import DISTINCT_ON_RANK_COLUMN
 from aetherdialect._contracts_base import NormalizedExpr, OrderByCol, PredicateGroup, WhereParam
+from aetherdialect._contracts_core import RuntimeIntent
 from aetherdialect._core_utils import reconcile_execute_bind_params
 from aetherdialect._dialect import (
     Dialect,
@@ -26,7 +25,6 @@ from aetherdialect._dialect import (
 from aetherdialect._dialect_postgres import PostgresDialect
 from aetherdialect._dialect_sqlglot_helper import SqlAlchemyResultBackend
 from aetherdialect._schema_graph import SchemaGraph
-from aetherdialect._contracts_core import RuntimeIntent
 from aetherdialect._sql_gen import (
     _join_clause_parts_with_bool_op,
     _quote_simple_qualified_mul_token,
@@ -159,19 +157,13 @@ def _pg_render() -> PostgresDialect:
 
 
 def _where_leaf(pred: WhereParam) -> str:
-    return f'"{pred.left_expr.primary_column.replace(".", "\".\"")}" = :p1'
+    return f'"{pred.left_expr.primary_column.replace(".", '"."')}" = :p1'
 
 
 @pytest.mark.fast
 def test_wrap_core_sql_with_distinct_on_multiline_select_appends_rank_via_ast() -> None:
     """ROW_NUMBER must join the SELECT list via parse/emit, not first- line text surgery."""
-    core_sql = (
-        'SELECT\n'
-        '  "customers"."id",\n'
-        '  "customers"."name"\n'
-        'FROM "customers"\n'
-        'WHERE "customers"."balance" > 0'
-    )
+    core_sql = 'SELECT\n  "customers"."id",\n  "customers"."name"\nFROM "customers"\nWHERE "customers"."balance" > 0'
     dialect = _pg_render()
     wrapped = wrap_core_sql_with_distinct_on(
         core_sql,
@@ -187,7 +179,7 @@ def test_wrap_core_sql_with_distinct_on_multiline_select_appends_rank_via_ast() 
     inner_end = wrapped.rindex("\n) AS _don_src")
     inner_sql = wrapped[inner_start:inner_end]
     assert dialect.parse_select(inner_sql) is not None
-    assert f'AS {DISTINCT_ON_RANK_COLUMN}' in inner_sql or f"AS {DISTINCT_ON_RANK_COLUMN.lower()}" in inner_sql
+    assert f"AS {DISTINCT_ON_RANK_COLUMN}" in inner_sql or f"AS {DISTINCT_ON_RANK_COLUMN.lower()}" in inner_sql
 
 
 @pytest.mark.fast
@@ -281,9 +273,7 @@ def test_sqlglot_quote_identifier_helper_exists_and_matches_generator() -> None:
         ("snowflake", "snowflake", False),
     ],
 )
-def test_dialect_quote_identifier_routes_through_sqlglot(
-    engine: str, sqlglot_name: str, quoted: bool
-) -> None:
+def test_dialect_quote_identifier_routes_through_sqlglot(engine: str, sqlglot_name: str, quoted: bool) -> None:
     """Registered dialects quote identifiers via the shared sqlglot helper."""
     from aetherdialect._dialect import sqlglot_quote_identifier
 
@@ -312,9 +302,7 @@ def test_dialect_quote_identifier_routes_through_sqlglot(
         ("snowflake", "snowflake", False),
     ],
 )
-def test_dialect_quote_table_column_routes_through_sqlglot(
-    engine: str, sqlglot_name: str, quoted: bool
-) -> None:
+def test_dialect_quote_table_column_routes_through_sqlglot(engine: str, sqlglot_name: str, quoted: bool) -> None:
     """table.column emission composes the same sqlglot-backed identifier helper."""
     from aetherdialect._dialect import sqlglot_quote_table_column
 

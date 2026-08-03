@@ -1,6 +1,7 @@
 """Stable import surface for the AetherEngine package."""
 
 from ._contracts_base import (
+    BusinessKnowledgeEntry,
     FederationCapExceededError,
     FederationConfigError,
     FederationContext,
@@ -12,12 +13,11 @@ from ._contracts_base import (
     FederationMemberExecutionError,
     FederationMemberUnprofilableError,
     FederationPartialFailureError,
+    FederationRuntimeError,
     FederationTurnCancelledError,
     PersistedFederationInspection,
-    FederationRuntimeError,
-    BusinessKnowledgeEntry,
-    TablePreviewResult,
     PlanPreviewResult,
+    TablePreviewResult,
 )
 from ._contracts_schema import UploadIngestResult
 from .aetherdialect import (

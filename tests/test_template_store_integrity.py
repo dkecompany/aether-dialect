@@ -110,9 +110,7 @@ def test_prune_enforces_template_count_and_disk_size_on_save(tmp_path, monkeypat
     monkeypatch.setattr(EngineConfig, "TEMPLATE_STORE_DIR", store_dir)
     graph_id = "sg_test000000000001__abcd1234"
     view = empty_template_store(graph_id)
-    templates = {
-        f"T{i:04d}": replace(_typed_template(tid=f"T{i:04d}"), trust_level=i) for i in range(5)
-    }
+    templates = {f"T{i:04d}": replace(_typed_template(tid=f"T{i:04d}"), trust_level=i) for i in range(5)}
     templates_to_store(view, templates)
     save_template_store(view)
     loaded = load_template_store(graph_id, schema=None)

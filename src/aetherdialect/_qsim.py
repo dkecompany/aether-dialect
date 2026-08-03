@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import math
 import os
 import random
-import importlib
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta
 from itertools import combinations

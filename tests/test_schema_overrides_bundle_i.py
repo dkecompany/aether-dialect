@@ -12,16 +12,15 @@ import pytest
 
 import aetherdialect._schema_overrides
 from aetherdialect._config import EngineConfig, PolicyConfig
-from aetherdialect._constants import SCHEMA_OVERRIDES_SIDECAR_FILENAME, SCHEMA_OVERRIDES_VERSION
+from aetherdialect._constants import SCHEMA_OVERRIDES_VERSION
 from aetherdialect._contracts_base import DescriptionOwner, RoleOwner
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, SensitivityClassification
+from aetherdialect._contracts_schema import SchemaGraph, SensitivityClassification
 from aetherdialect._core_utils import stable_json
 from aetherdialect._dialect import Dialect
 from aetherdialect._schema_graph import assign_schema_graph_hashes, compute_dialect_probe
 from aetherdialect._schema_overrides import (
     apply_overrides_and_persist,
     apply_schema_overrides_to_graph,
-    build_schema_graph,
     dump_schema_overrides_dict,
     finalize_with_overrides,
     save_overrides_sidecar,
@@ -155,8 +154,6 @@ def test_finalize_with_overrides_strict_raises_on_unknown_table(
     """I2: sidecar replay must not silently skip unknown table references."""
     from aetherdialect._config import ConfigError
 
-    from aetherdialect._schema_overrides import compute_metadata_hash
-
     monkeypatch.setattr(EngineConfig, "SCHEMA_JSON_PATH", str(tmp_path / "schema.json.gz"))
     cache_path = tmp_path / "schema.json.gz"
     cache_path.write_bytes(b"x")
@@ -179,7 +176,7 @@ def test_finalize_with_overrides_prunes_stale_table_keys(
     cache_path = tmp_path / "schema.json.gz"
     cache_path.write_bytes(b"x")
 
-    from aetherdialect._schema_overrides import compute_metadata_hash, load_overrides_sidecar
+    from aetherdialect._schema_overrides import load_overrides_sidecar
 
     save_overrides_sidecar(
         cache_path,

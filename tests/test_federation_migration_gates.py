@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -24,8 +23,6 @@ from aetherdialect._federation import (
     FederationMappings,
     apply_federation_migration_map,
     clear_federation_composite_template_store,
-    compute_federation_storage_dir,
-    clear_federation_plan_templates,
     compose_composite_graph,
     compute_federation_storage_dir,
     detect_broken_cross_source_joins,

@@ -20,7 +20,7 @@ from aetherdialect._contracts_core import (
     TemplateStats,
     ValueHistory,
 )
-from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, SQLShape, TableMetadata
+from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, SQLShape, TableMetadata
 from aetherdialect._federation import (
     federation_plan_combine_hash,
     federation_plan_matches_template,

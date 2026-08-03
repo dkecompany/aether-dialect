@@ -6,9 +6,9 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
-import duckdb
 import pytest
 
+import duckdb
 from aetherdialect import AetherEngine, UploadIngestResult
 from aetherdialect._config import DuckDBRuntimeConfig
 from aetherdialect._contracts_base import ConfigError, EngineContext, LLMConfig, RuntimeConfig

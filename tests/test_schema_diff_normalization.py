@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import copy
-
 import pytest
 
 from aetherdialect._contracts_base import ColumnRole, data_type_to_value_type

@@ -100,7 +100,6 @@ def test_inspect_persisted_missing_roster_raises() -> None:
     import json
 
     from aetherdialect._federation import federation_artifact_paths
-
     from tests.federation_helpers import build_two_member_federation
 
     bundle = build_two_member_federation(federation_id="fed_no_roster")

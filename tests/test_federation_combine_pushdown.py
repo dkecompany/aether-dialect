@@ -9,7 +9,7 @@ import pandas as pd
 import pytest
 
 from aetherdialect._contracts_base import NormalizedExpr, OrderByCol, WhereParam, predicate_group_from_list
-from aetherdialect._contracts_core import RuntimeIntent, SelectCol, SourceStep
+from aetherdialect._contracts_core import RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._federation import (
     FederationMappings,

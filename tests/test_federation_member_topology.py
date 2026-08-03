@@ -2,17 +2,15 @@
 
 from __future__ import annotations
 
-import threading
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
 from aetherdialect import AetherFederation
-from aetherdialect._contracts_base import FederationConfigError, FederationMappings
+from aetherdialect._contracts_base import FederationMappings
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._federation import (
-    compose_composite_graph,
     parse_federation_manifest,
     prune_federation_aliases,
     reconcile_authored_declaration_for_members,

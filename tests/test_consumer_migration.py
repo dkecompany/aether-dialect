@@ -7,7 +7,6 @@ import os
 import pytest
 
 from aetherdialect._config import EngineConfig
-from aetherdialect._constants import ARTIFACT_FORMAT_VERSION
 from aetherdialect._contracts_base import ColumnRole, MigrationTier
 from aetherdialect._contracts_core import (
     ConcreteIntent,

@@ -166,8 +166,7 @@ def test_refresh_existing_descriptions_noop_emits_diagnostic() -> None:
 def test_enriched_schema_lines_total_char_cap() -> None:
     long_desc = "x" * (SCHEMA_DESCRIPTION_PROMPT_MAX_CHARS + 100)
     columns = {
-        f"col_{i}": ColumnMetadata(name=f"col_{i}", data_type="varchar", description=long_desc)
-        for i in range(200)
+        f"col_{i}": ColumnMetadata(name=f"col_{i}", data_type="varchar", description=long_desc) for i in range(200)
     }
     table = TableMetadata(
         name="wide",

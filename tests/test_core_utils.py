@@ -18,8 +18,8 @@ from aetherdialect._contracts_base import (
     MigrationTier,
 )
 from aetherdialect._core_utils import (
-    RephraseHint,
     ArtifactManifest,
+    RephraseHint,
     _extract_first_json_object,
     _format_cell,
     _manifest_path,
@@ -66,7 +66,6 @@ from aetherdialect._core_utils import (
     write_artifact_manifest,
     write_gzip_json_atomic,
 )
-from aetherdialect._schema_graph import classify_migration_tier
 from aetherdialect._dialect import (
     _sql_simplify_executable,
     compute_sql_fp,
@@ -79,6 +78,7 @@ from aetherdialect._llm_provider import (
     llm_chat,
     llm_json,
 )
+from aetherdialect._schema_graph import classify_migration_tier
 from aetherdialect._templates import apply_migration_policy
 
 

@@ -41,7 +41,6 @@ from ._constants import (
     INFORMATION_SCHEMA_COLUMNS_DDL_PROBE_SQL,
     MYSQL_PROFILING_SAMPLE_PREDICATE,
     REDSHIFT_PROFILING_SAMPLE_PREDICATE,
-    SQL_BIND_TOKEN_RE,
     SQLITE_PROFILING_SAMPLE_PREDICATE,
     UNITY_INFORMATION_SCHEMA_COLUMNS_DDL_PROBE_SQL,
     UNITY_INFORMATION_SCHEMA_KEY_COLUMN_USAGE_SQL,
@@ -54,8 +53,8 @@ from ._constants import (
 )
 from ._contracts_base import (
     AccessError,
-    DataQualityReport,
     DatabasePingFailed,
+    DataQualityReport,
     EngineContext,
     SchemaInclude,
     SqlDiagnostic,
@@ -3628,7 +3627,7 @@ def _resolve_upload_native_connection(engine: Any) -> Any:
 
 def _upload_validation_config_error(message: str, data_quality_report: object) -> ConfigError:
     exc = ConfigError(message)
-    setattr(exc, "data_quality_report", data_quality_report)
+    exc.data_quality_report = data_quality_report
     return exc
 
 

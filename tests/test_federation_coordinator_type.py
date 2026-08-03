@@ -6,7 +6,6 @@ import pytest
 
 from aetherdialect._contracts_base import FederationDeclarationError
 from aetherdialect._contracts_core import RuntimeIntent, SelectCol
-from aetherdialect._intent_process import NormalizedExpr
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._federation import (
     _schema_column_duckdb_type,
@@ -14,6 +13,7 @@ from aetherdialect._federation import (
     parse_federation_manifest,
     plan_federated_intent,
 )
+from aetherdialect._intent_process import NormalizedExpr
 from aetherdialect._schema_graph import recompute_join_paths_multi
 
 

@@ -9,8 +9,8 @@ import pytest
 from aetherdialect._constants import DIAGNOSTIC_CODE_FEDERATION_MEMBER_EXECUTED
 from aetherdialect._contracts_core import (
     FederatedPlan,
-    FederatedPrepareOutcome,
     FederatedPreparedStep,
+    FederatedPrepareOutcome,
     RuntimeIntent,
     SourceStep,
 )
@@ -28,9 +28,8 @@ def _degenerate_prepared() -> tuple[FederatedPrepareOutcome, object]:
         },
         include_derived_roster=True,
     )
-    from aetherdialect._contracts_schema import ColumnMetadata, TableMetadata
+    from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
     from aetherdialect._schema_graph import recompute_join_paths_multi
-    from aetherdialect._contracts_schema import SchemaGraph
 
     tables = {
         "left_t": TableMetadata(

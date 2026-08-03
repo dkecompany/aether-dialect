@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._main_execution import PipelineSession, SESSION_KIND_ERROR
+from aetherdialect._main_execution import SESSION_KIND_ERROR, PipelineSession
 from aetherdialect._schema_graph import recompute_join_paths_multi
 from aetherdialect._templates import empty_template_store
 

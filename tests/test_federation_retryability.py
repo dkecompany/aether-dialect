@@ -9,11 +9,11 @@ import pytest
 from aetherdialect._contracts_base import (
     DatabasePingFailed,
     FederationPartialFailureError,
+    FederationPlanTemplate,
     RetryableError,
     SessionStep,
     StatementTimeoutError,
 )
-from aetherdialect._contracts_base import FederationPlanTemplate
 from aetherdialect._main_execution import PipelineSession, _handle_federation_partial_failure_interactive
 from aetherdialect._pipeline import _raise_partial_member_failure
 

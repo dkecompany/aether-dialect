@@ -9,15 +9,15 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from aetherdialect._config import EngineConfig
 from aetherdialect._constants import (
     ARTIFACT_FORMAT_VERSION,
-    ARTIFACT_MANIFEST_FILENAME,
     MIGRATION_MAP_ACTION_DESTRUCTIVE,
     MIGRATION_MAP_ACTION_REMAP,
     SEED_WARMUP_CACHE_ZIP,
     WRITE_QUEUE_FILENAME,
 )
-from aetherdialect._contracts_base import ColumnRole, MigrationTier
+from aetherdialect._contracts_base import ColumnRole, MigrationTier, SchemaMigrationMap, SchemaMigrationMapEntry
 from aetherdialect._contracts_core import ConcreteIntent, NormalizedExpr, SelectCol, Template, ValueHistory
 from aetherdialect._contracts_schema import (
     ColumnMetadata,
@@ -29,7 +29,6 @@ from aetherdialect._contracts_schema import (
     TableMetadata,
     TemplateStats,
 )
-from aetherdialect._config import EngineConfig
 from aetherdialect._core_utils import (
     ArtifactManifest,
     assess_rename_migration_plan,
@@ -46,7 +45,6 @@ from aetherdialect._schema_graph import (
     tables_structural_payload,
 )
 from aetherdialect._templates import (
-    TemplateStoreView,
     _load_partitioned_view_unlocked,
     apply_migration_policy,
     apply_schema_migration_map,
@@ -57,7 +55,6 @@ from aetherdialect._templates import (
     template_store_dir_for_space,
     templates_to_store,
 )
-from aetherdialect._contracts_base import SchemaMigrationMap, SchemaMigrationMapEntry
 
 
 def _col(

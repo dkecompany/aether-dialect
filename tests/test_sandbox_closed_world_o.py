@@ -23,7 +23,6 @@ from aetherdialect._sandbox import (
     _apply_bundled_federation_mappings,
     _apply_bundled_schema_overrides,
     _apply_sandbox_consumer_execution_scope,
-    _open_data_bundle,
     _resolve_sandbox_fixture_path,
     _resolve_sandbox_notes_and_sql,
     _sandbox_trusts_bundled_baseline,

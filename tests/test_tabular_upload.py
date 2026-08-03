@@ -9,7 +9,6 @@ import pytest
 
 import aetherdialect._constants
 from aetherdialect import inspect_tabular_upload
-from aetherdialect._contracts_base import ConfigError, DataQualityReport
 from aetherdialect._constants import (
     DATA_QUALITY_ISSUE_DUPLICATE_HEADER,
     DATA_QUALITY_ISSUE_EMPTY_FILE,
@@ -23,13 +22,14 @@ from aetherdialect._constants import (
     DATA_QUALITY_SEVERITY_FATAL,
     DATA_QUALITY_SEVERITY_REVIEW,
 )
+from aetherdialect._contracts_base import ConfigError, DataQualityReport
 from aetherdialect._data_quality import (
+    _issue_code,
+    _issue_severity,
     detect_grid_issues,
     load_source_grids,
     normalize_grid,
     validate_upload_sources,
-    _issue_code,
-    _issue_severity,
 )
 
 
@@ -88,11 +88,7 @@ def test_duplicate_header_is_advisory_not_blocking(tmp_path: Path) -> None:
     path.write_text("id,id\n1,2\n", encoding="utf-8")
     grid = normalize_grid(load_source_grids(path)[0])
     issues = detect_grid_issues(grid)
-    dup_issues = [
-        issue
-        for issue in issues
-        if _issue_code(issue) == DATA_QUALITY_ISSUE_DUPLICATE_HEADER
-    ]
+    dup_issues = [issue for issue in issues if _issue_code(issue) == DATA_QUALITY_ISSUE_DUPLICATE_HEADER]
     assert dup_issues, "expected duplicate_header issue"
     issue = dup_issues[0]
     assert _issue_severity(issue) == DATA_QUALITY_SEVERITY_ADVISORY

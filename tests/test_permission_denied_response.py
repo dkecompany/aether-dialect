@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from aetherdialect._constants import PERMISSION_DENIED_USER_MESSAGE
-from aetherdialect._contracts_base import AccessError, SessionStep
+from aetherdialect._contracts_base import AccessError
 from aetherdialect._main_execution import (
     PipelineSession,
     _run_sql_phase_after_intent_confirm,

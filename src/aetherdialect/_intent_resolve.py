@@ -58,7 +58,6 @@ from ._contracts_schema import (
     make_intent_issue,
 )
 from ._core_utils import debug, normalize_op, normalize_value_type, pipeline_trace, stable_json
-from ._validation_schema import validate_cte_limits
 from ._intent_expr import (
     classify_cte_expr,
     concat_logical_intent_prose,
@@ -74,6 +73,7 @@ from ._intent_repair import (
     cols_from_select_col,
 )
 from ._sql_gen import canonicalize_stored_join_path_signature, render_expr_sql
+from ._validation_schema import validate_cte_limits
 
 
 def _member_enum_storage_key(source_id: str, enum_name: str) -> str:

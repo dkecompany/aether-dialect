@@ -11,7 +11,6 @@ from aetherdialect._constants import (
     REFUSAL_CAPABILITY_GAP_REASON_CODES,
     REFUSAL_CAPABILITY_GAP_REASON_PREFIXES,
     REFUSAL_CTE_CAP_ISSUE_IDS,
-    REFUSAL_DIAGNOSTIC_CODES,
 )
 from aetherdialect._contracts_base import (
     AggregateJoinFanOutError,

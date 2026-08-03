@@ -14,7 +14,6 @@ from aetherdialect._contracts_base import FederationDeclarationError, Federation
 from aetherdialect._federation import (
     binding_from_member_engine,
     compose_composite_graph,
-    export_federation_declaration,
     federation_declaration_document,
     load_federation_declaration_from_path,
     parse_federation_declaration,
@@ -24,7 +23,6 @@ from aetherdialect._federation import (
 from tests.federation_helpers import write_federation_declaration_file
 from tests.test_aether_federation_public_surface import (
     _MANIFEST,
-    _fed,
     _graph,
     _init_bundle,
     _minimal_member,

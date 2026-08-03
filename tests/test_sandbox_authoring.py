@@ -283,7 +283,6 @@ def test_federation_offline_sandbox_honours_federation_context() -> None:
 @pytest.mark.fast
 def test_custom_federation_declaration_rejects_replica_without_authoritative_source(tmp_path: Path) -> None:
     _require_bundled_data()
-    from aetherdialect import AetherEngine
 
     payload = _minimal_payment_declaration(semantics="replica")
     del payload["logical_tables"][0]["authoritative_source"]
@@ -301,7 +300,6 @@ def test_custom_federation_declaration_rejects_replica_without_authoritative_sou
 @pytest.mark.fast
 def test_custom_federation_declaration_rejects_unknown_mapping_source(tmp_path: Path) -> None:
     _require_bundled_data()
-    from aetherdialect import AetherEngine
 
     payload = _minimal_payment_declaration()
     payload["logical_tables"][0]["members"] = [
@@ -321,7 +319,6 @@ def test_custom_federation_declaration_rejects_unknown_mapping_source(tmp_path: 
 @pytest.mark.fast
 def test_custom_federation_declaration_rejects_unresolved_mapping_table(tmp_path: Path) -> None:
     _require_bundled_data()
-    from aetherdialect import AetherEngine
 
     payload = _minimal_payment_declaration()
     payload["logical_tables"][0]["members"] = [
@@ -341,7 +338,6 @@ def test_custom_federation_declaration_rejects_unresolved_mapping_table(tmp_path
 @pytest.mark.fast
 def test_custom_federation_declaration_rejects_union_with_authoritative_source(tmp_path: Path) -> None:
     _require_bundled_data()
-    from aetherdialect import AetherEngine
 
     payload = _minimal_payment_declaration()
     payload["logical_tables"][0]["authoritative_source"] = "storefront"
@@ -359,7 +355,6 @@ def test_custom_federation_declaration_rejects_union_with_authoritative_source(t
 @pytest.mark.fast
 def test_custom_federation_declaration_rejects_cross_source_join_on_unowned_table(tmp_path: Path) -> None:
     _require_bundled_data()
-    from aetherdialect import AetherEngine
 
     payload = _minimal_payment_declaration()
     payload["cross_source_joins"] = [
@@ -446,7 +441,7 @@ def test_sandbox_aetherspace_rejects_unknown_table() -> None:
 @pytest.mark.fast
 def test_federation_aetherspace_rejects_partial_union_deny() -> None:
     _require_bundled_data()
-    from aetherdialect import AetherEngine, SpaceContext
+    from aetherdialect import SpaceContext
     from aetherdialect._contracts_base import ConfigError
 
     with Sandbox() as sandbox:

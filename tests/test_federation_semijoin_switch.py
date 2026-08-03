@@ -10,9 +10,8 @@ import pytest
 
 from aetherdialect._contracts_base import NormalizedExpr, WhereParam, predicate_group_from_list
 from aetherdialect._contracts_core import (
-    FederationReducingEdge,
-    FederatedPlan,
     FederatedStage,
+    FederationReducingEdge,
     RuntimeIntent,
     SelectCol,
     SourceStep,

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._core_utils import write_artifact_manifest
 from aetherdialect._main_execution import _reload_reader_learning_if_manifest_drift

@@ -101,10 +101,10 @@ from ._constants import (
     SESSION_KIND_ERROR,
     SESSION_KIND_IDLE,
     SESSION_KIND_RESULT,
+    SESSION_PERSISTENCE_FORMAT_VERSION,
     SESSION_PROMPT_REASON,
     SESSION_PROMPT_YESNO,
     SESSION_USER_FEEDBACK_BODY,
-    SESSION_PERSISTENCE_FORMAT_VERSION,
     SIMULATION_CACHE_EXACT_FILENAMES,
     SIMULATION_CACHE_GLOB_PATTERNS,
     SUSPEND_ID_TO_SESSION_KIND,
@@ -156,32 +156,32 @@ from ._core_utils import (
     llm_turn_audit_details,
     llm_turn_cost_diagnostic,
     load_runtime_config,
+    manifest_matches_schema,
     normalize_question,
     note_interactive_turn,
     notify,
     permission_denied_detail_logging_enabled,
     pop_ask_phase_callback,
     pop_engine_identity,
+    pop_session_turn_cancel,
     print_rephrase_hint,
     progress,
     prompt,
-    pop_session_turn_cancel,
     push_ask_phase_callback,
     push_engine_identity,
     push_session_turn_cancel,
     read_artifact_manifest,
-    session_turn_cancelled,
     reconcile_execute_bind_params,
     register_structural_migration_handler,
     reset_diagnostic_collector,
     reset_turn_llm_scope,
+    session_turn_cancelled,
     set_diagnostic_collector,
     set_turn_llm_scope,
     snapshot_llm_usage_records,
     take_and_clear_orphan_diagnostics,
     terminated,
     try_rename_migration_plan,
-    manifest_matches_schema,
     wipe_filenames,
     wipe_globs,
     wipe_versioned_artifacts,
@@ -301,13 +301,13 @@ from ._federation import (
     detect_federation_topology_change,
     export_federation_migration_map_skeleton,
     federation_artifact_paths,
+    federation_composite_migration_tier,
     federation_ineligible_answerable_hint,
     federation_plan_combine_hash,
     federation_plan_matches_template,
     federation_plan_residual_hash,
     federation_plan_step_fingerprints,
     federation_plan_topology_identity,
-    federation_composite_migration_tier,
     federation_residual_column_headers,
     federation_source_artifacts_dir,
     federation_user_facing_error_message,
@@ -326,15 +326,15 @@ from ._federation import (
     probe_federation_member_liveness,
     prune_cross_source_joins,
     prune_federation_aliases,
-    prune_federation_plan_templates_on_drift,
     prune_federation_mappings,
+    prune_federation_plan_templates_on_drift,
     qsim_intent_eligible_on_federation,
+    raise_if_descriptions_name_federation_sources,
+    raise_if_member_notes_name_federation_sources,
     reconcile_authored_declaration_for_members,
     reconcile_federation_member_graphs,
     reconcile_federation_topology,
     recorded_federation_source_ids,
-    raise_if_descriptions_name_federation_sources,
-    raise_if_member_notes_name_federation_sources,
     resolve_anchored_temporal_bind,
     resolve_federated_combine,
     resolve_federated_member_schema,
@@ -384,12 +384,11 @@ from ._pipeline import (
     stamp_sql_shape,
     try_federation_plan_intake_reuse,
 )
+from ._qsim import generate_all_intents, generate_all_questions, instantiate_all
 from ._refusal_diagnostics import (
     emit_session_refusal_diagnostic,
     refusal_diagnostic_code_for_federation_reason,
 )
-from ._qsim import instantiate_all
-from ._qsim import generate_all_intents, generate_all_questions
 from ._schema_catalog import emit_description_enrichment_failed, emit_description_enrichment_noop, llm_classify_schema
 from ._schema_graph import (
     assign_schema_graph_hashes,
@@ -404,7 +403,6 @@ from ._schema_graph import (
     validate_scope_against_graph,
 )
 from ._schema_overrides import apply_overrides_and_persist, build_schema_graph_with_diff, finalize_with_overrides
-from ._validation_execute import execute_guarded_sql, validate_sql
 from ._seed_warmup import (
     accepted_template_instance_keys,
     get_next_seed_warmup_version,
@@ -458,6 +456,7 @@ from ._utils import (
     zero_row_where_remediation_candidates,
     zero_row_where_suggestions,
 )
+from ._validation_execute import execute_guarded_sql, validate_sql
 
 
 def _sanitize_tenant_slug(tenant_slug: str) -> str:
@@ -6314,7 +6313,7 @@ def _notify_schema_context_warnings(schema_context: EngineContext, sink: Callabl
 def _upload_validation_config_error(message: str, data_quality_report: object) -> ConfigError:
     """Attach upload validation context to a configuration error."""
     exc = ConfigError(message)
-    setattr(exc, "data_quality_report", data_quality_report)
+    exc.data_quality_report = data_quality_report
     return exc
 
 
@@ -6816,7 +6815,7 @@ def initialize_aether_federation(
         [binding.source_id for binding in fed_manifest.sources],
     )
     source_ids = [binding.source_id for binding in fed_manifest.sources]
-    for source_id, member_engine in member_dict.items():
+    for _, member_engine in member_dict.items():
         member_ctx = EngineContext()
         runtime_cfg = getattr(member_engine, "_runtime_config", None)
         ctx = getattr(runtime_cfg, "engine_context", None) if runtime_cfg is not None else None

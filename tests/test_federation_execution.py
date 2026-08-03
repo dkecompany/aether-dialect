@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -44,7 +44,9 @@ def _two_source_manifest() -> dict:
             {"source_id": "b", "engine": "postgresql", "role": "owner"},
         ],
         "table_namespace": {"left_t": "a", "right_t": "b"},
-        "cross_source_joins": [{"left": "left_t.name", "right": "right_t.name", "kind": "inner", "logical_key": "name"}],
+        "cross_source_joins": [
+            {"left": "left_t.name", "right": "right_t.name", "kind": "inner", "logical_key": "name"}
+        ],
     }
 
 
@@ -163,7 +165,9 @@ def test_federation_plan_fingerprint_embeds_member_cost_cap() -> None:
                 {"source_id": "b", "engine": "duckdb", "role": "owner"},
             ],
             "table_namespace": {"left_t": "a", "right_t": "b"},
-            "cross_source_joins": [{"left": "left_t.name", "right": "right_t.name", "kind": "inner", "logical_key": "name"}],
+            "cross_source_joins": [
+                {"left": "left_t.name", "right": "right_t.name", "kind": "inner", "logical_key": "name"}
+            ],
             "coordinator": {"default_source_row_cap": 2000, "default_source_timeout_ms": 9000},
         },
         include_derived_roster=True,

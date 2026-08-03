@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import aetherdialect._core_utils
 import copy
 import gzip
 import hashlib
@@ -19,6 +18,8 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, cast
+
+import aetherdialect._core_utils
 
 from ._config import EngineConfig, PolicyConfig, SeedWarmupConfig, llm_credentials_configured
 from ._constants import (
@@ -73,7 +74,6 @@ from ._contracts_base import (
 from ._contracts_core import (
     ConcreteCteStep,
     ConcreteIntent,
-    concrete_intent_to_runtime_skeleton,
     FeedbackCounts,
     FeedbackKind,
     GenerationPath,
@@ -82,10 +82,9 @@ from ._contracts_core import (
     RejectionBucket,
     RuntimeIntent,
     SeedWarmupIntent,
-    SelectCol,
-    OrderByCol,
     Template,
     ValueHistory,
+    concrete_intent_to_runtime_skeleton,
     runtime_intent_to_concrete,
 )
 from ._contracts_schema import SchemaDiff, SchemaGraph, TableDiff, TemplateStats
@@ -109,16 +108,13 @@ from ._core_utils import (
     write_gzip_json_atomic,
 )
 from ._dialect import active_sqlglot_dialect, compute_sql_fp, parameter_abstract, sqlglot_dialect_for_engine
-from ._sql_gen import build_display_sql
 from ._federation import federation_artifact_manifest_view, member_feedback_q_norm
-from ._schema_graph import classify_migration_tier
 from ._intent_expr import collect_intent_referenced_param_keys, register_templates_module, replace_refs_in_expr
 from ._intent_resolve import (
     collect_column_refs_for_cte_step,
     collect_column_refs_for_post_processing,
     compute_intent_union,
     join_path_key_concrete,
-    join_path_key_runtime,
     join_path_segments_fingerprint_concrete,
     join_path_segments_fingerprint_runtime,
 )
@@ -126,12 +122,13 @@ from ._llm_provider import current_sandbox_runtime, llm_chat
 from ._schema_graph import (
     apply_fk_remaps_to_graph,
     apply_pk_remaps_to_graph,
+    classify_migration_tier,
     load_schema_graph_snapshot,
     schema_diff_cross_table_limitation_note,
     schema_diff_is_additive_only,
 )
 from ._schema_overrides import destructive_migration_execute, migrate_sidecar_for_diff, reconcile_sidecar_against_graph
-from ._sql_gen import canonicalize_stored_join_path_signature, generate_col_alias
+from ._sql_gen import build_display_sql, canonicalize_stored_join_path_signature, generate_col_alias
 from ._utils import (
     body_similarity_key_for_concrete,
     build_shape_question_index,
@@ -1579,7 +1576,9 @@ def _remap_concrete_clause_fields(
     having,
     replacer,
 ):
-    remap_expr = lambda expr: replace_refs_in_expr(expr, replacer)
+    def remap_expr(expr):
+        return replace_refs_in_expr(expr, replacer)
+
     remap_where = map_predicate_group(
         where,
         lambda fp: replace(

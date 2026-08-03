@@ -10,12 +10,12 @@ from unittest.mock import patch
 
 import pytest
 
+from aetherdialect._config import EngineConfig
 from aetherdialect._constants import MIGRATION_MAP_ACTION_REMAP
 from aetherdialect._contracts_base import ColumnRole, MigrationTier, SchemaMigrationMap, SchemaMigrationMapEntry
 from aetherdialect._contracts_core import ConcreteIntent, NormalizedExpr, SelectCol, Template, ValueHistory
 from aetherdialect._contracts_schema import (
     ColumnMetadata,
-    FKEdge,
     SchemaDiff,
     SchemaGraph,
     SQLShape,
@@ -23,10 +23,8 @@ from aetherdialect._contracts_schema import (
     TableMetadata,
     TemplateStats,
 )
-from aetherdialect._config import EngineConfig
 from aetherdialect._core_utils import write_artifact_manifest
 from aetherdialect._templates import (
-    _load_partitioned_view_unlocked,
     apply_schema_migration_map,
     empty_template_store,
     export_schema_migration_map_skeleton,

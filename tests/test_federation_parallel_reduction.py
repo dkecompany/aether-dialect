@@ -2,23 +2,21 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 from unittest.mock import MagicMock
 
-import pandas as pd
 import pytest
 
+from aetherdialect._contracts_base import NormalizedExpr
 from aetherdialect._contracts_core import (
-    FederationReducingEdge,
     FederatedPlan,
     FederatedPreparedStep,
     FederatedStage,
+    FederationReducingEdge,
     JoinSpec,
     RuntimeIntent,
     SelectCol,
     SourceStep,
 )
-from aetherdialect._contracts_base import NormalizedExpr
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._federation import (
     compose_composite_graph,

@@ -6,7 +6,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aetherdialect import AetherFederation
 from aetherdialect._constants import PERMISSION_DENIED_USER_MESSAGE, TABLE_PREVIEW_MAX_LIMIT
 from aetherdialect._contracts_base import (
     AccessError,

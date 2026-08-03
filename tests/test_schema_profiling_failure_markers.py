@@ -6,7 +6,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from aetherdialect._config import PolicyConfig
 from aetherdialect._constants import (
     DIAGNOSTIC_CODE_COLUMN_PROFILE_FAILED,
     DIAGNOSTIC_CODE_COMPOSITE_DESCRIPTIVE_PROFILE_FAILED,
@@ -25,7 +24,6 @@ from aetherdialect._schema_catalog import (
     _build_minmax_sql,
     _build_mode_sql,
     _maybe_set_profile_statement_timeout,
-    _profile_column,
     _profile_composite_descriptive,
     _profile_table,
     apply_catalog_descriptions_from_tables_meta,

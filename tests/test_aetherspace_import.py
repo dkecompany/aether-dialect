@@ -37,7 +37,9 @@ def _table(name: str, *, columns: dict[str, ColumnMetadata] | None = None) -> Ta
 def _sample_schema() -> SchemaGraph:
     return SchemaGraph(
         tables={
-            "film": _table("film", columns={"film_id": _column("film_id"), "title": _column("title", data_type="text")}),
+            "film": _table(
+                "film", columns={"film_id": _column("film_id"), "title": _column("title", data_type="text")}
+            ),
             "customer": _table("customer"),
         },
         join_paths_multi={},

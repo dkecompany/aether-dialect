@@ -210,7 +210,6 @@ def _sandbox_bundle_ready() -> bool:
 @pytest.fixture(autouse=True)
 def _cleanup_cwd_schema_migration_map() -> Any:
     """Remove migration map files left in the repo cwd by ``apply_migration_map`` demos."""
-
     cwd = Path.cwd()
     paths = (
         cwd / "schema_migration_map.json",
