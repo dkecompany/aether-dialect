@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-import re
 from pathlib import Path
 
 import pytest
@@ -13,9 +12,6 @@ from aetherdialect._constants import SOFT_DIAGNOSTIC_CODES
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SRC_ROOT = _REPO_ROOT / "src" / "aetherdialect"
-_TROUBLESHOOTING = _REPO_ROOT / "docs" / "TROUBLESHOOTING.md"
-_SESSION_CODE_RE = re.compile(r"\| `([^`]+)` \|")
-_PIPELINE_TRACE_SECTION = "## Pipeline trace markers"
 
 
 def _diagnostic_constant_map() -> dict[str, str]:
@@ -171,21 +167,6 @@ def declared_session_diagnostic_codes() -> set[str]:
     return set(_diagnostic_constant_map().values())
 
 
-def parse_documented_session_diagnostic_codes() -> set[str]:
-    text = _TROUBLESHOOTING.read_text(encoding="utf-8")
-    body, _, _tail = text.partition(_PIPELINE_TRACE_SECTION)
-    codes = set(_SESSION_CODE_RE.findall(body))
-    return {code for code in codes if code}
-
-
-def parse_documented_pipeline_trace_markers() -> set[str]:
-    text = _TROUBLESHOOTING.read_text(encoding="utf-8")
-    if _PIPELINE_TRACE_SECTION not in text:
-        return set()
-    tail = text.split(_PIPELINE_TRACE_SECTION, 1)[1]
-    return set(_SESSION_CODE_RE.findall(tail))
-
-
 def federation_attribution_gaps() -> list[str]:
     const_map = _diagnostic_constant_map()
     visitor = _DiagnosticEmissionVisitor(const_map)
@@ -193,26 +174,6 @@ def federation_attribution_gaps() -> list[str]:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         visitor.visit(tree)
     return visitor.federation_attribution_gaps
-
-
-@pytest.mark.fast
-def test_session_diagnostic_catalogue_matches_emitted_set() -> None:
-    emitted = discover_emitted_session_diagnostic_codes()
-    documented = parse_documented_session_diagnostic_codes()
-    assert emitted == documented, (
-        f"missing from docs: {sorted(emitted - documented)}; documented but not emitted: {sorted(documented - emitted)}"
-    )
-
-
-@pytest.mark.fast
-def test_pipeline_trace_markers_are_documented_separately() -> None:
-    documented = parse_documented_pipeline_trace_markers()
-    assert documented == {
-        "ENUM_PROMPT_TRUNCATED",
-        "FEDERATION_JOIN_CANDIDATE_CAP",
-        "FEDERATION_MAPPING_DRIFT",
-        "JOIN_CANDIDATE_CAP",
-    }
 
 
 @pytest.mark.fast
@@ -230,15 +191,12 @@ def test_federation_diagnostics_carry_source_id_and_phase() -> None:
 
 
 @pytest.mark.fast
-def test_refusal_diagnostic_codes_are_declared_emitted_and_documented() -> None:
+def test_refusal_diagnostic_codes_are_declared_and_emitted() -> None:
     from aetherdialect._refusal_diagnostics import REFUSAL_DIAGNOSTIC_CODES
 
     declared = declared_session_diagnostic_codes()
     emitted = discover_emitted_session_diagnostic_codes()
-    documented = parse_documented_session_diagnostic_codes()
     missing_declared = sorted(REFUSAL_DIAGNOSTIC_CODES - declared)
     missing_emitted = sorted(REFUSAL_DIAGNOSTIC_CODES - emitted)
-    missing_docs = sorted(REFUSAL_DIAGNOSTIC_CODES - documented)
     assert not missing_declared, f"refusal codes missing from constants: {missing_declared}"
     assert not missing_emitted, f"refusal codes never emitted: {missing_emitted}"
-    assert not missing_docs, f"refusal codes missing from TROUBLESHOOTING.md: {missing_docs}"

@@ -1,5 +1,4 @@
-"""Cross-surface coverage for IR capabilities added in Part B."""
-
+"""Cross-surface coverage for IR capabilities."""
 from typing import cast
 
 from sqlglot import exp, parse_one

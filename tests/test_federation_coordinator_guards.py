@@ -111,7 +111,7 @@ def _three_member_star_manifest() -> object:
     )
 
 
-# --- A3: coordinator combine fan-out ---
+# --- Coordinator combine fan-out ---
 
 
 @pytest.mark.fast
@@ -273,7 +273,7 @@ def test_residual_aggregate_sum_join_fan_out_refuses() -> None:
     assert exc_info.value.phase == "coordinator"
 
 
-# --- A4: cross-source key uniqueness ---
+# --- Cross-source key uniqueness ---
 
 
 @pytest.mark.fast
@@ -442,7 +442,7 @@ def test_join_key_clique_non_unique_endpoint_refuses_at_declaration() -> None:
     assert "not unique" in message
 
 
-# --- A5: union member disjointness ---
+# --- Union member disjointness ---
 
 
 def _union_members_and_mappings(
@@ -525,7 +525,7 @@ def test_union_row_count_sums_disjoint_members() -> None:
     assert payment.row_count == 4
 
 
-# --- A6: disagreeing primary keys ---
+# --- Disagreeing primary keys ---
 
 
 def _entity_graph(table: str, *, source_id: str, primary_key: list[str]) -> SchemaGraph:

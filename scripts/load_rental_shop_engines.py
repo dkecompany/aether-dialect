@@ -1644,6 +1644,19 @@ def _partition_table_order(partition: frozenset[str]) -> list[str]:
     return [table for table in _TABLE_ORDER if table in partition]
 
 
+def _apply_federation_column_projection(
+    frame: pd.DataFrame,
+    table: str,
+    projections: dict[str, frozenset[str]],
+) -> pd.DataFrame:
+    """Drop CSV columns outside the federation declaration projection for *table*."""
+    column_projection = projections.get(table)
+    if not column_projection:
+        return frame
+    keep = [col for col in frame.columns if col in column_projection]
+    return frame.loc[:, keep]
+
+
 def _filter_payment_frame(frame: pd.DataFrame, *, source_id: str, csv_dir: Path) -> pd.DataFrame:
     from sandbox_corpus import PAYMENT_UNION_SPLIT_STORE_THRESHOLD, payment_store_id_by_rental_id
 
@@ -1725,6 +1738,9 @@ def _load_federation_postgresql_partition(args: argparse.Namespace, *, source_id
         if pk_cols:
             cols = ", ".join(pk_cols)
             cur.execute(f"ALTER TABLE {schema}.{name} ADD CONSTRAINT {name}_pkey PRIMARY KEY ({cols})")
+    from sandbox_corpus import federation_member_column_projections
+
+    column_projections = federation_member_column_projections(source_id)
     for name, _, _ in parsed:
         csv_path = args.csv_dir / f"{name}.csv"
         if not csv_path.is_file():
@@ -1732,6 +1748,7 @@ def _load_federation_postgresql_partition(args: argparse.Namespace, *, source_id
         frame = pd.read_csv(csv_path)
         if name == "payment":
             frame = _filter_payment_frame(frame, source_id=source_id, csv_dir=args.csv_dir)
+        frame = _apply_federation_column_projection(frame, name, column_projections)
         frame = _prepare_dataframe("postgresql", name, frame)
         fq = f"{schema}.{name}"
         copy_sql = f"COPY {fq} FROM STDIN WITH (FORMAT csv, HEADER true, NULL '')"
@@ -1800,6 +1817,9 @@ def _load_federation_mysql_partition(
                 pk_stmt = translate_alter_pk(engine_name, table, schema, pk_cols)
                 if pk_stmt:
                     conn.execute(text(pk_stmt))
+        from sandbox_corpus import federation_member_column_projections
+
+        column_projections = federation_member_column_projections(source_id)
         for table in _partition_table_order(partition):
             csv_path = args.csv_dir / f"{table}.csv"
             if not csv_path.is_file():
@@ -1807,13 +1827,7 @@ def _load_federation_mysql_partition(
             frame = pd.read_csv(csv_path)
             if table == "payment":
                 frame = _filter_payment_frame(frame, source_id=source_id, csv_dir=args.csv_dir)
-            from sandbox_corpus import federation_member_column_projections
-
-            projections = federation_member_column_projections(source_id)
-            column_projection = projections.get(table)
-            if column_projection:
-                keep = [col for col in frame.columns if col in column_projection]
-                frame = frame.loc[:, keep]
+            frame = _apply_federation_column_projection(frame, table, column_projections)
             frame = _prepare_dataframe(engine_name, table, frame)
             frame.to_sql(table, conn, if_exists="append", index=False, method="multi", chunksize=500)
             _log_load_table(engine_name, table, len(frame))

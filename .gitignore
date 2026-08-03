@@ -39,6 +39,7 @@ dmypy.json
 site/
 
 # scripts/ generated data (private dev pipeline)
+# Federation partition seeds and federation_partition.json are committed artifacts (see scripts/README.md).
 scripts/data/rental_shop_csvs/
 scripts/data/rental_shop.zip
 scripts/data/_llm_cache/

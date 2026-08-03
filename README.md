@@ -85,11 +85,6 @@ No warehouse or LLM keys yet? [Sandbox guide](https://github.com/dkecompany/aeth
 | [Security](https://github.com/dkecompany/aether-dialect/blob/main/docs/SECURITY.md) | Threat model, LLM disclosure inventory, sensitivity tiers, deny lists. |
 | [Support matrix](https://github.com/dkecompany/aether-dialect/blob/main/docs/SUPPORT_MATRIX.md) | Per-engine capabilities, IR-unsupported constructs, dialect notes. |
 
-## See also
-
-- [Troubleshooting](https://github.com/dkecompany/aether-dialect/blob/main/docs/TROUBLESHOOTING.md) — session diagnostic codes and pipeline trace markers.
-- [Changelog](CHANGELOG.md) — release notes for the current package version.
-
 ## License
 
 See [LICENSE](https://github.com/dkecompany/aether-dialect/blob/main/LICENSE).

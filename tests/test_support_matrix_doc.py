@@ -67,7 +67,7 @@ def _legend_section(text: str) -> str:
 
 
 @pytest.mark.fast
-def test_support_matrix_s1_no_internal_representation_column() -> None:
+def test_support_matrix_no_internal_representation_column() -> None:
     """Supported constructs are user-facing; no internal representation column or field names."""
     text = _matrix_text()
     supported = _section_between(text, "## Supported intent constructs", "## Refused")
@@ -77,13 +77,13 @@ def test_support_matrix_s1_no_internal_representation_column() -> None:
 
 
 @pytest.mark.fast
-def test_support_matrix_s1_no_preserve_tables() -> None:
+def test_support_matrix_no_preserve_tables() -> None:
     """preserve_tables is internal and must not appear anywhere in the document."""
     assert "preserve_tables" not in _matrix_text()
 
 
 @pytest.mark.fast
-def test_support_matrix_s1_no_ordinary_sql_capability_rows() -> None:
+def test_support_matrix_no_ordinary_sql_capability_rows() -> None:
     """Ordinary SQL render paths are not listed as special capabilities."""
     supported = _section_between(
         _matrix_text(),
@@ -95,7 +95,7 @@ def test_support_matrix_s1_no_ordinary_sql_capability_rows() -> None:
 
 
 @pytest.mark.fast
-def test_support_matrix_s1_refused_constructs_listed_once() -> None:
+def test_support_matrix_refused_constructs_listed_once() -> None:
     """Refused constructs appear in one canonical section, not repeated across the document."""
     text = _matrix_text()
     present = [heading for heading in _REFUSED_CONSTRUCT_HEADINGS if heading in text]
@@ -105,7 +105,7 @@ def test_support_matrix_s1_refused_constructs_listed_once() -> None:
 
 
 @pytest.mark.fast
-def test_support_matrix_s2_no_internal_vocabulary() -> None:
+def test_support_matrix_no_internal_vocabulary() -> None:
     """Dialect notes and guidance avoid internal profiling names and configuration constants."""
     text = _matrix_text()
     found = [term for term in _INTERNAL_VOCAB_TERMS if term in text]
@@ -113,7 +113,7 @@ def test_support_matrix_s2_no_internal_vocabulary() -> None:
 
 
 @pytest.mark.fast
-def test_support_matrix_s2_self_comparison_user_guidance() -> None:
+def test_support_matrix_self_comparison_user_guidance() -> None:
     """Self-comparison and cross-table range guidance is one user-facing sentence."""
     text = _matrix_text()
     lowered = text.lower()
@@ -139,7 +139,7 @@ def test_support_matrix_s2_self_comparison_user_guidance() -> None:
 
 
 @pytest.mark.fast
-def test_support_matrix_s3_legend_immediately_before_engine_capabilities() -> None:
+def test_support_matrix_legend_immediately_before_engine_capabilities() -> None:
     """Legend explains engine-capability table vocabulary and sits directly above that table."""
     text = _matrix_text()
     legend_pos = text.index("## Legend")
@@ -152,7 +152,7 @@ def test_support_matrix_s3_legend_immediately_before_engine_capabilities() -> No
 
 
 @pytest.mark.fast
-def test_support_matrix_s3_legend_matches_engine_capability_cells() -> None:
+def test_support_matrix_legend_matches_engine_capability_cells() -> None:
     """Every legend vocabulary item appears in the table; every distinct cell form is defined."""
     text = _matrix_text()
     table = _engine_capabilities_table(text)

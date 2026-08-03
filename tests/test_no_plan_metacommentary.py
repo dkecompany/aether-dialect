@@ -102,7 +102,7 @@ _DOMAIN_PHASE_ALLOWLIST = frozenset(
 )
 
 _PLAN_STYLE_TEST_FILE_RE = re.compile(
-    r"test_(?:federation_(?:plan_|generic_plan)|federation_p\d+)",
+    r"(?:test_(?:federation_(?:plan_|generic_plan)|federation_p\d+)|_[iltkjgp]\d+(?:_[iltkjgp]\d+)*(?:_|\.py$))",
     re.IGNORECASE,
 )
 
