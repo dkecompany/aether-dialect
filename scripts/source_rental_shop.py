@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -27,8 +28,10 @@ for path in (_SRC, _SCRIPTS):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from load_rental_shop_engines import DEFAULT_ENV_FILE, load_env_file
-from aetherdialect._config import DEFAULT_RANDOM_SEED
+_load_rental_shop_engines = importlib.import_module("load_rental_shop_engines")
+DEFAULT_ENV_FILE = _load_rental_shop_engines.DEFAULT_ENV_FILE
+load_env_file = _load_rental_shop_engines.load_env_file
+DEFAULT_RANDOM_SEED = importlib.import_module("aetherdialect._config").DEFAULT_RANDOM_SEED
 
 STORE_COUNT = 12
 STAFF_COUNT = 24
@@ -55,6 +58,7 @@ _FILM_LEXICON_COUNT = 1000
 _ACTOR_LEXICON_COUNT = 200
 _CUSTOMER_LEXICON_COUNT = 599
 _STAFF_NAME_COUNT = 24
+
 
 def _activity_as_of() -> datetime:
     override = os.environ.get("RENTAL_SHOP_AS_OF", "").strip()
@@ -185,9 +189,7 @@ def _synth_synthesize_geo_tables(
         lex = addr_lex[address_id - 1]
         city_id = str(lex["city_id"])
         if int(city_id) > CITY_COUNT:
-            raise SystemExit(
-                f"addresses.jsonl row {address_id}: city_id {city_id} exceeds CITY_COUNT={CITY_COUNT}"
-            )
+            raise SystemExit(f"addresses.jsonl row {address_id}: city_id {city_id} exceeds CITY_COUNT={CITY_COUNT}")
         district = str(lex.get("district") or "").strip()
         if not district:
             raise SystemExit(f"addresses.jsonl row {address_id}: missing district")
@@ -262,11 +264,7 @@ def _synth_synthesize_staff(
         name_row = staff_names[(staff_id - 1) % len(staff_names)]
         first = str(name_row["first_name"])
         last = str(name_row["last_name"])
-        email = (
-            ""
-            if staff_id in (23, 24)
-            else _synth_email_local(first, last, staff_id)
-        )
+        email = "" if staff_id in (23, 24) else _synth_email_local(first, last, staff_id)
         username = f"staff{staff_id:02d}"
         staff_rows.append(
             {
@@ -298,9 +296,7 @@ def _synth_rebalance_customers(
         cid = int(row["customer_id"])
         row = dict(row)
         row["store_id"] = str(_synth_spread_fk(cid, store_count, "customer_store"))
-        row["create_date"] = _synth_fmt_date(
-            ACTIVITY_START + timedelta(days=_digest(cid, "create") % 540)
-        )
+        row["create_date"] = _synth_fmt_date(ACTIVITY_START + timedelta(days=_digest(cid, "create") % 540))
         row["last_update"] = _synth_activity_timestamp("customer", cid)
         out.append(row)
     return out
@@ -415,9 +411,7 @@ def _log_progress(message: str) -> None:
     print(message, flush=True)
 
 
-DEFAULT_BUNDLE_URL = (
-    "https://stdialectsampledata.blob.core.windows.net/aether-dialect-sample-data/rental_shop.zip"
-)
+DEFAULT_BUNDLE_URL = "https://stdialectsampledata.blob.core.windows.net/aether-dialect-sample-data/rental_shop.zip"
 _TABLE_ORDER = (
     "actor",
     "category",
@@ -481,9 +475,7 @@ _EXTENSION_CATEGORY_NAMES: dict[str, str] = {
 }
 
 _LEXICONS = _DOWNLOADS / "_lexicons"
-_GAMES_CSV_URL = (
-    "https://zenodo.org/records/10262075/files/all_games_PC.csv?download=1"
-)
+_GAMES_CSV_URL = "https://zenodo.org/records/10262075/files/all_games_PC.csv?download=1"
 _OPEN_LIBRARY_SEARCH = "https://openlibrary.org/search.json?q=fiction&limit=500"
 
 INVENTORY_TARGET = 5031
@@ -698,10 +690,7 @@ def _bootstrap_lexicon_csv(name: str, fieldnames: list[str]) -> None:
     if not rows:
         return
     if name in ("category", "language"):
-        rows = [
-            {k: str(v) for k, v in row.items()}
-            for row in synth.stagger_last_updates(rows, fieldnames[0], name)
-        ]
+        rows = [{k: str(v) for k, v in row.items()} for row in synth.stagger_last_updates(rows, fieldnames[0], name)]
     _write_csv(name, fieldnames, rows)
 
 
@@ -709,10 +698,7 @@ def _bootstrap_film_csv_from_lexicon() -> None:
     path = OUT_DIR / "film.csv"
     if path.is_file() and _read_csv("film"):
         return
-    features = {
-        row["film_id"]: row.get("special_features") or ""
-        for row in _read_lexicon_jsonl("film_features.jsonl")
-    }
+    features = {row["film_id"]: row.get("special_features") or "" for row in _read_lexicon_jsonl("film_features.jsonl")}
     films: list[dict[str, str]] = []
     for row in _read_lexicon_jsonl("film.jsonl"):
         film_id = int(row["film_id"])
@@ -833,7 +819,7 @@ def enforce_inventory_rental_sequence(rentals: list[dict[str, str]]) -> list[dic
         start = _parse_ts(row["rental_date"])
         end = _parse_ts(row["return_date"]) if str(row.get("return_date") or "").strip() else None
         by_inventory.setdefault(inv, []).append((idx, start, end))
-    for inv, spans in by_inventory.items():
+    for _inv, spans in by_inventory.items():
         spans.sort(key=lambda t: t[1])
         prev_end: datetime | None = None
         for idx, start, end in spans:
@@ -985,9 +971,7 @@ def synthesize_rental_spine() -> None:
             {
                 "payment_id": str(len(payment_rows) + 1),
                 "rental_id": rental["rental_id"],
-                "amount": _money(
-                    Decimal("1.50") + Decimal(_digest(len(payment_rows), "extra") % 300) / Decimal("100")
-                ),
+                "amount": _money(Decimal("1.50") + Decimal(_digest(len(payment_rows), "extra") % 300) / Decimal("100")),
                 "payment_date": _fmt_ts(base + timedelta(hours=2 + _digest(len(payment_rows), "extra_pay") % 72)),
             }
         )
@@ -1015,9 +999,7 @@ def synthesize_rental_spine() -> None:
             if len(film_actor_rows) >= FILM_ACTOR_TARGET:
                 break
         if len(film_actor_rows) < FILM_ACTOR_TARGET:
-            raise SystemExit(
-                f"film_actor: only {len(film_actor_rows)} pairs available; need {FILM_ACTOR_TARGET}"
-            )
+            raise SystemExit(f"film_actor: only {len(film_actor_rows)} pairs available; need {FILM_ACTOR_TARGET}")
     _write_csv("film_actor", ["actor_id", "film_id", "last_update"], film_actor_rows[:FILM_ACTOR_TARGET])
     _log_progress(f"[spine] film_actor.csv written ({min(len(film_actor_rows), FILM_ACTOR_TARGET)} rows)")
 
@@ -1048,18 +1030,21 @@ def _bootstrap_spine_csvs() -> None:
     _bootstrap_lexicon_csv("language", ["language_id", "name", "last_update"])
     _bootstrap_lexicon_csv("actor", ["actor_id", "first_name", "last_name", "last_update"])
     _bootstrap_lexicon_csv("country", ["country_id", "country", "last_update"])
-    _bootstrap_lexicon_csv("customer", [
-        "customer_id",
-        "store_id",
-        "first_name",
-        "last_name",
-        "email",
-        "address_id",
-        "activebool",
-        "create_date",
-        "last_update",
-        "active",
-    ])
+    _bootstrap_lexicon_csv(
+        "customer",
+        [
+            "customer_id",
+            "store_id",
+            "first_name",
+            "last_name",
+            "email",
+            "address_id",
+            "activebool",
+            "create_date",
+            "last_update",
+            "active",
+        ],
+    )
     synthesize_rental_spine()
 
 
@@ -1689,9 +1674,7 @@ def generate_authors_publishers(
         )
     publisher_names = synth.load_publisher_names()
     if len(publisher_names) < 40:
-        raise SystemExit(
-            f"publisher list needs at least 40 names, got {len(publisher_names)}"
-        )
+        raise SystemExit(f"publisher list needs at least 40 names, got {len(publisher_names)}")
     publisher_rows: list[dict[str, object]] = []
     for publisher_id in range(1, 41):
         name = publisher_names[(publisher_id - 1) % len(publisher_names)]
@@ -1798,18 +1781,14 @@ def generate_books_games(
         return (
             _read_csv("book"),
             _read_csv("game"),
-            _read_csv("game_supported_language")
-            if (OUT_DIR / "game_supported_language.csv").is_file()
-            else [],
+            _read_csv("game_supported_language") if (OUT_DIR / "game_supported_language.csv").is_file() else [],
             [],
         )
-    item_rows = [
-        row for row in _read_csv("item") if row.get("item_type") == "film"
-    ]
+    item_rows = [row for row in _read_csv("item") if row.get("item_type") == "film"]
     book_category_ids = list(BOOK_CATEGORY_IDS)
     game_category_ids = list(GAME_CATEGORY_IDS)
     publisher_names = synth.load_publisher_names()
-    language_ids = [int(l["language_id"]) for l in languages]
+    language_ids = [int(lang["language_id"]) for lang in languages]
     book_subtype_rows: list[dict[str, object]] = []
     game_subtype_rows: list[dict[str, object]] = []
     game_lang_rows: list[dict[str, object]] = []
@@ -1831,9 +1810,7 @@ def generate_books_games(
                 "language_id": language_ids[_digest(item_id, "lang") % len(language_ids)],
                 "rental_duration": 7,
                 "rental_rate": _money(rate),
-                "replacement_cost": _money(
-                    Decimal("12.99") + (_digest(item_id, "rc") % 800) / Decimal("100")
-                ),
+                "replacement_cost": _money(Decimal("12.99") + (_digest(item_id, "rc") % 800) / Decimal("100")),
                 "last_update": synth.activity_timestamp("book_item", item_id),
             }
         )
@@ -1870,9 +1847,7 @@ def generate_books_games(
                 "language_id": language_ids[_digest(item_id, "glang") % len(language_ids)],
                 "rental_duration": 5,
                 "rental_rate": _money(rate),
-                "replacement_cost": _money(
-                    Decimal("24.99") + (_digest(item_id, "grc") % 1500) / Decimal("100")
-                ),
+                "replacement_cost": _money(Decimal("24.99") + (_digest(item_id, "grc") % 1500) / Decimal("100")),
                 "last_update": synth.activity_timestamp("game_item", item_id),
             }
         )
@@ -2087,20 +2062,10 @@ def apply_benchmark_patterns(
     deliveries: list[dict[str, object]] | None = None,
 ) -> tuple[list[dict[str, str]], list[dict[str, str]], set[str]]:
     no_rental_ids = _no_rental_inventory_ids(inventory)
-    rentals = [
-        r for r in rentals if r["inventory_id"] not in no_rental_ids
-    ]
+    rentals = [r for r in rentals if r["inventory_id"] not in no_rental_ids]
     target_open = int(round(len(rentals) * float(OPEN_RENTAL_RATE)))
-    open_indices = [
-        i
-        for i, r in enumerate(rentals)
-        if not str(r.get("return_date") or "").strip()
-    ]
-    closed_indices = [
-        i
-        for i, r in enumerate(rentals)
-        if str(r.get("return_date") or "").strip()
-    ]
+    open_indices = [i for i, r in enumerate(rentals) if not str(r.get("return_date") or "").strip()]
+    closed_indices = [i for i, r in enumerate(rentals) if str(r.get("return_date") or "").strip()]
     if len(open_indices) < target_open:
         need = target_open - len(open_indices)
         for idx in sorted(closed_indices, key=lambda i: _digest(i, "open"))[:need]:
@@ -2111,7 +2076,6 @@ def apply_benchmark_patterns(
         if (OUT_DIR / "item.csv").is_file():
             items_by_id = {int(r["item_id"]): r for r in _read_csv("item")}
         inv_to_item = {r["inventory_id"]: int(r["item_id"]) for r in _read_csv("inventory")}
-        films_by_item = {int(r["item_id"]): r for r in _read_csv("film")} if (OUT_DIR / "film.csv").is_file() else {}
         for idx in sorted(open_indices, key=lambda i: _digest(i, "close"))[:excess]:
             rental_date = _parse_ts(rentals[idx]["rental_date"])
             item_id = inv_to_item.get(rentals[idx]["inventory_id"])
@@ -2123,9 +2087,7 @@ def apply_benchmark_patterns(
                     duration = max(1, int(raw))
                 except ValueError:
                     duration = 3
-            rentals[idx]["return_date"] = _fmt_ts(
-                min(rental_date + timedelta(days=duration), _activity_as_of())
-            )
+            rentals[idx]["return_date"] = _fmt_ts(min(rental_date + timedelta(days=duration), _activity_as_of()))
     _write_csv(
         "rental",
         [
@@ -2142,9 +2104,7 @@ def apply_benchmark_patterns(
     rentals = enforce_return_dates_at_anchor(rentals)
     if deliveries is not None:
         target_failed = int(round(len(deliveries) * float(FAILED_DELIVERY_RATE)))
-        for _i, row in enumerate(
-            sorted(range(len(deliveries)), key=lambda j: _digest(j, "fail"))[:target_failed]
-        ):
+        for _i, row in enumerate(sorted(range(len(deliveries)), key=lambda j: _digest(j, "fail"))[:target_failed]):
             deliveries[row]["status"] = "failed"
             deliveries[row]["delivered_at"] = ""
         _write_csv(
@@ -2237,14 +2197,13 @@ def generate_warehouses(addresses: list[dict[str, str]]) -> list[dict[str, objec
 
 
 def generate_promotions() -> list[dict[str, object]]:
-    promo_names = [_lexicon_field(row, "promo_name") for row in _require_lexicon(
-        "promotion_names.jsonl", min_rows=25, fields=("promo_name",)
-    )]
+    promo_names = [
+        _lexicon_field(row, "promo_name")
+        for row in _require_lexicon("promotion_names.jsonl", min_rows=25, fields=("promo_name",))
+    ]
     rows: list[dict[str, object]] = []
     for promotion_id in range(1, 26):
-        start = synth.ACTIVITY_START + timedelta(
-            days=_digest("promo", promotion_id) % 800
-        )
+        start = synth.ACTIVITY_START + timedelta(days=_digest("promo", promotion_id) % 800)
         end = start + timedelta(days=30 + (_digest(promotion_id) % 60))
         promo_type = _pick(PROMO_TYPES, promotion_id)
         rows.append(
@@ -2252,9 +2211,7 @@ def generate_promotions() -> list[dict[str, object]]:
                 "promotion_id": promotion_id,
                 "promo_name": promo_names[(promotion_id - 1) % len(promo_names)],
                 "promo_type": promo_type,
-                "discount_pct": _money(
-                    _sample_bounded_decimal(Decimal("5"), Decimal("50"), promotion_id, "disc")
-                ),
+                "discount_pct": _money(_sample_bounded_decimal(Decimal("5"), Decimal("50"), promotion_id, "disc")),
                 "start_date": _fmt_date(start),
                 "end_date": _fmt_date(end),
                 "is_active": "t" if promotion_id % 7 else "f",
@@ -2312,9 +2269,7 @@ def generate_deliveries(
                 "dispatched_at": dispatched_at,
                 "delivered_at": delivered_at,
                 "status": status,
-                "delivery_fee": _money(
-                    _sample_bounded_decimal(Decimal("2"), Decimal("25"), rental_id, "fee")
-                ),
+                "delivery_fee": _money(_sample_bounded_decimal(Decimal("2"), Decimal("25"), rental_id, "fee")),
                 "tracking_number": f"TRK{rental_id:08d}",
                 "last_update": _fmt_ts(dispatched),
             }
@@ -2372,9 +2327,7 @@ def generate_purchase_orders(
                     "po_id": po_id,
                     "item_id": item["item_id"],
                     "quantity": _sample_bounded_int(1, 50, line_id),
-                    "unit_cost": _money(
-                        _sample_bounded_decimal(Decimal("5"), Decimal("500"), line_id, "cost")
-                    ),
+                    "unit_cost": _money(_sample_bounded_decimal(Decimal("5"), Decimal("500"), line_id, "cost")),
                     "last_update": _fmt_ts(ordered),
                 }
             )
@@ -2397,17 +2350,13 @@ def generate_stock_transfers(
 ) -> None:
     rows: list[dict[str, object]] = []
     for transfer_id in range(1, 201):
-        transferred = synth.ACTIVITY_START + timedelta(
-            seconds=_digest("xfer", transfer_id) % (4 * 365 * 86400)
-        )
+        transferred = synth.ACTIVITY_START + timedelta(seconds=_digest("xfer", transfer_id) % (4 * 365 * 86400))
         item = items[_digest(transfer_id) % len(items)]
         rows.append(
             {
                 "transfer_id": transfer_id,
                 "item_id": item["item_id"],
-                "from_warehouse_id": warehouses[_digest(transfer_id, "wh") % len(warehouses)][
-                    "warehouse_id"
-                ],
+                "from_warehouse_id": warehouses[_digest(transfer_id, "wh") % len(warehouses)]["warehouse_id"],
                 "to_store_id": 1 + (_digest(transfer_id, "ts") % 2),
                 "quantity": _sample_bounded_int(1, 100, transfer_id, "qty"),
                 "transferred_at": _fmt_ts(transferred),
@@ -2449,9 +2398,7 @@ def generate_promotion_redemptions(
                 "redemption_id": redemption_id,
                 "promotion_id": promo_id,
                 "rental_id": rental_id,
-                "discount_amount": _money(
-                    _sample_bounded_decimal(Decimal("1"), Decimal("30"), rental_id, "disc")
-                ),
+                "discount_amount": _money(_sample_bounded_decimal(Decimal("1"), Decimal("30"), rental_id, "disc")),
                 "redeemed_at": _fmt_ts(rental_date + timedelta(days=_digest(rental_id, "redeem") % 7)),
                 "last_update": _fmt_ts(rental_date),
             }
@@ -2485,9 +2432,7 @@ def generate_inventory_status_history(
         history_rentals = rented_inv.get(inv_id, [])
         if not history_rentals and _digest(inv_id, "ish") % 4 != 0:
             continue
-        changed = synth.ACTIVITY_START + timedelta(
-            days=_digest(inv_id, "ish0") % 900
-        )
+        changed = synth.ACTIVITY_START + timedelta(days=_digest(inv_id, "ish0") % 900)
         rows.append(
             {
                 "status_id": status_id,
@@ -2555,9 +2500,7 @@ def generate_damage_reports(
                 "inventory_id": int(rental["inventory_id"]),
                 "reported_by_staff_id": int(rental["staff_id"]),
                 "severity": _pick(DAMAGE_SEVERITIES, rental_id, "sev"),
-                "repair_cost": _money(
-                    _sample_bounded_decimal(Decimal("10"), Decimal("500"), rental_id, "cost")
-                ),
+                "repair_cost": _money(_sample_bounded_decimal(Decimal("10"), Decimal("500"), rental_id, "cost")),
                 "reported_at": _fmt_ts(reported),
                 "last_update": _fmt_ts(reported),
             }
@@ -2609,9 +2552,7 @@ def generate_reservations(
         if status == "fulfilled":
             cust_rentals = rental_by_customer.get(str(customer_id), [])
             if cust_rentals:
-                fulfilled_rental_id = _csv_int(
-                    sorted(cust_rentals, key=lambda r: r["rental_date"])[0]["rental_id"]
-                )
+                fulfilled_rental_id = _csv_int(sorted(cust_rentals, key=lambda r: r["rental_date"])[0]["rental_id"])
             else:
                 status = "expired"
         rows.append(
@@ -2654,9 +2595,7 @@ def remove_obsolete_csvs() -> None:
 
 def _load_fk_rules() -> list[tuple[str, str, str, str]]:
     ddl = _DDL_PATH.read_text(encoding="utf-8")
-    pattern = re.compile(
-        r"ALTER TABLE (\w+) ADD CONSTRAINT \w+ FOREIGN KEY \((\w+)\) REFERENCES (\w+) \((\w+)\)"
-    )
+    pattern = re.compile(r"ALTER TABLE (\w+) ADD CONSTRAINT \w+ FOREIGN KEY \((\w+)\) REFERENCES (\w+) \((\w+)\)")
     matches = pattern.finditer(ddl)
     return [m.groups() for m in matches]
 
@@ -2677,18 +2616,14 @@ def verify_csv_integrity() -> list[str]:
         if not child_rows or not parent_rows:
             continue
         parent_keys = {
-            str(r[parent_col])
-            for r in parent_rows
-            if parent_col in r and str(r.get(parent_col, "")).strip() != ""
+            str(r[parent_col]) for r in parent_rows if parent_col in r and str(r.get(parent_col, "")).strip() != ""
         }
         for idx, row in enumerate(child_rows, start=2):
             raw = row.get(col)
             if raw is None or str(raw).strip() == "":
                 continue
             if str(raw) not in parent_keys:
-                errors.append(
-                    f"{child}.csv row {idx}: {col}={raw!r} missing in {parent}.{parent_col}"
-                )
+                errors.append(f"{child}.csv row {idx}: {col}={raw!r} missing in {parent}.{parent_col}")
     return errors
 
 
@@ -2699,7 +2634,11 @@ def verify_csv_semantics(*, as_of: datetime | None = None) -> list[str]:
     recent_start = anchor - timedelta(days=RECENT_WINDOW_DAYS)
 
     items = {int(r["item_id"]): r for r in _read_csv("item")} if (OUT_DIR / "item.csv").is_file() else {}
-    inv_to_item = {r["inventory_id"]: int(r["item_id"]) for r in _read_csv("inventory")} if (OUT_DIR / "inventory.csv").is_file() else {}
+    inv_to_item = (
+        {r["inventory_id"]: int(r["item_id"]) for r in _read_csv("inventory")}
+        if (OUT_DIR / "inventory.csv").is_file()
+        else {}
+    )
     rentals = _read_csv("rental") if (OUT_DIR / "rental.csv").is_file() else []
 
     open_count = 0
@@ -2980,9 +2919,7 @@ def _run_llm_enrichment(*, offline: bool = False) -> None:
 
         if offline:
             for entry in payload_items:
-                enriched[int(entry["id"])] = _offline_item_description(
-                    str(entry["type"]), str(entry["title"])
-                )
+                enriched[int(entry["id"])] = _offline_item_description(str(entry["type"]), str(entry["title"]))
             _log_progress(f"[llm] item.description batch {batch_no}/{total_batches} ids={id_range} offline")
             continue
 
@@ -2990,9 +2927,7 @@ def _run_llm_enrichment(*, offline: bool = False) -> None:
         cache_path = _llm_cache_path(model, cache_key)
         if cache_path.is_file():
             cached = json.loads(cache_path.read_text(encoding="utf-8"))
-            _log_progress(
-                f"[llm] item.description batch {batch_no}/{total_batches} ids={id_range} cache=hit"
-            )
+            _log_progress(f"[llm] item.description batch {batch_no}/{total_batches} ids={id_range} cache=hit")
         else:
             _log_progress(
                 f"[llm] item.description batch {batch_no}/{total_batches} ids={id_range} cache=miss calling API"
@@ -3051,19 +2986,10 @@ def _run_post_gen_sanity_checks() -> None:
     rentals = _read_csv("rental")
     items = {int(r["item_id"]): r.get("item_type") for r in _read_csv("item")}
     inv_by_id = {r["inventory_id"]: int(r["item_id"]) for r in _read_csv("inventory")}
-    bg_count = sum(
-        1
-        for r in rentals
-        if items.get(inv_by_id.get(r["inventory_id"], 0), "film") in ("book", "game")
-    )
+    bg_count = sum(1 for r in rentals if items.get(inv_by_id.get(r["inventory_id"], 0), "film") in ("book", "game"))
     if rentals and bg_count / len(rentals) < 0.15:
-        raise SystemExit(
-            f"Sanity: book/game rentals {bg_count}/{len(rentals)} below 15% threshold"
-        )
-    print(
-        f"Sanity OK: {len(customers)} customers, {len(years)} film years, "
-        f"bg rentals {bg_count}/{len(rentals)}"
-    )
+        raise SystemExit(f"Sanity: book/game rentals {bg_count}/{len(rentals)} below 15% threshold")
+    print(f"Sanity OK: {len(customers)} customers, {len(years)} film years, bg rentals {bg_count}/{len(rentals)}")
 
 
 def _download_file(url: str, dest: Path) -> None:
@@ -3196,9 +3122,7 @@ def _optional_bundle_sha256_check(zip_path: Path) -> None:
         return
     digest = hashlib.sha256(zip_path.read_bytes()).hexdigest()
     if digest != expected:
-        raise SystemExit(
-            f"Bundle SHA256 mismatch: expected {expected}, got {digest} ({zip_path})"
-        )
+        raise SystemExit(f"Bundle SHA256 mismatch: expected {expected}, got {digest} ({zip_path})")
 
 
 def ensure_csv_bundle(out_dir: Path, zip_path: Path) -> str:
@@ -3238,11 +3162,7 @@ def pack_csv_bundle(out_dir: Path, zip_path: Path) -> None:
 def _load_publisher_names_from_inputs() -> list[str]:
     with zipfile.ZipFile(_INPUTS_ZIP) as archive:
         raw = archive.read("publishers_expanded.csv").decode("utf-8")
-    names = [
-        row["publisher_name"]
-        for row in csv.DictReader(raw.splitlines())
-        if row.get("publisher_name")
-    ]
+    names = [row["publisher_name"] for row in csv.DictReader(raw.splitlines()) if row.get("publisher_name")]
     if len(names) < 40:
         raise SystemExit(f"publisher list needs at least 40 names, got {len(names)}")
     return names
@@ -3393,9 +3313,7 @@ def repair_csv_bundle(csv_dir: Path, *, book_seeds_path: Path | None = None) -> 
             if seed is None:
                 continue
             row["author_id"] = str(_author_id_for_seed(seed, author_rows))
-            row["publisher_id"] = str(
-                _publisher_id_for_seed(seed, publisher_rows, publisher_names)
-            )
+            row["publisher_id"] = str(_publisher_id_for_seed(seed, publisher_rows, publisher_names))
         _write_csv(
             "book",
             ["item_id", "author_id", "publisher_id", "isbn", "page_count", "last_update"],

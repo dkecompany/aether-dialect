@@ -29,6 +29,7 @@ from aetherdialect._sql_to_intent import (
     _convert_sqlglot,
     _dedup_cte_steps,
     _dedup_window_registry,
+    _runtime_from_pglast_sql,
     _union_merge_bucket_key,
     compute_sql_history_content_hash,
     convert_sql_to_intent,
@@ -121,8 +122,8 @@ def test_dedup_runtime_intents_union_merge_bare_columns() -> None:
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("customers.customer_id"))],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
-        having_param=[],
+        where=None,
+        having=None,
     )
     r2 = RuntimeIntent(
         tables=t,
@@ -130,8 +131,8 @@ def test_dedup_runtime_intents_union_merge_bare_columns() -> None:
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("customers.name"))],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
-        having_param=[],
+        where=None,
+        having=None,
     )
     out = dedup_runtime_intents([r1, r2])
     assert len(out) == 1
@@ -165,8 +166,8 @@ def test_dedup_window_registry_collapses_implicit_duplicate_frames() -> None:
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("customers.customer_id"))],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
-        having_param=[],
+        where=None,
+        having=None,
         window_registry=[w1, w2],
     )
     out = _dedup_window_registry(rt)
@@ -191,8 +192,8 @@ def test_dedup_cte_steps_union_merge_bare_columns() -> None:
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("customers.customer_id"))],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
-        having_param=[],
+        where=None,
+        having=None,
         cte_steps=[s1, s2],
     )
     out = _dedup_cte_steps(rt)
@@ -249,7 +250,7 @@ def test_pglast_where_literal_masks_into_param_values(
     sql = "SELECT customer_id FROM customers WHERE customer_id = 42"
     cr = convert_sql_to_intent(sql, schema_graph, dialect, verify_via_execute=False)
     assert cr.failure_code is None and cr.intent is not None
-    fp = cr.intent.filters_param[0]
+    fp = (cr.intent.where.leaves() if cr.intent.where else [])[0]
     assert fp.param_key and cr.intent.param_values.get(fp.param_key) == 42
 
 
@@ -306,12 +307,12 @@ def test_pglast_where_is_null_and_in_list(schema_graph: SchemaGraph) -> None:
     sql_null = "SELECT customer_id FROM customers WHERE email IS NULL"
     cr0 = convert_sql_to_intent(sql_null, schema_graph, dialect, verify_via_execute=False)
     assert cr0.failure_code is None and cr0.intent is not None
-    assert cr0.intent.filters_param[0].op == "is null"
+    assert (cr0.intent.where.leaves() if cr0.intent.where else [])[0].op == "is null"
 
     sql_in = "SELECT customer_id FROM customers WHERE customer_id IN (1, 2)"
     cr1 = convert_sql_to_intent(sql_in, schema_graph, dialect, verify_via_execute=False)
     assert cr1.failure_code is None and cr1.intent is not None
-    fp = cr1.intent.filters_param[0]
+    fp = (cr1.intent.where.leaves() if cr1.intent.where else [])[0]
     assert fp.op == "in"
     assert fp.param_key and cr1.intent.param_values.get(fp.param_key) == [1, 2]
 
@@ -346,14 +347,16 @@ def test_pglast_select_count_star(schema_graph: SchemaGraph) -> None:
 
 
 def test_pglast_where_top_level_or(schema_graph: SchemaGraph) -> None:
-    """Top-level ``OR`` of supported predicates assigns distinct ``filter_group`` ids."""
+    """Top-level ``OR`` of supported predicates becomes an OR PredicateGroup at extraction."""
     dialect = _pg()
     sql = "SELECT customer_id FROM customers WHERE customer_id = 1 OR customer_id = 2"
+    raw = _runtime_from_pglast_sql(sql, schema_graph)
+    assert raw is not None and raw.where is not None
+    assert raw.where.op == "or"
+    assert len(raw.where.leaves()) == 2
     cr = convert_sql_to_intent(sql, schema_graph, dialect, verify_via_execute=False)
     assert cr.failure_code is None and cr.intent is not None
-    assert len(cr.intent.filters_param) == 2
-    assert cr.intent.filters_param[0].filter_group == 1
-    assert cr.intent.filters_param[1].filter_group == 2
+    assert cr.intent.where is not None
 
 
 def test_pglast_where_between_and_like(schema_graph: SchemaGraph) -> None:
@@ -362,7 +365,7 @@ def test_pglast_where_between_and_like(schema_graph: SchemaGraph) -> None:
     sql_bt = "SELECT customer_id FROM customers WHERE customer_id BETWEEN 1 AND 100"
     cr = convert_sql_to_intent(sql_bt, schema_graph, dialect, verify_via_execute=False)
     assert cr.failure_code is None and cr.intent is not None
-    fp = cr.intent.filters_param[0]
+    fp = (cr.intent.where.leaves() if cr.intent.where else [])[0]
     if fp.op == "between":
         assert fp.param_key and fp.param_key_hi
         assert cr.intent.param_values.get(fp.param_key) == 1
@@ -375,7 +378,7 @@ def test_pglast_where_between_and_like(schema_graph: SchemaGraph) -> None:
     sql_like = "SELECT customer_id FROM customers WHERE name LIKE 'A%'"
     cr2 = convert_sql_to_intent(sql_like, schema_graph, dialect, verify_via_execute=False)
     assert cr2.failure_code is None and cr2.intent is not None
-    assert cr2.intent.filters_param[0].op == "like"
+    assert (cr2.intent.where.leaves() if cr2.intent.where else [])[0].op == "like"
 
 
 def test_pglast_having_aggregate_compare(schema_graph: SchemaGraph) -> None:
@@ -384,7 +387,7 @@ def test_pglast_having_aggregate_compare(schema_graph: SchemaGraph) -> None:
     sql = "SELECT customer_id FROM customers GROUP BY customer_id HAVING count(*) > 1"
     cr = convert_sql_to_intent(sql, schema_graph, dialect, verify_via_execute=False)
     assert cr.failure_code is None and cr.intent is not None
-    hp = cr.intent.having_param[0]
+    hp = (cr.intent.having.leaves() if cr.intent.having else [])[0]
     assert hp.op == ">"
     assert hp.left_expr.add_groups and hp.left_expr.add_groups[0].agg_func == "count"
 
@@ -458,14 +461,20 @@ def test_pglast_arithmetic_and_extract(schema_graph: SchemaGraph) -> None:
 
 
 def test_pglast_where_or_of_and_two_groups(schema_graph: SchemaGraph) -> None:
-    """Top-level ``OR`` of ``AND`` arms assigns ``filter_group`` ids."""
+    """Top-level ``OR`` of ``AND`` arms becomes nested PredicateGroup arms at extraction."""
     dialect = _pg()
     sql = "SELECT order_id FROM orders WHERE (customer_id = 1 AND order_id = 1) OR (customer_id = 2 AND order_id = 2)"
+    raw = _runtime_from_pglast_sql(sql, schema_graph)
+    assert raw is not None and raw.where is not None
+    assert raw.where.op == "or"
+    assert len(raw.where.groups) == 2
+    for arm in raw.where.groups:
+        assert arm.op == "and"
+        assert len(arm.predicates) == 2
+    assert len(raw.where.leaves()) == 4
     cr = convert_sql_to_intent(sql, schema_graph, dialect, verify_via_execute=False)
     assert cr.failure_code is None and cr.intent is not None
-    assert len(cr.intent.filters_param) == 4
-    gids = {f.filter_group for f in cr.intent.filters_param}
-    assert gids == {1, 2}
+    assert cr.intent.where is not None
 
 
 def test_pglast_where_not_rejected_by_pg_path(schema_graph: SchemaGraph) -> None:

@@ -114,3 +114,58 @@ def test_noop_query_log_engines_return_source() -> None:
         src = dialect.query_log_source()
         assert src is not None
         assert src.is_available(None) is False
+
+
+def test_profile_composite_descriptive_uses_qualified_table_ref() -> None:
+    from unittest.mock import MagicMock
+
+    from aetherdialect._contracts_schema import ColumnMetadata, TableMetadata
+    from aetherdialect._schema_catalog import _profile_composite_descriptive
+
+    captured: list[str] = []
+    dialect = MagicMock()
+    dialect.qualified_table_ref.return_value = '"ext_schema"."contacts"'
+    dialect.quote_identifier.side_effect = lambda name: f'"{name}"'
+
+    class _Conn:
+        def execute(self, statement, *_args, **_kwargs):
+            captured.append(str(statement))
+            return self
+
+        def scalar(self):
+            return 2
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    class _Engine:
+        def connect(self):
+            return _Conn()
+
+    table = TableMetadata(
+        name="contacts",
+        columns={
+            "first_name": ColumnMetadata(
+                name="first_name",
+                data_type="varchar",
+                sensitivity="none",
+                value_type="string",
+            ),
+            "last_name": ColumnMetadata(
+                name="last_name",
+                data_type="varchar",
+                sensitivity="none",
+                value_type="string",
+            ),
+        },
+        primary_key=[],
+        foreign_keys=[],
+        row_count=2,
+    )
+    _profile_composite_descriptive(dialect, _Engine(), table)
+    dialect.qualified_table_ref.assert_called_once_with("contacts", kind=table.kind)
+    assert captured
+    assert '"ext_schema"."contacts"' in captured[0]

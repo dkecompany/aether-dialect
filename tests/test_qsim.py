@@ -18,10 +18,10 @@ from aetherdialect._contracts_base import (
 from aetherdialect._contracts_schema import (
     ColumnMetadata,
     FKEdge,
-    QSimFilter,
     QSimHaving,
     QSimIntent,
     QSimSkeleton,
+    QSimWhereParam,
     SchemaGraph,
     TableMetadata,
     ValueDomain,
@@ -33,7 +33,7 @@ from aetherdialect._qsim import (
     _format_date,
     _identify_range_pairs,
     _instantiate_intent,
-    _is_excluded_filter_column,
+    _is_excluded_where_column,
     _is_integer_type,
     _parse_date,
     _sample_boolean,
@@ -271,27 +271,27 @@ class TestIsExcludedFilterColumn:
 
     def test_normal_column(self):
         """Normal column not excluded."""
-        assert _is_excluded_filter_column("name") is False
+        assert _is_excluded_where_column("name") is False
 
     def test_audit_column(self):
         """Audit-pattern column excluded if pattern matches."""
-        patterns = QSimConfig.EXCLUDED_FILTER_PATTERNS
+        patterns = QSimConfig.EXCLUDED_WHERE_PATTERNS
         if patterns:
             for p in patterns:
-                assert _is_excluded_filter_column(p) is True
+                assert _is_excluded_where_column(p) is True
                 break
 
     def test_empty_string_not_excluded(self):
         """Empty string matches no pattern."""
-        assert _is_excluded_filter_column("") is False
+        assert _is_excluded_where_column("") is False
 
     def test_substring_match(self):
         """Column containing pattern substring is excluded."""
-        assert _is_excluded_filter_column("user_password") is True
+        assert _is_excluded_where_column("user_password") is True
 
     def test_case_insensitive(self):
         """Pattern match is case-insensitive."""
-        assert _is_excluded_filter_column("PASSWORD") is True
+        assert _is_excluded_where_column("PASSWORD") is True
 
 
 class TestGetFilterableColumns:
@@ -388,7 +388,7 @@ class TestDecomposeBetweenFilter:
 
     def test_between_decomposed(self):
         """BETWEEN filter decomposes into >= and <=."""
-        f = QSimFilter(column="t.a", op="between", value_type="integer")
+        f = QSimWhereParam(column="t.a", op="between", value_type="integer")
         result = decompose_between_filter(f)
         assert len(result) == 2
         assert result[0].op == ">="
@@ -396,7 +396,7 @@ class TestDecomposeBetweenFilter:
 
     def test_non_between_unchanged(self):
         """Non-BETWEEN filter returns as-is."""
-        f = QSimFilter(column="t.a", op="=", value_type="string")
+        f = QSimWhereParam(column="t.a", op="=", value_type="string")
         result = decompose_between_filter(f)
         assert len(result) == 1
         assert result[0].op == "="
@@ -670,13 +670,13 @@ class TestComputeIntentIdEdgeCases:
             "tables": ["t1"],
             "grain": "scalar",
             "select_cols": ["t1.a"],
-            "filters_param": [{"column": "t1.x", "op": "="}],
+            "where": [{"column": "t1.x", "op": "="}],
         }
         d2 = {
             "tables": ["t1"],
             "grain": "scalar",
             "select_cols": ["t1.a"],
-            "filters_param": [],
+            "where": [],
         }
         assert compute_intent_id(d1) != compute_intent_id(d2)
 
@@ -684,8 +684,8 @@ class TestComputeIntentIdEdgeCases:
         """Filter order does not affect intent ID."""
         f1 = {"column": "t1.a", "op": "="}
         f2 = {"column": "t1.b", "op": ">"}
-        d1 = {"tables": ["t1"], "filters_param": [f1, f2]}
-        d2 = {"tables": ["t1"], "filters_param": [f2, f1]}
+        d1 = {"tables": ["t1"], "where": [f1, f2]}
+        d2 = {"tables": ["t1"], "where": [f2, f1]}
         assert compute_intent_id(d1) == compute_intent_id(d2)
 
 
@@ -840,13 +840,13 @@ class TestDecomposeBetweenFilterEdgeCases:
 
     def test_preserves_column(self):
         """Decomposed filters preserve original column."""
-        f = QSimFilter(column="t.date_col", op="between", value_type="date")
+        f = QSimWhereParam(column="t.date_col", op="between", value_type="date")
         result = decompose_between_filter(f)
         assert all(r.column == "t.date_col" for r in result)
 
     def test_preserves_value_type(self):
         """Decomposed filters preserve original value_type."""
-        f = QSimFilter(column="t.x", op="between", value_type="integer")
+        f = QSimWhereParam(column="t.x", op="between", value_type="integer")
         result = decompose_between_filter(f)
         assert all(r.value_type == "integer" for r in result)
 
@@ -929,8 +929,8 @@ class TestIdentifyRangePairs:
     def test_paired_range(self):
         """Paired >= and <= on same column detected."""
         filters = [
-            QSimFilter(column="orders.amount", op=">=", value_type="numeric"),
-            QSimFilter(column="orders.amount", op="<=", value_type="numeric"),
+            QSimWhereParam(column="orders.amount", op=">=", value_type="numeric"),
+            QSimWhereParam(column="orders.amount", op="<=", value_type="numeric"),
         ]
         pairs = _identify_range_pairs(filters)
         assert "orders.amount" in pairs
@@ -940,7 +940,7 @@ class TestIdentifyRangePairs:
     def test_no_pair(self):
         """Single-sided range is not a pair."""
         filters = [
-            QSimFilter(column="orders.amount", op=">=", value_type="numeric"),
+            QSimWhereParam(column="orders.amount", op=">=", value_type="numeric"),
         ]
         pairs = _identify_range_pairs(filters)
         assert pairs == {}
@@ -948,7 +948,7 @@ class TestIdentifyRangePairs:
     def test_expr_comparison_skipped(self):
         """Expr comparisons are skipped."""
         filters = [
-            QSimFilter(
+            QSimWhereParam(
                 column="orders.amount",
                 op=">=",
                 value_type="numeric",
@@ -961,8 +961,8 @@ class TestIdentifyRangePairs:
     def test_different_columns(self):
         """Different columns with matching ops don't pair."""
         filters = [
-            QSimFilter(column="orders.amount", op=">=", value_type="numeric"),
-            QSimFilter(column="orders.quantity", op="<=", value_type="numeric"),
+            QSimWhereParam(column="orders.amount", op=">=", value_type="numeric"),
+            QSimWhereParam(column="orders.quantity", op="<=", value_type="numeric"),
         ]
         pairs = _identify_range_pairs(filters)
         assert pairs == {}
@@ -970,8 +970,8 @@ class TestIdentifyRangePairs:
     def test_mixed_operators(self):
         """Mixed > and < on same column detected."""
         filters = [
-            QSimFilter(column="rental.date", op=">", value_type="temporal"),
-            QSimFilter(column="rental.date", op="<", value_type="temporal"),
+            QSimWhereParam(column="rental.date", op=">", value_type="temporal"),
+            QSimWhereParam(column="rental.date", op="<", value_type="temporal"),
         ]
         pairs = _identify_range_pairs(filters)
         assert "rental.date" in pairs
@@ -1068,7 +1068,7 @@ class TestComputeIntentVariance:
             select_cols=["orders.order_id"],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=[],
             having_param=[],
             param_values={},
             question="",
@@ -1086,7 +1086,7 @@ class TestComputeIntentVariance:
             select_cols=["orders.order_id"],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[QSimFilter(column="orders.status", op="=", value_type="categorical")],
+            where=[QSimWhereParam(column="orders.status", op="=", value_type="categorical")],
             having_param=[],
             param_values={},
             question="",
@@ -1112,7 +1112,7 @@ class TestComputeIntentVariance:
             select_cols=["COUNT(orders.order_id)"],
             group_by_cols=["orders.status"],
             order_by_cols=[],
-            filters_param=[QSimFilter(column="orders.status", op="=", value_type="categorical")],
+            where=[QSimWhereParam(column="orders.status", op="=", value_type="categorical")],
             having_param=[QSimHaving(expression="COUNT(orders.order_id)", op=">", value_type="number")],
             param_values={},
             question="",
@@ -1129,7 +1129,7 @@ class TestComputeIntentVariance:
             select_cols=["COUNT(orders.order_id)"],
             group_by_cols=["orders.status"],
             order_by_cols=[],
-            filters_param=[QSimFilter(column="orders.status", op="=", value_type="categorical")],
+            where=[QSimWhereParam(column="orders.status", op="=", value_type="categorical")],
             having_param=[],
             param_values={},
             question="",
@@ -1147,8 +1147,8 @@ class TestComputeIntentVariance:
             select_cols=["orders.order_id"],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                QSimFilter(
+            where=[
+                QSimWhereParam(
                     column="orders.amount",
                     op=">",
                     value_type="numeric",
@@ -1494,7 +1494,7 @@ class TestInstantiateIntent:
             select_cols=["orders.order_id"],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=[],
             having_param=[],
             param_values={},
             question="",
@@ -1506,7 +1506,7 @@ class TestInstantiateIntent:
     def test_simple_filter_populated(self):
         """Single categorical filter gets value in param_values."""
         intent = self._make_intent(
-            filters_param=[QSimFilter(column="orders.status", op="=", value_type="categorical")],
+            where=[QSimWhereParam(column="orders.status", op="=", value_type="categorical")],
         )
         domains = {"orders.status": ValueDomain(values=["active", "closed"])}
         result = _instantiate_intent(intent, domains, 0)
@@ -1516,14 +1516,14 @@ class TestInstantiateIntent:
     def test_missing_value_domain_skips_entire_variant(self):
         """When a non-null filter column has no domain entry, instantiation returns None."""
         intent = self._make_intent(
-            filters_param=[QSimFilter(column="orders.missing_col", op="=", value_type="categorical")],
+            where=[QSimWhereParam(column="orders.missing_col", op="=", value_type="categorical")],
         )
         assert _instantiate_intent(intent, {}, 0) is None
 
     def test_null_filter_skipped(self):
         """IS NULL filter does not generate param value."""
         intent = self._make_intent(
-            filters_param=[QSimFilter(column="orders.status", op="is null", value_type="null")],
+            where=[QSimWhereParam(column="orders.status", op="is null", value_type="null")],
         )
         result = _instantiate_intent(intent, {}, 0)
         assert result is not None
@@ -1532,8 +1532,8 @@ class TestInstantiateIntent:
     def test_expr_comparison_passthrough(self):
         """Expr comparison filters pass through without param value."""
         intent = self._make_intent(
-            filters_param=[
-                QSimFilter(
+            where=[
+                QSimWhereParam(
                     column="orders.amount",
                     op=">",
                     value_type="numeric",
@@ -1593,7 +1593,7 @@ class TestInstantiateAll:
             select_cols=["orders.status"],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[QSimFilter(column="orders.status", op="=", value_type="categorical")],
+            where=[QSimWhereParam(column="orders.status", op="=", value_type="categorical")],
             having_param=[],
             param_values={},
             question="",
@@ -1622,7 +1622,7 @@ class TestInstantiateAll:
                     select_cols=["orders.status"],
                     group_by_cols=[],
                     order_by_cols=[],
-                    filters_param=[QSimFilter(column="orders.status", op="=", value_type="categorical")],
+                    where=[QSimWhereParam(column="orders.status", op="=", value_type="categorical")],
                     having_param=[],
                     param_values={},
                     question="",

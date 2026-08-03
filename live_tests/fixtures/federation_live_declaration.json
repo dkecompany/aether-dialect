@@ -1,0 +1,125 @@
+{
+  "aliases": {},
+  "coordinator": {
+    "default_source_row_cap": 500000,
+    "default_source_timeout_ms": 30000,
+    "row_cap": 500000,
+    "semijoin_key_cap": 50000,
+    "spill_row_threshold": 50000
+  },
+  "cross_source_joins": [
+    {
+      "kind": "inner",
+      "left": "rental.inventory_id",
+      "logical_key": "inventory_id",
+      "right": "inventory.inventory_id"
+    },
+    {
+      "kind": "inner",
+      "left": "purchase_line.item_id",
+      "logical_key": "item_id",
+      "right": "item.item_id"
+    },
+    {
+      "kind": "inner",
+      "left": "delivery.rental_id",
+      "logical_key": "rental_id",
+      "right": "rental.rental_id"
+    },
+    {
+      "kind": "inner",
+      "left": "promotion_redemption.rental_id",
+      "logical_key": "rental_id",
+      "right": "rental.rental_id"
+    }
+  ],
+  "federation_id": "live_rental_shop",
+  "logical_columns": [
+    {
+      "logical": "inventory_id",
+      "members": [
+        "rental.inventory_id",
+        "inventory.inventory_id"
+      ],
+      "role": "join_key",
+      "unify_in_graph": true
+    },
+    {
+      "logical": "item_id",
+      "members": [
+        "purchase_line.item_id",
+        "item.item_id"
+      ],
+      "role": "join_key",
+      "unify_in_graph": true
+    },
+    {
+      "logical": "rental_id",
+      "members": [
+        "delivery.rental_id",
+        "promotion_redemption.rental_id",
+        "rental.rental_id"
+      ],
+      "role": "join_key",
+      "unify_in_graph": true
+    }
+  ],
+  "logical_tables": [
+    {
+      "logical": "payment",
+      "members": [
+        {
+          "columns": {},
+          "source": "storefront",
+          "table": "payment"
+        },
+        {
+          "columns": {},
+          "source": "catalog",
+          "table": "payment"
+        }
+      ],
+      "semantics": "union"
+    },
+    {
+      "authoritative_source": "storefront",
+      "logical": "customer",
+      "members": [
+        {
+          "columns": {},
+          "source": "storefront",
+          "table": "customer"
+        },
+        {
+          "columns": {},
+          "source": "crm",
+          "table": "customer"
+        }
+      ],
+      "semantics": "replica"
+    },
+    {
+      "authoritative_source": "storefront",
+      "logical": "staff",
+      "members": [
+        {
+          "columns": {},
+          "source": "storefront",
+          "table": "staff"
+        },
+        {
+          "columns": {
+            "first_name": "first_name",
+            "last_name": "last_name",
+            "staff_id": "staff_id",
+            "store_id": "store_id"
+          },
+          "source": "crm",
+          "table": "staff"
+        }
+      ],
+      "semantics": "replica"
+    }
+  ],
+  "version": 1
+}

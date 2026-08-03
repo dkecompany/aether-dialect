@@ -5,14 +5,15 @@ from typing import Any
 
 import pytest
 
-from aetherdialect._config import EngineConfig, PolicyConfig, QSimConfig
+from aetherdialect._config import EngineConfig, PolicyConfig
 from aetherdialect._constants import BOOLEAN_TRUTH_PATTERN_MAP
 from aetherdialect._contracts_base import (
     ColumnRole,
-    FilterParam,
     NormalizedExpr,
     RoleOwner,
     TableRole,
+    WhereParam,
+    predicate_group_from_list,
 )
 from aetherdialect._contracts_core import RuntimeIntent
 from aetherdialect._contracts_schema import (
@@ -407,6 +408,13 @@ class TestValidateColumnClassification:
         hard, soft = _validate_column_classification(col, ColumnRole.AUDIT.value)
         assert len(hard) == 0
 
+    def test_temporal_on_varchar_create_date_ok(self):
+        """TEMPORAL on VARCHAR create_date (federation seed) passes with soft warning."""
+        col = ColumnMetadata(name="create_date", data_type="VARCHAR", value_type="string")
+        hard, soft = _validate_column_classification(col, ColumnRole.TEMPORAL.value)
+        assert len(hard) == 0
+        assert _infer_column_role(col) == ColumnRole.TEMPORAL
+
     def test_role_value_type_compat_temporal_integer(self):
         """Infer duration integer columns as TEMPORAL."""
         col = ColumnMetadata(name="lead_time_days", data_type="integer", value_type="integer")
@@ -665,7 +673,7 @@ class TestCoerceAntonymPairColumn:
 class TestLlmClassifySchemaRefinePasses:
     """Second LLM classification pass is always invoked (notes vs consistency)."""
 
-    def test_runs_consistency_refine_when_no_notes(self, monkeypatch):
+    def test_runs_consistency_refine_when_no_notes(self, monkeypatch, tmp_path):
         col = ColumnMetadata(name="id", data_type="integer", is_primary_key=True)
         table = TableMetadata(name="t", columns={"id": col}, primary_key=["id"], foreign_keys=[])
         sg = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"t": table})
@@ -690,6 +698,7 @@ class TestLlmClassifySchemaRefinePasses:
             calls.append((system, task))
             return raw
 
+        monkeypatch.setattr(EngineConfig, "SCHEMA_JSON_PATH", str(tmp_path / "schema_graph.json.gz"))
         monkeypatch.setattr("aetherdialect._schema_catalog.llm_chat", fake_llm)
         out = llm_classify_schema(sg, None)
         assert len(calls) == 2
@@ -698,7 +707,7 @@ class TestLlmClassifySchemaRefinePasses:
         assert calls[1][1] == "schema"
         assert "t" in out
 
-    def test_runs_notes_refine_when_notes_present(self, monkeypatch):
+    def test_runs_notes_refine_when_notes_present(self, monkeypatch, tmp_path):
         col = ColumnMetadata(name="id", data_type="integer", is_primary_key=True)
         table = TableMetadata(name="t", columns={"id": col}, primary_key=["id"], foreign_keys=[])
         sg = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"t": table})
@@ -723,6 +732,7 @@ class TestLlmClassifySchemaRefinePasses:
             calls.append(system)
             return raw
 
+        monkeypatch.setattr(EngineConfig, "SCHEMA_JSON_PATH", str(tmp_path / "schema_graph.json.gz"))
         monkeypatch.setattr("aetherdialect._schema_catalog.llm_chat", fake_llm)
         llm_classify_schema(sg, "domain notes here")
         assert len(calls) == 2
@@ -833,7 +843,7 @@ class TestApplyColumnRolesLlmDescriptionInvariant:
         monkeypatch.setattr("aetherdialect._schema_catalog.llm_classify_schema", fake_classify)
         with pytest.raises(RuntimeError, match="Schema LLM classification failed"):
             apply_column_roles_llm(sg)
-        assert calls["n"] == QSimConfig.MAX_ROLE_CLASSIFICATION_RETRIES + 1
+        assert calls["n"] == PolicyConfig.MAX_ROLE_CLASSIFICATION_RETRIES + 1
 
     def test_retries_then_succeeds_when_descriptions_arrive(self, monkeypatch):
         col = ColumnMetadata(name="id", data_type="integer", is_primary_key=True)
@@ -1217,8 +1227,8 @@ class TestAssignColumnOps:
         t = TableMetadata(name="t", columns={"created_at": col}, foreign_keys=[], primary_key="")
         schema = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"t": t})
         assign_column_ops(schema)
-        assert "between" in col.valid_filter_ops
-        assert "is null" in col.valid_filter_ops
+        assert "between" in col.valid_where_ops
+        assert "is null" in col.valid_where_ops
         assert col.valid_aggregations == ["count"]
         assert col.valid_having_ops == ["=", "!=", "<", "<=", ">", ">="]
 
@@ -1235,8 +1245,8 @@ class TestAssignColumnOps:
         t = TableMetadata(name="t", columns={"id": col}, foreign_keys=[], primary_key="")
         schema = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"t": t})
         assign_column_ops(schema)
-        assert "=" in col.valid_filter_ops
-        assert "between" in col.valid_filter_ops
+        assert "=" in col.valid_where_ops
+        assert "between" in col.valid_where_ops
         assert "count" in col.valid_aggregations
         assert "sum" not in col.valid_aggregations
 
@@ -1252,8 +1262,8 @@ class TestAssignColumnOps:
         t = TableMetadata(name="t", columns={"status": col}, foreign_keys=[], primary_key="")
         schema = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"t": t})
         assign_column_ops(schema)
-        assert "like" in col.valid_filter_ops
-        assert "ilike" in col.valid_filter_ops
+        assert "like" in col.valid_where_ops
+        assert "ilike" in col.valid_where_ops
 
     def test_numeric_measure(self):
         """NUMERIC_MEASURE gets sum/avg aggregations."""
@@ -1269,7 +1279,7 @@ class TestAssignColumnOps:
         assign_column_ops(schema)
         assert "sum" in col.valid_aggregations
         assert "avg" in col.valid_aggregations
-        assert "between" in col.valid_filter_ops
+        assert "between" in col.valid_where_ops
 
     def test_temporal(self):
         """TEMPORAL columns get date-appropriate ops."""
@@ -1283,7 +1293,7 @@ class TestAssignColumnOps:
         t = TableMetadata(name="t", columns={"order_date": col}, foreign_keys=[], primary_key="")
         schema = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"t": t})
         assign_column_ops(schema)
-        assert "between" in col.valid_filter_ops
+        assert "between" in col.valid_where_ops
         assert "min" in col.valid_aggregations
         assert "sum" not in col.valid_aggregations
 
@@ -1299,8 +1309,8 @@ class TestAssignColumnOps:
         t = TableMetadata(name="t", columns={"is_active": col}, foreign_keys=[], primary_key="")
         schema = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"t": t})
         assign_column_ops(schema)
-        assert "=" in col.valid_filter_ops
-        assert "between" not in col.valid_filter_ops
+        assert "=" in col.valid_where_ops
+        assert "between" not in col.valid_where_ops
 
     def test_free_text(self):
         """FREE_TEXT columns retain pattern ops despite is_filterable=False."""
@@ -1314,13 +1324,13 @@ class TestAssignColumnOps:
         t = TableMetadata(name="t", columns={"description": col}, foreign_keys=[], primary_key="")
         schema = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"t": t})
         assign_column_ops(schema)
-        assert "like" in col.valid_filter_ops
-        assert "ilike" in col.valid_filter_ops
-        assert "not like" in col.valid_filter_ops
-        assert "not ilike" in col.valid_filter_ops
-        assert "is null" in col.valid_filter_ops
-        assert "is not null" in col.valid_filter_ops
-        assert "=" not in col.valid_filter_ops
+        assert "like" in col.valid_where_ops
+        assert "ilike" in col.valid_where_ops
+        assert "not like" in col.valid_where_ops
+        assert "not ilike" in col.valid_where_ops
+        assert "is null" in col.valid_where_ops
+        assert "is not null" in col.valid_where_ops
+        assert "=" not in col.valid_where_ops
         assert col.valid_aggregations == ["count"]
 
     def test_numeric_categorical(self):
@@ -1335,8 +1345,8 @@ class TestAssignColumnOps:
         t = TableMetadata(name="t", columns={"rating": col}, foreign_keys=[], primary_key="")
         schema = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"t": t})
         assign_column_ops(schema)
-        assert "between" in col.valid_filter_ops
-        assert "like" not in col.valid_filter_ops
+        assert "between" in col.valid_where_ops
+        assert "like" not in col.valid_where_ops
 
     def test_non_filterable_empty_ops(self):
         """Non-filterable columns get empty filter ops regardless of role."""
@@ -1350,7 +1360,7 @@ class TestAssignColumnOps:
         t = TableMetadata(name="t", columns={"x": col}, foreign_keys=[], primary_key="")
         schema = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"t": t})
         assign_column_ops(schema)
-        assert col.valid_filter_ops == []
+        assert col.valid_where_ops == []
 
     def test_string_only_ops_removed_from_numeric(self):
         """String-only ops removed from non-string columns."""
@@ -1364,8 +1374,8 @@ class TestAssignColumnOps:
         t = TableMetadata(name="t", columns={"amount": col}, foreign_keys=[], primary_key="")
         schema = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"t": t})
         assign_column_ops(schema)
-        assert "like" not in col.valid_filter_ops
-        assert "ilike" not in col.valid_filter_ops
+        assert "like" not in col.valid_where_ops
+        assert "ilike" not in col.valid_where_ops
 
     def test_numeric_aggs_removed_from_string(self):
         """Numeric-only aggregations removed from string columns."""
@@ -1395,7 +1405,7 @@ class TestAssignColumnOps:
         schema = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"t": t})
         assign_column_ops(schema)
         assert col.element_type == "string"
-        assert "contains" in col.valid_filter_ops
+        assert "contains" in col.valid_where_ops
 
     def test_array_bracket_type_puts_contains_first(self):
         """Typed array columns prepend ``contains`` ahead of role-based operators."""
@@ -1409,7 +1419,7 @@ class TestAssignColumnOps:
         t = TableMetadata(name="t", columns={"ids": col}, foreign_keys=[], primary_key="")
         schema = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"t": t})
         assign_column_ops(schema)
-        assert col.valid_filter_ops[0] == "contains"
+        assert col.valid_where_ops[0] == "contains"
 
     def test_fallback_role_branch_when_filterable(self):
         """Non-enum role string hits the default branch and keeps basic equality ops when filterable."""
@@ -1424,8 +1434,8 @@ class TestAssignColumnOps:
         t = TableMetadata(name="t", columns={"x": col}, foreign_keys=[], primary_key="")
         schema = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"t": t})
         assign_column_ops(schema)
-        assert "=" in col.valid_filter_ops
-        assert "is null" in col.valid_filter_ops
+        assert "=" in col.valid_where_ops
+        assert "is null" in col.valid_where_ops
         assert col.valid_aggregations == ["count"]
 
 
@@ -2066,10 +2076,10 @@ def _schema_with_partition(table: str, partition_cols: list[str]) -> SchemaGraph
     return SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={table: meta})
 
 
-def _filter_param(col: str, op: str, param_key: str | None = None, raw_value=None) -> FilterParam:
-    """Build a FilterParam for partition injection tests."""
+def _where_param(col: str, op: str, param_key: str | None = None, raw_value=None) -> WhereParam:
+    """Build a WhereParam for partition injection tests."""
     expr = NormalizedExpr.from_column(col)
-    return FilterParam(left_expr=expr, op=op, param_key=param_key or "", raw_value=raw_value)
+    return WhereParam(left_expr=expr, op=op, param_key=param_key or "", raw_value=raw_value)
 
 
 def _databricks_partition_dialect() -> DatabricksDialect:
@@ -2089,7 +2099,7 @@ class TestInjectPartitionFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[_filter_param("events.dt", "=", "p1", None)],
+            where=predicate_group_from_list([_where_param("events.dt", "=", "p1", None)]),
             param_values={"p1": "2024-01-15"},
         )
         sql = "SELECT * FROM events"
@@ -2106,10 +2116,12 @@ class TestInjectPartitionFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                _filter_param("logs.region", "=", "p1", None),
-                _filter_param("logs.region", "=", "p2", None),
-            ],
+            where=predicate_group_from_list(
+                [
+                    _where_param("logs.region", "=", "p1", None),
+                    _where_param("logs.region", "=", "p2", None),
+                ]
+            ),
             param_values={"p1": "us", "p2": "eu"},
         )
         sql = "SELECT * FROM logs"
@@ -2125,10 +2137,12 @@ class TestInjectPartitionFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                _filter_param("sales.dt", ">=", "p1", None),
-                _filter_param("sales.dt", "<=", "p2", None),
-            ],
+            where=predicate_group_from_list(
+                [
+                    _where_param("sales.dt", ">=", "p1", None),
+                    _where_param("sales.dt", "<=", "p2", None),
+                ]
+            ),
             param_values={"p1": "2024-01-01", "p2": "2024-01-31"},
         )
         sql = "SELECT * FROM sales"
@@ -2154,7 +2168,7 @@ class TestInjectPartitionFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[_filter_param("plain.id", "=", "p1", None)],
+            where=predicate_group_from_list([_where_param("plain.id", "=", "p1", None)]),
             param_values={"p1": 1},
         )
         sql = "SELECT * FROM plain WHERE id = 1"
@@ -2170,7 +2184,7 @@ class TestInjectPartitionFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[_filter_param("events.dt", "=", "p1", None)],
+            where=predicate_group_from_list([_where_param("events.dt", "=", "p1", None)]),
             param_values={"p1": "2024-01-15"},
         )
         sql = "SELECT * FROM events WHERE `events`.`dt` = '2024-01-15'"
@@ -2186,7 +2200,7 @@ class TestInjectPartitionFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[_filter_param("events.dt", "=", "p1", None)],
+            where=predicate_group_from_list([_where_param("events.dt", "=", "p1", None)]),
             param_values={"p1": "2024-01-15"},
         )
         sql = "SELECT * FROM events WHERE status = 'active'"

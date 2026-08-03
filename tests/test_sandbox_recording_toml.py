@@ -25,7 +25,7 @@ def test_write_sandbox_recording_toml_forces_memory_duckdb_and_keeps_llm_creds(t
     )
     toml_path = write_sandbox_recording_toml(str(env_path))
     try:
-        flat, _claimed = _load_config_file(toml_path)
+        flat, _claimed, _named = _load_config_file(toml_path)
         assert flat.get("DUCKDB_PATH") == ":memory:"
         assert flat.get("DUCKDB_SCHEMA") == "main"
         assert flat.get("OPENAI_API_KEY") == "sk-test-key"
@@ -46,7 +46,7 @@ def test_write_sandbox_recording_toml_overrides_file_duckdb_from_env() -> None:
         pytest.skip("env.env has no file-backed DUCKDB_PATH")
     toml_path = write_sandbox_recording_toml(str(env_path))
     try:
-        flat, _claimed = _load_config_file(toml_path)
+        flat, _claimed, _named = _load_config_file(toml_path)
         assert flat.get("DUCKDB_PATH") == ":memory:"
     finally:
         os.unlink(toml_path)

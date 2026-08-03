@@ -1,15 +1,19 @@
 """Shared fixtures for aetherdialect test suite."""
 
 import os
+from pathlib import Path
 from typing import Any
 
 import pytest
 
+from aetherdialect._config import DuckDBRuntimeConfig
 from aetherdialect._contracts_base import (
     ColumnRole,
-    FilterParam,
+    EngineIdentity,
     NormalizedExpr,
     TableRole,
+    WhereParam,
+    predicate_group_from_list,
 )
 from aetherdialect._contracts_core import (
     RuntimeIntent,
@@ -27,6 +31,25 @@ from aetherdialect._contracts_schema import (
     TemplateStats,
 )
 from aetherdialect._schema_catalog import assign_column_ops
+
+
+def duckdb_engine_identity() -> EngineIdentity:
+    """DuckDB identity for federation runtime binding tests."""
+    return EngineIdentity("duckdb", DuckDBRuntimeConfig)
+
+
+@pytest.fixture(autouse=True)
+def _default_engine_identity(request: pytest.FixtureRequest) -> Any:
+    """Bind a default engine identity for tests that call pipeline helpers directly."""
+    if request.node.get_closest_marker("no_default_engine_identity"):
+        yield
+        return
+    from aetherdialect._config import EngineConfig
+    from aetherdialect._core_utils import pop_engine_identity, push_engine_identity
+
+    token = push_engine_identity(EngineIdentity(EngineConfig.TYPE, EngineConfig.RUNTIME))
+    yield
+    pop_engine_identity(token)
 
 
 def _term_str(term: Any) -> str:
@@ -108,6 +131,8 @@ _SANDBOX_BUNDLE_MODULES = frozenset(
         "test_sandbox_recording_toml.py",
         "test_sandbox_recording_trace.py",
         "test_sandbox_tail_capture.py",
+        "test_aetherspace.py",
+        "test_doc_examples_smoke.py",
     }
 )
 
@@ -116,6 +141,14 @@ _EXECUTE_STEP_SANDBOX_TESTS = frozenset(
         "test_happy_path_returns_rows",
         "test_forbidden_statement_rejected_before_execute",
         "test_consumer_out_of_scope_blocked",
+    }
+)
+
+_SANDBOX_AUTHORING_NO_CORPUS_TESTS = frozenset(
+    {
+        "test_unrecorded_question_in_recorded_corpus_mode_names_mode",
+        "test_sandbox_guide_documents_engine_session_mode_as_primary_entry",
+        "test_api_reference_documents_sandbox_authoring_surface",
     }
 )
 
@@ -144,8 +177,10 @@ def _is_live_test(item: pytest.Item) -> bool:
     return "live_tests" in parts
 
 
-def _requires_sandbox_bundle(item: pytest.Item) -> bool:
+def _requires_corpus_bundle(item: pytest.Item) -> bool:
     """Return True when the test needs bundled ``sandbox/data.zip`` (``offline_sandbox`` corpus)."""
+    if item.get_closest_marker("needs_corpus") is not None:
+        return True
     if item.get_closest_marker("requires_sandbox") is not None:
         return True
     fspath = getattr(item, "path", None) or getattr(item, "fspath", None)
@@ -153,6 +188,8 @@ def _requires_sandbox_bundle(item: pytest.Item) -> bool:
     if mod in _SANDBOX_BUNDLE_MODULES:
         return True
     base_name = item.name.split("[", 1)[0]
+    if mod == "test_sandbox_authoring.py" and base_name not in _SANDBOX_AUTHORING_NO_CORPUS_TESTS:
+        return True
     if mod == "test_execute_step.py" and base_name in _EXECUTE_STEP_SANDBOX_TESTS:
         return True
     return mod == "test_sql_gen.py" and base_name == "test_rental_shop_category_film_emits_non_empty_join_path"
@@ -170,6 +207,28 @@ def _sandbox_bundle_ready() -> bool:
         return False
 
 
+@pytest.fixture(autouse=True)
+def _cleanup_cwd_schema_migration_map() -> Any:
+    """Remove migration map files left in the repo cwd by ``apply_migration_map`` demos."""
+
+    cwd = Path.cwd()
+    paths = (
+        cwd / "schema_migration_map.json",
+        cwd / "schema_migration_map.applied.json",
+        cwd / "federation_migration_map.json",
+        cwd / "federation_migration_map.applied.json",
+    )
+    for path in paths:
+        path.unlink(missing_ok=True)
+    for path in cwd.glob("federation_migration_map.applied.*.json"):
+        path.unlink(missing_ok=True)
+    yield
+    for path in paths:
+        path.unlink(missing_ok=True)
+    for path in cwd.glob("federation_migration_map.applied.*.json"):
+        path.unlink(missing_ok=True)
+
+
 @pytest.fixture
 def stub_schema_llm_classifier(monkeypatch: pytest.MonkeyPatch) -> None:
     """No-op ``apply_column_roles_llm`` for schema diff and partial- rebuild unit tests."""
@@ -183,22 +242,18 @@ def stub_schema_llm_classifier(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     sandbox_ready = _sandbox_bundle_ready()
-    skip_sandbox = pytest.mark.skip(reason="sandbox data.zip not ready")
+    skip_corpus = pytest.mark.skip(reason="needs_corpus: bundled sandbox data.zip absent")
     for item in items:
         if _is_live_test(item):
             continue
-        if _requires_sandbox_bundle(item):
-            item.add_marker(pytest.mark.requires_sandbox)
+        if _requires_corpus_bundle(item):
+            item.add_marker(pytest.mark.needs_corpus)
             if not sandbox_ready:
-                item.add_marker(skip_sandbox)
+                item.add_marker(skip_corpus)
             elif not _is_slow_sandbox_test(item):
                 item.add_marker(pytest.mark.fast)
         elif not _is_slow_sandbox_test(item):
             item.add_marker(pytest.mark.fast)
-
-
-def pytest_configure(config: Any) -> None:
-    config.addinivalue_line("markers", "integration: mocked multi-module pipeline slices")
 
 
 def pytest_runtest_logreport(report: pytest.TestReport) -> None:
@@ -462,7 +517,7 @@ def minimal_intent() -> RuntimeIntent:
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
+        where=None,
     )
 
 
@@ -478,16 +533,18 @@ def grouped_intent() -> RuntimeIntent:
         ],
         group_by_cols=[NormalizedExpr.from_column("customers.name")],
         order_by_cols=[],
-        filters_param=[
-            FilterParam(
-                left_expr=NormalizedExpr.from_column("orders.status"),
-                op="=",
-                value_type="string",
-                param_key="p1",
-                raw_value="shipped",
-            ),
-        ],
-        having_param=[],
+        where=predicate_group_from_list(
+            [
+                WhereParam(
+                    left_expr=NormalizedExpr.from_column("orders.status"),
+                    op="=",
+                    value_type="string",
+                    param_key="p1",
+                    raw_value="shipped",
+                ),
+            ]
+        ),
+        having=None,
         param_values={"p1": "shipped"},
         column_map={"name": "customers", "amount": "orders", "status": "orders"},
     )
@@ -696,3 +753,11 @@ def typed_schema() -> SchemaGraph:
     )
     assign_column_ops(sg)
     return sg
+
+
+@pytest.fixture
+def two_member_federation():
+    """Two-member duckdb federation with a declared cross-source join on ``id``."""
+    from tests.federation_helpers import build_two_member_federation
+
+    return build_two_member_federation()

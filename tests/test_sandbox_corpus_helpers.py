@@ -171,78 +171,33 @@ def test_recording_pipeline_ready_flags_incomplete(tmp_path: Path) -> None:
     assert reasons
 
 
-def test_merged_fixtures_for_verify_drops_stale_intent_for_slot(tmp_path: Path) -> None:
+def test_corpus_snapshot_restore_roundtrip(tmp_path: Path) -> None:
     sc = importlib.import_module("sandbox_corpus")
     fixtures_path = tmp_path / "fixtures.json"
     fixtures_path.write_text('{"version": 1, "fixtures": []}\n', encoding="utf-8")
     corpus = sc.FixtureCorpus(fixtures_path)
-    question = "Which actors appear in the most films?"
-    stale = {
-        "task": "intent",
-        "system": "You are the Ground stage.",
-        "user": f'{{"question":"{question}","interpret_plan":{{"approach":"stale"}}}}',
-        "output_text": "{}",
-    }
-    stale_ground_orphan = {
-        "task": "intent",
-        "system": "You are the Ground stage.",
-        "user": '{"interpret_plan":{"approach":"stale orphan ground without question label"}}',
-        "output_text": "{}",
-    }
-    shared = {
-        "task": "default",
-        "system": "gatekeeper",
-        "user": "shared",
-        "output_text": "{}",
-    }
-    corpus.fixtures.extend([dict(stale), dict(stale_ground_orphan), dict(shared)])
-    corpus.seen = {sc.fixture_key(row) for row in corpus.fixtures}
-    corpus.start_slot()
-    fresh = {
-        "task": "intent",
-        "system": "You are the Ground stage.",
-        "user": f'{{"question":"{question}","interpret_plan":{{"approach":"fresh"}}}}',
-        "output_text": '{"tables":["actor"]}',
-    }
-    corpus.record(
-        task=fresh["task"],
-        system=fresh["system"],
-        user_key=fresh["user"],
-        output_text=fresh["output_text"],
-    )
-    merged = corpus.merged_fixtures_for_verify(slot_label=question)
-    intent_rows = [row for row in merged if row.get("task") == "intent"]
-    assert len(intent_rows) == 1
-    assert "fresh" in intent_rows[0]["user"]
-    assert any(row.get("task") == "default" for row in merged)
-    assert not any(row.get("task") == "intent" and "stale" in row.get("user", "") for row in merged)
-
-
-def test_merged_fixtures_for_verify_keeps_other_question_intent(tmp_path: Path) -> None:
-    sc = importlib.import_module("sandbox_corpus")
-    fixtures_path = tmp_path / "fixtures.json"
-    fixtures_path.write_text('{"version": 1, "fixtures": []}\n', encoding="utf-8")
-    corpus = sc.FixtureCorpus(fixtures_path)
-    question = "Which actors appear in the most films?"
-    other = "How many books do we have?"
     corpus.fixtures.append(
         {
-            "task": "intent",
-            "system": "You are the Ground stage.",
-            "user": f'{{"question":"{other}","interpret_plan":{{"approach":"other"}}}}',
+            "task": "default",
+            "system": "gatekeeper",
+            "user": "before",
             "output_text": "{}",
         },
     )
     corpus.seen = {sc.fixture_key(row) for row in corpus.fixtures}
-    corpus.start_slot()
-    corpus.record(
-        task="intent",
-        system="You are the Ground stage.",
-        user_key=f'{{"question":"{question}","interpret_plan":{{"approach":"fresh"}}}}',
-        output_text='{"tables":["actor"]}',
+    snap = sc._corpus_snapshot(corpus)
+    corpus.fixtures.append(
+        {
+            "task": "default",
+            "system": "gatekeeper",
+            "user": "after",
+            "output_text": "{}",
+        },
     )
-    merged = corpus.merged_fixtures_for_verify(slot_label=question)
-    assert any(row.get("task") == "intent" and other in row.get("user", "") for row in merged)
+    corpus.seen.add(sc.fixture_key(corpus.fixtures[-1]))
+    sc._restore_corpus_snapshot(corpus, snap)
+    assert len(corpus.fixtures) == 1
+    assert corpus.fixtures[0]["user"] == "before"
 
 
 def test_mock_verify_targets_include_consumer_reader_for_practice_questions() -> None:

@@ -7,16 +7,21 @@ import os
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+    from ._contracts_base import FederationManifest
+    from ._contracts_schema import SchemaGraph
 
 from sqlalchemy import MetaData, inspect, text
 from sqlalchemy.schema import UniqueConstraint
 
-from ._config import (
-    EngineConfig,
-    PolicyConfig,
-)
+from ._config import EngineConfig, PolicyConfig
 from ._constants import (
+    FEDERATION_QUALIFIED_COLUMN_REF_RE,
+    FEDERATION_QUALIFIED_THREE_PART_REF_RE,
     JSON_COMPACT_SEPARATORS,
     MYSQL_INDEX_STATISTICS_SQL,
     MYSQL_PARTITION_EXPRESSIONS_SQL,
@@ -30,35 +35,27 @@ from ._constants import (
     SQLSERVER_UNIQUE_INDEX_COLUMNS_SQL,
 )
 from ._contracts_base import (
+    ConfigError,
     EngineContext,
+    FederationManifest,
     PkInferenceTag,
     SchemaAccessError,
     SchemaInclude,
     SchemaInvariantError,
+    resolve_federation_qualified_ref,
 )
-from ._contracts_schema import (
-    ColumnMetadata,
-    FKEdge,
-    SchemaGraph,
-    TableMetadata,
-)
-from ._core_utils import (
-    debug,
-    schema_hash_fp,
-    stable_json,
-)
-from ._schema_catalog import (
-    parse_sql_file,
-)
+from ._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
+from ._core_utils import debug, schema_hash_fp, stable_json
+from ._schema_catalog import apply_catalog_descriptions_from_tables_meta, parse_sql_file
 from ._schema_graph import (
     allow_objects_lower_set,
+    apply_deny_objects_filter,
     assign_schema_graph_hashes,
     catalog_fk_graph_is_connected,
     compute_join_paths_multi_from_adj,
     edge_key,
     expanded_scope_sql_file,
     load_pg_enum_values,
-    merge_reflected_schema_graphs,
     pair_targeted_fk_inference,
     recompute_join_paths_multi,
     schema_context_from_graph,
@@ -68,33 +65,81 @@ from ._schema_graph import (
 )
 
 
+def apply_full_build_deny_objects(sg: SchemaGraph, deny_objects: frozenset[str] | None) -> SchemaGraph:
+    """Remove denied relations on the structural reflection path before profiling."""
+    if deny_objects:
+        apply_deny_objects_filter(sg, EngineContext(deny_objects=deny_objects))
+    return sg
+
+
 def overrides_sidecar_path(schema_json_path: str | Path) -> Path:
     """Return the canonical sidecar location for *schema_json_path*'s overrides document."""
     parent = Path(schema_json_path).expanduser().resolve().parent
     return Path(parent / SCHEMA_OVERRIDES_SIDECAR_FILENAME)
 
 
-def split_fk_endpoint(endpoint: Any) -> tuple[str, list[str]] | None:
-    """Split a ``"schema.table.col"`` shorthand or ``["schema.table.col", ...]`` into ``(table, [cols])``."""
-    if isinstance(endpoint, str):
-        parts = endpoint.rsplit(".", 1)
-        if len(parts) != 2 or not parts[0] or not parts[1]:
+def _split_qualified_endpoint_text(
+    text: str,
+    *,
+    manifest: FederationManifest | None = None,
+    schema: SchemaGraph | None = None,
+    source_by_table: Mapping[str, str] | None = None,
+) -> tuple[str, str] | None:
+    """Split one ``table.column`` or ``source.table.column`` endpoint into table and column."""
+    raw = str(text).strip()
+    if not raw:
+        return None
+    if manifest is not None:
+        try:
+            resolved = resolve_federation_qualified_ref(
+                raw, manifest=manifest, schema=schema, source_by_table=source_by_table
+            )
+        except ConfigError:
             return None
-        return parts[0], [parts[1]]
+        return resolved.table, resolved.column
+    three = FEDERATION_QUALIFIED_THREE_PART_REF_RE.match(raw)
+    if three:
+        return three.group(2), three.group(3)
+    two = FEDERATION_QUALIFIED_COLUMN_REF_RE.match(raw)
+    if two:
+        return two.group(1), two.group(2)
+    parts = raw.rsplit(".", 1)
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        return None
+    return parts[0], parts[1]
+
+
+def split_fk_endpoint(
+    endpoint: Any,
+    *,
+    manifest: FederationManifest | None = None,
+    schema: SchemaGraph | None = None,
+    source_by_table: Mapping[str, str] | None = None,
+) -> tuple[str, list[str]] | None:
+    """Split a ``table.column`` or ``source.table.column`` shorthand into ``(table, [cols])``."""
+    if isinstance(endpoint, str):
+        split = _split_qualified_endpoint_text(
+            endpoint, manifest=manifest, schema=schema, source_by_table=source_by_table
+        )
+        if split is None:
+            return None
+        return split[0], [split[1]]
     if isinstance(endpoint, list) and endpoint:
         table_name: str | None = None
         cols: list[str] = []
         for ep in endpoint:
             if not isinstance(ep, str):
                 return None
-            parts = ep.rsplit(".", 1)
-            if len(parts) != 2 or not parts[0] or not parts[1]:
+            split = _split_qualified_endpoint_text(
+                ep, manifest=manifest, schema=schema, source_by_table=source_by_table
+            )
+            if split is None:
                 return None
             if table_name is None:
-                table_name = parts[0]
-            elif table_name != parts[0]:
+                table_name = split[0]
+            elif table_name != split[0]:
                 return None
-            cols.append(parts[1])
+            cols.append(split[1])
         if table_name is None:
             return None
         return table_name, cols
@@ -131,6 +176,10 @@ def read_sidecar_internal(schema_json_path: str | Path) -> dict[str, Any] | None
 
 def load_inference_block_lists(
     schema_json_path: str | Path | None,
+    *,
+    manifest: FederationManifest | None = None,
+    schema: SchemaGraph | None = None,
+    source_by_table: Mapping[str, str] | None = None,
 ) -> tuple[
     frozenset[tuple[str, str]],
     frozenset[tuple[str, tuple[str, ...], str, tuple[str, ...]]],
@@ -153,8 +202,8 @@ def load_inference_block_lists(
     for entry in internal.get("fk_block_inferred", []) or []:
         if not isinstance(entry, dict):
             continue
-        src = split_fk_endpoint(entry.get("from"))
-        dst = split_fk_endpoint(entry.get("to"))
+        src = split_fk_endpoint(entry.get("from"), manifest=manifest, schema=schema, source_by_table=source_by_table)
+        dst = split_fk_endpoint(entry.get("to"), manifest=manifest, schema=schema, source_by_table=source_by_table)
         if src is None or dst is None:
             continue
         fk_keys.add((src[0], tuple(src[1]), dst[0], tuple(dst[1])))
@@ -249,6 +298,7 @@ def _reflect_schema(
 
     if object_kind == "table":
         for t in md.tables.values():
+            existing_keys = {edge_key(e) for e in tables[t.name].foreign_keys}
             for fk in t.foreign_key_constraints:
                 e = FKEdge(
                     src_table=t.name,
@@ -256,11 +306,15 @@ def _reflect_schema(
                     dst_table=fk.elements[0].column.table.name,
                     dst_cols=[el.column.name for el in fk.elements],
                 )
+                ek = edge_key(e)
+                if ek in existing_keys:
+                    continue
+                existing_keys.add(ek)
                 tables[t.name].foreign_keys.append(e)
 
                 debug(
                     f"[{SCHEMA_BUILD_PHASE_C}]  explicit FK: {e.src_table}.{e.src_cols[0]} -> "
-                    f"{e.dst_table}.{e.dst_cols[0]}",
+                    f"{e.dst_table}.{e.dst_cols[0]}"
                 )
 
         fk_count = sum(len(tbl.foreign_keys) for tbl in tables.values())
@@ -286,10 +340,7 @@ def _reflect_schema(
 
     enum_values: dict[str, list[str]] = {}
     if load_pg_enums is None:
-        load_pg_enums = (EngineConfig.TYPE or "").strip().lower() in (
-            "postgresql",
-            "redshift",
-        )
+        load_pg_enums = (EngineConfig.TYPE or "").strip().lower() in ("postgresql", "redshift")
     if load_pg_enums:
         enum_values = load_pg_enum_values(engine)
 
@@ -316,10 +367,7 @@ def _reflect_schema(
     join_paths_multi = compute_join_paths_multi_from_adj(adj, tlist)
 
     sg = SchemaGraph(
-        tables=tables,
-        join_paths_multi=join_paths_multi,
-        created_at=datetime.now().isoformat(),
-        enum_values=enum_values,
+        tables=tables, join_paths_multi=join_paths_multi, created_at=datetime.now().isoformat(), enum_values=enum_values
     )
 
     return sg
@@ -339,7 +387,7 @@ def tables_meta_to_schema_graph(
     object_kind: Literal["table", "view"] = "table",
     row_kind_by_table: dict[str, Literal["table", "view"]] | None = None,
 ) -> SchemaGraph:
-    """Convert a raw table metadata dictionary to a fully connected. `SchemaGraph`."""
+    """Convert a raw table metadata dictionary to a ``SchemaGraph``."""
     tables: dict[str, TableMetadata] = {}
 
     for table_name, meta in tables_meta.items():
@@ -363,6 +411,7 @@ def tables_meta_to_schema_graph(
         enum_labels = meta.get("column_enum_labels", [])
         generated_flags = meta.get("column_is_generated", [])
         identity_flags = meta.get("column_is_identity", [])
+        original_labels = meta.get("original_column_labels", col_names)
         for i, col_name in enumerate(col_names):
             col_type = col_types[i] if i < len(col_types) else "UNKNOWN"
             if use_parsed_nullable and nullable_list is not None:
@@ -375,8 +424,10 @@ def tables_meta_to_schema_graph(
             labels = enum_labels[i] if i < len(enum_labels) else []
             is_generated = generated_flags[i] if i < len(generated_flags) else False
             is_identity = identity_flags[i] if i < len(identity_flags) else False
+            original_label = original_labels[i] if i < len(original_labels) else col_name
             columns[col_name] = ColumnMetadata(
                 name=col_name,
+                original_name=str(original_label) if str(original_label) != col_name else "",
                 data_type=col_type,
                 is_primary_key=col_name in pk_cols,
                 is_foreign_key=False,
@@ -392,16 +443,15 @@ def tables_meta_to_schema_graph(
         fk_edges = []
         for fk in meta.get("foreign_keys", []):
             edge = FKEdge(
-                src_table=table_name,
-                src_cols=fk["src_cols"],
-                dst_table=fk["dst_table"],
-                dst_cols=fk["dst_cols"],
+                src_table=table_name, src_cols=fk["src_cols"], dst_table=fk["dst_table"], dst_cols=fk["dst_cols"]
             )
             fk_edges.append(edge)
 
         partition_cols = meta.get("partition_columns", [])
+        table_original = str(meta.get("original_table_label", table_name) or table_name)
         tables[table_name] = TableMetadata(
             name=table_name,
+            original_name=table_original if table_original != table_name else "",
             columns=columns,
             primary_key=pk_cols,
             foreign_keys=fk_edges,
@@ -446,11 +496,9 @@ def tables_meta_to_schema_graph(
     join_paths_multi = compute_join_paths_multi_from_adj(adj, tlist)
 
     sg = SchemaGraph(
-        tables=tables,
-        join_paths_multi=join_paths_multi,
-        created_at=datetime.now().isoformat(),
-        enum_values={},
+        tables=tables, join_paths_multi=join_paths_multi, created_at=datetime.now().isoformat(), enum_values={}
     )
+    apply_catalog_descriptions_from_tables_meta(sg, tables_meta)
     unify_reflected_schema_graph(sg)
     assign_schema_graph_hashes(sg, EngineContext(), "")
     _assert_schema_invariants(sg)
@@ -508,10 +556,7 @@ def resolve_graph_table_name(raw_name: str, graph_tables: set[str]) -> str | Non
     return lower_index.get(raw_name.lower())
 
 
-def _merge_ddl_primary_keys_into_schema_graph(
-    sg: SchemaGraph,
-    ddl_tables: dict[str, dict[str, Any]],
-) -> None:
+def _merge_ddl_primary_keys_into_schema_graph(sg: SchemaGraph, ddl_tables: dict[str, dict[str, Any]]) -> None:
     """Add primary-key columns from parsed DDL into *sg* when columns exist."""
     if not ddl_tables or not sg.tables:
         return
@@ -533,10 +578,7 @@ def _merge_ddl_primary_keys_into_schema_graph(
                 col_meta.pk_inference_tag = PkInferenceTag.DDL
 
 
-def _merge_ddl_column_constraints_into_schema_graph(
-    sg: SchemaGraph,
-    ddl_tables: dict[str, dict[str, Any]],
-) -> None:
+def _merge_ddl_column_constraints_into_schema_graph(sg: SchemaGraph, ddl_tables: dict[str, dict[str, Any]]) -> None:
     """Apply UNIQUE and NOT NULL signals from parsed DDL onto *sg* when columns exist."""
     if not ddl_tables or not sg.tables:
         return
@@ -564,10 +606,7 @@ def _merge_ddl_column_constraints_into_schema_graph(
                 src_tbl.columns[uq_name].is_unique = True
 
 
-def merge_ddl_partition_columns_into_schema_graph(
-    sg: SchemaGraph,
-    ddl_tables: dict[str, dict[str, Any]],
-) -> None:
+def merge_ddl_partition_columns_into_schema_graph(sg: SchemaGraph, ddl_tables: dict[str, dict[str, Any]]) -> None:
     """Merge partition column names from parsed DDL into *sg* when columns exist."""
     if not ddl_tables or not sg.tables:
         return
@@ -589,10 +628,7 @@ def merge_ddl_partition_columns_into_schema_graph(
             src_tbl.partition_columns = validated
 
 
-def merge_ddl_foreign_keys_into_schema_graph(
-    sg: SchemaGraph,
-    ddl_tables: dict[str, dict[str, Any]],
-) -> None:
+def merge_ddl_foreign_keys_into_schema_graph(sg: SchemaGraph, ddl_tables: dict[str, dict[str, Any]]) -> None:
     """Add FK edges from parsed DDL into *sg* when endpoints exist, then. refresh paths."""
     if not ddl_tables or not sg.tables:
         return
@@ -617,12 +653,7 @@ def merge_ddl_foreign_keys_into_schema_graph(
             dst_tbl = sg.tables[dst_resolved]
             if any(c not in dst_tbl.columns for c in dst_cols):
                 continue
-            edge = FKEdge(
-                src_table=src_resolved,
-                src_cols=src_cols,
-                dst_table=dst_resolved,
-                dst_cols=dst_cols,
-            )
+            edge = FKEdge(src_table=src_resolved, src_cols=src_cols, dst_table=dst_resolved, dst_cols=dst_cols)
             ek = edge_key(edge)
             if ek in existing:
                 continue
@@ -633,12 +664,7 @@ def merge_ddl_foreign_keys_into_schema_graph(
     assign_schema_graph_hashes(sg, schema_context_from_graph(sg), sg.notes_sha256)
 
 
-def enrich_postgresql_partition_columns(
-    engine: Any,
-    sg: SchemaGraph,
-    *,
-    schema_name: str | None = None,
-) -> None:
+def enrich_postgresql_partition_columns(engine: Any, sg: SchemaGraph, *, schema_name: str | None = None) -> None:
     """Populate ``partition_columns`` on reflected PostgreSQL tables from ``pg_catalog``."""
     if not sg.tables or engine is None:
         return
@@ -648,10 +674,7 @@ def enrich_postgresql_partition_columns(
         effective_schema = str(runtime_schema) if runtime_schema else "public"
     try:
         with engine.connect() as conn:
-            rows = conn.execute(
-                text(POSTGRESQL_PARTITION_KEY_COLUMNS_SQL),
-                {"s": effective_schema},
-            ).fetchall()
+            rows = conn.execute(text(POSTGRESQL_PARTITION_KEY_COLUMNS_SQL), {"s": effective_schema}).fetchall()
     except Exception as e:
         debug(f"[{SCHEMA_BUILD_PHASE_C}]  catalog_query_failed: {e}")
         return
@@ -674,6 +697,7 @@ def load_or_create_schema_postgresql(
     *,
     include: SchemaInclude = "tables",
     allow_objects: frozenset[str] | None = None,
+    deny_objects: frozenset[str] | None = None,
     schema_json_path: str | Path | None = None,
     sql_file: str | None = None,
 ) -> SchemaGraph:
@@ -681,41 +705,23 @@ def load_or_create_schema_postgresql(
     try:
         debug(f"[{SCHEMA_BUILD_PHASE_C}] load_or_create_schema_postgresql reflecting_database")
         sidecar_path = schema_json_path if schema_json_path is not None else EngineConfig.SCHEMA_JSON_PATH
-        if include == "both":
-            sg = merge_reflected_schema_graphs(
-                _reflect_schema(
-                    engine,
-                    object_kind="table",
-                    allow_objects=allow_objects,
-                    schema_json_path=sidecar_path,
-                    load_pg_enums=True,
-                ),
-                _reflect_schema(
-                    engine,
-                    object_kind="view",
-                    allow_objects=allow_objects,
-                    schema_json_path=sidecar_path,
-                    load_pg_enums=True,
-                ),
-            )
-        else:
-            sg = _reflect_schema(
-                engine,
-                object_kind="table" if include == "tables" else "view",
-                allow_objects=allow_objects,
-                schema_json_path=sidecar_path,
-                load_pg_enums=True,
-            )
+        sg = _reflect_schema(
+            engine,
+            object_kind="table" if include == "tables" else "view",
+            allow_objects=allow_objects,
+            schema_json_path=sidecar_path,
+            load_pg_enums=True,
+        )
         debug(f"[{SCHEMA_BUILD_PHASE_C}]  reflected: {len(sg.tables)} tables")
-        if engine is not None and include in ("tables", "both"):
+        if engine is not None and include == "tables":
             enrich_postgresql_partition_columns(engine, sg)
         sql_file_path = expanded_scope_sql_file(sql_file)
-        if include in ("tables", "both") and sql_file_path and os.path.exists(sql_file_path) and sg.tables:
+        if include == "tables" and sql_file_path and os.path.exists(sql_file_path) and sg.tables:
             ddl_tables = parse_sql_file(Path(sql_file_path), reflected_schema=sg)
             if ddl_tables:
                 merge_ddl_foreign_keys_into_schema_graph(sg, ddl_tables)
                 merge_ddl_partition_columns_into_schema_graph(sg, ddl_tables)
-        return sg
+        return apply_full_build_deny_objects(sg, deny_objects)
     except Exception as e:
         debug(f"[{SCHEMA_BUILD_PHASE_C}]  reflection_failed: {e}")
         sql_file_path = expanded_scope_sql_file(sql_file)
@@ -732,7 +738,7 @@ def load_or_create_schema_postgresql(
             allow_lower = allow_objects_lower_set(allow_objects)
             if allow_lower is not None:
                 filtered = {k: v for k, v in tables_meta.items() if str(k).lower() in allow_lower}
-            return tables_meta_to_schema_graph(filtered, object_kind=ok)
+            return apply_full_build_deny_objects(tables_meta_to_schema_graph(filtered, object_kind=ok), deny_objects)
         raise SchemaAccessError(f"Database reflection failed and no SQL file available: {e}") from e
 
 
@@ -758,6 +764,7 @@ def _schema_graph_from_sql_file_fallback(
     allow_objects: frozenset[str] | None,
     log_prefix: str,
     sql_file: str | None = None,
+    deny_objects: frozenset[str] | None = None,
 ) -> SchemaGraph:
     """Parse ``EngineContext.sql_file`` when live catalog reflection fails."""
     sql_file_path = expanded_scope_sql_file(sql_file)
@@ -771,7 +778,7 @@ def _schema_graph_from_sql_file_fallback(
         allow_lower = allow_objects_lower_set(allow_objects)
         if allow_lower is not None:
             filtered = {k: v for k, v in tables_meta.items() if str(k).lower() in allow_lower}
-        return tables_meta_to_schema_graph(filtered, object_kind=ok)
+        return apply_full_build_deny_objects(tables_meta_to_schema_graph(filtered, object_kind=ok), deny_objects)
     raise SchemaAccessError(f"Database reflection failed and no SQL file available: {e}") from e
 
 
@@ -807,10 +814,7 @@ def _parse_mysql_partition_column(partition_expression: str) -> str | None:
 
 
 def _fk_tables_meta_edge_key(
-    table_name: str,
-    src_cols: list[str],
-    dst_table: str,
-    dst_cols: list[str],
+    table_name: str, src_cols: list[str], dst_table: str, dst_cols: list[str]
 ) -> tuple[str, tuple[str, ...], str, tuple[str, ...]]:
     """Return a dedupe key for a ``tables_meta`` foreign-key dict entry."""
     return (table_name, tuple(src_cols), dst_table, tuple(dst_cols))
@@ -833,7 +837,7 @@ def _append_tables_meta_foreign_key(
         return
     seen.add(key)
     tables_meta[table_name]["foreign_keys"].append(
-        {"src_cols": list(src_cols), "dst_table": dst_table, "dst_cols": list(dst_cols)},
+        {"src_cols": list(src_cols), "dst_table": dst_table, "dst_cols": list(dst_cols)}
     )
 
 
@@ -880,19 +884,11 @@ def _flush_information_schema_fk_buckets(
         if not dst_table:
             continue
         _append_tables_meta_foreign_key(
-            tables_meta,
-            table_name,
-            src_cols=src_cols,
-            dst_table=dst_table,
-            dst_cols=dst_cols,
-            seen=seen,
+            tables_meta, table_name, src_cols=src_cols, dst_table=dst_table, dst_cols=dst_cols, seen=seen
         )
 
 
-def _merge_svv_foreign_keys_into_tables_meta(
-    tables_meta: dict[str, dict[str, Any]],
-    svv_rows: list[Any],
-) -> None:
+def _merge_svv_foreign_keys_into_tables_meta(tables_meta: dict[str, dict[str, Any]], svv_rows: list[Any]) -> None:
     """Merge Redshift ``svv_foreign_keys`` rows into ``tables_meta`` without duplicating ``information_schema`` edges."""
     seen: set[tuple[str, tuple[str, ...], str, tuple[str, ...]]] = set()
     for tname, meta in tables_meta.items():
@@ -903,7 +899,7 @@ def _merge_svv_foreign_keys_into_tables_meta(
                     list(fk.get("src_cols", []) or []),
                     str(fk.get("dst_table", "")),
                     list(fk.get("dst_cols", []) or []),
-                ),
+                )
             )
     buckets: dict[tuple[str, str], list[tuple[str, str, str]]] = {}
     for row in svv_rows:
@@ -914,20 +910,13 @@ def _merge_svv_foreign_keys_into_tables_meta(
         parent_col = str(row[6] or "")
         if not child_table or not child_col or not parent_table or not parent_col:
             continue
-        buckets.setdefault((child_table, constraint_name), []).append(
-            (child_col, parent_table, parent_col),
-        )
+        buckets.setdefault((child_table, constraint_name), []).append((child_col, parent_table, parent_col))
     for (child_table, _constraint_name), pairs in buckets.items():
         src_cols = [p[0] for p in pairs]
         dst_table = pairs[0][1]
         dst_cols = [p[2] for p in pairs]
         _append_tables_meta_foreign_key(
-            tables_meta,
-            child_table,
-            src_cols=src_cols,
-            dst_table=dst_table,
-            dst_cols=dst_cols,
-            seen=seen,
+            tables_meta, child_table, src_cols=src_cols, dst_table=dst_table, dst_cols=dst_cols, seen=seen
         )
 
 
@@ -950,22 +939,18 @@ def _parse_mysql_enum_labels(column_type: str) -> list[str]:
 
 
 def _reflect_mysql_catalog(
-    engine: Any,
-    schema_name: str,
-    *,
-    include: SchemaInclude,
-    allow_objects: frozenset[str] | None,
+    engine: Any, schema_name: str, *, include: SchemaInclude, allow_objects: frozenset[str] | None
 ) -> SchemaGraph:
     """Reflect MySQL schema via ``information_schema`` queries."""
     allow_lower = allow_objects_lower_set(allow_objects)
-    want_views = include in ("views", "both")
-    want_tables = include in ("tables", "both")
+    want_views = include == "views"
+    want_tables = include == "tables"
     with engine.connect() as conn:
         table_rows = conn.execute(
             text(
                 "SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES "
                 "WHERE TABLE_SCHEMA = :s AND TABLE_TYPE IN ('BASE TABLE', 'VIEW') "
-                "ORDER BY TABLE_NAME",
+                "ORDER BY TABLE_NAME"
             ),
             {"s": schema_name},
         ).fetchall()
@@ -974,7 +959,7 @@ def _reflect_mysql_catalog(
                 "SELECT TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION, DATA_TYPE, IS_NULLABLE, "
                 "COLUMN_TYPE, EXTRA, COLUMN_KEY, GENERATION_EXPRESSION "
                 "FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = :s "
-                "ORDER BY TABLE_NAME, ORDINAL_POSITION",
+                "ORDER BY TABLE_NAME, ORDINAL_POSITION"
             ),
             {"s": schema_name},
         ).fetchall()
@@ -989,18 +974,12 @@ def _reflect_mysql_catalog(
                 " AND tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME "
                 "WHERE tc.TABLE_SCHEMA = :s "
                 "AND tc.CONSTRAINT_TYPE IN ('PRIMARY KEY', 'FOREIGN KEY', 'UNIQUE') "
-                "ORDER BY kcu.TABLE_NAME, tc.CONSTRAINT_NAME, kcu.ORDINAL_POSITION",
+                "ORDER BY kcu.TABLE_NAME, tc.CONSTRAINT_NAME, kcu.ORDINAL_POSITION"
             ),
             {"s": schema_name},
         ).fetchall()
-        partition_rows = conn.execute(
-            text(MYSQL_PARTITION_EXPRESSIONS_SQL),
-            {"s": schema_name},
-        ).fetchall()
-        statistics_rows = conn.execute(
-            text(MYSQL_INDEX_STATISTICS_SQL),
-            {"s": schema_name},
-        ).fetchall()
+        partition_rows = conn.execute(text(MYSQL_PARTITION_EXPRESSIONS_SQL), {"s": schema_name}).fetchall()
+        statistics_rows = conn.execute(text(MYSQL_INDEX_STATISTICS_SQL), {"s": schema_name}).fetchall()
     enum_values: dict[str, list[str]] = {}
     partition_by_table: dict[str, list[str]] = {}
     for tname, part_expr, _part_method in partition_rows:
@@ -1041,17 +1020,7 @@ def _reflect_mysql_catalog(
             "partition_columns": list(partition_by_table.get(name, [])),
             "indexed_columns": list(indexed_by_table.get(name, [])),
         }
-    for (
-        tname,
-        cname,
-        _ord,
-        dtype,
-        nullable,
-        col_type,
-        extra,
-        column_key,
-        generation_expr,
-    ) in col_rows:
+    for tname, cname, _ord, dtype, nullable, col_type, extra, column_key, generation_expr in col_rows:
         name = str(tname)
         if name not in tables_meta:
             continue
@@ -1095,7 +1064,7 @@ def _reflect_mysql_catalog(
             )
     _flush_information_schema_fk_buckets(tables_meta, fk_buckets, seen=fk_seen)
     row_kind: Literal["table", "view"] = "table" if include != "views" else "view"
-    row_by = table_kinds if include == "both" else None
+    row_by = None
     sg = tables_meta_to_schema_graph(tables_meta, object_kind=row_kind, row_kind_by_table=row_by)
     if enum_values:
         sg.enum_values = enum_values
@@ -1103,21 +1072,17 @@ def _reflect_mysql_catalog(
 
 
 def _reflect_redshift_catalog(
-    engine: Any,
-    schema_name: str,
-    *,
-    include: SchemaInclude,
-    allow_objects: frozenset[str] | None,
+    engine: Any, schema_name: str, *, include: SchemaInclude, allow_objects: frozenset[str] | None
 ) -> SchemaGraph:
     """Reflect Redshift schema via ``information_schema``, ``SVV_TABLE_INFO``, and ``svv_foreign_keys``."""
     allow_lower = allow_objects_lower_set(allow_objects)
-    want_views = include in ("views", "both")
-    want_tables = include in ("tables", "both")
+    want_views = include == "views"
+    want_tables = include == "tables"
     with engine.connect() as conn:
         table_rows = conn.execute(
             text(
                 "SELECT table_name, table_type FROM information_schema.tables "
-                "WHERE table_schema = :s ORDER BY table_name",
+                "WHERE table_schema = :s ORDER BY table_name"
             ),
             {"s": schema_name},
         ).fetchall()
@@ -1125,7 +1090,7 @@ def _reflect_redshift_catalog(
             text(
                 "SELECT table_name, column_name, ordinal_position, data_type, is_nullable "
                 "FROM information_schema.columns WHERE table_schema = :s "
-                "ORDER BY table_name, ordinal_position",
+                "ORDER BY table_name, ordinal_position"
             ),
             {"s": schema_name},
         ).fetchall()
@@ -1141,7 +1106,7 @@ def _reflect_redshift_catalog(
                 "  ON ccu.constraint_name = tc.constraint_name "
                 " AND ccu.table_schema = tc.table_schema "
                 "WHERE tc.table_schema = :s AND tc.constraint_type = 'FOREIGN KEY' "
-                "ORDER BY tc.table_name, tc.constraint_name, kcu.ordinal_position",
+                "ORDER BY tc.table_name, tc.constraint_name, kcu.ordinal_position"
             ),
             {"s": schema_name},
         ).fetchall()
@@ -1153,31 +1118,23 @@ def _reflect_redshift_catalog(
                 "  ON tc.constraint_name = kcu.constraint_name "
                 " AND tc.table_schema = kcu.table_schema "
                 "WHERE tc.table_schema = :s AND tc.constraint_type = 'PRIMARY KEY' "
-                "ORDER BY kcu.table_name, kcu.ordinal_position",
+                "ORDER BY kcu.table_name, kcu.ordinal_position"
             ),
             {"s": schema_name},
         ).fetchall()
         try:
             svv_rows = conn.execute(
-                text(
-                    'SELECT "table", diststyle, sortkey1, size, encoded FROM svv_table_info WHERE "schema" = :s',
-                ),
+                text('SELECT "table", diststyle, sortkey1, size, encoded FROM svv_table_info WHERE "schema" = :s'),
                 {"s": schema_name},
             ).fetchall()
         except Exception:
             svv_rows = []
         try:
-            uq_rows = conn.execute(
-                text(REDSHIFT_INFORMATION_SCHEMA_UNIQUE_COLUMNS_SQL),
-                {"s": schema_name},
-            ).fetchall()
+            uq_rows = conn.execute(text(REDSHIFT_INFORMATION_SCHEMA_UNIQUE_COLUMNS_SQL), {"s": schema_name}).fetchall()
         except Exception:
             uq_rows = []
         try:
-            svv_fk_rows = conn.execute(
-                text(REDSHIFT_SVV_FOREIGN_KEYS_SQL),
-                {"s": schema_name},
-            ).fetchall()
+            svv_fk_rows = conn.execute(text(REDSHIFT_SVV_FOREIGN_KEYS_SQL), {"s": schema_name}).fetchall()
         except Exception:
             svv_fk_rows = []
     tables_meta: dict[str, dict[str, Any]] = {}
@@ -1254,32 +1211,24 @@ def _reflect_redshift_catalog(
     _flush_information_schema_fk_buckets(tables_meta, fk_buckets, seen=fk_seen)
     _merge_svv_foreign_keys_into_tables_meta(tables_meta, list(svv_fk_rows))
     row_kind: Literal["table", "view"] = "table" if include != "views" else "view"
-    sg = tables_meta_to_schema_graph(
-        tables_meta,
-        object_kind=row_kind,
-        row_kind_by_table=table_kinds if include == "both" else None,
-    )
+    sg = tables_meta_to_schema_graph(tables_meta, object_kind=row_kind, row_kind_by_table=None)
     sg.enum_values = load_pg_enum_values(engine)
     return sg
 
 
 def _reflect_duckdb_catalog(
-    engine: Any,
-    schema_name: str,
-    *,
-    include: SchemaInclude,
-    allow_objects: frozenset[str] | None,
+    engine: Any, schema_name: str, *, include: SchemaInclude, allow_objects: frozenset[str] | None
 ) -> SchemaGraph:
     """Reflect DuckDB schema via ``information_schema`` including ``KEY_COLUMN_USAGE`` FK edges."""
     allow_lower = allow_objects_lower_set(allow_objects)
-    want_views = include in ("views", "both")
-    want_tables = include in ("tables", "both")
+    want_views = include == "views"
+    want_tables = include == "tables"
     with engine.connect() as conn:
         table_rows = conn.execute(
             text(
                 "SELECT table_name, table_type FROM information_schema.tables "
                 "WHERE table_schema = :s AND table_type IN ('BASE TABLE', 'VIEW') "
-                "ORDER BY table_name",
+                "ORDER BY table_name"
             ),
             {"s": schema_name},
         ).fetchall()
@@ -1287,7 +1236,7 @@ def _reflect_duckdb_catalog(
             text(
                 "SELECT table_name, column_name, ordinal_position, data_type, is_nullable "
                 "FROM information_schema.columns WHERE table_schema = :s "
-                "ORDER BY table_name, ordinal_position",
+                "ORDER BY table_name, ordinal_position"
             ),
             {"s": schema_name},
         ).fetchall()
@@ -1299,7 +1248,7 @@ def _reflect_duckdb_catalog(
                 "  ON tc.constraint_schema = kcu.constraint_schema "
                 " AND tc.constraint_name = kcu.constraint_name "
                 "WHERE tc.table_schema = :s AND tc.constraint_type = 'PRIMARY KEY' "
-                "ORDER BY kcu.table_name, kcu.ordinal_position",
+                "ORDER BY kcu.table_name, kcu.ordinal_position"
             ),
             {"s": schema_name},
         ).fetchall()
@@ -1311,7 +1260,7 @@ def _reflect_duckdb_catalog(
                 "  ON tc.constraint_schema = kcu.constraint_schema "
                 " AND tc.constraint_name = kcu.constraint_name "
                 "WHERE tc.table_schema = :s AND tc.constraint_type = 'UNIQUE' "
-                "ORDER BY kcu.table_name, kcu.ordinal_position",
+                "ORDER BY kcu.table_name, kcu.ordinal_position"
             ),
             {"s": schema_name},
         ).fetchall()
@@ -1329,7 +1278,7 @@ def _reflect_duckdb_catalog(
                     "  ON ccu.constraint_name = tc.constraint_name "
                     " AND ccu.table_schema = tc.table_schema "
                     "WHERE tc.table_schema = :s AND tc.constraint_type = 'FOREIGN KEY' "
-                    "ORDER BY kcu.table_name, tc.constraint_name, kcu.ordinal_position",
+                    "ORDER BY kcu.table_name, tc.constraint_name, kcu.ordinal_position"
                 ),
                 {"s": schema_name},
             ).fetchall()
@@ -1395,31 +1344,24 @@ def _reflect_duckdb_catalog(
             )
     _flush_information_schema_fk_buckets(tables_meta, fk_buckets, seen=fk_seen)
     row_kind: Literal["table", "view"] = "table" if include != "views" else "view"
-    return tables_meta_to_schema_graph(
-        tables_meta,
-        object_kind=row_kind,
-        row_kind_by_table=table_kinds if include == "both" else None,
-    )
+    return tables_meta_to_schema_graph(tables_meta, object_kind=row_kind, row_kind_by_table=None)
 
 
 def _reflect_sqlite_catalog(
-    engine: Any,
-    *,
-    include: SchemaInclude,
-    allow_objects: frozenset[str] | None,
+    engine: Any, *, include: SchemaInclude, allow_objects: frozenset[str] | None
 ) -> SchemaGraph:
     """Reflect SQLite schema from ``sqlite_master`` and ``PRAGMA foreign_key_list`` when FK enforcement is on."""
     allow_lower = allow_objects_lower_set(allow_objects)
-    want_views = include in ("views", "both")
-    want_tables = include in ("tables", "both")
+    want_views = include == "views"
+    want_tables = include == "tables"
     with engine.connect() as conn:
         fk_enabled = bool(conn.execute(text("PRAGMA foreign_keys")).scalar())
         table_rows = conn.execute(
             text(
                 "SELECT name, type FROM sqlite_master "
                 "WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' "
-                "ORDER BY name",
-            ),
+                "ORDER BY name"
+            )
         ).fetchall()
     tables_meta: dict[str, dict[str, Any]] = {}
     table_kinds: dict[str, Literal["table", "view"]] = {}
@@ -1460,41 +1402,26 @@ def _reflect_sqlite_catalog(
                 for fk in fk_rows:
                     fk_id = int(fk[0])
                     seq = int(fk[1] or 0)
-                    buckets.setdefault(fk_id, []).append(
-                        (seq, str(fk[3]), str(fk[2]), str(fk[4])),
-                    )
+                    buckets.setdefault(fk_id, []).append((seq, str(fk[3]), str(fk[2]), str(fk[4])))
                 for pairs in buckets.values():
                     pairs.sort(key=lambda x: x[0])
                     src_cols = [p[1] for p in pairs]
                     dst_table = pairs[0][2]
                     dst_cols = [p[3] for p in pairs]
                     _append_tables_meta_foreign_key(
-                        tables_meta,
-                        tname,
-                        src_cols=src_cols,
-                        dst_table=dst_table,
-                        dst_cols=dst_cols,
-                        seen=fk_seen,
+                        tables_meta, tname, src_cols=src_cols, dst_table=dst_table, dst_cols=dst_cols, seen=fk_seen
                     )
     row_kind: Literal["table", "view"] = "table" if include != "views" else "view"
-    return tables_meta_to_schema_graph(
-        tables_meta,
-        object_kind=row_kind,
-        row_kind_by_table=table_kinds if include == "both" else None,
-    )
+    return tables_meta_to_schema_graph(tables_meta, object_kind=row_kind, row_kind_by_table=None)
 
 
 def _reflect_sqlserver_catalog(
-    engine: Any,
-    schema_name: str,
-    *,
-    include: SchemaInclude,
-    allow_objects: frozenset[str] | None,
+    engine: Any, schema_name: str, *, include: SchemaInclude, allow_objects: frozenset[str] | None
 ) -> SchemaGraph:
     """Reflect SQL Server schema via ``sys.*`` catalog views."""
     allow_lower = allow_objects_lower_set(allow_objects)
-    want_views = include in ("views", "both")
-    want_tables = include in ("tables", "both")
+    want_views = include == "views"
+    want_tables = include == "tables"
     with engine.connect() as conn:
         rel_rows = conn.execute(
             text(
@@ -1503,7 +1430,7 @@ def _reflect_sqlserver_catalog(
                 "UNION ALL "
                 "SELECT v.name, 'VIEW' AS kind FROM sys.views v "
                 "JOIN sys.schemas s ON v.schema_id = s.schema_id WHERE s.name = :s "
-                "ORDER BY 1",
+                "ORDER BY 1"
             ),
             {"s": schema_name},
         ).fetchall()
@@ -1517,7 +1444,7 @@ def _reflect_sqlserver_catalog(
                 "JOIN sys.types ty ON c.user_type_id = ty.user_type_id "
                 "LEFT JOIN sys.computed_columns cc "
                 "  ON c.object_id = cc.object_id AND c.column_id = cc.column_id "
-                "WHERE s.name = :s ORDER BY o.name, c.column_id",
+                "WHERE s.name = :s ORDER BY o.name, c.column_id"
             ),
             {"s": schema_name},
         ).fetchall()
@@ -1528,7 +1455,7 @@ def _reflect_sqlserver_catalog(
                 "JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id "
                 "JOIN sys.tables t ON i.object_id = t.object_id "
                 "JOIN sys.schemas s ON t.schema_id = s.schema_id "
-                "WHERE i.is_primary_key = 1 AND s.name = :s ORDER BY t.name, ic.key_ordinal",
+                "WHERE i.is_primary_key = 1 AND s.name = :s ORDER BY t.name, ic.key_ordinal"
             ),
             {"s": schema_name},
         ).fetchall()
@@ -1545,7 +1472,7 @@ def _reflect_sqlserver_catalog(
                 " AND fkc.referenced_column_id = cr.column_id "
                 "JOIN sys.schemas s ON tp.schema_id = s.schema_id "
                 "WHERE s.name = :s "
-                "ORDER BY tp.name, fk.name, fkc.constraint_column_id",
+                "ORDER BY tp.name, fk.name, fkc.constraint_column_id"
             ),
             {"s": schema_name},
         ).fetchall()
@@ -1560,19 +1487,13 @@ def _reflect_sqlserver_catalog(
                 "JOIN sys.tables t ON i.object_id = t.object_id "
                 "JOIN sys.schemas s ON t.schema_id = s.schema_id "
                 "WHERE s.name = :s AND i.type IN (1, 2, 5, 6) "
-                "ORDER BY t.name, i.name, ic.key_ordinal",
+                "ORDER BY t.name, i.name, ic.key_ordinal"
             ),
             {"s": schema_name},
         ).fetchall()
-        uq_rows = conn.execute(
-            text(SQLSERVER_UNIQUE_INDEX_COLUMNS_SQL),
-            {"s": schema_name},
-        ).fetchall()
+        uq_rows = conn.execute(text(SQLSERVER_UNIQUE_INDEX_COLUMNS_SQL), {"s": schema_name}).fetchall()
         try:
-            partition_rows = conn.execute(
-                text(SQLSERVER_PARTITION_KEY_COLUMNS_SQL),
-                {"s": schema_name},
-            ).fetchall()
+            partition_rows = conn.execute(text(SQLSERVER_PARTITION_KEY_COLUMNS_SQL), {"s": schema_name}).fetchall()
         except Exception:
             partition_rows = []
     indexed_by_table: dict[str, list[str]] = {}
@@ -1613,15 +1534,7 @@ def _reflect_sqlserver_catalog(
             "partition_columns": list(partition_by_table.get(name, [])),
             "indexed_columns": list(indexed_by_table.get(name, [])),
         }
-    for (
-        tname,
-        cname,
-        dtype,
-        nullable,
-        is_identity,
-        is_computed,
-        _definition,
-    ) in col_rows:
+    for tname, cname, dtype, nullable, is_identity, is_computed, _definition in col_rows:
         name = str(tname)
         if name not in tables_meta:
             continue
@@ -1656,29 +1569,21 @@ def _reflect_sqlserver_catalog(
         )
     _flush_information_schema_fk_buckets(tables_meta, fk_buckets, seen=fk_seen)
     row_kind: Literal["table", "view"] = "table" if include != "views" else "view"
-    return tables_meta_to_schema_graph(
-        tables_meta,
-        object_kind=row_kind,
-        row_kind_by_table=table_kinds if include == "both" else None,
-    )
+    return tables_meta_to_schema_graph(tables_meta, object_kind=row_kind, row_kind_by_table=None)
 
 
 def _reflect_snowflake_catalog(
-    engine: Any,
-    schema_name: str,
-    *,
-    include: SchemaInclude,
-    allow_objects: frozenset[str] | None,
+    engine: Any, schema_name: str, *, include: SchemaInclude, allow_objects: frozenset[str] | None
 ) -> SchemaGraph:
     """Reflect Snowflake schema via ``INFORMATION_SCHEMA`` queries."""
     allow_lower = allow_objects_lower_set(allow_objects)
-    want_views = include in ("views", "both")
-    want_tables = include in ("tables", "both")
+    want_views = include == "views"
+    want_tables = include == "tables"
     with engine.connect() as conn:
         table_rows = conn.execute(
             text(
                 "SELECT TABLE_NAME, TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES "
-                "WHERE TABLE_SCHEMA = :s ORDER BY TABLE_NAME",
+                "WHERE TABLE_SCHEMA = :s ORDER BY TABLE_NAME"
             ),
             {"s": schema_name.upper()},
         ).fetchall()
@@ -1686,7 +1591,7 @@ def _reflect_snowflake_catalog(
             text(
                 "SELECT TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION, DATA_TYPE, IS_NULLABLE "
                 "FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = :s "
-                "ORDER BY TABLE_NAME, ORDINAL_POSITION",
+                "ORDER BY TABLE_NAME, ORDINAL_POSITION"
             ),
             {"s": schema_name.upper()},
         ).fetchall()
@@ -1701,15 +1606,13 @@ def _reflect_snowflake_catalog(
                 " AND tc.TABLE_SCHEMA = kcu.TABLE_SCHEMA "
                 "WHERE tc.TABLE_SCHEMA = :s "
                 "AND tc.CONSTRAINT_TYPE IN ('PRIMARY KEY', 'FOREIGN KEY', 'UNIQUE') "
-                "ORDER BY tc.TABLE_NAME, tc.CONSTRAINT_NAME, kcu.ORDINAL_POSITION",
+                "ORDER BY tc.TABLE_NAME, tc.CONSTRAINT_NAME, kcu.ORDINAL_POSITION"
             ),
             {"s": schema_name.upper()},
         ).fetchall()
         try:
             cluster_rows = conn.execute(
-                text(
-                    "SELECT TABLE_NAME, CLUSTERING_KEY FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = :s",
-                ),
+                text("SELECT TABLE_NAME, CLUSTERING_KEY FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = :s"),
                 {"s": schema_name.upper()},
             ).fetchall()
         except Exception:
@@ -1769,29 +1672,21 @@ def _reflect_snowflake_catalog(
             )
     _flush_information_schema_fk_buckets(tables_meta, fk_buckets, seen=fk_seen)
     row_kind: Literal["table", "view"] = "table" if include != "views" else "view"
-    return tables_meta_to_schema_graph(
-        tables_meta,
-        object_kind=row_kind,
-        row_kind_by_table=table_kinds if include == "both" else None,
-    )
+    return tables_meta_to_schema_graph(tables_meta, object_kind=row_kind, row_kind_by_table=None)
 
 
 def _reflect_bigquery_catalog(
-    engine: Any,
-    dataset: str,
-    *,
-    include: SchemaInclude,
-    allow_objects: frozenset[str] | None,
+    engine: Any, dataset: str, *, include: SchemaInclude, allow_objects: frozenset[str] | None
 ) -> SchemaGraph:
     """Reflect BigQuery schema via ``INFORMATION_SCHEMA``. BigQuery does not expose enforced FK metadata; join edges for multi- table queries must come from ``EngineContext.sql_file`` DDL and/or operator ``foreign_keys_add`` overrides (suffix/composite/semantic inference still runs during profiling when PK anchors exist)."""
     allow_lower = allow_objects_lower_set(allow_objects)
-    want_views = include in ("views", "both")
-    want_tables = include in ("tables", "both")
+    want_views = include == "views"
+    want_tables = include == "tables"
     with engine.connect() as conn:
         table_rows = conn.execute(
             text(
                 "SELECT table_name, table_type FROM INFORMATION_SCHEMA.TABLES "
-                "WHERE table_schema = :s ORDER BY table_name",
+                "WHERE table_schema = :s ORDER BY table_name"
             ),
             {"s": dataset},
         ).fetchall()
@@ -1799,7 +1694,7 @@ def _reflect_bigquery_catalog(
             text(
                 "SELECT table_name, column_name, ordinal_position, data_type, is_nullable "
                 "FROM INFORMATION_SCHEMA.COLUMNS WHERE table_schema = :s "
-                "ORDER BY table_name, ordinal_position",
+                "ORDER BY table_name, ordinal_position"
             ),
             {"s": dataset},
         ).fetchall()
@@ -1808,7 +1703,7 @@ def _reflect_bigquery_catalog(
                 text(
                     "SELECT table_name, partitioning_column, partition_type "
                     "FROM INFORMATION_SCHEMA.PARTITIONS WHERE table_schema = :s "
-                    "GROUP BY table_name, partitioning_column, partition_type",
+                    "GROUP BY table_name, partitioning_column, partition_type"
                 ),
                 {"s": dataset},
             ).fetchall()
@@ -1818,7 +1713,7 @@ def _reflect_bigquery_catalog(
             req_rows = conn.execute(
                 text(
                     "SELECT table_name, require_partition_filter, clustering_fields "
-                    "FROM INFORMATION_SCHEMA.TABLES WHERE table_schema = :s",
+                    "FROM INFORMATION_SCHEMA.TABLES WHERE table_schema = :s"
                 ),
                 {"s": dataset},
             ).fetchall()
@@ -1826,10 +1721,7 @@ def _reflect_bigquery_catalog(
             req_rows = []
     part_by_table: dict[str, tuple[str | None, str | None]] = {}
     for tname, pcol, ptype in part_rows:
-        part_by_table[str(tname)] = (
-            str(pcol) if pcol else None,
-            str(ptype) if ptype else None,
-        )
+        part_by_table[str(tname)] = (str(pcol) if pcol else None, str(ptype) if ptype else None)
     req_by_table: dict[str, tuple[bool, list[str]]] = {}
     for tname, req, cluster in req_rows:
         fields = [str(x).strip() for x in str(cluster or "").split(",") if str(x).strip()]
@@ -1870,23 +1762,15 @@ def _reflect_bigquery_catalog(
         meta["column_types"].append(str(dtype))
         meta["column_is_nullable"].append(_information_schema_nullable_flag(nullable))
     row_kind: Literal["table", "view"] = "table" if include != "views" else "view"
-    return tables_meta_to_schema_graph(
-        tables_meta,
-        object_kind=row_kind,
-        row_kind_by_table=table_kinds if include == "both" else None,
-    )
+    return tables_meta_to_schema_graph(tables_meta, object_kind=row_kind, row_kind_by_table=None)
 
 
 def _merge_schema_graph_sql_file_fks(
-    sg: SchemaGraph,
-    *,
-    include: SchemaInclude,
-    schema_json_path: str | Path | None,
-    sql_file: str | None = None,
+    sg: SchemaGraph, *, include: SchemaInclude, schema_json_path: str | Path | None, sql_file: str | None = None
 ) -> None:
     """Merge PK, column constraints, and FK hints from ``EngineContext.sql_file`` when tables are present."""
     sql_file_path = expanded_scope_sql_file(sql_file)
-    if include in ("tables", "both") and sql_file_path and os.path.exists(sql_file_path) and sg.tables:
+    if include == "tables" and sql_file_path and os.path.exists(sql_file_path) and sg.tables:
         ddl_tables = parse_sql_file(Path(sql_file_path), reflected_schema=sg)
         if ddl_tables:
             _merge_ddl_primary_keys_into_schema_graph(sg, ddl_tables)
@@ -1901,6 +1785,7 @@ def _load_or_create_schema_sqlalchemy(
     schema_name: str | None = None,
     include: SchemaInclude = "tables",
     allow_objects: frozenset[str] | None = None,
+    deny_objects: frozenset[str] | None = None,
     schema_json_path: str | Path | None = None,
     log_prefix: str,
     sql_file: str | None = None,
@@ -1910,38 +1795,20 @@ def _load_or_create_schema_sqlalchemy(
     try:
         debug(f"[{SCHEMA_BUILD_PHASE_C}] {log_prefix} reflecting_database")
         sidecar_path = schema_json_path if schema_json_path is not None else EngineConfig.SCHEMA_JSON_PATH
-        if include == "both":
-            sg = merge_reflected_schema_graphs(
-                _reflect_schema(
-                    engine,
-                    schema_name=effective_schema,
-                    object_kind="table",
-                    allow_objects=allow_objects,
-                    schema_json_path=sidecar_path,
-                ),
-                _reflect_schema(
-                    engine,
-                    schema_name=effective_schema,
-                    object_kind="view",
-                    allow_objects=allow_objects,
-                    schema_json_path=sidecar_path,
-                ),
-            )
-        else:
-            sg = _reflect_schema(
-                engine,
-                schema_name=effective_schema,
-                object_kind="table" if include == "tables" else "view",
-                allow_objects=allow_objects,
-                schema_json_path=sidecar_path,
-            )
+        sg = _reflect_schema(
+            engine,
+            schema_name=effective_schema,
+            object_kind="table" if include == "tables" else "view",
+            allow_objects=allow_objects,
+            schema_json_path=sidecar_path,
+        )
         debug(f"[{SCHEMA_BUILD_PHASE_C}] {log_prefix} reflected: {len(sg.tables)} tables")
         sql_file_path = expanded_scope_sql_file(sql_file)
-        if include in ("tables", "both") and sql_file_path and os.path.exists(sql_file_path) and sg.tables:
+        if include == "tables" and sql_file_path and os.path.exists(sql_file_path) and sg.tables:
             ddl_tables = parse_sql_file(Path(sql_file_path), reflected_schema=sg)
             if ddl_tables:
                 merge_ddl_foreign_keys_into_schema_graph(sg, ddl_tables)
-        return sg
+        return apply_full_build_deny_objects(sg, deny_objects)
     except Exception as e:
         debug(f"[{SCHEMA_BUILD_PHASE_C}] {log_prefix} reflection_failed: {e}")
         sql_file_path = expanded_scope_sql_file(sql_file)
@@ -1955,7 +1822,7 @@ def _load_or_create_schema_sqlalchemy(
             allow_lower = allow_objects_lower_set(allow_objects)
             if allow_lower is not None:
                 filtered = {k: v for k, v in tables_meta.items() if str(k).lower() in allow_lower}
-            return tables_meta_to_schema_graph(filtered, object_kind=ok)
+            return apply_full_build_deny_objects(tables_meta_to_schema_graph(filtered, object_kind=ok), deny_objects)
         raise SchemaAccessError(f"Database reflection failed and no SQL file available: {e}") from e
 
 
@@ -1964,6 +1831,7 @@ def load_or_create_schema_mysql(
     *,
     include: SchemaInclude = "tables",
     allow_objects: frozenset[str] | None = None,
+    deny_objects: frozenset[str] | None = None,
     schema_json_path: str | Path | None = None,
     sql_file: str | None = None,
 ) -> SchemaGraph:
@@ -1972,20 +1840,10 @@ def load_or_create_schema_mysql(
     log_prefix = "load_or_create_schema_mysql"
     try:
         debug(f"[{SCHEMA_BUILD_PHASE_C}] {log_prefix} reflecting_database")
-        sg = _reflect_mysql_catalog(
-            engine,
-            effective_schema,
-            include=include,
-            allow_objects=allow_objects,
-        )
+        sg = _reflect_mysql_catalog(engine, effective_schema, include=include, allow_objects=allow_objects)
         debug(f"[{SCHEMA_BUILD_PHASE_C}] {log_prefix} reflected: {len(sg.tables)} tables")
-        _merge_schema_graph_sql_file_fks(
-            sg,
-            include=include,
-            schema_json_path=schema_json_path,
-            sql_file=sql_file,
-        )
-        return sg
+        _merge_schema_graph_sql_file_fks(sg, include=include, schema_json_path=schema_json_path, sql_file=sql_file)
+        return apply_full_build_deny_objects(sg, deny_objects)
     except Exception as e:
         debug(f"[{SCHEMA_BUILD_PHASE_C}] {log_prefix} reflection_failed: {e}")
         return _schema_graph_from_sql_file_fallback(
@@ -1994,6 +1852,7 @@ def load_or_create_schema_mysql(
             allow_objects=allow_objects,
             log_prefix=log_prefix,
             sql_file=sql_file,
+            deny_objects=deny_objects,
         )
 
 
@@ -2002,6 +1861,7 @@ def load_or_create_schema_duckdb(
     *,
     include: SchemaInclude = "tables",
     allow_objects: frozenset[str] | None = None,
+    deny_objects: frozenset[str] | None = None,
     schema_json_path: str | Path | None = None,
     sql_file: str | None = None,
 ) -> SchemaGraph:
@@ -2010,30 +1870,20 @@ def load_or_create_schema_duckdb(
     log_prefix = "load_or_create_schema_duckdb"
     try:
         debug(f"[{SCHEMA_BUILD_PHASE_C}] {log_prefix} reflecting_database")
-        sg = _reflect_duckdb_catalog(
-            engine,
-            effective_schema,
-            include=include,
-            allow_objects=allow_objects,
-        )
+        sg = _reflect_duckdb_catalog(engine, effective_schema, include=include, allow_objects=allow_objects)
         debug(f"[{SCHEMA_BUILD_PHASE_C}] {log_prefix} reflected: {len(sg.tables)} tables")
-        _merge_schema_graph_sql_file_fks(
-            sg,
-            include=include,
-            schema_json_path=schema_json_path,
-            sql_file=sql_file,
-        )
-        return sg
+        _merge_schema_graph_sql_file_fks(sg, include=include, schema_json_path=schema_json_path, sql_file=sql_file)
+        return apply_full_build_deny_objects(sg, deny_objects)
     except Exception as e:
         debug(f"[{SCHEMA_BUILD_PHASE_C}] {log_prefix} reflection_failed: {e}")
-        sg = _schema_graph_from_sql_file_fallback(
+        return _schema_graph_from_sql_file_fallback(
             e,
             include=include,
             allow_objects=allow_objects,
             log_prefix=log_prefix,
             sql_file=sql_file,
+            deny_objects=deny_objects,
         )
-        return sg
 
 
 def load_or_create_schema_sqlite(
@@ -2041,6 +1891,7 @@ def load_or_create_schema_sqlite(
     *,
     include: SchemaInclude = "tables",
     allow_objects: frozenset[str] | None = None,
+    deny_objects: frozenset[str] | None = None,
     schema_json_path: str | Path | None = None,
     sql_file: str | None = None,
 ) -> SchemaGraph:
@@ -2048,29 +1899,20 @@ def load_or_create_schema_sqlite(
     log_prefix = "load_or_create_schema_sqlite"
     try:
         debug(f"[{SCHEMA_BUILD_PHASE_C}] {log_prefix} reflecting_database")
-        sg = _reflect_sqlite_catalog(
-            engine,
-            include=include,
-            allow_objects=allow_objects,
-        )
+        sg = _reflect_sqlite_catalog(engine, include=include, allow_objects=allow_objects)
         debug(f"[{SCHEMA_BUILD_PHASE_C}] {log_prefix} reflected: {len(sg.tables)} tables")
-        _merge_schema_graph_sql_file_fks(
-            sg,
-            include=include,
-            schema_json_path=schema_json_path,
-            sql_file=sql_file,
-        )
-        return sg
+        _merge_schema_graph_sql_file_fks(sg, include=include, schema_json_path=schema_json_path, sql_file=sql_file)
+        return apply_full_build_deny_objects(sg, deny_objects)
     except Exception as e:
         debug(f"[{SCHEMA_BUILD_PHASE_C}] {log_prefix} reflection_failed: {e}")
-        sg = _schema_graph_from_sql_file_fallback(
+        return _schema_graph_from_sql_file_fallback(
             e,
             include=include,
             allow_objects=allow_objects,
             log_prefix=log_prefix,
             sql_file=sql_file,
+            deny_objects=deny_objects,
         )
-        return sg
 
 
 def load_or_create_schema_redshift(
@@ -2078,6 +1920,7 @@ def load_or_create_schema_redshift(
     *,
     include: SchemaInclude = "tables",
     allow_objects: frozenset[str] | None = None,
+    deny_objects: frozenset[str] | None = None,
     schema_json_path: str | Path | None = None,
     sql_file: str | None = None,
 ) -> SchemaGraph:
@@ -2086,20 +1929,10 @@ def load_or_create_schema_redshift(
     log_prefix = "load_or_create_schema_redshift"
     try:
         debug(f"[{SCHEMA_BUILD_PHASE_C}] {log_prefix} reflecting_database")
-        sg = _reflect_redshift_catalog(
-            engine,
-            effective_schema,
-            include=include,
-            allow_objects=allow_objects,
-        )
+        sg = _reflect_redshift_catalog(engine, effective_schema, include=include, allow_objects=allow_objects)
         debug(f"[{SCHEMA_BUILD_PHASE_C}] {log_prefix} reflected: {len(sg.tables)} tables")
-        _merge_schema_graph_sql_file_fks(
-            sg,
-            include=include,
-            schema_json_path=schema_json_path,
-            sql_file=sql_file,
-        )
-        return sg
+        _merge_schema_graph_sql_file_fks(sg, include=include, schema_json_path=schema_json_path, sql_file=sql_file)
+        return apply_full_build_deny_objects(sg, deny_objects)
     except Exception as e:
         debug(f"[{SCHEMA_BUILD_PHASE_C}] {log_prefix} reflection_failed: {e}")
         return _schema_graph_from_sql_file_fallback(
@@ -2108,6 +1941,7 @@ def load_or_create_schema_redshift(
             allow_objects=allow_objects,
             log_prefix=log_prefix,
             sql_file=sql_file,
+            deny_objects=deny_objects,
         )
 
 
@@ -2116,6 +1950,7 @@ def load_or_create_schema_sqlserver(
     *,
     include: SchemaInclude = "tables",
     allow_objects: frozenset[str] | None = None,
+    deny_objects: frozenset[str] | None = None,
     schema_json_path: str | Path | None = None,
     sql_file: str | None = None,
 ) -> SchemaGraph:
@@ -2124,20 +1959,10 @@ def load_or_create_schema_sqlserver(
     log_prefix = "load_or_create_schema_sqlserver"
     try:
         debug(f"[{SCHEMA_BUILD_PHASE_C}] {log_prefix} reflecting_database")
-        sg = _reflect_sqlserver_catalog(
-            engine,
-            effective_schema,
-            include=include,
-            allow_objects=allow_objects,
-        )
+        sg = _reflect_sqlserver_catalog(engine, effective_schema, include=include, allow_objects=allow_objects)
         debug(f"[{SCHEMA_BUILD_PHASE_C}] {log_prefix} reflected: {len(sg.tables)} tables")
-        _merge_schema_graph_sql_file_fks(
-            sg,
-            include=include,
-            schema_json_path=schema_json_path,
-            sql_file=sql_file,
-        )
-        return sg
+        _merge_schema_graph_sql_file_fks(sg, include=include, schema_json_path=schema_json_path, sql_file=sql_file)
+        return apply_full_build_deny_objects(sg, deny_objects)
     except Exception as e:
         debug(f"[{SCHEMA_BUILD_PHASE_C}] {log_prefix} reflection_failed: {e}")
         return _schema_graph_from_sql_file_fallback(
@@ -2146,6 +1971,7 @@ def load_or_create_schema_sqlserver(
             allow_objects=allow_objects,
             log_prefix=log_prefix,
             sql_file=sql_file,
+            deny_objects=deny_objects,
         )
 
 
@@ -2154,6 +1980,7 @@ def load_or_create_schema_snowflake(
     *,
     include: SchemaInclude = "tables",
     allow_objects: frozenset[str] | None = None,
+    deny_objects: frozenset[str] | None = None,
     schema_json_path: str | Path | None = None,
     sql_file: str | None = None,
 ) -> SchemaGraph:
@@ -2162,20 +1989,10 @@ def load_or_create_schema_snowflake(
     log_prefix = "load_or_create_schema_snowflake"
     try:
         debug(f"[{SCHEMA_BUILD_PHASE_C}] {log_prefix} reflecting_database")
-        sg = _reflect_snowflake_catalog(
-            engine,
-            effective_schema,
-            include=include,
-            allow_objects=allow_objects,
-        )
+        sg = _reflect_snowflake_catalog(engine, effective_schema, include=include, allow_objects=allow_objects)
         debug(f"[{SCHEMA_BUILD_PHASE_C}] {log_prefix} reflected: {len(sg.tables)} tables")
-        _merge_schema_graph_sql_file_fks(
-            sg,
-            include=include,
-            schema_json_path=schema_json_path,
-            sql_file=sql_file,
-        )
-        return sg
+        _merge_schema_graph_sql_file_fks(sg, include=include, schema_json_path=schema_json_path, sql_file=sql_file)
+        return apply_full_build_deny_objects(sg, deny_objects)
     except Exception as e:
         debug(f"[{SCHEMA_BUILD_PHASE_C}] {log_prefix} reflection_failed: {e}")
         return _schema_graph_from_sql_file_fallback(
@@ -2184,6 +2001,7 @@ def load_or_create_schema_snowflake(
             allow_objects=allow_objects,
             log_prefix=log_prefix,
             sql_file=sql_file,
+            deny_objects=deny_objects,
         )
 
 
@@ -2192,6 +2010,7 @@ def load_or_create_schema_bigquery(
     *,
     include: SchemaInclude = "tables",
     allow_objects: frozenset[str] | None = None,
+    deny_objects: frozenset[str] | None = None,
     schema_json_path: str | Path | None = None,
     sql_file: str | None = None,
 ) -> SchemaGraph:
@@ -2200,20 +2019,10 @@ def load_or_create_schema_bigquery(
     log_prefix = "load_or_create_schema_bigquery"
     try:
         debug(f"[{SCHEMA_BUILD_PHASE_C}] {log_prefix} reflecting_database")
-        sg = _reflect_bigquery_catalog(
-            engine,
-            effective_schema,
-            include=include,
-            allow_objects=allow_objects,
-        )
+        sg = _reflect_bigquery_catalog(engine, effective_schema, include=include, allow_objects=allow_objects)
         debug(f"[{SCHEMA_BUILD_PHASE_C}] {log_prefix} reflected: {len(sg.tables)} tables")
-        _merge_schema_graph_sql_file_fks(
-            sg,
-            include=include,
-            schema_json_path=schema_json_path,
-            sql_file=sql_file,
-        )
-        return sg
+        _merge_schema_graph_sql_file_fks(sg, include=include, schema_json_path=schema_json_path, sql_file=sql_file)
+        return apply_full_build_deny_objects(sg, deny_objects)
     except Exception as e:
         debug(f"[{SCHEMA_BUILD_PHASE_C}] {log_prefix} reflection_failed: {e}")
         return _schema_graph_from_sql_file_fallback(
@@ -2222,22 +2031,16 @@ def load_or_create_schema_bigquery(
             allow_objects=allow_objects,
             log_prefix=log_prefix,
             sql_file=sql_file,
+            deny_objects=deny_objects,
         )
 
 
 def schema_cache_json_blob(cache_data: dict[str, Any]) -> str:
     """Serialize schema cache data as one compact JSON document."""
-    return json.dumps(
-        cache_data,
-        ensure_ascii=False,
-        separators=JSON_COMPACT_SEPARATORS,
-        sort_keys=True,
-    )
+    return json.dumps(cache_data, ensure_ascii=False, separators=JSON_COMPACT_SEPARATORS, sort_keys=True)
 
 
-def tables_payload_through_model_round_trip(
-    tables_json: dict[str, Any],
-) -> dict[str, Any]:
+def tables_payload_through_model_round_trip(tables_json: dict[str, Any]) -> dict[str, Any]:
     """Rebuild table dicts by parsing into TableMetadata and. serializing. back to plain dicts."""
     return {name: table_to_dict(table_from_dict(blob)) for name, blob in tables_json.items()}
 
@@ -2248,10 +2051,7 @@ def fingerprint_tables_after_document_round_trip(cache_data: dict[str, Any]) -> 
     return str(schema_hash_fp(reparsed["tables"]))
 
 
-def first_table_where_stable_json_differs(
-    left_tables: dict[str, Any],
-    right_tables: dict[str, Any],
-) -> str | None:
+def first_table_where_stable_json_differs(left_tables: dict[str, Any], right_tables: dict[str, Any]) -> str | None:
     """Return the first table name whose single-slot stable JSON. differs. between mappings."""
     names = sorted(set(left_tables) | set(right_tables))
     for name in names:

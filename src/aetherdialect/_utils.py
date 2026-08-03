@@ -6,55 +6,61 @@ import copy
 import itertools
 import random
 import re
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from typing import Any, cast
 
-from ._config import (
-    PolicyConfig,
-    SeedWarmupConfig,
-    llm_credentials_configured,
-)
+from ._config import PolicyConfig, SeedWarmupConfig, llm_credentials_configured
 from ._constants import (
     AGG_PATTERN,
     DO_NOT_LEMMATIZE,
     IRREGULAR_PLURALS_MAP,
     NORMALIZATION_ALLOWED_INTRODUCED_TOKENS,
     NORMALIZATION_JACCARD_FLOOR,
+    QUESTION_CANONICALIZE_SYSTEM,
+    QUESTION_FROM_SQL_SYSTEM,
+    QUESTION_NORMALIZE_VOCABULARY_GUIDANCE,
+    QUESTION_NORMALIZE_VOCABULARY_HEADING,
     QUESTION_STARTS_AGG,
     QUESTION_STARTS_GROUP,
     QUESTION_STARTS_LIST,
+    QUESTION_VALIDATION_SYSTEM,
     REALISM_DROP_REASON_CATEGORIES,
+    SCHEMA_DESCRIPTION_PROMPT_MAX_CHARS,
+    SCHEMA_ENRICHED_LINES_MAX_CHARS,
     SHAPE_FORM_DATE_REGEX,
     SHAPE_FORM_NUM_REGEX,
     SHAPE_FORM_STR_REGEX,
     STOPWORDS_GRAMMATICAL_PARTICLES,
     VALID_AGGREGATION_FUNCTIONS,
     VALID_EXPECTED_ROWS,
-    VALID_FILTER_OPS,
     VALID_GRAINS,
     VALID_HAVING_OPS,
+    VALID_WHERE_OPS,
+    WARMUP_FREEFORM_QUESTIONS_SYSTEM,
+    WARMUP_PARAPHRASES_BY_STYLE_SYSTEM,
 )
 from ._contracts_base import (
-    FilterParam,
     HavingParam,
     LlmJsonExhausted,
     NormalizedExpr,
     OrderByCol,
+    WhereParam,
+    having_leaves,
+    predicate_group_from_list,
+    where_leaves,
 )
 from ._contracts_core import (
     ConcreteIntent,
+    QuestionReuseMatch,
     RuntimeCteStep,
     RuntimeIntent,
     SelectCol,
     Template,
     concrete_intent_to_runtime_skeleton,
 )
-from ._contracts_schema import (
-    CteOutputColumnMeta,
-    SchemaGraph,
-    SQLShape,
-)
+from ._contracts_schema import CteOutputColumnMeta, SchemaGraph, SQLShape
 from ._core_utils import (
+    colmap_signature,
     debug,
     normalize_array_contains_param_value,
     normalize_question,
@@ -68,79 +74,14 @@ from ._dialect import (
     sql_has_group_by,
     sql_tables_referenced,
 )
-from ._intent_resolve import sort_filters, sort_having
+from ._intent_resolve import join_path_key_concrete, join_path_key_runtime, sort_having, sort_where_predicates
 from ._llm_provider import llm_json
-
-_REALISM_CATEGORY_LIST: str = ", ".join(sorted(REALISM_DROP_REASON_CATEGORIES))
-
-_QUESTION_NORMALIZE_VOCABULARY_HEADING: str = (
-    "Vocabulary preferences (apply only when context fits; preserve logical negation and constraints):"
-)
-_QUESTION_NORMALIZE_VOCABULARY_GUIDANCE: str = (
-    "Verb phrasing: prefer concise analytic wording over vague conversational fillers whenever the question intent is unchanged. "
-    "Aggregation: align stated aggregation language with the grain implied by the question. "
-    "Temporal: when any time scope appears, state it explicitly enough for deterministic routing. "
-    "Negation: preserve every explicit negator on the predicate it scopes; do not drop or soften negation."
-)
-
-_QUESTION_VALIDATION_SYSTEM = (
-    "You decide if user input is a database query request or not.\n\n"
-    "Treat the input as a VALID database query request whenever a reasonable relational database could store rows that answer it.\n"
-    "That includes list, show, get, find, count, sum, average, min, max, filter, sort, group, compare, rank, top-N, trend, or per-entity questions, including bounded counts such as listing two named entities.\n"
-    "When the utterance is ambiguous but still plausibly data-seeking, choose VALID.\n\n"
-    "Mark as INVALID only when it is clearly one of the following:\n"
-    '- Chitchat or meta conversation (e.g. "hello", "thanks", "who are you")\n'
-    '- A request for SQL tutoring, query help, or how-to without asking for actual rows (e.g. "how do I write a join")\n'
-    '- General world knowledge or opinion with no plausible tabular backing (e.g. "does the Earth orbit the Sun")\n\n'
-    "The label restricted applies only when the user asks for a DML, DDL, or administrative database operation. "
-    "DML covers any data mutation (delete, update, insert, merge, truncate, copy). "
-    "DDL covers schema mutation (create, drop, alter, rename). "
-    "Administrative covers privilege management, indexing, vacuuming, configuration, and any other non-analytical operation. "
-    "Analytical questions never receive restricted, including questions that describe their solution using analytical primitives such as CTEs, subqueries, joins, aggregations, window functions, distinct, recursion, or set operations. "
-    "Use of the literal words CTE, subquery, with, join, group, order, window, partition, recursive, or similar terms in the question never alone implies restricted.\n\n"
-    "Respond with JSON containing exactly three fields:\n"
-    '- "valid_database_question": "yes" or "no"\n'
-    '- "query_type": "allowed" if read/SELECT operation, "restricted" if write or schema-modifying, "unspecified" if unclear.\n'
-    '- "corrected": the input with spelling typos fixed only. Do NOT remove, reorder, or rephrase any words.\n\n'
-    "Respond ONLY with valid JSON, no explanation."
-)
-
-_QUESTION_NORMALIZE_SYSTEM = (
-    "You rewrite a typo-corrected database query into a canonical short query so that semantically identical "
-    "questions hash to the same string.\n\n"
-    "When the user message is JSON, field ``question`` carries the rewrite target; optional ``normalization_preferences`` "
-    "is advisory context only.\n\n"
-    "Apply these rules IN ORDER:\n"
-    "0. Before any other rewrite, normalize quantifier and aggregation openers: map phrases such as "
-    '"how many", "number of", and bare "count" asking for cardinality to the two-token prefix "count of"; '
-    'map "total of", "totals for", and bare "sum" used as an aggregation opener to "sum of"; '
-    'map "average of", "mean of", and bare "avg" used as an aggregation opener to "avg of"; '
-    'map "maximum of", "largest", "highest", "max" used as an aggregation opener to "max of"; '
-    'map "minimum of", "smallest", "lowest", "min" used as an aggregation opener to "min of". '
-    "Preserve trailing nouns and filters after those prefixes.\n"
-    '1. Replace any verb phrase whose only purpose is to ask for non-aggregated rows with the single token "list"; '
-    "do not replace the aggregation prefixes introduced in rule 0, and do not replace aggregation verbs "
-    "such as count, sum, average, max, min, or total when they already head a normalized aggregation phrase.\n"
-    "2. Drop polite or filler clauses that do not carry analytical meaning.\n"
-    "3. Replace plural common nouns with their singular base form. Do NOT singularize verbs.\n"
-    "4. Preserve every number, date, quoted literal, comparison word, adjective, named entity, "
-    "and any preposition immediately before a number/date/literal.\n"
-    "5. Preserve original word order.\n"
-    "6. If no rule applies, return the input unchanged.\n"
-    "7. Never add a word that did not appear in the input (including any inflected form already present).\n\n"
-    "Examples of rule 0 (JSON only illustrates the normalized field):\n"
-    '{"question":"how many films are in the action category","normalized":"count of film in the action category"}\n'
-    '{"question":"total payments last month by store","normalized":"sum of payment last month by store"}\n\n'
-    "Respond with JSON containing exactly one field:\n"
-    '- "normalized": the rewritten canonical short query.\n\n'
-    "Respond ONLY with valid JSON, no explanation."
-)
 
 
 def validate_question(question: str) -> tuple[bool, str, str]:
     """LLM gate: data question vs chitchat; typo fix; allowed vs restricted."""
     try:
-        result = llm_json(_QUESTION_VALIDATION_SYSTEM, question, task="default")
+        result = llm_json(QUESTION_VALIDATION_SYSTEM, question, task="default")
     except LlmJsonExhausted as exc:
         debug(f"[utils.validate_question] llm_json exhausted: {exc}")
         return False, "invalid", question
@@ -249,13 +190,13 @@ def _enforce_normalization_guard(corrected: str, normalized: str, *, raw_origina
 def normalize_question_via_llm(corrected: str, *, raw_original: str | None = None) -> str:
     """Canonicalize *corrected* via a dedicated LLM call separate from. typo validation."""
     raw_use = raw_original if raw_original is not None else corrected
-    vocab_block = _QUESTION_NORMALIZE_VOCABULARY_HEADING + "\n" + _QUESTION_NORMALIZE_VOCABULARY_GUIDANCE
+    vocab_block = QUESTION_NORMALIZE_VOCABULARY_HEADING + "\n" + QUESTION_NORMALIZE_VOCABULARY_GUIDANCE
     user_obj: dict[str, Any] = {
         "question": corrected,
         "normalization_preferences": vocab_block,
     }
     try:
-        result = llm_json(_QUESTION_NORMALIZE_SYSTEM, stable_json(user_obj), task="default")
+        result = llm_json(QUESTION_CANONICALIZE_SYSTEM, stable_json(user_obj), task="default")
     except LlmJsonExhausted as exc:
         debug(f"[utils.normalize_question_via_llm] llm_json exhausted: {exc}")
         return corrected
@@ -269,17 +210,17 @@ def normalize_question_via_llm(corrected: str, *, raw_original: str | None = Non
 
 def sql_shape(sql: str, intent: RuntimeIntent, *, sqlglot_dialect: str) -> SQLShape:
     """Count joins, CTEs, filters, having, and structural flags from. *sql* and *intent* via AST."""
-    num_filters = len(intent.filters_param or [])
-    num_having = len(intent.having_param or [])
+    num_where = len(where_leaves(intent.where) or [])
+    num_having = len(having_leaves(intent.having) or [])
     for cte in intent.cte_steps or []:
-        num_filters += len(cte.filters_param or [])
-        num_having += len(cte.having_param or [])
+        num_where += len(where_leaves(cte.where) or [])
+        num_having += len(having_leaves(cte.having) or [])
     return SQLShape(
         num_joins=sql_count_outer_joins(sql, sqlglot_dialect=sqlglot_dialect),
         has_group_by=sql_has_group_by(sql, sqlglot_dialect=sqlglot_dialect),
         has_agg=sql_has_aggregate(sql, sqlglot_dialect=sqlglot_dialect),
         num_cte=len(intent.cte_steps or []),
-        num_filters=num_filters,
+        num_where=num_where,
         num_having=num_having,
         has_distinct=sql_has_distinct(sql, sqlglot_dialect=sqlglot_dialect),
     )
@@ -355,10 +296,7 @@ def _neighboring_question_token_fingerprint_norms(norm: str) -> frozenset[str]:
 
 
 def _fuzzy_question_tokens_match_pair(
-    q1_norm: str,
-    q2_norm: str,
-    max_distance: int,
-    debug_label: str,
+    q1_norm: str, q2_norm: str, max_distance: int, debug_label: str
 ) -> tuple[bool, int]:
     """Return whether stopword-stripped token lists align with summed. per-token edit distance within *max_distance*."""
     base = "[utils.exact_question_match]"
@@ -383,22 +321,6 @@ def _fuzzy_question_tokens_match_pair(
         return False, total_dist
     debug(f"{tag} MATCH tokens={len(tokens1)} total_dist={total_dist}")
     return True, total_dist
-
-
-@dataclass(frozen=True, slots=True)
-class QuestionReuseMatch:
-    """Trusted template history row selected by fuzzy token match against a candidate question."""
-
-    template_id: str
-    history_index: int
-    stored_normalized_text: str
-    candidate_normalized: str
-    token_edit_sum: int
-
-    @property
-    def is_exact_string_reuse(self) -> bool:
-        """True when normalized candidate text equals the stored normalized history string (generation path 1)."""
-        return self.candidate_normalized == self.stored_normalized_text
 
 
 def match_question_against_template_history(
@@ -449,12 +371,7 @@ def match_question_against_template_history(
             if pair_filter is not None and (tpl.id, idx) not in pair_filter:
                 continue
             stored_normalized = normalize_question(hist_q)
-            ok, total = _fuzzy_question_tokens_match_pair(
-                candidate_normalized,
-                stored_normalized,
-                budget,
-                tpl.id,
-            )
+            ok, total = _fuzzy_question_tokens_match_pair(candidate_normalized, stored_normalized, budget, tpl.id)
             if not ok:
                 continue
             row_ac = int(tpl.value_history.accept_counts[idx])
@@ -478,10 +395,7 @@ def match_question_against_template_history(
 
 
 def exact_question_match(
-    q1: str,
-    q2: str,
-    max_distance: int = PolicyConfig.FUZZY_MATCH_MAX_DISTANCE,
-    label: str = "",
+    q1: str, q2: str, max_distance: int = PolicyConfig.FUZZY_MATCH_MAX_DISTANCE, label: str = ""
 ) -> bool:
     """True if normalised token sequences match 1:1 with summed edit. distance ≤ *max_distance*."""
     q1_norm = normalize_question(q1)
@@ -495,19 +409,17 @@ def is_exact_question_text_match(q1: str, q2: str) -> bool:
     return normalize_question(q1) == normalize_question(q2)
 
 
-def _normalize_filters(filters: list[Any]) -> list[FilterParam]:
-    """Coerce dicts / ``FilterParam`` to ``FilterParam`` and. ``sort_filters``."""
+def _normalize_where_predicates(filters: list[Any]) -> list[WhereParam]:
+    """Coerce dicts / ``WhereParam`` to ``WhereParam`` and. ``sort_where_predicates``."""
     if not filters:
         return []
     out = []
     for f in filters:
-        if isinstance(f, FilterParam):
+        if isinstance(f, WhereParam):
             left_expr = f.left_expr
             op = f.op.strip().lower() if f.op else "="
             vtype = f.value_type.strip().lower() if isinstance(f.value_type, str) else "unknown"
             right_expr = f.right_expr
-            bool_op = f.bool_op
-            filter_group = f.filter_group
         elif isinstance(f, dict):
             left_raw = f.get("left_expr")
             if isinstance(left_raw, dict):
@@ -519,24 +431,13 @@ def _normalize_filters(filters: list[Any]) -> list[FilterParam]:
             vtype = f.get("value_type", "unknown").strip().lower()
             right_raw = f.get("right_expr")
             right_expr = NormalizedExpr.from_dict(right_raw) if isinstance(right_raw, dict) and right_raw else None
-            bool_op = f.get("bool_op", "AND")
-            fg_raw = f.get("filter_group")
-            filter_group = int(fg_raw) if fg_raw is not None else None
         else:
             continue
         if not left_expr or not isinstance(op, str):
             continue
-        fp = FilterParam(
-            left_expr=left_expr,
-            op=op,
-            value_type=vtype,
-            param_key="",
-            right_expr=right_expr,
-            bool_op=bool_op,
-            filter_group=filter_group,
-        )
+        fp = WhereParam(left_expr=left_expr, op=op, value_type=vtype, param_key="", right_expr=right_expr)
         out.append(fp)
-    return sort_filters(out)
+    return sort_where_predicates(out)
 
 
 def _normalize_having_conditions(conditions: list[Any]) -> list[HavingParam]:
@@ -550,8 +451,6 @@ def _normalize_having_conditions(conditions: list[Any]) -> list[HavingParam]:
             op = c.op.strip().lower() if c.op else "="
             value_type = c.value_type.strip().lower() if c.value_type else "number"
             right_expr = c.right_expr
-            bool_op = c.bool_op
-            filter_group = c.filter_group
         elif isinstance(c, dict):
             left_raw = c.get("left_expr")
             if isinstance(left_raw, dict):
@@ -563,9 +462,6 @@ def _normalize_having_conditions(conditions: list[Any]) -> list[HavingParam]:
             value_type = c.get("value_type", "number")
             right_raw = c.get("right_expr")
             right_expr = NormalizedExpr.from_dict(right_raw) if isinstance(right_raw, dict) and right_raw else None
-            bool_op = c.get("bool_op", "AND")
-            fg_raw = c.get("filter_group")
-            filter_group = int(fg_raw) if fg_raw is not None else None
         else:
             continue
         if not left_expr or not left_expr.primary_term:
@@ -574,13 +470,7 @@ def _normalize_having_conditions(conditions: list[Any]) -> list[HavingParam]:
         if op_norm not in VALID_HAVING_OPS:
             op_norm = "="
         hp = HavingParam(
-            left_expr=left_expr,
-            op=op_norm,
-            value_type=str(value_type),
-            param_key="",
-            right_expr=right_expr,
-            bool_op=bool_op,
-            filter_group=filter_group,
+            left_expr=left_expr, op=op_norm, value_type=str(value_type), param_key="", right_expr=right_expr
         )
         out.append(hp)
     return sort_having(out)
@@ -601,8 +491,8 @@ def _normalize_cte_steps(steps: Any, available_ctes: dict[str, list[str]] | None
             select_cols = s.select_cols or []
             group_by_cols = s.group_by_cols or []
             output_columns = s.output_columns or []
-            filters_param = s.filters_param or []
-            having_param = s.having_param or []
+            where_params = where_leaves(s.where) or []
+            having_param = having_leaves(s.having) or []
             param_values = s.param_values or {}
             order_by_cols = s.order_by_cols or []
             limit = s.limit
@@ -610,6 +500,7 @@ def _normalize_cte_steps(steps: Any, available_ctes: dict[str, list[str]] | None
             output_column_metadata = s.output_column_metadata or {}
             chosen_join_candidate_id = s.chosen_join_candidate_id or ""
             chosen_join_path_signature = s.chosen_join_path_signature or []
+            emission = getattr(s, "emission", "join_table") or "join_table"
         elif isinstance(s, dict):
             cte_name = s.get("cte_name", "")
             tables = s.get("tables", [])
@@ -633,9 +524,11 @@ def _normalize_cte_steps(steps: Any, available_ctes: dict[str, list[str]] | None
                 for g in group_by_cols
             ]
             output_columns = s.get("output_columns", [])
-            fp_raw = s.get("filters_param", [])
-            filters_param = [FilterParam.from_dict(f) if isinstance(f, dict) else f for f in fp_raw]
-            hp_raw = s.get("having_param", [])
+            fp_raw = s.get("where", s.get("where_param", []))
+            fp_raw = fp_raw if isinstance(fp_raw, list) else []
+            where_params = [WhereParam.from_dict(f) if isinstance(f, dict) else f for f in fp_raw]
+            hp_raw = s.get("having", s.get("having_param", []))
+            hp_raw = hp_raw if isinstance(hp_raw, list) else []
             having_param = [HavingParam.from_dict(h) if isinstance(h, dict) else h for h in hp_raw]
             param_values = s.get("param_values", {})
             obc_raw = s.get("order_by_cols", [])
@@ -655,6 +548,7 @@ def _normalize_cte_steps(steps: Any, available_ctes: dict[str, list[str]] | None
             }
             chosen_join_candidate_id = s.get("chosen_join_candidate_id", "")
             chosen_join_path_signature = s.get("chosen_join_path_signature", [])
+            emission = s.get("emission", "join_table") or "join_table"
         else:
             continue
         if not cte_name:
@@ -662,10 +556,10 @@ def _normalize_cte_steps(steps: Any, available_ctes: dict[str, list[str]] | None
         if grain not in VALID_GRAINS:
             grain = "row_level"
         normalized_fp = []
-        for f in filters_param:
-            if isinstance(f, FilterParam):
+        for f in where_params:
+            if isinstance(f, WhereParam):
                 op = f.op.strip().lower() if f.op else "="
-                if op not in VALID_FILTER_OPS:
+                if op not in VALID_WHERE_OPS:
                     op = "="
                 vtype = f.value_type.strip().lower() if f.value_type else "unknown"
                 fp = replace(f, op=op, value_type=vtype)
@@ -738,26 +632,8 @@ def _normalize_cte_steps(steps: Any, available_ctes: dict[str, list[str]] | None
             select_cols=normalized_select_cols,
             group_by_cols=group_by_cols,
             output_columns=list(str(c) for c in output_columns),
-            filters_param=sorted(
-                normalized_fp,
-                key=lambda x: (
-                    x.filter_group if x.filter_group is not None else -1,
-                    x.left_expr.signature_key,
-                    x.op,
-                    x.right_expr.signature_key if x.right_expr else "",
-                    x.value_type,
-                ),
-            ),
-            having_param=sorted(
-                normalized_hp,
-                key=lambda x: (
-                    x.filter_group if x.filter_group is not None else -1,
-                    x.left_expr.signature_key,
-                    x.op,
-                    x.right_expr.signature_key if x.right_expr else "",
-                    x.value_type,
-                ),
-            ),
+            where=predicate_group_from_list(sort_where_predicates(normalized_fp)),
+            having=predicate_group_from_list(sort_having(normalized_hp)),
             param_values=param_values,
             order_by_cols=normalized_order_by,
             limit=limit,
@@ -765,14 +641,17 @@ def _normalize_cte_steps(steps: Any, available_ctes: dict[str, list[str]] | None
             output_column_metadata=ocm,
             chosen_join_candidate_id=chosen_join_candidate_id,
             chosen_join_path_signature=chosen_join_path_signature,
+            emission=emission,
         )
         out.append(cte)
         available_ctes[cte_name] = output_columns
     return out
 
 
-def _normalize_cte_steps_for_key(steps: list[RuntimeCteStep]) -> list[dict[str, Any]]:
-    """Projection of CTE steps to signature strings for ``intent_key`` JSON."""
+def _normalize_cte_steps_for_key(
+    steps: list[RuntimeCteStep], *, include_join_skeleton: bool = True
+) -> list[dict[str, Any]]:
+    """Projection of CTE steps to signature strings for structural intent hashes. When *include_join_skeleton* is false (``body_similarity_key``), CTE join-emission metadata is omitted so join-path variants group together."""
     result = []
     for cte in steps:
         select_sigs: list[str] = []
@@ -793,12 +672,11 @@ def _normalize_cte_steps_for_key(steps: list[RuntimeCteStep]) -> list[dict[str, 
             "select_cols": sorted(select_sigs),
             "group_by_cols": sorted([g.signature_key for g in (cte.group_by_cols or [])]),
             "output_columns": sorted(cte.output_columns or []),
-            "filters_param": [
-                f"{f.signature_key}|{'AND' if f.filter_group is not None else f.bool_op}|{f.filter_group}"
+            "where": [
+                f.signature_key
                 for f in sorted(
-                    cte.filters_param or [],
+                    where_leaves(cte.where) or [],
                     key=lambda x: (
-                        x.filter_group if x.filter_group is not None else -1,
                         x.left_expr.signature_key,
                         x.op,
                         x.right_expr.signature_key if x.right_expr else "",
@@ -807,11 +685,10 @@ def _normalize_cte_steps_for_key(steps: list[RuntimeCteStep]) -> list[dict[str, 
                 )
             ],
             "having_param": [
-                f"{h.signature_key}|{'AND' if h.filter_group is not None else h.bool_op}|{h.filter_group}"
+                h.signature_key
                 for h in sorted(
-                    cte.having_param or [],
+                    having_leaves(cte.having) or [],
                     key=lambda x: (
-                        x.filter_group if x.filter_group is not None else -1,
                         x.left_expr.signature_key,
                         x.op,
                         x.right_expr.signature_key if x.right_expr else "",
@@ -823,29 +700,31 @@ def _normalize_cte_steps_for_key(steps: list[RuntimeCteStep]) -> list[dict[str, 
             "window_registry": sorted(s.signature_key for s in (cte.window_registry or [])),
             "case_registry": sorted(s.signature_key for s in (cte.case_registry or [])),
         }
+        if include_join_skeleton:
+            cte_dict["emission"] = str(getattr(cte, "emission", "") or "")
         result.append(cte_dict)
     return result
 
 
-def _contains_filter_param_keys(intent: RuntimeIntent) -> set[str]:
+def _contains_where_param_keys(intent: RuntimeIntent) -> set[str]:
     keys: set[str] = set()
     for cte in intent.cte_steps or []:
-        for fp in cte.filters_param or []:
+        for fp in where_leaves(cte.where) or []:
             if fp.op == "contains" and fp.param_key and fp.right_expr is None:
                 keys.add(fp.param_key)
-    for fp in intent.filters_param or []:
+    for fp in where_leaves(intent.where) or []:
         if fp.op == "contains" and fp.param_key and fp.right_expr is None:
             keys.add(fp.param_key)
     return keys
 
 
 def flatten_param_values(intent: RuntimeIntent) -> dict[str, Any]:
-    """Merge CTE ``param_values`` then main; main overrides duplicate. keys. Applies:func:`core_utils.normalize_array_contains_param_value` to keys for ``filters_param`` rows with ``op == "contains"``. Dialect SQL for those filters also normalizes stored array elements at execution time."""
+    """Merge CTE ``param_values`` then main; main overrides duplicate. keys. Applies:func:`core_utils.normalize_array_contains_param_value` to keys for WHERE rows with ``op == "contains"``. Dialect SQL for those predicates also normalizes stored array elements at execution time."""
     merged = {}
     for cte in intent.cte_steps or []:
         merged.update(cte.param_values or {})
     merged.update(intent.param_values or {})
-    ckeys = _contains_filter_param_keys(intent)
+    ckeys = _contains_where_param_keys(intent)
     if not ckeys:
         return merged
     out = dict(merged)
@@ -855,8 +734,8 @@ def flatten_param_values(intent: RuntimeIntent) -> dict[str, Any]:
     return out
 
 
-def intent_key(intent: RuntimeIntent) -> str:
-    """SHA-256 of normalised structural intent: tables, selects, filters, group/order/having, CTEs. Omits ``grain``, ``limit``, and raw param values; uses normalised filter/having dicts and CTE key skeletons. Differs from :func:`aetherdialect._intent_process.intent_similarity`, which scores overlap via weighted clause similarity (including a separate CTE blend) rather than a single hash."""
+def _structural_intent_hash(intent: RuntimeIntent, *, include_join_skeleton: bool) -> str:
+    """Shared structural hash for ``intent_key`` and ``body_similarity_key``."""
     select_cols = intent.select_cols or []
 
     grain = intent.grain or "row_level"
@@ -874,10 +753,10 @@ def intent_key(intent: RuntimeIntent) -> str:
             expected_rows = "many"
         debug(f"[utils.intent_key] inferred_expected_rows: grain={grain} -> expected_rows={expected_rows}")
 
-    filters_normalized = _normalize_filters(intent.filters_param or [])
-    having_conditions_normalized = _normalize_having_conditions(intent.having_param or [])
+    filters_normalized = _normalize_where_predicates(where_leaves(intent.where) or [])
+    having_conditions_normalized = _normalize_having_conditions(having_leaves(intent.having) or [])
     cte_steps_normalized = _normalize_cte_steps(intent.cte_steps or [])
-    cte_steps_for_key = _normalize_cte_steps_for_key(cte_steps_normalized)
+    cte_steps_for_key = _normalize_cte_steps_for_key(cte_steps_normalized, include_join_skeleton=include_join_skeleton)
 
     select_cols_sorted = sorted([s.signature_key for s in select_cols])
     order_by_sorted = sorted([o.signature_key for o in (intent.order_by_cols or [])])
@@ -885,7 +764,7 @@ def intent_key(intent: RuntimeIntent) -> str:
     normalized = {
         "tables": sorted(intent.tables or []),
         "select_cols": select_cols_sorted,
-        "filters": [f.to_dict() for f in filters_normalized],
+        "where": [f.to_dict() for f in filters_normalized],
         "group_by_cols": sorted([g.signature_key for g in (intent.group_by_cols or [])]),
         "order_by_cols": order_by_sorted,
         "having_conditions": [hc.to_dict() for hc in having_conditions_normalized],
@@ -898,9 +777,14 @@ def intent_key(intent: RuntimeIntent) -> str:
     return key
 
 
+def intent_key(intent: RuntimeIntent) -> str:
+    """SHA-256 of normalised structural intent: tables, selects, filters, group/order/having, CTEs. Omits ``grain``, ``limit``, and raw param values; uses normalised filter/having dicts and CTE key skeletons. Differs from :func:`aetherdialect._intent_process.intent_similarity`, which scores overlap via weighted clause similarity (including a separate CTE blend) rather than a single hash."""
+    return _structural_intent_hash(intent, include_join_skeleton=True)
+
+
 def body_similarity_key(intent: RuntimeIntent) -> str:
     """Structural body fingerprint excluding grain, limit, column_map, join path, and param values."""
-    return intent_key(intent)
+    return _structural_intent_hash(intent, include_join_skeleton=False)
 
 
 def body_similarity_key_for_concrete(concrete: ConcreteIntent) -> str:
@@ -908,9 +792,62 @@ def body_similarity_key_for_concrete(concrete: ConcreteIntent) -> str:
     return body_similarity_key(concrete_intent_to_runtime_skeleton(concrete))
 
 
-def template_instance_key_from_parts(body_key: str, join_fp: str, sql_fp_val: str) -> str:
+def template_instance_key_from_parts(
+    body_key: str,
+    join_fp: str,
+    sql_fp_val: str,
+    *,
+    colmap_sig: str = "",
+    grain: str = "",
+    limit: int | None = None,
+    params_fp: str = "",
+) -> str:
     """Stable key for an executable template row: body + join fingerprint + parameterized SQL fingerprint."""
-    return sha256(stable_json({"b": body_key, "j": join_fp, "s": sql_fp_val}))
+    return sha256(
+        stable_json(
+            {
+                "b": body_key,
+                "j": join_fp,
+                "s": sql_fp_val,
+                "c": colmap_sig,
+                "g": grain,
+                "l": limit,
+                "p": params_fp,
+            }
+        )
+    )
+
+
+def template_instance_key_for_concrete(
+    concrete: ConcreteIntent,
+    sql_fp_val: str,
+    *,
+    param_values: dict[str, Any] | None = None,
+) -> str:
+    """Warmup/template-store instance key from a stored concrete intent."""
+    params = param_values if param_values is not None else dict(concrete.param_values or {})
+    return template_instance_key_from_parts(
+        body_similarity_key_for_concrete(concrete),
+        join_path_key_concrete(concrete),
+        sql_fp_val,
+        colmap_sig=colmap_signature(concrete.column_map or {}),
+        grain=concrete.grain or "row_level",
+        limit=concrete.limit,
+        params_fp=stable_json(params),
+    )
+
+
+def template_instance_key_for_runtime(runtime: RuntimeIntent, sql_fp_val: str) -> str:
+    """Warmup instance key from a post-join runtime intent."""
+    return template_instance_key_from_parts(
+        body_similarity_key(runtime),
+        join_path_key_runtime(runtime),
+        sql_fp_val,
+        colmap_sig=colmap_signature(runtime.column_map or {}),
+        grain=runtime.grain or "row_level",
+        limit=runtime.limit,
+        params_fp=stable_json(flatten_param_values(runtime)),
+    )
 
 
 def extract_tables_from_sql(sql: str, known_tables: list[str], *, sqlglot_dialect: str) -> list[str]:
@@ -1033,7 +970,7 @@ def generate_question(
         },
     }
 
-    response = llm_json(system, stable_json(user_prompt), retries=1, task="default")
+    response = llm_json(system, stable_json(user_prompt), retries=1, task="synth_variety")
     question = response.get("question")
     ir = response.get("is_realistic", True)
     if isinstance(ir, str):
@@ -1053,39 +990,6 @@ def generate_question(
     return None
 
 
-_QUESTION_FROM_SQL_SYSTEM = (
-    "You are given a SQL query and a schema description. "
-    "Your job is to decide whether the query represents a realistic, "
-    "meaningful business question and, if so, produce natural-language paraphrases "
-    "that a human analyst would ask to obtain this query's result.\n\n"
-    "Rules:\n"
-    "- If the query is unrealistic, nonsensical, or produces meaningless "
-    "results, set is_realistic to false and explain why in drop_reason.\n"
-    "- If realistic, set questions to an array of up to three distinct, "
-    "conversational paraphrases a non-technical user would ask. "
-    "Do NOT use SQL jargon or raw column names — use natural business language.\n"
-    "- Do not phrase the output as numbered steps, subqueries, JOIN recipes, or procedural SQL instructions; "
-    "each entry must read as one coherent analyst question.\n"
-    "- You may also set question (string) to the first paraphrase for compatibility; "
-    "when questions is non-empty, question should match questions[0].\n"
-    "- Output ONLY valid JSON with fields: "
-    '"questions" (array of strings), "question" (string, optional legacy), '
-    '"is_realistic" (boolean), "drop_reason" (string or null), and optionally '
-    '"drop_reason_category" (string) when is_realistic is false. '
-    f"If present, drop_reason_category must be one of: {_REALISM_CATEGORY_LIST}.\n"
-)
-
-
-_WARMUP_PARAPHRASES_BY_STYLE_SYSTEM = (
-    "Generate natural-language analyst questions grouped by stylistic palette slots. "
-    "Preserve entities, filters, metrics, grouping, ordering, and limits implied by the SQL or seed question. "
-    "Use schema descriptions only for terminology consistency. "
-    "Do not answer the question. Do not output SQL, identifiers, numbered steps, or JOIN recipes. "
-    "For each style slot you may return zero paraphrases when that style does not fit; never force a poor match. "
-    "Output ONLY valid JSON with field paraphrases_by_style mapping each style name to an array of strings."
-)
-
-
 def schema_table_descriptions_for_tables(schema: SchemaGraph, tables: list[str]) -> str:
     """Render table names and optional table descriptions for warmup NL prompts."""
     blocks: list[str] = []
@@ -1101,32 +1005,56 @@ def schema_table_descriptions_for_tables(schema: SchemaGraph, tables: list[str])
     return "\n\n".join(blocks)
 
 
+def _truncate_enriched_description(text: str) -> str:
+    """Bound one enriched description line to the schema prompt char cap."""
+    td = str(text).strip()
+    if not td:
+        return ""
+    if len(td) <= SCHEMA_DESCRIPTION_PROMPT_MAX_CHARS:
+        return td
+    return td[: SCHEMA_DESCRIPTION_PROMPT_MAX_CHARS - 3] + "..."
+
+
 def schema_context_enriched_lines_for_tables(schema: SchemaGraph, tables: list[str]) -> str:
-    """Render table descriptions plus column roles and optional column. descriptions for prompts."""
+    """Render table descriptions plus column roles and optional column descriptions for prompts."""
     blocks: list[str] = []
+    budget = SCHEMA_ENRICHED_LINES_MAX_CHARS
+    used = 0
+    separator = "\n\n"
     for table in tables:
         table_meta = schema.tables.get(table)
         if not table_meta:
             continue
         lines: list[str] = [f"TABLE {table}"]
-        td = getattr(table_meta, "description", "") or ""
-        if str(td).strip():
-            lines.append(f"  table_description: {str(td).strip()}")
+        td = _truncate_enriched_description(getattr(table_meta, "description", "") or "")
+        if td:
+            lines.append(f"  table_description: {td}")
         col_lines: list[str] = []
         for col_name, col_meta in table_meta.columns.items():
             piece = f"{col_name} ({col_meta.data_type or 'unknown'})"
             if col_meta.role:
                 piece += f" [{col_meta.role}]"
-            cd = col_meta.description or ""
-            if str(cd).strip():
-                piece += f" — {str(cd).strip()}"
+            cd = _truncate_enriched_description(col_meta.description or "")
+            if cd:
+                piece += f" — {cd}"
             col_lines.append(piece)
         if col_lines:
             lines.append("  columns:")
             for cl in col_lines:
                 lines.append(f"    {cl}")
-        blocks.append("\n".join(lines))
-    return "\n\n".join(blocks)
+        block = "\n".join(lines)
+        extra = len(separator) if blocks else 0
+        if used + extra + len(block) > budget:
+            remaining = budget - used - extra
+            if remaining <= 0:
+                break
+            if remaining > 3:
+                block = block[: remaining - 3] + "..."
+                blocks.append(block)
+            break
+        blocks.append(block)
+        used += extra + len(block)
+    return separator.join(blocks)
 
 
 def _phrase_jaccard_tokens(text: str) -> frozenset[str]:
@@ -1145,12 +1073,7 @@ def _phrase_jaccard_similarity(a: frozenset[str], b: frozenset[str]) -> float:
     return len(a & b) / union_n
 
 
-def select_diverse_paraphrases(
-    candidates: list[str],
-    *,
-    max_count: int,
-    lambda_mmr: float | None = None,
-) -> list[str]:
+def select_diverse_paraphrases(candidates: list[str], *, max_count: int, lambda_mmr: float | None = None) -> list[str]:
     """Pick up to *max_count* paraphrases with maximum marginal relevance over token Jaccard similarity."""
     uniq: list[str] = []
     seen: set[str] = set()
@@ -1189,11 +1112,7 @@ def select_diverse_paraphrases(
 
 
 def generate_warmup_paraphrases_by_style(
-    schema: SchemaGraph,
-    tables: list[str],
-    *,
-    sql: str | None = None,
-    seed_question: str | None = None,
+    schema: SchemaGraph, tables: list[str], *, sql: str | None = None, seed_question: str | None = None
 ) -> dict[str, list[str]] | None:
     """LLM paraphrases grouped by every configured warmup style (up to policy max per style)."""
     if not llm_credentials_configured():
@@ -1214,12 +1133,7 @@ def generate_warmup_paraphrases_by_style(
     if seed_question:
         body["seed_question"] = seed_question
     try:
-        response = llm_json(
-            _WARMUP_PARAPHRASES_BY_STYLE_SYSTEM,
-            stable_json(body),
-            retries=1,
-            task="default",
-        )
+        response = llm_json(WARMUP_PARAPHRASES_BY_STYLE_SYSTEM, stable_json(body), retries=1, task="synth_variety")
     except (TypeError, ValueError, LlmJsonExhausted):
         return None
     raw = response.get("paraphrases_by_style")
@@ -1261,38 +1175,18 @@ def flatten_warmup_paraphrases_by_style(by_style: dict[str, list[str]]) -> list[
 
 
 def generate_paraphrases_of_seed_question(
-    seed_question: str,
-    schema: SchemaGraph,
-    tables: list[str],
-    *,
-    style_pair: tuple[str, str] | None = None,
+    seed_question: str, schema: SchemaGraph, tables: list[str], *, style_pair: tuple[str, str] | None = None
 ) -> list[str] | None:
     """LLM paraphrases of an existing seed question grouped by warmup styles."""
     del style_pair
-    by_style = generate_warmup_paraphrases_by_style(
-        schema,
-        tables,
-        seed_question=seed_question,
-    )
+    by_style = generate_warmup_paraphrases_by_style(schema, tables, seed_question=seed_question)
     if not by_style:
         return None
     return flatten_warmup_paraphrases_by_style(by_style)
 
 
-_WARMUP_FREEFORM_QUESTIONS_SYSTEM = (
-    "You write natural-language analyst questions that faithfully describe what a SQL query computes. "
-    "Use schema table descriptions only for business terminology. "
-    "Do not output SQL, identifiers, numbered steps, or JOIN recipes. "
-    "Return 1–3 concise questions in a JSON object with field questions as an array of strings."
-)
-
-
 def generate_warmup_questions_freeform(
-    schema: SchemaGraph,
-    tables: list[str],
-    *,
-    sql: str | None = None,
-    seed_question: str | None = None,
+    schema: SchemaGraph, tables: list[str], *, sql: str | None = None, seed_question: str | None = None
 ) -> list[str] | None:
     """Single-call NL question generation when styled paraphrase buckets are empty."""
     if not llm_credentials_configured():
@@ -1308,7 +1202,7 @@ def generate_warmup_questions_freeform(
     if seed_question:
         body["seed_question"] = seed_question
     try:
-        response = llm_json(_WARMUP_FREEFORM_QUESTIONS_SYSTEM, stable_json(body), retries=0, task="default")
+        response = llm_json(WARMUP_FREEFORM_QUESTIONS_SYSTEM, stable_json(body), retries=0, task="synth_variety")
     except LlmJsonExhausted:
         return None
     raw = response.get("questions")
@@ -1330,62 +1224,8 @@ def generate_warmup_questions_freeform(
     return out or None
 
 
-def select_best_question_via_judge(
-    sql: str,
-    engine_context: str,
-    candidates: list[str],
-) -> int:
-    """Pick the candidate NL question that best matches *sql* given. *schema_context*. Uses a JSON-mode judge call with ``task="judge"``. On parse failure or any invalid index, returns ``0``."""
-    if not candidates:
-        return 0
-    if len(candidates) == 1:
-        return 0
-    system = (
-        "You compare natural-language question candidates against a SQL query and schema notes. "
-        "Choose exactly one candidate index that best captures what the SQL computes for an analyst. "
-        "Output ONLY valid JSON matching the requested shape."
-    )
-    payload = stable_json(
-        {
-            "sql": sql,
-            "schema_context": engine_context,
-            "candidates": [{"index": i, "text": t} for i, t in enumerate(candidates)],
-            "instructions": (
-                "chosen_index must be the zero-based index of the single best candidate. "
-                "Prefer faithful semantics over stylistic flair."
-            ),
-            "output_format": {"chosen_index": 0},
-        }
-    )
-    try:
-        response = llm_json(system, payload, retries=0, task="judge")
-        raw = response.get("chosen_index", 0)
-        if isinstance(raw, bool):
-            idx = 0
-        elif isinstance(raw, int):
-            idx = raw
-        elif isinstance(raw, float):
-            idx = int(raw)
-        elif isinstance(raw, str):
-            try:
-                idx = int(raw.strip())
-            except ValueError:
-                idx = 0
-        else:
-            idx = 0
-        if 0 <= idx < len(candidates):
-            return idx
-    except (TypeError, ValueError, LlmJsonExhausted):
-        pass
-    return 0
-
-
 def generate_question_from_sql(
-    sql: str,
-    schema: SchemaGraph,
-    tables: list[str],
-    *,
-    intent_source: str | None = None,
+    sql: str, schema: SchemaGraph, tables: list[str], *, intent_source: str | None = None
 ) -> dict[str, Any] | None:
     """LLM: *sql* plus column context yields NL questions and a realism flag."""
     schema_context = schema_table_descriptions_for_tables(schema, tables)
@@ -1402,12 +1242,7 @@ def generate_question_from_sql(
     }
     user_prompt = stable_json(user_body)
 
-    response = llm_json(
-        _QUESTION_FROM_SQL_SYSTEM,
-        user_prompt,
-        retries=1,
-        task="default",
-    )
+    response = llm_json(QUESTION_FROM_SQL_SYSTEM, user_prompt, retries=1, task="synth_variety")
     is_realistic = response.get("is_realistic", False)
     question = response.get("question", "")
     drop_reason = response.get("drop_reason")
@@ -1494,19 +1329,19 @@ def _parse_qualified_column_ref(left_expr: Any) -> tuple[str, str] | None:
     return table, column
 
 
-def _filter_equality_literal(filter_param: FilterParam, param_values: dict[str, Any]) -> str | None:
+def _where_equality_literal(where_param: WhereParam, param_values: dict[str, Any]) -> str | None:
     """Return a string literal for an equality filter when one is present."""
-    if filter_param.op not in ("=", "=="):
+    if where_param.op not in ("=", "=="):
         return None
-    if filter_param.right_expr is not None:
+    if where_param.right_expr is not None:
         return None
-    value_type = (filter_param.value_type or "string").strip().lower()
+    value_type = (where_param.value_type or "string").strip().lower()
     if value_type not in ("string", "categorical", "free_text"):
         return None
-    if filter_param.param_key and filter_param.param_key in param_values:
-        raw = param_values[filter_param.param_key]
-    elif filter_param.raw_value is not None:
-        raw = filter_param.raw_value
+    if where_param.param_key and where_param.param_key in param_values:
+        raw = param_values[where_param.param_key]
+    elif where_param.raw_value is not None:
+        raw = where_param.raw_value
     else:
         return None
     if raw is None:
@@ -1591,7 +1426,7 @@ def _cache_canonical_index(cached: list[str]) -> dict[str, str]:
     return {value.lower(): value for value in cached}
 
 
-def zero_row_filter_remediation_candidates(literal: str, cached: list[str]) -> list[str]:
+def zero_row_where_remediation_candidates(literal: str, cached: list[str]) -> list[str]:
     """Build ordered filter literal candidates from cached distinct values for zero-row remediation."""
     text = literal.strip()
     if not text or not cached:
@@ -1628,7 +1463,7 @@ def zero_row_filter_remediation_candidates(literal: str, cached: list[str]) -> l
     return candidates
 
 
-def _filter_param_matches(left: FilterParam, right: FilterParam) -> bool:
+def _where_param_matches(left: WhereParam, right: WhereParam) -> bool:
     """Return True when two filter params refer to the same equality slot."""
     if left.param_key and right.param_key and left.param_key == right.param_key:
         return True
@@ -1637,15 +1472,13 @@ def _filter_param_matches(left: FilterParam, right: FilterParam) -> bool:
     return left_ref is not None and left_ref == right_ref
 
 
-def patch_filter_literal_on_intent(
-    intent: RuntimeIntent,
-    filter_param: FilterParam,
-    canonical_value: str,
+def patch_where_literal_on_intent(
+    intent: RuntimeIntent, where_param: WhereParam, canonical_value: str
 ) -> RuntimeIntent:
     """Return a deep copy of *intent* with one equality filter literal replaced."""
     patched = copy.deepcopy(intent)
-    for candidate in patched.filters_param or []:
-        if not _filter_param_matches(candidate, filter_param):
+    for candidate in where_leaves(patched.where) or []:
+        if not _where_param_matches(candidate, where_param):
             continue
         candidate.raw_value = canonical_value
         if candidate.param_key:
@@ -1654,18 +1487,17 @@ def patch_filter_literal_on_intent(
     return patched
 
 
-def enumerate_zero_row_equality_filters(
-    intent: RuntimeIntent,
-    schema: SchemaGraph,
-) -> list[tuple[FilterParam, str, str, list[str]]]:
+def enumerate_zero_row_equality_where(
+    intent: RuntimeIntent, schema: SchemaGraph
+) -> list[tuple[WhereParam, str, str, list[str]]]:
     """List equality filters whose literals are absent from cached distinct values."""
     param_values = _merge_intent_param_values(intent)
-    targets: list[tuple[FilterParam, str, str, list[str]]] = []
-    for filter_param in intent.filters_param or []:
-        literal = _filter_equality_literal(filter_param, param_values)
+    targets: list[tuple[WhereParam, str, str, list[str]]] = []
+    for where_param in where_leaves(intent.where) or []:
+        literal = _where_equality_literal(where_param, param_values)
         if literal is None:
             continue
-        ref = _parse_qualified_column_ref(filter_param.left_expr)
+        ref = _parse_qualified_column_ref(where_param.left_expr)
         if ref is None:
             continue
         table, column = ref
@@ -1674,14 +1506,14 @@ def enumerate_zero_row_equality_filters(
             continue
         if literal.lower() in {value.lower() for value in cached}:
             continue
-        targets.append((filter_param, literal, column, cached))
+        targets.append((where_param, literal, column, cached))
     return targets
 
 
-def zero_row_filter_suggestions(intent: RuntimeIntent, schema: SchemaGraph) -> list[str]:
+def zero_row_where_suggestions(intent: RuntimeIntent, schema: SchemaGraph) -> list[str]:
     """Suggest cached distinct-value corrections for equality filters after a zero-row execute."""
     suggestions: list[str] = []
-    for _filter_param, literal, column, cached in enumerate_zero_row_equality_filters(intent, schema):
+    for _where_param, literal, column, cached in enumerate_zero_row_equality_where(intent, schema):
         best: str | None = None
         best_distance: int | None = None
         for value in cached:
@@ -1691,7 +1523,7 @@ def zero_row_filter_suggestions(intent: RuntimeIntent, schema: SchemaGraph) -> l
                 best = value
         if best is None or best_distance is None:
             continue
-        if best_distance > PolicyConfig.ZERO_ROW_FILTER_FUZZY_MAX_DISTANCE:
+        if best_distance > PolicyConfig.ZERO_ROW_WHERE_FUZZY_MAX_DISTANCE:
             continue
         suggestions.append(f"No rows for {column}={literal!r}. Did you mean {best!r}?")
     return suggestions

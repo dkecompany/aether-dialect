@@ -9,8 +9,9 @@ import pytest
 from aetherdialect import AetherEngine
 from aetherdialect._config import EngineConfig
 from aetherdialect._constants import SESSION_KIND_AWAITING_SQL_CONFIRM
+from aetherdialect._contracts_base import MockFixtureMissingError
 from aetherdialect._contracts_core import QuestionFormStorage, RuntimeIntent, ValueHistory
-from aetherdialect._llm_provider import MockFixtureMissingError, reset_mock_provider
+from aetherdialect._llm_provider import reset_mock_provider
 from aetherdialect._templates import (
     _append_runtime_paraphrase_variants,
     clear_sandbox_paraphrase_source,
@@ -155,7 +156,7 @@ def test_resolve_param_display_names_falls_back_on_missing_fixture(monkeypatch: 
     assert names["p1"] == "category"
 
 
-@pytest.mark.requires_sandbox
+@pytest.mark.needs_corpus
 def test_catalog_paraphrase_hits_direct_reuse_after_accept() -> None:
     canonical = "How many items are in the catalog by item type?"
     pairs = AetherEngine.sandbox_paraphrase_pairs()
@@ -223,7 +224,7 @@ def test_insert_template_record_accept_primary_not_double_counted(
         select_cols=[],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
+        where=None,
         natural_language="nl",
     )
     store: dict[str, object] = {"next_id": 1}
@@ -264,7 +265,7 @@ def test_insert_template_record_accept_without_registry_raises_normalized_only(
         select_cols=[],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
+        where=None,
         natural_language="nl",
     )
     store: dict[str, object] = {"next_id": 1}

@@ -1,14 +1,20 @@
-"""Execute and validate SQL, score confidence, validate CTE chains, and classify user rejections."""
+"""Execute and validate SQL, validate CTE chains, and classify user rejections."""
 
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from typing import Any
+
+import sqlglot
+from sqlglot import exp
 
 from ._config import PolicyConfig
 from ._constants import (
+    ARROW_RESULT_READER_KINDS,
     DIAG_TO_FAILURE_CATEGORY,
+    MASTER_AETHERSPACE_NAME,
     PERMISSION_DENIED_USER_MESSAGE,
     SCALAR_FUNCTIONS_NUMERIC,
     SCALAR_FUNCTIONS_STRING,
@@ -24,14 +30,14 @@ from ._contracts_base import (
     HavingParam,
     LogicalIntent,
     OrderByCol,
+    ProbeCtePlacementError,
     SqlDiagnostic,
     SqlDiagnosticCode,
+    having_leaves,
+    where_leaves,
 )
-from ._contracts_core import (
-    RuntimeCteStep,
-    RuntimeIntent,
-    SelectCol,
-)
+from ._contracts_core import RuntimeCteStep, RuntimeIntent, SelectCol
+from ._intent_repair import validate_table_scope_repairs
 from ._contracts_schema import (
     CaseRegistryStep,
     CteOutputColumnMeta,
@@ -41,13 +47,9 @@ from ._contracts_schema import (
     WindowRegistryStep,
     make_intent_issue,
 )
-from ._core_utils import (
-    debug,
-    pipeline_trace,
-    reconcile_execute_bind_params,
-    stable_json,
-)
+from ._core_utils import debug, pipeline_trace, reconcile_execute_bind_params, stable_json
 from ._dialect import Dialect
+from ._intent_expr import extract_columns_from_expr
 from ._intent_resolve import (
     check_qualified_refs_exist,
     collect_column_refs_for_cte_step,
@@ -55,35 +57,50 @@ from ._intent_resolve import (
     resolve_column_map,
 )
 from ._schema_graph import assert_consumer_sql_in_scope
+from ._sql_gen import classify_cte_emission, probe_cte_names
 from ._validation_schema import (
+    collect_fan_out_sensitive_aggregates,
+    cte_join_reachability_tables,
     extract_agg_col,
     extract_col_from_scalar_wrapper,
     extract_functions_from_term,
-    filter_param_to_having_param,
     get_col_type,
     iterate_case_branch_conditions,
+    multiplying_edges_for_table,
+    phys_table_key,
     validate_case_when_schema,
+    validate_clause_widened_rowset,
     validate_contains_array_filters,
+    validate_cte_emission_shapes,
+    validate_cte_limits,
     validate_date_diff_left_expr_is_subtraction,
     validate_date_diff_units,
     validate_date_window_units,
-    validate_filter_ops_per_column,
-    validate_filter_value_type_alignment,
+    validate_distinct_on_schema,
     validate_filters_schema,
     validate_group_by_cols_schema,
     validate_having_ops_per_column,
     validate_having_schema,
     validate_join_path_reachability,
     validate_join_path_reachability_for_tables,
+    intent_join_reachability_tables,
     validate_no_between_ops,
     validate_null_filters,
     validate_order_by_cols_schema,
+    validate_predicate_nesting_depth,
+    validate_preserve_tables,
+    validate_probe_cte_anchor_placement,
+    validate_probe_cte_modifiers,
     validate_redundant_extract_year_column_literals,
     validate_scope_registries,
     validate_select_cols_schema,
     validate_selectability,
+    validate_table_reference_counts,
+    validate_where_ops_per_column,
+    validate_where_value_type_alignment,
     validate_window_partition_group_by_alignment,
     validate_window_spec_schema,
+    where_param_to_having_param,
 )
 from ._validation_semantic import (
     validate_agg_vs_agg_having,
@@ -97,9 +114,7 @@ from ._validation_semantic import (
     validate_denied_references,
     validate_deny_bare_select,
     validate_empty_window,
-    validate_expr_vs_expr_filters,
-    validate_filter_expr_types,
-    validate_filter_no_aggregation,
+    validate_expr_vs_expr_where,
     validate_for_each_grouping,
     validate_grain_consistency,
     validate_grouped_requires_aggregation,
@@ -112,7 +127,7 @@ from ._validation_semantic import (
     validate_non_selectable_predicates,
     validate_order_by_aggregation_context,
     validate_order_by_expr_types,
-    validate_predicate_bool_op_filter_group_hints,
+    validate_predicate_group_hints,
     validate_predicate_sidedness,
     validate_question_agg_keyword_coverage,
     validate_question_distinct_hint,
@@ -122,6 +137,8 @@ from ._validation_semantic import (
     validate_sensitivity_group_by,
     validate_sensitivity_order_by,
     validate_threshold_missing_having,
+    validate_where_expr_types,
+    validate_where_no_aggregation,
 )
 
 
@@ -203,10 +220,7 @@ def _format_explain_validation_error(code: str, raw: str) -> str:
 
 
 def _column_resolution_issues(
-    columns: list[str],
-    tables: list[str],
-    schema: SchemaGraph,
-    context: str,
+    columns: list[str], tables: list[str], schema: SchemaGraph, context: str
 ) -> list[IntentIssue]:
     """Run ``resolve_column_map`` and prefix messages with *context* for non-main scopes."""
     _, raw = resolve_column_map(columns, schema, tables)
@@ -222,9 +236,77 @@ def _column_resolution_issues(
                 severity=iss.severity,
                 message=f"{context}: {iss.message}",
                 context={**iss.context, "location": context},
-            ),
+            )
         )
     return out
+
+
+def _sqlglot_select_has_forbidden_sql(select: exp.Select) -> bool:
+    """Return True when a sqlglot SELECT tree contains PolicyConfig- forbidden constructs."""
+    forbidden_nodes = (
+        exp.Exists,
+        exp.Lateral,
+        exp.Union,
+        exp.Intersect,
+        exp.Except,
+        exp.Insert,
+        exp.Update,
+        exp.Delete,
+        exp.Merge,
+        exp.Drop,
+        exp.Alter,
+        exp.Create,
+        exp.TruncateTable,
+        exp.Grant,
+        exp.Revoke,
+        exp.Command,
+        exp.Copy,
+        exp.Array,
+    )
+    for node_type in forbidden_nodes:
+        if list(select.find_all(node_type)):
+            return True
+    if select.args.get("offset") is not None:
+        return True
+    distinct = select.args.get("distinct")
+    if isinstance(distinct, exp.Distinct) and distinct.args.get("on"):
+        return True
+    for agg in select.find_all(exp.AggFunc):
+        name = (agg.name or "").upper()
+        if name == "ARRAY_AGG":
+            return True
+    for cast in select.find_all(exp.Cast):
+        to_type = cast.args.get("to")
+        if to_type is not None and "json" in str(to_type).lower():
+            return True
+    limit = select.args.get("limit")
+    if isinstance(limit, exp.Fetch):
+        return True
+    if isinstance(limit, exp.Limit) and limit.args.get("offset") is not None:
+        return True
+    return False
+
+
+def _pg_parsed_has_forbidden_sql(parsed: Any, *, sql: str, sqlglot_dialect: str) -> bool:
+    """Return True when a pglast-backed SELECT contains PolicyConfig- forbidden constructs."""
+    try:
+        tree = sqlglot.parse_one(sql, dialect=sqlglot_dialect)
+    except Exception:
+        return True
+    if isinstance(tree, exp.Select):
+        return _sqlglot_select_has_forbidden_sql(tree)
+    return True
+
+
+def _parsed_ast_has_forbidden_sql(parsed: Any, dialect: Dialect, *, sql: str) -> bool:
+    """Structural refusal list equivalent to PolicyConfig.FORBIDDEN_SQL."""
+    if isinstance(parsed, exp.Select):
+        return _sqlglot_select_has_forbidden_sql(parsed)
+    dialect_name = getattr(dialect, "name", None)
+    sqlglot_dialect = getattr(dialect, "sqlglot_dialect", None)
+    if dialect_name == "postgresql" and isinstance(sqlglot_dialect, str):
+        return _pg_parsed_has_forbidden_sql(parsed, sql=sql, sqlglot_dialect=sqlglot_dialect)
+    return False
 
 
 def _enforce_select_only(sql: str, dialect: Dialect) -> tuple[bool, str]:
@@ -233,8 +315,11 @@ def _enforce_select_only(sql: str, dialect: Dialect) -> tuple[bool, str]:
     for p in PolicyConfig.FORBIDDEN_SQL:
         if re.search(p, s, re.IGNORECASE):
             return False, "forbidden_sql"
-    if dialect.parse_select(sql) is None:
+    parsed = dialect.parse_select(sql)
+    if parsed is None:
         return False, "not_select"
+    if _parsed_ast_has_forbidden_sql(parsed, dialect, sql=sql):
+        return False, "forbidden_sql"
     return True, "ok"
 
 
@@ -248,53 +333,33 @@ def validate_sql(
 ) -> tuple[bool, str | None, FailureCategory | None, list[SqlDiagnostic]]:
     """Validate SQL as a safe ``SELECT`` and syntactically valid via. the. dialect AST. ``EXPLAIN`` is always attempted via ``dialect.explain_sql`` when the dialect still has a usable backend; it is skipped only after the dialect has self-disabled EXPLAIN in response to a permission-denied response from the database (see :meth:`Dialect._disable_explain_on_permission_denied`)."""
     debug(f"[validation_execute.validate_sql] checking SQL length={len(sql)}")
-    pipeline_trace(
-        "validation_execute.validate_sql.input",
-        lambda: stable_json({"sql": sql, "params": params or {}}),
-    )
+    pipeline_trace("validation_execute.validate_sql.input", lambda: stable_json({"sql": sql, "params": params or {}}))
     if UNBOUND_PYFORMAT_PLACEHOLDER_RE.search(sql):
         debug("[validation_execute.validate_sql] unbound pyformat placeholder detected")
-        pipeline_trace(
-            "validation_execute.validate_sql.FAILED_unbound_placeholder",
-            lambda: sql,
-        )
+        pipeline_trace("validation_execute.validate_sql.FAILED_unbound_placeholder", lambda: sql)
         return (
             False,
             "unbound_placeholder",
             FailureCategory.UNBOUND_PLACEHOLDER,
-            [
-                SqlDiagnostic(
-                    code=SqlDiagnosticCode.PARAM_UNBOUND,
-                    message="unbound pyformat placeholder",
-                )
-            ],
+            [SqlDiagnostic(code=SqlDiagnosticCode.PARAM_UNBOUND, message="unbound pyformat placeholder")],
         )
     ok, reason = _enforce_select_only(sql, dialect)
     if not ok:
         debug(f"[validation_execute.validate_sql] enforce_select_only FAILED: {reason}")
-        pipeline_trace(
-            "validation_execute.validate_sql.FAILED_enforce_select_only",
-            lambda: f"reason={reason}\n{sql}",
-        )
+        pipeline_trace("validation_execute.validate_sql.FAILED_enforce_select_only", lambda: f"reason={reason}\n{sql}")
         cat = FailureCategory.SCHEMA if reason == "not_select" else FailureCategory.OTHER
         diag_code = SqlDiagnosticCode.NOT_SELECT if reason == "not_select" else SqlDiagnosticCode.MULTIPLE_STATEMENTS
         return False, reason, cat, [SqlDiagnostic(code=diag_code, message=reason or "")]
     declared_params = set(params.keys()) if params else set()
     scalar_cte_names = _scalar_subquery_cte_names(intent)
     ast_diags = dialect.ast_validate_full(
-        sql,
-        schema=schema,
-        declared_params=declared_params,
-        scalar_cte_names=scalar_cte_names,
+        sql, schema=schema, declared_params=declared_params, scalar_cte_names=scalar_cte_names
     )
     if ast_diags:
         first = ast_diags[0]
         ast_err = first.message if first.message else first.code.value
         debug(f"[validation_execute.validate_sql] AST validation failed: {ast_err}")
-        pipeline_trace(
-            "validation_execute.validate_sql.FAILED_ast",
-            lambda: f"ast_err={ast_err}\n{sql}",
-        )
+        pipeline_trace("validation_execute.validate_sql.FAILED_ast", lambda: f"ast_err={ast_err}\n{sql}")
         return (
             False,
             f"SQL structure error: {ast_err}",
@@ -309,12 +374,7 @@ def validate_sql(
             raw = (explain_err or "").strip()
             if explain_diags and explain_diags[0].code == SqlDiagnosticCode.EXPLAIN_COST_EXCEEDED:
                 msg = explain_diags[0].message or raw
-                return (
-                    False,
-                    msg,
-                    FailureCategory.EXECUTION_COST_EXCEEDED,
-                    list(explain_diags),
-                )
+                return (False, msg, FailureCategory.EXECUTION_COST_EXCEEDED, list(explain_diags))
             code = _classify_explain_sql_failure(raw)
             formatted = _format_explain_validation_error(code, raw)
             ecat = _classify_explain_error(getattr(dialect, "name", ""), raw)
@@ -330,11 +390,37 @@ def validate_sql(
             )
             return False, formatted, ecat, hard_diags
         debug("[validation_execute.validate_sql] explain_sql passed")
-    pipeline_trace(
-        "validation_execute.validate_sql.PASSED",
-        lambda: sql,
-    )
+    pipeline_trace("validation_execute.validate_sql.PASSED", lambda: sql)
     return True, None, None, list(explain_diags)
+
+
+@contextmanager
+def temporary_dialect_member_limits(
+    dialect: Any,
+    *,
+    max_query_cost_rows: float | None = None,
+    max_query_cost_bytes: float | None = None,
+    profile_timeout_ms: int | None = None,
+) -> Iterator[None]:
+    """Temporarily apply per-member execution limits on *dialect* for validation."""
+    prior: dict[str, tuple[bool, Any]] = {}
+    for name, value in (
+        ("max_query_cost_rows", max_query_cost_rows),
+        ("max_query_cost_bytes", max_query_cost_bytes),
+        ("profile_timeout_ms", profile_timeout_ms),
+    ):
+        if value is not None:
+            existed = hasattr(dialect, name)
+            prior[name] = (existed, getattr(dialect, name, None) if existed else None)
+            setattr(dialect, name, value)
+    try:
+        yield
+    finally:
+        for name, (existed, old) in prior.items():
+            if existed:
+                setattr(dialect, name, old)
+            elif hasattr(dialect, name):
+                delattr(dialect, name)
 
 
 def execute_guarded_sql(
@@ -347,81 +433,92 @@ def execute_guarded_sql(
     schema_role: str = "owner",
     schema_context: EngineContext | None = None,
     visible_objects: frozenset[str] | None = None,
+    context_name: str = MASTER_AETHERSPACE_NAME,
+    timeout_ms: int | None = None,
+    max_query_cost_rows: float | None = None,
+    max_query_cost_bytes: float | None = None,
+    profile_timeout_ms: int | None = None,
 ) -> list[tuple[Any, ...]]:
     """Validate *sql* then execute via *dialect*, enforcing consumer scope when applicable."""
     if schema is not None:
         runtime_cfg_ctx = schema_context
         ctx = runtime_cfg_ctx if runtime_cfg_ctx is not None else EngineContext()
+        norm_name = str(context_name or MASTER_AETHERSPACE_NAME).strip().lower() or MASTER_AETHERSPACE_NAME
         gate_active = (
             schema_role == "consumer"
-            or getattr(ctx, "name", "master") != "master"
+            or norm_name != MASTER_AETHERSPACE_NAME
             or bool(ctx.allow_objects or ctx.deny_objects or ctx.deny_columns or ctx.allow_columns)
             or visible_objects is not None
         )
         if gate_active and not assert_consumer_sql_in_scope(sql, dialect, ctx, schema, visible_objects):
             raise AccessError("execute", PERMISSION_DENIED_USER_MESSAGE)
-    ok, err, _cat, _diags = validate_sql(
+    with temporary_dialect_member_limits(
         dialect,
-        sql,
-        params,
-        schema=schema,
-        intent=intent,
-    )
+        max_query_cost_rows=max_query_cost_rows,
+        max_query_cost_bytes=max_query_cost_bytes,
+        profile_timeout_ms=profile_timeout_ms,
+    ):
+        ok, err, _cat, _diags = validate_sql(dialect, sql, params, schema=schema, intent=intent)
     if not ok:
         raise ValueError(err or "sql validation failed")
     exec_params = reconcile_execute_bind_params(sql, params)
+    backend = getattr(dialect, "result_backend", None)
+    if timeout_ms is not None and backend is not None:
+        return list(backend.fetch_rows(sql, exec_params, timeout_ms=int(timeout_ms)))
     return dialect.execute(sql, exec_params)
 
 
-def compute_confidence(
-    best_score: float,
-    score_gap: float,
-    used_new_tables: bool,
-    shape_penalty: float,
-    negative_pen: float,
-    colmap_pen: float,
-    num_cte_pen: float = 0.0,
-    explain_pen: float = 0.0,
-) -> float:
-    """Compute overall confidence score for a query result. Combines. template similarity score, gap to next-best, new-table penalty, shape distance penalty, negative memory penalty, column-map penalty, CTE count penalty, and EXPLAIN soft-diagnostic penalty into a single float."""
-    debug("[validation_execute.compute_confidence] inputs:")
-    debug(
-        f"[validation_execute.compute_confidence] used_new_tables={used_new_tables}, shape_penalty={shape_penalty:.3f}, num_cte_pen={num_cte_pen:.3f}, explain_pen={explain_pen:.3f}"
-    )
-    c = 0.0
-    c += 0.62 * best_score
-    debug(f"[validation_execute.compute_confidence] +{0.62 * best_score:.3f} from best_score")
-    gap_contrib = 0.18 * max(0.0, min(1.0, score_gap * 2.0))
-    c += gap_contrib
-    debug(f"[validation_execute.compute_confidence] +{gap_contrib:.3f} from score_gap")
-    if used_new_tables:
-        c -= 0.12
-        debug("[validation_execute.compute_confidence] -0.120 from used_new_tables")
-    shape_deduct = 0.18 * shape_penalty
-    c -= shape_deduct
-    debug(f"[validation_execute.compute_confidence] -{shape_deduct:.3f} from shape_penalty")
-    neg_deduct = 0.35 * min(1.0, max(0.0, negative_pen))
-    c -= neg_deduct
-    debug(f"[validation_execute.compute_confidence] -{neg_deduct:.3f} from negative_pen")
-    colmap_deduct = 0.20 * min(1.0, max(0.0, colmap_pen))
-    c -= colmap_deduct
-    debug(f"[validation_execute.compute_confidence] -{colmap_deduct:.3f} from colmap_pen")
-    cte_deduct = 0.10 * min(1.0, max(0.0, num_cte_pen))
-    c -= cte_deduct
-    debug(f"[validation_execute.compute_confidence] -{cte_deduct:.3f} from num_cte_pen")
-    explain_deduct = 0.08 * min(1.0, max(0.0, explain_pen))
-    c -= explain_deduct
-    debug(f"[validation_execute.compute_confidence] -{explain_deduct:.3f} from explain_pen")
-    result = max(0.0, min(1.0, c))
-    if best_score == 0.0:
-        cold_start_floor = max(0.0, 0.50 - neg_deduct - colmap_deduct - cte_deduct - explain_deduct)
-        if result < cold_start_floor:
-            debug(
-                f"[validation_execute.compute_confidence] cold-start floor applied: {result:.3f} → {cold_start_floor:.3f}"
-            )
-            result = cold_start_floor
-    debug(f"[validation_execute.compute_confidence] FINAL confidence={result:.3f}")
-    return result
+def execute_guarded_arrow_table(
+    dialect: Dialect,
+    sql: str,
+    params: dict[str, Any] | None = None,
+    *,
+    schema: SchemaGraph | None = None,
+    intent: RuntimeIntent | None = None,
+    schema_role: str = "owner",
+    schema_context: EngineContext | None = None,
+    visible_objects: frozenset[str] | None = None,
+    context_name: str = MASTER_AETHERSPACE_NAME,
+    timeout_ms: int | None = None,
+    max_query_cost_rows: float | None = None,
+    max_query_cost_bytes: float | None = None,
+    profile_timeout_ms: int | None = None,
+) -> Any:
+    """Validate *sql* then execute via an Arrow-capable backend."""
+    reader_kind = getattr(dialect, "result_reader_kind", "sqlalchemy")
+    if reader_kind not in ARROW_RESULT_READER_KINDS:
+        raise ValueError(f"dialect result reader {reader_kind!r} does not support Arrow coordinator streaming")
+    if schema is not None:
+        runtime_cfg_ctx = schema_context
+        ctx = runtime_cfg_ctx if runtime_cfg_ctx is not None else EngineContext()
+        norm_name = str(context_name or MASTER_AETHERSPACE_NAME).strip().lower() or MASTER_AETHERSPACE_NAME
+        gate_active = (
+            schema_role == "consumer"
+            or norm_name != MASTER_AETHERSPACE_NAME
+            or bool(ctx.allow_objects or ctx.deny_objects or ctx.deny_columns or ctx.allow_columns)
+            or visible_objects is not None
+        )
+        if gate_active and not assert_consumer_sql_in_scope(sql, dialect, ctx, schema, visible_objects):
+            raise AccessError("execute", PERMISSION_DENIED_USER_MESSAGE)
+    with temporary_dialect_member_limits(
+        dialect,
+        max_query_cost_rows=max_query_cost_rows,
+        max_query_cost_bytes=max_query_cost_bytes,
+        profile_timeout_ms=profile_timeout_ms,
+    ):
+        ok, err, _cat, _diags = validate_sql(dialect, sql, params, schema=schema, intent=intent)
+    if not ok:
+        raise ValueError(err or "sql validation failed")
+    exec_params = reconcile_execute_bind_params(sql, params)
+    backend = getattr(dialect, "result_backend", None)
+    if backend is None:
+        raise ValueError("dialect has no result backend for Arrow fetch")
+    fetch_arrow = getattr(backend, "fetch_arrow_table", None)
+    if not callable(fetch_arrow):
+        raise ValueError("dialect result backend does not implement fetch_arrow_table")
+    if timeout_ms is not None:
+        return fetch_arrow(sql, exec_params, timeout_ms=int(timeout_ms))
+    return fetch_arrow(sql, exec_params)
 
 
 def canonicalize_rejection_reason(text: str) -> str:
@@ -437,8 +534,7 @@ def canonicalize_rejection_reason(text: str) -> str:
 
 
 def _merge_cte_projection_columns_into_outputs(
-    meta_by_col: dict[str, CteOutputColumnMeta],
-    output_columns: list[str],
+    meta_by_col: dict[str, CteOutputColumnMeta], output_columns: list[str]
 ) -> None:
     """Ensure *meta_by_col* contains a permissive entry for every bare name in *output_columns*. LLM payloads sometimes omit ``output_column_metadata`` keys even when ``output_columns`` is authoritative; schema validators key off this map."""
     for oc in output_columns:
@@ -463,9 +559,7 @@ def _cte_names_from_column_refs(refs: list[str], cte_names_lower: set[str]) -> s
 
 
 def _validate_main_query_cte_usage(
-    intent: RuntimeIntent,
-    cte_outputs: dict[str, list[str]],
-    cte_steps: list[RuntimeCteStep] | None = None,
+    intent: RuntimeIntent, cte_outputs: dict[str, list[str]], cte_steps: list[RuntimeCteStep] | None = None
 ) -> list[IntentIssue]:
     """Validate that the main query references CTE outputs correctly. Checks for unreferenced CTEs (computed via transitive closure through ``cte_steps[*].tables`` so a CTE consumed by another used CTE is itself considered used), main-query select columns not present in their referenced CTE outputs, ``column_map`` references missing from CTE outputs, and filter column references missing from CTE outputs."""
     issues: list[IntentIssue] = []
@@ -573,7 +667,7 @@ def _validate_main_query_cte_usage(
                     )
                 )
                 debug(f"[validation_execute.validate_main_query_cte_usage] column_map {col_name} not in CTE {source}")
-    for fp in intent.filters_param or []:
+    for fp in where_leaves(intent.where) or []:
         col_expr = fp.left_expr.primary_column
         if not col_expr or "." not in col_expr:
             continue
@@ -583,7 +677,7 @@ def _validate_main_query_cte_usage(
             if col_name.lower() not in {c.lower() for c in cte_cols}:
                 issues.append(
                     make_intent_issue(
-                        issue_id=f"main_filter_not_in_cte_{table_ref}_{col_name}",
+                        issue_id=f"main_where_not_in_cte_{table_ref}_{col_name}",
                         category=FailureCategory.CTE_COLUMN_REFERENCE,
                         severity="error",
                         message=f"Main query filter references column '{col_name}' not in CTE '{table_ref}'",
@@ -685,7 +779,7 @@ def _validate_cte_output_types(cte_steps: list[RuntimeCteStep], schema: SchemaGr
 
 
 def _validate_cte_cardinality(cte_steps: list[RuntimeCteStep]) -> list[IntentIssue]:
-    """Validate CTE cardinality expectations are internally consistent. Warns when scalar-grain CTEs have ``expected_rows != 'one'``, ``LIMIT 1`` CTEs have ``expected_rows != 'one'``, and notes when a many-row CTE depends on a single-row CTE."""
+    """Validate CTE cardinality expectations are internally consistent. Errors when scalar-grain CTEs have ``expected_rows != 'one'``, scalar CTEs allow more than one row via LIMIT, ``LIMIT 1`` CTEs have ``expected_rows != 'one'``, and notes when a many-row CTE depends on a single-row CTE."""
     issues: list[IntentIssue] = []
     cte_expected_rows: dict[str, str] = {}
     debug(f"[validation_execute.validate_cte_cardinality] validating {len(cte_steps)} CTE cardinalities")
@@ -695,12 +789,13 @@ def _validate_cte_cardinality(cte_steps: list[RuntimeCteStep]) -> list[IntentIss
         cte_name = cte.cte_name
         expected = cte.expected_rows or "many"
         grain = cte.grain
+        emission = getattr(cte, "emission", "join_table") or "join_table"
         if grain == "scalar" and expected != "one":
             issues.append(
                 make_intent_issue(
                     issue_id=f"cte_scalar_cardinality_{cte_name}",
                     category=FailureCategory.CTE_CARDINALITY,
-                    severity="warning",
+                    severity="error",
                     message=f"CTE '{cte_name}' has scalar grain but expected_rows='{expected}'",
                     context={
                         "cte_name": cte_name,
@@ -710,12 +805,48 @@ def _validate_cte_cardinality(cte_steps: list[RuntimeCteStep]) -> list[IntentIss
                 )
             )
             debug(f"[validation_execute.validate_cte_cardinality] scalar CTE with expected_rows={expected}")
+        if grain == "scalar" and cte.limit is not None and cte.limit != 1:
+            issues.append(
+                make_intent_issue(
+                    issue_id=f"cte_scalar_multi_row_limit_{cte_name}",
+                    category=FailureCategory.CTE_CARDINALITY,
+                    severity="error",
+                    message=(
+                        f"CTE '{cte_name}' has scalar grain but LIMIT {cte.limit}; "
+                        "scalar-subquery emission requires a single row"
+                    ),
+                    context={
+                        "cte_name": cte_name,
+                        "grain": grain,
+                        "limit": cte.limit,
+                        "emission": emission,
+                    },
+                )
+            )
+            debug(f"[validation_execute.validate_cte_cardinality] scalar CTE with multi-row limit={cte.limit}")
+        if emission == "scalar_subquery" and cte.limit is not None and cte.limit != 1:
+            issues.append(
+                make_intent_issue(
+                    issue_id=f"cte_scalar_subquery_multi_row_limit_{cte_name}",
+                    category=FailureCategory.CTE_CARDINALITY,
+                    severity="error",
+                    message=(
+                        f"CTE '{cte_name}' has scalar_subquery emission but LIMIT {cte.limit}; "
+                        "CROSS JOIN requires exactly one row"
+                    ),
+                    context={
+                        "cte_name": cte_name,
+                        "limit": cte.limit,
+                        "emission": emission,
+                    },
+                )
+            )
         if cte.limit == 1 and expected != "one":
             issues.append(
                 make_intent_issue(
                     issue_id=f"cte_limit1_cardinality_{cte_name}",
                     category=FailureCategory.CTE_CARDINALITY,
-                    severity="warning",
+                    severity="error",
                     message=f"CTE '{cte_name}' has LIMIT 1 but expected_rows='{expected}'",
                     context={
                         "cte_name": cte_name,
@@ -751,23 +882,16 @@ def _validate_case_branches_for_scope(
     location_prefix: str,
     param_values: Mapping[str, Any] | None,
 ) -> list[IntentIssue]:
-    """Apply the filter/HAVING-shaped validators against every CASE. branch condition. Walks ``case_registry[*].case_when`` branch conditions via :func:`iterate_case_branch_conditions`. For each branch the helper routes the condition through the same validators that the main and CTE bodies use for ``filters_param`` (when ``condition_scope`` is ``"filter"``) or ``having_param`` (when ``condition_scope`` is ``"having"``). Each branch is treated as a one-element list so that operator, type-alignment, NULL, array, and date-unit rules surface inside CASE branches with the same diagnostics as flat WHERE/HAVING predicates. Flat ``filters_param`` / ``having_param`` lists still run ``validate_no_between_ops`` at body scope so decomposable ``between`` rows are caught there; CASE branch conditions skip that check because each branch holds a single ``FilterParam`` and shares the CASE renderer path for ``between``, ``in``, and ``not in`` (:func:`aetherdialect._sql_gen._render_case_branch_sql`)."""
+    """Apply the WHERE/HAVING-shaped validators against every CASE branch condition. Walks ``case_registry[*].case_when`` branch conditions via :func:`iterate_case_branch_conditions`. For each branch the helper routes the condition through the same validators that the main and CTE bodies use for ``where`` (when ``condition_scope`` is ``"where"``) or ``having`` (when ``condition_scope`` is ``"having"``). Each branch is treated as a one-element list so that operator, type-alignment, NULL, array, and date-unit rules surface inside CASE branches with the same diagnostics as flat WHERE/HAVING predicates. Flat ``where`` / ``having`` trees still run ``validate_no_between_ops`` at body scope so decomposable ``between`` rows are caught there; CASE branch conditions skip that check because each branch holds a single ``WhereParam`` and shares the CASE renderer path for ``between``, ``in``, and ``not in`` (:func:`aetherdialect._sql_gen._render_case_branch_sql`)."""
     issues: list[IntentIssue] = []
     for cond, branch_scope, location in iterate_case_branch_conditions(
         select_cols, case_registry, window_registry, location_prefix
     ):
         f_list = [cond]
         if branch_scope == "having":
-            h_list = [filter_param_to_having_param(cond)]
+            h_list = [where_param_to_having_param(cond)]
             issues.extend(
-                validate_having_schema(
-                    h_list,
-                    schema,
-                    allowed_tables,
-                    cte_outputs,
-                    location,
-                    param_values=param_values,
-                )
+                validate_having_schema(h_list, schema, allowed_tables, cte_outputs, location, param_values=param_values)
             )
             issues.extend(validate_having_ops_per_column(h_list, schema, cte_outputs, location))
             issues.extend(validate_having_agg_per_role(h_list, schema, cte_outputs, location))
@@ -777,29 +901,71 @@ def _validate_case_branches_for_scope(
             issues.extend(validate_agg_vs_agg_having(h_list, schema, cte_outputs, location))
             continue
         issues.extend(
-            validate_filters_schema(
-                f_list,
-                schema,
-                allowed_tables,
-                cte_outputs,
-                location,
-                param_values=param_values,
-            )
+            validate_filters_schema(f_list, schema, allowed_tables, cte_outputs, location, param_values=param_values)
         )
-        issues.extend(validate_filter_ops_per_column(f_list, schema, cte_outputs, location))
-        issues.extend(validate_filter_no_aggregation(f_list, location))
-        issues.extend(validate_filter_expr_types(f_list, schema, cte_outputs, location))
+        issues.extend(validate_where_ops_per_column(f_list, schema, cte_outputs, location))
+        issues.extend(validate_where_no_aggregation(f_list, location))
+        issues.extend(validate_where_expr_types(f_list, schema, cte_outputs, location))
         issues.extend(validate_null_filters(f_list, cte_steps, location))
         issues.extend(
-            validate_filter_value_type_alignment(f_list, schema, location, cte_outputs, param_values=param_values)
+            validate_where_value_type_alignment(f_list, schema, location, cte_outputs, param_values=param_values)
         )
         issues.extend(validate_contains_array_filters(f_list, schema, cte_outputs, location))
         issues.extend(validate_date_window_units(f_list, cte_steps, location, scope_param_values=param_values))
         issues.extend(validate_date_diff_units(f_list, cte_steps, location, scope_param_values=param_values))
         issues.extend(validate_date_diff_left_expr_is_subtraction(f_list, cte_steps, location))
-        issues.extend(validate_expr_vs_expr_filters(f_list, schema, cte_outputs, location))
+        issues.extend(validate_expr_vs_expr_where(f_list, schema, cte_outputs, location))
         issues.extend(validate_predicate_sidedness(f_list, [], location))
     return issues
+
+
+def validate_cte_emission_reclassification(intent: RuntimeIntent, schema: SchemaGraph) -> list[IntentIssue]:
+    """Emit diagnostics when a declared emission value is reclassified to fit CTE shape."""
+    issues: list[IntentIssue] = []
+    for cte in intent.cte_steps or []:
+        declared = getattr(cte, "emission", "join_table") or "join_table"
+        if declared == "scalar_subquery":
+            issues.append(
+                make_intent_issue(
+                    issue_id=f"cte_emission_model_declared_scalar_subquery_{cte.cte_name}",
+                    category=FailureCategory.CTE_STRUCTURE,
+                    severity="error",
+                    message=(
+                        f"CTE '{cte.cte_name}': scalar_subquery emission is engine-owned; "
+                        "omit emission or declare semi_join/anti_join when appropriate"
+                    ),
+                    context={"cte_name": cte.cte_name, "declared": declared},
+                )
+            )
+            continue
+        derived = classify_cte_emission(cte, intent, schema)
+        if declared == derived:
+            continue
+        if declared == "join_table" and derived == "scalar_subquery":
+            continue
+        issues.append(
+            make_intent_issue(
+                issue_id=f"cte_emission_reclassified_{cte.cte_name}",
+                category=FailureCategory.CTE_STRUCTURE,
+                severity="error",
+                message=(f"CTE '{cte.cte_name}': declared emission '{declared}' reclassified to '{derived}'"),
+                context={"cte_name": cte.cte_name, "declared": declared, "derived": derived},
+            )
+        )
+    return issues
+
+
+def enforce_probe_cte_anchor_placement_post_resolution(intent: RuntimeIntent) -> None:
+    """Re-run probe anchor placement after join signatures are populated."""
+    issues = validate_probe_cte_anchor_placement(
+        intent,
+        join_signature=list(intent.chosen_join_path_signature or []),
+    )
+    for issue in issues:
+        if issue.severity != "error":
+            continue
+        scope_label = str(issue.context.get("cte_name") or "main query")
+        raise ProbeCtePlacementError(scope_label, issue.message)
 
 
 def validate_semantics(
@@ -811,12 +977,10 @@ def validate_semantics(
 ) -> IntentValidationResult:
     """Run the full semantic validation suite against a. ``RuntimeIntent``. Validators are grouped by tier. Tier 1 structural checks run on the main query body and again on each CTE body with that scope's ``tables`` and ``param_values``. Tier 2 NL-dependent checks use ``intent.natural_language`` for the main query and ``cte.description`` for CTE scopes. Tier 3 cross-scope checks run once on the full intent (CTE naming, dependency grains, and related rules). Applies every schema-level and semantic-level validation function to the main query and each CTE step, then aggregates CTE grain compatibility checks across the full CTE chain."""
     all_issues: list[IntentIssue] = []
+    all_issues.extend(validate_table_scope_repairs(intent))
     debug(f"[validation_execute.validate_semantics] post_binding={post_binding}")
     debug("[validation_execute.validate_semantics] running semantic validation suite")
-    pipeline_trace(
-        "validation_execute.validate_semantics.input_intent",
-        lambda: stable_json(intent.to_dict()),
-    )
+    pipeline_trace("validation_execute.validate_semantics.input_intent", lambda: stable_json(intent.to_dict()))
     if not intent.tables:
         all_issues.append(
             make_intent_issue(
@@ -906,8 +1070,8 @@ def validate_semantics(
             select_cols=intent.select_cols or [],
             group_by_cols=intent.group_by_cols or [],
             order_by_cols=intent.order_by_cols or [],
-            filters_param=intent.filters_param or [],
-            having_param=intent.having_param or [],
+            where_params=where_leaves(intent.where) or [],
+            having_param=having_leaves(intent.having) or [],
         )
     )
     all_issues.extend(
@@ -957,7 +1121,9 @@ def validate_semantics(
             param_values=intent.param_values,
         )
     )
-    all_issues.extend(validate_contains_array_filters(intent.filters_param or [], schema, cte_outputs, "main query"))
+    all_issues.extend(
+        validate_contains_array_filters(where_leaves(intent.where) or [], schema, cte_outputs, "main query")
+    )
     all_issues.extend(
         validate_selectability(
             intent.select_cols or [],
@@ -969,27 +1135,67 @@ def validate_semantics(
         )
     )
     all_issues.extend(validate_join_path_reachability(intent, schema, "main query"))
+    all_issues.extend(validate_table_reference_counts(intent_join_reachability_tables(intent), schema, "main query"))
     all_issues.extend(
-        validate_order_by_cols_schema(
-            intent.order_by_cols or [],
+        validate_aggregate_join_fan_out(
+            intent,
             schema,
-            allowed_tables,
-            cte_outputs,
             "main query",
+            from_anchor=intent.tables[0] if intent.tables else None,
         )
     )
     all_issues.extend(
-        validate_group_by_cols_schema(
-            intent.group_by_cols or [],
+        validate_window_join_fan_out(
+            intent,
             schema,
-            allowed_tables,
-            cte_outputs,
             "main query",
+            from_anchor=intent.tables[0] if intent.tables else None,
+        )
+    )
+    all_issues.extend(
+        validate_clause_widened_rowset(
+            intent,
+            schema,
+            "main query",
+            from_anchor=intent.tables[0] if intent.tables else None,
+        )
+    )
+    all_issues.extend(validate_predicate_nesting_depth(intent.where, intent.having, "main query"))
+    all_issues.extend(validate_cte_limits(intent, "main query"))
+    all_issues.extend(validate_cte_emission_reclassification(intent, schema))
+    all_issues.extend(validate_cte_emission_shapes(intent, schema))
+    all_issues.extend(validate_probe_cte_modifiers(intent))
+    probe_names = probe_cte_names(intent.cte_steps)
+    all_issues.extend(
+        validate_probe_cte_anchor_placement(
+            intent,
+            join_signature=list(intent.chosen_join_path_signature or []),
+        )
+    )
+    all_issues.extend(
+        validate_preserve_tables(
+            list(intent.tables or []),
+            list(intent.preserve_tables or []),
+            schema,
+            "main query",
+            join_signature=list(intent.chosen_join_path_signature or []),
+            probe_cte_names=probe_names,
+        )
+    )
+    all_issues.extend(
+        validate_order_by_cols_schema(intent.order_by_cols or [], schema, allowed_tables, cte_outputs, "main query")
+    )
+    all_issues.extend(
+        validate_group_by_cols_schema(intent.group_by_cols or [], schema, allowed_tables, cte_outputs, "main query")
+    )
+    all_issues.extend(
+        validate_distinct_on_schema(
+            intent.distinct_on or [], intent.order_by_cols or [], schema, allowed_tables, cte_outputs, "main query"
         )
     )
     all_issues.extend(
         validate_filters_schema(
-            intent.filters_param or [],
+            where_leaves(intent.where) or [],
             schema,
             allowed_tables,
             cte_outputs,
@@ -999,15 +1205,12 @@ def validate_semantics(
     )
     all_issues.extend(
         _column_resolution_issues(
-            collect_column_refs_for_post_processing(intent),
-            intent.tables or [],
-            schema,
-            "main query",
+            collect_column_refs_for_post_processing(intent), intent.tables or [], schema, "main query"
         )
     )
     all_issues.extend(
         validate_having_schema(
-            intent.having_param or [],
+            having_leaves(intent.having) or [],
             schema,
             allowed_tables,
             cte_outputs,
@@ -1015,9 +1218,15 @@ def validate_semantics(
             param_values=intent.param_values,
         )
     )
-    all_issues.extend(validate_filter_ops_per_column(intent.filters_param or [], schema, cte_outputs, "main query"))
-    all_issues.extend(validate_having_agg_per_role(intent.having_param or [], schema, cte_outputs, "main query"))
-    all_issues.extend(validate_having_ops_per_column(intent.having_param or [], schema, cte_outputs, "main query"))
+    all_issues.extend(
+        validate_where_ops_per_column(where_leaves(intent.where) or [], schema, cte_outputs, "main query")
+    )
+    all_issues.extend(
+        validate_having_agg_per_role(having_leaves(intent.having) or [], schema, cte_outputs, "main query")
+    )
+    all_issues.extend(
+        validate_having_ops_per_column(having_leaves(intent.having) or [], schema, cte_outputs, "main query")
+    )
     all_issues.extend(validate_select_agg_per_role(intent.select_cols or [], schema, cte_outputs, "main query"))
     all_issues.extend(validate_select_agg_semantics(intent.select_cols or [], schema, "main query"))
     all_issues.extend(validate_order_by_agg_per_role(intent.order_by_cols or [], schema, cte_outputs, "main query"))
@@ -1025,47 +1234,35 @@ def validate_semantics(
     all_issues.extend(
         validate_scalar_func_type_semantics(intent.select_cols or [], intent.order_by_cols or [], schema, "main query")
     )
-    all_issues.extend(validate_null_filters(intent.filters_param or [], cte_steps, "main query"))
+    all_issues.extend(validate_null_filters(where_leaves(intent.where) or [], cte_steps, "main query"))
     all_issues.extend(
         validate_date_window_units(
-            intent.filters_param or [],
-            cte_steps,
-            "main query",
-            scope_param_values=intent.param_values,
+            where_leaves(intent.where) or [], cte_steps, "main query", scope_param_values=intent.param_values
         )
     )
     all_issues.extend(
         validate_date_diff_units(
-            intent.filters_param or [],
-            cte_steps,
-            "main query",
-            scope_param_values=intent.param_values,
+            where_leaves(intent.where) or [], cte_steps, "main query", scope_param_values=intent.param_values
         )
     )
     all_issues.extend(
-        validate_redundant_extract_year_column_literals(
-            intent.filters_param or [],
-            cte_steps,
-            "main query",
-        )
+        validate_redundant_extract_year_column_literals(where_leaves(intent.where) or [], cte_steps, "main query")
     )
     all_issues.extend(validate_column_types(intent.select_cols or [], schema, "main query"))
     all_issues.extend(
-        validate_filter_value_type_alignment(
-            intent.filters_param or [],
-            schema,
-            "main query",
-            cte_outputs,
-            param_values=intent.param_values,
+        validate_where_value_type_alignment(
+            where_leaves(intent.where) or [], schema, "main query", cte_outputs, param_values=intent.param_values
         )
     )
-    all_issues.extend(validate_no_between_ops(intent.filters_param or [], intent.having_param or [], "main query"))
+    all_issues.extend(
+        validate_no_between_ops(where_leaves(intent.where) or [], having_leaves(intent.having) or [], "main query")
+    )
     all_issues.extend(
         validate_grain_consistency(
             intent.grain,
             intent.select_cols or [],
             intent.group_by_cols or [],
-            intent.having_param or [],
+            having_leaves(intent.having) or [],
             "main query",
         )
     )
@@ -1075,56 +1272,39 @@ def validate_semantics(
             intent.select_cols or [],
             intent.group_by_cols or [],
             "main query",
-            having_param=intent.having_param or [],
+            having_param=having_leaves(intent.having) or [],
         )
     )
     all_issues.extend(
-        validate_case_branch_aggregation_consistency(
-            intent.case_registry,
-            intent.group_by_cols or [],
-            "main query",
-        )
+        validate_case_branch_aggregation_consistency(intent.case_registry, intent.group_by_cols or [], "main query")
     )
     all_issues.extend(
         validate_semantic_contradictions(
-            intent.select_cols or [],
-            intent.natural_language,
-            intent.grain,
-            intent.expected_rows,
-            "main query",
+            intent.select_cols or [], intent.natural_language, intent.grain, intent.expected_rows, "main query"
         )
     )
     all_issues.extend(
-        validate_predicate_bool_op_filter_group_hints(
-            intent.natural_language,
-            intent.filters_param or [],
-            intent.having_param or [],
-            "main query",
-        )
+        validate_predicate_group_hints(intent.natural_language, intent.where, intent.having, "main query")
     )
     all_issues.extend(
         validate_threshold_missing_having(
             intent.natural_language,
             intent.select_cols or [],
-            intent.having_param or [],
+            having_leaves(intent.having) or [],
             intent.grain,
             "main query",
         )
     )
     all_issues.extend(
         validate_count_threshold_missing_having(
-            intent.natural_language,
-            intent.tables or [],
-            intent.having_param or [],
-            schema,
-            "main query",
+            intent.natural_language, intent.tables or [], having_leaves(intent.having) or [], schema, "main query"
         )
     )
     all_issues.extend(
         validate_logical_intent_numeric_coverage(
             numeric_coverage_logical,
-            intent.filters_param or [],
-            intent.having_param or [],
+            where_leaves(intent.where) or [],
+            having_leaves(intent.having) or [],
             intent.limit,
             "main query",
             param_values=intent.param_values,
@@ -1143,23 +1323,19 @@ def validate_semantics(
         validate_question_agg_keyword_coverage(
             intent.natural_language,
             intent.select_cols or [],
-            intent.having_param or [],
+            having_leaves(intent.having) or [],
             "main query",
             intent.cte_steps or [],
         )
     )
-    _has_agg = any(sc.is_aggregated for sc in (intent.select_cols or [])) or bool(intent.having_param)
-    all_issues.extend(
-        validate_for_each_grouping(
-            intent.natural_language,
-            intent.group_by_cols or [],
-            schema,
-            _has_agg,
-            "main query",
-        )
+    _has_agg = any(sc.is_aggregated for sc in (intent.select_cols or [])) or bool(
+        having_leaves(intent.having) if intent.having else []
     )
-    all_issues.extend(validate_expr_vs_expr_filters(intent.filters_param or [], schema, cte_outputs, "main query"))
-    all_issues.extend(validate_agg_vs_agg_having(intent.having_param or [], schema, cte_outputs, "main query"))
+    all_issues.extend(
+        validate_for_each_grouping(intent.natural_language, intent.group_by_cols or [], schema, _has_agg, "main query")
+    )
+    all_issues.extend(validate_expr_vs_expr_where(where_leaves(intent.where) or [], schema, cte_outputs, "main query"))
+    all_issues.extend(validate_agg_vs_agg_having(having_leaves(intent.having) or [], schema, cte_outputs, "main query"))
     all_issues.extend(
         _validate_case_branches_for_scope(
             select_cols=intent.select_cols or [],
@@ -1176,11 +1352,7 @@ def validate_semantics(
     all_issues.extend(validate_scalar_expression_semantics(intent.select_cols or [], schema, "main query"))
     all_issues.extend(
         validate_arith_expression_semantics(
-            intent.filters_param or [],
-            intent.having_param or [],
-            schema,
-            cte_outputs,
-            "main query",
+            where_leaves(intent.where) or [], having_leaves(intent.having) or [], schema, cte_outputs, "main query"
         )
     )
     all_issues.extend(validate_concat_mulgroups_in_runtime(intent, "main query"))
@@ -1188,24 +1360,24 @@ def validate_semantics(
     all_issues.extend(validate_pk_fk_aggregation(intent.select_cols or [], schema, "main query"))
     all_issues.extend(validate_select_expr_types(intent.select_cols or [], schema, cte_outputs, "main query"))
     all_issues.extend(validate_order_by_expr_types(intent.order_by_cols or [], schema, cte_outputs, "main query"))
-    all_issues.extend(validate_filter_expr_types(intent.filters_param or [], schema, cte_outputs, "main query"))
-    all_issues.extend(validate_having_expr_types(intent.having_param or [], schema, cte_outputs, "main query"))
-    all_issues.extend(validate_filter_no_aggregation(intent.filters_param or [], "main query"))
+    all_issues.extend(validate_where_expr_types(where_leaves(intent.where) or [], schema, cte_outputs, "main query"))
+    all_issues.extend(validate_having_expr_types(having_leaves(intent.having) or [], schema, cte_outputs, "main query"))
+    all_issues.extend(validate_where_no_aggregation(where_leaves(intent.where) or [], "main query"))
     all_issues.extend(
         validate_having_requires_aggregation(
-            intent.having_param or [],
-            "main query",
-            group_by_cols=intent.group_by_cols or [],
+            having_leaves(intent.having) or [], "main query", group_by_cols=intent.group_by_cols or []
         )
     )
-    all_issues.extend(validate_having_operator_is_numeric(intent.having_param or [], "main query"))
-    all_issues.extend(validate_predicate_sidedness(intent.filters_param or [], intent.having_param or [], "main query"))
+    all_issues.extend(validate_having_operator_is_numeric(having_leaves(intent.having) or [], "main query"))
+    all_issues.extend(
+        validate_predicate_sidedness(where_leaves(intent.where) or [], having_leaves(intent.having) or [], "main query")
+    )
     all_issues.extend(
         validate_no_nested_aggregation(
             intent.select_cols or [],
             intent.order_by_cols or [],
-            intent.filters_param or [],
-            intent.having_param or [],
+            where_leaves(intent.where) or [],
+            having_leaves(intent.having) or [],
             "main query",
         )
     )
@@ -1213,18 +1385,15 @@ def validate_semantics(
         validate_mixed_aggregation_in_mulgroup(
             intent.select_cols or [],
             intent.order_by_cols or [],
-            intent.filters_param or [],
-            intent.having_param or [],
+            where_leaves(intent.where) or [],
+            having_leaves(intent.having) or [],
             "main query",
         )
     )
     all_issues.extend(validate_order_by_aggregation_context(intent.order_by_cols or [], intent.grain, "main query"))
     all_issues.extend(
         validate_select_group_by_membership(
-            intent.select_cols or [],
-            intent.group_by_cols or [],
-            intent.grain,
-            "main query",
+            intent.select_cols or [], intent.group_by_cols or [], intent.grain, "main query"
         )
     )
     for cte in cte_steps:
@@ -1238,8 +1407,8 @@ def validate_semantics(
                 select_cols=cte.select_cols or [],
                 group_by_cols=cte.group_by_cols or [],
                 order_by_cols=cte.order_by_cols or [],
-                filters_param=cte.filters_param or [],
-                having_param=cte.having_param or [],
+                where_params=where_leaves(cte.where) or [],
+                having_param=having_leaves(cte.having) or [],
             )
         )
         all_issues.extend(
@@ -1283,7 +1452,9 @@ def validate_semantics(
                 param_values=cte.param_values,
             )
         )
-        all_issues.extend(validate_contains_array_filters(cte.filters_param or [], schema, cte_outputs, cte_context))
+        all_issues.extend(
+            validate_contains_array_filters(where_leaves(cte.where) or [], schema, cte_outputs, cte_context)
+        )
         all_issues.extend(
             validate_selectability(
                 cte.select_cols or [],
@@ -1294,7 +1465,11 @@ def validate_semantics(
                 case_registry=list(cte.case_registry or []),
             )
         )
-        all_issues.extend(validate_join_path_reachability_for_tables(cte.tables or [], schema, cte_context))
+        all_issues.extend(
+            validate_join_path_reachability_for_tables(cte_join_reachability_tables(cte), schema, cte_context)
+        )
+        all_issues.extend(validate_table_reference_counts(cte_join_reachability_tables(cte), schema, cte_context))
+        all_issues.extend(validate_predicate_nesting_depth(cte.where, cte.having, cte_context))
         all_issues.extend(
             validate_order_by_cols_schema(cte.order_by_cols or [], schema, cte_allowed, cte_outputs, cte_context)
         )
@@ -1302,8 +1477,63 @@ def validate_semantics(
             validate_group_by_cols_schema(cte.group_by_cols or [], schema, cte_allowed, cte_outputs, cte_context)
         )
         all_issues.extend(
+            validate_distinct_on_schema(
+                cte.distinct_on or [], cte.order_by_cols or [], schema, cte_allowed, cte_outputs, cte_context
+            )
+        )
+        cte_scope_intent = RuntimeIntent(
+            tables=list(cte.tables or []),
+            grain=cte.grain or "row_level",
+            select_cols=list(cte.select_cols or []),
+            group_by_cols=list(cte.group_by_cols or []),
+            order_by_cols=list(cte.order_by_cols or []),
+            where=cte.where,
+            having=cte.having,
+            limit=cte.limit,
+            limit_param_key=cte.limit_param_key or "",
+            distinct_select_index=cte.distinct_select_index,
+            distinct_on=list(cte.distinct_on or []),
+            chosen_join_path_signature=list(cte.chosen_join_path_signature or []),
+            resolved_join_tables=cte_join_reachability_tables(cte),
+            window_registry=list(cte.window_registry or []),
+        )
+        all_issues.extend(
+            validate_aggregate_join_fan_out(
+                cte_scope_intent,
+                schema,
+                cte_context,
+                from_anchor=cte.tables[0] if cte.tables else None,
+            )
+        )
+        all_issues.extend(
+            validate_window_join_fan_out(
+                cte_scope_intent,
+                schema,
+                cte_context,
+                from_anchor=cte.tables[0] if cte.tables else None,
+            )
+        )
+        all_issues.extend(
+            validate_clause_widened_rowset(
+                cte_scope_intent,
+                schema,
+                cte_context,
+                from_anchor=cte.tables[0] if cte.tables else None,
+            )
+        )
+        all_issues.extend(
+            validate_preserve_tables(
+                list(cte.tables or []),
+                list(cte.preserve_tables or []),
+                schema,
+                cte_context,
+                join_signature=list(cte.chosen_join_path_signature or []),
+                probe_cte_names=probe_names,
+            )
+        )
+        all_issues.extend(
             validate_filters_schema(
-                cte.filters_param or [],
+                where_leaves(cte.where) or [],
                 schema,
                 cte_allowed,
                 cte_outputs,
@@ -1312,16 +1542,11 @@ def validate_semantics(
             )
         )
         all_issues.extend(
-            _column_resolution_issues(
-                collect_column_refs_for_cte_step(cte),
-                cte.tables or [],
-                schema,
-                cte_context,
-            )
+            _column_resolution_issues(collect_column_refs_for_cte_step(cte), cte.tables or [], schema, cte_context)
         )
         all_issues.extend(
             validate_having_schema(
-                cte.having_param or [],
+                having_leaves(cte.having) or [],
                 schema,
                 cte_allowed,
                 cte_outputs,
@@ -1329,25 +1554,25 @@ def validate_semantics(
                 param_values=cte.param_values,
             )
         )
-        all_issues.extend(validate_filter_ops_per_column(cte.filters_param or [], schema, cte_outputs, cte_context))
+        all_issues.extend(
+            validate_where_ops_per_column(where_leaves(cte.where) or [], schema, cte_outputs, cte_context)
+        )
         all_issues.extend(
             validate_date_window_units(
-                cte.filters_param or [],
-                [],
-                cte_context,
-                scope_param_values=cte.param_values,
+                where_leaves(cte.where) or [], [], cte_context, scope_param_values=cte.param_values
             )
         )
         all_issues.extend(
             validate_date_diff_units(
-                cte.filters_param or [],
-                [],
-                cte_context,
-                scope_param_values=cte.param_values,
+                where_leaves(cte.where) or [], [], cte_context, scope_param_values=cte.param_values
             )
         )
-        all_issues.extend(validate_having_agg_per_role(cte.having_param or [], schema, cte_outputs, cte_context))
-        all_issues.extend(validate_having_ops_per_column(cte.having_param or [], schema, cte_outputs, cte_context))
+        all_issues.extend(
+            validate_having_agg_per_role(having_leaves(cte.having) or [], schema, cte_outputs, cte_context)
+        )
+        all_issues.extend(
+            validate_having_ops_per_column(having_leaves(cte.having) or [], schema, cte_outputs, cte_context)
+        )
         all_issues.extend(validate_select_agg_per_role(cte.select_cols or [], schema, cte_outputs, cte_context))
         all_issues.extend(validate_select_agg_semantics(cte.select_cols or [], schema, cte_context))
         all_issues.extend(validate_order_by_agg_per_role(cte.order_by_cols or [], schema, cte_outputs, cte_context))
@@ -1357,15 +1582,13 @@ def validate_semantics(
         )
         all_issues.extend(validate_column_types(cte.select_cols or [], schema, cte_context))
         all_issues.extend(
-            validate_filter_value_type_alignment(
-                cte.filters_param or [],
-                schema,
-                cte_context,
-                cte_outputs,
-                param_values=cte.param_values,
+            validate_where_value_type_alignment(
+                where_leaves(cte.where) or [], schema, cte_context, cte_outputs, param_values=cte.param_values
             )
         )
-        all_issues.extend(validate_no_between_ops(cte.filters_param or [], cte.having_param or [], cte_context))
+        all_issues.extend(
+            validate_no_between_ops(where_leaves(cte.where) or [], having_leaves(cte.having) or [], cte_context)
+        )
         all_issues.extend(validate_cte_grain_consistency(cte, cte_context))
         all_issues.extend(
             validate_grouped_requires_aggregation(
@@ -1373,35 +1596,22 @@ def validate_semantics(
                 cte.select_cols or [],
                 cte.group_by_cols or [],
                 cte_context,
-                having_param=cte.having_param or [],
+                having_param=having_leaves(cte.having) or [],
             )
         )
         all_issues.extend(
             validate_case_branch_aggregation_consistency(
-                getattr(cte, "case_registry", None),
-                cte.group_by_cols or [],
-                cte_context,
+                getattr(cte, "case_registry", None), cte.group_by_cols or [], cte_context
             )
         )
         all_issues.extend(
             validate_semantic_contradictions(
-                cte.select_cols or [],
-                cte.description or "",
-                cte.grain,
-                cte.expected_rows,
-                cte_context,
+                cte.select_cols or [], cte.description or "", cte.grain, cte.expected_rows, cte_context
             )
         )
-        all_issues.extend(
-            validate_predicate_bool_op_filter_group_hints(
-                cte.description or "",
-                cte.filters_param or [],
-                cte.having_param or [],
-                cte_context,
-            )
-        )
-        all_issues.extend(validate_expr_vs_expr_filters(cte.filters_param or [], schema, cte_outputs, cte_context))
-        all_issues.extend(validate_agg_vs_agg_having(cte.having_param or [], schema, cte_outputs, cte_context))
+        all_issues.extend(validate_predicate_group_hints(cte.description or "", cte.where, cte.having, cte_context))
+        all_issues.extend(validate_expr_vs_expr_where(where_leaves(cte.where) or [], schema, cte_outputs, cte_context))
+        all_issues.extend(validate_agg_vs_agg_having(having_leaves(cte.having) or [], schema, cte_outputs, cte_context))
         all_issues.extend(
             _validate_case_branches_for_scope(
                 select_cols=cte.select_cols or [],
@@ -1418,35 +1628,31 @@ def validate_semantics(
         all_issues.extend(validate_scalar_expression_semantics(cte.select_cols or [], schema, cte_context))
         all_issues.extend(
             validate_arith_expression_semantics(
-                cte.filters_param or [],
-                cte.having_param or [],
-                schema,
-                cte_outputs,
-                cte_context,
+                where_leaves(cte.where) or [], having_leaves(cte.having) or [], schema, cte_outputs, cte_context
             )
         )
         all_issues.extend(validate_temporal_columns(cte.select_cols or [], schema, cte_context))
         all_issues.extend(validate_pk_fk_aggregation(cte.select_cols or [], schema, cte_context))
         all_issues.extend(validate_select_expr_types(cte.select_cols or [], schema, cte_outputs, cte_context))
         all_issues.extend(validate_order_by_expr_types(cte.order_by_cols or [], schema, cte_outputs, cte_context))
-        all_issues.extend(validate_filter_expr_types(cte.filters_param or [], schema, cte_outputs, cte_context))
-        all_issues.extend(validate_having_expr_types(cte.having_param or [], schema, cte_outputs, cte_context))
-        all_issues.extend(validate_filter_no_aggregation(cte.filters_param or [], cte_context))
+        all_issues.extend(validate_where_expr_types(where_leaves(cte.where) or [], schema, cte_outputs, cte_context))
+        all_issues.extend(validate_having_expr_types(having_leaves(cte.having) or [], schema, cte_outputs, cte_context))
+        all_issues.extend(validate_where_no_aggregation(where_leaves(cte.where) or [], cte_context))
         all_issues.extend(
             validate_having_requires_aggregation(
-                cte.having_param or [],
-                cte_context,
-                group_by_cols=cte.group_by_cols or [],
+                having_leaves(cte.having) or [], cte_context, group_by_cols=cte.group_by_cols or []
             )
         )
-        all_issues.extend(validate_having_operator_is_numeric(cte.having_param or [], cte_context))
-        all_issues.extend(validate_predicate_sidedness(cte.filters_param or [], cte.having_param or [], cte_context))
+        all_issues.extend(validate_having_operator_is_numeric(having_leaves(cte.having) or [], cte_context))
+        all_issues.extend(
+            validate_predicate_sidedness(where_leaves(cte.where) or [], having_leaves(cte.having) or [], cte_context)
+        )
         all_issues.extend(
             validate_no_nested_aggregation(
                 cte.select_cols or [],
                 cte.order_by_cols or [],
-                cte.filters_param or [],
-                cte.having_param or [],
+                where_leaves(cte.where) or [],
+                having_leaves(cte.having) or [],
                 cte_context,
             )
         )
@@ -1454,8 +1660,8 @@ def validate_semantics(
             validate_mixed_aggregation_in_mulgroup(
                 cte.select_cols or [],
                 cte.order_by_cols or [],
-                cte.filters_param or [],
-                cte.having_param or [],
+                where_leaves(cte.where) or [],
+                having_leaves(cte.having) or [],
                 cte_context,
             )
         )
@@ -1469,10 +1675,7 @@ def validate_semantics(
     if cte_steps:
         all_issues.extend(
             validate_cte_dependency_grains(
-                cte_steps,
-                intent.grain,
-                main_tables=intent.tables or [],
-                select_cols=intent.select_cols or [],
+                cte_steps, intent.grain, main_tables=intent.tables or [], select_cols=intent.select_cols or []
             )
         )
         all_issues.extend(validate_cte_join_key_exposure(intent))
@@ -1489,31 +1692,19 @@ def validate_semantics(
         def _issue_trace_body(issue: IntentIssue = iss) -> str:
             return stable_json(issue.to_dict())
 
-        pipeline_trace(
-            f"validation_execute.validate_semantics.issue[{idx}]",
-            _issue_trace_body,
-        )
+        pipeline_trace(f"validation_execute.validate_semantics.issue[{idx}]", _issue_trace_body)
     result = IntentValidationResult(issues=all_issues)
-    pipeline_trace(
-        "validation_execute.validate_semantics.result",
-        lambda: stable_json(result.to_dict()),
-    )
+    pipeline_trace("validation_execute.validate_semantics.result", lambda: stable_json(result.to_dict()))
     return result
 
 
 def curated_warmup_semantic_issues(intent: RuntimeIntent, schema: SchemaGraph) -> list[str]:
     """Semantic checks aligned with live pipeline validation after deterministic repairs and lite post-processing. Delegates to :func:`validate_semantics` with ``post_binding=True`` so NL-conditioned rules stay disabled while the full schema-tier suite runs (including scope-registries via that suite)."""
     vr = validate_semantics(intent, schema, post_binding=True)
-    return list(
-        dict.fromkeys(i.message for i in vr.issues if (i.severity or "").lower() == "error"),
-    )
+    return list(dict.fromkeys(i.message for i in vr.issues if (i.severity or "").lower() == "error"))
 
 
-def curated_warmup_post_binding_issues(
-    intent: RuntimeIntent,
-    schema: SchemaGraph,
-    final_sql: str,
-) -> list[str]:
+def curated_warmup_post_binding_issues(intent: RuntimeIntent, schema: SchemaGraph, final_sql: str) -> list[str]:
     """Post-substitution parity checks mirroring :func:`_post_processing_revalidation_passes` without LLM use."""
     _ = final_sql
     msgs: list[str] = []
@@ -1671,15 +1862,13 @@ def validate_select_agg_per_role(
 
 
 def validate_select_agg_semantics(
-    select_cols: list[SelectCol],
-    schema: SchemaGraph,
-    context: str = "main",
+    select_cols: list[SelectCol], schema: SchemaGraph, context: str = "main"
 ) -> list[IntentIssue]:
     """Validate that SELECT aggregation functions are semantically. appropriate for column types. Errors for SUM/AVG on non-numeric columns; warns for MIN/MAX on FREE_TEXT columns."""
     issues = []
     if not select_cols:
         return []
-    numeric_aggs = {"sum", "avg"}
+    numeric_aggs = {"sum", "avg", "stddev", "variance", "median"}
     for sc in select_cols:
         _, agg_func = extract_functions_from_term(sc.expr.primary_term)
         if not agg_func:
@@ -1824,9 +2013,7 @@ def validate_order_by_agg_per_role(
 
 
 def validate_order_by_agg_semantics(
-    order_by_cols: list[OrderByCol],
-    schema: SchemaGraph,
-    context: str = "main",
+    order_by_cols: list[OrderByCol], schema: SchemaGraph, context: str = "main"
 ) -> list[IntentIssue]:
     """Validate that ORDER BY aggregation functions are semantically. appropriate for column types. Errors for SUM/AVG on non-numeric columns; warns for MIN/MAX on FREE_TEXT columns."""
     issues = []
@@ -1901,10 +2088,7 @@ def validate_order_by_agg_semantics(
 
 
 def validate_scalar_func_type_semantics(
-    select_cols: list[SelectCol],
-    order_by_cols: list[OrderByCol],
-    schema: SchemaGraph,
-    context: str = "main",
+    select_cols: list[SelectCol], order_by_cols: list[OrderByCol], schema: SchemaGraph, context: str = "main"
 ) -> list[IntentIssue]:
     """Validate that scalar functions are appropriate for column types. and aggregation context. Errors when a non-aggregate-compatible scalar wraps an aggregation, or when a type-specific scalar (string, numeric, temporal) is applied to the wrong column type."""
     issues = []
@@ -2018,14 +2202,7 @@ def validate_scalar_func_type_semantics(
     for idx, obc in enumerate(order_by_cols or []):
         obc_scalar, obc_agg = extract_functions_from_term(obc.expr.primary_term)
         if obc_scalar:
-            issues.extend(
-                check_scalar_semantics(
-                    obc_scalar,
-                    obc.expr.primary_column,
-                    obc_agg,
-                    f"order_by_cols[{idx}]",
-                )
-            )
+            issues.extend(check_scalar_semantics(obc_scalar, obc.expr.primary_column, obc_agg, f"order_by_cols[{idx}]"))
     if issues:
         debug(
             f"[validation_schema.validate_scalar_func_type_semantics] found {len(issues)} semantic issues in {context}"
@@ -2036,9 +2213,7 @@ def validate_scalar_func_type_semantics(
 
 
 def validate_column_types(
-    select_cols: list[SelectCol],
-    schema: SchemaGraph,
-    context: str = "main",
+    select_cols: list[SelectCol], schema: SchemaGraph, context: str = "main"
 ) -> list[IntentIssue]:
     """Validate that operations match their column types (heuristic. checks). Warns for numeric aggregations on text columns, date operations on non-date columns, and string operations on numeric columns."""
     issues = []
@@ -2159,9 +2334,7 @@ def validate_column_types(
 
 
 def validate_scalar_expression_semantics(
-    select_cols: list[SelectCol],
-    schema: SchemaGraph,
-    context: str = "main",
+    select_cols: list[SelectCol], schema: SchemaGraph, context: str = "main"
 ) -> list[IntentIssue]:
     """Validate that scalar functions are applied to semantically. appropriate column types."""
     issues = []
@@ -2212,9 +2385,7 @@ def validate_scalar_expression_semantics(
 
 
 def validate_temporal_columns(
-    select_cols: list[SelectCol],
-    schema: SchemaGraph,
-    context: str = "main",
+    select_cols: list[SelectCol], schema: SchemaGraph, context: str = "main"
 ) -> list[IntentIssue]:
     """Validate temporal aggregates against date-type columns in the. intent."""
     issues = []
@@ -2265,9 +2436,7 @@ def validate_temporal_columns(
 
 
 def validate_pk_fk_aggregation(
-    select_cols: list[SelectCol],
-    schema: SchemaGraph,
-    context: str = "main",
+    select_cols: list[SelectCol], schema: SchemaGraph, context: str = "main"
 ) -> list[IntentIssue]:
     """Validate that primary-key and foreign-key columns are not. aggregated with SUM or AVG."""
     issues = []
@@ -2305,4 +2474,114 @@ def validate_pk_fk_aggregation(
                 )
             )
             debug(f"[validation_semantic.validate_pk_fk_aggregation] {func_lower.upper()} on PK/FK: {actual_col}")
+    return issues
+
+
+def validate_aggregate_join_fan_out(
+    intent: RuntimeIntent,
+    schema: SchemaGraph,
+    context: str,
+    *,
+    join_signature: list[str] | None = None,
+    from_anchor: str | None = None,
+) -> list[IntentIssue]:
+    """Refuse aggregates that would be computed over rows duplicated by the resolved join path."""
+    signature = list(join_signature or intent.chosen_join_path_signature or [])
+    if not signature:
+        return []
+    if intent.group_by_cols:
+        return []
+    anchor = from_anchor or (intent.tables[0] if intent.tables else None)
+    main_tables = {phys_table_key(t) for t in intent_join_reachability_tables(intent)}
+    issues: list[IntentIssue] = []
+    for func, tbl, col, _distinct in collect_fan_out_sensitive_aggregates(intent):
+        if phys_table_key(tbl) not in main_tables:
+            continue
+        hits = multiplying_edges_for_table(signature, tbl, schema, from_anchor=anchor)
+        if not hits:
+            continue
+        edge = hits[0]["edge"]
+        issues.append(
+            make_intent_issue(
+                issue_id=f"aggregate_join_fan_out_{context.replace(' ', '_')}_{tbl}_{func}",
+                category=FailureCategory.AGGREGATION_SEMANTICS,
+                severity="error",
+                message=(
+                    f"{context}: {func.upper()}({tbl}.{col}) would be computed over rows duplicated by "
+                    f"join edge {edge!r}. Aggregate at the multiplied grain and group, or express the "
+                    f"relationship as a semi_join probe that filters without multiplying."
+                ),
+                context={
+                    "aggregate": func,
+                    "table": tbl,
+                    "column": col,
+                    "edge": edge,
+                    "tables": sorted(main_tables),
+                },
+            )
+        )
+    return issues
+
+
+def validate_window_join_fan_out(
+    intent: RuntimeIntent,
+    schema: SchemaGraph,
+    context: str,
+    *,
+    join_signature: list[str] | None = None,
+    from_anchor: str | None = None,
+) -> list[IntentIssue]:
+    """Refuse windows whose partition, ordering, or argument columns see join-multiplied rows."""
+    signature = list(join_signature or intent.chosen_join_path_signature or [])
+    if not signature or not intent.window_registry:
+        return []
+    anchor = from_anchor or (intent.tables[0] if intent.tables else None)
+    main_tables = {phys_table_key(t) for t in intent_join_reachability_tables(intent)}
+    row_level_ungrouped = (intent.grain or "row_level") == "row_level" and not intent.group_by_cols
+    issues: list[IntentIssue] = []
+    for wr in intent.window_registry or []:
+        ws = wr.window_spec
+        referenced: list[tuple[str, str, str]] = []
+        if row_level_ungrouped:
+            for pe in ws.partition_by or []:
+                for col in extract_columns_from_expr(pe):
+                    if "." in col:
+                        tbl, cn = col.split(".", 1)
+                        referenced.append(("partition", tbl, cn))
+            for ob in ws.order_by or []:
+                for col in extract_columns_from_expr(ob.expr):
+                    if "." in col:
+                        tbl, cn = col.split(".", 1)
+                        referenced.append(("order", tbl, cn))
+        if ws.argument is not None:
+            for col in extract_columns_from_expr(ws.argument):
+                if "." in col:
+                    tbl, cn = col.split(".", 1)
+                    referenced.append(("argument", tbl, cn))
+        for role, tbl, cn in referenced:
+            if phys_table_key(tbl) not in main_tables:
+                continue
+            hits = multiplying_edges_for_table(signature, tbl, schema, from_anchor=anchor)
+            if not hits:
+                continue
+            edge = hits[0]["edge"]
+            issues.append(
+                make_intent_issue(
+                    issue_id=f"window_join_fan_out_{context}_{wr.registry_id}_{tbl}_{role}",
+                    category=FailureCategory.AGGREGATION_SEMANTICS,
+                    severity="error",
+                    message=(
+                        f"{context}: window over {tbl}.{cn} would see rows duplicated by "
+                        f"join edge {edge!r}. Aggregate at the multiplied grain and group, or "
+                        f"express the relationship as a semi_join probe that filters without multiplying."
+                    ),
+                    context={
+                        "table": tbl,
+                        "column": cn,
+                        "edge": edge,
+                        "registry_id": wr.registry_id,
+                        "role": role,
+                    },
+                )
+            )
     return issues

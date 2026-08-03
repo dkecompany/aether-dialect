@@ -6,13 +6,13 @@
       "task": "intent",
       "stage": "interpret",
       "response": {
-        "approach": "Count rentals by checkout date using the rental table only.",
+        "approach": "Count stocked inventory copies tied to rentals on the requested date.",
         "tables": [
-          "rental"
+          "inventory"
         ],
         "grounding": [
           {
-            "ref": "rental",
+            "ref": "inventory",
             "used_for": "table"
           },
           {
@@ -28,10 +28,10 @@
       "stage": "ground",
       "response": {
         "tables": [
-          "rental"
+          "inventory"
         ],
-        "select": "count rental rows",
-        "filter": "keep only rows where rental.rental_date is in the single date literal 2025-01-01",
+        "select": "count inventory rows",
+        "filter": "keep only rows where rental.rental_date equals the date literal 2025-01-01",
         "group_by": "",
         "having": "",
         "order_by": "",
@@ -47,25 +47,25 @@
       "stage": "compose",
       "response": {
         "tables": [
-          "rental"
+          "inventory"
         ],
         "grain": "scalar",
         "select_cols": [
-          "count(rental.rental_id)"
+          "count(inventory.inventory_id)"
         ],
         "group_by_cols": [],
         "order_by_cols": [],
-        "filters_param": [
+        "where": [
           {
             "left_expr": "rental.rental_date",
-            "op": "array contains",
+            "op": "=",
             "value_type": "date",
             "value": "2025-01-01"
           }
         ],
         "having_param": [],
         "limit": null,
-        "natural_language": "Count rentals on the requested date."
+        "natural_language": "Count rentals on the requested date via inventory copies."
       }
     },
     {
@@ -118,7 +118,7 @@
         ],
         "group_by_cols": [],
         "order_by_cols": [],
-        "filters_param": [],
+        "where": [],
         "having_param": [],
         "limit": null,
         "natural_language": "Count all films."
@@ -149,7 +149,7 @@
         "tables": [
           "staff"
         ],
-        "select": "staff.ssn and payroll deduction totals per employee",
+        "select": "payroll deduction amount grouped by employee SSN",
         "filter": "",
         "group_by": "staff.ssn",
         "having": "",
@@ -168,20 +168,38 @@
         "tables": [
           "staff"
         ],
-        "grain": "grouped",
+        "grain": "many",
         "select_cols": [
-          {
-            "expr": "staff.ssn"
-          }
+          "staff.ssn",
+          "sum(staff.payroll_deduction)"
         ],
         "group_by_cols": [
           "staff.ssn"
         ],
         "order_by_cols": [],
-        "filters_param": [],
+        "where": [],
         "having_param": [],
         "limit": null,
         "natural_language": "Payroll deductions grouped by employee SSN."
+      }
+    },
+    {
+      "question": "Show rentals with malformed compose output for repair exercise.",
+      "task": "intent",
+      "stage": "compose",
+      "malformed": true,
+      "response": {
+        "tables": [
+          "rental"
+        ],
+        "select": "count rental rows",
+        "filter": "",
+        "group_by": "",
+        "having": "",
+        "order_by": "",
+        "limit": null,
+        "window": "",
+        "case": ""
       }
     }
   ]

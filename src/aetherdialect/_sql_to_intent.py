@@ -6,14 +6,11 @@ import hashlib
 import os
 import re
 from dataclasses import dataclass, field, replace
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 
 import sqlglot
 
-from ._config import (
-    EngineConfig,
-    SeedWarmupConfig,
-)
+from ._config import EngineConfig, SeedWarmupConfig
 from ._constants import (
     BIGQUERY_QUERY_LOG_AVAILABILITY_SQL,
     BIGQUERY_QUERY_LOG_FETCH_SQL,
@@ -23,6 +20,7 @@ from ._constants import (
     PG_LAST_WINDOW_FRAME_OPTIONS_RANGE_UNBOUNDED_CURRENT,
     PG_LAST_WINDOW_FRAME_OPTIONS_ROWS_OFFSET_CURRENT,
     PG_LAST_WINDOW_FRAME_OPTIONS_ROWS_UNBOUNDED_PAIR,
+    PG_SIMPLE_AGG_NAMES,
     REDSHIFT_QUERY_LOG_AVAILABILITY_SQL,
     REDSHIFT_QUERY_LOG_FETCH_SQL,
     SELF_JOIN_CTE_NAME_PREFIX,
@@ -45,6 +43,36 @@ from ._constants import (
     WINDOW_DEFAULT_FRAME_START_WITH_ORDER,
     WINDOW_DEFAULT_FRAME_START_WITHOUT_ORDER,
 )
+from ._contracts_base import (
+    HavingParam,
+    MulGroup,
+    NormalizedExpr,
+    OrderByCol,
+    PredicateGroup,
+    WhereParam,
+    WindowFrameKind,
+    having_leaves,
+    predicate_group_from_list,
+    where_leaves,
+)
+from ._contracts_core import RuntimeCteStep, RuntimeIntent, SeedWarmupIntent, SelectCol, runtime_intent_to_concrete
+from ._contracts_schema import (
+    CaseRegistryStep,
+    CaseWhenBranch,
+    CaseWhenExpr,
+    SchemaGraph,
+    WindowRegistryStep,
+    WindowSpec,
+)
+from ._core_utils import sha256, stable_json
+from ._dialect import get_dialect_class
+from ._dialect_postgres import pg_columnref_to_pair, pg_funcname
+from ._intent_process import apply_deterministic_repairs, cte_structural_signature, union_runtime_concrete_compatibility
+from ._intent_resolve import check_qualified_refs_exist
+from ._sql_gen import build_deterministic_sql
+from ._sql_to_intent_sqlglot import convert_sql_via_sqlglot
+from ._utils import body_similarity_key, sql_shape
+from ._validation_execute import curated_warmup_semantic_issues
 
 pglast: Any = None
 SubLinkType: Any = None
@@ -76,97 +104,41 @@ JoinType: Any = object
 NullTestType: Any = object
 SetOperation: Any = object
 SortByDir: Any = object
+SortByNulls: Any = object
 SQLValueFunctionOp: Any = object
 
 try:
     import pglast as _pglast_mod
-    from pglast.ast import (
-        A_Const as _A_Const,
-    )
-    from pglast.ast import (
-        A_Expr as _A_Expr,
-    )
-    from pglast.ast import (
-        Alias as _Alias,
-    )
-    from pglast.ast import (
-        BoolExpr as _BoolExpr,
-    )
-    from pglast.ast import (
-        CaseExpr as _CaseExpr,
-    )
-    from pglast.ast import (
-        CaseWhen as _CaseWhen,
-    )
-    from pglast.ast import (
-        CoalesceExpr as _CoalesceExpr,
-    )
-    from pglast.ast import (
-        ColumnRef as _ColumnRef,
-    )
-    from pglast.ast import (
-        CommonTableExpr as _CommonTableExpr,
-    )
-    from pglast.ast import (
-        FuncCall as _FuncCall,
-    )
-    from pglast.ast import (
-        Integer as _Integer,
-    )
-    from pglast.ast import (
-        JoinExpr as _JoinExpr,
-    )
-    from pglast.ast import (
-        NullTest as _NullTest,
-    )
-    from pglast.ast import (
-        RangeSubselect as _RangeSubselect,
-    )
-    from pglast.ast import (
-        RangeVar as _RangeVar,
-    )
-    from pglast.ast import (
-        RawStmt as _RawStmt,
-    )
-    from pglast.ast import (
-        ResTarget as _ResTarget,
-    )
-    from pglast.ast import (
-        SelectStmt as _SelectStmt,
-    )
-    from pglast.ast import (
-        SortBy as _SortBy,
-    )
-    from pglast.ast import (
-        SQLValueFunction as _SQLValueFunction,
-    )
-    from pglast.ast import (
-        SubLink as _SubLink,
-    )
-    from pglast.ast import (
-        TypeCast as _TypeCast,
-    )
-    from pglast.enums import (
-        A_Expr_Kind as _A_Expr_Kind,
-    )
-    from pglast.enums import (
-        BoolExprType as _BoolExprType,
-    )
-    from pglast.enums import (
-        JoinType as _JoinType,
-    )
-    from pglast.enums import (
-        NullTestType as _NullTestType,
-    )
-    from pglast.enums import (
-        SetOperation as _SetOperation,
-    )
-    from pglast.enums import (
-        SortByDir as _SortByDir,
-    )
-    from pglast.enums import (
-        SQLValueFunctionOp as _SQLValueFunctionOp,
-    )
+    from pglast.ast import A_Const as _A_Const
+    from pglast.ast import A_Expr as _A_Expr
+    from pglast.ast import Alias as _Alias
+    from pglast.ast import BoolExpr as _BoolExpr
+    from pglast.ast import CaseExpr as _CaseExpr
+    from pglast.ast import CaseWhen as _CaseWhen
+    from pglast.ast import CoalesceExpr as _CoalesceExpr
+    from pglast.ast import ColumnRef as _ColumnRef
+    from pglast.ast import CommonTableExpr as _CommonTableExpr
+    from pglast.ast import FuncCall as _FuncCall
+    from pglast.ast import Integer as _Integer
+    from pglast.ast import JoinExpr as _JoinExpr
+    from pglast.ast import NullTest as _NullTest
+    from pglast.ast import RangeSubselect as _RangeSubselect
+    from pglast.ast import RangeVar as _RangeVar
+    from pglast.ast import RawStmt as _RawStmt
+    from pglast.ast import ResTarget as _ResTarget
+    from pglast.ast import SelectStmt as _SelectStmt
+    from pglast.ast import SortBy as _SortBy
+    from pglast.ast import SQLValueFunction as _SQLValueFunction
+    from pglast.ast import SubLink as _SubLink
+    from pglast.ast import TypeCast as _TypeCast
+    from pglast.enums import A_Expr_Kind as _A_Expr_Kind
+    from pglast.enums import BoolExprType as _BoolExprType
+    from pglast.enums import JoinType as _JoinType
+    from pglast.enums import NullTestType as _NullTestType
+    from pglast.enums import SetOperation as _SetOperation
+    from pglast.enums import SortByDir as _SortByDir
+    from pglast.enums import SortByNulls as _SortByNulls
+    from pglast.enums import SQLValueFunctionOp as _SQLValueFunctionOp
     from pglast.enums.primnodes import SubLinkType as _SubLinkType
 
     pglast = _pglast_mod
@@ -199,48 +171,11 @@ try:
     NullTestType = _NullTestType
     SetOperation = _SetOperation
     SortByDir = _SortByDir
+    SortByNulls = _SortByNulls
     SQLValueFunctionOp = _SQLValueFunctionOp
 except ImportError:
     pglast = None
     SubLinkType = None
-
-
-from ._contracts_base import (
-    FilterParam,
-    HavingParam,
-    MulGroup,
-    NormalizedExpr,
-    OrderByCol,
-    WindowFrameKind,
-)
-from ._contracts_core import (
-    RuntimeCteStep,
-    RuntimeIntent,
-    SeedWarmupIntent,
-    SelectCol,
-    runtime_intent_to_concrete,
-)
-from ._contracts_schema import (
-    CaseRegistryStep,
-    CaseWhenBranch,
-    CaseWhenExpr,
-    SchemaGraph,
-    WindowRegistryStep,
-    WindowSpec,
-)
-from ._core_utils import sha256, stable_json
-from ._dialect import get_dialect_class
-from ._dialect_postgres import pg_columnref_to_pair, pg_funcname
-from ._intent_process import (
-    apply_deterministic_repairs,
-    cte_structural_signature,
-    union_runtime_concrete_compatibility,
-)
-from ._intent_resolve import check_qualified_refs_exist
-from ._sql_gen import build_deterministic_sql
-from ._sql_to_intent_sqlglot import convert_sql_via_sqlglot
-from ._utils import body_similarity_key, sql_shape
-from ._validation_execute import curated_warmup_semantic_issues
 
 
 @dataclass
@@ -300,10 +235,10 @@ def _cte_body_shell_key(step: RuntimeCteStep) -> str:
     parts: list[str] = [
         step.grain or "row_level",
         ",".join(sorted(step.tables or [])),
-        ",".join(sorted(f.signature_key for f in (step.filters_param or []))),
+        ",".join(sorted(f.signature_key for f in (where_leaves(step.where) or []))),
         ",".join(sorted(g.signature_key for g in (step.group_by_cols or []))),
         ",".join(sorted(o.signature_key for o in (step.order_by_cols or []))),
-        ",".join(sorted(h.signature_key for h in (step.having_param or []))),
+        ",".join(sorted(h.signature_key for h in (having_leaves(step.having) or []))),
         ",".join(sorted(s.signature_key for s in (step.window_registry or []))),
         ",".join(sorted(s.signature_key for s in (step.case_registry or []))),
     ]
@@ -318,8 +253,8 @@ def _runtime_intent_from_cte_step(step: RuntimeCteStep) -> RuntimeIntent:
         select_cols=list(step.select_cols or []),
         group_by_cols=list(step.group_by_cols or []),
         order_by_cols=list(step.order_by_cols or []),
-        filters_param=list(step.filters_param or []),
-        having_param=list(step.having_param or []),
+        where=step.where,
+        having=step.having,
         param_values={},
         cte_steps=[],
         natural_language="",
@@ -333,9 +268,7 @@ def _runtime_intent_from_cte_step(step: RuntimeCteStep) -> RuntimeIntent:
     )
 
 
-def _merge_union_compatible_cte_cluster(
-    cluster: list[RuntimeCteStep],
-) -> list[RuntimeCteStep]:
+def _merge_union_compatible_cte_cluster(cluster: list[RuntimeCteStep]) -> list[RuntimeCteStep]:
     """Greedy union-merge of CTE steps sharing :func:`_cte_body_shell_key`."""
     if len(cluster) <= 1:
         return list(cluster)
@@ -354,11 +287,7 @@ def _merge_union_compatible_cte_cluster(
                     continue
                 union_cols = row[0]
                 merged_name = a.cte_name if a.cte_name <= b.cte_name else b.cte_name
-                merged_step = replace(
-                    a,
-                    cte_name=merged_name,
-                    select_cols=list(union_cols),
-                )
+                merged_step = replace(a, cte_name=merged_name, select_cols=list(union_cols))
                 pending = [merged_step] + [pending[k] for k in range(len(pending)) if k not in (i, j)]
                 changed = True
                 break
@@ -445,22 +374,14 @@ def _infer_sqlglot_read(dialect: Any) -> str:
     return str(getattr(dialect, "sqlglot_dialect", "") or "postgres")
 
 
-def reformulate_imported_intent(
-    intent: RuntimeIntent,
-    schema: SchemaGraph,
-    dialect: Any,
-) -> RuntimeIntent:
+def reformulate_imported_intent(intent: RuntimeIntent, schema: SchemaGraph, dialect: Any) -> RuntimeIntent:
     """Apply intent-level reformulations shared by pglast and sqlglot extractors."""
     del schema, dialect
     return intent
 
 
 def normalize_imported_intent(
-    intent: RuntimeIntent,
-    schema: SchemaGraph,
-    dialect: Any,
-    *,
-    strict_semantic: bool = False,
+    intent: RuntimeIntent, schema: SchemaGraph, dialect: Any, *, strict_semantic: bool = False
 ) -> tuple[RuntimeIntent | None, str | None, str]:
     """Run post-extract normalization: reformulation, dedup, repairs, semantic gate."""
     preserved_main = list(intent.tables or [])
@@ -517,20 +438,12 @@ def _runtime_from_pglast_sql(sql: str, schema: SchemaGraph) -> RuntimeIntent | N
     tables_agg: set[str] = set(intent.tables or [])
     for st in cte_steps:
         tables_agg.update(st.tables or [])
-    intent = replace(
-        intent,
-        tables=sorted(tables_agg),
-        param_values=dict(param_store),
-        cte_steps=cte_steps,
-    )
+    intent = replace(intent, tables=sorted(tables_agg), param_values=dict(param_store), cte_steps=cte_steps)
     return intent
 
 
 def _pg_convert_pg_statement(
-    stmt: Any,
-    schema: SchemaGraph,
-    param_store: dict[str, Any],
-    next_lit_key: Any,
+    stmt: Any, schema: SchemaGraph, param_store: dict[str, Any], next_lit_key: Any
 ) -> tuple[RuntimeIntent, list[RuntimeCteStep]] | None:
     """Dispatch top-level ``SELECT`` (optionally wrapped in ``WITH``)."""
     if not isinstance(stmt, SelectStmt):
@@ -578,6 +491,16 @@ def _pg_convert_select_stmt(
     return body, sj_body + cte_steps
 
 
+def _pg_merge_alias_maps(
+    alias_map: dict[str, str],
+    correlated_aliases: dict[str, str] | None,
+) -> dict[str, str]:
+    """Merge outer correlated aliases into an inner scope alias map for predicate parsing."""
+    if not correlated_aliases:
+        return alias_map
+    return {**correlated_aliases, **alias_map}
+
+
 def _pg_materialize_cte_body(
     sel: Any,
     schema: SchemaGraph,
@@ -585,6 +508,8 @@ def _pg_materialize_cte_body(
     param_store: dict[str, Any],
     next_lit_key: Any,
     allowed_cte: frozenset[str],
+    *,
+    correlated_aliases: dict[str, str] | None = None,
 ) -> list[RuntimeCteStep] | None:
     """Flatten a CTE body ``SelectStmt`` into ordered ``RuntimeCteStep`` rows. Nested non-recursive ``WITH`` inside the body is expanded into preceding steps, then the named CTE shell."""
     if not isinstance(sel, SelectStmt):
@@ -610,7 +535,13 @@ def _pg_materialize_cte_body(
         allowed_here |= prior
 
     body_pair = _pg_runtime_intent_body_from_select(
-        sel, schema, param_store, next_lit_key, frozenset(allowed_here), _PgExtra()
+        sel,
+        schema,
+        param_store,
+        next_lit_key,
+        frozenset(allowed_here),
+        _PgExtra(),
+        correlated_aliases=correlated_aliases,
     )
     body, sj_local = body_pair
     if body is None:
@@ -628,8 +559,8 @@ def _pg_runtime_cte_step_from_body(sel: Any, body: RuntimeIntent, cte_name: str)
         select_cols=list(body.select_cols or []),
         group_by_cols=list(body.group_by_cols or []),
         order_by_cols=list(body.order_by_cols or []),
-        filters_param=list(body.filters_param or []),
-        having_param=list(body.having_param or []),
+        where=body.where,
+        having=body.having,
         param_values={},
         output_columns=output_columns,
         grain=body.grain or "row_level",
@@ -652,9 +583,7 @@ def _pg_infer_output_columns(sel: Any) -> list[str]:
 
 
 def _pg_collect_range_bindings(
-    from_clause: Any,
-    schema_tables: set[str],
-    allowed_cte: frozenset[str],
+    from_clause: Any, schema_tables: set[str], allowed_cte: frozenset[str]
 ) -> list[tuple[str, str]] | None:
     """Collect ordered ``(alias, relation_target)`` pairs from a. ``FROM`` clause."""
     allowed_joins = frozenset(
@@ -731,12 +660,7 @@ def _pg_count_alias_refs(sel: Any, alias: str) -> int:
     return n
 
 
-def _pg_rewrite_rangevar_to_cte(
-    from_clause: Any,
-    lift_alias: str,
-    physical: str,
-    cte_name: str,
-) -> bool:
+def _pg_rewrite_rangevar_to_cte(from_clause: Any, lift_alias: str, physical: str, cte_name: str) -> bool:
     """Rewrite the lifted ``RangeVar`` so it references the synthetic. CTE name."""
     allowed_joins = frozenset(
         {
@@ -822,10 +746,7 @@ def _pg_try_lift_from_subqueries(
                 return None
             pgx.self_join_steps.extend(chunk)
             return cast(Any, RangeVar)(
-                relname=cte_name,
-                inh=False,
-                relpersistence="p",
-                alias=cast(Any, Alias)(aliasname=alias),
+                relname=cte_name, inh=False, relpersistence="p", alias=cast(Any, Alias)(aliasname=alias)
             )
         if isinstance(node, RangeVar):
             return node
@@ -890,6 +811,8 @@ def _pg_runtime_intent_body_from_select(
     next_lit_key: Any,
     allowed_cte: frozenset[str],
     pg_extra: _PgExtra | None = None,
+    *,
+    correlated_aliases: dict[str, str] | None = None,
 ) -> tuple[RuntimeIntent | None, list[RuntimeCteStep]]:
     """Convert ``SelectStmt`` core fields when ``WITH`` was already lifted."""
     if not isinstance(sel, SelectStmt):
@@ -904,9 +827,9 @@ def _pg_runtime_intent_body_from_select(
     pgx = pg_extra if pg_extra is not None else _PgExtra()
     if not _pg_try_lift_from_subqueries(sel, schema, allowed_cte, pgx, param_store, next_lit_key):
         return None, []
-    if not _pg_try_lift_self_join(sel, schema_tables, allowed_cte, pgx):
-        return None, []
     extra_allowed = frozenset(set(allowed_cte) | {s.cte_name for s in pgx.self_join_steps})
+    if not _pg_try_lift_self_join(sel, schema_tables, extra_allowed, pgx):
+        return None, []
     bindings = _pg_collect_range_bindings(sel.fromClause, schema_tables, extra_allowed)
     if bindings is None:
         return None, []
@@ -931,41 +854,32 @@ def _pg_runtime_intent_body_from_select(
 
     distinct_idx = _pg_distinct_select_index(sel, alias_map, single_alias, select_cols, pgx)
 
-    filters: list[FilterParam] = []
+    where_group: PredicateGroup | None = None
     if getattr(sel, "whereClause", None):
-        fp = _pg_where_to_filters(
-            sel.whereClause, alias_map, single_alias, param_store, next_lit_key, pgx, extra_allowed, schema
-        )
-        if fp is None:
-            return None, []
-        filters = fp
-
-    group_by_cols: list[NormalizedExpr] = []
-    if getattr(sel, "groupClause", None):
-        gb = _pg_group_clause(
-            sel.groupClause,
-            alias_map,
+        where_alias_map = _pg_merge_alias_maps(alias_map, correlated_aliases)
+        where_group = _pg_where_to_predicate_group(
+            sel.whereClause,
+            where_alias_map,
             single_alias,
-            select_cols,
             param_store,
             next_lit_key,
             pgx,
+            extra_allowed,
+            schema,
         )
+        if where_group is None:
+            return None, []
+
+    group_by_cols: list[NormalizedExpr] = []
+    if getattr(sel, "groupClause", None):
+        gb = _pg_group_clause(sel.groupClause, alias_map, single_alias, select_cols, param_store, next_lit_key, pgx)
         if gb is None:
             return None, []
         group_by_cols = gb
 
     order_by_cols: list[OrderByCol] = []
     if getattr(sel, "sortClause", None):
-        ob = _pg_sort_clause(
-            sel.sortClause,
-            alias_map,
-            single_alias,
-            param_store,
-            next_lit_key,
-            select_cols,
-            pgx,
-        )
+        ob = _pg_sort_clause(sel.sortClause, alias_map, single_alias, param_store, next_lit_key, select_cols, pgx)
         if ob is None:
             return None, []
         order_by_cols = ob
@@ -1003,8 +917,8 @@ def _pg_runtime_intent_body_from_select(
         select_cols=select_cols,
         group_by_cols=group_by_cols,
         order_by_cols=order_by_cols,
-        filters_param=filters,
-        having_param=having_param,
+        where=where_group,
+        having=predicate_group_from_list(having_param),
         param_values={},
         cte_steps=[],
         natural_language="",
@@ -1017,10 +931,7 @@ def _pg_runtime_intent_body_from_select(
 
 
 def _pg_qual_column_name(
-    colref: Any,
-    alias_map: dict[str, str],
-    single_alias: str | None,
-    pgx: _PgExtra | None = None,
+    colref: Any, alias_map: dict[str, str], single_alias: str | None, pgx: _PgExtra | None = None
 ) -> str | None:
     """Turn ``ColumnRef`` into ``qual.col`` using FROM aliases."""
     pair = pg_columnref_to_pair(colref)
@@ -1039,7 +950,7 @@ def _pg_qual_column_name(
 
 
 def _pg_map_where_scalar_op(op_raw: str | None) -> str | None:
-    """Map pg ``A_Expr`` operator token strings to normalized ``FilterParam`` / ``HavingParam`` ops."""
+    """Map pg ``A_Expr`` operator token strings to normalized ``WhereParam`` / ``HavingParam`` ops."""
     if op_raw is None:
         return None
     key = str(op_raw).strip().lower()
@@ -1083,9 +994,6 @@ def _pg_distinct_select_index(
     return 0
 
 
-_PG_SIMPLE_AGG_NAMES: frozenset[str] = frozenset({"count", "sum", "avg", "min", "max"})
-
-
 def _pg_having_to_params(
     having: Any,
     alias_map: dict[str, str],
@@ -1123,13 +1031,7 @@ def _pg_having_to_params(
                 op_n = "is not null"
             else:
                 return None
-            out.append(
-                HavingParam(
-                    left_expr=left_e,
-                    op=op_n,
-                    value_type="null",
-                )
-            )
+            out.append(HavingParam(left_expr=left_e, op=op_n, value_type="null"))
             continue
         if not isinstance(p, A_Expr):
             return None
@@ -1153,10 +1055,7 @@ def _pg_having_to_params(
                 return None
             out.append(
                 HavingParam(
-                    left_expr=left_n,
-                    op=mapped_op,
-                    right_expr=NormalizedExpr.from_column(right_q),
-                    value_type="column",
+                    left_expr=left_n, op=mapped_op, right_expr=NormalizedExpr.from_column(right_q), value_type="column"
                 )
             )
             continue
@@ -1165,14 +1064,7 @@ def _pg_having_to_params(
             raw_v, vt = lit
             pk = next_lit_key()
             param_store[pk] = raw_v
-            out.append(
-                HavingParam(
-                    left_expr=left_n,
-                    op=mapped_op,
-                    value_type=vt,
-                    param_key=pk,
-                )
-            )
+            out.append(HavingParam(left_expr=left_n, op=mapped_op, value_type=vt, param_key=pk))
             continue
         right_e = _pg_expr_full(
             rexpr,
@@ -1187,14 +1079,7 @@ def _pg_having_to_params(
         )
         if right_e is None:
             return None
-        out.append(
-            HavingParam(
-                left_expr=left_n,
-                op=mapped_op,
-                right_expr=right_e,
-                value_type="column",
-            )
-        )
+        out.append(HavingParam(left_expr=left_n, op=mapped_op, right_expr=right_e, value_type="column"))
     return out
 
 
@@ -1399,6 +1284,50 @@ def _pg_window_partition_exprs(
     return out
 
 
+def _pg_order_col_from_sortby(
+    sb: Any,
+    alias_map: dict[str, str],
+    single_alias: str | None,
+    param_store: dict[str, Any],
+    next_lit_key: Any,
+    select_cols: list[SelectCol],
+    pgx: _PgExtra | None,
+) -> OrderByCol | None:
+    """Convert one pglast ``SortBy`` node to ``OrderByCol``."""
+    if not isinstance(sb, SortBy):
+        return None
+    node = sb.node
+    ex: NormalizedExpr | None
+    if isinstance(node, A_Const):
+        ord_i = _pg_const_int_only(node)
+        if ord_i is None or ord_i < 1 or ord_i > len(select_cols):
+            return None
+        ex = select_cols[ord_i - 1].expr
+    else:
+        ex = _pg_expr_full(
+            node,
+            alias_map,
+            single_alias,
+            param_store,
+            next_lit_key,
+            pgx,
+            allow_aggregate=False,
+            allow_window=False,
+            select_cols=select_cols,
+        )
+    if ex is None:
+        return None
+    direnum = getattr(sb, "sortby_dir", SortByDir.SORTBY_DEFAULT)
+    direction = "DESC" if direnum == SortByDir.SORTBY_DESC else "ASC"
+    nulls_placement: Literal["first", "last"] | None = None
+    nulls_enum = getattr(sb, "sortby_nulls", None)
+    if nulls_enum == SortByNulls.SORTBY_NULLS_FIRST:
+        nulls_placement = "first"
+    elif nulls_enum == SortByNulls.SORTBY_NULLS_LAST:
+        nulls_placement = "last"
+    return OrderByCol(expr=ex, direction=direction, nulls=nulls_placement)
+
+
 def _pg_window_sort_clause(
     nodes: Any,
     alias_map: dict[str, str],
@@ -1411,32 +1340,10 @@ def _pg_window_sort_clause(
     """Convert ``ORDER BY`` inside ``OVER``."""
     out: list[OrderByCol] = []
     for sb in nodes or ():
-        if not isinstance(sb, SortBy):
+        obc = _pg_order_col_from_sortby(sb, alias_map, single_alias, param_store, next_lit_key, select_cols, pgx)
+        if obc is None:
             return None
-        node = sb.node
-        ex: NormalizedExpr | None
-        if isinstance(node, A_Const):
-            ord_i = _pg_const_int_only(node)
-            if ord_i is None or ord_i < 1 or ord_i > len(select_cols):
-                return None
-            ex = select_cols[ord_i - 1].expr
-        else:
-            ex = _pg_expr_full(
-                node,
-                alias_map,
-                single_alias,
-                param_store,
-                next_lit_key,
-                pgx,
-                allow_aggregate=False,
-                allow_window=False,
-                select_cols=select_cols,
-            )
-        if ex is None:
-            return None
-        direnum = getattr(sb, "sortby_dir", SortByDir.SORTBY_DEFAULT)
-        direction = "DESC" if direnum == SortByDir.SORTBY_DESC else "ASC"
-        out.append(OrderByCol(expr=ex, direction=direction))
+        out.append(obc)
     return out
 
 
@@ -1465,19 +1372,41 @@ def _pg_window_def_to_spec(
     if part is None:
         return None
     order = _pg_window_sort_clause(
-        wdef.orderClause,
-        alias_map,
-        single_alias,
-        param_store,
-        next_lit_key,
-        select_cols,
-        pgx,
+        wdef.orderClause, alias_map, single_alias, param_store, next_lit_key, select_cols, pgx
     )
     if order is None:
         return None
     arg_expr: NormalizedExpr | None = None
+    numeric_argument: int | None = None
     args = fn.args or ()
-    if args:
+    if fn_name == "ntile":
+        if not args:
+            return None
+        numeric_argument = _pg_const_int_only(args[0])
+        if numeric_argument is None:
+            return None
+    elif fn_name == "nth_value":
+        if not args:
+            return None
+        arg_expr = _pg_expr_full(
+            args[0],
+            alias_map,
+            single_alias,
+            param_store,
+            next_lit_key,
+            pgx,
+            allow_aggregate=False,
+            allow_window=False,
+            select_cols=select_cols,
+        )
+        if arg_expr is None:
+            return None
+        if len(args) < 2:
+            return None
+        numeric_argument = _pg_const_int_only(args[1])
+        if numeric_argument is None:
+            return None
+    elif args:
         arg_expr = _pg_expr_full(
             args[0],
             alias_map,
@@ -1522,6 +1451,7 @@ def _pg_window_def_to_spec(
         partition_by=part,
         order_by=order,
         argument=arg_expr,
+        numeric_argument=numeric_argument,
         frame_kind=frame_kind,
         frame_start=frame_start,
         frame_end=frame_end,
@@ -1543,16 +1473,7 @@ def _pg_funcall_with_over_to_registry_step(
     """Emit ``WindowRegistryStep`` for ``FuncCall`` with ``OVER``."""
     if not isinstance(fn, FuncCall) or not getattr(fn, "over", None):
         return None
-    ws = _pg_window_def_to_spec(
-        fn.over,
-        fn,
-        alias_map,
-        single_alias,
-        param_store,
-        next_lit_key,
-        select_cols,
-        pgx,
-    )
+    ws = _pg_window_def_to_spec(fn.over, fn, alias_map, single_alias, param_store, next_lit_key, select_cols, pgx)
     if ws is None:
         return None
     rid = pgx.next_window_id()
@@ -1575,10 +1496,10 @@ def _pg_caseexpr_to_registry_step(
     for cw in node.args or ():
         if not isinstance(cw, CaseWhen):
             return None
-        cond = _pg_single_predicate_to_filter(cw.expr, alias_map, single_alias, param_store, next_lit_key, pgx)
+        cond = _pg_single_predicate_to_where(cw.expr, alias_map, single_alias, param_store, next_lit_key, pgx)
         if cond is None:
             return None
-        cond = replace(cond, bool_op="AND", filter_group=None)
+        cond = replace(cond)
         res = _pg_expr_full(
             cw.result,
             alias_map,
@@ -1610,10 +1531,7 @@ def _pg_caseexpr_to_registry_step(
             return None
     rid = pgx.next_case_id()
     pgx.case_registry.append(
-        CaseRegistryStep(
-            registry_id=rid,
-            case_when=CaseWhenExpr(branches=branches, else_result=else_result),
-        )
+        CaseRegistryStep(registry_id=rid, case_when=CaseWhenExpr(branches=branches, else_result=else_result))
     )
     return NormalizedExpr.from_column(rid)
 
@@ -1677,10 +1595,7 @@ def _pg_coalesce_to_expr(
         trail_args.append(str(ex.column_ref))
     mg = MulGroup(multiply=[first])
     return NormalizedExpr(
-        add_groups=[mg],
-        scalar_func="coalesce",
-        scalar_func_args=trail_args,
-        sarg_param_keys=trail_keys,
+        add_groups=[mg], scalar_func="coalesce", scalar_func_args=trail_args, sarg_param_keys=trail_keys
     )
 
 
@@ -1714,13 +1629,7 @@ def _pg_expr_full(
             if not (allow_window and pgx is not None and select_cols is not None):
                 return None
             win = _pg_funcall_with_over_to_registry_step(
-                node,
-                alias_map,
-                single_alias,
-                param_store,
-                next_lit_key,
-                select_cols,
-                pgx,
+                node, alias_map, single_alias, param_store, next_lit_key, select_cols, pgx
             )
             return win
         if allow_aggregate:
@@ -1749,11 +1658,7 @@ def _pg_expr_full(
             )
             if inner is None:
                 return None
-            mg = MulGroup(
-                multiply=[inner],
-                scalar_func="extract",
-                scalar_func_args=[str(fld[0]).strip()],
-            )
+            mg = MulGroup(multiply=[inner], scalar_func="extract", scalar_func_args=[str(fld[0]).strip()])
             return NormalizedExpr(add_groups=[mg])
         if fn_name in {"upper", "lower", "trim"}:
             parts = list(node.args or ())
@@ -1831,11 +1736,7 @@ def _pg_expr_full(
             )
             if l_e is None or r_e is None:
                 return None
-            mg = MulGroup(
-                multiply=[l_e],
-                scalar_func="nullif",
-                scalar_func_args=[_pg_expr_sql_token(r_e)],
-            )
+            mg = MulGroup(multiply=[l_e], scalar_func="nullif", scalar_func_args=[_pg_expr_sql_token(r_e)])
             return NormalizedExpr(add_groups=[mg])
         op_raw = (_pg_a_expr_op_name(node) or "").strip()
         if node.kind == A_Expr_Kind.AEXPR_OP and op_raw in {"+", "-", "*", "/"}:
@@ -1907,7 +1808,7 @@ def _pg_aggregate_funcall_to_expr(
         return None
     raw = (pg_funcname(fn) or "").strip().lower()
     fn_name = raw.split(".")[-1] if raw else ""
-    if fn_name not in _PG_SIMPLE_AGG_NAMES:
+    if fn_name not in PG_SIMPLE_AGG_NAMES:
         return None
     if getattr(fn, "agg_star", False):
         return NormalizedExpr.from_agg(fn_name, "*")
@@ -1927,11 +1828,7 @@ def _pg_aggregate_funcall_to_expr(
     )
     if inner is None:
         return None
-    mg = MulGroup(
-        multiply=[inner],
-        agg_func=fn_name,
-        distinct=bool(getattr(fn, "agg_distinct", False)),
-    )
+    mg = MulGroup(multiply=[inner], agg_func=fn_name, distinct=bool(getattr(fn, "agg_distinct", False)))
     return NormalizedExpr(add_groups=[mg])
 
 
@@ -1981,7 +1878,7 @@ def _pg_where_literal_payload(node: Any) -> tuple[Any, str] | None:
 
 def _pg_collect_in_literal_values(rexpr: Any) -> tuple[list[Any], str] | None:
     """Homogeneous literal list for ``IN`` / ``NOT IN`` right-hand sides."""
-    seq = rexpr if isinstance(rexpr, (list, tuple)) else (rexpr,)
+    seq = rexpr if isinstance(rexpr, (list, tuple)) else (rexpr)
     out: list[Any] = []
     vt: str | None = None
     for item in seq:
@@ -1999,7 +1896,7 @@ def _pg_collect_in_literal_values(rexpr: Any) -> tuple[list[Any], str] | None:
     return out, vt
 
 
-def _pg_sublink_to_filter(
+def _pg_sublink_to_where(
     p: Any,
     alias_map: dict[str, str],
     single_alias: str | None,
@@ -2008,7 +1905,7 @@ def _pg_sublink_to_filter(
     pgx: _PgExtra,
     allowed_cte: frozenset[str],
     schema: SchemaGraph,
-) -> FilterParam | None:
+) -> WhereParam | None:
     """Reformulate ``SubLink`` predicates into CTE-backed filters where supported."""
     if SubLinkType is None or not isinstance(p, SubLink):
         return None
@@ -2018,7 +1915,15 @@ def _pg_sublink_to_filter(
     sl_type = p.subLinkType
     cte_name = f"sq_{len(pgx.self_join_steps) + 1}"
     if sl_type == SubLinkType.EXISTS_SUBLINK:
-        chunk = _pg_materialize_cte_body(sub, schema, cte_name, param_store, next_lit_key, allowed_cte)
+        chunk = _pg_materialize_cte_body(
+            sub,
+            schema,
+            cte_name,
+            param_store,
+            next_lit_key,
+            allowed_cte,
+            correlated_aliases=alias_map,
+        )
         if chunk is None or not chunk:
             return None
         pgx.self_join_steps.extend(chunk)
@@ -2027,9 +1932,17 @@ def _pg_sublink_to_filter(
         test = getattr(p, "testexpr", None)
         is_not = isinstance(test, BoolExpr) and test.boolop == BoolExprType.NOT_EXPR
         op_n = "is null" if is_not else "is not null"
-        return FilterParam(left_expr=NormalizedExpr.from_column(probe), op=op_n, value_type="null")
+        return WhereParam(left_expr=NormalizedExpr.from_column(probe), op=op_n, value_type="null")
     if sl_type == SubLinkType.ANY_SUBLINK:
-        chunk = _pg_materialize_cte_body(sub, schema, cte_name, param_store, next_lit_key, allowed_cte)
+        chunk = _pg_materialize_cte_body(
+            sub,
+            schema,
+            cte_name,
+            param_store,
+            next_lit_key,
+            allowed_cte,
+            correlated_aliases=alias_map,
+        )
         if chunk is None or not chunk:
             return None
         pgx.self_join_steps.extend(chunk)
@@ -2053,14 +1966,17 @@ def _pg_sublink_to_filter(
         if names:
             op_raw = str(getattr(names[0], "sval", "") or "").strip().lower()
         op_in = "not in" if op_raw in ("<>", "!=") else "in"
-        return FilterParam(
-            left_expr=left_e,
-            op=op_in,
-            right_expr=NormalizedExpr.from_column(probe),
-            value_type="column",
-        )
+        return WhereParam(left_expr=left_e, op=op_in, right_expr=NormalizedExpr.from_column(probe), value_type="column")
     if sl_type == SubLinkType.EXPR_SUBLINK:
-        chunk = _pg_materialize_cte_body(sub, schema, cte_name, param_store, next_lit_key, allowed_cte)
+        chunk = _pg_materialize_cte_body(
+            sub,
+            schema,
+            cte_name,
+            param_store,
+            next_lit_key,
+            allowed_cte,
+            correlated_aliases=alias_map,
+        )
         if chunk is None or not chunk:
             return None
         scalar_step = replace(chunk[-1], grain="scalar")
@@ -2085,16 +2001,13 @@ def _pg_sublink_to_filter(
         if names:
             op_raw = str(getattr(names[0], "sval", "") or "").strip().lower()
         mapped = _pg_map_where_scalar_op(op_raw) or "="
-        return FilterParam(
-            left_expr=left_e,
-            op=mapped,
-            right_expr=NormalizedExpr.from_column(probe),
-            value_type="column",
+        return WhereParam(
+            left_expr=left_e, op=mapped, right_expr=NormalizedExpr.from_column(probe), value_type="column"
         )
     return None
 
 
-def _pg_single_predicate_to_filter(
+def _pg_single_predicate_to_where(
     p: Any,
     alias_map: dict[str, str],
     single_alias: str | None,
@@ -2104,12 +2017,12 @@ def _pg_single_predicate_to_filter(
     *,
     allowed_cte: frozenset[str] | None = None,
     schema: SchemaGraph | None = None,
-) -> FilterParam | None:
+) -> WhereParam | None:
     """Convert one ``WHERE`` predicate leaf (no nested ``BoolExpr``)."""
     if isinstance(p, SubLink):
         if pgx is None or allowed_cte is None or schema is None:
             return None
-        return _pg_sublink_to_filter(p, alias_map, single_alias, param_store, next_lit_key, pgx, allowed_cte, schema)
+        return _pg_sublink_to_where(p, alias_map, single_alias, param_store, next_lit_key, pgx, allowed_cte, schema)
     if isinstance(p, NullTest):
         left_e = _pg_expr_full(
             p.arg,
@@ -2130,11 +2043,7 @@ def _pg_single_predicate_to_filter(
             op_n = "is not null"
         else:
             return None
-        return FilterParam(
-            left_expr=left_e,
-            op=op_n,
-            value_type="null",
-        )
+        return WhereParam(left_expr=left_e, op=op_n, value_type="null")
     if isinstance(p, A_Expr) and p.kind == A_Expr_Kind.AEXPR_BETWEEN:
         lexpr, rexpr = p.lexpr, p.rexpr
         if lexpr is None or rexpr is None:
@@ -2152,7 +2061,7 @@ def _pg_single_predicate_to_filter(
         )
         if left_e is None:
             return None
-        seq = rexpr if isinstance(rexpr, (list, tuple)) else (rexpr,)
+        seq = rexpr if isinstance(rexpr, (list, tuple)) else (rexpr)
         if len(seq) != 2:
             return None
         lo_lit = _pg_where_literal_payload(seq[0])
@@ -2164,13 +2073,7 @@ def _pg_single_predicate_to_filter(
         pk_hi = next_lit_key()
         param_store[pk_lo] = lo_lit[0]
         param_store[pk_hi] = hi_lit[0]
-        return FilterParam(
-            left_expr=left_e,
-            op="between",
-            value_type=vt,
-            param_key=pk_lo,
-            param_key_hi=pk_hi,
-        )
+        return WhereParam(left_expr=left_e, op="between", value_type=vt, param_key=pk_lo, param_key_hi=pk_hi)
     if not isinstance(p, A_Expr):
         return None
     if p.kind == A_Expr_Kind.AEXPR_IN:
@@ -2199,12 +2102,7 @@ def _pg_single_predicate_to_filter(
         vals, vt = collected
         pk = next_lit_key()
         param_store[pk] = vals
-        return FilterParam(
-            left_expr=left_e,
-            op=op_in,
-            value_type=vt,
-            param_key=pk,
-        )
+        return WhereParam(left_expr=left_e, op=op_in, value_type=vt, param_key=pk)
     if p.kind not in (A_Expr_Kind.AEXPR_OP, A_Expr_Kind.AEXPR_LIKE):
         return None
     op_raw = _pg_a_expr_op_name(p)
@@ -2227,27 +2125,47 @@ def _pg_single_predicate_to_filter(
     )
     if left_e is None:
         return None
+    if isinstance(rexpr, SubLink) and SubLinkType is not None and rexpr.subLinkType == SubLinkType.EXPR_SUBLINK:
+        if pgx is None or allowed_cte is None or schema is None:
+            return None
+        sub = getattr(rexpr, "subselect", None)
+        if not isinstance(sub, SelectStmt):
+            return None
+        cte_name = f"sq_{len(pgx.self_join_steps) + 1}"
+        chunk = _pg_materialize_cte_body(
+            sub,
+            schema,
+            cte_name,
+            param_store,
+            next_lit_key,
+            allowed_cte,
+            correlated_aliases=alias_map,
+        )
+        if chunk is None or not chunk:
+            return None
+        scalar_step = replace(chunk[-1], grain="scalar")
+        pgx.self_join_steps.extend(chunk[:-1] + [scalar_step])
+        outs = _pg_infer_output_columns(sub)
+        probe = f"{cte_name}.{outs[0]}" if outs else f"{cte_name}.col_0"
+        return WhereParam(
+            left_expr=left_e,
+            op=mapped_op,
+            right_expr=NormalizedExpr.from_column(probe),
+            value_type="column",
+        )
     if isinstance(rexpr, ColumnRef):
         right_q = _pg_qual_column_name(rexpr, alias_map, single_alias, pgx)
         if right_q is None:
             return None
-        return FilterParam(
-            left_expr=left_e,
-            op=mapped_op,
-            right_expr=NormalizedExpr.from_column(right_q),
-            value_type="column",
+        return WhereParam(
+            left_expr=left_e, op=mapped_op, right_expr=NormalizedExpr.from_column(right_q), value_type="column"
         )
     lit = _pg_where_literal_payload(rexpr)
     if lit is not None:
         raw_v, vt = lit
         pk = next_lit_key()
         param_store[pk] = raw_v
-        return FilterParam(
-            left_expr=left_e,
-            op=mapped_op,
-            value_type=vt,
-            param_key=pk,
-        )
+        return WhereParam(left_expr=left_e, op=mapped_op, value_type=vt, param_key=pk)
     right_e = _pg_expr_full(
         rexpr,
         alias_map,
@@ -2261,12 +2179,7 @@ def _pg_single_predicate_to_filter(
     )
     if right_e is None:
         return None
-    return FilterParam(
-        left_expr=left_e,
-        op=mapped_op,
-        right_expr=right_e,
-        value_type="column",
-    )
+    return WhereParam(left_expr=left_e, op=mapped_op, right_expr=right_e, value_type="column")
 
 
 def _pg_bool_nesting_too_deep(node: Any, depth: int) -> bool:
@@ -2282,7 +2195,17 @@ def _pg_bool_nesting_too_deep(node: Any, depth: int) -> bool:
     return False
 
 
-def _pg_walk_bool_to_filter_groups(
+def _pg_flatten_or_arms(node: Any) -> list[Any]:
+    """Flatten nested ``OR`` ``BoolExpr`` chains into top-level arms."""
+    if isinstance(node, BoolExpr) and node.boolop == BoolExprType.OR_EXPR:
+        out: list[Any] = []
+        for a in node.args or ():
+            out.extend(_pg_flatten_or_arms(a))
+        return out
+    return [node]
+
+
+def _pg_walk_bool_to_predicate_group(
     where: Any,
     alias_map: dict[str, str],
     single_alias: str | None,
@@ -2291,22 +2214,20 @@ def _pg_walk_bool_to_filter_groups(
     pgx: _PgExtra | None = None,
     allowed_cte: frozenset[str] | None = None,
     schema: SchemaGraph | None = None,
-) -> list[FilterParam] | None:
-    """Map ``WHERE`` boolean trees to ``FilterParam`` rows with. optional. ``filter_group`` ids."""
+) -> PredicateGroup | None:
+    """Map ``WHERE`` boolean trees to a :class:`PredicateGroup`."""
     if _pg_bool_nesting_too_deep(where, 0):
         return None
     if isinstance(where, BoolExpr) and where.boolop == BoolExprType.NOT_EXPR:
         return None
-
     if isinstance(where, BoolExpr) and where.boolop == BoolExprType.OR_EXPR:
-        out_or: list[FilterParam] = []
-        gid = 1
-        for arg in where.args or ():
+        or_groups: list[PredicateGroup] = []
+        for arg in _pg_flatten_or_arms(where):
             if isinstance(arg, BoolExpr) and arg.boolop == BoolExprType.AND_EXPR:
                 sub = _pg_flatten_bool_and(arg)
-                first_arm = True
+                and_preds: list[WhereParam] = []
                 for subp in sub:
-                    fp = _pg_single_predicate_to_filter(
+                    fp = _pg_single_predicate_to_where(
                         subp,
                         alias_map,
                         single_alias,
@@ -2318,54 +2239,49 @@ def _pg_walk_bool_to_filter_groups(
                     )
                     if fp is None:
                         return None
-                    bo = "AND"
-                    if first_arm:
-                        first_arm = False
-                    else:
-                        bo = "AND"
-                    fp = replace(fp, filter_group=gid, bool_op=bo)
-                    out_or.append(fp)
-                gid += 1
+                    and_preds.append(fp)
+                if and_preds:
+                    or_groups.append(PredicateGroup(op="and", predicates=tuple(and_preds)))
                 continue
-            fp = _pg_single_predicate_to_filter(
-                arg,
-                alias_map,
-                single_alias,
-                param_store,
-                next_lit_key,
-                pgx,
-                allowed_cte=allowed_cte,
-                schema=schema,
+            fp = _pg_single_predicate_to_where(
+                arg, alias_map, single_alias, param_store, next_lit_key, pgx, allowed_cte=allowed_cte, schema=schema
             )
             if fp is None:
                 return None
-            fp = replace(fp, filter_group=gid, bool_op="AND")
-            out_or.append(fp)
-            gid += 1
-        return out_or
-
+            or_groups.append(PredicateGroup(op="and", predicates=(fp,)))
+        if not or_groups:
+            return None
+        if len(or_groups) == 1:
+            return or_groups[0]
+        return PredicateGroup(op="or", groups=tuple(or_groups))
     if isinstance(where, BoolExpr) and where.boolop != BoolExprType.AND_EXPR:
         return None
     parts = _pg_flatten_bool_and(where)
-    out: list[FilterParam] = []
+    preds: list[WhereParam] = []
+    nested: list[PredicateGroup] = []
     for p in parts:
-        fp = _pg_single_predicate_to_filter(
-            p,
-            alias_map,
-            single_alias,
-            param_store,
-            next_lit_key,
-            pgx,
-            allowed_cte=allowed_cte,
-            schema=schema,
+        if isinstance(p, BoolExpr) and p.boolop in (BoolExprType.AND_EXPR, BoolExprType.OR_EXPR):
+            child = _pg_walk_bool_to_predicate_group(
+                p, alias_map, single_alias, param_store, next_lit_key, pgx, allowed_cte=allowed_cte, schema=schema
+            )
+            if child is None:
+                return None
+            nested.append(child)
+            continue
+        fp = _pg_single_predicate_to_where(
+            p, alias_map, single_alias, param_store, next_lit_key, pgx, allowed_cte=allowed_cte, schema=schema
         )
         if fp is None:
             return None
-        out.append(fp)
-    return out
+        preds.append(fp)
+    if not preds and not nested:
+        return None
+    if not nested:
+        return PredicateGroup(op="and", predicates=tuple(preds))
+    return PredicateGroup(op="and", predicates=tuple(preds), groups=tuple(nested))
 
 
-def _pg_where_to_filters(
+def _pg_walk_bool_to_where_groups(
     where: Any,
     alias_map: dict[str, str],
     single_alias: str | None,
@@ -2374,11 +2290,49 @@ def _pg_where_to_filters(
     pgx: _PgExtra | None = None,
     allowed_cte: frozenset[str] | None = None,
     schema: SchemaGraph | None = None,
-) -> list[FilterParam] | None:
-    """Extract ``FilterParam`` rows from ``WHERE`` using grouped OR-of- AND semantics."""
-    return _pg_walk_bool_to_filter_groups(
+) -> list[WhereParam] | None:
+    """Map ``WHERE`` boolean trees to flat ``WhereParam`` leaves."""
+    group = _pg_walk_bool_to_predicate_group(
         where, alias_map, single_alias, param_store, next_lit_key, pgx, allowed_cte, schema
     )
+    if group is None:
+        return None
+    return [leaf for leaf in group.leaves() if isinstance(leaf, WhereParam)]
+
+
+def _pg_where_to_predicate_group(
+    where: Any,
+    alias_map: dict[str, str],
+    single_alias: str | None,
+    param_store: dict[str, Any],
+    next_lit_key: Any,
+    pgx: _PgExtra | None = None,
+    allowed_cte: frozenset[str] | None = None,
+    schema: SchemaGraph | None = None,
+) -> PredicateGroup | None:
+    """Extract a :class:`PredicateGroup` from ``WHERE`` using grouped OR-of-AND semantics."""
+    return _pg_walk_bool_to_predicate_group(
+        where, alias_map, single_alias, param_store, next_lit_key, pgx, allowed_cte, schema
+    )
+
+
+def _pg_where_to_where_params(
+    where: Any,
+    alias_map: dict[str, str],
+    single_alias: str | None,
+    param_store: dict[str, Any],
+    next_lit_key: Any,
+    pgx: _PgExtra | None = None,
+    allowed_cte: frozenset[str] | None = None,
+    schema: SchemaGraph | None = None,
+) -> list[WhereParam] | None:
+    """Extract flat ``WhereParam`` leaves from ``WHERE``."""
+    group = _pg_where_to_predicate_group(
+        where, alias_map, single_alias, param_store, next_lit_key, pgx, allowed_cte, schema
+    )
+    if group is None:
+        return None
+    return [leaf for leaf in group.leaves() if isinstance(leaf, WhereParam)]
 
 
 def _pg_a_expr_op_name(expr: Any) -> str | None:
@@ -2442,32 +2396,10 @@ def _pg_sort_clause(
     """Convert ``ORDER BY`` using column refs, ordinals, or leaf expressions."""
     out: list[OrderByCol] = []
     for sb in nodes or ():
-        if not isinstance(sb, SortBy):
+        obc = _pg_order_col_from_sortby(sb, alias_map, single_alias, param_store, next_lit_key, select_cols, pgx)
+        if obc is None:
             return None
-        node = sb.node
-        ex: NormalizedExpr | None
-        if isinstance(node, A_Const):
-            ord_i = _pg_const_int_only(node)
-            if ord_i is None or ord_i < 1 or ord_i > len(select_cols):
-                return None
-            ex = select_cols[ord_i - 1].expr
-        else:
-            ex = _pg_expr_full(
-                node,
-                alias_map,
-                single_alias,
-                param_store,
-                next_lit_key,
-                pgx,
-                allow_aggregate=False,
-                allow_window=False,
-                select_cols=select_cols,
-            )
-        if ex is None:
-            return None
-        direnum = getattr(sb, "sortby_dir", SortByDir.SORTBY_DEFAULT)
-        direction = "DESC" if direnum == SortByDir.SORTBY_DESC else "ASC"
-        out.append(OrderByCol(expr=ex, direction=direction))
+        out.append(obc)
     return out
 
 
@@ -2499,11 +2431,7 @@ def _convert_postgres(sql: str, schema: SchemaGraph, dialect: Any) -> RuntimeInt
 
 
 def _check_round_trip_shape(
-    original_sql: str,
-    intent: RuntimeIntent,
-    schema: SchemaGraph,
-    dialect: Any,
-    sqlglot_read: str,
+    original_sql: str, intent: RuntimeIntent, schema: SchemaGraph, dialect: Any, sqlglot_read: str
 ) -> bool:
     """Layer 1: structural SQL shape parity between the original text and the inferred intent."""
     try:
@@ -2535,10 +2463,7 @@ def databricks_plan_rows_from_explain_text(payload: str) -> float | None:
 
 
 def _check_round_trip_intent_parity(
-    intent: RuntimeIntent,
-    schema: SchemaGraph,
-    dialect: Any,
-    sqlglot_read: str,
+    intent: RuntimeIntent, schema: SchemaGraph, dialect: Any, sqlglot_read: str
 ) -> bool:
     """Layer 2: structural presence gate before deeper regeneration probes run elsewhere."""
     del schema, dialect, sqlglot_read
@@ -2546,12 +2471,7 @@ def _check_round_trip_intent_parity(
 
 
 def _check_round_trip_execute(
-    original_sql: str,
-    intent: RuntimeIntent,
-    schema: SchemaGraph,
-    dialect: Any,
-    *,
-    limit: int = WARMUP_ROUND_TRIP_LIMIT,
+    original_sql: str, intent: RuntimeIntent, schema: SchemaGraph, dialect: Any, *, limit: int = WARMUP_ROUND_TRIP_LIMIT
 ) -> bool:
     """Layer 3: compare planner cardinality estimates between original and regenerated SQL."""
     del limit
@@ -2576,11 +2496,7 @@ def _check_round_trip_execute(
 
 
 def convert_sql_to_intent(
-    sql: str,
-    schema: SchemaGraph,
-    dialect: Any,
-    *,
-    verify_via_execute: bool = True,
+    sql: str, schema: SchemaGraph, dialect: Any, *, verify_via_execute: bool = True
 ) -> _ConverterResult:
     """Convert one SQL statement to a RuntimeIntent and validate the. round trip."""
     h = _hash_sql(sql)
@@ -2604,17 +2520,7 @@ def convert_sql_to_intent(
     except Exception as exc:
         msg = str(exc)
         code = "SQL_PARSE_FAILED"
-        if any(
-            token in msg.lower()
-            for token in (
-                "grain",
-                "temporal",
-                "qualified",
-                "aggregation",
-                "frame",
-                "window",
-            )
-        ):
+        if any(token in msg.lower() for token in ("grain", "temporal", "qualified", "aggregation", "frame", "window")):
             code = "SEMANTIC_REJECT"
         return _ConverterResult(h, None, code, msg)
     if not _check_round_trip_shape(sql, intent, schema, dialect, sqlglot_read):
@@ -2634,10 +2540,10 @@ def _union_merge_bucket_key(intent: RuntimeIntent) -> str:
         "tables": sorted(intent.tables or []),
         "grain": intent.grain or "row_level",
         "distinct_select_index": int(intent.distinct_select_index),
-        "filters": sorted(f.signature_key for f in (intent.filters_param or [])),
+        "filters": sorted(f.signature_key for f in (where_leaves(intent.where) or [])),
         "group_by_cols": sorted(g.signature_key for g in (intent.group_by_cols or [])),
         "order_by_cols": sorted(o.signature_key for o in (intent.order_by_cols or [])),
-        "having_param": sorted(h.signature_key for h in (intent.having_param or [])),
+        "having_param": sorted(h.signature_key for h in (having_leaves(intent.having) or [])),
         "cte_steps": cte_structural_signature(intent.cte_steps or []),
         "window_registry": sorted(w.signature_key for w in (intent.window_registry or [])),
         "case_registry": sorted(c.signature_key for c in (intent.case_registry or [])),
@@ -2645,9 +2551,7 @@ def _union_merge_bucket_key(intent: RuntimeIntent) -> str:
     return sha256(stable_json(fp))
 
 
-def _merge_union_compatible_intents(
-    cluster: list[RuntimeIntent],
-) -> list[RuntimeIntent]:
+def _merge_union_compatible_intents(cluster: list[RuntimeIntent]) -> list[RuntimeIntent]:
     """Pairwise-merge compatible intents using the same union rules as. template matching."""
     if len(cluster) <= 1:
         return list(cluster)
@@ -2743,12 +2647,7 @@ def load_sql_history_statements(filepath: str) -> list[str]:
     return statements
 
 
-def seed_warmup_intent_from_runtime_intent(
-    rt: RuntimeIntent,
-    *,
-    intent_id: str,
-    seed_index: int,
-) -> SeedWarmupIntent:
+def seed_warmup_intent_from_runtime_intent(rt: RuntimeIntent, *, intent_id: str, seed_index: int) -> SeedWarmupIntent:
     """Materialize a seed-warmup intent row from a converted runtime intent for SQL-history warmup."""
     return SeedWarmupIntent(
         intent_id=intent_id,
@@ -2757,8 +2656,8 @@ def seed_warmup_intent_from_runtime_intent(
         select_cols=list(rt.select_cols),
         group_by_cols=list(rt.group_by_cols),
         order_by_cols=list(rt.order_by_cols),
-        filters_param=list(rt.filters_param),
-        having_param=list(rt.having_param),
+        where=rt.where,
+        having=rt.having,
         param_values=dict(rt.param_values),
         cte_steps=list(rt.cte_steps),
         natural_language=str(rt.natural_language or ""),
@@ -2779,13 +2678,7 @@ class _QueryLogSource(Protocol):
         ...
 
     def fetch(
-        self,
-        conn: Any,
-        *,
-        lookback_days: int,
-        max_queries: int,
-        min_runs: int,
-        user_filter: str | None,
+        self, conn: Any, *, lookback_days: int, max_queries: int, min_runs: int, user_filter: str | None
     ) -> list[str]:
         """Return distinct SQL texts newest-first within policy caps."""
         ...
@@ -2809,13 +2702,7 @@ class NoOpQueryLogSource:
         return False
 
     def fetch(
-        self,
-        conn: Any,
-        *,
-        lookback_days: int,
-        max_queries: int,
-        min_runs: int,
-        user_filter: str | None,
+        self, conn: Any, *, lookback_days: int, max_queries: int, min_runs: int, user_filter: str | None
     ) -> list[str]:
         """Return an empty list because query history is not supported."""
         _ = conn, lookback_days, max_queries, min_runs, user_filter
@@ -2832,13 +2719,7 @@ class DatabricksQueryLogSource:
         return True
 
     def fetch(
-        self,
-        conn: Any,
-        *,
-        lookback_days: int,
-        max_queries: int,
-        min_runs: int,
-        user_filter: str | None,
+        self, conn: Any, *, lookback_days: int, max_queries: int, min_runs: int, user_filter: str | None
     ) -> list[str]:
         """Fetch SQL texts from system tables when permitted."""
         del min_runs
@@ -2938,13 +2819,7 @@ class MySQLQueryLogSource:
         return bool(rows)
 
     def fetch(
-        self,
-        conn: Any,
-        *,
-        lookback_days: int,
-        max_queries: int,
-        min_runs: int,
-        user_filter: str | None,
+        self, conn: Any, *, lookback_days: int, max_queries: int, min_runs: int, user_filter: str | None
     ) -> list[str]:
         """Fetch recent statement digests from performance_schema."""
         del min_runs, user_filter
@@ -2971,19 +2846,12 @@ class RedshiftQueryLogSource:
         return bool(rows)
 
     def fetch(
-        self,
-        conn: Any,
-        *,
-        lookback_days: int,
-        max_queries: int,
-        min_runs: int,
-        user_filter: str | None,
+        self, conn: Any, *, lookback_days: int, max_queries: int, min_runs: int, user_filter: str | None
     ) -> list[str]:
         """Fetch recent query texts from ``svl_qlog``."""
         del min_runs, user_filter
         stmt = _bind_int_named_params(
-            REDSHIFT_QUERY_LOG_FETCH_SQL,
-            {"lookback_days": int(lookback_days), "max_queries": int(max_queries)},
+            REDSHIFT_QUERY_LOG_FETCH_SQL, {"lookback_days": int(lookback_days), "max_queries": int(max_queries)}
         )
         return _query_log_sql_texts(_query_log_fetch_rows(conn, stmt))
 
@@ -3020,30 +2888,20 @@ class SQLServerQueryLogSource:
             return False
 
     def fetch(
-        self,
-        conn: Any,
-        *,
-        lookback_days: int,
-        max_queries: int,
-        min_runs: int,
-        user_filter: str | None,
+        self, conn: Any, *, lookback_days: int, max_queries: int, min_runs: int, user_filter: str | None
     ) -> list[str]:
         """Fetch recent statement texts from Query Store, falling back to DMVs."""
         del min_runs, user_filter
         if self._query_store_available(conn):
             stmt = _bind_int_named_params(
                 SQLSERVER_QUERY_STORE_FETCH_SQL.replace(
-                    "SELECT DISTINCT",
-                    f"SELECT DISTINCT TOP ({int(max_queries)})",
-                    1,
+                    "SELECT DISTINCT", f"SELECT DISTINCT TOP ({int(max_queries)})", 1
                 ),
                 {"lookback_days": int(lookback_days)},
             )
             return _query_log_sql_texts(_query_log_fetch_rows(conn, stmt))
         dmv_stmt = SQLSERVER_QUERY_LOG_FETCH_SQL.replace(
-            "SELECT DISTINCT",
-            f"SELECT DISTINCT TOP ({int(max_queries)})",
-            1,
+            "SELECT DISTINCT", f"SELECT DISTINCT TOP ({int(max_queries)})", 1
         )
         return _query_log_sql_texts(_query_log_fetch_rows(conn, dmv_stmt))
 
@@ -3060,19 +2918,12 @@ class SnowflakeQueryLogSource:
         return bool(rows)
 
     def fetch(
-        self,
-        conn: Any,
-        *,
-        lookback_days: int,
-        max_queries: int,
-        min_runs: int,
-        user_filter: str | None,
+        self, conn: Any, *, lookback_days: int, max_queries: int, min_runs: int, user_filter: str | None
     ) -> list[str]:
         """Fetch successful query texts from Snowflake query history."""
         del min_runs, user_filter
         stmt = _bind_int_named_params(
-            SNOWFLAKE_QUERY_LOG_FETCH_SQL,
-            {"lookback_days": int(lookback_days), "max_queries": int(max_queries)},
+            SNOWFLAKE_QUERY_LOG_FETCH_SQL, {"lookback_days": int(lookback_days), "max_queries": int(max_queries)}
         )
         return _query_log_sql_texts(_query_log_fetch_rows(conn, stmt))
 
@@ -3093,13 +2944,7 @@ class BigQueryQueryLogSource:
         return bool(rows)
 
     def fetch(
-        self,
-        conn: Any,
-        *,
-        lookback_days: int,
-        max_queries: int,
-        min_runs: int,
-        user_filter: str | None,
+        self, conn: Any, *, lookback_days: int, max_queries: int, min_runs: int, user_filter: str | None
     ) -> list[str]:
         """Fetch completed job query texts from ``INFORMATION_SCHEMA.JOBS``."""
         del min_runs, user_filter
@@ -3114,13 +2959,7 @@ class BigQueryQueryLogSource:
 
 
 def fetch_query_log(
-    dialect_name: str,
-    conn: Any,
-    *,
-    lookback_days: int,
-    max_queries: int,
-    min_runs: int,
-    user_filter: str | None,
+    dialect_name: str, conn: Any, *, lookback_days: int, max_queries: int, min_runs: int, user_filter: str | None
 ) -> list[str]:
     """Dispatch to the dialect-appropriate :class:`_QueryLogSource` implementation."""
     dn = str(dialect_name).strip().lower()
@@ -3137,10 +2976,6 @@ def fetch_query_log(
     return cast(
         list[str],
         src.fetch(
-            conn,
-            lookback_days=lookback_days,
-            max_queries=max_queries,
-            min_runs=min_runs,
-            user_filter=user_filter,
+            conn, lookback_days=lookback_days, max_queries=max_queries, min_runs=min_runs, user_filter=user_filter
         ),
     )

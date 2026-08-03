@@ -2,7 +2,7 @@
   "version": 1,
   "slots": [
     {
-      "slot_id": "owner_writer:default:questions:How many items are in the catalog by item type?",
+      "slot_id": "owner:writer:How many items are in the catalog by item type?",
       "question": "How many items are in the catalog by item type?",
       "kind": "question",
       "profile": "owner_writer",
@@ -13,14 +13,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:How many books do we have?",
+      "slot_id": "owner:writer:How many books do we have?",
       "question": "How many books do we have?",
       "kind": "question",
       "profile": "owner_writer",
@@ -31,14 +31,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:How many games are in the catalog?",
+      "slot_id": "owner:writer:How many games are in the catalog?",
       "question": "How many games are in the catalog?",
       "kind": "question",
       "profile": "owner_writer",
@@ -49,14 +49,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:Which films include trailers?",
+      "slot_id": "owner:writer:Which films include trailers?",
       "question": "Which films include trailers?",
       "kind": "question",
       "profile": "owner_writer",
@@ -67,14 +67,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:Which games support English?",
+      "slot_id": "owner:writer:Which games support English?",
       "question": "Which games support English?",
       "kind": "question",
       "profile": "owner_writer",
@@ -85,7 +85,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [
           "game_supported_language"
         ],
@@ -94,7 +94,7 @@
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:How many open reservations are there?",
+      "slot_id": "owner:writer:How many open reservations are there?",
       "question": "How many open reservations are there?",
       "kind": "question",
       "profile": "owner_writer",
@@ -105,14 +105,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:Show active staff at each store.",
+      "slot_id": "owner:writer:Show active staff at each store.",
       "question": "Show active staff at each store.",
       "kind": "question",
       "profile": "owner_writer",
@@ -123,14 +123,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:How many rentals happened in 2025?",
+      "slot_id": "owner:writer:How many rentals happened in 2025?",
       "question": "How many rentals happened in 2025?",
       "kind": "question",
       "profile": "owner_writer",
@@ -141,14 +141,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:Who are our top 5 customers by total payment?",
+      "slot_id": "owner:writer:Who are our top 5 customers by total payment?",
       "question": "Who are our top 5 customers by total payment?",
       "kind": "question",
       "profile": "owner_writer",
@@ -159,14 +159,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:Rank films by rental count within each category.",
+      "slot_id": "owner:writer:Rank films by rental count within each category.",
       "question": "Rank films by rental count within each category.",
       "kind": "question",
       "profile": "owner_writer",
@@ -177,14 +177,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:What is the total delivery fee by courier?",
+      "slot_id": "owner:writer:What is the total delivery fee by courier?",
       "question": "What is the total delivery fee by courier?",
       "kind": "question",
       "profile": "owner_writer",
@@ -195,14 +195,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:What is the count of pending reservations by store?",
+      "slot_id": "owner:writer:What is the count of pending reservations by store?",
       "question": "What is the count of pending reservations by store?",
       "kind": "question",
       "profile": "owner_writer",
@@ -213,14 +213,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:What's the weather today?",
+      "slot_id": "owner:writer:What's the weather today?",
       "question": "What's the weather today?",
       "kind": "question",
       "profile": "owner_writer",
@@ -231,13 +231,13 @@
         "sql_required": false,
         "grain": "none",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": []
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:What is the best pizza topping?",
+      "slot_id": "owner:writer:What is the best pizza topping?",
       "question": "What is the best pizza topping?",
       "kind": "question",
       "profile": "owner_writer",
@@ -248,13 +248,13 @@
         "sql_required": false,
         "grain": "none",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": []
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:List all store locations by city.",
+      "slot_id": "owner:writer:List all store locations by city.",
       "question": "List all store locations by city.",
       "kind": "question",
       "profile": "owner_writer",
@@ -265,14 +265,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:What is the average rental duration?",
+      "slot_id": "owner:writer:What is the average rental duration?",
       "question": "What is the average rental duration?",
       "kind": "question",
       "profile": "owner_writer",
@@ -283,14 +283,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:Which films have the highest replacement cost?",
+      "slot_id": "owner:writer:Which films have the highest replacement cost?",
       "question": "Which films have the highest replacement cost?",
       "kind": "question",
       "profile": "owner_writer",
@@ -301,14 +301,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:How many actors are in the database?",
+      "slot_id": "owner:writer:How many actors are in the database?",
       "question": "How many actors are in the database?",
       "kind": "question",
       "profile": "owner_writer",
@@ -319,14 +319,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:What are the film ratings available?",
+      "slot_id": "owner:writer:What are the film ratings available?",
       "question": "What are the film ratings available?",
       "kind": "question",
       "profile": "owner_writer",
@@ -337,14 +337,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:Which staff members work at store 1?",
+      "slot_id": "owner:writer:Which staff members work at store 1?",
       "question": "Which staff members work at store 1?",
       "kind": "question",
       "profile": "owner_writer",
@@ -355,14 +355,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:List customers who have never rented an item.",
+      "slot_id": "owner:writer:List customers who have never rented an item.",
       "question": "List customers who have never rented an item.",
       "kind": "question",
       "profile": "owner_writer",
@@ -373,14 +373,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:What is the total revenue by store?",
+      "slot_id": "owner:writer:What is the total revenue by store?",
       "question": "What is the total revenue by store?",
       "kind": "question",
       "profile": "owner_writer",
@@ -391,14 +391,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:How many films are in the Horror category?",
+      "slot_id": "owner:writer:How many films are in the Horror category?",
       "question": "How many films are in the Horror category?",
       "kind": "question",
       "profile": "owner_writer",
@@ -409,14 +409,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:Which languages are available?",
+      "slot_id": "owner:writer:Which languages are available?",
       "question": "Which languages are available?",
       "kind": "question",
       "profile": "owner_writer",
@@ -427,14 +427,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:Which city has the most customers?",
+      "slot_id": "owner:writer:Which city has the most customers?",
       "question": "Which city has the most customers?",
       "kind": "question",
       "profile": "owner_writer",
@@ -448,14 +448,14 @@
           "city",
           "customer"
         ],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": true
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:How many customers are in each country?",
+      "slot_id": "owner:writer:How many customers are in each country?",
       "question": "How many customers are in each country?",
       "kind": "question",
       "profile": "owner_writer",
@@ -469,14 +469,14 @@
           "country",
           "customer"
         ],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": true
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:Which actors appear in the most films?",
+      "slot_id": "owner:writer:Which actors appear in the most films?",
       "question": "Which actors appear in the most films?",
       "kind": "question",
       "profile": "owner_writer",
@@ -487,14 +487,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:Which actors have the most film credits?",
+      "slot_id": "owner:writer:Which actors have the most film credits?",
       "question": "Which actors have the most film credits?",
       "kind": "question",
       "profile": "owner_writer",
@@ -505,14 +505,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:Which films are in the Horror category?",
+      "slot_id": "owner:writer:Which films are in the Horror category?",
       "question": "Which films are in the Horror category?",
       "kind": "question",
       "profile": "owner_writer",
@@ -523,14 +523,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:What is the average payment amount?",
+      "slot_id": "owner:writer:What is the average payment amount?",
       "question": "What is the average payment amount?",
       "kind": "question",
       "profile": "owner_writer",
@@ -541,14 +541,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:How many rentals are currently overdue?",
+      "slot_id": "owner:writer:How many rentals are currently overdue?",
       "question": "How many rentals are currently overdue?",
       "kind": "question",
       "profile": "owner_writer",
@@ -559,14 +559,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:List films released in 2006.",
+      "slot_id": "owner:writer:List films released in 2006.",
       "question": "List films released in 2006.",
       "kind": "question",
       "profile": "owner_writer",
@@ -577,14 +577,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:Which author has the most books?",
+      "slot_id": "owner:writer:Which author has the most books?",
       "question": "Which author has the most books?",
       "kind": "question",
       "profile": "owner_writer",
@@ -595,14 +595,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:How many inventory items does each store have?",
+      "slot_id": "owner:writer:How many inventory items does each store have?",
       "question": "How many inventory items does each store have?",
       "kind": "question",
       "profile": "owner_writer",
@@ -613,14 +613,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:List publishers with more than five books.",
+      "slot_id": "owner:writer:List publishers with more than five books.",
       "question": "List publishers with more than five books.",
       "kind": "question",
       "profile": "owner_writer",
@@ -631,14 +631,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:Show purchase orders still open by supplier.",
+      "slot_id": "owner:writer:Show purchase orders still open by supplier.",
       "question": "Show purchase orders still open by supplier.",
       "kind": "question",
       "profile": "owner_writer",
@@ -649,14 +649,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:How many damage reports are open?",
+      "slot_id": "owner:writer:How many damage reports are open?",
       "question": "How many damage reports are open?",
       "kind": "question",
       "profile": "owner_writer",
@@ -667,14 +667,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:List inventory status changes in the last 90 days.",
+      "slot_id": "owner:writer:List inventory status changes in the last 90 days.",
       "question": "List inventory status changes in the last 90 days.",
       "kind": "question",
       "profile": "owner_writer",
@@ -685,14 +685,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:Which warehouse holds the most stock?",
+      "slot_id": "owner:writer:Which warehouse holds the most stock?",
       "question": "Which warehouse holds the most stock?",
       "kind": "question",
       "profile": "owner_writer",
@@ -703,14 +703,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:List promotion redemptions by promotion name.",
+      "slot_id": "owner:writer:List promotion redemptions by promotion name.",
       "question": "List promotion redemptions by promotion name.",
       "kind": "question",
       "profile": "owner_writer",
@@ -721,14 +721,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:Show delivery status counts by courier.",
+      "slot_id": "owner:writer:Show delivery status counts by courier.",
       "question": "Show delivery status counts by courier.",
       "kind": "question",
       "profile": "owner_writer",
@@ -739,14 +739,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:List stock transfers between warehouses this year.",
+      "slot_id": "owner:writer:List stock transfers between warehouses this year.",
       "question": "List stock transfers between warehouses this year.",
       "kind": "question",
       "profile": "owner_writer",
@@ -757,14 +757,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:Which suppliers have the most purchase lines?",
+      "slot_id": "owner:writer:Which suppliers have the most purchase lines?",
       "question": "Which suppliers have the most purchase lines?",
       "kind": "question",
       "profile": "owner_writer",
@@ -775,14 +775,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:questions:What is the average page count by publisher?",
+      "slot_id": "owner:writer:What is the average page count by publisher?",
       "question": "What is the average page count by publisher?",
       "kind": "question",
       "profile": "owner_writer",
@@ -793,14 +793,14 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
     },
     {
-      "slot_id": "owner_writer:default:validation_failures:Show payroll deductions by employee SSN.",
+      "slot_id": "owner:writer:Show payroll deductions by employee SSN.",
       "question": "Show payroll deductions by employee SSN.",
       "kind": "question",
       "profile": "owner_writer",
@@ -811,14 +811,14 @@
         "sql_required": false,
         "grain": "none",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "validation_failure": true
       }
     },
     {
-      "slot_id": "owner_writer:default:validation_failures:Show me all staff salaries.",
+      "slot_id": "owner:writer:Show me all staff salaries.",
       "question": "Show me all staff salaries.",
       "kind": "question",
       "profile": "owner_writer",
@@ -829,14 +829,14 @@
         "sql_required": false,
         "grain": "none",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "validation_failure": true
       }
     },
     {
-      "slot_id": "owner_writer:default:validation_failures:How many rentals happened on 2025-01-01?",
+      "slot_id": "owner:writer:How many rentals happened on 2025-01-01?",
       "question": "How many rentals happened on 2025-01-01?",
       "kind": "question",
       "profile": "owner_writer",
@@ -847,14 +847,14 @@
         "sql_required": false,
         "grain": "none",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "validation_failure": true
       }
     },
     {
-      "slot_id": "owner_writer:default:validation_failures:How many rentals were made in total?",
+      "slot_id": "owner:writer:How many rentals were made in total?",
       "question": "How many rentals were made in total?",
       "kind": "question",
       "profile": "owner_writer",
@@ -867,7 +867,7 @@
         "must_tables": [
           "film"
         ],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [
           "item_id"
         ],
@@ -887,7 +887,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -905,7 +905,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -923,7 +923,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -941,7 +941,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -959,7 +959,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [
           "game_supported_language"
         ],
@@ -979,7 +979,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -997,7 +997,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -1015,7 +1015,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -1033,7 +1033,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -1051,7 +1051,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -1069,7 +1069,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -1087,7 +1087,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -1105,7 +1105,7 @@
         "sql_required": false,
         "grain": "none",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": []
       }
@@ -1122,7 +1122,7 @@
         "sql_required": false,
         "grain": "none",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": []
       }
@@ -1139,7 +1139,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -1157,7 +1157,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -1175,7 +1175,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -1193,7 +1193,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -1211,7 +1211,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -1229,7 +1229,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -1247,7 +1247,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -1265,7 +1265,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -1283,7 +1283,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -1301,7 +1301,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -1322,7 +1322,7 @@
           "city",
           "customer"
         ],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": true
@@ -1343,7 +1343,7 @@
           "country",
           "customer"
         ],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": true
@@ -1361,7 +1361,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -1379,7 +1379,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -1397,7 +1397,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -1415,7 +1415,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -1433,7 +1433,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -1451,7 +1451,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -1469,7 +1469,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -1487,7 +1487,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -1505,7 +1505,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -1523,7 +1523,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -1541,7 +1541,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -1559,7 +1559,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -1577,7 +1577,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -1595,7 +1595,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -1613,7 +1613,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -1631,7 +1631,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -1649,7 +1649,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -1667,7 +1667,7 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null
@@ -1685,13 +1685,13 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": []
       }
     },
     {
-      "slot_id": "owner_writer:default:spaces:catalog",
+      "slot_id": "owner:writer:catalog",
       "question": "catalog",
       "kind": "space",
       "profile": "feedback",
@@ -1702,7 +1702,182 @@
         "sql_required": true,
         "grain": "scalar",
         "must_tables": [],
-        "must_filter": [],
+        "must_where": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner:writer:How many rentals are linked to film titles?",
+      "question": "How many rentals are linked to film titles?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "federation",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "scalar_value": 192,
+        "must_tables": [],
+        "must_where": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner:writer:What is the total payment amount?",
+      "question": "What is the total payment amount?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "federation",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "scalar_value": 6947.73,
+        "scalar_tolerance": 0.02,
+        "must_tables": [],
+        "must_where": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner:writer:How many distinct customers rented horror films?",
+      "question": "How many distinct customers rented horror films?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "federation",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "scalar_value": 22,
+        "scalar_partial_sum_must_differ": true,
+        "scalar_partial_sum": 27,
+        "must_tables": [],
+        "must_where": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner:writer:Show payroll deductions grouped by staff member.",
+      "question": "Show payroll deductions grouped by staff member.",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "federation",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "row_level",
+        "must_tables": [],
+        "must_where": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner:writer:What is the average payment amount grouped by film category?",
+      "question": "What is the average payment amount grouped by film category?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "federation",
+      "expect": {
+        "terminal_status": "error",
+        "sql_required": false,
+        "grain": "none",
+        "error_contains": "cross-source aggregate",
+        "must_tables": [],
+        "must_where": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": []
+      }
+    },
+    {
+      "slot_id": "owner:writer:List all films in the catalog.",
+      "question": "List all films in the catalog.",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "federation",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "row_level",
+        "result_row_count": 96,
+        "must_tables": [],
+        "must_where": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner:writer:How many active customers do we have?",
+      "question": "How many active customers do we have?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "views_questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "scalar",
+        "must_tables": [
+          "active_customer_v"
+        ],
+        "must_where": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner:writer:What is the total revenue by store?",
+      "question": "What is the total revenue by store?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "views_questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "row_level",
+        "must_tables": [
+          "store_revenue_v"
+        ],
+        "must_where": [],
+        "sql_contains": [],
+        "forbidden_sql_tokens": [],
+        "contains_join": null
+      }
+    },
+    {
+      "slot_id": "owner:writer:Which films are in the catalog view?",
+      "question": "Which films are in the catalog view?",
+      "kind": "question",
+      "profile": "owner_writer",
+      "mode": null,
+      "tier": "views_questions",
+      "expect": {
+        "terminal_status": "ok",
+        "sql_required": true,
+        "grain": "row_level",
+        "must_tables": [
+          "film_catalog_v"
+        ],
+        "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
         "contains_join": null

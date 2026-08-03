@@ -1,4 +1,4 @@
-"""Tests for engine-correct execution limits and timeouts (Phase G)."""
+"""Tests for engine-correct execution limits and timeouts."""
 
 from __future__ import annotations
 

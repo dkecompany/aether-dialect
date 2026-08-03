@@ -9,9 +9,8 @@ import re
 
 import pytest
 
-from aetherdialect._config import ConfigError
 from aetherdialect._constants import SCHEMA_GRAPH_ID_PREFIX
-from aetherdialect._contracts_base import EngineContext
+from aetherdialect._contracts_base import ConfigError, EngineContext
 from aetherdialect._contracts_schema import (
     SchemaGraph,
     TableMetadata,
@@ -27,6 +26,18 @@ from aetherdialect._schema_graph import (
 
 def _table(name: str) -> TableMetadata:
     return TableMetadata(name=name, columns={}, primary_key=[], foreign_keys=[], row_count=1)
+
+
+def test_owner_fresh_build_id_is_content_derived() -> None:
+    """Identical owner graphs must mint the same schema_graph_id."""
+    ctx = EngineContext()
+    sg_a = SchemaGraph(join_paths_multi={}, tables={"a": _table("a")})
+    sg_b = SchemaGraph(join_paths_multi={}, tables={"a": _table("a")})
+    assign_schema_graph_hashes(sg_a, ctx, "", schema_role="owner")
+    assign_schema_graph_hashes(sg_b, ctx, "", schema_role="owner")
+    expected = derive_deterministic_schema_graph_id(sg_a.effective_structural_hash, sg_a.structural_hash)
+    assert sg_a.schema_graph_id == sg_b.schema_graph_id
+    assert sg_a.schema_graph_id == expected
 
 
 def test_owner_mint_matches_pattern() -> None:

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import inspect
 import os
+import re
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -10,9 +12,10 @@ import pytest
 
 import aetherdialect
 from aetherdialect import AetherEngine, AsyncPipelineSession
-from aetherdialect._config import ConfigError, EngineConfig
+from aetherdialect._config import EngineConfig
 from aetherdialect._contracts_base import (
     AuditEvent,
+    ConfigError,
     EngineContext,
     LLMConfig,
     RuntimeConfig,
@@ -21,6 +24,45 @@ from aetherdialect._contracts_base import (
 )
 from aetherdialect._core_utils import load_runtime_config
 from aetherdialect._templates import empty_template_store
+
+_API_REFERENCE = Path(__file__).resolve().parents[1] / "docs" / "API_REFERENCE.md"
+
+
+def _api_reference_text() -> str:
+    return _API_REFERENCE.read_text(encoding="utf-8")
+
+
+def _parse_exported_symbols_table(md: str) -> set[str]:
+    section = md.split("## Exported symbols", 1)[1].split("\n## ", 1)[0]
+    return {match.group(1) for match in re.finditer(r"^\| `([^`]+)` \|", section, re.MULTILINE)}
+
+
+def _parse_aether_engine_method_names(md: str) -> set[str]:
+    engine_section = md.split("## AetherEngine", 1)[1].split("\n## FederationContext", 1)[0]
+    methods_section = engine_section.split("### Methods", 1)[1]
+    names: set[str] = set()
+    for line in methods_section.splitlines():
+        if not line.startswith("| `"):
+            continue
+        cell = line.split("|", 2)[1].strip()
+        match = re.match(r"`([^`]+)`", cell)
+        if match:
+            name = match.group(1).split("(", 1)[0].rstrip(".")
+            if name and name != "inspect_tabular_upload":
+                names.add(name)
+    return names
+
+
+def _parse_offline_sandbox_param_names(md: str) -> set[str]:
+    section = md.split("### `AetherEngine.offline_sandbox` quick path", 1)[1]
+    table = section.split("| `SandboxHandle` member", 1)[0]
+    names: set[str] = set()
+    for line in table.splitlines():
+        if not line.startswith("| `"):
+            continue
+        cell = line.split("|", 2)[1]
+        names.update(re.findall(r"`([^`]+)`", cell))
+    return names
 
 
 def _minimal_engine(**overrides: object) -> AetherEngine:
@@ -48,6 +90,9 @@ def _minimal_engine(**overrides: object) -> AetherEngine:
         _schema_role="owner",
         _consumer_visible_objects=None,
         _schema_stats={"table_count": 3, "total_filterable": 10},
+        _construction_phase_callback=None,
+        _ask_phase_callback=None,
+        _token_provider=None,
     )
     defaults.update(overrides)
     obj = AetherEngine.__new__(AetherEngine)
@@ -60,24 +105,44 @@ def test_package_all_matches_documented_exports() -> None:
     """``__all__`` stays a curated subset of the public façade."""
     allowed = {
         "AetherEngine",
+        "AetherFederation",
         "AetherSpace",
         "AsyncPipelineSession",
         "AuditEvent",
+        "BusinessKnowledgeEntry",
         "ConfigError",
         "ConnectionError",
         "ConfigSnapshot",
+        "DataQualityReport",
         "DatabasePingFailed",
         "Diagnostic",
+        "FederationCapExceededError",
+        "FederationConfigError",
+        "FederationDeclarationError",
+        "FederationIneligibleError",
+        "FederationInvariantError",
+        "FederationJoinFanOutError",
+        "FederationMalformedMemberAnswerError",
+        "FederationMemberExecutionError",
+        "FederationMemberUnprofilableError",
+        "FederationPartialFailureError",
+        "FederationRuntimeError",
+        "FederationTurnCancelledError",
+        "inspect_tabular_upload",
         "EngineContext",
+        "FederationContext",
         "LlmTransientFailure",
         "MigrationPendingError",
         "MigrationPreview",
         "MockFixtureMissingError",
         "OwnerOnlyOperationError",
         "PERMISSION_DENIED_USER_MESSAGE",
+        "PersistedFederationInspection",
+        "PhaseProgressEvent",
         "PipelineSession",
         "QSimSummarySnapshot",
         "RetryableError",
+        "Sandbox",
         "SchemaAccessError",
         "SchemaStatsSnapshot",
         "SeedWarmupSummarySnapshot",
@@ -85,15 +150,53 @@ def test_package_all_matches_documented_exports() -> None:
         "SessionStep",
         "SpaceContext",
         "StatementTimeoutError",
+        "TablePreviewResult",
+        "PlanPreviewResult",
+        "UploadIngestResult",
         "__version__",
     }
     assert set(aetherdialect.__all__) == allowed
+    assert not hasattr(aetherdialect, "cancel_active_federation_turn")
+    assert not hasattr(aetherdialect, "compose_federation_dry_run")
+    assert hasattr(aetherdialect, "FederationMemberExecutionError")
+    assert hasattr(aetherdialect, "FederationCapExceededError")
+    assert callable(getattr(aetherdialect.PipelineSession, "cancel_active_federation_turn", None))
+    assert callable(getattr(aetherdialect.AsyncPipelineSession, "cancel_active_federation_turn", None))
+
+
+def test_package_exports_match_api_reference_symbols() -> None:
+    """``__all__`` and API_REFERENCE exported-symbols table stay aligned."""
+    documented = _parse_exported_symbols_table(_api_reference_text())
+    exported = set(aetherdialect.__all__)
+    missing_from_docs = sorted(exported - documented)
+    extra_in_docs = sorted(documented - exported)
+    assert missing_from_docs == [], f"exported but not documented in API_REFERENCE: {missing_from_docs}"
+    assert extra_in_docs == [], f"documented in API_REFERENCE but not exported: {extra_in_docs}"
+
+
+def test_aether_engine_documented_methods_exist() -> None:
+    """Every AetherEngine method named in API_REFERENCE exists on the class."""
+    documented = _parse_aether_engine_method_names(_api_reference_text())
+    missing = sorted(name for name in documented if not hasattr(AetherEngine, name))
+    assert missing == [], f"API_REFERENCE documents missing AetherEngine methods: {missing}"
+
+
+def test_offline_sandbox_documented_params_exist() -> None:
+    """offline_sandbox parameter table matches the classmethod signature."""
+    documented = _parse_offline_sandbox_param_names(_api_reference_text())
+    actual = set(inspect.signature(AetherEngine.offline_sandbox).parameters)
+    bogus = sorted(documented - actual)
+    undocumented = sorted(actual - documented)
+    assert bogus == [], f"API_REFERENCE documents bogus offline_sandbox params: {bogus}"
+    assert undocumented == [], f"offline_sandbox params missing from API_REFERENCE: {undocumented}"
 
 
 def test_renamed_public_symbols_exported() -> None:
     """Historical rename: ``AetherEngine`` and ``EngineContext`` replace legacy symbols."""
     assert hasattr(aetherdialect, "AetherEngine")
+    assert hasattr(aetherdialect, "AetherFederation")
     assert hasattr(aetherdialect, "EngineContext")
+    assert hasattr(aetherdialect, "Sandbox")
     assert hasattr(aetherdialect, "SpaceContext")
     assert hasattr(aetherdialect, "AetherSpace")
     assert not hasattr(aetherdialect, "Text2SQL")
@@ -126,7 +229,7 @@ def test_configure_llm_rejects_unknown_provider_key() -> None:
 
 def test_audit_sink_invoked_on_init(tmp_path: Path) -> None:
     """``audit_sink`` receives an ``AuditEvent`` when construction succeeds."""
-    from aetherdialect._main_execution import AetherEngineInitResult
+    from aetherdialect._contracts_base import AetherEngineInitResult
 
     events: list[AuditEvent] = []
 
@@ -178,8 +281,12 @@ def test_session_step_dataclass_shape() -> None:
         status=None,
         reply_shape=None,
         semantic_warnings=(),
+        notices=(),
+        data_truncated=False,
     )
     assert st.done is True
+    assert st.notices == ()
+    assert st.data_truncated is False
 
 
 def test_async_session_wraps_pipeline_session() -> None:
@@ -202,7 +309,7 @@ def test_clear_template_store_triggers_reinit() -> None:
         patch("aetherdialect.aetherdialect.clear_template_store_only", return_value=True) as clr,
         patch("aetherdialect.aetherdialect.initialize_aether_engine") as init,
     ):
-        from aetherdialect._main_execution import AetherEngineInitResult
+        from aetherdialect._contracts_base import AetherEngineInitResult
 
         init.return_value = AetherEngineInitResult(
             runtime_config=engine._runtime_config,

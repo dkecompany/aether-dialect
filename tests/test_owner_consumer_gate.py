@@ -146,7 +146,7 @@ class TestConsumerIntentScopeGate:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("customer.email"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         assert assert_consumer_intent_in_scope(intent, ctx, graph, frozenset({"customer"})) is False
 
@@ -169,6 +169,6 @@ class TestConsumerIntentScopeGate:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("customer.email"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         assert assert_consumer_intent_in_scope(intent, EngineContext(), graph, frozenset()) is False

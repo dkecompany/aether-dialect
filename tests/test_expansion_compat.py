@@ -14,7 +14,7 @@ def _base_intent(**kwargs: object) -> SeedWarmupIntent:
         "grain": "row_level",
         "select_cols": [],
         "group_by_cols": [],
-        "filters_param": [],
+        "where": [],
     }
     data.update(kwargs)
     return SeedWarmupIntent.from_dict(data)
@@ -49,11 +49,11 @@ class TestExpansionCompatible:
                 "expansion_path": [ExpansionOperatorId.EMI_MUTATE],
             },
         )
-        assert expansion_compatible(parent, ExpansionOperatorId.FILTER_OR_GROUP) is False
+        assert expansion_compatible(parent, ExpansionOperatorId.WHERE_OR_GROUP) is False
 
     def test_filter_add_allowed_on_fresh_intent(self) -> None:
         parent = _base_intent()
-        assert expansion_compatible(parent, ExpansionOperatorId.FILTER_ADD) is True
+        assert expansion_compatible(parent, ExpansionOperatorId.WHERE_ADD) is True
 
     def test_having_blocks_groupby_remove(self) -> None:
         parent = _base_intent(

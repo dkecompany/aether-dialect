@@ -13,25 +13,51 @@ import sys
 import tempfile
 import threading
 import time
+from collections import Counter, defaultdict
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar, Token
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from decimal import Decimal
+from importlib.metadata import PackageNotFoundError, version
+from itertools import permutations, product
+from pathlib import Path
+from typing import Any, Literal, cast
+from unittest.mock import patch
+
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
+
+from packaging.version import InvalidVersion, Version
 
 from ._config import (
-    LlmExecutionConfig,
+    EngineConfig,
     PolicyConfig,
 )
 from ._constants import (
     AETHERDIALECT_LOG_PERMISSION_DENIED_DETAIL_ENV,
     ARTIFACT_FORMAT_VERSION,
+    BUSINESS_KNOWLEDGE_COLUMN_REF_RE,
+    BUSINESS_KNOWLEDGE_DEFAULT_KIND,
     ARTIFACT_LOCK_FILENAME,
     ARTIFACT_LOCK_POLL_INTERVAL_SECONDS,
     ARTIFACT_LOCK_TIMEOUT_SECONDS,
     ARTIFACT_MANIFEST_FILENAME,
     AZURE_OPENAI_ENV_DEPLOYMENT_HEAVY,
     AZURE_OPENAI_ENV_DEPLOYMENT_LIGHT,
-    AZURE_OPENAI_ENV_DEPLOYMENT_MEDIUM,
     DIAGNOSTIC_CODE_ENGINE_INFO,
+    DIAGNOSTIC_CODE_LLM_TURN_COST,
     JSON_COMPACT_SEPARATORS,
     LEGACY_ARTIFACT_FILENAMES,
     LEGACY_ARTIFACT_GLOBS,
+    AETHERSPACES_SEGMENT,
+    SIMULATION_CACHE_EXACT_FILENAMES,
+    SIMULATION_CACHE_GLOB_PATTERNS,
+    LLM_PRICE_PER_MILLION,
+    LLM_PRICE_TABLE_AS_OF,
     MIGRATION_DATA_OVERLAP_MIN,
     MIN_COMPATIBLE_PACKAGE_VERSION,
     QUERY_RESULTS_HEADER,
@@ -40,6 +66,7 @@ from ._constants import (
     STRUCTURAL_IDENTITY_VALUES,
     STRUCTURAL_INLINE_SQL_LITERAL_LIST_RE,
     STRUCTURAL_SQL_PLACEHOLDER_PARAM_RE,
+    PRE_QUOTED_IN_LIST_INLINE_RE,
     TEMPLATE_STORE_SEGMENT,
     UNBOUND_PYFORMAT_PLACEHOLDER_RE,
     USER_ERROR_PREFIX,
@@ -50,39 +77,28 @@ from ._constants import (
     VALUE_TYPE_NORMALIZATION,
     WRITE_QUEUE_FILENAME,
 )
-
-if sys.platform == "win32":
-    import msvcrt
-else:
-    import fcntl
-
-from collections import Counter, defaultdict
-from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
-from contextvars import ContextVar
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from decimal import Decimal
-from enum import Enum
-from importlib.metadata import PackageNotFoundError, version
-from itertools import permutations, product
-from pathlib import Path
-from typing import Any, Literal, Protocol, cast
-from unittest.mock import patch
-
-from packaging.version import InvalidVersion, Version
-
 from ._contracts_base import (
+    BusinessKnowledgeEntry,
+    ConfigError,
     Diagnostic,
     EngineContext,
+    EngineIdentity,
+    FederationContext,
+    InteractiveChoicePort,
+    LlmExecutionConfig,
+    LlmUsageRecord,
     MigrationTier,
+    PhaseProgressEvent,
+    RephraseHint,
     WriteQueueEvent,
 )
-from ._contracts_core import RuntimeIntent
+from ._contracts_core import FederationExecutionContext, RuntimeCteStep, RuntimeIntent, StepResult
 from ._contracts_schema import (
     ColumnMetadata,
     FKEdge,
+    SchemaDiff,
     SchemaGraph,
+    SensitivityClassification,
     TableMetadata,
 )
 
@@ -102,6 +118,157 @@ LLM_EXECUTION_CONTEXT: ContextVar[LlmExecutionConfig | None] = ContextVar(
     "aetherdialect_llm_execution",
     default=None,
 )
+
+_ACTIVE_ENGINE_IDENTITY: ContextVar[EngineIdentity | None] = ContextVar(
+    "aetherdialect_active_engine_identity",
+    default=None,
+)
+
+_FEDERATION_EXECUTION_CONTEXT: ContextVar[FederationExecutionContext | None] = ContextVar(
+    "aetherdialect_federation_execution_context",
+    default=None,
+)
+
+
+def active_engine_identity() -> EngineIdentity:
+    """Return the active engine identity for this execution context."""
+    active = _ACTIVE_ENGINE_IDENTITY.get()
+    if active is not None:
+        return active
+    raise RuntimeError(
+        "no active engine identity; bind one with push_engine_identity before calling active_engine_identity"
+    )
+
+
+def push_engine_identity(identity: EngineIdentity) -> Token[EngineIdentity | None]:
+    """Bind *identity* for nested pipeline and SQL generation calls."""
+    return _ACTIVE_ENGINE_IDENTITY.set(identity)
+
+
+def pop_engine_identity(token: Token[EngineIdentity | None]) -> None:
+    """Restore the prior engine identity after :func:`push_engine_identity`."""
+    _ACTIVE_ENGINE_IDENTITY.reset(token)
+
+
+def push_federation_execution_context(
+    ctx: FederationExecutionContext,
+) -> Token[FederationExecutionContext | None]:
+    """Bind *ctx* for nested federated member worker calls."""
+    return _FEDERATION_EXECUTION_CONTEXT.set(ctx)
+
+
+def pop_federation_execution_context(
+    token: Token[FederationExecutionContext | None],
+) -> None:
+    """Restore the prior federation execution context."""
+    _FEDERATION_EXECUTION_CONTEXT.reset(token)
+
+
+def active_federation_execution_context() -> FederationExecutionContext | None:
+    """Return the active federation execution context, if any."""
+    return _FEDERATION_EXECUTION_CONTEXT.get()
+
+
+def federation_turn_cancelled() -> bool:
+    """Return True when the active federated turn has been cancelled."""
+    ctx = _FEDERATION_EXECUTION_CONTEXT.get()
+    return bool(ctx is not None and ctx.cancelled)
+
+
+_SESSION_TURN_CANCEL: ContextVar[threading.Event | None] = ContextVar(
+    "aetherdialect_session_turn_cancel",
+    default=None,
+)
+
+
+def push_session_turn_cancel(event: threading.Event) -> Token[threading.Event | None]:
+    """Bind *event* for cooperative cancellation of the active session turn."""
+    return _SESSION_TURN_CANCEL.set(event)
+
+
+def pop_session_turn_cancel(token: Token[threading.Event | None]) -> None:
+    """Restore the prior session turn cancellation event."""
+    _SESSION_TURN_CANCEL.reset(token)
+
+
+def session_turn_cancelled() -> bool:
+    """Return True when the active session turn has been cancelled."""
+    event = _SESSION_TURN_CANCEL.get()
+    return bool(event is not None and event.is_set())
+
+
+_CONSTRUCTION_PHASE_CALLBACK: ContextVar[Callable[[PhaseProgressEvent], None] | None] = ContextVar(
+    "aetherdialect_construction_phase_callback",
+    default=None,
+)
+_ASK_PHASE_CALLBACK: ContextVar[Callable[[PhaseProgressEvent], None] | None] = ContextVar(
+    "aetherdialect_ask_phase_callback",
+    default=None,
+)
+
+
+def push_construction_phase_callback(
+    callback: Callable[[PhaseProgressEvent], None] | None,
+) -> Token[Callable[[PhaseProgressEvent], None] | None]:
+    """Bind *callback* for construction-phase progress reporting."""
+    return _CONSTRUCTION_PHASE_CALLBACK.set(callback)
+
+
+def pop_construction_phase_callback(token: Token[Callable[[PhaseProgressEvent], None] | None]) -> None:
+    """Restore the prior construction-phase progress callback."""
+    _CONSTRUCTION_PHASE_CALLBACK.reset(token)
+
+
+def push_ask_phase_callback(
+    callback: Callable[[PhaseProgressEvent], None] | None,
+) -> Token[Callable[[PhaseProgressEvent], None] | None]:
+    """Bind *callback* for ask-turn phase progress reporting."""
+    return _ASK_PHASE_CALLBACK.set(callback)
+
+
+def pop_ask_phase_callback(token: Token[Callable[[PhaseProgressEvent], None] | None]) -> None:
+    """Restore the prior ask-turn phase progress callback."""
+    _ASK_PHASE_CALLBACK.reset(token)
+
+
+def emit_construction_phase(
+    phase: str,
+    *,
+    source: str | None = None,
+    stage: int | None = None,
+) -> None:
+    """Invoke the active construction-phase callback, if any."""
+    callback = _CONSTRUCTION_PHASE_CALLBACK.get()
+    if callback is None:
+        return
+    callback(
+        PhaseProgressEvent(
+            phase=phase,
+            timestamp_iso=datetime.now(timezone.utc).isoformat(),
+            source=source,
+            stage=stage,
+        )
+    )
+
+
+def emit_ask_phase(
+    phase: str,
+    *,
+    source: str | None = None,
+    stage: int | None = None,
+) -> None:
+    """Invoke the active ask-phase callback, if any."""
+    callback = _ASK_PHASE_CALLBACK.get()
+    if callback is None:
+        return
+    callback(
+        PhaseProgressEvent(
+            phase=phase,
+            timestamp_iso=datetime.now(timezone.utc).isoformat(),
+            source=source,
+            stage=stage,
+        )
+    )
 
 
 def is_structural_param_key(key: str) -> bool:
@@ -240,6 +407,365 @@ def drain_diagnostic_collector() -> tuple[Diagnostic, ...]:
     return out
 
 
+@contextmanager
+def phase_timer(
+    stage: str,
+    *,
+    source_id: str | None = None,
+    code: str = DIAGNOSTIC_CODE_ENGINE_INFO,
+    level: str = "info",
+    phase: str | None = None,
+) -> Iterator[None]:
+    """Emit a timed diagnostic for *stage* when the block completes."""
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        duration_ms = int((time.perf_counter() - start) * 1000)
+        details: tuple[tuple[str, str], ...] = (("phase", phase),) if phase else ()
+        notify(
+            stage,
+            stage=stage,
+            code=code,
+            level=level,
+            duration_ms=duration_ms,
+            source_id=source_id,
+            details=details,
+        )
+
+
+_LLM_USAGE_ACCUMULATOR: ContextVar[list[LlmUsageRecord] | None] = ContextVar(
+    "aetherdialect_llm_usage_accumulator",
+    default=None,
+)
+_LLM_USAGE_SCOPE_STACK: ContextVar[tuple[str, ...]] = ContextVar(
+    "aetherdialect_llm_usage_scope_stack",
+    default=(),
+)
+_TURN_LLM_SCOPE: ContextVar[str | None] = ContextVar(
+    "aetherdialect_turn_llm_scope",
+    default=None,
+)
+_LLM_USAGE_BLOCK_ID: ContextVar[int] = ContextVar(
+    "aetherdialect_llm_usage_block_id",
+    default=0,
+)
+_LLM_PRICE_OVERRIDE: dict[str, dict[str, float]] | None = None
+_LLM_USAGE_PHASE: ContextVar[str] = ContextVar("aetherdialect_llm_usage_phase", default="")
+_LLM_USAGE_SOURCE_ID: ContextVar[str] = ContextVar("aetherdialect_llm_usage_source_id", default="")
+
+
+def set_llm_price_table_override(table: dict[str, dict[str, float]] | None) -> None:
+    """Replace the shipped OpenAI price table (for tests or operator overrides)."""
+    global _LLM_PRICE_OVERRIDE
+    _LLM_PRICE_OVERRIDE = dict(table) if table is not None else None
+
+
+def llm_price_table_as_of() -> str:
+    """Return the as-of date stamped on the active OpenAI price table."""
+    return LLM_PRICE_TABLE_AS_OF
+
+
+def _active_llm_price_table() -> dict[str, dict[str, float]]:
+    return _LLM_PRICE_OVERRIDE if _LLM_PRICE_OVERRIDE is not None else LLM_PRICE_PER_MILLION
+
+
+def _current_llm_usage_scope() -> Literal["build", "question", "run"]:
+    turn_scope = _TURN_LLM_SCOPE.get()
+    if turn_scope in ("build", "question", "run"):
+        return cast(Literal["build", "question", "run"], turn_scope)
+    stack = _LLM_USAGE_SCOPE_STACK.get()
+    if "question" in stack:
+        return "question"
+    if "build" in stack:
+        return "build"
+    return "run"
+
+
+@contextmanager
+def llm_usage_session_scope() -> Iterator[None]:
+    """Open a session-scoped LLM usage accumulator when one is not already active."""
+    existing = _LLM_USAGE_ACCUMULATOR.get()
+    if existing is not None:
+        yield
+        return
+    buf: list[LlmUsageRecord] = []
+    _LLM_USAGE_ACCUMULATOR.set(buf)
+    yield
+
+
+@contextmanager
+def llm_usage_build_scope() -> Iterator[None]:
+    """Attribute subsequent LLM usage records to a build phase."""
+    stack = _LLM_USAGE_SCOPE_STACK.get()
+    block_tok = _LLM_USAGE_BLOCK_ID.set(_LLM_USAGE_BLOCK_ID.get() + 1)
+    scope_tok = _LLM_USAGE_SCOPE_STACK.set((*stack, "build"))
+    try:
+        yield
+    finally:
+        _LLM_USAGE_SCOPE_STACK.reset(scope_tok)
+        _LLM_USAGE_BLOCK_ID.reset(block_tok)
+
+
+@contextmanager
+def llm_usage_run_scope() -> Iterator[None]:
+    """Attribute subsequent LLM usage records to a run phase."""
+    stack = _LLM_USAGE_SCOPE_STACK.get()
+    block_tok = _LLM_USAGE_BLOCK_ID.set(_LLM_USAGE_BLOCK_ID.get() + 1)
+    scope_tok = _LLM_USAGE_SCOPE_STACK.set((*stack, "run"))
+    try:
+        yield
+    finally:
+        _LLM_USAGE_SCOPE_STACK.reset(scope_tok)
+        _LLM_USAGE_BLOCK_ID.reset(block_tok)
+
+
+@contextmanager
+def llm_usage_attribution(*, phase: str, source_id: str = "") -> Iterator[None]:
+    """Bind federation phase and member source for nested LLM usage records."""
+    phase_tok = _LLM_USAGE_PHASE.set(str(phase or ""))
+    source_tok = _LLM_USAGE_SOURCE_ID.set(str(source_id or ""))
+    try:
+        yield
+    finally:
+        _LLM_USAGE_PHASE.reset(phase_tok)
+        _LLM_USAGE_SOURCE_ID.reset(source_tok)
+
+
+@contextmanager
+def llm_usage_question_scope() -> Iterator[None]:
+    """Attribute subsequent LLM usage records to a question phase."""
+    stack = _LLM_USAGE_SCOPE_STACK.get()
+    block_tok = _LLM_USAGE_BLOCK_ID.set(_LLM_USAGE_BLOCK_ID.get() + 1)
+    scope_tok = _LLM_USAGE_SCOPE_STACK.set((*stack, "question"))
+    try:
+        yield
+    finally:
+        _LLM_USAGE_SCOPE_STACK.reset(scope_tok)
+        _LLM_USAGE_BLOCK_ID.reset(block_tok)
+
+
+def set_turn_llm_scope(scope: Literal["build", "question", "run"] | None) -> Token[str | None]:
+    """Bind an interactive turn scope that overrides harness scope until reset."""
+    if scope == "question":
+        _LLM_USAGE_BLOCK_ID.set(_LLM_USAGE_BLOCK_ID.get() + 1)
+    return _TURN_LLM_SCOPE.set(scope)
+
+
+def reset_turn_llm_scope(token: Token[str | None]) -> None:
+    """Restore the prior interactive turn scope."""
+    _TURN_LLM_SCOPE.reset(token)
+
+
+def snapshot_llm_usage_records() -> tuple[LlmUsageRecord, ...]:
+    """Return a snapshot of records accumulated so far without clearing them."""
+    buf = _LLM_USAGE_ACCUMULATOR.get()
+    if not buf:
+        return ()
+    return tuple(buf)
+
+
+def drain_llm_usage_records() -> tuple[LlmUsageRecord, ...]:
+    """Extract and clear all accumulated LLM usage records."""
+    buf = _LLM_USAGE_ACCUMULATOR.get()
+    if not buf:
+        return ()
+    out = tuple(buf)
+    buf.clear()
+    return out
+
+
+def reset_llm_usage_accumulator() -> None:
+    """Clear the active LLM usage accumulator without returning records."""
+    _LLM_USAGE_ACCUMULATOR.set(None)
+
+
+def record_llm_usage(
+    *,
+    task: str,
+    logical_model: str,
+    api_model: str,
+    provider: Literal["openai", "azure", "mock"],
+    input_tokens: int,
+    cached_input_tokens: int,
+    output_tokens: int,
+    cache_write_tokens: int | None,
+    attempt: int,
+    elapsed_ms: int,
+) -> None:
+    """Append one usage record when an accumulator is active; no-op otherwise."""
+    buf = _LLM_USAGE_ACCUMULATOR.get()
+    if buf is None:
+        return
+    buf.append(
+        LlmUsageRecord(
+            scope=_current_llm_usage_scope(),
+            block_id=_LLM_USAGE_BLOCK_ID.get(),
+            task=task,
+            logical_model=logical_model,
+            api_model=api_model,
+            provider=provider,
+            input_tokens=max(0, int(input_tokens)),
+            cached_input_tokens=max(0, int(cached_input_tokens)),
+            output_tokens=max(0, int(output_tokens)),
+            cache_write_tokens=None if cache_write_tokens is None else max(0, int(cache_write_tokens)),
+            attempt=max(1, int(attempt)),
+            elapsed_ms=max(0, int(elapsed_ms)),
+            phase=_LLM_USAGE_PHASE.get(),
+            source_id=_LLM_USAGE_SOURCE_ID.get(),
+        )
+    )
+
+
+def summarize_llm_usage_by_phase_and_source(
+    records: tuple[LlmUsageRecord, ...] | list[LlmUsageRecord],
+) -> tuple[tuple[str, str, str, int, int, int], ...]:
+    """Aggregate token usage by scope, phase, and federation source."""
+    buckets: dict[tuple[str, str, str], list[int]] = {}
+    for record in records:
+        key = (record.scope, record.phase or record.task, record.source_id or "")
+        slot = buckets.setdefault(key, [0, 0, 0])
+        slot[0] += 1
+        slot[1] += record.input_tokens
+        slot[2] += record.output_tokens
+    return tuple(
+        (scope, phase, source_id, counts[0], counts[1], counts[2])
+        for (scope, phase, source_id), counts in sorted(buckets.items())
+    )
+
+
+def emit_llm_usage_summary_diagnostics(
+    records: tuple[LlmUsageRecord, ...] | list[LlmUsageRecord],
+) -> None:
+    """Emit one notify line per scope/phase bucket in *records*."""
+    for scope, phase, source_id, requests, input_tokens, output_tokens in summarize_llm_usage_by_phase_and_source(
+        records
+    ):
+        details: list[tuple[str, str]] = [
+            ("requests", str(requests)),
+            ("input_tokens", str(input_tokens)),
+            ("output_tokens", str(output_tokens)),
+        ]
+        if source_id:
+            details.append(("source_id", source_id))
+        notify(
+            f"LLM {scope}/{phase}: {requests} request(s), {input_tokens} input, {output_tokens} output tokens",
+            stage="llm_usage_summary",
+            code=DIAGNOSTIC_CODE_LLM_TURN_COST,
+            level="info",
+            details=tuple(details),
+            source_id=source_id or None,
+        )
+
+
+def llm_call_cost_usd(record: LlmUsageRecord) -> float | None:
+    """Return the OpenAI list-price cost for *record*, or ``None`` when unknown or not priced."""
+    if record.provider != "openai":
+        return None
+    rates = _active_llm_price_table().get(record.logical_model)
+    if rates is None:
+        return None
+    billable_input = max(0, record.input_tokens - record.cached_input_tokens)
+    return (
+        billable_input * rates["input"]
+        + record.cached_input_tokens * rates["cached_input"]
+        + record.output_tokens * rates["output"]
+    ) / 1_000_000.0
+
+
+def llm_call_audit_details(record: LlmUsageRecord) -> tuple[tuple[str, str], ...]:
+    """Build audit detail pairs for one ``llm_call`` event."""
+    pairs: list[tuple[str, str]] = [
+        ("scope", record.scope),
+        ("task", record.task),
+        ("logical_model", record.logical_model),
+        ("api_model", record.api_model),
+        ("input_tokens", str(record.input_tokens)),
+        ("cached_input_tokens", str(record.cached_input_tokens)),
+        ("output_tokens", str(record.output_tokens)),
+        ("attempt", str(record.attempt)),
+        ("elapsed_ms", str(record.elapsed_ms)),
+    ]
+    if record.cache_write_tokens is not None:
+        pairs.append(("cache_write_tokens", str(record.cache_write_tokens)))
+    cost = llm_call_cost_usd(record)
+    if cost is not None:
+        pairs.append(("cost_usd", f"{cost:.6f}"))
+    elif record.provider == "openai":
+        pairs.append(("unpriced", record.logical_model))
+    return tuple(pairs)
+
+
+def llm_turn_cost_diagnostic(
+    records: tuple[LlmUsageRecord, ...] | list[LlmUsageRecord],
+    *,
+    provider: Literal["openai", "azure", "mock"],
+) -> Diagnostic | None:
+    """Build a single turn-total cost diagnostic from *records*."""
+    if not records:
+        return None
+    request_count = len(records)
+    input_tokens = sum(r.input_tokens for r in records)
+    cached_tokens = sum(r.cached_input_tokens for r in records)
+    output_tokens = sum(r.output_tokens for r in records)
+    details: list[tuple[str, str]] = [
+        ("requests", str(request_count)),
+        ("input_tokens", str(input_tokens)),
+        ("cached_input_tokens", str(cached_tokens)),
+        ("output_tokens", str(output_tokens)),
+    ]
+    message = (
+        f"LLM turn: {request_count} request(s), "
+        f"{input_tokens} input ({cached_tokens} cached), {output_tokens} output tokens"
+    )
+    if provider == "openai":
+        costs = [c for r in records if (c := llm_call_cost_usd(r)) is not None]
+        unpriced = sorted({r.logical_model for r in records if llm_call_cost_usd(r) is None})
+        if costs:
+            total_cost = sum(costs)
+            message += f", ${total_cost:.6f}"
+            details.append(("cost_usd", f"{total_cost:.6f}"))
+            details.append(("price_table_as_of", llm_price_table_as_of()))
+        if unpriced:
+            details.append(("unpriced_models", ",".join(unpriced)))
+    return Diagnostic(
+        stage="llm",
+        level="info",
+        code=DIAGNOSTIC_CODE_LLM_TURN_COST,
+        message=message,
+        details=tuple(details),
+    )
+
+
+def llm_turn_audit_details(
+    records: tuple[LlmUsageRecord, ...] | list[LlmUsageRecord],
+    *,
+    provider: Literal["openai", "azure", "mock"],
+) -> tuple[tuple[str, str], ...]:
+    """Build audit detail pairs for one ``llm_turn`` summary event."""
+    if not records:
+        return (("requests", "0"),)
+    request_count = len(records)
+    input_tokens = sum(r.input_tokens for r in records)
+    cached_tokens = sum(r.cached_input_tokens for r in records)
+    output_tokens = sum(r.output_tokens for r in records)
+    pairs: list[tuple[str, str]] = [
+        ("requests", str(request_count)),
+        ("input_tokens", str(input_tokens)),
+        ("cached_input_tokens", str(cached_tokens)),
+        ("output_tokens", str(output_tokens)),
+    ]
+    if provider == "openai":
+        costs = [c for r in records if (c := llm_call_cost_usd(r)) is not None]
+        unpriced = sorted({r.logical_model for r in records if llm_call_cost_usd(r) is None})
+        if costs:
+            pairs.append(("cost_usd", f"{sum(costs):.6f}"))
+            pairs.append(("price_table_as_of", llm_price_table_as_of()))
+        if unpriced:
+            pairs.append(("unpriced_models", ",".join(unpriced)))
+    return tuple(pairs)
+
+
 def notify(
     message: str,
     *,
@@ -248,6 +774,7 @@ def notify(
     level: str = "info",
     duration_ms: int | None = None,
     details: tuple[tuple[str, str], ...] = (),
+    source_id: str | None = None,
 ) -> None:
     """Append a diagnostic to the active collector and optionally mirror the line to a print listener."""
     eff_stage = stage or "notify"
@@ -258,6 +785,7 @@ def notify(
         message=message,
         details=details,
         duration_ms=duration_ms,
+        source_id=source_id,
     )
     buf = _DIAGNOSTIC_COLLECTOR.get()
     if buf is not None:
@@ -374,18 +902,6 @@ def invalid_input(detail: str | None = None) -> None:
         )
 
 
-class InteractiveChoicePort(Protocol):
-    """Bridges yes/no prompts to a session queue or stdin."""
-
-    def has_pending_choice(self) -> bool:
-        """Return True when at least one queued answer is available for the next prompt."""
-        ...
-
-    def take_yes_no(self, stage: str, prompt: str, options: list[str], silent_no: bool = False) -> str | None:
-        """Return a normalised choice or raise ``PipelineSuspended`` when the queue is empty."""
-        ...
-
-
 def note_interactive_turn(
     choice_port: InteractiveChoicePort | None,
     *,
@@ -398,6 +914,15 @@ def note_interactive_turn(
     intent: RuntimeIntent | None = None,
     matched_template: Any | None = None,
     template_history_index: int | None = None,
+    federated_bundle: Any | None = None,
+    federated_plan: Any | None = None,
+    generation_path: str | None = None,
+    federation_source_id: str | None = None,
+    federation_phase: str | None = None,
+    federation_succeeded: Sequence[tuple[str, int, str]] | None = None,
+    failure_kind: str | None = None,
+    retryable: bool | None = None,
+    refusal_diagnostic_code: str | None = None,
 ) -> None:
     """Record turn outcome on *choice_port* when it implements ``note_turn_outcome``."""
     fn = getattr(choice_port, "note_turn_outcome", None)
@@ -412,6 +937,15 @@ def note_interactive_turn(
             intent=intent,
             matched_template=matched_template,
             template_history_index=template_history_index,
+            federated_bundle=federated_bundle,
+            federated_plan=federated_plan,
+            generation_path=generation_path,
+            federation_source_id=federation_source_id,
+            federation_phase=federation_phase,
+            federation_succeeded=federation_succeeded,
+            failure_kind=failure_kind,
+            retryable=retryable,
+            refusal_diagnostic_code=refusal_diagnostic_code,
         )
 
 
@@ -522,6 +1056,239 @@ def stable_json(o: Any) -> str:
     return json.dumps(o, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def prompt_json(body: Mapping[str, Any], key_order: tuple[str, ...]) -> str:
+    """Serialize an outbound LLM user payload with explicit top-level key order. Static prompt sections (schemas, rules, output shapes) should precede per-question tails so provider prefix caching can reuse bytes across a run. Nested dict key order is preserved as built. Hashes and mock-fixture lookup continue to use :func:`stable_json`."""
+    ordered: dict[str, Any] = {}
+    seen: set[str] = set()
+    for key in key_order:
+        if key in body:
+            ordered[key] = body[key]
+            seen.add(key)
+    for key, value in body.items():
+        if key not in seen:
+            ordered[key] = value
+    return json.dumps(ordered, separators=(",", ":"), ensure_ascii=False)
+
+
+_PROMPT_CACHE_SCHEMA_HASH: ContextVar[str | None] = ContextVar(
+    "aetherdialect_prompt_cache_schema_hash",
+    default=None,
+)
+
+
+def active_prompt_cache_schema_hash() -> str | None:
+    """Return the schema hash bound for :func:`resolve_prompt_cache_key`, if any."""
+    return _PROMPT_CACHE_SCHEMA_HASH.get()
+
+
+@contextmanager
+def prompt_cache_schema_scope(schema_hash: str | None) -> Iterator[None]:
+    """Bind *schema_hash* for nested LLM calls that should share a ``prompt_cache_key``."""
+    cleaned = str(schema_hash or "").strip() or None
+    tok = _PROMPT_CACHE_SCHEMA_HASH.set(cleaned)
+    try:
+        yield
+    finally:
+        _PROMPT_CACHE_SCHEMA_HASH.reset(tok)
+
+
+_ACTIVE_BUSINESS_KNOWLEDGE: ContextVar[tuple[BusinessKnowledgeEntry, ...] | None] = ContextVar(
+    "aetherdialect_active_business_knowledge",
+    default=None,
+)
+_ACTIVE_BUSINESS_KNOWLEDGE_DIGEST: ContextVar[str | None] = ContextVar(
+    "aetherdialect_active_business_knowledge_digest",
+    default=None,
+)
+
+
+@dataclass
+class BusinessKnowledgeState:
+    version: int = 0
+    entries: tuple[BusinessKnowledgeEntry, ...] = ()
+    digest: str = ""
+
+
+def empty_business_knowledge_digest() -> str:
+    """Return the digest for an empty knowledge set."""
+    return business_knowledge_digest(())
+
+
+def business_knowledge_digest(entries: Sequence[BusinessKnowledgeEntry]) -> str:
+    """Stable SHA-256 digest over normalized business knowledge entries."""
+    payload = [{"key": entry.key, "kind": entry.kind, "text": entry.text} for entry in entries]
+    return sha256(stable_json(payload))
+
+
+def _normalize_business_knowledge_entry(entry: BusinessKnowledgeEntry) -> BusinessKnowledgeEntry:
+    key = str(entry.key).strip()
+    text = str(entry.text).strip()
+    kind = str(entry.kind or BUSINESS_KNOWLEDGE_DEFAULT_KIND).strip() or BUSINESS_KNOWLEDGE_DEFAULT_KIND
+    if not key:
+        raise ConfigError("business knowledge entry key must be non-empty")
+    if not text:
+        raise ConfigError(f"business knowledge entry {key!r} must have non-empty text")
+    if kind != entry.kind or key != entry.key or text != entry.text:
+        return BusinessKnowledgeEntry(key=key, text=text, kind=kind)
+    return entry
+
+
+def hidden_column_references_in_text(text: str, schema_graph: SchemaGraph) -> list[str]:
+    """Return qualified hidden column names referenced in *text*."""
+    found: list[str] = []
+    seen: set[str] = set()
+    for match in BUSINESS_KNOWLEDGE_COLUMN_REF_RE.finditer(text):
+        table_name, column_name = match.group(1), match.group(2)
+        qualified = f"{table_name}.{column_name}"
+        if qualified in seen:
+            continue
+        seen.add(qualified)
+        table = schema_graph.tables.get(table_name)
+        if table is None:
+            continue
+        column = table.columns.get(column_name)
+        if column is None:
+            continue
+        if column.sensitivity == SensitivityClassification.HIDDEN:
+            found.append(qualified)
+    return found
+
+
+def validate_business_knowledge_entries(
+    entries: Sequence[BusinessKnowledgeEntry],
+    schema_graph: SchemaGraph,
+) -> tuple[BusinessKnowledgeEntry, ...]:
+    """Normalize entries and refuse hidden-column references."""
+    normalized: list[BusinessKnowledgeEntry] = []
+    seen_keys: set[str] = set()
+    for raw in entries:
+        if not isinstance(raw, BusinessKnowledgeEntry):
+            raise TypeError("business knowledge entries must be BusinessKnowledgeEntry instances")
+        entry = _normalize_business_knowledge_entry(raw)
+        if entry.key in seen_keys:
+            raise ConfigError(f"duplicate business knowledge key: {entry.key!r}")
+        seen_keys.add(entry.key)
+        hidden_refs = hidden_column_references_in_text(entry.text, schema_graph)
+        if hidden_refs:
+            joined = ", ".join(sorted(hidden_refs))
+            raise ConfigError(f"business knowledge entry {entry.key!r} references hidden column(s): {joined}")
+        normalized.append(entry)
+    return tuple(normalized)
+
+
+def business_context_payload(entries: Sequence[BusinessKnowledgeEntry]) -> list[dict[str, str]] | None:
+    """Serialize active business knowledge for intent prompt injection."""
+    if not entries:
+        return None
+    return [{"key": entry.key, "kind": entry.kind, "text": entry.text} for entry in entries]
+
+
+def active_business_knowledge() -> tuple[BusinessKnowledgeEntry, ...]:
+    """Return business knowledge entries bound in the current scope."""
+    active = _ACTIVE_BUSINESS_KNOWLEDGE.get()
+    return active if active is not None else ()
+
+
+def active_business_knowledge_digest() -> str | None:
+    """Return the digest bound in the current scope, if any."""
+    digest = _ACTIVE_BUSINESS_KNOWLEDGE_DIGEST.get()
+    cleaned = str(digest or "").strip()
+    return cleaned or None
+
+
+@contextmanager
+def business_knowledge_scope(
+    entries: Sequence[BusinessKnowledgeEntry],
+    digest: str | None,
+) -> Iterator[None]:
+    """Bind business knowledge for nested intent parsing and prompt- cache routing."""
+    normalized = tuple(entries)
+    cleaned_digest = str(digest or "").strip() or None
+    tok_entries: Token[tuple[BusinessKnowledgeEntry, ...] | None] = _ACTIVE_BUSINESS_KNOWLEDGE.set(normalized)
+    tok_digest: Token[str | None] = _ACTIVE_BUSINESS_KNOWLEDGE_DIGEST.set(cleaned_digest)
+    try:
+        yield
+    finally:
+        _ACTIVE_BUSINESS_KNOWLEDGE.reset(tok_entries)
+        _ACTIVE_BUSINESS_KNOWLEDGE_DIGEST.reset(tok_digest)
+
+
+class BusinessKnowledgeHolder:
+    """Mutable versioned store for engine- or federation-level business knowledge."""
+
+    def __init__(self) -> None:
+        self._state = BusinessKnowledgeState(digest=empty_business_knowledge_digest())
+
+    def set(self, entries: Sequence[BusinessKnowledgeEntry], schema_graph: SchemaGraph) -> int:
+        normalized = validate_business_knowledge_entries(entries, schema_graph)
+        digest = business_knowledge_digest(normalized)
+        self._state = BusinessKnowledgeState(
+            version=self._state.version + 1,
+            entries=normalized,
+            digest=digest,
+        )
+        return self._state.version
+
+    def entries(self) -> tuple[BusinessKnowledgeEntry, ...]:
+        return self._state.entries
+
+    def digest(self) -> str:
+        return self._state.digest
+
+    def version(self) -> int:
+        return self._state.version
+
+    def scope_kwargs(self) -> dict[str, Any]:
+        """Keyword args for :func:`business_knowledge_scope`."""
+        return {"entries": self._state.entries, "digest": self._state.digest}
+
+
+def _tables_descriptions_payload_for_cache(tables: Any) -> dict[str, Any]:
+    """Build sorted table/column description dict for prompt-cache hashing."""
+    out: dict[str, Any] = {}
+    for tname in sorted(tables):
+        tbl = tables[tname]
+        cols_payload: dict[str, str] = {}
+        for cname in sorted(tbl.columns):
+            desc = (tbl.columns[cname].description or "").strip()
+            if desc:
+                cols_payload[cname] = desc
+        table_payload: dict[str, Any] = {}
+        table_desc = (tbl.description or "").strip()
+        if table_desc:
+            table_payload["description"] = table_desc
+        if cols_payload:
+            table_payload["columns"] = cols_payload
+        if table_payload:
+            out[tname] = table_payload
+    return out
+
+
+def schema_prompt_cache_id(schema_graph: Any) -> str | None:
+    """Return a stable schema identifier for prompt-cache routing."""
+    graph_id = str(getattr(schema_graph, "schema_graph_id", "") or "").strip()
+    if not graph_id:
+        structural = str(getattr(schema_graph, "effective_structural_hash", "") or "").strip()
+        if not structural:
+            return None
+        graph_id = structural
+    tables = getattr(schema_graph, "tables", None)
+    segments: list[str] = [graph_id]
+    desc_hash = str(getattr(schema_graph, "descriptions_hash", "") or "").strip()
+    if not desc_hash and tables is not None:
+        desc_hash = descriptions_hash_fp(_tables_descriptions_payload_for_cache(tables))
+    if desc_hash:
+        segments.append(desc_hash[:16])
+    prof_hash = str(getattr(schema_graph, "profiling_hash", "") or "").strip()
+    if prof_hash:
+        segments.append(prof_hash[:16])
+    if tables is not None:
+        meta_hash = metadata_hash_fp(_tables_metadata_payload_for_cache(tables))
+        if meta_hash:
+            segments.append(meta_hash[:16])
+    return ":".join(segments) if graph_id else None
+
+
 def colmap_signature(column_map: dict[str, str]) -> str:
     """SHA-256 of stable JSON for sorted ``column_map`` items."""
     return sha256(stable_json(sorted(column_map.items())))
@@ -542,6 +1309,41 @@ def profiling_hash_fp(tables_payload: dict[str, Any]) -> str:
     return sha256(stable_json({"tables": tables_payload}))
 
 
+def descriptions_hash_fp(tables_payload: dict[str, Any]) -> str:
+    """Fingerprint table and column description text across a schema graph."""
+    return sha256(stable_json({"tables": tables_payload}))
+
+
+def _tables_metadata_payload_for_cache(tables: Any) -> dict[str, Any]:
+    """Build sorted metadata dict for prompt-cache hashing."""
+    out: dict[str, Any] = {}
+    for tname in sorted(tables):
+        tbl = tables[tname]
+        cols_payload: dict[str, Any] = {}
+        for cname in sorted(tbl.columns):
+            col = tbl.columns[cname]
+            cols_payload[cname] = {
+                "description": col.description or "",
+                "description_owner": (col.description_owner.value if col.description_owner is not None else None),
+                "role": col.role,
+                "role_owner": (col.role_owner.value if col.role_owner is not None else None),
+                "sensitivity": col.sensitivity,
+            }
+        out[tname] = {
+            "description": tbl.description or "",
+            "description_owner": (tbl.description_owner.value if tbl.description_owner is not None else None),
+            "role": tbl.role,
+            "role_owner": tbl.role_owner.value if tbl.role_owner is not None else None,
+            "columns": cols_payload,
+        }
+    return out
+
+
+def metadata_hash_fp(tables_payload: dict[str, Any]) -> str:
+    """Fingerprint descriptions, roles, and sensitivities across a schema graph."""
+    return sha256(stable_json({"tables": tables_payload}))
+
+
 def _schema_scope_file_content_sha256(path: str | None) -> str:
     """Return a SHA-256 hex digest of the UTF-8 file at *path*, or ``""`` when the path is missing or not a readable file."""
     if path is None or not str(path).strip():
@@ -553,17 +1355,18 @@ def _schema_scope_file_content_sha256(path: str | None) -> str:
         return sha256(fh.read())
 
 
-def scope_hash_fp(schema_context: EngineContext) -> str:
-    """Fingerprint scope inputs: include mode, allow list, deny lists, and inlined DDL or notes file contents. ``EngineContext.name`` is intentionally excluded so master and named subset contexts share one graph id."""
+def scope_hash_fp(schema_context: EngineContext | FederationContext) -> str:
+    """Fingerprint scope inputs: include mode, allow list, deny lists, and inlined DDL or notes file contents. ``FederationContext`` has no ``sql_file`` slot, so that field reads as an empty string for federation scopes while the payload key stays present, leaving existing ``EngineContext`` hashes unchanged."""
     deny_cols = sorted(schema_context.deny_columns)
     allow_cols = sorted(schema_context.allow_columns)
+    sql_file = getattr(schema_context, "sql_file", "")
     payload = {
         "allow_objects": sorted(schema_context.allow_objects),
         "deny_objects": sorted(schema_context.deny_objects),
         "deny_columns": deny_cols,
         "allow_columns": allow_cols,
         "include": schema_context.include,
-        "sql_file_content_sha256": _schema_scope_file_content_sha256(schema_context.sql_file),
+        "sql_file_content_sha256": _schema_scope_file_content_sha256(sql_file),
         "notes_file_content_sha256": _schema_scope_file_content_sha256(schema_context.notes_file),
     }
     return sha256(stable_json(payload))
@@ -747,32 +1550,105 @@ def _escape_sql_single_quoted_literal(value: str) -> str:
     return value.replace("'", "''")
 
 
-def substitute_params(sql_param: str, params: dict[str, Any]) -> str:
+def _resolve_string_literal_formatter(
+    *,
+    engine: str | None = None,
+    dialect: Any | None = None,
+) -> Callable[[str], str] | None:
+    del engine
+    if dialect is not None:
+        quote = getattr(dialect, "quote_string_literal", None)
+        if callable(quote):
+            return quote
+    return None
+
+
+def _format_list_for_sql_inline(val: list[Any], *, format_literal: Callable[[str], str] | None = None) -> str:
+    formatted_items = []
+    for item in val:
+        if isinstance(item, str):
+            if format_literal is not None:
+                formatted_items.append(format_literal(item))
+            else:
+                formatted_items.append(f"'{_escape_sql_single_quoted_literal(item)}'")
+        else:
+            formatted_items.append(str(item))
+    return ", ".join(formatted_items)
+
+
+def inline_allowlisted_param_value(val: Any) -> str | None:
+    """Return a formatted SQL fragment only for explicit inline allowlist shapes."""
+    if isinstance(val, str):
+        if not val.strip():
+            raise ValueError("unbound_placeholder")
+        if PRE_QUOTED_IN_LIST_INLINE_RE.match(val):
+            return val
+        if STRUCTURAL_INLINE_SQL_LITERAL_LIST_RE.match(val):
+            return val
+    return None
+
+
+def substitute_params_for_execution(
+    sql_param: str,
+    params: dict[str, Any],
+    *,
+    engine: str | None = None,
+    dialect: Any | None = None,
+) -> str:
+    """Keep bind tokens for driver binding; inline only explicit allowlist shapes and IN-list expansions."""
+    format_literal = _resolve_string_literal_formatter(engine=engine, dialect=dialect)
+    _result = sql_param
+    for key in sorted(params.keys(), key=lambda k: -len(k)):
+        val = params[key]
+        if not key:
+            continue
+        formatted: str | None
+        if isinstance(val, list):
+            formatted = _format_list_for_sql_inline(val, format_literal=format_literal)
+        else:
+            formatted = inline_allowlisted_param_value(val)
+        if formatted is None:
+            continue
+        for prefix in (":", "$", "@"):
+            _result = _result.replace(f"{prefix}{key}", formatted)
+    required: set[str] = set()
+    for match in SQL_BIND_TOKEN_RE.finditer(_result):
+        required.add(match.group(1))
+    for match in re.finditer(r"%\((\w+)\)s", _result):
+        required.add(match.group(1))
+    missing = sorted(required - set(params.keys()))
+    if missing:
+        raise ValueError(f"unbound_placeholder: {', '.join(missing)}")
+    return _result
+
+
+def substitute_params(
+    sql_param: str,
+    params: dict[str, Any],
+    *,
+    engine: str | None = None,
+    dialect: Any | None = None,
+) -> str:
     """Replace ``:key``, ``@key``, and ``$key`` placeholders with formatted parameter values."""
+    format_literal = _resolve_string_literal_formatter(engine=engine, dialect=dialect)
     _result = sql_param
     for key in sorted(params.keys(), key=lambda k: -len(k)):
         val = params[key]
         if not key:
             continue
         if isinstance(val, list):
-            formatted_items = []
-            for item in val:
-                if isinstance(item, str):
-                    formatted_items.append(f"'{_escape_sql_single_quoted_literal(item)}'")
-                else:
-                    formatted_items.append(str(item))
-            formatted = ", ".join(formatted_items)
+            formatted = _format_list_for_sql_inline(val, format_literal=format_literal)
         elif isinstance(val, bool):
             formatted = "TRUE" if val else "FALSE"
         elif isinstance(val, str):
             if not val.strip():
                 raise ValueError("unbound_placeholder")
-            if val.startswith("'") and val.endswith("'") and "','" in val:
-                formatted = val
-            elif re.match(r"^-?\d+(?:\.\d+)?(?:,\s*-?\d+(?:\.\d+)?)*$", val):
-                formatted = val
-            else:
-                formatted = f"'{_escape_sql_single_quoted_literal(val)}'"
+            formatted = inline_allowlisted_param_value(val)
+            if formatted is None:
+                if format_literal is not None:
+                    formatted = format_literal(val)
+                else:
+                    formatted = f"'{_escape_sql_single_quoted_literal(val)}'"
         else:
             formatted = str(val)
         for prefix in (":", "$", "@"):
@@ -787,10 +1663,9 @@ def _format_scalar_for_structural_sql_inline(val: Any) -> str:
     if isinstance(val, bool):
         return "TRUE" if val else "FALSE"
     if isinstance(val, str):
-        if val.startswith("'") and val.endswith("'") and "','" in val:
-            return val
-        if STRUCTURAL_INLINE_SQL_LITERAL_LIST_RE.match(val):
-            return val
+        allowlisted = inline_allowlisted_param_value(val)
+        if allowlisted is not None:
+            return allowlisted
         return f"'{_escape_sql_single_quoted_literal(val)}'"
     return str(val)
 
@@ -939,16 +1814,34 @@ def ask_user_choice(prompt: str, options: list[str], silent_no: bool = False) ->
     return None
 
 
-class RephraseHint(Enum):
-    """User-facing rephrase hint categories printed when the pipeline cannot continue. Each value maps to a short, non-technical, suggestive message intended to help the user produce a better question without exposing internal validation output."""
+def _normalize_feature_word_key(text: str) -> str:
+    """Collapse a feature phrase to lowercase alphanumerics for delimiter-insensitive matching."""
+    return re.sub(r"[\s_\-]+", "", text.lower())
 
-    INTENT_PARSE_FAILED = "intent_parse_failed"
-    SCHEMA_INVALID_DECLINED = "schema_invalid_declined"
-    SQL_VALIDATION_FAILED = "sql_validation_failed"
-    USER_REJECTED_INTENT = "user_rejected_intent"
-    USER_REJECTED_RESULT = "user_rejected_result"
-    RESTRICTED_QUESTION = "restricted_question"
-    VAGUE_QUESTION = "vague_question"
+
+def resolve_feature_name_from_question(literal: str, question: str) -> str | None:
+    """Resolve an ``item_feature.feature_name`` filter literal against the user question. Words are matched after stripping spaces, underscores, and hyphens. When a matching span exists in the question, the returned token uses underscores between words (the canonical ``item_feature.feature_name`` storage form)."""
+    lit = str(literal or "").strip().strip("%").strip()
+    if not lit or not question:
+        return None
+    lit_key = _normalize_feature_word_key(lit)
+    if not lit_key:
+        return None
+    for match in re.finditer(r"[A-Za-z0-9]+(?:[\s_\-]+[A-Za-z0-9]+)*", question):
+        span = match.group(0)
+        if _normalize_feature_word_key(span) != lit_key:
+            continue
+        words = re.split(r"[\s_\-]+", span.strip())
+        words = [w for w in words if w]
+        if not words:
+            continue
+        return "_".join(w.lower() for w in words)
+    if _normalize_feature_word_key(question).find(lit_key) >= 0:
+        words = re.split(r"[\s_\-]+", lit.strip())
+        words = [w for w in words if w]
+        if words:
+            return "_".join(w.lower() for w in words)
+    return None
 
 
 def print_rephrase_hint(
@@ -1034,7 +1927,14 @@ def write_gzip_json_atomic(path: str, obj: Any, *, sort_keys: bool) -> None:
         try:
             with os.fdopen(fd, "wb") as tmp:
                 tmp.write(compressed)
-            os.replace(tmp_path, abs_path)
+            for attempt in range(5):
+                try:
+                    os.replace(tmp_path, abs_path)
+                    break
+                except PermissionError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.05 * (attempt + 1))
         except BaseException:
             try:
                 os.unlink(tmp_path)
@@ -1147,7 +2047,7 @@ def _manifest_path(artifacts_dir: str) -> str:
 
 
 @dataclass(frozen=True, slots=True)
-class _ArtifactManifest:
+class ArtifactManifest:
     """Typed view of ``artifact_manifest.json`` fields used by migration checks."""
 
     artifact_format_version: int = 0
@@ -1166,7 +2066,7 @@ class _ArtifactManifest:
     last_migration_at: str = ""
 
 
-def read_artifact_manifest(artifacts_dir: str) -> _ArtifactManifest | None:
+def read_artifact_manifest(artifacts_dir: str) -> ArtifactManifest | None:
     """Load artifact manifest JSON if present."""
     path = _manifest_path(artifacts_dir)
     with artifact_lock(artifacts_dir):
@@ -1183,7 +2083,7 @@ def read_artifact_manifest(artifacts_dir: str) -> _ArtifactManifest | None:
             ver = int(data.get("artifact_format_version", 0) or 0)
         except (TypeError, ValueError):
             ver = 0
-        return _ArtifactManifest(
+        return ArtifactManifest(
             artifact_format_version=ver,
             created_with_package_version=str(data.get("created_with_package_version", "") or ""),
             min_compatible_package_version=str(data.get("min_compatible_package_version", "") or ""),
@@ -1350,9 +2250,49 @@ def wipe_versioned_artifacts(artifacts_dir: str) -> None:
     """Remove on-disk template and simulation cache files under *artifacts_dir*."""
     wipe_filenames(artifacts_dir, LEGACY_ARTIFACT_FILENAMES)
     wipe_globs(artifacts_dir, LEGACY_ARTIFACT_GLOBS)
+    refresh_migration_simulation_caches(artifacts_dir)
+    _clear_write_queue_file(artifacts_dir)
+    _remove_aetherspace_snapshots(artifacts_dir)
     partitioned = os.path.join(artifacts_dir, TEMPLATE_STORE_SEGMENT)
     if os.path.isdir(partitioned):
         shutil.rmtree(partitioned, ignore_errors=True)
+
+
+def refresh_migration_simulation_caches(artifacts_dir: str) -> int:
+    """Remove QSim and seed-warmup simulation artifacts; return count of files removed."""
+    count = wipe_filenames(artifacts_dir, SIMULATION_CACHE_EXACT_FILENAMES)
+    count += wipe_globs(artifacts_dir, SIMULATION_CACHE_GLOB_PATTERNS)
+    return count
+
+
+def _clear_write_queue_file(artifacts_dir: str) -> bool:
+    path = os.path.join(artifacts_dir, WRITE_QUEUE_FILENAME)
+    if not os.path.isfile(path):
+        return False
+    try:
+        os.remove(path)
+    except OSError:
+        return False
+    return True
+
+
+def _remove_aetherspace_snapshots(artifacts_dir: str) -> bool:
+    root = os.path.join(artifacts_dir, AETHERSPACES_SEGMENT)
+    if not os.path.isdir(root):
+        return False
+    shutil.rmtree(root, ignore_errors=True)
+    return True
+
+
+def refresh_migration_auxiliary_artifacts(artifacts_dir: str, *, tier: MigrationTier) -> None:
+    """Refresh or wipe auxiliary learning artifacts for the given migration tier."""
+    if tier == MigrationTier.DESTRUCTIVE:
+        refresh_migration_simulation_caches(artifacts_dir)
+        _clear_write_queue_file(artifacts_dir)
+        _remove_aetherspace_snapshots(artifacts_dir)
+        return
+    refresh_migration_simulation_caches(artifacts_dir)
+    _clear_write_queue_file(artifacts_dir)
 
 
 def detect_legacy_artifacts(artifacts_dir: str) -> list[str]:
@@ -1521,8 +2461,6 @@ def _enumerate_tmap_candidates(old: SchemaGraph, new: SchemaGraph) -> Iterator[d
         n_names = sorted(nb[sig])
         if len(o_names) != len(n_names):
             return
-        if len(o_names) > 6:
-            return
         bucket_iters.append([dict(zip(o_names, perm, strict=True)) for perm in permutations(n_names)])
     for parts in product(*bucket_iters):
         merged: dict[str, str] = {}
@@ -1550,6 +2488,48 @@ def try_rename_migration_plan(
     new: SchemaGraph,
 ) -> tuple[tuple[tuple[str, str], ...], tuple[tuple[str, str, str], ...]] | None:
     """Return ``(renamed_tables, renamed_columns)`` when *old* maps to *new* by renames only."""
+    assessment = assess_rename_migration_plan(old, new)
+    if assessment is None:
+        return None
+    return assessment.plan
+
+
+@dataclass(frozen=True, slots=True)
+class RenameMigrationAssessment:
+    """Inferred rename migration with a confidence score in ``[0, 1]``."""
+
+    plan: tuple[tuple[tuple[str, str], ...], tuple[tuple[str, str, str], ...]]
+    confidence: float
+
+
+def _rename_plan_confidence(
+    old: SchemaGraph,
+    new: SchemaGraph,
+    tmap: dict[str, str],
+    colmap: dict[str, dict[str, str]],
+) -> float:
+    scores: list[float] = []
+    for otn, ntn in tmap.items():
+        if otn != ntn:
+            scores.append(1.0)
+        inner = colmap.get(otn, {})
+        for oc, nc in inner.items():
+            if oc == nc:
+                continue
+            ocol = old.tables[otn].columns[oc]
+            ncol = new.tables[ntn].columns[nc]
+            scores.append(_prof_jaccard_sets(_col_value_overlap_frozen(ocol), _col_value_overlap_frozen(ncol)))
+    if not scores:
+        return 1.0
+    return min(scores)
+
+
+def _collect_rename_migration_assessments(
+    old: SchemaGraph,
+    new: SchemaGraph,
+) -> list[RenameMigrationAssessment]:
+    out: list[RenameMigrationAssessment] = []
+    seen: set[tuple[tuple[tuple[str, str], ...], tuple[tuple[str, str, str], ...]]] = set()
     for tmap in _enumerate_tmap_candidates(old, new):
         colmap: dict[str, dict[str, str]] = {}
         col_renames: list[tuple[str, str, str]] = []
@@ -1572,11 +2552,33 @@ def try_rename_migration_plan(
         ctuples = tuple(sorted(col_renames))
         if not rtuples and not ctuples:
             continue
-        return (rtuples, ctuples)
-    return None
+        key = (rtuples, ctuples)
+        if key in seen:
+            continue
+        seen.add(key)
+        confidence = _rename_plan_confidence(old, new, tmap, colmap)
+        out.append(RenameMigrationAssessment(plan=key, confidence=confidence))
+    return out
 
 
-def _manifest_matches_schema(manifest: _ArtifactManifest, schema: SchemaGraph) -> bool:
+def assess_rename_migration_plan(old: SchemaGraph, new: SchemaGraph) -> RenameMigrationAssessment | None:
+    """Return a unique rename plan with confidence, or ``None`` when ambiguous or unmatched."""
+    assessments = _collect_rename_migration_assessments(old, new)
+    if len(assessments) != 1:
+        return None
+    assessment = assessments[0]
+    if assessment.confidence < MIGRATION_DATA_OVERLAP_MIN:
+        return None
+    return assessment
+
+
+def rename_migration_plan_confidence(old: SchemaGraph, new: SchemaGraph) -> float | None:
+    """Return the confidence of the inferred rename plan, or ``None`` when ambiguous."""
+    assessment = assess_rename_migration_plan(old, new)
+    return assessment.confidence if assessment is not None else None
+
+
+def manifest_matches_schema(manifest: ArtifactManifest, schema: SchemaGraph) -> bool:
     if manifest.schema_graph_id and schema.schema_graph_id:
         if manifest.schema_graph_id != schema.schema_graph_id:
             return False
@@ -1590,17 +2592,7 @@ def _manifest_matches_schema(manifest: _ArtifactManifest, schema: SchemaGraph) -
     )
 
 
-def _schema_diff_implies_remap(schema_diff: Any) -> bool:
-    """True when a non-empty structural diff carries rename signals (tables or columns)."""
-    if schema_diff is None:
-        return False
-    if getattr(schema_diff, "is_empty", True):
-        return False
-    impl = getattr(schema_diff, "implies_rename_remapping", None)
-    return bool(impl()) if callable(impl) else False
-
-
-def artifact_manifest_incompatible_with_package(manifest: _ArtifactManifest | None) -> bool:
+def artifact_manifest_incompatible_with_package(manifest: ArtifactManifest | None) -> bool:
     """Return True when the manifest requires a newer package or unknown artifact format."""
     if manifest is None:
         return False
@@ -1614,78 +2606,6 @@ def artifact_manifest_incompatible_with_package(manifest: _ArtifactManifest | No
         return Version(_artifact_package_version_string()) < Version(min_cv)
     except (InvalidVersion, TypeError, ValueError):
         return True
-
-
-def classify_migration_tier(
-    manifest: _ArtifactManifest | None,
-    schema: SchemaGraph,
-    *,
-    previous_schema: SchemaGraph | None = None,
-    schema_diff: Any | None = None,
-) -> MigrationTier:
-    """Compare stored manifest fingerprints to the live schema graph."""
-    if manifest is None:
-        return MigrationTier.NO_CHANGE
-    man_id = str(manifest.schema_graph_id or "")
-    live_id = str(schema.schema_graph_id or "")
-    if man_id and live_id and man_id == live_id and _manifest_matches_schema(manifest, schema):
-        return MigrationTier.NO_CHANGE
-    if not manifest.effective_structural_hash and not man_id:
-        return MigrationTier.NO_CHANGE
-    if _manifest_matches_schema(manifest, schema):
-        return MigrationTier.NO_CHANGE
-    if artifact_manifest_incompatible_with_package(manifest):
-        return MigrationTier.DESTRUCTIVE
-    same_effective = manifest.effective_structural_hash == schema.effective_structural_hash
-    if same_effective:
-        if (manifest.notes_hash or "") != (schema.notes_hash or ""):
-            return MigrationTier.SOFT_REFRESH
-        if (manifest.semantic_edges_hash or "") != (schema.semantic_edges_hash or ""):
-            return MigrationTier.SOFT_REFRESH
-        if manifest.profiling_hash != schema.profiling_hash:
-            if previous_schema is None:
-                return MigrationTier.DESTRUCTIVE
-            if _profiling_value_overlap(previous_schema, schema) >= MIGRATION_DATA_OVERLAP_MIN:
-                return MigrationTier.SOFT_REFRESH
-            return MigrationTier.DESTRUCTIVE
-        return MigrationTier.SOFT_REFRESH
-    if (
-        previous_schema is not None
-        and manifest.scope_hash == schema.scope_hash
-        and (try_rename_migration_plan(previous_schema, schema) is not None or _schema_diff_implies_remap(schema_diff))
-    ):
-        return MigrationTier.REMAP
-    return MigrationTier.DESTRUCTIVE
-
-
-@dataclass
-class StepResult:
-    """Mutable capture of pipeline outputs, metrics, and logs for one scenario run."""
-
-    scenario_id: str
-    question: str
-    status: str = "unknown"
-    intent: RuntimeIntent | None = None
-    sql: str | None = None
-    rows: list[tuple[Any, ...]] | None = None
-    confidence: float | None = None
-    reuse_type: str | None = None
-    template_id: str | None = None
-    validation_failed: bool = False
-    feedback: str | None = None
-    error: str | None = None
-    duration_seconds: float = 0.0
-    captured_logs: list[str] = field(default_factory=list)
-    semantic_warnings: list[str] = field(default_factory=list)
-    soft_warnings: list[str] = field(default_factory=list)
-    llm_calls: int = 0
-    reject_reason_actual: str | None = None
-    classified_category: str | None = None
-    classified_reason: str | None = None
-    generation_path: str | None = None
-    pending_feedback: Any | None = None
-    diagnostics: tuple[Any, ...] = ()
-    kind: str | None = None
 
 
 def format_failure_trace(step: StepResult | list[StepResult] | object) -> str:
@@ -1887,7 +2807,6 @@ def pipeline_capture(
         "_schema_graph",
         "_schema_catalog",
         "_qsim",
-        "_qsim_ops",
         "_main_execution",
         "_seed_warmup",
         "_llm_provider",
@@ -1924,14 +2843,10 @@ def pipeline_capture(
 
     if csv_dir:
         _original_save = pipeline_mod.save_result_csv
+        _csv_results_path = os.path.join(csv_dir, "results.csv")
 
-        def _redirected_save(df: Any) -> None:
-            orig_cwd = os.getcwd()
-            try:
-                os.chdir(csv_dir)
-                _original_save(df)
-            finally:
-                os.chdir(orig_cwd)
+        def _redirected_save(df: Any, *, output_path: str | os.PathLike[str] | None = None) -> None:
+            _original_save(df, output_path=output_path or _csv_results_path)
 
         extra_patches.append(patch.object(pipeline_mod, "save_result_csv", _redirected_save))
         live_testing_mod = _import_mod("_live_testing")
@@ -1970,6 +2885,7 @@ def apply_structural_migration_to_persisted_scopes(
     dropped_columns: tuple[str, ...] = (),
     table_renames: tuple[tuple[str, str], ...] = (),
     column_renames: tuple[tuple[str, str, str], ...] = (),
+    column_retypes: tuple[tuple[str, str, str], ...] = (),
 ) -> None:
     """Apply table/column migration to persisted aetherspace and named context specs."""
     if _structural_migration_handler is None:
@@ -1980,6 +2896,7 @@ def apply_structural_migration_to_persisted_scopes(
         dropped_columns=dropped_columns,
         table_renames=table_renames,
         column_renames=column_renames,
+        column_retypes=column_retypes,
     )
 
 
@@ -2083,7 +3000,6 @@ def load_runtime_config(
         "azure_api_key": "",
         "azure_api_version": "",
         "deployment_light": "",
-        "deployment_medium": "",
         "deployment_heavy": "",
         "max_query_cost_rows": 50_000_000,
         "max_query_cost_bytes": 50_000_000_000,
@@ -2097,7 +3013,6 @@ def load_runtime_config(
         "azure_api_key": "AZURE_OPENAI_API_KEY",
         "azure_api_version": "AZURE_OPENAI_API_VERSION",
         "deployment_light": AZURE_OPENAI_ENV_DEPLOYMENT_LIGHT,
-        "deployment_medium": AZURE_OPENAI_ENV_DEPLOYMENT_MEDIUM,
         "deployment_heavy": AZURE_OPENAI_ENV_DEPLOYMENT_HEAVY,
         "max_query_cost_rows": "AETHERDIALECT_MAX_QUERY_COST_ROWS",
         "max_query_cost_bytes": "AETHERDIALECT_MAX_QUERY_COST_BYTES",
@@ -2151,7 +3066,6 @@ def load_runtime_config(
         azure_api_key=str(merged.get("azure_api_key") or ""),
         azure_api_version=str(merged.get("azure_api_version") or ""),
         deployment_light=str(merged.get("deployment_light") or ""),
-        deployment_medium=str(merged.get("deployment_medium") or ""),
         deployment_heavy=str(merged.get("deployment_heavy") or ""),
         max_query_cost_rows=int(merged["max_query_cost_rows"]),
         max_query_cost_bytes=int(merged["max_query_cost_bytes"]),
@@ -2161,3 +3075,39 @@ def load_runtime_config(
         explain_timeout_ms=merged.get("explain_timeout_ms"),
     )
     return cfg
+
+
+def join_signature_tables(sig: list[str]) -> set[str]:
+    """Extract physical table names referenced in a join path signature."""
+    tables: set[str] = set()
+    for item in sig:
+        if "->" not in item:
+            continue
+        left, right = item.split("->", 1)
+        tables.add(left.split(".")[0].strip())
+        tables.add(right.split(".")[0].strip())
+    return tables
+
+
+def join_resolved_scope_tables(signature: list[str], scope_tables: list[str]) -> list[str]:
+    """Return intent scope tables union every table touched by a join path signature."""
+    covered = join_signature_tables([str(x) for x in signature])
+    return sorted(set(scope_tables) | covered)
+
+
+def intent_join_reachability_tables(intent: RuntimeIntent) -> list[str]:
+    if intent.resolved_join_tables:
+        return list(intent.resolved_join_tables)
+    sig = list(intent.chosen_join_path_signature or [])
+    if sig and intent.tables:
+        return join_resolved_scope_tables(sig, list(intent.tables))
+    return list(intent.tables or [])
+
+
+def cte_join_reachability_tables(cte: RuntimeCteStep) -> list[str]:
+    if cte.resolved_join_tables:
+        return list(cte.resolved_join_tables)
+    sig = list(cte.chosen_join_path_signature or [])
+    if sig and cte.tables:
+        return join_resolved_scope_tables(sig, list(cte.tables))
+    return list(cte.tables or [])

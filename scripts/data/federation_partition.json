@@ -1,0 +1,50 @@
+{
+  "catalog": [
+    "actor",
+    "author",
+    "book",
+    "category",
+    "city",
+    "country",
+    "film",
+    "film_actor",
+    "game",
+    "game_supported_language",
+    "inventory",
+    "item",
+    "item_category",
+    "item_feature",
+    "language",
+    "payment",
+    "publisher"
+  ],
+  "crm": [
+    "customer",
+    "promotion",
+    "promotion_redemption",
+    "staff"
+  ],
+  "logistics": [
+    "courier",
+    "damage_report",
+    "delivery",
+    "inventory_status_history",
+    "purchase_line",
+    "purchase_order",
+    "receipts",
+    "stock_transfer",
+    "supplier",
+    "warehouse"
+  ],
+  "storefront": [
+    "address",
+    "city",
+    "country",
+    "customer",
+    "payment",
+    "rental",
+    "reservation",
+    "staff",
+    "store"
+  ]
+}

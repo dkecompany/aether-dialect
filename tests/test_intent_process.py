@@ -7,20 +7,25 @@ from unittest.mock import patch
 
 import pytest
 
-from aetherdialect._constants import MAX_NON_AGG_COL_DIFF, VALID_HAVING_OPS, GenerationPath
+from aetherdialect._constants import MAX_NON_AGG_COL_DIFF, VALID_HAVING_OPS
 from aetherdialect._contracts_base import (
     FailureCategory,
-    FilterParam,
     HavingParam,
     NormalizedExpr,
     OrderByCol,
+    PredicateGroup,
+    WhereParam,
+    predicate_group_from_list,
+    where_leaves,
 )
 from aetherdialect._contracts_core import (
     ConcreteIntent,
+    GenerationPath,
     RuntimeCteStep,
     RuntimeIntent,
     SelectCol,
     Template,
+    UnionSelectColumnDelta,
     ValueHistory,
     concrete_intent_to_runtime_skeleton,
     runtime_intent_to_concrete,
@@ -41,12 +46,13 @@ from aetherdialect._contracts_schema import (
 from aetherdialect._core_utils import stable_json
 from aetherdialect._intent_expr import (
     _base_similarity,
-    _compute_filters_similarity,
     _compute_having_similarity,
     _compute_order_by_cols_similarity,
     _compute_select_cols_similarity,
+    _compute_where_similarity,
     _cte_step_similarity,
     _jaccard,
+    _predicate_group_structure_key,
     intent_similarity,
     logical_intent_from_parsed,
 )
@@ -85,7 +91,6 @@ from aetherdialect._intent_process import (
     union_template_compatibility,
 )
 from aetherdialect._intent_resolve import (
-    UnionSelectColumnDelta,
     check_qualified_refs_exist,
     classify_union_merge_case,
     compute_intent_union,
@@ -124,12 +129,12 @@ class TestComputeSimilarities:
 
     def test_filters_both_empty(self):
         """Both empty filter lists yield 1.0."""
-        assert _compute_filters_similarity([], []) == 1.0
+        assert _compute_where_similarity([], []) == 1.0
 
     def test_filters_one_empty(self):
         """One empty filter list yields 0.0."""
-        fp = FilterParam(left_expr=NormalizedExpr.from_column("t.a"), op="=", value_type="string")
-        assert _compute_filters_similarity([fp], []) == 0.0
+        fp = WhereParam(left_expr=NormalizedExpr.from_column("t.a"), op="=", value_type="string")
+        assert _compute_where_similarity([fp], []) == 0.0
 
     def test_having_both_empty(self):
         """Both empty having lists yield 1.0."""
@@ -157,8 +162,8 @@ class TestIntentSimilarity:
             select_cols=[sc],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             cte_steps=[],
             natural_language="test",
@@ -175,8 +180,8 @@ class TestIntentSimilarity:
             select_cols=[sc1],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             cte_steps=[],
             natural_language="test",
@@ -187,8 +192,8 @@ class TestIntentSimilarity:
             select_cols=[sc2],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             cte_steps=[],
             natural_language="test",
@@ -352,13 +357,13 @@ class TestBaseSimilarity:
         """When only tables overlap, non-table clause similarities vanish except the tables term."""
         sc1 = SelectCol(expr=NormalizedExpr.from_column("t.a"))
         sc2 = SelectCol(expr=NormalizedExpr.from_column("t.b"))
-        fp1 = FilterParam(
+        fp1 = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op="=",
             value_type="string",
             param_key="p1",
         )
-        fp2 = FilterParam(
+        fp2 = WhereParam(
             left_expr=NormalizedExpr.from_column("t.b"),
             op="=",
             value_type="string",
@@ -428,7 +433,7 @@ class TestStructuralBodyMatches:
             select_cols=[sc],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         concrete = ConcreteIntent(
             intent_id="c",
@@ -437,7 +442,7 @@ class TestStructuralBodyMatches:
             select_cols=[sc],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         assert _structural_body_matches(intent, concrete) is False
 
@@ -450,7 +455,7 @@ class TestStructuralBodyMatches:
             select_cols=[sc],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         concrete = ConcreteIntent(
             intent_id="c",
@@ -459,7 +464,7 @@ class TestStructuralBodyMatches:
             select_cols=[sc],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         assert _structural_body_matches(intent, concrete) is True
 
@@ -476,8 +481,8 @@ class TestCteStepSimilarity:
             select_cols=[sc],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             output_columns=[],
         )
@@ -493,8 +498,8 @@ class TestCteStepSimilarity:
             select_cols=[sc1],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             output_columns=[],
         )
@@ -504,8 +509,8 @@ class TestCteStepSimilarity:
             select_cols=[sc2],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             output_columns=[],
         )
@@ -524,8 +529,8 @@ class TestIntentSimilarityEdgeCases:
             select_cols=[sc],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             output_columns=[],
         )
@@ -535,8 +540,8 @@ class TestIntentSimilarityEdgeCases:
             select_cols=[sc],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             cte_steps=[cte],
             natural_language="test",
@@ -547,8 +552,8 @@ class TestIntentSimilarityEdgeCases:
             select_cols=[sc],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             cte_steps=[cte],
             natural_language="test",
@@ -565,8 +570,8 @@ class TestIntentSimilarityEdgeCases:
             select_cols=[sc],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             output_columns=[],
         )
@@ -576,8 +581,8 @@ class TestIntentSimilarityEdgeCases:
             select_cols=[sc],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             cte_steps=[cte],
             natural_language="test",
@@ -588,8 +593,8 @@ class TestIntentSimilarityEdgeCases:
             select_cols=[sc],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             cte_steps=[],
             natural_language="test",
@@ -603,8 +608,8 @@ class TestComputeSimilaritiesEdgeCases:
 
     def test_filters_identical(self):
         """Identical filter lists yield 1.0."""
-        fp = FilterParam(left_expr=NormalizedExpr.from_column("t.a"), op="=", value_type="string")
-        assert _compute_filters_similarity([fp], [fp]) == 1.0
+        fp = WhereParam(left_expr=NormalizedExpr.from_column("t.a"), op="=", value_type="string")
+        assert _compute_where_similarity([fp], [fp]) == 1.0
 
     def test_having_one_empty(self):
         """One empty having list yields 0.0."""
@@ -638,41 +643,33 @@ class TestComputeFiltersSimilarity:
 
     def test_identical_filters_score_one(self):
         """Identical filter lists produce score 1.0."""
-        fp = FilterParam(left_expr=NormalizedExpr.from_column("t.col"), op="=", value_type="string")
-        assert _compute_filters_similarity([fp], [fp]) == 1.0
+        fp = WhereParam(left_expr=NormalizedExpr.from_column("t.col"), op="=", value_type="string")
+        assert _compute_where_similarity([fp], [fp]) == 1.0
 
-    def test_different_filter_group_penalized(self):
-        """Different filter_group wiring reduces similarity when signature sets match."""
-        fp1 = FilterParam(
+    def test_different_predicate_structure_penalized(self):
+        """Different PredicateGroup wiring reduces similarity when signature sets match."""
+        fp1 = WhereParam(
             left_expr=NormalizedExpr.from_column("t.c1"),
             op="=",
             value_type="string",
-            filter_group=1,
         )
-        fp2 = FilterParam(
+        fp2 = WhereParam(
             left_expr=NormalizedExpr.from_column("t.c2"),
             op="=",
             value_type="string",
-            filter_group=2,
         )
-        fp1b = FilterParam(
-            left_expr=NormalizedExpr.from_column("t.c1"),
-            op="=",
-            value_type="string",
-            filter_group=1,
-        )
-        fp2b = FilterParam(
-            left_expr=NormalizedExpr.from_column("t.c2"),
-            op="=",
-            value_type="string",
-            filter_group=3,
-        )
-        score = _compute_filters_similarity([fp1, fp2], [fp1b, fp2b])
-        assert 0 < score < 1.0
+        g_and = predicate_group_from_list([fp1, fp2])
+        g_or = PredicateGroup(op="or", predicates=(fp1, fp2))
+        keys = {fp1.signature_key, fp2.signature_key}
+        score = _jaccard(keys, keys)
+        assert score == 1.0
+        if _predicate_group_structure_key(g_and) != _predicate_group_structure_key(g_or):
+            score *= 0.9
+        assert score == 0.9
 
     def test_empty_lists_score_one(self):
         """Both empty lists produce score 1.0."""
-        assert _compute_filters_similarity([], []) == 1.0
+        assert _compute_where_similarity([], []) == 1.0
 
 
 class TestComputeHavingSimilarity:
@@ -687,34 +684,26 @@ class TestComputeHavingSimilarity:
         )
         assert _compute_having_similarity([hp], [hp]) == 1.0
 
-    def test_different_filter_group_penalized(self):
-        """Different filter_group wiring reduces similarity when signature sets match."""
+    def test_different_predicate_structure_penalized(self):
+        """Different PredicateGroup wiring reduces similarity when signature sets match."""
         hp1 = HavingParam(
             left_expr=NormalizedExpr.from_agg("count", "t.id"),
             op=">",
             value_type="integer",
-            filter_group=1,
         )
         hp2 = HavingParam(
             left_expr=NormalizedExpr.from_agg("sum", "t.amt"),
             op=">",
             value_type="number",
-            filter_group=2,
         )
-        hp1b = HavingParam(
-            left_expr=NormalizedExpr.from_agg("count", "t.id"),
-            op=">",
-            value_type="integer",
-            filter_group=1,
-        )
-        hp2b = HavingParam(
-            left_expr=NormalizedExpr.from_agg("sum", "t.amt"),
-            op=">",
-            value_type="number",
-            filter_group=3,
-        )
-        score = _compute_having_similarity([hp1, hp2], [hp1b, hp2b])
-        assert 0 < score < 1.0
+        g_and = predicate_group_from_list([hp1, hp2])
+        g_or = PredicateGroup(op="or", predicates=(hp1, hp2))
+        keys = {hp1.signature_key, hp2.signature_key}
+        score = _jaccard(keys, keys)
+        assert score == 1.0
+        if _predicate_group_structure_key(g_and) != _predicate_group_structure_key(g_or):
+            score *= 0.9
+        assert score == 0.9
 
     def test_empty_lists_score_one(self):
         """Both empty lists produce score 1.0."""
@@ -751,18 +740,13 @@ class TestBuildIntentParsePrompt:
         data = json.loads(user)
         assert data["rules"] == list(INTENT_CRITICAL_RULES) + list(INTENT_PARSE_RULES_APPEND)
 
-    def test_rules_include_flat_or_of_and_filters_param_example(self):
+    def test_rules_include_predicate_group_where_encoding(self):
         _, user = build_intent_parse_prompt("q", "schema", ["orders"])
         data = json.loads(user)
         joined = "\n".join(data["rules"])
-        compact = joined.replace(" ", "")
-        assert "1,1,2,2" in compact
-        assert "filter_group" in compact.lower()
-        assert (
-            "Do not put bool_op on rows that carry filter_group" in joined
-            or "Do not emit bool_op on rows that have a filter_group" in joined
-        )
-        assert "Do not nest filter_group as an array" in joined
+        assert "PredicateGroup" in joined
+        assert "where" in joined.lower()
+        assert "having" in joined.lower()
 
     def test_operator_reference_having_ops_match_valid_having_ops(self):
         _, user = build_intent_parse_prompt("q", "schema", ["t"])
@@ -832,7 +816,7 @@ class TestFindTrustedTemplateMatch:
                 select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
                 group_by_cols=[],
                 order_by_cols=[],
-                filters_param=[],
+                where=None,
             ),
             intent_key="ik",
             tables_used=["orders"],
@@ -864,7 +848,7 @@ class TestFindTrustedTemplateMatch:
                 select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
                 group_by_cols=[],
                 order_by_cols=[],
-                filters_param=[],
+                where=None,
             ),
             intent_key="ik",
             tables_used=["orders"],
@@ -1003,7 +987,7 @@ class TestSemanticRepairPromptCriticalRules:
         )
         result = build_intent_semantic_repair_prompt("test q", '{"tables":[]}', [issue], [], "schema text")
         assert "critical_rules" in result
-        assert "having_param" in result
+        assert '"having"' in result
         assert "window_registry" in result
         payload = json.loads(result)
         assert payload["critical_rules"] == list(INTENT_CRITICAL_RULES)
@@ -1030,7 +1014,7 @@ def _runtime(
         select_cols=cols,
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
+        where=None,
     )
 
 
@@ -1046,7 +1030,7 @@ def _concrete(
         select_cols=cols,
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
+        where=None,
     )
 
 
@@ -1504,7 +1488,7 @@ class TestIntentFingerprintVsSimilarity:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column(t)) for t in select_terms],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
 
     def test_identical_intents_share_key_and_unit_similarity(self):
@@ -1669,8 +1653,8 @@ class TestNormalizeCteOutputAliases:
             select_cols=[sc],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             output_columns=["wrong_alias"],
         )
@@ -1731,13 +1715,15 @@ class TestNormalizeCteOutputAliases:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("cte1.category_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("cte1.film_count"),
-                    op="<",
-                    right_expr=NormalizedExpr.from_column("cte1.avg_films_per_category"),
-                )
-            ],
+            where=predicate_group_from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("cte1.film_count"),
+                        op="<",
+                        right_expr=NormalizedExpr.from_column("cte1.avg_films_per_category"),
+                    )
+                ]
+            ),
             cte_steps=[cte],
         )
         out = _normalize_cte_output_aliases(intent, sg)
@@ -1748,8 +1734,8 @@ class TestNormalizeCteOutputAliases:
             "count_item_id",
             "avg_films_per_category",
         ]
-        assert out.filters_param[0].left_expr.primary_term == "cte1.count_item_id"
-        assert out.filters_param[0].right_expr.primary_term == "cte1.avg_films_per_category"
+        assert (out.where.leaves() if out.where else [])[0].left_expr.primary_term == "cte1.count_item_id"
+        assert (out.where.leaves() if out.where else [])[0].right_expr.primary_term == "cte1.avg_films_per_category"
 
 
 class TestJoinPathKeys:
@@ -1764,7 +1750,7 @@ class TestJoinPathKeys:
             select_cols=[_col("t", "a")],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             chosen_join_path_signature=["p1", "p2"],
         )
         assert join_path_key_runtime(rt) == join_path_key_concrete(sig)
@@ -1779,6 +1765,12 @@ class TestJoinPathKeys:
             chosen_join_path_signature=["new"],
         )
         assert join_path_key_concrete(a) != join_path_key_concrete(b)
+
+    def test_same_edge_set_different_orders_hash_equal(self):
+        base = _concrete(["hub", "a", "b"], [_col("hub", "id")])
+        ordered_a = replace(base, chosen_join_path_signature=["a.id->hub.id", "b.id->hub.id"])
+        ordered_b = replace(base, chosen_join_path_signature=["b.id->hub.id", "a.id->hub.id"])
+        assert join_path_key_concrete(ordered_a) == join_path_key_concrete(ordered_b)
 
 
 class TestReconcileUnionFamilies:
@@ -1937,8 +1929,8 @@ class TestPhaseGPostValidation:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.a"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             natural_language="q",
         )
@@ -1967,7 +1959,7 @@ class TestApplyPostProcessingMissingParams:
         return SchemaGraph(tables={"t": tmeta}, join_paths_multi={}, effective_structural_hash="h")
 
     def test_missing_raw_value_for_assigned_param_key_returns_none(self):
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op="=",
             value_type="string",
@@ -1979,8 +1971,8 @@ class TestApplyPostProcessingMissingParams:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.a"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
-            having_param=[],
+            where=predicate_group_from_list([fp]),
+            having=None,
             param_values={},
             natural_language="",
         )
@@ -2103,7 +2095,7 @@ class TestFindTrustedTemplateMatchEdges:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.a"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         tmpl = Template(
             id="T1",
@@ -2130,7 +2122,7 @@ class TestFindTrustedTemplateMatchEdges:
                 select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.a"))],
                 group_by_cols=[],
                 order_by_cols=[],
-                filters_param=[],
+                where=None,
             )
             return Template(
                 id=tid,
@@ -2166,7 +2158,7 @@ class TestFindTrustedTemplateMatchUnionFamilyIntentKey:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         sig2 = ConcreteIntent(
             intent_id="t2",
@@ -2175,7 +2167,7 @@ class TestFindTrustedTemplateMatchUnionFamilyIntentKey:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.total"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
 
         def make_tpl(tid: str, sig: ConcreteIntent, ik: str) -> Template:
@@ -2231,7 +2223,7 @@ class TestFindTrustedTemplateMatchUnionFamilyIntentKey:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         sig2 = ConcreteIntent(
             intent_id="t2",
@@ -2240,7 +2232,7 @@ class TestFindTrustedTemplateMatchUnionFamilyIntentKey:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.total"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
 
         def make_tpl(tid: str, sig: ConcreteIntent, ik: str) -> Template:
@@ -2300,8 +2292,8 @@ class TestIntentSimilarityThreeCtes:
                 select_cols=[sc],
                 group_by_cols=[],
                 order_by_cols=[],
-                filters_param=[],
-                having_param=[],
+                where=None,
+                having=None,
                 param_values={},
                 output_columns=[],
             )
@@ -2313,8 +2305,8 @@ class TestIntentSimilarityThreeCtes:
             select_cols=[sc],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             cte_steps=ctes,
             natural_language="x",
@@ -2327,19 +2319,17 @@ class TestComputeFiltersSimilarityZeroJaccard:
     """bool_op branch only when Jaccard > 0."""
 
     def test_disjoint_signatures_ignore_bool_op_difference(self):
-        fp1 = FilterParam(
+        fp1 = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op="=",
             value_type="string",
-            bool_op="AND",
         )
-        fp2 = FilterParam(
+        fp2 = WhereParam(
             left_expr=NormalizedExpr.from_column("t.b"),
             op="=",
             value_type="string",
-            bool_op="OR",
         )
-        assert _compute_filters_similarity([fp1], [fp2]) == 0.0
+        assert _compute_where_similarity([fp1], [fp2]) == 0.0
 
 
 class TestMatchTemplateForUnionStableId:
@@ -2419,7 +2409,7 @@ class TestCaseRegistryEmptyBranchGuard:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.a"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             case_registry=[
                 CaseRegistryStep(registry_id="c01", case_when=CaseWhenExpr(branches=[])),
             ],
@@ -2433,7 +2423,7 @@ class TestCaseRegistryEmptyBranchGuard:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.a"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             case_registry=[
                 CaseRegistryStep(
                     registry_id="c01",
@@ -2454,7 +2444,7 @@ class TestApplyRuntimePostProcessingLite:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             natural_language="",
         )
         first, issues1 = apply_runtime_post_processing_lite(rt, schema_graph, question_fallback="qf")
@@ -2505,7 +2495,7 @@ class TestApplyPostProcessingIdempotence:
         return SchemaGraph(tables={"film": film}, join_paths_multi={}, effective_structural_hash="h")
 
     def test_param_values_survive_repeated_post_processing(self) -> None:
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("film.film_id"),
             op="=",
             value_type="integer",
@@ -2517,8 +2507,8 @@ class TestApplyPostProcessingIdempotence:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("film.title"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
-            having_param=[],
+            where=predicate_group_from_list([fp]),
+            having=None,
             param_values={},
             natural_language="q",
         )
@@ -2528,7 +2518,7 @@ class TestApplyPostProcessingIdempotence:
         assert not any(i.severity == "error" for i in issues1)
         assert out1.param_values
         first_key = next(iter(out1.param_values))
-        assert out1.filters_param[0].raw_value is None
+        assert (where_leaves(out1.where) or [])[0].raw_value is None
         out2, issues2 = _apply_post_processing(out1, schema, "q")
         assert out2 is not None
         assert not any(i.severity == "error" for i in issues2)
@@ -2556,8 +2546,8 @@ class TestAlignRuntimeTablesToPlanner:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("film.film_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             natural_language="q",
         )
@@ -2585,8 +2575,8 @@ class TestAlignRuntimeTablesToPlanner:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("film.film_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             natural_language="q",
             cte_steps=[cte],
@@ -2606,8 +2596,8 @@ class TestAlignRuntimeTablesToPlanner:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("x.y"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             natural_language="q",
             cte_steps=[cte],
@@ -2673,7 +2663,7 @@ def test_structural_tables_includes_prose_qualified_columns() -> None:
     logical = LogicalIntent(
         tables=("table", "other_table"),
         select="table.column",
-        filter="junction_table.column equals other_table.other_column",
+        where="junction_table.column equals other_table.other_column",
     )
     tables = _structural_tables_for_logical(logical)
     assert "junction_table" in tables

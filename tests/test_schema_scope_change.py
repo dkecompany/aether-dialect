@@ -12,7 +12,7 @@ import pytest
 
 import aetherdialect._schema_overrides
 from aetherdialect._config import EngineConfig
-from aetherdialect._contracts_base import EngineContext
+from aetherdialect._contracts_base import ConfigError, EngineContext, FederationContext
 from aetherdialect._contracts_schema import SchemaGraph
 from aetherdialect._core_utils import read_gzip_json
 from aetherdialect._dialect import Dialect
@@ -46,6 +46,7 @@ class _ProbeStubDialect(Dialect):
         *,
         include: Any = "tables",
         allow_objects: Any = None,
+        deny_objects: Any = None,
         sql_file: Any = None,
     ) -> SchemaGraph:
         self.reflect_calls += 1
@@ -117,10 +118,14 @@ def test_classify_orthogonal_when_different_denies() -> None:
     assert classify_scope_change(old, new) == "orthogonal"
 
 
-def test_classify_subset_include_lattice_tables_into_both() -> None:
-    old = EngineContext(include="both")
-    new = EngineContext(include="tables")
-    assert classify_scope_change(old, new) == "subset"
+def test_engine_context_rejects_include_both() -> None:
+    with pytest.raises(ConfigError, match="include must be 'tables' or 'views'"):
+        EngineContext(include="both")
+
+
+def test_federation_context_rejects_include_both() -> None:
+    with pytest.raises(ConfigError, match="include must be 'tables' or 'views'"):
+        FederationContext(include="both")
 
 
 def test_classify_orthogonal_include_tables_vs_views() -> None:
@@ -134,7 +139,7 @@ def test_scope_descriptor_round_trip() -> None:
         allow_objects=frozenset({"customers", "orders"}),
         deny_columns=frozenset({"products.price"}),
         allow_columns=frozenset({"*.name"}),
-        include="both",
+        include="views",
     )
     desc = scope_descriptor_for(ctx)
     rebuilt = schema_context_from_descriptor(desc)
@@ -278,6 +283,7 @@ def test_full_rebuild_profiles_only_columns_after_scope_trim(
             *,
             include: Any = "tables",
             allow_objects: Any = None,
+            deny_objects: Any = None,
             sql_file: Any = None,
         ) -> SchemaGraph:
             self.reflect_calls += 1
@@ -295,5 +301,38 @@ def test_full_rebuild_profiles_only_columns_after_scope_trim(
     )
     build_schema_graph(dialect, ctx, notes_content=None)
     assert dialect.reflect_calls == 1
-    assert reflect_kw == [("both", frozenset({"customers"}))]
+    assert reflect_kw == [("tables", frozenset({"customers"}))]
     assert profiled_snapshots == [1]
+
+
+def test_full_build_applies_deny_objects_filter(
+    schema_graph: SchemaGraph,
+    cache_path: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    template = deepcopy(schema_graph)
+
+    class _ReflectDialect(_ProbeStubDialect):
+        def reflect_schema_graph(
+            self,
+            *,
+            include: Any = "tables",
+            allow_objects: Any = None,
+            deny_objects: Any = None,
+            sql_file: Any = None,
+        ) -> SchemaGraph:
+            self.reflect_calls += 1
+            return deepcopy(template)
+
+    dialect = _ReflectDialect()
+    ctx = EngineContext(deny_objects=frozenset({"products"}))
+    monkeypatch.setattr(
+        aetherdialect._schema_overrides,
+        "apply_column_roles_llm",
+        lambda sg, notes_content=None, **kwargs: None,
+    )
+    out = build_schema_graph(dialect, ctx, notes_content="n")
+    assert dialect.reflect_calls == 1
+    assert "customers" in out.tables
+    assert "orders" in out.tables
+    assert "products" not in out.tables

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from aetherdialect._constants import GenerationPath
 from aetherdialect._contracts_base import NormalizedExpr
 from aetherdialect._contracts_core import (
+    GenerationPath,
     RuntimeIntent,
     SelectCol,
 )
@@ -30,8 +30,8 @@ def _customer_names_intent_with_limit(limit_value: int) -> RuntimeIntent:
         ],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
-        having_param=[],
+        where=None,
+        having=None,
         natural_language="list customer first and last names",
         limit=limit_value,
         limit_param_key="s1",

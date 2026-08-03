@@ -9,11 +9,7 @@ from typing import Any, ClassVar, Literal, Protocol, cast
 
 import sqlglot
 
-from ._config import (
-    EngineConfig,
-    EngineRuntimeConfig,
-    PolicyConfig,
-)
+from ._config import EngineConfig, EngineRuntimeConfig, PolicyConfig
 from ._constants import (
     AGGREGATE_FUNCTION_NAMES,
     CANONICAL_ENGINE_ORDER,
@@ -21,21 +17,21 @@ from ._constants import (
     EXPLAIN_PERMISSION_DENIED_PATTERNS,
     PG_NAMED_PLACEHOLDER_RE,
     QUALIFY_SKIP_IDENTIFIERS,
+    SQLGLOT_AGG_FUNC_KEY_ALIASES,
     SQLGLOT_DIALECT_BY_ENGINE,
     UNIT_TO_DAYS,
+    ARRAY_CONTAINS_EXCLUDED_ENGINES,
+    COLLATION_ENGINES,
+    STATISTICAL_AGG_EXCLUDED_ENGINES,
+    TIMESTAMPTZ_SEMANTICS_ENGINES,
+    UNSIGNED_SEMANTICS_ENGINES,
+    WINDOW_FRAMES_EXCLUDED_ENGINES,
 )
-from ._contracts_base import (
-    EngineContext,
-    SchemaInclude,
-    SqlDiagnostic,
-    SqlDiagnosticCode,
-)
+from ._contracts_base import EngineContext, SchemaInclude, SqlDiagnostic, SqlDiagnosticCode
 from ._contracts_core import RuntimeIntent
-from ._contracts_schema import (
-    CatalogStructuralConstraintsIndex,
-    SchemaGraph,
-)
+from ._contracts_schema import CatalogStructuralConstraintsIndex, SchemaGraph
 from ._core_utils import (
+    active_engine_identity,
     canonicalize_sql,
     cost_cap_active,
     debug,
@@ -44,6 +40,7 @@ from ._core_utils import (
     sha256,
     stable_json,
     substitute_params,
+    substitute_params_for_execution,
 )
 
 
@@ -60,16 +57,28 @@ class JoinEdge:
 def trace_finalize_render_stage(stage: str, sql_in: str, sql_out: str) -> None:
     """Log one ``finalize_render`` sub-step for debugging and. ``PIPELINE_TRACE`` capture."""
     debug(f"[dialect.finalize_render.{stage}] in_sql_len={len(sql_in)} out_sql_len={len(sql_out)}")
-    pipeline_trace(
-        f"dialect.finalize_render.{stage}",
-        lambda: stable_json({"in": sql_in, "out": sql_out}),
-    )
+    pipeline_trace(f"dialect.finalize_render.{stage}", lambda: stable_json({"in": sql_in, "out": sql_out}))
 
 
-def explain_cost_gate_violation(est_rows: float | None, est_bytes: float | None) -> tuple[bool, str]:
+def explain_cost_gate_violation(
+    est_rows: float | None,
+    est_bytes: float | None,
+    *,
+    dialect: Any | None = None,
+    max_query_cost_rows: float | None = None,
+    max_query_cost_bytes: float | None = None,
+) -> tuple[bool, str]:
     """Return ``(True, message)`` when planner estimates exceed configured caps."""
-    caps_r = PolicyConfig.MAX_QUERY_COST_ROWS
-    caps_b = PolicyConfig.MAX_QUERY_COST_BYTES
+    if max_query_cost_rows is None and dialect is not None:
+        override = getattr(dialect, "max_query_cost_rows", None)
+        if override is not None:
+            max_query_cost_rows = float(override)
+    if max_query_cost_bytes is None and dialect is not None:
+        override = getattr(dialect, "max_query_cost_bytes", None)
+        if override is not None:
+            max_query_cost_bytes = float(override)
+    caps_r = PolicyConfig.MAX_QUERY_COST_ROWS if max_query_cost_rows is None else max_query_cost_rows
+    caps_b = PolicyConfig.MAX_QUERY_COST_BYTES if max_query_cost_bytes is None else max_query_cost_bytes
     over_r = caps_r is not None and cost_cap_active(caps_r) and est_rows is not None and est_rows > caps_r
     over_b = caps_b is not None and cost_cap_active(caps_b) and est_bytes is not None and est_bytes > caps_b
     if not (over_r or over_b):
@@ -87,14 +96,24 @@ def finalize_executable_sql(
     structural_defaults: dict[str, Any] | None = None,
     *,
     sqlglot_dialect: str,
+    for_display: bool = False,
+    engine: str | None = None,
+    dialect: Dialect | None = None,
 ) -> str:
     """Reduce structural placeholders, substitute parameters, then AST- simplify the literal SQL."""
-    reduced, remaining = reduce_structural_sql_placeholders(
-        sql_param,
-        dict(params),
-        structural_defaults,
-    )
-    substituted = substitute_params(reduced, remaining)
+    bind_engine = engine
+    if bind_engine is None and dialect is not None:
+        bind_engine = getattr(dialect, "name", None)
+    if bind_engine is None:
+        try:
+            bind_engine = active_engine_identity().engine_type
+        except Exception:
+            bind_engine = None
+    reduced, remaining = reduce_structural_sql_placeholders(sql_param, dict(params), structural_defaults)
+    if for_display:
+        substituted = substitute_params(reduced, remaining, engine=bind_engine, dialect=dialect)
+    else:
+        substituted = substitute_params_for_execution(reduced, remaining, engine=bind_engine, dialect=dialect)
     return _sql_simplify_executable(substituted, sqlglot_dialect=sqlglot_dialect)
 
 
@@ -104,20 +123,25 @@ def is_permission_denied_error(message: str) -> bool:
     return any(pat in lower for pat in EXPLAIN_PERMISSION_DENIED_PATTERNS)
 
 
-def active_sqlglot_dialect() -> str:
-    """Return the sqlglot dialect token matching the configured ``EngineConfig.TYPE``."""
-    engine_type = (EngineConfig.TYPE or "").strip().lower()
-    if engine_type in _DIALECT_REGISTRY:
-        token = _DIALECT_REGISTRY[engine_type].sqlglot_dialect
+def sqlglot_dialect_for_engine(engine_type: str) -> str:
+    """Return the sqlglot dialect token for *engine_type*."""
+    et = (engine_type or "").strip().lower()
+    if et in _DIALECT_REGISTRY:
+        token = _DIALECT_REGISTRY[et].sqlglot_dialect
         if token:
             return token
-    fallback_token = SQLGLOT_DIALECT_BY_ENGINE.get(engine_type)
+    fallback_token = SQLGLOT_DIALECT_BY_ENGINE.get(et)
     if fallback_token is None:
         raise ValueError(
-            f"No sqlglot dialect mapping for engine type {engine_type!r}; expected one of "
+            f"No sqlglot dialect mapping for engine type {et!r}; expected one of "
             f"{sorted(_DIALECT_REGISTRY) or sorted(SQLGLOT_DIALECT_BY_ENGINE)}"
         )
     return fallback_token
+
+
+def active_sqlglot_dialect() -> str:
+    """Return the sqlglot dialect token for the active engine identity."""
+    return sqlglot_dialect_for_engine(active_engine_identity().engine_type)
 
 
 def _inspect_parse(sql: str, *, sqlglot_dialect: str) -> sqlglot.exp.Expression | None:
@@ -165,6 +189,26 @@ def emit_via_ast(sql: str, dialect_name: str) -> str:
     except Exception:
         return sql
     return normalize_named_placeholders(tree.sql(dialect=dialect_name))
+
+
+def sqlglot_quote_identifier(ident: str, sqlglot_dialect: str = "duckdb", *, quoted: bool = True) -> str:
+    """Quote a single SQL identifier via the sqlglot dialect generator."""
+    s = str(ident).strip()
+    if not s:
+        return s
+    if sqlglot_dialect == "snowflake" and not quoted:
+        return sqlglot.exp.to_identifier(s.upper(), quoted=False).sql(dialect=sqlglot_dialect)
+    return sqlglot.exp.to_identifier(s, quoted=quoted).sql(dialect=sqlglot_dialect)
+
+
+def sqlglot_quote_table_column(table: str, column: str, sqlglot_dialect: str = "duckdb", *, quoted: bool = True) -> str:
+    """Return dialect-safe ``table.column`` via the sqlglot identifier generator."""
+    if sqlglot_dialect == "snowflake" and not quoted:
+        return f"{str(table).upper()}.{str(column).upper()}"
+    return (
+        f"{sqlglot_quote_identifier(table, sqlglot_dialect, quoted=quoted)}"
+        f".{sqlglot_quote_identifier(column, sqlglot_dialect, quoted=quoted)}"
+    )
 
 
 def _outer_select(parsed: sqlglot.exp.Expression) -> sqlglot.exp.Select | None:
@@ -244,28 +288,20 @@ def sql_has_distinct(sql: str, *, sqlglot_dialect: str) -> bool:
 
 
 def sql_has_aggregate(sql: str, *, sqlglot_dialect: str) -> bool:
-    """Return True when *sql* contains an aggregate function call."""
+    """Return True when *sql* contains an aggregate function call. Classification matches IR parsing: sqlglot ``Func.key`` / Anonymous name is canonicalized via ``SQLGLOT_AGG_FUNC_KEY_ALIASES`` and checked against ``AGGREGATE_FUNCTION_NAMES``."""
     parsed = _inspect_parse(sql, sqlglot_dialect=sqlglot_dialect)
     if parsed is None:
         return False
     for node in parsed.walk():
-        if isinstance(
-            node,
-            (
-                sqlglot.exp.Sum,
-                sqlglot.exp.Count,
-                sqlglot.exp.Avg,
-                sqlglot.exp.Min,
-                sqlglot.exp.Max,
-                sqlglot.exp.Stddev,
-                sqlglot.exp.Variance,
-            ),
-        ):
-            return True
         if isinstance(node, sqlglot.exp.Anonymous):
-            name = (node.name or "").lower()
-            if name in AGGREGATE_FUNCTION_NAMES:
-                return True
+            func_name = (node.name or "").lower()
+        elif isinstance(node, sqlglot.exp.Func):
+            func_name = (node.key or "").lower()
+        else:
+            continue
+        canonical = SQLGLOT_AGG_FUNC_KEY_ALIASES.get(func_name, func_name)
+        if canonical in AGGREGATE_FUNCTION_NAMES:
+            return True
     return False
 
 
@@ -302,9 +338,7 @@ def sql_tables_referenced(sql: str, *, sqlglot_dialect: str) -> set[str]:
     return tables
 
 
-def _simplify_arithmetic_identities_in_tree(
-    tree: sqlglot.exp.Expression,
-) -> sqlglot.exp.Expression:
+def _simplify_arithmetic_identities_in_tree(tree: sqlglot.exp.Expression) -> sqlglot.exp.Expression:
     """In-place simplify ``1*x``, ``x*1``, ``x+0``, ``x-0``, drop ``LIMIT NULL`` and rewrite ``NOT (X IS NULL)`` to ``X IS NOT NULL``."""
     for node in list(tree.walk()):
         if isinstance(node, sqlglot.exp.Mul):
@@ -329,8 +363,7 @@ def _simplify_arithmetic_identities_in_tree(
                 and inner.this is not None
             ):
                 replacement = sqlglot.exp.Is(
-                    this=inner.this.copy(),
-                    expression=sqlglot.exp.Not(this=sqlglot.exp.Null()),
+                    this=inner.this.copy(), expression=sqlglot.exp.Not(this=sqlglot.exp.Null())
                 )
                 node.replace(replacement)
                 continue
@@ -403,10 +436,7 @@ def compute_sql_fp(sql: str, *, sqlglot_dialect: str) -> str:
 
 
 def check_schema_references_shared(
-    refs: list[tuple[str | None, str]],
-    alias_to_table: dict[str, str],
-    cte_names: set[str],
-    schema: SchemaGraph,
+    refs: list[tuple[str | None, str]], alias_to_table: dict[str, str], cte_names: set[str], schema: SchemaGraph
 ) -> list[SqlDiagnostic]:
     """Validate ``(table_or_alias, column)`` pairs against *schema*. Resolves each prefix through *alias_to_table*. References whose resolved table is a CTE name in *cte_names* are skipped (CTE projection columns are not in the schema graph). Unqualified references are checked for ambiguity across all FROM-side tables; qualified references are checked for table existence and column membership using lowercase normalisation."""
     diags: list[SqlDiagnostic] = []
@@ -476,8 +506,6 @@ def check_schema_references_shared(
 
 def _reflect_include_for_schema_build(ctx: EngineContext) -> SchemaInclude:
     """Mirror :func:`aetherdialect._schema_graph.effective_reflect_include` so partial and full rebuilds agree."""
-    if ctx.allow_objects:
-        return "both"
     return ctx.include
 
 
@@ -490,14 +518,21 @@ def register_profile_schema_native_dispatch(fn: Callable[..., None]) -> None:
     _PROFILE_SCHEMA_NATIVE_DISPATCH = fn
 
 
+def _sqlglot_identifier_name(node: Any) -> str:
+    """Return the bare identifier string from a sqlglot identifier node."""
+    if node is None:
+        return ""
+    name = getattr(node, "name", None)
+    if name:
+        return str(name).strip().strip('"').strip("`")
+    inner = getattr(node, "this", None)
+    if inner is not None and inner is not node:
+        return _sqlglot_identifier_name(inner)
+    return str(node).strip().strip('"').strip("`")
+
+
 def _qualify_tables_ast(
-    sql: str,
-    *,
-    sqlglot_dialect: str,
-    catalog: str | None,
-    schema: str,
-    cte_names: set[str],
-    backtick: bool,
+    sql: str, *, sqlglot_dialect: str, catalog: str | None, schema: str, cte_names: set[str], backtick: bool
 ) -> str:
     """Qualify bare table references with ``schema`` (and optional catalog) using sqlglot AST."""
     if not sql or not sql.strip():
@@ -523,7 +558,15 @@ def _qualify_tables_ast(
             continue
         if name in skip_lower:
             continue
-        if table.args.get("db") or table.args.get("catalog"):
+        existing_catalog = table.args.get("catalog")
+        existing_db = table.args.get("db")
+        if existing_catalog is not None:
+            continue
+        if existing_db is not None:
+            existing_schema = _sqlglot_identifier_name(existing_db)
+            if existing_schema and existing_schema.lower() == schema.lower():
+                continue
+            table.set("db", sqlglot.exp.to_identifier(schema, quoted=backtick))
             continue
         table.set("db", sqlglot.exp.to_identifier(schema, quoted=backtick))
         if catalog:
@@ -544,6 +587,15 @@ class Dialect:
 
     name: str = "base"
     sqlglot_dialect: ClassVar[str] = ""
+    registry_canonical_rank: ClassVar[int] = 1_000
+    registry_native_backend: ClassVar[bool] = False
+    registry_embedded: ClassVar[bool] = False
+    registry_structural_index: ClassVar[bool] = False
+    registry_qualified_table_ref: ClassVar[bool] = False
+    registry_statistical_agg_excluded: ClassVar[bool] = False
+    registry_window_frames_excluded: ClassVar[bool] = False
+    registry_array_contains_excluded: ClassVar[bool] = False
+    registry_toml_section: ClassVar[str | None] = None
 
     def __init__(self, config: EngineRuntimeConfig) -> None:
         """Attach runtime configuration used by dialect operations."""
@@ -576,34 +628,27 @@ class Dialect:
         """Return per-FROM handles in JOIN-placeholder injection order. Order is each CTE inner SELECT's FROM left-to-right followed by the outer SELECT's FROM. Returns ``None`` for unsupported shapes (e.g. top-level ``UNION``)."""
         raise NotImplementedError
 
-    def attach_joins(
-        self,
-        parsed: Any,
-        from_handle: Any,
-        edges: list[JoinEdge],
-    ) -> bool:
+    def attach_joins(self, parsed: Any, from_handle: Any, edges: list[JoinEdge]) -> bool:
         """Attach the given structured *edges* as JOIN nodes onto. *from_handle*. Implementations construct dialect-native JOIN AST nodes directly from *edges* and graft them into *from_handle* without re-parsing any SQL fragment."""
         raise NotImplementedError
 
     def attach_extra_from_and_where(
-        self,
-        parsed: Any,
-        from_handle: Any,
-        extra_from_tables: list[str],
-        where_edges: list[JoinEdge],
+        self, parsed: Any, from_handle: Any, extra_from_tables: list[str], where_edges: list[JoinEdge]
     ) -> bool:
-        """AND-inject *where_edges*' equality predicates into. *from_handle*'s ``WHERE`` and append any *extra_from_tables* to its ``FROM`` clause. Used to render Tier-B semantic edges (``edge_kind`` ``semantic_profile`` / ``semantic_profile_virtual``) as comma-FROM + ``WHERE`` equality predicates rather than ``JOIN ... ON``. ``where_edges[i].on_terms`` is a tuple of ``(left_token, left_col, right_token, right_col)`` equality conjuncts that get AND-ed into the existing ``WHERE``. Returns ``True`` on success (including the no-op case when both lists are empty), ``False`` when grafting fails."""
+        """AND-inject *where_edges*' equality predicates into. *from_handle*'s ``WHERE`` and append any *extra_from_tables* to its ``FROM`` clause. Used to render semantic-profile edges (``edge_kind`` ``semantic_profile`` / ``semantic_profile_virtual``) as comma-FROM + ``WHERE`` equality predicates rather than ``JOIN ... ON``. ``where_edges[i].on_terms`` is a tuple of ``(left_token, left_col, right_token, right_col)`` equality conjuncts that get AND-ed into the existing ``WHERE``. Returns ``True`` on success (including the no-op case when both lists are empty), ``False`` when grafting fails."""
         raise NotImplementedError
+
+    def attach_where_sql_fragments(self, from_handle: Any, fragments: list[str]) -> bool:
+        """AND-inject raw SQL predicate fragments into *from_handle*'s ``WHERE`` clause."""
+        _ = from_handle
+        _ = fragments
+        return not fragments
 
     def from_anchor_of(self, carrier: Any) -> str | None:
         """Return the bare anchor table name of *carrier*'s ``FROM`` clause. Used by :mod:`aetherdialect._sql_gen` to orient join signatures around the carrier's ``FROM`` table without resorting to text regex over the rendered SQL prefix."""
         raise NotImplementedError
 
-    def replace_projection(
-        self,
-        parsed: Any,
-        items: list[tuple[str, str | None]],
-    ) -> bool:
+    def replace_projection(self, parsed: Any, items: list[tuple[str, str | None]]) -> bool:
         """Replace the outer ``SELECT`` projection list with *items*. Each ``(expr_sql, alias)`` pair is parsed as a single SELECT- list expression in the dialect's native parser and grafted as a ``ResTarget``/``sqlglot.exp.Alias`` node so the surrounding SQL is reconstructed without text splicing. Returns ``True`` on success and ``False`` when any expression or the host statement cannot be parsed."""
         raise NotImplementedError
 
@@ -620,12 +665,7 @@ class Dialect:
         intent: RuntimeIntent | None = None,
     ) -> tuple[bool, str]:
         """Backwards-shaped wrapper over :meth:`explain_diagnose`. Returns ``(ok, raw_message)`` discarding structured diagnostics."""
-        ok, _diags, raw = self.explain_diagnose(
-            sql,
-            params,
-            schema=schema,
-            intent=intent,
-        )
+        ok, _diags, raw = self.explain_diagnose(sql, params, schema=schema, intent=intent)
         return ok, raw
 
     def explain_diagnose(
@@ -663,6 +703,11 @@ class Dialect:
         return False
 
     @property
+    def supports_case_insensitive_wrap(self) -> bool:
+        """Return True when case-insensitive comparison can render without native ``ILIKE``."""
+        return True
+
+    @property
     def supports_unnest_select_item(self) -> bool:
         """Return True when an array unnest/explode may appear directly as a SELECT-list item. Only set-returning-function dialects (PostgreSQL ``UNNEST``, Spark ``EXPLODE``) accept this. Engines whose unnest is table- valued (Snowflake ``FLATTEN``, MySQL ``JSON_TABLE``, SQL Server ``OPENJSON``, BigQuery ``UNNEST`` in ``FROM``, Redshift) require a ``FROM``-clause lateral join instead, so they inherit ``False`` and the projection falls back to selecting the array column as-is rather than emitting invalid SQL."""
         return False
@@ -681,7 +726,7 @@ class Dialect:
         """Normalize SQL text before sqlglot import parsing."""
         return sql
 
-    def map_import_filter_op(self, op_raw: str | None) -> str | None:
+    def map_import_where_op(self, op_raw: str | None) -> str | None:
         """Map a dialect-specific filter operator token to a normalized IR op, or ``None`` to use defaults."""
         _ = op_raw
         return None
@@ -701,9 +746,14 @@ class Dialect:
         _ = schema
         return intent
 
-    def extra_filter_ops(self) -> frozenset[str]:
-        """Return dialect-specific filter operators advertised to intent-parse prompts."""
-        extra: frozenset[str] = getattr(type(self), "EXTRA_FILTER_OPS", frozenset())
+    def extra_where_ops(self) -> frozenset[str]:
+        """Return dialect-specific WHERE operators advertised to intent- parse prompts."""
+        extra = set(getattr(type(self), "EXTRA_WHERE_OPS", frozenset()))
+        if self.supports_ilike:
+            extra.update({"ilike", "not ilike"})
+        else:
+            extra.discard("ilike")
+            extra.discard("not ilike")
         return frozenset(extra)
 
     def date_window_upper_bound_sql(self, unit: str) -> str:
@@ -721,22 +771,14 @@ class Dialect:
         return None
 
     def inject_pruning_predicates(
-        self,
-        sql: str,
-        *,
-        schema: SchemaGraph | None = None,
-        intent: RuntimeIntent | None = None,
+        self, sql: str, *, schema: SchemaGraph | None = None, intent: RuntimeIntent | None = None
     ) -> str:
         """Append engine-specific pruning predicates when the WHERE. clause omits required keys."""
         _ = schema, intent
         return sql
 
     def explain_row_estimate(
-        self,
-        sql_text: str,
-        *,
-        schema: SchemaGraph | None = None,
-        intent: RuntimeIntent | None = None,
+        self, sql_text: str, *, schema: SchemaGraph | None = None, intent: RuntimeIntent | None = None
     ) -> float | None:
         """Return planner row-count estimate for *sql_text*, or ``None`` when unavailable."""
         _ = sql_text, schema, intent
@@ -748,7 +790,10 @@ class Dialect:
 
     def quote_table_column(self, table: str, column: str) -> str:
         """Return a dialect-safe ``table.column`` reference for SQL. emission."""
-        raise NotImplementedError
+        dialect = getattr(type(self), "sqlglot_dialect", "") or ""
+        if not dialect:
+            raise NotImplementedError
+        return sqlglot_quote_table_column(table, column, dialect)
 
     def _disable_explain_on_permission_denied(self, error_message: str) -> bool:
         """Flip ``_explain_disabled`` when *error_message* indicates a credentials issue. Returns True when the error was classified as permission denied (and EXPLAIN has been disabled for this dialect instance), otherwise False."""
@@ -784,11 +829,7 @@ class Dialect:
                 return str(value)
         return ""
 
-    def qualified_table_ref(
-        self,
-        table: str,
-        kind: Literal["table", "view"] = "table",
-    ) -> str:
+    def qualified_table_ref(self, table: str, kind: Literal["table", "view"] = "table") -> str:
         """Return a dialect-safe fully qualified table reference for profiling and execution."""
         _ = kind
         return self.quote_identifier(table)
@@ -832,11 +873,7 @@ class Dialect:
             backtick=self._qualify_uses_backtick_identifiers(),
         )
 
-    def explain_validation_sql(
-        self,
-        sql: str,
-        param_values: dict[str, Any] | None = None,
-    ) -> str:
+    def explain_validation_sql(self, sql: str, param_values: dict[str, Any] | None = None) -> str:
         """Return SQL suitable for AST and EXPLAIN validation before execution rewrites."""
         _ = param_values
         return sql
@@ -862,10 +899,7 @@ class Dialect:
         """Produce executable SQL through the shared render pipeline."""
         sql_in_raw = execution_sql_override or sql_param
         substituted = finalize_executable_sql(
-            sql_in_raw,
-            params,
-            structural_defaults,
-            sqlglot_dialect=self.sqlglot_dialect,
+            sql_in_raw, params, structural_defaults, sqlglot_dialect=self.sqlglot_dialect
         )
         trace_finalize_render_stage("finalize_executable_sql", sql_in_raw, substituted)
         rewritten = self.pre_execute_rewrite(substituted)
@@ -903,11 +937,21 @@ class Dialect:
         """Execute SQL and return rows as tuples."""
         raise NotImplementedError
 
+    def cancel_statement(self) -> None:
+        """Cancel an in-flight statement when the active driver supports it."""
+        backend = getattr(self, "result_backend", None)
+        if backend is None:
+            return
+        cancel = getattr(backend, "cancel_statement", None)
+        if callable(cancel):
+            cancel()
+
     def quote_identifier(self, ident: str) -> str:
-        """Quote a single SQL identifier using ANSI double quotes."""
-        s = str(ident).strip()
-        esc = s.replace('"', '""')
-        return f'"{esc}"'
+        """Quote a single SQL identifier via the sqlglot dialect generator."""
+        dialect = getattr(type(self), "sqlglot_dialect", "") or ""
+        if dialect:
+            return sqlglot_quote_identifier(ident, dialect)
+        return sqlglot_quote_identifier(ident, "postgres")
 
     def quote_schema_qualified(self, name: str) -> str:
         """Quote a dotted identifier path as one quoted fragment per. segment."""
@@ -923,14 +967,7 @@ class Dialect:
         return f"'{esc}'"
 
     def render_date_diff(
-        self,
-        left_expr: str,
-        op: str,
-        unit: str,
-        amount: int,
-        *,
-        minuend_sql: str = "",
-        subtrahend_sql: str = "",
+        self, left_expr: str, op: str, unit: str, amount: int, *, minuend_sql: str = "", subtrahend_sql: str = ""
     ) -> str:
         """Render a date-difference comparison predicate."""
         scaled, plural_unit = format_interval_unit(unit, amount)
@@ -942,13 +979,77 @@ class Dialect:
             return f"({base_sql} + ({offset_sql}) * INTERVAL '1 day')"
         return f"({base_sql} - ({offset_sql}) * INTERVAL '1 day')"
 
-    def render_array_contains(
-        self,
-        column_sql: str,
-        param_key: str,
-        *,
-        column_meta: Any | None = None,
-    ) -> str:
+    @property
+    def supports_ordered_string_agg(self) -> bool:
+        """Return True when ``string_agg`` may carry an ``ORDER BY`` clause inside the aggregate."""
+        return True
+
+    def render_string_agg(self, expr_sql: str, sep_sql: str, order_by_sql: str) -> str:
+        """Render a per-group string concatenation aggregate."""
+        if order_by_sql:
+            return f"STRING_AGG({expr_sql}, {sep_sql} ORDER BY {order_by_sql})"
+        return f"STRING_AGG({expr_sql}, {sep_sql})"
+
+    @property
+    def supports_median(self) -> bool:
+        """Return True when a native or percentile median aggregate is available."""
+        return True
+
+    @property
+    def supports_semi_join(self) -> bool:
+        """Return True when the engine can emit semi-join (EXISTS-style) predicates."""
+        return True
+
+    @property
+    def supports_anti_join(self) -> bool:
+        """Return True when the engine can emit anti-join (NOT EXISTS- style) predicates."""
+        return True
+
+    @property
+    def supports_predicate_nesting(self) -> bool:
+        """Return True when nested boolean predicate groups are supported."""
+        return True
+
+    @property
+    def supports_stddev(self) -> bool:
+        """Return True when the engine can render a sample standard- deviation aggregate."""
+        return not type(self).registry_statistical_agg_excluded
+
+    @property
+    def supports_variance(self) -> bool:
+        """Return True when the engine can render a sample variance aggregate."""
+        return self.supports_stddev
+
+    @property
+    def supports_window_frames(self) -> bool:
+        """Return True when the engine can render explicit window ROWS/RANGE frames."""
+        return not type(self).registry_window_frames_excluded
+
+    @property
+    def supports_array_contains(self) -> bool:
+        """Return True when the engine can render array ``contains`` predicates."""
+        return not type(self).registry_array_contains_excluded
+
+    @property
+    def supports_collation(self) -> bool:
+        """Return True when the engine exposes explicit ``COLLATE`` semantics."""
+        return self.name in COLLATION_ENGINES
+
+    @property
+    def supports_unsigned_semantics(self) -> bool:
+        """Return True when the engine exposes unsigned integer semantics."""
+        return self.name in UNSIGNED_SEMANTICS_ENGINES
+
+    @property
+    def supports_timestamptz_semantics(self) -> bool:
+        """Return True when the engine distinguishes timezone-aware timestamps."""
+        return self.name in TIMESTAMPTZ_SEMANTICS_ENGINES
+
+    def render_median(self, expr_sql: str) -> str:
+        """Render a median aggregate using the dialect's portable spelling."""
+        return f"PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY {expr_sql})"
+
+    def render_array_contains(self, column_sql: str, param_key: str, *, column_meta: Any | None = None) -> str:
         """Render array membership (contains) for WHERE/HAVING."""
         _ = column_meta
         return f":{param_key} = ANY({column_sql})"
@@ -968,11 +1069,25 @@ class Dialect:
         """Wrap an expression for case-insensitive string comparison."""
         return f"LOWER({expr})"
 
+    def render_order_by_col(self, rendered_expr: str, direction: str, nulls: str | None) -> str:
+        """Render one ORDER BY key with optional explicit null placement."""
+        dir_up = (direction or "ASC").strip().upper() or "ASC"
+        base = f"{rendered_expr} {dir_up}"
+        if nulls not in ("first", "last"):
+            return base
+        if self.name in ("mysql", "mariadb", "sqlserver"):
+            is_null = f"({rendered_expr} IS NULL)"
+            lead_dir = "DESC" if nulls == "first" else "ASC"
+            return f"{is_null} {lead_dir}, {base}"
+        placement = "NULLS FIRST" if nulls == "first" else "NULLS LAST"
+        return f"{base} {placement}"
+
     def reflect_schema_graph(
         self,
         *,
         include: SchemaInclude = "tables",
         allow_objects: frozenset[str] | None = None,
+        deny_objects: frozenset[str] | None = None,
         sql_file: str | None = None,
     ) -> SchemaGraph:
         """Build a schema graph from catalog or DDL fallback."""
@@ -983,14 +1098,18 @@ class Dialect:
         _ = schema_context
         return ""
 
+    def compute_row_count_probe(self, sg: SchemaGraph) -> str:
+        """Return a cheap fingerprint of live table row counts for profiling-cache drift checks, or ``""`` when unavailable."""
+        _ = sg
+        return ""
+
     def reflect_only(self, schema_context: EngineContext) -> SchemaGraph:
         """Reflect a structural-only ``SchemaGraph`` honouring ``schema_context.include``. Used by the partial-rebuild diff path: only structural shape (tables, columns, FKs) is needed in order to compute a :class:`SchemaDiff`; profiling is run later, on the affected subset only. The default implementation delegates to :meth:`reflect_schema_graph` with the effective include kind. Dialects may override to skip work that is unnecessary for the diff (e.g., enum value enrichment)."""
         include = _reflect_include_for_schema_build(schema_context)
         allow_obj = schema_context.allow_objects if schema_context.allow_objects else None
+        deny_obj = schema_context.deny_objects if schema_context.deny_objects else None
         return self.reflect_schema_graph(
-            include=include,
-            allow_objects=allow_obj,
-            sql_file=schema_context.sql_file,
+            include=include, allow_objects=allow_obj, deny_objects=deny_obj, sql_file=schema_context.sql_file
         )
 
     def profile_schema_dispatch(self, sg: SchemaGraph) -> None:
@@ -1004,21 +1123,13 @@ class Dialect:
         self.profile_schema_dispatch(sg)
 
     def refresh_full_table_distinct_for_pk_inference(
-        self,
-        table_name: str,
-        col_name: str,
-        *,
-        table_kind: Literal["table", "view"] = "table",
+        self, table_name: str, col_name: str, *, table_kind: Literal["table", "view"] = "table"
     ) -> tuple[int, int, float] | None:
         """Run full-table statistics for PK inference after sampled profiling."""
         return None
 
     def refresh_composite_distinct_for_pk_inference(
-        self,
-        table_name: str,
-        col_names: list[str],
-        *,
-        table_kind: Literal["table", "view"] = "table",
+        self, table_name: str, col_names: list[str], *, table_kind: Literal["table", "view"] = "table"
     ) -> tuple[int, int, float] | None:
         """Run full-table composite distinct statistics for multi-column PK inference."""
         return None
@@ -1026,6 +1137,10 @@ class Dialect:
     def profiling_text_cast_sql(self, expr: str) -> str:
         """Return a dialect-correct text cast expression for profiling. overlap queries."""
         return f"CAST({expr} AS TEXT)"
+
+    def profiling_ordered_limit_sample_suffix(self, sample_size: int) -> str:
+        """Return a deterministic ordered row cap for engines without seeded sampling."""
+        return f"ORDER BY 1 LIMIT {sample_size}"
 
     def profiling_stats_sample_suffix(
         self,
@@ -1036,15 +1151,13 @@ class Dialect:
         random_seed: int,
         table_kind: Literal["table", "view"] = "table",
     ) -> str:
-        """Build a ``FROM``-clause sampling suffix for row-count. statistics queries."""
+        """Build a deterministic ``FROM``-clause sampling suffix for row-count statistics queries. The base dialect uses an ordered row cap (``ORDER BY 1 LIMIT``) so subquery sampling does not depend on physical heap order. Callers that embed the suffix in ``(SELECT col FROM tbl …)`` should rewrite ``ORDER BY 1`` to ``ORDER BY col`` when building the subquery."""
+        _ = row_count, random_seed, table_kind
         if not use_sample:
             return ""
-        return f"LIMIT {sample_size}"
+        return self.profiling_ordered_limit_sample_suffix(sample_size)
 
-    def profiling_stats_use_subquery_when_sampling(
-        self,
-        table_kind: Literal["table", "view"] = "table",
-    ) -> bool:
+    def profiling_stats_use_subquery_when_sampling(self, table_kind: Literal["table", "view"] = "table") -> bool:
         """Return True when distinct/null stats must scan a sampled. subquery."""
         return True
 
@@ -1064,11 +1177,54 @@ def get_registered_engines() -> list[str]:
     return list_engines()
 
 
-def register_dialect(
-    name: str,
-    cls: type[Dialect],
-    runtime_config_cls: type | None = None,
-) -> None:
+def derive_dialect_registry_surfaces() -> dict[str, Any]:
+    """Derive engine registry surfaces from registered dialect class metadata."""
+    registered = dict(_DIALECT_REGISTRY)
+    canonical_order = tuple(
+        sorted(registered.keys(), key=lambda engine: (registered[engine].registry_canonical_rank, engine))
+    )
+    return {
+        "canonical_engine_order": canonical_order,
+        "native_backend_engines": frozenset(
+            engine for engine, cls in registered.items() if cls.registry_native_backend
+        ),
+        "embedded_engine_names": frozenset(engine for engine, cls in registered.items() if cls.registry_embedded),
+        "structural_index_engines": frozenset(
+            engine for engine, cls in registered.items() if cls.registry_structural_index
+        ),
+        "qualified_table_ref_engines": frozenset(
+            engine for engine, cls in registered.items() if cls.registry_qualified_table_ref
+        ),
+        "statistical_agg_excluded_engines": frozenset(
+            engine for engine, cls in registered.items() if cls.registry_statistical_agg_excluded
+        ),
+        "window_frames_excluded_engines": frozenset(
+            engine for engine, cls in registered.items() if cls.registry_window_frames_excluded
+        ),
+        "array_contains_excluded_engines": frozenset(
+            engine for engine, cls in registered.items() if cls.registry_array_contains_excluded
+        ),
+        "toml_field_map_engines": frozenset(
+            (cls.registry_toml_section or engine) for engine, cls in registered.items()
+        ),
+    }
+
+
+def _sync_dialect_registry_constants() -> None:
+    """Publish derived registry surfaces into :mod:`aetherdialect._constants`."""
+    derived = derive_dialect_registry_surfaces()
+    const = importlib.import_module("aetherdialect._constants")
+    const.CANONICAL_ENGINE_ORDER = derived["canonical_engine_order"]
+    const.NATIVE_BACKEND_ENGINES = derived["native_backend_engines"]
+    const.EMBEDDED_ENGINE_NAMES = derived["embedded_engine_names"]
+    const.STRUCTURAL_INDEX_ENGINES = derived["structural_index_engines"]
+    const.QUALIFIED_TABLE_REF_ENGINES = derived["qualified_table_ref_engines"]
+    const.STATISTICAL_AGG_EXCLUDED_ENGINES = derived["statistical_agg_excluded_engines"]
+    const.WINDOW_FRAMES_EXCLUDED_ENGINES = derived["window_frames_excluded_engines"]
+    const.ARRAY_CONTAINS_EXCLUDED_ENGINES = derived["array_contains_excluded_engines"]
+
+
+def register_dialect(name: str, cls: type[Dialect], runtime_config_cls: type | None = None) -> None:
     """
     Register a dialect implementation under an engine name.
 
@@ -1085,6 +1241,7 @@ def register_dialect(
     if cls.sqlglot_dialect:
         const.SQLGLOT_DIALECT_BY_ENGINE[name] = cls.sqlglot_dialect
     const.set_supported_engines(frozenset(_DIALECT_REGISTRY))
+    _sync_dialect_registry_constants()
 
 
 def get_dialect_class(engine_type: str) -> type[Dialect]:
@@ -1107,11 +1264,107 @@ def get_runtime_config_class(engine_type: str) -> type:
     return _RUNTIME_REGISTRY[engine_type]
 
 
-def extra_filter_ops_for_engine(engine_type: str | None = None) -> frozenset[str]:
-    """Return dialect-specific filter operators without constructing a. dialect instance. Args: engine_type: Engine name; defaults to ``EngineConfig.TYPE``. Returns: Filter operator names advertised to intent-parse prompts."""
+def extra_where_ops_for_engine(engine_type: str | None = None) -> frozenset[str]:
+    """Return dialect-specific WHERE operators without constructing a dialect instance."""
     et = (engine_type or EngineConfig.TYPE).strip().lower()
-    dialect_cls = get_dialect_class(et)
-    return frozenset(getattr(dialect_cls, "EXTRA_FILTER_OPS", frozenset()))
+    cls = get_dialect_class(et)
+    stub = object.__new__(cls)
+    return stub.extra_where_ops()
+
+
+def member_supports_ilike_semantics(engine_type: str) -> bool:
+    """Return True when a member can express case-insensitive string filters."""
+    cls = get_dialect_class(engine_type.strip().lower())
+    stub = object.__new__(cls)
+    if stub.supports_ilike:
+        return True
+    return bool(stub.supports_case_insensitive_wrap)
+
+
+def dialect_supports_ilike_semantics(dialect: Dialect) -> bool:
+    """Return True when *dialect* can express case-insensitive string filters."""
+    if dialect.supports_ilike:
+        return True
+    return bool(dialect.supports_case_insensitive_wrap)
+
+
+def _dialect_stub_for_engine(engine_type: str) -> Dialect | None:
+    """Return an uninitialized dialect instance for capability introspection."""
+    engine = (engine_type or "").strip().lower()
+    if not engine:
+        return None
+    try:
+        cls = get_dialect_class(engine)
+    except (ValueError, KeyError):
+        return None
+    return object.__new__(cls)
+
+
+def _engine_supports_attr(engine_type: str, attr: str, *, default: bool = True) -> bool:
+    stub = _dialect_stub_for_engine(engine_type)
+    if stub is None:
+        return default
+    return bool(getattr(stub, attr))
+
+
+def engine_supports_ordered_string_agg(engine_type: str) -> bool:
+    """Return True when the engine can render ``string_agg`` with an in- aggregate ``ORDER BY``."""
+    return _engine_supports_attr(engine_type, "supports_ordered_string_agg")
+
+
+def engine_supports_median(engine_type: str) -> bool:
+    """Return True when the engine exposes a median aggregate."""
+    return _engine_supports_attr(engine_type, "supports_median")
+
+
+def engine_supports_stddev(engine_type: str) -> bool:
+    """Return True when the engine can render a sample standard- deviation aggregate."""
+    return _engine_supports_attr(engine_type, "supports_stddev")
+
+
+def engine_supports_variance(engine_type: str) -> bool:
+    """Return True when the engine can render a sample variance aggregate."""
+    return _engine_supports_attr(engine_type, "supports_variance")
+
+
+def engine_supports_window_frames(engine_type: str) -> bool:
+    """Return True when the engine can render explicit window ROWS/RANGE frames."""
+    return _engine_supports_attr(engine_type, "supports_window_frames")
+
+
+def engine_supports_array_contains(engine_type: str) -> bool:
+    """Return True when the engine can render array ``contains`` predicates."""
+    return _engine_supports_attr(engine_type, "supports_array_contains")
+
+
+def engine_supports_collation(engine_type: str) -> bool:
+    """Return True when the engine exposes explicit ``COLLATE`` semantics."""
+    return _engine_supports_attr(engine_type, "supports_collation", default=False)
+
+
+def engine_supports_unsigned_semantics(engine_type: str) -> bool:
+    """Return True when the engine exposes unsigned integer semantics."""
+    return _engine_supports_attr(engine_type, "supports_unsigned_semantics", default=False)
+
+
+def engine_supports_timestamptz_semantics(engine_type: str) -> bool:
+    """Return True when the engine distinguishes timezone-aware timestamps."""
+    return _engine_supports_attr(engine_type, "supports_timestamptz_semantics", default=False)
+
+
+def engine_supports_semi_join(engine_type: str) -> bool:
+    """Return True when the engine can emit semi-join predicates."""
+    return _engine_supports_attr(engine_type, "supports_semi_join")
+
+
+def engine_supports_anti_join(engine_type: str) -> bool:
+    """Return True when the engine can emit anti-join predicates."""
+    return _engine_supports_attr(engine_type, "supports_anti_join")
+
+
+def engine_supports_predicate_nesting(engine_type: str) -> bool:
+    """Return True when nested boolean predicate groups are supported."""
+    return _engine_supports_attr(engine_type, "supports_predicate_nesting")
 
 
 def resolve_dialect(name_or_api: str | Dialect) -> Dialect:
@@ -1139,21 +1392,12 @@ class _BaseDialectCtor(Protocol):
 
 
 class _SqlalchemyDialectCtor(Protocol):
-    def __call__(
-        self,
-        config: Any,
-        *,
-        sqlalchemy_engine: Any | None = ...,
-    ) -> Dialect: ...
+    def __call__(self, config: Any, *, sqlalchemy_engine: Any | None = ...) -> Dialect: ...
 
 
 class _EmbeddedDialectCtor(Protocol):
     def __call__(
-        self,
-        config: Any,
-        *,
-        sqlalchemy_engine: Any | None = ...,
-        native_connection: Any | None = ...,
+        self, config: Any, *, sqlalchemy_engine: Any | None = ..., native_connection: Any | None = ...
     ) -> Dialect: ...
 
 
@@ -1184,17 +1428,20 @@ def get_dialect(
         ValueError: If ``engine_type`` is not registered.
     """
     if engine_type is None:
-        engine_type = EngineConfig.TYPE
+        identity = active_engine_identity()
+        engine_type = identity.engine_type
     if config is None:
-        config = _RUNTIME_REGISTRY.get(engine_type, EngineConfig.RUNTIME)
+        if engine_type in _RUNTIME_REGISTRY:
+            config = _RUNTIME_REGISTRY[engine_type]
+        else:
+            identity = active_engine_identity()
+            config = identity.runtime_config
     if engine_type not in _DIALECT_REGISTRY:
         raise ValueError(f"Unsupported dialect: {engine_type}")
     ctor = _DIALECT_REGISTRY[engine_type]
     if engine_type in EMBEDDED_ENGINE_NAMES:
         return cast(_EmbeddedDialectCtor, ctor)(
-            config,
-            sqlalchemy_engine=sqlalchemy_engine,
-            native_connection=native_connection,
+            config, sqlalchemy_engine=sqlalchemy_engine, native_connection=native_connection
         )
     if sqlalchemy_engine is not None:
         return cast(_SqlalchemyDialectCtor, ctor)(config, sqlalchemy_engine=sqlalchemy_engine)

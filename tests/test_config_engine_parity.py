@@ -325,7 +325,7 @@ class TestSevenEngineTomlParsing:
             ),
             encoding="utf-8",
         )
-        got, claimed = _load_config_file(str(path))
+        got, claimed, _named = _load_config_file(str(path))
         expected = {
             "MYSQL_HOST": "mh",
             "MYSQL_PORT": "3307",

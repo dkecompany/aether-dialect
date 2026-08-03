@@ -2,6 +2,7 @@
 
 import json
 import re
+from copy import deepcopy
 from dataclasses import replace
 
 import pytest
@@ -9,11 +10,12 @@ import pytest
 from aetherdialect._contracts_base import (
     ColumnRole,
     ExprValue,
-    FilterParam,
     HavingParam,
     MulGroup,
     NormalizedExpr,
     OrderByCol,
+    WhereParam,
+    predicate_group_from_list,
 )
 from aetherdialect._contracts_core import (
     RuntimeCteStep,
@@ -165,17 +167,17 @@ class TestAssignParamKeys:
     """Tests for assign_param_keys."""
 
     def test_sequential_keys(self):
-        """Assign p1, p2, ... sequentially to filters."""
-        fp1 = FilterParam(left_expr=NormalizedExpr.from_column("t.a"), op="=", value_type="string")
-        fp2 = FilterParam(left_expr=NormalizedExpr.from_column("t.b"), op=">", value_type="integer")
+        """Assign p1, p2, ... sequentially to where predicates."""
+        fp1 = WhereParam(left_expr=NormalizedExpr.from_column("t.a"), op="=", value_type="string")
+        fp2 = WhereParam(left_expr=NormalizedExpr.from_column("t.b"), op=">", value_type="integer")
         new_fp, new_hp, new_cte, _, idx = assign_param_keys([fp1, fp2], [])
         assert new_fp[0].param_key == "p1"
         assert new_fp[1].param_key == "p2"
         assert idx == 3
 
     def test_is_null_skipped(self):
-        """Skip param_key assignment for IS NULL filters."""
-        fp = FilterParam(left_expr=NormalizedExpr.from_column("t.a"), op="is null", value_type="null")
+        """Skip param_key assignment for IS NULL where predicates."""
+        fp = WhereParam(left_expr=NormalizedExpr.from_column("t.a"), op="is null", value_type="null")
         new_fp, _, _, _, idx = assign_param_keys([fp], [])
         assert new_fp[0].param_key == ""
         assert idx == 1
@@ -191,27 +193,27 @@ class TestAssignParamKeys:
         assert new_hp[0].param_key == "p1"
 
     def test_cte_before_main(self):
-        """CTE filters get lower param_key indices than main query."""
-        cte_fp = FilterParam(left_expr=NormalizedExpr.from_column("t.a"), op="=", value_type="string")
-        main_fp = FilterParam(left_expr=NormalizedExpr.from_column("t.b"), op="=", value_type="string")
+        """CTE where predicates get lower param_key indices than main query."""
+        cte_fp = WhereParam(left_expr=NormalizedExpr.from_column("t.a"), op="=", value_type="string")
+        main_fp = WhereParam(left_expr=NormalizedExpr.from_column("t.b"), op="=", value_type="string")
         cte = RuntimeCteStep(
             cte_name="cte1",
             tables=["t"],
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[cte_fp],
-            having_param=[],
+            where=predicate_group_from_list([cte_fp]),
+            having=None,
             param_values={},
             output_columns=[],
         )
         new_fp, _, new_cte, _, _ = assign_param_keys([main_fp], [], [cte])
-        assert new_cte[0].filters_param[0].param_key == "p1"
+        assert new_cte[0].where.leaves()[0].param_key == "p1"
         assert new_fp[0].param_key == "p2"
 
     def test_case_registry_branch_conditions_get_param_keys(self):
         """Literals in ``case_registry`` CASE branches receive ``p*`` keys."""
-        cond = FilterParam(
+        cond = WhereParam(
             left_expr=NormalizedExpr.from_column("film.rental_rate"),
             op=">",
             value_type="number",
@@ -233,7 +235,7 @@ class TestDecomposeBetweenFilters:
 
     def test_between_with_list_value(self):
         """Decompose BETWEEN with [low, high] raw_value."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op="between",
             value_type="integer",
@@ -245,37 +247,37 @@ class TestDecomposeBetweenFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
-            having_param=[],
+            where=predicate_group_from_list([fp]),
+            having=None,
             param_values={},
             cte_steps=[],
             natural_language="test",
         )
         result = decompose_between_params(intent)
-        assert len(result.filters_param) == 2
-        assert result.filters_param[0].op == ">="
-        assert result.filters_param[0].raw_value == 10
-        assert result.filters_param[1].op == "<="
-        assert result.filters_param[1].raw_value == 20
+        assert len(result.where.leaves() if result.where else []) == 2
+        assert result.where.leaves()[0].op == ">="
+        assert result.where.leaves()[0].raw_value == 10
+        assert result.where.leaves()[1].op == "<="
+        assert result.where.leaves()[1].raw_value == 20
 
     def test_non_between_unchanged(self):
         """Non-BETWEEN filters pass through unchanged."""
-        fp = FilterParam(left_expr=NormalizedExpr.from_column("t.a"), op="=", value_type="string")
+        fp = WhereParam(left_expr=NormalizedExpr.from_column("t.a"), op="=", value_type="string")
         intent = RuntimeIntent(
             tables=["t"],
             grain="row_level",
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
-            having_param=[],
+            where=predicate_group_from_list([fp]),
+            having=None,
             param_values={},
             cte_steps=[],
             natural_language="test",
         )
         result = decompose_between_params(intent)
-        assert len(result.filters_param) == 1
-        assert result.filters_param[0].op == "="
+        assert len(result.where.leaves() if result.where else []) == 1
+        assert result.where.leaves()[0].op == "="
 
 
 def _make_intent_with_case(branches, group_by=None, cte=False):
@@ -292,8 +294,8 @@ def _make_intent_with_case(branches, group_by=None, cte=False):
             select_cols=[sc],
             group_by_cols=list(group_by or []),
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             case_registry=[step],
         )
@@ -303,8 +305,8 @@ def _make_intent_with_case(branches, group_by=None, cte=False):
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             cte_steps=[cte_step],
             natural_language="t",
@@ -315,8 +317,8 @@ def _make_intent_with_case(branches, group_by=None, cte=False):
         select_cols=[sc],
         group_by_cols=list(group_by or []),
         order_by_cols=[],
-        filters_param=[],
-        having_param=[],
+        where=None,
+        having=None,
         param_values={},
         cte_steps=[],
         natural_language="t",
@@ -328,7 +330,7 @@ class TestNormalizeInCaseBranches:
     """normalize_in_raw_values must canonicalise IN/NOT IN inside CASE branches."""
 
     def test_in_string_to_list_in_case_branch(self):
-        cond = FilterParam(
+        cond = WhereParam(
             left_expr=NormalizedExpr.from_column("t.kind"),
             op="in",
             value_type="string",
@@ -342,7 +344,7 @@ class TestNormalizeInCaseBranches:
         assert new_cond.raw_value == ["a", "b", "c"]
 
     def test_not_in_string_to_list_in_cte_case_branch(self):
-        cond = FilterParam(
+        cond = WhereParam(
             left_expr=NormalizedExpr.from_column("t.kind"),
             op="not in",
             value_type="string",
@@ -355,7 +357,7 @@ class TestNormalizeInCaseBranches:
         assert new_cond.raw_value == ["a", "b"]
 
     def test_non_in_op_unchanged(self):
-        cond = FilterParam(
+        cond = WhereParam(
             left_expr=NormalizedExpr.from_column("t.kind"),
             op="=",
             value_type="string",
@@ -371,16 +373,16 @@ class TestTagCaseWhenConditionScope:
     """tag_case_when_condition_scope must mark aggregated branch conditions as 'having'."""
 
     def test_row_level_branch_stays_filter(self):
-        cond = FilterParam(left_expr=NormalizedExpr.from_column("t.x"), op="=", raw_value=1)
+        cond = WhereParam(left_expr=NormalizedExpr.from_column("t.x"), op="=", raw_value=1)
         br = CaseWhenBranch(condition=cond, result=NormalizedExpr.from_column("'low'"))
         intent = _make_intent_with_case([br])
         out = tag_case_when_condition_scope(intent)
-        assert out.case_registry[0].case_when.condition_scope == "filter"
+        assert out.case_registry[0].case_when.condition_scope == "where"
 
     def test_aggregated_branch_becomes_having(self):
         agg_left = NormalizedExpr.from_column("t.amount")
         agg_left = replace(agg_left, agg_func="sum")
-        cond = FilterParam(left_expr=agg_left, op=">", value_type="number", raw_value=100)
+        cond = WhereParam(left_expr=agg_left, op=">", value_type="number", raw_value=100)
         br = CaseWhenBranch(condition=cond, result=NormalizedExpr.from_column("'high'"))
         intent = _make_intent_with_case([br], group_by=[NormalizedExpr.from_column("t.k")])
         out = tag_case_when_condition_scope(intent)
@@ -389,7 +391,7 @@ class TestTagCaseWhenConditionScope:
     def test_aggregated_branch_in_cte(self):
         agg_left = NormalizedExpr.from_column("t.amount")
         agg_left = replace(agg_left, agg_func="sum")
-        cond = FilterParam(left_expr=agg_left, op=">", value_type="number", raw_value=100)
+        cond = WhereParam(left_expr=agg_left, op=">", value_type="number", raw_value=100)
         br = CaseWhenBranch(condition=cond, result=NormalizedExpr.from_column("'high'"))
         intent = _make_intent_with_case([br], cte=True)
         out = tag_case_when_condition_scope(intent)
@@ -401,7 +403,7 @@ class TestNormalizeDateDiffRawValues:
 
     def test_plural_days_to_singular(self):
         """Plural 'days' in date_diff raw_value becomes 'day'."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op=">",
             value_type="date_diff",
@@ -413,18 +415,18 @@ class TestNormalizeDateDiffRawValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
-            having_param=[],
+            where=predicate_group_from_list([fp]),
+            having=None,
             param_values={},
             cte_steps=[],
             natural_language="test",
         )
         result = normalize_date_diff_raw_values(intent)
-        assert result.filters_param[0].raw_value["unit"] == "day"
+        assert result.where.leaves()[0].raw_value["unit"] == "day"
 
     def test_plural_weeks_to_singular(self):
         """Plural 'weeks' becomes 'week'."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op=">=",
             value_type="date_diff",
@@ -436,18 +438,18 @@ class TestNormalizeDateDiffRawValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
-            having_param=[],
+            where=predicate_group_from_list([fp]),
+            having=None,
             param_values={},
             cte_steps=[],
             natural_language="test",
         )
         result = normalize_date_diff_raw_values(intent)
-        assert result.filters_param[0].raw_value["unit"] == "week"
+        assert result.where.leaves()[0].raw_value["unit"] == "week"
 
     def test_date_window_plural_normalized(self):
         """date_window with plural unit is also normalized."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op=">=",
             value_type="date_window",
@@ -459,18 +461,18 @@ class TestNormalizeDateDiffRawValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
-            having_param=[],
+            where=predicate_group_from_list([fp]),
+            having=None,
             param_values={},
             cte_steps=[],
             natural_language="test",
         )
         result = normalize_date_diff_raw_values(intent)
-        assert result.filters_param[0].raw_value["unit"] == "month"
+        assert result.where.leaves()[0].raw_value["unit"] == "month"
 
     def test_non_date_filter_unchanged(self):
         """Filters without date_window/date_diff pass through unchanged."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op="=",
             value_type="string",
@@ -482,18 +484,18 @@ class TestNormalizeDateDiffRawValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
-            having_param=[],
+            where=predicate_group_from_list([fp]),
+            having=None,
             param_values={},
             cte_steps=[],
             natural_language="test",
         )
         result = normalize_date_diff_raw_values(intent)
-        assert result.filters_param[0].raw_value == "x"
+        assert result.where.leaves()[0].raw_value == "x"
 
 
 class TestCanonicalizeTemporalUnitArgs:
-    """Tests for canonicalize_temporal_unit_args (Phase 16)."""
+    """Tests for canonicalize_temporal_unit_args."""
 
     def _make_intent_with_select_expr(self, expr: NormalizedExpr) -> RuntimeIntent:
         return RuntimeIntent(
@@ -502,8 +504,8 @@ class TestCanonicalizeTemporalUnitArgs:
             select_cols=[SelectCol(expr=expr)],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             cte_steps=[],
             natural_language="test",
@@ -589,7 +591,7 @@ class TestCanonicalizeTemporalUnitArgs:
         """CTE-scoped filter exprs are also walked."""
         from aetherdialect._contracts_core import RuntimeCteStep
 
-        cte_filter = FilterParam(
+        cte_filter = WhereParam(
             left_expr=NormalizedExpr(
                 scalar_func="date_trunc",
                 scalar_func_args=["annually"],
@@ -606,8 +608,8 @@ class TestCanonicalizeTemporalUnitArgs:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[cte_filter],
-            having_param=[],
+            where=predicate_group_from_list([cte_filter]),
+            having=None,
         )
         intent = RuntimeIntent(
             tables=["t"],
@@ -615,18 +617,18 @@ class TestCanonicalizeTemporalUnitArgs:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             cte_steps=[cte],
             natural_language="test",
         )
         out = canonicalize_temporal_unit_args(intent)
-        assert out.cte_steps[0].filters_param[0].left_expr.scalar_func_args[0] == "year"
+        assert out.cte_steps[0].where.leaves()[0].left_expr.scalar_func_args[0] == "year"
 
     def test_date_diff_filter_alias_normalization_via_normalize_date_diff(self):
         """`normalize_date_diff_raw_values` also handles aliases like `monthly`."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op=">",
             value_type="date_diff",
@@ -638,14 +640,14 @@ class TestCanonicalizeTemporalUnitArgs:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
-            having_param=[],
+            where=predicate_group_from_list([fp]),
+            having=None,
             param_values={},
             cte_steps=[],
             natural_language="test",
         )
         result = normalize_date_diff_raw_values(intent)
-        assert result.filters_param[0].raw_value["unit"] == "month"
+        assert result.where.leaves()[0].raw_value["unit"] == "month"
 
 
 class TestClassifyCteExpr:
@@ -864,7 +866,7 @@ class TestTagExprNumeric:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = tag_expr_numeric(intent, mixed_schema)
         assert result.select_cols[0].expr.is_numeric is True
@@ -880,17 +882,19 @@ class TestTagExprNumeric:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr(add_groups=[MulGroup(coefficient=5.0, multiply=["t.name"])]),
-                    op="=",
-                    value_type="string",
-                ),
-            ],
+            where=predicate_group_from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr(add_groups=[MulGroup(coefficient=5.0, multiply=["t.name"])]),
+                        op="=",
+                        value_type="string",
+                    ),
+                ]
+            ),
         )
         result = tag_expr_numeric(intent, mixed_schema)
-        assert result.filters_param[0].left_expr.is_numeric is False
-        assert result.filters_param[0].left_expr.add_groups[0].coefficient == 1.0
+        assert result.where.leaves()[0].left_expr.is_numeric is False
+        assert result.where.leaves()[0].left_expr.add_groups[0].coefficient == 1.0
 
     def test_clears_non_numeric_values_in_intent(self, mixed_schema):
         """tag_expr_numeric clears add_values on non-numeric select expression."""
@@ -907,7 +911,7 @@ class TestTagExprNumeric:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = tag_expr_numeric(intent, mixed_schema)
         assert result.select_cols[0].expr.add_values == []
@@ -924,7 +928,7 @@ class TestTagExprNumeric:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = tag_expr_numeric(intent, mixed_schema)
         assert result.select_cols[0].expr.is_numeric is True
@@ -938,17 +942,19 @@ class TestTagExprNumeric:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr(add_groups=[MulGroup(coefficient=2.0, multiply=["t.amount"])]),
-                    op=">",
-                    value_type="number",
-                ),
-            ],
+            where=predicate_group_from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr(add_groups=[MulGroup(coefficient=2.0, multiply=["t.amount"])]),
+                        op=">",
+                        value_type="number",
+                    ),
+                ]
+            ),
         )
         result = tag_expr_numeric(intent, mixed_schema)
-        assert result.filters_param[0].left_expr.is_numeric is True
-        assert result.filters_param[0].left_expr.add_values == []
+        assert result.where.leaves()[0].left_expr.is_numeric is True
+        assert result.where.leaves()[0].left_expr.add_values == []
 
     def test_filter_right_expr_gets_injection(self, mixed_schema):
         """tag_expr_numeric injects ExprValue offset into filter right_expr when numeric."""
@@ -958,19 +964,21 @@ class TestTagExprNumeric:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr(add_groups=[MulGroup(coefficient=1.0, multiply=["t.amount"])]),
-                    op=">",
-                    value_type="number",
-                    right_expr=NormalizedExpr(add_groups=[MulGroup(coefficient=1.0, multiply=["t.amount"])]),
-                ),
-            ],
+            where=predicate_group_from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr(add_groups=[MulGroup(coefficient=1.0, multiply=["t.amount"])]),
+                        op=">",
+                        value_type="number",
+                        right_expr=NormalizedExpr(add_groups=[MulGroup(coefficient=1.0, multiply=["t.amount"])]),
+                    ),
+                ]
+            ),
         )
         result = tag_expr_numeric(intent, mixed_schema)
-        assert result.filters_param[0].right_expr.is_numeric is True
-        assert len(result.filters_param[0].right_expr.add_values) == 1
-        assert result.filters_param[0].right_expr.add_values[0].value == 0.0
+        assert result.where.leaves()[0].right_expr.is_numeric is True
+        assert len(result.where.leaves()[0].right_expr.add_values) == 1
+        assert result.where.leaves()[0].right_expr.add_values[0].value == 0.0
 
     def test_having_left_expr_skips_injection(self, mixed_schema):
         """tag_expr_numeric does not inject ExprValue offset into having left_expr."""
@@ -980,20 +988,22 @@ class TestTagExprNumeric:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[
-                HavingParam(
-                    left_expr=NormalizedExpr(
-                        add_groups=[MulGroup(coefficient=2.0, multiply=["t.amount"], agg_func="sum")]
+            where=None,
+            having=predicate_group_from_list(
+                [
+                    HavingParam(
+                        left_expr=NormalizedExpr(
+                            add_groups=[MulGroup(coefficient=2.0, multiply=["t.amount"], agg_func="sum")]
+                        ),
+                        op=">",
+                        value_type="number",
                     ),
-                    op=">",
-                    value_type="number",
-                ),
-            ],
+                ]
+            ),
         )
         result = tag_expr_numeric(intent, mixed_schema)
-        assert result.having_param[0].left_expr.is_numeric is True
-        assert result.having_param[0].left_expr.add_values == []
+        assert result.having.leaves()[0].left_expr.is_numeric is True
+        assert result.having.leaves()[0].left_expr.add_values == []
 
     def test_cte_filter_left_expr_skips_injection(self, mixed_schema):
         """tag_expr_numeric does not inject ExprValue offset into CTE filter left_expr."""
@@ -1003,14 +1013,16 @@ class TestTagExprNumeric:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr(add_groups=[MulGroup(coefficient=2.0, multiply=["t.amount"])]),
-                    op=">",
-                    value_type="number",
-                ),
-            ],
-            having_param=[],
+            where=predicate_group_from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr(add_groups=[MulGroup(coefficient=2.0, multiply=["t.amount"])]),
+                        op=">",
+                        value_type="number",
+                    ),
+                ]
+            ),
+            having=None,
             param_values={},
             output_columns=[],
         )
@@ -1020,12 +1032,12 @@ class TestTagExprNumeric:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
         result = tag_expr_numeric(intent, mixed_schema)
-        assert result.cte_steps[0].filters_param[0].left_expr.is_numeric is True
-        assert result.cte_steps[0].filters_param[0].left_expr.add_values == []
+        assert result.cte_steps[0].where.leaves()[0].left_expr.is_numeric is True
+        assert result.cte_steps[0].where.leaves()[0].left_expr.add_values == []
 
 
 class TestIsNontrivialGroup:
@@ -1064,7 +1076,8 @@ class TestAssignStructuralGroup:
         """Trivial group gets no structural param."""
         g = MulGroup(coefficient=1.0, multiply=["t.a"])
         pv = {}
-        idx = _assign_structural_group(g, 1, pv)
+        out, idx = _assign_structural_group(g, 1, pv)
+        assert out is g
         assert idx == 1
         assert pv == {}
 
@@ -1072,8 +1085,9 @@ class TestAssignStructuralGroup:
         """Nontrivial group gets coefficient param key."""
         g = MulGroup(coefficient=2.5, multiply=["t.a"], agg_func="sum")
         pv = {}
-        idx = _assign_structural_group(g, 1, pv)
-        assert g.coeff_param_key == "s1"
+        out, idx = _assign_structural_group(g, 1, pv)
+        assert g.coeff_param_key == ""
+        assert out.coeff_param_key == "s1"
         assert pv["s1"] == 2.5
         assert idx == 2
 
@@ -1081,8 +1095,11 @@ class TestAssignStructuralGroup:
         """Scalar func args get param keys; unit coefficient is skipped."""
         g = MulGroup(coefficient=1.0, multiply=["t.a"], scalar_func="round", scalar_func_args=[2])
         pv = {}
-        idx = _assign_structural_group(g, 1, pv)
+        out, idx = _assign_structural_group(g, 1, pv)
         assert g.coeff_param_key == ""
+        assert out.coeff_param_key == ""
+        assert g.sarg_param_keys == []
+        assert out.sarg_param_keys[0] == "s1"
         assert pv["s1"] == 2
         assert idx == 2
 
@@ -1090,7 +1107,8 @@ class TestAssignStructuralGroup:
         """Non-numeric group skips coefficient assignment."""
         g = MulGroup(coefficient=3.0, multiply=["t.a"], agg_func="count")
         pv = {}
-        _assign_structural_group(g, 1, pv, is_numeric=False)
+        out, _idx = _assign_structural_group(g, 1, pv, is_numeric=False)
+        assert out is g
         assert g.coeff_param_key == ""
         assert "s1" not in pv
 
@@ -1106,8 +1124,9 @@ class TestAssignStructuralExpr:
             is_numeric=True,
         )
         pv = {}
-        _assign_structural_expr(expr, 1, pv)
-        assert expr.add_values[0].param_key == "s1"
+        out, _idx = _assign_structural_expr(expr, 1, pv)
+        assert expr.add_values[0].param_key == ""
+        assert out.add_values[0].param_key == "s1"
         assert pv["s1"] == 5.0
 
     def test_sub_values_get_keys(self):
@@ -1118,8 +1137,9 @@ class TestAssignStructuralExpr:
             is_numeric=True,
         )
         pv = {}
-        _assign_structural_expr(expr, 1, pv)
-        assert expr.sub_values[0].param_key == "s1"
+        out, _idx = _assign_structural_expr(expr, 1, pv)
+        assert expr.sub_values[0].param_key == ""
+        assert out.sub_values[0].param_key == "s1"
         assert pv["s1"] == 3.0
 
     def test_nontrivial_group_and_values(self):
@@ -1130,7 +1150,11 @@ class TestAssignStructuralExpr:
             is_numeric=True,
         )
         pv = {}
-        idx = _assign_structural_expr(expr, 1, pv)
+        out, idx = _assign_structural_expr(expr, 1, pv)
+        assert expr.add_groups[0].coeff_param_key == ""
+        assert expr.add_values[0].param_key == ""
+        assert out.add_groups[0].coeff_param_key == "s1"
+        assert out.add_values[0].param_key == "s2"
         assert pv["s1"] == 2.0
         assert pv["s2"] == 10.0
         assert idx == 3
@@ -1144,7 +1168,8 @@ class TestAssignStructuralExpr:
             is_numeric=False,
         )
         pv = {}
-        idx = _assign_structural_expr(expr, 1, pv)
+        out, idx = _assign_structural_expr(expr, 1, pv)
+        assert out is expr
         assert pv == {}
         assert expr.add_values[0].param_key == ""
         assert expr.sub_values[0].param_key == ""
@@ -1164,7 +1189,8 @@ class TestAssignStructuralExpr:
             is_numeric=False,
         )
         pv = {}
-        idx = _assign_structural_expr(expr, 1, pv)
+        out, idx = _assign_structural_expr(expr, 1, pv)
+        assert out is expr
         assert pv == {}
         assert idx == 1
 
@@ -1306,7 +1332,7 @@ class TestEnsureScalarFuncDefaults:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = ensure_scalar_func_defaults(intent)
         assert result.select_cols[0].expr.add_groups[0].scalar_func_args == [2]
@@ -1325,8 +1351,8 @@ class TestEnsureScalarFuncDefaults:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             output_columns=[],
         )
@@ -1336,7 +1362,7 @@ class TestEnsureScalarFuncDefaults:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
         result = ensure_scalar_func_defaults(intent)
@@ -1350,7 +1376,7 @@ class TestEnsureScalarFuncDefaults:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = ensure_scalar_func_defaults(intent)
         assert result is intent
@@ -1367,7 +1393,7 @@ class TestExtractStructuralParams:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.a"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             limit=10,
         )
         result = extract_structural_params(intent)
@@ -1382,7 +1408,7 @@ class TestExtractStructuralParams:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.a"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = extract_structural_params(intent)
         assert result.limit_param_key == ""
@@ -1402,7 +1428,7 @@ class TestExtractStructuralParams:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = extract_structural_params(intent)
         assert "s1" in result.param_values
@@ -1413,7 +1439,7 @@ class TestExtractStructuralParams:
         cw = CaseWhenExpr(
             branches=[
                 CaseWhenBranch(
-                    condition=FilterParam(
+                    condition=WhereParam(
                         left_expr=NormalizedExpr.from_column("film.rental_rate"),
                         op=">",
                         right_expr=NormalizedExpr(add_values=[ExprValue(value=3)], is_numeric=True),
@@ -1432,7 +1458,7 @@ class TestExtractStructuralParams:
             select_cols=[case_col],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             case_registry=[step],
         )
         out = extract_structural_params(intent)
@@ -1444,13 +1470,101 @@ class TestExtractStructuralParams:
         compact = re.sub(r"\s+", "", final)
         assert "rental_rate>3" in compact
 
+    @pytest.mark.fast
+    def test_does_not_mutate_input_nested_nodes(self):
+        """extract_structural_params leaves the caller's nested IR untouched."""
+        intent = RuntimeIntent(
+            tables=["t"],
+            grain="row_level",
+            select_cols=[
+                SelectCol(
+                    expr=NormalizedExpr(
+                        add_groups=[
+                            MulGroup(
+                                coefficient=2.0,
+                                multiply=["t.a"],
+                                agg_func="sum",
+                                scalar_func="round",
+                                scalar_func_args=[2],
+                            )
+                        ],
+                        add_values=[ExprValue(value=5.0)],
+                        is_numeric=True,
+                    )
+                )
+            ],
+            group_by_cols=[],
+            order_by_cols=[],
+            where=predicate_group_from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("t.created_at"),
+                        op=">=",
+                        value_type="date_diff",
+                        raw_value={"unit": "day", "amount": 30},
+                    )
+                ]
+            ),
+            limit=10,
+            cte_steps=[
+                RuntimeCteStep(
+                    cte_name="c",
+                    select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.a"))],
+                    limit=5,
+                )
+            ],
+        )
+        before = deepcopy(intent)
+        out = extract_structural_params(intent)
+        assert intent == before
+        assert out is not intent
+        assert out.select_cols[0].expr.add_groups[0].coeff_param_key == "s3"
+        assert intent.select_cols[0].expr.add_groups[0].coeff_param_key == ""
+        assert intent.select_cols[0].expr.add_values[0].param_key == ""
+        assert (intent.where.leaves() if intent.where else [])[0].param_key_unit == ""
+        assert (intent.where.leaves() if intent.where else [])[0].raw_value == {"unit": "day", "amount": 30}
+        assert intent.cte_steps[0].limit_param_key == ""
+
+    @pytest.mark.fast
+    def test_shared_nested_nodes_get_independent_structural_keys(self):
+        """Stamping one sub-intent must not overwrite a sibling sharing nested IR."""
+        shared_group = MulGroup(coefficient=2.0, multiply=["t.a"], agg_func="sum")
+        shared_expr = NormalizedExpr(add_groups=[shared_group], is_numeric=True)
+        sub_a = RuntimeIntent(
+            tables=["t"],
+            grain="row_level",
+            select_cols=[SelectCol(expr=shared_expr)],
+            group_by_cols=[],
+            order_by_cols=[],
+            where=None,
+        )
+        sub_b = RuntimeIntent(
+            tables=["t"],
+            grain="row_level",
+            select_cols=[SelectCol(expr=shared_expr)],
+            group_by_cols=[],
+            order_by_cols=[],
+            where=None,
+            limit=10,
+        )
+        out_a = extract_structural_params(sub_a)
+        key_a = out_a.select_cols[0].expr.add_groups[0].coeff_param_key
+        out_b = extract_structural_params(sub_b)
+        key_b = out_b.select_cols[0].expr.add_groups[0].coeff_param_key
+        assert shared_group.coeff_param_key == ""
+        assert key_a == "s1"
+        assert key_b == "s2"
+        assert out_a.select_cols[0].expr.add_groups[0].coeff_param_key == key_a
+        assert out_a.select_cols[0].expr.add_groups[0] is not out_b.select_cols[0].expr.add_groups[0]
+        assert out_a.select_cols[0].expr.add_groups[0] is not shared_group
+
 
 class TestDecomposeBetweenFiltersEdgeCases:
     """Edge-case tests for decompose_between_params."""
 
     def test_between_with_string_value(self):
         """Non-list raw_value between still decomposes into >= and <=."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op="between",
             value_type="string",
@@ -1462,16 +1576,16 @@ class TestDecomposeBetweenFiltersEdgeCases:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
-            having_param=[],
+            where=predicate_group_from_list([fp]),
+            having=None,
             param_values={},
             cte_steps=[],
             natural_language="test",
         )
         result = decompose_between_params(intent)
-        assert len(result.filters_param) == 2
-        assert result.filters_param[0].op == ">="
-        assert result.filters_param[1].op == "<="
+        assert len(result.where.leaves() if result.where else []) == 2
+        assert result.where.leaves()[0].op == ">="
+        assert result.where.leaves()[1].op == "<="
 
     def test_empty_filters(self):
         """Empty filters returns empty."""
@@ -1481,29 +1595,29 @@ class TestDecomposeBetweenFiltersEdgeCases:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             cte_steps=[],
             natural_language="test",
         )
         result = decompose_between_params(intent)
-        assert result.filters_param == []
+        assert (result.where.leaves() if result.where else []) == []
 
 
 class TestAssignParamKeysEdgeCases:
     """Edge-case tests for assign_param_keys."""
 
     def test_empty_inputs(self):
-        """Empty filters and having yield empty results."""
+        """Empty where and having yield empty results."""
         fp, hp, cte, _, idx = assign_param_keys([], [])
         assert fp == []
         assert hp == []
         assert idx == 1
 
     def test_is_not_null_skipped(self):
-        """IS NOT NULL filters skip param_key."""
-        fp = FilterParam(
+        """IS NOT NULL where predicates skip param_key."""
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op="is not null",
             value_type="null",
@@ -1513,17 +1627,17 @@ class TestAssignParamKeysEdgeCases:
         assert idx == 1
 
     def test_mixed_null_and_regular(self):
-        """Mix of is null and regular filters."""
-        fp1 = FilterParam(left_expr=NormalizedExpr.from_column("t.a"), op="is null", value_type="null")
-        fp2 = FilterParam(left_expr=NormalizedExpr.from_column("t.b"), op="=", value_type="string")
+        """Mix of is null and regular where predicates."""
+        fp1 = WhereParam(left_expr=NormalizedExpr.from_column("t.a"), op="is null", value_type="null")
+        fp2 = WhereParam(left_expr=NormalizedExpr.from_column("t.b"), op="=", value_type="string")
         new_fp, _, _, _, idx = assign_param_keys([fp1, fp2], [])
         assert new_fp[0].param_key == ""
         assert new_fp[1].param_key == "p1"
         assert idx == 2
 
     def test_expr_vs_expr_filter_skips_param_key(self):
-        """Filter with right_expr skips param_key assignment."""
-        fp = FilterParam(
+        """Where predicate with right_expr skips param_key assignment."""
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op=">",
             value_type="number",
@@ -1546,8 +1660,8 @@ class TestAssignParamKeysEdgeCases:
         assert idx == 1
 
     def test_expr_vs_expr_cte_filter_skips_param_key(self):
-        """CTE filter with right_expr skips param_key assignment."""
-        fp = FilterParam(
+        """CTE where predicate with right_expr skips param_key assignment."""
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op=">",
             value_type="number",
@@ -1559,24 +1673,24 @@ class TestAssignParamKeysEdgeCases:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
-            having_param=[],
+            where=predicate_group_from_list([fp]),
+            having=None,
             param_values={},
             output_columns=[],
         )
         _, _, new_ctes, _, idx = assign_param_keys([], [], cte_steps=[cte])
-        assert new_ctes[0].filters_param[0].param_key == ""
+        assert new_ctes[0].where.leaves()[0].param_key == ""
         assert idx == 1
 
     def test_expr_vs_expr_mixed_with_regular(self):
-        """Expr-vs-expr filter followed by regular filter gets correct keys."""
-        fp1 = FilterParam(
+        """Expr-vs-expr where predicate followed by regular where predicate gets correct keys."""
+        fp1 = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op=">",
             value_type="number",
             right_expr=NormalizedExpr.from_column("t.b"),
         )
-        fp2 = FilterParam(left_expr=NormalizedExpr.from_column("t.c"), op="=", value_type="string")
+        fp2 = WhereParam(left_expr=NormalizedExpr.from_column("t.c"), op="=", value_type="string")
         new_fp, _, _, _, idx = assign_param_keys([fp1, fp2], [])
         assert new_fp[0].param_key == ""
         assert new_fp[1].param_key == "p1"
@@ -1655,18 +1769,18 @@ class TestParseIntentResponse:
 
     def test_parses_filters(self):
         """Parses filters_param with left_expr and op."""
-        raw = '{"tables": ["orders"], "select_cols": ["orders.order_id"], "filters_param": [{"left_expr": "orders.status", "op": "=", "value": "shipped", "value_type": "string"}]}'
+        raw = '{"tables": ["orders"], "select_cols": ["orders.order_id"], "where": [{"left_expr": "orders.status", "op": "=", "value": "shipped", "value_type": "string"}]}'
         result = parse_intent_response(raw, "q")
         assert result is not None
-        assert len(result.filters_param) == 1
-        assert result.filters_param[0].op == "="
+        assert len(result.where.leaves() if result.where else []) == 1
+        assert result.where.leaves()[0].op == "="
 
     def test_parses_having(self):
         """Parses having_param with left_expr and op."""
         raw = '{"tables": ["orders"], "select_cols": ["orders.order_id"], "having_param": [{"left_expr": "count(orders.order_id)", "op": ">", "value": 5, "value_type": "integer"}]}'
         result = parse_intent_response(raw, "q")
         assert result is not None
-        assert len(result.having_param) == 1
+        assert len(result.having.leaves() if result.having else []) == 1
 
     def test_parses_order_by(self):
         """Parses order_by_cols with direction."""
@@ -1704,18 +1818,21 @@ class TestParseIntentResponse:
         assert result.tables == ["orders"]
 
     def test_skips_filter_without_left_expr(self):
-        """Filters with no left_expr are skipped."""
-        raw = '{"tables": ["t"], "select_cols": ["t.x"], "filters_param": [{"op": "=", "value": "a"}]}'
+        """Legacy filters_param without left_expr migrate with an empty left side."""
+        raw = '{"tables": ["t"], "select_cols": ["t.x"], "where": [{"op": "=", "value": "a"}]}'
         result = parse_intent_response(raw, "q")
         assert result is not None
-        assert len(result.filters_param) == 0
+        assert result.where is not None
+        assert len(result.where.leaves()) == 1
+        assert result.where.op == "and"
+        assert result.where.leaves()[0].left_expr.primary_column == ""
 
     def test_filter_bool_op_parsed(self):
         raw = json.dumps(
             {
                 "tables": ["t"],
                 "select_cols": ["t.x"],
-                "filters_param": [
+                "where": [
                     {
                         "left_expr": "t.a",
                         "op": "=",
@@ -1734,15 +1851,17 @@ class TestParseIntentResponse:
         )
         result = parse_intent_response(raw, "q")
         assert result is not None
-        assert result.filters_param[0].bool_op == "AND"
-        assert result.filters_param[1].bool_op == "OR"
+        assert result.where is not None
+        assert result.where.op == "or"
+        assert len(result.where.groups) == 2
+        assert [p.left_expr.primary_column for p in result.where.leaves()] == ["t.a", "t.b"]
 
     def test_filter_bool_op_defaults_when_missing(self):
         raw = json.dumps(
             {
                 "tables": ["t"],
                 "select_cols": ["t.x"],
-                "filters_param": [
+                "where": [
                     {
                         "left_expr": "t.a",
                         "op": "=",
@@ -1754,42 +1873,46 @@ class TestParseIntentResponse:
         )
         result = parse_intent_response(raw, "q")
         assert result is not None
-        assert result.filters_param[0].bool_op == "AND"
+        assert result.where is not None
+        assert result.where.op == "and"
+        assert len(result.where.predicates) == 1
 
-    def test_filter_group_parsed(self):
+    def test_where_group_parsed(self):
         raw = json.dumps(
             {
                 "tables": ["t"],
                 "select_cols": ["t.x"],
-                "filters_param": [
+                "where": [
                     {
                         "left_expr": "t.a",
                         "op": "=",
                         "value": "1",
                         "value_type": "integer",
-                        "filter_group": 1,
+                        "where_group": 1,
                     },
                     {
                         "left_expr": "t.b",
                         "op": ">",
                         "value": "2",
                         "value_type": "integer",
-                        "filter_group": 1,
+                        "where_group": 1,
                     },
                 ],
             }
         )
         result = parse_intent_response(raw, "q")
         assert result is not None
-        assert result.filters_param[0].filter_group == 1
-        assert result.filters_param[1].filter_group == 1
+        assert result.where is not None
+        assert result.where.op == "and"
+        assert len(result.where.predicates) == 2
+        assert [p.left_expr.primary_column for p in result.where.leaves()] == ["t.a", "t.b"]
 
-    def test_filter_group_defaults_to_none(self):
+    def test_where_group_defaults_to_none(self):
         raw = json.dumps(
             {
                 "tables": ["t"],
                 "select_cols": ["t.x"],
-                "filters_param": [
+                "where": [
                     {
                         "left_expr": "t.a",
                         "op": "=",
@@ -1801,7 +1924,9 @@ class TestParseIntentResponse:
         )
         result = parse_intent_response(raw, "q")
         assert result is not None
-        assert result.filters_param[0].filter_group is None
+        assert result.where is not None
+        assert result.where.op == "and"
+        assert len(result.where.predicates) == 1
 
     def test_having_bool_op_parsed(self):
         raw = json.dumps(
@@ -1827,10 +1952,12 @@ class TestParseIntentResponse:
         )
         result = parse_intent_response(raw, "q")
         assert result is not None
-        assert result.having_param[0].bool_op == "AND"
-        assert result.having_param[1].bool_op == "OR"
+        assert result.having is not None
+        assert result.having.op == "or"
+        assert len(result.having.groups) == 2
+        assert len(result.having.leaves()) == 2
 
-    def test_having_filter_group_parsed(self):
+    def test_having_where_group_parsed(self):
         raw = json.dumps(
             {
                 "tables": ["t"],
@@ -1841,14 +1968,16 @@ class TestParseIntentResponse:
                         "op": ">",
                         "value": 5,
                         "value_type": "integer",
-                        "filter_group": 2,
+                        "where_group": 2,
                     },
                 ],
             }
         )
         result = parse_intent_response(raw, "q")
         assert result is not None
-        assert result.having_param[0].filter_group == 2
+        assert result.having is not None
+        assert result.having.op == "and"
+        assert len(result.having.predicates) == 1
 
     def test_filter_preserves_date_interval_right_expr(self):
         """right_expr with date/interval expression is preserved, not cleared."""
@@ -1858,7 +1987,7 @@ class TestParseIntentResponse:
                 "select_cols": [{"expr": "rental.rental_id"}],
                 "group_by_cols": [],
                 "order_by_cols": [],
-                "filters_param": [
+                "where": [
                     {
                         "left_expr": "rental.rental_date",
                         "op": ">=",
@@ -1873,19 +2002,19 @@ class TestParseIntentResponse:
         )
         result = parse_intent_response(raw, "rentals in last 90 days")
         assert result is not None
-        assert len(result.filters_param) == 1
-        fp = result.filters_param[0]
+        assert len(result.where.leaves() if result.where else []) == 1
+        fp = result.where.leaves()[0]
         assert fp.right_expr is not None
 
     def test_filter_clears_plain_literal_right_expr(self):
-        """right_expr without table.column and not date/interval is cleared."""
+        """Legacy filters_param preserves right_expr via WhereParam.from_dict migration."""
         raw = json.dumps(
             {
                 "tables": ["t"],
                 "select_cols": [{"expr": "t.x"}],
                 "group_by_cols": [],
                 "order_by_cols": [],
-                "filters_param": [
+                "where": [
                     {
                         "left_expr": "t.a",
                         "op": "=",
@@ -1900,8 +2029,9 @@ class TestParseIntentResponse:
         )
         result = parse_intent_response(raw, "test")
         assert result is not None
-        assert len(result.filters_param) == 1
-        assert result.filters_param[0].right_expr is None
+        assert len(result.where.leaves() if result.where else []) == 1
+        assert result.where.leaves()[0].right_expr is not None
+        assert result.where.leaves()[0].right_expr.column_ref == "42"
 
     def test_parse_window_spec_on_select_col(self):
         """LLM JSON with ``window_registry`` and bare ``w01`` ref is parsed into select and registry."""
@@ -1922,7 +2052,7 @@ class TestParseIntentResponse:
                 ],
                 "group_by_cols": [],
                 "order_by_cols": [],
-                "filters_param": [],
+                "where": [],
                 "having_param": [],
                 "limit": None,
                 "cte_steps": [],
@@ -1966,7 +2096,7 @@ class TestParseIntentResponse:
                 ],
                 "group_by_cols": [],
                 "order_by_cols": [],
-                "filters_param": [],
+                "where": [],
                 "having_param": [],
                 "limit": None,
                 "cte_steps": [],
@@ -2038,18 +2168,18 @@ class TestDecomposeBetweenHaving:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[hp],
+            where=None,
+            having=predicate_group_from_list([hp]),
             param_values={},
             cte_steps=[],
             natural_language="test",
         )
         result = decompose_between_params(intent)
-        assert len(result.having_param) == 2
-        assert result.having_param[0].op == ">="
-        assert result.having_param[0].raw_value == 5
-        assert result.having_param[1].op == "<="
-        assert result.having_param[1].raw_value == 10
+        assert len(result.having.leaves() if result.having else []) == 2
+        assert result.having.leaves()[0].op == ">="
+        assert result.having.leaves()[0].raw_value == 5
+        assert result.having.leaves()[1].op == "<="
+        assert result.having.leaves()[1].raw_value == 10
 
     def test_having_non_between_unchanged(self):
         """Non-BETWEEN having passes through unchanged."""
@@ -2065,15 +2195,15 @@ class TestDecomposeBetweenHaving:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[hp],
+            where=None,
+            having=predicate_group_from_list([hp]),
             param_values={},
             cte_steps=[],
             natural_language="test",
         )
         result = decompose_between_params(intent)
-        assert len(result.having_param) == 1
-        assert result.having_param[0].op == ">"
+        assert len(result.having.leaves() if result.having else []) == 1
+        assert result.having.leaves()[0].op == ">"
 
     def test_cte_having_between_decomposed(self):
         """BETWEEN having in a CTE step is also decomposed."""
@@ -2089,8 +2219,8 @@ class TestDecomposeBetweenHaving:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[cte_hp],
+            where=None,
+            having=predicate_group_from_list([cte_hp]),
             param_values={},
             output_columns=[],
         )
@@ -2100,16 +2230,16 @@ class TestDecomposeBetweenHaving:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             cte_steps=[cte],
             natural_language="test",
         )
         result = decompose_between_params(intent)
-        assert len(result.cte_steps[0].having_param) == 2
-        assert result.cte_steps[0].having_param[0].op == ">="
-        assert result.cte_steps[0].having_param[1].op == "<="
+        assert len(result.cte_steps[0].having.leaves()) == 2
+        assert result.cte_steps[0].having.leaves()[0].op == ">="
+        assert result.cte_steps[0].having.leaves()[1].op == "<="
 
 
 class TestParseBetweenRawValue:
@@ -2152,7 +2282,7 @@ class TestNormalizeInFilterRawValues:
 
     def test_string_to_list_filter(self):
         """String IN value gets parsed to a list."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op="in",
             value_type="string",
@@ -2164,18 +2294,18 @@ class TestNormalizeInFilterRawValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
-            having_param=[],
+            where=predicate_group_from_list([fp]),
+            having=None,
             param_values={},
             cte_steps=[],
             natural_language="test",
         )
         result = normalize_in_raw_values(intent)
-        assert result.filters_param[0].raw_value == ["R", "PG-13"]
+        assert result.where.leaves()[0].raw_value == ["R", "PG-13"]
 
     def test_quoted_string_to_list(self):
         """Quoted string IN value gets parsed correctly."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op="in",
             value_type="string",
@@ -2187,18 +2317,18 @@ class TestNormalizeInFilterRawValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
-            having_param=[],
+            where=predicate_group_from_list([fp]),
+            having=None,
             param_values={},
             cte_steps=[],
             natural_language="test",
         )
         result = normalize_in_raw_values(intent)
-        assert result.filters_param[0].raw_value == ["R", "PG-13", "NC-17"]
+        assert result.where.leaves()[0].raw_value == ["R", "PG-13", "NC-17"]
 
     def test_list_value_unchanged(self):
         """Already-list raw_value is not modified."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op="in",
             value_type="string",
@@ -2210,18 +2340,18 @@ class TestNormalizeInFilterRawValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
-            having_param=[],
+            where=predicate_group_from_list([fp]),
+            having=None,
             param_values={},
             cte_steps=[],
             natural_language="test",
         )
         result = normalize_in_raw_values(intent)
-        assert result.filters_param[0].raw_value == ["R", "PG"]
+        assert result.where.leaves()[0].raw_value == ["R", "PG"]
 
     def test_non_in_op_unchanged(self):
         """Non-IN ops are not touched even with string raw_value."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op="=",
             value_type="string",
@@ -2233,18 +2363,18 @@ class TestNormalizeInFilterRawValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
-            having_param=[],
+            where=predicate_group_from_list([fp]),
+            having=None,
             param_values={},
             cte_steps=[],
             natural_language="test",
         )
         result = normalize_in_raw_values(intent)
-        assert result.filters_param[0].raw_value == "R, PG"
+        assert result.where.leaves()[0].raw_value == "R, PG"
 
     def test_not_in_string_to_list(self):
         """NOT IN string value also gets parsed."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op="not in",
             value_type="string",
@@ -2256,18 +2386,18 @@ class TestNormalizeInFilterRawValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
-            having_param=[],
+            where=predicate_group_from_list([fp]),
+            having=None,
             param_values={},
             cte_steps=[],
             natural_language="test",
         )
         result = normalize_in_raw_values(intent)
-        assert result.filters_param[0].raw_value == ["R", "G"]
+        assert result.where.leaves()[0].raw_value == ["R", "G"]
 
     def test_single_element_string_unchanged(self):
         """Single-element string is not split into a list."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op="in",
             value_type="string",
@@ -2279,18 +2409,18 @@ class TestNormalizeInFilterRawValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
-            having_param=[],
+            where=predicate_group_from_list([fp]),
+            having=None,
             param_values={},
             cte_steps=[],
             natural_language="test",
         )
         result = normalize_in_raw_values(intent)
-        assert result.filters_param[0].raw_value == "PG-13"
+        assert result.where.leaves()[0].raw_value == "PG-13"
 
     def test_cte_in_filter_normalised(self):
         """CTE step IN string value gets parsed too."""
-        cte_fp = FilterParam(
+        cte_fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op="in",
             value_type="string",
@@ -2302,8 +2432,8 @@ class TestNormalizeInFilterRawValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[cte_fp],
-            having_param=[],
+            where=predicate_group_from_list([cte_fp]),
+            having=None,
             param_values={},
             output_columns=[],
         )
@@ -2313,14 +2443,14 @@ class TestNormalizeInFilterRawValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             cte_steps=[cte],
             natural_language="test",
         )
         result = normalize_in_raw_values(intent)
-        assert result.cte_steps[0].filters_param[0].raw_value == ["A", "B", "C"]
+        assert result.cte_steps[0].where.leaves()[0].raw_value == ["A", "B", "C"]
 
 
 class TestExtractColumnsFromExpr:
@@ -2394,7 +2524,7 @@ class TestRepairMisclassifiedDateDiff:
 
     def test_plain_column_converted_to_date_window(self):
         """date_diff with a plain column left_expr becomes date_window."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("rental.rental_date"),
             op=">=",
             value_type="date_diff",
@@ -2406,17 +2536,17 @@ class TestRepairMisclassifiedDateDiff:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=predicate_group_from_list([fp]),
             natural_language="test",
         )
         result = repair_misclassified_date_diff(intent)
-        repaired = result.filters_param[0]
+        repaired = result.where.leaves()[0]
         assert repaired.value_type == "date_window"
         assert repaired.raw_value == {"unit": "day", "amount": 90}
 
     def test_subtraction_expr_stays_date_diff(self):
         """date_diff with a subtraction left_expr is not reclassified."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr(
                 add_groups=[MulGroup(multiply=["rental.return_date"])],
                 sub_groups=[MulGroup(multiply=["rental.rental_date"])],
@@ -2431,15 +2561,15 @@ class TestRepairMisclassifiedDateDiff:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=predicate_group_from_list([fp]),
             natural_language="test",
         )
         result = repair_misclassified_date_diff(intent)
-        assert result.filters_param[0].value_type == "date_diff"
+        assert result.where.leaves()[0].value_type == "date_diff"
 
     def test_non_date_diff_unchanged(self):
         """Non-date_diff filters pass through unchanged."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.col"),
             op="=",
             value_type="string",
@@ -2451,15 +2581,15 @@ class TestRepairMisclassifiedDateDiff:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=predicate_group_from_list([fp]),
             natural_language="test",
         )
         result = repair_misclassified_date_diff(intent)
-        assert result.filters_param[0].value_type == "string"
+        assert result.where.leaves()[0].value_type == "string"
 
     def test_cte_filters_also_repaired(self):
         """date_diff in CTE filters is also reclassified."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("orders.order_date"),
             op=">=",
             value_type="date_diff",
@@ -2471,8 +2601,8 @@ class TestRepairMisclassifiedDateDiff:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
-            having_param=[],
+            where=predicate_group_from_list([fp]),
+            having=None,
             param_values={},
             output_columns=[],
         )
@@ -2482,18 +2612,18 @@ class TestRepairMisclassifiedDateDiff:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
             natural_language="test",
         )
         result = repair_misclassified_date_diff(intent)
-        repaired = result.cte_steps[0].filters_param[0]
+        repaired = result.cte_steps[0].where.leaves()[0]
         assert repaired.value_type == "date_window"
         assert repaired.raw_value == {"unit": "month", "amount": 6}
 
     def test_missing_amount_stays_date_diff(self):
         """date_diff without amount in raw_value is not rewritten."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("rental.rental_date"),
             op=">=",
             value_type="date_diff",
@@ -2505,15 +2635,15 @@ class TestRepairMisclassifiedDateDiff:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=predicate_group_from_list([fp]),
             natural_language="test",
         )
         result = repair_misclassified_date_diff(intent)
-        assert result.filters_param[0].value_type == "date_diff"
+        assert result.where.leaves()[0].value_type == "date_diff"
 
     def test_right_expr_date_diff_not_reclassified(self):
         """date_diff with column RHS stays date_diff even when LHS is a plain column."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("rental.rental_date"),
             op=">",
             right_expr=NormalizedExpr.from_column("rental.return_date"),
@@ -2526,18 +2656,18 @@ class TestRepairMisclassifiedDateDiff:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=predicate_group_from_list([fp]),
             natural_language="test",
         )
         result = repair_misclassified_date_diff(intent)
-        kept = result.filters_param[0]
+        kept = result.where.leaves()[0]
         assert kept.value_type == "date_diff"
         assert kept.right_expr is not None
         assert kept.raw_value == {"unit": "day", "amount": 7}
 
     def test_non_dict_raw_value_unchanged(self):
         """Non-dict raw_value does not trigger reclassification."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.d"),
             op="=",
             value_type="date_diff",
@@ -2549,16 +2679,16 @@ class TestRepairMisclassifiedDateDiff:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=predicate_group_from_list([fp]),
             natural_language="test",
         )
         result = repair_misclassified_date_diff(intent)
-        assert result.filters_param[0].value_type == "date_diff"
-        assert result.filters_param[0].raw_value == "nonsense"
+        assert result.where.leaves()[0].value_type == "date_diff"
+        assert result.where.leaves()[0].raw_value == "nonsense"
 
     def test_default_unit_when_missing_in_raw(self):
         """Reclassified date_window uses 'day' when unit is absent."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.event_date"),
             op=">=",
             value_type="date_diff",
@@ -2570,12 +2700,12 @@ class TestRepairMisclassifiedDateDiff:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=predicate_group_from_list([fp]),
             natural_language="test",
         )
         result = repair_misclassified_date_diff(intent)
-        assert result.filters_param[0].value_type == "date_window"
-        assert result.filters_param[0].raw_value == {"unit": "day", "amount": 3}
+        assert result.where.leaves()[0].value_type == "date_window"
+        assert result.where.leaves()[0].raw_value == {"unit": "day", "amount": 3}
 
 
 class TestNormalizeOrderDirection:
@@ -2659,7 +2789,7 @@ class TestParseIntentResponseExtended:
             {
                 "tables": ["t"],
                 "select_cols": ["t.x"],
-                "filters_param": [
+                "where": [
                     {
                         "left_expr": "t.y",
                         "op": "=",
@@ -2672,29 +2802,32 @@ class TestParseIntentResponseExtended:
         )
         r = parse_intent_response(raw, "q")
         assert r is not None
-        assert len(r.filters_param) == 1
-        assert r.filters_param[0].right_expr is None
+        assert len(r.where.leaves() if r.where else []) == 1
+        assert r.where.leaves()[0].right_expr is None
 
-    def test_filter_group_list_rejected_by_schema(self):
+    def test_where_group_list_rejected_by_schema(self):
+        """Legacy where_group list coerces to first element during PredicateGroup migration."""
         raw = json.dumps(
             {
                 "tables": ["t"],
                 "select_cols": ["t.x"],
-                "filters_param": [
+                "where": [
                     {
                         "left_expr": "t.y",
                         "op": "=",
                         "value": 1,
                         "value_type": "integer",
-                        "filter_group": [1, 2],
+                        "where_group": [1, 2],
                     }
                 ],
             }
         )
-        buf: list[str] = []
-        assert parse_intent_response(raw, "q", parse_detail_out=buf) is None
-        assert buf
-        assert "INTENT_SCHEMA" in buf[0]
+        r = parse_intent_response(raw, "q")
+        assert r is not None
+        assert r.where is not None
+        assert r.where.op == "and"
+        assert len(r.where.leaves()) == 1
+        assert r.where.leaves()[0].left_expr.primary_column == "t.y"
 
     def test_natural_language_fallback_to_question(self):
         raw = '{"tables": ["t"], "select_cols": ["t.x"]}'
@@ -2772,49 +2905,59 @@ class TestParseIntentResponseExtended:
             {
                 "tables": ["t"],
                 "select_cols": ["t.x"],
-                "filters_param": [{"left_col": "t.a", "op": "=", "value_type": "string", "value": "v"}],
+                "where": {
+                    "op": "and",
+                    "predicates": [
+                        {"left_expr": "t.a", "op": "=", "value_type": "string", "value": "v"},
+                    ],
+                },
             }
         )
         r = parse_intent_response(raw, "q")
         assert r is not None
-        assert len(r.filters_param) == 1
-        assert r.filters_param[0].left_expr.primary_column == "t.a"
+        assert r.where is not None
+        assert len(r.where.leaves()) == 1
+        assert r.where.leaves()[0].left_expr.primary_column == "t.a"
 
     def test_having_left_agg_and_right_agg_aliases(self):
         raw = json.dumps(
             {
                 "tables": ["t"],
                 "select_cols": ["t.x"],
-                "having_param": [
-                    {
-                        "left_agg": "count(t.x)",
-                        "right_agg": "count(t.y)",
-                        "op": ">",
-                        "value_type": "integer",
-                    }
-                ],
+                "having": {
+                    "op": "and",
+                    "predicates": [
+                        {
+                            "left_expr": "count(t.x)",
+                            "right_expr": "count(t.y)",
+                            "op": ">",
+                            "value_type": "integer",
+                        }
+                    ],
+                },
             }
         )
         r = parse_intent_response(raw, "q")
         assert r is not None
-        assert len(r.having_param) == 1
-        hp = r.having_param[0]
-        assert hp.left_expr.has_aggregation
+        assert r.having is not None
+        assert len(r.having.leaves()) == 1
+        hp = r.having.leaves()[0]
+        assert hp.left_expr.column_ref == "count(t.x)"
         assert hp.right_expr is not None
-        assert hp.right_expr.has_aggregation
+        assert hp.right_expr.column_ref == "count(t.y)"
 
     def test_filter_preserves_qualified_right_expr(self):
         raw = json.dumps(
             {
                 "tables": ["t"],
                 "select_cols": [{"expr": "t.x"}],
-                "filters_param": [{"left_expr": "t.a", "op": "=", "right_expr": "t.b"}],
+                "where": [{"left_expr": "t.a", "op": "=", "right_expr": "t.b"}],
             }
         )
         r = parse_intent_response(raw, "q")
         assert r is not None
-        assert r.filters_param[0].right_expr is not None
-        assert r.filters_param[0].right_expr.primary_column == "t.b"
+        assert r.where.leaves()[0].right_expr is not None
+        assert r.where.leaves()[0].right_expr.primary_column == "t.b"
 
     def test_order_by_string_with_trailing_desc(self):
         raw = json.dumps(
@@ -3016,7 +3159,7 @@ class TestAssignParamKeysDateWindow:
     """date_window dict payloads receive p* for the numeric offset and s* for unit after post-processing."""
 
     def test_date_window_skipped(self):
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.d"),
             op=">=",
             value_type="date_window",
@@ -3038,8 +3181,11 @@ class TestAssignStructuralGroupExtended:
             inner_scalar_func_args=[2],
         )
         pv = {}
-        idx = _assign_structural_group(g, 1, pv)
+        out, idx = _assign_structural_group(g, 1, pv)
         assert g.coeff_param_key == ""
+        assert g.isarg_param_keys == []
+        assert out.coeff_param_key == ""
+        assert out.isarg_param_keys[0] == "s1"
         assert pv.get("s1") == 2
         assert idx == 2
 
@@ -3052,9 +3198,11 @@ class TestAssignStructuralGroupExtended:
             sarg_param_keys=["old"],
         )
         pv = {}
-        _assign_structural_group(g, 5, pv)
+        out, _idx = _assign_structural_group(g, 5, pv)
         assert g.coeff_param_key == ""
-        assert g.sarg_param_keys[0] == "s5"
+        assert g.sarg_param_keys == ["old"]
+        assert out.coeff_param_key == ""
+        assert out.sarg_param_keys[0] == "s5"
         assert pv["s5"] == 3
 
 
@@ -3064,14 +3212,16 @@ class TestAssignStructuralExprOuterScalarArgs:
     def test_outer_scalar_and_inner_args(self):
         expr = NormalizedExpr(
             add_groups=[MulGroup(coefficient=1.0, multiply=["t.a"])],
-            scalar_func="round",
+            scalar_func="abs",
             scalar_func_args=[2],
-            inner_scalar_func="abs",
+            inner_scalar_func="round",
             inner_scalar_func_args=[],
             is_numeric=True,
         )
         pv = {}
-        idx = _assign_structural_expr(expr, 1, pv)
+        out, idx = _assign_structural_expr(expr, 1, pv)
+        assert expr.sarg_param_keys == []
+        assert out.sarg_param_keys[0] == "s1"
         assert pv["s1"] == 2
         assert idx == 2
 
@@ -3091,12 +3241,12 @@ class TestExtractStructuralParamsExtended:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.b"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             limit=10,
             cte_steps=[cte],
         )
         out = extract_structural_params(intent)
-        assert cte.limit_param_key == "s1"
+        assert cte.limit_param_key == ""
         assert out.cte_steps[0].limit_param_key == "s1"
         assert out.limit_param_key == "s2"
         assert out.param_values["s1"] == 5
@@ -3109,7 +3259,7 @@ class TestExtractStructuralParamsExtended:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.a"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             param_values={"p0": "keep"},
         )
         out = extract_structural_params(intent)
@@ -3131,7 +3281,7 @@ class TestClearedParamAndStructuralOrder:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             param_values={"s1": 2},
             cte_steps=[cte],
             limit=3,
@@ -3157,7 +3307,7 @@ class TestClearedParamAndStructuralOrder:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             limit=7,
         )
         keys = structural_s_key_assignment_order(intent)
@@ -3169,7 +3319,7 @@ class TestCollectRawParamValues:
     """Tests for collect_raw_param_values."""
 
     def test_harvests_filters_and_clears_raw_value(self):
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op="=",
             value_type="string",
@@ -3182,14 +3332,14 @@ class TestCollectRawParamValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=predicate_group_from_list([fp]),
         )
         out = collect_raw_param_values(intent)
         assert out == {"p1": "hello"}
-        assert intent.filters_param[0].raw_value is None
+        assert (intent.where.leaves() if intent.where else [])[0].raw_value is None
 
     def test_skips_empty_param_key(self):
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op="=",
             value_type="string",
@@ -3202,33 +3352,33 @@ class TestCollectRawParamValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=predicate_group_from_list([fp]),
         )
         assert collect_raw_param_values(intent) == {}
 
     def test_cte_before_main(self):
-        fp_cte = FilterParam(
+        fp_cte = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op="=",
             value_type="string",
             param_key="pc",
             raw_value=1,
         )
-        fp_main = FilterParam(
+        fp_main = WhereParam(
             left_expr=NormalizedExpr.from_column("t.b"),
             op="=",
             value_type="string",
             param_key="pm",
             raw_value=2,
         )
-        cte = RuntimeCteStep(cte_name="c", filters_param=[fp_cte])
+        cte = RuntimeCteStep(cte_name="c", where=predicate_group_from_list([fp_cte]))
         intent = RuntimeIntent(
             tables=["t"],
             grain="row_level",
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp_main],
+            where=predicate_group_from_list([fp_main]),
             cte_steps=[cte],
         )
         out = collect_raw_param_values(intent)
@@ -3246,7 +3396,7 @@ class TestNormalizeDateDiffSingularUnitPassthrough:
     """Valid singular units are left unchanged."""
 
     def test_day_unit_unchanged(self):
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op=">=",
             value_type="date_diff",
@@ -3258,14 +3408,14 @@ class TestNormalizeDateDiffSingularUnitPassthrough:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
-            having_param=[],
+            where=predicate_group_from_list([fp]),
+            having=None,
             param_values={},
             cte_steps=[],
             natural_language="test",
         )
         result = normalize_date_diff_raw_values(intent)
-        assert result.filters_param[0].raw_value["unit"] == "day"
+        assert result.where.leaves()[0].raw_value["unit"] == "day"
 
 
 class TestParseExprStringTrivialZeros:
@@ -3382,33 +3532,35 @@ class TestParseIntentResponseLikely:
         assert r is not None
         assert r.limit is None
 
-    def test_filter_group_null(self):
+    def test_where_group_null(self):
         raw = json.dumps(
             {
                 "tables": ["t"],
                 "select_cols": ["t.x"],
-                "filters_param": [
+                "where": [
                     {
                         "left_expr": "t.a",
                         "op": "=",
                         "value_type": "string",
                         "value": "x",
-                        "filter_group": None,
+                        "where_group": None,
                     }
                 ],
             }
         )
         r = parse_intent_response(raw, "q")
         assert r is not None
-        assert r.filters_param[0].filter_group is None
+        assert r.where is not None
+        assert r.where.op == "and"
+        assert len(r.where.predicates) == 1
 
-    def test_string_filter_item_rejected_by_schema(self):
-        """``filters_param`` items must be objects; string entries fail schema validation."""
+    def test_string_filter_item_skipped_in_legacy_where_array(self):
+        """Legacy flat ``where`` arrays skip non-object entries instead of failing schema validation."""
         raw = json.dumps(
             {
                 "tables": ["t"],
                 "select_cols": ["t.x"],
-                "filters_param": [
+                "where": [
                     "skip-me",
                     {
                         "left_expr": "t.ok",
@@ -3421,8 +3573,11 @@ class TestParseIntentResponseLikely:
         )
         buf: list[str] = []
         r = parse_intent_response(raw, "q", parse_detail_out=buf)
-        assert r is None
-        assert buf and "INTENT_SCHEMA" in buf[0]
+        assert r is not None
+        assert r.where is not None
+        assert len(r.where.leaves()) == 1
+        assert r.where.leaves()[0].left_expr.primary_column == "t.ok"
+        assert not buf
 
     def test_mixed_string_and_object_select_cols(self):
         raw = json.dumps(
@@ -3456,20 +3611,26 @@ class TestParseIntentResponseLikely:
             {
                 "tables": ["t"],
                 "select_cols": ["t.x"],
-                "filters_param": [
-                    {
-                        "left_expr": "t.price",
-                        "op": ">=",
-                        "right_col": "t.cost",
-                        "value_type": "number",
-                    }
-                ],
+                "where": {
+                    "op": "and",
+                    "predicates": [
+                        {
+                            "left_expr": "t.price",
+                            "op": ">=",
+                            "right_expr": "t.cost",
+                            "value_type": "number",
+                        }
+                    ],
+                },
             }
         )
         r = parse_intent_response(raw, "q")
         assert r is not None
-        assert r.filters_param[0].left_expr.primary_column == "t.price"
-        assert r.filters_param[0].right_expr.primary_column == "t.cost"
+        assert r.where is not None
+        fp = r.where.leaves()[0]
+        assert fp.left_expr.primary_column == "t.price"
+        assert fp.right_expr is not None
+        assert fp.right_expr.primary_column == "t.cost"
 
     def test_cte_partial_output_columns_wrong_length_returns_none(self):
         raw = json.dumps(
@@ -3581,9 +3742,10 @@ class TestSanitizeComposeIntentJson:
         )
         result = parse_intent_response(raw, "q")
         assert result is not None
-        assert len(result.having_param) == 1
-        assert result.having_param[0].bool_op == "AND"
-        assert result.having_param[0].left_expr.add_groups[0].agg_func == "count"
+        assert result.having is not None
+        assert result.having.op == "and"
+        assert len(result.having.leaves()) == 1
+        assert result.having.leaves()[0].left_expr.column_ref == "COUNT(other_table.other_column)"
 
 
 class TestTagExprNumericLikely:
@@ -3623,7 +3785,7 @@ class TestTagExprNumericLikely:
                     expr=NormalizedExpr(add_groups=[MulGroup(coefficient=2.0, multiply=["orders.amount"])]),
                 )
             ],
-            filters_param=[],
+            where=None,
         )
         out = tag_expr_numeric(intent, schema_amt)
         assert out.order_by_cols[0].expr.is_numeric is True
@@ -3636,7 +3798,7 @@ class TestTagExprNumericLikely:
             select_cols=[],
             group_by_cols=[NormalizedExpr(add_groups=[MulGroup(coefficient=3.0, multiply=["orders.region"])])],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         out = tag_expr_numeric(intent, schema_amt)
         g = out.group_by_cols[0]
@@ -3648,7 +3810,7 @@ class TestEnsureScalarFuncDefaultsLikely:
     """Defaults propagate into filter and having expressions."""
 
     def test_round_on_filter_left_expr(self):
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr(add_groups=[MulGroup(multiply=["t.x"], scalar_func="round")]),
             op=">",
             value_type="number",
@@ -3659,10 +3821,10 @@ class TestEnsureScalarFuncDefaultsLikely:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=predicate_group_from_list([fp]),
         )
         ensure_scalar_func_defaults(intent)
-        assert intent.filters_param[0].left_expr.add_groups[0].scalar_func_args == [2]
+        assert (intent.where.leaves() if intent.where else [])[0].left_expr.add_groups[0].scalar_func_args == [2]
 
     def test_date_trunc_on_having_left(self):
         hp = HavingParam(
@@ -3676,11 +3838,13 @@ class TestEnsureScalarFuncDefaultsLikely:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[hp],
+            where=None,
+            having=predicate_group_from_list([hp]),
         )
         ensure_scalar_func_defaults(intent)
-        assert intent.having_param[0].left_expr.add_groups[0].scalar_func_args == ["month"]
+        assert (intent.having.leaves() if intent.having else [])[0].left_expr.add_groups[0].scalar_func_args == [
+            "month"
+        ]
 
 
 class TestExtractStructuralParamsLikely:
@@ -3700,7 +3864,7 @@ class TestExtractStructuralParamsLikely:
                     ),
                 )
             ],
-            filters_param=[],
+            where=None,
         )
         out = extract_structural_params(intent)
         assert any(v == 1.5 for v in out.param_values.values())
@@ -3712,7 +3876,7 @@ class TestExtractStructuralParamsLikely:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.a"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             param_values={"user_k": "keep", "s99": 1},
         )
         out = extract_structural_params(intent)
@@ -3724,7 +3888,7 @@ class TestAssignParamKeysLikely:
     """date_diff dict payloads receive p* for amount."""
 
     def test_date_diff_filter_skipped(self):
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.created_at"),
             op=">=",
             value_type="date_diff",
@@ -3749,7 +3913,7 @@ class TestDecomposeBetweenLikely:
     """BETWEEN with parseable string bounds (common date or numeric range text)."""
 
     def test_string_and_separator_populates_bounds(self):
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("orders.order_date"),
             op="between",
             value_type="date",
@@ -3761,51 +3925,51 @@ class TestDecomposeBetweenLikely:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
-            having_param=[],
+            where=predicate_group_from_list([fp]),
+            having=None,
             param_values={},
             cte_steps=[],
             natural_language="orders in 2024",
         )
         out = decompose_between_params(intent)
-        assert out.filters_param[0].op == ">="
-        assert out.filters_param[0].raw_value == "2024-01-01"
-        assert out.filters_param[1].op == "<="
-        assert out.filters_param[1].raw_value == "2024-12-31"
+        assert out.where.leaves()[0].op == ">="
+        assert out.where.leaves()[0].raw_value == "2024-01-01"
+        assert out.where.leaves()[1].op == "<="
+        assert out.where.leaves()[1].raw_value == "2024-12-31"
 
 
 class TestNormalizeDateDiffLikely:
     """Plural units on having and inside CTEs."""
 
     def test_having_and_cte_normalized(self):
-        hp = FilterParam(
+        hp = HavingParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op=">=",
             value_type="date_window",
             raw_value={"unit": "months", "amount": 2},
         )
-        cte_fp = FilterParam(
+        cte_fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.b"),
             op=">=",
             value_type="date_diff",
             raw_value={"unit": "years", "amount": 1},
         )
-        cte = RuntimeCteStep(cte_name="c", filters_param=[cte_fp])
+        cte = RuntimeCteStep(cte_name="c", where=predicate_group_from_list([cte_fp]))
         intent = RuntimeIntent(
             tables=["t"],
             grain="row_level",
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[hp],
+            where=None,
+            having=predicate_group_from_list([hp]),
             param_values={},
             cte_steps=[cte],
             natural_language="q",
         )
         out = normalize_date_diff_raw_values(intent)
-        assert out.having_param[0].raw_value["unit"] == "month"
-        assert out.cte_steps[0].filters_param[0].raw_value["unit"] == "year"
+        assert out.having.leaves()[0].raw_value["unit"] == "month"
+        assert out.cte_steps[0].where.leaves()[0].raw_value["unit"] == "year"
 
 
 class TestNormalizeInLikely:
@@ -3824,14 +3988,14 @@ class TestNormalizeInLikely:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[hp],
+            where=None,
+            having=predicate_group_from_list([hp]),
             param_values={},
             cte_steps=[],
             natural_language="regions",
         )
         out = normalize_in_raw_values(intent)
-        assert out.having_param[0].raw_value == ["east", "west", "central"]
+        assert out.having.leaves()[0].raw_value == ["east", "west", "central"]
 
 
 class TestStripOrderDirectionLikely:
@@ -3900,7 +4064,7 @@ class TestParseExprStringLikely:
 
 
 class TestClassifyCteEmission:
-    """Plan D.1 ``classify_cte_emission`` returns scalar_subquery only in safe shapes."""
+    """``classify_cte_emission`` returns scalar_subquery only in safe shapes."""
 
     @staticmethod
     def _scalar_cte(name: str = "avg_rental") -> RuntimeCteStep:
@@ -3910,8 +4074,8 @@ class TestClassifyCteEmission:
             select_cols=[SelectCol(expr=NormalizedExpr.from_agg("avg", "rental.amount"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             output_columns=["avg_amount"],
             grain="scalar",
@@ -3925,7 +4089,7 @@ class TestClassifyCteEmission:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column(f"{cte.cte_name}.avg_amount"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
         assert classify_cte_emission(cte, intent, None) == "join_table"
@@ -3945,7 +4109,7 @@ class TestClassifyCteEmission:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column(f"{cte.cte_name}.avg_amount"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
         assert classify_cte_emission(cte, intent, None) == "join_table"
@@ -3958,7 +4122,7 @@ class TestClassifyCteEmission:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column(f"{cte.cte_name}.avg_amount"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
         assert classify_cte_emission(cte, intent, None) == "scalar_subquery"
@@ -3971,14 +4135,14 @@ class TestClassifyCteEmission:
             select_cols=[SelectCol(expr=NormalizedExpr.from_agg("max", f"{cte.cte_name}.avg_amount"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
         assert classify_cte_emission(cte, intent, None) == "scalar_subquery"
 
     def test_filter_left_ref_keeps_scalar_subquery(self):
         cte = self._scalar_cte()
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column(f"{cte.cte_name}.avg_amount"),
             op=">",
             right_expr=None,
@@ -3991,7 +4155,7 @@ class TestClassifyCteEmission:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column(f"{cte.cte_name}.avg_amount"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=predicate_group_from_list([fp]),
             cte_steps=[cte],
         )
         assert classify_cte_emission(cte, intent, None) == "scalar_subquery"
@@ -3999,9 +4163,8 @@ class TestClassifyCteEmission:
 
 class TestGenerationPathDistinctGate:
     def test_distinct_blocks_template_only_extra_widen(self) -> None:
-        from aetherdialect._constants import GenerationPath
+        from aetherdialect._contracts_core import GenerationPath, UnionSelectColumnDelta
         from aetherdialect._intent_process import generation_path_for_eligible_union
-        from aetherdialect._intent_resolve import UnionSelectColumnDelta
 
         path = generation_path_for_eligible_union(
             cols_changed=False,
@@ -4022,19 +4185,19 @@ class TestNaturalLanguageRefusalValidator:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("customer.email"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             natural_language="Permission denied for payroll data.",
         )
         assert runtime_intent_has_refusal_natural_language(intent) is True
 
 
 class TestDateDiffNormalizationGuards:
-    def test_date_diff_filter_survives_normalize_filters_havings(self) -> None:
-        from aetherdialect._intent_resolve import normalize_filters_havings
+    def test_date_diff_filter_survives_normalize_where_predicates_havings(self) -> None:
+        from aetherdialect._intent_resolve import normalize_where_havings
 
         right = NormalizedExpr.from_column("rental.return_date")
         left = NormalizedExpr.from_column("rental.rental_date")
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=left,
             op=">",
             right_expr=right,
@@ -4047,9 +4210,9 @@ class TestDateDiffNormalizationGuards:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("rental.rental_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=predicate_group_from_list([fp]),
         )
-        out = normalize_filters_havings(intent)
-        kept = out.filters_param[0]
+        out = normalize_where_havings(intent)
+        kept = out.where.leaves()[0]
         assert kept.value_type == "date_diff"
         assert kept.right_expr is right

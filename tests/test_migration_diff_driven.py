@@ -19,8 +19,10 @@ from aetherdialect._contracts_core import (
 )
 from aetherdialect._contracts_schema import (
     ColumnMetadata,
+    SchemaDiff,
     SchemaGraph,
     SQLShape,
+    TableDiff,
     TableMetadata,
     TemplateStats,
 )
@@ -29,7 +31,6 @@ from aetherdialect._core_utils import (
     write_artifact_manifest,
     write_gzip_json_atomic,
 )
-from aetherdialect._schema_graph import SchemaDiff, TableDiff
 from aetherdialect._templates import (
     TemplateStoreView,
     _load_partitioned_view_unlocked,
@@ -118,7 +119,7 @@ def _make_template(
         select_cols=[SelectCol(expr=NormalizedExpr.from_column(f"{table}.{column}"))],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
+        where=None,
         column_map={column: table},
     )
     return Template(

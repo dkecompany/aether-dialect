@@ -12,10 +12,7 @@ from typing import Any, ClassVar, Literal, Protocol, cast
 import sqlglot
 from sqlalchemy import create_engine, text
 
-from ._config import (
-    EngineRuntimeConfig,
-    PolicyConfig,
-)
+from ._config import EngineRuntimeConfig, PolicyConfig
 from ._constants import (
     DBR_CARTESIAN_TOKENS,
     DBR_ZERO_ROW_RE,
@@ -34,17 +31,20 @@ from ._constants import (
     REDSHIFT_SVV_FOREIGN_KEYS_SQL,
     SQL_BIND_TOKEN_RE,
     SQLITE_EXPLAIN_FULL_SCAN_TOKENS,
+    STRUCTURAL_CODE_TO_DIAG,
     ResultReaderKind,
 )
 from ._contracts_base import (
     AccessError,
+    ConfigError,
     DatabasePingFailed,
     EngineContext,
-    FilterParam,
     NormalizedExpr,
     SqlDiagnostic,
     SqlDiagnosticCode,
     StatementTimeoutError,
+    WhereParam,
+    where_leaves,
 )
 from ._contracts_core import RuntimeIntent
 from ._contracts_schema import (
@@ -82,25 +82,6 @@ from ._schema_catalog import (
     profile_schema_spark,
     profile_schema_sql_connector,
 )
-
-_STRUCTURAL_CODE_TO_DIAG: dict[str, SqlDiagnosticCode] = {
-    "ast_parse_failed": SqlDiagnosticCode.AST_PARSE_FAILED,
-    "multiple_statements": SqlDiagnosticCode.MULTIPLE_STATEMENTS,
-    "no_root": SqlDiagnosticCode.NO_ROOT,
-    "not_select": SqlDiagnosticCode.NOT_SELECT,
-    "subquery_not_allowed": SqlDiagnosticCode.SUBQUERY_NOT_ALLOWED,
-    "using_not_allowed": SqlDiagnosticCode.USING_NOT_ALLOWED,
-    "cross_join_not_allowed": SqlDiagnosticCode.CROSS_JOIN_NOT_ALLOWED,
-    "self_join_not_allowed": SqlDiagnosticCode.SELF_JOIN_NOT_ALLOWED,
-    "exists_not_allowed": SqlDiagnosticCode.EXISTS_NOT_ALLOWED,
-    "lateral_not_allowed": SqlDiagnosticCode.LATERAL_NOT_ALLOWED,
-    "forbidden_structure": SqlDiagnosticCode.FORBIDDEN_STRUCTURE,
-    "cte_recursive": SqlDiagnosticCode.FORBIDDEN_STRUCTURE,
-    "cte_malformed": SqlDiagnosticCode.FORBIDDEN_STRUCTURE,
-    "cte_contains_subquery": SqlDiagnosticCode.SUBQUERY_NOT_ALLOWED,
-    "cte_contains_exists": SqlDiagnosticCode.EXISTS_NOT_ALLOWED,
-    "cte_contains_set_op": SqlDiagnosticCode.FORBIDDEN_STRUCTURE,
-}
 
 ArrayStorageKind = Literal["native_array", "json_text_array", "unknown"]
 
@@ -190,8 +171,7 @@ def _join_rhs_unwrapped(join: sqlglot.exp.Join) -> sqlglot.exp.Expression | None
 
 
 def _validate_select_structural_inner(
-    select: sqlglot.exp.Select,
-    scalar_cte_names: frozenset[str] | None = None,
+    select: sqlglot.exp.Select, scalar_cte_names: frozenset[str] | None = None
 ) -> tuple[bool, str]:
     if list(select.find_all(sqlglot.exp.Exists)):
         return False, "exists_not_allowed"
@@ -242,10 +222,7 @@ def _validate_with_ctes(with_clause: sqlglot.exp.With) -> tuple[bool, str]:
 
 
 def ast_structural_valid_sqlglot(
-    sql: str,
-    *,
-    sqlglot_dialect: str,
-    scalar_cte_names: frozenset[str] | None = None,
+    sql: str, *, sqlglot_dialect: str, scalar_cte_names: frozenset[str] | None = None
 ) -> tuple[bool, str]:
     """Return structural validity for a single SELECT via sqlglot."""
     try:
@@ -292,12 +269,7 @@ class _SqlalchemyExecutionHost(Protocol):
 
     def profile_schema_dispatch(self, sg: SchemaGraph) -> None: ...
 
-    def qualified_table_ref(
-        self,
-        table: str,
-        *,
-        kind: Literal["table", "view"] = "table",
-    ) -> str: ...
+    def qualified_table_ref(self, table: str, *, kind: Literal["table", "view"] = "table") -> str: ...
 
     def quote_identifier(self, ident: str) -> str: ...
 
@@ -317,12 +289,10 @@ class SqlglotParseMixin:
     ) -> list[SqlDiagnostic]:
         """Validate SQL structurally and semantically via sqlglot."""
         ok, code = ast_structural_valid_sqlglot(
-            sql,
-            sqlglot_dialect=self.sqlglot_dialect,
-            scalar_cte_names=scalar_cte_names,
+            sql, sqlglot_dialect=self.sqlglot_dialect, scalar_cte_names=scalar_cte_names
         )
         if not ok:
-            mapped = _STRUCTURAL_CODE_TO_DIAG.get(code, SqlDiagnosticCode.FORBIDDEN_STRUCTURE)
+            mapped = SqlDiagnosticCode(STRUCTURAL_CODE_TO_DIAG.get(code, SqlDiagnosticCode.FORBIDDEN_STRUCTURE.value))
             return [SqlDiagnostic(code=mapped, message=code, node_kind=None)]
         diags: list[SqlDiagnostic] = []
         try:
@@ -396,9 +366,7 @@ class SqlglotParseMixin:
         if having is not None and group is None:
             diags.append(
                 SqlDiagnostic(
-                    code=SqlDiagnosticCode.HAVING_WITHOUT_GROUP,
-                    message="HAVING without GROUP BY",
-                    node_kind="Select",
+                    code=SqlDiagnosticCode.HAVING_WITHOUT_GROUP, message="HAVING without GROUP BY", node_kind="Select"
                 )
             )
         return diags
@@ -516,12 +484,7 @@ class SqlglotParseMixin:
             return None
         return name.lower()
 
-    def attach_joins(
-        self,
-        parsed: sqlglot.exp.Select,
-        from_handle: sqlglot.exp.Select,
-        edges: list[JoinEdge],
-    ) -> bool:
+    def attach_joins(self, parsed: sqlglot.exp.Select, from_handle: sqlglot.exp.Select, edges: list[JoinEdge]) -> bool:
         """Build sqlglot ``Join`` nodes from *edges* and append them to *from_handle*."""
         if not edges:
             return False
@@ -532,10 +495,7 @@ class SqlglotParseMixin:
                 return False
             table_node = sqlglot.exp.Table(this=sqlglot.exp.to_identifier(edge.table))
             if edge.alias:
-                table_node.set(
-                    "alias",
-                    sqlglot.exp.TableAlias(this=sqlglot.exp.to_identifier(edge.alias)),
-                )
+                table_node.set("alias", sqlglot.exp.TableAlias(this=sqlglot.exp.to_identifier(edge.alias)))
             join_kwargs: dict[str, Any] = {
                 "this": table_node,
                 "on": on_expr,
@@ -549,10 +509,7 @@ class SqlglotParseMixin:
         from_handle.set("joins", existing + new_joins)
         return True
 
-    def _build_on_expr(
-        self,
-        on_terms: tuple[tuple[str, str, str, str], ...],
-    ) -> sqlglot.exp.Expression | None:
+    def _build_on_expr(self, on_terms: tuple[tuple[str, str, str, str], ...]) -> sqlglot.exp.Expression | None:
         if not on_terms:
             return None
         eqs: list[sqlglot.exp.Expression] = []
@@ -562,8 +519,7 @@ class SqlglotParseMixin:
             rhs_sql = host.quote_table_column(right_token, right_col)
             try:
                 pred_tree = sqlglot.parse_one(
-                    f"SELECT 1 FROM t WHERE {lhs_sql} = {rhs_sql}",
-                    dialect=self.sqlglot_dialect,
+                    f"SELECT 1 FROM t WHERE {lhs_sql} = {rhs_sql}", dialect=self.sqlglot_dialect
                 )
             except Exception:
                 return None
@@ -575,8 +531,7 @@ class SqlglotParseMixin:
         for nxt in eqs[1:]:
             node = sqlglot.exp.And(this=node, expression=nxt)
         pipeline_trace(
-            "pipeline.join_resolve.dialect_quote_join_clause",
-            lambda: stable_json({"conjuncts": len(on_terms)}),
+            "pipeline.join_resolve.dialect_quote_join_clause", lambda: stable_json({"conjuncts": len(on_terms)})
         )
         return node
 
@@ -594,10 +549,7 @@ class SqlglotParseMixin:
             existing_joins = list(from_handle.args.get("joins") or [])
             for tbl in extra_from_tables:
                 existing_joins.append(
-                    sqlglot.exp.Join(
-                        this=sqlglot.exp.Table(this=sqlglot.exp.to_identifier(tbl)),
-                        kind="CROSS",
-                    ),
+                    sqlglot.exp.Join(this=sqlglot.exp.Table(this=sqlglot.exp.to_identifier(tbl)), kind="CROSS")
                 )
             from_handle.set("joins", existing_joins)
         if not where_edges:
@@ -622,11 +574,33 @@ class SqlglotParseMixin:
             existing_where.set("this", merged_pred)
         return True
 
-    def replace_projection(
-        self,
-        parsed: sqlglot.exp.Select,
-        items: list[tuple[str, str | None]],
-    ) -> bool:
+    def attach_where_sql_fragments(self, from_handle: sqlglot.exp.Select, fragments: list[str]) -> bool:
+        """AND-inject raw SQL predicate fragments into the carrier ``WHERE`` clause."""
+        if not fragments:
+            return True
+        new_preds: list[sqlglot.exp.Expression] = []
+        for frag in fragments:
+            try:
+                tree = sqlglot.parse_one(f"SELECT 1 WHERE {frag}", dialect=self.sqlglot_dialect)
+            except Exception:
+                return False
+            where = tree.args.get("where")
+            if where is None:
+                return False
+            new_preds.append(where.this)
+        merged: sqlglot.exp.Expression = new_preds[0]
+        for nxt in new_preds[1:]:
+            merged = sqlglot.exp.And(this=merged, expression=nxt)
+        existing_where = from_handle.args.get("where")
+        if existing_where is None:
+            from_handle.set("where", sqlglot.exp.Where(this=merged))
+        else:
+            existing_pred = existing_where.this
+            merged_pred: sqlglot.exp.Expression = sqlglot.exp.And(this=existing_pred, expression=merged)
+            existing_where.set("this", merged_pred)
+        return True
+
+    def replace_projection(self, parsed: sqlglot.exp.Select, items: list[tuple[str, str | None]]) -> bool:
         """Replace the outer ``Select`` projection list by parsing each expression via sqlglot."""
         new_exprs: list[sqlglot.exp.Expression] = []
         for expr_sql, alias in items:
@@ -670,6 +644,8 @@ class SqlalchemyExecutionMixin:
             return
         url = config.db_url() if hasattr(config, "db_url") else ""
         connect_args = config.connect_args() if hasattr(config, "connect_args") else {}
+        if str(url).startswith("duckdb"):
+            require_duckdb_sqlalchemy_dialect()
         try:
             self.engine = create_engine(url, connect_args=connect_args or {}, future=True)
         except Exception as exc:
@@ -697,10 +673,7 @@ class SqlalchemyExecutionMixin:
         return self._backend
 
     def parse_explain_plan(
-        self,
-        rows: list[Any],
-        *,
-        schema: SchemaGraph | None = None,
+        self, rows: list[Any], *, schema: SchemaGraph | None = None
     ) -> tuple[float | None, float | None, list[SqlDiagnostic], str]:
         """Parse engine-specific EXPLAIN output rows into estimates and. soft diagnostics."""
         _ = rows, schema
@@ -716,12 +689,7 @@ class SqlalchemyExecutionMixin:
     ) -> tuple[bool, list[SqlDiagnostic], str]:
         """Run ``EXPLAIN`` via SQLAlchemy and return structured findings."""
         host = cast(_SqlalchemyExecutionHost, self)
-        finalized = host.finalize_render(
-            sql,
-            params or {},
-            schema=schema,
-            intent=intent,
-        )
+        finalized = host.finalize_render(sql, params or {}, schema=schema, intent=intent)
         explain_sql = self.explain_statement_sql(finalized)
         try:
             backend = self.result_backend
@@ -730,22 +698,13 @@ class SqlalchemyExecutionMixin:
             tm = effective_explain_timeout_ms()
             explain_params = params if params and SQL_BIND_TOKEN_RE.search(explain_sql) else None
             rows = backend.fetch_rows(explain_sql, explain_params, timeout_ms=tm)
-            est_rows, est_bytes, soft_diags, plan_text = self.parse_explain_plan(
-                list(rows),
-                schema=schema,
-            )
+            est_rows, est_bytes, soft_diags, plan_text = self.parse_explain_plan(list(rows), schema=schema)
             if est_rows is not None or est_bytes is not None:
-                failed, why = explain_cost_gate_violation(est_rows, est_bytes)
+                failed, why = explain_cost_gate_violation(est_rows, est_bytes, dialect=self)
                 if failed:
                     return (
                         False,
-                        soft_diags
-                        + [
-                            SqlDiagnostic(
-                                code=SqlDiagnosticCode.EXPLAIN_COST_EXCEEDED,
-                                message=why,
-                            )
-                        ],
+                        soft_diags + [SqlDiagnostic(code=SqlDiagnosticCode.EXPLAIN_COST_EXCEEDED, message=why)],
                         why,
                     )
             return True, soft_diags, plan_text
@@ -753,11 +712,7 @@ class SqlalchemyExecutionMixin:
             err = str(e)
             if host._disable_explain_on_permission_denied(err):
                 return True, [], ""
-            return (
-                False,
-                [SqlDiagnostic(code=SqlDiagnosticCode.EXPLAIN_OTHER, message=err)],
-                err,
-            )
+            return (False, [SqlDiagnostic(code=SqlDiagnosticCode.EXPLAIN_OTHER, message=err)], err)
 
     def explain_statement_sql(self, finalized_sql: str) -> str:
         """Return the engine-specific EXPLAIN wrapper for *finalized_sql*."""
@@ -784,13 +739,9 @@ class SqlalchemyExecutionMixin:
             if not schema_name or host.engine is None:
                 return ""
             with host.engine.connect() as conn:
-                rows = conn.execute(
-                    text(INFORMATION_SCHEMA_COLUMNS_DDL_PROBE_SQL),
-                    {"s": schema_name},
-                ).fetchall()
+                rows = conn.execute(text(INFORMATION_SCHEMA_COLUMNS_DDL_PROBE_SQL), {"s": schema_name}).fetchall()
                 uniq_rows = conn.execute(
-                    text(INFORMATION_SCHEMA_UNIQUE_COLUMNS_DDL_PROBE_SQL),
-                    {"s": schema_name},
+                    text(INFORMATION_SCHEMA_UNIQUE_COLUMNS_DDL_PROBE_SQL), {"s": schema_name}
                 ).fetchall()
             payload_cols = "\n".join("|".join("" if c is None else str(c) for c in r) for r in rows)
             payload_uniq = "\n".join("|".join("" if c is None else str(c) for c in r) for r in uniq_rows)
@@ -799,12 +750,27 @@ class SqlalchemyExecutionMixin:
             debug(f"[{self.__class__.__name__}.compute_ddl_probe] failed, returning empty: {exc!r}")
             return ""
 
+    def compute_row_count_probe(self, sg: SchemaGraph) -> str:
+        """Return SHA-256 over live ``(table, row_count)`` pairs, or empty string on failure."""
+        try:
+            host = cast(_SqlalchemyExecutionHost, self)
+            backend = self.result_backend
+            if backend is None:
+                return ""
+            payload: dict[str, int] = {}
+            for tname in sorted(sg.tables):
+                tbl = sg.tables[tname]
+                q_table = host.qualified_table_ref(tname, kind=tbl.kind)
+                rows = backend.fetch_rows(f"SELECT COUNT(*) FROM {q_table}")
+                cnt = int(rows[0][0] or 0) if rows else 0
+                payload[tname] = cnt
+            return sha256(stable_json(payload))
+        except Exception as exc:
+            debug(f"[{self.__class__.__name__}.compute_row_count_probe] failed, returning empty: {exc!r}")
+            return ""
+
     def refresh_full_table_distinct_for_pk_inference(
-        self,
-        table_name: str,
-        col_name: str,
-        *,
-        table_kind: Literal["table", "view"] = "table",
+        self, table_name: str, col_name: str, *, table_kind: Literal["table", "view"] = "table"
     ) -> tuple[int, int, float] | None:
         """Run full-table statistics for PK inference after sampled. profiling."""
         try:
@@ -829,17 +795,11 @@ class SqlalchemyExecutionMixin:
             nr = float(nulls) / float(cnt) if cnt > 0 else 0.0
             return (dist, cnt, nr)
         except Exception as exc:
-            debug(
-                f"[{self.__class__.__name__}.refresh_full_table_distinct_for_pk_inference] failed: {exc!r}",
-            )
+            debug(f"[{self.__class__.__name__}.refresh_full_table_distinct_for_pk_inference] failed: {exc!r}")
             return None
 
     def refresh_composite_distinct_for_pk_inference(
-        self,
-        table_name: str,
-        col_names: list[str],
-        *,
-        table_kind: Literal["table", "view"] = "table",
+        self, table_name: str, col_names: list[str], *, table_kind: Literal["table", "view"] = "table"
     ) -> tuple[int, int, float] | None:
         """Run full-table composite distinct statistics for multi-column PK inference."""
         if not col_names:
@@ -870,20 +830,25 @@ class SqlalchemyExecutionMixin:
             nr = float(nulls) / float(cnt) if cnt > 0 else 0.0
             return (dist, cnt, nr)
         except Exception as exc:
-            debug(
-                f"[{self.__class__.__name__}.refresh_composite_distinct_for_pk_inference] failed: {exc!r}",
-            )
+            debug(f"[{self.__class__.__name__}.refresh_composite_distinct_for_pk_inference] failed: {exc!r}")
             return None
+
+
+def require_duckdb_sqlalchemy_dialect() -> None:
+    """Raise when the optional duckdb-engine SQLAlchemy dialect is not installed."""
+    import importlib.util
+
+    if importlib.util.find_spec("duckdb_engine") is None:
+        raise ConfigError(
+            "DuckDB SQLAlchemy URLs require the 'duckdb-engine' package. "
+            "Install with: pip install aetherdialect[sandbox]"
+        )
 
 
 class SqlglotEngineDialect(SqlglotParseMixin, SqlalchemyExecutionMixin, Dialect):
     """Base dialect using sqlglot for parse/emit and SQLAlchemy for execution."""
 
-    def qualified_table_ref(
-        self,
-        table: str,
-        kind: Literal["table", "view"] = "table",
-    ) -> str:
+    def qualified_table_ref(self, table: str, kind: Literal["table", "view"] = "table") -> str:
         """Return a schema-qualified table reference when a schema name is configured."""
         _ = kind
         schema = self.schema_name()
@@ -896,10 +861,7 @@ class SqlglotEngineDialect(SqlglotParseMixin, SqlalchemyExecutionMixin, Dialect)
         schema_name = self.schema_name()
         connection = getattr(self, "_native_connection", None)
         return structural_constraints_index_for_schema(
-            self,
-            schema_name,
-            engine=getattr(self, "engine", None),
-            connection=connection,
+            self, schema_name, engine=getattr(self, "engine", None), connection=connection
         )
 
     def pre_execute_rewrite(self, sql: str) -> str:
@@ -1078,27 +1040,22 @@ def _information_schema_literal_sql(sql_template: str, schema_name: str) -> str:
 
 
 def _information_schema_rows_from_connection(
-    connection: Any,
-    schema_name: str,
+    connection: Any, schema_name: str
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Fetch normalized information_schema constraint and column rows via a DB-API connection."""
     cursor = connection.cursor()
     try:
         tc_rows = information_schema_connector_fetchall_dict_rows(
-            cursor,
-            _information_schema_literal_sql(INFORMATION_SCHEMA_TABLE_CONSTRAINTS_SQL, schema_name),
+            cursor, _information_schema_literal_sql(INFORMATION_SCHEMA_TABLE_CONSTRAINTS_SQL, schema_name)
         )
         kcu_rows = information_schema_connector_fetchall_dict_rows(
-            cursor,
-            _information_schema_literal_sql(INFORMATION_SCHEMA_KEY_COLUMN_USAGE_SQL, schema_name),
+            cursor, _information_schema_literal_sql(INFORMATION_SCHEMA_KEY_COLUMN_USAGE_SQL, schema_name)
         )
         rc_rows = information_schema_connector_fetchall_dict_rows(
-            cursor,
-            _information_schema_literal_sql(INFORMATION_SCHEMA_REFERENTIAL_CONSTRAINTS_SQL, schema_name),
+            cursor, _information_schema_literal_sql(INFORMATION_SCHEMA_REFERENTIAL_CONSTRAINTS_SQL, schema_name)
         )
         cols_rows = information_schema_connector_fetchall_dict_rows(
-            cursor,
-            _information_schema_literal_sql(INFORMATION_SCHEMA_COLUMNS_DDL_PROBE_SQL, schema_name),
+            cursor, _information_schema_literal_sql(INFORMATION_SCHEMA_COLUMNS_DDL_PROBE_SQL, schema_name)
         )
         return tc_rows, kcu_rows, rc_rows, cols_rows
     finally:
@@ -1106,8 +1063,7 @@ def _information_schema_rows_from_connection(
 
 
 def _information_schema_rows_from_engine(
-    engine: Any,
-    schema_name: str,
+    engine: Any, schema_name: str
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Fetch normalized information_schema constraint and column rows via SQLAlchemy."""
     with engine.connect() as conn:
@@ -1142,11 +1098,7 @@ def _information_schema_rows_from_engine(
 
 
 def structural_constraints_index_for_schema(
-    dialect: Dialect,
-    schema_name: str,
-    *,
-    engine: Any | None = None,
-    connection: Any | None = None,
+    dialect: Dialect, schema_name: str, *, engine: Any | None = None, connection: Any | None = None
 ) -> CatalogStructuralConstraintsIndex:
     """Load PK, FK, and single-column UNIQUE metadata from ``information_schema`` for *schema_name*."""
     if not schema_name:
@@ -1173,10 +1125,7 @@ def structural_constraints_index_for_schema(
                 ctk = child_table.lower()
                 bundle = idx.tables.setdefault(ctk, CatalogTableStructuralConstraints())
                 edge = FKEdge(
-                    src_table=child_table,
-                    src_cols=[child_col],
-                    dst_table=parent_table,
-                    dst_cols=[parent_col],
+                    src_table=child_table, src_cols=[child_col], dst_table=parent_table, dst_cols=[parent_col]
                 )
                 if edge not in bundle.foreign_keys:
                     bundle.foreign_keys.append(edge)
@@ -1195,9 +1144,9 @@ def sqlite_structural_constraints_index(engine: Any) -> CatalogStructuralConstra
     try:
         with engine.connect() as conn:
             table_rows = conn.execute(
-                text("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"),
+                text("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
             ).fetchall()
-            for (table_name,) in table_rows:
+            for table_name in table_rows:
                 tkey = str(table_name).lower()
                 tables_out.setdefault(tkey, CatalogTableStructuralConstraints())
                 info_rows = conn.execute(text(f'PRAGMA table_info("{table_name}")')).fetchall()
@@ -1211,10 +1160,7 @@ def sqlite_structural_constraints_index(engine: Any) -> CatalogStructuralConstra
                     parent_table = str(fk[2])
                     parent_col = str(fk[4])
                     edge = FKEdge(
-                        src_table=str(table_name),
-                        src_cols=[child_col],
-                        dst_table=parent_table,
-                        dst_cols=[parent_col],
+                        src_table=str(table_name), src_cols=[child_col], dst_table=parent_table, dst_cols=[parent_col]
                     )
                     tables_out[tkey].foreign_keys.append(edge)
         return CatalogStructuralConstraintsIndex(tables=tables_out, column_nullability=nullability)
@@ -1224,13 +1170,7 @@ def sqlite_structural_constraints_index(engine: Any) -> CatalogStructuralConstra
 
 
 def qualify_tables_ast(
-    sql: str,
-    *,
-    sqlglot_dialect: str,
-    catalog: str | None,
-    schema: str,
-    cte_names: set[str],
-    backtick: bool,
+    sql: str, *, sqlglot_dialect: str, catalog: str | None, schema: str, cte_names: set[str], backtick: bool
 ) -> str:
     """Qualify bare table references with ``schema`` (and optional catalog) using sqlglot AST."""
     if not sql or not sql.strip():
@@ -1274,27 +1214,16 @@ def qualify_tables_ast(
 
 def explain_diag_cartesian_join(message: str, *, node_kind: str | None = None) -> SqlDiagnostic:
     """Build a cartesian-join soft diagnostic from an engine-specific. message."""
-    return SqlDiagnostic(
-        code=SqlDiagnosticCode.EXPLAIN_CARTESIAN_JOIN,
-        message=message,
-        node_kind=node_kind,
-    )
+    return SqlDiagnostic(code=SqlDiagnosticCode.EXPLAIN_CARTESIAN_JOIN, message=message, node_kind=node_kind)
 
 
 def explain_diag_zero_estimate(message: str, *, node_kind: str | None = None) -> SqlDiagnostic:
     """Build a zero-row estimate soft diagnostic."""
-    return SqlDiagnostic(
-        code=SqlDiagnosticCode.EXPLAIN_ZERO_ESTIMATE,
-        message=message,
-        node_kind=node_kind,
-    )
+    return SqlDiagnostic(code=SqlDiagnosticCode.EXPLAIN_ZERO_ESTIMATE, message=message, node_kind=node_kind)
 
 
 def explain_diag_seq_scan_indexed(
-    message: str,
-    *,
-    relation_name: str,
-    node_kind: str | None = "Seq Scan",
+    message: str, *, relation_name: str, node_kind: str | None = "Seq Scan"
 ) -> SqlDiagnostic:
     """Build a sequential-scan-on-indexed-column soft diagnostic."""
     return SqlDiagnostic(
@@ -1354,20 +1283,10 @@ def pg_walk_explain_plan(node: dict[str, Any], schema: SchemaGraph | None) -> li
         inner_plans = node.get("Plans", []) or []
         inner_has_cond = any(any(k in p for k in PG_INNER_CONDITION_KEYS) for p in inner_plans)
         if not has_join_cond and not inner_has_cond:
-            diags.append(
-                explain_diag_cartesian_join(
-                    f"{node_type} without join condition",
-                    node_kind=node_type,
-                )
-            )
+            diags.append(explain_diag_cartesian_join(f"{node_type} without join condition", node_kind=node_type))
     plan_rows = node.get("Plan Rows")
     if isinstance(plan_rows, (int, float)) and plan_rows == 0:
-        diags.append(
-            explain_diag_zero_estimate(
-                "planner estimates zero rows",
-                node_kind=node_type or None,
-            )
-        )
+        diags.append(explain_diag_zero_estimate("planner estimates zero rows", node_kind=node_type or None))
     if node_type == "Seq Scan":
         relation_name = str(node.get("Relation Name", ""))
         filter_text = str(node.get("Filter", ""))
@@ -1376,8 +1295,7 @@ def pg_walk_explain_plan(node: dict[str, Any], schema: SchemaGraph | None) -> li
             if indexed and any(col in filter_text for col in indexed):
                 diags.append(
                     explain_diag_seq_scan_indexed(
-                        f"sequential scan on {relation_name} filters indexed column",
-                        relation_name=relation_name,
+                        f"sequential scan on {relation_name} filters indexed column", relation_name=relation_name
                     )
                 )
     for child in node.get("Plans", []) or []:
@@ -1423,17 +1341,13 @@ def databricks_diagnostics_from_explain_text(text_payload: str) -> list[SqlDiagn
         return []
     diags: list[SqlDiagnostic] = []
     if any(tok in text_payload for tok in DBR_CARTESIAN_TOKENS):
-        diags.append(
-            explain_diag_cartesian_join("Spark plan contains an unconditioned join"),
-        )
+        diags.append(explain_diag_cartesian_join("Spark plan contains an unconditioned join"))
     if DBR_ZERO_ROW_RE.search(text_payload):
         diags.append(explain_diag_zero_estimate("Spark plan estimates zero rows"))
     return diags
 
 
-def databricks_plan_stats_from_explain_text(
-    text_payload: str,
-) -> tuple[float | None, float | None]:
+def databricks_plan_stats_from_explain_text(text_payload: str) -> tuple[float | None, float | None]:
     """Extract coarse row and byte estimates from Spark/Databricks. ``EXPLAIN COST`` text."""
     if not text_payload:
         return None, None
@@ -1451,10 +1365,7 @@ def databricks_plan_stats_from_explain_text(
             except (TypeError, ValueError):
                 continue
     byte_est: float | None = None
-    match_sz = re.search(
-        r"(?i)sizeInBytes\s*=\s*([\d.]+)\s*([KMGT]?iB|[KMGT]?B|bytes?)",
-        text_payload,
-    )
+    match_sz = re.search(r"(?i)sizeInBytes\s*=\s*([\d.]+)\s*([KMGT]?iB|[KMGT]?B|bytes?)", text_payload)
     if match_sz:
         try:
             val = float(match_sz.group(1))
@@ -1477,10 +1388,7 @@ def databricks_plan_stats_from_explain_text(
     return row_est, byte_est
 
 
-def mysql_diagnostics_from_explain_json(
-    raw: Any,
-    schema: SchemaGraph | None = None,
-) -> list[SqlDiagnostic]:
+def mysql_diagnostics_from_explain_json(raw: Any, schema: SchemaGraph | None = None) -> list[SqlDiagnostic]:
     """Parse MySQL ``EXPLAIN FORMAT=JSON`` output for soft diagnostics."""
     if isinstance(raw, str):
         try:
@@ -1502,9 +1410,7 @@ def mysql_diagnostics_from_explain_json(
             if table_name:
                 diags.append(
                     explain_diag_seq_scan_indexed(
-                        f"full table scan on {table_name}",
-                        relation_name=table_name,
-                        node_kind="ALL",
+                        f"full table scan on {table_name}", relation_name=table_name, node_kind="ALL"
                     )
                 )
                 attached = str(table.get("attached_condition") or "")
@@ -1521,9 +1427,7 @@ def mysql_diagnostics_from_explain_json(
         if table.get("using_filesort"):
             diags.append(
                 SqlDiagnostic(
-                    code=SqlDiagnosticCode.EXPLAIN_OTHER,
-                    message="MySQL plan uses filesort",
-                    node_kind="filesort",
+                    code=SqlDiagnosticCode.EXPLAIN_OTHER, message="MySQL plan uses filesort", node_kind="filesort"
                 )
             )
         if table.get("using_temporary_table"):
@@ -1545,9 +1449,7 @@ def mysql_diagnostics_from_explain_json(
                 if table_name:
                     diags.append(
                         explain_diag_seq_scan_indexed(
-                            f"full table scan on {table_name}",
-                            relation_name=table_name,
-                            node_kind="ALL",
+                            f"full table scan on {table_name}", relation_name=table_name, node_kind="ALL"
                         )
                     )
     cost_info = query_block.get("cost_info") or {}
@@ -1591,8 +1493,7 @@ def redshift_diagnostics_from_explain_text(text_payload: str) -> list[SqlDiagnos
         if dist_token in text_payload:
             diags.append(
                 explain_diag_cartesian_join(
-                    f"Redshift plan contains {dist_token} distribution risk",
-                    node_kind=dist_token,
+                    f"Redshift plan contains {dist_token} distribution risk", node_kind=dist_token
                 )
             )
     if re.search(r"(?i)\brows=0\b", text_payload):
@@ -1666,9 +1567,7 @@ def bigquery_diagnostics_from_dry_run(
     return diags
 
 
-def redshift_root_plan_estimates(
-    text_payload: str,
-) -> tuple[float | None, float | None]:
+def redshift_root_plan_estimates(text_payload: str) -> tuple[float | None, float | None]:
     """Extract coarse row estimate from Redshift EXPLAIN text."""
     if not text_payload:
         return None, None
@@ -1705,9 +1604,7 @@ def sqlserver_diagnostics_from_showplan_xml(text_payload: str) -> list[SqlDiagno
     if re.search(r'PhysicalOp="Table Scan"', text_payload, re.IGNORECASE):
         diags.append(
             explain_diag_seq_scan_indexed(
-                "SQL Server table scan in SHOWPLAN_XML",
-                relation_name="",
-                node_kind="Table Scan",
+                "SQL Server table scan in SHOWPLAN_XML", relation_name="", node_kind="Table Scan"
             )
         )
     if re.search(r'PhysicalOp="Clustered Index Scan"', text_payload, re.IGNORECASE):
@@ -1827,11 +1724,7 @@ def partition_get_column_ref(expr: NormalizedExpr) -> tuple[str | None, str | No
 
 
 def partition_format_predicate(
-    adapter: PartitionSqlAdapter,
-    table: str,
-    col: str,
-    fp: FilterParam,
-    params: dict[str, Any],
+    adapter: PartitionSqlAdapter, table: str, col: str, fp: WhereParam, params: dict[str, Any]
 ) -> str | None:
     """Format a single partition predicate using *adapter* quoting and. literal rules."""
     qual = adapter.quote_table_column(table, col)
@@ -1857,11 +1750,7 @@ def partition_format_predicate(
 
 
 def partition_format_grouped_predicate(
-    adapter: PartitionSqlAdapter,
-    table: str,
-    col: str,
-    fps: list[FilterParam],
-    params: dict[str, Any],
+    adapter: PartitionSqlAdapter, table: str, col: str, fps: list[WhereParam], params: dict[str, Any]
 ) -> str | None:
     """Format grouped partition predicates as ``IN`` or bounded range. SQL."""
     qual = adapter.quote_table_column(table, col)
@@ -1889,14 +1778,14 @@ def partition_format_grouped_predicate(
     return None
 
 
-def partition_contains_filter_param_keys(intent: RuntimeIntent) -> set[str]:
+def partition_contains_where_param_keys(intent: RuntimeIntent) -> set[str]:
     """Collect ``param_key`` values from ``contains`` filters in main. and CTE intents."""
     keys: set[str] = set()
     for cte in intent.cte_steps or []:
-        for fp in cte.filters_param or []:
+        for fp in where_leaves(cte.where) or []:
             if fp.op == "contains" and fp.param_key:
                 keys.add(fp.param_key)
-    for fp in intent.filters_param or []:
+    for fp in where_leaves(intent.where) or []:
         if fp.op == "contains" and fp.param_key:
             keys.add(fp.param_key)
     return keys
@@ -1908,7 +1797,7 @@ def partition_flatten_param_values(intent: RuntimeIntent) -> dict[str, Any]:
     for cte in intent.cte_steps or []:
         merged.update(cte.param_values or {})
     merged.update(intent.param_values or {})
-    contains_keys = partition_contains_filter_param_keys(intent)
+    contains_keys = partition_contains_where_param_keys(intent)
     if not contains_keys:
         return merged
     out = dict(merged)
@@ -1928,7 +1817,7 @@ def partition_build_predicates(
 ) -> list[str]:
     """Build partition predicates from intent filters and schema. metadata."""
     tables = intent.tables or []
-    filters = intent.filters_param or []
+    filters = where_leaves(intent.where) or []
     if not tables or not filters:
         return []
 
@@ -1936,7 +1825,7 @@ def partition_build_predicates(
         return list(getattr(table_meta, "partition_columns", []) or [])
 
     selector = column_selector or default_selector
-    grouped: dict[tuple[str, str], list[FilterParam]] = {}
+    grouped: dict[tuple[str, str], list[WhereParam]] = {}
 
     for table_name in tables:
         table_meta = schema.tables.get(table_name)
@@ -1982,11 +1871,7 @@ def partition_predicate_already_in_sql(sql: str, predicates: list[str]) -> bool:
     return True
 
 
-def partition_append_where_via_ast(
-    adapter: PartitionSqlAdapter,
-    sql: str,
-    predicate: str,
-) -> str | None:
+def partition_append_where_via_ast(adapter: PartitionSqlAdapter, sql: str, predicate: str) -> str | None:
     """Append *predicate* to the WHERE clause using a sqlglot AST round- trip."""
     try:
         tree = sqlglot.parse_one(sql, read=adapter.sqlglot_dialect)
@@ -2019,13 +1904,7 @@ def inject_partition_predicates(
 ) -> str:
     """Append missing partition predicates for pruning when absent from. *sql*."""
     params = partition_flatten_param_values(intent)
-    predicates = partition_build_predicates(
-        adapter,
-        schema,
-        intent,
-        params,
-        column_selector=column_selector,
-    )
+    predicates = partition_build_predicates(adapter, schema, intent, params, column_selector=column_selector)
     if not predicates:
         return sql
     if partition_predicate_already_in_sql(sql, predicates):
@@ -2107,9 +1986,7 @@ def information_schema_spark_collect_normalized_dicts(spark: Any, sql: str) -> l
     return rows
 
 
-def information_schema_key_column_lists(
-    kcu_rows: list[dict[str, Any]],
-) -> dict[tuple[str, str], list[str]]:
+def information_schema_key_column_lists(kcu_rows: list[dict[str, Any]]) -> dict[tuple[str, str], list[str]]:
     """Group ``key_column_usage`` rows into ordered column-name lists. keyed by constraint identity."""
     buckets: dict[tuple[str, str], list[tuple[int, str]]] = {}
     for r in kcu_rows:
@@ -2140,9 +2017,7 @@ def information_schema_trailing_relation_name(ref: str) -> str:
 
 
 def structural_constraints_index_from_information_schema_rows(
-    tc_rows: list[dict[str, Any]],
-    kcu_rows: list[dict[str, Any]],
-    rc_rows: list[dict[str, Any]],
+    tc_rows: list[dict[str, Any]], kcu_rows: list[dict[str, Any]], rc_rows: list[dict[str, Any]]
 ) -> CatalogStructuralConstraintsIndex:
     """Join normalized Unity ``information_schema`` constraint rows. into. a constraints index."""
     tc_norm = [information_schema_normalize_row(dict(r)) for r in tc_rows]
@@ -2206,19 +2081,14 @@ def structural_constraints_index_from_information_schema_rows(
             dst_simple = information_schema_trailing_relation_name(parent_table)
             ctk = child_table.lower()
             edge = FKEdge(
-                src_table=child_table,
-                src_cols=list(child_cols),
-                dst_table=dst_simple,
-                dst_cols=list(parent_cols),
+                src_table=child_table, src_cols=list(child_cols), dst_table=dst_simple, dst_cols=list(parent_cols)
             )
             bundle_for(ctk).foreign_keys.append(edge)
 
     return CatalogStructuralConstraintsIndex(tables=tables_out)
 
 
-def column_nullability_from_information_schema_rows(
-    col_rows: list[dict[str, Any]],
-) -> dict[str, dict[str, bool]]:
+def column_nullability_from_information_schema_rows(col_rows: list[dict[str, Any]]) -> dict[str, dict[str, bool]]:
     """Build per-table column nullability maps from ``information_schema.columns`` rows."""
     out: dict[str, dict[str, bool]] = {}
     for r in col_rows:
@@ -2239,13 +2109,19 @@ class ResultBackend(ABC):
 
     @abstractmethod
     def fetch_rows(
-        self,
-        sql: str,
-        params: dict[str, Any] | None = None,
-        *,
-        timeout_ms: int | None = None,
+        self, sql: str, params: dict[str, Any] | None = None, *, timeout_ms: int | None = None
     ) -> list[tuple[Any, ...]]:
         """Execute *sql* and return result rows as tuples."""
+
+    def fetch_arrow_table(
+        self, sql: str, params: dict[str, Any] | None = None, *, timeout_ms: int | None = None
+    ) -> Any:
+        """Execute *sql* and return a PyArrow table when the driver supports it."""
+        raise NotImplementedError(f"{type(self).__name__} does not support Arrow result fetch")
+
+    def cancel_statement(self) -> None:
+        """Cancel an in-flight statement when the driver supports it."""
+        return None
 
     def fetch_first_column_text(self, sql: str, params: dict[str, Any] | None = None) -> str:
         """Execute *sql* and join the first column of each row into. newline-separated text."""
@@ -2258,24 +2134,14 @@ class SqlAlchemyResultBackend(ResultBackend):
 
     kind = "sqlalchemy"
 
-    def __init__(
-        self,
-        engine: Any,
-        *,
-        dialect_name: str = "",
-        timeout_sql_provider: Any | None = None,
-    ) -> None:
+    def __init__(self, engine: Any, *, dialect_name: str = "", timeout_sql_provider: Any | None = None) -> None:
         """Wrap a SQLAlchemy engine for row fetch operations."""
         self._engine = engine
         self._dialect_name = dialect_name
         self._timeout_sql_provider = timeout_sql_provider
 
     def fetch_rows(
-        self,
-        sql: str,
-        params: dict[str, Any] | None = None,
-        *,
-        timeout_ms: int | None = None,
+        self, sql: str, params: dict[str, Any] | None = None, *, timeout_ms: int | None = None
     ) -> list[tuple[Any, ...]]:
         if diagnostic_debug_enabled():
             debug(f"[{self._dialect_name}.execute] sql=" + chr(10) + f"{sql}")
@@ -2303,16 +2169,45 @@ class SqlAlchemyResultBackend(ResultBackend):
                 raise StatementTimeoutError(err) from e
             raise
 
+    def fetch_rows_with_columns(
+        self, sql: str, params: dict[str, Any] | None = None, *, timeout_ms: int | None = None
+    ) -> tuple[list[tuple[Any, ...]], tuple[str, ...]]:
+        if diagnostic_debug_enabled():
+            debug(f"[{self._dialect_name}.execute] sql=" + chr(10) + f"{sql}")
+        try:
+            exec_params = reconcile_execute_bind_params(sql, params) or {}
+            if timeout_ms is not None and cost_cap_active(timeout_ms):
+                ms = int(timeout_ms)
+                timeout_sql = self._timeout_sql_provider(ms) if self._timeout_sql_provider is not None else None
+                with self._engine.begin() as conn:
+                    if timeout_sql:
+                        conn.execute(text(timeout_sql))
+                    result = conn.execute(text(sql), exec_params)
+                    rows = [tuple(r) for r in result.fetchall()]
+                    cols = tuple(str(k) for k in result.keys())
+            else:
+                with self._engine.connect() as conn:
+                    result = conn.execute(text(sql), exec_params)
+                    rows = [tuple(r) for r in result.fetchall()]
+                    cols = tuple(str(k) for k in result.keys())
+            return rows, cols
+        except KeyError as e:
+            raise ValueError(f"unbound_placeholder: {e.args[0]}") from e
+        except Exception as e:
+            err = str(e)
+            if is_permission_denied_error(err):
+                raise AccessError("execute", err) from e
+            el = err.lower()
+            if "timeout" in el and ("statement" in el or "cancel" in el or "deadline" in el):
+                raise StatementTimeoutError(err) from e
+            raise
+
 
 class SqlServerResultBackend(SqlAlchemyResultBackend):
     """SQL Server backend applying statement timeouts via the ODBC driver command timeout."""
 
     def fetch_rows(
-        self,
-        sql: str,
-        params: dict[str, Any] | None = None,
-        *,
-        timeout_ms: int | None = None,
+        self, sql: str, params: dict[str, Any] | None = None, *, timeout_ms: int | None = None
     ) -> list[tuple[Any, ...]]:
         if diagnostic_debug_enabled():
             debug(f"[{self._dialect_name}.execute] sql=" + chr(10) + f"{sql}")

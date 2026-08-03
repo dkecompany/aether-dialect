@@ -247,7 +247,7 @@ def test_completed_step_sets_status_after_final_sql_reject() -> None:
         select_cols=[],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
+        where=None,
     )
     sess._last_turn_outcome = {
         "outcome": "intent_rejected",

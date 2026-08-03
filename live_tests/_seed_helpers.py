@@ -13,8 +13,9 @@ from unittest.mock import patch
 
 from aetherdialect._config import EngineConfig
 from aetherdialect._contracts_base import (
-    FilterParam,
     NormalizedExpr,
+    WhereParam,
+    predicate_group_from_list,
 )
 from aetherdialect._contracts_core import (
     FeedbackKind,
@@ -94,8 +95,8 @@ def intent_rental_count_by_store() -> RuntimeIntent:
         ],
         group_by_cols=[NormalizedExpr.from_column("inventory.store_id")],
         order_by_cols=[],
-        filters_param=[],
-        having_param=[],
+        where=None,
+        having=None,
         natural_language="rentals per store",
     )
 
@@ -111,8 +112,8 @@ def intent_payment_sum_by_staff() -> RuntimeIntent:
         ],
         group_by_cols=[NormalizedExpr.from_column("payment.staff_id")],
         order_by_cols=[],
-        filters_param=[],
-        having_param=[],
+        where=None,
+        having=None,
         natural_language="total payments per staff",
     )
 
@@ -128,8 +129,8 @@ def intent_customer_first_names() -> RuntimeIntent:
         ],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
-        having_param=[],
+        where=None,
+        having=None,
         natural_language="list customer ids and first names",
     )
 
@@ -146,8 +147,8 @@ def intent_customer_full_names() -> RuntimeIntent:
         ],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
-        having_param=[],
+        where=None,
+        having=None,
         natural_language="list customer ids first names and last names",
     )
 
@@ -163,8 +164,8 @@ def intent_customer_emails_only() -> RuntimeIntent:
         ],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
-        having_param=[],
+        where=None,
+        having=None,
         natural_language="list customer ids and emails",
     )
 
@@ -182,8 +183,8 @@ def intent_store_staff_by_work() -> RuntimeIntent:
         ],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
-        having_param=[],
+        where=None,
+        having=None,
         natural_language=(
             "list every staff first and last name together with the last update time of the store where they work"
         ),
@@ -202,8 +203,8 @@ def intent_store_manager() -> RuntimeIntent:
         ],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
-        having_param=[],
+        where=None,
+        having=None,
         natural_language="who manages each store",
     )
 
@@ -218,16 +219,18 @@ def intent_film_in_category(category_name: str) -> RuntimeIntent:
         ],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[
-            FilterParam(
-                left_expr=NormalizedExpr.from_column("category.name"),
-                op="=",
-                value_type="text",
-                bool_op="AND",
-                raw_value=category_name,
-            ),
-        ],
-        having_param=[],
+        where=predicate_group_from_list(
+            [
+                WhereParam(
+                    left_expr=NormalizedExpr.from_column("category.name"),
+                    op="=",
+                    value_type="text",
+                    bool_op="AND",
+                    raw_value=category_name,
+                ),
+            ]
+        ),
+        having=None,
         natural_language=f"films in the {category_name} category",
     )
 
@@ -280,7 +283,6 @@ def seed_rejected(
         kind=FeedbackKind.INTENT_REJECTED,
         schema_hash=runner.schema.effective_structural_hash,
         user_reason=reason,
-        sql=sql,
     )
     record_question_feedback(runner.store, q_norm, ent)
     return SimpleNamespace(
@@ -326,7 +328,6 @@ def seed_negative_memory(
             kind=FeedbackKind.VALIDATION_FAILURE,
             schema_hash=eff,
             validator_errors=[reason],
-            sql=sql,
         )
         record_question_feedback(runner.store, qn, ent)
     return {"ikey": ikey, "sql_fp": sql_fp, "colmap_sig": cmap_sig, "q_norm": qn}

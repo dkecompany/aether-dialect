@@ -13,9 +13,10 @@ from typing import cast
 
 import pytest
 
-from aetherdialect import AetherEngine
+from aetherdialect import AetherEngine, EngineContext, Sandbox
 from aetherdialect._config import DuckDBRuntimeConfig
 from aetherdialect._constants import (
+    CONSUMER_RESTRICTED_ALLOW_OBJECTS,
     SANDBOX_TOUR_EXPECT_NO_SQL,
     SANDBOX_VALIDATION_FAILURE_EXPECT_NO_SQL,
     SANDBOX_VALIDATION_FAILURE_QUESTIONS,
@@ -266,8 +267,9 @@ class TestSandboxHandle:
     def test_consumer_reader_preset_first_question(self, _fixture_corpus: str) -> None:
         practice = AetherEngine.sandbox_questions()
         assert practice
-        with AetherEngine.offline_sandbox(preset="consumer_reader") as sb:
-            with sb.engine.session(mode="reader") as session:
+        with Sandbox() as sandbox:
+            engine = sandbox.engine(role="consumer")
+            with engine.session(mode="reader") as session:
                 step = session.accept_until_done(practice[0])
         assert step.done
         assert step.sql
@@ -279,7 +281,7 @@ class TestSandboxHandle:
             try:
                 custom.write(zf.read(seed_name))
                 custom.close()
-                with AetherEngine.offline_sandbox(seed_sql=custom.name) as sb:
+                with AetherEngine.offline_sandbox(seed_sql=custom.name, maintainer_access=True) as sb:
                     stats = sb.engine.get_schema_stats()
                     assert int(stats.stats.get("table_count", 0)) == 34
             finally:
@@ -298,8 +300,9 @@ class TestSandboxQuestions:
 
     def test_fixture_corpus_covers_consumer_reader_practice(self, _fixture_corpus: str) -> None:
         practice = AetherEngine.sandbox_questions()
-        with AetherEngine.offline_sandbox(preset="consumer_reader") as sb:
-            with sb.engine.session(mode="reader") as session:
+        with Sandbox() as sandbox:
+            engine = sandbox.engine(role="consumer")
+            with engine.session(mode="reader") as session:
                 for question in practice:
                     step = session.accept_until_done(question)
                     assert step.done, f"consumer reader failed for {question!r}: {step.error}"
@@ -368,8 +371,12 @@ class TestSandboxQuestions:
                 with sb.engine.session() as session:
                     step = session.accept_until_done(question)
         elif question == "Show me all staff salaries.":
-            with AetherEngine.offline_sandbox(preset="consumer_reader", restricted_consumer=True) as sb:
-                with sb.engine.session(mode="reader") as session:
+            with Sandbox() as sandbox:
+                engine = sandbox.engine(
+                    EngineContext(allow_objects=CONSUMER_RESTRICTED_ALLOW_OBJECTS),
+                    role="consumer",
+                )
+                with engine.session(mode="reader") as session:
                     step = session.accept_until_done(question)
         else:
             with AetherEngine.offline_sandbox() as sb:
@@ -435,15 +442,17 @@ class TestSandboxSessionWorkflows:
     ) -> None:
         monkeypatch.chdir(tmp_path)
         shared = tempfile.mkdtemp(prefix="sandbox_rw_test_")
-        with AetherEngine.offline_sandbox(preset="consumer_reader", artifacts_dir=shared) as reader:
-            reader.apply_bundled_schema_overrides()
-            queue = reader.engine.write_queue_path
+        with Sandbox(artifacts_dir=shared, cleanup=False) as reader_sandbox:
+            reader = reader_sandbox.engine(role="consumer")
+            reader_sandbox.apply_bundled_schema_overrides(reader)
+            queue = reader.write_queue_path
             assert queue.is_file()
             with queue.open(encoding="utf-8") as fh:
                 before = sum(1 for _ in fh)
             assert before > 0
-        with AetherEngine.offline_sandbox(preset="owner_writer", artifacts_dir=shared) as writer:
-            with writer.engine.session(mode="writer") as session:
+        with Sandbox(artifacts_dir=shared, cleanup=False) as writer_sandbox:
+            writer = writer_sandbox.engine(role="owner")
+            with writer.session(mode="writer") as session:
                 session.ask(AetherEngine.sandbox_questions()[0])
             if queue.is_file():
                 with queue.open(encoding="utf-8") as fh:
@@ -470,8 +479,12 @@ class TestSandboxSessionWorkflows:
             with owner.engine.session() as session:
                 step = session.accept_until_done(fails[0])
             assert step.done
-        with AetherEngine.offline_sandbox(preset="consumer_reader", restricted_consumer=True) as consumer:
-            with consumer.engine.session(mode="reader") as session:
+        with Sandbox() as sandbox:
+            consumer = sandbox.engine(
+                EngineContext(allow_objects=CONSUMER_RESTRICTED_ALLOW_OBJECTS),
+                role="consumer",
+            )
+            with consumer.session(mode="reader") as session:
                 step = session.accept_until_done("Show me all staff salaries.")
             assert step.done
             assert step.sql is None
@@ -526,9 +539,10 @@ class TestSandboxSecurity:
                 assert step.error and "No mock fixture" in step.error
 
     def test_consumer_writer_raises(self) -> None:
-        with AetherEngine.offline_sandbox(preset="consumer_reader") as sb:
+        with Sandbox() as sandbox:
+            engine = sandbox.engine(role="consumer")
             with pytest.raises(OwnerOnlyOperationError):
-                with sb.engine.session(mode="writer"):
+                with engine.session(mode="writer"):
                     pass
 
     def test_session_active_error(self) -> None:
@@ -541,8 +555,12 @@ class TestSandboxSecurity:
                     session.ask("another question while busy")
 
     def test_restricted_consumer_permission_denied(self) -> None:
-        with AetherEngine.offline_sandbox(preset="consumer_reader", restricted_consumer=True) as sb:
-            with sb.engine.session(mode="reader") as session:
+        with Sandbox() as sandbox:
+            engine = sandbox.engine(
+                EngineContext(allow_objects=CONSUMER_RESTRICTED_ALLOW_OBJECTS),
+                role="consumer",
+            )
+            with engine.session(mode="reader") as session:
                 step = session.accept_until_done("Show me all staff salaries.")
         assert step.done
         assert step.sql is None
@@ -559,14 +577,14 @@ class TestSandboxSecurity:
         assert "denied_reference" in codes or step.status != "ok"
 
     def test_warmup_blocked_in_sandbox(self) -> None:
-        from aetherdialect._config import ConfigError
+        from aetherdialect._contracts_base import ConfigError
 
         with AetherEngine.offline_sandbox() as sb:
             with pytest.raises(ConfigError, match="sandbox"):
                 sb.engine.run_seed_warmup("questions.txt")
 
     def test_qsim_blocked_in_sandbox(self) -> None:
-        from aetherdialect._config import ConfigError
+        from aetherdialect._contracts_base import ConfigError
 
         with AetherEngine.offline_sandbox() as sb:
             with pytest.raises(ConfigError, match="sandbox"):
@@ -622,6 +640,7 @@ class TestSandboxPublicApi:
 
     def test_consumer_override_proposal_only(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.chdir(tmp_path)
-        with AetherEngine.offline_sandbox(preset="consumer_reader") as sb:
-            sb.apply_bundled_schema_overrides()
-            assert sb.engine.write_queue_path.is_file()
+        with Sandbox() as sandbox:
+            engine = sandbox.engine(role="consumer")
+            sandbox.apply_bundled_schema_overrides(engine)
+            assert engine.write_queue_path.is_file()

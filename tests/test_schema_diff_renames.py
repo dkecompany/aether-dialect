@@ -278,7 +278,7 @@ def test_apply_diff_renamed_columns_with_retype_uses_new_data_type() -> None:
 
 
 def test_resolve_table_renames_matches_by_column_overlap() -> None:
-    """Dropped table + added table with overlapping profiles but DIFFERENT column names → rename. Column-set differs (Phase 3's column-stable rename match doesn't fire), so Phase 5's profile-overlap matching is what catches the rename."""
+    """Dropped table + added table with overlapping profiles but different column names rename via profile overlap."""
     cached = SchemaGraph(
         tables={
             "old_t": _mk_table(
@@ -388,7 +388,7 @@ def test_resolve_table_renames_with_partial_column_renames() -> None:
 
 
 def test_resolve_table_renames_skips_when_disjoint_profiles() -> None:
-    """No column overlap → drop+add, not rename. Use differing column names so Phase 3's column-set match also misses (forcing Phase 5 to be the decider)."""
+    """No column overlap yields drop+add rather than rename when column- set equality also misses."""
     cached = SchemaGraph(
         tables={
             "old_t": _mk_table(
@@ -496,7 +496,7 @@ def test_build_schema_graph_detects_table_rename(
     schema_graph: SchemaGraph,
     cache_path: str,
 ) -> None:
-    """Probe-mismatch + table renamed AND a column renamed → Phase 5 profile match. The fixture's ``products.title`` column gets seeded with profile values; in the new structural graph products → items AND title → label, so column-set equality fails and profile overlap is the only signal available."""
+    """Table and column rename together resolves through profile overlap when column-set equality fails."""
     ctx = EngineContext()
     products = schema_graph.tables["products"]
     products.columns["title"].frequent_values = ["alpha", "beta", "gamma"]

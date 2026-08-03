@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from aetherdialect._contracts_base import (
-    FilterParam,
     NormalizedExpr,
+    WhereParam,
+    predicate_group_from_list,
 )
 from aetherdialect._contracts_core import (
     RuntimeIntent,
@@ -30,8 +31,8 @@ def test_reformulate_imported_intent_identity(schema_graph: SchemaGraph) -> None
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("customers.customer_id"))],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
-        having_param=[],
+        where=None,
+        having=None,
     )
     out = reformulate_imported_intent(intent, schema_graph, _pg())
     assert out.tables == intent.tables
@@ -44,8 +45,8 @@ def test_normalize_preserves_physical_tables(schema_graph: SchemaGraph) -> None:
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("c.customer_id"))],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
-        having_param=[],
+        where=None,
+        having=None,
     )
     out, code, detail = normalize_imported_intent(intent, schema_graph, _pg())
     assert code is None and detail == ""
@@ -60,8 +61,8 @@ def test_normalize_strict_semantic_rejects_bad_grain(schema_graph: SchemaGraph) 
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("customers.customer_id"))],
         group_by_cols=[NormalizedExpr.from_column("customers.name")],
         order_by_cols=[],
-        filters_param=[],
-        having_param=[],
+        where=None,
+        having=None,
     )
     out, code, _ = normalize_imported_intent(intent, schema_graph, _pg(), strict_semantic=True)
     assert out is None or code in (None, "SEMANTIC_REJECT")
@@ -86,8 +87,8 @@ def test_normalize_dedup_cte_steps_merged(schema_graph: SchemaGraph) -> None:
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("customers.customer_id"))],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
-        having_param=[],
+        where=None,
+        having=None,
         cte_steps=[s1, s2],
     )
     out = _dedup_cte_steps(intent)
@@ -102,17 +103,19 @@ def test_normalize_assigns_param_keys(schema_graph: SchemaGraph) -> None:
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("customers.customer_id"))],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[
-            FilterParam(
-                left_expr=NormalizedExpr.from_column("customers.customer_id"),
-                op="=",
-                value_type="integer",
-                param_key="",
-                raw_value=1,
-            )
-        ],
-        having_param=[],
+        where=predicate_group_from_list(
+            [
+                WhereParam(
+                    left_expr=NormalizedExpr.from_column("customers.customer_id"),
+                    op="=",
+                    value_type="integer",
+                    param_key="",
+                    raw_value=1,
+                )
+            ]
+        ),
+        having=None,
     )
     out, code, _ = normalize_imported_intent(intent, schema_graph, _pg())
     assert code is None and out is not None
-    assert out.filters_param[0].raw_value == 1
+    assert (out.where.leaves() if out.where else [])[0].raw_value == 1

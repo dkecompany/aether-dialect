@@ -5,11 +5,15 @@ import pytest
 from aetherdialect._contracts_base import (
     ColumnRole,
     ExprValue,
-    FilterParam,
     HavingParam,
     MulGroup,
     NormalizedExpr,
     OrderByCol,
+    PredicateGroup,
+    WhereParam,
+    having_leaves,
+    predicate_group_from_list,
+    where_leaves,
 )
 from aetherdialect._contracts_core import (
     RuntimeCteStep,
@@ -31,39 +35,39 @@ from aetherdialect._intent_expr import (
 )
 from aetherdialect._intent_resolve import (
     _canonicalize_condition_order,
-    _dedup_filters,
     _dedup_having,
-    _filter_structural_key,
+    _dedup_where_predicates,
     _forward_links,
     _having_structural_key,
     _is_cte_output_groupable,
     _normalize_agg_to_agg_having,
-    _normalize_col_to_col_filter,
-    _normalize_filter_canonical,
-    _normalize_filter_scalar_on_left,
+    _normalize_col_to_col_where,
     _normalize_having_canonical,
-    _shift_multi_group_representative_filters_forward,
+    _normalize_where_canonical,
+    _normalize_where_scalar_on_left,
     _shift_multi_group_representative_having_forward,
+    _shift_multi_group_representative_where_forward,
     _simplify_expr,
+    _where_structural_key,
     check_qualified_refs_exist,
     enforce_cte_grain_consistency,
     enforce_grain_consistency,
     normalize_count_star,
     normalize_cte_names,
-    normalize_filters_havings,
+    normalize_where_havings,
     qualify_count_star_mulgroups,
     resolve_column_map,
     resolve_cte_column_maps,
-    resolve_window_registry_filter_rhs,
+    resolve_window_registry_where_rhs,
     rewrite_cte_output_refs_to_aliases,
     rewrite_main_query_refs_to_final_cte_columns,
     simplify_exprs,
-    sort_filters,
     sort_having,
     sort_select_cols,
+    sort_where_predicates,
 )
 from aetherdialect._sql_gen import (
-    _join_flat_predicate_parts_with_filter_groups,
+    _render_predicate_group_sql,
 )
 from tests.conftest import term_strs
 
@@ -112,7 +116,7 @@ class TestNormalizeCountStarInIntent:
             select_cols=[SelectCol(expr=NormalizedExpr(add_groups=[MulGroup(multiply=["COUNT(1)"])]))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = normalize_count_star(intent)
         assert term_strs(result.select_cols[0].expr.add_groups[0].multiply) == ["COUNT(*)"]
@@ -125,7 +129,7 @@ class TestNormalizeCountStarInIntent:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.col"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = normalize_count_star(intent)
         assert result.select_cols[0].expr.primary_column == "t.col"
@@ -138,8 +142,8 @@ class TestNormalizeCountStarInIntent:
             select_cols=[SelectCol(expr=NormalizedExpr(add_groups=[MulGroup(multiply=["COUNT(1)"])]))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
         )
         intent = RuntimeIntent(
             tables=["t"],
@@ -147,7 +151,7 @@ class TestNormalizeCountStarInIntent:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
         result = normalize_count_star(intent)
@@ -190,7 +194,7 @@ class TestQualifyCountStarMulgroups:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
         out = qualify_count_star_mulgroups(intent, schema)
@@ -223,7 +227,7 @@ class TestQualifyCountStarMulgroups:
             select_cols=[SelectCol(expr=NormalizedExpr(add_groups=[MulGroup(agg_func="count", multiply=["*"])]))],
             group_by_cols=[NormalizedExpr.from_column("rental.customer_id")],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             window_registry=[
                 WindowRegistryStep(
                     registry_id="w01",
@@ -287,7 +291,7 @@ class TestQualifyCountStarMulgroups:
             ],
             group_by_cols=[NormalizedExpr.from_column("category.name")],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         out = qualify_count_star_mulgroups(intent, schema)
         assert term_strs(out.select_cols[1].expr.add_groups[0].multiply) == ["*"]
@@ -300,7 +304,7 @@ class TestQualifyCountStarMulgroups:
             ],
             group_by_cols=[NormalizedExpr.from_column("category.name")],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         reconciled = reconcile_tables(qualified)
         assert "rental" in reconciled.tables
@@ -308,7 +312,7 @@ class TestQualifyCountStarMulgroups:
 
 
 class TestSortFunctions:
-    """Tests for sort_select_cols, sort_filters, sort_having."""
+    """Tests for sort_select_cols, sort_where_predicates, sort_having."""
 
     def test_sort_select_cols_non_agg_first(self):
         """sort_select_cols places non-aggregated columns before aggregated."""
@@ -324,11 +328,11 @@ class TestSortFunctions:
         """sort_select_cols returns empty list for empty input."""
         assert sort_select_cols([]) == []
 
-    def test_sort_filters_by_signature(self):
-        """sort_filters sorts by left_expr signature."""
-        f1 = FilterParam(left_expr=NormalizedExpr.from_column("z.col"), op="=")
-        f2 = FilterParam(left_expr=NormalizedExpr.from_column("a.col"), op="=")
-        sorted_f = sort_filters([f1, f2])
+    def test_sort_where_predicates_by_signature(self):
+        """sort_where_predicates sorts by left_expr signature."""
+        f1 = WhereParam(left_expr=NormalizedExpr.from_column("z.col"), op="=")
+        f2 = WhereParam(left_expr=NormalizedExpr.from_column("a.col"), op="=")
+        sorted_f = sort_where_predicates([f1, f2])
         assert sorted_f[0].left_expr.primary_term == "a.col"
 
     def test_sort_having_by_signature(self):
@@ -340,500 +344,271 @@ class TestSortFunctions:
 
 
 class TestCanonicalizeConditionOrder:
-    """Tests for _canonicalize_condition_order precedence-tree algorithm."""
+    """Tests for _canonicalize_condition_order structural-key sorting."""
 
     def test_single_item_unchanged(self):
         """Single-item list is returned unchanged."""
-        fp = FilterParam(left_expr=NormalizedExpr.from_column("t.a"), op="=", bool_op="OR")
-        result = _canonicalize_condition_order([fp], _filter_structural_key)
+        fp = WhereParam(left_expr=NormalizedExpr.from_column("t.a"), op="=")
+        result = _canonicalize_condition_order([fp], _where_structural_key)
         assert len(result) == 1
         assert result[0].left_expr.primary_term == "t.a"
-        assert result[0].bool_op == "OR"
 
     def test_empty_list(self):
         """Empty list returns empty."""
-        assert _canonicalize_condition_order([], _filter_structural_key) == []
+        assert _canonicalize_condition_order([], _where_structural_key) == []
 
-    def test_all_and_sorts_by_structural_key(self):
-        """All-AND list sorts freely by structural key."""
-        fz = FilterParam(left_expr=NormalizedExpr.from_column("t.z"), op="=", bool_op="AND")
-        fa = FilterParam(left_expr=NormalizedExpr.from_column("t.a"), op="=", bool_op="AND")
-        fm = FilterParam(left_expr=NormalizedExpr.from_column("t.m"), op="=", bool_op="AND")
-        result = _canonicalize_condition_order([fz, fa, fm], _filter_structural_key)
+    def test_sorts_by_structural_key(self):
+        """List is sorted by structural key regardless of input order."""
+        fz = WhereParam(left_expr=NormalizedExpr.from_column("t.z"), op="=")
+        fa = WhereParam(left_expr=NormalizedExpr.from_column("t.a"), op="=")
+        fm = WhereParam(left_expr=NormalizedExpr.from_column("t.m"), op="=")
+        result = _canonicalize_condition_order([fz, fa, fm], _where_structural_key)
         assert [r.left_expr.primary_term for r in result] == ["t.a", "t.m", "t.z"]
-        assert all(r.bool_op == "AND" for r in result)
 
-    def test_all_or_sorts_by_structural_key(self):
-        """All-OR list sorts freely by structural key."""
-        fz = FilterParam(left_expr=NormalizedExpr.from_column("t.z"), op="=", bool_op="OR")
-        fa = FilterParam(left_expr=NormalizedExpr.from_column("t.a"), op="=", bool_op="OR")
-        result = _canonicalize_condition_order([fz, fa], _filter_structural_key)
+    def test_two_items_sorted(self):
+        """Two-item list sorts by structural key."""
+        fz = WhereParam(left_expr=NormalizedExpr.from_column("t.z"), op="=")
+        fa = WhereParam(left_expr=NormalizedExpr.from_column("t.a"), op="=")
+        result = _canonicalize_condition_order([fz, fa], _where_structural_key)
         assert result[0].left_expr.primary_term == "t.a"
         assert result[1].left_expr.primary_term == "t.z"
 
-    def test_mixed_ops_preserves_semantics(self):
-        """Mixed AND/OR: A(OR) B(AND) C → splits at OR into [A], [B,C] and canonicalizes."""
-        fa = FilterParam(left_expr=NormalizedExpr.from_column("t.a"), op="=", bool_op="OR")
-        fc = FilterParam(left_expr=NormalizedExpr.from_column("t.c"), op="=", bool_op="AND")
-        fb = FilterParam(left_expr=NormalizedExpr.from_column("t.b"), op="=", bool_op="AND")
-        result = _canonicalize_condition_order([fa, fc, fb], _filter_structural_key)
-        assert result[0].left_expr.primary_term == "t.a"
-        assert result[0].bool_op == "OR"
-        assert result[1].left_expr.primary_term == "t.b"
-        assert result[1].bool_op == "AND"
-        assert result[2].left_expr.primary_term == "t.c"
-
-    def test_and_chunk_sorted_within(self):
-        """AND-chunk members are sorted by structural key."""
-        fc = FilterParam(left_expr=NormalizedExpr.from_column("t.c"), op="=", bool_op="AND")
-        fa = FilterParam(left_expr=NormalizedExpr.from_column("t.a"), op="=", bool_op="AND")
-        fb = FilterParam(left_expr=NormalizedExpr.from_column("t.b"), op="=", bool_op="AND")
-        result = _canonicalize_condition_order([fc, fa, fb], _filter_structural_key)
-        assert [r.left_expr.primary_term for r in result] == ["t.a", "t.b", "t.c"]
-
-    def test_or_chunks_sorted_by_first_element(self):
-        """OR-separated chunks are sorted by their first element's structural key."""
-        fz = FilterParam(left_expr=NormalizedExpr.from_column("t.z"), op="=", bool_op="OR")
-        fa = FilterParam(left_expr=NormalizedExpr.from_column("t.a"), op="=", bool_op="AND")
-        result = _canonicalize_condition_order([fz, fa], _filter_structural_key)
-        assert result[0].left_expr.primary_term == "t.a"
-        assert result[0].bool_op == "OR"
-        assert result[1].left_expr.primary_term == "t.z"
-
-    def test_inter_connector_preserved_on_last(self):
-        """The last element's original bool_op (inter-group connector) is preserved on the new last."""
-        fa = FilterParam(left_expr=NormalizedExpr.from_column("t.a"), op="=", bool_op="AND")
-        fb = FilterParam(left_expr=NormalizedExpr.from_column("t.b"), op="=", bool_op="OR")
-        result = _canonicalize_condition_order([fa, fb], _filter_structural_key)
-        assert result[-1].bool_op == "OR"
-
-    def test_canonicalize_condition_order_preserves_or_link(self):
-        """Forward OR links split chunks; ``_forward_links`` matches connector positions."""
-        fa = FilterParam(left_expr=NormalizedExpr.from_column("t.a"), op="=", bool_op="OR")
-        fb = FilterParam(left_expr=NormalizedExpr.from_column("t.b"), op="=", bool_op="AND")
-        fc = FilterParam(left_expr=NormalizedExpr.from_column("t.c"), op="=", bool_op="AND")
+    def test_forward_links_returns_and_connectors(self):
+        """``_forward_links`` is a legacy helper that always returns AND connectors."""
+        fa = WhereParam(left_expr=NormalizedExpr.from_column("t.a"), op="=")
+        fb = WhereParam(left_expr=NormalizedExpr.from_column("t.b"), op="=")
+        fc = WhereParam(left_expr=NormalizedExpr.from_column("t.c"), op="=")
         items = [fa, fb, fc]
-        assert _forward_links(items) == ["OR", "AND", "AND"]
-        result = _canonicalize_condition_order(items, _filter_structural_key)
-        assert result[0].bool_op == "OR"
-        assert result[1].bool_op == "AND"
-
-    def test_complex_mixed_expression(self):
-        """Complex: D(OR) A(OR) C(AND) B(AND) E → parse as [D],[A],[C AND B AND E]."""
-        fd = FilterParam(left_expr=NormalizedExpr.from_column("t.d"), op="=", bool_op="OR")
-        fa = FilterParam(left_expr=NormalizedExpr.from_column("t.a"), op="=", bool_op="OR")
-        fc = FilterParam(left_expr=NormalizedExpr.from_column("t.c"), op="=", bool_op="AND")
-        fb = FilterParam(left_expr=NormalizedExpr.from_column("t.b"), op="=", bool_op="AND")
-        fe = FilterParam(left_expr=NormalizedExpr.from_column("t.e"), op="=", bool_op="AND")
-        result = _canonicalize_condition_order([fd, fa, fc, fb, fe], _filter_structural_key)
-        assert result[0].left_expr.primary_term == "t.a"
-        assert result[0].bool_op == "OR"
-        assert result[1].left_expr.primary_term == "t.b"
-        assert result[1].bool_op == "AND"
-        assert result[2].left_expr.primary_term == "t.c"
-        assert result[2].bool_op == "AND"
-        assert result[3].left_expr.primary_term == "t.e"
-        assert result[3].bool_op == "OR"
-        assert result[4].left_expr.primary_term == "t.d"
+        assert _forward_links(items) == ["AND", "AND", "AND"]
+        result = _canonicalize_condition_order(items, _where_structural_key)
+        assert [r.left_expr.primary_term for r in result] == ["t.a", "t.b", "t.c"]
 
     def test_having_variant(self):
         """Canonicalization works with HavingParam via _having_structural_key."""
-        hz = HavingParam(left_expr=NormalizedExpr.from_agg("sum", "t.z"), op=">", bool_op="AND")
-        ha = HavingParam(left_expr=NormalizedExpr.from_agg("count", "t.a"), op=">", bool_op="AND")
+        hz = HavingParam(left_expr=NormalizedExpr.from_agg("sum", "t.z"), op=">")
+        ha = HavingParam(left_expr=NormalizedExpr.from_agg("count", "t.a"), op=">")
         result = _canonicalize_condition_order([hz, ha], _having_structural_key)
         assert result[0].left_expr.add_groups[0].agg_func == "count"
         assert result[1].left_expr.add_groups[0].agg_func == "sum"
 
     def test_idempotent(self):
         """Applying canonicalization twice produces the same result."""
-        fa = FilterParam(left_expr=NormalizedExpr.from_column("t.a"), op="=", bool_op="OR")
-        fc = FilterParam(left_expr=NormalizedExpr.from_column("t.c"), op="=", bool_op="AND")
-        fb = FilterParam(left_expr=NormalizedExpr.from_column("t.b"), op="=", bool_op="AND")
-        first = _canonicalize_condition_order([fa, fc, fb], _filter_structural_key)
-        second = _canonicalize_condition_order(first, _filter_structural_key)
+        fa = WhereParam(left_expr=NormalizedExpr.from_column("t.a"), op="=")
+        fc = WhereParam(left_expr=NormalizedExpr.from_column("t.c"), op="=")
+        fb = WhereParam(left_expr=NormalizedExpr.from_column("t.b"), op="=")
+        first = _canonicalize_condition_order([fa, fc, fb], _where_structural_key)
+        second = _canonicalize_condition_order(first, _where_structural_key)
         assert [r.left_expr.primary_term for r in first] == [r.left_expr.primary_term for r in second]
-        assert [r.bool_op for r in first] == [r.bool_op for r in second]
 
 
 class TestSortFiltersGroupAware:
-    """Tests for sort_filters with filter_group partitioning."""
+    """Tests for sort_where_predicates flat structural-key sorting."""
 
-    def test_single_group_or(self):
-        """Filters in the same group with all-OR are sorted by structural key."""
-        fz = FilterParam(
-            left_expr=NormalizedExpr.from_column("t.z"),
-            op="=",
-            bool_op="OR",
-            filter_group=1,
-        )
-        fa = FilterParam(
-            left_expr=NormalizedExpr.from_column("t.a"),
-            op="=",
-            bool_op="OR",
-            filter_group=1,
-        )
-        result = sort_filters([fz, fa])
+    def test_sorts_by_structural_key(self):
+        """Filters are sorted by structural key."""
+        fz = WhereParam(left_expr=NormalizedExpr.from_column("t.z"), op="=")
+        fa = WhereParam(left_expr=NormalizedExpr.from_column("t.a"), op="=")
+        result = sort_where_predicates([fz, fa])
         assert result[0].left_expr.primary_term == "t.a"
         assert result[1].left_expr.primary_term == "t.z"
-        assert all(r.filter_group == 1 for r in result)
 
-    def test_ungrouped_and_grouped_inter_group_sort(self):
-        """Inter-group order is determined by structural key of group representatives."""
-        fz = FilterParam(left_expr=NormalizedExpr.from_column("t.z"), op="=", filter_group=None)
-        fa = FilterParam(
-            left_expr=NormalizedExpr.from_column("t.a"),
-            op="=",
-            bool_op="OR",
-            filter_group=1,
-        )
-        fb = FilterParam(
-            left_expr=NormalizedExpr.from_column("t.b"),
-            op="=",
-            bool_op="AND",
-            filter_group=1,
-        )
-        result = sort_filters([fz, fa, fb])
-        assert [(r.left_expr.primary_term, r.filter_group) for r in result] == [
-            ("t.z", 2),
-            ("t.a", 1),
-            ("t.b", 1),
-        ]
-        assert all(r.bool_op == "AND" for r in result)
+    def test_sorts_three_items_by_structural_key(self):
+        """Multiple filters sort by structural key regardless of input order."""
+        fz = WhereParam(left_expr=NormalizedExpr.from_column("t.z"), op="=")
+        fa = WhereParam(left_expr=NormalizedExpr.from_column("t.a"), op="=")
+        fb = WhereParam(left_expr=NormalizedExpr.from_column("t.b"), op="=")
+        result = sort_where_predicates([fz, fa, fb])
+        assert [r.left_expr.primary_term for r in result] == ["t.a", "t.b", "t.z"]
 
-    def test_multiple_groups_sorted_by_representative(self):
-        """Multiple filter_groups are sorted by their representative structural key."""
-        g2a = FilterParam(
-            left_expr=NormalizedExpr.from_column("t.z"),
-            op="=",
-            bool_op="AND",
-            filter_group=2,
-        )
-        g1a = FilterParam(
-            left_expr=NormalizedExpr.from_column("t.a"),
-            op="=",
-            bool_op="AND",
-            filter_group=1,
-        )
-        result = sort_filters([g2a, g1a])
-        assert result[0].filter_group == 2
-        assert result[1].filter_group == 1
-
-    def test_multi_group_two_filters_backward_or_becomes_forward_or(self):
-        """Two groups: inter-group OR is carried on the first group's representative."""
-        g1 = FilterParam(
-            left_expr=NormalizedExpr.from_column("t.a"),
-            op="=",
-            bool_op="OR",
-            filter_group=1,
-        )
-        g2 = FilterParam(
-            left_expr=NormalizedExpr.from_column("t.b"),
-            op="=",
-            bool_op="AND",
-            filter_group=2,
-        )
-        result = sort_filters([g1, g2])
+    def test_render_or_predicate_group(self):
+        """OR semantics are expressed via PredicateGroup trees, not flat bool_op."""
+        g1 = WhereParam(left_expr=NormalizedExpr.from_column("t.a"), op="=")
+        g2 = WhereParam(left_expr=NormalizedExpr.from_column("t.b"), op="=")
+        result = sort_where_predicates([g1, g2])
         assert len(result) == 2
-        assert all(r.bool_op == "AND" for r in result)
-        where_sql = _join_flat_predicate_parts_with_filter_groups(
-            [
-                ("t.a = :p1", result[0].bool_op, result[0].filter_group),
-                ("t.b = :p2", result[1].bool_op, result[1].filter_group),
-            ]
+        or_group = PredicateGroup(
+            op="or",
+            groups=(
+                PredicateGroup(op="and", predicates=(result[0],)),
+                PredicateGroup(op="and", predicates=(result[1],)),
+            ),
         )
+        where_sql = _render_predicate_group_sql(or_group, lambda p: f"{p.left_expr.primary_term} = :p")
         assert " OR " in where_sql
 
-    def test_sort_filters_preserves_or_across_groups(self):
-        """Explicit OR between ``filter_group`` representatives survives ``sort_filters``."""
-        g1 = FilterParam(
-            left_expr=NormalizedExpr.from_column("t.a"),
-            op="=",
-            bool_op="OR",
-            filter_group=1,
-        )
-        g2 = FilterParam(
-            left_expr=NormalizedExpr.from_column("t.b"),
-            op="=",
-            bool_op="AND",
-            filter_group=2,
-        )
-        result = sort_filters([g1, g2])
+    def test_render_or_predicate_group_after_sort(self):
+        """Sorted flat filters can be wrapped in an OR PredicateGroup for rendering."""
+        g1 = WhereParam(left_expr=NormalizedExpr.from_column("t.a"), op="=")
+        g2 = WhereParam(left_expr=NormalizedExpr.from_column("t.b"), op="=")
+        result = sort_where_predicates([g1, g2])
         assert len(result) == 2
-        assert all(r.bool_op == "AND" for r in result)
-        joined = _join_flat_predicate_parts_with_filter_groups(
-            [
-                ("t.a = :p1", result[0].bool_op, result[0].filter_group),
-                ("t.b = :p2", result[1].bool_op, result[1].filter_group),
-            ]
+        joined = _render_predicate_group_sql(
+            PredicateGroup(
+                op="or",
+                groups=(
+                    PredicateGroup(op="and", predicates=(result[0],)),
+                    PredicateGroup(op="and", predicates=(result[1],)),
+                ),
+            ),
+            lambda p: f"{p.left_expr.primary_term} = :p",
         )
         assert " OR " in joined
 
-    def test_inter_group_connector_preserved(self):
-        """The inter-group connector (last filter's bool_op) is preserved through sorting."""
-        fa = FilterParam(
-            left_expr=NormalizedExpr.from_column("t.a"),
-            op="=",
-            bool_op="OR",
-            filter_group=1,
-        )
-        fb = FilterParam(
-            left_expr=NormalizedExpr.from_column("t.b"),
-            op="=",
-            bool_op="AND",
-            filter_group=1,
-        )
-        fc = FilterParam(
-            left_expr=NormalizedExpr.from_column("t.c"),
-            op="=",
-            bool_op="AND",
-            filter_group=None,
-        )
-        result = sort_filters([fc, fa, fb])
-        group1 = [r for r in result if r.filter_group == 1]
-        assert group1[-1].bool_op == "AND"
+    def test_mixed_input_order_canonical(self):
+        """Filters in arbitrary input order are canonicalized by structural key."""
+        fa = WhereParam(left_expr=NormalizedExpr.from_column("t.a"), op="=")
+        fc = WhereParam(left_expr=NormalizedExpr.from_column("t.c"), op="=")
+        fb = WhereParam(left_expr=NormalizedExpr.from_column("t.b"), op="=")
+        result = sort_where_predicates([fa, fc, fb])
+        assert [r.left_expr.primary_term for r in result] == ["t.a", "t.b", "t.c"]
 
-    def test_intra_group_mixed_ops_canonical(self):
-        """Mixed ops within a group are canonicalized via precedence tree."""
-        fa = FilterParam(
-            left_expr=NormalizedExpr.from_column("t.a"),
-            op="=",
-            bool_op="OR",
-            filter_group=1,
-        )
-        fc = FilterParam(
-            left_expr=NormalizedExpr.from_column("t.c"),
-            op="=",
-            bool_op="AND",
-            filter_group=1,
-        )
-        fb = FilterParam(
-            left_expr=NormalizedExpr.from_column("t.b"),
-            op="=",
-            bool_op="AND",
-            filter_group=1,
-        )
-        result = sort_filters([fa, fc, fb])
-        terms = [r.left_expr.primary_term for r in result]
-        assert terms == ["t.a", "t.b", "t.c"]
-
-    def test_sort_filters_idempotent(self):
-        """sort_filters applied twice yields the same result."""
-        fa = FilterParam(
-            left_expr=NormalizedExpr.from_column("t.a"),
-            op="=",
-            bool_op="OR",
-            filter_group=1,
-        )
-        fb = FilterParam(
-            left_expr=NormalizedExpr.from_column("t.b"),
-            op="=",
-            bool_op="AND",
-            filter_group=1,
-        )
-        fc = FilterParam(left_expr=NormalizedExpr.from_column("t.c"), op="=", filter_group=None)
-        first = sort_filters([fc, fa, fb])
-        second = sort_filters(first)
+    def test_sort_where_predicates_idempotent(self):
+        """sort_where_predicates applied twice yields the same result."""
+        fa = WhereParam(left_expr=NormalizedExpr.from_column("t.a"), op="=")
+        fb = WhereParam(left_expr=NormalizedExpr.from_column("t.b"), op="=")
+        fc = WhereParam(left_expr=NormalizedExpr.from_column("t.c"), op="=")
+        first = sort_where_predicates([fc, fa, fb])
+        second = sort_where_predicates(first)
         assert [r.left_expr.primary_term for r in first] == [r.left_expr.primary_term for r in second]
-        assert [r.bool_op for r in first] == [r.bool_op for r in second]
-        assert [r.filter_group for r in first] == [r.filter_group for r in second]
 
 
 class TestSortHavingGroupAware:
-    """Tests for sort_having with filter_group partitioning."""
+    """Tests for sort_having flat structural-key sorting."""
 
-    def test_single_group_or(self):
-        """Having conditions in the same group with all-OR are sorted by structural key."""
-        hz = HavingParam(
-            left_expr=NormalizedExpr.from_agg("sum", "t.z"),
-            op=">",
-            bool_op="OR",
-            filter_group=1,
-        )
-        ha = HavingParam(
-            left_expr=NormalizedExpr.from_agg("count", "t.a"),
-            op=">",
-            bool_op="OR",
-            filter_group=1,
-        )
+    def test_sorts_by_structural_key(self):
+        """Having conditions are sorted by structural key."""
+        hz = HavingParam(left_expr=NormalizedExpr.from_agg("sum", "t.z"), op=">")
+        ha = HavingParam(left_expr=NormalizedExpr.from_agg("count", "t.a"), op=">")
         result = sort_having([hz, ha])
         assert result[0].left_expr.add_groups[0].agg_func == "count"
         assert result[1].left_expr.add_groups[0].agg_func == "sum"
-        assert all(r.filter_group == 1 for r in result)
 
-    def test_ungrouped_and_grouped(self):
-        """Having conditions with mixed groups are sorted by structural key across groups."""
-        hz = HavingParam(left_expr=NormalizedExpr.from_agg("sum", "t.z"), op=">", filter_group=None)
-        ha = HavingParam(
-            left_expr=NormalizedExpr.from_agg("count", "t.a"),
-            op=">",
-            bool_op="OR",
-            filter_group=1,
-        )
+    def test_sorts_mixed_items_by_structural_key(self):
+        """Multiple having conditions sort by structural key regardless of input order."""
+        hz = HavingParam(left_expr=NormalizedExpr.from_agg("sum", "t.z"), op=">")
+        ha = HavingParam(left_expr=NormalizedExpr.from_agg("count", "t.a"), op=">")
         result = sort_having([hz, ha])
-        assert result[0].filter_group == 2
-        assert result[0].left_expr.add_groups[0].agg_func == "sum"
-        assert result[1].filter_group == 1
+        assert result[0].left_expr.add_groups[0].agg_func == "count"
+        assert result[1].left_expr.add_groups[0].agg_func == "sum"
 
     def test_intra_group_mixed_ops(self):
-        """Mixed ops within a having group are canonicalized via precedence tree."""
-        ha = HavingParam(
-            left_expr=NormalizedExpr.from_agg("sum", "t.a"),
-            op=">",
-            bool_op="OR",
-            filter_group=1,
-        )
-        hc = HavingParam(
-            left_expr=NormalizedExpr.from_agg("max", "t.c"),
-            op=">",
-            bool_op="AND",
-            filter_group=1,
-        )
-        hb = HavingParam(
-            left_expr=NormalizedExpr.from_agg("min", "t.b"),
-            op=">",
-            bool_op="AND",
-            filter_group=1,
-        )
+        """Having conditions in arbitrary input order are canonicalized by structural key."""
+        ha = HavingParam(left_expr=NormalizedExpr.from_agg("sum", "t.a"), op=">")
+        hc = HavingParam(left_expr=NormalizedExpr.from_agg("max", "t.c"), op=">")
+        hb = HavingParam(left_expr=NormalizedExpr.from_agg("min", "t.b"), op=">")
         result = sort_having([ha, hc, hb])
         funcs = [r.left_expr.add_groups[0].agg_func for r in result]
         assert funcs[1] < funcs[2]
 
     def test_sort_having_idempotent(self):
         """sort_having applied twice yields the same result."""
-        ha = HavingParam(
-            left_expr=NormalizedExpr.from_agg("sum", "t.a"),
-            op=">",
-            bool_op="OR",
-            filter_group=1,
-        )
-        hb = HavingParam(
-            left_expr=NormalizedExpr.from_agg("count", "t.b"),
-            op=">",
-            bool_op="AND",
-            filter_group=1,
-        )
+        ha = HavingParam(left_expr=NormalizedExpr.from_agg("sum", "t.a"), op=">")
+        hb = HavingParam(left_expr=NormalizedExpr.from_agg("count", "t.b"), op=">")
         first = sort_having([ha, hb])
         second = sort_having(first)
         assert [r.left_expr.primary_term for r in first] == [r.left_expr.primary_term for r in second]
-        assert [r.bool_op for r in first] == [r.bool_op for r in second]
 
 
 class TestDedupFiltersGroupAware:
-    """Tests for _dedup_filters with bool_op and filter_group in dedup key."""
+    """Tests for _dedup_where_predicates structural-signature dedup."""
 
-    def test_same_signature_different_bool_op_kept(self):
-        """Filters with same signature_key but different bool_op are both kept."""
-        fp_and = FilterParam(
+    def test_same_signature_deduped(self):
+        """Filters with identical signature_key are deduped."""
+        fp1 = WhereParam(
             left_expr=NormalizedExpr.from_column("t.x"),
             op="=",
             value_type="string",
-            bool_op="AND",
         )
-        fp_or = FilterParam(
+        fp2 = WhereParam(
             left_expr=NormalizedExpr.from_column("t.x"),
             op="=",
             value_type="string",
-            bool_op="OR",
         )
-        result = _dedup_filters([fp_and, fp_or])
+        result = _dedup_where_predicates([fp1, fp2])
+        assert len(result) == 1
+
+    def test_different_signatures_kept(self):
+        """Filters with different signature_key are both kept."""
+        fp1 = WhereParam(
+            left_expr=NormalizedExpr.from_column("t.x"),
+            op="=",
+            value_type="string",
+        )
+        fp2 = WhereParam(
+            left_expr=NormalizedExpr.from_column("t.y"),
+            op="=",
+            value_type="string",
+        )
+        result = _dedup_where_predicates([fp1, fp2])
         assert len(result) == 2
 
-    def test_same_signature_different_filter_group_kept(self):
-        """Filters with same signature_key but different filter_group are both kept."""
-        fp1 = FilterParam(
+    def test_identical_deduped(self):
+        """Identical filters are deduped."""
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.x"),
             op="=",
             value_type="string",
-            filter_group=1,
         )
-        fp2 = FilterParam(
-            left_expr=NormalizedExpr.from_column("t.x"),
-            op="=",
-            value_type="string",
-            filter_group=2,
-        )
-        result = _dedup_filters([fp1, fp2])
-        assert len(result) == 2
-
-    def test_identical_including_bool_op_and_group_deduped(self):
-        """Filters identical in signature_key, bool_op, and filter_group are deduped."""
-        fp = FilterParam(
-            left_expr=NormalizedExpr.from_column("t.x"),
-            op="=",
-            value_type="string",
-            bool_op="OR",
-            filter_group=1,
-        )
-        result = _dedup_filters([fp, fp])
+        result = _dedup_where_predicates([fp, fp])
         assert len(result) == 1
 
 
 class TestDedupHavingGroupAware:
-    """Tests for _dedup_having with bool_op and filter_group in dedup key."""
+    """Tests for _dedup_having structural-signature dedup."""
 
-    def test_same_signature_different_bool_op_kept(self):
-        """Havings with same signature_key but different bool_op are both kept."""
-        hp_and = HavingParam(
-            left_expr=NormalizedExpr.from_column("t.x"),
-            op="=",
-            value_type="number",
-            bool_op="AND",
-        )
-        hp_or = HavingParam(
-            left_expr=NormalizedExpr.from_column("t.x"),
-            op="=",
-            value_type="number",
-            bool_op="OR",
-        )
-        result = _dedup_having([hp_and, hp_or])
-        assert len(result) == 2
-
-    def test_same_signature_different_filter_group_kept(self):
-        """Havings with same signature_key but different filter_group are both kept."""
+    def test_same_signature_deduped(self):
+        """Havings with identical signature_key are deduped."""
         hp1 = HavingParam(
             left_expr=NormalizedExpr.from_column("t.x"),
             op="=",
             value_type="number",
-            filter_group=1,
         )
         hp2 = HavingParam(
             left_expr=NormalizedExpr.from_column("t.x"),
             op="=",
             value_type="number",
-            filter_group=2,
+        )
+        result = _dedup_having([hp1, hp2])
+        assert len(result) == 1
+
+    def test_different_signatures_kept(self):
+        """Havings with different signature_key are both kept."""
+        hp1 = HavingParam(
+            left_expr=NormalizedExpr.from_column("t.x"),
+            op="=",
+            value_type="number",
+        )
+        hp2 = HavingParam(
+            left_expr=NormalizedExpr.from_column("t.y"),
+            op="=",
+            value_type="number",
         )
         result = _dedup_having([hp1, hp2])
         assert len(result) == 2
 
-    def test_identical_including_bool_op_and_group_deduped(self):
-        """Havings identical in signature_key, bool_op, and filter_group are deduped."""
+    def test_identical_deduped(self):
+        """Identical havings are deduped."""
         hp = HavingParam(
             left_expr=NormalizedExpr.from_column("t.x"),
             op="=",
             value_type="number",
-            bool_op="OR",
-            filter_group=1,
         )
         result = _dedup_having([hp, hp])
         assert len(result) == 1
 
 
 class TestNormalizeIntentFiltersHavingsGroupAware:
-    """Tests for normalize_filters_havings with group-aware sort and dedup."""
+    """Tests for normalize_where_havings with group-aware sort and dedup."""
 
     def test_grouped_or_filters_sorted_within_group(self):
         """Grouped OR filters are sorted by structural key within the group."""
-        fz = FilterParam(
+        fz = WhereParam(
             left_expr=NormalizedExpr.from_column("t.z"),
             op="=",
-            bool_op="OR",
-            filter_group=1,
         )
-        fa = FilterParam(
+        fa = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op="=",
-            bool_op="OR",
-            filter_group=1,
         )
         intent = RuntimeIntent(
             tables=["t"],
@@ -841,25 +616,21 @@ class TestNormalizeIntentFiltersHavingsGroupAware:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fz, fa],
+            where=predicate_group_from_list([fz, fa]),
         )
-        result = normalize_filters_havings(intent)
-        assert result.filters_param[0].left_expr.primary_term == "t.a"
-        assert result.filters_param[1].left_expr.primary_term == "t.z"
+        result = normalize_where_havings(intent)
+        assert (result.where.leaves() if result.where else [])[0].left_expr.primary_term == "t.a"
+        assert (result.where.leaves() if result.where else [])[1].left_expr.primary_term == "t.z"
 
     def test_grouped_having_sorted_within_group(self):
         """Grouped OR havings are sorted by structural key within the group."""
         hz = HavingParam(
             left_expr=NormalizedExpr.from_agg("sum", "t.z"),
             op=">",
-            bool_op="OR",
-            filter_group=1,
         )
         ha = HavingParam(
             left_expr=NormalizedExpr.from_agg("count", "t.a"),
             op=">",
-            bool_op="OR",
-            filter_group=1,
         )
         intent = RuntimeIntent(
             tables=["t"],
@@ -867,25 +638,21 @@ class TestNormalizeIntentFiltersHavingsGroupAware:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[hz, ha],
+            where=None,
+            having=predicate_group_from_list([hz, ha]),
         )
-        result = normalize_filters_havings(intent)
-        assert result.having_param[0].left_expr.add_groups[0].agg_func == "count"
+        result = normalize_where_havings(intent)
+        assert (result.having.leaves() if result.having else [])[0].left_expr.add_groups[0].agg_func == "count"
 
     def test_cte_filters_group_aware_sort(self):
         """CTE step filters are group-aware sorted."""
-        fz = FilterParam(
+        fz = WhereParam(
             left_expr=NormalizedExpr.from_column("t.z"),
             op="=",
-            bool_op="OR",
-            filter_group=1,
         )
-        fa = FilterParam(
+        fa = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op="=",
-            bool_op="OR",
-            filter_group=1,
         )
         cte = RuntimeCteStep(
             cte_name="cte1",
@@ -893,8 +660,8 @@ class TestNormalizeIntentFiltersHavingsGroupAware:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fz, fa],
-            having_param=[],
+            where=predicate_group_from_list([fz, fa]),
+            having=None,
             param_values={},
             output_columns=[],
         )
@@ -904,25 +671,21 @@ class TestNormalizeIntentFiltersHavingsGroupAware:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
-        result = normalize_filters_havings(intent)
-        assert result.cte_steps[0].filters_param[0].left_expr.primary_term == "t.a"
+        result = normalize_where_havings(intent)
+        assert (where_leaves(result.cte_steps[0].where) or [])[0].left_expr.primary_term == "t.a"
 
     def test_cte_having_group_aware_sort(self):
         """CTE step having conditions are group-aware sorted."""
         hz = HavingParam(
             left_expr=NormalizedExpr.from_agg("sum", "t.z"),
             op=">",
-            bool_op="OR",
-            filter_group=1,
         )
         ha = HavingParam(
             left_expr=NormalizedExpr.from_agg("count", "t.a"),
             op=">",
-            bool_op="OR",
-            filter_group=1,
         )
         cte = RuntimeCteStep(
             cte_name="cte1",
@@ -930,8 +693,8 @@ class TestNormalizeIntentFiltersHavingsGroupAware:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[hz, ha],
+            where=None,
+            having=predicate_group_from_list([hz, ha]),
             param_values={},
             output_columns=[],
         )
@@ -941,25 +704,23 @@ class TestNormalizeIntentFiltersHavingsGroupAware:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
-        result = normalize_filters_havings(intent)
-        assert result.cte_steps[0].having_param[0].left_expr.add_groups[0].agg_func == "count"
+        result = normalize_where_havings(intent)
+        assert (having_leaves(result.cte_steps[0].having) or [])[0].left_expr.add_groups[0].agg_func == "count"
 
-    def test_dedup_respects_bool_op_in_pipeline(self):
-        """Pipeline dedup keeps filters with same structure but different bool_op."""
-        fp_and = FilterParam(
+    def test_dedup_respects_signature_in_pipeline(self):
+        """Pipeline dedup removes filters with identical structural signatures."""
+        fp1 = WhereParam(
             left_expr=NormalizedExpr.from_column("t.x"),
             op="=",
             value_type="string",
-            bool_op="AND",
         )
-        fp_or = FilterParam(
+        fp2 = WhereParam(
             left_expr=NormalizedExpr.from_column("t.x"),
             op="=",
             value_type="string",
-            bool_op="OR",
         )
         intent = RuntimeIntent(
             tables=["t"],
@@ -967,10 +728,10 @@ class TestNormalizeIntentFiltersHavingsGroupAware:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp_and, fp_or],
+            where=predicate_group_from_list([fp1, fp2]),
         )
-        result = normalize_filters_havings(intent)
-        assert len(result.filters_param) == 2
+        result = normalize_where_havings(intent)
+        assert len(result.where.leaves() if result.where else []) == 1
 
 
 class TestSimplifyExpr:
@@ -1074,7 +835,7 @@ class TestSimplifyIntentExprs:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = simplify_exprs(intent)
         assert len(result.select_cols[0].expr.add_groups) == 1
@@ -1082,17 +843,17 @@ class TestSimplifyIntentExprs:
 
 
 class TestNormalizeFilterScalarOnLeft:
-    """Tests for _normalize_filter_scalar_on_left."""
+    """Tests for _normalize_where_scalar_on_left."""
 
     def test_swaps_scalar_left_column_right(self):
         """Swap when left is scalar and right is column, flipping operator."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=parse_expr_string("CURRENT_DATE"),
             op="<=",
             right_expr=NormalizedExpr.from_column("payment.payment_date"),
             value_type="date",
         )
-        result = _normalize_filter_scalar_on_left(fp)
+        result = _normalize_where_scalar_on_left(fp)
         assert result.left_expr.primary_column == "payment.payment_date"
         assert result.right_expr is not None
         assert "current_date" in result.right_expr.signature_key.lower()
@@ -1100,49 +861,49 @@ class TestNormalizeFilterScalarOnLeft:
 
     def test_swaps_interval_left_column_right(self):
         """Swap when left is INTERVAL expression and right is column."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=parse_expr_string("CURRENT_DATE - INTERVAL '90 days'"),
             op="<",
             right_expr=NormalizedExpr.from_column("rental.rental_date"),
             value_type="date",
         )
-        result = _normalize_filter_scalar_on_left(fp)
+        result = _normalize_where_scalar_on_left(fp)
         assert result.left_expr.primary_column == "rental.rental_date"
         assert result.op == ">"
 
     def test_column_left_scalar_right_unchanged(self):
         """Leave column-on-left, scalar-on-right unchanged."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("rental.rental_date"),
             op=">=",
             right_expr=parse_expr_string("CURRENT_DATE - INTERVAL '90 days'"),
             value_type="date",
         )
-        result = _normalize_filter_scalar_on_left(fp)
+        result = _normalize_where_scalar_on_left(fp)
         assert result.left_expr.primary_column == "rental.rental_date"
         assert result.op == ">="
 
     def test_column_left_column_right_unchanged(self):
-        """Leave col-vs-col filters unchanged (handled by _normalize_col_to_col_filter)."""
-        fp = FilterParam(
+        """Leave col-vs-col filters unchanged (handled by _normalize_col_to_col_where)."""
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op="=",
             right_expr=NormalizedExpr.from_column("t.b"),
             value_type="string",
         )
-        result = _normalize_filter_scalar_on_left(fp)
+        result = _normalize_where_scalar_on_left(fp)
         assert result.left_expr.primary_column == "t.a"
         assert result.right_expr.primary_column == "t.b"
 
     def test_no_right_expr_unchanged(self):
         """Leave filters without right_expr unchanged."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op="=",
             value_type="string",
             raw_value="x",
         )
-        result = _normalize_filter_scalar_on_left(fp)
+        result = _normalize_where_scalar_on_left(fp)
         assert result.left_expr.primary_column == "t.a"
         assert result.right_expr is None
 
@@ -1152,24 +913,24 @@ class TestNormalizeFilterCanonical:
 
     def test_swaps_empty_left_with_right(self):
         """normalize_filter_canonical swaps empty left with right."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr(add_groups=[], add_values=[]),
             op=">",
             right_expr=NormalizedExpr.from_column("t.x"),
             value_type="number",
         )
-        result = _normalize_filter_canonical(fp)
+        result = _normalize_where_canonical(fp)
         assert result.left_expr.primary_term == "t.x"
         assert result.op == "<"
 
     def test_nonempty_left_unchanged(self):
         """normalize_filter_canonical leaves non-empty left unchanged."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.x"),
             op="=",
             value_type="number",
         )
-        result = _normalize_filter_canonical(fp)
+        result = _normalize_where_canonical(fp)
         assert result.left_expr.primary_column == "t.x"
         assert result.op == "="
 
@@ -1205,25 +966,25 @@ class TestNormalizeColToColFilter:
 
     def test_smaller_sig_on_left(self):
         """normalize_col_to_col_filter puts smaller signature on left."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.z"),
             op=">",
             right_expr=NormalizedExpr.from_column("t.a"),
             value_type="number",
         )
-        result = _normalize_col_to_col_filter(fp)
+        result = _normalize_col_to_col_where(fp)
         assert result.left_expr.primary_column == "t.a"
         assert result.op == "<"
 
     def test_already_ordered_unchanged(self):
         """normalize_col_to_col_filter leaves already-ordered unchanged."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op=">",
             right_expr=NormalizedExpr.from_column("t.z"),
             value_type="number",
         )
-        result = _normalize_col_to_col_filter(fp)
+        result = _normalize_col_to_col_where(fp)
         assert result.left_expr.primary_column == "t.a"
         assert result.op == ">"
 
@@ -1258,24 +1019,24 @@ class TestNormalizeAggToAggHaving:
 
 
 class TestDedupFilters:
-    """Tests for _dedup_filters."""
+    """Tests for _dedup_where_predicates."""
 
     def test_removes_duplicate(self):
-        """_dedup_filters removes duplicate by signature_key."""
-        fp = FilterParam(left_expr=NormalizedExpr.from_column("t.x"), op="=", value_type="string")
-        result = _dedup_filters([fp, fp])
+        """_dedup_where_predicates removes duplicate by signature_key."""
+        fp = WhereParam(left_expr=NormalizedExpr.from_column("t.x"), op="=", value_type="string")
+        result = _dedup_where_predicates([fp, fp])
         assert len(result) == 1
 
     def test_preserves_unique(self):
-        """_dedup_filters preserves unique filters."""
-        fp1 = FilterParam(left_expr=NormalizedExpr.from_column("t.x"), op="=", value_type="string")
-        fp2 = FilterParam(left_expr=NormalizedExpr.from_column("t.y"), op=">", value_type="number")
-        result = _dedup_filters([fp1, fp2])
+        """_dedup_where_predicates preserves unique filters."""
+        fp1 = WhereParam(left_expr=NormalizedExpr.from_column("t.x"), op="=", value_type="string")
+        fp2 = WhereParam(left_expr=NormalizedExpr.from_column("t.y"), op=">", value_type="number")
+        result = _dedup_where_predicates([fp1, fp2])
         assert len(result) == 2
 
     def test_empty_list(self):
-        """_dedup_filters returns empty for empty input."""
-        assert _dedup_filters([]) == []
+        """_dedup_where_predicates returns empty for empty input."""
+        assert _dedup_where_predicates([]) == []
 
 
 class TestDedupHaving:
@@ -1296,35 +1057,35 @@ class TestDedupHaving:
 
 
 class TestNormalizeIntentFiltersHavings:
-    """Tests for normalize_filters_havings."""
+    """Tests for normalize_where_havings."""
 
     def test_deduplicates_filters(self):
-        """normalize_filters_havings deduplicates filters."""
-        fp = FilterParam(left_expr=NormalizedExpr.from_column("t.x"), op="=", value_type="string")
+        """normalize_where_havings deduplicates filters."""
+        fp = WhereParam(left_expr=NormalizedExpr.from_column("t.x"), op="=", value_type="string")
         intent = RuntimeIntent(
             tables=["t"],
             grain="row_level",
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp, fp],
+            where=predicate_group_from_list([fp, fp]),
         )
-        result = normalize_filters_havings(intent)
-        assert len(result.filters_param) == 1
+        result = normalize_where_havings(intent)
+        assert len(result.where.leaves() if result.where else []) == 1
 
     def test_normalizes_ops(self):
-        """normalize_filters_havings normalizes operators."""
-        fp = FilterParam(left_expr=NormalizedExpr.from_column("t.x"), op="==", value_type="string")
+        """normalize_where_havings normalizes operators."""
+        fp = WhereParam(left_expr=NormalizedExpr.from_column("t.x"), op="==", value_type="string")
         intent = RuntimeIntent(
             tables=["t"],
             grain="row_level",
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=predicate_group_from_list([fp]),
         )
-        result = normalize_filters_havings(intent)
-        assert result.filters_param[0].op == "="
+        result = normalize_where_havings(intent)
+        assert (result.where.leaves() if result.where else [])[0].op == "="
 
 
 class TestEnforceGrainConsistency:
@@ -1382,7 +1143,7 @@ class TestEnforceGrainConsistency:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = enforce_grain_consistency(intent, grain_schema)
         assert result.grain == "grouped"
@@ -1397,7 +1158,7 @@ class TestEnforceGrainConsistency:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.amount"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = enforce_grain_consistency(intent, grain_schema)
         assert result.grain == "row_level"
@@ -1410,7 +1171,7 @@ class TestEnforceGrainConsistency:
             select_cols=[SelectCol(expr=NormalizedExpr.from_agg("count", "orders.id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = enforce_grain_consistency(intent, grain_schema)
         assert result.grain == "row_level"
@@ -1431,7 +1192,7 @@ class TestEnforceGrainConsistency:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             window_registry=[
                 WindowRegistryStep(
                     registry_id="w01",
@@ -1662,7 +1423,7 @@ class TestNormalizeCteNames:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("other_step.val"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte1, cte2],
         )
         result = normalize_cte_names(intent)
@@ -1678,7 +1439,7 @@ class TestNormalizeCteNames:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = normalize_cte_names(intent)
         assert result.cte_steps == []
@@ -1695,7 +1456,7 @@ class TestNormalizeCteNames:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("old_name.x"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
         result = normalize_cte_names(intent)
@@ -1712,7 +1473,7 @@ class TestNormalizeCteNames:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte1, cte2],
         )
         result = normalize_cte_names(intent)
@@ -1729,7 +1490,7 @@ class TestNormalizeCteNames:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte1, cte2],
         )
         result = normalize_cte_names(intent)
@@ -1759,7 +1520,7 @@ class TestNormalizeCteNames:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("final_step.amount"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte1, cte2],
         )
         result = normalize_cte_names(intent)
@@ -1783,7 +1544,7 @@ class TestNormalizeCteNames:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("metrics.avg_rate"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
         result = normalize_cte_names(intent)
@@ -1803,7 +1564,7 @@ class TestNormalizeCteNames:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("customer_totals.total"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
             planner_cte_names=["customer_totals"],
             window_registry=[
@@ -1837,17 +1598,19 @@ class TestNormalizeCteNames:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("cte1.cte1"),
-                    op=">",
-                    raw_value=1,
-                )
-            ],
+            where=predicate_group_from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("cte1.cte1"),
+                        op=">",
+                        raw_value=1,
+                    )
+                ]
+            ),
             cte_steps=[cte],
         )
         out = rewrite_main_query_refs_to_final_cte_columns(intent)
-        assert out.filters_param[0].left_expr.primary_term == "cte1.rate"
+        assert (out.where.leaves() if out.where else [])[0].left_expr.primary_term == "cte1.rate"
 
     def test_rewrite_main_query_refs_inferred_alias_to_explicit_output(self):
         """When output_columns disagree with inferred select aliases, remap by position."""
@@ -1867,23 +1630,25 @@ class TestNormalizeCteNames:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("cte1.avg_amount"),
-                    op="=",
-                    raw_value=1,
-                ),
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("cte1.status"),
-                    op="=",
-                    raw_value="x",
-                ),
-            ],
+            where=predicate_group_from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("cte1.avg_amount"),
+                        op="=",
+                        raw_value=1,
+                    ),
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("cte1.status"),
+                        op="=",
+                        raw_value="x",
+                    ),
+                ]
+            ),
             cte_steps=[cte],
         )
         out = rewrite_main_query_refs_to_final_cte_columns(intent)
-        assert out.filters_param[0].left_expr.primary_term == "cte1.avg_amt"
-        assert out.filters_param[1].left_expr.primary_term == "cte1.order_status"
+        assert (out.where.leaves() if out.where else [])[0].left_expr.primary_term == "cte1.avg_amt"
+        assert (out.where.leaves() if out.where else [])[1].left_expr.primary_term == "cte1.order_status"
 
     def test_rewrite_main_query_refs_raw_sql_fragment(self):
         cte = RuntimeCteStep(
@@ -1900,17 +1665,19 @@ class TestNormalizeCteNames:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr(raw_sql="cte1.cte1 > 1"),
-                    op=">",
-                    raw_value=1,
-                )
-            ],
+            where=predicate_group_from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr(raw_sql="cte1.cte1 > 1"),
+                        op=">",
+                        raw_value=1,
+                    )
+                ]
+            ),
             cte_steps=[cte],
         )
         out = rewrite_main_query_refs_to_final_cte_columns(intent)
-        assert "cte1.rate" in (out.filters_param[0].left_expr.raw_sql or "")
+        assert "cte1.rate" in ((out.where.leaves() if out.where else [])[0].left_expr.raw_sql or "")
 
 
 class TestEnforceIntentSchema:
@@ -1943,7 +1710,7 @@ class TestEnforceIntentSchema:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         _, errors = check_qualified_refs_exist(intent, validate_schema)
         assert errors == []
@@ -1956,7 +1723,7 @@ class TestEnforceIntentSchema:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         _, errors = check_qualified_refs_exist(intent, validate_schema)
         assert any("Unknown table" in e for e in errors)
@@ -1969,7 +1736,7 @@ class TestEnforceIntentSchema:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.nonexistent"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         _, errors = check_qualified_refs_exist(intent, validate_schema)
         assert any("Unknown" in e and "nonexistent" in e for e in errors)
@@ -1983,7 +1750,7 @@ class TestEnforceIntentSchema:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
         _, errors = check_qualified_refs_exist(intent, validate_schema)
@@ -2025,7 +1792,7 @@ class TestNormalizeCountStarEdgeCases:
 
     def test_fixes_count_in_filters(self):
         """normalize_count_star fixes COUNT(1) in filter expressions."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr(add_groups=[MulGroup(multiply=["COUNT(1)"])]),
             op=">",
         )
@@ -2035,10 +1802,12 @@ class TestNormalizeCountStarEdgeCases:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=predicate_group_from_list([fp]),
         )
         result = normalize_count_star(intent)
-        assert term_strs(result.filters_param[0].left_expr.add_groups[0].multiply) == ["COUNT(*)"]
+        assert term_strs((result.where.leaves() if result.where else [])[0].left_expr.add_groups[0].multiply) == [
+            "COUNT(*)"
+        ]
 
     def test_no_count_unchanged(self):
         """normalize_count_star leaves non-count terms unchanged."""
@@ -2048,7 +1817,7 @@ class TestNormalizeCountStarEdgeCases:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.name"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = normalize_count_star(intent)
         assert result.select_cols[0].expr.primary_term == "t.name"
@@ -2064,9 +1833,9 @@ class TestSortFunctionsEdgeCases:
         result = sort_select_cols([c2, c1])
         assert result[0].expr.primary_term == "t.a"
 
-    def test_sort_filters_empty(self):
-        """sort_filters returns empty for empty input."""
-        assert sort_filters([]) == []
+    def test_sort_where_predicates_empty(self):
+        """sort_where_predicates returns empty for empty input."""
+        assert sort_where_predicates([]) == []
 
     def test_sort_having_empty(self):
         """sort_having returns empty for empty input."""
@@ -2113,8 +1882,8 @@ class TestNormalizeCountStarCte:
             select_cols=[SelectCol(expr=NormalizedExpr(add_groups=[MulGroup(multiply=["COUNT(1)"])]))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             output_columns=[],
         )
@@ -2124,7 +1893,7 @@ class TestNormalizeCountStarCte:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
         result = normalize_count_star(intent)
@@ -2148,8 +1917,8 @@ class TestSimplifyIntentExprsCte:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             output_columns=[],
         )
@@ -2159,7 +1928,7 @@ class TestSimplifyIntentExprsCte:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
         result = simplify_exprs(intent)
@@ -2168,19 +1937,19 @@ class TestSimplifyIntentExprsCte:
 
 
 class TestNormalizeIntentFiltersHavingsCte:
-    """CTE path tests for normalize_filters_havings."""
+    """CTE path tests for normalize_where_havings."""
 
     def test_cte_filters_deduped(self):
         """Duplicate filters in a CTE step are deduplicated."""
-        fp = FilterParam(left_expr=NormalizedExpr.from_column("t.x"), op="=", value_type="string")
+        fp = WhereParam(left_expr=NormalizedExpr.from_column("t.x"), op="=", value_type="string")
         cte = RuntimeCteStep(
             cte_name="cte1",
             tables=["t"],
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp, fp],
-            having_param=[],
+            where=predicate_group_from_list([fp, fp]),
+            having=None,
             param_values={},
             output_columns=[],
         )
@@ -2190,11 +1959,11 @@ class TestNormalizeIntentFiltersHavingsCte:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
-        result = normalize_filters_havings(intent)
-        assert len(result.cte_steps[0].filters_param) == 1
+        result = normalize_where_havings(intent)
+        assert len(where_leaves(result.cte_steps[0].where) or []) == 1
 
     def test_cte_having_ops_normalised(self):
         """Operators in CTE havings are normalised."""
@@ -2209,8 +1978,8 @@ class TestNormalizeIntentFiltersHavingsCte:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[hp],
+            where=None,
+            having=predicate_group_from_list([hp]),
             param_values={},
             output_columns=[],
         )
@@ -2220,30 +1989,30 @@ class TestNormalizeIntentFiltersHavingsCte:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
-        result = normalize_filters_havings(intent)
-        assert result.cte_steps[0].having_param[0].op == "="
+        result = normalize_where_havings(intent)
+        assert (having_leaves(result.cte_steps[0].having) or [])[0].op == "="
 
 
 class TestFilterAndHavingStructuralKeys:
-    """Direct tests for _filter_structural_key and _having_structural_key."""
+    """Direct tests for _where_structural_key and _having_structural_key."""
 
     def test_filter_key_lowercases_op_and_value_type(self):
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("T.X"),
             op="EQ",
             right_expr=NormalizedExpr.from_column("T.Y"),
             value_type="STRING",
         )
-        key = _filter_structural_key(fp)
+        key = _where_structural_key(fp)
         assert key[1] == "eq"
         assert key[3] == "string"
 
     def test_filter_key_empty_when_exprs_missing(self):
-        fp = FilterParam(left_expr=NormalizedExpr(), op="=", value_type="number")
-        key = _filter_structural_key(fp)
+        fp = WhereParam(left_expr=NormalizedExpr(), op="=", value_type="number")
+        key = _where_structural_key(fp)
         assert key[0] == ""
         assert key[2] == ""
 
@@ -2261,31 +2030,23 @@ class TestFilterAndHavingStructuralKeys:
 
 
 class TestShiftMultiGroupRepresentatives:
-    """Tests for forward bool_op wiring between group representatives."""
+    """Tests for legacy no-op group representative helpers."""
 
     def test_single_filter_unchanged(self):
-        fp = FilterParam(left_expr=NormalizedExpr.from_column("t.a"), op="=", bool_op="OR")
-        assert _shift_multi_group_representative_filters_forward([fp]) == [fp]
+        fp = WhereParam(left_expr=NormalizedExpr.from_column("t.a"), op="=")
+        assert _shift_multi_group_representative_where_forward([fp]) == [fp]
 
-    def test_two_reps_forward_connectors(self):
-        r1 = FilterParam(left_expr=NormalizedExpr.from_column("t.a"), op="=", bool_op="OR")
-        r2 = FilterParam(left_expr=NormalizedExpr.from_column("t.b"), op="=", bool_op="AND")
-        out = _shift_multi_group_representative_filters_forward([r1, r2])
-        assert out[0].bool_op == "OR"
-        assert out[1].bool_op == "AND"
-
-    def test_default_and_when_bool_op_none(self):
-        r1 = FilterParam(left_expr=NormalizedExpr.from_column("t.a"), op="=", bool_op=None)
-        r2 = FilterParam(left_expr=NormalizedExpr.from_column("t.b"), op="=", bool_op="OR")
-        out = _shift_multi_group_representative_filters_forward([r1, r2])
-        assert out[0].bool_op == "AND"
+    def test_two_reps_unchanged(self):
+        r1 = WhereParam(left_expr=NormalizedExpr.from_column("t.a"), op="=")
+        r2 = WhereParam(left_expr=NormalizedExpr.from_column("t.b"), op="=")
+        out = _shift_multi_group_representative_where_forward([r1, r2])
+        assert out == [r1, r2]
 
     def test_having_variant(self):
-        h1 = HavingParam(left_expr=NormalizedExpr.from_column("t.a"), op=">", bool_op="OR")
-        h2 = HavingParam(left_expr=NormalizedExpr.from_column("t.b"), op=">", bool_op="AND")
+        h1 = HavingParam(left_expr=NormalizedExpr.from_column("t.a"), op=">")
+        h2 = HavingParam(left_expr=NormalizedExpr.from_column("t.b"), op=">")
         out = _shift_multi_group_representative_having_forward([h1, h2])
-        assert out[0].bool_op == "OR"
-        assert out[1].bool_op == "AND"
+        assert out == [h1, h2]
 
 
 class TestIsCteOutputGroupable:
@@ -2326,7 +2087,7 @@ class TestRewriteCteOutputRefsToAliases:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("raw.orders.amount"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
         result = rewrite_cte_output_refs_to_aliases(intent)
@@ -2345,7 +2106,7 @@ class TestRewriteCteOutputRefsToAliases:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("raw.orders.amount"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
         result = rewrite_cte_output_refs_to_aliases(intent)
@@ -2356,13 +2117,15 @@ class TestRewriteCteOutputRefsToAliases:
             cte_name="inner",
             tables=["orders"],
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.amount"))],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("inner.orders.amount"),
-                    op=">",
-                    right_expr=NormalizedExpr(add_values=[ExprValue(value=0.0)]),
-                )
-            ],
+            where=predicate_group_from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("inner.orders.amount"),
+                        op=">",
+                        right_expr=NormalizedExpr(add_values=[ExprValue(value=0.0)]),
+                    )
+                ]
+            ),
             output_columns=["amt"],
         )
         intent = RuntimeIntent(
@@ -2371,11 +2134,11 @@ class TestRewriteCteOutputRefsToAliases:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
         result = rewrite_cte_output_refs_to_aliases(intent)
-        left = result.cte_steps[0].filters_param[0].left_expr
+        left = (where_leaves(result.cte_steps[0].where) or [])[0].left_expr
         assert left.primary_term == "inner.amt"
 
     def test_maps_inferred_alias_to_output_column(self):
@@ -2391,21 +2154,23 @@ class TestRewriteCteOutputRefsToAliases:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("cte1.film_count"),
-                    op=">",
-                    right_expr=NormalizedExpr.from_column("w01"),
-                )
-            ],
+            where=predicate_group_from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("cte1.film_count"),
+                        op=">",
+                        right_expr=NormalizedExpr.from_column("w01"),
+                    )
+                ]
+            ),
             cte_steps=[cte],
         )
         result = rewrite_cte_output_refs_to_aliases(intent)
-        assert result.filters_param[0].left_expr.primary_term == "cte1.count_film_id"
+        assert (result.where.leaves() if result.where else [])[0].left_expr.primary_term == "cte1.count_film_id"
 
 
 class TestResolveWindowRegistryFilterRhs:
-    """Tests for resolve_window_registry_filter_rhs."""
+    """Tests for resolve_window_registry_where_rhs."""
 
     def test_moves_registry_token_from_raw_value_to_right_expr(self):
         intent = RuntimeIntent(
@@ -2414,14 +2179,16 @@ class TestResolveWindowRegistryFilterRhs:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("orders.amount"),
-                    op=">",
-                    raw_value="w01",
-                    param_key="p1",
-                )
-            ],
+            where=predicate_group_from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("orders.amount"),
+                        op=">",
+                        raw_value="w01",
+                        param_key="p1",
+                    )
+                ]
+            ),
             window_registry=[
                 WindowRegistryStep(
                     registry_id="w01",
@@ -2429,8 +2196,8 @@ class TestResolveWindowRegistryFilterRhs:
                 )
             ],
         )
-        out = resolve_window_registry_filter_rhs(intent)
-        fp = out.filters_param[0]
+        out = resolve_window_registry_where_rhs(intent)
+        fp = (out.where.leaves() if out.where else [])[0]
         assert fp.right_expr is not None
         assert fp.right_expr.column_ref == "w01"
         assert fp.raw_value is None
@@ -2448,17 +2215,19 @@ class TestPromoteDateSubtractionToDateDiff:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=left,
-                    op=">",
-                    raw_value=7,
-                    value_type="number",
-                )
-            ],
+            where=predicate_group_from_list(
+                [
+                    WhereParam(
+                        left_expr=left,
+                        op=">",
+                        raw_value=7,
+                        value_type="number",
+                    )
+                ]
+            ),
         )
         out = promote_date_subtraction_to_date_diff(intent)
-        fp = out.filters_param[0]
+        fp = (out.where.leaves() if out.where else [])[0]
         assert fp.value_type == "date_diff"
         assert fp.raw_value == {"unit": "day", "amount": 7}
 
@@ -2472,16 +2241,18 @@ class TestPromoteDateSubtractionToDateDiff:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=left,
-                    op=">",
-                    right_expr=right,
-                )
-            ],
+            where=predicate_group_from_list(
+                [
+                    WhereParam(
+                        left_expr=left,
+                        op=">",
+                        right_expr=right,
+                    )
+                ]
+            ),
         )
         out = promote_date_subtraction_to_date_diff(intent)
-        fp = out.filters_param[0]
+        fp = (out.where.leaves() if out.where else [])[0]
         assert fp.right_expr is not None
         assert fp.value_type != "date_diff"
 
@@ -2548,7 +2319,7 @@ class TestEnforceGrainConsistencyExtended:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[inner],
         )
         result = enforce_grain_consistency(intent, grain_schema)
@@ -2589,7 +2360,7 @@ class TestEnforceGrainConsistencyExtended:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = enforce_grain_consistency(intent, isolated)
         assert all(g.primary_term != "orders.weird" for g in result.group_by_cols)
@@ -2605,7 +2376,7 @@ class TestEnforceGrainConsistencyExtended:
             ],
             group_by_cols=[NormalizedExpr.from_column("orders.customer_id")],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = enforce_grain_consistency(intent, schema_graph)
         terms = {g.primary_term for g in result.group_by_cols}
@@ -2621,7 +2392,7 @@ class TestEnforceGrainConsistencyExtended:
             ],
             group_by_cols=[NormalizedExpr.from_column("customers.customer_id")],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = enforce_grain_consistency(intent, schema_graph)
         select_terms = {sc.expr.primary_term for sc in result.select_cols}
@@ -2634,7 +2405,7 @@ class TestEnforceGrainConsistencyExtended:
             select_cols=[SelectCol(expr=NormalizedExpr.from_agg("sum", "orders.amount"))],
             group_by_cols=[NormalizedExpr.from_column("orders.customer_id")],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = enforce_grain_consistency(intent, schema_graph)
         gb_terms = {g.primary_term for g in result.group_by_cols}
@@ -2715,20 +2486,24 @@ class TestResolveCteColumnMapsExtended:
             cte_name="c1",
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.a"))],
             order_by_cols=[OrderByCol(expr=NormalizedExpr.from_column("a"), direction="ASC")],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("a"),
-                    op=">",
-                    right_expr=NormalizedExpr(add_values=[ExprValue(value=0.0)]),
-                )
-            ],
-            having_param=[
-                HavingParam(
-                    left_expr=NormalizedExpr.from_agg("count", "a"),
-                    op=">",
-                    right_expr=NormalizedExpr(add_values=[ExprValue(value=1.0)]),
-                )
-            ],
+            where=predicate_group_from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("a"),
+                        op=">",
+                        right_expr=NormalizedExpr(add_values=[ExprValue(value=0.0)]),
+                    )
+                ]
+            ),
+            having=predicate_group_from_list(
+                [
+                    HavingParam(
+                        left_expr=NormalizedExpr.from_agg("count", "a"),
+                        op=">",
+                        right_expr=NormalizedExpr(add_values=[ExprValue(value=1.0)]),
+                    )
+                ]
+            ),
             output_columns=["a"],
         )
         cte2 = RuntimeCteStep(
@@ -2772,7 +2547,7 @@ class TestNormalizeCteNamesExtended:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("My_Step.col"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
         result = normalize_cte_names(intent)
@@ -2794,7 +2569,7 @@ class TestNormalizeCteNamesExtended:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             column_map={"old_cte.k": "old_cte"},
             cte_steps=[cte],
         )
@@ -2814,13 +2589,13 @@ class TestNormalizeCountStarExtended:
             select_cols=[SelectCol(expr=NormalizedExpr(add_groups=[MulGroup(multiply=["count(1)"])]))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = normalize_count_star(intent)
         assert term_strs(result.select_cols[0].expr.add_groups[0].multiply) == ["COUNT(*)"]
 
     def test_order_by_having_and_main_having(self):
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr(add_groups=[MulGroup(multiply=["COUNT(1)"])]),
             op=">",
             right_expr=NormalizedExpr(add_values=[ExprValue(value=0.0)]),
@@ -2836,13 +2611,17 @@ class TestNormalizeCountStarExtended:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[OrderByCol(expr=NormalizedExpr(add_groups=[MulGroup(multiply=["COUNT(1)"])]))],
-            filters_param=[fp],
-            having_param=[hp],
+            where=predicate_group_from_list([fp]),
+            having=predicate_group_from_list([hp]),
         )
         result = normalize_count_star(intent)
         assert term_strs(result.order_by_cols[0].expr.add_groups[0].multiply) == ["COUNT(*)"]
-        assert term_strs(result.filters_param[0].left_expr.add_groups[0].multiply) == ["COUNT(*)"]
-        assert term_strs(result.having_param[0].left_expr.add_groups[0].multiply) == ["COUNT(*)"]
+        assert term_strs((result.where.leaves() if result.where else [])[0].left_expr.add_groups[0].multiply) == [
+            "COUNT(*)"
+        ]
+        assert term_strs((result.having.leaves() if result.having else [])[0].left_expr.add_groups[0].multiply) == [
+            "COUNT(*)"
+        ]
 
 
 class TestSimplifyExprsExtended:
@@ -2851,7 +2630,7 @@ class TestSimplifyExprsExtended:
     def test_simplifies_order_by_filters_and_having(self):
         dup = MulGroup(coefficient=1.0, multiply=["t.x"])
         expr = NormalizedExpr(add_groups=[dup, MulGroup(coefficient=2.0, multiply=["t.x"])])
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=expr,
             op=">",
             right_expr=NormalizedExpr(add_values=[ExprValue(value=0.0)]),
@@ -2867,14 +2646,14 @@ class TestSimplifyExprsExtended:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[OrderByCol(expr=expr, direction="DESC")],
-            filters_param=[fp],
-            having_param=[hp],
+            where=predicate_group_from_list([fp]),
+            having=predicate_group_from_list([hp]),
         )
         result = simplify_exprs(intent)
         assert len(result.order_by_cols[0].expr.add_groups) == 1
         assert result.order_by_cols[0].expr.add_groups[0].coefficient == 3.0
-        assert len(result.filters_param[0].left_expr.add_groups) == 1
-        assert len(result.having_param[0].left_expr.add_groups) == 1
+        assert len((result.where.leaves() if result.where else [])[0].left_expr.add_groups) == 1
+        assert len((result.having.leaves() if result.having else [])[0].left_expr.add_groups) == 1
 
     def test_net_zero_constant_drops_numeric_values(self):
         expr = NormalizedExpr(
@@ -2887,17 +2666,17 @@ class TestSimplifyExprsExtended:
 
 
 class TestNormalizeColToColFilterExtended:
-    """Edge cases for _normalize_col_to_col_filter."""
+    """Edge cases for _normalize_col_to_col_where."""
 
     def test_param_key_prevents_swap(self):
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.z"),
             op=">",
             right_expr=NormalizedExpr.from_column("t.a"),
             value_type="number",
             param_key="p",
         )
-        result = _normalize_col_to_col_filter(fp)
+        result = _normalize_col_to_col_where(fp)
         assert result.left_expr.primary_column == "t.z"
 
 
@@ -2924,7 +2703,7 @@ class TestEnforceSchemaExtended:
         )
 
     def test_unknown_column_in_filter_right_side(self, validate_schema):
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("orders.amount"),
             op="=",
             right_expr=NormalizedExpr.from_column("orders.not_a_col"),
@@ -2936,7 +2715,7 @@ class TestEnforceSchemaExtended:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=predicate_group_from_list([fp]),
         )
         _, errors = check_qualified_refs_exist(intent, validate_schema)
         assert any("not_a_col" in e for e in errors)
@@ -2948,7 +2727,7 @@ class TestEnforceSchemaExtended:
             select_cols=[],
             group_by_cols=[NormalizedExpr.from_column("orders.bad_col")],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         _, errors = check_qualified_refs_exist(intent, validate_schema)
         assert any("bad_col" in e for e in errors)
@@ -2961,7 +2740,7 @@ class TestEnforceSchemaExtended:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
         _, errors = check_qualified_refs_exist(intent, validate_schema)
@@ -2979,7 +2758,7 @@ class TestEnforceSchemaExtended:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
         _, errors = check_qualified_refs_exist(intent, validate_schema)
@@ -3010,7 +2789,7 @@ def test_lift_distinct_select_from_raw_sql_promotes_structured_select(
         ],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
+        where=None,
         cte_steps=[cte],
     )
     out = lift_distinct_select_from_raw_sql(intent, schema_graph)
@@ -3031,7 +2810,7 @@ def test_simplify_exprs_preserves_last_select_col(schema_graph: SchemaGraph) -> 
         select_cols=[SelectCol(expr=NormalizedExpr(raw_sql="DISTINCT customers.name"))],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
+        where=None,
     )
     out = simplify_exprs(intent)
     assert out.select_cols[0].expr.raw_sql == "DISTINCT customers.name"
@@ -3056,7 +2835,7 @@ def test_prune_unused_cte_steps_drops_orphan() -> None:
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("live.a"))],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
+        where=None,
         cte_steps=[orphan, keeper],
     )
     out = prune_unused_cte_steps(intent)
@@ -3132,8 +2911,8 @@ class TestPruneUnusedCteOutputColumns:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("c1.title"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             natural_language="q",
             cte_steps=[cte],
@@ -3160,8 +2939,8 @@ class TestPruneUnusedCteOutputColumns:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("c1.title"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             natural_language="q",
             cte_steps=[cte],
@@ -3188,8 +2967,8 @@ class TestPruneUnusedCteOutputColumns:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("p1.payment_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             natural_language="q",
             cte_steps=[cte],
@@ -3226,8 +3005,8 @@ class TestPruneUnusedCteOutputColumns:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("c1.title"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             natural_language="q",
             cte_steps=[cte],
@@ -3262,8 +3041,8 @@ class TestCollectColumnRefsConcatMultiply:
             select_cols=[SelectCol(expr=expr)],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             natural_language="q",
         )

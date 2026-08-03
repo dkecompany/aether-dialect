@@ -7,7 +7,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from aetherdialect._contracts_base import EngineIdentity
 from aetherdialect._contracts_schema import ColumnMetadata
+from aetherdialect._core_utils import pop_engine_identity, push_engine_identity
 from aetherdialect._dialect import Dialect, get_dialect, resolve_dialect
 from aetherdialect._dialect_postgres import PostgresDialect
 from aetherdialect._dialect_sqlglot_engines import (
@@ -317,8 +319,8 @@ class TestGetDialect:
             get_dialect("nonexistent_engine", MagicMock())
 
     @patch("aetherdialect._dialect.EngineConfig")
-    def test_none_engine_type_uses_config_type(self, mock_config):
-        """get_dialect with engine_type None uses EngineConfig.TYPE."""
+    def test_none_engine_type_uses_pushed_identity(self, mock_config):
+        """get_dialect with engine_type None uses the pushed engine identity."""
         mock_runtime = SimpleNamespace(
             HOST="localhost",
             PORT=5432,
@@ -330,9 +332,14 @@ class TestGetDialect:
         mock_runtime.db_url = lambda: "postgresql://u:p@localhost:5432/d"
         mock_config.TYPE = "postgresql"
         mock_config.RUNTIME = mock_runtime
-        with patch("sqlalchemy.create_engine"):
-            d = get_dialect(engine_type=None, config=mock_runtime)
-        assert isinstance(d, PostgresDialect)
+        identity = EngineIdentity("postgresql", mock_runtime)
+        token = push_engine_identity(identity)
+        try:
+            with patch("sqlalchemy.create_engine"):
+                d = get_dialect(engine_type=None, config=mock_runtime)
+            assert isinstance(d, PostgresDialect)
+        finally:
+            pop_engine_identity(token)
 
 
 class TestDialectBase:
@@ -779,7 +786,7 @@ class TestDatabricksDialectInitFallback:
     @patch("aetherdialect._dialect.Dialect.__init__", return_value=None)
     def test_both_fail_raises(self, _super_init: MagicMock) -> None:
         """When connector, SQLAlchemy, and PySpark all fail, ConfigError is raised."""
-        from aetherdialect._config import ConfigError
+        from aetherdialect._contracts_base import ConfigError
 
         dbr_parent, dbr_mod = self._dbr_sql_module(connect_side_effect=RuntimeError("conn fail"))
         with patch.dict(
@@ -796,7 +803,7 @@ class TestDatabricksDialectInitFallback:
 
 
 class TestAttachExtraFromAndWhere:
-    """Tier-B semantic edge injection (FROM extension + WHERE AND- conjuncts)."""
+    """Semantic-profile edge injection (FROM extension + WHERE AND- conjuncts)."""
 
     def _edge(self, left_tok: str, lc: str, right_tok: str, rc: str):
         from aetherdialect._dialect import JoinEdge

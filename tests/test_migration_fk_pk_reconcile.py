@@ -1,4 +1,4 @@
-"""Tests for migration FK/PK reconciliation (Phase J)."""
+"""Tests for migration FK/PK reconciliation."""
 
 from __future__ import annotations
 
@@ -15,13 +15,13 @@ from aetherdialect._contracts_base import (
 from aetherdialect._contracts_schema import (
     ColumnMetadata,
     FKEdge,
+    SchemaDiff,
     SchemaGraph,
+    TableDiff,
     TableMetadata,
 )
 from aetherdialect._schema_build import overrides_sidecar_path
 from aetherdialect._schema_graph import (
-    SchemaDiff,
-    TableDiff,
     collapse_redundant_inferences,
 )
 from aetherdialect._schema_overrides import (

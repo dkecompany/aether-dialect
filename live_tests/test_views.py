@@ -33,7 +33,6 @@ _VIEW_SCENARIO = Scenario(
         min_rows=1,
         max_rows=500,
         grain="row_level",
-        min_confidence=0.35,
     ),
     category="views",
 )

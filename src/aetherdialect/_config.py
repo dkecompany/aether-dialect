@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
 from importlib.util import find_spec
 from pathlib import Path
 from typing import Any, ClassVar
@@ -27,7 +26,7 @@ from ._constants import (
     DUCKDB_ENV_PATH,
     DUCKDB_ENV_SCHEMA,
     ENGINE_STORAGE_PLACEHOLDER_DIR,
-    EXCLUDED_FILTER_PATTERNS,
+    EXCLUDED_WHERE_PATTERNS,
     MARIADB_ENV_DATABASE,
     MARIADB_ENV_HOST,
     MARIADB_ENV_PASSWORD,
@@ -85,10 +84,7 @@ from ._constants import (
     env_role_hint,
     package_importable,
 )
-
-
-class ConfigError(ValueError):
-    """Raised when environment variables or static configuration are missing or contradictory."""
+from ._contracts_base import ConfigError
 
 
 def _read_optional_positive_float_env(name: str, *, default: float | None = None) -> float | None:
@@ -122,7 +118,15 @@ class PolicyConfig:
 
     JOIN_SHORTEST_PATH_TIE_CAP: ClassVar[int] = 4
 
+    JOIN_COMPARISON_SCOPE_MAX_HOPS: ClassVar[int] = 2
+    TABLE_REFERENCE_MAX_PER_SCOPE: ClassVar[int] = 2
+
+    MAX_CTE_STEPS: ClassVar[int] = 16
+    MAX_CTE_REFERENCE_DEPTH: ClassVar[int] = 8
+
     JOIN_CANDIDATE_CROSS_PRODUCT_CAP: ClassVar[int] = 16
+
+    ELIMINATE_REDUNDANT_KEY_JOINS: ClassVar[bool] = False
 
     DEBUG: ClassVar[bool] = False
 
@@ -130,6 +134,23 @@ class PolicyConfig:
     REGENERATE_SCHEMA_GRAPH: ClassVar[bool] = False
     REGENERATE_SKELETON_CACHE: ClassVar[bool] = False
     SANDBOX_TRUST_SCHEMA_BASELINE: ClassVar[bool] = False
+
+    LLM_BATCH_ENABLED: ClassVar[bool] = str(
+        os.environ.get("AETHERDIALECT_LLM_BATCH_ENABLED", "") or ""
+    ).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    TABULAR_LLM_ASSIST: ClassVar[bool] = str(
+        os.environ.get("AETHERDIALECT_TABULAR_LLM_ASSIST", "1") or "1"
+    ).strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
 
     MAX_ASK_INTERPRET_GROUND_RETRIES: ClassVar[int] = 2
     MAX_ASK_COMPOSE_REPAIRS: ClassVar[int] = 2
@@ -162,8 +183,8 @@ class PolicyConfig:
 
     LOW_CARDINALITY_FULL_VALUES_LIMIT: ClassVar[int] = 200
     LOW_CARDINALITY_DISTINCT_RATIO = 0.05
-    ZERO_ROW_FILTER_AUTO_FIX_ENABLED = True
-    ZERO_ROW_FILTER_FUZZY_MAX_DISTANCE: ClassVar[int] = 5
+    ZERO_ROW_WHERE_AUTO_FIX_ENABLED = True
+    ZERO_ROW_WHERE_FUZZY_MAX_DISTANCE: ClassVar[int] = 5
     GOLD_INTENT_PARSE_ATTEMPTS: ClassVar[int] = 3
 
     UNUSABLE_NULL_RATIO_THRESHOLD = 0.99
@@ -179,9 +200,10 @@ class PolicyConfig:
     SEMANTIC_JOIN_MIN_DISTINCT = 4
     SEMANTIC_JOIN_MIN_INTERSECTION = 3
 
-    FINAL_SQL_AUTO_ACCEPT_THRESHOLD = 0.95
     RESULT_ROW_COUNT_SOFT_WARNING: ClassVar[int] = 5_000
     FUZZY_MATCH_MAX_DISTANCE = 2
+    FEDERATION_MAPPING_SUGGESTION_CROSS_SOURCE_CUTOFF: ClassVar[float] = 0.35
+    FEDERATION_MAPPING_SUGGESTION_WITHIN_SOURCE_CUTOFF: ClassVar[float] = 0.50
     QUESTION_TOKEN_INDEX_NEIGHBOR_CAP = 2048
 
     PENALTY_CAP = 0.30
@@ -197,28 +219,26 @@ class PolicyConfig:
     MAX_SUMMARY_BULLETS: ClassVar[int] = 6
 
     MAX_QUERY_COST_ROWS: ClassVar[float | None] = _read_optional_positive_float_env(
-        "AETHERDIALECT_MAX_QUERY_COST_ROWS",
-        default=50_000_000.0,
+        "AETHERDIALECT_MAX_QUERY_COST_ROWS", default=50_000_000.0
     )
     MAX_QUERY_COST_BYTES: ClassVar[float | None] = _read_optional_positive_float_env(
-        "AETHERDIALECT_MAX_QUERY_COST_BYTES",
-        default=50_000_000_000.0,
+        "AETHERDIALECT_MAX_QUERY_COST_BYTES", default=50_000_000_000.0
     )
     STATEMENT_TIMEOUT_MS: ClassVar[int | None] = _read_optional_positive_int_env(
-        "AETHERDIALECT_STATEMENT_TIMEOUT_MS",
-        default=30_000,
+        "AETHERDIALECT_STATEMENT_TIMEOUT_MS", default=30_000
     )
     LLM_TIMEOUT_MS: ClassVar[int | None] = _read_optional_positive_int_env(
-        "AETHERDIALECT_LLM_TIMEOUT_MS",
-        default=60_000,
+        "AETHERDIALECT_LLM_TIMEOUT_MS", default=60_000
     )
     PROFILE_TIMEOUT_MS: ClassVar[int | None] = _read_optional_positive_int_env(
-        "AETHERDIALECT_PROFILE_TIMEOUT_MS",
-        default=120_000,
+        "AETHERDIALECT_PROFILE_TIMEOUT_MS", default=120_000
     )
+    PROFILING_SAMPLE_THRESHOLD: ClassVar[int] = 100_000
+    PROFILING_SAMPLE_SIZE: ClassVar[int] = 10_000
+    PROFILING_SCHEMA_DEEP_QUERY_BUDGET: ClassVar[int | None] = 25_000
+    MAX_ROLE_CLASSIFICATION_RETRIES: ClassVar[int] = 2
     EXPLAIN_TIMEOUT_MS: ClassVar[int | None] = _read_optional_positive_int_env(
-        "AETHERDIALECT_EXPLAIN_TIMEOUT_MS",
-        default=None,
+        "AETHERDIALECT_EXPLAIN_TIMEOUT_MS", default=None
     )
     STOPWORDS = STOPWORDS_GRAMMATICAL_PARTICLES
 
@@ -258,11 +278,7 @@ class PolicyConfig:
         """Refresh execution-limit ClassVars from *env* without mutating ``os.environ``."""
         float_keys = (
             ("MAX_QUERY_COST_ROWS", "AETHERDIALECT_MAX_QUERY_COST_ROWS", 50_000_000.0),
-            (
-                "MAX_QUERY_COST_BYTES",
-                "AETHERDIALECT_MAX_QUERY_COST_BYTES",
-                50_000_000_000.0,
-            ),
+            ("MAX_QUERY_COST_BYTES", "AETHERDIALECT_MAX_QUERY_COST_BYTES", 50_000_000_000.0),
         )
         int_keys = (
             ("STATEMENT_TIMEOUT_MS", "AETHERDIALECT_STATEMENT_TIMEOUT_MS", 30_000),
@@ -350,6 +366,38 @@ class EngineRuntimeConfig:
     def redacted_fields(cls) -> frozenset[str]:
         """Return connection field names that must be redacted in runtime introspection."""
         return frozenset()
+
+    @classmethod
+    def rotatable_credential_fields(cls) -> tuple[str, ...]:
+        """Return ClassVar names that may be replaced without rebuilding schema artifacts."""
+        fields: list[str] = []
+        for name in sorted(cls.redacted_fields()):
+            upper = str(name).upper()
+            if hasattr(cls, upper):
+                fields.append(upper)
+            elif hasattr(cls, name):
+                fields.append(str(name))
+        return tuple(fields)
+
+    @classmethod
+    def apply_connection_credentials(cls, credentials: str | Mapping[str, str]) -> None:
+        """Apply in-place credential replacement before (re)opening a database connection."""
+        if isinstance(credentials, str):
+            fields = cls.rotatable_credential_fields()
+            if not fields:
+                raise ValueError(f"{cls.ENGINE_NAME or cls.__name__} has no rotatable credential fields")
+            setattr(cls, fields[0], credentials)
+            return
+        for raw_key, value in credentials.items():
+            key = str(raw_key)
+            if hasattr(cls, key):
+                field = key
+            else:
+                alias = key.lower()
+                field = alias.upper() if hasattr(cls, alias.upper()) else alias
+                if not hasattr(cls, field):
+                    raise ValueError(f"unknown credential field {raw_key!r} for {cls.ENGINE_NAME or cls.__name__}")
+            setattr(cls, field, value)
 
 
 class PostgresRuntimeConfig(EngineRuntimeConfig):
@@ -525,7 +573,7 @@ class DatabricksRuntimeConfig(EngineRuntimeConfig):
             and not package_importable("databricks.sql")
         ):
             blockers.append(
-                "Databricks SQL warehouse variables are set but the databricks-sql-connector package is not installed.",
+                "Databricks SQL warehouse variables are set but the databricks-sql-connector package is not installed."
             )
         elif not cls.env_complete(env):
             blockers.append(
@@ -764,6 +812,7 @@ class CsvRuntimeConfig(EngineRuntimeConfig):
 
     DIRECTORY: ClassVar[str | None] = None
     FILES: ClassVar[tuple[str, ...]] = ()
+    SOURCE_SELECTIONS: ClassVar[dict[str, dict[str, Any]]] = {}
     SCHEMA: ClassVar[str] = "main"
     NATIVE_CONNECTION: ClassVar[Any | None] = None
 
@@ -818,44 +867,59 @@ class CsvRuntimeConfig(EngineRuntimeConfig):
                 return [str(exc)]
         blockers: list[str] = []
         if not driver_ok:
-            blockers.append("CSV backend driver (duckdb; install aetherdialect[csv] or [duckdb])")
+            blockers.append("CSV backend driver (duckdb)")
         if driver_ok and not cls.env_complete(env):
             blockers.append("CSV env (set CSV_DIRECTORY or CSV_FILES; mutually exclusive)")
         return blockers
 
     @classmethod
+    def _allowed_source_suffixes(cls) -> frozenset[str]:
+        """Return upload suffixes permitted for the CSV file engine."""
+        return frozenset({".csv", ".xlsx"})
+
+    @classmethod
     def resolve_source_files(cls) -> tuple[Path, ...]:
         """Resolve configured CSV/Excel inputs to absolute file paths."""
+        engine = cls.ENGINE_NAME
+        allowed = cls._allowed_source_suffixes()
         directory = str(cls.DIRECTORY or "").strip()
         files = tuple(str(item).strip() for item in cls.FILES if str(item).strip())
         if directory and files:
-            raise ConfigError("csv: set either CSV_DIRECTORY or CSV_FILES, not both")
+            raise ConfigError(f"{engine}: set either CSV_DIRECTORY or CSV_FILES, not both")
         paths: list[Path]
         if directory:
             dir_path = Path(os.path.expanduser(directory))
             if not dir_path.is_dir():
-                raise ConfigError(f"csv directory not found: {directory}")
-            paths = sorted(
-                path for path in dir_path.iterdir() if path.is_file() and path.suffix.lower() in {".csv", ".xlsx"}
-            )
+                raise ConfigError(f"{engine} directory not found: {directory}")
+            paths = sorted(path for path in dir_path.iterdir() if path.is_file() and path.suffix.lower() in allowed)
         elif files:
             paths = []
             for raw in files:
                 path = Path(os.path.expanduser(raw))
                 if not path.is_file():
-                    raise ConfigError(f"csv file not found: {raw}")
-                if path.suffix.lower() not in {".csv", ".xlsx"}:
-                    raise ConfigError(f"csv unsupported file type: {raw}")
+                    raise ConfigError(f"{engine} file not found: {raw}")
+                suffix = path.suffix.lower()
+                if suffix not in allowed:
+                    raise ConfigError(f"{engine} unsupported file type: {raw}")
                 paths.append(path)
             paths.sort(key=lambda item: item.name.lower())
         else:
-            raise ConfigError("csv: set CSV_DIRECTORY or CSV_FILES")
+            raise ConfigError(f"{engine}: set CSV_DIRECTORY or CSV_FILES")
         if not paths:
-            raise ConfigError("csv: no matching *.csv or *.xlsx files found")
+            allowed_label = ", ".join(sorted(allowed))
+            raise ConfigError(f"{engine}: no matching files with suffix ({allowed_label}) found")
         stems = [path.stem.lower() for path in paths]
         if len(stems) != len(set(stems)):
-            raise ConfigError("csv: duplicate relation names (same file stem)")
+            raise ConfigError(f"{engine}: duplicate relation names (same file stem)")
         return tuple(path.resolve() for path in paths)
+
+    @classmethod
+    def set_source_selections(cls, raw: Mapping[str, Mapping[str, Any]] | None) -> None:
+        """Store per-file upload interpretation choices for the CSV file engine."""
+        if not raw:
+            cls.SOURCE_SELECTIONS = {}
+            return
+        cls.SOURCE_SELECTIONS = {str(key): dict(value) for key, value in raw.items()}
 
     @classmethod
     def connection_slug_fields(cls) -> dict[str, str]:
@@ -1310,18 +1374,15 @@ class SnowflakeRuntimeConfig(EngineRuntimeConfig):
     def env_complete(cls, env: Mapping[str, str]) -> bool:
         """Return True when required Snowflake env vars are present."""
         if not (env_any_nonempty(env, SNOWFLAKE_ENV_ACCOUNT) and env_any_nonempty(env, SNOWFLAKE_ENV_USER)):
-            account = cls.ACCOUNT or ""
-            user = cls.USER or ""
-            if not (str(account).strip() and str(user).strip()):
-                return False
-        if env_any_nonempty(env, SNOWFLAKE_ENV_PRIVATE_KEY_PATH) or cls.PRIVATE_KEY_PATH:
+            return False
+        if env_any_nonempty(env, SNOWFLAKE_ENV_PRIVATE_KEY_PATH):
             return True
-        if env_any_nonempty(env, SNOWFLAKE_ENV_OAUTH_TOKEN) or cls.OAUTH_TOKEN:
+        if env_any_nonempty(env, SNOWFLAKE_ENV_OAUTH_TOKEN):
             return True
-        auth = env_first_nonempty(env, *SNOWFLAKE_ENV_AUTHENTICATOR) or (cls.AUTHENTICATOR or "")
+        auth = env_first_nonempty(env, *SNOWFLAKE_ENV_AUTHENTICATOR)
         if auth.strip().lower() in ("externalbrowser", "oauth", "sso"):
             return True
-        return env_any_nonempty(env, SNOWFLAKE_ENV_PASSWORD) or bool(cls.PASSWORD)
+        return env_any_nonempty(env, SNOWFLAKE_ENV_PASSWORD)
 
     @classmethod
     def connection_slug_fields(cls) -> dict[str, str]:
@@ -1399,8 +1460,8 @@ class BigQueryRuntimeConfig(EngineRuntimeConfig):
     @classmethod
     def env_complete(cls, env: Mapping[str, str]) -> bool:
         """Return True when required BigQuery env vars are present."""
-        project = env_first_nonempty(env, *BIGQUERY_ENV_PROJECT) or (cls.PROJECT or "")
-        dataset = env_first_nonempty(env, *BIGQUERY_ENV_DATASET) or (cls.DATASET or cls.SCHEMA or "")
+        project = env_first_nonempty(env, *BIGQUERY_ENV_PROJECT)
+        dataset = env_first_nonempty(env, *BIGQUERY_ENV_DATASET)
         return bool(project.strip() and dataset.strip())
 
     @classmethod
@@ -1424,8 +1485,14 @@ class BigQueryRuntimeConfig(EngineRuntimeConfig):
         return frozenset()
 
 
+class SandboxBundlePolicy:
+    """Internal: refuse sandbox entry when the bundled corpus is absent."""
+
+    REQUIRE_BUNDLE: ClassVar[bool] = True
+
+
 class EngineConfig:
-    """Internal process-wide defaults for backend selection (`TYPE`/`RUNTIME`), LLM credentials/models, and JSON artifact paths. This class is not part of the public API and is not exported from the ``aetherdialect`` package root. The only supported user-facing configuration paths are the documented environment variables (for example ``AZURE_OPENAI_DEPLOYMENT_LIGHT`` and sibling slot variables) and the ``EngineContext`` object passed to public entry points."""
+    """Internal process-wide defaults for backend selection (`TYPE`/`RUNTIME`), LLM credentials/models, and JSON artifact paths. This class is not part of the public API and is not exported from the ``aetherdialect`` package root. The only supported user-facing configuration paths are the documented environment variables (for example ``AZURE_OPENAI_DEPLOYMENT_LIGHT`` and ``AZURE_OPENAI_DEPLOYMENT_HEAVY``) and the ``EngineContext`` object passed to public entry points."""
 
     TYPE: ClassVar[str] = "postgresql"
 
@@ -1435,12 +1502,18 @@ class EngineConfig:
     AZURE_API_TOKEN: ClassVar[str | None] = os.environ.get("AZURE_OPENAI_API_KEY")
     LLM_PROVIDER: ClassVar[str] = "openai"
     MOCK_FIXTURES_FILE: ClassVar[str] = ""
-    OPENAI_MODEL: ClassVar[str] = "gpt-4o-mini"
+    OPENAI_MODEL: ClassVar[str] = "gpt-4.1-nano"
     OPENAI_MODEL_INTENT: ClassVar[str] = "gpt-5.4-mini"
-    OPENAI_MODEL_JOIN: ClassVar[str] = "gpt-5.4-mini"
+    OPENAI_MODEL_JOIN: ClassVar[str] = "gpt-5.4-nano"
     OPENAI_MODEL_SCHEMA_BASE: ClassVar[str] = "gpt-4.1-mini"
-    OPENAI_MODEL_DDL: ClassVar[str] = "gpt-4.1-mini"
-    OPENAI_MODEL_SCHEMA: ClassVar[str] = "gpt-5.4-mini"
+    OPENAI_MODEL_DDL: ClassVar[str] = "gpt-4.1-nano"
+    OPENAI_MODEL_SCHEMA: ClassVar[str] = "gpt-5-mini"
+    OPENAI_MODEL_SYNTH: ClassVar[str] = "gpt-5-mini"
+    OPENAI_MODEL_SYNTH_VARIETY: ClassVar[str] = "gpt-5-nano"
+    OPENAI_MODEL_INTENT_FORMAT: ClassVar[str] = "gpt-4.1-nano"
+    OPENAI_MODEL_INTENT_SCHEMA_REPAIR: ClassVar[str] = "gpt-5.4-nano"
+    OPENAI_MODEL_UPLOAD_SUMMARY: ClassVar[str] = "gpt-5.4-nano"
+    OPENAI_MODEL_UPLOAD_INTERPRET: ClassVar[str] = "gpt-5-mini"
     OPENAI_BASE_URL: ClassVar[str | None] = "https://api.openai.com/v1"
     AZURE_OPENAI_BASE_URL: ClassVar[str | None] = os.environ.get("AZURE_OPENAI_BASE_URL")
     AZURE_OPENAI_ENDPOINT: ClassVar[str | None] = os.environ.get("AZURE_OPENAI_ENDPOINT")
@@ -1465,8 +1538,8 @@ class QSimConfig:
     INTENT_TYPES = 20
     QUESTIONS_COUNT = 100
     MAX_TABLES_PER_INTENT = 3
-    MAX_FILTERS_PER_INTENT = 4
-    MAX_FILTER_COLUMNS = 2
+    MAX_WHERE_PREDICATES_PER_INTENT = 4
+    MAX_WHERE_COLUMNS = 2
     MAX_GROUP_BY_COLUMNS = 2
 
     MIN_AVG_VARIANTS_PER_INTENT = 1
@@ -1484,9 +1557,6 @@ class QSimConfig:
     MIN_HAVING_RATIO = 0.15
     MIN_THREE_TABLE_RATIO = 0.10
 
-    PROFILING_SAMPLE_THRESHOLD = 100_000
-    PROFILING_SAMPLE_SIZE = 10_000
-
     RANDOM_SEED = DEFAULT_RANDOM_SEED
 
     SELECT_COL_GEOMETRIC_P: float = 0.6
@@ -1498,32 +1568,12 @@ class QSimConfig:
         "highly_complex": 0.10,
     }
 
-    EXCLUDED_FILTER_PATTERNS = EXCLUDED_FILTER_PATTERNS
+    EXCLUDED_WHERE_PATTERNS = EXCLUDED_WHERE_PATTERNS
 
     SKELETONS_JSON_PATH = os.path.join(ENGINE_STORAGE_PLACEHOLDER_DIR, "qsim_skeletons.json.gz")
 
-    MAX_ROLE_CLASSIFICATION_RETRIES = 2
-
     MIN_ADVANCED_FEATURE_RATIO = 0.15
     MIN_PER_FEATURE_FLOOR = 2
-
-
-@dataclass(frozen=True, slots=True)
-class LlmExecutionConfig:
-    """Merged Azure OpenAI credentials plus execution cost and timeout limits for the engine runtime. Public operators configure three deployment slots named ``LIGHT``, ``MEDIUM``, and ``HEAVY`` that provision Azure deployments sized for the ``gpt-4o-mini``, ``gpt-4.1-mini``, and ``gpt-5.4-mini`` model classes respectively. Internal routing from logical model identifiers to these slots is not part of the public stability contract."""
-
-    azure_endpoint: str
-    azure_api_key: str
-    azure_api_version: str
-    deployment_light: str
-    deployment_medium: str
-    deployment_heavy: str
-    max_query_cost_rows: int
-    max_query_cost_bytes: int
-    statement_timeout_ms: int
-    llm_timeout_ms: int
-    profile_timeout_ms: int
-    explain_timeout_ms: int | None
 
 
 class SeedWarmupConfig:
@@ -1531,7 +1581,7 @@ class SeedWarmupConfig:
 
     MAX_SEED_QUESTIONS: int = 500
 
-    MAX_FILTERS = 3
+    MAX_WHERE_PREDICATES = 3
     MAX_TABLES = 3
     MAX_GROUPBY = 2
 

@@ -1,7 +1,7 @@
-"""Unit tests for aetherdialect._qsim_ops module."""
+"""Unit tests for QSim LLM orchestration helpers in aetherdialect._qsim."""
 
 from aetherdialect._contracts_schema import QSimIntent, QSimSkeleton
-from aetherdialect._qsim_ops import (
+from aetherdialect._qsim import (
     _compute_skeleton_complexity_tier,
     _compute_table_set_richness,
     _extract_agg_info,
@@ -19,7 +19,7 @@ def _skeleton(**overrides) -> QSimSkeleton:
     defaults = dict(
         tables=["orders"],
         has_aggregation=False,
-        num_filters=0,
+        num_where=0,
         num_groupby=0,
         has_orderby=False,
         num_having=0,
@@ -39,7 +39,7 @@ def _qsim_intent(**overrides) -> QSimIntent:
         select_cols=["orders.order_id"],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
+        where=[],
         having_param=[],
         param_values={},
         question="",
@@ -56,22 +56,22 @@ class TestIsNoVarianceSkeleton:
 
     def test_no_filters_no_having(self):
         """Zero filters and no having is no-variance."""
-        skel = _skeleton(num_filters=0, num_having=0)
+        skel = _skeleton(num_where=0, num_having=0)
         assert _is_no_variance_skeleton(skel) is True
 
     def test_has_filters(self):
         """Any filters means it has variance."""
-        skel = _skeleton(num_filters=2, num_having=0)
+        skel = _skeleton(num_where=2, num_having=0)
         assert _is_no_variance_skeleton(skel) is False
 
     def test_has_having(self):
         """Having alone means it has variance."""
-        skel = _skeleton(num_filters=0, num_having=1)
+        skel = _skeleton(num_where=0, num_having=1)
         assert _is_no_variance_skeleton(skel) is False
 
     def test_both_filters_and_having(self):
         """Both filters and having means it has variance."""
-        skel = _skeleton(num_filters=1, num_having=1)
+        skel = _skeleton(num_where=1, num_having=1)
         assert _is_no_variance_skeleton(skel) is False
 
 
@@ -90,12 +90,12 @@ class TestComputeSkeletonComplexityTier:
 
     def test_tier_b_aggregation(self):
         """Aggregation alone gives score=3, not enough for B. Add 1 filter: 3+2=5 -> B."""
-        skel = _skeleton(has_aggregation=True, num_filters=1)
+        skel = _skeleton(has_aggregation=True, num_where=1)
         assert _compute_skeleton_complexity_tier(skel) == "B"
 
     def test_tier_b_boundary(self):
         """Score=4 -> tier B (distinct=2 + filter×1=2 -> 4)."""
-        skel = _skeleton(has_distinct=True, num_filters=1)
+        skel = _skeleton(has_distinct=True, num_where=1)
         assert _compute_skeleton_complexity_tier(skel) == "B"
 
     def test_tier_a_high_complexity(self):
@@ -103,7 +103,7 @@ class TestComputeSkeletonComplexityTier:
         skel = _skeleton(
             has_aggregation=True,
             num_having=1,
-            num_filters=2,
+            num_where=2,
             num_groupby=1,
         )
         tier = _compute_skeleton_complexity_tier(skel)
@@ -111,14 +111,14 @@ class TestComputeSkeletonComplexityTier:
 
     def test_tier_a_score_boundary(self):
         """Score = 8 exactly -> tier A. 2 filters(4) + aggregation(3) + orderby(1) = 8."""
-        skel = _skeleton(has_aggregation=True, num_filters=2, has_orderby=True)
+        skel = _skeleton(has_aggregation=True, num_where=2, has_orderby=True)
         assert _compute_skeleton_complexity_tier(skel) == "A"
 
     def test_all_features(self):
         """All features yield very high score -> tier A."""
         skel = _skeleton(
             has_aggregation=True,
-            num_filters=3,
+            num_where=3,
             num_groupby=2,
             num_having=1,
             has_orderby=True,
@@ -187,7 +187,7 @@ class TestNormalizeQsimIntent:
             tables=["orders", "customers"],
             select_cols=["orders.order_id"],
             group_by_cols=[],
-            filters_param=[],
+            where=[],
         )
         result = _normalize_qsim_intent(intent, schema_graph)
         assert "customers" not in result.tables
@@ -278,7 +278,7 @@ class TestValidateSkeletonConstraints:
 
     def test_valid_response(self):
         """Matching response passes validation."""
-        skel = _skeleton(has_aggregation=True, num_filters=1, num_groupby=1)
+        skel = _skeleton(has_aggregation=True, num_where=1, num_groupby=1)
         response = {
             "select_cols": ["COUNT(orders.order_id)", "orders.status"],
             "filters": [{"column": "orders.status", "op": "="}],
@@ -382,7 +382,7 @@ class TestParseLlmResponse:
 
     def test_missing_filters_when_required(self, schema_graph):
         """Skeleton requiring filters rejects response with none."""
-        skel = _skeleton(tables=["orders"], num_filters=1)
+        skel = _skeleton(tables=["orders"], num_where=1)
         column_roles = {}
         response = {
             "select_cols": ["orders.order_id"],

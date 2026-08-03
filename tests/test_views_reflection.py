@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from aetherdialect._config import DuckDBRuntimeConfig, EngineConfig
-from aetherdialect._contracts_base import EngineContext
+from aetherdialect._contracts_base import ConfigError, EngineContext
 from aetherdialect._dialect import get_dialect
 
 _ORIG_ENGINE_TYPE = EngineConfig.TYPE
@@ -52,16 +52,17 @@ def test_views_only_reflection() -> None:
     assert all(tbl.kind == "view" for tbl in graph.tables.values())
 
 
-def test_both_reflection_includes_tables_and_views() -> None:
+def test_tables_only_reflection() -> None:
     duckdb = pytest.importorskip("duckdb")
     connection = duckdb.connect(":memory:")
     _seed_views_catalog(connection)
     dialect = get_dialect("duckdb", DuckDBRuntimeConfig, native_connection=connection)
-    ctx = EngineContext(include="both")
+    ctx = EngineContext(include="tables")
     graph = dialect.reflect_schema_graph(include=ctx.include)
-    names = set(graph.tables)
-    assert "payments" in names
-    assert "store_revenue_v" in names
-    kinds = {name: tbl.kind for name, tbl in graph.tables.items()}
-    assert kinds["payments"] == "table"
-    assert kinds["store_revenue_v"] == "view"
+    assert set(graph.tables) == {"payments"}
+    assert all(tbl.kind == "table" for tbl in graph.tables.values())
+
+
+def test_engine_context_rejects_include_both() -> None:
+    with pytest.raises(ConfigError, match="include must be 'tables' or 'views'"):
+        EngineContext(include="both")

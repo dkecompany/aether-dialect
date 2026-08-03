@@ -39,32 +39,6 @@ _CONST_EXEMPT = {
 _CONST_LOCATION_GRANDFATHERED: frozenset[tuple[str, str]] = frozenset(
     {
         ("_core_utils.py", "_DIAGNOSTIC_FORCE_DEPTH"),
-        ("_dialect_postgres.py", "_PG_STRUCTURAL_CODE_TO_DIAG"),
-        ("_dialect_sqlglot_helper.py", "_STRUCTURAL_CODE_TO_DIAG"),
-        ("_expansion_ops.py", "_EXPANSION_SUBTREE_POOL_MAX"),
-        ("_main_execution.py", "NAMED_SCHEMA_CONTEXT_ARTIFACT_VERSION"),
-        ("_main_execution.py", "NAMED_SCHEMA_CONTEXT_PREFIX"),
-        ("_main_execution.py", "_SESSION_USER_FEEDBACK_BODY"),
-        ("_main_execution.py", "_SESSION_INTENT_FEEDBACK_BODY"),
-        ("_qsim_ops.py", "_QSIM_FILL_SYSTEM"),
-        ("_sandbox.py", "_BASELINE_CACHE_FILES"),
-        ("_sandbox.py", "_LEGACY_FAITHFULNESS"),
-        ("_schema_catalog.py", "SCHEMA_NOTES_REFINE_SYSTEM"),
-        ("_schema_catalog.py", "SCHEMA_CONSISTENCY_REFINE_SYSTEM"),
-        ("_schema_graph.py", "_INFERRED_PK_NAME_SUFFIXES"),
-        ("_schema_graph.py", "_PK_NAME_SUFFIXES_FOR_LONGEST"),
-        ("_schema_graph.py", "_UF_EXCLUDE_SEMANTIC_INFERENCE_ONLY"),
-        ("_schema_graph.py", "_INFERRED_COLLAPSE_TAGS"),
-        ("_schema_overrides.py", "_DESCRIPTION_REFINER_SYSTEM"),
-        ("_seed_warmup.py", "_SEED_LINE_NORMALIZE_SYSTEM"),
-        ("_sql_gen.py", "_WHERE_BUCKET_EDGE_KINDS"),
-        ("_sql_to_intent.py", "_PG_SIMPLE_AGG_NAMES"),
-        ("_utils.py", "_QUESTION_NORMALIZE_VOCABULARY_HEADING"),
-        ("_utils.py", "_QUESTION_NORMALIZE_VOCABULARY_GUIDANCE"),
-        ("_utils.py", "_QUESTION_VALIDATION_SYSTEM"),
-        ("_utils.py", "_QUESTION_NORMALIZE_SYSTEM"),
-        ("_utils.py", "_WARMUP_PARAPHRASES_BY_STYLE_SYSTEM"),
-        ("_utils.py", "_WARMUP_FREEFORM_QUESTIONS_SYSTEM"),
     }
 )
 
@@ -286,6 +260,12 @@ def _is_constant_like_value(node: ast.AST | None) -> bool:
         return True
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
         return _is_constant_like_value(node.left) and _is_constant_like_value(node.right)
+    if isinstance(node, ast.JoinedStr):
+        return all(
+            isinstance(part, ast.Constant)
+            or (isinstance(part, ast.FormattedValue) and _is_constant_like_value(part.value))
+            for part in node.values
+        )
     if not isinstance(node, ast.Call):
         return False
     func = node.func
@@ -644,3 +624,98 @@ def test_docs_avoid_internal_import_paths(doc_path: Path) -> None:
     if hits:
         rel = doc_path.relative_to(_ROOT)
         pytest.fail(f"Internal import path(s) in {rel}:\n" + "\n".join(hits))
+
+
+_DOC_META_HEADING_RE = re.compile(r"^##\s+(New|Updated|Changelog)\b", re.IGNORECASE)
+_DOC_PLAN_TEST_FILE_RE = re.compile(r"test_(?:step\d+|phase_[a-z])", re.IGNORECASE)
+
+
+def _doc_body_sections(lines: list[str]) -> list[int]:
+    """Return line indices of ``##`` headings that are not the front- matter ``## Sections``."""
+    return [idx for idx, line in enumerate(lines) if line.startswith("## ") and not line.startswith("## Sections")]
+
+
+def _doc_front_matter_violations(doc_path: Path) -> list[str]:
+    text = doc_path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    violations: list[str] = []
+    if not lines or not lines[0].startswith("# "):
+        violations.append("first line must be an H1 title")
+        return violations
+    try:
+        reading_idx = next(idx for idx, line in enumerate(lines) if line.startswith("**Reading order:**"))
+    except StopIteration:
+        violations.append("missing **Reading order:** line")
+        return violations
+    try:
+        sections_idx = next(idx for idx, line in enumerate(lines) if line.strip() == "## Sections")
+    except StopIteration:
+        violations.append("missing ## Sections heading")
+        return violations
+    about_lines = [line for line in lines[1:reading_idx] if line.strip()]
+    if not about_lines:
+        violations.append("missing About paragraph before **Reading order:**")
+    if not (reading_idx < sections_idx):
+        violations.append("**Reading order:** must appear before ## Sections")
+    separator_indices = [idx for idx, line in enumerate(lines) if line.strip() == "---"]
+    if not separator_indices:
+        violations.append("missing --- separator before body")
+        return violations
+    body_headings = _doc_body_sections(lines)
+    if not body_headings:
+        violations.append("missing body section heading (## …)")
+        return violations
+    first_body = body_headings[0]
+    if not any(idx < first_body for idx in separator_indices):
+        violations.append("--- must appear before the first body section")
+    return violations
+
+
+@pytest.mark.fast
+@pytest.mark.parametrize("doc_path", sorted(_DOCS.glob("*.md")) if _DOCS.is_dir() else [])
+def test_doc_guides_follow_front_matter_template(doc_path: Path) -> None:
+    """Each docs/*.md guide uses About → Reading order → Sections → --- → body."""
+    violations = _doc_front_matter_violations(doc_path)
+    if violations:
+        rel = doc_path.relative_to(_ROOT)
+        pytest.fail(f"{rel} front-matter violations:\n" + "\n".join(violations))
+
+
+@pytest.mark.fast
+def test_join_helper_modules_are_not_standalone_files() -> None:
+    assert not (_SRC / "_join_fan_out.py").is_file()
+    assert not (_SRC / "_qsim_ops.py").is_file()
+    assert not (_SRC / "_join_comparison_scope.py").is_file()
+
+
+@pytest.mark.fast
+def test_needs_corpus_marker_is_registered() -> None:
+    import tomllib
+
+    markers = tomllib.loads((_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["tool"]["pytest"]["ini_options"][
+        "markers"
+    ]
+    assert any(str(entry).startswith("needs_corpus:") for entry in markers)
+
+
+@pytest.mark.fast
+def test_corpus_absent_skip_reason_names_needs_corpus() -> None:
+    text = (_ROOT / "tests" / "conftest.py").read_text(encoding="utf-8")
+    assert "needs_corpus: bundled sandbox data.zip absent" in text
+    assert "sandbox data.zip not ready" not in text
+
+
+@pytest.mark.fast
+@pytest.mark.parametrize("doc_path", sorted(_DOCS.glob("*.md")) if _DOCS.is_dir() else [])
+def test_docs_avoid_plan_meta_headings(doc_path: Path) -> None:
+    """User docs must not use changelog-style headings or reference plan-style test filenames."""
+    text = doc_path.read_text(encoding="utf-8")
+    hits: list[str] = []
+    for idx, line in enumerate(text.splitlines(), 1):
+        if _DOC_META_HEADING_RE.search(line):
+            hits.append(f"line {idx}: {line.strip()}")
+        if _DOC_PLAN_TEST_FILE_RE.search(line):
+            hits.append(f"line {idx}: plan-style test filename reference: {line.strip()}")
+    if hits:
+        rel = doc_path.relative_to(_ROOT)
+        pytest.fail(f"Plan meta heading(s) in {rel}:\n" + "\n".join(hits))

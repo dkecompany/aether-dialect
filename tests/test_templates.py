@@ -29,7 +29,7 @@ from aetherdialect._contracts_core import (
     Template,
     ValueHistory,
 )
-from aetherdialect._contracts_schema import SchemaGraph, SQLShape, TableMetadata, TemplateStats
+from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, SQLShape, TableMetadata, TemplateStats
 from aetherdialect._core_utils import read_gzip_json, write_gzip_json_atomic
 from aetherdialect._templates import (
     TemplateStoreView,
@@ -39,6 +39,7 @@ from aetherdialect._templates import (
     join_fingerprint_from_concrete_intent,
     join_fingerprint_from_runtime_intent,
     load_template_store,
+    merge_seed_warmup_templates_into_store,
     record_question_feedback,
     save_template_store,
     summarize_failure_for_memory,
@@ -58,7 +59,7 @@ def _minimal_intent() -> RuntimeIntent:
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.id"))],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
+        where=None,
     )
 
 
@@ -70,7 +71,7 @@ def _minimal_template(tid: str = "T0001") -> Template:
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.id"))],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
+        where=None,
     )
     return Template(
         id=tid,
@@ -90,7 +91,13 @@ def _minimal_template(tid: str = "T0001") -> Template:
 
 
 def _tiny_schema() -> SchemaGraph:
-    tbl = TableMetadata(name="t", columns={}, primary_key=[], foreign_keys=[], row_count=1)
+    tbl = TableMetadata(
+        name="t",
+        columns={"id": ColumnMetadata(name="id", data_type="integer", sensitivity="none")},
+        primary_key=["id"],
+        foreign_keys=[],
+        row_count=1,
+    )
     return SchemaGraph(join_paths_multi={}, effective_structural_hash="sh1", tables={"t": tbl})
 
 
@@ -293,7 +300,7 @@ class TestJoinFingerprints:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         assert join_fingerprint_from_concrete_intent(ci) == join_fingerprint_from_runtime_intent(_minimal_intent())
 
@@ -419,3 +426,88 @@ class TestPartitionedTemplateStore:
         assert not v.dirty_partitions()
         save_template_store(v)
         assert not v.dirty_partitions()
+
+
+@pytest.mark.fast
+def test_load_template_store_invalidates_on_schema_graph_id_mismatch(tmp_path, monkeypatch) -> None:
+    from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
+    from aetherdialect._schema_graph import recompute_join_paths_multi
+
+    monkeypatch.setattr(PolicyConfig, "REGENERATE_TEMPLATE_STORE", False)
+    store_dir = str(tmp_path / "intent_templates")
+    os.makedirs(store_dir, exist_ok=True)
+    monkeypatch.setattr(EngineConfig, "TEMPLATE_STORE_DIR", store_dir)
+    tmpl = _minimal_template()
+    store = empty_template_store(tmpl.schema_graph_id)
+    templates_to_store(store, {tmpl.id: tmpl})
+    save_template_store(store)
+    tables = {
+        "t": TableMetadata(
+            name="t",
+            columns={"id": ColumnMetadata(name="id", data_type="integer", sensitivity="none")},
+            primary_key=["id"],
+            foreign_keys=[],
+        )
+    }
+    schema = SchemaGraph(
+        tables=tables,
+        join_paths_multi=recompute_join_paths_multi(tables),
+        schema_graph_id="different-graph-id",
+        effective_structural_hash="different-graph-id",
+    )
+    loaded = load_template_store(schema.schema_graph_id, schema)
+    assert tmpl.id in loaded.partition_map
+    assert loaded.schema_graph_id == schema.schema_graph_id
+
+
+def _join_template(
+    *,
+    tid: str,
+    candidate_id: str,
+    question: str,
+    intent_key_val: str = "ik_join",
+    sql_fp: str = "fp_join",
+) -> Template:
+    signature = ["child.parent_id->parent.id"]
+    ci = ConcreteIntent(
+        intent_id="i",
+        tables=["child", "parent"],
+        grain="row_level",
+        select_cols=[SelectCol(expr=NormalizedExpr.from_column("child.id"))],
+        group_by_cols=[],
+        order_by_cols=[],
+        where=None,
+        chosen_join_path_signature=signature,
+        chosen_join_candidate_id=candidate_id,
+    )
+    return Template(
+        id=tid,
+        effective_structural_hash="h",
+        schema_graph_id="sg_test000000000001__abcd1234",
+        intent_signature=ci,
+        intent_key=intent_key_val,
+        tables_used=["child", "parent"],
+        sql_param="SELECT child.id FROM child JOIN parent ON child.parent_id = parent.id",
+        sql_fp=sql_fp,
+        shape=SQLShape(num_joins=1, has_group_by=False, has_agg=False),
+        colmap_sig="cm",
+        value_history=ValueHistory(param_values=[{}], questions=[question], natural_language=[question]),
+        stats=TemplateStats(accept=1, reject=0),
+        trust_level=1,
+    )
+
+
+@pytest.mark.fast
+def test_warmup_template_dedupe_merges_same_join_fingerprint_different_candidate_ids() -> None:
+    """Seed-warmup store merge must key on join fingerprint, not unstable candidate ids."""
+    templates = {"T0001": _join_template(tid="T0001", candidate_id="J01", question="q1")}
+    new_templates = [_join_template(tid="T0002", candidate_id="J02", question="q2")]
+
+    merge_seed_warmup_templates_into_store(templates, new_templates)
+
+    assert len(templates) == 1
+    only = next(iter(templates.values()))
+    assert set(only.value_history.questions) == {"q1", "q2"}
+    assert join_fingerprint_from_concrete_intent(only.intent_signature) == join_fingerprint_from_concrete_intent(
+        new_templates[0].intent_signature
+    )

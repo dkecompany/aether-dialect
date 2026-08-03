@@ -28,7 +28,6 @@ _REQUIRED_METHODS: tuple[str, ...] = (
     "execute",
     "reflect_schema_graph",
     "profile_schema",
-    "quote_table_column",
 )
 
 _SQLGLOT_HOOK_METHODS: tuple[str, ...] = (
@@ -83,6 +82,8 @@ _SAMPLE_SUFFIX_ENGINES: frozenset[str] = frozenset(
 
 _SAMPLE_SUFFIX_WHERE_ENGINES: frozenset[str] = frozenset({"mysql", "redshift"})
 
+_SAMPLE_SUFFIX_ORDERED_LIMIT_ENGINES: frozenset[str] = frozenset({"sqlserver", "bigquery"})
+
 
 def _uninit_dialect(cls: type[Dialect]) -> Dialect:
     return cls.__new__(cls)
@@ -101,7 +102,7 @@ def _assert_dialect_contract(dialect: Dialect, engine: str) -> None:
     assert isinstance(dialect.sqlglot_dialect, str)
     assert dialect.sqlglot_dialect or engine == "postgresql"
     assert isinstance(dialect.dialect_label, str) and dialect.dialect_label
-    assert isinstance(dialect.extra_filter_ops(), frozenset)
+    assert isinstance(dialect.extra_where_ops(), frozenset)
     assert dialect.result_reader_kind in RESULT_READER_KINDS
     assert isinstance(dialect.inject_pruning_predicates("SELECT 1", schema=None, intent=None), str)
     assert isinstance(dialect.date_window_upper_bound_sql("day"), str) and dialect.date_window_upper_bound_sql("day")
@@ -134,6 +135,8 @@ def _assert_dialect_contract(dialect: Dialect, engine: str) -> None:
         assert suffix
         if engine in _SAMPLE_SUFFIX_WHERE_ENGINES:
             assert suffix.startswith("WHERE ")
+        elif engine in _SAMPLE_SUFFIX_ORDERED_LIMIT_ENGINES:
+            assert suffix.upper().startswith("ORDER BY")
         elif engine == "databricks":
             assert "TABLESAMPLE" in suffix
         else:
@@ -199,3 +202,14 @@ def test_sqlglot_hook_engine_sets_cover_config() -> None:
     registered = set(get_registered_engines())
     assert SQLGLOT_DIALECT_HOOK_ENGINES <= registered
     assert "postgresql" not in SQLGLOT_DIALECT_HOOK_ENGINES
+
+
+@pytest.mark.parametrize("engine", get_registered_engines())
+def test_ilike_extra_where_ops_matches_supports_ilike(engine: str) -> None:
+    from aetherdialect._dialect import get_dialect_class
+
+    dialect = _uninit_dialect(get_dialect_class(engine))
+    ops = dialect.extra_where_ops()
+    has_ilike = "ilike" in ops
+    assert has_ilike == dialect.supports_ilike
+    assert ("not ilike" in ops) == dialect.supports_ilike

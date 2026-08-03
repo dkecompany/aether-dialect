@@ -26,6 +26,9 @@ from aetherdialect._contracts_base import EngineContext, SensitivityClassificati
 from aetherdialect._core_utils import (
     StepResult,
     append_failure_trace,
+    llm_usage_build_scope,
+    llm_usage_question_scope,
+    llm_usage_session_scope,
 )
 from aetherdialect._live_testing import LiveTestRunner
 from aetherdialect._main_execution import load_schema_context_cache, write_schema_context_cache
@@ -37,6 +40,8 @@ from aetherdialect._templates import (
     load_template_store,
     store_to_templates,
 )
+
+from ._invoice import clear_invoice_file, write_invoice_file
 
 _RENTAL_SHOP_OVERRIDES = Path(__file__).resolve().parent.parent / "scripts" / "data" / "rental_shop_overrides.json"
 
@@ -61,6 +66,12 @@ def pytest_sessionstart(session: pytest.Session) -> None:
     _ = session
     _results_trace_pending_sep = False
     _clear_results_file()
+    clear_invoice_file()
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    _ = session, exitstatus
+    write_invoice_file()
 
 
 def _is_databricks_live_nodeid(nodeid: str) -> bool:
@@ -172,8 +183,6 @@ def _flat_live_env_to_nested_document(flat: dict[str, str]) -> dict[str, Any]:
     deployments: dict[str, str] = {}
     if v := flat.get("AZURE_OPENAI_DEPLOYMENT_LIGHT"):
         deployments["light"] = v
-    if v := flat.get("AZURE_OPENAI_DEPLOYMENT_MEDIUM"):
-        deployments["medium"] = v
     if v := flat.get("AZURE_OPENAI_DEPLOYMENT_HEAVY"):
         deployments["heavy"] = v
     if deployments:
@@ -661,53 +670,64 @@ def _redirect_to_livetest_dir(t2s: AetherEngine) -> str:
     return live_dir
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _llm_usage_invoice_session() -> Any:
+    """Keep one session-scoped LLM usage accumulator for ``invoice.txt``."""
+    with llm_usage_session_scope():
+        yield
+
+
 def _build_live_aether_engine(*, relax_sensitivity: bool) -> AetherEngine:
     """Construct a session ``AetherEngine`` instance for rental_shop live tests."""
     notes = _domain_notes_path()
     cfg_path = write_live_env_file_to_temp_config_toml(_env_file(), {"AETHERDIALECT_ENGINE": "postgresql"})
     try:
-        instance = AetherEngine(
-            EngineContext(
-                notes_file=str(notes) if notes else None,
-                sql_file=_pg_param("SQL_FILE", os.path.join("scripts", "data", "rental_shop.sql")),
-            ),
-            artifacts_dir=tempfile.mkdtemp(prefix="live_pg_artifacts_"),
-            config_file=cfg_path,
-        )
-
-        _redirect_to_livetest_dir(instance)
-
-        prev_regen_graph = PolicyConfig.REGENERATE_SCHEMA_GRAPH
-        prev_regen_skeleton = PolicyConfig.REGENERATE_SKELETON_CACHE
-        PolicyConfig.REGENERATE_SCHEMA_GRAPH = True
-        PolicyConfig.REGENERATE_SKELETON_CACHE = True
-        try:
-            print("Live tests: building schema graph from PostgreSQL...", flush=True)
-            schema_graph = instance._schema_graph
-            table_count = len(schema_graph.tables)
-            column_count = sum(len(table.columns) for table in schema_graph.tables.values())
-            print(
-                f"Live tests: schema graph ready ({table_count} tables, {column_count} columns)",
-                flush=True,
+        with llm_usage_build_scope():
+            instance = AetherEngine(
+                EngineContext(
+                    notes_file=str(notes) if notes else None,
+                    sql_file=_pg_param("SQL_FILE", os.path.join("scripts", "data", "rental_shop.sql")),
+                ),
+                artifacts_dir=tempfile.mkdtemp(prefix="live_pg_artifacts_"),
+                config_file=cfg_path,
             )
-        finally:
-            PolicyConfig.REGENERATE_SCHEMA_GRAPH = prev_regen_graph
-            PolicyConfig.REGENERATE_SKELETON_CACHE = prev_regen_skeleton
 
-        fresh_store = load_template_store(instance._schema_graph.effective_structural_hash, instance._schema_graph)
-        instance._store = fresh_store
-        instance._templates = store_to_templates(fresh_store)
-        instance._rejected = {}
+            _redirect_to_livetest_dir(instance)
 
-        if relax_sensitivity:
-            _relax_rental_shop_selectability(instance._schema_graph, _pg_param("PGDATABASE", "rental_shop"))
-        elif _RENTAL_SHOP_OVERRIDES.is_file():
-            apply_schema_overrides_to_graph(
+            prev_regen_graph = PolicyConfig.REGENERATE_SCHEMA_GRAPH
+            prev_regen_skeleton = PolicyConfig.REGENERATE_SKELETON_CACHE
+            PolicyConfig.REGENERATE_SCHEMA_GRAPH = True
+            PolicyConfig.REGENERATE_SKELETON_CACHE = True
+            try:
+                print("Live tests: building schema graph from PostgreSQL...", flush=True)
+                schema_graph = instance._schema_graph
+                table_count = len(schema_graph.tables)
+                column_count = sum(len(table.columns) for table in schema_graph.tables.values())
+                print(
+                    f"Live tests: schema graph ready ({table_count} tables, {column_count} columns)",
+                    flush=True,
+                )
+            finally:
+                PolicyConfig.REGENERATE_SCHEMA_GRAPH = prev_regen_graph
+                PolicyConfig.REGENERATE_SKELETON_CACHE = prev_regen_skeleton
+
+            fresh_store = load_template_store(
+                instance._schema_graph.effective_structural_hash,
                 instance._schema_graph,
-                load_schema_overrides_file(_RENTAL_SHOP_OVERRIDES),
             )
+            instance._store = fresh_store
+            instance._templates = store_to_templates(fresh_store)
+            instance._rejected = {}
 
-        return instance
+            if relax_sensitivity:
+                _relax_rental_shop_selectability(instance._schema_graph, _pg_param("PGDATABASE", "rental_shop"))
+            elif _RENTAL_SHOP_OVERRIDES.is_file():
+                apply_schema_overrides_to_graph(
+                    instance._schema_graph,
+                    load_schema_overrides_file(_RENTAL_SHOP_OVERRIDES),
+                )
+
+            return instance
     finally:
         Path(cfg_path).unlink(missing_ok=True)
 
@@ -959,12 +979,14 @@ def _instrument_runner(target: LiveTestRunner) -> None:
     bound_clone = LiveTestRunner.clone.__get__(target, LiveTestRunner)
 
     def _capturing_run(scenario: Any, retries: int = 0) -> StepResult:
-        result = bound_run(scenario, retries=retries)
+        with llm_usage_question_scope():
+            result = bound_run(scenario, retries=retries)
         _capture_result(result, scenario)
         return result
 
     def _capturing_run_deferred(scenario: Any, retries: int = 0) -> StepResult:
-        result = bound_deferred(scenario, retries=retries)
+        with llm_usage_question_scope():
+            result = bound_deferred(scenario, retries=retries)
         _capture_result(result, scenario)
         return result
 

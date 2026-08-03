@@ -5,13 +5,8 @@ from __future__ import annotations
 from aetherdialect._contracts_base import (
     ColumnRole,
     InferenceTag,
-    NormalizedExpr,
     OverrideSkip,
     TableRole,
-)
-from aetherdialect._contracts_core import (
-    RuntimeIntent,
-    SelectCol,
 )
 from aetherdialect._contracts_schema import (
     ColumnMetadata,
@@ -25,7 +20,6 @@ from aetherdialect._schema_graph import (
     pair_targeted_fk_inference,
 )
 from aetherdialect._validation_schema import (
-    validate_join_path_reachability,
     validate_join_path_reachability_for_tables,
 )
 
@@ -42,6 +36,7 @@ def _col(**overrides) -> ColumnMetadata:
         distinct_count=10,
         distinct_ratio=0.5,
         row_count=20,
+        value_overlap_sample=["1", "2", "3", "4", "5"],
     )
     defaults.update(overrides)
     return ColumnMetadata(**defaults)
@@ -147,27 +142,4 @@ class TestJoinPathReachability:
             join_paths_multi={"orders": {"customers": []}, "customers": {"orders": []}},
         )
         issues = validate_join_path_reachability_for_tables(["orders", "customers"], sg, "main query")
-        assert issues
-
-    def test_join_path_from_intent_extra_tables(self) -> None:
-        o = _table("orders", {"id": _col(name="id", is_primary_key=True)}, primary_key=["id"])
-        c = _table(
-            "customers",
-            {"id": _col(name="id", is_primary_key=True)},
-            primary_key=["id"],
-        )
-        sg = SchemaGraph(
-            tables={"orders": o, "customers": c},
-            join_paths_multi={"orders": {"customers": []}, "customers": {"orders": []}},
-        )
-        intent = RuntimeIntent(
-            tables=["orders"],
-            grain="row_level",
-            select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.id"))],
-            group_by_cols=[],
-            order_by_cols=[],
-            filters_param=[],
-            extra_tables={"customers"},
-        )
-        issues = validate_join_path_reachability(intent, sg, "main query")
         assert issues

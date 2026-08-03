@@ -58,7 +58,7 @@ def test_faithfulness_passes_when_required_tables_in_cte_or_sql() -> None:
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("city.name"))],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
+        where=None,
         cte_steps=[
             RuntimeCteStep(
                 cte_name="ranked_cities",

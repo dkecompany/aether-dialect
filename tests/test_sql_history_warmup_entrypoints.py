@@ -28,8 +28,8 @@ def _intent(**overrides: object) -> SeedWarmupIntent:
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("t1.id"))],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
-        having_param=[],
+        where=None,
+        having=None,
         param_values={},
         source="sql_history",
     )
@@ -127,7 +127,7 @@ def test_sql_history_pipeline_expand_builds_larger_queue(monkeypatch, tmp_path) 
     )
     monkeypatch.setattr(
         "aetherdialect._main_execution.compute_schema_limits",
-        lambda _s: MagicMock(max_filters=3, max_groupby=2, max_tables=4),
+        lambda _s: MagicMock(max_where_predicates=3, max_groupby=2, max_tables=4),
     )
     expand_called: list[bool] = []
 
@@ -210,7 +210,7 @@ def test_sql_history_pipeline_passes_max_kept_intents_to_execution(monkeypatch, 
     )
     monkeypatch.setattr(
         "aetherdialect._main_execution.compute_schema_limits",
-        lambda _s: MagicMock(max_filters=3, max_groupby=2, max_tables=4),
+        lambda _s: MagicMock(max_where_predicates=3, max_groupby=2, max_tables=4),
     )
     monkeypatch.setattr(
         "aetherdialect._main_execution.resolve_joins_for_table_set",

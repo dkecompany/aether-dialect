@@ -84,7 +84,6 @@ class TestLoadConfigFile:
                     "",
                     "[azure_openai.deployments]",
                     'light = "al"',
-                    'medium = "am"',
                     'heavy = "ah"',
                     "",
                     "[postgresql]",
@@ -119,7 +118,7 @@ class TestLoadConfigFile:
             ),
             encoding="utf-8",
         )
-        got, claimed = aetherdialect._main_execution._load_config_file(str(path))
+        got, claimed, named = aetherdialect._main_execution._load_config_file(str(path))
         expected = {
             "OPENAI_API_KEY": "oak",
             "OPENAI_BASE_URL": "https://example-openai/v1",
@@ -128,7 +127,6 @@ class TestLoadConfigFile:
             "AZURE_OPENAI_API_VERSION": "2024-01-01",
             "AZURE_OPENAI_BASE_URL": "https://ex.azure.com/base",
             "AZURE_OPENAI_DEPLOYMENT_LIGHT": "al",
-            "AZURE_OPENAI_DEPLOYMENT_MEDIUM": "am",
             "AZURE_OPENAI_DEPLOYMENT_HEAVY": "ah",
             "POSTGRES_HOST": "h",
             "POSTGRES_PORT": "5433",
@@ -152,6 +150,112 @@ class TestLoadConfigFile:
         }
         assert got == expected
         assert frozenset(expected.keys()) <= claimed
+        assert named == {}
+
+
+def test_load_config_file_named_connections_flatten_selected(tmp_path) -> None:
+    path = tmp_path / "named.toml"
+    path.write_text(
+        "\n".join(
+            (
+                "[postgresql.crm]",
+                'host = "crm.internal"',
+                'database = "crm"',
+                'user = "crm_user"',
+                'password = "crm_pw"',
+                "",
+                "[postgresql.warehouse]",
+                'host = "wh.internal"',
+                'database = "warehouse"',
+                'user = "wh_user"',
+                'password = "wh_pw"',
+                "",
+                "[engine]",
+                'selected = "postgresql"',
+                'connection = "warehouse"',
+            ),
+        ),
+        encoding="utf-8",
+    )
+    flat, claimed, named = aetherdialect._main_execution._load_config_file(str(path))
+    assert named == {"postgresql": frozenset({"crm", "warehouse"})}
+    assert flat.get("AETHERDIALECT_ENGINE") == "postgresql"
+    assert flat.get("AETHERDIALECT_CONNECTION") == "warehouse"
+    assert "POSTGRES_HOST" not in flat
+
+    selected, claimed2, _ = aetherdialect._main_execution._load_config_file(
+        str(path),
+        connection="warehouse",
+    )
+    assert selected["POSTGRES_HOST"] == "wh.internal"
+    assert selected["POSTGRES_DB"] == "warehouse"
+    assert selected["POSTGRES_USER"] == "wh_user"
+    assert selected["POSTGRES_PASSWORD"] == "wh_pw"
+    assert "POSTGRES_HOST" in claimed2
+
+
+def test_load_config_file_single_named_connection_auto_flattens(tmp_path) -> None:
+    path = tmp_path / "single_named.toml"
+    path.write_text(
+        "\n".join(
+            (
+                "[postgresql.crm]",
+                'host = "crm.internal"',
+                'database = "crm"',
+                'user = "u"',
+                'password = "p"',
+            ),
+        ),
+        encoding="utf-8",
+    )
+    flat, _claimed, named = aetherdialect._main_execution._load_config_file(str(path))
+    assert named == {"postgresql": frozenset({"crm"})}
+    assert flat["POSTGRES_HOST"] == "crm.internal"
+    assert flat["POSTGRES_DB"] == "crm"
+
+
+def test_load_config_file_rejects_scalar_and_named_mix(tmp_path) -> None:
+    path = tmp_path / "mixed.toml"
+    path.write_text(
+        "\n".join(
+            (
+                "[postgresql]",
+                'host = "flat.internal"',
+                "[postgresql.crm]",
+                'host = "crm.internal"',
+            ),
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="mixes scalar keys"):
+        aetherdialect._main_execution._load_config_file(str(path))
+
+
+def test_select_connection_name_requires_explicit_when_multiple() -> None:
+    from aetherdialect._main_execution import _select_connection_name
+
+    named = {"postgresql": frozenset({"crm", "warehouse"})}
+    with pytest.raises(ConfigError, match="AETHERDIALECT_CONNECTION"):
+        _select_connection_name({}, named, "postgresql")
+    assert _select_connection_name({}, named, "postgresql", explicit_connection="crm") == "crm"
+    assert _select_connection_name({"AETHERDIALECT_CONNECTION": "warehouse"}, named, "postgresql") == "warehouse"
+
+
+def test_compute_connection_storage_slug_ignores_connection_handle(monkeypatch) -> None:
+    from aetherdialect._config import PostgresRuntimeConfig
+
+    monkeypatch.setattr(PostgresRuntimeConfig, "HOST", "db.internal", raising=False)
+    monkeypatch.setattr(PostgresRuntimeConfig, "PORT", 5432, raising=False)
+    monkeypatch.setattr(PostgresRuntimeConfig, "DATABASE", "analytics", raising=False)
+    monkeypatch.setattr(PostgresRuntimeConfig, "SCHEMA", "public", raising=False)
+    slug_a = compute_connection_storage_slug("postgresql")
+
+    monkeypatch.setattr(PostgresRuntimeConfig, "HOST", "other.internal", raising=False)
+    monkeypatch.setattr(PostgresRuntimeConfig, "DATABASE", "other_db", raising=False)
+    slug_b = compute_connection_storage_slug("postgresql")
+
+    assert slug_a != slug_b
+    assert slug_a == "conn_postgresql_db_internal_5432_analytics_public"
 
 
 def test_load_config_file_claims_empty_openai_api_key_without_flat_value(
@@ -159,7 +263,7 @@ def test_load_config_file_claims_empty_openai_api_key_without_flat_value(
 ) -> None:
     path = tmp_path / "empty_key.toml"
     path.write_text('[openai]\napi_key = ""\n', encoding="utf-8")
-    flat, claimed = aetherdialect._main_execution._load_config_file(str(path))
+    flat, claimed, _named = aetherdialect._main_execution._load_config_file(str(path))
     assert flat == {}
     assert "OPENAI_API_KEY" in claimed
 
@@ -581,6 +685,7 @@ class TestConfigureRuntimeFromEnvironment:
             "AZURE_OPENAI_API_VERSION",
         ):
             monkeypatch.delenv(k, raising=False)
+        monkeypatch.setenv("AETHERDIALECT_ENGINE", "postgresql")
         monkeypatch.setenv("PGDATABASE", "db")
         monkeypatch.setenv("PGUSER", "u")
         monkeypatch.setenv("PGPASSWORD", "p")
@@ -610,8 +715,8 @@ class TestConfigureRuntimeFromEnvironment:
             ):
                 configure_runtime_from_environment(EngineContext(), _snapshot_os_environ())
             assert EngineConfig.LLM_PROVIDER == "openai"
-            assert EngineConfig.OPENAI_MODEL == "gpt-4o-mini"
-            assert EngineConfig.OPENAI_MODEL_JOIN == "gpt-5.4-mini"
+            assert EngineConfig.OPENAI_MODEL == "gpt-4.1-nano"
+            assert EngineConfig.OPENAI_MODEL_JOIN == "gpt-5.4-nano"
         finally:
             for k, v in snap_eng.items():
                 setattr(EngineConfig, k, v)
@@ -620,6 +725,7 @@ class TestConfigureRuntimeFromEnvironment:
 
     def test_azure_deployment_env_overrides(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setenv("AETHERDIALECT_ENGINE", "postgresql")
         monkeypatch.setenv("PGDATABASE", "db")
         monkeypatch.setenv("PGUSER", "u")
         monkeypatch.setenv("PGPASSWORD", "p")
@@ -627,7 +733,6 @@ class TestConfigureRuntimeFromEnvironment:
         monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://x.openai.azure.com")
         monkeypatch.setenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
         monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT_LIGHT", "dep-a")
-        monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT_MEDIUM", "dep-b")
         monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT_HEAVY", "dep-c")
         eng_fields = (
             "TYPE",
@@ -657,8 +762,8 @@ class TestConfigureRuntimeFromEnvironment:
             from aetherdialect._llm_provider import _azure_deployment_for_model
 
             assert EngineConfig.LLM_PROVIDER == "azure"
-            assert _azure_deployment_for_model("gpt-4o-mini") == "dep-a"
-            assert _azure_deployment_for_model("gpt-4.1-mini") == "dep-b"
+            assert _azure_deployment_for_model("gpt-4.1-nano") == "dep-a"
+            assert _azure_deployment_for_model("gpt-5.4-nano") == "dep-a"
             assert _azure_deployment_for_model("gpt-5.4-mini") == "dep-c"
         finally:
             for k, v in snap_eng.items():
@@ -667,6 +772,7 @@ class TestConfigureRuntimeFromEnvironment:
                 setattr(PostgresRuntimeConfig, k, v)
 
     def test_both_llm_providers_configured_requires_explicit_choice(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("AETHERDIALECT_ENGINE", "postgresql")
         monkeypatch.setenv("PGDATABASE", "db")
         monkeypatch.setenv("PGUSER", "u")
         monkeypatch.setenv("PGPASSWORD", "p")
@@ -693,7 +799,7 @@ class TestConfigureRuntimeFromEnvironment:
         snap_pg = {
             k: getattr(PostgresRuntimeConfig, k) for k in ("HOST", "PORT", "USER", "PASSWORD", "DATABASE", "SCHEMA")
         }
-        from aetherdialect._config import ConfigError
+        from aetherdialect._contracts_base import ConfigError
 
         try:
             with patch.object(
@@ -710,6 +816,7 @@ class TestConfigureRuntimeFromEnvironment:
                 setattr(PostgresRuntimeConfig, k, v)
 
     def test_both_llm_providers_explicit_openai_configures(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("AETHERDIALECT_ENGINE", "postgresql")
         monkeypatch.setenv("PGDATABASE", "db")
         monkeypatch.setenv("PGUSER", "u")
         monkeypatch.setenv("PGPASSWORD", "p")
@@ -800,21 +907,23 @@ class TestSchemaContextCache:
         loaded = aetherdialect._main_execution.load_schema_context_cache(str(tmp_path))
         assert loaded is None
 
-    def test_load_bad_version_returns_none(self, tmp_path) -> None:
+    def test_load_bad_version_raises_config_error(self, tmp_path) -> None:
         adir = str(tmp_path)
         path = os.path.join(adir, aetherdialect._main_execution.SCHEMA_CONTEXT_CACHE_NAME)
         with open(path, "w", encoding="utf-8") as f:
             json.dump({"version": 999}, f)
-        assert aetherdialect._main_execution.load_schema_context_cache(adir) is None
+        with pytest.raises(ConfigError, match=r"version .*999"):
+            aetherdialect._main_execution.load_schema_context_cache(adir)
 
 
 class TestPipelineSessionSuspendToStep:
     """Tests for :meth:`PipelineSession._suspend_to_step` prompt and payload assembly."""
 
     def test_sql_feedback_suspend_populates_message_prompt(self) -> None:
-        from aetherdialect._constants import PIPELINE_SUSPEND_ID_SQL, GenerationPath
+        from aetherdialect._constants import PIPELINE_SUSPEND_ID_SQL
         from aetherdialect._contracts_base import PipelineSuspended
         from aetherdialect._contracts_core import (
+            GenerationPath,
             InteractiveTailSnapshot,
             RuntimeIntent,
             SqlFeedbackSuspendContext,
@@ -828,7 +937,7 @@ class TestPipelineSessionSuspendToStep:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         tail = InteractiveTailSnapshot(
             q_norm="q",
@@ -859,7 +968,6 @@ class TestPipelineSessionSuspendToStep:
             execution_intent=ri,
             sql="SELECT 1",
             rows=(),
-            conf=0.5,
             tmpl_sd=None,
             gen_out=gen_out,
             matched_rejected_template=None,
@@ -877,10 +985,11 @@ class TestPipelineSessionSuspendToStep:
         assert step.data is None
 
     def test_direct_reuse_suspend_populates_sql_data_message(self) -> None:
-        from aetherdialect._constants import PIPELINE_SUSPEND_ID_DIRECT_REUSE, GenerationPath
+        from aetherdialect._constants import PIPELINE_SUSPEND_ID_DIRECT_REUSE
         from aetherdialect._contracts_base import PipelineSuspended
         from aetherdialect._contracts_core import (
             DirectReuseSuspendContext,
+            GenerationPath,
             RuntimeIntent,
         )
         from aetherdialect._main_execution import PipelineSession
@@ -891,7 +1000,7 @@ class TestPipelineSessionSuspendToStep:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         ctx = DirectReuseSuspendContext(
             q_norm="how many",
@@ -954,7 +1063,7 @@ def test_reader_mode_does_not_save_templates(monkeypatch: pytest.MonkeyPatch, tm
         select_cols=[],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
+        where=None,
     )
     choice_port = MagicMock()
     choice_port.has_pending_choice.return_value = True

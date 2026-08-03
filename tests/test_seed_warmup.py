@@ -9,16 +9,17 @@ from unittest.mock import patch
 import pytest
 
 from aetherdialect._config import SeedWarmupConfig
-from aetherdialect._constants import GenerationPath
 from aetherdialect._contracts_base import (
-    FilterParam,
     HavingParam,
     LlmJsonExhausted,
     NormalizedExpr,
+    WhereParam,
     WorkloadFamily,
+    predicate_group_from_list,
 )
 from aetherdialect._contracts_core import (
     ConcreteIntent,
+    GenerationPath,
     RuntimeIntent,
     SeedWarmupIntent,
     SeedWarmupResult,
@@ -46,7 +47,7 @@ from aetherdialect._seed_warmup import (
     _build_value_domains,
     _confirm_gold_intent,
     _create_template_from_result,
-    _decompose_between_filter_param,
+    _decompose_between_where_param,
     _gold_failure_trace_text,
     _identify_range_pairs,
     _load_seed_questions,
@@ -90,8 +91,8 @@ def _warmup_intent(**overrides) -> SeedWarmupIntent:
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
-        having_param=[],
+        where=None,
+        having=None,
         param_values={},
         expansion_metadata=None,
         limit=None,
@@ -153,7 +154,7 @@ class TestAbstractValues:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             param_values={"p1": "shipped", "p2": "100"},
         )
         result = _abstract_values(intent)
@@ -167,7 +168,7 @@ class TestAbstractValues:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             param_values={"p1": "val"},
         )
         result = _abstract_values(intent)
@@ -181,7 +182,7 @@ class TestAbstractValues:
             select_cols=[SelectCol(expr=NormalizedExpr.from_agg("count", "orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             param_values={"p1": "x"},
         )
         result = _abstract_values(intent)
@@ -189,7 +190,7 @@ class TestAbstractValues:
 
     def test_preserves_filters(self):
         """Abstracted intent preserves filter structure."""
-        f = FilterParam(
+        f = WhereParam(
             left_expr=NormalizedExpr.from_column("orders.status"),
             op="=",
             value_type="string",
@@ -202,11 +203,11 @@ class TestAbstractValues:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[f],
+            where=predicate_group_from_list([f]),
             param_values={"p1": "shipped"},
         )
         result = _abstract_values(intent)
-        assert len(result.filters_param) == 1
+        assert len(result.where.leaves() if result.where else []) == 1
         assert result.param_values == {}
 
     def test_returns_new_object(self):
@@ -217,7 +218,7 @@ class TestAbstractValues:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             param_values={"p1": "val"},
         )
         result = _abstract_values(intent)
@@ -237,14 +238,16 @@ class TestInstantiateIntent:
     def test_populates_filter_value(self):
         """Filter value is sampled from domain."""
         intent = _warmup_intent(
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("orders.status"),
-                    op="=",
-                    value_type="string",
-                    param_key="p1",
-                )
-            ],
+            where=predicate_group_from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("orders.status"),
+                        op="=",
+                        value_type="string",
+                        param_key="p1",
+                    )
+                ]
+            ),
         )
         domains = {
             "orders.status": ValueDomain(
@@ -259,49 +262,55 @@ class TestInstantiateIntent:
     def test_null_filter_passthrough(self):
         """Null/is-null filters pass through without value sampling."""
         intent = _warmup_intent(
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("orders.status"),
-                    op="is not null",
-                    value_type="null",
-                    param_key="p1",
-                )
-            ],
+            where=predicate_group_from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("orders.status"),
+                        op="is not null",
+                        value_type="null",
+                        param_key="p1",
+                    )
+                ]
+            ),
         )
         result = instantiate_intent(intent, {})
         assert result is not None
-        assert result.filters_param[0].op == "is not null"
+        assert (result.where.leaves() if result.where else [])[0].op == "is not null"
 
     def test_date_window_passthrough(self):
         """date_window filters pass through without value sampling."""
         intent = _warmup_intent(
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("orders.order_date"),
-                    op=">=",
-                    value_type="date_window",
-                    param_key="",
-                    raw_value={"unit": "day", "amount": 30},
-                )
-            ],
+            where=predicate_group_from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("orders.order_date"),
+                        op=">=",
+                        value_type="date_window",
+                        param_key="",
+                        raw_value={"unit": "day", "amount": 30},
+                    )
+                ]
+            ),
         )
         result = instantiate_intent(intent, {})
         assert result is not None
-        assert result.filters_param[0].value_type == "date_window"
+        assert (result.where.leaves() if result.where else [])[0].value_type == "date_window"
 
     def test_having_value_populated(self):
         """HAVING params get deterministic values."""
         intent = _warmup_intent(
             grain="grouped",
             group_by_cols=[NormalizedExpr.from_column("orders.status")],
-            having_param=[
-                HavingParam(
-                    left_expr=NormalizedExpr.from_agg("count", "*"),
-                    op=">",
-                    value_type="number",
-                    param_key="h1",
-                )
-            ],
+            having=predicate_group_from_list(
+                [
+                    HavingParam(
+                        left_expr=NormalizedExpr.from_agg("count", "*"),
+                        op=">",
+                        value_type="number",
+                        param_key="h1",
+                    )
+                ]
+            ),
         )
         result = instantiate_intent(intent, {})
         assert result is not None
@@ -310,32 +319,36 @@ class TestInstantiateIntent:
     def test_right_expr_filter_passthrough(self):
         """Column-to-column filters are copied without sampling."""
         intent = _warmup_intent(
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("orders.customer_id"),
-                    op="=",
-                    value_type="integer",
-                    param_key="p1",
-                    right_expr=NormalizedExpr.from_column("customers.customer_id"),
-                )
-            ],
+            where=predicate_group_from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("orders.customer_id"),
+                        op="=",
+                        value_type="integer",
+                        param_key="p1",
+                        right_expr=NormalizedExpr.from_column("customers.customer_id"),
+                    )
+                ]
+            ),
         )
         result = instantiate_intent(intent, {})
         assert result is not None
-        assert result.filters_param[0].right_expr is not None
+        assert (result.where.leaves() if result.where else [])[0].right_expr is not None
         assert "p1" not in result.param_values
 
     def test_missing_domain_skips_value(self):
         """No domain for a value filter leaves param_values empty for that key."""
         intent = _warmup_intent(
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("orders.unknown_col"),
-                    op="=",
-                    value_type="string",
-                    param_key="px",
-                )
-            ],
+            where=predicate_group_from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("orders.unknown_col"),
+                        op="=",
+                        value_type="string",
+                        param_key="px",
+                    )
+                ]
+            ),
         )
         result = instantiate_intent(intent, {})
         assert result is not None
@@ -574,7 +587,7 @@ class TestRunSeedQuestionNormalization:
 
     @patch("aetherdialect._seed_warmup.llm_json")
     def test_falls_back_to_originals_when_llm_json_exhausted(self, mock_llm):
-        mock_llm.side_effect = LlmJsonExhausted(task="intent", attempts=3)
+        mock_llm.side_effect = LlmJsonExhausted(task="default", attempts=3)
         seeds = [{"number": 1, "question": "alpha"}, {"number": 2, "question": "beta"}]
         phrases, _, _ = run_seed_question_normalization(seeds)
         assert phrases[1]["normalized"] == "alpha"
@@ -633,18 +646,18 @@ class TestLoadSeedQuestions:
             os.unlink(path)
 
 
-class TestDecomposeBetweenFilterParam:
-    """Tests for _decompose_between_filter_param."""
+class TestDecomposeBetweenWhereParam:
+    """Tests for _decompose_between_where_param."""
 
     def test_between_decomposed(self):
         """BETWEEN filter becomes >= and <= pair."""
-        f = FilterParam(
+        f = WhereParam(
             left_expr=NormalizedExpr.from_column("orders.amount"),
             op="between",
             value_type="number",
             param_key="p1",
         )
-        parts = _decompose_between_filter_param(f)
+        parts = _decompose_between_where_param(f)
         assert len(parts) == 2
         ops = {p.op for p in parts}
         assert ">=" in ops
@@ -652,25 +665,25 @@ class TestDecomposeBetweenFilterParam:
 
     def test_non_between_passthrough(self):
         """Non-between filter passes through unchanged."""
-        f = FilterParam(
+        f = WhereParam(
             left_expr=NormalizedExpr.from_column("orders.status"),
             op="=",
             value_type="string",
             param_key="p1",
         )
-        parts = _decompose_between_filter_param(f)
+        parts = _decompose_between_where_param(f)
         assert len(parts) == 1
         assert parts[0].op == "="
 
     def test_between_empty_param_key_uses_none_keys(self):
         """BETWEEN with no param_key yields filters with param_key None."""
-        f = FilterParam(
+        f = WhereParam(
             left_expr=NormalizedExpr.from_column("orders.amount"),
             op="between",
             value_type="number",
             param_key="",
         )
-        parts = _decompose_between_filter_param(f)
+        parts = _decompose_between_where_param(f)
         assert len(parts) == 2
         assert parts[0].param_key is None
         assert parts[1].param_key is None
@@ -682,13 +695,13 @@ class TestIdentifyRangePairs:
     def test_identifies_range(self):
         """Detects paired >= / <= on the same column."""
         filters = [
-            FilterParam(
+            WhereParam(
                 left_expr=NormalizedExpr.from_column("orders.amount"),
                 op=">=",
                 value_type="number",
                 param_key="p1",
             ),
-            FilterParam(
+            WhereParam(
                 left_expr=NormalizedExpr.from_column("orders.amount"),
                 op="<=",
                 value_type="number",
@@ -703,7 +716,7 @@ class TestIdentifyRangePairs:
     def test_no_range(self):
         """Single-sided filter produces no range pair."""
         filters = [
-            FilterParam(
+            WhereParam(
                 left_expr=NormalizedExpr.from_column("orders.amount"),
                 op=">=",
                 value_type="number",
@@ -716,7 +729,7 @@ class TestIdentifyRangePairs:
     def test_expr_filters_excluded(self):
         """Filters with right_expr are excluded."""
         filters = [
-            FilterParam(
+            WhereParam(
                 left_expr=NormalizedExpr.from_column("orders.amount"),
                 op=">=",
                 value_type="number",
@@ -730,13 +743,13 @@ class TestIdentifyRangePairs:
     def test_gt_lt_pair_detected(self):
         """> and < on the same column form a range pair."""
         filters = [
-            FilterParam(
+            WhereParam(
                 left_expr=NormalizedExpr.from_column("orders.amount"),
                 op=">",
                 value_type="number",
                 param_key="a",
             ),
-            FilterParam(
+            WhereParam(
                 left_expr=NormalizedExpr.from_column("orders.amount"),
                 op="<",
                 value_type="number",
@@ -849,8 +862,8 @@ class TestCreateTemplateFromResult:
             select_cols=intent.select_cols,
             group_by_cols=intent.group_by_cols,
             order_by_cols=intent.order_by_cols,
-            filters_param=intent.filters_param,
-            having_param=intent.having_param,
+            where=intent.where,
+            having=intent.having,
             param_values=intent.param_values,
             seed_prompt_original="raw seed line",
             seed_prompt_normalized="Refined seed line",
@@ -899,7 +912,7 @@ class TestParseGoldIntentStrict:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             natural_language="x",
         )
 
@@ -919,7 +932,7 @@ class TestParseGoldIntentStrict:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
 
         def fake_parse(q, schema_inner, max_retries=3):
@@ -968,7 +981,7 @@ class TestConfirmGoldIntent:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             natural_language="nl",
         )
         monkeypatch.setattr("aetherdialect._seed_warmup.ask_user_choice", lambda _p, _opts: "y")
@@ -983,7 +996,7 @@ class TestConfirmGoldIntent:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             natural_language="nl",
         )
         monkeypatch.setattr("aetherdialect._seed_warmup.ask_user_choice", lambda _p, _opts: "n")
@@ -1050,7 +1063,7 @@ class TestGoldFailureTrace:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("film.film_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             natural_language="films",
         )
 
@@ -1384,7 +1397,7 @@ class TestWarmupAnchorLatticePersistence:
 
 
 class TestSeedWarmupCacheGoldSnapshotAndSampledIn:
-    """P1 gold snapshot in cache zip and sampled_in lifecycle on work units."""
+    """Gold snapshot in cache zip and sampled_in lifecycle on work units."""
 
     def test_save_cache_zip_includes_gold_intents_json(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1527,7 +1540,7 @@ class TestAcceptedTemplateInstanceKeys:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         tmpl = Template(
             id="T0001",
@@ -1587,7 +1600,7 @@ class TestWarmupSyntheticStorePathBlocks:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         tmpl = Template(
             id="T1",
@@ -1679,11 +1692,11 @@ class TestBuildAnchorLatticeDiskMerge:
 class TestCheckIntentAgainstExpectation:
     """Tests for gold expectation matching."""
 
-    def test_must_filter_matches_param_values(self):
+    def test_must_where_matches_param_values(self):
         intent = {
             "tables": ["reservation"],
             "grain": "scalar",
-            "filters_param": [
+            "where": [
                 {
                     "left_expr": "reservation.status",
                     "op": "=",
@@ -1694,7 +1707,7 @@ class TestCheckIntentAgainstExpectation:
         }
         failures = check_intent_against_expectation(
             intent,
-            {"grain": "scalar", "must_tables": ["reservation"], "must_filter": ["expired"]},
+            {"grain": "scalar", "must_tables": ["reservation"], "must_where": ["expired"]},
         )
         assert failures == []
 

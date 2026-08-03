@@ -9,7 +9,7 @@ from aetherdialect._llm_provider import reset_mock_provider
 
 pytest.importorskip("duckdb")
 
-pytestmark = pytest.mark.requires_sandbox
+pytestmark = pytest.mark.needs_corpus
 
 
 @pytest.fixture(autouse=True)

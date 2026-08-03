@@ -8,64 +8,80 @@ import gzip
 import hashlib
 import json
 import os
-from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import asdict
 from datetime import datetime
 from itertools import combinations
 from typing import Any, Literal
-from uuid import uuid4
 
 import sqlglot
 from sqlalchemy import text
 
-from ._config import (
-    ConfigError,
-    PolicyConfig,
-)
+from ._config import PolicyConfig
 from ._constants import (
     COMPATIBLE_TYPE_PAIRS,
     DIAGNOSTIC_CODE_PK_INFERENCE_PROMPT,
+    DIAGNOSTIC_CODE_PROFILE_TABLE_CLONE_FAILED,
     FK_INFERENCE_SUFFIX_STEMS,
+    INFERRED_COLLAPSE_TAGS,
     INFERRED_PK_VALUE_TYPES,
     INTEGER_VALUE_TYPES,
+    JOIN_PATH_TIE_OVERFLOW_MARKER,
+    JOIN_PATH_TIE_REFUSAL_CEILING,
     MIGRATION_DATA_OVERLAP_MIN,
     MIGRATION_TABLE_RENAME_COLUMN_FRACTION,
-    PK_STYLE_FK_STEMS,
+    PK_NAME_SUFFIXES_FOR_LONGEST,
     SCHEMA_GRAPH_ID_DETERMINISTIC_SEED_V1,
     SCHEMA_GRAPH_ID_PREFIX,
     STRING_VALUE_TYPES,
     TEMPLATE_STORE_HEADER_FILENAME,
     TEMPLATE_STORE_PARTITION_PREFIX,
     TEMPLATE_STORE_SEGMENT,
+    UF_EXCLUDE_SEMANTIC_INFERENCE_ONLY,
     WRITE_QUEUE_FILENAME,
 )
 from ._contracts_base import (
     ColumnRole,
+    ConfigError,
     DatabaseFeatureCapability,
     EngineContext,
+    FederationContext,
     InferenceTag,
+    MigrationTier,
     OverrideSkip,
     PkInferenceTag,
     SchemaAccessError,
     SchemaInclude,
+    SchemaInvariantError,
     SchemaRole,
     SensitivityClassification,
     data_type_to_value_type,
+    having_leaves,
     is_date_type,
     is_numeric_type,
+    structural_data_type_key,
+    where_leaves,
 )
 from ._contracts_core import RuntimeIntent
 from ._contracts_schema import (
     ColumnMetadata,
     FKEdge,
+    SchemaDiff,
     SchemaGraph,
     SchemaLimits,
+    TableDiff,
     TableMetadata,
     set_schema_helpers,
 )
 from ._core_utils import (
+    ArtifactManifest,
+    artifact_manifest_incompatible_with_package,
+    cte_join_reachability_tables,
     debug,
+    descriptions_hash_fp,
     effective_structural_hash_fp,
+    intent_join_reachability_tables,
+    manifest_matches_schema,
     notify,
     profiling_hash_fp,
     read_artifact_manifest,
@@ -73,10 +89,25 @@ from ._core_utils import (
     scope_hash_fp,
     stable_json,
     structural_hash_fp,
+    try_rename_migration_plan,
     write_artifact_manifest,
     write_gzip_json_atomic,
 )
-from ._dialect import Dialect
+from ._dialect import (
+    Dialect,
+    engine_supports_anti_join,
+    engine_supports_array_contains,
+    engine_supports_collation,
+    engine_supports_median,
+    engine_supports_ordered_string_agg,
+    engine_supports_predicate_nesting,
+    engine_supports_semi_join,
+    engine_supports_stddev,
+    engine_supports_timestamptz_semantics,
+    engine_supports_unsigned_semantics,
+    engine_supports_variance,
+    engine_supports_window_frames,
+)
 from ._intent_expr import extract_columns_from_expr
 from ._qsim import get_aggregatable_columns, get_groupable_columns
 from ._schema_catalog import (
@@ -154,7 +185,7 @@ def compute_schema_stats(schema: SchemaGraph) -> dict[str, Any]:
         "total_groupable": 0,
         "total_aggregatable": 0,
         "min_filterable_per_table": float("inf"),
-        "max_filterable_per_table": 0,
+        "max_whereable_per_table": 0,
         "min_groupable_per_table": float("inf"),
         "max_groupable_per_table": 0,
         "table_count": len(schema.tables),
@@ -182,7 +213,7 @@ def compute_schema_stats(schema: SchemaGraph) -> dict[str, Any]:
 
         if filterable_count > 0:
             stats["min_filterable_per_table"] = min(stats["min_filterable_per_table"], filterable_count)
-            stats["max_filterable_per_table"] = max(stats["max_filterable_per_table"], filterable_count)
+            stats["max_whereable_per_table"] = max(stats["max_whereable_per_table"], filterable_count)
             stats["filterable_per_table"].append(filterable_count)
 
         if groupable_count > 0:
@@ -206,7 +237,7 @@ def compute_schema_stats(schema: SchemaGraph) -> dict[str, Any]:
     debug(f"  total_groupable: {stats['total_groupable']}")
     debug(f"  total_aggregatable: {stats['total_aggregatable']}")
     debug(f"  min_filterable_per_table: {stats['min_filterable_per_table']}")
-    debug(f"  max_filterable_per_table: {stats['max_filterable_per_table']}")
+    debug(f"  max_whereable_per_table: {stats['max_whereable_per_table']}")
     debug(f"  min_groupable_per_table: {stats['min_groupable_per_table']}")
     debug(f"  max_groupable_per_table: {stats['max_groupable_per_table']}")
     debug(f"  filterable_per_table distribution: {stats['filterable_per_table']}")
@@ -220,7 +251,7 @@ def compute_schema_limits(schema_stats: dict[str, Any]) -> SchemaLimits:
     total_filterable = schema_stats.get("total_filterable", 0)
     total_groupable = schema_stats.get("total_groupable", 0)
 
-    max_filters = max(1, total_filterable // table_count) if table_count > 0 else 1
+    max_where_predicates = max(1, total_filterable // table_count) if table_count > 0 else 1
     max_groupby = max(1, total_groupable // table_count) if table_count > 0 else 1
 
     if table_count <= 3:
@@ -230,11 +261,7 @@ def compute_schema_limits(schema_stats: dict[str, Any]) -> SchemaLimits:
     else:
         max_tables = 4
 
-    return SchemaLimits(
-        max_filters=max_filters,
-        max_groupby=max_groupby,
-        max_tables=max_tables,
-    )
+    return SchemaLimits(max_where_predicates=max_where_predicates, max_groupby=max_groupby, max_tables=max_tables)
 
 
 def edge_key(e: FKEdge) -> tuple[str, tuple[str, ...], str, tuple[str, ...]]:
@@ -247,6 +274,7 @@ def table_to_dict(table: TableMetadata) -> dict[str, Any]:
     return {
         "name": table.name,
         "kind": table.kind,
+        "source_id": table.source_id,
         "columns": {k: asdict(v) for k, v in table.columns.items()},
         "primary_key": table.primary_key,
         "foreign_keys": [asdict(fk) for fk in table.foreign_keys],
@@ -305,6 +333,7 @@ def table_from_dict(d: dict[str, Any]) -> TableMetadata:
         primary_key=d["primary_key"],
         foreign_keys=[FKEdge(**fk) for fk in d["foreign_keys"]],
         kind=kind,
+        source_id=str(d.get("source_id", "") or ""),
         partition_columns=d.get("partition_columns", []),
         role=d.get("role"),
         row_count=d.get("row_count", 0),
@@ -355,15 +384,11 @@ def _semantic_neighbor_edge_count(sg: SchemaGraph) -> int:
 
 
 def effective_reflect_include(ctx: EngineContext) -> SchemaInclude:
-    """Use catalog-wide reflection when an explicit allow-list is provided."""
-    if ctx.allow_objects:
-        return "both"
+    """Return the catalog kind to reflect for *ctx* (tables or views only)."""
     return ctx.include
 
 
-def allow_objects_lower_set(
-    allow_objects: frozenset[str] | None,
-) -> frozenset[str] | None:
+def allow_objects_lower_set(allow_objects: frozenset[str] | None) -> frozenset[str] | None:
     """Return lowercase relation names for filtering, or ``None`` when no allow-list."""
     if not allow_objects:
         return None
@@ -371,14 +396,14 @@ def allow_objects_lower_set(
 
 
 def merge_reflected_schema_graphs(a: SchemaGraph, b: SchemaGraph) -> SchemaGraph:
-    """Merge two reflected graphs keyed by relation name."""
+    """Merge table-kind and view-kind reflection passes keyed by relation name (internal only)."""
     merged_tables = dict(a.tables)
     for name, meta in b.tables.items():
         if name in merged_tables:
             existing = merged_tables[name]
             if existing.kind != meta.kind:
                 raise SchemaAccessError(
-                    f"ambiguous relation name {name!r} resolves to both a table and a view in the catalog",
+                    f"ambiguous relation name {name!r} resolves to both a table and a view in the catalog"
                 )
         merged_tables[name] = meta
     join_paths_multi = recompute_join_paths_multi(merged_tables)
@@ -431,7 +456,7 @@ def semantic_edges_fingerprint(tables: dict[str, TableMetadata]) -> str:
     return hashlib.sha256(stable_json({"semantic_edges": edges}).encode("utf-8")).hexdigest()
 
 
-def validate_scope_against_graph(sg: SchemaGraph, ctx: EngineContext) -> None:
+def validate_scope_against_graph(sg: SchemaGraph, ctx: EngineContext | FederationContext) -> None:
     """Ensure deny_columns reference relations and columns present in the graph."""
     reasons: list[str] = []
     offending: list[str] = []
@@ -478,7 +503,7 @@ def validate_scope_against_graph(sg: SchemaGraph, ctx: EngineContext) -> None:
         raise SchemaAccessError("; ".join(reasons))
 
 
-def _deny_columns_by_table(sg: SchemaGraph, ctx: EngineContext) -> dict[str, set[str]]:
+def deny_columns_by_table(sg: SchemaGraph, ctx: EngineContext) -> dict[str, set[str]]:
     """Resolve ``ctx`` deny specs to canonical ``{table: {column, ...}}`` against *sg*."""
     deny_by_table: dict[str, set[str]] = {}
     tindex = _graph_tables_lower_index(sg.tables)
@@ -501,7 +526,7 @@ def _deny_columns_by_table(sg: SchemaGraph, ctx: EngineContext) -> dict[str, set
     return deny_by_table
 
 
-def _prune_foreign_keys_after_column_removal(sg: SchemaGraph) -> None:
+def prune_foreign_keys_after_column_removal(sg: SchemaGraph) -> None:
     """Drop FK edges whose source or destination columns were removed from the graph."""
     tindex = _graph_tables_lower_index(sg.tables)
     for _canon_tbl, tbl in sg.tables.items():
@@ -521,7 +546,7 @@ def _prune_foreign_keys_after_column_removal(sg: SchemaGraph) -> None:
 
 def strip_schema_context_denied_columns(sg: SchemaGraph, ctx: EngineContext) -> None:
     """Remove denied columns from ``TableMetadata.columns`` before profiling. Prunes foreign keys that referenced removed endpoints, clears ``SchemaGraph.deny_columns`` because denied names no longer exist as rows, and leaves the authoritative deny specification on the frozen ``EngineContext`` passed into the build."""
-    deny_by_table = _deny_columns_by_table(sg, ctx)
+    deny_by_table = deny_columns_by_table(sg, ctx)
     for canon_tbl, cols in deny_by_table.items():
         tbl = sg.tables.get(canon_tbl)
         if tbl is None:
@@ -529,7 +554,7 @@ def strip_schema_context_denied_columns(sg: SchemaGraph, ctx: EngineContext) -> 
         for col_name in cols:
             tbl.columns.pop(col_name, None)
         tbl.primary_key = [c for c in tbl.primary_key if c in tbl.columns]
-    _prune_foreign_keys_after_column_removal(sg)
+    prune_foreign_keys_after_column_removal(sg)
     sg.deny_columns = {}
 
 
@@ -584,7 +609,7 @@ def apply_schema_context_allow_columns(sg: SchemaGraph, ctx: EngineContext) -> N
 
 def _scope_is_subset_or_equal(narrow: EngineContext, wide: EngineContext) -> bool:
     """Return True iff every (table, column) visible under *narrow* is also visible under *wide*."""
-    if narrow.include != wide.include and wide.include != "both":
+    if narrow.include != wide.include:
         return False
 
     if wide.allow_objects:
@@ -642,68 +667,10 @@ def filter_schema_graph_by_scope(sg: SchemaGraph, new_ctx: EngineContext) -> Sch
     return new_sg
 
 
-@dataclass(frozen=True)
-class TableDiff:
-    """Per-table delta between a cached and a freshly-reflected ``SchemaGraph``. Entries are sorted tuples to keep equality + hashing deterministic in tests. ``retyped_columns`` records catalog type changes where the normalized ``value_type`` changes (profile must be refreshed). ``redeclared_columns`` holds pure ``data_type`` widenings (for example ``varchar(50)`` to ``text``) where ``value_type`` is unchanged; those updates merge metadata without clearing profiling samples. ``value_type_changed_columns`` mirrors the ``(column, old_vt, new_vt)`` entries implied by ``retyped_columns``. ``renamed_columns`` is populated by :func:`resolve_column_renames` after profile overlap matching; columns appearing here are removed from ``added_columns`` / ``dropped_columns``."""
-
-    added_columns: tuple[str, ...] = ()
-    dropped_columns: tuple[str, ...] = ()
-    redeclared_columns: tuple[tuple[str, str, str], ...] = ()
-    retyped_columns: tuple[tuple[str, str, str], ...] = ()
-    value_type_changed_columns: tuple[tuple[str, str, str], ...] = ()
-    renamed_columns: tuple[tuple[str, str], ...] = ()
-    fk_changed: bool = False
-    pk_changed: bool = False
-
-    @property
-    def is_empty(self) -> bool:
-        return (
-            not self.added_columns
-            and not self.dropped_columns
-            and not self.redeclared_columns
-            and not self.retyped_columns
-            and not self.renamed_columns
-            and not self.fk_changed
-            and not self.pk_changed
-        )
-
-    @property
-    def needs_profile(self) -> bool:
-        """True when applying this diff requires re-profiling the table. Pure-rename tables keep cached profiles. Adds and value-type retypes always need profiling; pure ``redeclared_columns`` (same ``value_type``) do not. Tables whose catalog PK or FK edge sets changed are pulled into :meth:`SchemaDiff.changed_table_names` so subset reprofiling refreshes statistics on those relations even when no columns were added or retyped."""
-        return bool(self.added_columns or self.retyped_columns)
-
-
-@dataclass
-class SchemaDiff:
-    """Whole-graph delta consumed by :func:`apply_diff` and downstream invalidation."""
-
-    added_tables: tuple[str, ...] = ()
-    dropped_tables: tuple[str, ...] = ()
-    table_renames: tuple[tuple[str, str], ...] = ()
-    per_table: dict[str, TableDiff] = field(default_factory=dict)
-    dropped_user_fks: list[tuple[str, str, str, str, str]] = field(default_factory=list)
-    dropped_catalog_fks: list[tuple[str, str, str, str]] = field(default_factory=list)
-    ported_user_fks: list[tuple[str, str, str, str, str, str]] = field(default_factory=list)
-
-    @property
-    def is_empty(self) -> bool:
-        return not self.added_tables and not self.dropped_tables and not self.table_renames and not self.per_table
-
-    def implies_rename_remapping(self) -> bool:
-        """True when template rename migration should treat this diff as a REMAP-tier rename."""
-        if self.table_renames:
-            return True
-        return any(td.renamed_columns for td in self.per_table.values())
-
-    def changed_table_names(self) -> set[str]:
-        """Tables in the *new* graph that need subset profiling (adds, retypes, catalog PK/FK shape changes)."""
-        out: set[str] = set(self.added_tables)
-        for _old, new in self.table_renames:
-            out.add(new)
-        for tname, td in self.per_table.items():
-            if td.needs_profile or td.pk_changed or td.fk_changed:
-                out.add(tname)
-        return out
+def _column_identity_name(col: ColumnMetadata) -> str:
+    """Return the upload label used for structural identity when present."""
+    original = (col.original_name or "").strip()
+    return original or col.name
 
 
 def _table_column_typed_set(t: TableMetadata) -> frozenset[tuple[str, str]]:
@@ -713,21 +680,138 @@ def _table_column_typed_set(t: TableMetadata) -> frozenset[tuple[str, str]]:
         vt = (c.value_type or "").strip().lower()
         if not vt:
             vt = data_type_to_value_type(c.data_type)
-        out.append((c.name, vt))
+        out.append((_column_identity_name(c), vt))
     return frozenset(out)
 
 
-def _fk_edge_set(
-    t: TableMetadata,
-) -> frozenset[tuple[str, tuple[str, ...], str, tuple[str, ...]]]:
+def _fk_edge_set(t: TableMetadata) -> frozenset[tuple[str, tuple[str, ...], str, tuple[str, ...]]]:
     return frozenset(edge_key(fk) for fk in t.foreign_keys)
 
 
-def _catalog_fk_edge_set(
-    t: TableMetadata,
-) -> frozenset[tuple[str, tuple[str, ...], str, tuple[str, ...]]]:
+def _catalog_fk_edge_set(t: TableMetadata) -> frozenset[tuple[str, tuple[str, ...], str, tuple[str, ...]]]:
     """Return only the catalog-declared FK edges (``inference_tag is None``). The diff uses this rather than the full edge set so that inferred or user-override edges sitting only on the cached graph do not register as a structural change between the cache and a fresh reflection (which never carries non-catalog tags)."""
     return frozenset(edge_key(fk) for fk in t.foreign_keys if fk.inference_tag is None)
+
+
+def raise_if_schema_diff_covers_structural_change(
+    old_sg: SchemaGraph,
+    new_sg: SchemaGraph,
+    diff: SchemaDiff,
+) -> None:
+    """Raise when structural hashes disagree but *diff* is empty — the differ missed a change."""
+    if not diff.is_empty:
+        return
+    old_hash = structural_hash_fp(tables_structural_payload(old_sg.tables))
+    new_hash = structural_hash_fp(tables_structural_payload(new_sg.tables))
+    if old_hash != new_hash:
+        raise SchemaInvariantError(
+            "structural hash changed between schema graphs but diff_schemas produced an empty diff"
+        )
+
+
+def _table_diff_without_columns(
+    td: TableDiff,
+    *,
+    dropped_columns: tuple[str, ...],
+    added_columns: tuple[str, ...],
+) -> TableDiff:
+    return TableDiff(
+        added_columns=added_columns,
+        dropped_columns=dropped_columns,
+        redeclared_columns=td.redeclared_columns,
+        retyped_columns=td.retyped_columns,
+        value_type_changed_columns=td.value_type_changed_columns,
+        renamed_columns=td.renamed_columns,
+        nullability_changed_columns=td.nullability_changed_columns,
+        uniqueness_changed_columns=td.uniqueness_changed_columns,
+        indexes_changed=td.indexes_changed,
+        view_definition_changed=td.view_definition_changed,
+        fk_changed=td.fk_changed,
+        pk_changed=td.pk_changed,
+    )
+
+
+def _resolve_cross_table_column_moves(
+    per_table: dict[str, TableDiff],
+    old_sg: SchemaGraph,
+    new_sg: SchemaGraph,
+) -> tuple[dict[str, TableDiff], tuple[tuple[str, str, str, str], ...]]:
+    """Match unambiguous same-name column moves between tables and remove spurious drop+add pairs."""
+    dropped: list[tuple[str, str, str]] = []
+    added: list[tuple[str, str, str]] = []
+    for tname, td in per_table.items():
+        old_t = old_sg.tables.get(tname)
+        new_t = new_sg.tables.get(tname)
+        for c in td.dropped_columns:
+            if old_t is None or c not in old_t.columns:
+                continue
+            dropped.append((tname, c, structural_data_type_key(old_t.columns[c].data_type)))
+        for c in td.added_columns:
+            if new_t is None or c not in new_t.columns:
+                continue
+            added.append((tname, c, structural_data_type_key(new_t.columns[c].data_type)))
+    if not dropped or not added:
+        return per_table, ()
+
+    drop_index: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    add_index: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    for tname, c, type_key in dropped:
+        drop_index.setdefault((c.lower(), type_key), []).append((tname, c))
+    for tname, c, type_key in added:
+        add_index.setdefault((c.lower(), type_key), []).append((tname, c))
+
+    moves: list[tuple[str, str, str, str]] = []
+    matched_drops: set[tuple[str, str]] = set()
+    matched_adds: set[tuple[str, str]] = set()
+    for key, drop_candidates in drop_index.items():
+        add_candidates = add_index.get(key)
+        if not add_candidates or len(drop_candidates) != 1 or len(add_candidates) != 1:
+            continue
+        src_table, src_col = drop_candidates[0]
+        dst_table, dst_col = add_candidates[0]
+        if src_table == dst_table:
+            continue
+        moves.append((src_table, src_col, dst_table, dst_col))
+        matched_drops.add((src_table, src_col))
+        matched_adds.add((dst_table, dst_col))
+
+    if not moves:
+        return per_table, ()
+
+    new_per_table: dict[str, TableDiff] = {}
+    for tname, td in per_table.items():
+        new_dropped = tuple(c for c in td.dropped_columns if (tname, c) not in matched_drops)
+        new_added = tuple(c for c in td.added_columns if (tname, c) not in matched_adds)
+        if new_dropped == td.dropped_columns and new_added == td.added_columns:
+            new_per_table[tname] = td
+            continue
+        new_td = _table_diff_without_columns(td, dropped_columns=new_dropped, added_columns=new_added)
+        if not new_td.is_empty:
+            new_per_table[tname] = new_td
+    return new_per_table, tuple(sorted(moves))
+
+
+def schema_diff_cross_table_limitation_note(diff: SchemaDiff) -> str | None:
+    """Return operator guidance when cross-table drop/add pairs could not be auto-resolved."""
+    if diff.cross_table_column_moves:
+        return None
+    dropped_by_name: dict[str, list[str]] = {}
+    added_by_name: dict[str, list[str]] = {}
+    for tname, td in diff.per_table.items():
+        for c in td.dropped_columns:
+            dropped_by_name.setdefault(c.lower(), []).append(tname)
+        for c in td.added_columns:
+            added_by_name.setdefault(c.lower(), []).append(tname)
+    for col_lower, drop_tables in dropped_by_name.items():
+        add_tables = added_by_name.get(col_lower, [])
+        if not add_tables:
+            continue
+        if any(dt != at for dt in drop_tables for at in add_tables):
+            return (
+                "Cross-table column moves are not auto-detected when pairings are ambiguous; "
+                "map them manually in schema_migration_map.json."
+            )
+    return None
 
 
 def diff_schemas(old_sg: SchemaGraph, new_sg: SchemaGraph) -> SchemaDiff:
@@ -743,14 +827,16 @@ def diff_schemas(old_sg: SchemaGraph, new_sg: SchemaGraph) -> SchemaDiff:
         old_sig = _table_column_typed_set(old_sg.tables[old_name])
         if not old_sig:
             continue
-        match: str | None = None
-        for new_name in sorted(added_only - used_added):
-            if _table_column_typed_set(new_sg.tables[new_name]) == old_sig:
-                match = new_name
-                break
-        if match is not None:
-            renames.append((old_name, match))
-            used_added.add(match)
+        candidates = [
+            new_name
+            for new_name in sorted(added_only - used_added)
+            if _table_column_typed_set(new_sg.tables[new_name]) == old_sig
+        ]
+        if len(candidates) != 1:
+            continue
+        match = candidates[0]
+        renames.append((old_name, match))
+        used_added.add(match)
 
     renamed_old = {o for o, _n in renames}
     renamed_new = {n for _o, n in renames}
@@ -770,10 +856,18 @@ def diff_schemas(old_sg: SchemaGraph, new_sg: SchemaGraph) -> SchemaDiff:
         retyped: list[tuple[str, str, str]] = []
         redeclared: list[tuple[str, str, str]] = []
         vt_changed: list[tuple[str, str, str]] = []
+        nullability_changed: list[str] = []
+        uniqueness_changed: list[str] = []
         for c in sorted(old_cols & new_cols):
-            old_dt = old_t.columns[c].data_type
-            new_dt = new_t.columns[c].data_type
-            if old_dt == new_dt:
+            old_col = old_t.columns[c]
+            new_col = new_t.columns[c]
+            old_dt = old_col.data_type
+            new_dt = new_col.data_type
+            if old_col.is_nullable != new_col.is_nullable:
+                nullability_changed.append(c)
+            if old_col.is_unique != new_col.is_unique:
+                uniqueness_changed.append(c)
+            if structural_data_type_key(old_dt) == structural_data_type_key(new_dt):
                 continue
             old_vt = data_type_to_value_type(old_dt)
             new_vt = data_type_to_value_type(new_dt)
@@ -784,30 +878,144 @@ def diff_schemas(old_sg: SchemaGraph, new_sg: SchemaGraph) -> SchemaDiff:
                 redeclared.append((c, old_dt, new_dt))
         fk_changed = _catalog_fk_edge_set(old_t) != _catalog_fk_edge_set(new_t)
         pk_changed = sorted(old_t.primary_key) != sorted(new_t.primary_key)
+        indexes_changed = sorted(old_t.indexed_columns or []) != sorted(new_t.indexed_columns or [])
+        view_definition_changed = (
+            old_t.kind == "view"
+            and new_t.kind == "view"
+            and (old_t.view_definition or "").strip() != (new_t.view_definition or "").strip()
+        )
         td = TableDiff(
             added_columns=added_cols,
             dropped_columns=dropped_cols,
             redeclared_columns=tuple(redeclared),
             retyped_columns=tuple(retyped),
             value_type_changed_columns=tuple(vt_changed),
+            nullability_changed_columns=tuple(nullability_changed),
+            uniqueness_changed_columns=tuple(uniqueness_changed),
+            indexes_changed=indexes_changed,
+            view_definition_changed=view_definition_changed,
             fk_changed=fk_changed,
             pk_changed=pk_changed,
         )
         if not td.is_empty:
             per_table[name] = td
 
+    per_table, cross_table_moves = _resolve_cross_table_column_moves(per_table, old_sg, new_sg)
+
     result = SchemaDiff(
         added_tables=final_added,
         dropped_tables=final_dropped,
         table_renames=tuple(renames),
         per_table=per_table,
+        cross_table_column_moves=cross_table_moves,
     )
     debug(
         "[schema.diff_schemas] "
         f"+tables={len(result.added_tables)} -tables={len(result.dropped_tables)} "
         f"renames={len(result.table_renames)} per_table={len(result.per_table)}"
     )
+    raise_if_schema_diff_covers_structural_change(old_sg, new_sg, result)
     return result
+
+
+def schema_diff_is_additive_only(schema_diff: SchemaDiff) -> bool:
+    """True when *schema_diff* contains only added tables/columns with no other structural changes."""
+    if schema_diff.is_empty:
+        return False
+    if schema_diff.dropped_tables or schema_diff.table_renames:
+        return False
+    if schema_diff.dropped_user_fks or schema_diff.dropped_catalog_fks or schema_diff.ported_user_fks:
+        return False
+    for td in schema_diff.per_table.values():
+        if (
+            td.dropped_columns
+            or td.redeclared_columns
+            or td.retyped_columns
+            or td.value_type_changed_columns
+            or td.renamed_columns
+            or td.nullability_changed_columns
+            or td.uniqueness_changed_columns
+            or td.indexes_changed
+            or td.view_definition_changed
+            or td.fk_changed
+            or td.pk_changed
+        ):
+            return False
+    has_additions = bool(schema_diff.added_tables) or any(td.added_columns for td in schema_diff.per_table.values())
+    return has_additions
+
+
+def _schema_diff_implies_remap(schema_diff: SchemaDiff | None) -> bool:
+    """True when a non-empty structural diff carries rename signals (tables or columns)."""
+    if schema_diff is None:
+        return False
+    if schema_diff.is_empty:
+        return False
+    impl = getattr(schema_diff, "implies_rename_remapping", None)
+    return bool(impl()) if callable(impl) else False
+
+
+def _schema_diff_has_explicit_renames(schema_diff: SchemaDiff) -> bool:
+    """True when *schema_diff* records table or column rename pairs."""
+    if schema_diff.table_renames:
+        return True
+    return any(td.renamed_columns for td in schema_diff.per_table.values())
+
+
+def classify_migration_tier(
+    manifest: ArtifactManifest | None,
+    schema: SchemaGraph,
+    *,
+    previous_schema: SchemaGraph | None = None,
+    schema_diff: SchemaDiff | None = None,
+) -> MigrationTier:
+    """Compare stored manifest fingerprints to the live schema graph."""
+    if manifest is None:
+        return MigrationTier.NO_CHANGE
+    man_id = str(manifest.schema_graph_id or "")
+    live_id = str(schema.schema_graph_id or "")
+    if man_id and live_id and man_id == live_id and manifest_matches_schema(manifest, schema):
+        return MigrationTier.NO_CHANGE
+    if not manifest.effective_structural_hash and not man_id:
+        return MigrationTier.NO_CHANGE
+    if manifest_matches_schema(manifest, schema):
+        return MigrationTier.NO_CHANGE
+    if artifact_manifest_incompatible_with_package(manifest):
+        return MigrationTier.DESTRUCTIVE
+    same_effective = manifest.effective_structural_hash == schema.effective_structural_hash
+    if same_effective:
+        if (manifest.notes_hash or "") != (schema.notes_hash or ""):
+            return MigrationTier.SOFT_REFRESH
+        if (manifest.semantic_edges_hash or "") != (schema.semantic_edges_hash or ""):
+            return MigrationTier.SOFT_REFRESH
+        if manifest.profiling_hash != schema.profiling_hash:
+            return MigrationTier.SOFT_REFRESH
+        return MigrationTier.SOFT_REFRESH
+    resolved_diff: SchemaDiff | None = None
+    if schema_diff is not None and not schema_diff.is_empty:
+        resolved_diff = schema_diff
+    elif previous_schema is not None:
+        inferred = diff_schemas(previous_schema, schema)
+        if not inferred.is_empty:
+            resolved_diff = inferred
+    if resolved_diff is not None:
+        if schema_diff_is_additive_only(resolved_diff):
+            return MigrationTier.ADDITIVE
+        if manifest.scope_hash == schema.scope_hash:
+            if (
+                _schema_diff_has_explicit_renames(resolved_diff)
+                or _schema_diff_implies_remap(resolved_diff)
+                or (previous_schema is not None and try_rename_migration_plan(previous_schema, schema) is not None)
+            ):
+                return MigrationTier.REMAP
+            return MigrationTier.SOFT_REFRESH
+    if (
+        previous_schema is not None
+        and manifest.scope_hash == schema.scope_hash
+        and try_rename_migration_plan(previous_schema, schema) is not None
+    ):
+        return MigrationTier.REMAP
+    return MigrationTier.DESTRUCTIVE
 
 
 def _column_topk_set(col: ColumnMetadata) -> frozenset[str]:
@@ -829,11 +1037,7 @@ def _column_jaccard(a: ColumnMetadata, b: ColumnMetadata) -> float:
     return len(sa & sb) / union
 
 
-def _profile_table_clone(
-    dialect: Dialect,
-    table: TableMetadata,
-    notes_content: str | None,
-) -> TableMetadata | None:
+def _profile_table_clone(dialect: Dialect, table: TableMetadata, notes_content: str | None) -> TableMetadata | None:
     """Deep-copy *table* and run profiling/classification against it; return the clone. Returns ``None`` when profiling raises so callers can fall back to drop+add."""
     clone = copy.deepcopy(table)
     tmp_sg = SchemaGraph(tables={clone.name: clone}, join_paths_multi={})
@@ -843,7 +1047,14 @@ def _profile_table_clone(
         apply_boolean_coercion_pass(tmp_sg)
         assign_column_ops(tmp_sg)
     except Exception as exc:
-        debug(f"[schema._profile_table_clone] profile failed for {table.name!r}: {exc!r}")
+        table.profile_failed = True
+        notify(
+            f"profile clone failed for table {table.name!r}: {exc}",
+            stage="schema",
+            code=DIAGNOSTIC_CODE_PROFILE_TABLE_CLONE_FAILED,
+            level="warning",
+            details=(("table", table.name),),
+        )
         return None
     return clone
 
@@ -884,17 +1095,22 @@ def resolve_column_renames(
             old_col = cached_t.columns.get(old_col_name)
             if old_col is None:
                 continue
-            best_name: str | None = None
-            best_score = -1.0
+            scored: list[tuple[str, float]] = []
             for new_col_name in remaining_added:
                 new_col = profiled_clone.columns.get(new_col_name)
                 if new_col is None:
                     continue
-                score = _column_jaccard(old_col, new_col)
-                if score > best_score:
-                    best_score = score
-                    best_name = new_col_name
-            if best_name is not None and best_score >= threshold:
+                scored.append((new_col_name, _column_jaccard(old_col, new_col)))
+            if not scored:
+                continue
+            best_score = max(score for _name, score in scored)
+            if best_score < threshold:
+                continue
+            tied = [name for name, score in scored if score == best_score]
+            if len(tied) != 1:
+                continue
+            best_name = tied[0]
+            if best_name is not None:
                 new_col = profiled_clone.columns.get(best_name)
                 if new_col is None:
                     continue
@@ -929,6 +1145,7 @@ def resolve_column_renames(
         dropped_tables=diff.dropped_tables,
         table_renames=diff.table_renames,
         per_table=new_per_table,
+        cross_table_column_moves=diff.cross_table_column_moves,
     )
 
 
@@ -953,10 +1170,7 @@ def resolve_table_renames(
 
     profiled_added: dict[str, TableMetadata] = {}
 
-    def _candidate_score(
-        old_table: TableMetadata,
-        new_clone: TableMetadata,
-    ) -> tuple[float, list[tuple[str, str]]]:
+    def _candidate_score(old_table: TableMetadata, new_clone: TableMetadata) -> tuple[float, list[tuple[str, str]]]:
         """Return ``(matched_fraction, column_pairings)`` for an old↔new table pair."""
         old_cols = list(old_table.columns.values())
         new_col_names = list(new_clone.columns.keys())
@@ -989,7 +1203,8 @@ def resolve_table_renames(
             continue
         old_t = cached_sg.tables[old_name]
         old_col_count = len(old_t.columns)
-        best_match: tuple[str, float, list[tuple[str, str]]] | None = None
+        best_fraction = -1.0
+        tied_matches: list[tuple[str, float, list[tuple[str, str]]]] = []
         for new_name in remaining_added:
             if new_name not in new_sg.tables:
                 continue
@@ -1004,13 +1219,16 @@ def resolve_table_renames(
             fraction, pairings = _candidate_score(old_t, profiled_added[new_name])
             if fraction < column_fraction:
                 continue
-            if best_match is None or fraction > best_match[1]:
-                best_match = (new_name, fraction, pairings)
+            if fraction > best_fraction:
+                best_fraction = fraction
+                tied_matches = [(new_name, fraction, pairings)]
+            elif fraction == best_fraction:
+                tied_matches.append((new_name, fraction, pairings))
 
-        if best_match is None:
+        if len(tied_matches) != 1:
             continue
 
-        new_name, fraction, pairings = best_match
+        new_name, fraction, pairings = tied_matches[0]
         debug(
             f"[schema.resolve_table_renames] {old_name!r} -> {new_name!r} "
             f"(matched_fraction={fraction:.2f}, pairings={pairings!r})"
@@ -1038,6 +1256,7 @@ def resolve_table_renames(
         dropped_tables=tuple(sorted(remaining_dropped)),
         table_renames=tuple(sorted(new_table_renames)),
         per_table=per_table,
+        cross_table_column_moves=diff.cross_table_column_moves,
     )
 
 
@@ -1058,10 +1277,7 @@ def redact_hidden_sensitivity_profile_values(sg: SchemaGraph) -> int:
     return redacted
 
 
-def apply_fk_remaps_to_graph(
-    sg: SchemaGraph,
-    remaps: tuple[Any, ...] | list[Any],
-) -> int:
+def apply_fk_remaps_to_graph(sg: SchemaGraph, remaps: tuple[Any, ...] | list[Any]) -> int:
     """Rewire FK parent tables according to migration-map ``fk_remap`` entries."""
     count = 0
     for entry in remaps:
@@ -1081,10 +1297,7 @@ def apply_fk_remaps_to_graph(
     return count
 
 
-def apply_pk_remaps_to_graph(
-    sg: SchemaGraph,
-    remaps: tuple[Any, ...] | list[Any],
-) -> int:
+def apply_pk_remaps_to_graph(sg: SchemaGraph, remaps: tuple[Any, ...] | list[Any]) -> int:
     """Rewire PK columns and dependent FK dst endpoints per migration- map ``pk_remap`` entries."""
     count = 0
     for entry in remaps:
@@ -1118,7 +1331,9 @@ def apply_pk_remaps_to_graph(
     return count
 
 
-def raise_if_schema_unusable(sg: SchemaGraph, schema_context: EngineContext) -> None:
+def raise_if_schema_unusable(
+    sg: SchemaGraph, schema_context: EngineContext, *, federation_composite: bool = False
+) -> None:
     """Raise :class:`SchemaAccessError` when the graph fails pipeline invariants."""
     reasons: list[str] = []
     offending: list[str] = []
@@ -1126,9 +1341,7 @@ def raise_if_schema_unusable(sg: SchemaGraph, schema_context: EngineContext) -> 
         reasons.append("no relations reflected after applying include mode, allow_objects, and deny lists")
     for name, tbl in sg.tables.items():
         if not tbl.columns:
-            reasons.append(
-                f"table {name} reflected with zero columns; likely a catalog misconfiguration",
-            )
+            reasons.append(f"table {name} reflected with zero columns; likely a catalog misconfiguration")
             offending.append(name)
         if schema_context.include == "tables" and tbl.kind != "table":
             reasons.append(f"internal invariant: non-table relation in tables-only scope: {name}")
@@ -1146,19 +1359,93 @@ def raise_if_schema_unusable(sg: SchemaGraph, schema_context: EngineContext) -> 
             seen_lower[low] = n
     fk_ct = sum(len(x.foreign_keys) for x in sg.tables.values())
     sem_ct = _semantic_neighbor_edge_count(sg)
-    if len(sg.tables) > 1:
-        if schema_context.include in ("tables", "both"):
+    if len(sg.tables) > 1 and not federation_composite:
+        if schema_context.include == "tables":
             if fk_ct + sem_ct == 0:
                 reasons.append(
                     "graph has multiple relations but no FK edges and no semantic join neighbors; "
-                    "multi-table questions cannot be answered",
+                    "multi-table questions cannot be answered"
                 )
         elif sem_ct == 0:
             reasons.append(
-                "graph has multiple views but no semantic join neighbors; multi-view questions cannot be routed",
+                "graph has multiple views but no semantic join neighbors; multi-view questions cannot be routed"
             )
     if reasons:
         raise SchemaAccessError("; ".join(reasons))
+
+
+def _is_catalog_structural_fk_edge(edge: FKEdge) -> bool:
+    """Return True when *edge* is catalog- or inference-derived (not a user sidecar assertion)."""
+    tag = edge.inference_tag
+    if tag is None:
+        return True
+    return not (isinstance(tag, str) and tag.startswith("user_override_"))
+
+
+def _catalog_primary_key_columns(table: TableMetadata) -> list[str]:
+    """PK columns that are catalog- or profile-inferred, excluding user sidecar promotions."""
+    out: list[str] = []
+    for cname in table.primary_key:
+        col = table.columns.get(cname)
+        if col is None:
+            continue
+        if col.pk_inference_tag == PkInferenceTag.USER_OVERRIDE:
+            continue
+        out.append(cname)
+    return out
+
+
+def _catalog_fk_source_columns(table: TableMetadata) -> set[str]:
+    """Return source column names participating in catalog-declared FK edges."""
+    cols: set[str] = set()
+    for edge in table.foreign_keys:
+        if edge.inference_tag is not None:
+            continue
+        if edge.src_table == table.name:
+            cols.update(edge.src_cols)
+    return cols
+
+
+def _column_catalog_structural_dict(col: ColumnMetadata, *, catalog_pk: bool, catalog_fk: bool) -> dict[str, Any]:
+    """DDL-stable column payload for catalog structural hashing (excludes user sidecar promotions)."""
+    payload = dict(_column_structural_dict(col))
+    if col.is_primary_key and not catalog_pk:
+        payload["is_primary_key"] = False
+    if col.is_foreign_key and not catalog_fk:
+        payload["is_foreign_key"] = False
+        payload["fk_target"] = None
+    return payload
+
+
+def _table_catalog_structural_dict(table: TableMetadata) -> dict[str, Any]:
+    """DDL-stable table payload for catalog structural hashing (excludes user sidecar FK/PK assertions)."""
+    catalog_pk = set(_catalog_primary_key_columns(table))
+    catalog_fk_cols = _catalog_fk_source_columns(table)
+    cols = {
+        k: _column_catalog_structural_dict(
+            table.columns[k],
+            catalog_pk=(k in catalog_pk),
+            catalog_fk=(k in catalog_fk_cols),
+        )
+        for k in sorted(table.columns)
+    }
+    fkeys = sorted(
+        (_fk_edge_stable_dict(e) for e in table.foreign_keys if _is_catalog_structural_fk_edge(e)),
+        key=lambda d: (d["src_table"], tuple(d["src_cols"]), d["dst_table"], tuple(d["dst_cols"])),
+    )
+    return {
+        "columns": cols,
+        "foreign_keys": fkeys,
+        "indexed_columns": sorted(table.indexed_columns or []),
+        "kind": table.kind,
+        "primary_key": _catalog_primary_key_columns(table),
+        "view_definition": (table.view_definition or "").strip(),
+    }
+
+
+def tables_catalog_structural_payload(tables: dict[str, TableMetadata]) -> dict[str, Any]:
+    """Build sorted catalog-only structural table dict for migration- tier hashing."""
+    return {name: _table_catalog_structural_dict(tables[name]) for name in sorted(tables)}
 
 
 def _fk_edge_stable_dict(edge: FKEdge) -> dict[str, Any]:
@@ -1175,14 +1462,15 @@ def _fk_edge_stable_dict(edge: FKEdge) -> dict[str, Any]:
 def _column_structural_dict(col: ColumnMetadata) -> dict[str, Any]:
     """DDL-stable subset of column metadata for structural hashing."""
     fk = [col.fk_target[0], col.fk_target[1]] if col.fk_target else None
+    identity_name = (col.original_name or "").strip() or col.name
     return {
-        "data_type": col.data_type,
+        "data_type": structural_data_type_key(col.data_type),
         "fk_target": fk,
         "is_foreign_key": col.is_foreign_key,
         "is_nullable": col.is_nullable,
         "is_primary_key": col.is_primary_key,
         "is_unique": col.is_unique,
-        "name": col.name,
+        "name": identity_name,
     }
 
 
@@ -1208,7 +1496,7 @@ def _column_profiling_dict(col: ColumnMetadata) -> dict[str, Any]:
         "sensitivity": col.sensitivity,
         "frequent_values": collect_profiling_frequent_values(col.frequent_values),
         "valid_aggregations": col.valid_aggregations,
-        "valid_filter_ops": col.valid_filter_ops,
+        "valid_where_ops": col.valid_where_ops,
         "valid_having_ops": col.valid_having_ops,
         "value_type": col.value_type,
     }
@@ -1219,18 +1507,15 @@ def _table_structural_dict(table: TableMetadata) -> dict[str, Any]:
     cols = {k: _column_structural_dict(table.columns[k]) for k in sorted(table.columns)}
     fkeys = sorted(
         (_fk_edge_stable_dict(e) for e in table.foreign_keys),
-        key=lambda d: (
-            d["src_table"],
-            tuple(d["src_cols"]),
-            d["dst_table"],
-            tuple(d["dst_cols"]),
-        ),
+        key=lambda d: (d["src_table"], tuple(d["src_cols"]), d["dst_table"], tuple(d["dst_cols"])),
     )
     return {
         "columns": cols,
         "foreign_keys": fkeys,
+        "indexed_columns": sorted(table.indexed_columns or []),
         "kind": table.kind,
         "primary_key": list(table.primary_key),
+        "view_definition": (table.view_definition or "").strip(),
     }
 
 
@@ -1257,9 +1542,31 @@ def tables_profiling_payload(tables: dict[str, TableMetadata]) -> dict[str, Any]
     return {name: _table_profiling_dict(tables[name]) for name in sorted(tables)}
 
 
-def _fresh_schema_graph_seed() -> str:
-    """Return a random 16-hex seed for a newly minted schema-graph identity."""
-    return uuid4().hex[:16]
+def tables_row_count_fingerprint(tables: dict[str, TableMetadata]) -> str:
+    """Return a stable digest of cached table row counts for live drift checks."""
+    payload = {name: int(tables[name].row_count or 0) for name in sorted(tables)}
+    return hashlib.sha256(stable_json(payload).encode("utf-8")).hexdigest()
+
+
+def tables_descriptions_payload(tables: dict[str, TableMetadata]) -> dict[str, Any]:
+    """Build sorted table/column description dict for :func:`descriptions_hash_fp`."""
+    out: dict[str, Any] = {}
+    for tname in sorted(tables):
+        tbl = tables[tname]
+        cols_payload: dict[str, str] = {}
+        for cname in sorted(tbl.columns):
+            desc = (tbl.columns[cname].description or "").strip()
+            if desc:
+                cols_payload[cname] = desc
+        table_payload: dict[str, Any] = {}
+        table_desc = (tbl.description or "").strip()
+        if table_desc:
+            table_payload["description"] = table_desc
+        if cols_payload:
+            table_payload["columns"] = cols_payload
+        if table_payload:
+            out[tname] = table_payload
+    return out
 
 
 def _derive_deterministic_schema_graph_seed(effective_structural_hash: str) -> str:
@@ -1273,10 +1580,7 @@ def mint_schema_graph_id(*, seed_hex: str, structural_hash: str) -> str:
     return f"{SCHEMA_GRAPH_ID_PREFIX}{seed_hex}__{structural_hash[:8]}"
 
 
-def derive_deterministic_schema_graph_id(
-    effective_structural_hash: str,
-    structural_hash: str,
-) -> str:
+def derive_deterministic_schema_graph_id(effective_structural_hash: str, structural_hash: str) -> str:
     """Build a stable schema-graph identity for upgrading legacy artifact directories."""
     seed = _derive_deterministic_schema_graph_seed(effective_structural_hash)
     return mint_schema_graph_id(seed_hex=seed, structural_hash=structural_hash)
@@ -1294,20 +1598,23 @@ def unify_reflected_schema_graph(sg: SchemaGraph) -> None:
 
 def assign_schema_graph_hashes(
     sg: SchemaGraph,
-    schema_context: EngineContext,
+    schema_context: EngineContext | FederationContext,
     notes_sha256: str,
     *,
     schema_role: SchemaRole = "owner",
     pinned_schema_graph_id: str | None = None,
+    federation_scope_hash: str | None = None,
 ) -> None:
     """Compute structural, profiling, scope, effective, notes, semantic- edge hashes and schema-graph identity on *sg* in place."""
     prior_structural = sg.structural_hash
-    st = structural_hash_fp(tables_structural_payload(sg.tables))
+    st = structural_hash_fp(tables_catalog_structural_payload(sg.tables))
     pr = profiling_hash_fp(tables_profiling_payload(sg.tables))
-    sc = scope_hash_fp(schema_context)
+    dr = descriptions_hash_fp(tables_descriptions_payload(sg.tables))
+    sc = federation_scope_hash if federation_scope_hash else scope_hash_fp(schema_context)
     ef = effective_structural_hash_fp(st, sc)
     sg.structural_hash = st
     sg.profiling_hash = pr
+    sg.descriptions_hash = dr
     sg.scope_hash = sc
     sg.effective_structural_hash = ef
     sg.include = schema_context.include
@@ -1321,10 +1628,10 @@ def assign_schema_graph_hashes(
         sg.schema_graph_id = pin
         return
     if not sg.schema_graph_id:
-        sg.schema_graph_id = mint_schema_graph_id(seed_hex=_fresh_schema_graph_seed(), structural_hash=st)
+        sg.schema_graph_id = derive_deterministic_schema_graph_id(ef, st)
         return
     if prior_structural and prior_structural != st:
-        sg.schema_graph_id = mint_schema_graph_id(seed_hex=_fresh_schema_graph_seed(), structural_hash=st)
+        sg.schema_graph_id = derive_deterministic_schema_graph_id(ef, st)
 
 
 def consumer_graph_is_permission_subset(owner: SchemaGraph, consumer: SchemaGraph) -> bool:
@@ -1346,6 +1653,9 @@ def assert_intent_in_scope(
     allowed_tables: frozenset[str],
     allowed_columns: frozenset[str],
     schema_graph: SchemaGraph,
+    *,
+    deny_tables: frozenset[str] | None = None,
+    deny_columns: frozenset[str] | None = None,
 ) -> bool:
     """Return True when every intent table/column reference lies in the space allowlists."""
     if not isinstance(intent, RuntimeIntent):
@@ -1355,13 +1665,18 @@ def assert_intent_in_scope(
     effective_tables = set(graph_tables)
     if allowed_tables:
         effective_tables &= set(allowed_tables)
-    restrict_columns = bool(allowed_columns)
+    if deny_tables:
+        effective_tables -= set(deny_tables)
+    restrict_columns = bool(allowed_columns) or bool(deny_columns)
     allowed_column_set = set(allowed_columns)
+    deny_column_set = set(deny_columns or ())
 
     def _column_allowed(table_name: str, col_name: str) -> bool:
+        qc = f"{table_name}.{col_name}"
+        if qc in deny_column_set:
+            return False
         if not restrict_columns:
             return True
-        qc = f"{table_name}.{col_name}"
         return qc in allowed_column_set
 
     cte_names = {cte.cte_name for cte in (intent.cte_steps or [])}
@@ -1372,9 +1687,22 @@ def assert_intent_in_scope(
             return True
         return table_name in effective_tables
 
-    def _check_column_ref(col: str) -> bool:
+    def _resolve_unqualified_column(col: str, scope_tables: list[str] | None) -> tuple[str, str] | None:
+        for table_name in scope_tables or []:
+            if table_name in cte_names:
+                continue
+            tm = schema_graph.tables.get(table_name)
+            if tm is not None and col in tm.columns:
+                return table_name, col
+        return None
+
+    def _check_column_ref(col: str, *, scope_tables: list[str] | None = None) -> bool:
         if "." not in col:
-            return True
+            resolved = _resolve_unqualified_column(col, scope_tables)
+            if resolved is None:
+                return not (restrict_columns or deny_column_set)
+            table_name, col_name = resolved
+            return _column_allowed(table_name, col_name)
         table_name, col_name = col.rsplit(".", 1)
         if table_name in cte_output_cols:
             return col_name in cte_output_cols[table_name]
@@ -1389,7 +1717,7 @@ def assert_intent_in_scope(
     def _check_scope_block(
         tables: list[str] | None,
         select_cols: list[Any] | None,
-        filters_param: list[Any] | None,
+        where_params: list[Any] | None,
         having_param: list[Any] | None,
         order_by_cols: list[Any] | None,
         group_by_cols: list[Any] | None,
@@ -1400,53 +1728,53 @@ def assert_intent_in_scope(
                 return False
         for sc in select_cols or []:
             for col in extract_columns_from_expr(sc.expr):
-                if not _check_column_ref(col):
+                if not _check_column_ref(col, scope_tables=tables):
                     return False
-        for fp in filters_param or []:
+        for fp in where_params or []:
             for col in extract_columns_from_expr(fp.left_expr):
-                if not _check_column_ref(col):
+                if not _check_column_ref(col, scope_tables=tables):
                     return False
             if fp.right_expr is not None:
                 for col in extract_columns_from_expr(fp.right_expr):
-                    if not _check_column_ref(col):
+                    if not _check_column_ref(col, scope_tables=tables):
                         return False
         for hp in having_param or []:
             for col in extract_columns_from_expr(hp.left_expr):
-                if not _check_column_ref(col):
+                if not _check_column_ref(col, scope_tables=tables):
                     return False
             if hp.right_expr is not None:
                 for col in extract_columns_from_expr(hp.right_expr):
-                    if not _check_column_ref(col):
+                    if not _check_column_ref(col, scope_tables=tables):
                         return False
         for ob in order_by_cols or []:
             for col in extract_columns_from_expr(ob.expr):
-                if not _check_column_ref(col):
+                if not _check_column_ref(col, scope_tables=tables):
                     return False
         for gb in group_by_cols or []:
             col = gb.primary_term if hasattr(gb, "primary_term") else str(gb)
-            if not _check_column_ref(col):
+            if not _check_column_ref(col, scope_tables=tables):
                 return False
         for step in window_registry or []:
             ws = step.window_spec
             for part in ws.partition_by or []:
                 for col in extract_columns_from_expr(part):
-                    if not _check_column_ref(col):
+                    if not _check_column_ref(col, scope_tables=tables):
                         return False
             for obc in ws.order_by or []:
                 for col in extract_columns_from_expr(obc.expr):
-                    if not _check_column_ref(col):
+                    if not _check_column_ref(col, scope_tables=tables):
                         return False
             if ws.argument is not None:
                 for col in extract_columns_from_expr(ws.argument):
-                    if not _check_column_ref(col):
+                    if not _check_column_ref(col, scope_tables=tables):
                         return False
         return True
 
     if not _check_scope_block(
-        list(intent.tables or []),
+        intent_join_reachability_tables(intent),
         intent.select_cols,
-        intent.filters_param,
-        intent.having_param,
+        where_leaves(intent.where),
+        having_leaves(intent.having),
         intent.order_by_cols,
         intent.group_by_cols,
         intent.window_registry,
@@ -1454,10 +1782,10 @@ def assert_intent_in_scope(
         return False
     for cte in intent.cte_steps or []:
         if not _check_scope_block(
-            list(cte.tables or []),
+            cte_join_reachability_tables(cte),
             cte.select_cols,
-            cte.filters_param,
-            cte.having_param,
+            where_leaves(cte.where),
+            having_leaves(cte.having),
             cte.order_by_cols,
             cte.group_by_cols,
             cte.window_registry,
@@ -1467,10 +1795,7 @@ def assert_intent_in_scope(
 
 
 def assert_consumer_intent_in_scope(
-    intent: Any,
-    schema_context: EngineContext,
-    schema_graph: SchemaGraph,
-    visible_objects: frozenset[str] | None,
+    intent: Any, schema_context: EngineContext, schema_graph: SchemaGraph, visible_objects: frozenset[str] | None
 ) -> bool:
     """Return True when every intent table and column reference lies in consumer scope."""
     if not isinstance(intent, RuntimeIntent):
@@ -1494,17 +1819,13 @@ def assert_consumer_intent_in_scope(
         if visible_objects is not None:
             if not allowed_tables:
                 return False
-            return assert_intent_in_scope(
-                intent,
-                frozenset(allowed_tables),
-                frozenset(),
-                schema_graph,
-            )
+            return assert_intent_in_scope(intent, frozenset(allowed_tables), frozenset(), schema_graph)
         return assert_intent_in_scope(
             intent,
-            frozenset(allowed_tables) if schema_context.allow_objects else frozenset(),
+            frozenset(allowed_tables),
             frozenset(),
             schema_graph,
+            deny_tables=frozenset(schema_context.deny_objects or ()),
         )
 
     def _column_allowed(table_name: str, col_name: str) -> bool:
@@ -1528,9 +1849,26 @@ def assert_consumer_intent_in_scope(
             return True
         return table_name in allowed_tables
 
-    def _check_column_ref(col: str) -> bool:
+    def _resolve_unqualified_column(col: str, scope_tables: list[str] | None) -> tuple[str, str] | None:
+        for table_name in scope_tables or []:
+            if table_name in cte_names:
+                continue
+            tm = schema_graph.tables.get(table_name)
+            if tm is not None and col in tm.columns:
+                return table_name, col
+        return None
+
+    def _check_column_ref(col: str, *, scope_tables: list[str] | None = None) -> bool:
         if "." not in col:
-            return True
+            resolved = _resolve_unqualified_column(col, scope_tables)
+            if resolved is None:
+                return not (restrict_columns or qualified_denies or glob_denies)
+            table_name, col_name = resolved
+            if table_name in cte_output_cols:
+                return col_name in cte_output_cols[table_name]
+            if not _check_table(table_name):
+                return False
+            return _column_allowed(table_name, col_name)
         table_name, col_name = col.rsplit(".", 1)
         if table_name in cte_output_cols:
             return col_name in cte_output_cols[table_name]
@@ -1545,7 +1883,7 @@ def assert_consumer_intent_in_scope(
     def _check_scope_block(
         tables: list[str] | None,
         select_cols: list[Any] | None,
-        filters_param: list[Any] | None,
+        where_params: list[Any] | None,
         having_param: list[Any] | None,
         order_by_cols: list[Any] | None,
         group_by_cols: list[Any] | None,
@@ -1556,53 +1894,53 @@ def assert_consumer_intent_in_scope(
                 return False
         for sc in select_cols or []:
             for col in extract_columns_from_expr(sc.expr):
-                if not _check_column_ref(col):
+                if not _check_column_ref(col, scope_tables=tables):
                     return False
-        for fp in filters_param or []:
+        for fp in where_params or []:
             for col in extract_columns_from_expr(fp.left_expr):
-                if not _check_column_ref(col):
+                if not _check_column_ref(col, scope_tables=tables):
                     return False
             if fp.right_expr is not None:
                 for col in extract_columns_from_expr(fp.right_expr):
-                    if not _check_column_ref(col):
+                    if not _check_column_ref(col, scope_tables=tables):
                         return False
         for hp in having_param or []:
             for col in extract_columns_from_expr(hp.left_expr):
-                if not _check_column_ref(col):
+                if not _check_column_ref(col, scope_tables=tables):
                     return False
             if hp.right_expr is not None:
                 for col in extract_columns_from_expr(hp.right_expr):
-                    if not _check_column_ref(col):
+                    if not _check_column_ref(col, scope_tables=tables):
                         return False
         for ob in order_by_cols or []:
             for col in extract_columns_from_expr(ob.expr):
-                if not _check_column_ref(col):
+                if not _check_column_ref(col, scope_tables=tables):
                     return False
         for gb in group_by_cols or []:
             col = gb.primary_term if hasattr(gb, "primary_term") else str(gb)
-            if not _check_column_ref(col):
+            if not _check_column_ref(col, scope_tables=tables):
                 return False
         for step in window_registry or []:
             ws = step.window_spec
             for part in ws.partition_by or []:
                 for col in extract_columns_from_expr(part):
-                    if not _check_column_ref(col):
+                    if not _check_column_ref(col, scope_tables=tables):
                         return False
             for obc in ws.order_by or []:
                 for col in extract_columns_from_expr(obc.expr):
-                    if not _check_column_ref(col):
+                    if not _check_column_ref(col, scope_tables=tables):
                         return False
             if ws.argument is not None:
                 for col in extract_columns_from_expr(ws.argument):
-                    if not _check_column_ref(col):
+                    if not _check_column_ref(col, scope_tables=tables):
                         return False
         return True
 
     if not _check_scope_block(
-        list(intent.tables or []),
+        intent_join_reachability_tables(intent),
         intent.select_cols,
-        intent.filters_param,
-        intent.having_param,
+        where_leaves(intent.where),
+        having_leaves(intent.having),
         intent.order_by_cols,
         intent.group_by_cols,
         intent.window_registry,
@@ -1610,10 +1948,10 @@ def assert_consumer_intent_in_scope(
         return False
     for cte in intent.cte_steps or []:
         if not _check_scope_block(
-            list(cte.tables or []),
+            cte_join_reachability_tables(cte),
             cte.select_cols,
-            cte.filters_param,
-            cte.having_param,
+            where_leaves(cte.where),
+            having_leaves(cte.having),
             cte.order_by_cols,
             cte.group_by_cols,
             cte.window_registry,
@@ -1713,13 +2051,7 @@ def upgrade_artifacts_schema_graph_id(artifacts_dir: str) -> dict[str, int]:
             header = read_gzip_json(header_path)
             if isinstance(header, dict):
                 eff = str(header.get("effective_structural_hash", header.get("schema_hash", "")) or "")
-        except (
-            OSError,
-            EOFError,
-            gzip.BadGzipFile,
-            json.JSONDecodeError,
-            UnicodeDecodeError,
-        ):
+        except (OSError, EOFError, gzip.BadGzipFile, json.JSONDecodeError, UnicodeDecodeError):
             eff = ""
     if not structural and eff:
         structural = eff
@@ -1729,13 +2061,7 @@ def upgrade_artifacts_schema_graph_id(artifacts_dir: str) -> dict[str, int]:
     if os.path.isfile(header_path):
         try:
             header = read_gzip_json(header_path)
-        except (
-            OSError,
-            EOFError,
-            gzip.BadGzipFile,
-            json.JSONDecodeError,
-            UnicodeDecodeError,
-        ):
+        except (OSError, EOFError, gzip.BadGzipFile, json.JSONDecodeError, UnicodeDecodeError):
             header = {}
         if isinstance(header, dict):
             header["schema_graph_id"] = graph_id
@@ -1744,13 +2070,7 @@ def upgrade_artifacts_schema_graph_id(artifacts_dir: str) -> dict[str, int]:
         for part_path in glob.glob(os.path.join(store_dir, f"{TEMPLATE_STORE_PARTITION_PREFIX}*.json.gz")):
             try:
                 part_doc = read_gzip_json(part_path)
-            except (
-                OSError,
-                EOFError,
-                gzip.BadGzipFile,
-                json.JSONDecodeError,
-                UnicodeDecodeError,
-            ):
+            except (OSError, EOFError, gzip.BadGzipFile, json.JSONDecodeError, UnicodeDecodeError):
                 continue
             if not isinstance(part_doc, dict):
                 continue
@@ -1766,13 +2086,7 @@ def upgrade_artifacts_schema_graph_id(artifacts_dir: str) -> dict[str, int]:
             if isinstance(cache, dict):
                 cache["schema_graph_id"] = graph_id
                 write_gzip_json_atomic(schema_path, cache, sort_keys=True)
-        except (
-            OSError,
-            EOFError,
-            gzip.BadGzipFile,
-            json.JSONDecodeError,
-            UnicodeDecodeError,
-        ):
+        except (OSError, EOFError, gzip.BadGzipFile, json.JSONDecodeError, UnicodeDecodeError):
             pass
     write_artifact_manifest(
         artifacts_dir,
@@ -1820,7 +2134,7 @@ def upgrade_artifacts_schema_graph_id(artifacts_dir: str) -> dict[str, int]:
     return counts
 
 
-def scope_descriptor_for(ctx: EngineContext) -> dict[str, Any]:
+def scope_descriptor_for(ctx: EngineContext | FederationContext) -> dict[str, Any]:
     """Return a JSON-serialisable descriptor of *ctx*'s scope-relevant fields for cache persistence."""
     return {
         "allow_objects": sorted(ctx.allow_objects),
@@ -1834,10 +2148,9 @@ def scope_descriptor_for(ctx: EngineContext) -> dict[str, Any]:
 def schema_context_from_descriptor(desc: dict[str, Any]) -> EngineContext:
     """Reconstruct a :class:`EngineContext` from a cached scope descriptor (4 scope fields)."""
     inc_raw = desc.get("include", "tables")
-    if inc_raw not in ("tables", "views", "both"):
+    if inc_raw not in ("tables", "views"):
         inc_raw = "tables"
     return EngineContext(
-        name="master",
         allow_objects=frozenset(str(x) for x in (desc.get("allow_objects") or [])),
         deny_objects=frozenset(str(x) for x in (desc.get("deny_objects") or [])),
         deny_columns=frozenset(str(x) for x in (desc.get("deny_columns") or [])),
@@ -1875,10 +2188,7 @@ def _analyze_fk_path_topology(path: list[dict[str, Any]]) -> tuple[str, str, lis
     if not table_counts:
         return ("none", "", [])
     leaves = sorted([t for t, c in table_counts.items() if c == 1])
-    hubs = sorted(
-        [t for t, c in table_counts.items() if c > 1],
-        key=lambda t: (-table_counts[t], t),
-    )
+    hubs = sorted([t for t, c in table_counts.items() if c > 1], key=lambda t: (-table_counts[t], t))
     if len(leaves) == 2 and len(hubs) == len(table_counts) - 2:
         return ("linear", min(leaves), leaves)
     if len(hubs) == 1:
@@ -1888,12 +2198,47 @@ def _analyze_fk_path_topology(path: list[dict[str, Any]]) -> tuple[str, str, lis
     return ("linear", min(table_counts.keys()), list(table_counts.keys()))
 
 
+def _tie_overflow_marker(path_count: int) -> list[list[dict[str, Any]]]:
+    """Encode an exceeded tie count as a single stored path entry."""
+    return [[{JOIN_PATH_TIE_OVERFLOW_MARKER: path_count}]]
+
+
+def _parse_stored_join_paths(raw: list[list[dict[str, Any]]]) -> tuple[list[list[dict[str, Any]]], int | None]:
+    """Split stored pair paths from an overflow marker, when present."""
+    if (
+        len(raw) == 1
+        and len(raw[0]) == 1
+        and isinstance(raw[0][0], dict)
+        and JOIN_PATH_TIE_OVERFLOW_MARKER in raw[0][0]
+    ):
+        return [], int(raw[0][0][JOIN_PATH_TIE_OVERFLOW_MARKER])
+    return raw, None
+
+
+def join_path_pair_tie_count(
+    join_paths_multi: dict[str, dict[str, list[list[dict[str, Any]]]]], source: str, target: str
+) -> int:
+    """Return the equal-length shortest-path count for one ordered table pair."""
+    raw = join_paths_multi.get(source, {}).get(target, [])
+    _paths, overflow = _parse_stored_join_paths(raw)
+    if overflow is not None:
+        return overflow
+    return len(raw)
+
+
+def stored_join_paths_for_pair(
+    join_paths_multi: dict[str, dict[str, list[list[dict[str, Any]]]]], source: str, target: str
+) -> tuple[list[list[dict[str, Any]]], int | None]:
+    """Return usable stored paths and an overflow count when the pair exceeded storage."""
+    raw = join_paths_multi.get(source, {}).get(target, [])
+    return _parse_stored_join_paths(raw)
+
+
 def compute_join_paths_multi_from_adj(
-    adj: dict[str, list[FKEdge]],
-    tlist: list[str],
+    adj: dict[str, list[FKEdge]], tlist: list[str], *, tie_cap: int | None = None
 ) -> dict[str, dict[str, list[list[dict[str, Any]]]]]:
-    """All shortest FK-edge paths per ordered table pair, capped per. pair for storage size."""
-    cap = max(1, int(PolicyConfig.JOIN_SHORTEST_PATH_TIE_CAP))
+    """All shortest FK-edge paths per ordered table pair, marking pairs that exceed storage."""
+    refusal_ceiling = max(1, int(tie_cap if tie_cap is not None else JOIN_PATH_TIE_REFUSAL_CEILING))
     join_paths_multi: dict[str, dict[str, list[list[dict[str, Any]]]]] = {}
     for s in tlist:
         row: dict[str, list[list[dict[str, Any]]]] = {s: [[]]}
@@ -1938,9 +2283,7 @@ def compute_join_paths_multi_from_adj(
                 _preds: dict[str, list[tuple[str, FKEdge]]] = preds,
                 _target: str = s,
             ) -> None:
-                """Depth-first FK-path enumeration bounded by ``cap`` for one source/target pair."""
-                if len(_paths_edges) >= cap:
-                    return
+                """Depth-first FK-path enumeration for one source/target pair."""
                 if node == _target:
                     _paths_edges.append(list(reversed(stack)))
                     return
@@ -1958,7 +2301,10 @@ def compute_join_paths_multi_from_adj(
                     continue
                 seen_keys.add(key)
                 out_paths.append(norm)
-            row[t] = out_paths
+            if len(out_paths) > refusal_ceiling:
+                row[t] = _tie_overflow_marker(len(out_paths))
+            else:
+                row[t] = out_paths
         join_paths_multi[s] = row
     return join_paths_multi
 
@@ -2111,12 +2457,12 @@ def _fk_overlap_sample_norm_set(col: ColumnMetadata) -> set[str]:
 
 
 def fk_overlap_validates(src: ColumnMetadata, dst: ColumnMetadata) -> bool:
-    """Return True when sampled values overlap enough to support an inferred FK. Compares ``value_overlap_sample`` from both sides after normalizing via ``str()`` and stripping. When either side has fewer than ``PolicyConfig.FK_INFER_OVERLAP_MIN_SAMPLE`` non-empty samples the helper returns True (insufficient evidence to reject — fall back to the naming-only signal). Otherwise the overlap ratio is computed against the smaller sample set, and the candidate is accepted when the ratio is at least ``PolicyConfig.FK_INFER_OVERLAP_MIN_RATIO``. The helper is symmetric and treats integer / digit-string pairs as equal after string normalization so it cooperates with ``_fk_string_int_compatible``."""
+    """Return True when sampled values overlap enough to support an inferred FK. Compares ``value_overlap_sample`` from both sides after normalizing via ``str()`` and stripping. When either side has fewer than ``PolicyConfig.FK_INFER_OVERLAP_MIN_SAMPLE`` non-empty samples the helper returns False (insufficient evidence to accept). Otherwise the overlap ratio is computed against the smaller sample set, and the candidate is accepted when the ratio is at least ``PolicyConfig.FK_INFER_OVERLAP_MIN_RATIO``. The helper is symmetric and treats integer / digit-string pairs as equal after string normalization so it cooperates with ``_fk_string_int_compatible``."""
     a_set = _fk_overlap_sample_norm_set(src)
     b_set = _fk_overlap_sample_norm_set(dst)
     min_sample = int(PolicyConfig.FK_INFER_OVERLAP_MIN_SAMPLE)
     if len(a_set) < min_sample or len(b_set) < min_sample:
-        return True
+        return False
     overlap = len(a_set & b_set)
     smaller = min(len(a_set), len(b_set))
     ratio = overlap / smaller if smaller else 0.0
@@ -2124,12 +2470,12 @@ def fk_overlap_validates(src: ColumnMetadata, dst: ColumnMetadata) -> bool:
 
 
 def _fk_containment_validates(child: ColumnMetadata, parent: ColumnMetadata) -> bool:
-    """Return True when the child sample is sufficiently contained in the parent sample. Directional FK semantics require child values to appear in the parent key domain. ASC-ordered LIMIT-N samples are not guaranteed to be subsets, so acceptance uses ``|child ∩ parent| / |child|`` against ``PolicyConfig.FK_INFER_CONTAINMENT_MIN_RATIO``."""
+    """Return True when the child sample is sufficiently contained in the parent sample. Directional FK semantics require child values to appear in the parent key domain. ASC-ordered LIMIT-N samples are not guaranteed to be subsets, so acceptance uses ``|child ∩ parent| / |child|`` against ``PolicyConfig.FK_INFER_CONTAINMENT_MIN_RATIO``. When either side has fewer than ``PolicyConfig.FK_INFER_OVERLAP_MIN_SAMPLE`` non-empty samples the helper returns False (insufficient evidence to accept)."""
     child_set = _fk_overlap_sample_norm_set(child)
     parent_set = _fk_overlap_sample_norm_set(parent)
     min_sample = int(PolicyConfig.FK_INFER_OVERLAP_MIN_SAMPLE)
     if len(child_set) < min_sample or len(parent_set) < min_sample:
-        return True
+        return False
     if not child_set:
         return True
     containment = len(child_set & parent_set) / len(child_set)
@@ -2182,8 +2528,25 @@ def revalidate_named_fks_with_overlap(sg: SchemaGraph) -> int:
     return removed
 
 
-_INFERRED_PK_NAME_SUFFIXES: tuple[str, ...] = tuple(s for s in FK_INFERENCE_SUFFIX_STEMS if s in PK_STYLE_FK_STEMS)
-_PK_NAME_SUFFIXES_FOR_LONGEST: tuple[str, ...] = ("_id", "_key", "_uuid", "_pk")
+def refuse_incompatible_catalog_foreign_keys(sg: SchemaGraph) -> None:
+    """Refuse catalog foreign keys whose column types are incompatible at graph build."""
+    for tbl_name, tbl in sg.tables.items():
+        for edge in tbl.foreign_keys:
+            if edge.inference_tag is not None:
+                continue
+            dst_tbl = sg.tables.get(edge.dst_table)
+            if dst_tbl is None:
+                continue
+            for src_col, dst_col in zip(edge.src_cols, edge.dst_cols, strict=True):
+                child_col = tbl.columns.get(src_col)
+                parent_col = dst_tbl.columns.get(dst_col)
+                if child_col is None or parent_col is None:
+                    continue
+                if not fk_infer_value_types_compatible(child_col, parent_col):
+                    raise SchemaInvariantError(
+                        f"catalog foreign key {tbl_name}.{src_col} -> {edge.dst_table}.{dst_col} has "
+                        f"incompatible value types {child_col.value_type!r} and {parent_col.value_type!r}"
+                    )
 
 
 def _pk_null_gate_passes(col: ColumnMetadata) -> bool:
@@ -2196,24 +2559,14 @@ def _pk_null_gate_passes(col: ColumnMetadata) -> bool:
 
 
 def _statistical_pk_unique(
-    table_name: str,
-    table: TableMetadata,
-    col_name: str,
-    col: ColumnMetadata,
-    *,
-    dialect: Any | None,
-    min_rows: int,
+    table_name: str, table: TableMetadata, col_name: str, col: ColumnMetadata, *, dialect: Any | None, min_rows: int
 ) -> bool:
     """Return True when profiling statistics support a tier-2 PK candidate."""
     rc = int(table.row_count or 0)
     if col.distinct_from_sample:
         if dialect is None:
             return False
-        ft = dialect.refresh_full_table_distinct_for_pk_inference(
-            table_name,
-            col_name,
-            table_kind=table.kind,
-        )
+        ft = dialect.refresh_full_table_distinct_for_pk_inference(table_name, col_name, table_kind=table.kind)
         if ft is None:
             return False
         dist_ft, cnt_ft, nr_ft = ft
@@ -2237,12 +2590,7 @@ def _apply_inferred_pk_columns(table: TableMetadata, col_names: list[str]) -> No
 
 
 def _infer_composite_pk_from_profile(
-    table_name: str,
-    table: TableMetadata,
-    not_null_cols: list[str],
-    *,
-    dialect: Any | None,
-    min_rows: int,
+    table_name: str, table: TableMetadata, not_null_cols: list[str], *, dialect: Any | None, min_rows: int
 ) -> list[str] | None:
     """Probe NOT NULL column combinations until one matches row-count distinct tuples."""
     rc = int(table.row_count or 0)
@@ -2268,10 +2616,7 @@ def _infer_composite_pk_from_profile(
 
 
 def infer_missing_pks_from_profile(
-    tables: dict[str, TableMetadata],
-    *,
-    blocked: frozenset[tuple[str, str]] = frozenset(),
-    dialect: Any | None = None,
+    tables: dict[str, TableMetadata], *, blocked: frozenset[tuple[str, str]] = frozenset(), dialect: Any | None = None
 ) -> list[tuple[str, str]]:
     """Infer single- or composite-column primary keys from catalog UNIQUE and profiling statistics."""
     inferred: list[tuple[str, str]] = []
@@ -2296,14 +2641,7 @@ def infer_missing_pks_from_profile(
             if col.is_unique:
                 tier1.append(col_name)
                 continue
-            if _statistical_pk_unique(
-                table_name,
-                table,
-                col_name,
-                col,
-                dialect=dialect,
-                min_rows=min_rows,
-            ):
+            if _statistical_pk_unique(table_name, table, col_name, col, dialect=dialect, min_rows=min_rows):
                 tier2.append(col_name)
         chosen_cols: list[str] | None = None
         if tier1:
@@ -2316,11 +2654,7 @@ def infer_missing_pks_from_profile(
                 chosen_cols = [chosen]
         elif not_null_cols:
             composite = _infer_composite_pk_from_profile(
-                table_name,
-                table,
-                not_null_cols,
-                dialect=dialect,
-                min_rows=min_rows,
+                table_name, table, not_null_cols, dialect=dialect, min_rows=min_rows
             )
             if composite:
                 chosen_cols = composite
@@ -2360,7 +2694,7 @@ def _select_inferred_pk_candidate(table_name: str, candidates: list[str]) -> str
     best_len = -1
     for name in sorted_candidates:
         lower = name.lower()
-        for suffix in _PK_NAME_SUFFIXES_FOR_LONGEST:
+        for suffix in PK_NAME_SUFFIXES_FOR_LONGEST:
             if lower.endswith(suffix) and len(suffix) > best_len:
                 best = name
                 best_len = len(suffix)
@@ -2415,9 +2749,7 @@ def table_pair_has_structural_fk(sg: SchemaGraph, a: str, b: str) -> bool:
 
 
 def bridge_disjoint_graph_by_value_overlap(
-    sg: SchemaGraph,
-    *,
-    blocked: frozenset[tuple[str, tuple[str, ...], str, tuple[str, ...]]] = frozenset(),
+    sg: SchemaGraph, *, blocked: frozenset[tuple[str, tuple[str, ...], str, tuple[str, ...]]] = frozenset()
 ) -> int:
     """Bridge catalog-FK islands using type-compatible column value overlap."""
     if catalog_fk_graph_is_connected(sg):
@@ -2425,8 +2757,10 @@ def bridge_disjoint_graph_by_value_overlap(
     uf = catalog_fk_union_find(sg)
     promoted = 0
     cols: list[tuple[str, str, ColumnMetadata]] = []
-    for tname, tbl in sg.tables.items():
-        for cname, cmeta in tbl.columns.items():
+    for tname in sorted(sg.tables):
+        tbl = sg.tables[tname]
+        for cname in sorted(tbl.columns):
+            cmeta = tbl.columns[cname]
             if cmeta.value_overlap_sample:
                 cols.append((tname, cname, cmeta))
     for i, (t1, c1, m1) in enumerate(cols):
@@ -2451,12 +2785,10 @@ def bridge_disjoint_graph_by_value_overlap(
                 src_tbl, src_col, dst_tbl, dst_col = t1, c1, t2, c2
             else:
                 m1.semantic_join_neighbors = sorted(
-                    set(m1.semantic_join_neighbors) | {(t2, c2)},
-                    key=lambda p: (p[0], p[1]),
+                    set(m1.semantic_join_neighbors) | {(t2, c2)}, key=lambda p: (p[0], p[1])
                 )
                 m2.semantic_join_neighbors = sorted(
-                    set(m2.semantic_join_neighbors) | {(t1, c1)},
-                    key=lambda p: (p[0], p[1]),
+                    set(m2.semantic_join_neighbors) | {(t1, c1)}, key=lambda p: (p[0], p[1])
                 )
                 continue
             child = sg.tables[src_tbl].columns[src_col]
@@ -2487,13 +2819,13 @@ def run_fk_inference_if_disconnected(
     semantic_neighbors: bool = True,
     semantic_promotion: bool = True,
 ) -> int:
-    """Run FK inference, semantic discovery, and overlap bridging only when catalog FKs leave islands."""
+    """Populate semantic join neighbours from profile overlap, then infer FKs and bridge islands only when catalog FKs are disconnected."""
+    if semantic_neighbors:
+        compute_semantic_profile_join_neighbors(sg)
     if catalog_fk_graph_is_connected(sg):
         debug("[schema.fk_inference] catalog FK graph connected; skipping inference")
         return 0
     total = pair_targeted_fk_inference(sg, blocked=blocked)
-    if semantic_neighbors:
-        compute_semantic_profile_join_neighbors(sg)
     revalidated = revalidate_named_fks_with_overlap(sg)
     if revalidated:
         debug(f"[schema.fk_inference] removed {revalidated} name-inferred FK(s) failing overlap")
@@ -2566,10 +2898,7 @@ class _FkUnionFind:
             self._rank[ra] += 1
 
 
-def _union_find_with_tag_filter(
-    sg: SchemaGraph,
-    exclude_tags: frozenset[InferenceTag],
-) -> _FkUnionFind:
+def _union_find_with_tag_filter(sg: SchemaGraph, exclude_tags: frozenset[InferenceTag]) -> _FkUnionFind:
     """Connect tables using FK edges whose inference_tag is not in *exclude_tags* (catalog edges always union)."""
     uf = _FkUnionFind()
     for t in sg.tables:
@@ -2602,23 +2931,8 @@ def _union_find_truth_fk_edges(sg: SchemaGraph) -> _FkUnionFind:
     return uf
 
 
-_UF_EXCLUDE_SEMANTIC_INFERENCE_ONLY: frozenset[InferenceTag] = frozenset({InferenceTag.SEMANTIC})
-
-_INFERRED_COLLAPSE_TAGS: frozenset[InferenceTag] = frozenset(
-    {
-        InferenceTag.SUFFIX,
-        InferenceTag.SELF,
-        InferenceTag.COMPOSITE,
-        InferenceTag.SEMANTIC,
-        InferenceTag.SEMANTIC_PROMOTED,
-    }
-)
-
-
 def pair_targeted_fk_inference(
-    sg: SchemaGraph,
-    *,
-    blocked: frozenset[tuple[str, tuple[str, ...], str, tuple[str, ...]]],
+    sg: SchemaGraph, *, blocked: frozenset[tuple[str, tuple[str, ...], str, tuple[str, ...]]]
 ) -> int:
     """Infer FK candidates between table pairs until fixed point when the catalog FK graph is disconnected."""
     if catalog_fk_graph_is_connected(sg):
@@ -2633,10 +2947,7 @@ def pair_targeted_fk_inference(
             if t not in sg.tables:
                 continue
             edges = infer_missing_fks(
-                sg.tables,
-                blocked=blocked,
-                restrict_tables=frozenset({t}),
-                skip_table_pairs=skip_pairs,
+                sg.tables, blocked=blocked, restrict_tables=frozenset({t}), skip_table_pairs=skip_pairs
             )
             round_added += _apply_inferred_fks_to_graph(sg, edges)
         uf = _union_find_with_tag_filter(sg, frozenset())
@@ -2650,10 +2961,7 @@ def pair_targeted_fk_inference(
                     continue
                 skip_pairs = structural_fk_table_pairs(sg)
                 edges = infer_missing_fks(
-                    sg.tables,
-                    blocked=blocked,
-                    restrict_tables=frozenset({a, b}),
-                    skip_table_pairs=skip_pairs,
+                    sg.tables, blocked=blocked, restrict_tables=frozenset({a, b}), skip_table_pairs=skip_pairs
                 )
                 n = _apply_inferred_fks_to_graph(sg, edges)
                 round_added += n
@@ -2675,11 +2983,10 @@ def collapse_redundant_inferences(sg: SchemaGraph, skipped: list[OverrideSkip]) 
             if e.src_table != tbl_name:
                 continue
             tag = e.inference_tag
-            if tag in _INFERRED_COLLAPSE_TAGS and uf_truth.find(e.src_table) == uf_truth.find(e.dst_table):
+            if tag in INFERRED_COLLAPSE_TAGS and uf_truth.find(e.src_table) == uf_truth.find(e.dst_table):
                 skipped.append(
                     OverrideSkip(
-                        path=f"foreign_keys.inferred.{e.src_table}->{e.dst_table}",
-                        reason="superseded_by_user_fk",
+                        path=f"foreign_keys.inferred.{e.src_table}->{e.dst_table}", reason="superseded_by_user_fk"
                     )
                 )
                 removed += 1
@@ -2710,10 +3017,7 @@ def collapse_redundant_inferences(sg: SchemaGraph, skipped: list[OverrideSkip]) 
             st, _sc, dt, _dc = quad
             if st in sg.tables and dt in sg.tables and uf_truth.find(st) == uf_truth.find(dt):
                 skipped.append(
-                    OverrideSkip(
-                        path=f"tables.{tbl_name}._user_semantic_neighbors",
-                        reason="superseded_by_user_fk",
-                    )
+                    OverrideSkip(path=f"tables.{tbl_name}._user_semantic_neighbors", reason="superseded_by_user_fk")
                 )
                 removed += 1
                 continue
@@ -2761,9 +3065,11 @@ def promote_semantic_neighbor_pairs(
         return 0
     seen_pairs: set[tuple[tuple[str, str], tuple[str, str]]] = set()
     promotions: list[tuple[tuple[str, str], tuple[str, str]]] = []
-    for tbl_name, tbl in sg.tables.items():
-        for col_name, col in tbl.columns.items():
-            for neigh_tbl, neigh_col in col.semantic_join_neighbors:
+    for tbl_name, tbl in sorted(sg.tables.items(), key=lambda item: item[0].lower()):
+        for col_name, col in sorted(tbl.columns.items(), key=lambda item: item[0].lower()):
+            for neigh_tbl, neigh_col in sorted(
+                col.semantic_join_neighbors, key=lambda item: (item[0].lower(), item[1].lower())
+            ):
                 a = (tbl_name, col_name)
                 b = (neigh_tbl, neigh_col)
                 ordered_pair: list[tuple[str, str]] = sorted([a, b])
@@ -2773,7 +3079,7 @@ def promote_semantic_neighbor_pairs(
                 seen_pairs.add(pair)
                 promotions.append(pair)
     promoted = 0
-    uf = _union_find_with_tag_filter(sg, _UF_EXCLUDE_SEMANTIC_INFERENCE_ONLY)
+    uf = _union_find_with_tag_filter(sg, frozenset(InferenceTag(t) for t in UF_EXCLUDE_SEMANTIC_INFERENCE_ONLY))
     for left, right in promotions:
         left_tbl = sg.tables.get(left[0])
         right_tbl = sg.tables.get(right[0])
@@ -2843,7 +3149,7 @@ def promote_semantic_neighbor_pairs(
         if added == 0:
             continue
         promoted += added
-        uf = _union_find_with_tag_filter(sg, _UF_EXCLUDE_SEMANTIC_INFERENCE_ONLY)
+        uf = _union_find_with_tag_filter(sg, frozenset(InferenceTag(t) for t in UF_EXCLUDE_SEMANTIC_INFERENCE_ONLY))
         for tbl_name_c, col_name_c, other in (
             (src_tbl_name, src_col_name, (dst_tbl_name, dst_col_name)),
             (dst_tbl_name, dst_col_name, (src_tbl_name, src_col_name)),
@@ -2867,8 +3173,8 @@ def _infer_missing_fks_suffix(
 ) -> list[FKEdge]:
     """Infer FK edges from ``*_id`` / ``*_key`` style names using case- insensitive matching."""
     inferred: list[FKEdge] = []
-    for table_name, table in tables.items():
-        for col_name, col in table.columns.items():
+    for table_name, table in sorted(tables.items(), key=lambda item: item[0].lower()):
+        for col_name, col in sorted(table.columns.items(), key=lambda item: item[0].lower()):
             if col.is_foreign_key or col.is_primary_key:
                 continue
             col_lower = col_name.lower()
@@ -2926,16 +3232,11 @@ def _infer_missing_fks_suffix(
 
 
 def promote_cross_component_semantic_edges(
-    sg: SchemaGraph,
-    *,
-    blocked: frozenset[tuple[str, tuple[str, ...], str, tuple[str, ...]]] = frozenset(),
+    sg: SchemaGraph, *, blocked: frozenset[tuple[str, tuple[str, ...], str, tuple[str, ...]]] = frozenset()
 ) -> int:
     """Prefer semantic promotions that bridge structural FK islands."""
     return promote_semantic_neighbor_pairs(
-        sg,
-        cross_component_only=True,
-        inference_tag=InferenceTag.SEMANTIC_PROMOTED,
-        blocked=blocked,
+        sg, cross_component_only=True, inference_tag=InferenceTag.SEMANTIC_PROMOTED, blocked=blocked
     )
 
 
@@ -2963,7 +3264,7 @@ def compute_database_feature_capability(sg: SchemaGraph) -> DatabaseFeatureCapab
             self_tables.add(e.src_table)
 
     agg_by: dict[str, set[str]] = {}
-    other_date_columny: dict[str, set[str]] = {}
+    date_columns_by_table_local: dict[str, set[str]] = {}
     arr_by: dict[str, set[str]] = {}
     has_num = False
     has_date = False
@@ -2980,7 +3281,7 @@ def compute_database_feature_capability(sg: SchemaGraph) -> DatabaseFeatureCapab
             role_v = str(col.role or "")
             if is_date_type(dt) or role_v == ColumnRole.TEMPORAL.value:
                 has_date = True
-                other_date_columny.setdefault(tn, set()).add(cn)
+                date_columns_by_table_local.setdefault(tn, set()).add(cn)
             if is_numeric_type(dt) or role_v == ColumnRole.NUMERIC_MEASURE.value:
                 has_num = True
                 agg_by.setdefault(tn, set()).add(cn)
@@ -3011,8 +3312,174 @@ def compute_database_feature_capability(sg: SchemaGraph) -> DatabaseFeatureCapab
         tables_supporting_self_join=frozenset(self_tables),
         has_window_capable_table_sets=has_window,
         aggregatable_columns_by_table={k: frozenset(v) for k, v in agg_by.items()},
-        date_columns_by_table={k: frozenset(v) for k, v in other_date_columny.items()},
+        date_columns_by_table={k: frozenset(v) for k, v in date_columns_by_table_local.items()},
         array_columns_by_table={k: frozenset(v) for k, v in arr_by.items()},
+        supports_semi_join=_graph_supports_semi_join(sg) and tc > 0,
+        supports_anti_join=_graph_supports_anti_join(sg) and tc > 0,
+        supports_predicate_nesting=_graph_supports_predicate_nesting(sg) and tc > 0,
+        supports_preserve_tables=fk_edge_count >= 1 or tc >= 2,
+        supports_ordered_string_agg=_graph_supports_ordered_string_agg(sg),
+        supports_median=_graph_supports_median(sg),
+        supports_stddev=_graph_supports_stddev(sg),
+        supports_variance=_graph_supports_variance(sg),
+        supports_window_frames=_graph_supports_window_frames(sg),
+        supports_array_contains=_graph_supports_array_contains(sg),
+        supports_collation=_graph_supports_collation(sg),
+        supports_unsigned_semantics=_graph_supports_unsigned_semantics(sg),
+        supports_timestamptz_semantics=_graph_supports_timestamptz_semantics(sg),
+    )
+
+
+def _graph_engine_from_membership(sg: SchemaGraph) -> str:
+    membership = sg.federation_membership if isinstance(sg.federation_membership, dict) else {}
+    return str((membership or {}).get("engine", "") or "").strip().lower()
+
+
+def _graph_supports_median(sg: SchemaGraph) -> bool:
+    engine = _graph_engine_from_membership(sg)
+    if engine:
+        return engine_supports_median(engine)
+    return True
+
+
+def _graph_supports_ordered_string_agg(sg: SchemaGraph) -> bool:
+    engine = _graph_engine_from_membership(sg)
+    if engine:
+        return engine_supports_ordered_string_agg(engine)
+    return True
+
+
+def _graph_supports_semi_join(sg: SchemaGraph) -> bool:
+    engine = _graph_engine_from_membership(sg)
+    if engine:
+        return engine_supports_semi_join(engine)
+    return True
+
+
+def _graph_supports_anti_join(sg: SchemaGraph) -> bool:
+    engine = _graph_engine_from_membership(sg)
+    if engine:
+        return engine_supports_anti_join(engine)
+    return True
+
+
+def _graph_supports_predicate_nesting(sg: SchemaGraph) -> bool:
+    engine = _graph_engine_from_membership(sg)
+    if engine:
+        return engine_supports_predicate_nesting(engine)
+    return True
+
+
+def _graph_supports_stddev(sg: SchemaGraph) -> bool:
+    engine = _graph_engine_from_membership(sg)
+    if engine:
+        return engine_supports_stddev(engine)
+    return True
+
+
+def _graph_supports_variance(sg: SchemaGraph) -> bool:
+    engine = _graph_engine_from_membership(sg)
+    if engine:
+        return engine_supports_variance(engine)
+    return True
+
+
+def _graph_supports_window_frames(sg: SchemaGraph) -> bool:
+    engine = _graph_engine_from_membership(sg)
+    if engine:
+        return engine_supports_window_frames(engine)
+    return True
+
+
+def _graph_supports_array_contains(sg: SchemaGraph) -> bool:
+    engine = _graph_engine_from_membership(sg)
+    if engine:
+        return engine_supports_array_contains(engine)
+    return True
+
+
+def _graph_supports_collation(sg: SchemaGraph) -> bool:
+    engine = _graph_engine_from_membership(sg)
+    if engine:
+        return engine_supports_collation(engine)
+    return True
+
+
+def _graph_supports_unsigned_semantics(sg: SchemaGraph) -> bool:
+    engine = _graph_engine_from_membership(sg)
+    if engine:
+        return engine_supports_unsigned_semantics(engine)
+    return True
+
+
+def _graph_supports_timestamptz_semantics(sg: SchemaGraph) -> bool:
+    engine = _graph_engine_from_membership(sg)
+    if engine:
+        return engine_supports_timestamptz_semantics(engine)
+    return True
+
+
+def _intersect_column_sets_by_table(
+    caps: Sequence[DatabaseFeatureCapability],
+    field: Literal["aggregatable_columns_by_table", "date_columns_by_table", "array_columns_by_table"],
+) -> dict[str, frozenset[str]]:
+    """Intersect per-table column name sets across member capability snapshots."""
+    if not caps:
+        return {}
+    common_tables = set(getattr(caps[0], field).keys())
+    for cap in caps[1:]:
+        common_tables &= set(getattr(cap, field).keys())
+    merged: dict[str, set[str]] = {}
+    for cap in caps:
+        table_map = getattr(cap, field)
+        for table_name in common_tables:
+            cols = table_map.get(table_name)
+            if cols is None:
+                continue
+            merged.setdefault(table_name, set(cols)).intersection_update(cols)
+    return {table_name: frozenset(cols) for table_name, cols in merged.items()}
+
+
+def intersect_member_database_feature_capabilities(
+    member_graphs: Mapping[str, SchemaGraph],
+) -> DatabaseFeatureCapability:
+    """Derive federation structural capability as the intersection of member graphs."""
+    caps = [graph.database_feature_capability for graph in member_graphs.values()]
+    if not caps:
+        return compute_database_feature_capability(SchemaGraph(tables={}, join_paths_multi={}))
+    if len(caps) == 1:
+        return caps[0]
+    self_join_tables = caps[0].tables_supporting_self_join
+    for cap in caps[1:]:
+        self_join_tables &= cap.tables_supporting_self_join
+    return DatabaseFeatureCapability(
+        table_count=min(cap.table_count for cap in caps),
+        fk_edge_count=min(cap.fk_edge_count for cap in caps),
+        has_numeric_measures=all(cap.has_numeric_measures for cap in caps),
+        has_date_columns=all(cap.has_date_columns for cap in caps),
+        has_array_columns=all(cap.has_array_columns for cap in caps),
+        has_categorical_columns=all(cap.has_categorical_columns for cap in caps),
+        max_tables_on_any_join_path=min(cap.max_tables_on_any_join_path for cap in caps),
+        max_fk_chain_depth=min(cap.max_fk_chain_depth for cap in caps),
+        has_self_referential_fk=all(cap.has_self_referential_fk for cap in caps),
+        tables_supporting_self_join=frozenset(self_join_tables),
+        has_window_capable_table_sets=all(cap.has_window_capable_table_sets for cap in caps),
+        aggregatable_columns_by_table=_intersect_column_sets_by_table(caps, "aggregatable_columns_by_table"),
+        date_columns_by_table=_intersect_column_sets_by_table(caps, "date_columns_by_table"),
+        array_columns_by_table=_intersect_column_sets_by_table(caps, "array_columns_by_table"),
+        supports_semi_join=all(cap.supports_semi_join for cap in caps),
+        supports_anti_join=all(cap.supports_anti_join for cap in caps),
+        supports_predicate_nesting=all(cap.supports_predicate_nesting for cap in caps),
+        supports_preserve_tables=all(cap.supports_preserve_tables for cap in caps),
+        supports_ordered_string_agg=all(cap.supports_ordered_string_agg for cap in caps),
+        supports_median=all(cap.supports_median for cap in caps),
+        supports_stddev=all(cap.supports_stddev for cap in caps),
+        supports_variance=all(cap.supports_variance for cap in caps),
+        supports_window_frames=all(cap.supports_window_frames for cap in caps),
+        supports_array_contains=all(cap.supports_array_contains for cap in caps),
+        supports_collation=all(cap.supports_collation for cap in caps),
+        supports_unsigned_semantics=all(cap.supports_unsigned_semantics for cap in caps),
+        supports_timestamptz_semantics=all(cap.supports_timestamptz_semantics for cap in caps),
     )
 
 
@@ -3025,11 +3492,7 @@ def schema_context_from_graph(sg: SchemaGraph) -> EngineContext:
     for tbl, cols in sg.deny_columns.items():
         for c in cols:
             specs.append(f"{tbl}.{c}")
-    return EngineContext(
-        name="master",
-        include=sg.include,
-        deny_columns=frozenset(specs),
-    )
+    return EngineContext(include=sg.include, deny_columns=frozenset(specs))
 
 
 def _infer_missing_fks_same_name(
@@ -3041,12 +3504,12 @@ def _infer_missing_fks_same_name(
     """Infer FK edges from exact same-name columns with value overlap."""
     inferred: list[FKEdge] = []
     by_lower: dict[str, list[tuple[str, str, ColumnMetadata]]] = {}
-    for tname, tbl in tables.items():
-        for cname, col in tbl.columns.items():
+    for tname, tbl in sorted(tables.items(), key=lambda item: item[0].lower()):
+        for cname, col in sorted(tbl.columns.items(), key=lambda item: item[0].lower()):
             if col.is_foreign_key or col.is_primary_key:
                 continue
             by_lower.setdefault(cname.lower(), []).append((tname, cname, col))
-    for entries in by_lower.values():
+    for entries in sorted(by_lower.values(), key=lambda items: (items[0][0].lower(), items[0][1].lower())):
         if len(entries) < 2:
             continue
         for i, (t1, c1, col1) in enumerate(entries):
@@ -3088,7 +3551,7 @@ def _infer_missing_fks_composite(
     existing: list[FKEdge],
     skip_table_pairs: frozenset[frozenset[str]] = frozenset(),
 ) -> list[FKEdge]:
-    """Infer composite foreign keys when a source table contains every column of a target's composite PK. A candidate composite FK requires: - The target table has a primary key with two or more columns. - The source table contains every PK column by exact case-insensitive name and none of those columns are already declared (or just inferred via the suffix pass) as part of a foreign key. - Every per-column pair passes ``fk_infer_value_types_compatible``; the string ↔ digit-only-string relaxation participates here too. - The source table is not the target table (self-referential composite FKs are rejected). Sample-overlap validation is intentionally omitted because per-column ``top_k_values`` are not row-aligned and a faithful tuple overlap would require additional profiling queries."""
+    """Infer composite foreign keys when a source table contains every column of a target's composite PK. A candidate composite FK requires: - The target table has a primary key with two or more columns. - The source table contains every PK column by exact case-insensitive name and none of those columns are already declared (or just inferred via the suffix pass) as part of a foreign key. - Every per-column pair passes ``fk_infer_value_types_compatible``; the string ↔ digit-only-string relaxation participates here too. - Every per-column pair passes ``fk_overlap_validates`` on ``value_overlap_sample``. - The source table is not the target table (self-referential composite FKs are rejected)."""
     if not tables:
         return []
     inferred: list[FKEdge] = []
@@ -3096,8 +3559,9 @@ def _infer_missing_fks_composite(
     for e in existing:
         for c in e.src_cols:
             existing_src_cols.add((e.src_table, c.lower()))
-    for src_name, src_tbl in tables.items():
-        for _dst_name_lower, dst_real in tables_lower.items():
+    for src_name in sorted(tables.keys(), key=str.lower):
+        src_tbl = tables[src_name]
+        for dst_real in sorted(tables.keys(), key=str.lower):
             if dst_real == src_name:
                 continue
             if frozenset({src_name, dst_real}) in skip_table_pairs:
@@ -3126,6 +3590,9 @@ def _infer_missing_fks_composite(
                 if not fk_infer_value_types_compatible(src_col_meta, dst_col_meta):
                     ok = False
                     break
+                if not fk_overlap_validates(src_col_meta, dst_col_meta):
+                    ok = False
+                    break
                 mapped.append((src_real, pk_col))
             if not ok or not mapped:
                 continue
@@ -3148,12 +3615,14 @@ def _infer_missing_fks_composite(
 
 
 def recompute_join_paths_multi(
-    tables: dict[str, TableMetadata],
+    tables: dict[str, TableMetadata], *, tie_cap: int | None = None
 ) -> dict[str, dict[str, list[list[dict[str, Any]]]]]:
     """Recompute ``join_paths_multi`` from current ``TableMetadata`` FK. edges."""
     adj: dict[str, list[FKEdge]] = {t: [] for t in tables}
     for tbl in tables.values():
         for e in tbl.foreign_keys:
+            if e.inference_tag == InferenceTag.CROSS_SOURCE:
+                continue
             if e.src_table not in tables or e.dst_table not in tables:
                 continue
             adj[e.src_table].append(e)
@@ -3170,20 +3639,15 @@ def recompute_join_paths_multi(
         adj[t] = sorted(adj[t], key=lambda x: edge_key(x))
 
     tlist = sorted(tables.keys())
-    return compute_join_paths_multi_from_adj(adj, tlist)
+    return compute_join_paths_multi_from_adj(adj, tlist, tie_cap=tie_cap)
 
 
 def promote_same_component_semantic_edges(
-    sg: SchemaGraph,
-    *,
-    blocked: frozenset[tuple[str, tuple[str, ...], str, tuple[str, ...]]] = frozenset(),
+    sg: SchemaGraph, *, blocked: frozenset[tuple[str, tuple[str, ...], str, tuple[str, ...]]] = frozenset()
 ) -> int:
     """Emit semantic FK shortcuts within an already-connected structural component."""
     return promote_semantic_neighbor_pairs(
-        sg,
-        cross_component_only=False,
-        inference_tag=InferenceTag.SEMANTIC,
-        blocked=blocked,
+        sg, cross_component_only=False, inference_tag=InferenceTag.SEMANTIC, blocked=blocked
     )
 
 

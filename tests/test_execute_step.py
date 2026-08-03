@@ -10,10 +10,10 @@ from aetherdialect import AetherEngine
 from aetherdialect._constants import (
     PIPELINE_SUSPEND_ID_EXECUTE,
     SESSION_KIND_EXECUTE,
-    GenerationPath,
 )
 from aetherdialect._contracts_base import PipelineSuspended
 from aetherdialect._contracts_core import (
+    GenerationPath,
     InteractiveTailSnapshot,
     RuntimeIntent,
     SqlExecuteSuspendContext,
@@ -39,15 +39,21 @@ class TestExecuteSql:
                 sb.engine.execute_sql("DELETE FROM film WHERE film_id = 1")
 
     def test_consumer_out_of_scope_blocked(self) -> None:
-        with AetherEngine.offline_sandbox(preset="consumer_reader", restricted_consumer=True) as sb:
-            from aetherdialect._schema_graph import assert_consumer_sql_in_scope
+        from aetherdialect import EngineContext, Sandbox
+        from aetherdialect._constants import CONSUMER_RESTRICTED_ALLOW_OBJECTS
+        from aetherdialect._schema_graph import assert_consumer_sql_in_scope
 
+        with Sandbox() as sandbox:
+            engine = sandbox.engine(
+                EngineContext(allow_objects=CONSUMER_RESTRICTED_ALLOW_OBJECTS),
+                role="consumer",
+            )
             sql = "SELECT customer_id FROM customer LIMIT 1"
             allowed = assert_consumer_sql_in_scope(
                 sql,
-                sb.engine._dialect,
-                sb.engine._runtime_config.engine_context,
-                sb.engine._schema_graph,
+                engine._dialect,
+                engine._runtime_config.engine_context,
+                engine._schema_graph,
                 frozenset({"film"}),
             )
             assert allowed is False
@@ -61,7 +67,7 @@ class TestSessionExecuteStep:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         owner = MagicMock()
         owner._audit_emit = MagicMock()
@@ -101,7 +107,6 @@ class TestSessionExecuteStep:
             force_feedback=False,
             tmpl_sd=None,
             rows=(),
-            conf=0.9,
         )
         owner = MagicMock()
         owner._audit_emit = MagicMock()
@@ -132,7 +137,7 @@ class TestSessionExecuteStep:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         tail = InteractiveTailSnapshot(
             q_norm="q",
@@ -167,7 +172,6 @@ class TestSessionExecuteStep:
             force_feedback=False,
             tmpl_sd=None,
             rows=((42,),),
-            conf=0.95,
         )
         with patch("aetherdialect._main_execution._run_pipeline_sql_rows") as run_rows:
             with patch("aetherdialect._main_execution._offer_sql_feedback_after_execute"):

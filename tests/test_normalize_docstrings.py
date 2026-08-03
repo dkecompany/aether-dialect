@@ -14,7 +14,7 @@ from normalize_docstrings import (
 
 def test_unwrap_summary_joins_bad_agent_wraps() -> None:
     lines = [
-        "Create FilterParam from",
+        "Create WhereParam from",
         "dictionary.",
         "",
         "Args:",
@@ -22,7 +22,7 @@ def test_unwrap_summary_joins_bad_agent_wraps() -> None:
         "d: Dictionary.",
     ]
     out = unwrap_summary_block(lines)
-    assert out[0] == "Create FilterParam from dictionary."
+    assert out[0] == "Create WhereParam from dictionary."
     assert out[1] == "Args:"
 
 
@@ -73,7 +73,7 @@ def test_finalize_indents_under_args() -> None:
 
 
 def test_prepare_phase_full() -> None:
-    raw = """Create FilterParam from
+    raw = """Create WhereParam from
     dictionary.
 
     Args:
@@ -82,7 +82,7 @@ def test_prepare_phase_full() -> None:
         other: Second key.
     """
     result = normalize_docstring_text(raw, "prepare")
-    assert "Create FilterParam from" in result
+    assert "Create WhereParam from" in result
     assert "Args:" in result
     assert "d: Dictionary with keys." in result
     assert "other: Second key." in result

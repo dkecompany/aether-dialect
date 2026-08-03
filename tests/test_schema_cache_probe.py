@@ -52,6 +52,7 @@ class _ProbeStubDialect(Dialect):
         *,
         include: Any = "tables",
         allow_objects: Any = None,
+        deny_objects: Any = None,
         sql_file: Any = None,
     ) -> SchemaGraph:
         self.reflect_calls += 1
@@ -254,17 +255,22 @@ def test_legacy_cache_without_probe_falls_to_legacy_branch_and_backfills(
     cache_path: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import copy
+
     ctx = EngineContext()
     _save_with_probe(schema_graph, ctx, notes_content="n", probe_hash="", cache_path=cache_path)
     raw_before = read_gzip_json(cache_path)
     assert raw_before["ddl_probe_hash"] == ""
 
-    dialect = _ProbeStubDialect(probe_value="DIALECT_DIGEST")
+    dialect = _ProbeStubDialect(
+        probe_value="DIALECT_DIGEST",
+        reflect_result=copy.deepcopy(schema_graph),
+    )
     combined_probe = compute_dialect_probe(dialect, ctx)
 
     out = build_schema_graph(dialect, ctx, notes_content="n")
 
-    assert dialect.reflect_calls == 0
+    assert dialect.reflect_calls == 1
     assert dialect.profile_calls == 0
     assert out.ddl_probe_hash == combined_probe
     raw_after = read_gzip_json(cache_path)
@@ -304,6 +310,7 @@ def test_base_dialect_compute_ddl_probe_returns_empty(
             *,
             include: Any = "tables",
             allow_objects: Any = None,
+            deny_objects: Any = None,
             sql_file: Any = None,
         ) -> SchemaGraph:
             raise NotImplementedError

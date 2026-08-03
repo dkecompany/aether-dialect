@@ -5,7 +5,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 from aetherdialect import SessionStep
-from aetherdialect._contracts_base import FilterParam, NormalizedExpr, ParameterBinding
+from aetherdialect._contracts_base import NormalizedExpr, ParameterBinding, WhereParam, predicate_group_from_list
 from aetherdialect._contracts_core import ConcreteIntent, Template, ValueHistory
 from aetherdialect._contracts_schema import SQLShape, TemplateStats
 from aetherdialect._templates import (
@@ -23,14 +23,16 @@ def _minimal_template(*, question: str = "count of item in category x") -> Templ
         select_cols=[],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[
-            FilterParam(
-                left_expr=NormalizedExpr.from_column("t1.category"),
-                op="=",
-                value_type="string",
-                param_key="p1",
-            )
-        ],
+        where=predicate_group_from_list(
+            [
+                WhereParam(
+                    left_expr=NormalizedExpr.from_column("t1.category"),
+                    op="=",
+                    value_type="string",
+                    param_key="p1",
+                )
+            ]
+        ),
     )
     return Template(
         id="T0001",
@@ -39,7 +41,7 @@ def _minimal_template(*, question: str = "count of item in category x") -> Templ
         tables_used=["t1"],
         sql_param="SELECT 1 FROM t1 WHERE category = :p1",
         sql_fp="fp",
-        shape=SQLShape(num_joins=0, has_group_by=False, has_agg=False, num_filters=1),
+        shape=SQLShape(num_joins=0, has_group_by=False, has_agg=False, num_where=1),
         colmap_sig="cm",
         value_history=ValueHistory(
             param_values=[{"p1": "x"}],

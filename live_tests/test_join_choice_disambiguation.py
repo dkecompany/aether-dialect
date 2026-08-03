@@ -4,8 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from aetherdialect._constants import GenerationPath
-from aetherdialect._contracts_core import RuntimeIntent
+from aetherdialect._contracts_core import GenerationPath, RuntimeIntent
 from aetherdialect._live_testing import Expected, LiveTestRunner, Scenario
 from aetherdialect._templates import store_to_templates
 from aetherdialect._utils import normalize_question

@@ -11,18 +11,19 @@ import pytest
 
 from aetherdialect._constants import (
     VALID_AGGREGATION_FUNCTIONS,
-    VALID_FILTER_OPS,
     VALID_RELATIVE_DATE_UNITS,
     VALID_SCALAR_FUNCTIONS,
+    VALID_WHERE_OPS,
     VALID_WINDOW_FUNCTIONS,
     WINDOW_FRAME_BOUNDS,
 )
 from aetherdialect._contracts_base import (
-    FilterParam,
     HavingParam,
     MulGroup,
     NormalizedExpr,
     OrderByCol,
+    WhereParam,
+    predicate_group_from_list,
 )
 from aetherdialect._contracts_core import (
     RuntimeCteStep,
@@ -42,6 +43,7 @@ from aetherdialect._contracts_schema import (
 )
 from aetherdialect._dialect import Dialect, get_dialect_class, get_registered_engines
 from aetherdialect._sql_gen import build_deterministic_sql, inject_join_into_deterministic_sql
+from tests.join_test_helpers import catalog_edge_kinds_for_signatures
 
 VerifyFn = Callable[[str, str, str], None]
 
@@ -86,6 +88,7 @@ def _render_conformance_sql(
             sql_param,
             [case.join_signature],
             case.schema,
+            edge_kinds_ordered=catalog_edge_kinds_for_signatures([case.join_signature]),
             dialect=dialect,
         )
     resolved = params if params is not None else dict(case.intent.param_values or {})
@@ -100,7 +103,7 @@ def _render_conformance_sql(
 def _single_table_intent(
     *,
     select_expr: NormalizedExpr,
-    filters: list[FilterParam] | None = None,
+    filters: list[WhereParam] | None = None,
     having: list[HavingParam] | None = None,
     grain: str = "row_level",
     group_by: list[NormalizedExpr] | None = None,
@@ -118,8 +121,8 @@ def _single_table_intent(
         select_cols=[SelectCol(expr=select_expr)],
         group_by_cols=group_by or [],
         order_by_cols=order_by or [],
-        filters_param=filters or [],
-        having_param=having or [],
+        where=predicate_group_from_list(filters) if filters else None,
+        having=predicate_group_from_list(having) if having else None,
         limit=limit,
         distinct_select_index=distinct_index if distinct_index is not None else -1,
         window_registry=window_registry or [],
@@ -181,12 +184,12 @@ def _cast_expr(target_type: str = "INTEGER", *, column: str = "t1.n") -> Normali
     )
 
 
-def _date_diff_filter(unit: str, amount: int = 7) -> FilterParam:
+def _date_diff_filter(unit: str, amount: int = 7) -> WhereParam:
     left = NormalizedExpr(
         add_groups=[MulGroup(multiply=[NormalizedExpr(column_ref="t1.end_d")])],
         sub_groups=[MulGroup(multiply=[NormalizedExpr(column_ref="t1.start_d")])],
     )
-    return FilterParam(
+    return WhereParam(
         left_expr=left,
         op=">",
         value_type="date_diff",
@@ -248,10 +251,52 @@ def _verify_filter_op(op: str, sql: str, engine: str) -> bool:
 
 
 def _agg_expr(func: str, column: str = "t1.amt", *, distinct: bool = False) -> NormalizedExpr:
+    if func == "string_agg":
+        return NormalizedExpr(
+            add_groups=[
+                MulGroup(
+                    multiply=[NormalizedExpr.from_column(column)],
+                    agg_func="string_agg",
+                    agg_sep_param_key="sep",
+                )
+            ],
+            sub_groups=[],
+        )
     return NormalizedExpr(
         add_groups=[MulGroup(multiply=[column], agg_func=func, distinct=distinct)],
         sub_groups=[],
     )
+
+
+def _verify_string_agg_sql(sql: str, engine: str) -> bool:
+    upper = sql.upper()
+    fragments = {
+        "postgresql": ("STRING_AGG",),
+        "duckdb": ("STRING_AGG", "LISTAGG"),
+        "redshift": ("STRING_AGG", "LISTAGG"),
+        "bigquery": ("STRING_AGG",),
+        "sqlserver": ("STRING_AGG",),
+        "csv": ("STRING_AGG", "LISTAGG"),
+        "mysql": ("GROUP_CONCAT",),
+        "mariadb": ("GROUP_CONCAT",),
+        "sqlite": ("GROUP_CONCAT",),
+        "snowflake": ("LISTAGG",),
+        "databricks": ("ARRAY_JOIN",),
+    }
+    return any(token in upper for token in fragments.get(engine, ("STRING_AGG",)))
+
+
+def _verify_variance_sql(sql: str, engine: str) -> bool:
+    _ = engine
+    upper = sql.upper()
+    return "VAR_SAMP" in upper or "VARIANCE(" in upper
+
+
+def _verify_median_sql(sql: str, engine: str) -> bool:
+    upper = sql.upper()
+    if engine in ("duckdb", "snowflake", "databricks", "csv"):
+        return "MEDIAN(" in upper
+    return "PERCENTILE_CONT" in upper
 
 
 def _two_table_join_schema(*, nullable_fk: bool = False) -> SchemaGraph:
@@ -318,6 +363,48 @@ def _build_scalar_cases() -> list[ConformanceCase]:
 def _build_agg_cases() -> list[ConformanceCase]:
     cases: list[ConformanceCase] = []
     for func in sorted(VALID_AGGREGATION_FUNCTIONS):
+        if func == "string_agg":
+            cases.append(
+                ConformanceCase(
+                    case_id="agg_string_agg",
+                    tags=frozenset({"agg:string_agg"}),
+                    intent=_single_table_intent(
+                        select_expr=_agg_expr("string_agg"),
+                        grain="grouped",
+                        group_by=[_col_expr("t1", "grp")],
+                    ),
+                    verify=_verify_string_agg_sql,
+                )
+            )
+            continue
+        if func == "variance":
+            cases.append(
+                ConformanceCase(
+                    case_id="agg_variance",
+                    tags=frozenset({"agg:variance"}),
+                    intent=_single_table_intent(
+                        select_expr=_agg_expr("variance"),
+                        grain="grouped",
+                        group_by=[_col_expr("t1", "grp")],
+                    ),
+                    verify=_verify_variance_sql,
+                )
+            )
+            continue
+        if func == "median":
+            cases.append(
+                ConformanceCase(
+                    case_id="agg_median",
+                    tags=frozenset({"agg:median"}),
+                    intent=_single_table_intent(
+                        select_expr=_agg_expr("median"),
+                        grain="grouped",
+                        group_by=[_col_expr("t1", "grp")],
+                    ),
+                    verify=_verify_median_sql,
+                )
+            )
+            continue
         cases.append(
             ConformanceCase(
                 case_id=f"agg_{func}",
@@ -364,7 +451,7 @@ def _window_case(
     frame_end_offset: int | None = None,
     extra_tags: frozenset[str] | None = None,
 ) -> ConformanceCase:
-    needs_arg = func in {"sum", "avg", "lag", "lead", "first_value", "last_value"}
+    needs_arg = func in {"sum", "avg", "lag", "lead", "first_value", "last_value", "nth_value"}
     ws = WindowSpec(
         function=func,
         partition_by=[NormalizedExpr.from_column("t1.grp")],
@@ -375,6 +462,7 @@ def _window_case(
         frame_start_offset=frame_start_offset,
         frame_end_offset=frame_end_offset,
         argument=NormalizedExpr.from_column("t1.amt") if needs_arg else None,
+        numeric_argument=1 if func == "nth_value" else None,
     )
     fn_token = func.upper()
     tags = {f"window:{func}"} | (extra_tags or frozenset())
@@ -419,26 +507,22 @@ def _build_window_cases() -> list[ConformanceCase]:
 def _build_filter_cases() -> list[ConformanceCase]:
     cases: list[ConformanceCase] = []
     base_col = NormalizedExpr.from_column("t1.name")
-    for op in sorted(VALID_FILTER_OPS):
+    for op in sorted(VALID_WHERE_OPS):
         if op in {"is null", "is not null"}:
-            fp = FilterParam(left_expr=base_col, op=op, value_type="null")
+            fp = WhereParam(left_expr=base_col, op=op, value_type="null")
             must = ("IS NULL",) if op == "is null" else ()
         elif op == "contains":
-            fp = FilterParam(
-                left_expr=NormalizedExpr.from_column("t1.tags"), op=op, value_type="array", param_key="tag"
-            )
+            fp = WhereParam(left_expr=NormalizedExpr.from_column("t1.tags"), op=op, value_type="array", param_key="tag")
             must = ()
         elif op in {"like", "not like", "ilike", "not ilike"}:
-            fp = FilterParam(left_expr=base_col, op=op, value_type="string", param_key="pat")
+            fp = WhereParam(left_expr=base_col, op=op, value_type="string", param_key="pat")
             must = () if op in {"not like", "ilike", "not ilike"} else (op.upper(),)
         elif op in {"in", "not in"}:
-            fp = FilterParam(left_expr=base_col, op=op, value_type="string", param_key="vals")
+            fp = WhereParam(left_expr=base_col, op=op, value_type="string", param_key="vals")
             must = () if op == "not in" else (op.upper(),)
         elif op == "between":
-            fp = FilterParam(
-                left_expr=NormalizedExpr.from_column("t1.n"), op=">=", value_type="integer", param_key="lo"
-            )
-            fp2 = FilterParam(
+            fp = WhereParam(left_expr=NormalizedExpr.from_column("t1.n"), op=">=", value_type="integer", param_key="lo")
+            fp2 = WhereParam(
                 left_expr=NormalizedExpr.from_column("t1.n"), op="<=", value_type="integer", param_key="hi"
             )
             cases.append(
@@ -451,7 +535,7 @@ def _build_filter_cases() -> list[ConformanceCase]:
             )
             continue
         else:
-            fp = FilterParam(left_expr=NormalizedExpr.from_column("t1.n"), op=op, value_type="integer", param_key="p")
+            fp = WhereParam(left_expr=NormalizedExpr.from_column("t1.n"), op=op, value_type="integer", param_key="p")
             must: tuple[str, ...] = ()
             if op in {"=", "<", "<=", ">", ">="}:
                 must = (op,)
@@ -534,7 +618,7 @@ def _build_date_cases() -> list[ConformanceCase]:
                 intent=_single_table_intent(
                     select_expr=_col_expr("t1", "d"),
                     filters=[
-                        FilterParam(
+                        WhereParam(
                             left_expr=_col_expr("t1", "d"),
                             value_type="date_window",
                             raw_value={"unit": unit, "amount": 30},
@@ -564,7 +648,7 @@ def _build_date_cases() -> list[ConformanceCase]:
             intent=_single_table_intent(
                 select_expr=_col_expr("t1", "d"),
                 filters=[
-                    FilterParam(
+                    WhereParam(
                         left_expr=_col_expr("t1", "d"),
                         value_type="date_window",
                         raw_value={"start": "2020-01-01", "end": "2020-12-31"},
@@ -584,7 +668,7 @@ def _build_structural_cases() -> list[ConformanceCase]:
         case_when=CaseWhenExpr(
             branches=[
                 CaseWhenBranch(
-                    condition=FilterParam(
+                    condition=WhereParam(
                         left_expr=NormalizedExpr.from_column("t1.flag"),
                         op="=",
                         value_type="boolean",
@@ -621,8 +705,8 @@ def _build_structural_cases() -> list[ConformanceCase]:
         output_columns=["tag_item"],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
-        having_param=[],
+        where=None,
+        having=None,
         column_map={},
         output_column_metadata={},
         description="",
@@ -638,8 +722,8 @@ def _build_structural_cases() -> list[ConformanceCase]:
         output_columns=["cnt"],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
-        having_param=[],
+        where=None,
+        having=None,
         column_map={},
         output_column_metadata={},
         description="",
@@ -653,8 +737,8 @@ def _build_structural_cases() -> list[ConformanceCase]:
         output_columns=["total"],
         group_by_cols=[_col_expr("t1", "grp")],
         order_by_cols=[],
-        filters_param=[],
-        having_param=[],
+        where=None,
+        having=None,
         column_map={},
         output_column_metadata={},
         description="",
@@ -695,8 +779,8 @@ def _build_structural_cases() -> list[ConformanceCase]:
                 select_cols=[SelectCol(expr=_col_expr("main_tbl", "a"))],
                 group_by_cols=[],
                 order_by_cols=[],
-                filters_param=[],
-                having_param=[],
+                where=None,
+                having=None,
                 cte_steps=[scalar_cte],
             ),
             must_contain=("WITH", " AS "),
@@ -735,7 +819,7 @@ def _build_structural_cases() -> list[ConformanceCase]:
             intent=_single_table_intent(
                 select_expr=_col_expr("t1", "tags"),
                 filters=[
-                    FilterParam(
+                    WhereParam(
                         left_expr=NormalizedExpr.from_column("t1.tags"),
                         op="contains",
                         value_type="array",
@@ -751,7 +835,7 @@ def _build_structural_cases() -> list[ConformanceCase]:
             intent=_single_table_intent(
                 select_expr=_col_expr("t1", "tags"),
                 filters=[
-                    FilterParam(
+                    WhereParam(
                         left_expr=NormalizedExpr.from_column("t1.tags"),
                         op="contains",
                         value_type="array",
@@ -770,8 +854,8 @@ def _build_structural_cases() -> list[ConformanceCase]:
                 select_cols=[SelectCol(expr=NormalizedExpr.from_column("arr_cte.tag_item"))],
                 group_by_cols=[],
                 order_by_cols=[],
-                filters_param=[],
-                having_param=[],
+                where=None,
+                having=None,
                 cte_steps=[unnest_cte],
             ),
             schema=unnest_schema,
@@ -787,7 +871,7 @@ def _build_structural_cases() -> list[ConformanceCase]:
             intent=_single_table_intent(
                 select_expr=_col_expr("t1", "active"),
                 filters=[
-                    FilterParam(
+                    WhereParam(
                         left_expr=NormalizedExpr.from_column("t1.active"),
                         op="=",
                         value_type="boolean",
@@ -835,7 +919,7 @@ def _expected_tags_from_config() -> frozenset[str]:
     for bound in WINDOW_FRAME_BOUNDS:
         tags.add(f"frame:{bound}")
     tags.add("frame:range_bounds")
-    for op in VALID_FILTER_OPS:
+    for op in VALID_WHERE_OPS:
         tags.add(f"filter:{op}")
     for unit in VALID_RELATIVE_DATE_UNITS:
         tags.add(f"date_window:{unit}")

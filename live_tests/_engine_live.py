@@ -18,7 +18,7 @@ from aetherdialect._contracts_schema import (
     SchemaGraph,
     TableMetadata,
 )
-from aetherdialect._core_utils import write_gzip_json_atomic
+from aetherdialect._core_utils import llm_usage_build_scope, write_gzip_json_atomic
 from aetherdialect._live_testing import LiveTestRunner
 from aetherdialect._templates import load_template_store, store_to_templates
 
@@ -221,29 +221,30 @@ def build_engine_t2s(engine_name: str, schema: str) -> AetherEngine:
 
     cfg_path = write_live_env_file_to_temp_config_toml(_env_file(), {"AETHERDIALECT_ENGINE": engine_name})
     try:
-        instance = AetherEngine(
-            EngineContext(
-                notes_file=str(notes) if notes else None,
-                sql_file=sql_file,
-            ),
-            artifacts_dir=tempfile.mkdtemp(prefix=f"live_{engine_name}_artifacts_"),
-            config_file=cfg_path,
-        )
+        with llm_usage_build_scope():
+            instance = AetherEngine(
+                EngineContext(
+                    notes_file=str(notes) if notes else None,
+                    sql_file=sql_file,
+                ),
+                artifacts_dir=tempfile.mkdtemp(prefix=f"live_{engine_name}_artifacts_"),
+                config_file=cfg_path,
+            )
 
-        _redirect_to_livetest_dir(instance)
+            _redirect_to_livetest_dir(instance)
 
-        fresh_store = load_template_store(instance._schema_graph.effective_structural_hash, instance._schema_graph)
-        instance._store = fresh_store
-        instance._templates = store_to_templates(fresh_store)
-        instance._rejected = {}
+            fresh_store = load_template_store(instance._schema_graph.effective_structural_hash, instance._schema_graph)
+            instance._store = fresh_store
+            instance._templates = store_to_templates(fresh_store)
+            instance._rejected = {}
 
-        _relax_rental_shop_selectability(instance._schema_graph, schema)
-        if engine_name in ("duckdb", "sqlite"):
-            _merge_rental_shop_views_into_graph(instance)
-            apply_synthetic_rental_partition_metadata(instance._schema_graph)
+            _relax_rental_shop_selectability(instance._schema_graph, schema)
+            if engine_name in ("duckdb", "sqlite"):
+                _merge_rental_shop_views_into_graph(instance)
+                apply_synthetic_rental_partition_metadata(instance._schema_graph)
 
-        _SESSION_ENGINE_CACHE[cache_key] = instance
-        return instance
+            _SESSION_ENGINE_CACHE[cache_key] = instance
+            return instance
     finally:
         Path(cfg_path).unlink(missing_ok=True)
 

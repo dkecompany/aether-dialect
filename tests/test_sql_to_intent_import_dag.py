@@ -70,7 +70,7 @@ def test_dialect_import_hooks_exist(schema_graph: SchemaGraph) -> None:
     pg = PostgresDialect.__new__(PostgresDialect)
     assert pg.parse_backend == "pglast"
     assert pg.preparse_sql_for_import("SELECT 1") == "SELECT 1"
-    assert pg.map_import_filter_op("=") is None
+    assert pg.map_import_where_op("=") is None
     assert pg.map_import_scalar_func("count") == "count"
     assert pg.import_unnest_policy() == "select_item"
     intent = pg.postprocess_imported_intent(
@@ -80,8 +80,8 @@ def test_dialect_import_hooks_exist(schema_graph: SchemaGraph) -> None:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
         ),
         schema_graph,
     )

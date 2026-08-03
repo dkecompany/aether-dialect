@@ -8,13 +8,15 @@ import importlib
 import os
 import re
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any, ClassVar, Literal, cast
 
 import sqlglot
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import StaticPool
+
+import duckdb
 
 from ._config import (
     BigQueryRuntimeConfig,
@@ -48,21 +50,27 @@ from ._constants import (
     UNITY_INFORMATION_SCHEMA_TABLES_TABLE_TYPE_SQL,
     UNITY_INFORMATION_SCHEMA_UNIQUE_COLUMNS_DDL_PROBE_SQL,
     ResultReaderKind,
+    is_upload_ingest_engine,
 )
 from ._contracts_base import (
     AccessError,
+    DataQualityReport,
     DatabasePingFailed,
     EngineContext,
     SchemaInclude,
     SqlDiagnostic,
     SqlDiagnosticCode,
     StatementTimeoutError,
+    where_leaves,
 )
 from ._contracts_core import RuntimeIntent
 from ._contracts_schema import (
     CatalogStructuralConstraintsIndex,
     ColumnMetadata,
+    CsvSourceSelection,
+    SchemaDiff,
     SchemaGraph,
+    UploadIngestResult,
 )
 from ._core_utils import (
     cost_cap_active,
@@ -75,6 +83,13 @@ from ._core_utils import (
     reconcile_execute_bind_params,
     sha256,
 )
+from ._data_quality import (
+    PreparedRelation,
+    parse_source_selections,
+    pinned_names_from_schema_graph,
+    prepare_relations_for_paths,
+    validate_upload_sources,
+)
 from ._dialect import (
     Dialect,
     emit_via_ast,
@@ -82,6 +97,8 @@ from ._dialect import (
     format_interval_unit,
     is_permission_denied_error,
     register_dialect,
+    sqlglot_quote_identifier,
+    sqlglot_quote_table_column,
     trace_finalize_render_stage,
     unit_to_approx_days,
 )
@@ -131,9 +148,19 @@ from ._schema_build import (
     load_or_create_schema_sqlserver,
     tables_meta_to_schema_graph,
 )
-from ._schema_graph import allow_objects_lower_set
+from ._schema_graph import (
+    allow_objects_lower_set,
+    assign_schema_graph_hashes,
+    diff_schemas,
+    load_schema_graph_snapshot,
+    raise_if_schema_unusable,
+)
 from ._schema_overrides import (
+    apply_diff,
+    finalize_with_overrides,
     load_or_create_schema_databricks,
+    migrate_sidecar_for_diff,
+    save_schema_to_cache,
 )
 from ._sql_gen import databricks_unqualify_agg_arg_sql
 from ._sql_to_intent import (
@@ -188,11 +215,7 @@ class DatabricksConnectorBackend(ResultBackend):
         self._connection = connection
 
     def fetch_rows(
-        self,
-        sql: str,
-        params: dict[str, Any] | None = None,
-        *,
-        timeout_ms: int | None = None,
+        self, sql: str, params: dict[str, Any] | None = None, *, timeout_ms: int | None = None
     ) -> list[tuple[Any, ...]]:
         _ = params
         if timeout_ms is not None and cost_cap_active(timeout_ms):
@@ -218,11 +241,7 @@ class DatabricksSparkBackend(ResultBackend):
         self._spark = spark
 
     def fetch_rows(
-        self,
-        sql: str,
-        params: dict[str, Any] | None = None,
-        *,
-        timeout_ms: int | None = None,
+        self, sql: str, params: dict[str, Any] | None = None, *, timeout_ms: int | None = None
     ) -> list[tuple[Any, ...]]:
         _ = params
         if timeout_ms is not None and cost_cap_active(timeout_ms):
@@ -286,12 +305,7 @@ class BigQueryClientBackend(ResultBackend):
         self._job_timeout_ms = job_timeout_ms
         self._dialect_name = dialect_name
 
-    def _job_config(
-        self,
-        *,
-        timeout_ms: int | None = None,
-        params: dict[str, Any] | None = None,
-    ) -> Any:
+    def _job_config(self, *, timeout_ms: int | None = None, params: dict[str, Any] | None = None) -> Any:
         import google.cloud.bigquery
 
         job_config = google.cloud.bigquery.QueryJobConfig(use_query_cache=False)
@@ -305,19 +319,12 @@ class BigQueryClientBackend(ResultBackend):
         return job_config
 
     def fetch_rows(
-        self,
-        sql: str,
-        params: dict[str, Any] | None = None,
-        *,
-        timeout_ms: int | None = None,
+        self, sql: str, params: dict[str, Any] | None = None, *, timeout_ms: int | None = None
     ) -> list[tuple[Any, ...]]:
         if diagnostic_debug_enabled():
             debug(f"[{self._dialect_name}.execute] sql=\n{sql}")
         try:
-            job = self._client.query(
-                sql,
-                job_config=self._job_config(timeout_ms=timeout_ms, params=params),
-            )
+            job = self._client.query(sql, job_config=self._job_config(timeout_ms=timeout_ms, params=params))
             rows = job.result()
             return [tuple(row.values()) for row in rows]
         except Exception as e:
@@ -342,31 +349,37 @@ class BigQueryStorageBackend(ResultBackend):
         dialect_name: str = "",
     ) -> None:
         self._client_backend = BigQueryClientBackend(
-            client,
-            maximum_bytes_billed=maximum_bytes_billed,
-            job_timeout_ms=job_timeout_ms,
-            dialect_name=dialect_name,
+            client, maximum_bytes_billed=maximum_bytes_billed, job_timeout_ms=job_timeout_ms, dialect_name=dialect_name
         )
         self._storage_client = storage_client
 
     def fetch_rows(
-        self,
-        sql: str,
-        params: dict[str, Any] | None = None,
-        *,
-        timeout_ms: int | None = None,
+        self, sql: str, params: dict[str, Any] | None = None, *, timeout_ms: int | None = None
     ) -> list[tuple[Any, ...]]:
         if diagnostic_debug_enabled():
             debug(f"[{self._client_backend._dialect_name}.execute] sql=\n{sql}")
         try:
             job = self._client_backend._client.query(
-                sql,
-                job_config=self._client_backend._job_config(timeout_ms=timeout_ms, params=params),
+                sql, job_config=self._client_backend._job_config(timeout_ms=timeout_ms, params=params)
             )
             rows_iter = job.result(bqstorage_client=self._storage_client)
             return [tuple(row.values()) for row in rows_iter]
         except Exception:
             return self._client_backend.fetch_rows(sql, params, timeout_ms=timeout_ms)
+
+    def fetch_arrow_table(
+        self, sql: str, params: dict[str, Any] | None = None, *, timeout_ms: int | None = None
+    ) -> Any:
+        if diagnostic_debug_enabled():
+            debug(f"[{self._client_backend._dialect_name}.execute] sql=\n{sql}")
+        job = self._client_backend._client.query(
+            sql, job_config=self._client_backend._job_config(timeout_ms=timeout_ms, params=params)
+        )
+        rows_iter = job.result(bqstorage_client=self._storage_client)
+        to_arrow = getattr(rows_iter, "to_arrow", None)
+        if callable(to_arrow):
+            return to_arrow()
+        raise RuntimeError("BigQuery storage result iterator does not expose to_arrow")
 
 
 class SnowflakeArrowBackend(ResultBackend):
@@ -374,21 +387,12 @@ class SnowflakeArrowBackend(ResultBackend):
 
     kind = "snowflake_arrow"
 
-    def __init__(
-        self,
-        *,
-        snowpark: Any | None = None,
-        connection: Any | None = None,
-    ) -> None:
+    def __init__(self, *, snowpark: Any | None = None, connection: Any | None = None) -> None:
         self._snowpark = snowpark
         self._connection = connection
 
     def fetch_rows(
-        self,
-        sql: str,
-        params: dict[str, Any] | None = None,
-        *,
-        timeout_ms: int | None = None,
+        self, sql: str, params: dict[str, Any] | None = None, *, timeout_ms: int | None = None
     ) -> list[tuple[Any, ...]]:
         _ = params
         if timeout_ms is not None and cost_cap_active(timeout_ms):
@@ -410,7 +414,7 @@ class SnowflakeArrowBackend(ResultBackend):
                 elif hasattr(row, "asDict"):
                     out.append(tuple(row.asDict().values()))
                 else:
-                    out.append((row,))
+                    out.append(row)
             return out
         if self._connection is None:
             raise RuntimeError("SnowflakeArrowBackend has no snowpark session or connection")
@@ -427,6 +431,43 @@ class SnowflakeArrowBackend(ResultBackend):
         finally:
             cursor.close()
 
+    def fetch_arrow_table(
+        self, sql: str, params: dict[str, Any] | None = None, *, timeout_ms: int | None = None
+    ) -> Any:
+        _ = params
+        if timeout_ms is not None and cost_cap_active(timeout_ms):
+            secs = max(1, int(timeout_ms) // 1000)
+            if self._snowpark is not None:
+                self._snowpark.sql(f"ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = {secs}").collect()
+            elif self._connection is not None:
+                cur = self._connection.cursor()
+                try:
+                    cur.execute(f"ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = {secs}")
+                finally:
+                    cur.close()
+        if self._connection is None:
+            raise RuntimeError("SnowflakeArrowBackend has no connection for Arrow fetch")
+        cursor = self._connection.cursor()
+        try:
+            cursor.execute(sql)
+            fetch_arrow = getattr(cursor, "fetch_arrow_all", None)
+            if not callable(fetch_arrow):
+                raise RuntimeError("Snowflake cursor does not expose fetch_arrow_all")
+            return fetch_arrow()
+        finally:
+            cursor.close()
+
+    def cancel_statement(self) -> None:
+        connection = self._connection
+        if connection is None:
+            return
+        cancel = getattr(connection, "cancel", None)
+        if callable(cancel):
+            try:
+                cancel()
+            except Exception:
+                pass
+
 
 class MySQLConnectorBackend(ResultBackend):
     """Pymysql DB-API backend for MySQL and MariaDB."""
@@ -437,11 +478,7 @@ class MySQLConnectorBackend(ResultBackend):
         self._connection = connection
 
     def fetch_rows(
-        self,
-        sql: str,
-        params: dict[str, Any] | None = None,
-        *,
-        timeout_ms: int | None = None,
+        self, sql: str, params: dict[str, Any] | None = None, *, timeout_ms: int | None = None
     ) -> list[tuple[Any, ...]]:
         cursor = self._connection.cursor()
         try:
@@ -464,11 +501,7 @@ class RedshiftConnectorBackend(ResultBackend):
         self._connection = connection
 
     def fetch_rows(
-        self,
-        sql: str,
-        params: dict[str, Any] | None = None,
-        *,
-        timeout_ms: int | None = None,
+        self, sql: str, params: dict[str, Any] | None = None, *, timeout_ms: int | None = None
     ) -> list[tuple[Any, ...]]:
         cursor = self._connection.cursor()
         try:
@@ -491,14 +524,10 @@ class DuckDBNativeBackend(ResultBackend):
         self._connection = connection
 
     def fetch_rows(
-        self,
-        sql: str,
-        params: dict[str, Any] | None = None,
-        *,
-        timeout_ms: int | None = None,
+        self, sql: str, params: dict[str, Any] | None = None, *, timeout_ms: int | None = None
     ) -> list[tuple[Any, ...]]:
         _ = timeout_ms
-        bind_map = params if params and SQL_BIND_TOKEN_RE.search(sql) else None
+        bind_map = reconcile_execute_bind_params(sql, params) or {}
         if bind_map:
             result = self._connection.execute(sql, bind_map)
         else:
@@ -516,17 +545,14 @@ class SQLiteNativeBackend(ResultBackend):
         self._connection = connection
 
     def fetch_rows(
-        self,
-        sql: str,
-        params: dict[str, Any] | None = None,
-        *,
-        timeout_ms: int | None = None,
+        self, sql: str, params: dict[str, Any] | None = None, *, timeout_ms: int | None = None
     ) -> list[tuple[Any, ...]]:
         _ = timeout_ms
         cursor = self._connection.cursor()
         try:
-            if params:
-                cursor.execute(sql, params)
+            exec_params = reconcile_execute_bind_params(sql, params) or {}
+            if exec_params:
+                cursor.execute(sql, exec_params)
             else:
                 cursor.execute(sql)
             rows = cursor.fetchall() or []
@@ -565,24 +591,15 @@ def _open_redshift_connector(config: RedshiftRuntimeConfig) -> Any:
     return redshift_connector.connect(**kwargs)
 
 
-def _open_duckdb_connection(
-    config: DuckDBRuntimeConfig,
-    *,
-    connection: Any | None = None,
-) -> Any:
+def _open_duckdb_connection(config: DuckDBRuntimeConfig, *, connection: Any | None = None) -> Any:
     """Return an existing or newly opened native duckdb connection."""
     if connection is not None:
         return connection
-    import duckdb
 
     return duckdb.connect(str(config.DATABASE_PATH or ":memory:"))
 
 
-def _open_sqlite_connection(
-    config: SQLiteRuntimeConfig,
-    *,
-    connection: Any | None = None,
-) -> Any:
+def _open_sqlite_connection(config: SQLiteRuntimeConfig, *, connection: Any | None = None) -> Any:
     """Return an existing or newly opened stdlib sqlite3 connection."""
     if connection is not None:
         return connection
@@ -619,11 +636,7 @@ class _EmbeddedDuckDBConnection:
     def __init__(self, connection: Any) -> None:
         self._connection = connection
 
-    def execute(
-        self,
-        statement: Any,
-        parameters: dict[str, Any] | None = None,
-    ) -> _EmbeddedDuckDBResult:
+    def execute(self, statement: Any, parameters: dict[str, Any] | None = None) -> _EmbeddedDuckDBResult:
         sql = statement.text if hasattr(statement, "text") else str(statement)
         params = parameters or {}
         if params:
@@ -678,6 +691,11 @@ def _bind_colon_parameters(sql: str, parameters: dict[str, Any]) -> tuple[str, l
 
 def create_duckdb_sqlalchemy_engine(connection: Any) -> Any:
     """Build a reflection engine over a single duckdb connection."""
+    try:
+        import duckdb as _duckdb
+    except ImportError as exc:
+        raise ConfigError("DuckDB requires the 'duckdb' package.") from exc
+    _ = _duckdb
     return _EmbeddedDuckDBEngine(connection)
 
 
@@ -706,11 +724,7 @@ def extract_static_pool_connection(engine: Any) -> Any | None:
 
 
 def _resolve_embedded_native_connection(
-    config: EngineRuntimeConfig,
-    sqlalchemy_engine: Any | None,
-    native_connection: Any | None,
-    *,
-    open_new: Any,
+    config: EngineRuntimeConfig, sqlalchemy_engine: Any | None, native_connection: Any | None, *, open_new: Any
 ) -> tuple[Any, bool]:
     """Resolve the single native connection for an embedded dialect."""
     if native_connection is not None:
@@ -726,9 +740,7 @@ def _resolve_embedded_native_connection(
 
 
 def _embedded_sqlalchemy_engine_for_connection(
-    connection: Any,
-    engine_name: Literal["duckdb", "sqlite"],
-    sqlalchemy_engine: Any | None,
+    connection: Any, engine_name: Literal["duckdb", "sqlite"], sqlalchemy_engine: Any | None
 ) -> tuple[Any, bool]:
     """Reuse or build the SQLAlchemy engine for an embedded native connection."""
     if sqlalchemy_engine is not None:
@@ -745,6 +757,10 @@ class MySQLDialect(SqlglotEngineDialect):
 
     name: str = "mysql"
     sqlglot_dialect: ClassVar[str] = "mysql"
+    registry_canonical_rank: ClassVar[int] = 3
+    registry_native_backend: ClassVar[bool] = True
+    registry_structural_index: ClassVar[bool] = True
+    registry_qualified_table_ref: ClassVar[bool] = True
 
     def __init__(self, config: EngineRuntimeConfig, sqlalchemy_engine: Any | None = None):
         """Prefer pymysql connector backend with SQLAlchemy fallback."""
@@ -776,17 +792,9 @@ class MySQLDialect(SqlglotEngineDialect):
 
     def can_explain(self) -> bool:
         """Return True when pymysql or SQLAlchemy can run EXPLAIN."""
-        return can_explain_for_backends(
-            self,
-            sqlalchemy_engine=self.engine,
-            native_connection=self._native_connection,
-        )
+        return can_explain_for_backends(self, sqlalchemy_engine=self.engine, native_connection=self._native_connection)
 
-    def qualified_table_ref(
-        self,
-        table: str,
-        kind: Literal["table", "view"] = "table",
-    ) -> str:
+    def qualified_table_ref(self, table: str, kind: Literal["table", "view"] = "table") -> str:
         """Return a backtick-quoted ``database.table`` reference."""
         _ = kind
         schema = self.schema_name()
@@ -812,20 +820,6 @@ class MySQLDialect(SqlglotEngineDialect):
             connection=getattr(self, "_native_connection", None),
         )
 
-    def quote_table_column(self, table: str, column: str) -> str:
-        """Backtick-quote MySQL identifiers for ``table.column`` emission."""
-
-        def q(x: str) -> str:
-            return "`" + str(x).replace("`", "``") + "`"
-
-        return f"{q(table)}.{q(column)}"
-
-    def quote_identifier(self, ident: str) -> str:
-        """Quote a MySQL identifier with backticks."""
-        s = str(ident).strip()
-        esc = s.replace("`", "``")
-        return f"`{esc}`"
-
     def profiling_text_cast_sql(self, expr: str) -> str:
         """Return MySQL ``CAST(… AS CHAR)`` for overlap sampling."""
         return f"CAST({expr} AS CHAR)"
@@ -835,6 +829,7 @@ class MySQLDialect(SqlglotEngineDialect):
         *,
         include: SchemaInclude = "tables",
         allow_objects: frozenset[str] | None = None,
+        deny_objects: frozenset[str] | None = None,
         sql_file: str | None = None,
     ) -> SchemaGraph:
         """Build a schema graph from MySQL information_schema or SQL file fallback."""
@@ -842,6 +837,7 @@ class MySQLDialect(SqlglotEngineDialect):
             self.engine,
             include=include,
             allow_objects=allow_objects,
+            deny_objects=deny_objects,
             schema_json_path=EngineConfig.SCHEMA_JSON_PATH,
             sql_file=sql_file,
         )
@@ -851,10 +847,7 @@ class MySQLDialect(SqlglotEngineDialect):
         return f"EXPLAIN FORMAT=JSON {finalized_sql}"
 
     def parse_explain_plan(
-        self,
-        rows: list[Any],
-        *,
-        schema: SchemaGraph | None = None,
+        self, rows: list[Any], *, schema: SchemaGraph | None = None
     ) -> tuple[float | None, float | None, list[Any], str]:
         """Parse MySQL ``EXPLAIN FORMAT=JSON`` rows into estimates and soft diagnostics."""
         _ = schema
@@ -864,11 +857,7 @@ class MySQLDialect(SqlglotEngineDialect):
         return est_rows, est_bytes, diags, str(payload or "")
 
     def explain_row_estimate(
-        self,
-        sql_text: str,
-        *,
-        schema: SchemaGraph | None = None,
-        intent: Any | None = None,
+        self, sql_text: str, *, schema: SchemaGraph | None = None, intent: Any | None = None
     ) -> float | None:
         """Return MySQL planner row estimate from ``EXPLAIN FORMAT=JSON``."""
         eng = getattr(self, "engine", None)
@@ -893,14 +882,7 @@ class MySQLDialect(SqlglotEngineDialect):
         return MySQLQueryLogSource()
 
     def render_date_diff(
-        self,
-        left_expr: str,
-        op: str,
-        unit: str,
-        amount: int,
-        *,
-        minuend_sql: str = "",
-        subtrahend_sql: str = "",
+        self, left_expr: str, op: str, unit: str, amount: int, *, minuend_sql: str = "", subtrahend_sql: str = ""
     ) -> str:
         """Render MySQL date comparison using ``TIMESTAMPDIFF``. MySQL has no interval-typed ``date - date`` result, so a difference of two date columns cannot be compared against an ``INTERVAL`` literal. Use the scalar ``TIMESTAMPDIFF(unit, earlier, later)`` form (mirrors the SQL Server ``DATEDIFF`` shape), comparing the integer unit count directly."""
         unit_token = unit.upper()
@@ -911,20 +893,13 @@ class MySQLDialect(SqlglotEngineDialect):
         return emit_via_ast(sql, self.sqlglot_dialect)
 
     def render_array_contains(
-        self,
-        column_sql: str,
-        param_key: str,
-        *,
-        column_meta: ColumnMetadata | None = None,
+        self, column_sql: str, param_key: str, *, column_meta: ColumnMetadata | None = None
     ) -> str:
         """Render MySQL JSON array membership with case-insensitive element matching."""
         kind = array_storage_kind(column_meta) if column_meta is not None else "native_array"
         if kind in ("json_text_array", "native_array"):
             sql = quoted_json_element_token_predicate(
-                column_sql=column_sql,
-                param_key=param_key,
-                position_fn="INSTR",
-                value_cast="CHAR",
+                column_sql=column_sql, param_key=param_key, position_fn="INSTR", value_cast="CHAR"
             )
             return emit_via_ast(sql, self.sqlglot_dialect)
         norm_param = f"LOWER(TRIM(BOTH '%' FROM CAST(:{param_key} AS CHAR)))"
@@ -964,27 +939,20 @@ class MySQLDialect(SqlglotEngineDialect):
         random_seed: int,
         table_kind: Literal["table", "view"] = "table",
     ) -> str:
-        """Return a MySQL ``WHERE RAND()`` suffix for statistics."""
-        _ = random_seed, table_kind
+        """Return a MySQL ``WHERE RAND(seed)`` suffix for statistics."""
+        _ = table_kind
         if not use_sample:
             return ""
         ratio = max(0.0001, min(1.0, sample_size / max(row_count, 1)))
-        return f"WHERE {MYSQL_PROFILING_SAMPLE_PREDICATE.format(ratio=ratio)}"
+        return f"WHERE {MYSQL_PROFILING_SAMPLE_PREDICATE.format(ratio=ratio, seed=random_seed)}"
 
-    def profiling_stats_use_subquery_when_sampling(
-        self,
-        table_kind: Literal["table", "view"] = "table",
-    ) -> bool:
+    def profiling_stats_use_subquery_when_sampling(self, table_kind: Literal["table", "view"] = "table") -> bool:
         """MySQL samples via a ``WHERE RAND()`` predicate inside a subquery."""
         _ = table_kind
         return True
 
     def inject_pruning_predicates(
-        self,
-        sql: str,
-        *,
-        schema: SchemaGraph | None = None,
-        intent: RuntimeIntent | None = None,
+        self, sql: str, *, schema: SchemaGraph | None = None, intent: RuntimeIntent | None = None
     ) -> str:
         """Append MySQL partition predicates from ``information_schema.partitions`` metadata."""
         if schema is None or intent is None:
@@ -996,18 +964,34 @@ class MySQLDialect(SqlglotEngineDialect):
         )
         return inject_partition_predicates(adapter, sql, schema, intent)
 
+    def render_string_agg(self, expr_sql: str, sep_sql: str, order_by_sql: str) -> str:
+        if order_by_sql:
+            return f"GROUP_CONCAT({expr_sql} ORDER BY {order_by_sql} SEPARATOR {sep_sql})"
+        return f"GROUP_CONCAT({expr_sql} SEPARATOR {sep_sql})"
+
+    @property
+    def supports_median(self) -> bool:
+        return False
+
+    def quote_string_literal(self, text: str) -> str:
+        """Render a MySQL string literal with backslash and quote escaping."""
+        s = str(text).replace("\\", "\\\\").replace("'", "''")
+        return f"'{s}'"
+
 
 class MariaDBDialect(MySQLDialect):
     """MariaDB dialect that reuses MySQL SQL generation, execution, and reflection."""
 
     name: str = "mariadb"
     sqlglot_dialect: ClassVar[str] = "mysql"
+    registry_canonical_rank: ClassVar[int] = 4
 
     def reflect_schema_graph(
         self,
         *,
         include: SchemaInclude = "tables",
         allow_objects: frozenset[str] | None = None,
+        deny_objects: frozenset[str] | None = None,
         sql_file: str | None = None,
     ) -> SchemaGraph:
         """Build a schema graph from MariaDB information_schema or SQL file fallback."""
@@ -1015,6 +999,7 @@ class MariaDBDialect(MySQLDialect):
             self.engine,
             include=include,
             allow_objects=allow_objects,
+            deny_objects=deny_objects,
             schema_json_path=EngineConfig.SCHEMA_JSON_PATH,
             sql_file=sql_file,
         )
@@ -1037,6 +1022,10 @@ class RedshiftDialect(SqlglotEngineDialect):
 
     name: str = "redshift"
     sqlglot_dialect: ClassVar[str] = "redshift"
+    registry_canonical_rank: ClassVar[int] = 7
+    registry_native_backend: ClassVar[bool] = True
+    registry_structural_index: ClassVar[bool] = True
+    registry_qualified_table_ref: ClassVar[bool] = True
 
     def __init__(self, config: EngineRuntimeConfig, sqlalchemy_engine: Any | None = None):
         """Prefer redshift_connector backend with SQLAlchemy fallback."""
@@ -1068,17 +1057,9 @@ class RedshiftDialect(SqlglotEngineDialect):
 
     def can_explain(self) -> bool:
         """Return True when redshift_connector or SQLAlchemy can run EXPLAIN."""
-        return can_explain_for_backends(
-            self,
-            sqlalchemy_engine=self.engine,
-            native_connection=self._native_connection,
-        )
+        return can_explain_for_backends(self, sqlalchemy_engine=self.engine, native_connection=self._native_connection)
 
-    def qualified_table_ref(
-        self,
-        table: str,
-        kind: Literal["table", "view"] = "table",
-    ) -> str:
+    def qualified_table_ref(self, table: str, kind: Literal["table", "view"] = "table") -> str:
         """Return a double-quoted ``schema.table`` reference."""
         _ = kind
         schema = self.schema_name()
@@ -1107,19 +1088,12 @@ class RedshiftDialect(SqlglotEngineDialect):
         """Redshift supports ``ILIKE`` via Postgres-compatible syntax."""
         return True
 
-    def quote_table_column(self, table: str, column: str) -> str:
-        """Double-quote Redshift identifiers for ``table.column`` emission."""
-
-        def q(x: str) -> str:
-            return '"' + str(x).replace('"', '""') + '"'
-
-        return f"{q(table)}.{q(column)}"
-
     def reflect_schema_graph(
         self,
         *,
         include: SchemaInclude = "tables",
         allow_objects: frozenset[str] | None = None,
+        deny_objects: frozenset[str] | None = None,
         sql_file: str | None = None,
     ) -> SchemaGraph:
         """Build a schema graph from Redshift catalog views or SQL file fallback."""
@@ -1127,6 +1101,7 @@ class RedshiftDialect(SqlglotEngineDialect):
             self.engine,
             include=include,
             allow_objects=allow_objects,
+            deny_objects=deny_objects,
             schema_json_path=EngineConfig.SCHEMA_JSON_PATH,
             sql_file=sql_file,
         )
@@ -1136,10 +1111,7 @@ class RedshiftDialect(SqlglotEngineDialect):
         return f"EXPLAIN {finalized_sql}"
 
     def parse_explain_plan(
-        self,
-        rows: list[Any],
-        *,
-        schema: SchemaGraph | None = None,
+        self, rows: list[Any], *, schema: SchemaGraph | None = None
     ) -> tuple[float | None, float | None, list[Any], str]:
         """Parse Redshift ``EXPLAIN`` text rows into estimates and soft diagnostics."""
         _ = schema
@@ -1149,11 +1121,7 @@ class RedshiftDialect(SqlglotEngineDialect):
         return est_rows, est_bytes, diags, text_payload
 
     def explain_row_estimate(
-        self,
-        sql_text: str,
-        *,
-        schema: SchemaGraph | None = None,
-        intent: Any | None = None,
+        self, sql_text: str, *, schema: SchemaGraph | None = None, intent: Any | None = None
     ) -> float | None:
         """Return Redshift planner row estimate from ``EXPLAIN``."""
         eng = getattr(self, "engine", None)
@@ -1178,14 +1146,7 @@ class RedshiftDialect(SqlglotEngineDialect):
         return RedshiftQueryLogSource()
 
     def render_date_diff(
-        self,
-        left_expr: str,
-        op: str,
-        unit: str,
-        amount: int,
-        *,
-        minuend_sql: str = "",
-        subtrahend_sql: str = "",
+        self, left_expr: str, op: str, unit: str, amount: int, *, minuend_sql: str = "", subtrahend_sql: str = ""
     ) -> str:
         """Render Redshift interval date-difference comparison."""
         _ = minuend_sql, subtrahend_sql
@@ -1194,28 +1155,18 @@ class RedshiftDialect(SqlglotEngineDialect):
         return emit_via_ast(sql, self.sqlglot_dialect)
 
     def render_array_contains(
-        self,
-        column_sql: str,
-        param_key: str,
-        *,
-        column_meta: ColumnMetadata | None = None,
+        self, column_sql: str, param_key: str, *, column_meta: ColumnMetadata | None = None
     ) -> str:
         """Render Redshift array membership, branching on column storage kind."""
         kind = array_storage_kind(column_meta) if column_meta is not None else "native_array"
         if kind == "json_text_array":
             sql = quoted_json_element_token_predicate(
-                column_sql=column_sql,
-                param_key=param_key,
-                position_fn="STRPOS",
-                value_cast="VARCHAR",
+                column_sql=column_sql, param_key=param_key, position_fn="STRPOS", value_cast="VARCHAR"
             )
             return emit_via_ast(sql, self.sqlglot_dialect)
         if kind == "native_array":
             sql = quoted_json_element_token_predicate(
-                column_sql=column_sql,
-                param_key=param_key,
-                position_fn="STRPOS",
-                value_cast="VARCHAR",
+                column_sql=column_sql, param_key=param_key, position_fn="STRPOS", value_cast="VARCHAR"
             )
             return emit_via_ast(sql, self.sqlglot_dialect)
         norm_param = f"LOWER(BTRIM(CAST(:{param_key} AS VARCHAR), ' ' || CHR(34) || CHR(39)))"
@@ -1255,27 +1206,20 @@ class RedshiftDialect(SqlglotEngineDialect):
         random_seed: int,
         table_kind: Literal["table", "view"] = "table",
     ) -> str:
-        """Return a Redshift ``WHERE RANDOM()`` suffix for statistics."""
-        _ = random_seed, table_kind
+        """Return a Redshift seeded hash-bucket ``WHERE`` suffix for statistics."""
+        _ = table_kind
         if not use_sample:
             return ""
         ratio = max(0.0001, min(1.0, sample_size / max(row_count, 1)))
-        return f"WHERE {REDSHIFT_PROFILING_SAMPLE_PREDICATE.format(ratio=ratio)}"
+        return f"WHERE {REDSHIFT_PROFILING_SAMPLE_PREDICATE.format(ratio=ratio, seed=random_seed)}"
 
-    def profiling_stats_use_subquery_when_sampling(
-        self,
-        table_kind: Literal["table", "view"] = "table",
-    ) -> bool:
+    def profiling_stats_use_subquery_when_sampling(self, table_kind: Literal["table", "view"] = "table") -> bool:
         """Redshift samples via a ``WHERE RANDOM()`` predicate inside a subquery."""
         _ = table_kind
         return True
 
     def inject_pruning_predicates(
-        self,
-        sql: str,
-        *,
-        schema: SchemaGraph | None = None,
-        intent: RuntimeIntent | None = None,
+        self, sql: str, *, schema: SchemaGraph | None = None, intent: RuntimeIntent | None = None
     ) -> str:
         """Append sortkey and distkey predicates when schema and intent are available."""
         if schema is None or intent is None:
@@ -1285,13 +1229,7 @@ class RedshiftDialect(SqlglotEngineDialect):
             format_literal=self.quote_string_literal,
             sqlglot_dialect=self.sqlglot_dialect,
         )
-        return inject_partition_predicates(
-            adapter,
-            sql,
-            schema,
-            intent,
-            column_selector=_redshift_pruning_columns,
-        )
+        return inject_partition_predicates(adapter, sql, schema, intent, column_selector=_redshift_pruning_columns)
 
 
 def _snowflake_cluster_columns(table_meta: Any) -> list[str]:
@@ -1308,6 +1246,15 @@ class SnowflakeDialect(SqlglotEngineDialect):
 
     name: str = "snowflake"
     sqlglot_dialect: ClassVar[str] = "snowflake"
+    registry_canonical_rank: ClassVar[int] = 9
+    registry_native_backend: ClassVar[bool] = True
+    registry_structural_index: ClassVar[bool] = True
+    registry_qualified_table_ref: ClassVar[bool] = True
+
+    @property
+    def supports_ilike(self) -> bool:
+        """Return True because Snowflake exposes ``ILIKE``."""
+        return True
 
     def __init__(self, config: EngineRuntimeConfig, sqlalchemy_engine: Any | None = None):
         """Open connector, SQLAlchemy, or Snowpark backends in priority order."""
@@ -1370,13 +1317,9 @@ class SnowflakeDialect(SqlglotEngineDialect):
 
     def quote_table_column(self, table: str, column: str) -> str:
         """Emit unquoted uppercase Snowflake identifiers by default."""
-        return f"{str(table).upper()}.{str(column).upper()}"
+        return sqlglot_quote_table_column(table, column, self.sqlglot_dialect, quoted=False)
 
-    def qualified_table_ref(
-        self,
-        table: str,
-        kind: Literal["table", "view"] = "table",
-    ) -> str:
+    def qualified_table_ref(self, table: str, kind: Literal["table", "view"] = "table") -> str:
         """Return a double-quoted ``database.schema.table`` reference."""
         _ = kind
         config = getattr(self, "config", None)
@@ -1439,11 +1382,6 @@ class SnowflakeDialect(SqlglotEngineDialect):
             spark_session=getattr(self, "_snowpark_session", None),
         )
 
-    @property
-    def supports_unnest_select_item(self) -> bool:
-        """Return True because Snowflake ``FLATTEN`` may appear as a SELECT-list lateral item."""
-        return True
-
     def profiling_text_cast_sql(self, expr: str) -> str:
         """Return Snowflake ``CAST(… AS VARCHAR)`` for overlap sampling."""
         return f"CAST({expr} AS VARCHAR)"
@@ -1453,6 +1391,7 @@ class SnowflakeDialect(SqlglotEngineDialect):
         *,
         include: SchemaInclude = "tables",
         allow_objects: frozenset[str] | None = None,
+        deny_objects: frozenset[str] | None = None,
         sql_file: str | None = None,
     ) -> SchemaGraph:
         """Build a schema graph from Snowflake INFORMATION_SCHEMA or SQL file fallback."""
@@ -1460,6 +1399,7 @@ class SnowflakeDialect(SqlglotEngineDialect):
             self.engine,
             include=include,
             allow_objects=allow_objects,
+            deny_objects=deny_objects,
             schema_json_path=EngineConfig.SCHEMA_JSON_PATH,
             sql_file=sql_file,
         )
@@ -1469,10 +1409,7 @@ class SnowflakeDialect(SqlglotEngineDialect):
         return f"EXPLAIN USING JSON {finalized_sql}"
 
     def parse_explain_plan(
-        self,
-        rows: list[Any],
-        *,
-        schema: SchemaGraph | None = None,
+        self, rows: list[Any], *, schema: SchemaGraph | None = None
     ) -> tuple[float | None, float | None, list[SqlDiagnostic], str]:
         """Parse Snowflake ``EXPLAIN USING JSON`` rows into estimates and soft diagnostics."""
         _ = schema
@@ -1490,12 +1427,7 @@ class SnowflakeDialect(SqlglotEngineDialect):
         intent: RuntimeIntent | None = None,
     ) -> tuple[bool, list[SqlDiagnostic], str]:
         """Run Snowflake ``EXPLAIN USING JSON`` via the active result backend."""
-        finalized = self.finalize_render(
-            sql,
-            params or {},
-            schema=schema,
-            intent=intent,
-        )
+        finalized = self.finalize_render(sql, params or {}, schema=schema, intent=intent)
         explain_sql = self.explain_statement_sql(finalized)
         try:
             backend = self.result_backend
@@ -1505,13 +1437,11 @@ class SnowflakeDialect(SqlglotEngineDialect):
             if tm is not None and backend.kind == "sqlalchemy" and self.engine is not None:
                 ms = int(tm)
                 with self.engine.begin() as conn:
-                    conn.execute(
-                        text(f"ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = {max(1, ms // 1000)}"),
-                    )
+                    conn.execute(text(f"ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = {max(1, ms // 1000)}"))
             rows = backend.fetch_rows(explain_sql, params, timeout_ms=tm)
             est_rows, est_bytes, soft_diags, plan_text = self.parse_explain_plan(list(rows), schema=schema)
             if cost_cap_active(None) and (est_rows is not None or est_bytes is not None):
-                failed, why = explain_cost_gate_violation(est_rows, est_bytes)
+                failed, why = explain_cost_gate_violation(est_rows, est_bytes, dialect=self)
                 if failed:
                     return (
                         False,
@@ -1523,18 +1453,10 @@ class SnowflakeDialect(SqlglotEngineDialect):
             err = _format_result_backend_error(e)
             if self._disable_explain_on_permission_denied(err):
                 return True, [], ""
-            return (
-                False,
-                [SqlDiagnostic(code=SqlDiagnosticCode.EXPLAIN_OTHER, message=err)],
-                err,
-            )
+            return (False, [SqlDiagnostic(code=SqlDiagnosticCode.EXPLAIN_OTHER, message=err)], err)
 
     def explain_row_estimate(
-        self,
-        sql_text: str,
-        *,
-        schema: SchemaGraph | None = None,
-        intent: Any | None = None,
+        self, sql_text: str, *, schema: SchemaGraph | None = None, intent: Any | None = None
     ) -> float | None:
         """Return Snowflake planner row estimate from ``EXPLAIN USING JSON``."""
         backend = self.result_backend
@@ -1565,11 +1487,7 @@ class SnowflakeDialect(SqlglotEngineDialect):
         return SnowflakeQueryLogSource()
 
     def inject_pruning_predicates(
-        self,
-        sql: str,
-        *,
-        schema: SchemaGraph | None = None,
-        intent: RuntimeIntent | None = None,
+        self, sql: str, *, schema: SchemaGraph | None = None, intent: RuntimeIntent | None = None
     ) -> str:
         """Append cluster-key predicates when schema and intent carry date signals."""
         if schema is None or intent is None:
@@ -1579,23 +1497,10 @@ class SnowflakeDialect(SqlglotEngineDialect):
             format_literal=self.quote_string_literal,
             sqlglot_dialect=self.sqlglot_dialect,
         )
-        return inject_partition_predicates(
-            adapter,
-            sql,
-            schema,
-            intent,
-            column_selector=_snowflake_cluster_columns,
-        )
+        return inject_partition_predicates(adapter, sql, schema, intent, column_selector=_snowflake_cluster_columns)
 
     def render_date_diff(
-        self,
-        left_expr: str,
-        op: str,
-        unit: str,
-        amount: int,
-        *,
-        minuend_sql: str = "",
-        subtrahend_sql: str = "",
+        self, left_expr: str, op: str, unit: str, amount: int, *, minuend_sql: str = "", subtrahend_sql: str = ""
     ) -> str:
         """Render Snowflake date comparison using ``DATEDIFF``. Snowflake ``DATEDIFF(part, start, end)`` returns an integer count, so a two-column difference must pass the columns as separate ``start``/``end`` arguments (``date - date`` is not a valid Snowflake interval). Falls back to comparing a single date column against ``CURRENT_DATE()``."""
         if minuend_sql and subtrahend_sql:
@@ -1605,20 +1510,13 @@ class SnowflakeDialect(SqlglotEngineDialect):
         return emit_via_ast(sql, self.sqlglot_dialect)
 
     def render_array_contains(
-        self,
-        column_sql: str,
-        param_key: str,
-        *,
-        column_meta: ColumnMetadata | None = None,
+        self, column_sql: str, param_key: str, *, column_meta: ColumnMetadata | None = None
     ) -> str:
         """Render Snowflake array membership with trimmed, case- insensitive element comparison."""
         kind = array_storage_kind(column_meta) if column_meta is not None else "native_array"
         if kind == "json_text_array":
             sql = quoted_json_element_token_predicate(
-                column_sql=column_sql,
-                param_key=param_key,
-                position_fn="STRPOS",
-                value_cast="VARCHAR",
+                column_sql=column_sql, param_key=param_key, position_fn="STRPOS", value_cast="VARCHAR"
             )
             return emit_via_ast(sql, self.sqlglot_dialect)
         trim_set = "CONCAT(' ', CHR(34), CHR(39))"
@@ -1661,20 +1559,25 @@ class SnowflakeDialect(SqlglotEngineDialect):
         random_seed: int,
         table_kind: Literal["table", "view"] = "table",
     ) -> str:
-        """Return a Snowflake ``SAMPLE`` suffix for statistics."""
-        _ = row_count, random_seed, table_kind
+        """Return a Snowflake seeded ``SAMPLE`` suffix for statistics."""
+        _ = row_count, table_kind
         if not use_sample:
             return ""
         pct = max(0.01, min(100.0, 100.0 * sample_size / max(row_count, 1)))
-        return f"SAMPLE ({pct:.2f})"
+        return f"SAMPLE ({pct:.2f}) SEED ({random_seed})"
 
-    def profiling_stats_use_subquery_when_sampling(
-        self,
-        table_kind: Literal["table", "view"] = "table",
-    ) -> bool:
+    def profiling_stats_use_subquery_when_sampling(self, table_kind: Literal["table", "view"] = "table") -> bool:
         """Snowflake ``SAMPLE`` applies directly on the scanned table."""
         _ = table_kind
         return False
+
+    def render_string_agg(self, expr_sql: str, sep_sql: str, order_by_sql: str) -> str:
+        if order_by_sql:
+            return f"LISTAGG({expr_sql}, {sep_sql}) WITHIN GROUP (ORDER BY {order_by_sql})"
+        return f"LISTAGG({expr_sql}, {sep_sql})"
+
+    def render_median(self, expr_sql: str) -> str:
+        return f"MEDIAN({expr_sql})"
 
 
 class SQLServerDialect(SqlglotEngineDialect):
@@ -1682,17 +1585,27 @@ class SQLServerDialect(SqlglotEngineDialect):
 
     name: str = "sqlserver"
     sqlglot_dialect: ClassVar[str] = "tsql"
+    registry_canonical_rank: ClassVar[int] = 5
+    registry_native_backend: ClassVar[bool] = True
+    registry_structural_index: ClassVar[bool] = True
+    registry_qualified_table_ref: ClassVar[bool] = True
+
+    @property
+    def supports_ilike(self) -> bool:
+        """Return True because SQL Server exposes ``ILIKE`` (case- insensitive ``LIKE``)."""
+        return True
+
+    def render_string_agg(self, expr_sql: str, sep_sql: str, order_by_sql: str) -> str:
+        if order_by_sql:
+            return f"STRING_AGG({expr_sql}, {sep_sql}) WITHIN GROUP (ORDER BY {order_by_sql})"
+        return f"STRING_AGG({expr_sql}, {sep_sql})"
 
     def __init__(self, config: EngineRuntimeConfig, sqlalchemy_engine: Any | None = None):
         """Attach SQL Server ODBC backend and SHOWPLAN diagnose cache."""
         self._showplan_row_cache: dict[str, float | None] = {}
         super().__init__(config, sqlalchemy_engine=sqlalchemy_engine)
 
-    def qualified_table_ref(
-        self,
-        table: str,
-        kind: Literal["table", "view"] = "table",
-    ) -> str:
+    def qualified_table_ref(self, table: str, kind: Literal["table", "view"] = "table") -> str:
         """Return a bracket-quoted ``schema.table`` reference."""
         _ = kind
         schema = self.schema_name()
@@ -1703,11 +1616,7 @@ class SQLServerDialect(SqlglotEngineDialect):
     def structural_constraints_index(self) -> CatalogStructuralConstraintsIndex:
         """Load PK, FK, and UNIQUE metadata from SQL Server ``information_schema``."""
         schema_name = self.schema_name()
-        return structural_constraints_index_for_schema(
-            self,
-            schema_name,
-            engine=getattr(self, "engine", None),
-        )
+        return structural_constraints_index_for_schema(self, schema_name, engine=getattr(self, "engine", None))
 
     def can_explain(self) -> bool:
         """Return True when SQLAlchemy or ODBC can run SHOWPLAN."""
@@ -1718,29 +1627,12 @@ class SQLServerDialect(SqlglotEngineDialect):
         if self._backend is not None:
             return
         if getattr(self, "engine", None) is not None:
-            self._backend = SqlServerResultBackend(
-                self.engine,
-                dialect_name=self.__class__.__name__,
-            )
+            self._backend = SqlServerResultBackend(self.engine, dialect_name=self.__class__.__name__)
 
     def profile_statement_timeout_sql(self, timeout_ms: int) -> str | None:
         """Return ``None`` because T-SQL has no portable session statement-timeout statement. SQL Server statement timeouts are enforced via the ODBC driver command timeout in :class:`SqlServerResultBackend`."""
         _ = timeout_ms
         return None
-
-    def quote_table_column(self, table: str, column: str) -> str:
-        """Bracket-quote T-SQL identifiers for ``table.column`` emission."""
-
-        def q(x: str) -> str:
-            return "[" + str(x).replace("]", "]]") + "]"
-
-        return f"{q(table)}.{q(column)}"
-
-    def quote_identifier(self, ident: str) -> str:
-        """Quote a T-SQL identifier with square brackets."""
-        s = str(ident).strip()
-        esc = s.replace("]", "]]")
-        return f"[{esc}]"
 
     def profiling_text_cast_sql(self, expr: str) -> str:
         """Return T-SQL ``CAST(… AS NVARCHAR(4000))`` for overlap sampling."""
@@ -1751,6 +1643,7 @@ class SQLServerDialect(SqlglotEngineDialect):
         *,
         include: SchemaInclude = "tables",
         allow_objects: frozenset[str] | None = None,
+        deny_objects: frozenset[str] | None = None,
         sql_file: str | None = None,
     ) -> SchemaGraph:
         """Build a schema graph from ``sys.*`` catalog views or SQL file fallback."""
@@ -1758,6 +1651,7 @@ class SQLServerDialect(SqlglotEngineDialect):
             self.engine,
             include=include,
             allow_objects=allow_objects,
+            deny_objects=deny_objects,
             schema_json_path=EngineConfig.SCHEMA_JSON_PATH,
             sql_file=sql_file,
         )
@@ -1767,10 +1661,7 @@ class SQLServerDialect(SqlglotEngineDialect):
         return finalized_sql
 
     def parse_explain_plan(
-        self,
-        rows: list[Any],
-        *,
-        schema: SchemaGraph | None = None,
+        self, rows: list[Any], *, schema: SchemaGraph | None = None
     ) -> tuple[float | None, float | None, list[SqlDiagnostic], str]:
         """Parse SQL Server ``SHOWPLAN_ALL`` rows into estimates and soft diagnostics."""
         _ = schema
@@ -1788,12 +1679,7 @@ class SQLServerDialect(SqlglotEngineDialect):
         intent: RuntimeIntent | None = None,
     ) -> tuple[bool, list[SqlDiagnostic], str]:
         """Run T-SQL ``SHOWPLAN_ALL`` via separate driver batches."""
-        finalized = self.finalize_render(
-            sql,
-            params or {},
-            schema=schema,
-            intent=intent,
-        )
+        finalized = self.finalize_render(sql, params or {}, schema=schema, intent=intent)
         try:
             if self.engine is None:
                 return (
@@ -1832,7 +1718,7 @@ class SQLServerDialect(SqlglotEngineDialect):
                 xml_diags = []
             merged_diags = list(soft_diags) + xml_diags
             if cost_cap_active(None) and (est_rows is not None or est_bytes is not None):
-                failed, why = explain_cost_gate_violation(est_rows, est_bytes)
+                failed, why = explain_cost_gate_violation(est_rows, est_bytes, dialect=self)
                 if failed:
                     return (
                         False,
@@ -1847,18 +1733,10 @@ class SQLServerDialect(SqlglotEngineDialect):
             err = str(e)
             if self._disable_explain_on_permission_denied(err):
                 return True, [], ""
-            return (
-                False,
-                [SqlDiagnostic(code=SqlDiagnosticCode.EXPLAIN_OTHER, message=err)],
-                err,
-            )
+            return (False, [SqlDiagnostic(code=SqlDiagnosticCode.EXPLAIN_OTHER, message=err)], err)
 
     def explain_row_estimate(
-        self,
-        sql_text: str,
-        *,
-        schema: SchemaGraph | None = None,
-        intent: Any | None = None,
+        self, sql_text: str, *, schema: SchemaGraph | None = None, intent: Any | None = None
     ) -> float | None:
         """Return SQL Server planner row estimate from cached SHOWPLAN diagnose."""
         try:
@@ -1886,20 +1764,16 @@ class SQLServerDialect(SqlglotEngineDialect):
         random_seed: int,
         table_kind: Literal["table", "view"] = "table",
     ) -> str:
-        """Return a T-SQL ``TABLESAMPLE SYSTEM`` suffix for statistics."""
-        _ = random_seed, table_kind
+        """Return a deterministic ordered row cap when T-SQL ``TABLESAMPLE`` is unseeded."""
+        _ = row_count, random_seed, table_kind
         if not use_sample:
             return ""
-        pct = max(0.01, min(100.0, 100.0 * sample_size / max(row_count, 1)))
-        return f"TABLESAMPLE SYSTEM ({pct:.2f} PERCENT)"
+        return self.profiling_ordered_limit_sample_suffix(sample_size)
 
-    def profiling_stats_use_subquery_when_sampling(
-        self,
-        table_kind: Literal["table", "view"] = "table",
-    ) -> bool:
-        """T-SQL ``TABLESAMPLE`` applies directly on the scanned table."""
+    def profiling_stats_use_subquery_when_sampling(self, table_kind: Literal["table", "view"] = "table") -> bool:
+        """Ordered-limit sampling scans a deterministic subquery."""
         _ = table_kind
-        return False
+        return True
 
     def execute(self, sql: str, params: dict[str, Any] | None = None) -> list[tuple[Any, ...]]:
         """Execute SQL via the active result backend, including ``sp_executesql`` batches."""
@@ -1912,11 +1786,7 @@ class SQLServerDialect(SqlglotEngineDialect):
         return backend.fetch_rows(sql, params, timeout_ms=tm)
 
     def inject_pruning_predicates(
-        self,
-        sql: str,
-        *,
-        schema: SchemaGraph | None = None,
-        intent: RuntimeIntent | None = None,
+        self, sql: str, *, schema: SchemaGraph | None = None, intent: RuntimeIntent | None = None
     ) -> str:
         """Append partition-key predicates when schema and intent carry filter signals."""
         if schema is None or intent is None:
@@ -1929,14 +1799,7 @@ class SQLServerDialect(SqlglotEngineDialect):
         return inject_partition_predicates(adapter, sql, schema, intent)
 
     def render_date_diff(
-        self,
-        left_expr: str,
-        op: str,
-        unit: str,
-        amount: int,
-        *,
-        minuend_sql: str = "",
-        subtrahend_sql: str = "",
+        self, left_expr: str, op: str, unit: str, amount: int, *, minuend_sql: str = "", subtrahend_sql: str = ""
     ) -> str:
         """Render T-SQL ``DATEDIFF`` comparison against ``GETDATE()``."""
         _ = left_expr
@@ -1956,20 +1819,13 @@ class SQLServerDialect(SqlglotEngineDialect):
         return emit_via_ast(sql, self.sqlglot_dialect)
 
     def render_array_contains(
-        self,
-        column_sql: str,
-        param_key: str,
-        *,
-        column_meta: ColumnMetadata | None = None,
+        self, column_sql: str, param_key: str, *, column_meta: ColumnMetadata | None = None
     ) -> str:
         """Render SQL Server JSON-array membership as a validator-safe scalar predicate. SQL Server has no scalar "array contains" function: ``OPENJSON`` is table-valued and requires a subquery / ``CROSS APPLY`` that the structural SQL validator forbids (no ``EXISTS`` / subqueries). Arrays are stored as JSON text, so membership is tested as a quoted-token match, which is precise for JSON string elements (the surrounding quotes prevent prefix false positives such as ``Trailers`` matching ``Trailers Extended``)."""
         kind = array_storage_kind(column_meta) if column_meta is not None else "native_array"
         if kind in ("json_text_array", "native_array"):
             sql = quoted_json_element_token_predicate(
-                column_sql=column_sql,
-                param_key=param_key,
-                position_fn="CHARINDEX",
-                value_cast="NVARCHAR(MAX)",
+                column_sql=column_sql, param_key=param_key, position_fn="CHARINDEX", value_cast="NVARCHAR(MAX)"
             )
             return emit_via_ast(sql, self.sqlglot_dialect)
         norm_param = f"LOWER(LTRIM(RTRIM(CAST(:{param_key} AS NVARCHAR(MAX)))))"
@@ -2012,6 +1868,10 @@ class BigQueryDialect(SqlglotEngineDialect):
 
     name: str = "bigquery"
     sqlglot_dialect: ClassVar[str] = "bigquery"
+    registry_canonical_rank: ClassVar[int] = 10
+    registry_native_backend: ClassVar[bool] = True
+    registry_structural_index: ClassVar[bool] = True
+    registry_qualified_table_ref: ClassVar[bool] = True
 
     def __init__(self, config: EngineRuntimeConfig, sqlalchemy_engine: Any | None = None):
         """Build BigQuery client, optional storage reader, and SQLAlchemy inspect engine."""
@@ -2029,9 +1889,7 @@ class BigQueryDialect(SqlglotEngineDialect):
                 from_service_account: Any = service_account.Credentials.from_service_account_file
                 credentials = from_service_account(str(bq_config.CREDENTIALS_PATH))
             self._bq_client = bigquery.Client(
-                project=str(bq_config.PROJECT or ""),
-                credentials=credentials,
-                location=str(bq_config.LOCATION or "US"),
+                project=str(bq_config.PROJECT or ""), credentials=credentials, location=str(bq_config.LOCATION or "US")
             )
             try:
                 bq_storage = importlib.import_module("google.cloud.bigquery_storage")
@@ -2075,10 +1933,7 @@ class BigQueryDialect(SqlglotEngineDialect):
             )
             return
         if getattr(self, "engine", None) is not None:
-            self._backend = SqlAlchemyResultBackend(
-                self.engine,
-                dialect_name=self.__class__.__name__,
-            )
+            self._backend = SqlAlchemyResultBackend(self.engine, dialect_name=self.__class__.__name__)
 
     @property
     def result_reader_kind(
@@ -2090,25 +1945,7 @@ class BigQueryDialect(SqlglotEngineDialect):
             return cast(ResultReaderKind, backend.kind)
         return "sqlalchemy"
 
-    def quote_table_column(self, table: str, column: str) -> str:
-        """Backtick-quote BigQuery table path and column."""
-
-        def q(x: str) -> str:
-            return "`" + str(x).replace("`", "``") + "`"
-
-        return f"{q(table)}.{q(column)}"
-
-    def quote_identifier(self, ident: str) -> str:
-        """Quote a BigQuery identifier with backticks."""
-        s = str(ident).strip()
-        esc = s.replace("`", "``")
-        return f"`{esc}`"
-
-    def qualified_table_ref(
-        self,
-        table: str,
-        kind: Literal["table", "view"] = "table",
-    ) -> str:
+    def qualified_table_ref(self, table: str, kind: Literal["table", "view"] = "table") -> str:
         """Return a backtick-quoted ``project.dataset.table`` reference."""
         _ = kind
         config = getattr(self, "config", None)
@@ -2133,9 +1970,7 @@ class BigQueryDialect(SqlglotEngineDialect):
     def can_explain(self) -> bool:
         """Return True when the BigQuery client or SQLAlchemy engine can dry-run."""
         return can_explain_for_backends(
-            self,
-            sqlalchemy_engine=self.engine,
-            native_connection=getattr(self, "_bq_client", None),
+            self, sqlalchemy_engine=self.engine, native_connection=getattr(self, "_bq_client", None)
         )
 
     def apply_execute_cost_limits(self, target: Any) -> None:
@@ -2172,6 +2007,7 @@ class BigQueryDialect(SqlglotEngineDialect):
         *,
         include: SchemaInclude = "tables",
         allow_objects: frozenset[str] | None = None,
+        deny_objects: frozenset[str] | None = None,
         sql_file: str | None = None,
     ) -> SchemaGraph:
         """Build a schema graph from BigQuery INFORMATION_SCHEMA or SQL file fallback."""
@@ -2179,6 +2015,7 @@ class BigQueryDialect(SqlglotEngineDialect):
             self.engine,
             include=include,
             allow_objects=allow_objects,
+            deny_objects=deny_objects,
             schema_json_path=EngineConfig.SCHEMA_JSON_PATH,
             sql_file=sql_file,
         )
@@ -2192,12 +2029,7 @@ class BigQueryDialect(SqlglotEngineDialect):
         intent: RuntimeIntent | None = None,
     ) -> tuple[bool, list[SqlDiagnostic], str]:
         """Validate SQL via BigQuery dry-run query job and enforce bytes-billed caps."""
-        finalized = self.finalize_render(
-            sql,
-            params or {},
-            schema=schema,
-            intent=intent,
-        )
+        finalized = self.finalize_render(sql, params or {}, schema=schema, intent=intent)
         if self._bq_client is None:
             return True, [], ""
         try:
@@ -2211,7 +2043,7 @@ class BigQueryDialect(SqlglotEngineDialect):
                 job_config.job_timeout_ms = int(timeout_ms)
             job = self._bq_client.query(finalized, job_config=job_config)
             est_bytes = float(job.total_bytes_processed or 0)
-            failed, why = explain_cost_gate_violation(None, est_bytes)
+            failed, why = explain_cost_gate_violation(None, est_bytes, dialect=self)
             require_part: list[str] = []
             partition_filter_present = True
             if schema is not None:
@@ -2240,18 +2072,10 @@ class BigQueryDialect(SqlglotEngineDialect):
             err = str(e)
             if self._disable_explain_on_permission_denied(err):
                 return True, [], ""
-            return (
-                False,
-                [SqlDiagnostic(code=SqlDiagnosticCode.EXPLAIN_OTHER, message=err)],
-                err,
-            )
+            return (False, [SqlDiagnostic(code=SqlDiagnosticCode.EXPLAIN_OTHER, message=err)], err)
 
     def explain_row_estimate(
-        self,
-        sql_text: str,
-        *,
-        schema: SchemaGraph | None = None,
-        intent: Any | None = None,
+        self, sql_text: str, *, schema: SchemaGraph | None = None, intent: Any | None = None
     ) -> float | None:
         """BigQuery dry-run does not expose row estimates; always return ``None``."""
         _ = sql_text, schema, intent
@@ -2265,9 +2089,7 @@ class BigQueryDialect(SqlglotEngineDialect):
         """Return SHA-256 over information_schema columns only (no UNIQUE probe on BigQuery)."""
         _ = schema_context
         try:
-            schema_name = str(
-                getattr(self.config, "DATASET", None) or getattr(self.config, "SCHEMA", None) or "",
-            )
+            schema_name = str(getattr(self.config, "DATASET", None) or getattr(self.config, "SCHEMA", None) or "")
             if not schema_name:
                 return ""
             backend = getattr(self, "_backend", None)
@@ -2280,10 +2102,7 @@ class BigQueryDialect(SqlglotEngineDialect):
             if self.engine is None:
                 return ""
             with self.engine.connect() as conn:
-                rows = conn.execute(
-                    text(INFORMATION_SCHEMA_COLUMNS_DDL_PROBE_SQL),
-                    {"s": schema_name},
-                ).fetchall()
+                rows = conn.execute(text(INFORMATION_SCHEMA_COLUMNS_DDL_PROBE_SQL), {"s": schema_name}).fetchall()
             payload_cols = "\n".join("|".join("" if c is None else str(c) for c in r) for r in rows)
             return sha256(payload_cols)
         except Exception as exc:
@@ -2300,11 +2119,7 @@ class BigQueryDialect(SqlglotEngineDialect):
         return cast(list[tuple[Any, ...]], backend.fetch_rows(sql, bind, timeout_ms=tm))
 
     def inject_pruning_predicates(
-        self,
-        sql: str,
-        *,
-        schema: SchemaGraph | None = None,
-        intent: RuntimeIntent | None = None,
+        self, sql: str, *, schema: SchemaGraph | None = None, intent: RuntimeIntent | None = None
     ) -> str:
         """Append partition guard predicates using shared partition helpers."""
         if schema is None or intent is None:
@@ -2314,13 +2129,7 @@ class BigQueryDialect(SqlglotEngineDialect):
             format_literal=self.quote_string_literal,
             sqlglot_dialect=self.sqlglot_dialect,
         )
-        pruned = inject_partition_predicates(
-            adapter,
-            sql,
-            schema,
-            intent,
-            column_selector=_bq_partition_columns,
-        )
+        pruned = inject_partition_predicates(adapter, sql, schema, intent, column_selector=_bq_partition_columns)
 
         def _default_guard(table_name: str, part_col: str) -> str:
             qual = self.quote_table_column(table_name, part_col)
@@ -2338,13 +2147,8 @@ class BigQueryDialect(SqlglotEngineDialect):
         trace_finalize_render_stage("inject_pruning_predicates", sql, out)
         return out
 
-    def _partition_predicate_from_intent(
-        self,
-        intent: RuntimeIntent,
-        table_name: str,
-        part_col: str,
-    ) -> str | None:
-        for fp in intent.filters_param or []:
+    def _partition_predicate_from_intent(self, intent: RuntimeIntent, table_name: str, part_col: str) -> str | None:
+        for fp in where_leaves(intent.where) or []:
             term = (fp.left_expr.primary_term or "").strip() if fp.left_expr else ""
             if not term:
                 continue
@@ -2357,14 +2161,7 @@ class BigQueryDialect(SqlglotEngineDialect):
         return None
 
     def render_date_diff(
-        self,
-        left_expr: str,
-        op: str,
-        unit: str,
-        amount: int,
-        *,
-        minuend_sql: str = "",
-        subtrahend_sql: str = "",
+        self, left_expr: str, op: str, unit: str, amount: int, *, minuend_sql: str = "", subtrahend_sql: str = ""
     ) -> str:
         """Render BigQuery date comparison using ``DATE_DIFF``. BigQuery ``DATE_DIFF(end, start, part)`` returns an integer, so a two-column difference passes the columns as separate ``end``/``start`` arguments (``date - date`` is not valid in BigQuery). Falls back to comparing a single date column against ``CURRENT_DATE()``."""
         unit_token = unit.upper()
@@ -2375,11 +2172,7 @@ class BigQueryDialect(SqlglotEngineDialect):
         return emit_via_ast(sql, self.sqlglot_dialect)
 
     def render_array_contains(
-        self,
-        column_sql: str,
-        param_key: str,
-        *,
-        column_meta: ColumnMetadata | None = None,
+        self, column_sql: str, param_key: str, *, column_meta: ColumnMetadata | None = None
     ) -> str:
         """Render BigQuery array membership as a scalar JSON text match."""
         kind = array_storage_kind(column_meta) if column_meta is not None else "native_array"
@@ -2432,20 +2225,16 @@ class BigQueryDialect(SqlglotEngineDialect):
         random_seed: int,
         table_kind: Literal["table", "view"] = "table",
     ) -> str:
-        """Return a BigQuery ``TABLESAMPLE SYSTEM`` suffix."""
-        _ = random_seed, table_kind
+        """Return a deterministic ordered row cap when BigQuery ``TABLESAMPLE`` is unseeded."""
+        _ = row_count, random_seed, table_kind
         if not use_sample:
             return ""
-        pct = max(0.01, min(100.0, 100.0 * sample_size / max(row_count, 1)))
-        return f"TABLESAMPLE SYSTEM ({pct:.2f} PERCENT)"
+        return self.profiling_ordered_limit_sample_suffix(sample_size)
 
-    def profiling_stats_use_subquery_when_sampling(
-        self,
-        table_kind: Literal["table", "view"] = "table",
-    ) -> bool:
-        """BigQuery ``TABLESAMPLE SYSTEM`` applies directly on the scanned table."""
+    def profiling_stats_use_subquery_when_sampling(self, table_kind: Literal["table", "view"] = "table") -> bool:
+        """Ordered-limit sampling scans a deterministic subquery."""
         _ = table_kind
-        return False
+        return True
 
 
 def _dbr_format_partition_literal(val: Any) -> str:
@@ -2472,20 +2261,25 @@ class DatabricksDialect(SqlglotParseMixin, Dialect):
 
     name: str = "databricks"
     sqlglot_dialect: ClassVar[str] = "databricks"
+    registry_canonical_rank: ClassVar[int] = 8
+    registry_native_backend: ClassVar[bool] = True
+    registry_structural_index: ClassVar[bool] = True
+    registry_qualified_table_ref: ClassVar[bool] = True
 
-    def quote_table_column(self, table: str, column: str) -> str:
-        """Backtick-quote Spark identifiers for ``table.column`` emission."""
+    @property
+    def supports_ilike(self) -> bool:
+        """Return True because Spark SQL exposes ``ILIKE``."""
+        return True
 
-        def q(x: str) -> str:
-            return "`" + str(x).replace("`", "``") + "`"
+    @property
+    def supports_ordered_string_agg(self) -> bool:
+        return False
 
-        return f"{q(table)}.{q(column)}"
+    def render_string_agg(self, expr_sql: str, sep_sql: str, order_by_sql: str) -> str:
+        return f"array_join(collect_list({expr_sql}), {sep_sql})"
 
-    def quote_identifier(self, ident: str) -> str:
-        """Quote a Spark identifier with backticks."""
-        s = str(ident).strip()
-        esc = s.replace("`", "``")
-        return f"`{esc}`"
+    def render_median(self, expr_sql: str) -> str:
+        return f"median({expr_sql})"
 
     def profiling_text_cast_sql(self, expr: str) -> str:
         """Return Spark ``CAST(… AS STRING)`` for overlap sampling."""
@@ -2514,9 +2308,7 @@ class DatabricksDialect(SqlglotParseMixin, Dialect):
             try:
                 import databricks.sql
 
-                progress(
-                    "  Connecting to Databricks SQL warehouse (cold start can take several minutes)...",
-                )
+                progress("  Connecting to Databricks SQL warehouse (cold start can take several minutes)...")
                 connect_started = time.monotonic()
                 self.connection = databricks.sql.connect(
                     server_hostname=db_config.SERVER_HOSTNAME,
@@ -2542,13 +2334,9 @@ class DatabricksDialect(SqlglotParseMixin, Dialect):
                 except Exception as exc:
                     debug(f"[DatabricksDialect.__init__] warehouse warmup probe failed: {exc}")
                     if engine_connect_likely_transient(exc):
-                        raise DatabasePingFailed(
-                            "Databricks warehouse warmup probe failed after connect.",
-                        ) from exc
+                        raise DatabasePingFailed("Databricks warehouse warmup probe failed after connect.") from exc
                     raise
-                progress(
-                    f"  Warehouse ready in {time.monotonic() - connect_started:.1f}s.",
-                )
+                progress(f"  Warehouse ready in {time.monotonic() - connect_started:.1f}s.")
                 url = db_config.sqlalchemy_url()
                 if url:
                     try:
@@ -2633,10 +2421,7 @@ class DatabricksDialect(SqlglotParseMixin, Dialect):
             self._backend = DatabricksConnectorBackend(self.connection)
             return
         if self.engine is not None:
-            self._backend = DatabricksSqlAlchemyBackend(
-                self.engine,
-                dialect_name=self.__class__.__name__,
-            )
+            self._backend = DatabricksSqlAlchemyBackend(self.engine, dialect_name=self.__class__.__name__)
             return
         if self.spark is not None:
             self._backend = DatabricksSparkBackend(self.spark)
@@ -2678,19 +2463,12 @@ class DatabricksDialect(SqlglotParseMixin, Dialect):
         """Run an EXPLAIN statement and return newline-joined first- column text."""
         return self._backend.fetch_first_column_text(explain_sql) if self._backend is not None else ""
 
-    def _explain_result_from_text(
-        self,
-        text_payload: str,
-    ) -> tuple[bool, list[SqlDiagnostic], str]:
+    def _explain_result_from_text(self, text_payload: str) -> tuple[bool, list[SqlDiagnostic], str]:
         """Parse EXPLAIN text into cost-gate outcome and soft diagnostics."""
         er, eb = databricks_plan_stats_from_explain_text(text_payload)
-        failed, why = explain_cost_gate_violation(er, eb)
+        failed, why = explain_cost_gate_violation(er, eb, dialect=self)
         if failed:
-            return (
-                False,
-                [SqlDiagnostic(code=SqlDiagnosticCode.EXPLAIN_COST_EXCEEDED, message=why)],
-                why,
-            )
+            return (False, [SqlDiagnostic(code=SqlDiagnosticCode.EXPLAIN_COST_EXCEEDED, message=why)], why)
         return True, databricks_diagnostics_from_explain_text(text_payload), ""
 
     def explain_diagnose(
@@ -2702,12 +2480,7 @@ class DatabricksDialect(SqlglotParseMixin, Dialect):
         intent: RuntimeIntent | None = None,
     ) -> tuple[bool, list[SqlDiagnostic], str]:
         """Run Spark/Databricks ``EXPLAIN`` and return ``(ok, diagnostics, raw_message)``. ``ok`` is False only on hard validation failures. A permission- denied error disables EXPLAIN for the remainder of this dialect instance and is reported as ``ok=True`` with no diagnostics so the caller can proceed without treating missing privileges as invalid SQL. Soft plan- shape findings (suspected cartesian joins, zero-row estimates) are emitted as :class:`SqlDiagnostic` entries with codes from ``SOFT_DIAGNOSTIC_CODES`` in ``_config`` so callers may apply confidence penalties without rejecting the SQL."""
-        finalized = self.finalize_render(
-            sql,
-            params or {},
-            schema=schema,
-            intent=intent,
-        )
+        finalized = self.finalize_render(sql, params or {}, schema=schema, intent=intent)
         explain_sql = f"EXPLAIN COST {finalized}"
         if self._backend is None:
             return True, [], ""
@@ -2718,17 +2491,9 @@ class DatabricksDialect(SqlglotParseMixin, Dialect):
             err = str(e)
             if self._disable_explain_on_permission_denied(err):
                 return True, [], ""
-            return (
-                False,
-                [SqlDiagnostic(code=SqlDiagnosticCode.EXPLAIN_OTHER, message=err)],
-                err,
-            )
+            return (False, [SqlDiagnostic(code=SqlDiagnosticCode.EXPLAIN_OTHER, message=err)], err)
 
-    def qualified_table_ref(
-        self,
-        table: str,
-        kind: Literal["table", "view"] = "table",
-    ) -> str:
+    def qualified_table_ref(self, table: str, kind: Literal["table", "view"] = "table") -> str:
         """Return a Unity Catalog three-part backtick-quoted table reference."""
         _ = kind
         catalog = self.catalog_name()
@@ -2782,18 +2547,11 @@ class DatabricksDialect(SqlglotParseMixin, Dialect):
     def can_explain(self) -> bool:
         """Return True when SQLAlchemy, the native connector, or Spark can run EXPLAIN."""
         return can_explain_for_backends(
-            self,
-            sqlalchemy_engine=self.engine,
-            native_connection=self.connection,
-            spark_session=self.spark,
+            self, sqlalchemy_engine=self.engine, native_connection=self.connection, spark_session=self.spark
         )
 
     def inject_pruning_predicates(
-        self,
-        sql: str,
-        *,
-        schema: SchemaGraph | None = None,
-        intent: RuntimeIntent | None = None,
+        self, sql: str, *, schema: SchemaGraph | None = None, intent: RuntimeIntent | None = None
     ) -> str:
         """Append Delta partition predicates when schema and intent are available."""
         if schema is None or intent is None:
@@ -2830,11 +2588,7 @@ class DatabricksDialect(SqlglotParseMixin, Dialect):
         return databricks_unqualify_agg_arg_sql(frag)
 
     def explain_row_estimate(
-        self,
-        sql_text: str,
-        *,
-        schema: SchemaGraph | None = None,
-        intent: Any | None = None,
+        self, sql_text: str, *, schema: SchemaGraph | None = None, intent: Any | None = None
     ) -> float | None:
         """Return Databricks planner row estimate from ``EXPLAIN COST``."""
         try:
@@ -2917,6 +2671,7 @@ class DatabricksDialect(SqlglotParseMixin, Dialect):
         *,
         include: SchemaInclude = "tables",
         allow_objects: frozenset[str] | None = None,
+        deny_objects: frozenset[str] | None = None,
         sql_file: str | None = None,
     ) -> SchemaGraph:
         """Build a graph from Unity Catalog or DDL fallback."""
@@ -2925,6 +2680,7 @@ class DatabricksDialect(SqlglotParseMixin, Dialect):
             connection=self.connection,
             include=include,
             allow_objects=allow_objects,
+            deny_objects=deny_objects,
             table_kinds_map=self.table_kinds_map(),
             structural_constraints_index=self.structural_constraints_index(),
             sql_file=sql_file,
@@ -2943,8 +2699,7 @@ class DatabricksDialect(SqlglotParseMixin, Dialect):
             esc_sch = schema_name.replace("'", "''")
             cols_sql = UNITY_INFORMATION_SCHEMA_COLUMNS_DDL_PROBE_SQL.format(catalog_esc=esc_cat, schema_lit=esc_sch)
             unique_sql = UNITY_INFORMATION_SCHEMA_UNIQUE_COLUMNS_DDL_PROBE_SQL.format(
-                catalog_esc=esc_cat,
-                schema_lit=esc_sch,
+                catalog_esc=esc_cat, schema_lit=esc_sch
             )
             if self._backend is None:
                 return ""
@@ -2966,11 +2721,7 @@ class DatabricksDialect(SqlglotParseMixin, Dialect):
         self.profile_schema_dispatch(sg)
 
     def refresh_full_table_distinct_for_pk_inference(
-        self,
-        table_name: str,
-        col_name: str,
-        *,
-        table_kind: Literal["table", "view"] = "table",
+        self, table_name: str, col_name: str, *, table_kind: Literal["table", "view"] = "table"
     ) -> tuple[int, int, float] | None:
         """Run full-table statistics for PK inference after sampled. profiling."""
         try:
@@ -2996,14 +2747,7 @@ class DatabricksDialect(SqlglotParseMixin, Dialect):
             return None
 
     def render_date_diff(
-        self,
-        left_expr: str,
-        op: str,
-        unit: str,
-        amount: int,
-        *,
-        minuend_sql: str = "",
-        subtrahend_sql: str = "",
+        self, left_expr: str, op: str, unit: str, amount: int, *, minuend_sql: str = "", subtrahend_sql: str = ""
     ) -> str:
         """Render Spark ``DATEDIFF``-based date-difference comparison. When *minuend_sql* and *subtrahend_sql* are available the method emits ``DATEDIFF(minuend, subtrahend)`` which returns an integer, avoiding the INTERVAL-vs-INT type mismatch that raw date subtraction causes on Databricks/Spark."""
         days = unit_to_approx_days(unit, amount)
@@ -3014,20 +2758,13 @@ class DatabricksDialect(SqlglotParseMixin, Dialect):
         return emit_via_ast(sql, self.sqlglot_dialect)
 
     def render_array_contains(
-        self,
-        column_sql: str,
-        param_key: str,
-        *,
-        column_meta: ColumnMetadata | None = None,
+        self, column_sql: str, param_key: str, *, column_meta: ColumnMetadata | None = None
     ) -> str:
         """Render Databricks array membership with trimmed element. comparison."""
         kind = array_storage_kind(column_meta) if column_meta is not None else "native_array"
         if kind == "json_text_array":
             sql = quoted_json_element_token_predicate(
-                column_sql=column_sql,
-                param_key=param_key,
-                position_fn="STRPOS",
-                value_cast="STRING",
+                column_sql=column_sql, param_key=param_key, position_fn="STRPOS", value_cast="STRING"
             )
             return emit_via_ast(sql, self.sqlglot_dialect)
         trim_set = "CONCAT(' ', chr(34), chr(39))"
@@ -3082,17 +2819,14 @@ class DatabricksDialect(SqlglotParseMixin, Dialect):
         random_seed: int,
         table_kind: Literal["table", "view"] = "table",
     ) -> str:
-        """Return a Spark ``TABLESAMPLE`` suffix for statistics."""
-        _ = random_seed, table_kind
+        """Return a Spark ``TABLESAMPLE … REPEATABLE`` suffix for statistics."""
+        _ = table_kind
         if not use_sample:
             return ""
         pct = max(0.01, min(100.0, 100.0 * sample_size / max(row_count, 1)))
-        return f"TABLESAMPLE ({pct:.2f} PERCENT)"
+        return f"TABLESAMPLE ({pct:.2f} PERCENT) REPEATABLE ({random_seed})"
 
-    def profiling_stats_use_subquery_when_sampling(
-        self,
-        table_kind: Literal["table", "view"] = "table",
-    ) -> bool:
+    def profiling_stats_use_subquery_when_sampling(self, table_kind: Literal["table", "view"] = "table") -> bool:
         """Spark ``TABLESAMPLE`` applies directly on the scanned table."""
         _ = table_kind
         return False
@@ -3108,13 +2842,16 @@ class DuckDBDialect(SqlglotEngineDialect):
 
     name: str = "duckdb"
     sqlglot_dialect: ClassVar[str] = "duckdb"
+    registry_canonical_rank: ClassVar[int] = 1
+    registry_native_backend: ClassVar[bool] = True
+    registry_embedded: ClassVar[bool] = True
+    registry_structural_index: ClassVar[bool] = True
+
+    def render_median(self, expr_sql: str) -> str:
+        return f"median({expr_sql})"
 
     def __init__(
-        self,
-        config: EngineRuntimeConfig,
-        sqlalchemy_engine: Any | None = None,
-        *,
-        native_connection: Any | None = None,
+        self, config: EngineRuntimeConfig, sqlalchemy_engine: Any | None = None, *, native_connection: Any | None = None
     ) -> None:
         """Open one native duckdb connection for reflection and execution."""
         self._native_connection: Any | None = None
@@ -3130,9 +2867,7 @@ class DuckDBDialect(SqlglotEngineDialect):
                     open_new=lambda: _open_duckdb_connection(duckdb_config),
                 )
                 engine, owns_engine = _embedded_sqlalchemy_engine_for_connection(
-                    connection,
-                    "duckdb",
-                    sqlalchemy_engine,
+                    connection, "duckdb", sqlalchemy_engine
                 )
                 self._native_connection = connection
                 self._owns_native_connection = owns_connection
@@ -3183,11 +2918,7 @@ class DuckDBDialect(SqlglotEngineDialect):
 
     def can_explain(self) -> bool:
         """Return True when native duckdb or SQLAlchemy can run EXPLAIN."""
-        return can_explain_for_backends(
-            self,
-            sqlalchemy_engine=self.engine,
-            native_connection=self._native_connection,
-        )
+        return can_explain_for_backends(self, sqlalchemy_engine=self.engine, native_connection=self._native_connection)
 
     def structural_constraints_index(self) -> CatalogStructuralConstraintsIndex:
         """Load PK, FK, and UNIQUE metadata from DuckDB ``information_schema``."""
@@ -3210,11 +2941,7 @@ class DuckDBDialect(SqlglotEngineDialect):
         return normalize_datetrunc_sql(sql, sqlglot_dialect=self.sqlglot_dialect)
 
     def inject_pruning_predicates(
-        self,
-        sql: str,
-        *,
-        schema: SchemaGraph | None = None,
-        intent: RuntimeIntent | None = None,
+        self, sql: str, *, schema: SchemaGraph | None = None, intent: RuntimeIntent | None = None
     ) -> str:
         """Append partition predicates from ``TableMetadata.partition_columns`` when present."""
         if schema is None or intent is None:
@@ -3236,19 +2963,6 @@ class DuckDBDialect(SqlglotEngineDialect):
         """Return True because DuckDB allows UNNEST directly in the SELECT list."""
         return True
 
-    def quote_table_column(self, table: str, column: str) -> str:
-        """Return double-quoted DuckDB identifiers for table.column emission."""
-
-        def q(x: str) -> str:
-            return '"' + str(x).replace('"', '""') + '"'
-
-        return f"{q(table)}.{q(column)}"
-
-    def quote_identifier(self, ident: str) -> str:
-        """Quote a DuckDB identifier with double quotes."""
-        s = str(ident).strip()
-        return '"' + s.replace('"', '""') + '"'
-
     def profiling_text_cast_sql(self, expr: str) -> str:
         """Return DuckDB CAST(... AS VARCHAR) for overlap sampling."""
         return f"CAST({expr} AS VARCHAR)"
@@ -3258,6 +2972,7 @@ class DuckDBDialect(SqlglotEngineDialect):
         *,
         include: SchemaInclude = "tables",
         allow_objects: frozenset[str] | None = None,
+        deny_objects: frozenset[str] | None = None,
         sql_file: str | None = None,
     ) -> SchemaGraph:
         """Build a schema graph from DuckDB reflection or SQL file fallback."""
@@ -3265,6 +2980,7 @@ class DuckDBDialect(SqlglotEngineDialect):
             self.engine,
             include=include,
             allow_objects=allow_objects,
+            deny_objects=deny_objects,
             schema_json_path=EngineConfig.SCHEMA_JSON_PATH,
             sql_file=sql_file,
         )
@@ -3274,10 +2990,7 @@ class DuckDBDialect(SqlglotEngineDialect):
         return f"EXPLAIN {finalized_sql}"
 
     def parse_explain_plan(
-        self,
-        rows: list[Any],
-        *,
-        schema: SchemaGraph | None = None,
+        self, rows: list[Any], *, schema: SchemaGraph | None = None
     ) -> tuple[float | None, float | None, list[Any], str]:
         """Parse DuckDB EXPLAIN rows into estimates and soft diagnostics."""
         _ = schema
@@ -3287,14 +3000,7 @@ class DuckDBDialect(SqlglotEngineDialect):
         return est_rows, est_bytes, diags, plan_text
 
     def render_date_diff(
-        self,
-        left_expr: str,
-        op: str,
-        unit: str,
-        amount: int,
-        *,
-        minuend_sql: str = "",
-        subtrahend_sql: str = "",
+        self, left_expr: str, op: str, unit: str, amount: int, *, minuend_sql: str = "", subtrahend_sql: str = ""
     ) -> str:
         """Render a DuckDB date_diff comparison."""
         unit_token = unit.lower()
@@ -3305,11 +3011,7 @@ class DuckDBDialect(SqlglotEngineDialect):
         return emit_via_ast(sql, self.sqlglot_dialect)
 
     def render_array_contains(
-        self,
-        column_sql: str,
-        param_key: str,
-        *,
-        column_meta: ColumnMetadata | None = None,
+        self, column_sql: str, param_key: str, *, column_meta: ColumnMetadata | None = None
     ) -> str:
         """Render DuckDB list membership with case-insensitive comparison."""
         kind = array_storage_kind(column_meta) if column_meta is not None else "native_array"
@@ -3359,17 +3061,14 @@ class DuckDBDialect(SqlglotEngineDialect):
         random_seed: int,
         table_kind: Literal["table", "view"] = "table",
     ) -> str:
-        """Return a DuckDB USING SAMPLE suffix when sampling, else an empty suffix."""
-        _ = random_seed, table_kind
+        """Return a DuckDB seeded ``USING SAMPLE`` suffix when sampling, else an empty suffix."""
+        _ = table_kind
         if not use_sample or row_count <= 0:
             return ""
         pct = max(min(100.0 * float(sample_size) / float(row_count), 100.0), 0.0001)
-        return DUCKDB_PROFILING_SAMPLE_PREDICATE.format(pct=pct)
+        return DUCKDB_PROFILING_SAMPLE_PREDICATE.format(pct=pct, seed=random_seed)
 
-    def profiling_stats_use_subquery_when_sampling(
-        self,
-        table_kind: Literal["table", "view"] = "table",
-    ) -> bool:
+    def profiling_stats_use_subquery_when_sampling(self, table_kind: Literal["table", "view"] = "table") -> bool:
         """Return True so distinct/null stats scan a sampled subquery."""
         _ = table_kind
         return True
@@ -3380,13 +3079,21 @@ class SQLiteDialect(SqlglotEngineDialect):
 
     name: str = "sqlite"
     sqlglot_dialect: ClassVar[str] = "sqlite"
+    registry_canonical_rank: ClassVar[int] = 0
+    registry_native_backend: ClassVar[bool] = True
+    registry_embedded: ClassVar[bool] = True
+    registry_structural_index: ClassVar[bool] = True
+    registry_statistical_agg_excluded: ClassVar[bool] = True
+
+    @property
+    def supports_ordered_string_agg(self) -> bool:
+        return False
+
+    def render_string_agg(self, expr_sql: str, sep_sql: str, order_by_sql: str) -> str:
+        return f"GROUP_CONCAT({expr_sql})"
 
     def __init__(
-        self,
-        config: EngineRuntimeConfig,
-        sqlalchemy_engine: Any | None = None,
-        *,
-        native_connection: Any | None = None,
+        self, config: EngineRuntimeConfig, sqlalchemy_engine: Any | None = None, *, native_connection: Any | None = None
     ) -> None:
         """Open one native sqlite3 connection for reflection and execution."""
         self._native_connection: Any | None = None
@@ -3402,9 +3109,7 @@ class SQLiteDialect(SqlglotEngineDialect):
                     open_new=lambda: _open_sqlite_connection(sqlite_config),
                 )
                 engine, owns_engine = _embedded_sqlalchemy_engine_for_connection(
-                    connection,
-                    "sqlite",
-                    sqlalchemy_engine,
+                    connection, "sqlite", sqlalchemy_engine
                 )
                 self._native_connection = connection
                 self._owns_native_connection = owns_connection
@@ -3455,11 +3160,7 @@ class SQLiteDialect(SqlglotEngineDialect):
 
     def can_explain(self) -> bool:
         """Return True when sqlite3 or SQLAlchemy can run EXPLAIN QUERY PLAN."""
-        return can_explain_for_backends(
-            self,
-            sqlalchemy_engine=self.engine,
-            native_connection=self._native_connection,
-        )
+        return can_explain_for_backends(self, sqlalchemy_engine=self.engine, native_connection=self._native_connection)
 
     def structural_constraints_index(self) -> CatalogStructuralConstraintsIndex:
         """Load FK metadata from ``PRAGMA foreign_key_list`` when foreign keys are enabled."""
@@ -3468,19 +3169,6 @@ class SQLiteDialect(SqlglotEngineDialect):
     def query_log_source(self) -> Any | None:
         """Return a documented no-op query-log source for SQLite."""
         return NoOpQueryLogSource()
-
-    def quote_table_column(self, table: str, column: str) -> str:
-        """Return double-quoted SQLite identifiers for table.column emission."""
-
-        def q(x: str) -> str:
-            return '"' + str(x).replace('"', '""') + '"'
-
-        return f"{q(table)}.{q(column)}"
-
-    def quote_identifier(self, ident: str) -> str:
-        """Quote a SQLite identifier with double quotes."""
-        s = str(ident).strip()
-        return '"' + s.replace('"', '""') + '"'
 
     def profiling_text_cast_sql(self, expr: str) -> str:
         """Return SQLite CAST(... AS TEXT) for overlap sampling."""
@@ -3491,6 +3179,7 @@ class SQLiteDialect(SqlglotEngineDialect):
         *,
         include: SchemaInclude = "tables",
         allow_objects: frozenset[str] | None = None,
+        deny_objects: frozenset[str] | None = None,
         sql_file: str | None = None,
     ) -> SchemaGraph:
         """Build a schema graph from SQLite reflection or SQL file fallback."""
@@ -3498,6 +3187,7 @@ class SQLiteDialect(SqlglotEngineDialect):
             self.engine,
             include=include,
             allow_objects=allow_objects,
+            deny_objects=deny_objects,
             schema_json_path=EngineConfig.SCHEMA_JSON_PATH,
             sql_file=sql_file,
         )
@@ -3514,7 +3204,7 @@ class SQLiteDialect(SqlglotEngineDialect):
                     text("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
                 ).fetchall()
                 payload: list[str] = []
-                for (table_name,) in table_rows:
+                for table_name in table_rows:
                     info_rows = conn.execute(text(f'PRAGMA table_info("{table_name}")')).fetchall()
                     for info in info_rows:
                         payload.append(f"{table_name}|{info[1]}|{info[0]}|{info[2]}|{info[3]}")
@@ -3527,10 +3217,7 @@ class SQLiteDialect(SqlglotEngineDialect):
         return f"EXPLAIN QUERY PLAN {finalized_sql}"
 
     def parse_explain_plan(
-        self,
-        rows: list[Any],
-        *,
-        schema: SchemaGraph | None = None,
+        self, rows: list[Any], *, schema: SchemaGraph | None = None
     ) -> tuple[float | None, float | None, list[Any], str]:
         """Parse SQLite EXPLAIN QUERY PLAN rows into soft diagnostics with no cardinality estimate."""
         _ = schema
@@ -3539,25 +3226,14 @@ class SQLiteDialect(SqlglotEngineDialect):
         return None, None, diags, plan_text
 
     def explain_row_estimate(
-        self,
-        sql_text: str,
-        *,
-        schema: SchemaGraph | None = None,
-        intent: Any | None = None,
+        self, sql_text: str, *, schema: SchemaGraph | None = None, intent: Any | None = None
     ) -> float | None:
         """Return None because SQLite provides no planner row-count estimate."""
         _ = (sql_text, schema, intent)
         return None
 
     def render_date_diff(
-        self,
-        left_expr: str,
-        op: str,
-        unit: str,
-        amount: int,
-        *,
-        minuend_sql: str = "",
-        subtrahend_sql: str = "",
+        self, left_expr: str, op: str, unit: str, amount: int, *, minuend_sql: str = "", subtrahend_sql: str = ""
     ) -> str:
         """Render a SQLite day-grain date difference using julianday."""
         if minuend_sql and subtrahend_sql:
@@ -3567,11 +3243,7 @@ class SQLiteDialect(SqlglotEngineDialect):
         return emit_via_ast(sql, self.sqlglot_dialect)
 
     def render_array_contains(
-        self,
-        column_sql: str,
-        param_key: str,
-        *,
-        column_meta: ColumnMetadata | None = None,
+        self, column_sql: str, param_key: str, *, column_meta: ColumnMetadata | None = None
     ) -> str:
         """Render SQLite JSON array membership as a validator-safe scalar predicate."""
         kind = array_storage_kind(column_meta) if column_meta is not None else "native_array"
@@ -3621,17 +3293,14 @@ class SQLiteDialect(SqlglotEngineDialect):
         random_seed: int,
         table_kind: Literal["table", "view"] = "table",
     ) -> str:
-        """Return a SQLite ``WHERE random()`` suffix when sampling, else an empty suffix."""
-        _ = random_seed, table_kind
+        """Return a SQLite seeded hash-bucket ``WHERE`` suffix when sampling."""
+        _ = table_kind
         if not use_sample:
             return ""
         ratio = max(0.0001, min(1.0, sample_size / max(row_count, 1)))
-        return f"WHERE {SQLITE_PROFILING_SAMPLE_PREDICATE.format(ratio=ratio)}"
+        return f"WHERE {SQLITE_PROFILING_SAMPLE_PREDICATE.format(ratio=ratio, seed=random_seed)}"
 
-    def profiling_stats_use_subquery_when_sampling(
-        self,
-        table_kind: Literal["table", "view"] = "table",
-    ) -> bool:
+    def profiling_stats_use_subquery_when_sampling(self, table_kind: Literal["table", "view"] = "table") -> bool:
         """SQLite samples via a ``WHERE random()`` predicate inside a subquery."""
         _ = table_kind
         return True
@@ -3648,8 +3317,7 @@ register_dialect("bigquery", BigQueryDialect, BigQueryRuntimeConfig)
 register_dialect("databricks", DatabricksDialect, DatabricksRuntimeConfig)
 
 
-def _quote_ident(name: str) -> str:
-    return '"' + str(name).replace('"', '""') + '"'
+_quote_ident = sqlglot_quote_identifier
 
 
 def _normalize_header_columns(headers: Sequence[str], *, source: Path) -> list[str]:
@@ -3710,10 +3378,7 @@ def _iter_xlsx_rows(path: Path) -> Iterator[dict[str, str]]:
             header_row = next(row_iter)
         except StopIteration as exc:
             raise ConfigError(f"csv file is empty: {path}") from exc
-        columns = _normalize_header_columns(
-            ["" if cell is None else str(cell) for cell in header_row],
-            source=path,
-        )
+        columns = _normalize_header_columns(["" if cell is None else str(cell) for cell in header_row], source=path)
         for values in row_iter:
             if values is None:
                 continue
@@ -3815,10 +3480,7 @@ def _load_locked_column_types(schema_json_path: str | Path | None) -> dict[str, 
 
 
 def _column_types_for_source(
-    path: Path,
-    *,
-    locked_types: Mapping[str, str] | None = None,
-    sample_limit: int = 512,
+    path: Path, *, locked_types: Mapping[str, str] | None = None, sample_limit: int = 512
 ) -> tuple[list[str], list[str]]:
     columns = _read_source_header(path)
     locked = dict(locked_types or {})
@@ -3836,8 +3498,27 @@ def _column_types_for_source(
     return columns, types
 
 
-def _tables_meta_from_sources(
-    paths: Sequence[Path],
+def _csv_schema_pins(schema_json_path: str | None = None) -> tuple[dict[str, str], dict[str, dict[str, str]]]:
+    cached = load_schema_graph_snapshot(schema_json_path or EngineConfig.SCHEMA_JSON_PATH)
+    return pinned_names_from_schema_graph(cached)
+
+
+def _csv_relations_for_config(
+    config: CsvRuntimeConfig, *, schema_json_path: str | None = None
+) -> list[PreparedRelation]:
+    paths = config.resolve_source_files()
+    table_pins, column_pins = _csv_schema_pins(schema_json_path)
+    return prepare_relations_for_paths(
+        paths,
+        pinned_table_names=table_pins,
+        pinned_column_names=column_pins,
+        apply_auto_correct=True,
+        source_selections=parse_source_selections(config.SOURCE_SELECTIONS),
+    )
+
+
+def _tables_meta_from_relations(
+    relations: Sequence[PreparedRelation],
     *,
     locked_by_table: Mapping[str, Mapping[str, str]] | None = None,
     allow_objects: frozenset[str] | None = None,
@@ -3845,23 +3526,240 @@ def _tables_meta_from_sources(
     allow_lower = allow_objects_lower_set(allow_objects)
     locked = locked_by_table or {}
     tables_meta: dict[str, dict[str, Any]] = {}
-    for path in paths:
-        relation = path.stem
-        if allow_lower is not None and relation.lower() not in allow_lower:
+    for relation in relations:
+        if allow_lower is not None and relation.relation_name.lower() not in allow_lower:
             continue
-        columns, types = _column_types_for_source(
-            path,
-            locked_types=locked.get(relation.lower()),
-        )
-        tables_meta[relation] = {
-            "column_names_original": columns,
+        types = list(relation.column_types)
+        locked_types = locked.get(relation.relation_name.lower(), {})
+        for idx, col in enumerate(relation.columns):
+            if col in locked_types:
+                types[idx] = locked_types[col]
+        tables_meta[relation.relation_name] = {
+            "column_names_original": list(relation.columns),
+            "original_column_labels": list(relation.original_column_labels),
+            "original_table_label": relation.original_table_label,
             "column_types": types,
-            "column_is_nullable": [True] * len(columns),
+            "column_is_nullable": [True] * len(relation.columns),
             "primary_keys": [],
             "unique_columns": [],
             "foreign_keys": [],
         }
     return tables_meta
+
+
+def _load_prepared_relation_into_connection(connection: Any, relation: PreparedRelation) -> None:
+    locked_by_table = _load_locked_column_types(EngineConfig.SCHEMA_JSON_PATH)
+    locked_types = locked_by_table.get(relation.relation_name.lower(), {})
+    types: list[str] = []
+    for idx, col in enumerate(relation.columns):
+        locked_type = locked_types.get(col)
+        types.append(locked_type if locked_type else relation.column_types[idx])
+    connection.execute(f"DROP TABLE IF EXISTS {_quote_ident(relation.relation_name)}")
+    connection.execute(_create_table_sql(relation.relation_name, relation.columns, types))
+    _insert_rows(connection, relation.relation_name, relation.columns, types, list(relation.rows))
+
+
+def load_prepared_relation_into_native_connection(connection: Any, relation: PreparedRelation) -> None:
+    """Materialise one validated upload relation into an embedded native connection."""
+    _load_prepared_relation_into_connection(connection, relation)
+
+
+def _normalize_upload_paths(paths: Sequence[str | os.PathLike[str]]) -> tuple[Path, ...]:
+    return tuple(Path(os.fspath(path)) for path in paths)
+
+
+def _normalize_upload_selections(
+    source_selections: Mapping[str, CsvSourceSelection | Mapping[str, Any]] | None,
+) -> dict[str, CsvSourceSelection]:
+    if not source_selections:
+        return {}
+    out: dict[str, CsvSourceSelection] = {}
+    raw: dict[str, Mapping[str, Any]] = {}
+    for name, body in source_selections.items():
+        if isinstance(body, CsvSourceSelection):
+            out[str(name)] = body
+        else:
+            raw[str(name)] = body
+    if raw:
+        out.update(parse_source_selections(raw))
+    return out
+
+
+def _upload_selection_to_confirmed_dict(selection: CsvSourceSelection) -> dict[str, Any]:
+    confirmed: dict[str, Any] = {}
+    if selection.sheet:
+        confirmed["sheet"] = selection.sheet
+    if selection.header_row is not None:
+        confirmed["header_row"] = selection.header_row
+    if selection.skip_rows:
+        confirmed["skip_rows"] = selection.skip_rows
+    if selection.table_range:
+        confirmed["table_range"] = selection.table_range
+    if selection.merge_regions:
+        confirmed["merge_regions"] = list(selection.merge_regions)
+    if selection.append_regions:
+        confirmed["append_regions"] = list(selection.append_regions)
+    return confirmed
+
+
+def _confirmed_upload_selections_payload(
+    selections: Mapping[str, CsvSourceSelection],
+) -> dict[str, dict[str, Any]]:
+    return {name: _upload_selection_to_confirmed_dict(selection) for name, selection in selections.items()}
+
+
+def _resolve_upload_engine_type(engine: Any) -> str:
+    engine_type = str(getattr(engine, "dialect", "") or "").strip().lower()
+    if engine_type:
+        return engine_type
+    runtime_cfg = getattr(engine, "_runtime_config", None)
+    return str(getattr(runtime_cfg, "engine", "") or "").strip().lower()
+
+
+def _resolve_upload_native_connection(engine: Any) -> Any:
+    dialect = getattr(engine, "_dialect", None)
+    connection = getattr(dialect, "_native_connection", None) if dialect is not None else None
+    if connection is None:
+        connection = getattr(engine, "_native_connection", None)
+    if connection is None:
+        raise ConfigError("ingest_upload_sources requires an embedded engine with a native connection")
+    return connection
+
+
+def _upload_validation_config_error(message: str, data_quality_report: object) -> ConfigError:
+    exc = ConfigError(message)
+    setattr(exc, "data_quality_report", data_quality_report)
+    return exc
+
+
+def _sync_upload_engine_config_globals(engine: Any) -> None:
+    engine_type = _resolve_upload_engine_type(engine)
+    EngineConfig.TYPE = engine_type
+    if engine_type == "duckdb":
+        EngineConfig.RUNTIME = DuckDBRuntimeConfig
+    elif engine_type == "csv":
+        EngineConfig.RUNTIME = CsvRuntimeConfig
+    else:
+        raise ConfigError(f"ingest_upload_sources requires a duckdb or csv engine member, got {engine_type!r}")
+
+
+def _refresh_engine_schema_after_ingest(engine: Any) -> tuple[SchemaGraph, SchemaDiff | None]:
+    dialect = getattr(engine, "_dialect", None)
+    if dialect is None:
+        raise ConfigError("ingest_upload_sources requires a live engine dialect")
+    cached_sg = getattr(engine, "_schema_graph", None)
+    if not isinstance(cached_sg, SchemaGraph):
+        raise ConfigError("ingest_upload_sources requires an initialized schema graph")
+    runtime_cfg = getattr(engine, "_runtime_config", None)
+    schema_context = getattr(runtime_cfg, "engine_context", None) if runtime_cfg is not None else None
+    if schema_context is None:
+        schema_context = EngineContext()
+    notes_sha = str(getattr(cached_sg, "notes_sha256", "") or "")
+    schema_json_path = str(getattr(engine, "_artifacts_dir", Path(".")) / "schema_graph.json.gz")
+    EngineConfig.SCHEMA_JSON_PATH = schema_json_path
+    _sync_upload_engine_config_globals(engine)
+    new_struct = dialect.reflect_schema_graph()
+    if not isinstance(new_struct, SchemaGraph):
+        raise ConfigError("ingest_upload_sources failed to reflect the updated member schema")
+    schema_diff = diff_schemas(cached_sg, new_struct)
+    if not schema_diff.is_empty:
+        apply_diff(
+            cached_sg,
+            new_struct,
+            schema_diff,
+            dialect,
+            schema_json_path=schema_json_path,
+        )
+    cached_sg.notes_sha256 = notes_sha
+    raise_if_schema_unusable(cached_sg, schema_context)
+    assign_schema_graph_hashes(
+        cached_sg,
+        schema_context,
+        notes_sha,
+        schema_role=str(getattr(engine, "_schema_role", "owner") or "owner"),
+    )
+    save_schema_to_cache(cached_sg, schema_json_path)
+    migrate_sidecar_for_diff(schema_json_path, schema_diff)
+    finalize_with_overrides(cached_sg, schema_json_path, dialect=dialect)
+    return cached_sg, schema_diff if not schema_diff.is_empty else None
+
+
+def ingest_upload_sources_into_engine(
+    engine: Any,
+    paths: Sequence[str | os.PathLike[str]],
+    *,
+    source_selections: Mapping[str, CsvSourceSelection | Mapping[str, Any]] | None = None,
+    relation_names: Mapping[str, str] | None = None,
+    log_sink: Callable[[str], None] | None = None,
+) -> UploadIngestResult:
+    """Validate uploads, materialise relations into *engine*, and return schema delta info."""
+    engine_type = _resolve_upload_engine_type(engine)
+    if not is_upload_ingest_engine(engine_type):
+        raise ConfigError(
+            f"ingest_upload_sources requires a duckdb or csv engine member, got {engine_type!r}",
+        )
+    resolved_paths = _normalize_upload_paths(paths)
+    if not resolved_paths:
+        raise ConfigError("ingest_upload_sources requires at least one upload path")
+    selections = _normalize_upload_selections(source_selections)
+    selection_by_name = {path.name: selections[path.name] for path in resolved_paths if path.name in selections}
+    report = validate_upload_sources(
+        resolved_paths,
+        log_sink=log_sink,
+        source_selections=selection_by_name,
+    )
+    if report.requires_review and not selections:
+        raise _upload_validation_config_error(
+            f"{report.narrative} "
+            "Call inspect_tabular_upload and pass source_selections with the accepted interpretation.",
+            report,
+        )
+    if not report.ok:
+        raise _upload_validation_config_error(report.narrative, report)
+    if selections:
+        report = DataQualityReport(
+            ok=report.ok,
+            issues=report.issues,
+            narrative=report.narrative,
+            suggested_selections=report.suggested_selections,
+            confirmed_selections=_confirmed_upload_selections_payload(selections),
+        )
+    cached_sg = getattr(engine, "_schema_graph", None)
+    if not isinstance(cached_sg, SchemaGraph):
+        raise ConfigError("ingest_upload_sources requires an initialized schema graph")
+    table_pins, column_pins = pinned_names_from_schema_graph(cached_sg)
+    if relation_names:
+        table_pins.update({str(key): str(value) for key, value in relation_names.items()})
+    relations = prepare_relations_for_paths(
+        resolved_paths,
+        pinned_table_names=table_pins,
+        pinned_column_names=column_pins,
+        source_selections=selection_by_name,
+    )
+    schema_json_path = str(getattr(engine, "_artifacts_dir", Path(".")) / "schema_graph.json.gz")
+    EngineConfig.SCHEMA_JSON_PATH = schema_json_path
+    _sync_upload_engine_config_globals(engine)
+    connection = _resolve_upload_native_connection(engine)
+    for relation in relations:
+        load_prepared_relation_into_native_connection(connection, relation)
+    relation_names_created = tuple(relation.relation_name for relation in relations)
+    updated_schema, schema_diff = _refresh_engine_schema_after_ingest(engine)
+    engine._schema_graph = updated_schema
+    engine._schema_stats = updated_schema.refresh_schema_stats()
+    engine._data_quality_report = report
+    return UploadIngestResult(
+        relation_names=relation_names_created,
+        report=report,
+        schema_diff=schema_diff,
+    )
+
+
+def _build_csv_memory_connection(config: CsvRuntimeConfig) -> Any:
+    duckdb = importlib.import_module("duckdb")
+    connection = duckdb.connect(":memory:")
+    for relation in _csv_relations_for_config(config):
+        _load_prepared_relation_into_connection(connection, relation)
+    return connection
 
 
 def _create_table_sql(table: str, columns: Sequence[str], types: Sequence[str]) -> str:
@@ -3870,11 +3768,7 @@ def _create_table_sql(table: str, columns: Sequence[str], types: Sequence[str]) 
 
 
 def _insert_rows(
-    connection: Any,
-    table: str,
-    columns: Sequence[str],
-    types: Sequence[str],
-    rows: Sequence[Mapping[str, str]],
+    connection: Any, table: str, columns: Sequence[str], types: Sequence[str], rows: Sequence[Mapping[str, str]]
 ) -> None:
     if not rows:
         return
@@ -3888,31 +3782,17 @@ def _insert_rows(
         connection.execute(insert_sql, values)
 
 
-def _load_source_into_connection(
-    connection: Any,
-    path: Path,
-    *,
-    locked_types: Mapping[str, str] | None = None,
-) -> None:
-    relation = path.stem
-    columns, types = _column_types_for_source(path, locked_types=locked_types)
-    connection.execute(f"DROP TABLE IF EXISTS {_quote_ident(relation)}")
-    connection.execute(_create_table_sql(relation, columns, types))
-    _insert_rows(connection, relation, columns, types, list(_iter_source_rows(path)))
-
-
-def _build_csv_memory_connection(config: CsvRuntimeConfig) -> Any:
-    duckdb = importlib.import_module("duckdb")
-    paths = config.resolve_source_files()
-    locked_by_table = _load_locked_column_types(EngineConfig.SCHEMA_JSON_PATH)
-    connection = duckdb.connect(":memory:")
-    for path in paths:
-        _load_source_into_connection(
-            connection,
-            path,
-            locked_types=locked_by_table.get(path.stem.lower()),
-        )
-    return connection
+def _load_source_into_connection(connection: Any, path: Path, *, locked_types: Mapping[str, str] | None = None) -> None:
+    _ = locked_types
+    table_pins, column_pins = _csv_schema_pins()
+    for relation in prepare_relations_for_paths(
+        [path],
+        pinned_table_names=table_pins,
+        pinned_column_names=column_pins,
+        apply_auto_correct=True,
+        source_selections=parse_source_selections(CsvRuntimeConfig.SOURCE_SELECTIONS),
+    ):
+        _load_prepared_relation_into_connection(connection, relation)
 
 
 def _csv_source_probe_payload(paths: Sequence[Path]) -> str:
@@ -3929,38 +3809,31 @@ class CsvDialect(DuckDBDialect):
 
     name: str = "csv"
     sqlglot_dialect: ClassVar[str] = "duckdb"
+    registry_canonical_rank: ClassVar[int] = 2
+    registry_statistical_agg_excluded: ClassVar[bool] = True
+    registry_window_frames_excluded: ClassVar[bool] = True
+    registry_array_contains_excluded: ClassVar[bool] = True
 
     def __init__(
-        self,
-        config: CsvRuntimeConfig,
-        sqlalchemy_engine: Any | None = None,
-        *,
-        native_connection: Any | None = None,
+        self, config: CsvRuntimeConfig, sqlalchemy_engine: Any | None = None, *, native_connection: Any | None = None
     ) -> None:
+        self._schema_json_path = str(EngineConfig.SCHEMA_JSON_PATH)
         self._native_connection: Any | None = None
         self._owns_native_connection = False
         self._owns_sqlalchemy_engine = False
-        if getattr(config, "ENGINE_NAME", None) == "csv":
-            try:
-                connection, owns_connection = _resolve_embedded_native_connection(
-                    config,
-                    sqlalchemy_engine,
-                    native_connection,
-                    open_new=lambda: _build_csv_memory_connection(config),
-                )
-                engine, owns_engine = _embedded_sqlalchemy_engine_for_connection(
-                    connection,
-                    "duckdb",
-                    sqlalchemy_engine,
-                )
-                self._native_connection = connection
-                self._owns_native_connection = owns_connection
-                self._owns_sqlalchemy_engine = owns_engine
-                super(DuckDBDialect, self).__init__(config, sqlalchemy_engine=engine)
-                self._backend = DuckDBNativeBackend(connection)
-                return
-            except Exception as exc:
-                debug(f"[CsvDialect.__init__] csv duckdb unavailable: {exc!r}")
+        try:
+            connection, owns_connection = _resolve_embedded_native_connection(
+                config, sqlalchemy_engine, native_connection, open_new=lambda: _build_csv_memory_connection(config)
+            )
+            engine, owns_engine = _embedded_sqlalchemy_engine_for_connection(connection, "duckdb", sqlalchemy_engine)
+            self._native_connection = connection
+            self._owns_native_connection = owns_connection
+            self._owns_sqlalchemy_engine = owns_engine
+            super(DuckDBDialect, self).__init__(config, sqlalchemy_engine=engine)
+            self._backend = DuckDBNativeBackend(connection)
+            return
+        except Exception as exc:
+            debug(f"[CsvDialect.__init__] csv duckdb unavailable: {exc!r}")
         super().__init__(config, sqlalchemy_engine=sqlalchemy_engine, native_connection=native_connection)
 
     def reflect_schema_graph(
@@ -3968,19 +3841,18 @@ class CsvDialect(DuckDBDialect):
         *,
         include: SchemaInclude = "tables",
         allow_objects: frozenset[str] | None = None,
+        deny_objects: frozenset[str] | None = None,
         sql_file: str | None = None,
-    ) -> Any:
+    ) -> SchemaGraph:
         """Build a schema graph from CSV/Excel headers and inferred column types."""
         _ = sql_file
         if include == "views":
             return tables_meta_to_schema_graph({}, object_kind="view")
         csv_config = cast(CsvRuntimeConfig, self.config)
-        paths = csv_config.resolve_source_files()
-        locked_by_table = _load_locked_column_types(EngineConfig.SCHEMA_JSON_PATH)
-        tables_meta = _tables_meta_from_sources(
-            paths,
-            locked_by_table=locked_by_table,
-            allow_objects=allow_objects,
+        locked_by_table = _load_locked_column_types(self._schema_json_path)
+        relations = _csv_relations_for_config(csv_config, schema_json_path=self._schema_json_path)
+        tables_meta = _tables_meta_from_relations(
+            relations, locked_by_table=locked_by_table, allow_objects=allow_objects
         )
         return tables_meta_to_schema_graph(tables_meta, object_kind="table")
 

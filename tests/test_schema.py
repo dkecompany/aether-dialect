@@ -67,6 +67,7 @@ def _col(**overrides) -> ColumnMetadata:
         distinct_count=10,
         distinct_ratio=0.5,
         row_count=20,
+        value_overlap_sample=["1", "2", "3", "4", "5"],
     )
     defaults.update(overrides)
     return ColumnMetadata(**defaults)
@@ -164,7 +165,7 @@ class TestComputeSchemaLimits:
         limits = compute_schema_limits(stats)
         assert isinstance(limits, SchemaLimits)
         assert limits.max_tables == 3
-        assert limits.max_filters >= 1
+        assert limits.max_where_predicates >= 1
         assert limits.max_groupby >= 1
 
     def test_medium_schema(self):
@@ -183,13 +184,13 @@ class TestComputeSchemaLimits:
         """Zero tables should produce valid limits without division error."""
         stats = {"table_count": 0, "total_filterable": 0, "total_groupable": 0}
         limits = compute_schema_limits(stats)
-        assert limits.max_filters == 1
+        assert limits.max_where_predicates == 1
         assert limits.max_groupby == 1
 
     def test_missing_keys_use_defaults(self):
         """Missing table_count / totals default so limits stay valid."""
         limits = compute_schema_limits({})
-        assert limits.max_filters == 1
+        assert limits.max_where_predicates == 1
         assert limits.max_groupby == 1
         assert limits.max_tables == 1
 
@@ -653,7 +654,7 @@ class TestInferMissingFks:
 
 
 class TestInferMissingFksLongestPrefixAndOverlap:
-    """Tests for Phase 13 longest-prefix matching and value-overlap validation."""
+    """Tests for longest-prefix matching and value-overlap validation."""
 
     def test_prefers_plural_table_over_singular_when_both_exist(self):
         """`customer_id` should target the longer-named table when singular and plural both exist."""
@@ -757,25 +758,25 @@ class TestInferMissingFksLongestPrefixAndOverlap:
         assert len(inferred) == 1
         assert inferred[0].dst_table == "customer"
 
-    def test_overlap_falls_open_when_samples_missing(self):
-        """When neither side has populated samples, overlap-validate should not block inference."""
+    def test_overlap_refuses_when_samples_missing(self):
+        """When neither side has populated samples, overlap validation refuses inference."""
         tables = {
             "customer": _table(
                 "customer",
-                {"customer_id": _col(name="customer_id", is_primary_key=True)},
+                {"customer_id": _col(name="customer_id", is_primary_key=True, value_overlap_sample=[])},
                 primary_key=["customer_id"],
             ),
             "orders": _table(
                 "orders",
                 {
-                    "order_id": _col(name="order_id", is_primary_key=True),
-                    "customer_id": _col(name="customer_id"),
+                    "order_id": _col(name="order_id", is_primary_key=True, value_overlap_sample=[]),
+                    "customer_id": _col(name="customer_id", value_overlap_sample=[]),
                 },
                 primary_key=["order_id"],
             ),
         }
         inferred = infer_missing_fks(tables)
-        assert len(inferred) == 1
+        assert len(inferred) == 0
 
     def test_string_int_compatible_when_string_samples_are_digits(self):
         """String↔integer FK inference should be allowed when string- side samples are digit strings."""
@@ -846,7 +847,7 @@ class TestInferMissingFksLongestPrefixAndOverlap:
 
 
 class TestInferMissingFksComposite:
-    """Tests for Phase 15 composite (multi-column) FK inference."""
+    """Tests for composite (multi-column) FK inference."""
 
     def test_infers_composite_fk_when_all_pk_columns_present(self):
         """When src table contains every column of dst's composite PK, infer the multi-column FK."""
@@ -2128,10 +2129,10 @@ class TestSchemaContextAllowColumnsParser:
         assert ctx.allow_columns == frozenset({"contacts.email", "*.name"})
 
     def test_too_many_dots_raises(self):
-        from aetherdialect._config import ConfigError
+        from aetherdialect._contracts_base import ConfigError
 
         try:
-            EngineContext(allow_columns=frozenset({"a.b.c"}))
+            EngineContext(allow_columns=frozenset({"a.b.c.d"}))
         except ConfigError as e:
             assert "allow_columns" in str(e)
         else:
@@ -2291,25 +2292,17 @@ class TestSchemaOverrides:
     """JSON-roundtrip user editing of the built schema graph."""
 
     def test_dump_dict_round_trips_current_state(self, schema_graph):
-        from aetherdialect._constants import SCHEMA_OVERRIDES_EXPORT_DEFAULT_OWNER, SCHEMA_OVERRIDES_VERSION
+        from aetherdialect._constants import SCHEMA_OVERRIDES_VERSION
         from aetherdialect._schema_overrides import dump_schema_overrides_dict
 
         d = dump_schema_overrides_dict(schema_graph)
         assert d["version"] == SCHEMA_OVERRIDES_VERSION
-        assert set(d["tables"].keys()) == {"customers", "orders", "products"}
-        for _tname, tval in d["tables"].items():
-            assert set(tval["description"].keys()) == {"value", "owner"}
-            assert set(tval["role"].keys()) == {"value", "owner"}
-            assert tval["description"]["owner"] == SCHEMA_OVERRIDES_EXPORT_DEFAULT_OWNER
-            assert tval["role"]["owner"] == SCHEMA_OVERRIDES_EXPORT_DEFAULT_OWNER
-            for _cname, cval in tval["columns"].items():
-                assert "description" in cval
-                assert "role" in cval
-                assert "sensitivity" in cval
-                assert set(cval["description"].keys()) == {"value", "owner"}
-                assert set(cval["role"].keys()) == {"value", "owner"}
-                assert cval["description"]["owner"] == SCHEMA_OVERRIDES_EXPORT_DEFAULT_OWNER
-                assert cval["role"]["owner"] == SCHEMA_OVERRIDES_EXPORT_DEFAULT_OWNER
+        assert set(d["tables"].keys()) == set()
+        readonly_tables = {row["name"] for row in d["_readonly"]["tables_current"]}
+        assert readonly_tables == {"customers", "orders", "products"}
+        for row in d["_readonly"]["tables_current"]:
+            assert "role" in row
+            assert "description" in row
         assert d["foreign_keys_add"] == []
 
     def test_dump_to_path_replaces_existing_atomically(self, schema_graph, tmp_path):
@@ -2393,7 +2386,7 @@ class TestSchemaOverrides:
                         "orders": {
                             "description": {
                                 "value": "Hello",
-                                "owner": "catalog",
+                                "owner": "bogus",
                             }
                         }
                     },
@@ -2640,7 +2633,7 @@ class TestSchemaOverrides:
         monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: True)
 
         def _fake_llm_chat(system, user, task):
-            assert task == "schema"
+            assert task == "default"
             return json.dumps(
                 {
                     "items": [
@@ -2906,6 +2899,7 @@ class TestBundleI:
             ),
         )
         assert report.pks_added == 1
+        col = schema_graph.tables["orders"].columns["order_id"]
         assert col.is_primary_key is True
         assert col.pk_inference_tag == PkInferenceTag.USER_OVERRIDE
         assert "order_id" in schema_graph.tables["orders"].primary_key
@@ -2949,6 +2943,7 @@ class TestBundleI:
         )
         assert report.pks_added == 0
         assert report.pks_endorsed == 1
+        col = schema_graph.tables["orders"].columns["amount"]
         assert col.pk_inference_tag == PkInferenceTag.USER_OVERRIDE
         assert any("endorsement" in s.reason for s in report.skipped)
         doc = dump_schema_overrides_dict(schema_graph)
@@ -2974,6 +2969,7 @@ class TestBundleI:
         )
         assert report.pks_added == 0
         assert report.pks_endorsed == 1
+        col = schema_graph.tables["customers"].columns["customer_id"]
         assert col.pk_inference_tag == PkInferenceTag.USER_OVERRIDE
         assert any("endorsement" in s.reason for s in report.skipped)
         doc = dump_schema_overrides_dict(schema_graph)

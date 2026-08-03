@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import replace
 from difflib import get_close_matches
-from typing import Any, cast
+from typing import Any, Literal, cast
 
+from ._config import PolicyConfig
 from ._constants import (
     ARRAY_REWRITABLE_OPS,
     BOOLEAN_FALSY_VALUES,
@@ -17,16 +18,22 @@ from ._constants import (
     DATE_RESULT_SCALARS,
     DESCRIPTIVE_ALLOWED_VALUE_TYPES,
     DESCRIPTIVE_EXCLUDED_VALUE_TYPES,
+    DIAGNOSTIC_CODE_REDUNDANT_JOIN_WHERE_DROPPED,
+    DIAGNOSTIC_CODE_REDUNDANT_KEY_JOIN_CAP_REACHED,
+    DIAGNOSTIC_CODE_REDUNDANT_KEY_JOIN_ELIMINATED,
     DIAGNOSTIC_CODE_SENSITIVITY_GATE_HIT,
     DIAGNOSTIC_FUZZY_CUTOFF,
+    ELIMINATE_REDUNDANT_KEY_JOINS_MAX_ITERATIONS,
     IDENTIFIER_RE,
     IMPOSSIBLE_HAVING_RE,
+    INSTRUCTIONAL_SHAPE_PLACEHOLDER_TOKENS,
     INTENT_PLACEHOLDER_ANGLE_RE,
     MAX_REPAIR_ATTEMPTS_PER_CODE,
     NON_NUMERIC_AGGS_FOR_DATES,
     NULL_OP_DOUBLE_NEGATED_ALIASES,
     NULL_OP_NEGATED_ALIASES,
     NULL_OP_PLAIN_ALIASES,
+    NULL_SENSITIVE_ELIMINATION_OPS,
     NUMERIC_DATA_TYPES,
     NUMERIC_RESULT_AGGS,
     NUMERIC_RESULT_SCALARS,
@@ -36,6 +43,7 @@ from ._constants import (
     SQL_KEYWORDS,
     STRING_COLUMN_VALUE_TYPES,
     STRING_OPS,
+    TABLE_SCOPE_REPAIR_REASON_TEXT,
     UNKNOWN_DATEPART_TO_EXTRACT_UNIT,
     WINDOW_AGG_FUNCTIONS,
     YEAR_LITERAL_COMPARISON_OPS,
@@ -43,53 +51,65 @@ from ._constants import (
 )
 from ._contracts_base import (
     FailureCategory,
-    FilterParam,
+    FederationManifest,
     HavingParam,
+    InferenceTag,
     MulGroup,
     NormalizedExpr,
     OrderByCol,
+    PredicateGroup,
     RawValue,
     SensitivityClassification,
     SqlDiagnostic,
     SqlDiagnosticCode,
+    WhereParam,
     expr_registry_ref,
+    having_leaves,
+    map_predicate_group,
+    merge_predicate_groups,
+    predicate_group_from_list,
+    reapply_predicate_leaves,
+    rebuild_predicate_group_from_leaves,
+    where_leaves,
 )
-from ._contracts_core import (
-    RuntimeCteStep,
-    RuntimeIntent,
-    SelectCol,
-    effective_select_parts,
-)
+from ._contracts_core import RuntimeCteStep, RuntimeIntent, SelectCol, TableScopeRepair, effective_select_parts
 from ._contracts_schema import (
     CaseRegistryStep,
     CaseWhenBranch,
     CaseWhenExpr,
     ColumnMetadata,
+    FKEdge,
+    IntentIssue,
     SchemaGraph,
     TableMetadata,
     WindowRegistryStep,
     WindowSpec,
+    make_intent_issue,
 )
 from ._core_utils import debug, notify, pipeline_trace, stable_json
 from ._dialect_sqlglot_helper import array_storage_kind
 from ._intent_expr import (
     expr_canonical_key,
     extract_columns_from_expr,
+    is_plain_column_expr,
     map_case_branch_conditions,
     replace_refs_in_expr,
 )
-from ._sql_gen import render_expr_sql
+from ._sql_gen import (
+    cte_emission_map,
+    inner_equality_pairs_from_resolved_join_path,
+    probe_cte_names,
+    render_expr_sql,
+)
 from ._validation_schema import (
-    filter_param_to_having_param,
     selectability_exempt_qualified_refs,
+    validate_join_path_reachability_for_tables,
+    where_param_to_having_param,
 )
-from ._validation_semantic import (
-    validate_having_operator_is_numeric,
-    validate_having_requires_aggregation,
-)
+from ._validation_semantic import validate_having_operator_is_numeric, validate_having_requires_aggregation
 
 
-def dedup_extract_year_vs_column_literal(filters: list[FilterParam]) -> tuple[list[FilterParam], bool]:
+def dedup_extract_year_vs_column_literal(filters: list[WhereParam]) -> tuple[list[WhereParam], bool]:
     """Drop bare four-digit year comparisons on a column when an EXTRACT(year FROM that column) filter already exists."""
     if not filters:
         return filters, False
@@ -105,7 +125,7 @@ def dedup_extract_year_vs_column_literal(filters: list[FilterParam]) -> tuple[li
     if not extract_years:
         return filters, False
 
-    new_filters: list[FilterParam] = []
+    new_filters: list[WhereParam] = []
     changed = False
     for fp in filters:
         is_bare_year_lit = False
@@ -126,98 +146,100 @@ def dedup_extract_year_vs_column_literal(filters: list[FilterParam]) -> tuple[li
     return new_filters, changed
 
 
-def apply_filters_to_main_and_ctes(
-    intent: RuntimeIntent,
-    process_fn: Callable[[list[FilterParam]], tuple[list[FilterParam], bool]],
+def apply_where_to_main_and_ctes(
+    intent: RuntimeIntent, process_fn: Callable[[list[WhereParam]], tuple[list[WhereParam], bool]]
 ) -> RuntimeIntent:
-    """Apply a filter processor to the main intent and each CTE, merging results. Also extends the processor to every CASE WHEN branch whose ``condition_scope`` is ``"filter"`` so that branch-shaped predicates receive identical repairs as flat ``filters_param`` entries. A processor that returns zero or multiple predicates for a single- element branch input keeps the original branch condition because a CASE branch holds exactly one predicate."""
-    new_fp, main_changed = process_fn(intent.filters_param or [])
+    """Apply a where processor to the main intent and each CTE, merging results. Also extends the processor to every CASE WHEN branch whose ``condition_scope`` is ``"where"`` so that branch-shaped predicates receive identical repairs as flat ``where`` leaves. A processor that returns zero or multiple predicates for a single- element branch input keeps the original branch condition because a CASE branch holds exactly one predicate."""
+    new_fp, main_changed = process_fn(where_leaves(intent.where) or [])
     if not intent.cte_steps:
-        result = replace(intent, filters_param=new_fp) if main_changed else intent
-        return _apply_filter_processor_to_case_branches(result, process_fn)
+        result = (
+            replace(intent, where=rebuild_predicate_group_from_leaves(intent.where, new_fp)) if main_changed else intent
+        )
+        return _apply_where_processor_to_case_branches(result, process_fn)
     new_cte_steps = []
     cte_changed = False
     for cte in intent.cte_steps:
-        cte_fp, c = process_fn(cte.filters_param or [])
+        cte_fp, c = process_fn(where_leaves(cte.where) or [])
         if c:
             cte_changed = True
-        new_cte_steps.append(replace(cte, filters_param=cte_fp))
+        new_cte_steps.append(
+            replace(cte, where=rebuild_predicate_group_from_leaves(cte.where, cte_fp) if c else cte.where)
+        )
     if not main_changed and not cte_changed:
-        return _apply_filter_processor_to_case_branches(intent, process_fn)
-    result = replace(intent, filters_param=new_fp)
+        return _apply_where_processor_to_case_branches(intent, process_fn)
+    result = replace(intent, where=rebuild_predicate_group_from_leaves(intent.where, new_fp))
     if cte_changed:
         result = replace(result, cte_steps=new_cte_steps)
-    return _apply_filter_processor_to_case_branches(result, process_fn)
+    return _apply_where_processor_to_case_branches(result, process_fn)
 
 
 def apply_having_to_main_and_ctes(
-    intent: RuntimeIntent,
-    process_fn: Callable[[list[HavingParam]], tuple[list[HavingParam], bool]],
+    intent: RuntimeIntent, process_fn: Callable[[list[HavingParam]], tuple[list[HavingParam], bool]]
 ) -> RuntimeIntent:
-    """Apply a HAVING processor to the main intent and each CTE, merging results. Also extends the processor to every CASE WHEN branch whose ``condition_scope`` is ``"having"``. The branch condition is wrapped as a one-element ``HavingParam`` list via :func:`filter_param_to_having_param`, processed, and converted back via :func:`_having_param_to_filter_param`. A processor that returns zero or multiple predicates keeps the original branch because a CASE branch holds exactly one."""
-    new_hp, main_changed = process_fn(intent.having_param or [])
+    """Apply a HAVING processor to the main intent and each CTE, merging results. Also extends the processor to every CASE WHEN branch whose ``condition_scope`` is ``"having"``. The branch condition is wrapped as a one-element ``HavingParam`` list via :func:`where_param_to_having_param`, processed, and converted back via :func:`_having_param_to_where_param`. A processor that returns zero or multiple predicates keeps the original branch because a CASE branch holds exactly one."""
+    new_hp, main_changed = process_fn(having_leaves(intent.having) or [])
     if not intent.cte_steps:
-        result = replace(intent, having_param=new_hp) if main_changed else intent
+        result = (
+            replace(intent, having=rebuild_predicate_group_from_leaves(intent.having, new_hp))
+            if main_changed
+            else intent
+        )
         return _apply_having_processor_to_case_branches(result, process_fn)
     new_cte_steps = []
     cte_changed = False
     for cte in intent.cte_steps:
-        cte_hp, c = process_fn(cte.having_param or [])
+        cte_hp, c = process_fn(having_leaves(cte.having) or [])
         if c:
             cte_changed = True
-        new_cte_steps.append(replace(cte, having_param=cte_hp))
+        new_cte_steps.append(
+            replace(cte, having=rebuild_predicate_group_from_leaves(cte.having, cte_hp) if c else cte.having)
+        )
     if not main_changed and not cte_changed:
         return _apply_having_processor_to_case_branches(intent, process_fn)
-    result = replace(intent, having_param=new_hp)
+    result = replace(intent, having=rebuild_predicate_group_from_leaves(intent.having, new_hp))
     if cte_changed:
         result = replace(result, cte_steps=new_cte_steps)
     return _apply_having_processor_to_case_branches(result, process_fn)
 
 
-def _having_param_to_filter_param(hp: HavingParam) -> FilterParam:
-    """Translate a :class:`HavingParam` back into the matching :class:`FilterParam`."""
-    return FilterParam(
+def _having_param_to_where_param(hp: HavingParam) -> WhereParam:
+    """Translate a :class:`HavingParam` back into the matching :class:`WhereParam`."""
+    return WhereParam(
         left_expr=hp.left_expr,
         op=hp.op,
         right_expr=hp.right_expr,
         value_type=hp.value_type,
         param_key=hp.param_key,
         raw_value=hp.raw_value,
-        bool_op=hp.bool_op,
-        filter_group=hp.filter_group,
     )
 
 
-def _apply_filter_processor_to_case_branches(
-    intent: RuntimeIntent,
-    process_fn: Callable[[list[FilterParam]], tuple[list[FilterParam], bool]],
+def _apply_where_processor_to_case_branches(
+    intent: RuntimeIntent, process_fn: Callable[[list[WhereParam]], tuple[list[WhereParam], bool]]
 ) -> RuntimeIntent:
     """Run *process_fn* against every filter-scope CASE branch via :func:`map_case_branch_conditions`."""
 
-    def _branch_transform(conds: list[FilterParam]) -> list[FilterParam]:
+    def _branch_transform(conds: list[WhereParam]) -> list[WhereParam]:
         new_list, _ = process_fn(conds)
         return new_list
 
-    return map_case_branch_conditions(intent, _branch_transform, scopes=frozenset({"filter"}))
+    return map_case_branch_conditions(intent, _branch_transform, scopes=frozenset({"where"}))
 
 
 def _apply_having_processor_to_case_branches(
-    intent: RuntimeIntent,
-    process_fn: Callable[[list[HavingParam]], tuple[list[HavingParam], bool]],
+    intent: RuntimeIntent, process_fn: Callable[[list[HavingParam]], tuple[list[HavingParam], bool]]
 ) -> RuntimeIntent:
     """Run *process_fn* against every having-scope CASE branch via :func:`map_case_branch_conditions`."""
 
-    def _branch_transform(conds: list[FilterParam]) -> list[FilterParam]:
-        h_in = [filter_param_to_having_param(c) for c in conds]
+    def _branch_transform(conds: list[WhereParam]) -> list[WhereParam]:
+        h_in = [where_param_to_having_param(c) for c in conds]
         new_h, _ = process_fn(h_in)
-        return [_having_param_to_filter_param(h) for h in new_h]
+        return [_having_param_to_where_param(h) for h in new_h]
 
     return map_case_branch_conditions(intent, _branch_transform, scopes=frozenset({"having"}))
 
 
-def _dedup_contradictory_filters_list(
-    filters: list[FilterParam],
-) -> tuple[list[FilterParam], bool]:
+def _dedup_contradictory_where_list(filters: list[WhereParam]) -> tuple[list[WhereParam], bool]:
     """Drop range filters on a column that also has an equality on that. column."""
     eq_columns: set[str] = set()
     for fp in filters:
@@ -228,21 +250,19 @@ def _dedup_contradictory_filters_list(
     if not eq_columns:
         return filters, False
 
-    kept: list[FilterParam] = []
+    kept: list[WhereParam] = []
     changed = False
     for fp in filters:
         col = fp.left_expr.primary_column or ""
         if col in eq_columns and fp.op in RANGE_OPS:
-            debug(f"[intent_repair.dedup_contradictory_filters] dropping {fp.op} on '{col}' that contradicts =")
+            debug(f"[intent_repair.dedup_contradictory_where] dropping {fp.op} on '{col}' that contradicts =")
             changed = True
             continue
         kept.append(fp)
     return kept, changed
 
 
-def _dedup_contradictory_having_list(
-    having: list[HavingParam],
-) -> tuple[list[HavingParam], bool]:
+def _dedup_contradictory_having_list(having: list[HavingParam]) -> tuple[list[HavingParam], bool]:
     """Drop range HAVING predicates on an aggregation expression that also has an equality on that key. Keys use :func:`expr_canonical_key` on ``left_expr`` (aggregation expressions lack a single ``primary_column`` like WHERE filters)."""
     eq_keys: set[str] = set()
     for hp in having:
@@ -265,9 +285,9 @@ def _dedup_contradictory_having_list(
     return kept, changed
 
 
-def dedup_contradictory_filters(intent: RuntimeIntent) -> RuntimeIntent:
+def dedup_contradictory_where(intent: RuntimeIntent) -> RuntimeIntent:
     """Remove contradictory range filters and HAVING predicates from main query and CTEs."""
-    intent = apply_filters_to_main_and_ctes(intent, _dedup_contradictory_filters_list)
+    intent = apply_where_to_main_and_ctes(intent, _dedup_contradictory_where_list)
     return apply_having_to_main_and_ctes(intent, _dedup_contradictory_having_list)
 
 
@@ -326,8 +346,8 @@ def _raw_value_to_temporal_keyword(raw: Any) -> str | None:
     return None
 
 
-def _promote_temporal_keyword_filters(filters: list[FilterParam]) -> tuple[list[FilterParam], bool]:
-    out: list[FilterParam] = []
+def _promote_temporal_keyword_where(filters: list[WhereParam]) -> tuple[list[WhereParam], bool]:
+    out: list[WhereParam] = []
     changed = False
     for fp in filters:
         if fp.right_expr is not None and _normalized_expr_is_keyword_leaf(fp.right_expr):
@@ -335,14 +355,7 @@ def _promote_temporal_keyword_filters(filters: list[FilterParam]) -> tuple[list[
             continue
         kw = _raw_value_to_temporal_keyword(fp.raw_value)
         if kw is not None and fp.right_expr is None and fp.op not in ("is null", "is not null"):
-            out.append(
-                replace(
-                    fp,
-                    right_expr=NormalizedExpr(keyword=kw),
-                    raw_value=None,
-                    param_key="",
-                )
-            )
+            out.append(replace(fp, right_expr=NormalizedExpr(keyword=kw), raw_value=None, param_key=""))
             changed = True
         else:
             out.append(fp)
@@ -358,14 +371,7 @@ def _promote_temporal_keyword_havings(havings: list[HavingParam]) -> tuple[list[
             continue
         kw = _raw_value_to_temporal_keyword(hp.raw_value)
         if kw is not None and hp.right_expr is None and hp.op not in ("is null", "is not null"):
-            out.append(
-                replace(
-                    hp,
-                    right_expr=NormalizedExpr(keyword=kw),
-                    raw_value=None,
-                    param_key="",
-                )
-            )
+            out.append(replace(hp, right_expr=NormalizedExpr(keyword=kw), raw_value=None, param_key=""))
             changed = True
         else:
             out.append(hp)
@@ -374,11 +380,11 @@ def _promote_temporal_keyword_havings(havings: list[HavingParam]) -> tuple[list[
 
 def promote_temporal_keyword_rhs(intent: RuntimeIntent) -> RuntimeIntent:
     """Promote temporal keyword string literals on filter/having RHS into keyword ``right_expr`` leaves."""
-    intent = apply_filters_to_main_and_ctes(intent, _promote_temporal_keyword_filters)
+    intent = apply_where_to_main_and_ctes(intent, _promote_temporal_keyword_where)
     return apply_having_to_main_and_ctes(intent, _promote_temporal_keyword_havings)
 
 
-def _filter_right_expr_redundant_with_value(fp: FilterParam) -> bool:
+def _where_right_expr_redundant_with_value(fp: WhereParam) -> bool:
     if fp.right_expr is None or fp.raw_value is None:
         return False
     if _normalized_expr_is_keyword_leaf(fp.right_expr):
@@ -414,13 +420,11 @@ def _having_right_expr_redundant_with_value(hp: HavingParam) -> bool:
     return _rendered_expr_matches_param_raw(rendered, hp.raw_value)
 
 
-def _dedup_value_vs_right_expr_filters(
-    filters: list[FilterParam],
-) -> tuple[list[FilterParam], bool]:
-    out: list[FilterParam] = []
+def _dedup_value_vs_right_expr_where(filters: list[WhereParam]) -> tuple[list[WhereParam], bool]:
+    out: list[WhereParam] = []
     changed = False
     for fp in filters:
-        if _filter_right_expr_redundant_with_value(fp):
+        if _where_right_expr_redundant_with_value(fp):
             out.append(replace(fp, right_expr=None))
             changed = True
         else:
@@ -428,9 +432,7 @@ def _dedup_value_vs_right_expr_filters(
     return out, changed
 
 
-def _dedup_value_vs_right_expr_havings(
-    having: list[HavingParam],
-) -> tuple[list[HavingParam], bool]:
+def _dedup_value_vs_right_expr_havings(having: list[HavingParam]) -> tuple[list[HavingParam], bool]:
     out: list[HavingParam] = []
     changed = False
     for hp in having:
@@ -444,7 +446,7 @@ def _dedup_value_vs_right_expr_havings(
 
 def dedup_value_vs_right_expr(intent: RuntimeIntent) -> RuntimeIntent:
     """Drop ``right_expr`` when it duplicates the bound ``value`` for parametric predicates."""
-    intent = apply_filters_to_main_and_ctes(intent, _dedup_value_vs_right_expr_filters)
+    intent = apply_where_to_main_and_ctes(intent, _dedup_value_vs_right_expr_where)
     return apply_having_to_main_and_ctes(intent, _dedup_value_vs_right_expr_havings)
 
 
@@ -474,16 +476,14 @@ def _canonicalize_null_op(op: str) -> str:
     return op
 
 
-def repair_null_equality_filters(intent: RuntimeIntent) -> RuntimeIntent:
+def repair_null_equality_where(intent: RuntimeIntent) -> RuntimeIntent:
     """Rewrite ``=`` / ``!=`` / ``<>`` against null into ``is null`` / ``is not null``."""
-    intent = apply_filters_to_main_and_ctes(intent, _repair_null_equality_list)
+    intent = apply_where_to_main_and_ctes(intent, _repair_null_equality_list)
     return apply_having_to_main_and_ctes(intent, _repair_null_equality_having_list)
 
 
-def _repair_null_equality_list(
-    filters: list[FilterParam],
-) -> tuple[list[FilterParam], bool]:
-    repaired: list[FilterParam] = []
+def _repair_null_equality_list(filters: list[WhereParam]) -> tuple[list[WhereParam], bool]:
+    repaired: list[WhereParam] = []
     changed = False
     for fp in filters:
         if fp.param_key:
@@ -501,33 +501,17 @@ def _repair_null_equality_list(
             repaired.append(fp)
             continue
         if fp.op == "=" and _is_null_value(fp.raw_value):
-            repaired.append(
-                replace(
-                    fp,
-                    op="is null",
-                    raw_value=None,
-                    value_type="null",
-                )
-            )
+            repaired.append(replace(fp, op="is null", raw_value=None, value_type="null"))
             changed = True
         elif fp.op in ("!=", "<>") and _is_null_value(fp.raw_value):
-            repaired.append(
-                replace(
-                    fp,
-                    op="is not null",
-                    raw_value=None,
-                    value_type="null",
-                )
-            )
+            repaired.append(replace(fp, op="is not null", raw_value=None, value_type="null"))
             changed = True
         else:
             repaired.append(fp)
     return repaired, changed
 
 
-def _repair_null_equality_having_list(
-    having: list[HavingParam],
-) -> tuple[list[HavingParam], bool]:
+def _repair_null_equality_having_list(having: list[HavingParam]) -> tuple[list[HavingParam], bool]:
     repaired: list[HavingParam] = []
     changed = False
     for hp in having:
@@ -546,24 +530,10 @@ def _repair_null_equality_having_list(
             repaired.append(hp)
             continue
         if hp.op == "=" and _is_null_value(hp.raw_value):
-            repaired.append(
-                replace(
-                    hp,
-                    op="is null",
-                    raw_value=None,
-                    value_type="null",
-                )
-            )
+            repaired.append(replace(hp, op="is null", raw_value=None, value_type="null"))
             changed = True
         elif hp.op in ("!=", "<>") and _is_null_value(hp.raw_value):
-            repaired.append(
-                replace(
-                    hp,
-                    op="is not null",
-                    raw_value=None,
-                    value_type="null",
-                )
-            )
+            repaired.append(replace(hp, op="is not null", raw_value=None, value_type="null"))
             changed = True
         else:
             repaired.append(hp)
@@ -585,10 +555,7 @@ def _descriptive_column_score(col_name: str, col_meta: ColumnMetadata) -> tuple[
 
 
 def _best_descriptive_columns(
-    table: str,
-    schema_graph: SchemaGraph,
-    exclude: set[str],
-    max_count: int = 2,
+    table: str, schema_graph: SchemaGraph, exclude: set[str], max_count: int = 2
 ) -> list[str]:
     """Pick up to *max_count* descriptive columns for *table* (non- PK/FK, high cardinality)."""
     tbl_meta = schema_graph.tables.get(table)
@@ -624,8 +591,7 @@ def _best_descriptive_columns(
 
 
 def _best_composite_name_pair(
-    tbl_meta: TableMetadata,
-    candidates: list[tuple[str, ColumnMetadata]],
+    tbl_meta: TableMetadata, candidates: list[tuple[str, ColumnMetadata]]
 ) -> tuple[str, str] | None:
     """Return two name-like columns when their composite distinct ratio. beats any single."""
     name_candidates = [(name, meta) for name, meta in candidates if _descriptive_column_score(name, meta)[1] >= 2]
@@ -643,12 +609,7 @@ def _best_composite_name_pair(
     return None
 
 
-def best_descriptive_columns(
-    table: str,
-    schema_graph: SchemaGraph,
-    exclude: set[str],
-    max_count: int = 2,
-) -> list[str]:
+def best_descriptive_columns(table: str, schema_graph: SchemaGraph, exclude: set[str], max_count: int = 2) -> list[str]:
     """
     Pick up to *max_count* descriptive columns for *table* (non- PK/FK, high cardinality).
 
@@ -701,15 +662,15 @@ def best_descriptive_column(table: str, schema_graph: SchemaGraph, exclude: set[
     return cols[0] if cols else None
 
 
-def _repair_fk_filters(
-    filters: list[FilterParam],
+def _repair_fk_where(
+    filters: list[WhereParam],
     select_cols: list[SelectCol],
     tables: list[str],
     schema_graph: SchemaGraph,
     label: str = "",
-) -> tuple[list[FilterParam], list[str], bool]:
+) -> tuple[list[WhereParam], list[str], bool]:
     """Scan filters for FK integer + string/enum value pairs (debug. only; no rewrite)."""
-    new_filters: list[FilterParam] = []
+    new_filters: list[WhereParam] = []
     tables = list(tables)
     changed = False
     existing_terms = {sc.expr.primary_term for sc in select_cols or []}
@@ -736,31 +697,28 @@ def _repair_fk_filters(
         if desc:
             changed = True
             debug(
-                f"[intent_resolve.repair_fk_filter_type_mismatch{label}] detected fk filter {col} needing descriptive column"
+                f"[intent_resolve.repair_fk_where_type_mismatch{label}] detected fk filter {col} needing descriptive column"
             )
     return new_filters, tables, changed
 
 
-def repair_fk_filter_type_mismatch(intent: RuntimeIntent, schema_graph: SchemaGraph) -> RuntimeIntent:
-    """Detect string/enum values on numeric FK filters (debug trace; filters not rewritten). Filter-only by design; FK-type hints apply to ``filters_param``, not HAVING aggregates."""
-    main_filters, _, main_changed = _repair_fk_filters(
-        intent.filters_param or [],
-        intent.select_cols or [],
-        list(intent.tables or []),
-        schema_graph,
+def repair_fk_where_type_mismatch(intent: RuntimeIntent, schema_graph: SchemaGraph) -> RuntimeIntent:
+    """Detect string/enum values on numeric FK where predicates (debug trace; predicates not rewritten). Where-only by design; FK-type hints apply to ``where`` leaves, not HAVING aggregates."""
+    main_filters, _, main_changed = _repair_fk_where(
+        where_leaves(intent.where) or [], intent.select_cols or [], list(intent.tables or []), schema_graph
     )
     cte_changed = False
     new_cte_steps = []
     for cte in intent.cte_steps or []:
-        cte_filters, _, c = _repair_fk_filters(
-            cte.filters_param or [],
+        cte_filters, _, c = _repair_fk_where(
+            where_leaves(cte.where) or [],
             cte.select_cols or [],
             list(cte.tables or []),
             schema_graph,
             label=f" CTE '{cte.cte_name}'",
         )
         if c:
-            new_cte_steps.append(replace(cte, filters_param=cte_filters))
+            new_cte_steps.append(replace(cte, where=predicate_group_from_list(cte_filters)))
             cte_changed = True
         else:
             new_cte_steps.append(cte)
@@ -768,16 +726,14 @@ def repair_fk_filter_type_mismatch(intent: RuntimeIntent, schema_graph: SchemaGr
         return intent
     result = intent
     if main_changed:
-        result = replace(result, filters_param=main_filters)
+        result = replace(result, where=predicate_group_from_list(main_filters))
     if cte_changed:
         result = replace(result, cte_steps=new_cte_steps)
     return result
 
 
 def _expand_fk_select_to_descriptive_tables_sel(
-    select_cols: list[SelectCol],
-    tables: list[str],
-    schema_graph: SchemaGraph,
+    select_cols: list[SelectCol], tables: list[str], schema_graph: SchemaGraph
 ) -> tuple[list[SelectCol], list[str], bool]:
     """Expand bare FK integer selects to descriptive columns and extend. ``tables``."""
     tables_out = list(tables or [])
@@ -797,17 +753,21 @@ def _expand_fk_select_to_descriptive_tables_sel(
         if not col_meta or not col_meta.is_foreign_key or col_meta.value_type not in {"integer", "number"}:
             new_select.append(sc)
             continue
+        tbl_meta = schema_graph.tables.get(parts[0])
+        if tbl_meta is not None:
+            fk_is_cross_source = any(
+                parts[1] in (fk.src_cols or []) and fk.inference_tag == InferenceTag.CROSS_SOURCE
+                for fk in tbl_meta.foreign_keys or []
+            )
+            if fk_is_cross_source:
+                new_select.append(sc)
+                continue
         fk_target = col_meta.fk_target
         if not fk_target:
             new_select.append(sc)
             continue
         target_table, _ = fk_target
-        descs = _best_descriptive_columns(
-            target_table,
-            schema_graph,
-            existing_terms,
-            max_count=2,
-        )
+        descs = _best_descriptive_columns(target_table, schema_graph, existing_terms, max_count=2)
         if not descs:
             new_select.append(sc)
             continue
@@ -829,9 +789,7 @@ def _expand_fk_select_to_descriptive_tables_sel(
 def expand_fk_select_to_descriptive(intent: RuntimeIntent, schema_graph: SchemaGraph) -> RuntimeIntent:
     """Rewrite bare non-aggregated FK integer selects on the main query. to descriptive columns and add join tables. CTE bodies are not expanded so grouped CTE ``GROUP BY`` stays aligned with CTE ``select_cols``."""
     ns, nt, main_ch = _expand_fk_select_to_descriptive_tables_sel(
-        list(intent.select_cols or []),
-        list(intent.tables or []),
-        schema_graph,
+        list(intent.select_cols or []), list(intent.tables or []), schema_graph
     )
     if not main_ch:
         return intent
@@ -846,7 +804,7 @@ def strip_spurious_group_by(intent: RuntimeIntent) -> RuntimeIntent:
     main_distinct = intent.distinct_select_index
     if intent.group_by_cols:
         has_agg = any(sc.is_aggregated for sc in (intent.select_cols or []))
-        has_agg = has_agg or any(hp.left_expr.has_aggregation for hp in (intent.having_param or []))
+        has_agg = has_agg or any(hp.left_expr.has_aggregation for hp in (having_leaves(intent.having) or []))
         if not has_agg:
             debug(
                 f"[intent_resolve.strip_spurious_group_by] group_by_cols present without aggregation — stripping {[g.primary_term for g in intent.group_by_cols]}"
@@ -868,7 +826,7 @@ def strip_spurious_group_by(intent: RuntimeIntent) -> RuntimeIntent:
             new_cte_steps.append(cte)
             continue
         cte_has_agg = any(sc.is_aggregated for sc in (cte.select_cols or []))
-        cte_has_agg = cte_has_agg or any(hp.left_expr.has_aggregation for hp in (cte.having_param or []))
+        cte_has_agg = cte_has_agg or any(hp.left_expr.has_aggregation for hp in (having_leaves(cte.having) or []))
         if cte_has_agg:
             new_cte_steps.append(cte)
             continue
@@ -933,7 +891,7 @@ def _is_impossible_having(hp: HavingParam) -> bool:
 
 def strip_impossible_having(intent: RuntimeIntent) -> RuntimeIntent:
     """Drop HAVING clauses that ``_is_impossible_having`` flags (main. and CTEs)."""
-    main_having = intent.having_param or []
+    main_having = having_leaves(intent.having) or []
     kept_main = [hp for hp in main_having if not _is_impossible_having(hp)]
     main_changed = len(kept_main) != len(main_having)
     if main_changed:
@@ -943,11 +901,11 @@ def strip_impossible_having(intent: RuntimeIntent) -> RuntimeIntent:
     new_cte_steps = []
     cte_changed = False
     for cte in intent.cte_steps or []:
-        cte_having = cte.having_param or []
+        cte_having = having_leaves(cte.having) or []
         kept_cte = [hp for hp in cte_having if not _is_impossible_having(hp)]
         if len(kept_cte) != len(cte_having):
             cte_changed = True
-            new_cte_steps.append(replace(cte, having_param=kept_cte))
+            new_cte_steps.append(replace(cte, having=predicate_group_from_list(kept_cte)))
         else:
             new_cte_steps.append(cte)
 
@@ -955,17 +913,69 @@ def strip_impossible_having(intent: RuntimeIntent) -> RuntimeIntent:
         return intent
     return replace(
         intent,
-        having_param=kept_main,
+        having=predicate_group_from_list(kept_main),
         cte_steps=new_cte_steps if cte_changed else (intent.cte_steps or []),
     )
 
 
+def _federation_table_source(schema: SchemaGraph, table: str, manifest: FederationManifest | None) -> str:
+    meta = schema.tables.get(table)
+    if meta is not None and meta.source_id:
+        return meta.source_id
+    if manifest is not None:
+        return str(manifest.table_namespace.get(table, "") or "")
+    return ""
+
+
+def _intent_source_scope(
+    schema: SchemaGraph, intent: RuntimeIntent, manifest: FederationManifest | None = None
+) -> frozenset[str]:
+    scopes: set[str] = set()
+    for table in intent.tables or []:
+        source_id = _federation_table_source(schema, table, manifest)
+        if source_id:
+            scopes.add(source_id)
+    return frozenset(scopes)
+
+
+def _scoped_valid_tables(schema_graph: SchemaGraph, source_scope: frozenset[str]) -> dict[str, str]:
+    if not source_scope:
+        return {t.lower(): t for t in schema_graph.tables}
+    scoped: dict[str, str] = {}
+    for name, meta in schema_graph.tables.items():
+        if meta.source_id and meta.source_id in source_scope:
+            scoped[name.lower()] = name
+        elif not meta.source_id and meta.member_source_ids and source_scope.intersection(meta.member_source_ids):
+            scoped[name.lower()] = name
+    return scoped
+
+
+def _single_source_scope_from_schema(schema: SchemaGraph) -> frozenset[str]:
+    sources = {meta.source_id for meta in schema.tables.values() if meta.source_id}
+    return frozenset(sources) if len(sources) == 1 else frozenset()
+
+
+def _repair_source_scope(
+    schema: SchemaGraph,
+    intent: RuntimeIntent,
+    diag: SqlDiagnostic,
+    *,
+    manifest: FederationManifest | None = None,
+) -> frozenset[str]:
+    detail_source = (diag.details.get("source_id") or "").strip()
+    if detail_source:
+        return frozenset({detail_source})
+    intent_scope = _intent_source_scope(schema, intent, manifest)
+    if intent_scope:
+        return intent_scope
+    return _single_source_scope_from_schema(schema)
+
+
 def _sanitize_table_names_list(
-    tables: list[str],
-    schema_graph: SchemaGraph,
+    tables: list[str], schema_graph: SchemaGraph, *, valid_tables: Mapping[str, str] | None = None
 ) -> tuple[list[str], bool]:
     """Return a copy of *tables* with SQL-keyword-prefixed hallucinations corrected when possible."""
-    valid_tables = {t.lower(): t for t in schema_graph.tables}
+    valid_tables = valid_tables or {t.lower(): t for t in schema_graph.tables}
     new_tables: list[str] = []
     changed = False
     for tbl in tables or []:
@@ -983,14 +993,23 @@ def _sanitize_table_names_list(
     return new_tables, changed
 
 
-def sanitize_table_names(intent: RuntimeIntent, schema_graph: SchemaGraph) -> RuntimeIntent:
+def sanitize_table_names(
+    intent: RuntimeIntent, schema_graph: SchemaGraph, federation_manifest: FederationManifest | None = None
+) -> RuntimeIntent:
     """Remove leading SQL keyword tokens from hallucinated multi-token. table names. Applies to the main ``tables`` list and each CTE ``tables`` list."""
-    nt, main_ch = _sanitize_table_names_list(list(intent.tables or []), schema_graph)
+    has_federation_tables = federation_manifest is not None or any(
+        meta.source_id for meta in schema_graph.tables.values()
+    )
+    source_scope = (
+        _intent_source_scope(schema_graph, intent, federation_manifest) if has_federation_tables else frozenset()
+    )
+    scoped_tables = _scoped_valid_tables(schema_graph, source_scope) if source_scope else None
+    nt, main_ch = _sanitize_table_names_list(list(intent.tables or []), schema_graph, valid_tables=scoped_tables)
     out = replace(intent, tables=nt) if main_ch else intent
     new_cte_steps: list[RuntimeCteStep] = []
     cte_ch = False
     for cte in out.cte_steps or []:
-        ctb, c = _sanitize_table_names_list(list(cte.tables or []), schema_graph)
+        ctb, c = _sanitize_table_names_list(list(cte.tables or []), schema_graph, valid_tables=scoped_tables)
         if c:
             cte_ch = True
             new_cte_steps.append(replace(cte, tables=ctb))
@@ -1003,17 +1022,33 @@ def sanitize_table_names(intent: RuntimeIntent, schema_graph: SchemaGraph) -> Ru
     return out
 
 
-def _strip_join_condition_filters(filters: list[FilterParam], schema_graph: SchemaGraph) -> list[FilterParam]:
+def _table_source_id(schema: SchemaGraph, table: str) -> str:
+    meta = schema.tables.get(table)
+    return str(meta.source_id or "") if meta is not None else ""
+
+
+def _same_federation_source(schema: SchemaGraph, left_table: str, right_table: str) -> bool:
+    """Return True when both tables share a source id, or neither is source-stamped."""
+    left_src = _table_source_id(schema, left_table)
+    right_src = _table_source_id(schema, right_table)
+    if left_src and right_src:
+        return left_src == right_src
+    return True
+
+
+def _strip_join_condition_where(filters: list[WhereParam], schema_graph: SchemaGraph) -> list[WhereParam]:
     """Drop ``=`` filters that duplicate a schema FK edge (column-to- column)."""
     fk_pairs: set[tuple[str, str]] = set()
     for tbl in schema_graph.tables.values():
         for fk in tbl.foreign_keys:
+            if fk.inference_tag == InferenceTag.CROSS_SOURCE:
+                continue
             if len(fk.src_cols) == 1 and len(fk.dst_cols) == 1:
                 left = f"{fk.src_table}.{fk.src_cols[0]}"
                 right = f"{fk.dst_table}.{fk.dst_cols[0]}"
                 fk_pairs.add((left, right))
                 fk_pairs.add((right, left))
-    result: list[FilterParam] = []
+    result: list[WhereParam] = []
     for fp in filters:
         if fp.right_expr is None or fp.op not in ("=", "in"):
             result.append(fp)
@@ -1022,7 +1057,7 @@ def _strip_join_condition_filters(filters: list[FilterParam], schema_graph: Sche
         right_term = fp.right_expr.primary_term
         if (left_term, right_term) in fk_pairs:
             debug(
-                f"[intent_resolve.strip_join_condition_filters] dropping FK join filter: {left_term} {fp.op} {right_term}"
+                f"[intent_resolve.strip_join_condition_where] dropping FK join filter: {left_term} {fp.op} {right_term}"
             )
             continue
         result.append(fp)
@@ -1030,16 +1065,638 @@ def _strip_join_condition_filters(filters: list[FilterParam], schema_graph: Sche
 
 
 def strip_join_conditions(intent: RuntimeIntent, schema_graph: SchemaGraph) -> RuntimeIntent:
-    """Apply ``_strip_join_condition_filters`` to main and each CTE."""
-    new_filters = _strip_join_condition_filters(intent.filters_param or [], schema_graph)
+    """Apply ``_strip_join_condition_where`` to main and each CTE."""
+    new_filters = _strip_join_condition_where(where_leaves(intent.where) or [], schema_graph)
     new_cte_steps = [
         replace(
             cte,
-            filters_param=_strip_join_condition_filters(cte.filters_param or [], schema_graph),
+            where=rebuild_predicate_group_from_leaves(
+                cte.where, _strip_join_condition_where(where_leaves(cte.where) or [], schema_graph)
+            ),
         )
         for cte in (intent.cte_steps or [])
     ]
-    return replace(intent, filters_param=new_filters, cte_steps=new_cte_steps)
+    return replace(
+        intent, where=rebuild_predicate_group_from_leaves(intent.where, new_filters), cte_steps=new_cte_steps
+    )
+
+
+def _where_param_is_bare_column_equality(fp: WhereParam) -> bool:
+    """Return True when *fp* is ``table.col = table.col`` with no literal or param value."""
+    if fp.op != "=" or fp.right_expr is None:
+        return False
+    if fp.param_key or fp.raw_value is not None:
+        return False
+    return is_plain_column_expr(fp.left_expr) and is_plain_column_expr(fp.right_expr)
+
+
+def _drop_redundant_join_where_list(
+    filters: list[WhereParam],
+    *,
+    droppable_pairs: set[frozenset[str]],
+) -> tuple[list[WhereParam], bool]:
+    """Remove ``where`` leaves duplicated by a resolved INNER join edge."""
+    if not filters or not droppable_pairs:
+        return filters, False
+    kept: list[WhereParam] = []
+    changed = False
+    for fp in filters:
+        if not _where_param_is_bare_column_equality(fp):
+            kept.append(fp)
+            continue
+        left_term = fp.left_expr.primary_term
+        right_term = fp.right_expr.primary_term if fp.right_expr is not None else ""
+        if frozenset({left_term, right_term}) in droppable_pairs:
+            changed = True
+            notify(
+                (
+                    f"Dropped redundant join filter {left_term} = {right_term}; "
+                    "the resolved join path already renders this equality in ON."
+                ),
+                stage="join",
+                code=DIAGNOSTIC_CODE_REDUNDANT_JOIN_WHERE_DROPPED,
+                level="info",
+                details=(
+                    ("predicate", f"{left_term} = {right_term}"),
+                    ("subsumed_by", "resolved_join_path"),
+                ),
+            )
+            continue
+        kept.append(fp)
+    return kept, changed
+
+
+def drop_redundant_resolved_join_where_predicates(
+    intent: RuntimeIntent,
+    schema: SchemaGraph | None,
+    *,
+    join_sigs_ordered: list[list[str]],
+    edge_kinds_ordered: list[list[str]],
+) -> tuple[RuntimeIntent, bool]:
+    """Drop ``where`` leaves that repeat INNER join equalities from resolved path signatures."""
+    emissions = cte_emission_map(intent.cte_steps)
+    probes = probe_cte_names(intent.cte_steps)
+    changed = False
+    cte_steps = list(intent.cte_steps or [])
+    for idx, cte in enumerate(cte_steps):
+        sig = join_sigs_ordered[idx] if idx < len(join_sigs_ordered) else []
+        kinds = edge_kinds_ordered[idx] if idx < len(edge_kinds_ordered) else []
+        anchor = (cte.tables or [""])[0] if cte.tables else ""
+        pairs = inner_equality_pairs_from_resolved_join_path(
+            list(sig or []),
+            list(kinds or []),
+            anchor,
+            schema,
+            preserve_tables=list(cte.preserve_tables or []),
+            cte_emissions=emissions,
+            probe_cte_names=probes,
+        )
+        new_filters, scope_changed = _drop_redundant_join_where_list(
+            where_leaves(cte.where) or [],
+            droppable_pairs=pairs,
+        )
+        if scope_changed:
+            changed = True
+            cte_steps[idx] = replace(
+                cte,
+                where=rebuild_predicate_group_from_leaves(cte.where, new_filters),
+            )
+    main_sig = join_sigs_ordered[-1] if join_sigs_ordered else []
+    main_kinds = edge_kinds_ordered[-1] if edge_kinds_ordered else []
+    main_anchor = (intent.tables or [""])[0] if intent.tables else ""
+    main_pairs = inner_equality_pairs_from_resolved_join_path(
+        list(main_sig or []),
+        list(main_kinds or []),
+        main_anchor,
+        schema,
+        preserve_tables=list(intent.preserve_tables or []),
+        cte_emissions=emissions,
+        probe_cte_names=probes,
+    )
+    main_filters, main_changed = _drop_redundant_join_where_list(
+        where_leaves(intent.where) or [],
+        droppable_pairs=main_pairs,
+    )
+    if main_changed:
+        changed = True
+    if not changed:
+        return intent, False
+    return (
+        replace(
+            intent,
+            where=rebuild_predicate_group_from_leaves(intent.where, main_filters),
+            cte_steps=cte_steps,
+        ),
+        True,
+    )
+
+
+def _tables_in_join_signature(signature: list[str]) -> set[str]:
+    """Return physical table names referenced by a stored join-path signature."""
+    tables: set[str] = set()
+    for seg in signature or []:
+        seg = str(seg).strip()
+        if "->" not in seg:
+            continue
+        left_part, right_part = seg.split("->", 1)
+        for part in (left_part, right_part):
+            part = part.strip()
+            if "." in part:
+                tables.add(part.split(".", 1)[0].strip())
+    return tables
+
+
+def _join_path_tables_locked(intent: RuntimeIntent) -> set[str]:
+    """Return tables that must not be eliminated because a join path is already pinned."""
+    signature = list(intent.chosen_join_path_signature or [])
+    if not signature:
+        return set()
+    locked = _tables_in_join_signature(signature)
+    for cte in intent.cte_steps or []:
+        locked.update(_tables_in_join_signature(list(cte.chosen_join_path_signature or [])))
+    return locked
+
+
+def _federation_cross_source_endpoint_tables(manifest: FederationManifest | None) -> set[str]:
+    """Return table names that participate in declared cross-source joins."""
+    if manifest is None:
+        return set()
+    endpoints: set[str] = set()
+    for join in manifest.cross_source_joins or ():
+        for endpoint in (join.left, join.right):
+            endpoint = str(endpoint or "").strip()
+            if "." in endpoint:
+                endpoints.add(endpoint.split(".", 1)[0].strip())
+    return endpoints
+
+
+def _cross_source_endpoint_tables(schema: SchemaGraph) -> set[str]:
+    """Return table names stamped with a cross-source foreign-key edge."""
+    endpoints: set[str] = set()
+    for tbl in schema.tables.values():
+        for fk in tbl.foreign_keys or []:
+            if fk.inference_tag == InferenceTag.CROSS_SOURCE:
+                endpoints.add(fk.src_table)
+                endpoints.add(fk.dst_table)
+    return endpoints
+
+
+def _rewrite_term_map_for_fk(fk: FKEdge) -> dict[str, str]:
+    """Build ``far.col`` to ``near.col`` replacements for one catalog foreign-key edge."""
+    return {f"{fk.dst_table}.{dc}": f"{fk.src_table}.{sc}" for sc, dc in zip(fk.src_cols, fk.dst_cols, strict=True)}
+
+
+def _column_ref_replacer(rewrites: dict[str, str]) -> Callable[[str], str]:
+    """Return a column-reference replacer that applies *rewrites* case- insensitively."""
+
+    def repl(term: str) -> str:
+        direct = rewrites.get(term)
+        if direct is not None:
+            return direct
+        lowered = term.lower()
+        for old, new in rewrites.items():
+            if old.lower() == lowered:
+                return new
+        return term
+
+    return repl
+
+
+def _rewrite_normalized_expr(expr: NormalizedExpr, rewrites: dict[str, str]) -> NormalizedExpr:
+    """Rewrite column references inside one normalized expression."""
+    if not rewrites:
+        return expr
+    return replace_refs_in_expr(expr, _column_ref_replacer(rewrites))
+
+
+def _rewrite_where_params(params: list[WhereParam], rewrites: dict[str, str]) -> list[WhereParam]:
+    """Rewrite column references in a flat ``where`` leaf list."""
+    out: list[WhereParam] = []
+    for fp in params:
+        le = _rewrite_normalized_expr(fp.left_expr, rewrites)
+        rexp = _rewrite_normalized_expr(fp.right_expr, rewrites) if fp.right_expr else None
+        out.append(replace(fp, left_expr=le, right_expr=rexp))
+    return out
+
+
+def _rewrite_having_params(params: list[HavingParam], rewrites: dict[str, str]) -> list[HavingParam]:
+    """Rewrite column references in a flat ``having`` leaf list."""
+    out: list[HavingParam] = []
+    for hp in params:
+        le = _rewrite_normalized_expr(hp.left_expr, rewrites)
+        rexp = _rewrite_normalized_expr(hp.right_expr, rewrites) if hp.right_expr else None
+        out.append(replace(hp, left_expr=le, right_expr=rexp))
+    return out
+
+
+def _rewrite_window_spec(ws: WindowSpec, rewrites: dict[str, str]) -> WindowSpec:
+    """Rewrite partition, order, and argument expressions in a window spec."""
+    pb = [_rewrite_normalized_expr(e, rewrites) for e in ws.partition_by]
+    ob = [replace(o, expr=_rewrite_normalized_expr(o.expr, rewrites)) for o in ws.order_by]
+    arg = _rewrite_normalized_expr(ws.argument, rewrites) if ws.argument else None
+    return replace(ws, partition_by=pb, order_by=ob, argument=arg)
+
+
+def _rewrite_case_when(cw: CaseWhenExpr, rewrites: dict[str, str]) -> CaseWhenExpr:
+    """Rewrite CASE branch conditions and results."""
+    branches: list[CaseWhenBranch] = []
+    for br in cw.branches:
+        cond = _rewrite_where_params([br.condition], rewrites)[0]
+        res = _rewrite_normalized_expr(br.result, rewrites)
+        branches.append(CaseWhenBranch(condition=cond, result=res))
+    er = _rewrite_normalized_expr(cw.else_result, rewrites) if cw.else_result else None
+    return replace(cw, branches=branches, else_result=er)
+
+
+def _scope_column_refs(
+    *,
+    select_cols: list[SelectCol] | None,
+    order_by_cols: list[OrderByCol] | None,
+    group_by_cols: list[NormalizedExpr] | None,
+    where: PredicateGroup | None,
+    having: PredicateGroup | None,
+    window_registry: list[WindowRegistryStep] | None,
+    case_registry: list[CaseRegistryStep] | None,
+    distinct_on: list[NormalizedExpr] | None,
+) -> set[str]:
+    """Collect qualified column references from one intent scope."""
+    refs: set[str] = set()
+    for sc in select_cols or []:
+        refs.update(cols_from_select_col(sc, window_registry, case_registry))
+    for obc in order_by_cols or []:
+        refs.update(extract_columns_from_expr(obc.expr))
+    for g in group_by_cols or []:
+        refs.update(extract_columns_from_expr(g))
+    for expr in distinct_on or []:
+        refs.update(extract_columns_from_expr(expr))
+    for fp in where_leaves(where) or []:
+        refs.update(extract_columns_from_expr(fp.left_expr))
+        if fp.right_expr:
+            refs.update(extract_columns_from_expr(fp.right_expr))
+    for hp in having_leaves(having) or []:
+        refs.update(extract_columns_from_expr(hp.left_expr))
+        if hp.right_expr:
+            refs.update(extract_columns_from_expr(hp.right_expr))
+    for win_step in window_registry or []:
+        for col in cols_from_named_registries([win_step], None):
+            refs.add(col)
+    for case_step in case_registry or []:
+        for col in cols_from_named_registries(None, [case_step]):
+            refs.add(col)
+    return refs
+
+
+def _refs_for_table(column_refs: set[str], table: str) -> set[str]:
+    """Return qualified references belonging to *table*."""
+    prefix = f"{table.lower()}."
+    return {ref for ref in column_refs if ref.lower().startswith(prefix)}
+
+
+def _predicate_touches_column(param: WhereParam | HavingParam, column_ref: str) -> bool:
+    """Return whether a filter leaf references *column_ref*."""
+    cols: list[str] = []
+    cols.extend(extract_columns_from_expr(param.left_expr))
+    if param.right_expr:
+        cols.extend(extract_columns_from_expr(param.right_expr))
+    target = column_ref.lower()
+    return any(c.lower() == target for c in cols)
+
+
+def _guard_catalog_foreign_key(fk: FKEdge) -> str | None:
+    """Refuse elimination when the edge is not a catalog foreign key."""
+    if fk.inference_tag is not None:
+        return "foreign_key_not_catalog"
+    return None
+
+
+def _guard_complete_primary_key_target(fk: FKEdge, schema: SchemaGraph) -> str | None:
+    """Refuse when the foreign key does not target the full primary key of the far table."""
+    far_meta = schema.tables.get(fk.dst_table)
+    if far_meta is None:
+        return "far_table_missing"
+    pk_cols = list(far_meta.primary_key or [])
+    if not pk_cols:
+        return "missing_primary_key"
+    if list(fk.dst_cols) != pk_cols:
+        return "incomplete_primary_key"
+    if len(fk.src_cols) != len(fk.dst_cols):
+        return "fk_column_count_mismatch"
+    return None
+
+
+def _guard_null_safe_foreign_key(
+    fk: FKEdge,
+    schema: SchemaGraph,
+    where_params: list[WhereParam],
+    having_params: list[HavingParam],
+) -> str | None:
+    """Refuse when a nullable foreign-key column has a null-sensitive predicate."""
+    near_meta = schema.tables.get(fk.src_table)
+    if near_meta is None:
+        return "near_table_missing"
+    for src_col in fk.src_cols:
+        col_meta = near_meta.columns.get(src_col)
+        if col_meta is None or not col_meta.is_nullable:
+            continue
+        fk_ref = f"{fk.src_table}.{src_col}"
+        for fp in where_params:
+            if _predicate_touches_column(fp, fk_ref) and fp.op.lower() in NULL_SENSITIVE_ELIMINATION_OPS:
+                return "null_sensitive_predicate"
+        for hp in having_params:
+            if _predicate_touches_column(hp, fk_ref) and hp.op.lower() in NULL_SENSITIVE_ELIMINATION_OPS:
+                return "null_sensitive_predicate"
+    return None
+
+
+def _guard_only_primary_key_references(far_table: str, pk_cols: list[str], column_refs: set[str]) -> str | None:
+    """Refuse when any reference to the far table is not exactly its primary key."""
+    allowed = {f"{far_table}.{col}".lower() for col in pk_cols}
+    for ref in _refs_for_table(column_refs, far_table):
+        if ref.lower() not in allowed:
+            return "non_primary_key_reference"
+    referenced_pk = {ref.lower() for ref in _refs_for_table(column_refs, far_table)}
+    if len(pk_cols) > 1 and referenced_pk != allowed:
+        return "composite_primary_key_incomplete"
+    return None
+
+
+def _guard_special_table(
+    far_table: str,
+    *,
+    preserve_tables: list[str],
+    cte_names: set[str],
+    locked_tables: set[str],
+    cross_source_tables: set[str],
+) -> str | None:
+    """Refuse when the far table is preserved, virtual, pinned, or federated."""
+    if far_table in preserve_tables:
+        return "preserve_tables"
+    if far_table in cte_names:
+        return "cte_name"
+    if far_table in locked_tables:
+        return "pinned_join_path"
+    if far_table in cross_source_tables:
+        return "cross_source_endpoint"
+    return None
+
+
+def _guard_remainder_connected(
+    tables: list[str],
+    far_table: str,
+    schema: SchemaGraph,
+) -> str | None:
+    """Refuse when removing *far_table* disconnects the remaining scope tables."""
+    remaining = [t for t in tables if t != far_table]
+    if len(remaining) <= 1:
+        return None
+    issues = validate_join_path_reachability_for_tables(remaining, schema, "key_join_elimination")
+    if any(i.severity == "error" for i in issues):
+        return "disconnected_remainder"
+    return None
+
+
+def _elimination_probe_block(far_table: str, cte_steps: list[RuntimeCteStep] | None) -> str | None:
+    """Refuse when the far table is a probe CTE."""
+    for cte in cte_steps or []:
+        if cte.cte_name != far_table:
+            continue
+        if getattr(cte, "emission", "join_table") in ("anti_join", "semi_join"):
+            return "probe_emission"
+    return None
+
+
+def _rewrite_scope_fields(
+    *,
+    select_cols: list[SelectCol] | None,
+    order_by_cols: list[OrderByCol] | None,
+    group_by_cols: list[NormalizedExpr] | None,
+    where: PredicateGroup | None,
+    having: PredicateGroup | None,
+    window_registry: list[WindowRegistryStep] | None,
+    case_registry: list[CaseRegistryStep] | None,
+    distinct_on: list[NormalizedExpr] | None,
+    rewrites: dict[str, str],
+) -> dict[str, Any]:
+    """Return rewritten scope fields after applying *rewrites*."""
+    new_select = [replace(sc, expr=_rewrite_normalized_expr(sc.expr, rewrites)) for sc in (select_cols or [])]
+    new_order = [replace(obc, expr=_rewrite_normalized_expr(obc.expr, rewrites)) for obc in (order_by_cols or [])]
+    new_group = [_rewrite_normalized_expr(g, rewrites) for g in (group_by_cols or [])]
+    new_where = rebuild_predicate_group_from_leaves(where, _rewrite_where_params(where_leaves(where) or [], rewrites))
+    new_having = rebuild_predicate_group_from_leaves(
+        having, _rewrite_having_params(having_leaves(having) or [], rewrites)
+    )
+    new_windows = [
+        replace(step, window_spec=_rewrite_window_spec(step.window_spec, rewrites)) for step in (window_registry or [])
+    ]
+    new_cases = [
+        replace(step, case_when=_rewrite_case_when(step.case_when, rewrites)) for step in (case_registry or [])
+    ]
+    new_distinct = [_rewrite_normalized_expr(expr, rewrites) for expr in (distinct_on or [])]
+    return {
+        "select_cols": new_select,
+        "order_by_cols": new_order,
+        "group_by_cols": new_group,
+        "where": new_where,
+        "having": new_having,
+        "window_registry": new_windows,
+        "case_registry": new_cases,
+        "distinct_on": new_distinct,
+    }
+
+
+def _try_eliminate_far_from_scope(
+    *,
+    tables: list[str],
+    anchor: str | None,
+    preserve_tables: list[str],
+    select_cols: list[SelectCol] | None,
+    order_by_cols: list[OrderByCol] | None,
+    group_by_cols: list[NormalizedExpr] | None,
+    where: PredicateGroup | None,
+    having: PredicateGroup | None,
+    window_registry: list[WindowRegistryStep] | None,
+    case_registry: list[CaseRegistryStep] | None,
+    distinct_on: list[NormalizedExpr] | None,
+    schema: SchemaGraph,
+    cte_names: set[str],
+    locked_tables: set[str],
+    cross_source_tables: set[str],
+    cte_steps: list[RuntimeCteStep] | None,
+) -> tuple[dict[str, Any] | None, FKEdge | None]:
+    """Attempt one redundant key-join elimination within a single scope."""
+    where_params = where_leaves(where) or []
+    having_params = having_leaves(having) or []
+    column_refs = _scope_column_refs(
+        select_cols=select_cols,
+        order_by_cols=order_by_cols,
+        group_by_cols=group_by_cols,
+        where=where,
+        having=having,
+        window_registry=window_registry,
+        case_registry=case_registry,
+        distinct_on=distinct_on,
+    )
+    table_set = set(tables or [])
+    for near_table in sorted(table_set):
+        near_meta = schema.tables.get(near_table)
+        if near_meta is None:
+            continue
+        for fk in near_meta.foreign_keys or []:
+            far_table = fk.dst_table
+            if far_table not in table_set or fk.src_table != near_table:
+                continue
+            far_table_name = far_table
+            guards = (
+                _guard_catalog_foreign_key,
+                lambda edge: _guard_complete_primary_key_target(edge, schema),
+                lambda edge: _guard_null_safe_foreign_key(edge, schema, where_params, having_params),
+                lambda _edge, ft=far_table_name: _guard_special_table(
+                    ft,
+                    preserve_tables=preserve_tables,
+                    cte_names=cte_names,
+                    locked_tables=locked_tables,
+                    cross_source_tables=cross_source_tables,
+                ),
+                lambda _edge, ft=far_table_name: _elimination_probe_block(ft, cte_steps),
+                lambda _edge, ft=far_table_name: _guard_only_primary_key_references(
+                    ft,
+                    list(
+                        (
+                            schema.tables.get(ft) or TableMetadata(name=ft, columns={}, primary_key=[], foreign_keys=[])
+                        ).primary_key
+                        or []
+                    ),
+                    column_refs,
+                ),
+                lambda _edge, ft=far_table_name: _guard_remainder_connected(list(tables), ft, schema),
+            )
+            blocked = False
+            for guard in guards:
+                reason = guard(fk)
+                if reason is not None:
+                    blocked = True
+                    break
+            if blocked:
+                continue
+            rewrites = _rewrite_term_map_for_fk(fk)
+            rewritten = _rewrite_scope_fields(
+                select_cols=select_cols,
+                order_by_cols=order_by_cols,
+                group_by_cols=group_by_cols,
+                where=where,
+                having=having,
+                window_registry=window_registry,
+                case_registry=case_registry,
+                distinct_on=distinct_on,
+                rewrites=rewrites,
+            )
+            rewritten["tables"] = sorted(t for t in tables if t != far_table)
+            notify(
+                (f"Eliminated redundant key join via {near_table}.{fk.src_cols[0]} -> {far_table}.{fk.dst_cols[0]}"),
+                stage="intent",
+                code=DIAGNOSTIC_CODE_REDUNDANT_KEY_JOIN_ELIMINATED,
+                level="info",
+                details=(
+                    ("near_table", near_table),
+                    ("far_table", far_table),
+                    ("near_column", f"{near_table}.{fk.src_cols[0]}"),
+                    ("far_column", f"{far_table}.{fk.dst_cols[0]}"),
+                ),
+            )
+            return rewritten, fk
+    return None, None
+
+
+def _eliminate_redundant_key_joins_once(
+    intent: RuntimeIntent,
+    schema: SchemaGraph,
+    *,
+    locked_tables: set[str],
+    cross_source_tables: set[str],
+) -> tuple[RuntimeIntent, bool]:
+    """Run one fixpoint iteration of redundant key-join elimination across all scopes."""
+    cte_names = {cte.cte_name for cte in (intent.cte_steps or []) if cte.cte_name}
+    changed = False
+    new_cte_steps: list[RuntimeCteStep] = list(intent.cte_steps or [])
+    for idx, cte in enumerate(new_cte_steps):
+        rewritten, _fk = _try_eliminate_far_from_scope(
+            tables=list(cte.tables or []),
+            anchor=cte.tables[0] if cte.tables else "",
+            preserve_tables=list(cte.preserve_tables or []),
+            select_cols=cte.select_cols,
+            order_by_cols=cte.order_by_cols,
+            group_by_cols=cte.group_by_cols,
+            where=cte.where,
+            having=cte.having,
+            window_registry=cte.window_registry,
+            case_registry=cte.case_registry,
+            distinct_on=cte.distinct_on,
+            schema=schema,
+            cte_names=cte_names,
+            locked_tables=locked_tables,
+            cross_source_tables=cross_source_tables,
+            cte_steps=intent.cte_steps,
+        )
+        if rewritten is None:
+            continue
+        changed = True
+        new_cte_steps[idx] = replace(cte, **rewritten)
+    main_rewritten, _fk = _try_eliminate_far_from_scope(
+        tables=list(intent.tables or []),
+        anchor=intent.tables[0] if intent.tables else "",
+        preserve_tables=list(intent.preserve_tables or []),
+        select_cols=intent.select_cols,
+        order_by_cols=intent.order_by_cols,
+        group_by_cols=intent.group_by_cols,
+        where=intent.where,
+        having=intent.having,
+        window_registry=intent.window_registry,
+        case_registry=intent.case_registry,
+        distinct_on=intent.distinct_on,
+        schema=schema,
+        cte_names=cte_names,
+        locked_tables=locked_tables,
+        cross_source_tables=cross_source_tables,
+        cte_steps=intent.cte_steps,
+    )
+    if main_rewritten is not None:
+        changed = True
+        intent = replace(intent, cte_steps=new_cte_steps, **main_rewritten)
+    elif changed:
+        intent = replace(intent, cte_steps=new_cte_steps)
+    return intent, changed
+
+
+def eliminate_redundant_key_joins(
+    intent: RuntimeIntent,
+    schema: SchemaGraph,
+    *,
+    federation_manifest: FederationManifest | None = None,
+) -> RuntimeIntent:
+    """Remove far-side tables that are referenced only through their primary key."""
+    if not PolicyConfig.ELIMINATE_REDUNDANT_KEY_JOINS:
+        return intent
+    locked_tables = _join_path_tables_locked(intent)
+    cross_source_tables = _federation_cross_source_endpoint_tables(federation_manifest) | _cross_source_endpoint_tables(
+        schema
+    )
+    current = intent
+    for _ in range(ELIMINATE_REDUNDANT_KEY_JOINS_MAX_ITERATIONS):
+        current, changed = _eliminate_redundant_key_joins_once(
+            current,
+            schema,
+            locked_tables=locked_tables,
+            cross_source_tables=cross_source_tables,
+        )
+        if not changed:
+            return current
+    notify(
+        "Redundant key-join elimination reached its iteration cap.",
+        stage="intent",
+        code=DIAGNOSTIC_CODE_REDUNDANT_KEY_JOIN_CAP_REACHED,
+        level="warning",
+    )
+    return current
 
 
 def _is_pk_column(col_ref: str, schema_graph: SchemaGraph) -> bool:
@@ -1125,9 +1782,7 @@ def _lift_distinct_from_select_col(sc: SelectCol) -> tuple[SelectCol, bool]:
 
 
 def _expr_primary_column_value_type(
-    expr: NormalizedExpr,
-    schema: SchemaGraph,
-    cte_steps: Sequence[RuntimeCteStep] | None = None,
+    expr: NormalizedExpr, schema: SchemaGraph, cte_steps: Sequence[RuntimeCteStep] | None = None
 ) -> str | None:
     col = expr.primary_column or ""
     if "." not in col:
@@ -1145,11 +1800,7 @@ def _expr_primary_column_value_type(
     return (cmeta.value_type or "").lower() or None
 
 
-def _cte_output_value_type(
-    qualifier: str,
-    output_alias: str,
-    cte_steps: Sequence[RuntimeCteStep] | None,
-) -> str | None:
+def _cte_output_value_type(qualifier: str, output_alias: str, cte_steps: Sequence[RuntimeCteStep] | None) -> str | None:
     """Return the value_type of a ``cte_name.output_alias`` reference, or None when not found."""
     if not cte_steps or not qualifier:
         return None
@@ -1195,9 +1846,7 @@ def _infer_select_col_value_type(sc: SelectCol) -> str | None:
 
 
 def _is_expr_date(
-    expr: NormalizedExpr | None,
-    schema: SchemaGraph,
-    cte_steps: Sequence[RuntimeCteStep] | None = None,
+    expr: NormalizedExpr | None, schema: SchemaGraph, cte_steps: Sequence[RuntimeCteStep] | None = None
 ) -> bool:
     if expr is None:
         return False
@@ -1216,9 +1865,7 @@ def _is_expr_date(
 
 
 def _is_expr_string(
-    expr: NormalizedExpr | None,
-    schema: SchemaGraph,
-    cte_steps: Sequence[RuntimeCteStep] | None = None,
+    expr: NormalizedExpr | None, schema: SchemaGraph, cte_steps: Sequence[RuntimeCteStep] | None = None
 ) -> bool:
     if expr is None:
         return False
@@ -1229,10 +1876,8 @@ def _is_expr_string(
 
 
 def _align_pred_value_type(
-    pred: FilterParam | HavingParam,
-    schema: SchemaGraph,
-    cte_steps: Sequence[RuntimeCteStep] | None = None,
-) -> FilterParam | HavingParam:
+    pred: WhereParam | HavingParam, schema: SchemaGraph, cte_steps: Sequence[RuntimeCteStep] | None = None
+) -> WhereParam | HavingParam:
     left = pred.left_expr
     op = (pred.op or "").lower()
     current = pred.value_type or ""
@@ -1244,8 +1889,7 @@ def _align_pred_value_type(
     if right is not None and _normalized_expr_is_keyword_leaf(right):
         if current not in ("date", "date_window", "date_diff", "timestamp"):
             debug(
-                f"[align_filter_value_type_to_exprs] overriding value_type "
-                f"{current!r} -> 'date' on temporal keyword RHS"
+                f"[align_where_value_type_to_exprs] overriding value_type {current!r} -> 'date' on temporal keyword RHS"
             )
             return replace(pred, value_type="date")
         return pred
@@ -1255,7 +1899,7 @@ def _align_pred_value_type(
 
     if op in STRING_OPS:
         if current != "string":
-            debug(f"[align_filter_value_type_to_exprs] overriding value_type {current!r} -> 'string' for op {op!r}")
+            debug(f"[align_where_value_type_to_exprs] overriding value_type {current!r} -> 'string' for op {op!r}")
             return replace(pred, value_type="string")
         return pred
 
@@ -1271,7 +1915,7 @@ def _align_pred_value_type(
         target = "number"
         if current != target:
             debug(
-                f"[align_filter_value_type_to_exprs] overriding value_type "
+                f"[align_where_value_type_to_exprs] overriding value_type "
                 f"{current!r} -> {target!r} on numeric predicate"
             )
             return replace(pred, value_type=target)
@@ -1281,37 +1925,35 @@ def _align_pred_value_type(
     right_date = right is None or _is_expr_date(right, schema, cte_steps)
     if left_date and right_date and right is not None:
         if current != "date":
-            debug(f"[align_filter_value_type_to_exprs] overriding value_type {current!r} -> 'date' on date predicate")
+            debug(f"[align_where_value_type_to_exprs] overriding value_type {current!r} -> 'date' on date predicate")
             return replace(pred, value_type="date")
         return pred
 
     if _is_expr_string(left, schema, cte_steps) or _is_expr_string(right, schema, cte_steps):
-        if current not in ("string",) and current not in ("date_window", "date_diff"):
+        if current not in ("string") and current not in ("date_window", "date_diff"):
             debug(
-                f"[align_filter_value_type_to_exprs] overriding value_type "
+                f"[align_where_value_type_to_exprs] overriding value_type "
                 f"{current!r} -> 'string' on string column predicate"
             )
             return replace(pred, value_type="string")
     return pred
 
 
-def _collect_number_typed_predicate_param_keys(
-    pred: FilterParam | HavingParam,
-) -> set[str]:
+def _collect_number_typed_predicate_param_keys(pred: WhereParam | HavingParam) -> set[str]:
     if (pred.value_type or "").lower() != "number":
         return set()
     keys: set[str] = set()
     pk = (pred.param_key or "").strip()
     if pk:
         keys.add(pk)
-    if isinstance(pred, FilterParam):
+    if isinstance(pred, WhereParam):
         pkh = (pred.param_key_hi or "").strip()
         if pkh:
             keys.add(pkh)
     return keys
 
 
-def _maybe_coerce_bool_literal_for_filter(fp: FilterParam) -> FilterParam:
+def _maybe_coerce_bool_literal_for_where(fp: WhereParam) -> WhereParam:
     if (fp.value_type or "").lower() != "number":
         return fp
     if isinstance(fp.raw_value, bool):
@@ -1327,17 +1969,13 @@ def _maybe_coerce_bool_literal_for_having(hp: HavingParam) -> HavingParam:
     return hp
 
 
-def _maybe_coerce_bool_literal_for_numeric_pred(
-    pred: FilterParam | HavingParam,
-) -> FilterParam | HavingParam:
-    if isinstance(pred, FilterParam):
-        return _maybe_coerce_bool_literal_for_filter(pred)
+def _maybe_coerce_bool_literal_for_numeric_pred(pred: WhereParam | HavingParam) -> WhereParam | HavingParam:
+    if isinstance(pred, WhereParam):
+        return _maybe_coerce_bool_literal_for_where(pred)
     return _maybe_coerce_bool_literal_for_having(pred)
 
 
-def _collect_numeric_predicate_param_keys_from_case_registry(
-    registry: Sequence[CaseRegistryStep] | None,
-) -> set[str]:
+def _collect_numeric_predicate_param_keys_from_case_registry(registry: Sequence[CaseRegistryStep] | None) -> set[str]:
     keys: set[str] = set()
     if not registry:
         return keys
@@ -1351,18 +1989,16 @@ def _collect_numeric_predicate_param_keys_from_case_registry(
     return keys
 
 
-def _coerce_boolean_bindings_for_number_typed_filters(
-    intent: RuntimeIntent,
-) -> RuntimeIntent:
+def _coerce_boolean_bindings_for_number_typed_where(intent: RuntimeIntent) -> RuntimeIntent:
     keys: set[str] = set()
-    for fp in intent.filters_param or []:
+    for fp in where_leaves(intent.where) or []:
         keys.update(_collect_number_typed_predicate_param_keys(fp))
-    for hp in intent.having_param or []:
+    for hp in having_leaves(intent.having) or []:
         keys.update(_collect_number_typed_predicate_param_keys(hp))
     for cte in intent.cte_steps or []:
-        for fp in cte.filters_param or []:
+        for fp in where_leaves(cte.where) or []:
             keys.update(_collect_number_typed_predicate_param_keys(fp))
-        for hp in cte.having_param or []:
+        for hp in having_leaves(cte.having) or []:
             keys.update(_collect_number_typed_predicate_param_keys(hp))
         keys.update(_collect_numeric_predicate_param_keys_from_case_registry(cte.case_registry))
     keys.update(_collect_numeric_predicate_param_keys_from_case_registry(intent.case_registry))
@@ -1377,34 +2013,34 @@ def _coerce_boolean_bindings_for_number_typed_filters(
         return base
 
     new_pv = _patch_param_map(intent.param_values)
-    new_filters = [_maybe_coerce_bool_literal_for_filter(fp) for fp in intent.filters_param or []]
-    new_having = [_maybe_coerce_bool_literal_for_having(hp) for hp in intent.having_param or []]
+    new_filters = [_maybe_coerce_bool_literal_for_where(fp) for fp in where_leaves(intent.where) or []]
+    new_having = [_maybe_coerce_bool_literal_for_having(hp) for hp in having_leaves(intent.having) or []]
     new_ctes: list[RuntimeCteStep] = []
     for cte in intent.cte_steps or []:
-        nf = [_maybe_coerce_bool_literal_for_filter(x) for x in cte.filters_param or []]
-        nh = [_maybe_coerce_bool_literal_for_having(x) for x in cte.having_param or []]
+        nf = [_maybe_coerce_bool_literal_for_where(x) for x in where_leaves(cte.where) or []]
+        nh = [_maybe_coerce_bool_literal_for_having(x) for x in having_leaves(cte.having) or []]
         new_ctes.append(
             replace(
                 cte,
-                filters_param=nf,
-                having_param=nh,
+                where=predicate_group_from_list(nf),
+                having=predicate_group_from_list(nh),
                 param_values=_patch_param_map(cte.param_values),
             )
         )
     return replace(
         intent,
-        filters_param=new_filters,
-        having_param=new_having,
+        where=predicate_group_from_list(new_filters),
+        having=predicate_group_from_list(new_having),
         cte_steps=new_ctes,
         param_values=new_pv,
     )
 
 
-def _align_filter_value_type(
-    fp: FilterParam, schema: SchemaGraph, cte_steps: Sequence[RuntimeCteStep] | None
-) -> FilterParam:
+def _align_where_value_type(
+    fp: WhereParam, schema: SchemaGraph, cte_steps: Sequence[RuntimeCteStep] | None
+) -> WhereParam:
     aligned = _align_pred_value_type(fp, schema, cte_steps)
-    return aligned if isinstance(aligned, FilterParam) else fp
+    return aligned if isinstance(aligned, WhereParam) else fp
 
 
 def _align_having_value_type(
@@ -1414,39 +2050,37 @@ def _align_having_value_type(
     return aligned if isinstance(aligned, HavingParam) else hp
 
 
-def align_filter_value_type_to_exprs(intent: RuntimeIntent, schema: SchemaGraph) -> RuntimeIntent:
-    """Align ``FilterParam.value_type`` and ``HavingParam.value_type`` to the actual typing of the predicate sides. Decision order: ``is null``/``is not null`` is preserved; ``date_window``/``date_diff`` is preserved; LIKE/ILIKE/contains -> ``string``; both sides numeric (and not string columns) -> ``number``; both sides date -> ``date``; any side string column -> ``string``. Walks main + CTE filters/havings and case-branch conditions, consulting CTE output column metadata when a predicate references a ``cte_name.alias`` reference."""
+def align_where_value_type_to_exprs(intent: RuntimeIntent, schema: SchemaGraph) -> RuntimeIntent:
+    """Align ``WhereParam.value_type`` and ``HavingParam.value_type`` to the actual typing of the predicate sides. Decision order: ``is null``/``is not null`` is preserved; ``date_window``/``date_diff`` is preserved; LIKE/ILIKE/contains -> ``string``; both sides numeric (and not string columns) -> ``number``; both sides date -> ``date``; any side string column -> ``string``. Walks main + CTE filters/havings and case-branch conditions, consulting CTE output column metadata when a predicate references a ``cte_name.alias`` reference."""
     cte_steps_seq = intent.cte_steps or []
-    new_filters = [_align_filter_value_type(fp, schema, cte_steps_seq) for fp in (intent.filters_param or [])]
-    new_having = [_align_having_value_type(hp, schema, cte_steps_seq) for hp in (intent.having_param or [])]
+    new_filters = [_align_where_value_type(fp, schema, cte_steps_seq) for fp in (where_leaves(intent.where) or [])]
+    new_having = [_align_having_value_type(hp, schema, cte_steps_seq) for hp in (having_leaves(intent.having) or [])]
     new_cte_steps = []
     for cte in cte_steps_seq:
-        cte_filters = [_align_filter_value_type(fp, schema, cte_steps_seq) for fp in (cte.filters_param or [])]
-        cte_having = [_align_having_value_type(hp, schema, cte_steps_seq) for hp in (cte.having_param or [])]
-        new_cte_steps.append(replace(cte, filters_param=cte_filters, having_param=cte_having))
+        cte_filters = [_align_where_value_type(fp, schema, cte_steps_seq) for fp in (where_leaves(cte.where) or [])]
+        cte_having = [_align_having_value_type(hp, schema, cte_steps_seq) for hp in (having_leaves(cte.having) or [])]
+        new_cte_steps.append(
+            replace(cte, where=predicate_group_from_list(cte_filters), having=predicate_group_from_list(cte_having))
+        )
     intent = replace(
         intent,
-        filters_param=new_filters,
-        having_param=new_having,
+        where=predicate_group_from_list(new_filters),
+        having=predicate_group_from_list(new_having),
         cte_steps=new_cte_steps,
     )
 
-    def _branch_align(conds: list[FilterParam]) -> list[FilterParam]:
-        return [_align_filter_value_type(c, schema, cte_steps_seq) for c in conds]
+    def _branch_align(conds: list[WhereParam]) -> list[WhereParam]:
+        return [_align_where_value_type(c, schema, cte_steps_seq) for c in conds]
 
     intent = map_case_branch_conditions(intent, _branch_align)
 
-    def _branch_coerce_bool_num(conds: list[FilterParam]) -> list[FilterParam]:
+    def _branch_coerce_bool_num(conds: list[WhereParam]) -> list[WhereParam]:
         if not conds:
             return conds
-        return [_maybe_coerce_bool_literal_for_filter(conds[0])]
+        return [_maybe_coerce_bool_literal_for_where(conds[0])]
 
-    intent = map_case_branch_conditions(
-        intent,
-        _branch_coerce_bool_num,
-        scopes=frozenset({"filter", "having"}),
-    )
-    return _coerce_boolean_bindings_for_number_typed_filters(intent)
+    intent = map_case_branch_conditions(intent, _branch_coerce_bool_num, scopes=frozenset({"where", "having"}))
+    return _coerce_boolean_bindings_for_number_typed_where(intent)
 
 
 def lift_distinct_modifier_in_multiply(intent: RuntimeIntent) -> RuntimeIntent:
@@ -1468,12 +2102,7 @@ def lift_distinct_modifier_in_multiply(intent: RuntimeIntent) -> RuntimeIntent:
             if lifted and cte_distinct_index < 0:
                 cte_distinct_index = j
         new_cte_steps.append(replace(cte, select_cols=cte_select, distinct_select_index=cte_distinct_index))
-    return replace(
-        intent,
-        select_cols=new_select,
-        cte_steps=new_cte_steps,
-        distinct_select_index=main_distinct_index,
-    )
+    return replace(intent, select_cols=new_select, cte_steps=new_cte_steps, distinct_select_index=main_distinct_index)
 
 
 def _rewrite_group_unknown_datepart_to_extract(group: MulGroup) -> MulGroup:
@@ -1494,9 +2123,7 @@ def _rewrite_group_unknown_datepart_to_extract(group: MulGroup) -> MulGroup:
     return group
 
 
-def _rewrite_expr_unknown_datepart_to_extract(
-    expr: NormalizedExpr | None,
-) -> NormalizedExpr | None:
+def _rewrite_expr_unknown_datepart_to_extract(expr: NormalizedExpr | None) -> NormalizedExpr | None:
     """Apply unknown-datepart rewrite across all groups of *expr*."""
     if expr is None:
         return expr
@@ -1536,8 +2163,8 @@ def _rewrite_select_col_unknown_datepart(sc: SelectCol) -> SelectCol:
 def replace_unknown_scalar_funcs(intent: RuntimeIntent) -> RuntimeIntent:
     """Rewrite ``YEAR``/``MONTH``/``DAY``/``QUARTER``/``DOW`` calls to canonical ``EXTRACT(unit FROM x)``. The renderer and validator only accept the ``extract`` scalar; LLMs often produce vendor-specific date-part functions that fail validation or execution. This deterministic step normalizes them in main and CTE select expressions, filters, having, group-by, and order-by exprs."""
 
-    def _rewrite_filters(items: list[FilterParam]) -> list[FilterParam]:
-        out: list[FilterParam] = []
+    def _rewrite_filters(items: list[WhereParam]) -> list[WhereParam]:
+        out: list[WhereParam] = []
         for fp in items:
             new_left = _rewrite_expr_unknown_datepart_to_extract(fp.left_expr) or fp.left_expr
             new_right = (
@@ -1566,8 +2193,8 @@ def replace_unknown_scalar_funcs(intent: RuntimeIntent) -> RuntimeIntent:
         replace(obc, expr=_rewrite_expr_unknown_datepart_to_extract(obc.expr) or obc.expr)
         for obc in (intent.order_by_cols or [])
     ]
-    new_filters = _rewrite_filters(intent.filters_param or [])
-    new_having = _rewrite_havings(intent.having_param or [])
+    new_filters = _rewrite_filters(where_leaves(intent.where) or [])
+    new_having = _rewrite_havings(having_leaves(intent.having) or [])
     new_cte_steps: list[RuntimeCteStep] = []
     for cte in intent.cte_steps or []:
         cte_select = [_rewrite_select_col_unknown_datepart(sc) for sc in (cte.select_cols or [])]
@@ -1576,16 +2203,16 @@ def replace_unknown_scalar_funcs(intent: RuntimeIntent) -> RuntimeIntent:
             replace(obc, expr=_rewrite_expr_unknown_datepart_to_extract(obc.expr) or obc.expr)
             for obc in (cte.order_by_cols or [])
         ]
-        cte_filters = _rewrite_filters(cte.filters_param or [])
-        cte_having = _rewrite_havings(cte.having_param or [])
+        cte_filters = _rewrite_filters(where_leaves(cte.where) or [])
+        cte_having = _rewrite_havings(having_leaves(cte.having) or [])
         new_cte_steps.append(
             replace(
                 cte,
                 select_cols=cte_select,
                 group_by_cols=cte_group_by,
                 order_by_cols=cte_order_by,
-                filters_param=cte_filters,
-                having_param=cte_having,
+                where=reapply_predicate_leaves(cte.where, cte_filters),
+                having=reapply_predicate_leaves(cte.having, cte_having),
             )
         )
     return replace(
@@ -1593,8 +2220,8 @@ def replace_unknown_scalar_funcs(intent: RuntimeIntent) -> RuntimeIntent:
         select_cols=new_select,
         group_by_cols=new_group_by,
         order_by_cols=new_order_by,
-        filters_param=new_filters,
-        having_param=new_having,
+        where=reapply_predicate_leaves(intent.where, new_filters),
+        having=reapply_predicate_leaves(intent.having, new_having),
         cte_steps=new_cte_steps,
     )
 
@@ -1644,8 +2271,7 @@ def cols_from_select_col(
 
 
 def cols_from_named_registries(
-    window_registry: Sequence[WindowRegistryStep] | None,
-    case_registry: Sequence[CaseRegistryStep] | None,
+    window_registry: Sequence[WindowRegistryStep] | None, case_registry: Sequence[CaseRegistryStep] | None
 ) -> list[str]:
     """Column references from window and case registry definitions."""
     buf: list[str] = []
@@ -1671,22 +2297,24 @@ def collect_referenced_tables(
     select_cols: list[SelectCol],
     order_by_cols: list[OrderByCol],
     group_by_cols: list[NormalizedExpr],
-    filters_param: list[FilterParam],
+    where_params: list[WhereParam],
     having_param: list[HavingParam],
     *,
     window_registry: Sequence[WindowRegistryStep] | None = None,
     case_registry: Sequence[CaseRegistryStep] | None = None,
+    include_unreferenced_registries: bool = True,
 ) -> set[str]:
     """Union of tables referenced in select, order, group, filters, and. having."""
     all_cols: list[str] = []
     for sc in select_cols or []:
         all_cols.extend(cols_from_select_col(sc, window_registry, case_registry))
-    all_cols.extend(cols_from_named_registries(window_registry, case_registry))
+    if include_unreferenced_registries:
+        all_cols.extend(cols_from_named_registries(window_registry, case_registry))
     for obc in order_by_cols or []:
         all_cols.extend(extract_columns_from_expr(obc.expr))
     for g in group_by_cols or []:
         all_cols.extend(extract_columns_from_expr(g))
-    for fp in filters_param or []:
+    for fp in where_params or []:
         all_cols.extend(extract_columns_from_expr(fp.left_expr))
         if fp.right_expr:
             all_cols.extend(extract_columns_from_expr(fp.right_expr))
@@ -1697,18 +2325,272 @@ def collect_referenced_tables(
     return _tables_from_columns(all_cols)
 
 
+def collect_projected_tables(
+    select_cols: Sequence[SelectCol] | None = None,
+    order_by_cols: Sequence[OrderByCol] | None = None,
+    group_by_cols: Sequence[NormalizedExpr] | None = None,
+    *,
+    distinct_on: Sequence[NormalizedExpr] | None = None,
+    window_registry: Sequence[WindowRegistryStep] | None = None,
+    case_registry: Sequence[CaseRegistryStep] | None = None,
+    include_unreferenced_registries: bool = True,
+) -> set[str]:
+    """Return tables referenced by projection clauses rather than comparison operands."""
+    all_cols: list[str] = []
+    for sc in select_cols or []:
+        all_cols.extend(cols_from_select_col(sc, window_registry, case_registry))
+    if include_unreferenced_registries:
+        all_cols.extend(cols_from_named_registries(window_registry, case_registry))
+    for obc in order_by_cols or []:
+        all_cols.extend(extract_columns_from_expr(obc.expr))
+    for g in group_by_cols or []:
+        all_cols.extend(extract_columns_from_expr(g))
+    for expr in distinct_on or []:
+        all_cols.extend(extract_columns_from_expr(expr))
+    return _tables_from_columns(all_cols)
+
+
+def collect_comparison_operand_tables(
+    where_params: Sequence[WhereParam] | None = None,
+    having_param: Sequence[HavingParam] | None = None,
+) -> set[str]:
+    """Return tables referenced only on the right-hand side of cross- table predicates."""
+    all_cols: list[str] = []
+    for fp in where_params or []:
+        if fp.right_expr:
+            all_cols.extend(extract_columns_from_expr(fp.right_expr))
+    for hp in having_param or []:
+        if hp.right_expr:
+            all_cols.extend(extract_columns_from_expr(hp.right_expr))
+    return _tables_from_columns(all_cols)
+
+
+def derive_comparison_only_tables(
+    *,
+    select_cols: Sequence[SelectCol] | None,
+    order_by_cols: Sequence[OrderByCol] | None,
+    group_by_cols: Sequence[NormalizedExpr] | None,
+    where_params: Sequence[WhereParam] | None,
+    having_param: Sequence[HavingParam] | None,
+    distinct_on: Sequence[NormalizedExpr] | None = None,
+    window_registry: Sequence[WindowRegistryStep] | None = None,
+    case_registry: Sequence[CaseRegistryStep] | None = None,
+) -> list[str]:
+    """Return tables brought into scope solely by cross-table comparison operands."""
+    projected = collect_projected_tables(
+        select_cols,
+        order_by_cols,
+        group_by_cols,
+        distinct_on=distinct_on,
+        window_registry=window_registry,
+        case_registry=case_registry,
+    )
+    comparison_ops = collect_comparison_operand_tables(where_params, having_param)
+    return sorted(comparison_ops - projected, key=str.lower)
+
+
+def is_join_unreachable_issue(issue: IntentIssue) -> bool:
+    """Return whether *issue* is a join-path reachability refusal."""
+    return str(issue.issue_id or "").startswith("join_unreachable_")
+
+
+def _scope_tables(intent: RuntimeIntent, scope_label: str) -> frozenset[str]:
+    if scope_label == "main query":
+        return frozenset(intent.tables or [])
+    if scope_label.startswith("CTE '") and scope_label.endswith("'"):
+        cte_name = scope_label[5:-1]
+        for cte in intent.cte_steps or []:
+            if cte.cte_name == cte_name:
+                return frozenset(cte.tables or [])
+    return frozenset(intent.tables or [])
+
+
+def refusal_for_join_unreachable_table_removal(
+    before: RuntimeIntent,
+    after: RuntimeIntent,
+    open_errors: Sequence[IntentIssue],
+) -> str | None:
+    """Refuse when repair drops tables while a join-unreachable error was still open."""
+    unreachable = [issue for issue in open_errors if is_join_unreachable_issue(issue)]
+    if not unreachable:
+        return None
+    for issue in unreachable:
+        ctx = issue.context or {}
+        scope_label = str(ctx.get("scope_label") or "main query")
+        before_tables = _scope_tables(before, scope_label)
+        after_tables = _scope_tables(after, scope_label)
+        removed = before_tables - after_tables
+        if not removed:
+            continue
+        root = str(ctx.get("root") or "")
+        target = str(ctx.get("target") or "")
+        if root and target:
+            return (
+                f"Tables '{root}' and '{target}' cannot be joined: no foreign key or semantic edge "
+                "relates them. Repair removed a table to clear the error, which would answer a "
+                "different question. Declare foreign_keys_add or a semantic neighbour override when "
+                "the relationship is real."
+            )
+        return (
+            "Repair removed a table while a join-unreachable error was open, which would answer a "
+            "different question. Declare foreign_keys_add or a semantic neighbour override when "
+            "the relationship is real."
+        )
+    return None
+
+
+def referenced_registry_ids_in_scope(
+    *,
+    select_cols: Sequence[SelectCol] | None = None,
+    order_by_cols: Sequence[OrderByCol] | None = None,
+    group_by_cols: Sequence[NormalizedExpr] | None = None,
+    where_params: Sequence[WhereParam] | None = None,
+    having_param: Sequence[HavingParam] | None = None,
+) -> set[str]:
+    """Return registry ids referenced by clause expressions in one query scope."""
+    ids: set[str] = set()
+    for sc in select_cols or []:
+        ref = expr_registry_ref(sc.expr)
+        if ref:
+            ids.add(ref)
+    for obc in order_by_cols or []:
+        ref = expr_registry_ref(obc.expr)
+        if ref:
+            ids.add(ref)
+    for group in group_by_cols or []:
+        ref = expr_registry_ref(group)
+        if ref:
+            ids.add(ref)
+    for fp in where_params or []:
+        for expr in (fp.left_expr, fp.right_expr):
+            if expr is None:
+                continue
+            ref = expr_registry_ref(expr)
+            if ref:
+                ids.add(ref)
+    for hp in having_param or []:
+        for expr in (hp.left_expr, hp.right_expr):
+            if expr is None:
+                continue
+            ref = expr_registry_ref(expr)
+            if ref:
+                ids.add(ref)
+    return ids
+
+
+def where_scope_registries_to_referenced(
+    *,
+    select_cols: Sequence[SelectCol] | None = None,
+    order_by_cols: Sequence[OrderByCol] | None = None,
+    group_by_cols: Sequence[NormalizedExpr] | None = None,
+    where_params: Sequence[WhereParam] | None = None,
+    having_param: Sequence[HavingParam] | None = None,
+    window_registry: Sequence[WindowRegistryStep] | None = None,
+    case_registry: Sequence[CaseRegistryStep] | None = None,
+) -> tuple[list[WindowRegistryStep], list[CaseRegistryStep]]:
+    """Keep only window/case registry rows referenced by the scope's clauses."""
+    referenced = referenced_registry_ids_in_scope(
+        select_cols=select_cols,
+        order_by_cols=order_by_cols,
+        group_by_cols=group_by_cols,
+        where_params=where_params,
+        having_param=having_param,
+    )
+    kept_wr = [step for step in (window_registry or []) if step.registry_id in referenced]
+    kept_cr = [step for step in (case_registry or []) if step.registry_id in referenced]
+    return kept_wr, kept_cr
+
+
+def append_table_scope_repairs(
+    intent: RuntimeIntent,
+    *,
+    scope_label: str,
+    added: Sequence[str] | None = None,
+    removed: Sequence[str] | None = None,
+    add_reason: Literal["planner_align", "expression_reference", "unreferenced_table", "join_bridge"] = (
+        "planner_align"
+    ),
+    remove_reason: Literal["planner_align", "expression_reference", "unreferenced_table", "join_bridge"] = (
+        "unreferenced_table"
+    ),
+) -> RuntimeIntent:
+    """Append engine table-scope repair records when tables are added or removed."""
+    repairs = list(intent.table_scope_repairs)
+    add_set = sorted({str(t) for t in (added or ()) if str(t)})
+    rem_set = sorted({str(t) for t in (removed or ()) if str(t)})
+    if add_set:
+        repairs.append(TableScopeRepair(scope_label, tuple(add_set), "add", add_reason))
+    if rem_set:
+        repairs.append(TableScopeRepair(scope_label, tuple(rem_set), "remove", remove_reason))
+    if repairs == list(intent.table_scope_repairs):
+        return intent
+    return replace(intent, table_scope_repairs=repairs)
+
+
+def format_table_scope_repair_message(repair: TableScopeRepair) -> str:
+    """Return one user-facing line describing a table-scope repair."""
+    reason_text = TABLE_SCOPE_REPAIR_REASON_TEXT.get(repair.reason, repair.reason)
+    verb = "added" if repair.action == "add" else "removed"
+    table_list = ", ".join(repair.tables)
+    return f"Engine {verb} table(s) {table_list} in {repair.scope_label} because they are {reason_text}."
+
+
+def table_scope_repair_warning_messages(intent: RuntimeIntent) -> list[str]:
+    """Return deduplicated user-facing warning strings for recorded table-scope repairs."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for repair in intent.table_scope_repairs or []:
+        msg = format_table_scope_repair_message(repair)
+        if msg in seen:
+            continue
+        seen.add(msg)
+        out.append(msg)
+    return out
+
+
+def validate_table_scope_repairs(intent: RuntimeIntent) -> list[IntentIssue]:
+    """Surface recorded table-scope repairs as semantic warnings."""
+    issues: list[IntentIssue] = []
+    for idx, repair in enumerate(intent.table_scope_repairs or []):
+        issues.append(
+            make_intent_issue(
+                issue_id=f"table_scope_repair_{repair.scope_label.replace(' ', '_')}_{repair.action}_{idx}",
+                category=FailureCategory.STRUCTURAL,
+                severity="warning",
+                message=format_table_scope_repair_message(repair),
+                context={
+                    "scope_label": repair.scope_label,
+                    "tables": list(repair.tables),
+                    "action": repair.action,
+                    "reason": repair.reason,
+                },
+            )
+        )
+    return issues
+
+
 def reconcile_tables(intent: RuntimeIntent) -> RuntimeIntent:
     """Set ``tables`` at every level to exactly the tables and CTEs. referenced at that level. For the main scope and each CTE step independently, this function recomputes the referenced table set from select, order, group, filter, having, window registry, and case registry expressions. The resulting ``tables`` list is the sorted reference set. No table is force-added because of CTE chain membership and no prior CTE name is inserted into a downstream CTE's tables list. Tables present in the input but not referenced are removed; tables referenced but missing from the input are added back."""
     main_referenced = collect_referenced_tables(
         intent.select_cols,
         intent.order_by_cols,
         intent.group_by_cols,
-        intent.filters_param,
-        intent.having_param,
+        where_leaves(intent.where),
+        having_leaves(intent.having),
         window_registry=intent.window_registry,
         case_registry=intent.case_registry,
     )
     main_tables = sorted(main_referenced)
+    main_comparison_only = derive_comparison_only_tables(
+        select_cols=intent.select_cols,
+        order_by_cols=intent.order_by_cols,
+        group_by_cols=intent.group_by_cols,
+        where_params=where_leaves(intent.where),
+        having_param=having_leaves(intent.having),
+        distinct_on=intent.distinct_on,
+        window_registry=intent.window_registry,
+        case_registry=intent.case_registry,
+    )
     original_main = set(intent.tables or [])
     added_main = main_referenced - original_main
     removed_main = original_main - main_referenced
@@ -1716,6 +2598,14 @@ def reconcile_tables(intent: RuntimeIntent) -> RuntimeIntent:
         debug(f"[reconcile_tables] main added {sorted(added_main)}")
     if removed_main:
         debug(f"[reconcile_tables] main removed {sorted(removed_main)}")
+    intent = append_table_scope_repairs(
+        intent,
+        scope_label="main query",
+        added=sorted(added_main),
+        removed=sorted(removed_main),
+        add_reason="expression_reference",
+        remove_reason="unreferenced_table",
+    )
 
     new_cte_steps: list[RuntimeCteStep] = []
     for cte in intent.cte_steps or []:
@@ -1723,12 +2613,22 @@ def reconcile_tables(intent: RuntimeIntent) -> RuntimeIntent:
             cte.select_cols,
             cte.order_by_cols,
             cte.group_by_cols,
-            cte.filters_param,
-            cte.having_param,
+            where_leaves(cte.where),
+            having_leaves(cte.having),
             window_registry=cte.window_registry,
             case_registry=cte.case_registry,
         )
         cte_tables = sorted(cte_referenced)
+        cte_comparison_only = derive_comparison_only_tables(
+            select_cols=cte.select_cols,
+            order_by_cols=cte.order_by_cols,
+            group_by_cols=cte.group_by_cols,
+            where_params=where_leaves(cte.where),
+            having_param=having_leaves(cte.having),
+            distinct_on=cte.distinct_on,
+            window_registry=cte.window_registry,
+            case_registry=cte.case_registry,
+        )
         cte_original = set(cte.tables or [])
         cte_added = cte_referenced - cte_original
         cte_removed = cte_original - cte_referenced
@@ -1736,13 +2636,29 @@ def reconcile_tables(intent: RuntimeIntent) -> RuntimeIntent:
             debug(f"[reconcile_tables] CTE '{cte.cte_name}' added {sorted(cte_added)}")
         if cte_removed:
             debug(f"[reconcile_tables] CTE '{cte.cte_name}' removed {sorted(cte_removed)}")
-        new_cte_steps.append(replace(cte, tables=cte_tables))
+        cte_scope = f"CTE '{cte.cte_name}'" if cte.cte_name else "CTE"
+        intent = append_table_scope_repairs(
+            intent,
+            scope_label=cte_scope,
+            added=sorted(cte_added),
+            removed=sorted(cte_removed),
+            add_reason="expression_reference",
+            remove_reason="unreferenced_table",
+        )
+        new_cte_steps.append(replace(cte, tables=cte_tables, comparison_only_tables=cte_comparison_only))
 
-    return replace(intent, tables=main_tables, cte_steps=new_cte_steps)
+    return replace(
+        intent,
+        tables=main_tables,
+        comparison_only_tables=main_comparison_only,
+        cte_steps=new_cte_steps,
+    )
 
 
 def _fk_specialization_parent(scope_table: str, ref_table: str, schema: SchemaGraph) -> bool:
     """Return True when *scope_table* FK-targets *ref_table* on *ref_table*'s primary key."""
+    if not _same_federation_source(schema, scope_table, ref_table):
+        return False
     tbl = schema.tables.get(scope_table)
     dst_meta = schema.tables.get(ref_table)
     if tbl is None or dst_meta is None:
@@ -1751,6 +2667,8 @@ def _fk_specialization_parent(scope_table: str, ref_table: str, schema: SchemaGr
     if not pk_set:
         return False
     for fk in tbl.foreign_keys:
+        if fk.inference_tag == InferenceTag.CROSS_SOURCE:
+            continue
         if fk.dst_table != ref_table:
             continue
         if set(fk.dst_cols) <= pk_set and fk.src_cols:
@@ -1758,11 +2676,7 @@ def _fk_specialization_parent(scope_table: str, ref_table: str, schema: SchemaGr
     return False
 
 
-def _expand_scope_tables_for_refs(
-    tables: list[str],
-    referenced: set[str],
-    schema: SchemaGraph,
-) -> list[str]:
+def _expand_scope_tables_for_refs(tables: list[str], referenced: set[str], schema: SchemaGraph) -> list[str]:
     out_set = set(tables or [])
     for ref_tbl in referenced:
         if ref_tbl in out_set:
@@ -1781,8 +2695,8 @@ def expand_shared_pk_tables_for_refs(intent: RuntimeIntent, schema: SchemaGraph)
         intent.select_cols,
         intent.order_by_cols,
         intent.group_by_cols,
-        intent.filters_param,
-        intent.having_param,
+        where_leaves(intent.where),
+        having_leaves(intent.having),
         window_registry=intent.window_registry,
         case_registry=intent.case_registry,
     )
@@ -1793,8 +2707,8 @@ def expand_shared_pk_tables_for_refs(intent: RuntimeIntent, schema: SchemaGraph)
             cte.select_cols,
             cte.order_by_cols,
             cte.group_by_cols,
-            cte.filters_param,
-            cte.having_param,
+            where_leaves(cte.where),
+            having_leaves(cte.having),
             window_registry=cte.window_registry,
             case_registry=cte.case_registry,
         )
@@ -1835,12 +2749,9 @@ def _consolidate_in_list(vals: list[Any], data_type: str) -> str:
     return ", ".join(parts)
 
 
-def _normalize_in_types_for_list(
-    filters: list[FilterParam],
-    schema_graph: SchemaGraph,
-) -> tuple[list[FilterParam], bool]:
+def _normalize_in_types_for_list(filters: list[WhereParam], schema_graph: SchemaGraph) -> tuple[list[WhereParam], bool]:
     """Coerce IN-list elements to column types, then consolidate to one. SQL string."""
-    new_filters: list[FilterParam] = []
+    new_filters: list[WhereParam] = []
     changed = False
     for fp in filters:
         if fp.op.lower() not in {"in", "not in"} or not isinstance(fp.raw_value, list):
@@ -1865,40 +2776,34 @@ def _normalize_in_types_for_list(
     return new_filters, changed
 
 
-def normalize_in_filter_types(intent: RuntimeIntent, schema_graph: SchemaGraph) -> RuntimeIntent:
-    """Run IN coercion on main/CTEs, then. ``_decompose_in_not_in_filters``. Filter-only by design; HAVING operates on aggregation results, not ``IN``-list expansion here."""
+def normalize_in_where_types(intent: RuntimeIntent, schema_graph: SchemaGraph) -> RuntimeIntent:
+    """Run IN coercion on main/CTEs, then. ``_decompose_in_not_in_where``. Filter-only by design; HAVING operates on aggregation results, not ``IN``-list expansion here."""
 
-    def process(filters: list[FilterParam]) -> tuple[list[FilterParam], bool]:
+    def process(filters: list[WhereParam]) -> tuple[list[WhereParam], bool]:
         return _normalize_in_types_for_list(filters, schema_graph)
 
-    intent = apply_filters_to_main_and_ctes(intent, process)
-    return _decompose_in_not_in_filters(intent)
+    intent = apply_where_to_main_and_ctes(intent, process)
+    return _decompose_in_not_in_where(intent)
 
 
-def _decompose_in_list(
-    filters: list[FilterParam],
-    max_list_size: int = 10,
-) -> list[FilterParam]:
-    """Split short IN/NOT IN lists into chained ``=``/``!=`` filters. with OR/AND."""
-    new_filters: list[FilterParam] = []
+def _decompose_in_list(filters: list[WhereParam], max_list_size: int = 10) -> PredicateGroup | None:
+    """Split short IN/NOT IN lists into ``=``/``!=`` leaves under OR (IN) or AND (NOT IN) groups."""
+    parts: list[PredicateGroup] = []
     for fp in filters:
-        if fp.filter_group is not None:
-            new_filters.append(fp)
-            continue
         raw = fp.raw_value
         op_lower = (fp.op or "").lower()
         if op_lower in {"in", "not in"} and isinstance(raw, str):
-            parts = [p.strip().strip("'").strip('"') for p in raw.split(",")]
-            parts = [p for p in parts if p]
+            split_parts = [p.strip().strip("'").strip('"') for p in raw.split(",")]
+            split_parts = [p for p in split_parts if p]
             value_type_lower = (fp.value_type or "").lower()
             if value_type_lower in {"integer", "int", "bigint", "smallint"}:
                 coerced: list[Any] = []
-                for p in parts:
+                for p in split_parts:
                     try:
                         coerced.append(int(p))
                     except (TypeError, ValueError):
                         coerced.append(p)
-                parts = coerced
+                split_parts = coerced
             elif value_type_lower in {
                 "number",
                 "numeric",
@@ -1908,47 +2813,37 @@ def _decompose_in_list(
                 "real",
             }:
                 coerced_f: list[Any] = []
-                for p in parts:
+                for p in split_parts:
                     try:
                         coerced_f.append(float(p))
                     except (TypeError, ValueError):
                         coerced_f.append(p)
-                parts = coerced_f
-            if parts:
-                fp = replace(fp, raw_value=cast(RawValue, parts))
-                raw = cast(list[Any], parts)
+                split_parts = coerced_f
+            if split_parts:
+                fp = replace(fp, raw_value=cast(RawValue, split_parts))
+                raw = cast(list[Any], split_parts)
         if not isinstance(raw, list) or op_lower not in {"in", "not in"} or len(raw) == 0 or len(raw) > max_list_size:
-            new_filters.append(fp)
+            parts.append(PredicateGroup(op="and", predicates=(fp,)))
             continue
         elems = list(raw)
-        n = len(elems)
-        connector = "OR" if op_lower == "in" else "AND"
-        new_group = []
-        for idx, val in enumerate(elems):
-            link_after = (fp.bool_op or "AND") if idx == n - 1 else connector
-            new_fp = replace(
-                fp,
-                op="=" if op_lower == "in" else "!=",
-                raw_value=val,
-                bool_op=link_after,
-            )
-            new_group.append(new_fp)
-        new_filters.extend(new_group)
-    return new_filters
+        expanded = tuple(replace(fp, op="=" if op_lower == "in" else "!=", raw_value=val) for val in elems)
+        connector: Literal["and", "or"] = "or" if op_lower == "in" else "and"
+        parts.append(PredicateGroup(op=connector, predicates=expanded))
+    return merge_predicate_groups("and", parts)
 
 
-def _decompose_in_not_in_filters(intent: RuntimeIntent) -> RuntimeIntent:
+def _decompose_in_not_in_where(intent: RuntimeIntent) -> RuntimeIntent:
     """Apply ``_decompose_in_list`` to main and each CTE (filter-only; HAVING is out of scope)."""
-    main_filters = _decompose_in_list(intent.filters_param or [])
+    main_where = _decompose_in_list(where_leaves(intent.where) or [])
     new_ctes: list[RuntimeCteStep] = []
     for cte in intent.cte_steps or []:
-        decomposed = _decompose_in_list(cte.filters_param or [])
-        new_ctes.append(replace(cte, filters_param=decomposed))
-    out = replace(intent, filters_param=main_filters, cte_steps=new_ctes or intent.cte_steps)
-    expanded = len(main_filters) != len(intent.filters_param or [])
+        decomposed = _decompose_in_list(where_leaves(cte.where) or [])
+        new_ctes.append(replace(cte, where=decomposed))
+    out = replace(intent, where=main_where, cte_steps=new_ctes or intent.cte_steps)
+    expanded = len((main_where.leaves() if main_where else []) or []) != len(where_leaves(intent.where) or [])
     if not expanded:
         for oc, nc in zip(intent.cte_steps or [], new_ctes, strict=True):
-            if len(oc.filters_param or []) != len(nc.filters_param or []):
+            if len(where_leaves(oc.where) or []) != len(where_leaves(nc.where) or []):
                 expanded = True
                 break
     if expanded:
@@ -1956,7 +2851,7 @@ def _decompose_in_not_in_filters(intent: RuntimeIntent) -> RuntimeIntent:
             "intent_after_deterministic_repair.decompose_in_filters",
             lambda: stable_json(
                 {
-                    "main_filters": len(out.filters_param or []),
+                    "main_filters": len(where_leaves(out.where) or []),
                     "cte_steps": len(out.cte_steps or []),
                 }
             ),
@@ -1979,11 +2874,11 @@ def _resolve_boolean_value(raw_value: Any, col_meta: ColumnMetadata) -> tuple[An
     return None
 
 
-def _normalize_boolean_filter_list(
-    filters: list[FilterParam], schema_graph: SchemaGraph
-) -> tuple[list[FilterParam], bool]:
+def _normalize_boolean_where_list(
+    filters: list[WhereParam], schema_graph: SchemaGraph
+) -> tuple[list[WhereParam], bool]:
     """Rewrite boolean-column filters to Python bool and ``value_type`` ``boolean``."""
-    new_filters: list[FilterParam] = []
+    new_filters: list[WhereParam] = []
     changed = False
     for fp in filters:
         if fp.raw_value is None:
@@ -2006,26 +2901,24 @@ def _normalize_boolean_filter_list(
         new_filters.append(replace(fp, raw_value=bool_val, value_type=vtype))
         changed = True
         debug(
-            f"[intent_resolve_normalize_boolean_filter_list] {col}: "
+            f"[intent_resolve_normalize_boolean_where_list] {col}: "
             f"{fp.raw_value!r} ({fp.value_type}) → {bool_val!r} ({vtype})"
         )
     return new_filters, changed
 
 
-def normalize_boolean_filter_values(intent: RuntimeIntent, schema_graph: SchemaGraph) -> RuntimeIntent:
-    """Apply ``_normalize_boolean_filter_list`` to main and CTE filters. Filter-only by design; boolean coercion applies to ``filters_param`` row literals, not HAVING."""
+def normalize_boolean_where_values(intent: RuntimeIntent, schema_graph: SchemaGraph) -> RuntimeIntent:
+    """Apply ``_normalize_boolean_where_list`` to main and CTE where trees. Where-only by design; boolean coercion applies to ``where`` row literals, not HAVING."""
 
-    def process(filters: list[FilterParam]) -> tuple[list[FilterParam], bool]:
-        return _normalize_boolean_filter_list(filters, schema_graph)
+    def process(filters: list[WhereParam]) -> tuple[list[WhereParam], bool]:
+        return _normalize_boolean_where_list(filters, schema_graph)
 
-    return apply_filters_to_main_and_ctes(intent, process)
+    return apply_where_to_main_and_ctes(intent, process)
 
 
-def _normalize_null_filter_list(
-    filters: list[FilterParam],
-) -> tuple[list[FilterParam], bool]:
+def _normalize_null_where_list(filters: list[WhereParam]) -> tuple[list[WhereParam], bool]:
     """Force ``value_type="null"`` and ``raw_value=None`` for null. operators."""
-    result: list[FilterParam] = []
+    result: list[WhereParam] = []
     changed = False
     for fp in filters:
         if fp.op in ("is null", "is not null"):
@@ -2038,9 +2931,7 @@ def _normalize_null_filter_list(
     return result, changed
 
 
-def _normalize_null_having_list(
-    having: list[HavingParam],
-) -> tuple[list[HavingParam], bool]:
+def _normalize_null_having_list(having: list[HavingParam]) -> tuple[list[HavingParam], bool]:
     """Force ``value_type="null"`` and ``raw_value=None`` for null operators on HAVING rows."""
     result: list[HavingParam] = []
     changed = False
@@ -2055,9 +2946,9 @@ def _normalize_null_having_list(
     return result, changed
 
 
-def normalize_null_filter_values(intent: RuntimeIntent) -> RuntimeIntent:
-    """Apply null-operator normalization to main and CTE ``filters_param`` and ``having_param``."""
-    intent = apply_filters_to_main_and_ctes(intent, _normalize_null_filter_list)
+def normalize_null_where_values(intent: RuntimeIntent) -> RuntimeIntent:
+    """Apply null-operator normalization to main and CTE ``where`` and ``having`` trees."""
+    intent = apply_where_to_main_and_ctes(intent, _normalize_null_where_list)
     return apply_having_to_main_and_ctes(intent, _normalize_null_having_list)
 
 
@@ -2071,10 +2962,7 @@ def _allocate_window_registry_id(registry: list[WindowRegistryStep]) -> str:
     return f"w{mx + 1:02d}"
 
 
-def _select_cols_have_aggregation(
-    select_cols: Sequence[SelectCol],
-    window_registry: list[WindowRegistryStep],
-) -> bool:
+def _select_cols_have_aggregation(select_cols: Sequence[SelectCol], window_registry: list[WindowRegistryStep]) -> bool:
     """Return True when *select_cols* contains an aggregated expression without an enclosing window registry step."""
     for sc in select_cols:
         if effective_select_parts(sc, window_registry, None).window_spec is not None:
@@ -2124,10 +3012,7 @@ def _promote_aggregates_to_running_window(
     return promoted, registry, changed
 
 
-def repair_cumulative_phrasing_window_intent(
-    intent: RuntimeIntent,
-    question_norm: str,
-) -> RuntimeIntent:
+def repair_cumulative_phrasing_window_intent(intent: RuntimeIntent, question_norm: str) -> RuntimeIntent:
     """Promote plain aggregate select columns to running-window aggregates when *question_norm* contains a cumulative phrasing (``running total``, ``cumulative``, ``year-to-date``, ``rolling N``, ``moving sum``)."""
     haystack: str = (question_norm or "") + " " + (intent.natural_language or "")
     if not CUMULATIVE_PHRASING_RE.search(haystack):
@@ -2138,10 +3023,7 @@ def repair_cumulative_phrasing_window_intent(
     main_changed: bool = False
     if _select_cols_have_aggregation(main_select, main_wr):
         main_select, main_wr, main_changed = _promote_aggregates_to_running_window(
-            main_select,
-            main_order,
-            main_wr,
-            list(intent.case_registry or []),
+            main_select, main_order, main_wr, list(intent.case_registry or [])
         )
     if main_changed:
         intent = replace(intent, select_cols=main_select, window_registry=main_wr)
@@ -2155,10 +3037,7 @@ def repair_cumulative_phrasing_window_intent(
         cte_wr: list[WindowRegistryStep] = list(cte.window_registry or [])
         if _select_cols_have_aggregation(cte_select, cte_wr):
             cte_select, cte_wr, c = _promote_aggregates_to_running_window(
-                cte_select,
-                cte_order,
-                cte_wr,
-                list(cte.case_registry or []),
+                cte_select, cte_order, cte_wr, list(cte.case_registry or [])
             )
             if c:
                 cte_changed = True
@@ -2170,16 +3049,12 @@ def repair_cumulative_phrasing_window_intent(
     return intent
 
 
-def drop_invalid_case_registry_entries(
-    intent: RuntimeIntent,
-    schema_graph: SchemaGraph,
-) -> RuntimeIntent:
+def drop_invalid_case_registry_entries(intent: RuntimeIntent, schema_graph: SchemaGraph) -> RuntimeIntent:
     """Remove case-registry rows whose ``case_when`` has no branches. and. drop select columns that reference those ids."""
     _ = schema_graph
 
     def prune_scope(
-        select_cols: list[SelectCol],
-        case_registry: list[CaseRegistryStep],
+        select_cols: list[SelectCol], case_registry: list[CaseRegistryStep]
     ) -> tuple[list[SelectCol], list[CaseRegistryStep], bool]:
         invalid_ids = {step.registry_id for step in case_registry if not step.case_when.branches}
         if not invalid_ids:
@@ -2193,10 +3068,7 @@ def drop_invalid_case_registry_entries(
             kept_select.append(sc)
         return kept_select, kept_registry, True
 
-    main_sel, main_cr, main_changed = prune_scope(
-        list(intent.select_cols or []),
-        list(intent.case_registry or []),
-    )
+    main_sel, main_cr, main_changed = prune_scope(list(intent.select_cols or []), list(intent.case_registry or []))
     result = intent
     if main_changed:
         result = replace(result, select_cols=main_sel, case_registry=main_cr)
@@ -2216,10 +3088,7 @@ def drop_invalid_case_registry_entries(
     return result
 
 
-def repair_case_when_intent(
-    intent: RuntimeIntent,
-    schema_graph: SchemaGraph,
-) -> RuntimeIntent:
+def repair_case_when_intent(intent: RuntimeIntent, schema_graph: SchemaGraph) -> RuntimeIntent:
     """Drop ``case_registry`` rows whose ``case_when`` has no branches."""
     _ = schema_graph
 
@@ -2231,10 +3100,7 @@ def repair_case_when_intent(
     return replace(intent, case_registry=new_cr, cte_steps=new_ctes)
 
 
-def _column_meta_for_filter_left(
-    fp: FilterParam,
-    schema_graph: SchemaGraph,
-) -> ColumnMetadata | None:
+def _column_meta_for_where_left(fp: WhereParam, schema_graph: SchemaGraph) -> ColumnMetadata | None:
     """Return metadata when ``left_expr`` references exactly one qualified column."""
     cols = extract_columns_from_expr(fp.left_expr)
     if len(cols) != 1:
@@ -2245,18 +3111,14 @@ def _column_meta_for_filter_left(
     return schema_graph.get_column(parts[0], parts[1])
 
 
-def repair_array_filters_intent(
-    intent: RuntimeIntent,
-    schema_graph: SchemaGraph,
-    question: str = "",
-) -> RuntimeIntent:
+def repair_array_where_intent(intent: RuntimeIntent, schema_graph: SchemaGraph, question: str = "") -> RuntimeIntent:
     """Normalise array-column filters: rewrite ``=``/``like`` on array columns to ``contains`` and remove ``contains`` on non-array columns."""
 
-    def process(filters: list[FilterParam]) -> tuple[list[FilterParam], bool]:
-        out: list[FilterParam] = []
+    def process(filters: list[WhereParam]) -> tuple[list[WhereParam], bool]:
+        out: list[WhereParam] = []
         changed = False
         for fp in filters:
-            meta = _column_meta_for_filter_left(fp, schema_graph)
+            meta = _column_meta_for_where_left(fp, schema_graph)
             if fp.op == "contains":
                 kind = array_storage_kind(meta) if meta is not None else "unknown"
                 if kind in ("native_array", "json_text_array"):
@@ -2267,37 +3129,28 @@ def repair_array_filters_intent(
                     rv = fp.raw_value
                     if isinstance(rv, str) and rv and "%" not in rv:
                         rv = f"%{rv}%"
-                    new_fp = replace(
-                        fp,
-                        op="like",
-                        raw_value=rv,
-                        value_type="string",
-                    )
+                    new_fp = replace(fp, op="like", raw_value=rv, value_type="string")
                     out.append(new_fp)
                     changed = True
                     continue
                 if meta is None or not meta.element_type:
-                    debug(f"[intent_repair.repair_array_filters] dropping contains on non-array column: {fp.param_key}")
+                    debug(f"[intent_repair.repair_array_where] dropping contains on non-array column: {fp.param_key}")
                     changed = True
                     continue
             elif (
                 fp.op in ARRAY_REWRITABLE_OPS
                 and meta is not None
-                and array_storage_kind(meta)
-                in (
-                    "native_array",
-                    "json_text_array",
-                )
+                and array_storage_kind(meta) in ("native_array", "json_text_array")
             ):
                 debug(
-                    f"[intent_repair.repair_array_filters] rewriting {fp.op} to contains for array column: {fp.param_key}"
+                    f"[intent_repair.repair_array_where] rewriting {fp.op} to contains for array column: {fp.param_key}"
                 )
                 fp = replace(fp, op="contains", value_type="string")
                 changed = True
             out.append(fp)
         return out, changed
 
-    return apply_filters_to_main_and_ctes(intent, process)
+    return apply_where_to_main_and_ctes(intent, process)
 
 
 def _norm_expr_blocked_non_selectable_refs(expr: NormalizedExpr, schema: SchemaGraph) -> list[str]:
@@ -2326,10 +3179,7 @@ def _select_col_dropped_blocked_columns(sc: SelectCol, schema: SchemaGraph) -> l
     return _norm_expr_blocked_non_selectable_refs(sc.expr, schema)
 
 
-def enforce_sensitivity_policy_intent(
-    intent: RuntimeIntent,
-    schema_graph: SchemaGraph,
-) -> RuntimeIntent:
+def enforce_sensitivity_policy_intent(intent: RuntimeIntent, schema_graph: SchemaGraph) -> RuntimeIntent:
     """Drop select and ``GROUP BY`` entries that reference sensitive columns and notify when any are dropped."""
     original_main = list(intent.select_cols or [])
     dropped_main: list[tuple[SelectCol, list[str]]] = []
@@ -2419,7 +3269,7 @@ def enforce_sensitivity_policy_intent(
 
 
 def intent_text_has_leakable_placeholder(text: str | None) -> bool:
-    """Return True if *text* still has angle-bracket or numeric. placeholder tokens."""
+    """Return True if *text* still has angle-bracket, numeric, or instructional shape tokens."""
     if not text:
         return False
     if INTENT_PLACEHOLDER_ANGLE_RE.search(text):
@@ -2432,6 +3282,13 @@ def intent_text_has_leakable_placeholder(text: str | None) -> bool:
         return True
     if re.search(r"\bcol\d+\b", text, re.IGNORECASE):
         return True
+    lowered = text.lower()
+    for token in INSTRUCTIONAL_SHAPE_PLACEHOLDER_TOKENS:
+        if "." in token:
+            if token in lowered:
+                return True
+        elif re.search(rf"\b{re.escape(token)}\b", lowered):
+            return True
     return False
 
 
@@ -2496,7 +3353,7 @@ def _yield_window_spec_instructional_strings(spec: WindowSpec) -> Iterator[str]:
         yield from _yield_normalized_expr_instructional_strings(spec.argument)
 
 
-def _yield_filter_instructional_strings(fp: FilterParam) -> Iterator[str]:
+def _yield_where_instructional_strings(fp: WhereParam) -> Iterator[str]:
     """Yield strings from filter expressions and inline raw value."""
     yield from _yield_normalized_expr_instructional_strings(fp.left_expr)
     if fp.right_expr is not None:
@@ -2517,7 +3374,7 @@ def _yield_having_instructional_strings(hp: HavingParam) -> Iterator[str]:
 def _yield_case_when_instructional_strings(case_when: CaseWhenExpr) -> Iterator[str]:
     """Yield strings from CASE branches and else clause."""
     for branch in case_when.branches:
-        yield from _yield_filter_instructional_strings(branch.condition)
+        yield from _yield_where_instructional_strings(branch.condition)
         yield from _yield_normalized_expr_instructional_strings(branch.result)
     if case_when.else_result is not None:
         yield from _yield_normalized_expr_instructional_strings(case_when.else_result)
@@ -2528,26 +3385,20 @@ def _yield_select_col_instructional_strings(col: SelectCol) -> Iterator[str]:
     yield from _yield_normalized_expr_instructional_strings(col.expr)
 
 
-def _yield_window_registry_step_instructional_strings(
-    step: WindowRegistryStep,
-) -> Iterator[str]:
+def _yield_window_registry_step_instructional_strings(step: WindowRegistryStep) -> Iterator[str]:
     """Yield strings from a window registry row (id/label and nested expressions)."""
     yield step.registry_id
     yield from _yield_window_spec_instructional_strings(step.window_spec)
 
 
-def _yield_case_registry_step_instructional_strings(
-    step: CaseRegistryStep,
-) -> Iterator[str]:
+def _yield_case_registry_step_instructional_strings(step: CaseRegistryStep) -> Iterator[str]:
     """Yield strings from a case registry row (id/label and CASE body)."""
     yield step.registry_id
     yield step.label
     yield from _yield_case_when_instructional_strings(step.case_when)
 
 
-def _yield_runtime_cte_step_instructional_strings(
-    step: RuntimeCteStep,
-) -> Iterator[str]:
+def _yield_runtime_cte_step_instructional_strings(step: RuntimeCteStep) -> Iterator[str]:
     """Yield strings from one CTE step relevant to instructional placeholders."""
     yield step.cte_name
     yield step.description
@@ -2558,9 +3409,9 @@ def _yield_runtime_cte_step_instructional_strings(
         yield from _yield_normalized_expr_instructional_strings(gb)
     for ob in step.order_by_cols or []:
         yield from _yield_normalized_expr_instructional_strings(ob.expr)
-    for fp in step.filters_param or []:
-        yield from _yield_filter_instructional_strings(fp)
-    for hp in step.having_param or []:
+    for fp in where_leaves(step.where) or []:
+        yield from _yield_where_instructional_strings(fp)
+    for hp in having_leaves(step.having) or []:
         yield from _yield_having_instructional_strings(hp)
     for w in step.window_registry or []:
         yield from _yield_window_registry_step_instructional_strings(w)
@@ -2572,9 +3423,7 @@ def _yield_runtime_cte_step_instructional_strings(
     yield from step.chosen_join_path_signature or []
 
 
-def _yield_runtime_intent_instructional_scan_strings(
-    intent: RuntimeIntent,
-) -> Iterator[str]:
+def _yield_runtime_intent_instructional_scan_strings(intent: RuntimeIntent) -> Iterator[str]:
     """Yield structured intent strings to scan for instructional placeholders."""
     yield from intent.tables or []
     for col in intent.select_cols or []:
@@ -2583,9 +3432,9 @@ def _yield_runtime_intent_instructional_scan_strings(
         yield from _yield_normalized_expr_instructional_strings(gb)
     for ob in intent.order_by_cols or []:
         yield from _yield_normalized_expr_instructional_strings(ob.expr)
-    for fp in intent.filters_param or []:
-        yield from _yield_filter_instructional_strings(fp)
-    for hp in intent.having_param or []:
+    for fp in where_leaves(intent.where) or []:
+        yield from _yield_where_instructional_strings(fp)
+    for hp in having_leaves(intent.having) or []:
         yield from _yield_having_instructional_strings(hp)
     for w in intent.window_registry or []:
         yield from _yield_window_registry_step_instructional_strings(w)
@@ -2659,10 +3508,7 @@ def _intent_expr_terms_blob(expr: NormalizedExpr) -> str:
     return " ".join(parts)
 
 
-def _repair_intent_placeholder_normalized_expr(
-    expr: NormalizedExpr,
-    alias_map: dict[str, str],
-) -> NormalizedExpr:
+def _repair_intent_placeholder_normalized_expr(expr: NormalizedExpr, alias_map: dict[str, str]) -> NormalizedExpr:
     """Rewrite placeholder table tokens inside a ``NormalizedExpr``."""
     if not alias_map and not INTENT_PLACEHOLDER_ANGLE_RE.search(_intent_expr_terms_blob(expr)):
         return expr
@@ -2673,12 +3519,9 @@ def _repair_intent_placeholder_normalized_expr(
     return replace_refs_in_expr(expr, repl)
 
 
-def _repair_intent_placeholder_filters(
-    params: list[FilterParam],
-    alias_map: dict[str, str],
-) -> list[FilterParam]:
+def _repair_intent_placeholder_filters(params: list[WhereParam], alias_map: dict[str, str]) -> list[WhereParam]:
     """Repair filter left/right expressions for placeholder leaks."""
-    out: list[FilterParam] = []
+    out: list[WhereParam] = []
     for fp in params:
         le = _repair_intent_placeholder_normalized_expr(fp.left_expr, alias_map)
         rexp = _repair_intent_placeholder_normalized_expr(fp.right_expr, alias_map) if fp.right_expr else None
@@ -2686,10 +3529,7 @@ def _repair_intent_placeholder_filters(
     return out
 
 
-def _repair_intent_placeholder_having(
-    params: list[HavingParam],
-    alias_map: dict[str, str],
-) -> list[HavingParam]:
+def _repair_intent_placeholder_having(params: list[HavingParam], alias_map: dict[str, str]) -> list[HavingParam]:
     """Repair HAVING left/right expressions for placeholder leaks."""
     out: list[HavingParam] = []
     for hp in params:
@@ -2700,31 +3540,20 @@ def _repair_intent_placeholder_having(
 
 
 def _repair_intent_placeholder_window_registry_step(
-    step: WindowRegistryStep,
-    alias_map: dict[str, str],
+    step: WindowRegistryStep, alias_map: dict[str, str]
 ) -> WindowRegistryStep:
     """Repair window spec inside one window registry row."""
-    return replace(
-        step,
-        window_spec=_repair_intent_placeholder_window_spec(step.window_spec, alias_map),
-    )
+    return replace(step, window_spec=_repair_intent_placeholder_window_spec(step.window_spec, alias_map))
 
 
 def _repair_intent_placeholder_case_registry_step(
-    step: CaseRegistryStep,
-    alias_map: dict[str, str],
+    step: CaseRegistryStep, alias_map: dict[str, str]
 ) -> CaseRegistryStep:
     """Repair CASE body inside one case registry row."""
-    return replace(
-        step,
-        case_when=_repair_intent_placeholder_case_when(step.case_when, alias_map),
-    )
+    return replace(step, case_when=_repair_intent_placeholder_case_when(step.case_when, alias_map))
 
 
-def _repair_intent_placeholder_window_spec(
-    ws: WindowSpec,
-    alias_map: dict[str, str],
-) -> WindowSpec:
+def _repair_intent_placeholder_window_spec(ws: WindowSpec, alias_map: dict[str, str]) -> WindowSpec:
     """Repair window partition, order, and argument expressions."""
     pb = [_repair_intent_placeholder_normalized_expr(e, alias_map) for e in ws.partition_by]
     ob = [replace(o, expr=_repair_intent_placeholder_normalized_expr(o.expr, alias_map)) for o in ws.order_by]
@@ -2732,10 +3561,7 @@ def _repair_intent_placeholder_window_spec(
     return replace(ws, partition_by=pb, order_by=ob, argument=arg)
 
 
-def _repair_intent_placeholder_case_when(
-    cw: CaseWhenExpr,
-    alias_map: dict[str, str],
-) -> CaseWhenExpr:
+def _repair_intent_placeholder_case_when(cw: CaseWhenExpr, alias_map: dict[str, str]) -> CaseWhenExpr:
     """Repair CASE branches and else for placeholder leaks."""
     branches: list[CaseWhenBranch] = []
     for br in cw.branches:
@@ -2746,10 +3572,7 @@ def _repair_intent_placeholder_case_when(
     return CaseWhenExpr(branches=branches, else_result=er)
 
 
-def _repair_intent_placeholder_select_cols(
-    cols: list[SelectCol],
-    alias_map: dict[str, str],
-) -> list[SelectCol]:
+def _repair_intent_placeholder_select_cols(cols: list[SelectCol], alias_map: dict[str, str]) -> list[SelectCol]:
     """Repair select list expressions."""
     out: list[SelectCol] = []
     for sc in cols:
@@ -2758,29 +3581,20 @@ def _repair_intent_placeholder_select_cols(
     return out
 
 
-def _repair_intent_placeholder_order_by_cols(
-    cols: list[OrderByCol],
-    alias_map: dict[str, str],
-) -> list[OrderByCol]:
+def _repair_intent_placeholder_order_by_cols(cols: list[OrderByCol], alias_map: dict[str, str]) -> list[OrderByCol]:
     """Repair ORDER BY expressions for placeholder leaks."""
     return [replace(obc, expr=_repair_intent_placeholder_normalized_expr(obc.expr, alias_map)) for obc in cols]
 
 
-def _repair_intent_placeholder_cte_step(
-    step: RuntimeCteStep,
-    alias_map: dict[str, str],
-) -> RuntimeCteStep:
+def _repair_intent_placeholder_cte_step(step: RuntimeCteStep, alias_map: dict[str, str]) -> RuntimeCteStep:
     """Repair one CTE step: selects, group/order, filters, having."""
     return replace(
         step,
         select_cols=_repair_intent_placeholder_select_cols(step.select_cols or [], alias_map),
         group_by_cols=[_repair_intent_placeholder_normalized_expr(g, alias_map) for g in (step.group_by_cols or [])],
-        order_by_cols=_repair_intent_placeholder_order_by_cols(
-            step.order_by_cols or [],
-            alias_map,
-        ),
-        filters_param=_repair_intent_placeholder_filters(step.filters_param or [], alias_map),
-        having_param=_repair_intent_placeholder_having(step.having_param or [], alias_map),
+        order_by_cols=_repair_intent_placeholder_order_by_cols(step.order_by_cols or [], alias_map),
+        where=map_predicate_group(step.where, lambda fp: _repair_intent_placeholder_filters([fp], alias_map)[0]),
+        having=map_predicate_group(step.having, lambda hp: _repair_intent_placeholder_having([hp], alias_map)[0]),
         window_registry=[
             _repair_intent_placeholder_window_registry_step(w, alias_map) for w in (step.window_registry or [])
         ],
@@ -2788,10 +3602,7 @@ def _repair_intent_placeholder_cte_step(
     )
 
 
-def repair_intent_placeholder_tokens(
-    intent: RuntimeIntent,
-    _schema_graph: SchemaGraph,
-) -> RuntimeIntent:
+def repair_intent_placeholder_tokens(intent: RuntimeIntent, _schema_graph: SchemaGraph) -> RuntimeIntent:
     """Rewrite ``table_N``-style leaks using ``intent.tables`` sort. order."""
     tables = list(intent.tables or [])
     if not tables:
@@ -2800,8 +3611,6 @@ def repair_intent_placeholder_tokens(
     sel = _repair_intent_placeholder_select_cols(intent.select_cols or [], alias_map_main)
     gb = [_repair_intent_placeholder_normalized_expr(g, alias_map_main) for g in (intent.group_by_cols or [])]
     ob = _repair_intent_placeholder_order_by_cols(intent.order_by_cols or [], alias_map_main)
-    fp = _repair_intent_placeholder_filters(intent.filters_param or [], alias_map_main)
-    hp = _repair_intent_placeholder_having(intent.having_param or [], alias_map_main)
     ctes = []
     for c in intent.cte_steps or []:
         c_tables = list(c.tables or [])
@@ -2814,8 +3623,10 @@ def repair_intent_placeholder_tokens(
         select_cols=sel,
         group_by_cols=gb,
         order_by_cols=ob,
-        filters_param=fp,
-        having_param=hp,
+        where=map_predicate_group(intent.where, lambda fp: _repair_intent_placeholder_filters([fp], alias_map_main)[0]),
+        having=map_predicate_group(
+            intent.having, lambda hp: _repair_intent_placeholder_having([hp], alias_map_main)[0]
+        ),
         cte_steps=ctes,
         window_registry=wr,
         case_registry=cr,
@@ -2827,11 +3638,7 @@ def _flip_comparison_op(op: str) -> str:
     return OP_FLIP.get(op, op)
 
 
-def _having_candidate_passes_numeric_and_group_rules(
-    hp: HavingParam,
-    *,
-    group_by_cols: list[Any] | None,
-) -> bool:
+def _having_candidate_passes_numeric_and_group_rules(hp: HavingParam, *, group_by_cols: list[Any] | None) -> bool:
     """Return True when *hp* satisfies HAVING operator and GROUP BY presence rules."""
     if validate_having_operator_is_numeric([hp], "auto_repair"):
         return False
@@ -2840,16 +3647,13 @@ def _having_candidate_passes_numeric_and_group_rules(
     return True
 
 
-def auto_repair_filter_having(
-    filters_param: list[FilterParam],
-    having_param: list[HavingParam],
-    *,
-    group_by_cols: list[Any] | None = None,
-) -> tuple[list[FilterParam], list[HavingParam]]:
+def auto_repair_where_having(
+    where_params: list[WhereParam], having_param: list[HavingParam], *, group_by_cols: list[Any] | None = None
+) -> tuple[list[WhereParam], list[HavingParam]]:
     """Repair misplaced filter and HAVING conditions by moving or flipping them. Filters whose ``left_expr`` contains an aggregation are promoted to HAVING only when the candidate HAVING row uses a numeric comparison operator and GROUP BY is present. HAVING rows whose aggregation is on the right are flipped so the aggregation appears on the left. HAVING rows with no aggregation on either side are demoted to filters."""
-    repaired_filters: list[FilterParam] = []
+    repaired_filters: list[WhereParam] = []
     repaired_having: list[HavingParam] = []
-    for fp in filters_param or []:
+    for fp in where_params or []:
         if fp.left_expr.has_aggregation:
             cand = HavingParam(
                 left_expr=fp.left_expr,
@@ -2858,12 +3662,10 @@ def auto_repair_filter_having(
                 value_type=fp.value_type,
                 param_key=fp.param_key,
                 raw_value=fp.raw_value,
-                bool_op=fp.bool_op,
-                filter_group=fp.filter_group,
             )
             if _having_candidate_passes_numeric_and_group_rules(cand, group_by_cols=group_by_cols):
                 repaired_having.append(cand)
-                debug(f"[intent_repair.auto_repair_filter_having] filter->having: {fp.param_key}")
+                debug(f"[intent_repair.auto_repair_where_having] filter->having: {fp.param_key}")
             else:
                 repaired_filters.append(fp)
         else:
@@ -2880,25 +3682,21 @@ def auto_repair_filter_having(
                     value_type=hp.value_type,
                     param_key=hp.param_key,
                     raw_value=hp.raw_value,
-                    bool_op=hp.bool_op,
-                    filter_group=hp.filter_group,
                 )
             )
-            debug(f"[intent_repair.auto_repair_filter_having] having flip (agg->left): {hp.param_key}")
+            debug(f"[intent_repair.auto_repair_where_having] having flip (agg->left): {hp.param_key}")
         else:
             repaired_filters.append(
-                FilterParam(
+                WhereParam(
                     left_expr=hp.left_expr,
                     op=hp.op,
                     right_expr=hp.right_expr,
                     value_type=hp.value_type,
                     param_key=hp.param_key,
                     raw_value=hp.raw_value,
-                    bool_op=hp.bool_op,
-                    filter_group=hp.filter_group,
                 )
             )
-            debug(f"[intent_repair.auto_repair_filter_having] having->filter: {hp.param_key}")
+            debug(f"[intent_repair.auto_repair_where_having] having->filter: {hp.param_key}")
     return repaired_filters, repaired_having
 
 
@@ -2936,10 +3734,7 @@ def _term_matches_column(term: str, table: str | None, column: str) -> bool:
 
 
 def _build_column_term_replacer(
-    src_table: str | None,
-    src_column: str,
-    dst_table: str | None,
-    dst_column: str,
+    src_table: str | None, src_column: str, dst_table: str | None, dst_column: str
 ) -> Callable[[str], str]:
     """Return a term-level replacer that swaps matching column references."""
 
@@ -2980,11 +3775,9 @@ def _transform_order_by_col_expr(oc: OrderByCol, transformer: Callable[[Normaliz
     return OrderByCol(expr=transformer(oc.expr), direction=oc.direction)
 
 
-def _transform_filter_param_expr(
-    fp: FilterParam, transformer: Callable[[NormalizedExpr], NormalizedExpr]
-) -> FilterParam:
+def _transform_where_param_expr(fp: WhereParam, transformer: Callable[[NormalizedExpr], NormalizedExpr]) -> WhereParam:
     """Apply *transformer* to both sides of a filter param."""
-    return FilterParam(
+    return WhereParam(
         left_expr=transformer(fp.left_expr),
         op=fp.op,
         right_expr=transformer(fp.right_expr) if fp.right_expr is not None else None,
@@ -2992,8 +3785,6 @@ def _transform_filter_param_expr(
         param_key=fp.param_key,
         param_key_hi=fp.param_key_hi,
         raw_value=fp.raw_value,
-        bool_op=fp.bool_op,
-        filter_group=fp.filter_group,
     )
 
 
@@ -3008,8 +3799,6 @@ def _transform_having_param_expr(
         value_type=hp.value_type,
         param_key=hp.param_key,
         raw_value=hp.raw_value,
-        bool_op=hp.bool_op,
-        filter_group=hp.filter_group,
     )
 
 
@@ -3022,8 +3811,7 @@ def _transform_window_spec(ws: WindowSpec, transformer: Callable[[NormalizedExpr
 
 
 def _transform_window_registry_steps(
-    regs: list[WindowRegistryStep] | None,
-    transformer: Callable[[NormalizedExpr], NormalizedExpr],
+    regs: list[WindowRegistryStep] | None, transformer: Callable[[NormalizedExpr], NormalizedExpr]
 ) -> list[WindowRegistryStep]:
     """Map *transformer* across every ``WindowRegistryStep.window_spec`` expression subtree."""
     out: list[WindowRegistryStep] = []
@@ -3033,16 +3821,14 @@ def _transform_window_registry_steps(
 
 
 def _transform_case_when_expr(
-    cw: CaseWhenExpr,
-    transformer: Callable[[NormalizedExpr], NormalizedExpr],
+    cw: CaseWhenExpr, transformer: Callable[[NormalizedExpr], NormalizedExpr]
 ) -> CaseWhenExpr:
     """Apply *transformer* to branch conditions, branch results, and ``else_result``."""
     new_branches: list[CaseWhenBranch] = []
     for br in cw.branches or []:
         new_branches.append(
             CaseWhenBranch(
-                condition=_transform_filter_param_expr(br.condition, transformer),
-                result=transformer(br.result),
+                condition=_transform_where_param_expr(br.condition, transformer), result=transformer(br.result)
             )
         )
     new_else = transformer(cw.else_result) if cw.else_result is not None else None
@@ -3050,8 +3836,7 @@ def _transform_case_when_expr(
 
 
 def _transform_case_registry_steps(
-    regs: list[CaseRegistryStep] | None,
-    transformer: Callable[[NormalizedExpr], NormalizedExpr],
+    regs: list[CaseRegistryStep] | None, transformer: Callable[[NormalizedExpr], NormalizedExpr]
 ) -> list[CaseRegistryStep]:
     """Map *transformer* across every CASE registry ``case_when`` subtree."""
     out: list[CaseRegistryStep] = []
@@ -3071,16 +3856,15 @@ def _transform_cte_step_exprs(
         select_cols=[_transform_select_col_expr(sc, transformer) for sc in (step.select_cols or [])],
         group_by_cols=[transformer(g) for g in (step.group_by_cols or [])],
         order_by_cols=[_transform_order_by_col_expr(oc, transformer) for oc in (step.order_by_cols or [])],
-        filters_param=[_transform_filter_param_expr(fp, transformer) for fp in (step.filters_param or [])],
-        having_param=[_transform_having_param_expr(hp, transformer) for hp in (step.having_param or [])],
+        where=map_predicate_group(step.where, lambda fp: _transform_where_param_expr(fp, transformer)),
+        having=map_predicate_group(step.having, lambda hp: _transform_having_param_expr(hp, transformer)),
         window_registry=_transform_window_registry_steps(step.window_registry, transformer),
         case_registry=_transform_case_registry_steps(step.case_registry, transformer),
     )
 
 
 def _walk_intent_normalized_exprs(
-    intent: RuntimeIntent,
-    transformer: Callable[[NormalizedExpr], NormalizedExpr],
+    intent: RuntimeIntent, transformer: Callable[[NormalizedExpr], NormalizedExpr]
 ) -> RuntimeIntent:
     """Map *transformer* across every NormalizedExpr in *intent* (top- level and CTE steps)."""
     return replace(
@@ -3088,18 +3872,15 @@ def _walk_intent_normalized_exprs(
         select_cols=[_transform_select_col_expr(sc, transformer) for sc in (intent.select_cols or [])],
         group_by_cols=[transformer(g) for g in (intent.group_by_cols or [])],
         order_by_cols=[_transform_order_by_col_expr(oc, transformer) for oc in (intent.order_by_cols or [])],
-        filters_param=[_transform_filter_param_expr(fp, transformer) for fp in (intent.filters_param or [])],
-        having_param=[_transform_having_param_expr(hp, transformer) for hp in (intent.having_param or [])],
+        where=map_predicate_group(intent.where, lambda fp: _transform_where_param_expr(fp, transformer)),
+        having=map_predicate_group(intent.having, lambda hp: _transform_having_param_expr(hp, transformer)),
         window_registry=_transform_window_registry_steps(intent.window_registry, transformer),
         case_registry=_transform_case_registry_steps(intent.case_registry, transformer),
         cte_steps=[_transform_cte_step_exprs(c, transformer) for c in (intent.cte_steps or [])],
     )
 
 
-def _apply_column_replacer_to_intent(
-    intent: RuntimeIntent,
-    replacer: Callable[[str], str],
-) -> RuntimeIntent:
+def _apply_column_replacer_to_intent(intent: RuntimeIntent, replacer: Callable[[str], str]) -> RuntimeIntent:
     """Apply a multiply/divide term-level *replacer* across every NormalizedExpr in *intent*."""
 
     def transform(expr: NormalizedExpr) -> NormalizedExpr:
@@ -3122,7 +3903,7 @@ def _intent_columns_for_table(intent: RuntimeIntent, table: str) -> list[str]:
             t, c = _split_qualified_ref(ref)
             if t == table_low and c not in seen:
                 seen.append(c)
-    for fp in intent.filters_param or []:
+    for fp in where_leaves(intent.where) or []:
         for ref in extract_columns_from_expr(fp.left_expr):
             t, c = _split_qualified_ref(ref)
             if t == table_low and c not in seen:
@@ -3130,29 +3911,50 @@ def _intent_columns_for_table(intent: RuntimeIntent, table: str) -> list[str]:
     return seen
 
 
-def _table_columns_from_schema(schema: SchemaGraph, table: str) -> list[str]:
+def _table_columns_from_schema(
+    schema: SchemaGraph,
+    table: str,
+    *,
+    source_scope: frozenset[str] | None = None,
+) -> list[str]:
     """Return lowercase column names for *table* in *schema*; empty when missing."""
     table_low = table.strip().lower()
     meta = schema.tables.get(table_low) if schema and schema.tables else None
     if meta is None:
+        meta = schema.tables.get(table) if schema and schema.tables else None
+    if meta is None:
         return []
-    return [c.strip().lower() for c in meta.columns.keys()]
+    if not source_scope or not meta.column_member_sources:
+        return [c.strip().lower() for c in meta.columns.keys()]
+    scoped: list[str] = []
+    for col in meta.columns:
+        col_low = col.strip().lower()
+        holders = meta.column_member_sources.get(col) or meta.column_member_sources.get(col_low) or []
+        if not holders or source_scope.intersection(holders):
+            scoped.append(col_low)
+    return scoped
 
 
-def _fuzzy_pick(target: str, candidates: Sequence[str]) -> str | None:
+def _fuzzy_pick(
+    target: str,
+    candidates: Sequence[str],
+    *,
+    source_scope: set[str] | frozenset[str] | None = None,
+    table_source: Callable[[str], str] | None = None,
+) -> str | None:
     """Return the closest match in *candidates* to *target* using ratio cutoff, or None."""
     pool = [c for c in candidates if c]
+    if source_scope and table_source is not None:
+        scoped = [candidate for candidate in pool if table_source(candidate) in source_scope]
+        if scoped:
+            pool = scoped
     if not pool:
         return None
     matches = get_close_matches(target.strip().lower(), pool, n=1, cutoff=DIAGNOSTIC_FUZZY_CUTOFF)
     return matches[0] if matches else None
 
 
-def _repair_unknown_column(
-    intent: RuntimeIntent,
-    schema: SchemaGraph,
-    diag: SqlDiagnostic,
-) -> RuntimeIntent | None:
+def _repair_unknown_column(intent: RuntimeIntent, schema: SchemaGraph, diag: SqlDiagnostic) -> RuntimeIntent | None:
     """Rewrite an unknown column to its closest schema-known sibling on the same table."""
     raw = (diag.offending_identifier or "").strip()
     if not raw:
@@ -3160,8 +3962,10 @@ def _repair_unknown_column(
     src_table, src_column = _split_qualified_ref(raw)
     if not src_column:
         return None
+    source_scope = _repair_source_scope(schema, intent, diag)
+    column_scope = source_scope or None
     if src_table is not None:
-        candidates = _table_columns_from_schema(schema, src_table)
+        candidates = _table_columns_from_schema(schema, src_table, source_scope=column_scope)
         best = _fuzzy_pick(src_column, candidates)
         if best is None or best == src_column:
             return None
@@ -3171,7 +3975,7 @@ def _repair_unknown_column(
     best_table: str | None = None
     best_column: str | None = None
     for t in intent.tables or []:
-        cands = _table_columns_from_schema(schema, t)
+        cands = _table_columns_from_schema(schema, t, source_scope=column_scope)
         pick = _fuzzy_pick(src_column, cands)
         if pick is not None and pick != src_column:
             best_table = t.strip().lower()
@@ -3184,12 +3988,8 @@ def _repair_unknown_column(
     return _apply_column_replacer_to_intent(intent, replacer)
 
 
-def _repair_ambiguous_column(
-    intent: RuntimeIntent,
-    schema: SchemaGraph,
-    diag: SqlDiagnostic,
-) -> RuntimeIntent | None:
-    """Qualify an ambiguous bare column with the first owner table that appears in ``intent.tables``."""
+def _repair_ambiguous_column(intent: RuntimeIntent, schema: SchemaGraph, diag: SqlDiagnostic) -> RuntimeIntent | None:
+    """Qualify an ambiguous bare column when a single owner table can be resolved."""
     raw = (diag.offending_identifier or "").strip().lower()
     if not raw or "." in raw:
         return None
@@ -3199,6 +3999,27 @@ def _repair_ambiguous_column(
         owners = [t.strip().lower() for t in (intent.tables or []) if raw in _table_columns_from_schema(schema, t)]
     if not owners:
         return None
+    detail_source = (diag.details.get("source_id") or "").strip()
+    if detail_source:
+        source_owners = [owner for owner in owners if _federation_table_source(schema, owner, None) == detail_source]
+        if source_owners:
+            owners = source_owners
+        elif owners:
+            return None
+    intent_scope = _intent_source_scope(schema, intent) or _single_source_scope_from_schema(schema)
+    if intent_scope:
+        scoped_owners = [owner for owner in owners if _federation_table_source(schema, owner, None) in intent_scope]
+        if scoped_owners:
+            owners = scoped_owners
+        elif owners:
+            return None
+    source_ids = {
+        _federation_table_source(schema, owner, None)
+        for owner in owners
+        if _federation_table_source(schema, owner, None)
+    }
+    if len(source_ids) > 1:
+        return None
     intent_tables = [t.strip().lower() for t in (intent.tables or [])]
     chosen: str | None = None
     for t in intent_tables:
@@ -3206,23 +4027,23 @@ def _repair_ambiguous_column(
             chosen = t
             break
     if chosen is None:
-        chosen = owners[0]
+        return None
     replacer = _build_column_term_replacer(None, raw, chosen, raw)
     debug(f"[intent_repair._repair_ambiguous_column] {raw} -> {chosen}.{raw}")
     return _apply_column_replacer_to_intent(intent, replacer)
 
 
-def _repair_unknown_table(
-    intent: RuntimeIntent,
-    schema: SchemaGraph,
-    diag: SqlDiagnostic,
-) -> RuntimeIntent | None:
+def _repair_unknown_table(intent: RuntimeIntent, schema: SchemaGraph, diag: SqlDiagnostic) -> RuntimeIntent | None:
     """Rewrite an unknown table to its closest schema-known sibling and retarget column refs."""
     raw = (diag.offending_identifier or "").strip().lower()
     if not raw:
         return None
     candidates = list(schema.tables.keys()) if schema and schema.tables else []
-    best = _fuzzy_pick(raw, candidates)
+    source_scope = _intent_source_scope(schema, intent)
+    table_source = (
+        (lambda table_name: _federation_table_source(schema, table_name, None) or "") if source_scope else None
+    )
+    best = _fuzzy_pick(raw, candidates, source_scope=source_scope, table_source=table_source)
     if best is None or best == raw:
         return None
     new_tables = [best if (t.strip().lower() == raw) else t for t in (intent.tables or [])]
@@ -3234,11 +4055,7 @@ def _repair_unknown_table(
     return replace(rewritten, tables=new_tables)
 
 
-def _repair_grain_consistency(
-    intent: RuntimeIntent,
-    _schema: SchemaGraph,
-    diag: SqlDiagnostic,
-) -> RuntimeIntent | None:
+def _repair_grain_consistency(intent: RuntimeIntent, _schema: SchemaGraph, diag: SqlDiagnostic) -> RuntimeIntent | None:
     """Add the offending non-grouped select column to ``group_by_cols`` when missing."""
     raw = (diag.offending_identifier or "").strip()
     if not raw:
@@ -3253,28 +4070,18 @@ def _repair_grain_consistency(
     return replace(intent, group_by_cols=[*existing, new_expr])
 
 
-def _repair_agg_in_where(
-    intent: RuntimeIntent,
-    _schema: SchemaGraph,
-    _diag: SqlDiagnostic,
-) -> RuntimeIntent | None:
-    """Promote any aggregation-bearing WHERE filter into HAVING via :func:`auto_repair_filter_having`."""
-    new_filters, new_having = auto_repair_filter_having(
-        intent.filters_param or [],
-        intent.having_param or [],
-        group_by_cols=intent.group_by_cols or [],
+def _repair_agg_in_where(intent: RuntimeIntent, _schema: SchemaGraph, _diag: SqlDiagnostic) -> RuntimeIntent | None:
+    """Promote any aggregation-bearing WHERE filter into HAVING via :func:`auto_repair_where_having`."""
+    new_filters, new_having = auto_repair_where_having(
+        where_leaves(intent.where) or [], having_leaves(intent.having) or [], group_by_cols=intent.group_by_cols or []
     )
-    if new_filters == list(intent.filters_param or []) and new_having == list(intent.having_param or []):
+    if new_filters == list(where_leaves(intent.where) or []) and new_having == list(having_leaves(intent.having) or []):
         return None
     debug("[intent_repair._repair_agg_in_where] filter->having promotion applied")
-    return replace(intent, filters_param=new_filters, having_param=new_having)
+    return replace(intent, where=predicate_group_from_list(new_filters), having=predicate_group_from_list(new_having))
 
 
-def _repair_cartesian(
-    intent: RuntimeIntent,
-    _schema: SchemaGraph,
-    _diag: SqlDiagnostic,
-) -> RuntimeIntent | None:
+def _repair_cartesian(intent: RuntimeIntent, _schema: SchemaGraph, _diag: SqlDiagnostic) -> RuntimeIntent | None:
     """Clear the chosen join candidate so the next render re-selects an explicit join path."""
     if not intent.chosen_join_candidate_id and not intent.chosen_join_path_signature:
         return None
@@ -3282,31 +4089,23 @@ def _repair_cartesian(
     return replace(intent, chosen_join_candidate_id="", chosen_join_path_signature=[])
 
 
-def _repair_filter_overlap(
-    intent: RuntimeIntent,
-    _schema: SchemaGraph,
-    _diag: SqlDiagnostic,
-) -> RuntimeIntent | None:
+def _repair_where_overlap(intent: RuntimeIntent, _schema: SchemaGraph, _diag: SqlDiagnostic) -> RuntimeIntent | None:
     """De-duplicate contradictory filters; return new intent only when something changed."""
-    repaired = dedup_contradictory_filters(intent)
+    repaired = dedup_contradictory_where(intent)
     if repaired is intent:
         return None
     return repaired
 
 
-def _repair_param_binding(
-    intent: RuntimeIntent,
-    _schema: SchemaGraph,
-    diag: SqlDiagnostic,
-) -> RuntimeIntent | None:
+def _repair_param_binding(intent: RuntimeIntent, _schema: SchemaGraph, diag: SqlDiagnostic) -> RuntimeIntent | None:
     """Drop a filter that references an unbound parameter when it has no literal raw_value."""
     target = (diag.offending_identifier or "").strip()
     if not target:
         return None
     target_low = target.lstrip(":").lower()
-    new_filters: list[FilterParam] = []
+    new_filters: list[WhereParam] = []
     dropped = False
-    for fp in intent.filters_param or []:
+    for fp in where_leaves(intent.where) or []:
         keys = {(fp.param_key or "").lower(), (fp.param_key_hi or "").lower()}
         if target_low in keys and fp.raw_value is None:
             dropped = True
@@ -3315,7 +4114,7 @@ def _repair_param_binding(
     if not dropped:
         return None
     debug(f"[intent_repair._repair_param_binding] dropped unbound-param filter: {target_low}")
-    return replace(intent, filters_param=new_filters)
+    return replace(intent, where=predicate_group_from_list(new_filters))
 
 
 DIAGNOSTIC_REPAIR_DISPATCH: dict[
@@ -3330,7 +4129,7 @@ DIAGNOSTIC_REPAIR_DISPATCH: dict[
         ("non_grouped_select_col", _repair_grain_consistency),
         ("agg_in_where", _repair_agg_in_where),
         ("explain_cartesian_join", _repair_cartesian),
-        ("explain_zero_estimate", _repair_filter_overlap),
+        ("explain_zero_estimate", _repair_where_overlap),
         ("param_unbound", _repair_param_binding),
     )
 }
@@ -3363,18 +4162,18 @@ def apply_diagnostic_repairs(
     return current, changed
 
 
-def decompose_in_not_in_filters(intent: RuntimeIntent) -> RuntimeIntent:
+def decompose_in_not_in_where(intent: RuntimeIntent) -> RuntimeIntent:
     """Apply ``_decompose_in_list`` to main and each CTE (filter-only; HAVING is out of scope)."""
-    main_filters = _decompose_in_list(intent.filters_param or [])
+    main_where = _decompose_in_list(where_leaves(intent.where) or [])
     new_ctes: list[RuntimeCteStep] = []
     for cte in intent.cte_steps or []:
-        decomposed = _decompose_in_list(cte.filters_param or [])
-        new_ctes.append(replace(cte, filters_param=decomposed))
-    out = replace(intent, filters_param=main_filters, cte_steps=new_ctes or intent.cte_steps)
-    expanded = len(main_filters) != len(intent.filters_param or [])
+        decomposed = _decompose_in_list(where_leaves(cte.where) or [])
+        new_ctes.append(replace(cte, where=decomposed))
+    out = replace(intent, where=main_where, cte_steps=new_ctes or intent.cte_steps)
+    expanded = len((main_where.leaves() if main_where else []) or []) != len(where_leaves(intent.where) or [])
     if not expanded:
         for oc, nc in zip(intent.cte_steps or [], new_ctes, strict=True):
-            if len(oc.filters_param or []) != len(nc.filters_param or []):
+            if len(where_leaves(oc.where) or []) != len(where_leaves(nc.where) or []):
                 expanded = True
                 break
     if expanded:
@@ -3382,7 +4181,7 @@ def decompose_in_not_in_filters(intent: RuntimeIntent) -> RuntimeIntent:
             "intent_after_deterministic_repair.decompose_in_filters",
             stable_json(
                 {
-                    "main_filters": len(out.filters_param or []),
+                    "main_filters": len(where_leaves(out.where) or []),
                     "cte_steps": len(out.cte_steps or []),
                 }
             ),

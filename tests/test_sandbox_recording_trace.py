@@ -74,7 +74,7 @@ def test_slot_id_for_question_and_feedback() -> None:
 
     assert (
         corpus_mod.slot_id_for(corpus_mod.RecordingSlot(tier="questions", label="How many books do we have?"))
-        == "owner_writer:default:questions:How many books do we have?"
+        == "owner:writer:How many books do we have?"
     )
     assert (
         corpus_mod.slot_id_for(corpus_mod.RecordingSlot(tier="feedback", label="bad sql", kind="feedback"))
@@ -87,23 +87,23 @@ def test_recording_manifest_roundtrip(tmp_path: Path, monkeypatch: pytest.Monkey
 
     monkeypatch.setattr(corpus_mod, "STAGING", tmp_path)
     monkeypatch.setattr(corpus_mod, "RECORDING_MANIFEST_PATH", tmp_path / "recording_manifest.json")
-    rows = [{"slot_id": "owner_writer:default:questions:Q1", "committed": True, "attempts": 1, "detail": ""}]
+    rows = [{"slot_id": "owner:writer:Q1", "committed": True, "attempts": 1, "detail": ""}]
     corpus_mod.write_recording_manifest(rows)
     loaded = corpus_mod._load_recording_manifest()
     assert loaded["slots"] == rows
-    assert corpus_mod.committed_slot_ids(loaded) == {"owner_writer:default:questions:Q1"}
+    assert corpus_mod.committed_slot_ids(loaded) == {"owner:writer:Q1"}
 
 
 def test_upsert_manifest_row_preserves_existing_entries() -> None:
     corpus_mod = importlib.import_module("sandbox_corpus")
 
     rows = [
-        {"slot_id": "owner_writer:default:questions:Q1", "committed": True, "label": "Q1"},
-        {"slot_id": "owner_writer:default:questions:Q2", "committed": True, "label": "Q2"},
+        {"slot_id": "owner:writer:Q1", "committed": True, "label": "Q1"},
+        {"slot_id": "owner:writer:Q2", "committed": True, "label": "Q2"},
     ]
     corpus_mod._upsert_manifest_row(
         rows,
-        {"slot_id": "owner_writer:default:questions:Q2", "committed": False, "label": "Q2", "detail": "retry"},
+        {"slot_id": "owner:writer:Q2", "committed": False, "label": "Q2", "detail": "retry"},
     )
     assert len(rows) == 2
     assert rows[0]["committed"] is True
@@ -111,7 +111,7 @@ def test_upsert_manifest_row_preserves_existing_entries() -> None:
     assert rows[1]["detail"] == "retry"
     corpus_mod._upsert_manifest_row(
         rows,
-        {"slot_id": "owner_writer:default:questions:Q3", "committed": True, "label": "Q3"},
+        {"slot_id": "owner:writer:Q3", "committed": True, "label": "Q3"},
     )
     assert len(rows) == 3
 

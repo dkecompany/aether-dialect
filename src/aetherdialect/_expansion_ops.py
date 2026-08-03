@@ -9,18 +9,30 @@ from dataclasses import replace
 from typing import Any, cast
 
 from ._config import SeedWarmupConfig
-from ._constants import CASE_ADD_OPS, CTE_ADD_OPS, HAVING_ADD_OPS, WINDOW_ADD_OPS, ExpansionOperatorId
+from ._constants import (
+    CASE_ADD_OPS,
+    CTE_ADD_OPS,
+    EXPANSION_SUBTREE_POOL_MAX,
+    HAVING_ADD_OPS,
+    WINDOW_ADD_OPS,
+    ExpansionOperatorId,
+)
 from ._contracts_base import (
     ColumnRole,
     ExprValue,
-    FilterParam,
     HavingParam,
     MulGroup,
     NormalizedExpr,
     OrderByCol,
+    PredicateGroup,
     RawValue,
     TableRole,
+    WhereParam,
     expr_registry_ref,
+    having_leaves,
+    merge_predicate_groups,
+    predicate_group_from_list,
+    where_leaves,
 )
 from ._contracts_core import (
     RuntimeCteStep,
@@ -40,7 +52,7 @@ from ._contracts_schema import (
     WindowSpec,
 )
 from ._core_utils import debug
-from ._dialect import extra_filter_ops_for_engine
+from ._dialect import extra_where_ops_for_engine
 from ._intent_expr import extract_columns_from_expr, replace_refs_in_expr
 from ._intent_process import apply_deterministic_repairs
 from ._intent_repair import drop_invalid_case_registry_entries, repair_case_when_intent
@@ -70,9 +82,9 @@ def expansion_compatible(parent: SeedWarmupIntent, candidate_op: str) -> bool:
     if candidate_op in WINDOW_ADD_OPS and any(op in WINDOW_ADD_OPS for op in path_set):
         return False
     if candidate_op == ExpansionOperatorId.EMI_MUTATE:
-        if ExpansionOperatorId.EMI_MUTATE in path_set or ExpansionOperatorId.FILTER_OR_GROUP in path_set:
+        if ExpansionOperatorId.EMI_MUTATE in path_set or ExpansionOperatorId.WHERE_OR_GROUP in path_set:
             return False
-    if candidate_op == ExpansionOperatorId.FILTER_OR_GROUP and ExpansionOperatorId.EMI_MUTATE in path_set:
+    if candidate_op == ExpansionOperatorId.WHERE_OR_GROUP and ExpansionOperatorId.EMI_MUTATE in path_set:
         return False
     if candidate_op == ExpansionOperatorId.GROUPBY_REMOVE and any(op in HAVING_ADD_OPS for op in path_set):
         return False
@@ -91,11 +103,7 @@ def expansion_compatible(parent: SeedWarmupIntent, candidate_op: str) -> bool:
 
 
 def _accept_expansion_variant(
-    var: SeedWarmupIntent,
-    schema: SchemaGraph,
-    *,
-    parent: SeedWarmupIntent,
-    candidate_op: str,
+    var: SeedWarmupIntent, schema: SchemaGraph, *, parent: SeedWarmupIntent, candidate_op: str
 ) -> SeedWarmupIntent | None:
     """Run repair, reference, compatibility, and semantic gates on one expansion variant."""
     if not expansion_compatible(parent, candidate_op):
@@ -115,13 +123,12 @@ def _accept_expansion_variant(
 
 
 _EXPANSION_SUBTREE_POOL: list[SeedWarmupIntent] = []
-_EXPANSION_SUBTREE_POOL_MAX: int = 128
 
 
 def _record_expansion_subtree_pool(intent: SeedWarmupIntent) -> None:
     """Append a validated expansion snapshot for splice reuse when under the pool cap."""
     global _EXPANSION_SUBTREE_POOL
-    if len(_EXPANSION_SUBTREE_POOL) >= _EXPANSION_SUBTREE_POOL_MAX:
+    if len(_EXPANSION_SUBTREE_POOL) >= EXPANSION_SUBTREE_POOL_MAX:
         return
     _EXPANSION_SUBTREE_POOL.append(copy.deepcopy(intent))
 
@@ -183,8 +190,7 @@ def _finalize_registry_touch_seed(intent: SeedWarmupIntent, schema: SchemaGraph)
 
 
 def _column_meta_for_qualified_col(
-    full_col: str,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    full_col: str, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> dict[str, Any]:
     """Return column metadata dict for a ``table.column`` reference, or empty."""
     table = _table_from_column_ref(full_col)
@@ -202,31 +208,12 @@ def _agg_change_allowed_for_meta(new_agg: str, meta: dict[str, Any]) -> bool:
     if na == "count":
         return True
     numericish = (
-        vt
-        in (
-            "numeric",
-            "integer",
-            "float",
-            "decimal",
-            "double",
-            "bigint",
-            "smallint",
-        )
+        vt in ("numeric", "integer", "float", "decimal", "double", "bigint", "smallint")
         or role == ColumnRole.NUMERIC_MEASURE.value.lower()
     )
     orderable = (
         numericish
-        or vt
-        in (
-            "date",
-            "datetime",
-            "timestamp",
-            "time",
-            "string",
-            "categorical",
-            "text",
-            "varchar",
-        )
+        or vt in ("date", "datetime", "timestamp", "time", "string", "categorical", "text", "varchar")
         or role
         in (
             ColumnRole.NUMERIC_MEASURE.value.lower(),
@@ -276,9 +263,7 @@ def _table_from_column_ref(col_ref: str) -> str:
     return col_ref.split(".", 1)[0]
 
 
-def _build_column_metadata(
-    schema: SchemaGraph,
-) -> dict[str, dict[str, dict[str, Any]]]:
+def _build_column_metadata(schema: SchemaGraph) -> dict[str, dict[str, dict[str, Any]]]:
     """Build a nested `table` → `column` → metadata dict from `schema`."""
     result: dict[str, dict[str, dict[str, Any]]] = {}
     for table_name, table_obj in schema.tables.items():
@@ -317,10 +302,7 @@ def _build_fk_map(schema: SchemaGraph) -> dict[str, list[dict[str, str]]]:
     return fk_map
 
 
-def _tables_are_connected(
-    tables: list[str],
-    fk_map: dict[str, list[dict[str, str]]],
-) -> bool:
+def _tables_are_connected(tables: list[str], fk_map: dict[str, list[dict[str, str]]]) -> bool:
     """Return whether all tables in `tables` form one connected. component via `fk_map`."""
     if len(tables) <= 1:
         return True
@@ -346,10 +328,7 @@ def _tables_are_connected(
     return len(visited) == len(tables)
 
 
-def _get_filterable_columns(
-    schema: SchemaGraph,
-    table_name: str,
-) -> list[str]:
+def _get_filterable_columns(schema: SchemaGraph, table_name: str) -> list[str]:
     """Return `table.column` references suitable for value filters."""
     if table_name not in schema.tables:
         return []
@@ -358,19 +337,11 @@ def _get_filterable_columns(
         f"{table_name}.{c}"
         for c, col in table.columns.items()
         if col.is_visible
-        and col.role
-        in (
-            ColumnRole.CATEGORICAL.value,
-            ColumnRole.TEMPORAL.value,
-            ColumnRole.IDENTIFIER.value,
-        )
+        and col.role in (ColumnRole.CATEGORICAL.value, ColumnRole.TEMPORAL.value, ColumnRole.IDENTIFIER.value)
     ]
 
 
-def _get_groupable_columns(
-    schema: SchemaGraph,
-    table_name: str,
-) -> list[str]:
+def _get_groupable_columns(schema: SchemaGraph, table_name: str) -> list[str]:
     """Return `table.column` references suitable for `GROUP BY`."""
     if table_name not in schema.tables:
         return []
@@ -378,19 +349,11 @@ def _get_groupable_columns(
     return [
         f"{table_name}.{c}"
         for c, col in table.columns.items()
-        if col.is_visible
-        and col.role
-        in (
-            ColumnRole.CATEGORICAL.value,
-            ColumnRole.TEMPORAL.value,
-        )
+        if col.is_visible and col.role in (ColumnRole.CATEGORICAL.value, ColumnRole.TEMPORAL.value)
     ]
 
 
-def _get_temporal_columns(
-    schema: SchemaGraph,
-    table_name: str,
-) -> list[str]:
+def _get_temporal_columns(schema: SchemaGraph, table_name: str) -> list[str]:
     """Return `table.column` references for temporal columns."""
     if table_name not in schema.tables:
         return []
@@ -402,10 +365,7 @@ def _get_temporal_columns(
     ]
 
 
-def _get_numeric_measure_columns(
-    schema: SchemaGraph,
-    table_name: str,
-) -> list[str]:
+def _get_numeric_measure_columns(schema: SchemaGraph, table_name: str) -> list[str]:
     """Return `table.column` references for numeric measure columns."""
     if table_name not in schema.tables:
         return []
@@ -417,10 +377,7 @@ def _get_numeric_measure_columns(
     ]
 
 
-def _get_categorical_identifier_columns(
-    schema: SchemaGraph,
-    table_name: str,
-) -> list[str]:
+def _get_categorical_identifier_columns(schema: SchemaGraph, table_name: str) -> list[str]:
     """Return `table.column` references suitable as `PARTITION BY` keys. for windows."""
     if table_name not in schema.tables:
         return []
@@ -428,17 +385,12 @@ def _get_categorical_identifier_columns(
     return [
         f"{table_name}.{c}"
         for c, col in table.columns.items()
-        if col.is_visible
-        and col.role
-        in (
-            ColumnRole.CATEGORICAL.value,
-            ColumnRole.IDENTIFIER.value,
-        )
+        if col.is_visible and col.role in (ColumnRole.CATEGORICAL.value, ColumnRole.IDENTIFIER.value)
     ]
 
 
-def _filter_value_type_and_op_from_metadata(meta: dict[str, Any]) -> tuple[str | None, str]:
-    """Map schema column metadata to a ``FilterParam`` semantic type. and. default comparison op."""
+def _where_value_type_and_op_from_metadata(meta: dict[str, Any]) -> tuple[str | None, str]:
+    """Map schema column metadata to a ``WhereParam`` semantic type. and. default comparison op."""
     if meta.get("element_type"):
         return None, "="
     vt = (meta.get("value_type") or "").strip().lower()
@@ -456,12 +408,7 @@ def _filter_value_type_and_op_from_metadata(meta: dict[str, Any]) -> tuple[str |
     return "string", "="
 
 
-def _rewrite_table_qualifier(
-    intent: SeedWarmupIntent,
-    old_table: str,
-    new_table: str,
-    schema: SchemaGraph,
-) -> bool:
+def _rewrite_table_qualifier(intent: SeedWarmupIntent, old_table: str, new_table: str, schema: SchemaGraph) -> bool:
     """Rewrite qualified ``old_table`` column references to. ``new_table`` when bare names exist."""
     new_tm = schema.tables.get(new_table)
     if new_tm is None:
@@ -476,7 +423,7 @@ def _rewrite_table_qualifier(
             if "." in c:
                 refs.add(c)
 
-    def _note_filter(fp: FilterParam) -> None:
+    def _note_where(fp: WhereParam) -> None:
         _note_expr(fp.left_expr)
         if fp.right_expr:
             _note_expr(fp.right_expr)
@@ -487,9 +434,9 @@ def _rewrite_table_qualifier(
         _note_expr(g)
     for ob in intent.order_by_cols or []:
         _note_expr(ob.expr)
-    for fp in intent.filters_param or []:
-        _note_filter(fp)
-    for hp in intent.having_param or []:
+    for fp in where_leaves(intent.where) or []:
+        _note_where(fp)
+    for hp in having_leaves(intent.having) or []:
         _note_expr(hp.left_expr)
         if hp.right_expr:
             _note_expr(hp.right_expr)
@@ -503,7 +450,7 @@ def _rewrite_table_qualifier(
     for cr in intent.case_registry or []:
         cw = cr.case_when
         for br in cw.branches or []:
-            _note_filter(br.condition)
+            _note_where(br.condition)
             _note_expr(br.result)
         _note_expr(cw.else_result)
 
@@ -530,22 +477,30 @@ def _rewrite_table_qualifier(
     intent.select_cols = [replace(sc, expr=_rex(sc.expr) or sc.expr) for sc in (intent.select_cols or [])]
     intent.group_by_cols = [_rex(g) or g for g in (intent.group_by_cols or [])]
     intent.order_by_cols = [replace(ob, expr=_rex(ob.expr) or ob.expr) for ob in (intent.order_by_cols or [])]
-    intent.filters_param = [
-        replace(
-            fp,
-            left_expr=_rex(fp.left_expr) or fp.left_expr,
-            right_expr=_rex(fp.right_expr) if fp.right_expr else None,
+    if intent.where is not None:
+        intent.where = PredicateGroup(
+            op=intent.where.op,
+            predicates=tuple(
+                replace(
+                    fp,
+                    left_expr=_rex(fp.left_expr) or fp.left_expr,
+                    right_expr=_rex(fp.right_expr) if fp.right_expr else None,
+                )
+                for fp in where_leaves(intent.where)
+            ),
         )
-        for fp in (intent.filters_param or [])
-    ]
-    intent.having_param = [
-        replace(
-            hp,
-            left_expr=_rex(hp.left_expr) or hp.left_expr,
-            right_expr=_rex(hp.right_expr) if hp.right_expr else None,
+    if intent.having is not None:
+        intent.having = PredicateGroup(
+            op=intent.having.op,
+            predicates=tuple(
+                replace(
+                    hp,
+                    left_expr=_rex(hp.left_expr) or hp.left_expr,
+                    right_expr=_rex(hp.right_expr) if hp.right_expr else None,
+                )
+                for hp in having_leaves(intent.having)
+            ),
         )
-        for hp in (intent.having_param or [])
-    ]
     new_wr: list[WindowRegistryStep] = []
     for wr in intent.window_registry or []:
         ws = wr.window_spec
@@ -568,13 +523,7 @@ def _rewrite_table_qualifier(
                 left_expr=_rex(cond.left_expr) or cond.left_expr,
                 right_expr=_rex(cond.right_expr) if cond.right_expr else None,
             )
-            new_branches.append(
-                replace(
-                    br,
-                    condition=new_cond,
-                    result=_rex(br.result) or br.result,
-                )
-            )
+            new_branches.append(replace(br, condition=new_cond, result=_rex(br.result) or br.result))
         new_cw = replace(
             cw,
             branches=new_branches,
@@ -590,17 +539,11 @@ def _get_dimension_tables(schema: SchemaGraph) -> list[str]:
     return [t for t, info in schema.tables.items() if info.role == TableRole.DIMENSION.value]
 
 
-def _add_expansion_metadata(
-    intent: SeedWarmupIntent,
-    operator: str,
-) -> None:
+def _add_expansion_metadata(intent: SeedWarmupIntent, operator: str) -> None:
     """Attach expansion metadata to `intent` in place for `operator`."""
     if intent.expansion_metadata is None:
         intent.expansion_metadata = ExpansionMetadata(
-            parent_intent_id="",
-            operator=operator,
-            depth=1,
-            expansion_path=[operator],
+            parent_intent_id="", operator=operator, depth=1, expansion_path=[operator]
         )
     else:
         intent.expansion_metadata = ExpansionMetadata(
@@ -611,55 +554,47 @@ def _add_expansion_metadata(
         )
 
 
-def _filter_add(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+def _where_add(
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
-    """FILTER_ADD: add one value-based filter per filterable column not yet filtered."""
-    current_filter_cols = {f.left_expr.primary_column for f in (intent.filters_param or [])}
-    if len(current_filter_cols) >= SeedWarmupConfig.MAX_FILTERS:
+    """WHERE_ADD: add one value-based filter per filterable column not yet filtered."""
+    current_where_cols = {f.left_expr.primary_column for f in (where_leaves(intent.where) or [])}
+    if len(current_where_cols) >= SeedWarmupConfig.MAX_WHERE_PREDICATES:
         return []
 
     results: list[SeedWarmupIntent] = []
     for table in intent.tables or []:
         for col in _get_filterable_columns(schema, table):
-            if col in current_filter_cols:
+            if col in current_where_cols:
                 continue
             bare = col.split(".", 1)[1] if "." in col else col
             meta = column_metadata.get(table, {}).get(bare, {})
-            vtype, fop = _filter_value_type_and_op_from_metadata(meta)
+            vtype, fop = _where_value_type_and_op_from_metadata(meta)
             if vtype is None:
                 continue
             new_intent = copy.deepcopy(intent)
-            new_filter = FilterParam(
+            new_filter = WhereParam(
                 left_expr=NormalizedExpr.from_column(col),
                 op=fop,
                 value_type=vtype,
                 param_key=f"f_{col.replace('.', '_')}",
             )
-            new_intent.filters_param = list(new_intent.filters_param or []) + [new_filter]
-            _add_expansion_metadata(new_intent, ExpansionOperatorId.FILTER_ADD)
+            new_intent.where = merge_predicate_groups(
+                "and", [new_intent.where, predicate_group_from_list([new_filter])]
+            )
+            _add_expansion_metadata(new_intent, ExpansionOperatorId.WHERE_ADD)
             results.append(new_intent)
     return results
 
 
-def _filter_expr_add(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+def _where_expr_add(
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
-    """FILTER_EXPR_ADD: add column-vs-column comparisons for same-type column pairs."""
+    """WHERE_EXPR_ADD: add column-vs-column comparisons for same-type column pairs."""
     existing = set()
-    for f in intent.filters_param or []:
+    for f in where_leaves(intent.where) or []:
         if f.right_expr:
-            existing.add(
-                (
-                    f.left_expr.primary_column,
-                    f.op,
-                    f.right_expr.primary_column,
-                )
-            )
+            existing.add((f.left_expr.primary_column, f.op, f.right_expr.primary_column))
     if len(existing) >= SeedWarmupConfig.MAX_EXPR_COMPARISONS:
         return []
 
@@ -699,15 +634,17 @@ def _filter_expr_add(
                 if (left_col, op, right_col) in existing:
                     continue
                 new_intent = copy.deepcopy(intent)
-                new_filter = FilterParam(
+                new_filter = WhereParam(
                     left_expr=NormalizedExpr.from_column(left_col),
                     op=op,
                     right_expr=NormalizedExpr.from_column(right_col),
                     value_type="column",
                     param_key="",
                 )
-                new_intent.filters_param = list(new_intent.filters_param or []) + [new_filter]
-                _add_expansion_metadata(new_intent, ExpansionOperatorId.FILTER_EXPR_ADD)
+                new_intent.where = merge_predicate_groups(
+                    "and", [new_intent.where, predicate_group_from_list([new_filter])]
+                )
+                _add_expansion_metadata(new_intent, ExpansionOperatorId.WHERE_EXPR_ADD)
                 results.append(new_intent)
     return results
 
@@ -723,9 +660,7 @@ def _swap_agg_func(expr: NormalizedExpr, new_agg: str) -> NormalizedExpr:
 
 
 def _agg_change(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """AGG_CHANGE: swap aggregation function on each aggregated select column."""
     results: list[SeedWarmupIntent] = []
@@ -755,9 +690,7 @@ def _agg_change(
 
 
 def _groupby_add(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """GROUPBY_ADD: add one `GROUP BY` column per groupable column not yet grouped."""
     current_gb = {g.primary_column for g in (intent.group_by_cols or [])}
@@ -767,7 +700,7 @@ def _groupby_add(
         return []
 
     has_agg_sel = any(sc.is_aggregated for sc in intent.select_cols or [])
-    has_hav = len(intent.having_param or []) > 0
+    has_hav = len(having_leaves(intent.having) or []) > 0
     if not has_agg_sel and not has_hav:
         return []
 
@@ -778,8 +711,7 @@ def _groupby_add(
                 continue
             new_intent = copy.deepcopy(intent)
             new_intent.group_by_cols = sorted(
-                list(intent.group_by_cols or []) + [NormalizedExpr.from_column(col)],
-                key=lambda g: g.signature_key,
+                list(intent.group_by_cols or []) + [NormalizedExpr.from_column(col)], key=lambda g: g.signature_key
             )
             if new_intent.grain == "row_level":
                 new_intent.grain = "grouped"
@@ -789,9 +721,7 @@ def _groupby_add(
 
 
 def _orderby_add(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """ORDERBY_ADD: add `ORDER BY` for each select or group-by column in ascending and descending order."""
     current_ob = {o.expr.primary_column for o in (intent.order_by_cols or [])}
@@ -812,10 +742,7 @@ def _orderby_add(
             continue
         for direction in ["ASC", "DESC"]:
             new_intent = copy.deepcopy(intent)
-            new_order = OrderByCol(
-                expr=NormalizedExpr.from_column(col),
-                direction=direction,
-            )
+            new_order = OrderByCol(expr=NormalizedExpr.from_column(col), direction=direction)
             new_intent.order_by_cols = list(new_intent.order_by_cols or []) + [new_order]
             _add_expansion_metadata(new_intent, ExpansionOperatorId.ORDERBY_ADD)
             results.append(new_intent)
@@ -823,14 +750,12 @@ def _orderby_add(
 
 
 def _having_value_add(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """HAVING_VALUE_ADD: add `HAVING` with a value threshold for grouped intents."""
     if intent.grain != "grouped" or not intent.group_by_cols:
         return []
-    existing = {(h.left_expr.primary_term, h.op) for h in (intent.having_param or [])}
+    existing = {(h.left_expr.primary_term, h.op) for h in (having_leaves(intent.having) or [])}
     numeric_targets: list[str] = []
     for tbl in intent.tables or []:
         numeric_targets.extend(_get_numeric_measure_columns(schema, tbl))
@@ -852,21 +777,21 @@ def _having_value_add(
                 value_type="number",
                 param_key=f"h_{agg_func}_{op.replace('<', 'lt').replace('>', 'gt').replace('=', 'e')}",
             )
-            new_intent.having_param = list(new_intent.having_param or []) + [new_having]
+            new_intent.having = merge_predicate_groups(
+                "and", [new_intent.having, predicate_group_from_list([new_having])]
+            )
             _add_expansion_metadata(new_intent, ExpansionOperatorId.HAVING_VALUE_ADD)
             results.append(new_intent)
     return results
 
 
 def _having_expr_add(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """HAVING_EXPR_ADD: add `HAVING` aggregate-vs-aggregate comparisons for grouped intents."""
     if intent.grain != "grouped" or not intent.group_by_cols:
         return []
-    existing = {(h.left_expr.primary_term, h.op) for h in (intent.having_param or [])}
+    existing = {(h.left_expr.primary_term, h.op) for h in (having_leaves(intent.having) or [])}
     agg_cols = [sc.expr.primary_column for sc in (intent.select_cols or []) if sc.is_aggregated]
     numeric_targets: list[str] = []
     for tbl in intent.tables or []:
@@ -899,35 +824,31 @@ def _having_expr_add(
             value_type="expression",
             param_key="",
         )
-        new_intent.having_param = list(new_intent.having_param or []) + [new_having]
+        new_intent.having = merge_predicate_groups("and", [new_intent.having, predicate_group_from_list([new_having])])
         _add_expansion_metadata(new_intent, ExpansionOperatorId.HAVING_EXPR_ADD)
         results.append(new_intent)
     return results
 
 
-def _filter_remove(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+def _where_remove(
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
-    """FILTER_REMOVE: remove each filter one at a time."""
-    current = intent.filters_param or []
+    """WHERE_REMOVE: remove each filter one at a time."""
+    current = where_leaves(intent.where) or []
     if not current:
         return []
     results: list[SeedWarmupIntent] = []
     for i in range(len(current)):
         new_intent = copy.deepcopy(intent)
-        fp = list(new_intent.filters_param or [])
-        new_intent.filters_param = list(fp[:i] + fp[i + 1 :])
-        _add_expansion_metadata(new_intent, ExpansionOperatorId.FILTER_REMOVE)
+        _where_leaves = list(where_leaves(new_intent.where) or [])
+        new_intent.where = predicate_group_from_list(_where_leaves[:i] + _where_leaves[i + 1 :])
+        _add_expansion_metadata(new_intent, ExpansionOperatorId.WHERE_REMOVE)
         results.append(new_intent)
     return results
 
 
 def _groupby_remove(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """GROUPBY_REMOVE: remove each `GROUP BY` column one at a time when more than one exists."""
     current = list(intent.group_by_cols or [])
@@ -944,19 +865,17 @@ def _groupby_remove(
 
 
 def _having_remove(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """HAVING_REMOVE: remove each `HAVING` condition one at a time."""
-    current = intent.having_param or []
+    current = having_leaves(intent.having) or []
     if not current:
         return []
     results: list[SeedWarmupIntent] = []
     for i in range(len(current)):
         new_intent = copy.deepcopy(intent)
-        hp = list(new_intent.having_param or [])
-        new_intent.having_param = list(hp[:i] + hp[i + 1 :])
+        _having_leaves = list(having_leaves(new_intent.having) or [])
+        new_intent.having = predicate_group_from_list(_having_leaves[:i] + _having_leaves[i + 1 :])
         _add_expansion_metadata(new_intent, ExpansionOperatorId.HAVING_REMOVE)
         results.append(new_intent)
     return results
@@ -1052,10 +971,7 @@ def _join_fact_add(
                     seen_targets.add(other_table)
                     new_intent = copy.deepcopy(intent)
                     new_intent.tables = sorted(new_tables)
-                    _add_expansion_metadata(
-                        new_intent,
-                        ExpansionOperatorId.JOIN_FACT_ADD,
-                    )
+                    _add_expansion_metadata(new_intent, ExpansionOperatorId.JOIN_FACT_ADD)
                     results.append(new_intent)
                     break
     return results
@@ -1161,16 +1077,18 @@ def _table_remove(
                         return True
             return False
 
-        new_filters: list[FilterParam] = []
-        for f in new_intent.filters_param or []:
+        new_filters: list[WhereParam] = []
+        for f in where_leaves(new_intent.where) or []:
             if _table_from_column_ref(f.left_expr.primary_column) not in ts:
                 continue
             if f.right_expr and _table_from_column_ref(f.right_expr.primary_column) == table:
                 continue
             new_filters.append(f)
-        new_intent.filters_param = new_filters
+        new_intent.where = predicate_group_from_list(new_filters)
 
-        new_intent.having_param = [h for h in (new_intent.having_param or []) if not _having_refs_removed_table(h)]
+        new_intent.having = predicate_group_from_list(
+            [h for h in (having_leaves(new_intent.having) or []) if not _having_refs_removed_table(h)]
+        )
 
         dropped_win: set[str] = {
             wr.registry_id for wr in (new_intent.window_registry or []) if _window_refs_removed_table(wr.window_spec)
@@ -1255,18 +1173,13 @@ def _bridge_intermediate_add(
             continue
         new_intent = copy.deepcopy(intent)
         new_intent.tables = sorted(new_tables)
-        _add_expansion_metadata(
-            new_intent,
-            ExpansionOperatorId.BRIDGE_INTERMEDIATE_ADD,
-        )
+        _add_expansion_metadata(new_intent, ExpansionOperatorId.BRIDGE_INTERMEDIATE_ADD)
         results.append(new_intent)
     return results
 
 
 def _include_gold(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """INCLUDE_GOLD: include the gold intent unchanged with expansion metadata stamped."""
     gold_copy = copy.deepcopy(intent)
@@ -1275,9 +1188,7 @@ def _include_gold(
 
 
 def _temp_extract_groupby(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """TEMP_EXTRACT_GROUPBY: wrap temporal columns with `extract(unit)` in select and group-by lists."""
     if intent.grain == "scalar":
@@ -1288,30 +1199,20 @@ def _temp_extract_groupby(
             for unit in SeedWarmupConfig.EXTRACT_EXPANSION_UNITS:
                 new_intent = copy.deepcopy(intent)
                 extract_expr = NormalizedExpr.from_column(col)
-                extract_expr = replace(
-                    extract_expr,
-                    scalar_func="extract",
-                    scalar_func_args=[unit],
-                )
+                extract_expr = replace(extract_expr, scalar_func="extract", scalar_func_args=[unit])
                 new_intent.select_cols = list(new_intent.select_cols or []) + [SelectCol(expr=extract_expr)]
                 new_intent.group_by_cols = sorted(
-                    list(new_intent.group_by_cols or []) + [extract_expr],
-                    key=lambda g: g.signature_key,
+                    list(new_intent.group_by_cols or []) + [extract_expr], key=lambda g: g.signature_key
                 )
                 if new_intent.grain == "row_level":
                     new_intent.grain = "grouped"
-                _add_expansion_metadata(
-                    new_intent,
-                    ExpansionOperatorId.TEMP_EXTRACT_GROUPBY,
-                )
+                _add_expansion_metadata(new_intent, ExpansionOperatorId.TEMP_EXTRACT_GROUPBY)
                 results.append(new_intent)
     return results
 
 
 def _temp_date_trunc_groupby(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """TEMP_DATE_TRUNC_GROUPBY: wrap temporal columns with `date_trunc(unit)` in group-by and select lists."""
     if intent.grain == "scalar":
@@ -1322,94 +1223,78 @@ def _temp_date_trunc_groupby(
             for unit in SeedWarmupConfig.DATE_TRUNC_EXPANSION_UNITS:
                 new_intent = copy.deepcopy(intent)
                 trunc_expr = NormalizedExpr.from_column(col)
-                trunc_expr = replace(
-                    trunc_expr,
-                    scalar_func="date_trunc",
-                    scalar_func_args=[unit],
-                )
+                trunc_expr = replace(trunc_expr, scalar_func="date_trunc", scalar_func_args=[unit])
                 new_intent.select_cols = list(new_intent.select_cols or []) + [SelectCol(expr=trunc_expr)]
                 new_intent.group_by_cols = sorted(
-                    list(new_intent.group_by_cols or []) + [trunc_expr],
-                    key=lambda g: g.signature_key,
+                    list(new_intent.group_by_cols or []) + [trunc_expr], key=lambda g: g.signature_key
                 )
                 if new_intent.grain == "row_level":
                     new_intent.grain = "grouped"
-                _add_expansion_metadata(
-                    new_intent,
-                    ExpansionOperatorId.TEMP_DATE_TRUNC_GROUPBY,
-                )
+                _add_expansion_metadata(new_intent, ExpansionOperatorId.TEMP_DATE_TRUNC_GROUPBY)
                 results.append(new_intent)
     return results
 
 
 def _temp_date_window_filter(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
-    """TEMP_DATE_WINDOW_FILTER: add `date_window` filters on temporal columns using config presets."""
-    current_filter_cols = {f.left_expr.primary_column for f in (intent.filters_param or [])}
-    if len(current_filter_cols) >= SeedWarmupConfig.MAX_FILTERS:
+    """TEMP_DATE_WINDOW_WHERE: add `date_window` filters on temporal columns using config presets."""
+    current_where_cols = {f.left_expr.primary_column for f in (where_leaves(intent.where) or [])}
+    if len(current_where_cols) >= SeedWarmupConfig.MAX_WHERE_PREDICATES:
         return []
     results: list[SeedWarmupIntent] = []
     for table in intent.tables or []:
         for col in _get_temporal_columns(schema, table):
-            if col in current_filter_cols:
+            if col in current_where_cols:
                 continue
             for preset in SeedWarmupConfig.DATE_WINDOW_EXPANSION_PRESETS:
                 new_intent = copy.deepcopy(intent)
-                new_filter = FilterParam(
+                new_filter = WhereParam(
                     left_expr=NormalizedExpr.from_column(col),
                     op=">=",
                     value_type="date_window",
                     param_key="",
                     raw_value=dict(preset),
                 )
-                new_intent.filters_param = list(new_intent.filters_param or []) + [new_filter]
-                _add_expansion_metadata(
-                    new_intent,
-                    ExpansionOperatorId.TEMP_DATE_WINDOW_FILTER,
+                new_intent.where = merge_predicate_groups(
+                    "and", [new_intent.where, predicate_group_from_list([new_filter])]
                 )
+                _add_expansion_metadata(new_intent, ExpansionOperatorId.TEMP_DATE_WINDOW_WHERE)
                 results.append(new_intent)
     return results
 
 
 def _temp_date_diff_filter(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
-    """TEMP_DATE_DIFF_FILTER: add `date_diff` filters on temporal columns using config presets."""
-    current_filter_cols = {f.left_expr.primary_column for f in (intent.filters_param or [])}
-    if len(current_filter_cols) >= SeedWarmupConfig.MAX_FILTERS:
+    """TEMP_DATE_DIFF_WHERE: add `date_diff` filters on temporal columns using config presets."""
+    current_where_cols = {f.left_expr.primary_column for f in (where_leaves(intent.where) or [])}
+    if len(current_where_cols) >= SeedWarmupConfig.MAX_WHERE_PREDICATES:
         return []
     results: list[SeedWarmupIntent] = []
     for table in intent.tables or []:
         for col in _get_temporal_columns(schema, table):
-            if col in current_filter_cols:
+            if col in current_where_cols:
                 continue
             for preset in SeedWarmupConfig.DATE_DIFF_EXPANSION_PRESETS:
                 new_intent = copy.deepcopy(intent)
-                new_filter = FilterParam(
+                new_filter = WhereParam(
                     left_expr=NormalizedExpr.from_column(col),
                     op="<=",
                     value_type="date_diff",
                     param_key="",
                     raw_value=dict(preset),
                 )
-                new_intent.filters_param = list(new_intent.filters_param or []) + [new_filter]
-                _add_expansion_metadata(
-                    new_intent,
-                    ExpansionOperatorId.TEMP_DATE_DIFF_FILTER,
+                new_intent.where = merge_predicate_groups(
+                    "and", [new_intent.where, predicate_group_from_list([new_filter])]
                 )
+                _add_expansion_metadata(new_intent, ExpansionOperatorId.TEMP_DATE_DIFF_WHERE)
                 results.append(new_intent)
     return results
 
 
 def _num_round_select(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """NUM_ROUND_SELECT: wrap numeric-measure select columns with `round`."""
     numeric_cols: set[str] = set()
@@ -1423,11 +1308,7 @@ def _num_round_select(
         if sc.expr.scalar_func == "round":
             continue
         new_intent = copy.deepcopy(intent)
-        new_expr = replace(
-            new_intent.select_cols[idx].expr,
-            scalar_func="round",
-            scalar_func_args=[0],
-        )
+        new_expr = replace(new_intent.select_cols[idx].expr, scalar_func="round", scalar_func_args=[0])
         new_intent.select_cols[idx] = SelectCol(expr=new_expr)
         _add_expansion_metadata(new_intent, ExpansionOperatorId.NUM_ROUND_SELECT)
         results.append(new_intent)
@@ -1435,13 +1316,11 @@ def _num_round_select(
 
 
 def _num_abs_filter(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
-    """NUM_ABS_FILTER: wrap numeric filter left-hand expressions with `abs` for range operators."""
+    """NUM_ABS_WHERE: wrap numeric filter left-hand expressions with `abs` for range operators."""
     results: list[SeedWarmupIntent] = []
-    for idx, f in enumerate(intent.filters_param or []):
+    for idx, f in enumerate(where_leaves(intent.where) or []):
         if f.op not in (">", "<", ">=", "<="):
             continue
         if f.left_expr.scalar_func == "abs":
@@ -1455,23 +1334,17 @@ def _num_abs_filter(
         if col_info.get("role") != ColumnRole.NUMERIC_MEASURE.value:
             continue
         new_intent = copy.deepcopy(intent)
-        new_expr = replace(
-            new_intent.filters_param[idx].left_expr,
-            scalar_func="abs",
-        )
-        new_intent.filters_param[idx] = replace(
-            new_intent.filters_param[idx],
-            left_expr=new_expr,
-        )
-        _add_expansion_metadata(new_intent, ExpansionOperatorId.NUM_ABS_FILTER)
+        _where_leaves = list(where_leaves(new_intent.where) or [])
+        new_expr = replace(_where_leaves[idx].left_expr, scalar_func="abs")
+        _where_leaves[idx] = replace(_where_leaves[idx], left_expr=new_expr)
+        new_intent.where = predicate_group_from_list(_where_leaves)
+        _add_expansion_metadata(new_intent, ExpansionOperatorId.NUM_ABS_WHERE)
         results.append(new_intent)
     return results
 
 
 def _distinct_add(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """DISTINCT_ADD: set ``distinct_select_index`` to the first select column when not already distinct."""
     if intent.distinct_select_index >= 0:
@@ -1484,9 +1357,7 @@ def _distinct_add(
 
 
 def _limit_add(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """LIMIT_ADD: add `limit` using representative values from config."""
     if intent.limit is not None:
@@ -1500,13 +1371,11 @@ def _limit_add(
     return results
 
 
-def _filter_or_group(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+def _where_or_group(
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
-    """FILTER_OR_GROUP: convert pairs of existing conjunctive filters into OR groups."""
-    filters = intent.filters_param or []
+    """WHERE_OR_GROUP: convert pairs of existing conjunctive filters into OR groups."""
+    filters = where_leaves(intent.where) or []
     if len(filters) < 2:
         return []
     results: list[SeedWarmupIntent] = []
@@ -1520,28 +1389,19 @@ def _filter_or_group(
             if fj.value_type in ("date_window", "date_diff"):
                 continue
             new_intent = copy.deepcopy(intent)
-            next_group = max((fp.filter_group or 0) for fp in filters) + 1
-            new_fi = replace(
-                new_intent.filters_param[i],
-                bool_op="OR",
-                filter_group=next_group,
-            )
-            new_fj = replace(
-                new_intent.filters_param[j],
-                bool_op="OR",
-                filter_group=next_group,
-            )
-            new_intent.filters_param[i] = new_fi
-            new_intent.filters_param[j] = new_fj
-            _add_expansion_metadata(new_intent, ExpansionOperatorId.FILTER_OR_GROUP)
+            _where_leaves = list(where_leaves(new_intent.where) or [])
+            new_fi, new_fj = _where_leaves[i], _where_leaves[j]
+            del _where_leaves[j]
+            del _where_leaves[i]
+            or_group = PredicateGroup(op="or", predicates=(new_fi, new_fj))
+            new_intent.where = merge_predicate_groups("and", [predicate_group_from_list(_where_leaves), or_group])
+            _add_expansion_metadata(new_intent, ExpansionOperatorId.WHERE_OR_GROUP)
             results.append(new_intent)
     return results
 
 
 def _window_rank_add(
-    intent: SeedWarmupIntent,
-    _schema: SchemaGraph,
-    _column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, _schema: SchemaGraph, _column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """WINDOW_RANK_ADD: add `row_number` over group keys ordered by a select aggregate for grouped grain."""
     if _intent_has_window_select(intent):
@@ -1567,9 +1427,7 @@ def _window_rank_add(
 
 
 def _window_sum_partition_add(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    _column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, _column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """WINDOW_SUM_PARTITION_ADD: add `sum(measure) over (partition by dim)` style window columns for row-level grain."""
     if _intent_has_window_select(intent):
@@ -1598,9 +1456,7 @@ def _window_sum_partition_add(
 
 
 def _select_expr_pair_multiply(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """SELECT_EXPR_PAIR_MULTIPLY: add composed multiply-group expressions from numeric column pairs in select."""
     if intent.grain == "grouped":
@@ -1622,9 +1478,9 @@ def _select_expr_pair_multiply(
                         multiply=[
                             NormalizedExpr.from_column(column),
                             NormalizedExpr.from_column(other_column),
-                        ],
+                        ]
                     ),
-                ],
+                ]
             )
             new_intent.select_cols = list(new_intent.select_cols or []) + [SelectCol(expr=composed)]
             _add_expansion_metadata(new_intent, ExpansionOperatorId.SELECT_EXPR_PAIR_MULTIPLY)
@@ -1633,9 +1489,7 @@ def _select_expr_pair_multiply(
 
 
 def _select_case_label_add(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """Append a numeric-labeled CASE over one measure column (threshold. vs else)."""
     _ = column_metadata
@@ -1645,20 +1499,14 @@ def _select_case_label_add(
     for table in intent.tables or []:
         for col in _get_numeric_measure_columns(schema, table):
             new_intent = copy.deepcopy(intent)
-            cond = FilterParam(
+            cond = WhereParam(
                 left_expr=NormalizedExpr.from_column(col),
                 op=">",
                 value_type="numeric",
                 param_key=f"case_thr_{col.replace('.', '_')}",
             )
-            branch = CaseWhenBranch(
-                condition=cond,
-                result=NormalizedExpr(add_values=[ExprValue(value=1.0)]),
-            )
-            cw = CaseWhenExpr(
-                branches=[branch],
-                else_result=NormalizedExpr(add_values=[ExprValue(value=0.0)]),
-            )
+            branch = CaseWhenBranch(condition=cond, result=NormalizedExpr(add_values=[ExprValue(value=1.0)]))
+            cw = CaseWhenExpr(branches=[branch], else_result=NormalizedExpr(add_values=[ExprValue(value=0.0)]))
             _append_case_registry_column(new_intent, cw)
             _add_expansion_metadata(new_intent, ExpansionOperatorId.SELECT_CASE_LABEL_ADD)
             fin = _finalize_registry_touch_seed(new_intent, schema)
@@ -1668,9 +1516,7 @@ def _select_case_label_add(
 
 
 def _window_lag_add(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    _column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, _column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """Add a `lag` window column over row-level intents (partition + temporal order)."""
     if _intent_has_window_select(intent):
@@ -1703,9 +1549,7 @@ def _window_lag_add(
 
 
 def _window_lead_add(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """Add a `lead` window column (same shape as `_window_lag_add`)."""
     lag_variants = _window_lag_add(intent, schema, column_metadata)
@@ -1727,17 +1571,15 @@ def _window_lead_add(
     return results
 
 
-def _filter_ilike_add(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+def _where_ilike_add(
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """Add case-insensitive `ilike` filters on categorical string. columns (PostgreSQL only)."""
     _ = column_metadata
-    if "ilike" not in extra_filter_ops_for_engine():
+    if "ilike" not in extra_where_ops_for_engine():
         return []
-    current_filter_cols = {f.left_expr.primary_column for f in (intent.filters_param or [])}
-    if len(current_filter_cols) >= SeedWarmupConfig.MAX_FILTERS:
+    current_where_cols = {f.left_expr.primary_column for f in (where_leaves(intent.where) or [])}
+    if len(current_where_cols) >= SeedWarmupConfig.MAX_WHERE_PREDICATES:
         return []
     results: list[SeedWarmupIntent] = []
     for table in intent.tables or []:
@@ -1745,34 +1587,31 @@ def _filter_ilike_add(
             continue
         for col_name, col in schema.tables[table].columns.items():
             full = f"{table}.{col_name}"
-            if full in current_filter_cols:
+            if full in current_where_cols:
                 continue
             if col.role != ColumnRole.CATEGORICAL.value:
                 continue
             if col.value_type not in ("string", "categorical", ""):
                 continue
             new_intent = copy.deepcopy(intent)
-            new_filter = FilterParam(
-                left_expr=NormalizedExpr.from_column(full),
-                op="ilike",
-                value_type="string",
-                param_key=f"ilk_{col_name}",
+            new_filter = WhereParam(
+                left_expr=NormalizedExpr.from_column(full), op="ilike", value_type="string", param_key=f"ilk_{col_name}"
             )
-            new_intent.filters_param = list(new_intent.filters_param or []) + [new_filter]
-            _add_expansion_metadata(new_intent, ExpansionOperatorId.FILTER_ILIKE_ADD)
+            new_intent.where = merge_predicate_groups(
+                "and", [new_intent.where, predicate_group_from_list([new_filter])]
+            )
+            _add_expansion_metadata(new_intent, ExpansionOperatorId.WHERE_ILIKE_ADD)
             results.append(new_intent)
     return results
 
 
-def _filter_array_contains_add(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+def _where_array_contains_add(
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """Add `contains` filters for columns that declare an array. `element_type`."""
     _ = column_metadata
-    current_filter_cols = {f.left_expr.primary_column for f in (intent.filters_param or [])}
-    if len(current_filter_cols) >= SeedWarmupConfig.MAX_FILTERS:
+    current_where_cols = {f.left_expr.primary_column for f in (where_leaves(intent.where) or [])}
+    if len(current_where_cols) >= SeedWarmupConfig.MAX_WHERE_PREDICATES:
         return []
     results: list[SeedWarmupIntent] = []
     for table in intent.tables or []:
@@ -1782,25 +1621,25 @@ def _filter_array_contains_add(
             if not col.element_type:
                 continue
             full = f"{table}.{col_name}"
-            if full in current_filter_cols:
+            if full in current_where_cols:
                 continue
             new_intent = copy.deepcopy(intent)
-            new_filter = FilterParam(
+            new_filter = WhereParam(
                 left_expr=NormalizedExpr.from_column(full),
                 op="contains",
                 value_type="array",
                 param_key=f"arr_{col_name}",
             )
-            new_intent.filters_param = list(new_intent.filters_param or []) + [new_filter]
-            _add_expansion_metadata(new_intent, ExpansionOperatorId.FILTER_ARRAY_CONTAINS_ADD)
+            new_intent.where = merge_predicate_groups(
+                "and", [new_intent.where, predicate_group_from_list([new_filter])]
+            )
+            _add_expansion_metadata(new_intent, ExpansionOperatorId.WHERE_ARRAY_CONTAINS_ADD)
             results.append(new_intent)
     return results
 
 
 def _orderby_remove(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """Remove the last `ORDER BY` column when present."""
     _ = schema, column_metadata
@@ -1814,9 +1653,7 @@ def _orderby_remove(
 
 
 def _limit_remove(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """Clear a set `limit` when present."""
     _ = schema, column_metadata
@@ -1829,9 +1666,7 @@ def _limit_remove(
 
 
 def _select_col_trim(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """Drop one non-aggregated select column when multiple exist."""
     _ = schema, column_metadata
@@ -1853,9 +1688,7 @@ def _select_col_trim(
 
 
 def _window_strip(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """Remove select columns that only carry a window specification."""
     _ = schema, column_metadata
@@ -1902,9 +1735,7 @@ def _window_strip(
 
 
 def _distinct_remove(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """Turn off ``distinct_select_index`` when it is set on the intent."""
     _ = schema, column_metadata
@@ -1928,98 +1759,110 @@ def _splice_subtree(
         return []
     idx = hash(intent.intent_id or "") % len(_EXPANSION_SUBTREE_POOL)
     donor = _EXPANSION_SUBTREE_POOL[idx]
-    fps = donor.filters_param or []
+    fps = where_leaves(donor.where) or []
     if not fps:
         return []
     overlap = set(intent.tables or []) & set(donor.tables or [])
     if not overlap:
         return []
     new_intent = copy.deepcopy(intent)
-    new_intent.filters_param = list(new_intent.filters_param or []) + [copy.deepcopy(fps[0])]
+    new_intent.where = merge_predicate_groups(
+        "and", [new_intent.where, predicate_group_from_list([copy.deepcopy(fps[0])])]
+    )
     _add_expansion_metadata(new_intent, ExpansionOperatorId.SPLICE_SUBTREE)
     return [new_intent]
 
 
-def _filter_null_add(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+def _where_null_add(
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
-    """FILTER_NULL_ADD: add IS NULL filters on nullable columns."""
+    """WHERE_NULL_ADD: add IS NULL filters on nullable columns."""
     _ = schema
-    current_filter_cols = {f.left_expr.primary_column for f in (intent.filters_param or [])}
-    if len(current_filter_cols) >= SeedWarmupConfig.MAX_FILTERS:
+    current_where_cols = {f.left_expr.primary_column for f in (where_leaves(intent.where) or [])}
+    if len(current_where_cols) >= SeedWarmupConfig.MAX_WHERE_PREDICATES:
         return []
     results: list[SeedWarmupIntent] = []
     for table in intent.tables or []:
         for col in _get_filterable_columns(schema, table):
-            if col in current_filter_cols:
+            if col in current_where_cols:
                 continue
             bare = col.split(".", 1)[1] if "." in col else col
             meta = column_metadata.get(table, {}).get(bare, {})
             if not meta.get("nullable"):
                 continue
             new_intent = copy.deepcopy(intent)
-            new_intent.filters_param = list(new_intent.filters_param or []) + [
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column(col),
-                    op="is null",
-                    value_type="null",
-                    param_key=f"null_{col.replace('.', '_')}",
-                ),
-            ]
-            _add_expansion_metadata(new_intent, ExpansionOperatorId.FILTER_NULL_ADD)
+            new_intent.where = merge_predicate_groups(
+                "and",
+                [
+                    new_intent.where,
+                    predicate_group_from_list(
+                        [
+                            WhereParam(
+                                left_expr=NormalizedExpr.from_column(col),
+                                op="is null",
+                                value_type="null",
+                                param_key=f"null_{col.replace('.', '_')}",
+                            ),
+                        ]
+                    ),
+                ],
+            )
+            _add_expansion_metadata(new_intent, ExpansionOperatorId.WHERE_NULL_ADD)
             results.append(new_intent)
     return results
 
 
-def _filter_not_null_add(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+def _where_not_null_add(
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
-    """FILTER_NOT_NULL_ADD: add IS NOT NULL filters on nullable columns."""
+    """WHERE_NOT_NULL_ADD: add IS NOT NULL filters on nullable columns."""
     _ = schema
-    current_filter_cols = {f.left_expr.primary_column for f in (intent.filters_param or [])}
-    if len(current_filter_cols) >= SeedWarmupConfig.MAX_FILTERS:
+    current_where_cols = {f.left_expr.primary_column for f in (where_leaves(intent.where) or [])}
+    if len(current_where_cols) >= SeedWarmupConfig.MAX_WHERE_PREDICATES:
         return []
     results: list[SeedWarmupIntent] = []
     for table in intent.tables or []:
         for col in _get_filterable_columns(schema, table):
-            if col in current_filter_cols:
+            if col in current_where_cols:
                 continue
             bare = col.split(".", 1)[1] if "." in col else col
             meta = column_metadata.get(table, {}).get(bare, {})
             if not meta.get("nullable"):
                 continue
             new_intent = copy.deepcopy(intent)
-            new_intent.filters_param = list(new_intent.filters_param or []) + [
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column(col),
-                    op="is not null",
-                    value_type="null",
-                    param_key=f"notnull_{col.replace('.', '_')}",
-                ),
-            ]
-            _add_expansion_metadata(new_intent, ExpansionOperatorId.FILTER_NOT_NULL_ADD)
+            new_intent.where = merge_predicate_groups(
+                "and",
+                [
+                    new_intent.where,
+                    predicate_group_from_list(
+                        [
+                            WhereParam(
+                                left_expr=NormalizedExpr.from_column(col),
+                                op="is not null",
+                                value_type="null",
+                                param_key=f"notnull_{col.replace('.', '_')}",
+                            ),
+                        ]
+                    ),
+                ],
+            )
+            _add_expansion_metadata(new_intent, ExpansionOperatorId.WHERE_NOT_NULL_ADD)
             results.append(new_intent)
     return results
 
 
-def _filter_in_list_add(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+def _where_in_list_add(
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
-    """FILTER_IN_LIST_ADD: add IN-list filters using profiled categorical samples."""
+    """WHERE_IN_LIST_ADD: add IN-list filters using profiled categorical samples."""
     _ = schema
-    current_filter_cols = {f.left_expr.primary_column for f in (intent.filters_param or [])}
-    if len(current_filter_cols) >= SeedWarmupConfig.MAX_FILTERS:
+    current_where_cols = {f.left_expr.primary_column for f in (where_leaves(intent.where) or [])}
+    if len(current_where_cols) >= SeedWarmupConfig.MAX_WHERE_PREDICATES:
         return []
     results: list[SeedWarmupIntent] = []
     for table in intent.tables or []:
         for col in _get_filterable_columns(schema, table):
-            if col in current_filter_cols:
+            if col in current_where_cols:
                 continue
             bare = col.split(".", 1)[1] if "." in col else col
             meta = column_metadata.get(table, {}).get(bare, {})
@@ -2033,34 +1876,40 @@ def _filter_in_list_add(
                 continue
             pick = [str(v) for v in samples[:3]]
             new_intent = copy.deepcopy(intent)
-            new_intent.filters_param = list(new_intent.filters_param or []) + [
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column(col),
-                    op="in",
-                    value_type="string_list",
-                    param_key=f"in_{col.replace('.', '_')}",
-                    raw_value=cast(RawValue, pick),
-                ),
-            ]
-            _add_expansion_metadata(new_intent, ExpansionOperatorId.FILTER_IN_LIST_ADD)
+            new_intent.where = merge_predicate_groups(
+                "and",
+                [
+                    new_intent.where,
+                    predicate_group_from_list(
+                        [
+                            WhereParam(
+                                left_expr=NormalizedExpr.from_column(col),
+                                op="in",
+                                value_type="string_list",
+                                param_key=f"in_{col.replace('.', '_')}",
+                                raw_value=cast(RawValue, pick),
+                            ),
+                        ]
+                    ),
+                ],
+            )
+            _add_expansion_metadata(new_intent, ExpansionOperatorId.WHERE_IN_LIST_ADD)
             results.append(new_intent)
     return results
 
 
-def _filter_like_add(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+def _where_like_add(
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
-    """FILTER_LIKE_ADD: add LIKE pattern filters on categorical string columns."""
+    """WHERE_LIKE_ADD: add LIKE pattern filters on categorical string columns."""
     _ = schema
-    current_filter_cols = {f.left_expr.primary_column for f in (intent.filters_param or [])}
-    if len(current_filter_cols) >= SeedWarmupConfig.MAX_FILTERS:
+    current_where_cols = {f.left_expr.primary_column for f in (where_leaves(intent.where) or [])}
+    if len(current_where_cols) >= SeedWarmupConfig.MAX_WHERE_PREDICATES:
         return []
     results: list[SeedWarmupIntent] = []
     for table in intent.tables or []:
         for col in _get_filterable_columns(schema, table):
-            if col in current_filter_cols:
+            if col in current_where_cols:
                 continue
             bare = col.split(".", 1)[1] if "." in col else col
             meta = column_metadata.get(table, {}).get(bare, {})
@@ -2072,24 +1921,30 @@ def _filter_like_add(
                 continue
             pattern = f"%{sample[:3]}%"
             new_intent = copy.deepcopy(intent)
-            new_intent.filters_param = list(new_intent.filters_param or []) + [
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column(col),
-                    op="like",
-                    value_type="string",
-                    param_key=f"like_{col.replace('.', '_')}",
-                    raw_value=pattern,
-                ),
-            ]
-            _add_expansion_metadata(new_intent, ExpansionOperatorId.FILTER_LIKE_ADD)
+            new_intent.where = merge_predicate_groups(
+                "and",
+                [
+                    new_intent.where,
+                    predicate_group_from_list(
+                        [
+                            WhereParam(
+                                left_expr=NormalizedExpr.from_column(col),
+                                op="like",
+                                value_type="string",
+                                param_key=f"like_{col.replace('.', '_')}",
+                                raw_value=pattern,
+                            ),
+                        ]
+                    ),
+                ],
+            )
+            _add_expansion_metadata(new_intent, ExpansionOperatorId.WHERE_LIKE_ADD)
             results.append(new_intent)
     return results
 
 
 def _having_match_select_agg(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """HAVING_MATCH_SELECT_AGG: add HAVING thresholds on aggregates already present in SELECT."""
     _ = schema, column_metadata
@@ -2098,7 +1953,7 @@ def _having_match_select_agg(
     agg_cols = [sc for sc in (intent.select_cols or []) if sc.is_aggregated]
     if not agg_cols:
         return []
-    existing = {(h.left_expr.primary_term, h.op) for h in (intent.having_param or [])}
+    existing = {(h.left_expr.primary_term, h.op) for h in (having_leaves(intent.having) or [])}
     results: list[SeedWarmupIntent] = []
     for sc in agg_cols:
         left_term = sc.expr.primary_term
@@ -2114,16 +1969,16 @@ def _having_match_select_agg(
                 value_type="number",
                 param_key=f"hmatch_{op.replace('<', 'lt').replace('>', 'gt').replace('=', 'e')}",
             )
-            new_intent.having_param = list(new_intent.having_param or []) + [new_having]
+            new_intent.having = merge_predicate_groups(
+                "and", [new_intent.having, predicate_group_from_list([new_having])]
+            )
             _add_expansion_metadata(new_intent, ExpansionOperatorId.HAVING_MATCH_SELECT_AGG)
             results.append(new_intent)
     return results
 
 
 def _count_distinct_add(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """COUNT_DISTINCT_ADD: add count(distinct identifier) select columns."""
     _ = column_metadata
@@ -2133,12 +1988,8 @@ def _count_distinct_add(
             new_intent = copy.deepcopy(intent)
             expr = NormalizedExpr(
                 add_groups=[
-                    MulGroup(
-                        multiply=[NormalizedExpr.from_column(col)],
-                        agg_func="count",
-                        distinct=True,
-                    ),
-                ],
+                    MulGroup(multiply=[NormalizedExpr.from_column(col)], agg_func="count", distinct=True),
+                ]
             )
             new_intent.select_cols = list(new_intent.select_cols or []) + [SelectCol(expr=expr)]
             _add_expansion_metadata(new_intent, ExpansionOperatorId.COUNT_DISTINCT_ADD)
@@ -2147,9 +1998,7 @@ def _count_distinct_add(
 
 
 def _case_categorical_add(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """CASE_CATEGORICAL_ADD: append string-labeled CASE branches from profiled categorical values."""
     _ = column_metadata
@@ -2165,21 +2014,15 @@ def _case_categorical_add(
                 continue
             label_val = str(samples[0])
             new_intent = copy.deepcopy(intent)
-            cond = FilterParam(
+            cond = WhereParam(
                 left_expr=NormalizedExpr.from_column(col),
                 op="=",
                 value_type="string",
                 param_key=f"case_cat_{col.replace('.', '_')}",
                 raw_value=label_val,
             )
-            branch = CaseWhenBranch(
-                condition=cond,
-                result=NormalizedExpr(raw_sql=f"'label_{label_val[:12]}'"),
-            )
-            cw = CaseWhenExpr(
-                branches=[branch],
-                else_result=NormalizedExpr(raw_sql="'other'"),
-            )
+            branch = CaseWhenBranch(condition=cond, result=NormalizedExpr(raw_sql=f"'label_{label_val[:12]}'"))
+            cw = CaseWhenExpr(branches=[branch], else_result=NormalizedExpr(raw_sql="'other'"))
             _append_case_registry_column(new_intent, cw)
             _add_expansion_metadata(new_intent, ExpansionOperatorId.CASE_CATEGORICAL_ADD)
             fin = _finalize_registry_touch_seed(new_intent, schema)
@@ -2189,9 +2032,7 @@ def _case_categorical_add(
 
 
 def _cte_wrap_grouped(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """CTE_WRAP_GROUPED: wrap the grouped body in ``cte1`` and query it from the outer scope."""
     _ = schema, column_metadata
@@ -2210,23 +2051,21 @@ def _cte_wrap_grouped(
         select_cols=copy.deepcopy(list(intent.select_cols or [])),
         group_by_cols=copy.deepcopy(list(intent.group_by_cols or [])),
         order_by_cols=copy.deepcopy(list(intent.order_by_cols or [])),
-        filters_param=copy.deepcopy(list(intent.filters_param or [])),
-        having_param=copy.deepcopy(list(intent.having_param or [])),
+        where=copy.deepcopy(intent.where),
+        having=copy.deepcopy(intent.having),
         grain="grouped",
         emission="join_table",
     )
     new_intent.cte_steps = [cte_step]
     new_intent.tables = ["cte1"]
-    new_intent.filters_param = []
-    new_intent.having_param = []
+    new_intent.where = None
+    new_intent.having = None
     _add_expansion_metadata(new_intent, ExpansionOperatorId.CTE_WRAP_GROUPED)
     return [new_intent]
 
 
 def _cte_scalar_threshold(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """CTE_SCALAR_THRESHOLD: scalar params CTE with aggregate threshold and a filter referencing it."""
     _ = column_metadata
@@ -2242,11 +2081,8 @@ def _cte_scalar_threshold(
             cte_name = "params"
             agg_expr = NormalizedExpr(
                 add_groups=[
-                    MulGroup(
-                        multiply=[NormalizedExpr.from_column(measure)],
-                        agg_func="avg",
-                    ),
-                ],
+                    MulGroup(multiply=[NormalizedExpr.from_column(measure)], agg_func="avg"),
+                ]
             )
             cte_step = RuntimeCteStep(
                 cte_name=cte_name,
@@ -2258,25 +2094,30 @@ def _cte_scalar_threshold(
             )
             new_intent = copy.deepcopy(intent)
             new_intent.cte_steps = [cte_step]
-            new_intent.filters_param = list(new_intent.filters_param or []) + [
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column(measure),
-                    op=">",
-                    right_expr=NormalizedExpr.from_column(f"{cte_name}.threshold"),
-                    value_type="expression",
-                    param_key="",
-                ),
-            ]
+            new_intent.where = merge_predicate_groups(
+                "and",
+                [
+                    new_intent.where,
+                    predicate_group_from_list(
+                        [
+                            WhereParam(
+                                left_expr=NormalizedExpr.from_column(measure),
+                                op=">",
+                                right_expr=NormalizedExpr.from_column(f"{cte_name}.threshold"),
+                                value_type="expression",
+                                param_key="",
+                            ),
+                        ]
+                    ),
+                ],
+            )
             _add_expansion_metadata(new_intent, ExpansionOperatorId.CTE_SCALAR_THRESHOLD)
             results.append(new_intent)
     return results
 
 
 def _window_rank_variant_add(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    function: str,
-    operator_id: str,
+    intent: SeedWarmupIntent, schema: SchemaGraph, function: str, operator_id: str
 ) -> list[SeedWarmupIntent]:
     """Shared grouped-window rank/dense_rank/rank helper ordered by a select aggregate."""
     if _intent_has_window_select(intent):
@@ -2302,9 +2143,7 @@ def _window_rank_variant_add(
 
 
 def _window_dense_rank_add(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """WINDOW_DENSE_RANK_ADD: add ``dense_rank`` over group keys ordered by a select aggregate."""
     _ = column_metadata
@@ -2312,9 +2151,7 @@ def _window_dense_rank_add(
 
 
 def _window_rank_func_add(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """WINDOW_RANK_FUNC_ADD: add ``rank`` over group keys ordered by a select aggregate."""
     _ = column_metadata
@@ -2322,9 +2159,7 @@ def _window_rank_func_add(
 
 
 def _window_avg_partition_add(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """WINDOW_AVG_PARTITION_ADD: add ``avg(measure) over (partition by dim)`` for row-level grain."""
     _ = column_metadata
@@ -2354,9 +2189,7 @@ def _window_avg_partition_add(
 
 
 def _orderby_window_columndd(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """ORDERBY_WINDOW_COL_ADD: order by the first window registry column when present."""
     _ = schema, column_metadata
@@ -2376,9 +2209,7 @@ def _orderby_window_columndd(
 
 
 def _select_coalesce_add(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """SELECT_COALESCE_ADD: coalesce nullable numeric measures with zero in the select list."""
     if intent.grain == "grouped":
@@ -2404,9 +2235,7 @@ def _select_coalesce_add(
 
 
 def _select_string_scalar_add(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """SELECT_STRING_SCALAR_ADD: wrap categorical display columns with ``upper`` in select."""
     _ = column_metadata
@@ -2416,10 +2245,7 @@ def _select_string_scalar_add(
     for table in intent.tables or []:
         for col in _get_categorical_identifier_columns(schema, table):
             new_intent = copy.deepcopy(intent)
-            upper_expr = replace(
-                NormalizedExpr.from_column(col),
-                scalar_func="upper",
-            )
+            upper_expr = replace(NormalizedExpr.from_column(col), scalar_func="upper")
             new_intent.select_cols = list(new_intent.select_cols or []) + [SelectCol(expr=upper_expr)]
             _add_expansion_metadata(new_intent, ExpansionOperatorId.SELECT_STRING_SCALAR_ADD)
             results.append(new_intent)
@@ -2427,14 +2253,12 @@ def _select_string_scalar_add(
 
 
 def _temp_extract_filter(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
-    """TEMP_EXTRACT_FILTER: filter on ``extract(year)`` of a temporal column."""
+    """TEMP_EXTRACT_WHERE: filter on ``extract(year)`` of a temporal column."""
     _ = column_metadata
-    current_filter_cols = {f.left_expr.primary_column for f in (intent.filters_param or [])}
-    if len(current_filter_cols) >= SeedWarmupConfig.MAX_FILTERS:
+    current_where_cols = {f.left_expr.primary_column for f in (where_leaves(intent.where) or [])}
+    if len(current_where_cols) >= SeedWarmupConfig.MAX_WHERE_PREDICATES:
         return []
     results: list[SeedWarmupIntent] = []
     for table in intent.tables or []:
@@ -2447,30 +2271,32 @@ def _temp_extract_filter(
                 sample = str(samples[0])
                 if len(sample) >= 4 and sample[:4].isdigit():
                     year_val = sample[:4]
-            extract_expr = replace(
-                NormalizedExpr.from_column(col),
-                scalar_func="extract",
-                scalar_func_args=["year"],
-            )
+            extract_expr = replace(NormalizedExpr.from_column(col), scalar_func="extract", scalar_func_args=["year"])
             new_intent = copy.deepcopy(intent)
-            new_intent.filters_param = list(new_intent.filters_param or []) + [
-                FilterParam(
-                    left_expr=extract_expr,
-                    op="=",
-                    value_type="number",
-                    param_key=f"extract_yr_{col.replace('.', '_')}",
-                    raw_value=year_val,
-                ),
-            ]
-            _add_expansion_metadata(new_intent, ExpansionOperatorId.TEMP_EXTRACT_FILTER)
+            new_intent.where = merge_predicate_groups(
+                "and",
+                [
+                    new_intent.where,
+                    predicate_group_from_list(
+                        [
+                            WhereParam(
+                                left_expr=extract_expr,
+                                op="=",
+                                value_type="number",
+                                param_key=f"extract_yr_{col.replace('.', '_')}",
+                                raw_value=year_val,
+                            ),
+                        ]
+                    ),
+                ],
+            )
+            _add_expansion_metadata(new_intent, ExpansionOperatorId.TEMP_EXTRACT_WHERE)
             results.append(new_intent)
     return results
 
 
 def _multi_cte_chain_add(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """MULTI_CTE_CHAIN_ADD: append a second CTE that reads from an existing wrapped grouped CTE."""
     _ = schema, column_metadata
@@ -2488,15 +2314,15 @@ def _multi_cte_chain_add(
         select_cols=copy.deepcopy(list(first.select_cols or [])),
         group_by_cols=copy.deepcopy(list(first.group_by_cols or [])),
         order_by_cols=copy.deepcopy(list(first.order_by_cols or [])),
-        filters_param=[],
-        having_param=[],
+        where=None,
+        having=None,
         grain="grouped",
         emission="join_table",
     )
     new_intent.cte_steps = list(new_intent.cte_steps or []) + [second]
     new_intent.tables = ["cte2"]
-    new_intent.filters_param = []
-    new_intent.having_param = []
+    new_intent.where = None
+    new_intent.having = None
     _add_expansion_metadata(new_intent, ExpansionOperatorId.MULTI_CTE_CHAIN_ADD)
     return [new_intent]
 
@@ -2509,19 +2335,19 @@ def _emi_equivalence_augment(
 ) -> list[SeedWarmupIntent]:
     """Duplicate an existing AND filter to preserve row sets under. conjunctive semantics."""
     _ = schema, fk_map, column_metadata
-    fps = intent.filters_param or []
+    fps = where_leaves(intent.where) or []
     if not fps:
         return []
     new_intent = copy.deepcopy(intent)
-    new_intent.filters_param = list(new_intent.filters_param or []) + [copy.deepcopy(fps[0])]
+    new_intent.where = merge_predicate_groups(
+        "and", [new_intent.where, predicate_group_from_list([copy.deepcopy(fps[0])])]
+    )
     _add_expansion_metadata(new_intent, ExpansionOperatorId.EMI_MUTATE)
     return [new_intent]
 
 
 def _expansion_noop(
-    intent: SeedWarmupIntent,
-    schema: SchemaGraph,
-    column_metadata: dict[str, dict[str, dict[str, Any]]] | None = None,
+    intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]] | None = None
 ) -> list[SeedWarmupIntent]:
     """Placeholder expansion operator reserved for a future deterministic transform."""
     _ = intent, schema, column_metadata
@@ -2529,19 +2355,18 @@ def _expansion_noop(
 
 
 def _build_operator_registry(
-    column_metadata: dict[str, dict[str, dict[str, Any]]],
-    fk_map: dict[str, list[dict[str, str]]],
+    column_metadata: dict[str, dict[str, dict[str, Any]]], fk_map: dict[str, list[dict[str, str]]]
 ) -> dict[str, Any]:
     """Build the registry mapping operator ids to callables."""
     return {
-        ExpansionOperatorId.FILTER_ADD: lambda i, s: _filter_add(i, s, column_metadata),
-        ExpansionOperatorId.FILTER_EXPR_ADD: lambda i, s: _filter_expr_add(i, s, column_metadata),
+        ExpansionOperatorId.WHERE_ADD: lambda i, s: _where_add(i, s, column_metadata),
+        ExpansionOperatorId.WHERE_EXPR_ADD: lambda i, s: _where_expr_add(i, s, column_metadata),
         ExpansionOperatorId.AGG_CHANGE: lambda i, s: _agg_change(i, s, column_metadata),
         ExpansionOperatorId.GROUPBY_ADD: lambda i, s: _groupby_add(i, s, column_metadata),
         ExpansionOperatorId.ORDERBY_ADD: lambda i, s: _orderby_add(i, s, column_metadata),
         ExpansionOperatorId.HAVING_VALUE_ADD: lambda i, s: _having_value_add(i, s, column_metadata),
         ExpansionOperatorId.HAVING_EXPR_ADD: lambda i, s: _having_expr_add(i, s, column_metadata),
-        ExpansionOperatorId.FILTER_REMOVE: lambda i, s: _filter_remove(i, s, column_metadata),
+        ExpansionOperatorId.WHERE_REMOVE: lambda i, s: _where_remove(i, s, column_metadata),
         ExpansionOperatorId.GROUPBY_REMOVE: lambda i, s: _groupby_remove(i, s, column_metadata),
         ExpansionOperatorId.HAVING_REMOVE: lambda i, s: _having_remove(i, s, column_metadata),
         ExpansionOperatorId.JOIN_DIMENSION_ADD: lambda i, s: _join_dimension_add(i, s, fk_map, column_metadata),
@@ -2554,21 +2379,21 @@ def _build_operator_registry(
         ExpansionOperatorId.INCLUDE_GOLD: lambda i, s: _include_gold(i, s, column_metadata),
         ExpansionOperatorId.TEMP_EXTRACT_GROUPBY: lambda i, s: _temp_extract_groupby(i, s, column_metadata),
         ExpansionOperatorId.TEMP_DATE_TRUNC_GROUPBY: lambda i, s: _temp_date_trunc_groupby(i, s, column_metadata),
-        ExpansionOperatorId.TEMP_DATE_WINDOW_FILTER: lambda i, s: _temp_date_window_filter(i, s, column_metadata),
-        ExpansionOperatorId.TEMP_DATE_DIFF_FILTER: lambda i, s: _temp_date_diff_filter(i, s, column_metadata),
+        ExpansionOperatorId.TEMP_DATE_WINDOW_WHERE: lambda i, s: _temp_date_window_filter(i, s, column_metadata),
+        ExpansionOperatorId.TEMP_DATE_DIFF_WHERE: lambda i, s: _temp_date_diff_filter(i, s, column_metadata),
         ExpansionOperatorId.NUM_ROUND_SELECT: lambda i, s: _num_round_select(i, s, column_metadata),
-        ExpansionOperatorId.NUM_ABS_FILTER: lambda i, s: _num_abs_filter(i, s, column_metadata),
+        ExpansionOperatorId.NUM_ABS_WHERE: lambda i, s: _num_abs_filter(i, s, column_metadata),
         ExpansionOperatorId.DISTINCT_ADD: lambda i, s: _distinct_add(i, s, column_metadata),
         ExpansionOperatorId.LIMIT_ADD: lambda i, s: _limit_add(i, s, column_metadata),
-        ExpansionOperatorId.FILTER_OR_GROUP: lambda i, s: _filter_or_group(i, s, column_metadata),
+        ExpansionOperatorId.WHERE_OR_GROUP: lambda i, s: _where_or_group(i, s, column_metadata),
         ExpansionOperatorId.SELECT_EXPR_PAIR_MULTIPLY: lambda i, s: _select_expr_pair_multiply(i, s, column_metadata),
         ExpansionOperatorId.WINDOW_RANK_ADD: lambda i, s: _window_rank_add(i, s, column_metadata),
         ExpansionOperatorId.WINDOW_SUM_PARTITION_ADD: lambda i, s: _window_sum_partition_add(i, s, column_metadata),
         ExpansionOperatorId.SELECT_CASE_LABEL_ADD: lambda i, s: _select_case_label_add(i, s, column_metadata),
         ExpansionOperatorId.WINDOW_LAG_ADD: lambda i, s: _window_lag_add(i, s, column_metadata),
         ExpansionOperatorId.WINDOW_LEAD_ADD: lambda i, s: _window_lead_add(i, s, column_metadata),
-        ExpansionOperatorId.FILTER_ILIKE_ADD: lambda i, s: _filter_ilike_add(i, s, column_metadata),
-        ExpansionOperatorId.FILTER_ARRAY_CONTAINS_ADD: lambda i, s: _filter_array_contains_add(i, s, column_metadata),
+        ExpansionOperatorId.WHERE_ILIKE_ADD: lambda i, s: _where_ilike_add(i, s, column_metadata),
+        ExpansionOperatorId.WHERE_ARRAY_CONTAINS_ADD: lambda i, s: _where_array_contains_add(i, s, column_metadata),
         ExpansionOperatorId.ORDERBY_REMOVE: lambda i, s: _orderby_remove(i, s, column_metadata),
         ExpansionOperatorId.LIMIT_REMOVE: lambda i, s: _limit_remove(i, s, column_metadata),
         ExpansionOperatorId.SELECT_COL_TRIM: lambda i, s: _select_col_trim(i, s, column_metadata),
@@ -2576,10 +2401,10 @@ def _build_operator_registry(
         ExpansionOperatorId.DISTINCT_REMOVE: lambda i, s: _distinct_remove(i, s, column_metadata),
         ExpansionOperatorId.SPLICE_SUBTREE: lambda i, s: _splice_subtree(i, s, column_metadata, fk_map),
         ExpansionOperatorId.EMI_MUTATE: lambda i, s: _emi_equivalence_augment(i, s, column_metadata, fk_map),
-        ExpansionOperatorId.FILTER_NULL_ADD: lambda i, s: _filter_null_add(i, s, column_metadata),
-        ExpansionOperatorId.FILTER_NOT_NULL_ADD: lambda i, s: _filter_not_null_add(i, s, column_metadata),
-        ExpansionOperatorId.FILTER_IN_LIST_ADD: lambda i, s: _filter_in_list_add(i, s, column_metadata),
-        ExpansionOperatorId.FILTER_LIKE_ADD: lambda i, s: _filter_like_add(i, s, column_metadata),
+        ExpansionOperatorId.WHERE_NULL_ADD: lambda i, s: _where_null_add(i, s, column_metadata),
+        ExpansionOperatorId.WHERE_NOT_NULL_ADD: lambda i, s: _where_not_null_add(i, s, column_metadata),
+        ExpansionOperatorId.WHERE_IN_LIST_ADD: lambda i, s: _where_in_list_add(i, s, column_metadata),
+        ExpansionOperatorId.WHERE_LIKE_ADD: lambda i, s: _where_like_add(i, s, column_metadata),
         ExpansionOperatorId.HAVING_MATCH_SELECT_AGG: lambda i, s: _having_match_select_agg(i, s, column_metadata),
         ExpansionOperatorId.COUNT_DISTINCT_ADD: lambda i, s: _count_distinct_add(i, s, column_metadata),
         ExpansionOperatorId.CASE_CATEGORICAL_ADD: lambda i, s: _case_categorical_add(i, s, column_metadata),
@@ -2591,7 +2416,7 @@ def _build_operator_registry(
         ExpansionOperatorId.ORDERBY_WINDOW_COL_ADD: lambda i, s: _orderby_window_columndd(i, s, column_metadata),
         ExpansionOperatorId.SELECT_COALESCE_ADD: lambda i, s: _select_coalesce_add(i, s, column_metadata),
         ExpansionOperatorId.SELECT_STRING_SCALAR_ADD: lambda i, s: _select_string_scalar_add(i, s, column_metadata),
-        ExpansionOperatorId.TEMP_EXTRACT_FILTER: lambda i, s: _temp_extract_filter(i, s, column_metadata),
+        ExpansionOperatorId.TEMP_EXTRACT_WHERE: lambda i, s: _temp_extract_filter(i, s, column_metadata),
         ExpansionOperatorId.CTE_UNNEST_ADD: lambda i, s: _expansion_noop(i, s, column_metadata),
         ExpansionOperatorId.SELF_JOIN_CTE_ADD: lambda i, s: _expansion_noop(i, s, column_metadata),
         ExpansionOperatorId.MULTI_CTE_CHAIN_ADD: lambda i, s: _multi_cte_chain_add(i, s, column_metadata),
@@ -2600,10 +2425,7 @@ def _build_operator_registry(
     }
 
 
-def _deterministic_repair_warmup_seed(
-    seed: SeedWarmupIntent,
-    schema: SchemaGraph,
-) -> SeedWarmupIntent:
+def _deterministic_repair_warmup_seed(seed: SeedWarmupIntent, schema: SchemaGraph) -> SeedWarmupIntent:
     """Run the same deterministic repair chain as interactive parsing. on. a seed intent."""
     rt: RuntimeIntent = seed.to_runtime_intent()
     nl = seed.natural_language or seed.intent_id or ""
@@ -2613,10 +2435,10 @@ def _deterministic_repair_warmup_seed(
         case_registry=list(repaired.case_registry),
         cte_steps=repaired.cte_steps,
         distinct_select_index=repaired.distinct_select_index,
-        filters_param=repaired.filters_param,
+        where=repaired.where,
         grain=repaired.grain,
         group_by_cols=repaired.group_by_cols,
-        having_param=repaired.having_param,
+        having=repaired.having,
         limit=repaired.limit,
         natural_language=repaired.natural_language or seed.natural_language,
         order_by_cols=repaired.order_by_cols,
@@ -2642,12 +2464,7 @@ def _expand_single_depth(
                 continue
             variants = op_func(intent, schema)
             for var in variants:
-                accepted = _accept_expansion_variant(
-                    var,
-                    schema,
-                    parent=intent,
-                    candidate_op=op_name,
-                )
+                accepted = _accept_expansion_variant(var, schema, parent=intent, candidate_op=op_name)
                 if accepted is None:
                     continue
                 var = accepted
@@ -2671,12 +2488,12 @@ def expand_gold_intents(
 ) -> list[SeedWarmupIntent]:
     """Expand gold intents into synthetic intents via multi-depth. deterministic expansion."""
     if limits is not None:
-        SeedWarmupConfig.MAX_FILTERS = limits.max_filters
+        SeedWarmupConfig.MAX_WHERE_PREDICATES = limits.max_where_predicates
         SeedWarmupConfig.MAX_GROUPBY = limits.max_groupby
         SeedWarmupConfig.MAX_TABLES = limits.max_tables
         debug(
             f"expand_gold_intents: using SchemaLimits "
-            f"max_filters={limits.max_filters}, "
+            f"max_where_predicates={limits.max_where_predicates}, "
             f"max_groupby={limits.max_groupby}, "
             f"max_tables={limits.max_tables}"
         )
@@ -2706,13 +2523,7 @@ def expand_gold_intents(
         denom = len(seen_keys)
         cc = dict(tier_counts)
         current_layer.sort(key=lambda it: _tier_expansion_sort_key(it, cc, denom))
-        new_variants = _expand_single_depth(
-            current_layer,
-            schema,
-            operators,
-            seen_keys,
-            layer_tag,
-        )
+        new_variants = _expand_single_depth(current_layer, schema, operators, seen_keys, layer_tag)
         debug(f"expand_gold_intents: depth={depth} produced {len(new_variants)} new variants")
         if not new_variants:
             break

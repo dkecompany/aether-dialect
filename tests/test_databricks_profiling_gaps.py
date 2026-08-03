@@ -38,7 +38,11 @@ def test_profile_column_spark_uses_percent_tablesample() -> None:
     def fake_sql(sql: str) -> MagicMock:
         captured.append(sql)
         result = MagicMock()
-        if "COUNT(*)" in sql:
+        if "MAX(freq) AS mx" in sql:
+            result.collect.return_value = [_spark_row(mx=1)]
+        elif " AS v " in sql and "GROUP BY" in sql:
+            result.collect.return_value = []
+        elif "as cnt" in sql.lower() and "count(distinct" in sql.lower():
             result.collect.return_value = [_spark_row(cnt=200_000, dist=50_000, nulls=0)]
         elif "MIN(" in sql:
             result.collect.return_value = [_indexed_spark_row(1, 999)]
@@ -153,6 +157,8 @@ def test_profiling_stats_sample_suffix_defined_per_engine(engine: str) -> None:
     assert suffix
     if engine in ("mysql", "redshift", "sqlite"):
         assert suffix.startswith("WHERE ")
+    elif engine in ("bigquery", "sqlserver"):
+        assert suffix.upper().startswith("ORDER BY")
     elif engine == "duckdb":
         assert "SAMPLE" in suffix.upper()
     else:
@@ -180,3 +186,21 @@ def test_fk_containment_uses_samples_for_high_cardinality_key_columns() -> None:
     assert _column_value_overlap_eligible(child) is True
     assert _column_value_overlap_eligible(parent) is True
     assert _fk_containment_validates(child, parent) is True
+
+
+def test_profile_table_spark_surfaces_count_probe_failure() -> None:
+    from aetherdialect._contracts_base import ConfigError
+    from aetherdialect._contracts_schema import TableMetadata
+    from aetherdialect._schema_catalog import _profile_table_spark
+
+    spark = MagicMock()
+    spark.sql.side_effect = RuntimeError("connection lost")
+    table = TableMetadata(
+        name="orders",
+        columns={"id": ColumnMetadata(name="id", data_type="bigint", value_type="integer")},
+        primary_key=["id"],
+        foreign_keys=[],
+    )
+    dialect = DatabricksDialect.__new__(DatabricksDialect)
+    with pytest.raises(ConfigError, match="schema profiling failed for orders"):
+        _profile_table_spark(spark, "cat", "sch", table, dialect=dialect)

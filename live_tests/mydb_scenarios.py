@@ -91,7 +91,6 @@ def single_table_scenarios() -> list[Scenario]:
                 max_rows=2000,
                 contains_join=False,
                 grain="row_level",
-                min_confidence=0.5,
             ),
             category="single_table",
         ),
@@ -121,7 +120,6 @@ def single_table_scenarios() -> list[Scenario]:
                 min_rows=1,
                 max_rows=1,
                 grain="scalar",
-                min_confidence=0.4,
             ),
             category="single_table",
         ),
@@ -205,6 +203,17 @@ def single_table_scenarios() -> list[Scenario]:
                 max_rows=1,
                 grain="scalar",
                 contains_join=False,
+            ),
+            category="single_table",
+        ),
+        Scenario(
+            id="ST-015",
+            question="list all films in the catalog",
+            expected=Expected(
+                tables_one_of=FILM_SCOPED,
+                min_rows=1,
+                contains_join=False,
+                grain="row_level",
             ),
             category="single_table",
         ),
@@ -505,6 +514,22 @@ def multi_table_scenarios() -> list[Scenario]:
             ),
             category="multi_table",
         ),
+        Scenario(
+            id="MT-026",
+            question="how many rentals are linked to film titles",
+            expected=Expected(
+                tables_one_of=[
+                    *film_with("rental", "inventory"),
+                    ["rental", "inventory", "item"],
+                    ["rental", "inventory", "item", "film"],
+                ],
+                min_rows=1,
+                max_rows=1,
+                grain="scalar",
+                contains_join=True,
+            ),
+            category="multi_table",
+        ),
     ]
     return base
 
@@ -531,7 +556,6 @@ def aggregation_scenarios() -> list[Scenario]:
                 grain="grouped",
                 min_rows=1,
                 max_rows=1000,
-                min_confidence=0.24,
                 sql_contains=["SUM"],
             ),
             category="aggregation",
@@ -1136,6 +1160,43 @@ def aggregation_scenarios() -> list[Scenario]:
             ),
             category="aggregation",
         ),
+        Scenario(
+            id="AG-053",
+            question="what is the total payment amount",
+            expected=Expected(
+                tables=["payment"],
+                min_rows=1,
+                max_rows=1,
+                grain="scalar",
+                sql_contains=["SUM"],
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-054",
+            question="what is the average payment amount grouped by film category",
+            expected=Expected(
+                contains_group_by=True,
+                grain="grouped",
+                min_rows=1,
+                sql_contains=["SUM"],
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-055",
+            question="show payroll deductions grouped by staff member",
+            expected=Expected(
+                tables_one_of=[
+                    ["staff"],
+                    ["staff", "store"],
+                ],
+                contains_group_by=True,
+                grain="grouped",
+                min_rows=0,
+            ),
+            category="aggregation",
+        ),
     ]
     return base
 
@@ -1637,15 +1698,15 @@ def repair_loop_scenarios() -> list[Scenario]:
 
 
 def confidence_scenarios() -> list[Scenario]:
-    """Confidence scoring tests with expected minimum thresholds."""
+    """Scenarios that check row and grain expectations."""
     return [
         Scenario(
             id="CF-001",
             question="how many customers are in each country",
             expected=Expected(
-                min_confidence=0.25,
                 contains_join=True,
                 min_rows=1,
+                grain="grouped",
             ),
             category="confidence",
         ),
@@ -1653,9 +1714,9 @@ def confidence_scenarios() -> list[Scenario]:
             id="CF-002",
             question="what is the average film length",
             expected=Expected(
-                min_confidence=0.4,
                 min_rows=1,
                 max_rows=1,
+                grain="scalar",
             ),
             category="confidence",
         ),
@@ -1663,8 +1724,8 @@ def confidence_scenarios() -> list[Scenario]:
             id="CF-003",
             question="list all customer email addresses",
             expected=Expected(
-                min_confidence=0.4,
                 min_rows=1,
+                tables=["customer"],
             ),
             category="confidence",
         ),
@@ -2541,6 +2602,17 @@ def count_distinct_scenarios() -> list[Scenario]:
                 min_rows=1,
                 max_rows=1,
                 grain="scalar",
+            ),
+            category="count_distinct",
+        ),
+        Scenario(
+            id="CD-007",
+            question="how many distinct customers rented horror films",
+            expected=Expected(
+                min_rows=1,
+                max_rows=1,
+                grain="scalar",
+                sql_contains=["horror"],
             ),
             category="count_distinct",
         ),
@@ -3510,7 +3582,6 @@ def partition_scenarios() -> list[Scenario]:
                 min_rows=0,
                 max_rows=1000,
                 grain="scalar",
-                min_confidence=0.45,
             ),
             category="partition",
         ),

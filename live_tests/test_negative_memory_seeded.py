@@ -63,7 +63,6 @@ def test_validation_failure_feedback_surfaces_for_prompt(_mock_no_llm, schema, s
 def test_validation_failure_rows_scoped_to_schema(_mock_no_llm, schema, schema_terms, t2s) -> None:
     """Structural validation rows do not leak across schema hashes."""
     intent = intent_customer_first_names()
-    sql = "SELECT customer.customer_id, customer.first_name FROM customer"
     with isolated_runner(schema, schema_terms, t2s, label="nm_hint_scope") as runner:
         ent = summarize_failure_for_memory(
             question=_FAILURE_Q_NORM,
@@ -71,7 +70,6 @@ def test_validation_failure_rows_scoped_to_schema(_mock_no_llm, schema, schema_t
             kind=FeedbackKind.VALIDATION_FAILURE,
             schema_hash="different-schema-hash",
             validator_errors=[_FAILURE_MESSAGE],
-            sql=sql,
         )
         record_question_feedback(runner.store, _FAILURE_Q_NORM, ent)
         rows = collect_question_feedback_for_prompt(

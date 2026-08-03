@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import os
 import re
@@ -9,12 +11,14 @@ import time
 import unicodedata
 import zipfile
 from collections.abc import Callable
+from contextvars import ContextVar, Token
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 
 from openai import AzureOpenAI, OpenAI
 
-from ._config import EngineConfig
+from ._config import EngineConfig, PolicyConfig
 from ._constants import (
     INTENT_COMPOSE_SYSTEM,
     INTENT_GROUND_SYSTEM,
@@ -26,13 +30,23 @@ from ._constants import (
     TASK_MODEL_TO_DEPLOYMENT_FIELD,
     TASK_PROFILES,
 )
-from ._contracts_base import LlmJsonExhausted, LlmTransientFailure
+from ._contracts_base import (
+    LlmBatchRequest,
+    LlmExecutionConfig,
+    LlmJsonExhausted,
+    LlmTransientFailure,
+    MockFixtureMissingError,
+    register_mock_fixture_recorded_corpus_count,
+)
 from ._core_utils import (
     LLM_EXECUTION_CONTEXT,
+    active_business_knowledge_digest,
+    active_prompt_cache_schema_hash,
     debug,
     diagnostic_debug_enabled,
     effective_llm_timeout_ms,
     pipeline_trace,
+    record_llm_usage,
     safe_json_loads,
     stable_json,
 )
@@ -41,27 +55,60 @@ _clients: dict[tuple[str, int, str], OpenAI | AzureOpenAI] = {}
 
 _DEFAULT_LLM_CHAT_TIMEOUT = object()
 
+_sandbox_recorded_corpus_questions: int | None = None
 
-class MockFixtureMissingError(RuntimeError):
-    """Raised when the mock provider has no fixture for the requested LLM call."""
 
-    def __init__(self, *, task: str, system: str, user: str) -> None:
-        self.task = task
-        self.system = system
-        self.user = user
-        skeleton = json.dumps(
-            {
-                "task": task,
-                "system": system[:200] + ("..." if len(system) > 200 else ""),
-                "user": user[:500] + ("..." if len(user) > 500 else ""),
-                "output_text": "<paste model JSON/text here>",
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-        super().__init__(
-            f"No mock fixture for task={task!r}. Add an entry to the fixture corpus:\n{skeleton}",
-        )
+@dataclass
+class SandboxRuntimeState:
+    """Per-sandbox mutable state that must not leak across Sandbox instances."""
+
+    paraphrase_source: dict[str, list[str]] | None = None
+    recorded_corpus_question_count: int | None = None
+    faithfulness_by_question: dict[str, Any] = field(default_factory=dict)
+    faithfulness_loaded: bool = False
+    mock_provider: Any | None = None
+    mock_fixtures_path: str | None = None
+
+
+_ACTIVE_SANDBOX_RUNTIME: ContextVar[SandboxRuntimeState | None] = ContextVar(
+    "aetherdialect_active_sandbox_runtime",
+    default=None,
+)
+
+
+def bind_sandbox_runtime(state: SandboxRuntimeState | None) -> Token[SandboxRuntimeState | None]:
+    """Bind *state* for nested sandbox-scoped helpers."""
+    return _ACTIVE_SANDBOX_RUNTIME.set(state)
+
+
+def reset_sandbox_runtime(token: Token[SandboxRuntimeState | None]) -> None:
+    """Restore the prior sandbox runtime binding."""
+    _ACTIVE_SANDBOX_RUNTIME.reset(token)
+
+
+def current_sandbox_runtime() -> SandboxRuntimeState | None:
+    """Return the sandbox runtime bound for this execution context, if any."""
+    return _ACTIVE_SANDBOX_RUNTIME.get()
+
+
+def set_sandbox_recorded_corpus_question_count(count: int | None) -> None:
+    """Pin the recorded-corpus question count for sandbox mock-mode error text."""
+    runtime = current_sandbox_runtime()
+    if runtime is not None:
+        runtime.recorded_corpus_question_count = count
+        return
+    global _sandbox_recorded_corpus_questions
+    _sandbox_recorded_corpus_questions = count
+
+
+def _sandbox_recorded_corpus_question_count() -> int | None:
+    runtime = current_sandbox_runtime()
+    if runtime is not None:
+        return runtime.recorded_corpus_question_count
+    return _sandbox_recorded_corpus_questions
+
+
+register_mock_fixture_recorded_corpus_count(_sandbox_recorded_corpus_question_count)
 
 
 class _LLMProvider(Protocol):
@@ -76,9 +123,40 @@ class _LLMProvider(Protocol):
     ) -> str: ...
 
 
+def _hash_credential_part(value: str) -> str:
+    """Return a short stable digest for a credential string used in cache keys."""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
+def _llm_credential_identity(provider: str, llm: LlmExecutionConfig | None) -> str:
+    """Return a stable cache identity for the credentials used to build *provider* clients."""
+    if provider == "openai":
+        token = (EngineConfig.API_TOKEN or "").strip()
+        base = (EngineConfig.OPENAI_BASE_URL or "").strip()
+        return f"openai:{base}:{_hash_credential_part(token)}"
+    if provider == "azure":
+        if llm is not None and llm.azure_endpoint.strip():
+            endpoint = llm.azure_endpoint.strip()
+            api_version = (llm.azure_api_version or "").strip()
+            api_key = (llm.azure_api_key or EngineConfig.AZURE_API_TOKEN or EngineConfig.API_TOKEN or "").strip()
+        else:
+            endpoint = (EngineConfig.AZURE_OPENAI_ENDPOINT or EngineConfig.AZURE_OPENAI_BASE_URL or "").strip()
+            api_version = (EngineConfig.AZURE_OPENAI_API_VERSION or "").strip()
+            api_key = (EngineConfig.AZURE_API_TOKEN or EngineConfig.API_TOKEN or "").strip()
+        return f"azure:{endpoint}:{api_version}:{_hash_credential_part(api_key)}"
+    return provider
+
+
 def clear_llm_clients() -> None:
-    """Remove cached OpenAI clients so a new environment configuration takes effect."""
-    _clients.clear()
+    """Remove cached clients for the active credential identity only."""
+    provider = EngineConfig.LLM_PROVIDER
+    if provider not in {"openai", "azure"}:
+        return
+    llm = LLM_EXECUTION_CONTEXT.get()
+    credential_identity = _llm_credential_identity(provider, llm)
+    for key in list(_clients):
+        if key[0] == provider and key[2] == credential_identity:
+            del _clients[key]
 
 
 def _azure_deployment_for_model(model_id: str) -> str:
@@ -92,12 +170,15 @@ def _azure_deployment_for_model(model_id: str) -> str:
             if isinstance(dep, str) and dep.strip():
                 return dep.strip()
         return mid
-    env_triples: tuple[tuple[str, tuple[str, ...]], ...] = (
+    env_pairs: tuple[tuple[str, tuple[str, ...]], ...] = (
         ("gpt-5.4-mini", ("AZURE_OPENAI_DEPLOYMENT_HEAVY",)),
-        ("gpt-4.1-mini", ("AZURE_OPENAI_DEPLOYMENT_MEDIUM",)),
-        ("gpt-4o-mini", ("AZURE_OPENAI_DEPLOYMENT_LIGHT",)),
+        ("gpt-5.4-nano", ("AZURE_OPENAI_DEPLOYMENT_LIGHT",)),
+        ("gpt-5-mini", ("AZURE_OPENAI_DEPLOYMENT_LIGHT",)),
+        ("gpt-5-nano", ("AZURE_OPENAI_DEPLOYMENT_LIGHT",)),
+        ("gpt-4.1-mini", ("AZURE_OPENAI_DEPLOYMENT_LIGHT",)),
+        ("gpt-4.1-nano", ("AZURE_OPENAI_DEPLOYMENT_LIGHT",)),
     )
-    for known_id, env_keys in env_triples:
+    for known_id, env_keys in env_pairs:
         if known_id != mid:
             continue
         for key in env_keys:
@@ -110,10 +191,14 @@ def _azure_deployment_for_model(model_id: str) -> str:
 
 def _task_model_for_profile(task: str) -> str:
     """Return the configured logical model name for *task* from ``EngineConfig``."""
-    if task == "intent":
+    if task in ("intent", "conversation"):
         return str(EngineConfig.OPENAI_MODEL_INTENT)
+    if task == "intent_format":
+        return str(EngineConfig.OPENAI_MODEL_INTENT_FORMAT)
+    if task == "intent_schema_repair":
+        return str(EngineConfig.OPENAI_MODEL_INTENT_SCHEMA_REPAIR)
     if task == "feedback":
-        return str(EngineConfig.OPENAI_MODEL_INTENT)
+        return str(EngineConfig.OPENAI_MODEL)
     if task == "schema":
         return str(EngineConfig.OPENAI_MODEL_SCHEMA)
     if task == "schema_base":
@@ -122,17 +207,56 @@ def _task_model_for_profile(task: str) -> str:
         return str(EngineConfig.OPENAI_MODEL_DDL)
     if task == "join":
         return str(EngineConfig.OPENAI_MODEL_JOIN)
-    if task == "judge":
-        return str(EngineConfig.OPENAI_MODEL_JOIN)
-    if task == "conversation":
-        return str(EngineConfig.OPENAI_MODEL_INTENT)
+    if task == "synth":
+        return str(EngineConfig.OPENAI_MODEL_SYNTH)
+    if task == "synth_variety":
+        return str(EngineConfig.OPENAI_MODEL_SYNTH_VARIETY)
     return str(EngineConfig.OPENAI_MODEL)
 
 
-def _provider_order() -> list[str]:
+def _logical_model_uses_reasoning(model_id: str) -> bool:
+    """Return whether *model_id* is a reasoning model that accepts ``reasoning`` instead of ``temperature``."""
+    mid = str(model_id).strip().lower()
+    if mid.startswith("gpt-4"):
+        return False
+    return mid.startswith("gpt-5") or mid.startswith("o")
+
+
+def _reasoning_effort_for_model(model_id: str, effort: str) -> str:
+    """Map a profile effort token to the effort keyword supported by *model_id*."""
+    mid = str(model_id).strip().lower()
+    if mid.startswith("gpt-5.4") and effort == "minimal":
+        return "none"
+    return effort
+
+
+def _apply_generation_profile(kwargs: dict[str, Any], profile: dict[str, Any], logical_model: str) -> None:
+    """Attach ``reasoning`` or ``temperature`` to *kwargs* based on the active provider and model."""
+    if EngineConfig.LLM_PROVIDER == "azure":
+        if "reasoning" in profile:
+            effort = str(profile["reasoning"].get("effort", "low"))
+        else:
+            effort = "none"
+        kwargs["reasoning"] = {
+            "effort": effort,
+            "summary": str(profile.get("reasoning", {}).get("summary", "concise")),
+        }
+        return
+    if "reasoning" in profile and _logical_model_uses_reasoning(logical_model):
+        reasoning = profile["reasoning"]
+        effort = _reasoning_effort_for_model(logical_model, str(reasoning.get("effort", "low")))
+        kwargs["reasoning"] = {
+            "effort": effort,
+            "summary": str(reasoning.get("summary", "concise")),
+        }
+        return
+    kwargs["temperature"] = profile.get("temperature", 0)
+
+
+def _provider_order() -> list[Literal["openai", "azure", "mock"]]:
     """Return the single resolved provider stored on :class:`EngineConfig`."""
     if EngineConfig.LLM_PROVIDER in {"openai", "azure", "mock"}:
-        return [EngineConfig.LLM_PROVIDER]
+        return [cast(Literal["openai", "azure", "mock"], EngineConfig.LLM_PROVIDER)]
     return ["openai"]
 
 
@@ -163,10 +287,7 @@ def _build_client(provider: str) -> OpenAI | AzureOpenAI:
     llm = LLM_EXECUTION_CONTEXT.get()
     timeout_ms = _resolve_llm_timeout_ms()
     timeout_s = timeout_ms / 1000.0
-    endpoint_sig = ""
-    if llm is not None and isinstance(llm.azure_endpoint, str) and llm.azure_endpoint.strip():
-        endpoint_sig = llm.azure_endpoint.strip()
-    cache_key = (provider, timeout_ms, endpoint_sig)
+    cache_key = (provider, timeout_ms, _llm_credential_identity(provider, llm))
     if cache_key in _clients:
         return _clients[cache_key]
     if provider == "openai":
@@ -507,19 +628,17 @@ def _llm_request_kwargs(system: str, user: str, *, task: str, timeout: float) ->
     profile = TASK_PROFILES.get(task, TASK_PROFILES["default"])
     model = _task_model_for_profile(task)
     api_model = _azure_deployment_for_model(model) if EngineConfig.LLM_PROVIDER == "azure" else model
+    user_for_llm = _llm_user_text_without_sensitivity_classification(user)
     kwargs: dict[str, Any] = {
         "model": api_model,
         "input": [
             {"role": "system", "content": [{"type": "input_text", "text": system}]},
-            {"role": "user", "content": [{"type": "input_text", "text": user}]},
+            {"role": "user", "content": [{"type": "input_text", "text": user_for_llm}]},
         ],
         "timeout": timeout,
         "text": {"format": {"type": "json_object"}},
     }
-    if "reasoning" in profile:
-        kwargs["reasoning"] = profile["reasoning"]
-    else:
-        kwargs["temperature"] = profile.get("temperature", 0)
+    _apply_generation_profile(kwargs, profile, model)
     return kwargs
 
 
@@ -659,10 +778,16 @@ _mock_provider: MockProvider | None = None
 
 
 def _get_mock_provider() -> MockProvider:
-    global _mock_provider
     path = (EngineConfig.MOCK_FIXTURES_FILE or "").strip()
     if not path:
         raise RuntimeError("Mock provider requires AETHERDIALECT_MOCK_FIXTURES_FILE")
+    runtime = current_sandbox_runtime()
+    if runtime is not None:
+        if runtime.mock_provider is None or runtime.mock_fixtures_path != path:
+            runtime.mock_provider = MockProvider(path)
+            runtime.mock_fixtures_path = path
+        return cast(MockProvider, runtime.mock_provider)
+    global _mock_provider
     if _mock_provider is None:
         _mock_provider = MockProvider(path)
     return _mock_provider
@@ -671,6 +796,10 @@ def _get_mock_provider() -> MockProvider:
 def reset_mock_provider(*, clear_literals: bool = False) -> None:
     """Clear cached mock fixture index."""
     global _mock_provider, _handcrafted_entries_cache
+    runtime = current_sandbox_runtime()
+    if runtime is not None:
+        runtime.mock_provider = None
+        runtime.mock_fixtures_path = None
     _mock_provider = None
     _handcrafted_entries_cache = None
     if clear_literals:
@@ -681,6 +810,28 @@ def _clear_provider_cache() -> None:
     """Clear HTTP client and mock fixture caches."""
     clear_llm_clients()
     reset_mock_provider()
+
+
+def resolve_prompt_cache_key(task: str) -> str | None:
+    """Return a provider ``prompt_cache_key`` when a schema scope is active."""
+    schema_hash = active_prompt_cache_schema_hash()
+    if not schema_hash:
+        return None
+    business_digest = active_business_knowledge_digest()
+    if business_digest:
+        return f"{task}:{schema_hash}:{business_digest[:16]}"
+    return f"{task}:{schema_hash}"
+
+
+def _usage_tokens_from_response(usage: Any) -> tuple[int, int, int]:
+    """Return ``(input_tokens, output_tokens, cached_input_tokens)`` from a provider usage object."""
+    in_tok = int(getattr(usage, "input_tokens", 0) or 0)
+    out_tok = int(getattr(usage, "output_tokens", 0) or 0)
+    cached = 0
+    details = getattr(usage, "input_tokens_details", None)
+    if details is not None:
+        cached = int(getattr(details, "cached_tokens", 0) or 0)
+    return in_tok, out_tok, cached
 
 
 def llm_chat(
@@ -714,10 +865,11 @@ def llm_chat(
         "text": {"format": {"type": "json_object"}},
     }
 
-    if "reasoning" in profile:
-        kwargs["reasoning"] = profile["reasoning"]
-    else:
-        kwargs["temperature"] = profile.get("temperature", 0)
+    _apply_generation_profile(kwargs, profile, model)
+
+    cache_key = resolve_prompt_cache_key(task)
+    if cache_key is not None:
+        kwargs["prompt_cache_key"] = cache_key
 
     debug(f"[llm_provider.llm_chat] task={task} system_len={len(system)} user_len={len(user_for_llm)}")
     pipeline_trace(f"llm_chat.request task={task} system_message", lambda: system)
@@ -760,6 +912,20 @@ def llm_chat(
                     f"[llm_provider.llm_chat] provider={provider} model={api_model} task={task} "
                     f"completed in {elapsed:.1f}s (attempt {attempt + 1}/{max_retries}){tok_str}"
                 )
+                if usage is not None:
+                    usage_in, usage_out, usage_cached = _usage_tokens_from_response(usage)
+                    record_llm_usage(
+                        task=task,
+                        logical_model=model,
+                        api_model=api_model,
+                        provider=provider,
+                        input_tokens=usage_in,
+                        cached_input_tokens=usage_cached,
+                        output_tokens=usage_out,
+                        cache_write_tokens=None,
+                        attempt=attempt + 1,
+                        elapsed_ms=int(elapsed * 1000),
+                    )
                 return output
             except Exception as e:
                 elapsed = time.time() - start
@@ -821,3 +987,119 @@ def llm_json(system: str, user: str, retries: int = 1, task: str = "default") ->
 
     debug("[llm_provider.llm_json] all_retries_failed")
     raise LlmJsonExhausted(task=task, attempts=total_attempts)
+
+
+def llm_batch_enabled() -> bool:
+    """Return whether offline corpus generation should use the OpenAI Batch API."""
+    return bool(PolicyConfig.LLM_BATCH_ENABLED and EngineConfig.LLM_PROVIDER == "openai")
+
+
+def _batch_output_text_from_body(body: dict[str, Any]) -> str:
+    output = body.get("output")
+    if isinstance(output, list):
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "output_text":
+                    text = part.get("text")
+                    if isinstance(text, str) and text.strip():
+                        return text.strip()
+    response = body.get("response")
+    if isinstance(response, dict):
+        nested = response.get("body")
+        if isinstance(nested, dict):
+            return _batch_output_text_from_body(nested)
+    output_text = body.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text.strip()
+    return ""
+
+
+def _poll_openai_batch(client: OpenAI, batch_id: str, *, timeout_s: float) -> Any:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        batch = client.batches.retrieve(batch_id)
+        status = str(getattr(batch, "status", "") or "")
+        if status in {"completed", "failed", "cancelled", "expired"}:
+            return batch
+        time.sleep(2.0)
+    raise RuntimeError(f"OpenAI batch {batch_id} did not complete within {timeout_s:.0f}s")
+
+
+def llm_batch_chat(requests: list[LlmBatchRequest]) -> dict[str, str]:
+    """Run independent JSON-mode completions via the OpenAI Batch API and return outputs keyed by ``custom_id``."""
+    if not requests:
+        return {}
+    if not llm_batch_enabled():
+        return {req.custom_id: llm_chat(req.system, req.user, task=req.task) for req in requests}
+    providers = [p for p in _provider_order() if _provider_is_configured(p)]
+    if providers != ["openai"]:
+        return {req.custom_id: llm_chat(req.system, req.user, task=req.task) for req in requests}
+    timeout_val = _resolve_llm_timeout_ms() / 1000.0
+    client = _build_client("openai")
+    lines: list[str] = []
+    for req in requests:
+        body = _llm_request_kwargs(req.system, req.user, task=req.task, timeout=timeout_val)
+        lines.append(
+            json.dumps(
+                {
+                    "custom_id": req.custom_id,
+                    "method": "POST",
+                    "url": "/v1/responses",
+                    "body": body,
+                },
+                ensure_ascii=False,
+            )
+        )
+    batch_file = client.files.create(file=io.BytesIO("\n".join(lines).encode("utf-8")), purpose="batch")
+    batch = client.batches.create(
+        input_file_id=batch_file.id,
+        endpoint="/v1/responses",
+        completion_window="24h",
+    )
+    finished = _poll_openai_batch(client, batch.id, timeout_s=max(timeout_val, 300.0))
+    status = str(getattr(finished, "status", "") or "")
+    if status != "completed":
+        raise RuntimeError(f"OpenAI batch finished with status {status!r}")
+    output_file_id = getattr(finished, "output_file_id", None)
+    if not isinstance(output_file_id, str) or not output_file_id.strip():
+        raise RuntimeError("OpenAI batch completed without an output file")
+    raw_file = client.files.content(output_file_id)
+    payload_raw = raw_file.read()
+    payload_text = payload_raw.decode("utf-8") if isinstance(payload_raw, bytes) else str(payload_raw)
+    outputs: dict[str, str] = {}
+    for line in payload_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        row = json.loads(line)
+        if not isinstance(row, dict):
+            continue
+        custom_id = str(row.get("custom_id", "") or "")
+        if not custom_id:
+            continue
+        response = row.get("response")
+        if not isinstance(response, dict):
+            continue
+        response_body = response.get("body")
+        if not isinstance(response_body, dict):
+            continue
+        text = _batch_output_text_from_body(response_body)
+        if text:
+            outputs[custom_id] = text
+    return outputs
+
+
+def llm_batch_json(requests: list[LlmBatchRequest]) -> dict[str, dict[str, Any]]:
+    """Parse JSON outputs from :func:`llm_batch_chat` for each ``custom_id``."""
+    raw_by_id = llm_batch_chat(requests)
+    parsed: dict[str, dict[str, Any]] = {}
+    for custom_id, raw in raw_by_id.items():
+        obj = safe_json_loads(raw)
+        if isinstance(obj, dict):
+            parsed[custom_id] = obj
+    return parsed

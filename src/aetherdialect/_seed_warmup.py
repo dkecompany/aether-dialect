@@ -8,7 +8,6 @@ import json
 import math
 import os
 import re
-import uuid
 import zipfile
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
@@ -16,10 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
 
-from ._config import (
-    PolicyConfig,
-    SeedWarmupConfig,
-)
+from ._config import PolicyConfig, SeedWarmupConfig
 from ._constants import (
     DIAGNOSTIC_CODE_ENGINE_INFO,
     EMPTY_JOIN_CANDIDATES,
@@ -28,20 +24,25 @@ from ._constants import (
     REALISM_DROP_REASON_CATEGORIES,
     SEED_FAILURE_CODE_REALISM_DROPPED,
     SEED_NORMALIZATION_BATCH_SIZE,
+    SEED_QUESTION_CLARIFY_SYSTEM,
     SEED_WARMUP_DROP_CODES,
     SEED_WARMUP_FAILURE_CODES,
     WARMUP_OPERATOR_FEATURE_TUPLE_4BIT_CARDINALITY,
-    GenerationPath,
 )
 from ._contracts_base import (
-    FilterParam,
     HavingParam,
+    LlmBatchRequest,
     LlmJsonExhausted,
+    WhereParam,
+    having_leaves,
+    predicate_group_from_list,
+    where_leaves,
 )
 from ._contracts_core import (
     AnchorLattice,
     AnchorLatticeCell,
     AnchorLatticeKey,
+    GenerationPath,
     QuestionFormStorage,
     RuntimeCteStep,
     RuntimeIntent,
@@ -73,6 +74,7 @@ from ._core_utils import (
     telemetry_capture,
 )
 from ._dialect import active_sqlglot_dialect, compute_sql_fp
+from ._federation import schema_spans_multiple_sources
 from ._intent_expr import apply_default_structural_values
 from ._intent_process import (
     apply_deterministic_repairs,
@@ -87,16 +89,18 @@ from ._intent_resolve import (
     join_path_key_runtime,
     prune_unused_cte_steps,
 )
-from ._llm_provider import llm_json
-from ._pipeline import finalize_substitute_sql, other_template_owns_question_string
-from ._qsim import (
-    deterministic_having_value,
-    sample_coordinated_range,
-    sample_value_from_domain,
+from ._llm_provider import llm_batch_enabled, llm_batch_json, llm_json
+from ._pipeline import (
+    execute_federated_warmup_intent,
+    finalize_substitute_sql,
+    other_template_owns_question_string,
+    persist_federated_warmup_learning,
 )
-from ._qsim_ops import greedy_cover_indices_by_atoms
+from ._qsim import deterministic_having_value, sample_coordinated_range, sample_value_from_domain
+from ._qsim import greedy_cover_indices_by_atoms
 from ._sql_gen import (
     build_deterministic_sql,
+    edge_kinds_for_join_candidate,
     get_join_choice_from_llm,
     inject_join_into_deterministic_sql,
     join_candidate_map,
@@ -112,33 +116,19 @@ from ._utils import (
     generate_warmup_paraphrases_by_style,
     generate_warmup_questions_freeform,
     intent_key,
+    template_instance_key_for_concrete,
+    template_instance_key_for_runtime,
     template_instance_key_from_parts,
 )
-from ._validation_execute import (
-    curated_warmup_post_binding_issues,
-    curated_warmup_semantic_issues,
-    validate_sql,
-)
-
-_SEED_LINE_NORMALIZE_SYSTEM = (
-    "You rephrase database analyst questions for clarity only. Do not answer them. "
-    "Preserve all entities, filters, metrics, grouping, ordering, and limits implied by each source line. "
-    "Do not add or remove requirements. Do not use SQL or qualified identifiers unless the source already does. "
-    'Output only valid JSON: {"lines":[{"index":<int>,"normalized":"<string>"}]} with exactly one object '
-    "per input index, indices matching the batch, no extra keys, no markdown."
-)
+from ._validation_execute import curated_warmup_post_binding_issues, curated_warmup_semantic_issues, validate_sql
 
 
 def warmup_intent_fingerprint(intent: SeedWarmupIntent) -> str:
     """Stable SHA-256 hex of the serialized seed warmup intent (pre- execute)."""
-    return hashlib.sha256(
-        stable_json(intent.to_dict()).encode("utf-8"),
-    ).hexdigest()
+    return hashlib.sha256(stable_json(intent.to_dict()).encode("utf-8")).hexdigest()
 
 
-def warmup_pool_operator_feature_stats(
-    intents: list[SeedWarmupIntent],
-) -> dict[str, Any]:
+def warmup_pool_operator_feature_stats(intents: list[SeedWarmupIntent]) -> dict[str, Any]:
     """Summarize operator-vector diversity for seed-warmup funnel. reporting."""
     vectors = [operator_feature_vector_for_seed_intent(i) for i in intents]
     distinct_vectors = len(set(vectors))
@@ -159,10 +149,7 @@ def warmup_pool_operator_feature_stats(
 
 def _warmup_anchor_lattice_json_path(output_root: str, schema: SchemaGraph) -> str:
     """Absolute path to persisted anchor-lattice JSON for *schema* under. *output_root*."""
-    base = os.path.join(
-        output_root,
-        SeedWarmupConfig.WARMUP_ANCHOR_LATTICE_SUBDIR,
-    )
+    base = os.path.join(output_root, SeedWarmupConfig.WARMUP_ANCHOR_LATTICE_SUBDIR)
     fn = f"lattice_{schema.schema_graph_id}_v{SeedWarmupConfig.WARMUP_ANCHOR_LATTICE_CODE_VERSION}.json"
     return os.path.join(base, fn)
 
@@ -189,11 +176,7 @@ def _load_warmup_anchor_lattice(path: str) -> dict[str, list[str]]:
     return out
 
 
-def _save_warmup_anchor_lattice(
-    path: str,
-    schema: SchemaGraph,
-    cells: dict[str, list[str]],
-) -> None:
+def _save_warmup_anchor_lattice(path: str, schema: SchemaGraph, cells: dict[str, list[str]]) -> None:
     """Persist anchor lattice cells atomically next to other warmup. artifacts."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     payload = {
@@ -207,9 +190,7 @@ def _save_warmup_anchor_lattice(
     os.replace(tmp, path)
 
 
-def load_seed_warmup_cache_zip(
-    output_dir: str,
-) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+def load_seed_warmup_cache_zip(output_dir: str) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
     """Read ``seed_warmup_cache.zip`` from *output_dir*."""
     path = os.path.join(output_dir, SeedWarmupConfig.SEED_WARMUP_CACHE_ZIP)
     if not os.path.isfile(path):
@@ -253,11 +234,7 @@ def save_seed_warmup_cache_zip(
         if gold_intent_dicts is not None:
             zf.writestr(
                 SeedWarmupConfig.WARMUP_CACHE_GOLD_INTENTS_JSON,
-                json.dumps(
-                    gold_intent_dicts,
-                    ensure_ascii=False,
-                    separators=JSON_COMPACT_SEPARATORS,
-                ),
+                json.dumps(gold_intent_dicts, ensure_ascii=False, separators=JSON_COMPACT_SEPARATORS),
             )
         for wid, rec in work_units.items():
             zf.writestr(
@@ -267,7 +244,7 @@ def save_seed_warmup_cache_zip(
     os.replace(tmp, path)
     debug(
         f"save_seed_warmup_cache_zip: wrote {len(work_units)} work units"
-        f"{' and gold snapshot' if gold_intent_dicts is not None else ''} to {path}",
+        f"{' and gold snapshot' if gold_intent_dicts is not None else ''} to {path}"
     )
 
 
@@ -282,10 +259,10 @@ class SeedWarmupCacheSession:
     touched_work_unit_ids: list[str] = field(default_factory=list)
 
     def ensure_work_unit_id(self, fingerprint: str) -> str:
-        """Return stable id for *fingerprint*, allocating a UUID on first sight."""
+        """Return stable content-addressed id for *fingerprint*."""
         wid = self.fp_to_wid.get(fingerprint)
         if wid is None:
-            wid = str(uuid.uuid4())
+            wid = fingerprint
             self.fp_to_wid[fingerprint] = wid
         return wid
 
@@ -303,12 +280,7 @@ class SeedWarmupCacheSession:
         return er
 
     def write_work_unit(
-        self,
-        fingerprint: str,
-        intent: SeedWarmupIntent,
-        packed_execute: dict[str, Any],
-        *,
-        report_version: int,
+        self, fingerprint: str, intent: SeedWarmupIntent, packed_execute: dict[str, Any], *, report_version: int
     ) -> None:
         """Persist one work unit record and append *report_version* to session id lists."""
         wid = self.ensure_work_unit_id(fingerprint)
@@ -359,13 +331,7 @@ class SeedWarmupCacheSession:
             self.touched_work_unit_ids.append(wid)
         return wid
 
-    def record_question_llm(
-        self,
-        fingerprint: str,
-        payload: dict[str, Any],
-        *,
-        ok: bool,
-    ) -> None:
+    def record_question_llm(self, fingerprint: str, payload: dict[str, Any], *, ok: bool) -> None:
         """Attach question/realism LLM payload and advance lifecycle after sampling."""
         wid = self.fp_to_wid.get(fingerprint)
         if not wid:
@@ -382,6 +348,22 @@ class SeedWarmupCacheSession:
         self.work_units[wid] = rec
 
 
+def _prune_stale_warmup_work_units(
+    work_units: dict[str, dict[str, Any]],
+    schema: SchemaGraph,
+) -> dict[str, dict[str, Any]]:
+    """Drop cached work units whose schema refs are no longer live in *schema*."""
+    pruned: dict[str, dict[str, Any]] = {}
+    for wid, wu in work_units.items():
+        refs = warmup_work_unit_schema_refs(wu)
+        if not refs.tables:
+            continue
+        ok, _ = template_is_live(refs, schema)
+        if ok:
+            pruned[wid] = wu
+    return pruned
+
+
 def open_seed_warmup_cache_session(
     output_dir: str,
     schema: SchemaGraph,
@@ -396,10 +378,7 @@ def open_seed_warmup_cache_session(
         identity_ok = True
     if (
         sql_history_content_sha256 is not None
-        and manifest.get(
-            "sql_history_content_hash",
-        )
-        == sql_history_content_sha256
+        and manifest.get("sql_history_content_hash") == sql_history_content_sha256
     ):
         identity_ok = True
     seed_ok = identity_ok
@@ -415,17 +394,9 @@ def open_seed_warmup_cache_session(
     if not seed_ok:
         work_units = {}
     elif not eff_ok:
-        pruned: dict[str, dict[str, Any]] = {}
-        for wid, wu in work_units.items():
-            refs = warmup_work_unit_schema_refs(wu)
-            if not refs.tables:
-                continue
-            ok, _ = template_is_live(refs, schema)
-            if ok:
-                pruned[wid] = wu
-        work_units = pruned
+        work_units = _prune_stale_warmup_work_units(work_units, schema)
     elif prev_prof and prev_prof != schema.profiling_hash:
-        pass
+        work_units = _prune_stale_warmup_work_units(work_units, schema)
 
     fp_to_wid = {
         str(wu["intent_fingerprint"]): str(wu["work_unit_id"])
@@ -473,9 +444,7 @@ def _warmup_pack_execute(
 
 
 def _warmup_synthetic_store_path_blocks(
-    intent: SeedWarmupIntent,
-    runtime: RuntimeIntent,
-    templates: dict[str, Template],
+    intent: SeedWarmupIntent, runtime: RuntimeIntent, templates: dict[str, Template]
 ) -> str | None:
     """Return drop code when a synthetic row matches the store only via warmup-forbidden path 4.1 or 4.2."""
     if (intent.source or "gold") == "gold":
@@ -513,22 +482,38 @@ def get_next_seed_warmup_version(output_dir: str) -> int:
     return max(versions) + 1 if versions else 1
 
 
-def run_seed_question_normalization(
-    seeds: list[dict[str, Any]],
-) -> tuple[dict[int, dict[str, str]], str, str]:
+def run_seed_question_normalization(seeds: list[dict[str, Any]]) -> tuple[dict[int, dict[str, str]], str, str]:
     """Batch LLM normalization for seed lines; return phrases plus. compact JSON and `.txt` payloads."""
     by_num: dict[int, str] = {int(s["number"]): str(s["question"]).strip() for s in seeds}
     sorted_nums = sorted(by_num.keys())
     out: dict[int, dict[str, str]] = {}
+    batch_chunks: list[tuple[str, list[int], str]] = []
     for i in range(0, len(sorted_nums), SEED_NORMALIZATION_BATCH_SIZE):
         batch = sorted_nums[i : i + SEED_NORMALIZATION_BATCH_SIZE]
         payload = [{"index": n, "source": by_num[n]} for n in batch]
         user = stable_json({"batch": payload})
+        batch_chunks.append((f"seed-normalize-{i}", batch, user))
+
+    parsed_by_id: dict[str, dict[str, Any]] = {}
+    if llm_batch_enabled() and batch_chunks:
+        requests = [
+            LlmBatchRequest(custom_id=custom_id, system=SEED_QUESTION_CLARIFY_SYSTEM, user=user, task="default")
+            for custom_id, _batch, user in batch_chunks
+        ]
         try:
-            parsed = llm_json(_SEED_LINE_NORMALIZE_SYSTEM, user, retries=2, task="intent")
-        except LlmJsonExhausted as exc:
-            debug(f"[seed_warmup.run_seed_question_normalization] llm_json exhausted on batch {i}: {exc}")
-            parsed = {}
+            parsed_by_id = llm_batch_json(requests)
+        except (RuntimeError, OSError, ValueError) as exc:
+            debug(f"[seed_warmup.run_seed_question_normalization] batch failed: {exc}")
+            parsed_by_id = {}
+
+    for custom_id, batch, user in batch_chunks:
+        parsed = parsed_by_id.get(custom_id, {})
+        if not parsed:
+            try:
+                parsed = llm_json(SEED_QUESTION_CLARIFY_SYSTEM, user, retries=2, task="default")
+            except LlmJsonExhausted as exc:
+                debug(f"[seed_warmup.run_seed_question_normalization] llm_json exhausted on {custom_id}: {exc}")
+                parsed = {}
         lines = parsed.get("lines")
         if not isinstance(lines, list):
             lines = []
@@ -537,7 +522,7 @@ def run_seed_question_normalization(
             if not isinstance(row, dict):
                 continue
             idx = row.get("index")
-            nm = str(row.get("normalized", "")).strip()
+            nm = str(row.get("clarified") or row.get("normalized") or "").strip()
             if idx is not None and nm:
                 got[int(idx)] = nm
         for n in batch:
@@ -564,11 +549,7 @@ def _load_seed_questions(filepath: str) -> list[dict[str, Any]]:
             if not line:
                 continue
             if line.startswith("#"):
-                phase_match = re.search(
-                    r"Phase\s+(\d+)",
-                    line,
-                    re.IGNORECASE,
-                )
+                phase_match = re.search(r"Phase\s+(\d+)", line, re.IGNORECASE)
                 if phase_match:
                     current_phase = f"phase_{phase_match.group(1)}"
                 continue
@@ -617,10 +598,7 @@ def _load_seed_questions(filepath: str) -> list[dict[str, Any]]:
     return questions
 
 
-def _parse_gold_intent_strict(
-    question: str,
-    schema: SchemaGraph,
-) -> tuple[RuntimeIntent | None, list[str]]:
+def _parse_gold_intent_strict(question: str, schema: SchemaGraph) -> tuple[RuntimeIntent | None, list[str]]:
     """Parse a seed question with optional retry when the first parse. returns no intent."""
     q_norm = normalize_question(question)
     last_warns: list[str] = []
@@ -653,10 +631,7 @@ def _gold_failure_trace_text(seed_warmup_version: int, sections: list[str]) -> s
     return header + "\n\n".join(sections)
 
 
-def _confirm_gold_intent(
-    question: str,
-    intent: RuntimeIntent,
-) -> tuple[bool, RuntimeIntent | None]:
+def _confirm_gold_intent(question: str, intent: RuntimeIntent) -> tuple[bool, RuntimeIntent | None]:
     """Interactively confirm a parsed gold intent with the user."""
     nl_summary = intent.natural_language or ""
     if not nl_summary:
@@ -691,20 +666,10 @@ def _confirm_gold_intent(
     if choice is None:
         return False, None
     elif choice == "y":
-        notify(
-            "\nIntent accepted.",
-            stage="cli",
-            code=DIAGNOSTIC_CODE_ENGINE_INFO,
-            level="info",
-        )
+        notify("\nIntent accepted.", stage="cli", code=DIAGNOSTIC_CODE_ENGINE_INFO, level="info")
         return True, intent
     else:
-        notify(
-            "\nIntent rejected.",
-            stage="cli",
-            code=DIAGNOSTIC_CODE_ENGINE_INFO,
-            level="info",
-        )
+        notify("\nIntent rejected.", stage="cli", code=DIAGNOSTIC_CODE_ENGINE_INFO, level="info")
         return False, None
 
 
@@ -716,8 +681,8 @@ def _abstract_values(intent: RuntimeIntent) -> RuntimeIntent:
         select_cols=intent.select_cols,
         group_by_cols=intent.group_by_cols,
         order_by_cols=intent.order_by_cols,
-        filters_param=intent.filters_param,
-        having_param=intent.having_param,
+        where=intent.where,
+        having=intent.having,
         param_values={},
         cte_steps=intent.cte_steps,
         column_map=intent.column_map,
@@ -826,8 +791,7 @@ def run_gold_intent_generation(
 
 
 def _collect_resolved_table_names(
-    tables: list[str],
-    cte_steps: list[RuntimeCteStep] | list[dict[str, object]] | list[object],
+    tables: list[str], cte_steps: list[RuntimeCteStep] | list[dict[str, object]] | list[object]
 ) -> set[str]:
     """Return top-level and CTE-referenced table names in lowercase."""
     names = {str(t).lower() for t in tables}
@@ -843,11 +807,10 @@ def _collect_resolved_table_names(
     return names
 
 
-def _filter_hint_search_blob(
-    filters: list[FilterParam] | list[dict[str, object]] | list[object],
-    param_values: Mapping[str, object],
+def _where_hint_search_blob(
+    filters: list[WhereParam] | list[dict[str, object]] | list[object], param_values: Mapping[str, object]
 ) -> str:
-    """Build lowercase searchable text for ``must_filter`` hint matching."""
+    """Build lowercase searchable text for ``must_where`` hint matching."""
     parts: list[str] = []
     for filt in filters:
         if isinstance(filt, dict):
@@ -887,8 +850,7 @@ def _optional_int(value: object) -> int | None:
 
 
 def check_intent_against_expectation(
-    intent: dict[str, object] | RuntimeIntent,
-    expectation: dict[str, object],
+    intent: dict[str, object] | RuntimeIntent, expectation: dict[str, object]
 ) -> list[str]:
     """Return human-readable failure reasons when *intent* violates *expectation*."""
     tables: list[str]
@@ -905,7 +867,7 @@ def check_intent_against_expectation(
         grain = str(intent.grain or "")
         select_cols = [cast(object, sc) for sc in (intent.select_cols or [])]
         group_by = [cast(object, g) for g in (intent.group_by_cols or [])]
-        filters = [cast(object, f) for f in (intent.filters_param or [])]
+        filters = [cast(object, f) for f in (where_leaves(intent.where) or [])]
         limit = intent.limit
         cte_steps = [cast(object, c) for c in (intent.cte_steps or [])]
         window_registry = [cast(object, w) for w in (intent.window_registry or [])]
@@ -915,7 +877,7 @@ def check_intent_against_expectation(
         grain = str(intent.get("grain") or "")
         select_cols = _object_list(intent.get("select_cols"))
         group_by = _object_list(intent.get("group_by_cols"))
-        filters = _object_list(intent.get("filters_param"))
+        filters = _object_list(intent.get("where", intent.get("where_param")))
         limit = _optional_int(intent.get("limit"))
         cte_steps = _object_list(intent.get("cte_steps"))
         window_registry = _object_list(intent.get("window_registry"))
@@ -963,10 +925,10 @@ def check_intent_against_expectation(
         if not any(hint_l in str(g).lower() for g in group_by):
             failures.append(f"missing group_by hint {hint!r}")
 
-    for hint in _object_list(expectation.get("must_filter")):
-        blob = _filter_hint_search_blob(filters, param_values)
+    for hint in _object_list(expectation.get("must_where", expectation.get("must_filter"))):
+        blob = _where_hint_search_blob(filters, param_values)
         if str(hint).lower() not in blob:
-            failures.append(f"missing filter hint {hint!r}")
+            failures.append(f"missing where hint {hint!r}")
 
     exp_limit = expectation.get("limit")
     if exp_limit is not None and limit != exp_limit:
@@ -1024,12 +986,7 @@ def resolve_joins_for_table_set(
         return entry
 
     join_tables = physical_tables_for_join_hints(tables, schema)
-    candidates = join_hints_multi(
-        schema,
-        join_tables,
-        virtual_specs={},
-        include_semantic=False,
-    )
+    candidates = join_hints_multi(schema, join_tables, virtual_specs={}, include_semantic=False)
     cmap = join_candidate_map(candidates)
 
     if not candidates:
@@ -1077,7 +1034,7 @@ def resolve_joins_for_table_set(
     return entry
 
 
-def _decompose_between_filter_param(f: FilterParam) -> list[FilterParam]:
+def _decompose_between_where_param(f: WhereParam) -> list[WhereParam]:
     """Decompose a `between` filter into `>=` and `<=` filters."""
     if f.op != "between":
         return [f]
@@ -1089,22 +1046,12 @@ def _decompose_between_filter_param(f: FilterParam) -> list[FilterParam]:
         lower_key = None
         upper_key = None
     return [
-        replace(
-            f,
-            op=">=",
-            param_key=lower_key,
-        ),
-        replace(
-            f,
-            op="<=",
-            param_key=upper_key,
-        ),
+        replace(f, op=">=", param_key=lower_key),
+        replace(f, op="<=", param_key=upper_key),
     ]
 
 
-def _identify_range_pairs(
-    filters: list[FilterParam],
-) -> dict[str, dict[str, int]]:
+def _identify_range_pairs(filters: list[WhereParam]) -> dict[str, dict[str, int]]:
     """Identify columns with paired lower and upper bound filters."""
     column_ops: dict[str, dict[str, int]] = {}
     for idx, f in enumerate(filters):
@@ -1117,14 +1064,11 @@ def _identify_range_pairs(
     return {col: ops for col, ops in column_ops.items() if "lower_idx" in ops and "upper_idx" in ops}
 
 
-def instantiate_intent(
-    intent: SeedWarmupIntent,
-    value_domains: dict[str, ValueDomain],
-) -> SeedWarmupIntent | None:
+def instantiate_intent(intent: SeedWarmupIntent, value_domains: dict[str, ValueDomain]) -> SeedWarmupIntent | None:
     """Populate filter and HAVING values from profiling data."""
-    decomposed: list[FilterParam] = []
-    for f in intent.filters_param:
-        decomposed.extend(_decompose_between_filter_param(f))
+    decomposed: list[WhereParam] = []
+    for f in where_leaves(intent.where) if intent.where else []:
+        decomposed.extend(_decompose_between_where_param(f))
 
     range_pairs = _identify_range_pairs(decomposed)
     range_values: dict[str, tuple[str, str]] = {}
@@ -1138,7 +1082,7 @@ def instantiate_intent(
         if lower_val is not None and upper_val is not None:
             range_values[col_key] = (lower_val, upper_val)
 
-    new_filters: list[FilterParam] = []
+    new_filters: list[WhereParam] = []
     new_param_values: dict[str, Any] = {}
 
     for filter_idx, f in enumerate(decomposed):
@@ -1171,35 +1115,21 @@ def instantiate_intent(
             elif f.op in ("<", "<="):
                 value = upper_val
             else:
-                value = sample_value_from_domain(
-                    domain,
-                    f.value_type,
-                    f.op,
-                    0,
-                )
+                value = sample_value_from_domain(domain, f.value_type, f.op, 0)
         else:
-            value = sample_value_from_domain(
-                domain,
-                f.value_type,
-                f.op,
-                0,
-            )
+            value = sample_value_from_domain(domain, f.value_type, f.op, 0)
 
         if value is not None:
             new_param_values[param_key] = value
         new_filters.append(replace(f, param_key=param_key))
 
     new_having: list[HavingParam] = []
-    for having_idx, h in enumerate(intent.having_param):
+    for having_idx, h in enumerate(having_leaves(intent.having)):
         param_key = h.param_key or f"having_{having_idx}"
         if h.right_expr is not None:
             new_having.append(replace(h, param_key=param_key))
             continue
-        value = deterministic_having_value(
-            h.left_expr.primary_term,
-            0,
-            having_idx,
-        )
+        value = deterministic_having_value(h.left_expr.primary_term, 0, having_idx)
         new_param_values[param_key] = value
         new_having.append(replace(h, param_key=param_key))
 
@@ -1210,8 +1140,8 @@ def instantiate_intent(
         select_cols=intent.select_cols,
         group_by_cols=intent.group_by_cols,
         order_by_cols=intent.order_by_cols,
-        filters_param=new_filters,
-        having_param=new_having,
+        where=predicate_group_from_list(new_filters),
+        having=predicate_group_from_list(new_having),
         param_values=new_param_values,
         cte_steps=intent.cte_steps,
         question="",
@@ -1233,9 +1163,7 @@ def accepted_template_instance_keys(templates: dict[str, Template]) -> set[str]:
     keys: set[str] = set()
     for tmpl in templates.values():
         conc = tmpl.intent_signature
-        bk = body_similarity_key_for_concrete(conc)
-        jk = join_path_key_concrete(conc)
-        keys.add(template_instance_key_from_parts(bk, jk, tmpl.sql_fp))
+        keys.add(template_instance_key_for_concrete(conc, tmpl.sql_fp))
     return keys
 
 
@@ -1304,8 +1232,8 @@ def _warmup_body_footprint(intent: SeedWarmupIntent) -> int:
     """Structural size heuristic for tie-breaking duplicate Jaccard signatures."""
     return (
         len(intent.select_cols or [])
-        + len(intent.filters_param or [])
-        + len(intent.having_param or [])
+        + len(where_leaves(intent.where) or [])
+        + len(having_leaves(intent.having) or [])
         + len(intent.cte_steps or [])
     )
 
@@ -1386,10 +1314,7 @@ def _warmup_semantic_coverage_atoms(intent: SeedWarmupIntent) -> frozenset[str]:
     return frozenset(atoms)
 
 
-def _warmup_low_volume_cap_positions(
-    positions: list[int],
-    ordered_intents: list[SeedWarmupIntent],
-) -> set[int]:
+def _warmup_low_volume_cap_positions(positions: list[int], ordered_intents: list[SeedWarmupIntent]) -> set[int]:
     """Apply body-key caps when the low-volume bypass keeps all survivors."""
     body_counts: dict[str, int] = {}
     tier_body_counts: dict[tuple[str, str], int] = {}
@@ -1412,7 +1337,9 @@ def _warmup_low_volume_cap_positions(
 
 def _warmup_llm_uncertainty_score(intent: SeedWarmupIntent) -> float:
     """Deterministic uncertainty score in [0, 1] for LLM diversity routing."""
-    rule_count = len(intent.filters_param or []) + len(intent.having_param or []) + len(intent.select_cols or [])
+    rule_count = (
+        len(where_leaves(intent.where) or []) + len(having_leaves(intent.having) or []) + len(intent.select_cols or [])
+    )
     score = 0.0
     if rule_count < 4:
         score += 0.40
@@ -1429,10 +1356,7 @@ def _warmup_llm_uncertainty_score(intent: SeedWarmupIntent) -> float:
 
 
 def _warmup_submodular_atoms_for_row(
-    ordered_intents: list[SeedWarmupIntent],
-    pos: int,
-    *,
-    position_rsig: dict[int, str] | None = None,
+    ordered_intents: list[SeedWarmupIntent], pos: int, *, position_rsig: dict[int, str] | None = None
 ) -> frozenset[str]:
     """Coverage atoms for greedy set-cover over synthetic execute indices."""
     intent = ordered_intents[pos]
@@ -1456,11 +1380,7 @@ def _warmup_jaccard_similarity_frozen(a: frozenset[str], b: frozenset[str]) -> f
     return len(a & b) / union_n
 
 
-def _warmup_mmr_order(
-    positions: list[int],
-    ordered_intents: list[SeedWarmupIntent],
-    lambda_mmr: float,
-) -> list[int]:
+def _warmup_mmr_order(positions: list[int], ordered_intents: list[SeedWarmupIntent], lambda_mmr: float) -> list[int]:
     """Maximum marginal relevance ordering for diversified survivor ordering."""
     if len(positions) <= 1:
         return list(positions)
@@ -1491,8 +1411,7 @@ def _warmup_mmr_order(
 
 
 def _warmup_dedupe_jaccard_positions(
-    positions: list[int],
-    ordered_intents: list[SeedWarmupIntent],
+    positions: list[int], ordered_intents: list[SeedWarmupIntent]
 ) -> tuple[list[int], list[dict[str, Any]]]:
     """Keep one survivor per Jaccard signature with smallest structural footprint."""
     by_sig: dict[frozenset[str], list[int]] = {}
@@ -1502,10 +1421,7 @@ def _warmup_dedupe_jaccard_positions(
     kept: list[int] = []
     drop_records: list[dict[str, Any]] = []
     for plist in by_sig.values():
-        best = min(
-            plist,
-            key=lambda p: (_warmup_body_footprint(ordered_intents[p]), p),
-        )
+        best = min(plist, key=lambda p: (_warmup_body_footprint(ordered_intents[p]), p))
         kept.append(best)
         for p in plist:
             if p == best:
@@ -1544,26 +1460,18 @@ def build_anchor_lattice(
         disk_a = lattice_disk_by_sig.get(lk)
         if disk_a:
             cells[key] = AnchorLatticeCell(
-                key=key,
-                representative_intent_id=rows[0][0].intent_id,
-                anchors=tuple(str(x) for x in disk_a),
+                key=key, representative_intent_id=rows[0][0].intent_id, anchors=tuple(str(x) for x in disk_a)
             )
             continue
         best_intent, best_sql = rows[0]
-        by_style = generate_warmup_paraphrases_by_style(
-            schema,
-            best_intent.tables or [],
-            sql=best_sql,
-        )
+        by_style = generate_warmup_paraphrases_by_style(schema, best_intent.tables or [], sql=best_sql)
         if not by_style:
             continue
         raw_phrases = flatten_warmup_paraphrases_by_style(by_style)
         if not raw_phrases:
             continue
         cells[key] = AnchorLatticeCell(
-            key=key,
-            representative_intent_id=best_intent.intent_id,
-            anchors=tuple(raw_phrases),
+            key=key, representative_intent_id=best_intent.intent_id, anchors=tuple(raw_phrases)
         )
     return AnchorLattice(cells=cells)
 
@@ -1589,11 +1497,7 @@ def _warmup_collect_phrases_for_intent(
         )
         if not seed:
             return [], None
-        by_style = generate_warmup_paraphrases_by_style(
-            schema,
-            intent.tables or [],
-            seed_question=seed,
-        )
+        by_style = generate_warmup_paraphrases_by_style(schema, intent.tables or [], seed_question=seed)
         phrases = [seed]
         if by_style:
             for p in flatten_warmup_paraphrases_by_style(by_style):
@@ -1601,35 +1505,19 @@ def _warmup_collect_phrases_for_intent(
                     phrases.append(p)
         return phrases, by_style
     if origin_sql_history:
-        by_style = generate_warmup_paraphrases_by_style(
-            schema,
-            intent.tables or [],
-            sql=final_sql,
-        )
+        by_style = generate_warmup_paraphrases_by_style(schema, intent.tables or [], sql=final_sql)
         phrases = flatten_warmup_paraphrases_by_style(by_style) if by_style else []
         if not phrases:
-            freeform = generate_warmup_questions_freeform(
-                schema,
-                intent.tables or [],
-                sql=final_sql,
-            )
+            freeform = generate_warmup_questions_freeform(schema, intent.tables or [], sql=final_sql)
             phrases = list(freeform or [])
         typed = {str(k): list(v) for k, v in by_style.items() if isinstance(v, list)} if by_style else None
         return phrases, typed
     if lattice_anchors:
         return list(lattice_anchors), None
-    by_style = generate_warmup_paraphrases_by_style(
-        schema,
-        intent.tables or [],
-        sql=final_sql,
-    )
+    by_style = generate_warmup_paraphrases_by_style(schema, intent.tables or [], sql=final_sql)
     phrases = flatten_warmup_paraphrases_by_style(by_style) if by_style else []
     if not phrases:
-        freeform = generate_warmup_questions_freeform(
-            schema,
-            intent.tables or [],
-            sql=final_sql,
-        )
+        freeform = generate_warmup_questions_freeform(schema, intent.tables or [], sql=final_sql)
         phrases = list(freeform or [])
     return phrases, by_style
 
@@ -1678,9 +1566,7 @@ def _work_unit_question_llm_succeeded(wu: dict[str, Any]) -> bool:
 
 
 def derive_capped_warmup_view_from_uncapped(
-    work_units: list[dict[str, Any]],
-    *,
-    max_kept_intents: int | None | _WarmupCapDefaultSentinel = _WARMUP_CAP_DEFAULT,
+    work_units: list[dict[str, Any]], *, max_kept_intents: int | None | _WarmupCapDefaultSentinel = _WARMUP_CAP_DEFAULT
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Replay capped sampling and fillback on cached uncapped work units without new LLM calls."""
     fp_to_wu: dict[str, dict[str, Any]] = {}
@@ -1714,10 +1600,7 @@ def derive_capped_warmup_view_from_uncapped(
 
     fillback_cap, _uncapped_exec = resolve_warmup_max_kept_intents(max_kept_intents)
     sampled, gold_dropped_pos, sampling_detail = _warmup_submodular_cover_select(
-        ordered_intents,
-        execute_positions,
-        position_rsig=position_rsig,
-        max_kept_intents=max_kept_intents,
+        ordered_intents, execute_positions, position_rsig=position_rsig, max_kept_intents=max_kept_intents
     )
     sampling_detail["result_signature_positions"] = len(position_rsig)
     sampling_detail["selection_order"] = sorted(sampled)
@@ -1833,9 +1716,7 @@ def derive_capped_warmup_view_from_uncapped(
             trace["drop_detail"] = drop_rec.get("detail")
     sampling_detail["selection_order"] = sorted(success_positions)
     sampling_detail["coverage_order"] = _warmup_positions_coverage_order(
-        sorted(success_positions),
-        ordered_intents,
-        position_rsig=position_rsig,
+        sorted(success_positions), ordered_intents, position_rsig=position_rsig
     )
 
     return capped_units, sampling_detail
@@ -1910,11 +1791,7 @@ def _warmup_submodular_cover_select(
         pool_n = len(e_list)
         gr = len(g_positions) / max(pool_n, 1)
         min_gold = min(
-            len(g_positions),
-            max(
-                int(math.ceil(_warmup_min_gold_fraction() * target)),
-                int(math.ceil(gr * target)),
-            ),
+            len(g_positions), max(int(math.ceil(_warmup_min_gold_fraction() * target)), int(math.ceil(gr * target)))
         )
     gold_stratum: dict[str, list[int]] = {}
     for pos in g_positions:
@@ -2087,10 +1964,7 @@ def _warmup_submodular_cover_select(
 
 
 def _warmup_positions_coverage_order(
-    positions: list[int],
-    ordered_intents: list[SeedWarmupIntent],
-    *,
-    position_rsig: dict[int, str] | None = None,
+    positions: list[int], ordered_intents: list[SeedWarmupIntent], *, position_rsig: dict[int, str] | None = None
 ) -> list[int]:
     """Return a deterministic coverage-first ordering for selected positions."""
     if len(positions) <= 1:
@@ -2143,10 +2017,7 @@ def _create_template_from_result(
     first_q = phrases[0].strip()
     q_norm = normalize_question(first_q) or normalize_question(result.question or "") or "?"
     norm_opt = q_norm if q_norm != first_q else None
-    form_storage = QuestionFormStorage(
-        corrected=first_q,
-        normalized_optional=norm_opt,
-    )
+    form_storage = QuestionFormStorage(corrected=first_q, normalized_optional=norm_opt)
 
     vh: ValueHistory | None = None
     if seed_warmup_intent and (seed_warmup_intent.seed_prompt_original or seed_warmup_intent.seed_prompt_normalized):
@@ -2187,9 +2058,7 @@ def _create_template_from_result(
     return tmpl
 
 
-def _build_value_domains(
-    schema: SchemaGraph,
-) -> dict[str, ValueDomain]:
+def _build_value_domains(schema: SchemaGraph) -> dict[str, ValueDomain]:
     """Build `ValueDomain` objects from schema column metadata."""
     domains: dict[str, ValueDomain] = {}
     for table_name, table_meta in schema.tables.items():
@@ -2218,6 +2087,14 @@ def run_seed_warmup_execution(
     warmup_report_version: int = 1,
     warmup_lattice_root: str | None = None,
     max_kept_intents: int | None | _WarmupCapDefaultSentinel = _WARMUP_CAP_DEFAULT,
+    federation_manifest: Any | None = None,
+    federation_mappings: Any | None = None,
+    stores_by_source: dict[str, Any] | None = None,
+    dialects_by_source: Mapping[str, Any] | None = None,
+    source_runtimes: Mapping[str, Any] | None = None,
+    member_graphs: Mapping[str, SchemaGraph] | None = None,
+    federation_dir: str | None = None,
+    persist_template_learning: bool = True,
 ) -> tuple[list[SeedWarmupResult], list[Template], int, dict[str, Any]]:
     """Execute SQL for each intent, stratify successes, then run question LLM on the sample."""
     if join_cache is None:
@@ -2258,9 +2135,13 @@ def run_seed_warmup_execution(
     sampled_work_unit_ids: list[str] = []
 
     debug(f"run_seed_warmup_execution: processing {len(intents)} intents")
-    debug("[P6] Warmup union pre-align (4.3 only), validate, execute, then sampling")
+    debug("Warmup union pre-align: validate, execute, then sampling")
 
-    results_file = Path(os.getcwd()) / "live_tests" / "results.txt"
+    if warmup_lattice_root:
+        results_root = Path(warmup_lattice_root)
+    else:
+        results_root = Path(os.getcwd())
+    results_file = results_root / "live_tests" / "results.txt"
 
     ordered_intents = sorted(intents, key=_seed_warmup_intent_sort_key)
     cap_n = SeedWarmupConfig.MAX_WARMUP_EXECUTE_UNITS
@@ -2278,6 +2159,7 @@ def run_seed_warmup_execution(
             list[Any],
             dict[str, Any],
             SeedWarmupResult,
+            Any | None,
         ]
     ] = []
 
@@ -2286,11 +2168,7 @@ def run_seed_warmup_execution(
 
         with pipeline_capture(auto_responses=["y", "y", "y"]) as capture:
             runtime = intent.to_runtime_intent()
-            runtime = apply_deterministic_repairs(
-                runtime,
-                schema,
-                intent.natural_language or intent.intent_id or "",
-            )
+            runtime = apply_deterministic_repairs(runtime, schema, intent.natural_language or intent.intent_id or "")
             result = SeedWarmupResult(runtime, "")
 
             def _wu_record(
@@ -2330,12 +2208,7 @@ def run_seed_warmup_execution(
                     join_path_key=jkr,
                     template_instance_key=tik,
                 )
-                warmup_cache.write_work_unit(
-                    unit_fp,
-                    unit_intent,
-                    pack,
-                    report_version=warmup_report_version,
-                )
+                warmup_cache.write_work_unit(unit_fp, unit_intent, pack, report_version=warmup_report_version)
 
             runtime, qual_msgs = check_qualified_refs_exist(runtime, schema)
             if qual_msgs:
@@ -2343,45 +2216,25 @@ def run_seed_warmup_execution(
                 result.failure_code = "warmup_qualified_refs"
                 results.append(result)
                 fail_count += 1
-                _wu_record(
-                    runtime,
-                    ok=False,
-                    final_sql=None,
-                    fc="warmup_qualified_refs",
-                    err=result.error,
-                )
+                _wu_record(runtime, ok=False, final_sql=None, fc="warmup_qualified_refs", err=result.error)
                 continue
 
             lit_rt, pp_issues = apply_runtime_post_processing_lite(
-                runtime,
-                schema,
-                question_fallback=intent.intent_id or "",
+                runtime, schema, question_fallback=intent.intent_id or ""
             )
             if lit_rt is None:
                 result.error = "warmup_post_processing_lite_failed"
                 result.failure_code = "warmup_post_processing_lite_failed"
                 results.append(result)
                 fail_count += 1
-                _wu_record(
-                    runtime,
-                    ok=False,
-                    final_sql=None,
-                    fc="warmup_post_processing_lite_failed",
-                    err=result.error,
-                )
+                _wu_record(runtime, ok=False, final_sql=None, fc="warmup_post_processing_lite_failed", err=result.error)
                 continue
             if any((i.severity or "").lower() == "error" for i in pp_issues):
                 result.error = f"warmup_post_processing_lite_failed: {pp_issues[0].message}"
                 result.failure_code = "warmup_post_processing_lite_failed"
                 results.append(result)
                 fail_count += 1
-                _wu_record(
-                    lit_rt,
-                    ok=False,
-                    final_sql=None,
-                    fc="warmup_post_processing_lite_failed",
-                    err=result.error,
-                )
+                _wu_record(lit_rt, ok=False, final_sql=None, fc="warmup_post_processing_lite_failed", err=result.error)
                 continue
             runtime = lit_rt
 
@@ -2392,13 +2245,7 @@ def run_seed_warmup_execution(
                 results.append(result)
                 fail_count += 1
                 semantic_precheck_failed += 1
-                _wu_record(
-                    runtime,
-                    ok=False,
-                    final_sql=None,
-                    fc="warmup_semantic_precheck",
-                    err=result.error,
-                )
+                _wu_record(runtime, ok=False, final_sql=None, fc="warmup_semantic_precheck", err=result.error)
                 continue
 
             if warmup_cache is not None:
@@ -2452,18 +2299,14 @@ def run_seed_warmup_execution(
                     res_hit.success = False
                     fs_sql = str(er_hit.get("final_sql") or "")
                     all_pv_hit = dict(rt_hit.param_values or {})
-                    pending_success.append((idx, intent, rt_hit, fs_sql, [], all_pv_hit, res_hit))
+                    pending_success.append((idx, intent, rt_hit, fs_sql, [], all_pv_hit, res_hit, None))
                     results.append(res_hit)
                     continue
 
             try:
                 reuse_entry = _ambiguous_join_reuse_from_parent(intent, join_cache, id_to_intent)
                 join_id, join_sig, candidates = resolve_joins_for_table_set(
-                    intent.tables or [],
-                    schema,
-                    intent.intent_id,
-                    join_cache,
-                    ambiguous_reuse_entry=reuse_entry,
+                    intent.tables or [], schema, intent.intent_id, join_cache, ambiguous_reuse_entry=reuse_entry
                 )
             except Exception as e:
                 result.error = f"join_resolution_failed: {e}"
@@ -2471,13 +2314,7 @@ def run_seed_warmup_execution(
                 results.append(result)
                 fail_count += 1
                 join_resolution_failed += 1
-                _wu_record(
-                    runtime,
-                    ok=False,
-                    final_sql=None,
-                    fc="join_resolution_failed",
-                    err=result.error,
-                )
+                _wu_record(runtime, ok=False, final_sql=None, fc="join_resolution_failed", err=result.error)
                 continue
 
             try:
@@ -2486,10 +2323,12 @@ def run_seed_warmup_execution(
 
                 det_sql = build_deterministic_sql(runtime, None, schema, dialect)
                 if join_id != "J00" and join_sig:
+                    join_kinds = edge_kinds_for_join_candidate(candidates, join_id)
                     det_sql = inject_join_into_deterministic_sql(
                         det_sql,
                         [join_sig],
                         schema=schema,
+                        edge_kinds_ordered=[join_kinds],
                         dialect=dialect,
                     )
                 runtime.sql_param = det_sql
@@ -2505,14 +2344,7 @@ def run_seed_warmup_execution(
                         warmup_path41_drop += 1
                     else:
                         warmup_path42_drop += 1
-                    _wu_record(
-                        runtime,
-                        ok=False,
-                        final_sql=None,
-                        fc=syn_drop,
-                        err=syn_drop,
-                        tik="",
-                    )
+                    _wu_record(runtime, ok=False, final_sql=None, fc=syn_drop, err=syn_drop, tik="")
                     continue
             except Exception as e:
                 result.error = f"sql_build_failed: {e}"
@@ -2520,13 +2352,7 @@ def run_seed_warmup_execution(
                 results.append(result)
                 fail_count += 1
                 sql_build_failed += 1
-                _wu_record(
-                    runtime,
-                    ok=False,
-                    final_sql=None,
-                    fc="sql_build_failed",
-                    err=result.error,
-                )
+                _wu_record(runtime, ok=False, final_sql=None, fc="sql_build_failed", err=result.error)
                 continue
 
             instantiated = instantiate_intent(intent, value_domains)
@@ -2536,37 +2362,21 @@ def run_seed_warmup_execution(
                 results.append(result)
                 fail_count += 1
                 instantiation_failed += 1
-                _wu_record(
-                    runtime,
-                    ok=False,
-                    final_sql=None,
-                    fc="instantiation_failed",
-                    err=result.error,
-                )
+                _wu_record(runtime, ok=False, final_sql=None, fc="instantiation_failed", err=result.error)
                 continue
 
             all_params = dict(instantiated.param_values)
             all_params.update(runtime.param_values or {})
             try:
                 runtime.sql_param = det_sql
-                final_sql = finalize_substitute_sql(
-                    runtime,
-                    structural_defaults_src=None,
-                    params=all_params,
-                )
+                final_sql = finalize_substitute_sql(runtime, structural_defaults_src=None, params=all_params)
             except Exception as e:
                 result.error = f"substitution_failed: {e}"
                 result.failure_code = "substitution_failed"
                 results.append(result)
                 fail_count += 1
                 substitution_failed += 1
-                _wu_record(
-                    runtime,
-                    ok=False,
-                    final_sql=None,
-                    fc="substitution_failed",
-                    err=result.error,
-                )
+                _wu_record(runtime, ok=False, final_sql=None, fc="substitution_failed", err=result.error)
                 continue
 
             if not final_sql or not final_sql.strip():
@@ -2575,13 +2385,7 @@ def run_seed_warmup_execution(
                 results.append(result)
                 fail_count += 1
                 empty_sql_failed += 1
-                _wu_record(
-                    runtime,
-                    ok=False,
-                    final_sql=None,
-                    fc="empty_sql_after_substitution",
-                    err=result.error,
-                )
+                _wu_record(runtime, ok=False, final_sql=None, fc="empty_sql_after_substitution", err=result.error)
                 continue
 
             post_msgs_pb = curated_warmup_post_binding_issues(runtime, schema, final_sql)
@@ -2590,182 +2394,185 @@ def run_seed_warmup_execution(
                 result.failure_code = "warmup_post_binding_semantics"
                 results.append(result)
                 fail_count += 1
-                _wu_record(
-                    runtime,
-                    ok=False,
-                    final_sql=final_sql,
-                    fc="warmup_post_binding_semantics",
-                    err=result.error,
-                )
+                _wu_record(runtime, ok=False, final_sql=final_sql, fc="warmup_post_binding_semantics", err=result.error)
                 continue
 
-            try:
-                ok, err, vcat, vdiags = validate_sql(
+            rows: list[Any] | None = None
+            federation_executed = False
+            federated_prepared: Any | None = None
+            if (
+                federation_manifest is not None
+                and schema_spans_multiple_sources(schema)
+                and stores_by_source is not None
+            ):
+                qn = normalize_question(intent.natural_language or intent.intent_id or "warmup")
+                ok_fed, err_fed, rows_fed, fed_sql, fed_prep = execute_federated_warmup_intent(
+                    qn,
+                    runtime,
+                    schema,
                     dialect,
-                    final_sql,
-                    bind_params_for_sql(final_sql, all_params),
-                    schema=schema,
-                    intent=runtime,
+                    federation_manifest=federation_manifest,
+                    federation_mappings=federation_mappings,
+                    stores_by_source=stores_by_source,
+                    dialects_by_source=dialects_by_source,
+                    source_runtimes=source_runtimes,
+                    member_graphs=member_graphs,
+                    federation_dir=federation_dir,
+                    persist_template_learning=persist_template_learning,
                 )
-            except Exception as e:
-                result.error = f"validation_exception: {e}"
-                result.failure_code = "validation_exception_unexpected"
-                results.append(result)
-                validation_drop += 1
-                fail_count += 1
-                _wu_record(
-                    runtime,
-                    ok=False,
-                    final_sql=final_sql,
-                    fc="validation_exception_unexpected",
-                    err=result.error,
-                )
-                continue
+                if not ok_fed:
+                    result.error = err_fed or "federated_warmup_failed"
+                    result.failure_code = "federated_warmup_failed"
+                    results.append(result)
+                    validation_drop += 1
+                    fail_count += 1
+                    _wu_record(
+                        runtime,
+                        ok=False,
+                        final_sql=fed_sql or final_sql,
+                        fc="federated_warmup_failed",
+                        err=result.error,
+                    )
+                    continue
+                final_sql = fed_sql or final_sql
+                rows = rows_fed
+                federation_executed = True
+                federated_prepared = fed_prep
 
-            skip_after_diag = False
-            if not ok:
-                for _rep in range(SeedWarmupConfig.WARMUP_DIAGNOSTIC_REPAIR_MAX_ROUNDS):
-                    runtime_r, chg = apply_diagnostic_repairs(runtime, schema, vdiags)
-                    if not chg:
-                        break
-                    try:
-                        runtime = runtime_r
-                        runtime = apply_default_structural_values(runtime)
-                        runtime = prune_unused_cte_steps(runtime)
-                        det_sql = build_deterministic_sql(runtime, None, schema, dialect)
-                        if join_id != "J00" and join_sig:
-                            det_sql = inject_join_into_deterministic_sql(
-                                det_sql,
-                                [join_sig],
+            if not federation_executed:
+                try:
+                    ok, err, vcat, vdiags = validate_sql(
+                        dialect, final_sql, bind_params_for_sql(final_sql, all_params), schema=schema, intent=runtime
+                    )
+                except Exception as e:
+                    result.error = f"validation_exception: {e}"
+                    result.failure_code = "validation_exception_unexpected"
+                    results.append(result)
+                    validation_drop += 1
+                    fail_count += 1
+                    _wu_record(
+                        runtime, ok=False, final_sql=final_sql, fc="validation_exception_unexpected", err=result.error
+                    )
+                    continue
+
+                skip_after_diag = False
+                if not ok:
+                    for _rep in range(SeedWarmupConfig.WARMUP_DIAGNOSTIC_REPAIR_MAX_ROUNDS):
+                        runtime_r, chg = apply_diagnostic_repairs(runtime, schema, vdiags)
+                        if not chg:
+                            break
+                        try:
+                            runtime = runtime_r
+                            runtime = apply_default_structural_values(runtime)
+                            runtime = prune_unused_cte_steps(runtime)
+                            det_sql = build_deterministic_sql(runtime, None, schema, dialect)
+                            if join_id != "J00" and join_sig:
+                                join_kinds = edge_kinds_for_join_candidate(candidates, join_id)
+                                det_sql = inject_join_into_deterministic_sql(
+                                    det_sql,
+                                    [join_sig],
+                                    schema=schema,
+                                    edge_kinds_ordered=[join_kinds],
+                                    dialect=dialect,
+                                )
+                            runtime.sql_param = det_sql
+                            runtime.chosen_join_candidate_id = join_id
+                            runtime.chosen_join_path_signature = join_sig
+                            instantiated2 = instantiate_intent(intent, value_domains)
+                            if instantiated2 is None:
+                                break
+                            all_params2 = dict(instantiated2.param_values)
+                            all_params2.update(runtime.param_values or {})
+                            final_sql = finalize_substitute_sql(
+                                runtime, structural_defaults_src=None, params=all_params2
+                            )
+                            all_params = all_params2
+                            post_retry = curated_warmup_post_binding_issues(runtime, schema, final_sql)
+                            if post_retry:
+                                result.error = f"warmup_post_binding_semantics: {post_retry[0]}"
+                                result.failure_code = "warmup_post_binding_semantics"
+                                results.append(result)
+                                validation_drop += 1
+                                fail_count += 1
+                                _wu_record(
+                                    runtime,
+                                    ok=False,
+                                    final_sql=final_sql,
+                                    fc="warmup_post_binding_semantics",
+                                    err=result.error,
+                                )
+                                skip_after_diag = True
+                                break
+                            if not final_sql or not final_sql.strip():
+                                break
+                            ok, err, vcat, vdiags = validate_sql(
+                                dialect,
+                                final_sql,
+                                bind_params_for_sql(final_sql, runtime.param_values),
                                 schema=schema,
-                                dialect=dialect,
+                                intent=runtime,
                             )
-                        runtime.sql_param = det_sql
-                        runtime.chosen_join_candidate_id = join_id
-                        runtime.chosen_join_path_signature = join_sig
-                        instantiated2 = instantiate_intent(intent, value_domains)
-                        if instantiated2 is None:
+                            if ok:
+                                break
+                        except Exception:
                             break
-                        all_params2 = dict(instantiated2.param_values)
-                        all_params2.update(runtime.param_values or {})
-                        final_sql = finalize_substitute_sql(
-                            runtime,
-                            structural_defaults_src=None,
-                            params=all_params2,
-                        )
-                        all_params = all_params2
-                        post_retry = curated_warmup_post_binding_issues(runtime, schema, final_sql)
-                        if post_retry:
-                            result.error = f"warmup_post_binding_semantics: {post_retry[0]}"
-                            result.failure_code = "warmup_post_binding_semantics"
-                            results.append(result)
-                            validation_drop += 1
-                            fail_count += 1
-                            _wu_record(
-                                runtime,
-                                ok=False,
-                                final_sql=final_sql,
-                                fc="warmup_post_binding_semantics",
-                                err=result.error,
-                            )
-                            skip_after_diag = True
-                            break
-                        if not final_sql or not final_sql.strip():
-                            break
-                        ok, err, vcat, vdiags = validate_sql(
-                            dialect,
-                            final_sql,
-                            bind_params_for_sql(final_sql, runtime.param_values),
-                            schema=schema,
-                            intent=runtime,
-                        )
-                        if ok:
-                            break
-                    except Exception:
-                        break
 
-            if skip_after_diag:
-                continue
+                if skip_after_diag:
+                    continue
 
-            if not ok:
-                vcode = seed_warmup_failure_code_from_validate_sql_error(
-                    err,
-                    failure_category=vcat.value if vcat is not None else None,
-                )
-                result.error = f"validation_failed: {err}"
-                result.failure_code = vcode
-                results.append(result)
-                validation_drop += 1
-                fail_count += 1
-                _wu_record(runtime, ok=False, final_sql=final_sql, fc=vcode, err=result.error)
-                continue
+                if not ok:
+                    vcode = seed_warmup_failure_code_from_validate_sql_error(
+                        err, failure_category=vcat.value if vcat is not None else None
+                    )
+                    result.error = f"validation_failed: {err}"
+                    result.failure_code = vcode
+                    results.append(result)
+                    validation_drop += 1
+                    fail_count += 1
+                    _wu_record(runtime, ok=False, final_sql=final_sql, fc=vcode, err=result.error)
+                    continue
 
-            try:
-                exec_sql = dialect.finalize_render(
-                    runtime.sql_param or "",
-                    all_params,
-                    schema=schema,
-                    intent=runtime,
-                    execution_sql_override=None,
-                    structural_defaults=None,
-                )
-                if dialect.can_explain():
-                    ok_ex, _diags_ex, err_ex = dialect.explain_diagnose(
-                        exec_sql,
+                try:
+                    exec_sql = dialect.finalize_render(
+                        runtime.sql_param or "",
                         all_params,
                         schema=schema,
                         intent=runtime,
+                        execution_sql_override=None,
+                        structural_defaults=None,
                     )
-                    if not ok_ex:
-                        result.error = f"explain_failed: {err_ex}"
-                        result.failure_code = "explain_failed"
-                        results.append(result)
-                        validation_drop += 1
-                        fail_count += 1
-                        _wu_record(
-                            runtime,
-                            ok=False,
-                            final_sql=final_sql,
-                            fc="explain_failed",
-                            err=result.error,
+                    if dialect.can_explain():
+                        ok_ex, _diags_ex, err_ex = dialect.explain_diagnose(
+                            exec_sql, all_params, schema=schema, intent=runtime
                         )
-                        continue
-                rows = dialect.execute(
-                    exec_sql,
-                    reconcile_execute_bind_params(exec_sql, all_params),
-                )
-            except Exception as e:
-                result.error = f"execution_failed: {e}"
-                result.failure_code = "execution_failed"
-                results.append(result)
-                validation_drop += 1
-                fail_count += 1
-                _wu_record(
-                    runtime,
-                    ok=False,
-                    final_sql=final_sql,
-                    fc="execution_failed",
-                    err=result.error,
-                )
-                continue
+                        if not ok_ex:
+                            result.error = f"explain_failed: {err_ex}"
+                            result.failure_code = "explain_failed"
+                            results.append(result)
+                            validation_drop += 1
+                            fail_count += 1
+                            _wu_record(runtime, ok=False, final_sql=final_sql, fc="explain_failed", err=result.error)
+                            continue
+                    rows = dialect.execute(exec_sql, reconcile_execute_bind_params(exec_sql, all_params))
+                except Exception as e:
+                    result.error = f"execution_failed: {e}"
+                    result.failure_code = "execution_failed"
+                    results.append(result)
+                    validation_drop += 1
+                    fail_count += 1
+                    _wu_record(runtime, ok=False, final_sql=final_sql, fc="execution_failed", err=result.error)
+                    continue
 
             sfp = compute_sql_fp(final_sql, sqlglot_dialect=active_sqlglot_dialect())
-            bk = body_similarity_key(runtime)
-            jkr = join_path_key_runtime(runtime)
-            tik = template_instance_key_from_parts(bk, jkr, sfp)
-            if tik in store_keys:
+            tik = template_instance_key_for_runtime(runtime, sfp)
+            if not federation_executed and tik in store_keys:
                 result.failure_code = "template_instance_exists"
                 result.error = "template_instance_exists"
                 results.append(result)
                 fail_count += 1
                 template_instance_exists_count += 1
                 _wu_record(
-                    runtime,
-                    ok=False,
-                    final_sql=final_sql,
-                    fc="template_instance_exists",
-                    err=result.error,
-                    tik=tik,
+                    runtime, ok=False, final_sql=final_sql, fc="template_instance_exists", err=result.error, tik=tik
                 )
                 continue
 
@@ -2775,15 +2582,10 @@ def run_seed_warmup_execution(
             result.rows = rows
             result.execute_ok = True
             result.success = False
-            _wu_record(
-                runtime,
-                ok=True,
-                final_sql=final_sql,
-                fc=None,
-                err=None,
-                tik=tik,
+            _wu_record(runtime, ok=True, final_sql=final_sql, fc=None, err=None, tik=tik)
+            pending_success.append(
+                (idx, intent, runtime, final_sql, rows or [], all_params, result, federated_prepared)
             )
-            pending_success.append((idx, intent, runtime, final_sql, rows, all_params, result))
             results.append(result)
 
     pre_cap_drop = 0
@@ -2798,22 +2600,19 @@ def run_seed_warmup_execution(
     execute_positions = [t[0] for t in pending_success]
     assert len(execute_positions) == len(pending_success)
     position_rsig: dict[int, str] = {}
-    for idx, _intent, _runtime, _final_sql, rows, _all_params, _res in pending_success:
+    for idx, _intent, _runtime, _final_sql, rows, _all_params, _res, _fed_prep in pending_success:
         sig = _warmup_canonical_result_signature(rows)
         if sig:
             position_rsig[idx] = sig
     fillback_cap, _uncapped_exec = resolve_warmup_max_kept_intents(max_kept_intents)
     sampled, gold_dropped_pos, sampling_detail = _warmup_submodular_cover_select(
-        ordered_intents,
-        execute_positions,
-        position_rsig=position_rsig,
-        max_kept_intents=max_kept_intents,
+        ordered_intents, execute_positions, position_rsig=position_rsig, max_kept_intents=max_kept_intents
     )
     sampling_detail["result_signature_positions"] = len(position_rsig)
     sampling_detail["selection_order"] = sorted(sampled)
     sampling_detail["max_kept_intents"] = None if _uncapped_exec else fillback_cap
     replay_traces: list[dict[str, Any]] = []
-    for idx, intent, _runtime, final_sql, _rows, _all_params, _res in pending_success:
+    for idx, intent, _runtime, final_sql, _rows, _all_params, _res, _fed_prep in pending_success:
         em = intent.expansion_metadata
         replay_traces.append(
             {
@@ -2849,7 +2648,7 @@ def run_seed_warmup_execution(
     }
 
     synthetic_pairs_for_lattice: list[tuple[SeedWarmupIntent, str]] = []
-    for idx, intent, _runtime, final_sql, _rows, _all_params, _res in pending_success:
+    for idx, intent, _runtime, final_sql, _rows, _all_params, _res, _fed_prep in pending_success:
         if idx not in sampled:
             continue
         if (intent.source or "gold") == "gold":
@@ -2876,6 +2675,9 @@ def run_seed_warmup_execution(
         intent: SeedWarmupIntent,
         final_sql: str,
         res: SeedWarmupResult,
+        *,
+        runtime_intent: RuntimeIntent | None = None,
+        federated_prepared: Any | None = None,
     ) -> bool:
         nonlocal success_count, fail_count, question_generation_failed, realism_drop, all_questions_dropped
         nonlocal sampled_work_unit_ids, seen_nl_norm, new_templates_collected
@@ -2893,10 +2695,7 @@ def run_seed_warmup_execution(
             if cell is not None and cell.anchors:
                 lattice_anchors = list(cell.anchors)
         raw_phrases, by_style = _warmup_collect_phrases_for_intent(
-            intent,
-            final_sql,
-            schema,
-            lattice_anchors=lattice_anchors,
+            intent, final_sql, schema, lattice_anchors=lattice_anchors
         )
         if not raw_phrases:
             res.error = "question_generation_failed"
@@ -2964,7 +2763,6 @@ def run_seed_warmup_execution(
         selected = filtered[0]
         res.question = selected
         res.questions = list(filtered)
-        res.confidence = 1.0
         res.success = True
         success_positions.add(idx)
 
@@ -2989,22 +2787,44 @@ def run_seed_warmup_execution(
                 trace["question_generation_status"] = "success"
                 break
 
-        tmpl = _create_template_from_result(
-            res,
-            schema,
-            int(warmup_store["next_id"]),
-            dialect,
-            seed_warmup_intent=intent,
-            question_phrases=filtered,
-            store=warmup_store,
-            templates=batch_templates,
-        )
-        if tmpl:
-            new_templates_collected.append(tmpl)
+        if (
+            federated_prepared is not None
+            and persist_template_learning
+            and stores_by_source is not None
+            and federation_manifest is not None
+        ):
+            qn = normalize_question(selected) or selected
+            parent_rt = runtime_intent if runtime_intent is not None else intent.to_runtime_intent()
+            created = persist_federated_warmup_learning(
+                qn,
+                parent_rt,
+                federated_prepared,
+                schema,
+                stores_by_source=stores_by_source,
+                dialects_by_source=dialects_by_source,
+                member_graphs=member_graphs,
+                federation_dir=federation_dir,
+                federation_manifest=federation_manifest,
+                question_phrases=filtered,
+            )
+            new_templates_collected.extend(created)
+        else:
+            tmpl = _create_template_from_result(
+                res,
+                schema,
+                int(warmup_store["next_id"]),
+                dialect,
+                seed_warmup_intent=intent,
+                question_phrases=filtered,
+                store=warmup_store,
+                templates=batch_templates,
+            )
+            if tmpl:
+                new_templates_collected.append(tmpl)
         success_count += 1
         return True
 
-    for idx, intent, _runtime, final_sql, _rows, _all_params, res in pending_success:
+    for idx, intent, runtime, final_sql, _rows, _all_params, res, fed_prep in pending_success:
         if idx not in sampled:
             not_sampled_after_execute += 1
             rec = sampling_drop_by_index.get(idx)
@@ -3039,7 +2859,7 @@ def run_seed_warmup_execution(
                     trace["drop_detail"] = fc_fallback
             fail_count += 1
             continue
-        _warmup_question_llm_branch(idx, intent, final_sql, res)
+        _warmup_question_llm_branch(idx, intent, final_sql, res, runtime_intent=runtime, federated_prepared=fed_prep)
 
     unsampled_ordered = [i for i in execute_positions if i not in sampled]
     fillback_cap, _uncapped_exec = resolve_warmup_max_kept_intents(max_kept_intents)
@@ -3065,7 +2885,7 @@ def run_seed_warmup_execution(
             row = pending_by_idx.get(idx)
             if row is None:
                 continue
-            _i, intent, _rt, final_sql, _rows, _all_params, res = row
+            _i, intent, runtime, final_sql, _rows, _all_params, res, fed_prep = row
             fail_count -= 1
             res.failure_code = None
             res.error = None
@@ -3074,7 +2894,9 @@ def run_seed_warmup_execution(
             trace = trace_by_index.get(idx)
             if trace is not None:
                 trace["selected_via_fillback"] = True
-            _warmup_question_llm_branch(idx, intent, final_sql, res)
+            _warmup_question_llm_branch(
+                idx, intent, final_sql, res, runtime_intent=runtime, federated_prepared=fed_prep
+            )
 
     debug(
         f"run_seed_warmup_execution: "
@@ -3119,9 +2941,7 @@ def run_seed_warmup_execution(
     }
     sampling_detail["selection_order"] = sorted(success_positions)
     sampling_detail["coverage_order"] = _warmup_positions_coverage_order(
-        sorted(success_positions),
-        ordered_intents,
-        position_rsig=position_rsig,
+        sorted(success_positions), ordered_intents, position_rsig=position_rsig
     )
     for trace in replay_traces:
         idx = int(trace.get("intent_index", -1))
@@ -3178,10 +2998,7 @@ def seed_warmup_provenance_rows_path_for_report(report_filepath: str) -> str | N
     return None
 
 
-def _warmup_frontier_summary(
-    replay_traces: list[dict[str, Any]],
-    selection_order: list[int],
-) -> dict[str, Any]:
+def _warmup_frontier_summary(replay_traces: list[dict[str, Any]], selection_order: list[int]) -> dict[str, Any]:
     """Summarize marginal coverage gain across the selected frontier."""
     atom_map: dict[int, frozenset[str]] = {}
     pool_atoms: set[str] = set()
@@ -3255,10 +3072,7 @@ def _warmup_frontier_summary(
     }
 
 
-def save_warmup_replay_manifest(
-    report_filepath: str,
-    funnel: dict[str, Any] | None,
-) -> None:
+def save_warmup_replay_manifest(report_filepath: str, funnel: dict[str, Any] | None) -> None:
     """Persist intermediate warmup scores, selection order, and removal reasons."""
     path = seed_warmup_replay_manifest_path_for_report(report_filepath)
     if not path:
@@ -3283,10 +3097,7 @@ def save_warmup_replay_manifest(
     debug(f"save_warmup_replay_manifest: wrote replay manifest to {path}")
 
 
-def save_seed_warmup_provenance(
-    report_filepath: str,
-    funnel: dict[str, Any] | None,
-) -> None:
+def save_seed_warmup_provenance(report_filepath: str, funnel: dict[str, Any] | None) -> None:
     """Persist private seed warmup provenance summaries and per-row traces."""
     path = seed_warmup_provenance_path_for_report(report_filepath)
     rows_path = seed_warmup_provenance_rows_path_for_report(report_filepath)
@@ -3320,9 +3131,7 @@ def save_seed_warmup_provenance(
 
 
 def save_seed_warmup_report(
-    results: list[SeedWarmupResult],
-    filepath: str,
-    funnel: dict[str, Any] | None = None,
+    results: list[SeedWarmupResult], filepath: str, funnel: dict[str, Any] | None = None
 ) -> None:
     """Save compact aggregate seed warmup metrics and optional funnel. counters to a JSON file."""
     fn = funnel or {}
@@ -3390,9 +3199,7 @@ def save_seed_warmup_report(
         with open(drops_path, "w", encoding="utf-8") as jf:
             for row in audit:
                 if isinstance(row, dict):
-                    jf.write(
-                        json.dumps(row, ensure_ascii=False, separators=JSON_COMPACT_SEPARATORS) + "\n",
-                    )
+                    jf.write(json.dumps(row, ensure_ascii=False, separators=JSON_COMPACT_SEPARATORS) + "\n")
         debug(f"save_seed_warmup_report: wrote {len(audit)} sampling drop rows to {drops_path}")
     detail_path = seed_warmup_drops_detail_jsonl_path_for_report(filepath)
     if detail_path and isinstance(ws, dict):
@@ -3400,9 +3207,7 @@ def save_seed_warmup_report(
         with open(detail_path, "w", encoding="utf-8") as df:
             for row in detail_rows:
                 if isinstance(row, dict):
-                    df.write(
-                        json.dumps(row, ensure_ascii=False, separators=JSON_COMPACT_SEPARATORS) + "\n",
-                    )
+                    df.write(json.dumps(row, ensure_ascii=False, separators=JSON_COMPACT_SEPARATORS) + "\n")
         debug(f"save_seed_warmup_report: wrote {len(detail_rows)} sampling drops_detail rows to {detail_path}")
     save_warmup_replay_manifest(filepath, fn)
     save_seed_warmup_provenance(filepath, fn)

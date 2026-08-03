@@ -43,6 +43,12 @@ Show delivery status counts by courier.
 List stock transfers between warehouses this year.
 Which suppliers have the most purchase lines?
 What is the average page count by publisher?
+How many rentals are linked to film titles?
+What is the total payment amount?
+How many distinct customers rented horror films?
+Show payroll deductions grouped by staff member.
+What is the average payment amount grouped by film category?
+List all films in the catalog.
 
 # validation_failures
 Show payroll deductions by employee SSN.
@@ -52,3 +58,8 @@ How many rentals were made in total?
 
 # feedback_samples
 The intent is wrong, count distinct films only.
+
+# views questions
+How many active customers do we have?
+What is the total revenue by store?
+Which films are in the catalog view?

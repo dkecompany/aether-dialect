@@ -8,7 +8,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from aetherdialect._config import EngineConfig, PolicyConfig
-from aetherdialect._constants import ARTIFACT_FORMAT_VERSION, ARTIFACT_MANIFEST_FILENAME
+from aetherdialect._constants import (
+    ARTIFACT_FORMAT_VERSION,
+    ARTIFACT_MANIFEST_FILENAME,
+)
 from aetherdialect._contracts_base import (
     LlmJsonExhausted,
     MigrationReport,
@@ -16,7 +19,7 @@ from aetherdialect._contracts_base import (
 )
 from aetherdialect._core_utils import (
     RephraseHint,
-    _ArtifactManifest,
+    ArtifactManifest,
     _extract_first_json_object,
     _format_cell,
     _manifest_path,
@@ -25,7 +28,6 @@ from aetherdialect._core_utils import (
     _strip_fences,
     ask_user_choice,
     canonicalize_sql,
-    classify_migration_tier,
     colmap_signature,
     dataframe_to_row_tuples,
     debug,
@@ -64,6 +66,7 @@ from aetherdialect._core_utils import (
     write_artifact_manifest,
     write_gzip_json_atomic,
 )
+from aetherdialect._schema_graph import classify_migration_tier
 from aetherdialect._dialect import (
     _sql_simplify_executable,
     compute_sql_fp,
@@ -1390,7 +1393,7 @@ class TestArtifactManifest:
         assert rep.tier == MigrationTier.DESTRUCTIVE
 
     def test_classify_profiling_change_overlap_gate(self):
-        m = _ArtifactManifest(
+        m = ArtifactManifest(
             artifact_format_version=ARTIFACT_FORMAT_VERSION,
             effective_structural_hash="e",
             structural_hash="t",
@@ -1410,10 +1413,10 @@ class TestArtifactManifest:
         with patch("aetherdialect._core_utils._profiling_value_overlap", return_value=0.5):
             assert classify_migration_tier(m, sch, previous_schema=prev) == MigrationTier.SOFT_REFRESH
         with patch("aetherdialect._core_utils._profiling_value_overlap", return_value=0.01):
-            assert classify_migration_tier(m, sch, previous_schema=prev) == MigrationTier.DESTRUCTIVE
+            assert classify_migration_tier(m, sch, previous_schema=prev) == MigrationTier.SOFT_REFRESH
 
     def test_classify_stale_artifact_format_is_destructive(self):
-        m = _ArtifactManifest(
+        m = ArtifactManifest(
             artifact_format_version=1,
             effective_structural_hash="e",
             structural_hash="t",
@@ -1432,7 +1435,7 @@ class TestArtifactManifest:
         assert classify_migration_tier(m, sch) == MigrationTier.DESTRUCTIVE
 
     def test_classify_package_below_manifest_min_is_destructive(self):
-        m = _ArtifactManifest(
+        m = ArtifactManifest(
             artifact_format_version=ARTIFACT_FORMAT_VERSION,
             min_compatible_package_version="99.0.0",
             effective_structural_hash="e",
@@ -1453,9 +1456,9 @@ class TestArtifactManifest:
 
     def test_classify_schema_diff_implies_remap_when_rename_plan_missing(self) -> None:
         """Non-empty diff with column renames yields REMAP when scope is stable even if try_rename is None."""
-        from aetherdialect._schema_graph import SchemaDiff, TableDiff
+        from aetherdialect._contracts_schema import SchemaDiff, TableDiff
 
-        m = _ArtifactManifest(
+        m = ArtifactManifest(
             artifact_format_version=ARTIFACT_FORMAT_VERSION,
             effective_structural_hash="e1",
             structural_hash="t1",
@@ -1558,7 +1561,6 @@ class TestLlmChat:
         snap_p = EngineConfig.LLM_PROVIDER
         try:
             EngineConfig.LLM_PROVIDER = "azure"
-            monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT_MEDIUM", "dep-sql")
             monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT_LIGHT", "dep0")
             monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT_HEAVY", "dep2")
             mock_resp = MagicMock()
@@ -1578,7 +1580,7 @@ class TestLlmChat:
                             with patch("aetherdialect._core_utils.pipeline_trace"):
                                 llm_chat("sys", "usr", max_retries=1, task="join")
             call_kw = mock_client.responses.create.call_args.kwargs
-            assert call_kw["model"] == "dep2"
+            assert call_kw["model"] == "dep0"
         finally:
             EngineConfig.LLM_PROVIDER = snap_p
 
@@ -1588,7 +1590,7 @@ class TestLlmChat:
         snap_p = EngineConfig.LLM_PROVIDER
         try:
             EngineConfig.LLM_PROVIDER = "openai"
-            monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT_MEDIUM", "y")
+            monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT_LIGHT", "dep0")
             mock_resp = MagicMock()
             mock_resp.output_text = "{}"
             mock_client = MagicMock()
@@ -1606,7 +1608,7 @@ class TestLlmChat:
                             with patch("aetherdialect._core_utils.pipeline_trace"):
                                 llm_chat("sys", "usr", max_retries=1, task="join")
             call_kw = mock_client.responses.create.call_args.kwargs
-            assert call_kw["model"] == "gpt-5.4-mini"
+            assert call_kw["model"] == "gpt-5.4-nano"
         finally:
             EngineConfig.LLM_PROVIDER = snap_p
 

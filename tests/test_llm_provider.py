@@ -8,7 +8,8 @@ from pathlib import Path
 import pytest
 
 from aetherdialect._config import EngineConfig, llm_credentials_configured
-from aetherdialect._llm_provider import MockFixtureMissingError, MockProvider, llm_chat, llm_json, reset_mock_provider
+from aetherdialect._contracts_base import MockFixtureMissingError
+from aetherdialect._llm_provider import MockProvider, llm_chat, llm_json, reset_mock_provider
 
 
 @pytest.fixture(autouse=True)

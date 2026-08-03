@@ -5,16 +5,17 @@ from __future__ import annotations
 from live_tests._rental_partition_metadata import apply_synthetic_rental_partition_metadata
 
 from aetherdialect._contracts_base import (
-    FilterParam,
     NormalizedExpr,
+    WhereParam,
+    predicate_group_from_list,
 )
 from aetherdialect._contracts_core import RuntimeIntent
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._dialect_sqlglot_engines import DuckDBDialect
 
 
-def _filter_param(col: str, op: str, param_key: str, value) -> FilterParam:
-    return FilterParam(
+def _where_param(col: str, op: str, param_key: str, value) -> WhereParam:
+    return WhereParam(
         left_expr=NormalizedExpr.from_column(col),
         op=op,
         param_key=param_key,
@@ -70,7 +71,7 @@ class TestDuckDBInjectPruningPredicates:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[_filter_param("rental.rental_date", "=", "p1", None)],
+            where=predicate_group_from_list([_where_param("rental.rental_date", "=", "p1", None)]),
             param_values={"p1": "2023-07-15"},
         )
         sql = "SELECT * FROM rental"
@@ -87,7 +88,7 @@ class TestDuckDBInjectPruningPredicates:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[_filter_param("rental.rental_date", "=", "p1", None)],
+            where=predicate_group_from_list([_where_param("rental.rental_date", "=", "p1", None)]),
             param_values={"p1": "2023-07-15"},
         )
         sql = "SELECT * FROM rental WHERE rental_date = '2023-07-15'"

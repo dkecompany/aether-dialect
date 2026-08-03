@@ -8,8 +8,9 @@ from typing import Any
 import pytest
 
 from aetherdialect._contracts_base import (
-    FilterParam,
     NormalizedExpr,
+    WhereParam,
+    predicate_group_from_list,
 )
 from aetherdialect._contracts_core import RuntimeIntent
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
@@ -35,10 +36,10 @@ from aetherdialect._schema_build import (
 )
 
 
-def _filter_param(col: str, op: str, param_key: str | None = None, raw_value=None) -> FilterParam:
-    """Build a FilterParam for partition injection tests."""
+def _where_param(col: str, op: str, param_key: str | None = None, raw_value=None) -> WhereParam:
+    """Build a WhereParam for partition injection tests."""
     expr = NormalizedExpr.from_column(col)
-    return FilterParam(left_expr=expr, op=op, param_key=param_key or "", raw_value=raw_value)
+    return WhereParam(left_expr=expr, op=op, param_key=param_key or "", raw_value=raw_value)
 
 
 def _schema_with_partition(table: str, partition_cols: list[str]) -> SchemaGraph:
@@ -101,7 +102,7 @@ def _equality_intent(table: str, col: str, value: str) -> RuntimeIntent:
         select_cols=[],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[_filter_param(f"{table}.{col}", "=", "p1", None)],
+        where=predicate_group_from_list([_where_param(f"{table}.{col}", "=", "p1", None)]),
         param_values={"p1": value},
     )
 
@@ -283,7 +284,7 @@ class TestRequiredPartitionFilterGuard:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         sql = "SELECT * FROM events"
         out = append_required_partition_filter_guard(

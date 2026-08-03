@@ -6,8 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
-from aetherdialect._constants import GenerationPath
-from aetherdialect._contracts_core import FeedbackKind, UserFeedbackRejectSuspendContext
+from aetherdialect._contracts_core import FeedbackKind, GenerationPath, UserFeedbackRejectSuspendContext
 from aetherdialect._dialect import get_dialect
 from aetherdialect._pipeline import complete_user_feedback_reject
 from aetherdialect._templates import _compute_intent_structural_signature

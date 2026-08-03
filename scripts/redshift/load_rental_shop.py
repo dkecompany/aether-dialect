@@ -12,9 +12,7 @@ _ENGINE = "redshift"
 
 def main() -> int:
     flag = _ENGINE.replace("_", "-")
-    return subprocess.call(
-        [sys.executable, str(_SCRIPTS / "load_rental_shop_engines.py"), f"--{flag}", *sys.argv[1:]]
-    )
+    return subprocess.call([sys.executable, str(_SCRIPTS / "load_rental_shop_engines.py"), f"--{flag}", *sys.argv[1:]])
 
 
 if __name__ == "__main__":

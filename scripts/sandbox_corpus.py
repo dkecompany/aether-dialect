@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import stat
@@ -16,7 +17,57 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
+
+import pandas as pd
+
+import aetherdialect._live_testing
+import aetherdialect._llm_provider
+import aetherdialect._main_execution
+import aetherdialect._pipeline
+import aetherdialect._sandbox
+import aetherdialect._schema_overrides
+from aetherdialect._config import (
+    ConfigError,
+    DuckDBRuntimeConfig,
+    EngineConfig,
+    PolicyConfig,
+    llm_credentials_configured,
+)
+from aetherdialect._constants import (
+    FEDERATION_DECLARATION_FILENAME,
+    INTENT_COMPOSE_SYSTEM,
+    INTENT_GROUND_SYSTEM,
+    INTENT_INTERPRET_SYSTEM,
+    SANDBOX_INTERPRET_DOMAIN_FILENAME,
+    SANDBOX_QUESTION_TIERS,
+    SANDBOX_SCHEMA_LITERALS_FILENAME,
+)
+from aetherdialect._contracts_core import TemplateMatch
+from aetherdialect._core_utils import (
+    StepResult,
+    append_failure_trace,
+    build_session_step_trace,
+    pipeline_capture,
+    stable_json,
+)
+from aetherdialect._llm_provider import (
+    mock_fixture_user_key,
+    reset_mock_provider,
+)
+from aetherdialect._main_execution import (
+    _configure_llm_from_environment,
+    compute_engine_storage_dir,
+)
+from aetherdialect._sandbox import (
+    _sandbox_doctor_verbose,
+    assert_sandbox_complete,
+    check_sandbox_faithfulness,
+    question_ok,
+    validate_sandbox_corpus,
+)
+from aetherdialect._utils import generate_paraphrases_of_seed_question, normalize_question
+from aetherdialect.aetherdialect import AetherEngine
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -52,65 +103,208 @@ SKIP_ZIP_NAMES = frozenset(
     },
 )
 
-_SRC = REPO / "src"
-if str(_SRC) not in sys.path:
-    sys.path.insert(0, str(_SRC))
-if str(REPO) not in sys.path:
-    sys.path.insert(0, str(REPO))
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-import aetherdialect._live_testing
-import aetherdialect._llm_provider
-import aetherdialect._main_execution
-import aetherdialect._pipeline
-import aetherdialect._sandbox
-import aetherdialect._schema_overrides
-from aetherdialect._config import (
-    ConfigError,
-    DuckDBRuntimeConfig,
-    EngineConfig,
-    PolicyConfig,
-    llm_credentials_configured,
-)
-from aetherdialect._constants import (
-    INTENT_COMPOSE_SYSTEM,
-    INTENT_GROUND_SYSTEM,
-    INTENT_INTERPRET_SYSTEM,
-    SANDBOX_QUESTION_TIERS,
-    SANDBOX_SCHEMA_LITERALS_FILENAME,
-    SANDBOX_INTERPRET_DOMAIN_FILENAME,
-)
-from aetherdialect._contracts_core import TemplateMatch
-from aetherdialect.aetherdialect import AetherEngine
-from aetherdialect._core_utils import (
-    StepResult,
-    append_failure_trace,
-    build_session_step_trace,
-    pipeline_capture,
-    run_with_pipeline_capture,
-    stable_json,
-)
-from aetherdialect._llm_provider import (
-    mock_fixture_user_key,
-    reset_mock_provider,
-)
-from aetherdialect._main_execution import (
-    _configure_llm_from_environment,
-    compute_engine_storage_dir,
-)
-from aetherdialect._sandbox import (
-    check_sandbox_faithfulness,
-    question_ok,
-    validate_sandbox_corpus,
-    sandbox_doctor,
-    _sandbox_doctor_verbose,
-    assert_sandbox_complete,
-)
-from aetherdialect._utils import generate_paraphrases_of_seed_question, normalize_question
-
 BASELINE_OWNER_SUBDIR = "owner"
 BASELINE_CONSUMER_SUBDIR = "consumer"
+BASELINE_OWNER_VIEWS_SUBDIR = "owner_views"
+BASELINE_CONSUMER_VIEWS_SUBDIR = "consumer_views"
+BASELINE_FEDERATION_SUBDIR = "federation"
+FEDERATION_DECLARATION_PATH = DATA / FEDERATION_DECLARATION_FILENAME
+FEDERATION_STOREFRONT_PG_SCHEMA = "rental_shop_fed_storefront"
+FEDERATION_CATALOG_MYSQL_DATABASE = "rental_shop_fed_catalog"
+FEDERATION_LOGISTICS_PG_SCHEMA = "rental_shop_fed_logistics"
+FEDERATION_CRM_MARIADB_DATABASE = "rental_shop_fed_crm"
+PAYMENT_UNION_SPLIT_STORE_THRESHOLD = 6
+_CROSS_PARTITION_FK_RE = re.compile(
+    r"\bREFERENCES\s+(\w+)\s*\(",
+    re.IGNORECASE,
+)
+
+
+def load_federation_declaration_data() -> dict[str, Any]:
+    """Return the parsed federation declaration from ``scripts/data``."""
+    if not FEDERATION_DECLARATION_PATH.is_file():
+        raise FileNotFoundError(f"Missing federation declaration: {FEDERATION_DECLARATION_PATH}")
+    payload = json.loads(FEDERATION_DECLARATION_PATH.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("federation declaration must be a JSON object")
+    return payload
+
+
+FEDERATION_PARTITION_TABLES: dict[str, frozenset[str]] = {
+    "storefront": frozenset(
+        {
+            "country",
+            "city",
+            "address",
+            "store",
+            "staff",
+            "customer",
+            "rental",
+            "reservation",
+            "payment",
+        },
+    ),
+    "catalog": frozenset(
+        {
+            "language",
+            "item",
+            "film",
+            "book",
+            "game",
+            "actor",
+            "film_actor",
+            "category",
+            "item_category",
+            "item_feature",
+            "game_supported_language",
+            "author",
+            "publisher",
+            "inventory",
+            "payment",
+            "country",
+            "city",
+        },
+    ),
+    "logistics": frozenset(
+        {
+            "warehouse",
+            "stock_transfer",
+            "supplier",
+            "purchase_order",
+            "purchase_line",
+            "courier",
+            "delivery",
+            "damage_report",
+            "inventory_status_history",
+            "receipts",
+        },
+    ),
+    "crm": frozenset({"promotion", "promotion_redemption", "customer", "staff"}),
+}
+
+
+def load_federation_partition_map() -> dict[str, frozenset[str]]:
+    """Return the authoritative federation partition map from ``scripts/data`` or the in-code constant."""
+    path = Path(__file__).resolve().parent / "data" / "federation_partition.json"
+    if path.is_file():
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("federation_partition.json must be a JSON object")
+        return {
+            str(source_id): frozenset(str(table) for table in tables if str(table).strip())
+            for source_id, tables in payload.items()
+            if isinstance(tables, list)
+        }
+    return dict(FEDERATION_PARTITION_TABLES)
+
+
+def federation_partition_tables(source_id: str) -> frozenset[str]:
+    """Return physical table names that belong to *source_id* (union members included)."""
+    from aetherdialect._federation import parse_federation_declaration
+
+    partition_map = load_federation_partition_map()
+    tables: set[str] = set(partition_map.get(source_id, frozenset()))
+    _, mappings = parse_federation_declaration(load_federation_declaration_data())
+    for entry in mappings.logical_tables:
+        for member in entry.members:
+            if str(member.source).strip() == source_id:
+                tables.add(str(member.table).strip())
+    return frozenset(name for name in tables if name)
+
+
+def federation_member_column_projections(source_id: str) -> dict[str, frozenset[str]]:
+    """Return per-table column projections declared for *source_id*."""
+    from aetherdialect._federation import parse_federation_declaration
+
+    _, mappings = parse_federation_declaration(load_federation_declaration_data())
+    out: dict[str, frozenset[str]] = {}
+    for entry in mappings.logical_tables:
+        for member in entry.members:
+            if str(member.source).strip() != source_id:
+                continue
+            if member.columns:
+                out[str(member.table).strip()] = frozenset(str(key).strip() for key in member.columns)
+    return out
+
+
+def _strip_disallowed_create_table_foreign_keys(
+    create_sql: str,
+    table: str,
+    partition_tables: frozenset[str],
+) -> str:
+    pattern = re.compile(r"\s+REFERENCES\s+\w+\s*\([^)]*\)", re.IGNORECASE)
+
+    def _replace(match: re.Match[str]) -> str:
+        clause = match.group(0).strip()
+        if federation_foreign_key_allowed(table, clause, partition_tables):
+            return match.group(0)
+        return ""
+
+    return pattern.sub(_replace, create_sql)
+
+
+def _create_table_sql_for_projection(
+    conn: sqlite3.Connection,
+    table: str,
+    columns: frozenset[str],
+) -> str:
+    info = conn.execute(f"PRAGMA table_info([{table}])").fetchall()
+    col_defs: list[str] = []
+    for _cid, name, ctype, _notnull, _dflt, pk in info:
+        if str(name) not in columns:
+            continue
+        part = f"{name} {ctype or 'TEXT'}"
+        if pk:
+            part += " PRIMARY KEY"
+        col_defs.append(part)
+    if not col_defs:
+        raise ValueError(f"no projected columns for table {table!r}")
+    return f"CREATE TABLE {table} ({', '.join(col_defs)});"
+
+
+def federation_foreign_key_allowed(table: str, fk_clause: str, partition_tables: frozenset[str]) -> bool:
+    """Return True when both ends of *fk_clause* stay inside *partition_tables*."""
+    if table not in partition_tables:
+        return False
+    match = _CROSS_PARTITION_FK_RE.search(fk_clause)
+    if match is None:
+        return True
+    return match.group(1) in partition_tables
+
+
+def payment_store_id_by_rental_id(csv_dir: Path) -> dict[int, int]:
+    """Map rental_id to store_id via inventory for payment union partitioning."""
+    rental_path = csv_dir / "rental.csv"
+    inventory_path = csv_dir / "inventory.csv"
+    if not rental_path.is_file() or not inventory_path.is_file():
+        return {}
+    rentals = pd.read_csv(rental_path, usecols=["rental_id", "inventory_id"])
+    inventory = pd.read_csv(inventory_path, usecols=["inventory_id", "store_id"])
+    merged = rentals.merge(inventory, on="inventory_id", how="left")
+    out: dict[int, int] = {}
+    for rental_id, store_id in zip(merged["rental_id"], merged["store_id"], strict=False):
+        if pd.isna(rental_id):
+            continue
+        out[int(rental_id)] = 0 if pd.isna(store_id) else int(store_id)
+    return out
+
+
+def payment_store_id_by_payment_id(conn: sqlite3.Connection) -> dict[int, int]:
+    """Map payment_id to store_id for sqlite seed export partitioning."""
+    rows = conn.execute(
+        """
+        SELECT p.payment_id, i.store_id
+        FROM payment p
+        JOIN rental r ON r.rental_id = p.rental_id
+        JOIN inventory i ON i.inventory_id = r.inventory_id
+        """,
+    ).fetchall()
+    return {int(payment_id): int(store_id) for payment_id, store_id in rows}
+
+
 LLM_PATCH_MODULES = (
     "aetherdialect._intent_process",
     "aetherdialect._pipeline",
@@ -123,11 +317,12 @@ LLM_PATCH_MODULES = (
 )
 
 
-def slot_id_for(slot: "RecordingSlot") -> str:
+def slot_id_for(slot: RecordingSlot) -> str:
     if slot.kind == "feedback":
         return f"feedback:{slot.label}"
-    mode_part = slot.mode or "default"
-    return f"{slot.preset}:{mode_part}:{slot.tier}:{slot.label}"
+    role = "consumer" if slot.preset.startswith("consumer") else "owner"
+    mode = slot.mode or ("reader" if role == "consumer" else "writer")
+    return f"{role}:{mode}:{slot.label}"
 
 
 def _load_recording_manifest(path: Path | None = None) -> dict[str, object]:
@@ -228,11 +423,17 @@ def _intent_fixture_question(row: dict[str, str]) -> str | None:
 
 def _mock_verify_targets_for_slot(
     slot: RecordingSlot,
-) -> list[tuple[str, bool, str | None, bool, str, str]]:
-    """Return mock-verify runs that must pass before a slot commits (mirrors pack validate)."""
+) -> list[tuple[str, bool, str | None, bool, str, str, str]]:
+    """Return mock-verify runs that must pass before a slot commits (mirrors pack validate).
+
+    Each target carries the expectation ``slot_id`` it must be judged under, so replay
+    resolves the same expectation row the live capture check used.
+    """
+    scenario = _load_scenarios_by_question().get(slot.label.lower(), {})
+    recipe = _recipe_for_slot(slot, scenario)
     preset, restricted_consumer, mode, apply_overrides = _mock_preset_for_slot(slot)
-    targets: list[tuple[str, bool, str | None, bool, str, str]] = [
-        (preset, restricted_consumer, mode, apply_overrides, slot.preset, slot.tier),
+    targets: list[tuple[str, bool, str | None, bool, str, str, str]] = [
+        (preset, restricted_consumer, mode, apply_overrides, slot.preset, slot_id_for(slot), slot.tier),
     ]
     if (
         slot.kind == "question"
@@ -240,16 +441,62 @@ def _mock_verify_targets_for_slot(
         and slot.preset == "owner_writer"
         and slot.mode in (None, "writer")
     ):
-        targets.append(
-            ("consumer_reader", False, "reader", False, "consumer_reader", "consumer_reader"),
+        consumer_slot = RecordingSlot(
+            tier="consumer_reader",
+            label=slot.label,
+            preset="consumer_reader",
+            mode="reader",
         )
+        targets.append(
+            (
+                "consumer_reader",
+                False,
+                "reader",
+                False,
+                "consumer_reader",
+                slot_id_for(consumer_slot),
+                "consumer_reader",
+            ),
+        )
+        if recipe == "single":
+            targets.append(
+                (
+                    "federation",
+                    False,
+                    "writer",
+                    False,
+                    "owner_writer",
+                    slot_id_for(slot),
+                    slot.tier,
+                ),
+            )
     return targets
 
 
-def baseline_dir_for_preset(bundle_dir: Path, preset: str) -> Path:
+def baseline_dir_for_preset(
+    bundle_dir: Path,
+    preset: str,
+    *,
+    include: Literal["tables", "views"] = "tables",
+) -> Path:
     """Return the preset-scoped baseline directory under *bundle_dir*."""
-    del preset
+    from aetherdialect._constants import FEDERATION_COMPOSITE_SCHEMA_FILENAME
+
     root = bundle_dir / "artifacts_baseline"
+    if include == "views":
+        if preset == "consumer_reader":
+            views = root / BASELINE_CONSUMER_VIEWS_SUBDIR
+        else:
+            views = root / BASELINE_OWNER_VIEWS_SUBDIR
+        if views.is_dir() and (views / "schema_graph.json.gz").is_file():
+            return views
+        return views if views.is_dir() else root / BASELINE_OWNER_VIEWS_SUBDIR
+    if preset == "federation":
+        fed = root / BASELINE_FEDERATION_SUBDIR
+        if fed.is_dir() and (fed / FEDERATION_COMPOSITE_SCHEMA_FILENAME).is_file():
+            return fed
+        if fed.is_dir() and (fed / "schema_graph.json.gz").is_file():
+            return fed
     owner = root / BASELINE_OWNER_SUBDIR
     if owner.is_dir() and (owner / "schema_graph.json.gz").is_file():
         return owner
@@ -269,11 +516,17 @@ _BASELINE_CACHE_FILES = (
 
 
 def _copy_baseline_cache_files(source: Path, dest: Path) -> None:
+    from aetherdialect._constants import FEDERATION_COMPOSITE_SCHEMA_FILENAME
+
     dest.mkdir(parents=True, exist_ok=True)
     for name in _BASELINE_CACHE_FILES:
         src = source / name
         if src.is_file():
             shutil.copy2(src, dest / name)
+    composite = source / FEDERATION_COMPOSITE_SCHEMA_FILENAME
+    schema_dest = dest / "schema_graph.json.gz"
+    if composite.is_file() and not schema_dest.is_file():
+        shutil.copy2(composite, schema_dest)
     for sidecar in source.glob("schema_context*.json"):
         if sidecar.name == "schema_context.json":
             continue
@@ -298,14 +551,23 @@ def _sandbox_memory_engine_dir(artifacts_dir: str) -> Path:
         DuckDBRuntimeConfig.SCHEMA = saved_schema
 
 
-def _seed_engine_baseline(*, artifacts_dir: str, bundle_dir: Path, preset: str) -> None:
-    baseline = baseline_dir_for_preset(bundle_dir, preset)
+def _seed_engine_baseline(
+    *,
+    artifacts_dir: str,
+    bundle_dir: Path,
+    preset: str,
+    include: Literal["tables", "views"] = "tables",
+) -> None:
+    from aetherdialect._constants import FEDERATION_COMPOSITE_SCHEMA_FILENAME
+
+    baseline = baseline_dir_for_preset(bundle_dir, preset, include=include)
     graph_path = baseline / "schema_graph.json.gz"
+    composite_path = baseline / FEDERATION_COMPOSITE_SCHEMA_FILENAME
     if not baseline.is_dir():
         verbose_message(f"[build] seed baseline skip: missing baseline dir {baseline}")
         return
-    if not graph_path.is_file():
-        verbose_message(f"[build] seed baseline skip: no schema_graph.json.gz under {baseline}")
+    if not graph_path.is_file() and not composite_path.is_file():
+        verbose_message(f"[build] seed baseline skip: no schema graph under {baseline}")
         return
     engine_dir = _sandbox_memory_engine_dir(artifacts_dir)
     if (engine_dir / "schema_graph.json.gz").is_file():
@@ -368,12 +630,14 @@ class RecordingEnvironment:
     prev_provider: str
     openai_toml: Callable[..., str]
     skip_template_reuse: Callable[..., object]
+    skip_template_learning: Callable[[object | None], bool]
     llm_patch_modules: tuple[str, ...]
 
 
 def prepare_recording_environment() -> RecordingEnvironment:
     """Load credentials, sync ``EngineConfig``, and apply recording patches."""
     from live_tests.conftest import write_sandbox_recording_toml
+
     from load_rental_shop_engines import load_env_file
 
     env_path = load_env_file(ENV_FILE, override=True)
@@ -408,20 +672,20 @@ def prepare_recording_environment() -> RecordingEnvironment:
     orig_refine = aetherdialect._schema_overrides._refine_descriptions_via_llm
     orig_write_toml = aetherdialect._sandbox._write_sandbox_toml
     orig_template_match = aetherdialect._pipeline.match_question_level_template_reuse
-    setattr(aetherdialect._sandbox, "_write_sandbox_toml", openai_toml)
+    aetherdialect._sandbox._write_sandbox_toml = openai_toml
     prev_provider = EngineConfig.LLM_PROVIDER
     reset_mock_provider()
     EngineConfig.LLM_PROVIDER = "openai"
-    setattr(aetherdialect._pipeline, "match_question_level_template_reuse", skip_template_reuse)
-    setattr(aetherdialect._main_execution, "match_question_level_template_reuse", skip_template_reuse)
-    setattr(aetherdialect._live_testing, "match_question_level_template_reuse", skip_template_reuse)
+    aetherdialect._pipeline.match_question_level_template_reuse = skip_template_reuse
+    aetherdialect._main_execution.match_question_level_template_reuse = skip_template_reuse
+    aetherdialect._live_testing.match_question_level_template_reuse = skip_template_reuse
     orig_persist = aetherdialect._main_execution._persist_template_learning_for_pipeline_session
 
     def skip_template_learning(_port: object | None) -> bool:
         del _port
         return False
 
-    setattr(aetherdialect._main_execution, "_persist_template_learning_for_pipeline_session", skip_template_learning)
+    aetherdialect._main_execution._persist_template_learning_for_pipeline_session = skip_template_learning
 
     return RecordingEnvironment(
         orig_write_toml=orig_write_toml,
@@ -431,18 +695,19 @@ def prepare_recording_environment() -> RecordingEnvironment:
         prev_provider=prev_provider,
         openai_toml=openai_toml,
         skip_template_reuse=skip_template_reuse,
+        skip_template_learning=skip_template_learning,
         llm_patch_modules=LLM_PATCH_MODULES,
     )
 
 
 def teardown_recording_environment(env: RecordingEnvironment) -> None:
     """Restore module patches applied by :func:`prepare_recording_environment`."""
-    setattr(aetherdialect._schema_overrides, "_refine_descriptions_via_llm", env.orig_refine)
-    setattr(aetherdialect._sandbox, "_write_sandbox_toml", env.orig_write_toml)
-    setattr(aetherdialect._pipeline, "match_question_level_template_reuse", env.orig_template_match)
-    setattr(aetherdialect._main_execution, "match_question_level_template_reuse", env.orig_template_match)
-    setattr(aetherdialect._live_testing, "match_question_level_template_reuse", env.orig_template_match)
-    setattr(aetherdialect._main_execution, "_persist_template_learning_for_pipeline_session", env.orig_persist_template_learning)
+    aetherdialect._schema_overrides._refine_descriptions_via_llm = env.orig_refine
+    aetherdialect._sandbox._write_sandbox_toml = env.orig_write_toml
+    aetherdialect._pipeline.match_question_level_template_reuse = env.orig_template_match
+    aetherdialect._main_execution.match_question_level_template_reuse = env.orig_template_match
+    aetherdialect._live_testing.match_question_level_template_reuse = env.orig_template_match
+    aetherdialect._main_execution._persist_template_learning_for_pipeline_session = env.orig_persist_template_learning
     EngineConfig.LLM_PROVIDER = env.prev_provider
 
 
@@ -462,6 +727,389 @@ SMALL_TABLES_WHOLE = frozenset(
         "publisher",
     }
 )
+
+CORPUS_REALISM_ORPHAN_DELIVERY_RENTAL_IDS: tuple[int, ...] = (9999001, 9999002, 9999003)
+
+CORPUS_REALISM_COUNTRY_CATALOG_DRIFT: dict[int, str] = {
+    44: "Great Britain",
+    1: "Australia (catalog replica)",
+    62: "Japan",
+}
+
+CORPUS_REALISM_COUNTRY_STOREFRONT_ONLY: dict[int, str] = {
+    15: "Brazil",
+}
+
+CORPUS_REALISM_COUNTRY_CATALOG_ONLY: dict[int, str] = {
+    211: "Catalog-only Island Republic",
+}
+
+SUBSCRIPTION_RETAIL_RESKIN_REPLACEMENTS: tuple[tuple[str, str], ...] = (
+    ("Action", "Activewear & Gear"),
+    ("Comedy", "Casual Essentials"),
+    ("Documentary", "How-To Guides"),
+    ("Drama", "Premium Lifestyle"),
+    ("Family", "Family Subscription"),
+    ("Games", "Equipment Rental"),
+    ("Horror", "Limited Release"),
+    ("Music", "Audio Subscriptions"),
+    ("New", "New Arrivals"),
+    ("Sci-Fi", "Tech & Innovation"),
+    ("Sports", "Sports & Outdoors"),
+    ("Travel", "Travel & Adventure"),
+    ("Children", "Youth Programs"),
+    ("Foreign", "International Plans"),
+    ("Animation", "Digital Media"),
+)
+
+CRM_CUSTOMER_DESYNC_IDS: frozenset[int] = frozenset({1, 5, 12, 23, 37})
+
+CRM_CUSTOMER_LOYALTY_TIERS: tuple[str, ...] = ("bronze", "silver", "gold", "platinum")
+
+
+def _reskin_subscription_retail_text(text: str) -> str:
+    out = text
+    for old, new in SUBSCRIPTION_RETAIL_RESKIN_REPLACEMENTS:
+        out = out.replace(old, new)
+    out = out.replace("DVD", "subscription bundle")
+    out = out.replace("VHS", "legacy equipment")
+    return out
+
+
+def _reskin_seed_line(line: str) -> str:
+    if not line.startswith("INSERT INTO"):
+        return line
+    return _reskin_subscription_retail_text(line)
+
+
+def _reskin_seed_lines(lines: list[str]) -> list[str]:
+    return [_reskin_seed_line(line) for line in lines]
+
+
+def _storefront_rental_create_sql() -> str:
+    return (
+        "CREATE TABLE rental ("
+        "rental_id INTEGER NOT NULL, "
+        "rental_date TIMESTAMP NOT NULL, "
+        "inventory_id INTEGER NOT NULL, "
+        "customer_id INTEGER NOT NULL, "
+        "return_date TIMESTAMP, "
+        "staff_id INTEGER NOT NULL, "
+        "last_update TIMESTAMP NOT NULL"
+        ");"
+    )
+
+
+def _logistics_receipts_create_sql() -> str:
+    return (
+        "CREATE TABLE receipts ("
+        "rcpt_id INTEGER NOT NULL, "
+        "rent_id INTEGER NOT NULL, "
+        "amt REAL NOT NULL, "
+        "dt TEXT NOT NULL"
+        ");"
+    )
+
+
+def _logistics_purchase_order_create_sql() -> str:
+    return (
+        "CREATE TABLE purchase_order ("
+        "ord_id INTEGER NOT NULL, "
+        "sup_id INTEGER NOT NULL, "
+        "store_id INTEGER NOT NULL, "
+        "ord_dt TEXT NOT NULL, "
+        "recv_dt TEXT, "
+        "status VARCHAR(20) NOT NULL, "
+        "last_update TIMESTAMP NOT NULL"
+        ");"
+    )
+
+
+def _logistics_purchase_line_create_sql() -> str:
+    return (
+        "CREATE TABLE purchase_line ("
+        "line_id INTEGER NOT NULL, "
+        "ord_id INTEGER NOT NULL, "
+        "item_id INTEGER NOT NULL, "
+        "quantity SMALLINT NOT NULL, "
+        "unit_cost NUMERIC(8,2) NOT NULL, "
+        "last_update TIMESTAMP NOT NULL"
+        ");"
+    )
+
+
+def _crm_customer_create_sql() -> str:
+    return (
+        "CREATE TABLE customer ("
+        "customer_id INTEGER NOT NULL, "
+        "store_id INTEGER NOT NULL, "
+        "first_name VARCHAR(45) NOT NULL, "
+        "last_name VARCHAR(45) NOT NULL, "
+        "email_addr VARCHAR(50), "
+        "address_id INTEGER NOT NULL, "
+        "loyalty_tier VARCHAR(20), "
+        "create_date DATE NOT NULL, "
+        "last_update TIMESTAMP"
+        ");"
+    )
+
+
+def _format_timestamp_second_precision(value: object) -> str:
+    text = str(value).strip().strip("'")
+    if not text or text.upper() == "NULL":
+        return "NULL"
+    if " " in text:
+        date_part, time_part = text.split(" ", 1)
+        if "." in time_part:
+            time_part = time_part.split(".", 1)[0]
+        text = f"{date_part} {time_part}"
+    return "'" + text.replace("'", "''") + "'"
+
+
+def _loyalty_tier_for_customer(customer_id: int) -> str:
+    return CRM_CUSTOMER_LOYALTY_TIERS[customer_id % len(CRM_CUSTOMER_LOYALTY_TIERS)]
+
+
+def _crm_customer_desync_first_name(customer_id: int, first_name: str) -> str:
+    if customer_id not in CRM_CUSTOMER_DESYNC_IDS:
+        return first_name
+    return f"{first_name} (crm)"
+
+
+def _build_logistics_receipt_lines(
+    conn: sqlite3.Connection,
+    subset: dict[str, set[int]],
+) -> list[str]:
+    lines: list[str] = []
+    lines.append(_logistics_receipts_create_sql().rstrip(";") + ";;")
+    for row in conn.execute("SELECT payment_id, rental_id, amount, payment_date FROM payment ORDER BY payment_id"):
+        row_map = {
+            "payment_id": row[0],
+            "rental_id": row[1],
+            "amount": row[2],
+            "payment_date": row[3],
+        }
+        if not _row_allowed("payment", ["payment_id", "rental_id", "amount", "payment_date"], row, subset):
+            continue
+        payment_id = int(row_map["payment_id"])
+        if payment_id % 3 != 0:
+            continue
+        rental_id = int(row_map["rental_id"])
+        amount = row_map["amount"]
+        payment_date = str(row_map["payment_date"])
+        if " " in payment_date and "." in payment_date.split(" ", 1)[1]:
+            payment_date = payment_date.split(".", 1)[0]
+        lines.append(
+            f"INSERT INTO receipts (rcpt_id, rent_id, amt, dt) VALUES "
+            f"({payment_id}, {rental_id}, {repr(float(amount))}, '{payment_date}');"
+        )
+    return lines
+
+
+def _build_orphan_delivery_lines(
+    conn: sqlite3.Connection,
+    subset: dict[str, set[int]],
+) -> list[str]:
+    lines: list[str] = []
+    courier_ids = [int(row[0]) for row in conn.execute("SELECT courier_id FROM courier ORDER BY courier_id")]
+    if not courier_ids:
+        return lines
+    max_delivery_id = int(
+        conn.execute("SELECT COALESCE(MAX(delivery_id), 0) FROM delivery").fetchone()[0],
+    )
+    for index, rental_id in enumerate(CORPUS_REALISM_ORPHAN_DELIVERY_RENTAL_IDS):
+        delivery_id = max_delivery_id + index + 1
+        courier_id = courier_ids[index % len(courier_ids)]
+        lines.append(
+            f"INSERT INTO delivery (delivery_id, rental_id, courier_id, shipped_at, delivered_at, "
+            f"tracking_number, status, last_update) VALUES "
+            f"({delivery_id}, {rental_id}, {courier_id}, '2024-06-01 10:00:00', NULL, "
+            f"'ORPHAN-{rental_id}', 'shipped', '2024-06-01 10:00:00');"
+        )
+    return lines
+
+
+def _apply_catalog_country_drift_line(line: str) -> str:
+    if not line.startswith("INSERT INTO country"):
+        return line
+    for country_id, drift_name in CORPUS_REALISM_COUNTRY_CATALOG_DRIFT.items():
+        marker = f"({country_id},"
+        if marker in line:
+            parts = line.split("VALUES (", 1)
+            if len(parts) != 2:
+                return line
+            prefix, rest = parts
+            closing = rest.rfind(")")
+            if closing < 0:
+                return line
+            values = rest[:closing]
+            fields = [part.strip() for part in values.split(",")]
+            if len(fields) >= 2:
+                fields[1] = "'" + drift_name.replace("'", "''") + "'"
+                return prefix + "VALUES (" + ", ".join(fields) + rest[closing:]
+    return line
+
+
+def _append_catalog_only_country_lines(lines: list[str]) -> list[str]:
+    for country_id, country_name in CORPUS_REALISM_COUNTRY_CATALOG_ONLY.items():
+        escaped = country_name.replace("'", "''")
+        lines.append(
+            f"INSERT INTO country (country_id, country, last_update) VALUES "
+            f"({country_id}, '{escaped}', '2024-01-01 00:00:00');"
+        )
+    return lines
+
+
+def _export_crm_customer_lines(
+    conn: sqlite3.Connection,
+    subset: dict[str, set[int]],
+) -> list[str]:
+    lines: list[str] = []
+    lines.append(_crm_customer_create_sql().rstrip(";") + ";;")
+    full_cols = [
+        "customer_id",
+        "store_id",
+        "first_name",
+        "last_name",
+        "email",
+        "address_id",
+        "activebool",
+        "create_date",
+        "last_update",
+    ]
+    for row in conn.execute("SELECT * FROM customer ORDER BY customer_id"):
+        if not _row_allowed("customer", full_cols, row, subset):
+            continue
+        row_map = dict(zip(full_cols, row, strict=True))
+        customer_id = int(row_map["customer_id"])
+        first_name = _crm_customer_desync_first_name(customer_id, str(row_map["first_name"]))
+        email = row_map["email"]
+        email_sql = "NULL"
+        if email is not None and str(email).strip():
+            email_sql = "'" + str(email).replace("'", "''") + "'"
+        create_date = row_map["create_date"]
+        create_sql = "'" + str(create_date).replace("'", "''") + "'"
+        last_update = row_map["last_update"]
+        last_sql = "NULL"
+        if last_update is not None and str(last_update).strip():
+            last_sql = _format_timestamp_second_precision(last_update)
+        loyalty = _loyalty_tier_for_customer(customer_id)
+        first_sql = first_name.replace("'", "''")
+        last_name_sql = str(row_map["last_name"]).replace("'", "''")
+        lines.append(
+            f"INSERT INTO customer (customer_id, store_id, first_name, last_name, email_addr, "
+            f"address_id, loyalty_tier, create_date, last_update) VALUES "
+            f"({customer_id}, {int(row_map['store_id'])}, '{first_sql}', "
+            f"'{last_name_sql}', {email_sql}, "
+            f"{int(row_map['address_id'])}, '{loyalty}', {create_sql}, {last_sql});"
+        )
+    return lines
+
+
+def _export_logistics_purchase_lines(
+    conn: sqlite3.Connection,
+    subset: dict[str, set[int]],
+) -> list[str]:
+    lines: list[str] = []
+    lines.append(_logistics_purchase_order_create_sql().rstrip(";") + ";;")
+    lines.append(_logistics_purchase_line_create_sql().rstrip(";") + ";;")
+    po_cols = ["po_id", "supplier_id", "store_id", "ordered_date", "received_date", "status", "last_update"]
+    for row in conn.execute("SELECT * FROM purchase_order ORDER BY po_id"):
+        if not _row_allowed("purchase_order", po_cols, row, subset):
+            continue
+        row_map = dict(zip(po_cols, row, strict=True))
+        ord_id = int(row_map["po_id"])
+        sup_id = int(row_map["supplier_id"])
+        store_id = int(row_map["store_id"])
+        ord_dt = "'" + str(row_map["ordered_date"]).replace("'", "''") + "'"
+        recv = row_map["received_date"]
+        recv_dt = "NULL"
+        if recv is not None and str(recv).strip():
+            recv_dt = "'" + str(recv).replace("'", "''") + "'"
+        status = "'" + str(row_map["status"]).replace("'", "''") + "'"
+        last_update = _format_timestamp_second_precision(row_map["last_update"])
+        lines.append(
+            f"INSERT INTO purchase_order (ord_id, sup_id, store_id, ord_dt, recv_dt, status, last_update) "
+            f"VALUES ({ord_id}, {sup_id}, {store_id}, {ord_dt}, {recv_dt}, {status}, {last_update});"
+        )
+    line_cols = ["line_id", "po_id", "item_id", "quantity", "unit_cost", "last_update"]
+    for row in conn.execute("SELECT * FROM purchase_line ORDER BY line_id"):
+        if not _row_allowed("purchase_line", line_cols, row, subset):
+            continue
+        row_map = dict(zip(line_cols, row, strict=True))
+        last_update = _format_timestamp_second_precision(row_map["last_update"])
+        lines.append(
+            f"INSERT INTO purchase_line (line_id, ord_id, item_id, quantity, unit_cost, last_update) "
+            f"VALUES ({int(row_map['line_id'])}, {int(row_map['po_id'])}, {int(row_map['item_id'])}, "
+            f"{int(row_map['quantity'])}, {repr(float(row_map['unit_cost']))}, {last_update});"
+        )
+    return lines
+
+
+def _apply_corpus_realism_post_export(
+    source_id: str,
+    lines: list[str],
+    conn: sqlite3.Connection,
+    subset: dict[str, set[int]],
+) -> list[str]:
+    if source_id == "storefront":
+        out: list[str] = []
+        for line in lines:
+            if line.startswith("CREATE TABLE rental"):
+                out.append(_storefront_rental_create_sql().rstrip(";") + ";;")
+                continue
+            if line.startswith("INSERT INTO rental"):
+                parts = line.split("VALUES (", 1)
+                if len(parts) != 2:
+                    out.append(line)
+                    continue
+                prefix, rest = parts
+                values = rest.rsplit(")", 1)[0]
+                fields = [part.strip() for part in values.split(",")]
+                if len(fields) >= 5:
+                    fields[1] = _format_timestamp_second_precision(fields[1])
+                    if fields[4].upper() != "NULL":
+                        fields[4] = _format_timestamp_second_precision(fields[4])
+                    out.append(prefix + "VALUES (" + ", ".join(fields) + ");")
+                    continue
+            out.append(line)
+        lines = out
+    if source_id == "catalog":
+        lines = [_apply_catalog_country_drift_line(line) for line in lines]
+        lines = _append_catalog_only_country_lines(lines)
+    if source_id == "logistics":
+        filtered: list[str] = []
+        for line in lines:
+            if line.startswith("CREATE TABLE purchase_order") or line.startswith("CREATE TABLE purchase_line"):
+                continue
+            if line.startswith("INSERT INTO purchase_order") or line.startswith("INSERT INTO purchase_line"):
+                continue
+            filtered.append(line)
+        lines = filtered
+        lines.extend(_export_logistics_purchase_lines(conn, subset))
+        lines.extend(_build_logistics_receipt_lines(conn, subset))
+        lines.extend(_build_orphan_delivery_lines(conn, subset))
+    if source_id == "crm":
+        filtered_crm: list[str] = []
+        skipping_customer = False
+        for line in lines:
+            if line.startswith("CREATE TABLE customer"):
+                skipping_customer = True
+                continue
+            if skipping_customer and line.startswith("INSERT INTO customer"):
+                continue
+            if skipping_customer and line.startswith("CREATE TABLE"):
+                skipping_customer = False
+            if not skipping_customer:
+                filtered_crm.append(line)
+        lines = filtered_crm
+        insert_idx = next(
+            (index for index, line in enumerate(lines) if line.startswith("INSERT INTO")),
+            len(lines),
+        )
+        lines[insert_idx:insert_idx] = _export_crm_customer_lines(conn, subset)
+    return _reskin_seed_lines(lines)
+
 
 def corpus_message(message: str) -> None:
     print(message, flush=True)
@@ -489,10 +1137,7 @@ def _paraphrase_catalog_ready(*, staging_dir: Path = STAGING) -> bool:
     pairs = payload.get("paraphrase_pairs")
     if not isinstance(pairs, list) or not pairs:
         return False
-    return any(
-        isinstance(row, dict) and str(row.get("canonical", "")).strip()
-        for row in pairs
-    )
+    return any(isinstance(row, dict) and str(row.get("canonical", "")).strip() for row in pairs)
 
 
 def _aetherspace_snapshots_ready(*, staging_dir: Path = STAGING) -> bool:
@@ -599,7 +1244,7 @@ def _recording_pipeline_ready(
 
 
 def _paraphrase_seeds_for_missing(
-    session: "RecordingSession",
+    session: RecordingSession,
     missing: list[RecordingSlot],
     collected: list[tuple[RecordingSlot, object]],
 ) -> list[tuple[RecordingSlot, object]]:
@@ -645,6 +1290,8 @@ def parse_questions_file(path: Path) -> dict[str, list[str]]:
         "questions": [],
         "validation_failures": [],
         "feedback_samples": [],
+        "federation": [],
+        "views_questions": [],
     }
     current = "questions"
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -658,23 +1305,27 @@ def parse_questions_file(path: Path) -> dict[str, list[str]]:
             continue
         if current:
             tiers[current].append(stripped)
+    tiers["questions"].extend(tiers.pop("federation", []))
     return tiers
 
 
+FEDERATION_SMOKE_QUESTION = "How many rentals are linked to film titles?"
+
+
 def smoke_questions(*, source: Path | None = None) -> dict[str, list[str]]:
-    """Minimal question set: one practice question plus all validation/feedback sections."""
+    """Minimal question set: one practice question, one cross-source question, plus validation sections."""
     full = parse_questions_file(source or QUESTIONS_SOURCE)
-    practice = (
-        [SMOKE_TOUR_QUESTION]
-        if SMOKE_TOUR_QUESTION in full["questions"]
-        else full["questions"][:1]
-    )
+    practice: list[str] = []
+    if SMOKE_TOUR_QUESTION in full["questions"]:
+        practice.append(SMOKE_TOUR_QUESTION)
+    elif full["questions"]:
+        practice.append(full["questions"][0])
+    if FEDERATION_SMOKE_QUESTION in full["questions"] and FEDERATION_SMOKE_QUESTION not in practice:
+        practice.append(FEDERATION_SMOKE_QUESTION)
     return {
         "questions": practice,
         "validation_failures": [
-            question
-            for question in full["validation_failures"]
-            if question != "How many rentals were made in total?"
+            question for question in full["validation_failures"] if question != "How many rentals were made in total?"
         ],
         "feedback_samples": list(full["feedback_samples"]),
     }
@@ -694,7 +1345,7 @@ def _smoke_expectations_from_source() -> list[dict[str, object]]:
 
 def write_questions_file(path: Path, questions: dict[str, list[str]]) -> None:
     lines: list[str] = []
-    for tier in ("questions", "validation_failures", "feedback_samples"):
+    for tier in SANDBOX_QUESTION_TIERS + ("feedback_samples",):
         lines.append(f"# {tier.replace('_', ' ')}")
         lines.extend(questions.get(tier, []))
         lines.append("")
@@ -721,7 +1372,7 @@ def iter_recording_slots(questions: dict[str, list[str]]) -> list[RecordingSlot]
     """Live LLM fixture slots — owner writer only (consumer is validated, not re-recorded)."""
     slots: list[RecordingSlot] = []
     for tier in SANDBOX_QUESTION_TIERS:
-        for question in questions[tier]:
+        for question in questions.get(tier, []):
             slots.append(RecordingSlot(tier=tier, label=question))
     feedback = questions["feedback_samples"]
     if feedback:
@@ -757,16 +1408,6 @@ def _expectation_row_for_slot(slot: RecordingSlot) -> dict[str, object]:
     }
 
 
-def build_expectations() -> list[dict[str, object]]:
-    questions = load_staging_questions()
-    rows: list[dict[str, object]] = []
-    for slot in iter_recording_slots(questions):
-        rows.append(_expectation_row_for_slot(slot))
-    for slot in iter_consumer_validation_slots(questions):
-        rows.append(_expectation_row_for_slot(slot))
-    return rows
-
-
 INVALID_QUESTIONS = frozenset(
     {
         "What's the weather today?",
@@ -785,6 +1426,11 @@ VALIDATION_FAILURE_QUESTIONS = frozenset(
         "Show payroll deductions by employee SSN.",
         "Show me all staff salaries.",
         "How many rentals happened on 2025-01-01?",
+    },
+)
+FEDERATION_INELIGIBLE_QUESTIONS = frozenset(
+    {
+        "What is the average payment amount grouped by film category?",
     },
 )
 FAITHFULNESS: dict[str, dict[str, object]] = {
@@ -808,14 +1454,23 @@ FAITHFULNESS: dict[str, dict[str, object]] = {
         "must_tables": ["film"],
         "sql_contains": ["item_id"],
     },
+    "How many active customers do we have?": {
+        "must_tables": ["active_customer_v"],
+    },
+    "What is the total revenue by store?": {
+        "must_tables": ["store_revenue_v"],
+    },
+    "Which films are in the catalog view?": {
+        "must_tables": ["film_catalog_v"],
+    },
 }
 SANDBOX_ZIP_BUILD_TIME_ONLY = frozenset(
-    {
-    },
+    {},
 )
 PARAPHRASE_SOURCE_TIERS = frozenset({"questions"})
 INLINE_PARAPHRASE_COPY_RULES: dict[str, tuple[str, ...]] = {
     "How many rentals happened in 2025?": ("How many rentals happened in 2026?",),
+    "Which games support English?": ("Which games have English language support?",),
 }
 INLINE_REUSE_PARAM_COPY_RULES: dict[tuple[str, str], tuple[tuple[str, str], ...]] = {
     ("How many rentals happened in 2025?", "How many rentals happened in 2026?"): (("2025", "2026"),),
@@ -844,7 +1499,7 @@ def _expect_for_question(question: str, *, kind: str) -> dict[str, object]:
             "sql_required": False,
             "grain": "none",
             "must_tables": [],
-            "must_filter": [],
+            "must_where": [],
             "sql_contains": [],
             "forbidden_sql_tokens": [],
         }
@@ -854,10 +1509,20 @@ def _expect_for_question(question: str, *, kind: str) -> dict[str, object]:
             "sql_required": False,
             "grain": "none",
             "must_tables": [],
-            "must_filter": [],
+            "must_where": [],
             "sql_contains": [],
             "forbidden_sql_tokens": [],
             "validation_failure": question in VALIDATION_FAILURE_QUESTIONS,
+        }
+    if question in FEDERATION_INELIGIBLE_QUESTIONS:
+        return {
+            "terminal_status": "error",
+            "sql_required": False,
+            "grain": "none",
+            "must_tables": [],
+            "must_where": [],
+            "sql_contains": [],
+            "forbidden_sql_tokens": [],
         }
     if kind == "feedback":
         return {
@@ -865,7 +1530,7 @@ def _expect_for_question(question: str, *, kind: str) -> dict[str, object]:
             "sql_required": True,
             "grain": "scalar",
             "must_tables": [],
-            "must_filter": [],
+            "must_where": [],
             "sql_contains": [],
             "forbidden_sql_tokens": [],
         }
@@ -875,7 +1540,7 @@ def _expect_for_question(question: str, *, kind: str) -> dict[str, object]:
         "sql_required": True,
         "grain": "scalar",
         "must_tables": list(extra.get("must_tables", [])),
-        "must_filter": [],
+        "must_where": [],
         "sql_contains": list(extra.get("sql_contains", [])),
         "forbidden_sql_tokens": list(extra.get("forbidden_sql_tokens", [])),
         "contains_join": extra.get("contains_join"),
@@ -1054,9 +1719,7 @@ class FixtureCorpus:
 
     def commit_slot(self, *, prune_question: str = "") -> int:
         buffer_rows = self.collapsed_slot_fixtures()
-        buffer_intent_keys = {
-            fixture_key(row) for row in buffer_rows if str(row.get("task", "")) == "intent"
-        }
+        buffer_intent_keys = {fixture_key(row) for row in buffer_rows if str(row.get("task", "")) == "intent"}
         for entry in buffer_rows:
             key = fixture_key(entry)
             replaced = False
@@ -1081,35 +1744,31 @@ class FixtureCorpus:
         self.flush()
         return removed
 
-    def merged_fixtures_for_verify(self, *, slot_label: str = "") -> list[dict[str, str]]:
-        buffer = self.collapsed_slot_fixtures()
-        buffer_keys = {fixture_key(row) for row in buffer}
-        buffer_has_intent = any(str(row.get("task", "")) == "intent" for row in buffer)
-        slot_question = normalize_question(slot_label) if slot_label.strip() else ""
-        merged: list[dict[str, str]] = []
-        for row in self.fixtures:
-            if buffer_has_intent and str(row.get("task", "")) == "intent":
-                row_question = _intent_fixture_question(row)
-                if row_question is None:
-                    continue
-                if slot_question and row_question == slot_question and fixture_key(row) not in buffer_keys:
-                    continue
-            merged.append(dict(row))
-        for entry in buffer:
-            key = fixture_key(entry)
-            replaced = False
-            for idx, row in enumerate(merged):
-                if fixture_key(row) == key:
-                    merged[idx] = entry
-                    replaced = True
-                    break
-            if not replaced:
-                merged.append(entry)
-        return merged
 
-    def write_verify_snapshot(self, dest: Path, *, slot_label: str = "") -> None:
-        payload = {"version": 1, "fixtures": self.merged_fixtures_for_verify(slot_label=slot_label)}
-        write_text_atomic(dest, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+def _corpus_snapshot(corpus: FixtureCorpus) -> tuple[list[dict[str, str]], set[tuple[str, str, str]]]:
+    return [dict(row) for row in corpus.fixtures], set(corpus.seen)
+
+
+def _restore_corpus_snapshot(
+    corpus: FixtureCorpus,
+    snap: tuple[list[dict[str, str]], set[tuple[str, str, str]]],
+) -> None:
+    corpus.fixtures, corpus.seen = snap[0], snap[1]
+    corpus.flush()
+
+
+@contextmanager
+def _staging_bundle_env():
+    """Point sandbox bundle resolution at the staging workspace."""
+    prev = os.environ.get("AETHERDIALECT_SANDBOX_DATA_ZIP")
+    os.environ["AETHERDIALECT_SANDBOX_DATA_ZIP"] = str(STAGING)
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop("AETHERDIALECT_SANDBOX_DATA_ZIP", None)
+        else:
+            os.environ["AETHERDIALECT_SANDBOX_DATA_ZIP"] = prev
 
 
 def _digest(*parts: object) -> int:
@@ -1131,6 +1790,7 @@ def _remove_tree(path: Path) -> None:
 def _prepare_sqlite_from_csvs() -> None:
     import argparse
 
+    import load_rental_shop_engines as load_mod
     from load_rental_shop_engines import (
         DEFAULT_ENV_FILE,
         _load_sqlite,
@@ -1139,8 +1799,6 @@ def _prepare_sqlite_from_csvs() -> None:
         load_env_file,
     )
     from source_rental_shop import OUT_DIR, ZIP_PATH, ensure_csv_bundle
-
-    import load_rental_shop_engines as load_mod
 
     source = ensure_csv_bundle(OUT_DIR, ZIP_PATH)
     verbose_message(f"CSV bundle source: {source}")
@@ -1396,8 +2054,163 @@ def export_seed_sql(path: Path) -> None:
                 lines.append(f"INSERT INTO {table_name} ({col_list}) VALUES ({', '.join(vals)});")
     finally:
         conn.close()
+    lines = _reskin_seed_lines(lines)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     verbose_message(f"Wrote {path} ({path.stat().st_size} bytes)")
+
+
+def _payment_row_matches_filter(
+    row_map: dict[str, object],
+    payment_filter: str | None,
+    *,
+    payment_store_ids: dict[int, int] | None = None,
+) -> bool:
+    if not payment_filter:
+        return True
+    store_id = 0
+    if payment_store_ids is not None:
+        payment_id = int(row_map.get("payment_id", 0) or 0)
+        store_id = int(payment_store_ids.get(payment_id, 0))
+    threshold_text = payment_filter.split()[-1]
+    threshold = int(threshold_text)
+    if "<=" in payment_filter:
+        return store_id <= threshold
+    if ">" in payment_filter:
+        return store_id > threshold
+    return True
+
+
+def _export_partition_seed(
+    path: Path,
+    conn: sqlite3.Connection,
+    subset: dict[str, set[int]],
+    allowed_tables: set[str],
+    *,
+    source_id: str,
+    payment_filter: str | None = None,
+    column_projections: dict[str, frozenset[str]] | None = None,
+) -> None:
+    partition_tables = frozenset(allowed_tables)
+    column_projections = column_projections or {}
+    payment_store_ids = payment_store_id_by_payment_id(conn) if payment_filter else None
+    table_rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+    ).fetchall()
+    lines: list[str] = []
+    for (table_name,) in table_rows:
+        table = str(table_name)
+        if table.startswith("sqlite_"):
+            continue
+        include_payment = table == "payment" and payment_filter is not None and table in allowed_tables
+        if table not in allowed_tables and not include_payment:
+            continue
+        projection = column_projections.get(table)
+        if projection:
+            lines.append(_create_table_sql_for_projection(conn, table, projection).rstrip(";") + ";;")
+        else:
+            create_row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone()
+            if create_row and create_row[0]:
+                create_sql = _strip_disallowed_create_table_foreign_keys(
+                    str(create_row[0]).rstrip(";"),
+                    table,
+                    partition_tables,
+                )
+                lines.append(create_sql + ";;")
+        full_cols = [desc[0] for desc in conn.execute(f"SELECT * FROM [{table}] LIMIT 0").description]
+        cols = full_cols
+        if projection:
+            cols = [col for col in full_cols if col in projection]
+        col_list = ", ".join(cols)
+        for row in conn.execute(f"SELECT * FROM [{table}]"):
+            row_map = dict(zip(full_cols, row, strict=True))
+            if table == "payment":
+                if not _payment_row_matches_filter(
+                    row_map,
+                    payment_filter,
+                    payment_store_ids=payment_store_ids,
+                ):
+                    continue
+            if not _row_allowed(table, full_cols, row, subset):
+                continue
+            vals = []
+            for col_name in cols:
+                value = row_map[col_name]
+                if value is None or value == "":
+                    vals.append("NULL")
+                elif isinstance(value, bool):
+                    vals.append("1" if value else "0")
+                elif value in ("t", "f", "true", "false"):
+                    vals.append("1" if str(value).lower() in ("t", "true") else "0")
+                elif isinstance(value, str):
+                    vals.append("'" + value.replace("'", "''") + "'")
+                elif isinstance(value, bytes):
+                    vals.append("X'" + value.hex() + "'")
+                else:
+                    vals.append(repr(value))
+            lines.append(f"INSERT INTO {table} ({col_list}) VALUES ({', '.join(vals)});")
+    lines = _apply_corpus_realism_post_export(source_id, lines, conn, subset)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    verbose_message(f"Wrote {path} ({path.stat().st_size} bytes)")
+
+
+def export_federation_partition_seeds(
+    storefront_path: Path,
+    catalog_path: Path,
+    logistics_path: Path,
+    crm_path: Path,
+) -> None:
+    """Export four federation member DuckDB seed SQL files from the rental_shop sqlite corpus."""
+    member_tables = {
+        "storefront": set(federation_partition_tables("storefront")),
+        "catalog": set(federation_partition_tables("catalog")),
+        "logistics": set(federation_partition_tables("logistics")),
+        "crm": set(federation_partition_tables("crm")),
+    }
+    sqlite_path = REPO / "scripts" / "sqlite" / "rental_shop.sqlite"
+    if not sqlite_path.is_file():
+        raise SystemExit(f"Missing seed source: {sqlite_path}")
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        subset = _compute_sandbox_subset(conn)
+        _export_partition_seed(
+            storefront_path,
+            conn,
+            subset,
+            member_tables["storefront"],
+            source_id="storefront",
+            payment_filter=f"store_id <= {PAYMENT_UNION_SPLIT_STORE_THRESHOLD}",
+            column_projections=federation_member_column_projections("storefront"),
+        )
+        _export_partition_seed(
+            catalog_path,
+            conn,
+            subset,
+            member_tables["catalog"],
+            source_id="catalog",
+            payment_filter=f"store_id > {PAYMENT_UNION_SPLIT_STORE_THRESHOLD}",
+            column_projections=federation_member_column_projections("catalog"),
+        )
+        _export_partition_seed(
+            logistics_path,
+            conn,
+            subset,
+            member_tables["logistics"],
+            source_id="logistics",
+            column_projections=federation_member_column_projections("logistics"),
+        )
+        _export_partition_seed(
+            crm_path,
+            conn,
+            subset,
+            member_tables["crm"],
+            source_id="crm",
+            column_projections=federation_member_column_projections("crm"),
+        )
+    finally:
+        conn.close()
 
 
 def assemble_staging(*, reset_fixtures: bool = True, smoke: bool = False) -> None:
@@ -1411,6 +2224,32 @@ def assemble_staging(*, reset_fixtures: bool = True, smoke: bool = False) -> Non
     STAGING.mkdir(parents=True)
     _prepare_sqlite_from_csvs()
     export_seed_sql(STAGING / "rental_shop_seed.sql")
+    sqlite_path = REPO / "scripts" / "sqlite" / "rental_shop.sqlite"
+    if sqlite_path.is_file():
+        export_federation_partition_seeds(
+            DATA / "federation_storefront_seed.sql",
+            DATA / "federation_catalog_seed.sql",
+            DATA / "federation_logistics_seed.sql",
+            DATA / "federation_crm_seed.sql",
+        )
+        (DATA / "federation_partition.json").write_text(
+            json.dumps(
+                {source: sorted(tables) for source, tables in FEDERATION_PARTITION_TABLES.items()},
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    for seed_name in (
+        "federation_storefront_seed.sql",
+        "federation_catalog_seed.sql",
+        "federation_logistics_seed.sql",
+        "federation_crm_seed.sql",
+    ):
+        src = DATA / seed_name
+        if src.is_file():
+            shutil.copy2(src, STAGING / seed_name)
     for name, src in (
         ("rental_shop.sql", DATA / "rental_shop.sql"),
         ("rental_shop_views.sql", DATA / "rental_shop_views.sql"),
@@ -1420,6 +2259,8 @@ def assemble_staging(*, reset_fixtures: bool = True, smoke: bool = False) -> Non
         ("sandbox_scenarios.json", SCENARIOS_SOURCE),
         ("sandbox_handcrafted_fixtures.json", HANDCRAFTED_FIXTURES_SOURCE),
         ("sandbox_space_catalog_notes.txt", SPACE_CATALOG_NOTES_SOURCE),
+        ("federation_declaration.json", DATA / FEDERATION_DECLARATION_FILENAME),
+        ("federation_partition.json", DATA / "federation_partition.json"),
     ):
         if not src.is_file():
             raise SystemExit(f"Missing source file: {src}")
@@ -1468,11 +2309,11 @@ def write_migration_demo() -> None:
 def build_artifacts_baseline() -> None:
     """Build fresh schema artifacts and bundled schema literals from staging."""
     from live_tests.conftest import write_sandbox_recording_toml
-    from load_rental_shop_engines import DEFAULT_ENV_FILE, load_env_file
 
     import aetherdialect._sandbox
     import aetherdialect.aetherdialect
     from aetherdialect.aetherdialect import AetherEngine
+    from load_rental_shop_engines import DEFAULT_ENV_FILE, load_env_file
 
     load_env_file(DEFAULT_ENV_FILE, override=True)
     baseline_root = STAGING / "artifacts_baseline"
@@ -1491,7 +2332,7 @@ def build_artifacts_baseline() -> None:
     def build_log_sink(line: str) -> None:
         del line
 
-    setattr(aetherdialect._sandbox, "_write_sandbox_toml", openai_toml)
+    aetherdialect._sandbox._write_sandbox_toml = openai_toml
     reset_mock_provider()
     merged_env = dict(os.environ)
     merged_env["AETHERDIALECT_LLM_PROVIDER"] = "openai"
@@ -1520,11 +2361,38 @@ def build_artifacts_baseline() -> None:
             consumer_baseline.mkdir(parents=True, exist_ok=True)
             _copy_baseline_cache_files(owner_engine_dir, consumer_baseline)
             written = [
-                f"{name}={ (owner_baseline / name).stat().st_size }B"
+                f"{name}={(owner_baseline / name).stat().st_size}B"
                 for name in _BASELINE_CACHE_FILES
                 if (owner_baseline / name).is_file()
             ]
             verbose_message(f"[build] artifacts baseline files: {', '.join(written) or 'none'}")
+        owner_views_baseline = baseline_root / BASELINE_OWNER_VIEWS_SUBDIR
+        consumer_views_baseline = baseline_root / BASELINE_CONSUMER_VIEWS_SUBDIR
+        corpus_message("[build] artifacts baseline: building views schema graph...")
+        with AetherEngine.offline_sandbox(
+            cleanup_artifacts=True,
+            bundle_dir=str(STAGING),
+            seed_sql=seed_sql,
+            include="views",
+        ) as owner_views_sb:
+            views_schema_graph = owner_views_sb.engine._schema_graph
+            views_table_count = len(views_schema_graph.tables)
+            views_column_count = sum(len(table.columns) for table in views_schema_graph.tables.values())
+            corpus_message(
+                f"[build] artifacts baseline: views schema graph ready "
+                f"({views_table_count} views, {views_column_count} columns)",
+            )
+            views_engine_dir = Path(EngineConfig.SCHEMA_JSON_PATH).parent
+            owner_views_baseline.mkdir(parents=True, exist_ok=True)
+            _copy_baseline_cache_files(views_engine_dir, owner_views_baseline)
+            consumer_views_baseline.mkdir(parents=True, exist_ok=True)
+            _copy_baseline_cache_files(views_engine_dir, consumer_views_baseline)
+            views_written = [
+                f"{name}={(owner_views_baseline / name).stat().st_size}B"
+                for name in _BASELINE_CACHE_FILES
+                if (owner_views_baseline / name).is_file()
+            ]
+            verbose_message(f"[build] artifacts views baseline files: {', '.join(views_written) or 'none'}")
         literals_payload = {"owner": owner_literal, "consumer": owner_literal}
         (STAGING / SANDBOX_SCHEMA_LITERALS_FILENAME).write_text(
             json.dumps(literals_payload, ensure_ascii=False, indent=2) + "\n",
@@ -1541,13 +2409,106 @@ def build_artifacts_baseline() -> None:
         demo_root.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(owner_baseline, demo_root)
     finally:
-        setattr(aetherdialect.aetherdialect, "_init_log_sink", original_log_sink)
+        aetherdialect.aetherdialect._init_log_sink = original_log_sink
         PolicyConfig.REGENERATE_SCHEMA_GRAPH = prev_regen
-        setattr(aetherdialect._sandbox, "_write_sandbox_toml", orig_write_toml)
+        aetherdialect._sandbox._write_sandbox_toml = orig_write_toml
         reset_mock_provider()
         EngineConfig.LLM_PROVIDER = prev_provider
     aetherdialect._sandbox._pin_bundled_schema_literals(STAGING)
     verbose_message(f"Wrote artifacts baseline under {baseline_root}")
+    build_federation_artifacts_baseline(STAGING)
+
+
+def build_federation_artifacts_baseline(staging_dir: Path = STAGING) -> None:
+    """Stage federation composite artifacts and per-member trees when partition seeds are present."""
+    from live_tests.conftest import write_sandbox_recording_toml
+
+    from aetherdialect._constants import (
+        ARTIFACT_DIRECTORY_SEGMENT,
+        ARTIFACT_MANIFEST_FILENAME,
+        FEDERATION_COMPOSITE_SCHEMA_FILENAME,
+        FEDERATION_DECLARATION_FILENAME,
+        FEDERATION_MANIFEST_FILENAME,
+        FEDERATION_MAPPINGS_FILENAME,
+    )
+    from aetherdialect._federation import federation_source_storage_slug, parse_federation_declaration
+    from load_rental_shop_engines import DEFAULT_ENV_FILE, load_env_file
+
+    storefront = staging_dir / "federation_storefront_seed.sql"
+    catalog = staging_dir / "federation_catalog_seed.sql"
+    if not storefront.is_file() or not catalog.is_file():
+        corpus_message("[build] federation baseline skipped: partition seeds not staged")
+        return
+    fed_baseline = staging_dir / "artifacts_baseline" / BASELINE_FEDERATION_SUBDIR
+    fed_baseline.mkdir(parents=True, exist_ok=True)
+    declaration_src = staging_dir / FEDERATION_DECLARATION_FILENAME
+    if not declaration_src.is_file():
+        corpus_message("[build] federation baseline skipped: declaration not staged")
+        return
+    if declaration_src.is_file():
+        shutil.copy2(declaration_src, fed_baseline / FEDERATION_DECLARATION_FILENAME)
+    manifest_src = staging_dir / FEDERATION_MANIFEST_FILENAME
+    mappings_src = staging_dir / FEDERATION_MAPPINGS_FILENAME
+    if manifest_src.is_file():
+        shutil.copy2(manifest_src, fed_baseline / FEDERATION_MANIFEST_FILENAME)
+    if mappings_src.is_file():
+        shutil.copy2(mappings_src, fed_baseline / FEDERATION_MAPPINGS_FILENAME)
+    load_env_file(DEFAULT_ENV_FILE, override=True)
+    orig_write_toml = aetherdialect._sandbox._write_sandbox_toml
+    prev_provider = EngineConfig.LLM_PROVIDER
+
+    def openai_toml(*, fixtures_file: str) -> str:
+        del fixtures_file
+        return write_sandbox_recording_toml(str(DEFAULT_ENV_FILE))
+
+    aetherdialect._sandbox._write_sandbox_toml = openai_toml
+    merged_env = dict(os.environ)
+    merged_env["AETHERDIALECT_LLM_PROVIDER"] = "openai"
+    _configure_llm_from_environment(merged_env)
+    parsed_manifest, _ = parse_federation_declaration(json.loads(declaration_src.read_text(encoding="utf-8")))
+    try:
+        with AetherEngine.offline_sandbox(
+            cleanup_artifacts=True,
+            bundle_dir=str(staging_dir),
+            preset="federation",
+        ) as fed_sb:
+            fed_manifest = getattr(fed_sb.engine, "_federation_manifest", parsed_manifest)
+            fed_engine_dir = Path(EngineConfig.SCHEMA_JSON_PATH).parent
+            _copy_baseline_cache_files(fed_engine_dir, fed_baseline)
+            fed_storage = getattr(fed_sb.engine, "_federation_storage_dir", None)
+            if fed_storage:
+                storage = Path(str(fed_storage))
+                for name in (
+                    FEDERATION_COMPOSITE_SCHEMA_FILENAME,
+                    ARTIFACT_MANIFEST_FILENAME,
+                    FEDERATION_MANIFEST_FILENAME,
+                    FEDERATION_MAPPINGS_FILENAME,
+                ):
+                    src = storage / name
+                    if src.is_file():
+                        shutil.copy2(src, fed_baseline / name)
+            artifacts_root = getattr(fed_sb.engine, "_runtime_config", None)
+            artifacts_parent = Path(str(getattr(artifacts_root, "artifacts_dir", fed_engine_dir.parent)))
+            for source in fed_manifest.sources:
+                slug = federation_source_storage_slug(source)
+                member_src = artifacts_parent / ARTIFACT_DIRECTORY_SEGMENT / slug
+                member_dest = fed_baseline / slug
+                if member_src.is_dir():
+                    if member_dest.exists():
+                        shutil.rmtree(member_dest)
+                    shutil.copytree(member_src, member_dest)
+            composite_dest = fed_baseline / FEDERATION_COMPOSITE_SCHEMA_FILENAME
+            schema_dest = fed_baseline / "schema_graph.json.gz"
+            if composite_dest.is_file() and not schema_dest.is_file():
+                shutil.copy2(composite_dest, schema_dest)
+            elif schema_dest.is_file() and not composite_dest.is_file():
+                shutil.copy2(schema_dest, composite_dest)
+    except Exception as exc:
+        raise RuntimeError(f"federation baseline build failed: {exc}") from exc
+    finally:
+        aetherdialect._sandbox._write_sandbox_toml = orig_write_toml
+        EngineConfig.LLM_PROVIDER = prev_provider
+    verbose_message(f"Wrote federation artifacts baseline under {fed_baseline}")
 
 
 def ensure_schema_literals(staging_dir: Path = STAGING) -> None:
@@ -1580,6 +2541,151 @@ def ensure_interpret_domain(staging_dir: Path = STAGING) -> None:
     ) as handle:
         domain = json.loads(handle.engine._schema_graph.schema_payload_interpret())
     target.write_text(json.dumps(domain, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+_QUESTION_GATEKEEPER_MARKER = "valid_database_question"
+_QUESTION_NORMALIZE_MARKER = "rewritten canonical short query"
+
+
+def sync_gatekeeper_normalization_fixture_questions(corpus: FixtureCorpus) -> int:
+    """Align normalization and intent question fields with gatekeeper corrected text."""
+    corrected_by_raw: dict[str, str] = {}
+    for row in corpus.fixtures:
+        if str(row.get("task", "")) != "default":
+            continue
+        system = str(row.get("system", ""))
+        user = str(row.get("user", "")).strip()
+        if _QUESTION_GATEKEEPER_MARKER not in system or user.startswith("{"):
+            continue
+        try:
+            payload = json.loads(str(row.get("output_text", "")))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        corrected = str(payload.get("corrected", "") or user).strip()
+        if not corrected:
+            continue
+        corrected_by_raw[user] = corrected
+        corrected_by_raw[normalize_question(user)] = corrected
+
+    if not corrected_by_raw:
+        return 0
+
+    replacements: dict[tuple[str, str, str], dict[str, str]] = {}
+    for row in corpus.fixtures:
+        task = str(row.get("task", ""))
+        system = str(row.get("system", ""))
+        user = str(row.get("user", "")).strip()
+        if not user.startswith("{"):
+            continue
+        try:
+            body = json.loads(user)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(body, dict):
+            continue
+        question = str(body.get("question", "") or "").strip()
+        if not question:
+            continue
+        if task == "default" and _QUESTION_NORMALIZE_MARKER not in system:
+            continue
+        corrected = corrected_by_raw.get(question) or corrected_by_raw.get(normalize_question(question))
+        if not corrected or corrected == question:
+            continue
+        body["question"] = corrected
+        new_user = mock_fixture_user_key(stable_json(body))
+        if new_user == user:
+            continue
+        replacements[fixture_key(row)] = {
+            "task": task,
+            "system": system,
+            "user": new_user,
+            "output_text": str(row.get("output_text", "")),
+        }
+
+    if not replacements:
+        return 0
+    updated: list[dict[str, str]] = []
+    for row in corpus.fixtures:
+        updated.append(replacements.get(fixture_key(row), row))
+    corpus.fixtures = updated
+    corpus.seen = {fixture_key(row) for row in corpus.fixtures}
+    corpus.flush()
+    return len(replacements)
+
+
+def repair_federation_intent_schema_literals(corpus: FixtureCorpus, staging_dir: Path = STAGING) -> int:
+    """Backfill federation intent fixture schema_literal_json from the bundled composite graph."""
+    from aetherdialect._llm_provider import stable_schema_literal
+    from aetherdialect._sandbox import create_offline_sandbox
+
+    fixtures_path = staging_dir / "fixtures" / "rental_shop_mock.json"
+    if not fixtures_path.is_file():
+        return 0
+
+    markers = sorted(
+        {
+            str(row.get("question", "")).strip().lower()
+            for row in _load_scenarios_by_question().values()
+            if str(row.get("recipe", "")) == "federation" and str(row.get("question", "")).strip()
+        },
+    )
+    if not markers:
+        return 0
+
+    with create_offline_sandbox(
+        AetherEngine,
+        preset="federation",
+        bundle_dir=str(staging_dir),
+        cleanup_artifacts=True,
+    ) as handle:
+        schema_literal = stable_schema_literal(handle.engine._schema_graph.schema_literal_json)
+
+    def _is_federation_intent_fixture(user: str) -> bool:
+        lowered = user.lower()
+        return any(marker in lowered for marker in markers)
+
+    replacements: dict[tuple[str, str, str], dict[str, str]] = {}
+    for row in corpus.fixtures:
+        if str(row.get("task", "")) != "intent":
+            continue
+        user = str(row.get("user", "")).strip()
+        if not user.startswith("{") or not _is_federation_intent_fixture(user):
+            continue
+        try:
+            body = json.loads(user)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(body, dict) or "schema_literal_json" not in body:
+            continue
+        embedded = body.get("schema_literal_json")
+        if isinstance(embedded, dict):
+            embedded_text = stable_schema_literal(json.dumps(embedded, ensure_ascii=False))
+        else:
+            embedded_text = stable_schema_literal(str(embedded or "{}"))
+        if embedded_text == schema_literal:
+            continue
+        body["schema_literal_json"] = schema_literal
+        new_user = mock_fixture_user_key(stable_json(body))
+        if new_user == user:
+            continue
+        replacements[fixture_key(row)] = {
+            "task": str(row.get("task", "")),
+            "system": str(row.get("system", "")),
+            "user": new_user,
+            "output_text": str(row.get("output_text", "")),
+        }
+
+    if not replacements:
+        return 0
+    updated: list[dict[str, str]] = []
+    for row in corpus.fixtures:
+        updated.append(replacements.get(fixture_key(row), row))
+    corpus.fixtures = updated
+    corpus.seen = {fixture_key(row) for row in corpus.fixtures}
+    corpus.flush()
+    return len(replacements)
 
 
 def recanonicalize_mock_fixture_user_keys(corpus: FixtureCorpus) -> int:
@@ -1664,13 +2770,27 @@ class WarmRecordingPool:
         self._seed_sql = str(bundle_dir / "rental_shop_seed.sql")
         self._live_artifacts_owner = tempfile.mkdtemp(prefix="aetherdialect_record_live_owner_")
         self._live_artifacts_consumer = tempfile.mkdtemp(prefix="aetherdialect_record_live_consumer_")
+        self._live_artifacts_owner_views = tempfile.mkdtemp(prefix="aetherdialect_record_live_owner_views_")
+        self._live_artifacts_consumer_views = tempfile.mkdtemp(prefix="aetherdialect_record_live_consumer_views_")
+        self._live_artifacts_federation = tempfile.mkdtemp(prefix="aetherdialect_record_live_federation_")
         self._connection = aetherdialect._sandbox._load_memory_connection(self._seed_sql)
         self._engine_cls = AetherEngine
         self._live_handles: dict[str, object] = {}
         self._closed = False
         self._literals_pinned = False
 
-    def _artifacts_for_preset(self, preset: str) -> str:
+    def _artifacts_for_preset(
+        self,
+        preset: str,
+        *,
+        include: Literal["tables", "views"] = "tables",
+    ) -> str:
+        if include == "views":
+            if preset == "consumer_reader":
+                return self._live_artifacts_consumer_views
+            return self._live_artifacts_owner_views
+        if preset == "federation":
+            return self._live_artifacts_federation
         if preset == "consumer_reader":
             return self._live_artifacts_consumer
         return self._live_artifacts_owner
@@ -1681,19 +2801,26 @@ class WarmRecordingPool:
         aetherdialect._sandbox._pin_bundled_schema_literals(self._bundle_dir)
         self._literals_pinned = True
 
-    def live_handle(self, *, preset: str = "owner_writer", restricted_consumer: bool = False) -> object:
+    def live_handle(
+        self,
+        *,
+        preset: str = "owner_writer",
+        restricted_consumer: bool = False,
+        include: Literal["tables", "views"] = "tables",
+    ) -> object:
         if self._closed:
             raise RuntimeError("Warm recording pool is closed")
-        cache_key = f"{preset}:restricted={restricted_consumer}"
+        cache_key = f"{preset}:restricted={restricted_consumer}:include={include}"
         cached = self._live_handles.get(cache_key)
         if cached is not None:
             return cached
         _reset_sandbox_duckdb_runtime()
-        artifacts_dir = self._artifacts_for_preset(preset)
+        artifacts_dir = self._artifacts_for_preset(preset, include=include)
         _seed_engine_baseline(
             artifacts_dir=artifacts_dir,
             bundle_dir=self._bundle_dir,
             preset=preset,
+            include=include,
         )
         kwargs: dict[str, object] = {
             "bundle_dir": str(self._bundle_dir),
@@ -1702,6 +2829,7 @@ class WarmRecordingPool:
             "owns_connection": False,
             "artifacts_dir": artifacts_dir,
             "cleanup_artifacts": False,
+            "include": include,
         }
         if preset != "owner_writer":
             kwargs["preset"] = preset
@@ -1711,9 +2839,15 @@ class WarmRecordingPool:
         self._live_handles[cache_key] = handle
         return handle
 
-    def evict_live_handle(self, *, preset: str = "owner_writer", restricted_consumer: bool = False) -> None:
+    def evict_live_handle(
+        self,
+        *,
+        preset: str = "owner_writer",
+        restricted_consumer: bool = False,
+        include: Literal["tables", "views"] = "tables",
+    ) -> None:
         """Drop a cached live handle so bundled overrides cannot pollute later recordings."""
-        cache_key = f"{preset}:restricted={restricted_consumer}"
+        cache_key = f"{preset}:restricted={restricted_consumer}:include={include}"
         handle = self._live_handles.pop(cache_key, None)
         if handle is not None:
             handle.close()
@@ -1725,21 +2859,19 @@ class WarmRecordingPool:
         fixtures_file: str,
         provider: str,
         restricted_consumer: bool = False,
+        live_recording: bool = False,
+        include: Literal["tables", "views"] = "tables",
     ) -> tuple[object, str]:
         del provider
+        self._pin_schema_literals()
         verify_artifacts = tempfile.mkdtemp(prefix="aetherdialect_record_verify_")
         _reset_sandbox_duckdb_runtime()
         _seed_engine_baseline(
             artifacts_dir=verify_artifacts,
             bundle_dir=self._bundle_dir,
             preset=preset,
+            include=include,
         )
-        orig_write = aetherdialect._sandbox._write_sandbox_toml
-
-        def mock_toml(*, fixtures_file: str) -> str:
-            return orig_write(fixtures_file=fixtures_file)
-
-        setattr(aetherdialect._sandbox, "_write_sandbox_toml", mock_toml)
         kwargs: dict[str, object] = {
             "bundle_dir": str(self._bundle_dir),
             "seed_sql": self._seed_sql,
@@ -1747,15 +2879,25 @@ class WarmRecordingPool:
             "owns_connection": False,
             "artifacts_dir": verify_artifacts,
             "cleanup_artifacts": True,
+            "include": include,
         }
         if preset != "owner_writer":
             kwargs["preset"] = preset
         if restricted_consumer:
             kwargs["restricted_consumer"] = True
+        if live_recording:
+            handle = self._engine_cls.offline_sandbox(**kwargs)
+            return handle, verify_artifacts
+        orig_write = aetherdialect._sandbox._write_sandbox_toml
+
+        def mock_toml(*, fixtures_file: str) -> str:
+            return orig_write(fixtures_file=fixtures_file)
+
+        aetherdialect._sandbox._write_sandbox_toml = mock_toml
         try:
             handle = self._engine_cls.offline_sandbox(**kwargs)
         finally:
-            setattr(aetherdialect._sandbox, "_write_sandbox_toml", orig_write)
+            aetherdialect._sandbox._write_sandbox_toml = orig_write
         return handle, verify_artifacts
 
     def run_live(self, question: str, *, preset: str = "owner_writer", mode: str | None = None) -> object:
@@ -1779,20 +2921,19 @@ class WarmRecordingPool:
         from aetherdialect._llm_provider import reset_mock_provider
 
         self._pin_schema_literals()
+        reset_mock_provider()
 
         effective_fixtures = fixtures_file
         cleanup_fixtures = False
         try:
-            with open(fixtures_file, "r", encoding="utf-8") as f:
+            with open(fixtures_file, encoding="utf-8") as f:
                 data = json.load(f)
             if "slots" in data:
                 flat = []
                 for block in data["slots"].values():
                     if isinstance(block, dict) and "fixtures" in block:
                         flat.extend(block["fixtures"])
-                tmp = tempfile.NamedTemporaryFile(
-                    mode="w", suffix=".json", delete=False, encoding="utf-8"
-                )
+                tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8")
                 json.dump({"fixtures": flat}, tmp)
                 tmp.close()
                 effective_fixtures = tmp.name
@@ -1813,8 +2954,9 @@ class WarmRecordingPool:
         try:
             if apply_overrides:
                 handle.apply_bundled_schema_overrides()
-            session_cm = handle.engine.session(mode=mode) if mode else handle.engine.session()
-            with session_cm as session:
+            from aetherdialect._sandbox import federation_scenario_session
+
+            with federation_scenario_session(handle.engine, question, mode=mode) as session:
                 step = session.accept_until_done(question)
             return step, ""
         except Exception as exc:
@@ -1842,10 +2984,15 @@ class WarmRecordingPool:
         except Exception:
             pass
 
-        for artifacts_dir in (self._live_artifacts_owner, self._live_artifacts_consumer):
+        for artifacts_dir in (
+            self._live_artifacts_owner,
+            self._live_artifacts_consumer,
+            self._live_artifacts_owner_views,
+            self._live_artifacts_consumer_views,
+            self._live_artifacts_federation,
+        ):
             aetherdialect._sandbox._unlink_artifact_lock_files(artifacts_dir)
             shutil.rmtree(artifacts_dir, ignore_errors=True)
-
 
 
 def _load_scenarios_by_question() -> dict[str, dict[str, object]]:
@@ -1947,8 +3094,7 @@ def _swap_copy_tokens(text: str, swaps: tuple[tuple[str, str], ...]) -> str:
 
 def _is_param_extraction_fixture_row(row: dict[str, str]) -> bool:
     return (
-        str(row.get("task", "")) == "default"
-        and PARAM_EXTRACTION_SYSTEM_MARKER in str(row.get("system", "")).lower()
+        str(row.get("task", "")) == "default" and PARAM_EXTRACTION_SYSTEM_MARKER in str(row.get("system", "")).lower()
     )
 
 
@@ -2169,25 +3315,32 @@ def _build_reverse_param_extraction_rows(
     return out
 
 
-def _recording_handle_for_slot(pool: WarmRecordingPool, slot: RecordingSlot) -> tuple[object, bool, str | None]:
-    """Return (handle, apply_overrides, mode) for a recording slot."""
-    scenario = _load_scenarios_by_question().get(slot.label.lower(), {})
+def _recipe_for_slot(slot: RecordingSlot, scenario: dict[str, object] | None = None) -> str:
+    """Return the internal sandbox recipe for *slot* from scenario metadata."""
+    if scenario is None:
+        scenario = _load_scenarios_by_question().get(slot.label.lower(), {})
     mechanism = str(scenario.get("mechanism", ""))
-    if mechanism == "bundled_overrides_hide_staff_ssn":
-        return pool.live_handle(preset=slot.preset), True, slot.mode
-    if mechanism == "schema_validation_failure":
-        return pool.live_handle(preset="consumer_reader", restricted_consumer=True), False, "reader"
-    return pool.live_handle(preset=slot.preset), False, slot.mode
+    recipe = str(scenario.get("recipe", ""))
+    if mechanism.startswith("federation_") or recipe == "federation":
+        return "federation"
+    if mechanism == "views_scope" or recipe == "views":
+        return "views"
+    return "single"
 
 
 def _mock_preset_for_slot(slot: RecordingSlot) -> tuple[str, bool, str | None, bool]:
     """Return (preset, restricted_consumer, mode, apply_overrides) for mock replay."""
     scenario = _load_scenarios_by_question().get(slot.label.lower(), {})
     mechanism = str(scenario.get("mechanism", ""))
+    recipe = _recipe_for_slot(slot, scenario)
     if mechanism == "bundled_overrides_hide_staff_ssn":
         return slot.preset, False, slot.mode, True
     if mechanism == "schema_validation_failure":
         return "consumer_reader", True, "reader", False
+    if recipe == "federation":
+        return "federation", False, slot.mode, False
+    if recipe == "views":
+        return slot.preset, False, slot.mode, False
     return slot.preset, False, slot.mode, False
 
 
@@ -2222,17 +3375,17 @@ class RecordingSession:
         self._set_llm_json(self._recording_json)
 
     def _set_llm_chat(self, hook: Callable[..., str]) -> None:
-        setattr(self._llm_mod, "llm_chat", hook)
+        self._llm_mod.llm_chat = hook
         for mod_name in self.env.llm_patch_modules:
             mod = __import__(mod_name, fromlist=["llm_chat"])
-            setattr(mod, "llm_chat", hook)
+            mod.llm_chat = hook
 
     def _set_llm_json(self, hook: Callable[..., dict[str, Any]]) -> None:
-        setattr(self._llm_mod, "llm_json", hook)
+        self._llm_mod.llm_json = hook
         for mod_name in self.env.llm_patch_modules:
             mod = __import__(mod_name, fromlist=["llm_json"])
             if hasattr(mod, "llm_json"):
-                setattr(mod, "llm_json", hook)
+                mod.llm_json = hook
 
     @contextmanager
     def _patched_handcrafted_entries(self, question: str) -> Any:
@@ -2319,19 +3472,22 @@ class RecordingSession:
 
     def _run_live_slot(self, slot: RecordingSlot) -> tuple[object | None, str]:
         if slot.kind == "question":
+            self.pool._pin_schema_literals()
             preset, restricted_consumer, mode, apply_overrides = _mock_preset_for_slot(slot)
             handle, artifacts_dir = self.pool._ephemeral_handle(
                 preset=preset,
                 fixtures_file=str(FIXTURES_PATH),
                 provider="openai",
                 restricted_consumer=restricted_consumer,
+                live_recording=True,
             )
             try:
                 if apply_overrides:
                     handle.apply_bundled_schema_overrides()
-                session_cm = handle.engine.session(mode=mode) if mode else handle.engine.session()
+                from aetherdialect._sandbox import federation_scenario_session
+
                 try:
-                    with session_cm as session:
+                    with federation_scenario_session(handle.engine, slot.label, mode=mode) as session:
                         step = session.accept_until_done(slot.label)
                 except Exception as exc:
                     return None, str(exc)
@@ -2358,8 +3514,9 @@ class RecordingSession:
             catalog = SpaceContext(
                 tables=frozenset({"item", "film", "category", "item_category"}),
                 columns=frozenset(),
+                notes_file=notes_arg,
             )
-            handle.engine.aetherspace("catalog", space_context=catalog, notes_file=notes_arg)
+            handle.engine.aetherspace("catalog", space_context=catalog)
             return handle.engine, ""
         except Exception as exc:
             return None, str(exc)
@@ -2390,19 +3547,60 @@ class RecordingSession:
         return step, err
 
     @contextmanager
+    def _mock_replay_env(self) -> Any:
+        """Serve LLM calls from the recorded corpus instead of the live provider.
+
+        Recording installs global patches (``llm_chat``/``llm_json`` hooks plus an OpenAI
+        sandbox TOML). Without undoing them the verify pass re-samples the live LLM and
+        records those answers, so a slot that just passed capture can fail verification for
+        reasons unrelated to the fixtures it produced.
+        """
+        self.corpus.flush()
+        saved_toml = aetherdialect._sandbox._write_sandbox_toml
+        prev_provider = EngineConfig.LLM_PROVIDER
+        prev_fixtures = EngineConfig.MOCK_FIXTURES_FILE
+        saved_pipeline_match = aetherdialect._pipeline.match_question_level_template_reuse
+        saved_main_match = aetherdialect._main_execution.match_question_level_template_reuse
+        saved_live_match = aetherdialect._live_testing.match_question_level_template_reuse
+        saved_persist = aetherdialect._main_execution._persist_template_learning_for_pipeline_session
+        self._set_llm_chat(self._orig_chat)
+        self._set_llm_json(self._orig_json)
+        aetherdialect._sandbox._write_sandbox_toml = self.env.orig_write_toml
+        EngineConfig.LLM_PROVIDER = "mock"
+        EngineConfig.MOCK_FIXTURES_FILE = str(FIXTURES_PATH)
+        aetherdialect._pipeline.match_question_level_template_reuse = self.env.skip_template_reuse
+        aetherdialect._main_execution.match_question_level_template_reuse = self.env.skip_template_reuse
+        aetherdialect._live_testing.match_question_level_template_reuse = self.env.skip_template_reuse
+        aetherdialect._main_execution._persist_template_learning_for_pipeline_session = self.env.skip_template_learning
+        reset_mock_provider()
+        try:
+            yield
+        finally:
+            reset_mock_provider()
+            EngineConfig.LLM_PROVIDER = prev_provider
+            EngineConfig.MOCK_FIXTURES_FILE = prev_fixtures
+            aetherdialect._pipeline.match_question_level_template_reuse = saved_pipeline_match
+            aetherdialect._main_execution.match_question_level_template_reuse = saved_main_match
+            aetherdialect._live_testing.match_question_level_template_reuse = saved_live_match
+            aetherdialect._main_execution._persist_template_learning_for_pipeline_session = saved_persist
+            aetherdialect._sandbox._write_sandbox_toml = saved_toml
+            self._set_llm_chat(self._recording_chat)
+            self._set_llm_json(self._recording_json)
+
+    @contextmanager
     def _template_match_enabled(self) -> Any:
         saved_pipeline_match = aetherdialect._pipeline.match_question_level_template_reuse
         saved_main_match = aetherdialect._main_execution.match_question_level_template_reuse
         saved_live_match = aetherdialect._live_testing.match_question_level_template_reuse
-        setattr(aetherdialect._pipeline, "match_question_level_template_reuse", self.env.orig_template_match)
-        setattr(aetherdialect._main_execution, "match_question_level_template_reuse", self.env.orig_template_match)
-        setattr(aetherdialect._live_testing, "match_question_level_template_reuse", self.env.orig_template_match)
+        aetherdialect._pipeline.match_question_level_template_reuse = self.env.orig_template_match
+        aetherdialect._main_execution.match_question_level_template_reuse = self.env.orig_template_match
+        aetherdialect._live_testing.match_question_level_template_reuse = self.env.orig_template_match
         try:
             yield
         finally:
-            setattr(aetherdialect._pipeline, "match_question_level_template_reuse", saved_pipeline_match)
-            setattr(aetherdialect._main_execution, "match_question_level_template_reuse", saved_main_match)
-            setattr(aetherdialect._live_testing, "match_question_level_template_reuse", saved_live_match)
+            aetherdialect._pipeline.match_question_level_template_reuse = saved_pipeline_match
+            aetherdialect._main_execution.match_question_level_template_reuse = saved_main_match
+            aetherdialect._live_testing.match_question_level_template_reuse = saved_live_match
 
     def _verify_mock_feedback(self, slot: RecordingSlot, fixtures_file: str) -> tuple[bool, str]:
         scenario = _feedback_scenario()
@@ -2446,73 +3644,25 @@ class RecordingSession:
     def _verify_mock_slot(self, slot: RecordingSlot) -> tuple[bool, str]:
         if not _slot_requires_mock_verify(slot):
             return True, ""
-        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8")
-        tmp_path = Path(tmp.name)
-        tmp.close()
-        try:
-            self.corpus.write_verify_snapshot(tmp_path, slot_label=slot.label)
-            if slot.kind == "feedback":
-                return self._verify_mock_feedback(slot, str(tmp_path))
-            for preset, restricted_consumer, mode, apply_overrides, profile, tier in _mock_verify_targets_for_slot(
-                slot,
-            ):
-                logs: list[str] = []
-                step: object | None = None
-                with self._patched_handcrafted_entries(slot.label):
-                    step, err, logs = run_with_pipeline_capture(
-                        lambda preset=preset, restricted_consumer=restricted_consumer, mode=mode, apply_overrides=apply_overrides: self.pool.run_mock(
-                            slot.label,
-                            preset=preset,
-                            mode=mode,
-                            fixtures_file=str(tmp_path),
-                            restricted_consumer=restricted_consumer,
-                            apply_overrides=apply_overrides,
-                        ),
-                    )
-                if err:
-                    append_failure_trace(
-                        build_session_step_trace(
-                            scenario_id=slot_id_for(slot),
-                            question=slot.label,
-                            step=step,
-                            error=err,
-                            captured_logs=logs,
-                        ),
-                        RECORDING_RESULTS_PATH,
-                    )
-                    return False, f"mock replay ({tier}): {err}"
-                if step is None:
-                    append_failure_trace(
-                        build_session_step_trace(
-                            scenario_id=slot_id_for(slot),
-                            question=slot.label,
-                            step=None,
-                            error="mock replay failed",
-                            captured_logs=logs,
-                        ),
-                        RECORDING_RESULTS_PATH,
-                    )
-                    return False, f"mock replay ({tier}): failed"
-                ok, detail = _check_slot_recording(step, slot, profile=profile, tier=tier)
-                if ok:
-                    continue
-                append_failure_trace(
-                    build_session_step_trace(
-                        scenario_id=slot_id_for(slot),
-                        question=slot.label,
-                        step=step,
-                        error=detail or "expectation not met",
-                        captured_logs=logs,
-                    ),
-                    RECORDING_RESULTS_PATH,
-                )
-                return False, f"mock replay ({tier}): {detail or 'expectation not met'}"
-            return True, ""
-        finally:
-            tmp_path.unlink(missing_ok=True)
+        if slot.kind == "feedback":
+            with self._mock_replay_env():
+                return self._verify_mock_feedback(slot, str(FIXTURES_PATH))
+        with self._mock_replay_env():
+            ok, detail = _verify_slot_with_validate(slot, pool=self.pool)
+        if not ok:
+            append_failure_trace(
+                build_session_step_trace(
+                    scenario_id=slot_id_for(slot),
+                    question=slot.label,
+                    step=None,
+                    error=detail or "validate failed",
+                    captured_logs=[],
+                ),
+                RECORDING_RESULTS_PATH,
+            )
+        return ok, detail
 
     def record_slot(self, slot: RecordingSlot) -> tuple[bool, str, int, object | None]:
-        import live_tests.conftest as lt_conftest
 
         last_detail = ""
         attempts_used = 0
@@ -2558,9 +3708,12 @@ class RecordingSession:
                     break
                 continue
 
+            corpus_snap = _corpus_snapshot(self.corpus)
+            self.corpus.commit_slot(prune_question="")
             mock_ok, mock_detail = self._verify_mock_slot(slot)
             if not mock_ok:
-                last_detail = mock_detail or "mock replay failed"
+                last_detail = mock_detail or "validate failed"
+                _restore_corpus_snapshot(self.corpus, corpus_snap)
                 self.corpus.discard_slot()
                 if _BUILD_VERBOSE:
                     corpus_message(
@@ -2581,11 +3734,7 @@ class RecordingSession:
                     break
                 continue
 
-            removed = self.corpus.commit_slot(
-                prune_question=slot.label if slot.kind == "question" else "",
-            )
-            if removed and _BUILD_VERBOSE:
-                corpus_message(f"  pruned {removed} orphan intent fixture(s) for {slot.label[:60]}")
+            _finalize_fixture_corpus_repair(self.corpus)
             _upsert_manifest_row(
                 self.manifest_rows,
                 {
@@ -2638,11 +3787,15 @@ class RecordingSession:
                 if canonical:
                     merged_by_canonical[canonical] = row
         new_rows: list[dict[str, object]] = []
+        failed: list[str] = []
+        from aetherdialect._utils import generate_warmup_questions_freeform
+
         for slot, step in recorded_slots:
             intent_summary = getattr(step, "intent_summary", None)
             tables = [str(item) for item in getattr(intent_summary, "tables", ()) if str(item).strip()]
             if not tables:
-                return False, f"missing tables for paraphrase generation on {slot.label!r}"
+                failed.append(f"{slot.label!r}: missing tables")
+                continue
             preset, restricted_consumer, _mode, apply_overrides = _mock_preset_for_slot(slot)
             handle, artifacts_dir = self.pool._ephemeral_handle(
                 preset=preset,
@@ -2662,8 +3815,16 @@ class RecordingSession:
                     )
                     paraphrases = _clean_generated_paraphrases(slot.label, raw)
                     if not paraphrases:
+                        raw_freeform = generate_warmup_questions_freeform(
+                            handle.engine._schema_graph,
+                            tables,
+                            seed_question=slot.label,
+                        )
+                        paraphrases = _clean_generated_paraphrases(slot.label, raw_freeform)
+                    if not paraphrases:
                         self.corpus.discard_slot()
-                        return False, f"no paraphrases generated for {slot.label!r}"
+                        failed.append(f"{slot.label!r}: no paraphrases generated")
+                        continue
                     self.corpus.commit_slot()
                 finally:
                     handle.close()
@@ -2671,7 +3832,8 @@ class RecordingSession:
                     shutil.rmtree(artifacts_dir, ignore_errors=True)
             except Exception as exc:
                 self.corpus.discard_slot()
-                return False, str(exc)
+                failed.append(f"{slot.label!r}: {exc}")
+                continue
             new_rows.append({"canonical": slot.label, "paraphrases": paraphrases})
             for paraphrase in paraphrases:
                 swaps = INLINE_REUSE_PARAM_COPY_RULES.get((slot.label, paraphrase))
@@ -2679,12 +3841,15 @@ class RecordingSession:
                     continue
                 ok, detail = self.record_inline_reuse_param_fixtures(slot.label, paraphrase, swaps=swaps)
                 if not ok:
-                    return False, detail
+                    failed.append(f"{slot.label!r} reuse: {detail}")
         for row in new_rows:
             merged_by_canonical[str(row["canonical"])] = row
         final_rows = list(merged_by_canonical.values())
         self.paraphrase_catalog_rows = final_rows
-        write_sandbox_catalog_file(target_dir=STAGING, paraphrase_pairs=final_rows)
+        if final_rows:
+            write_sandbox_catalog_file(target_dir=STAGING, paraphrase_pairs=final_rows)
+        if failed:
+            return False, "; ".join(failed[:3]) + (f" (+{len(failed) - 3} more)" if len(failed) > 3 else "")
         return True, ""
 
     def record_reuse_param_fixtures(self) -> tuple[bool, str]:
@@ -2836,7 +4001,6 @@ class RecordingSession:
     def record_all(self, *, slots: list[RecordingSlot] | None = None, record_reuse_pairs: bool = False) -> bool:
         import live_tests.conftest as lt_conftest
 
-        del record_reuse_pairs
         slot_list = slots if slots is not None else iter_recording_slots(self.questions)
         total = len(slot_list)
         self.paraphrase_seeds_collected = []
@@ -2845,6 +4009,7 @@ class RecordingSession:
         original_log_sink = aetherdialect.aetherdialect._init_log_sink
         aetherdialect.aetherdialect._init_log_sink = lambda _line: None
         _begin_eval_results(RECORDING_RESULTS_PATH)
+        reuse_pair_failures: list[str] = []
         try:
             if _BUILD_VERBOSE:
                 corpus_message(f"Recording sandbox fixtures ({total} slots)...")
@@ -2863,6 +4028,26 @@ class RecordingSession:
                         and step_result is not None
                     ):
                         self.paraphrase_seeds_collected.append((slot, step_result))
+                    if record_reuse_pairs and (
+                        slot.kind == "question"
+                        and slot.tier in PARAPHRASE_SOURCE_TIERS
+                        and slot.preset == "owner_writer"
+                        and slot.mode in (None, "writer")
+                        and _paraphrase_eligible_question(slot.label, kind=slot.kind)
+                    ):
+                        for paraphrase in INLINE_PARAPHRASE_COPY_RULES.get(slot.label, ()):
+                            swaps = INLINE_REUSE_PARAM_COPY_RULES.get((slot.label, paraphrase))
+                            if swaps is None:
+                                continue
+                            reuse_ok, reuse_detail = self.record_inline_reuse_param_fixtures(
+                                slot.label,
+                                paraphrase,
+                                swaps=swaps,
+                            )
+                            if not reuse_ok:
+                                reuse_pair_failures.append(
+                                    f"{slot.label!r} -> {paraphrase!r}: {reuse_detail}",
+                                )
                 else:
                     reason = _short_retry_reason(detail)
                     retry_note = f" — retry {attempts}/{self.max_attempts}" if attempts > 1 else ""
@@ -2880,11 +4065,16 @@ class RecordingSession:
                 f"{len(self.failed_slots)} slot(s) failed recording. "
                 f"See {RECORDING_RESULTS_PATH}:\n" + "\n".join(lines),
             )
-        return not self.failed_slots
+        if reuse_pair_failures:
+            corpus_message(
+                f"{len(reuse_pair_failures)} reuse-pair capture(s) failed:\n"
+                + "\n".join(f"  {line}" for line in reuse_pair_failures),
+            )
+        return not self.failed_slots and not reuse_pair_failures
 
     def close(self) -> None:
-        setattr(self._llm_mod, "llm_chat", self._orig_chat)
-        setattr(self._llm_mod, "llm_json", self._orig_json)
+        self._llm_mod.llm_chat = self._orig_chat
+        self._llm_mod.llm_json = self._orig_json
 
 
 def pack_bundled_aetherspace_snapshots(pool: WarmRecordingPool) -> None:
@@ -2901,8 +4091,9 @@ def pack_bundled_aetherspace_snapshots(pool: WarmRecordingPool) -> None:
         catalog = SpaceContext(
             tables=frozenset({"item", "film", "category", "item_category"}),
             columns=frozenset(),
+            notes_file=notes_arg,
         )
-        handle.engine.aetherspace("catalog", space_context=catalog, notes_file=notes_arg)
+        handle.engine.aetherspace("catalog", space_context=catalog)
         src_dir = artifacts_root / AETHERSPACES_SEGMENT
     dest = STAGING / "artifacts_baseline" / AETHERSPACES_SEGMENT
     dest.mkdir(parents=True, exist_ok=True)
@@ -2956,16 +4147,14 @@ def finalize_recording_tail(
         if not migration_ok:
             corpus_message(f"[build] migration fixture capture failed: {detail}")
             ok = False
-    removed = prune_orphan_intent_fixtures(corpus, session.questions)
-    if removed:
-        corpus_message(f"[build] pruned {removed} orphan intent fixture(s) from corpus")
+    _post_record_corpus_hygiene(corpus, session.questions)
+    _finalize_fixture_corpus_repair(corpus)
     write_build_fingerprint()
     print(f"Wrote {len(corpus.fixtures)} fixtures to {FIXTURES_PATH}", flush=True)
     return ok
 
 
 def record_corpus(record_reuse_pairs: bool = False) -> bool:
-    del record_reuse_pairs
     ensure_schema_literals()
     ensure_interpret_domain()
     pin_staging_mock_fixture_keys()
@@ -2987,7 +4176,7 @@ def record_corpus(record_reuse_pairs: bool = False) -> bool:
     )
     with _staging_sandbox_bundle():
         try:
-            session.record_all()
+            session.record_all(record_reuse_pairs=record_reuse_pairs)
             manifest = _load_recording_manifest()
             missing_para = _missing_paraphrase_canonicals(questions, manifest)
             need_para = bool(missing_para)
@@ -3072,6 +4261,115 @@ def staging_fingerprint_matches(*, staging_dir: Path = STAGING) -> bool:
     return str(stored.get("fingerprint", "")) == str(current.get("fingerprint", ""))
 
 
+def _finalize_fixture_corpus_repair(corpus: FixtureCorpus) -> None:
+    normalized = normalize_fixture_corpus_schema_domains(corpus)
+    if normalized:
+        corpus_message(f"[repair] normalized schema_domain on {normalized} intent fixture(s)")
+    synced = sync_gatekeeper_normalization_fixture_questions(corpus)
+    if synced:
+        corpus_message(
+            f"[repair] synced gatekeeper corrected text on {synced} normalization/intent fixture(s)",
+        )
+    federation_literals = repair_federation_intent_schema_literals(corpus)
+    if federation_literals:
+        corpus_message(
+            f"[repair] backfilled schema_literal_json on {federation_literals} federation intent fixture(s)",
+        )
+    rekeyed = recanonicalize_mock_fixture_user_keys(corpus)
+    if rekeyed:
+        corpus_message(f"[repair] re-keyed {rekeyed} mock fixture user payload(s)")
+
+
+def _post_record_corpus_hygiene(corpus: FixtureCorpus, questions: dict[str, list[str]]) -> int:
+    """Drop superseded intent rows after committed slots are finalized and verified."""
+    removed = prune_orphan_intent_fixtures(corpus, questions, committed_only=True)
+    if removed:
+        corpus_message(f"[build] pruned {removed} orphan intent fixture(s) from corpus")
+    return removed
+
+
+def _replay_sandbox_factory(pool: WarmRecordingPool) -> Callable[..., Any]:
+    """Build sandboxes for replay the same way live capture builds them.
+
+    Live capture seeds the preset baseline artifacts and reuses the warm connection and
+    staging bundle. Rebuilding the engine any other way re-derives the schema graph, which
+    shifts the schema context embedded in every intent prompt and misses recorded fixtures.
+    """
+
+    @contextmanager
+    def factory(
+        *,
+        preset: str,
+        restricted_consumer: bool = False,
+        include: Literal["tables", "views"] = "tables",
+    ) -> Any:
+        handle, artifacts_dir = pool._ephemeral_handle(
+            preset=preset,
+            fixtures_file=str(FIXTURES_PATH),
+            provider="mock",
+            restricted_consumer=restricted_consumer,
+            include=include,
+        )
+        try:
+            yield handle
+        finally:
+            handle.close()
+            aetherdialect._sandbox._unlink_artifact_lock_files(artifacts_dir)
+            shutil.rmtree(artifacts_dir, ignore_errors=True)
+
+    return factory
+
+
+def _verify_slot_with_validate(
+    slot: RecordingSlot,
+    *,
+    pool: WarmRecordingPool | None = None,
+) -> tuple[bool, str]:
+    """Run the same offline validation predicate used at pack time against staging fixtures."""
+    from aetherdialect._sandbox import SandboxPreset, _validate_federation_slot, _validate_question_slot
+    from aetherdialect.aetherdialect import AetherEngine
+
+    if slot.kind == "feedback":
+        return True, ""
+
+    sandbox_factory = _replay_sandbox_factory(pool) if pool is not None else None
+    with _staging_bundle_env():
+        for (
+            preset,
+            restricted_consumer,
+            mode,
+            apply_overrides,
+            _profile,
+            target_slot_id,
+            tier,
+        ) in _mock_verify_targets_for_slot(slot):
+            if tier == "federation":
+                row = _validate_federation_slot(
+                    AetherEngine,
+                    slot.label,
+                    slot_id=target_slot_id,
+                    sandbox_factory=sandbox_factory,
+                )
+            else:
+                include: Literal["tables", "views"] = "views" if tier == "views_questions" else "tables"
+                row = _validate_question_slot(
+                    AetherEngine,
+                    slot.label,
+                    tier=tier,
+                    preset=cast(SandboxPreset, preset),
+                    mode=mode,
+                    apply_overrides=apply_overrides,
+                    restricted_consumer=restricted_consumer,
+                    slot_id=target_slot_id,
+                    sandbox_factory=sandbox_factory,
+                    include=include,
+                )
+            if row is not None:
+                detail = str(row.get("detail", "") or "expectation not met")
+                return False, f"validate ({tier}): {detail}"
+    return True, ""
+
+
 def repair_failing_slots(*, force: bool = False) -> bool:
     if not STAGING.is_dir():
         raise SystemExit(f"Missing staging directory: {STAGING}")
@@ -3105,12 +4403,7 @@ def repair_failing_slots(*, force: bool = False) -> bool:
     need_migration = not _migration_fixtures_ready(corpus)
     if not slots_to_repair and not need_paraphrases and not need_reuse and not need_aetherspace and not need_migration:
         print("All recording slots committed in manifest.", flush=True)
-        normalized = normalize_fixture_corpus_schema_domains(corpus)
-        if normalized:
-            corpus_message(f"[repair] normalized schema_domain on {normalized} intent fixture(s)")
-        rekeyed = recanonicalize_mock_fixture_user_keys(corpus)
-        if rekeyed:
-            corpus_message(f"[repair] re-keyed {rekeyed} mock fixture user payload(s)")
+        _post_record_corpus_hygiene(corpus, questions)
         return _recording_pipeline_ready(questions=questions, manifest=manifest, corpus=corpus)[0]
     env = prepare_recording_environment()
     pool = WarmRecordingPool(STAGING)
@@ -3153,12 +4446,7 @@ def repair_failing_slots(*, force: bool = False) -> bool:
             pool.close()
             teardown_recording_environment(env)
     manifest = _load_recording_manifest()
-    normalized = normalize_fixture_corpus_schema_domains(corpus)
-    if normalized:
-        corpus_message(f"[repair] normalized schema_domain on {normalized} intent fixture(s)")
-    rekeyed = recanonicalize_mock_fixture_user_keys(corpus)
-    if rekeyed:
-        corpus_message(f"[repair] re-keyed {rekeyed} mock fixture user payload(s)")
+    _post_record_corpus_hygiene(corpus, questions)
     return _recording_pipeline_ready(questions=questions, manifest=manifest, corpus=corpus)[0]
 
 
@@ -3259,6 +4547,22 @@ def _practice_questions_from_validate_failures(failures: list[dict[str, str]]) -
     return out
 
 
+def _federation_questions_from_validate_failures(failures: list[dict[str, str]]) -> set[str]:
+    """Return federation questions that failed pack-time validate and need re-record."""
+    out: set[str] = set()
+    for row in failures:
+        tier = str(row.get("tier", "")).strip()
+        kind = str(row.get("kind", "")).strip()
+        if tier != "federation":
+            continue
+        if kind not in {"question", "faithfulness"}:
+            continue
+        name = str(row.get("name", "")).strip()
+        if name:
+            out.add(name)
+    return out
+
+
 def _uncommit_practice_question_slots(questions: set[str]) -> int:
     """Mark owner practice question slots uncommitted so repair will re-record them."""
     if not questions:
@@ -3267,6 +4571,29 @@ def _uncommit_practice_question_slots(questions: set[str]) -> int:
     touched = 0
     for slot in iter_recording_slots(load_staging_questions()):
         if slot.kind != "question" or slot.tier != "questions":
+            continue
+        if slot.label not in questions:
+            continue
+        sid = slot_id_for(slot)
+        for row in rows:
+            if str(row.get("slot_id", "")) != sid:
+                continue
+            if row.get("committed"):
+                row["committed"] = False
+                touched += 1
+    if touched:
+        write_recording_manifest(rows)
+    return touched
+
+
+def _uncommit_federation_question_slots(questions: set[str]) -> int:
+    """Mark federation question slots uncommitted so repair will re-record them."""
+    if not questions:
+        return 0
+    rows = _load_manifest_rows()
+    touched = 0
+    for slot in iter_recording_slots(load_staging_questions()):
+        if slot.kind != "question" or slot.tier != "federation":
             continue
         if slot.label not in questions:
             continue
@@ -3300,21 +4627,28 @@ def finalize_validate_and_pack(*, smoke: bool = False, force: bool = False) -> N
             pack_and_promote(smoke=smoke)
             return
         questions = _practice_questions_from_validate_failures(failures)
-        if not questions:
+        federation_questions = _federation_questions_from_validate_failures(failures)
+        if not questions and not federation_questions:
             report_lines = [
-                f"FAIL [{row['kind']}] {row.get('tier', '')} {row['name'][:70]}: {row['detail']}"
-                for row in failures
+                f"FAIL [{row['kind']}] {row.get('tier', '')} {row['name'][:70]}: {row['detail']}" for row in failures
             ]
             VALIDATE_OUT.parent.mkdir(parents=True, exist_ok=True)
             VALIDATE_OUT.write_text("\n".join(report_lines) + "\n", encoding="utf-8")
             for line in report_lines:
                 print(line)
             raise SystemExit(f"{len(failures)} sandbox validation failures")
-        corpus_message(
-            f"{prefix}validate pass {pass_num}/{RECORDING_MAX_VALIDATE_PASSES}: "
-            f"re-record {len(questions)} practice question(s) after expectation mismatch",
-        )
-        _uncommit_practice_question_slots(questions)
+        if questions:
+            corpus_message(
+                f"{prefix}validate pass {pass_num}/{RECORDING_MAX_VALIDATE_PASSES}: "
+                f"re-record {len(questions)} practice question(s) after expectation mismatch",
+            )
+            _uncommit_practice_question_slots(questions)
+        if federation_questions:
+            corpus_message(
+                f"{prefix}validate pass {pass_num}/{RECORDING_MAX_VALIDATE_PASSES}: "
+                f"re-record {len(federation_questions)} federation question(s) after expectation mismatch",
+            )
+            _uncommit_federation_question_slots(federation_questions)
     raise SystemExit(
         f"sandbox validate did not pass after {RECORDING_MAX_VALIDATE_PASSES} repair passes",
     )
@@ -3368,6 +4702,7 @@ def pack_and_promote(*, smoke: bool = False) -> None:
     if STAGING_ZIP.is_file():
         STAGING_ZIP.unlink()
     verbose_message("Removed ephemeral staging workspace after successful pack.")
+
 
 def _run_full_build(record_reuse_pairs: bool = False, *, smoke: bool = False) -> None:
     global _SMOKE_BUILD
@@ -3438,7 +4773,6 @@ def main() -> None:
         corpus_message("[repair] done.")
         return
     _run_full_build(record_reuse_pairs=args.record_reuse_pairs, smoke=args.smoke)
-
 
 
 if __name__ == "__main__":

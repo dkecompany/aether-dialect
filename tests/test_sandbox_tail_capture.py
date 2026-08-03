@@ -32,6 +32,7 @@ def test_finalize_recording_tail_runs_reuse_without_paraphrases(
     corpus.fixtures = []
     pool = MagicMock()
     monkeypatch.setattr(sandbox_corpus, "write_build_fingerprint", lambda: None)
+    monkeypatch.setattr(sandbox_corpus, "_finalize_fixture_corpus_repair", lambda _corpus: None)
 
     ok = sandbox_corpus.finalize_recording_tail(
         session,
@@ -58,6 +59,7 @@ def test_finalize_recording_tail_runs_paraphrase_and_reuse_together(
     corpus.fixtures = []
     pool = MagicMock()
     monkeypatch.setattr(sandbox_corpus, "write_build_fingerprint", lambda: None)
+    monkeypatch.setattr(sandbox_corpus, "_finalize_fixture_corpus_repair", lambda _corpus: None)
 
     ok = sandbox_corpus.finalize_recording_tail(
         session,

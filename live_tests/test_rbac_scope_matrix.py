@@ -5,10 +5,10 @@ from __future__ import annotations
 import pytest
 
 from aetherdialect import AetherEngine
-from aetherdialect._config import ConfigError
 from aetherdialect._constants import PERMISSION_DENIED_USER_MESSAGE
 from aetherdialect._contracts_base import (
     AccessError,
+    ConfigError,
     EngineContext,
     OwnerOnlyOperationError,
     SpaceContext,
@@ -55,12 +55,12 @@ class TestAllowObjectsOwner:
         rbac_postgres_config_path: str,
     ) -> None:
         """Named allow_objects subset blocks staff even for owner execution scope."""
-        subset = EngineContext(
-            name="consumer_mirror",
-            allow_objects=_RENTAL_SHOP_CONSUMER_ALLOW_OBJECTS,
+        t2s_rbac_owner.engine_context(
+            "consumer_mirror",
+            EngineContext(allow_objects=_RENTAL_SHOP_CONSUMER_ALLOW_OBJECTS),
         )
         narrowed = AetherEngine(
-            subset,
+            "consumer_mirror",
             artifacts_dir=str(t2s_rbac_owner._artifacts_dir),
             config_file=rbac_postgres_config_path,
             role="owner",
@@ -75,12 +75,12 @@ class TestAllowObjectsOwner:
         rbac_postgres_config_path: str,
     ) -> None:
         """Named allow_objects subset still permits in-scope tables."""
-        subset = EngineContext(
-            name="films_only_ctx",
-            allow_objects=frozenset({"film", "item"}),
+        t2s_rbac_owner.engine_context(
+            "films_only_ctx",
+            EngineContext(allow_objects=frozenset({"film", "item"})),
         )
         narrowed = AetherEngine(
-            subset,
+            "films_only_ctx",
             artifacts_dir=str(t2s_rbac_owner._artifacts_dir),
             config_file=rbac_postgres_config_path,
             role="owner",
@@ -145,20 +145,13 @@ class TestNamedEngineContext:
     def test_owner_persists_named_context(
         self,
         t2s_rbac_owner: AetherEngine,
-        rbac_postgres_config_path: str,
     ) -> None:
-        """Owner creates a named EngineContext subset spec."""
-        named = EngineContext(
-            name="team_retail_persist",
-            allow_objects=_RENTAL_SHOP_CONSUMER_ALLOW_OBJECTS,
+        """Owner registers a named EngineContext subset spec."""
+        t2s_rbac_owner.engine_context(
+            "team_retail_persist",
+            EngineContext(allow_objects=_RENTAL_SHOP_CONSUMER_ALLOW_OBJECTS),
         )
-        AetherEngine(
-            named,
-            artifacts_dir=str(t2s_rbac_owner._artifacts_dir),
-            config_file=rbac_postgres_config_path,
-            role="owner",
-        )
-        names = t2s_rbac_owner.list_aetherengines()
+        names = t2s_rbac_owner.list_engine_contexts()
         assert "team_retail_persist" in names
 
     def test_consumer_consumes_named_context_by_name(
@@ -168,15 +161,9 @@ class TestNamedEngineContext:
         rbac_consumer_config_path: str,
     ) -> None:
         """Consumer loads a persisted named context by string name."""
-        named = EngineContext(
-            name="team_retail_consume",
-            allow_objects=_RENTAL_SHOP_CONSUMER_ALLOW_OBJECTS,
-        )
-        AetherEngine(
-            named,
-            artifacts_dir=str(t2s_rbac_owner._artifacts_dir),
-            config_file=rbac_postgres_config_path,
-            role="owner",
+        t2s_rbac_owner.engine_context(
+            "team_retail_consume",
+            EngineContext(allow_objects=_RENTAL_SHOP_CONSUMER_ALLOW_OBJECTS),
         )
         consumer = _build_rbac_consumer_engine(
             t2s_rbac_owner,
@@ -194,24 +181,20 @@ class TestNamedEngineContext:
         with pytest.raises(OwnerOnlyOperationError):
             _build_rbac_consumer_engine(
                 t2s_rbac_owner,
-                engine_context=EngineContext(name="inline", allow_objects=frozenset({"film"})),
+                engine_context=EngineContext(allow_objects=frozenset({"film"})),
                 config_file=rbac_consumer_config_path,
             )
 
     def test_export_named_context_round_trip(
         self,
         t2s_rbac_owner: AetherEngine,
-        rbac_postgres_config_path: str,
     ) -> None:
-        """export_aetherengine dumps a persisted named context."""
-        named = EngineContext(name="export_probe", allow_objects=frozenset({"film"}))
-        AetherEngine(
-            named,
-            artifacts_dir=str(t2s_rbac_owner._artifacts_dir),
-            config_file=rbac_postgres_config_path,
-            role="owner",
+        """export_engine_context dumps a persisted named context."""
+        t2s_rbac_owner.engine_context(
+            "export_probe",
+            EngineContext(allow_objects=frozenset({"film"})),
         )
-        path = t2s_rbac_owner.export_aetherengine("export_probe")
+        path = t2s_rbac_owner.export_engine_context("export_probe")
         assert path.is_file()
 
 

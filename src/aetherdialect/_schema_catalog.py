@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Callable
@@ -11,11 +12,7 @@ from typing import Any, Literal
 import sqlglot
 from sqlalchemy import text
 
-from ._config import (
-    EngineConfig,
-    PolicyConfig,
-    QSimConfig,
-)
+from ._config import EngineConfig, PolicyConfig
 from ._constants import (
     BOOLEAN_AFFIRMATIVE_STRIP_PREFIXES,
     BOOLEAN_ANTONYM_MIN_STEM_LEN,
@@ -23,29 +20,35 @@ from ._constants import (
     BOOLEAN_NEGATION_SUFFIXES,
     BOOLEAN_TRUTH_PATTERN_MAP,
     COLUMN_DEFINITION_STOP_WORDS,
+    DATE_COLUMN_NAME_TOKENS,
+    DEFAULT_RANDOM_SEED,
+    DIAGNOSTIC_CODE_COLUMN_PROFILE_FAILED,
+    DIAGNOSTIC_CODE_COMPOSITE_DESCRIPTIVE_PROFILE_FAILED,
+    DIAGNOSTIC_CODE_DESCRIPTION_ENRICHMENT_FAILED,
+    DIAGNOSTIC_CODE_DESCRIPTION_ENRICHMENT_NOOP,
     DIAGNOSTIC_CODE_ENGINE_INFO,
+    DIAGNOSTIC_CODE_SCHEMA_FK_CATALOG_ABSENT,
     DURATION_COLUMN_NAME_TOKENS,
     NAME_COLUMN_PATTERN,
     ROLE_VALUE_TYPE_COMPAT,
+    SCHEMA_CONSISTENCY_REFINE_SYSTEM,
+    SCHEMA_NOTES_REFINE_SYSTEM,
     VALID_SENSITIVITY_LEVELS,
     YEAR_LIKE_COLUMN_NAME_TOKENS,
 )
 from ._contracts_base import (
     ColumnRole,
+    ConfigError,
     DescriptionOwner,
     RoleOwner,
+    SensitivityClassification,
     can_overwrite_role,
     set_description,
     set_sensitivity,
 )
-from ._contracts_schema import (
-    CatalogStructuralConstraintsIndex,
-    ColumnMetadata,
-    FKEdge,
-    SchemaGraph,
-    TableMetadata,
-)
+from ._contracts_schema import CatalogStructuralConstraintsIndex, ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
 from ._core_utils import (
+    artifact_lock,
     cost_cap_active,
     debug,
     diagnostic_debug_enabled,
@@ -89,8 +92,19 @@ def _pglast_raw_stream_render(node: Any) -> str:
     return str(RawStream()(node)).strip()
 
 
+def _resolve_profile_timeout_ms(dialect_or_engine: Any) -> int | None:
+    """Return the profiling statement timeout for *dialect_or_engine*, preferring per-dialect overrides."""
+    for candidate in (dialect_or_engine, getattr(dialect_or_engine, "dialect", None)):
+        if candidate is None:
+            continue
+        override = getattr(candidate, "profile_timeout_ms", None)
+        if override is not None:
+            return int(override)
+    return PolicyConfig.PROFILE_TIMEOUT_MS
+
+
 def _maybe_set_profile_statement_timeout(conn: Any, dialect_or_engine: Any) -> None:
-    """Apply ``PolicyConfig.PROFILE_TIMEOUT_MS`` via the active dialect when supported."""
+    """Apply the resolved profiling statement timeout via the active dialect when supported."""
     dialect = dialect_or_engine
     if not hasattr(dialect, "profile_statement_timeout_sql"):
         eng = getattr(dialect_or_engine, "dialect", None)
@@ -98,11 +112,11 @@ def _maybe_set_profile_statement_timeout(conn: Any, dialect_or_engine: Any) -> N
             dialect = eng
         else:
             return
-    tm = PolicyConfig.PROFILE_TIMEOUT_MS
+    tm = _resolve_profile_timeout_ms(dialect_or_engine)
     if tm is None or not cost_cap_active(tm):
         return
     sql = dialect.profile_statement_timeout_sql(int(tm))
-    if sql:
+    if isinstance(sql, str) and sql.strip():
         conn.execute(text(sql))
 
 
@@ -156,15 +170,62 @@ def _is_boolean_like_column(col: ColumnMetadata) -> bool:
     return False
 
 
-def _build_profile_stats_sql(
-    qcol: str,
-    qtbl: str,
+def _normalize_profiling_sample_clause(qcol: str, sample_clause: str) -> str:
+    """Rewrite base-dialect ``ORDER BY 1`` sampling and ``{col}`` hash predicates."""
+    if "{col}" in sample_clause:
+        sample_clause = sample_clause.replace("{col}", qcol)
+    prefix = "ORDER BY 1 LIMIT "
+    if sample_clause.startswith(prefix):
+        return f"ORDER BY {qcol} {sample_clause[len('ORDER BY 1 ') :]}"
+    return sample_clause
+
+
+class _ProfilingDeepQueryBudget:
+    """Schema-wide cap on expensive per-column profiling queries (min/max, frequent values, mode)."""
+
+    __slots__ = ("_remaining",)
+
+    def __init__(self, limit: int | None) -> None:
+        self._remaining = limit
+
+    def allow(self, cost: int = 1) -> bool:
+        if self._remaining is None:
+            return True
+        if self._remaining < cost:
+            return False
+        self._remaining -= cost
+        return True
+
+
+def _resolve_profiling_sample_params(
+    dialect: Dialect,
     *,
     use_sample: bool,
-    sample_clause: str,
-    use_subquery: bool,
-) -> str:
+    row_count: int,
+    sample_size: int,
+    table_kind: Literal["table", "view"],
+) -> tuple[str, bool]:
+    """Return sampling suffix and subquery flag, with ordered-limit fallback when sampling is required but unsupported."""
+    if not use_sample:
+        return "", False
+    sample_clause = dialect.profiling_stats_sample_suffix(
+        use_sample=True,
+        row_count=row_count,
+        sample_size=sample_size,
+        random_seed=DEFAULT_RANDOM_SEED,
+        table_kind=table_kind,
+    )
+    use_subquery = dialect.profiling_stats_use_subquery_when_sampling(table_kind)
+    if not sample_clause.strip():
+        sample_clause = dialect.profiling_ordered_limit_sample_suffix(sample_size)
+        use_subquery = True
+    return sample_clause, use_subquery
+
+
+def _build_profile_stats_sql(qcol: str, qtbl: str, *, use_sample: bool, sample_clause: str, use_subquery: bool) -> str:
     """Build the column statistics query (row count, distinct count, null count)."""
+    if use_sample and use_subquery:
+        sample_clause = _normalize_profiling_sample_clause(qcol, sample_clause)
     if use_sample and not use_subquery:
         return (
             f"SELECT COUNT(*) as cnt, COUNT(DISTINCT {qcol}) as dist, "
@@ -179,35 +240,85 @@ def _build_profile_stats_sql(
     return f"SELECT COUNT(*) as cnt, COUNT(DISTINCT {qcol}) as dist, COUNT(*) - COUNT({qcol}) as nulls FROM {qtbl}"
 
 
-def _build_frequent_values_sql(qcol: str, qtbl: str, limit: int) -> str:
+def _build_frequent_values_sql(
+    qcol: str, qtbl: str, limit: int, *, sample_clause: str = "", use_subquery: bool = False
+) -> str:
     """Build a frequency-ordered value sample query capped at ``limit``."""
+    if sample_clause and use_subquery:
+        sample_clause = _normalize_profiling_sample_clause(qcol, sample_clause)
+        return (
+            f"SELECT t.c AS v FROM (SELECT {qcol} AS c FROM {qtbl} {sample_clause}) t "
+            f"WHERE t.c IS NOT NULL GROUP BY t.c ORDER BY COUNT(*) DESC LIMIT {limit}"
+        )
+    suffix = f" {sample_clause}" if sample_clause else ""
     return (
-        f"SELECT {qcol} AS v FROM {qtbl} WHERE {qcol} IS NOT NULL GROUP BY {qcol} ORDER BY COUNT(*) DESC LIMIT {limit}"
+        f"SELECT {qcol} AS v FROM {qtbl}{suffix} WHERE {qcol} IS NOT NULL "
+        f"GROUP BY {qcol} ORDER BY COUNT(*) DESC LIMIT {limit}"
     )
 
 
-def _build_minmax_sql(qcol: str, qtbl: str) -> str:
+def _build_minmax_sql(qcol: str, qtbl: str, *, sample_clause: str = "", use_subquery: bool = False) -> str:
     """Build a min/max aggregate query for numeric or date columns."""
-    return f"SELECT MIN({qcol}), MAX({qcol}) FROM {qtbl}"
+    if sample_clause and use_subquery:
+        sample_clause = _normalize_profiling_sample_clause(qcol, sample_clause)
+        return f"SELECT MIN(t.c), MAX(t.c) FROM (SELECT {qcol} AS c FROM {qtbl} {sample_clause}) t"
+    suffix = f" {sample_clause}" if sample_clause else ""
+    return f"SELECT MIN({qcol}), MAX({qcol}) FROM {qtbl}{suffix}"
 
 
-def _build_mode_sql(qcol: str, qtbl: str) -> str:
+def _build_mode_sql(qcol: str, qtbl: str, *, sample_clause: str = "", use_subquery: bool = False) -> str:
     """Build a query returning the maximum per-value frequency for a column."""
-    return f"SELECT MAX(c) FROM (SELECT COUNT(*) AS c FROM {qtbl} WHERE {qcol} IS NOT NULL GROUP BY {qcol}) s"
+    if sample_clause and use_subquery:
+        sample_clause = _normalize_profiling_sample_clause(qcol, sample_clause)
+        return (
+            f"SELECT MAX(c) FROM ("
+            f"SELECT COUNT(*) AS c FROM (SELECT {qcol} AS c FROM {qtbl} {sample_clause}) t "
+            f"WHERE t.c IS NOT NULL GROUP BY t.c) s"
+        )
+    suffix = f" {sample_clause}" if sample_clause else ""
+    return f"SELECT MAX(c) FROM (SELECT COUNT(*) AS c FROM {qtbl}{suffix} WHERE {qcol} IS NOT NULL GROUP BY {qcol}) s"
+
+
+def _build_composite_descriptive_sql(
+    dialect: Dialect,
+    q1: str,
+    q2: str,
+    qtbl: str,
+    *,
+    row_count: int,
+    table_kind: Literal["table", "view"],
+    sample_threshold: int | None = None,
+    sample_size: int | None = None,
+) -> str:
+    """Build a bounded composite-descriptive distinct-count query."""
+    if sample_threshold is None:
+        sample_threshold = PolicyConfig.PROFILING_SAMPLE_THRESHOLD
+    if sample_size is None:
+        sample_size = PolicyConfig.PROFILING_SAMPLE_SIZE
+    use_sample = row_count > sample_threshold
+    sample_clause, use_subquery = _resolve_profiling_sample_params(
+        dialect,
+        use_sample=use_sample,
+        row_count=row_count,
+        sample_size=sample_size,
+        table_kind=table_kind,
+    )
+    if use_sample and use_subquery:
+        return (
+            f"SELECT COUNT(DISTINCT CONCAT(t.c1, ' ', t.c2)) FROM "
+            f"(SELECT {q1} AS c1, {q2} AS c2 FROM {qtbl} {sample_clause}) t"
+        )
+    suffix = f" {sample_clause}" if sample_clause else ""
+    return f"SELECT COUNT(DISTINCT CONCAT({q1}, ' ', {q2})) FROM {qtbl}{suffix}"
 
 
 def _build_value_overlap_sample_sql(
-    dialect: Dialect,
-    qcol: str,
-    qtbl: str,
-    limit: int,
-    *,
-    sample_clause: str = "",
-    use_subquery: bool = False,
+    dialect: Dialect, qcol: str, qtbl: str, limit: int, *, sample_clause: str = "", use_subquery: bool = False
 ) -> str:
     """Build an ascending distinct overlap sample with optional table sampling."""
     cast_expr = dialect.profiling_text_cast_sql("t.c")
     if sample_clause and use_subquery:
+        sample_clause = _normalize_profiling_sample_clause(qcol, sample_clause)
         return (
             f"SELECT DISTINCT {cast_expr} AS v FROM "
             f"(SELECT {qcol} AS c FROM {qtbl} {sample_clause}) t "
@@ -230,13 +341,7 @@ def _column_low_cardinality_catalog_eligible(col: ColumnMetadata, row_count: int
 
 
 def _build_array_element_distinct_sql(
-    dialect: Dialect,
-    qcol: str,
-    qtbl: str,
-    limit: int,
-    *,
-    sample_clause: str = "",
-    use_subquery: bool = False,
+    dialect: Dialect, qcol: str, qtbl: str, limit: int, *, sample_clause: str = "", use_subquery: bool = False
 ) -> str | None:
     """Build a one-time DISTINCT query over unnested array elements when supported."""
     engine_type = str(getattr(dialect, "engine_type", "") or "").lower()
@@ -245,6 +350,7 @@ def _build_array_element_distinct_sql(
     elem_alias = "elem"
     cast_expr = dialect.profiling_text_cast_sql(f"u.{elem_alias}")
     if sample_clause and use_subquery:
+        sample_clause = _normalize_profiling_sample_clause(qcol, sample_clause)
         from_clause = f"(SELECT {qcol} AS c FROM {qtbl} {sample_clause}) t"
         unnest_ref = "t.c"
     else:
@@ -257,6 +363,11 @@ def _build_array_element_distinct_sql(
     )
 
 
+def _column_profiling_excluded(col: ColumnMetadata) -> bool:
+    """Return True when profiling must not read column values from the database."""
+    return col.sensitivity != SensitivityClassification.NONE
+
+
 def _profile_column(
     dialect: Dialect,
     engine: Any,
@@ -267,82 +378,85 @@ def _profile_column(
     sample_size: int | None = None,
     *,
     table_kind: Literal["table", "view"] = "table",
+    deep_query_budget: _ProfilingDeepQueryBudget | None = None,
 ) -> None:
     """Profile a single column and update its metadata in-place."""
+    if _column_profiling_excluded(col):
+        debug(f"[schema_profiling.profile_column] skipping sensitive column {table_name}.{col.name}")
+        return
     debug(f"[schema_profiling.profile_column] profiling {table_name}.{col.name}")
     if sample_threshold is None:
-        sample_threshold = QSimConfig.PROFILING_SAMPLE_THRESHOLD
+        sample_threshold = PolicyConfig.PROFILING_SAMPLE_THRESHOLD
     if sample_size is None:
-        sample_size = QSimConfig.PROFILING_SAMPLE_SIZE
+        sample_size = PolicyConfig.PROFILING_SAMPLE_SIZE
+    if deep_query_budget is None:
+        deep_query_budget = _ProfilingDeepQueryBudget(None)
 
     col.row_count = row_count
     use_sample = row_count > sample_threshold
     qcol = dialect.quote_identifier(col.name)
-    qtbl = dialect.quote_identifier(table_name)
+    qtbl = dialect.qualified_table_ref(table_name, kind=table_kind)
 
     try:
         with engine.connect() as conn:
             _maybe_set_profile_statement_timeout(conn, dialect)
-            sample_clause = dialect.profiling_stats_sample_suffix(
+            sample_clause, use_subquery = _resolve_profiling_sample_params(
+                dialect,
                 use_sample=use_sample,
                 row_count=row_count,
                 sample_size=sample_size,
-                random_seed=QSimConfig.RANDOM_SEED,
                 table_kind=table_kind,
             )
-            use_subquery = use_sample and dialect.profiling_stats_use_subquery_when_sampling(table_kind)
 
             stats_sql = _build_profile_stats_sql(
-                qcol,
-                qtbl,
-                use_sample=use_sample,
-                sample_clause=sample_clause,
-                use_subquery=use_subquery,
+                qcol, qtbl, use_sample=use_sample, sample_clause=sample_clause, use_subquery=use_subquery
             )
 
             result = conn.execute(text(stats_sql)).fetchone()
-            cnt = result[0] or 1
-            dist = result[1] or 0
-            nulls = result[2] or 0
+            cnt = result[0] if result[0] is not None else 0
+            dist = result[1] if result[1] is not None else 0
+            nulls = result[2] if result[2] is not None else 0
 
             col.distinct_count = dist
             col.distinct_ratio = dist / cnt if cnt > 0 else 0.0
             col.null_ratio = nulls / cnt if cnt > 0 else 0.0
             col.distinct_from_sample = bool(use_sample)
 
-            if col.value_type in ("integer", "number") or col.value_type == "date":
-                minmax_sql = _build_minmax_sql(qcol, qtbl)
+            if (col.value_type in ("integer", "number") or col.value_type == "date") and deep_query_budget.allow():
+                minmax_sql = _build_minmax_sql(qcol, qtbl, sample_clause=sample_clause, use_subquery=use_subquery)
                 minmax_result = conn.execute(text(minmax_sql)).fetchone()
                 if minmax_result:
                     col.min_val = str(minmax_result[0]) if minmax_result[0] is not None else None
                     col.max_val = str(minmax_result[1]) if minmax_result[1] is not None else None
 
-            if _column_frequent_values_eligible(col):
-                freq_sql = _build_frequent_values_sql(qcol, qtbl, PolicyConfig.CATEGORICAL_SAMPLE_SIZE)
+            if _column_frequent_values_eligible(col) and deep_query_budget.allow():
+                freq_sql = _build_frequent_values_sql(
+                    qcol,
+                    qtbl,
+                    PolicyConfig.CATEGORICAL_SAMPLE_SIZE,
+                    sample_clause=sample_clause,
+                    use_subquery=use_subquery,
+                )
                 freq_result = conn.execute(text(freq_sql)).fetchall()
                 col.frequent_values = collect_profiling_frequent_values(
-                    [row[0] for row in freq_result if row[0] is not None],
+                    [row[0] for row in freq_result if row[0] is not None]
                 )
-            mode_sql = _build_mode_sql(qcol, qtbl)
-            mode_row = conn.execute(text(mode_sql)).fetchone()
-            non_null = max(0, cnt - nulls)
-            if mode_row and mode_row[0] is not None and non_null > 0:
-                top_freq = mode_row[0] or 0
-                col.mode_frequency_ratio = float(top_freq) / float(non_null) if top_freq else 0.0
-            else:
-                col.mode_frequency_ratio = 0.0
+            if deep_query_budget.allow():
+                mode_sql = _build_mode_sql(qcol, qtbl, sample_clause=sample_clause, use_subquery=use_subquery)
+                mode_row = conn.execute(text(mode_sql)).fetchone()
+                non_null = max(0, cnt - nulls)
+                if mode_row and mode_row[0] is not None and non_null > 0:
+                    top_freq = mode_row[0] or 0
+                    col.mode_frequency_ratio = float(top_freq) / float(non_null) if top_freq else 0.0
+                else:
+                    col.mode_frequency_ratio = 0.0
 
             if _column_value_overlap_eligible(col):
                 cap = PolicyConfig.VALUE_OVERLAP_SAMPLE_LIMIT
                 if _column_low_cardinality_catalog_eligible(col, cnt):
                     cap = PolicyConfig.LOW_CARDINALITY_FULL_VALUES_LIMIT
                 overlap_sql = _build_value_overlap_sample_sql(
-                    dialect,
-                    qcol,
-                    qtbl,
-                    cap,
-                    sample_clause=sample_clause,
-                    use_subquery=use_subquery,
+                    dialect, qcol, qtbl, cap, sample_clause=sample_clause, use_subquery=use_subquery
                 )
                 overlap_rows = conn.execute(text(overlap_sql)).fetchall()
                 col.value_overlap_sample = [str(r[0]) for r in overlap_rows if r[0] is not None]
@@ -351,12 +465,7 @@ def _profile_column(
             if is_arr:
                 arr_cap = PolicyConfig.LOW_CARDINALITY_FULL_VALUES_LIMIT
                 arr_sql = _build_array_element_distinct_sql(
-                    dialect,
-                    qcol,
-                    qtbl,
-                    arr_cap,
-                    sample_clause=sample_clause,
-                    use_subquery=use_subquery,
+                    dialect, qcol, qtbl, arr_cap, sample_clause=sample_clause, use_subquery=use_subquery
                 )
                 if arr_sql:
                     arr_rows = conn.execute(text(arr_sql)).fetchall()
@@ -364,8 +473,29 @@ def _profile_column(
                     if elements:
                         col.frequent_values = collect_profiling_frequent_values(elements)
                         col.value_overlap_sample = sorted({v for v in elements})
-    except Exception as e:
-        debug(f"[schema_profiling.profile_column] failed: {table_name}.{col.name}: {e}")
+    except Exception as exc:
+        _record_column_profile_failure(table_name, col, exc)
+
+
+def _record_column_profile_failure(table_name: str, col: ColumnMetadata, exc: Exception) -> None:
+    col.profile_failed = True
+    col.distinct_count = 0
+    col.distinct_ratio = 0.0
+    col.distinct_from_sample = False
+    col.null_ratio = 0.0
+    col.frequent_values = []
+    col.value_overlap_sample = []
+    col.min_val = None
+    col.max_val = None
+    col.is_unique = False
+    col.mode_frequency_ratio = 0.0
+    notify(
+        f"column profile failed for {table_name}.{col.name}: {exc}",
+        stage="schema",
+        code=DIAGNOSTIC_CODE_COLUMN_PROFILE_FAILED,
+        level="warning",
+        details=(("table", table_name), ("column", col.name)),
+    )
 
 
 def _column_value_overlap_eligible(col: ColumnMetadata) -> bool:
@@ -394,19 +524,55 @@ def _column_frequent_values_eligible(col: ColumnMetadata) -> bool:
     return vt not in ("blob", "binary")
 
 
-def _profile_composite_descriptive(
-    engine: Any,
-    table: TableMetadata,
-) -> None:
-    """Compute composite distinct ratios for name-like column pairs."""
-    name_cols = [
+def _composite_descriptive_name_columns(table: TableMetadata) -> list[str]:
+    return [
         col_name
         for col_name, col_meta in table.columns.items()
         if (col_meta.value_type or "").lower() == "string"
         and NAME_COLUMN_PATTERN.search(col_name)
         and not col_meta.is_primary_key
         and not col_meta.is_foreign_key
+        and not _column_profiling_excluded(col_meta)
     ]
+
+
+def _mark_composite_descriptive_columns_unprofiled(table: TableMetadata, name_cols: list[str]) -> None:
+    table.composite_descriptive_ratios.clear()
+    for col_name in name_cols:
+        col = table.columns.get(col_name)
+        if col is None:
+            continue
+        col.distinct_count = 0
+        col.distinct_ratio = 0.0
+        col.distinct_from_sample = False
+        col.null_ratio = 0.0
+        col.frequent_values = []
+        col.value_overlap_sample = []
+        col.min_val = None
+        col.max_val = None
+        col.is_unique = False
+        col.mode_frequency_ratio = 0.0
+        col.profile_failed = True
+
+
+def _record_composite_descriptive_profile_failure(
+    table: TableMetadata,
+    name_cols: list[str],
+    exc: Exception,
+) -> None:
+    _mark_composite_descriptive_columns_unprofiled(table, name_cols)
+    notify(
+        f"composite descriptive profile failed for table {table.name!r}: {exc}",
+        stage="schema",
+        code=DIAGNOSTIC_CODE_COMPOSITE_DESCRIPTIVE_PROFILE_FAILED,
+        level="warning",
+        details=(("table", table.name),),
+    )
+
+
+def _profile_composite_descriptive(dialect: Dialect, engine: Any, table: TableMetadata) -> None:
+    """Compute composite distinct ratios for name-like column pairs."""
+    name_cols = _composite_descriptive_name_columns(table)
     if len(name_cols) < 2:
         return
     row_count = table.row_count or 0
@@ -414,12 +580,22 @@ def _profile_composite_descriptive(
         return
 
     try:
+        full_table = dialect.qualified_table_ref(table.name, kind=table.kind)
         with engine.connect() as conn:
-            _maybe_set_profile_statement_timeout(conn, engine)
+            _maybe_set_profile_statement_timeout(conn, dialect)
             for i in range(len(name_cols)):
                 for j in range(i + 1, len(name_cols)):
                     c1, c2 = name_cols[i], name_cols[j]
-                    sql = f'SELECT COUNT(DISTINCT CONCAT("{c1}", \' \', "{c2}")) FROM "{table.name}"'
+                    q1 = dialect.quote_identifier(c1)
+                    q2 = dialect.quote_identifier(c2)
+                    sql = _build_composite_descriptive_sql(
+                        dialect,
+                        q1,
+                        q2,
+                        full_table,
+                        row_count=row_count,
+                        table_kind=table.kind,
+                    )
                     composite_distinct = conn.execute(text(sql)).scalar() or 0
                     ratio = composite_distinct / row_count
                     table.composite_descriptive_ratios[(c1, c2)] = ratio
@@ -428,27 +604,39 @@ def _profile_composite_descriptive(
                         f"{table.name}.({c1}, {c2}) composite_ratio={ratio:.4f}"
                     )
     except Exception as exc:
-        debug(f"[schema_profiling._profile_composite_descriptive] failed for {table.name}: {exc}")
+        _record_composite_descriptive_profile_failure(table, name_cols, exc)
 
 
-def _profile_table(dialect: Dialect, engine: Any, table: TableMetadata) -> None:
+def _profile_table(
+    dialect: Dialect,
+    engine: Any,
+    table: TableMetadata,
+    *,
+    deep_query_budget: _ProfilingDeepQueryBudget | None = None,
+) -> None:
     """Profile all columns in a table and update metadata in-place."""
     debug(f"[schema_profiling.profile_table] profiling {table.name} ({len(table.columns)} columns)")
-    try:
-        with engine.connect() as conn:
-            _maybe_set_profile_statement_timeout(conn, dialect)
-            count_sql = f'SELECT COUNT(*) FROM "{table.name}"'
-            row_count = conn.execute(text(count_sql)).scalar() or 0
-            table.row_count = row_count
-    except Exception as e:
-        debug(f"[schema_profiling.profile_table] row count failed: {table.name}: {e}")
-        row_count = 0
-        table.row_count = 0
+    if deep_query_budget is None:
+        deep_query_budget = _ProfilingDeepQueryBudget(PolicyConfig.PROFILING_SCHEMA_DEEP_QUERY_BUDGET)
+    with engine.connect() as conn:
+        _maybe_set_profile_statement_timeout(conn, dialect)
+        full_table = dialect.qualified_table_ref(table.name, kind=table.kind)
+        count_sql = f"SELECT COUNT(*) FROM {full_table}"
+        row_count = conn.execute(text(count_sql)).scalar() or 0
+        table.row_count = row_count
 
     for col in table.columns.values():
-        _profile_column(dialect, engine, col, table.name, row_count, table_kind=table.kind)
+        _profile_column(
+            dialect,
+            engine,
+            col,
+            table.name,
+            row_count,
+            table_kind=table.kind,
+            deep_query_budget=deep_query_budget,
+        )
 
-    _profile_composite_descriptive(engine, table)
+    _profile_composite_descriptive(dialect, engine, table)
 
     debug(f"[schema_profiling.profile_table] completed: {table.name}")
 
@@ -456,15 +644,17 @@ def _profile_table(dialect: Dialect, engine: Any, table: TableMetadata) -> None:
 def profile_schema(engine: Any, schema: SchemaGraph, dialect: Dialect) -> None:
     """Profile all tables in a schema and update metadata in-place."""
     debug(f"[schema_profiling.profile_schema] profiling {len(schema.tables)} tables")
+    deep_query_budget = _ProfilingDeepQueryBudget(PolicyConfig.PROFILING_SCHEMA_DEEP_QUERY_BUDGET)
     total = len(schema.tables)
-    for idx, table in enumerate(schema.tables.values(), start=1):
+    for idx, table_name in enumerate(sorted(schema.tables.keys(), key=str.lower), start=1):
+        table = schema.tables[table_name]
         notify(
             f"  Profiling [{idx}/{total}] {table.name}",
             stage="schema",
             code=DIAGNOSTIC_CODE_ENGINE_INFO,
             details=(("table", table.name), ("index", str(idx)), ("total", str(total))),
         )
-        _profile_table(dialect, engine, table)
+        _profile_table(dialect, engine, table, deep_query_budget=deep_query_budget)
     debug("[schema_profiling.profile_schema] completed")
 
 
@@ -479,26 +669,30 @@ def _profile_column_spark(
     sample_size: int | None = None,
     *,
     dialect: Dialect,
+    table_kind: Literal["table", "view"] = "table",
+    deep_query_budget: _ProfilingDeepQueryBudget | None = None,
 ) -> None:
     """Profile a single column from a Databricks table via Spark SQL. and. update metadata in-place."""
     debug(f"[schema_profiling.profile_column_spark] profiling {table_name}.{col.name}")
     if sample_threshold is None:
-        sample_threshold = QSimConfig.PROFILING_SAMPLE_THRESHOLD
+        sample_threshold = PolicyConfig.PROFILING_SAMPLE_THRESHOLD
     if sample_size is None:
-        sample_size = QSimConfig.PROFILING_SAMPLE_SIZE
+        sample_size = PolicyConfig.PROFILING_SAMPLE_SIZE
+    if deep_query_budget is None:
+        deep_query_budget = _ProfilingDeepQueryBudget(None)
 
     col.row_count = row_count
     use_sample = row_count > sample_threshold
     qcol = dialect.quote_identifier(col.name)
 
     try:
-        full_table = dialect.qualified_table_ref(table_name)
-        sample_clause = dialect.profiling_stats_sample_suffix(
+        full_table = dialect.qualified_table_ref(table_name, kind=table_kind)
+        sample_clause, use_subquery = _resolve_profiling_sample_params(
+            dialect,
             use_sample=use_sample,
             row_count=row_count,
             sample_size=sample_size,
-            random_seed=QSimConfig.RANDOM_SEED,
-            table_kind="table",
+            table_kind=table_kind,
         )
 
         if use_sample:
@@ -519,48 +713,43 @@ def _profile_column_spark(
             """
 
         result = spark.sql(stats_sql).collect()[0]
-        cnt = result["cnt"] or 1
-        dist = result["dist"] or 0
-        nulls = result["nulls"] or 0
+        cnt = result["cnt"] if result["cnt"] is not None else 0
+        dist = result["dist"] if result["dist"] is not None else 0
+        nulls = result["nulls"] if result["nulls"] is not None else 0
 
         col.distinct_count = dist
         col.distinct_ratio = dist / cnt if cnt > 0 else 0.0
         col.null_ratio = nulls / cnt if cnt > 0 else 0.0
         col.distinct_from_sample = bool(use_sample)
 
-        if col.value_type in ("integer", "number") or col.value_type == "date":
-            minmax_sql = f"SELECT MIN({qcol}), MAX({qcol}) FROM {full_table}"
+        if (col.value_type in ("integer", "number") or col.value_type == "date") and deep_query_budget.allow():
+            minmax_sql = _build_minmax_sql(qcol, full_table, sample_clause=sample_clause, use_subquery=use_subquery)
             minmax_result = spark.sql(minmax_sql).collect()[0]
             if minmax_result:
                 col.min_val = str(minmax_result[0]) if minmax_result[0] is not None else None
                 col.max_val = str(minmax_result[1]) if minmax_result[1] is not None else None
 
-        if _column_frequent_values_eligible(col):
-            freq_sql = f"""
-                SELECT {qcol} AS v FROM {full_table}
-                WHERE {qcol} IS NOT NULL
-                GROUP BY {qcol}
-                ORDER BY COUNT(*) DESC
-                LIMIT {PolicyConfig.CATEGORICAL_SAMPLE_SIZE}
-            """
+        if _column_frequent_values_eligible(col) and deep_query_budget.allow():
+            freq_sql = _build_frequent_values_sql(
+                qcol,
+                full_table,
+                PolicyConfig.CATEGORICAL_SAMPLE_SIZE,
+                sample_clause=sample_clause,
+                use_subquery=use_subquery,
+            )
             freq_result = spark.sql(freq_sql).collect()
             col.frequent_values = collect_profiling_frequent_values(
-                [row["v"] for row in freq_result if row["v"] is not None],
+                [row["v"] for row in freq_result if row["v"] is not None]
             )
-        mode_sql = f"""
-            SELECT MAX(freq) AS mx FROM (
-                SELECT COUNT(*) AS freq FROM {full_table}
-                WHERE {qcol} IS NOT NULL
-                GROUP BY {qcol}
-            ) g
-        """
-        mode_rows = spark.sql(mode_sql).collect()
-        non_null = max(0, cnt - nulls)
-        if mode_rows and mode_rows[0]["mx"] is not None and non_null > 0:
-            top_freq = mode_rows[0]["mx"] or 0
-            col.mode_frequency_ratio = float(top_freq) / float(non_null) if top_freq else 0.0
-        else:
-            col.mode_frequency_ratio = 0.0
+        if deep_query_budget.allow():
+            mode_sql = _build_mode_sql(qcol, full_table, sample_clause=sample_clause, use_subquery=use_subquery)
+            mode_rows = spark.sql(mode_sql).collect()
+            non_null = max(0, cnt - nulls)
+            if mode_rows and mode_rows[0][0] is not None and non_null > 0:
+                top_freq = mode_rows[0][0] or 0
+                col.mode_frequency_ratio = float(top_freq) / float(non_null) if top_freq else 0.0
+            else:
+                col.mode_frequency_ratio = 0.0
 
         if _column_value_overlap_eligible(col):
             cap = PolicyConfig.VALUE_OVERLAP_SAMPLE_LIMIT
@@ -572,27 +761,15 @@ def _profile_column_spark(
             )
             sem_rows = spark.sql(sem_sql).collect()
             col.value_overlap_sample = [str(r["v"]) for r in sem_rows if r.get("v") is not None]
-    except Exception as e:
-        debug(f"[schema_profiling.profile_column_spark] failed: {table_name}.{col.name}: {e}")
+    except Exception as exc:
+        _record_column_profile_failure(table_name, col, exc)
 
 
 def _profile_composite_descriptive_spark(
-    spark: Any,
-    catalog: str,
-    schema_name: str,
-    table: TableMetadata,
-    *,
-    dialect: Dialect,
+    spark: Any, catalog: str, schema_name: str, table: TableMetadata, *, dialect: Dialect
 ) -> None:
     """Compute composite distinct ratios for name-like column pairs via. Spark."""
-    name_cols = [
-        col_name
-        for col_name, col_meta in table.columns.items()
-        if (col_meta.value_type or "").lower() == "string"
-        and NAME_COLUMN_PATTERN.search(col_name)
-        and not col_meta.is_primary_key
-        and not col_meta.is_foreign_key
-    ]
+    name_cols = _composite_descriptive_name_columns(table)
     if len(name_cols) < 2:
         return
     row_count = table.row_count or 0
@@ -605,7 +782,14 @@ def _profile_composite_descriptive_spark(
                 c1, c2 = name_cols[i], name_cols[j]
                 q1 = dialect.quote_identifier(c1)
                 q2 = dialect.quote_identifier(c2)
-                sql = f"SELECT COUNT(DISTINCT CONCAT({q1}, ' ', {q2})) FROM {full_table}"
+                sql = _build_composite_descriptive_sql(
+                    dialect,
+                    q1,
+                    q2,
+                    full_table,
+                    row_count=row_count,
+                    table_kind=table.kind,
+                )
                 composite_distinct = spark.sql(sql).collect()[0][0] or 0
                 ratio = composite_distinct / row_count
                 table.composite_descriptive_ratios[(c1, c2)] = ratio
@@ -614,7 +798,7 @@ def _profile_composite_descriptive_spark(
                     f"{table.name}.({c1}, {c2}) composite_ratio={ratio:.4f}"
                 )
     except Exception as exc:
-        debug(f"[schema_profiling._profile_composite_descriptive_spark] failed for {table.name}: {exc}")
+        _record_composite_descriptive_profile_failure(table, name_cols, exc)
 
 
 def _profile_table_spark(
@@ -624,18 +808,19 @@ def _profile_table_spark(
     table: TableMetadata,
     *,
     dialect: Dialect,
+    deep_query_budget: _ProfilingDeepQueryBudget | None = None,
 ) -> None:
     """Profile all columns in a Databricks table via Spark queries."""
     debug(f"[schema_profiling.profile_table_spark] profiling {table.name} ({len(table.columns)} columns)")
+    if deep_query_budget is None:
+        deep_query_budget = _ProfilingDeepQueryBudget(PolicyConfig.PROFILING_SCHEMA_DEEP_QUERY_BUDGET)
     try:
         full_table = dialect.qualified_table_ref(table.name)
         count_sql = f"SELECT COUNT(*) FROM {full_table}"
         row_count = spark.sql(count_sql).collect()[0][0] or 0
         table.row_count = row_count
     except Exception as e:
-        debug(f"[schema_profiling.profile_table_spark] row count failed: {table.name}: {e}")
-        row_count = 0
-        table.row_count = 0
+        raise ConfigError(f"schema profiling failed for {table.name}: {e}") from e
 
     for col in table.columns.values():
         _profile_column_spark(
@@ -646,6 +831,8 @@ def _profile_table_spark(
             table.name,
             row_count,
             dialect=dialect,
+            table_kind=table.kind,
+            deep_query_budget=deep_query_budget,
         )
 
     _profile_composite_descriptive_spark(spark, catalog, schema_name, table, dialect=dialect)
@@ -653,25 +840,20 @@ def _profile_table_spark(
     debug(f"[schema_profiling.profile_table_spark] completed: {table.name}")
 
 
-def profile_schema_spark(
-    spark: Any,
-    catalog: str,
-    schema_name: str,
-    schema: SchemaGraph,
-    *,
-    dialect: Dialect,
-) -> None:
+def profile_schema_spark(spark: Any, catalog: str, schema_name: str, schema: SchemaGraph, *, dialect: Dialect) -> None:
     """Profile all tables in a Databricks schema via Spark queries."""
     debug(f"[schema_profiling.profile_schema_spark] profiling {len(schema.tables)} tables")
+    deep_query_budget = _ProfilingDeepQueryBudget(PolicyConfig.PROFILING_SCHEMA_DEEP_QUERY_BUDGET)
     total = len(schema.tables)
-    for idx, table in enumerate(schema.tables.values(), start=1):
+    for idx, table_name in enumerate(sorted(schema.tables.keys(), key=str.lower), start=1):
+        table = schema.tables[table_name]
         notify(
             f"  Profiling [{idx}/{total}] {table.name}",
             stage="schema",
             code=DIAGNOSTIC_CODE_ENGINE_INFO,
             details=(("table", table.name), ("index", str(idx)), ("total", str(total))),
         )
-        _profile_table_spark(spark, catalog, schema_name, table, dialect=dialect)
+        _profile_table_spark(spark, catalog, schema_name, table, dialect=dialect, deep_query_budget=deep_query_budget)
     debug("[schema_profiling.profile_schema_spark] completed")
 
 
@@ -697,9 +879,7 @@ def _trailing_table_identifier(ref: str) -> str:
     return tokens[-1] if tokens else ""
 
 
-def _tables_meta_foreign_key_dicts_from_edges(
-    edges: list[FKEdge],
-) -> list[dict[str, Any]]:
+def _tables_meta_foreign_key_dicts_from_edges(edges: list[FKEdge]) -> list[dict[str, Any]]:
     """Convert :class:`FKEdge` instances into ``tables_meta`` foreign- key dict entries."""
     out: list[dict[str, Any]] = []
     for e in edges:
@@ -724,21 +904,25 @@ def _profile_column_sql_connector(
     sample_size: int | None = None,
     *,
     dialect: Dialect,
+    table_kind: Literal["table", "view"] = "table",
+    deep_query_budget: _ProfilingDeepQueryBudget | None = None,
 ) -> None:
     """Profile a single column via databricks-sql-connector and update. metadata in-place."""
     if sample_threshold is None:
-        sample_threshold = QSimConfig.PROFILING_SAMPLE_THRESHOLD
+        sample_threshold = PolicyConfig.PROFILING_SAMPLE_THRESHOLD
     if sample_size is None:
-        sample_size = QSimConfig.PROFILING_SAMPLE_SIZE
+        sample_size = PolicyConfig.PROFILING_SAMPLE_SIZE
+    if deep_query_budget is None:
+        deep_query_budget = _ProfilingDeepQueryBudget(None)
     col.row_count = row_count
     use_sample = row_count > sample_threshold
-    full_table = dialect.qualified_table_ref(table_name)
-    sample_clause = dialect.profiling_stats_sample_suffix(
+    full_table = dialect.qualified_table_ref(table_name, kind=table_kind)
+    sample_clause, use_subquery = _resolve_profiling_sample_params(
+        dialect,
         use_sample=use_sample,
         row_count=row_count,
         sample_size=sample_size,
-        random_seed=QSimConfig.RANDOM_SEED,
-        table_kind="table",
+        table_kind=table_kind,
     )
     qcol = dialect.quote_identifier(col.name)
     try:
@@ -765,51 +949,46 @@ def _profile_column_sql_connector(
             stats_nulls = 0
             if rows:
                 r = rows[0]
-                cnt = r.get("cnt") or 1
-                dist = r.get("dist") or 0
-                nulls = r.get("nulls") or 0
+                cnt = r.get("cnt") if r.get("cnt") is not None else 0
+                dist = r.get("dist") if r.get("dist") is not None else 0
+                nulls = r.get("nulls") if r.get("nulls") is not None else 0
                 col.distinct_count = dist
                 col.distinct_ratio = dist / cnt if cnt > 0 else 0.0
                 col.null_ratio = nulls / cnt if cnt > 0 else 0.0
                 col.distinct_from_sample = bool(use_sample)
                 stats_cnt = cnt
                 stats_nulls = nulls
-            if col.value_type in ("integer", "number") or col.value_type == "date":
-                minmax_sql = f"SELECT MIN({qcol}) as mn, MAX({qcol}) as mx FROM {full_table}"
+            if (col.value_type in ("integer", "number") or col.value_type == "date") and deep_query_budget.allow():
+                minmax_sql = _build_minmax_sql(qcol, full_table, sample_clause=sample_clause, use_subquery=use_subquery)
                 cursor.execute(minmax_sql)
                 minmax_rows = _cursor_rows_as_dicts(cursor)
                 if minmax_rows:
-                    r = minmax_rows[0]
-                    col.min_val = str(r["mn"]) if r.get("mn") is not None else None
-                    col.max_val = str(r["mx"]) if r.get("mx") is not None else None
-            if _column_frequent_values_eligible(col):
-                freq_sql = f"""
-                    SELECT {qcol} AS v FROM {full_table}
-                    WHERE {qcol} IS NOT NULL
-                    GROUP BY {qcol}
-                    ORDER BY COUNT(*) DESC
-                    LIMIT {PolicyConfig.CATEGORICAL_SAMPLE_SIZE}
-                """
+                    vals = list(minmax_rows[0].values())
+                    col.min_val = str(vals[0]) if vals and vals[0] is not None else None
+                    col.max_val = str(vals[1]) if len(vals) > 1 and vals[1] is not None else None
+            if _column_frequent_values_eligible(col) and deep_query_budget.allow():
+                freq_sql = _build_frequent_values_sql(
+                    qcol,
+                    full_table,
+                    PolicyConfig.CATEGORICAL_SAMPLE_SIZE,
+                    sample_clause=sample_clause,
+                    use_subquery=use_subquery,
+                )
                 cursor.execute(freq_sql)
                 freq_rows = _cursor_rows_as_dicts(cursor)
                 col.frequent_values = collect_profiling_frequent_values(
-                    [r["v"] for r in freq_rows if r and r.get("v") is not None],
+                    [r["v"] for r in freq_rows if r and r.get("v") is not None]
                 )
-            mode_sql = f"""
-                SELECT MAX(freq) AS mx FROM (
-                    SELECT COUNT(*) AS freq FROM {full_table}
-                    WHERE {qcol} IS NOT NULL
-                    GROUP BY {qcol}
-                ) g
-            """
-            cursor.execute(mode_sql)
-            mode_rows = _cursor_rows_as_dicts(cursor)
-            non_null = max(0, stats_cnt - stats_nulls)
-            if mode_rows and mode_rows[0].get("mx") is not None and non_null > 0:
-                top_freq = mode_rows[0].get("mx") or 0
-                col.mode_frequency_ratio = float(top_freq) / float(non_null) if top_freq else 0.0
-            else:
-                col.mode_frequency_ratio = 0.0
+            if deep_query_budget.allow():
+                mode_sql = _build_mode_sql(qcol, full_table, sample_clause=sample_clause, use_subquery=use_subquery)
+                cursor.execute(mode_sql)
+                mode_rows = _cursor_rows_as_dicts(cursor)
+                non_null = max(0, stats_cnt - stats_nulls)
+                if mode_rows and list(mode_rows[0].values())[0] is not None and non_null > 0:
+                    top_freq = list(mode_rows[0].values())[0] or 0
+                    col.mode_frequency_ratio = float(top_freq) / float(non_null) if top_freq else 0.0
+                else:
+                    col.mode_frequency_ratio = 0.0
             if _column_value_overlap_eligible(col):
                 cap = PolicyConfig.VALUE_OVERLAP_SAMPLE_LIMIT
                 overlap_sample = f" {sample_clause}" if sample_clause else ""
@@ -821,27 +1000,15 @@ def _profile_column_sql_connector(
                 cursor.execute(sem_sql)
                 sem_rows = _cursor_rows_as_dicts(cursor)
                 col.value_overlap_sample = [str(r["v"]) for r in sem_rows if r.get("v") is not None]
-    except Exception as e:
-        debug(f"[schema_profiling._profile_column_sql_connector] failed: {table_name}.{col.name}: {e}")
+    except Exception as exc:
+        _record_column_profile_failure(table_name, col, exc)
 
 
 def _profile_composite_descriptive_sql_connector(
-    connection: Any,
-    catalog: str,
-    schema_name: str,
-    table: TableMetadata,
-    *,
-    dialect: Dialect,
+    connection: Any, catalog: str, schema_name: str, table: TableMetadata, *, dialect: Dialect
 ) -> None:
     """Compute composite distinct ratios for name-like column pairs via. SQL connector."""
-    name_cols = [
-        col_name
-        for col_name, col_meta in table.columns.items()
-        if (col_meta.value_type or "").lower() == "string"
-        and NAME_COLUMN_PATTERN.search(col_name)
-        and not col_meta.is_primary_key
-        and not col_meta.is_foreign_key
-    ]
+    name_cols = _composite_descriptive_name_columns(table)
     if len(name_cols) < 2:
         return
     row_count = table.row_count or 0
@@ -855,7 +1022,14 @@ def _profile_composite_descriptive_sql_connector(
                     c1, c2 = name_cols[i], name_cols[j]
                     q1 = dialect.quote_identifier(c1)
                     q2 = dialect.quote_identifier(c2)
-                    sql = f"SELECT COUNT(DISTINCT CONCAT({q1}, ' ', {q2})) FROM {full_table}"
+                    sql = _build_composite_descriptive_sql(
+                        dialect,
+                        q1,
+                        q2,
+                        full_table,
+                        row_count=row_count,
+                        table_kind=table.kind,
+                    )
                     cursor.execute(sql)
                     rows = _cursor_rows_as_dicts(cursor)
                     composite_distinct = 0
@@ -868,7 +1042,7 @@ def _profile_composite_descriptive_sql_connector(
                         f"{table.name}.({c1}, {c2}) composite_ratio={ratio:.4f}"
                     )
     except Exception as exc:
-        debug(f"[schema_profiling._profile_composite_descriptive_sql_connector] failed for {table.name}: {exc}")
+        _record_composite_descriptive_profile_failure(table, name_cols, exc)
 
 
 def _profile_table_sql_connector(
@@ -878,18 +1052,17 @@ def _profile_table_sql_connector(
     table: TableMetadata,
     *,
     dialect: Dialect,
+    deep_query_budget: _ProfilingDeepQueryBudget | None = None,
 ) -> None:
     """Profile all columns in a Databricks table via databricks-sql- connector."""
     debug(f"[schema_profiling._profile_table_sql_connector] profiling {table.name}")
+    if deep_query_budget is None:
+        deep_query_budget = _ProfilingDeepQueryBudget(PolicyConfig.PROFILING_SCHEMA_DEEP_QUERY_BUDGET)
     full_table = dialect.qualified_table_ref(table.name)
-    try:
-        with connection.cursor() as cursor:
-            cursor.execute(f"SELECT COUNT(*) FROM {full_table}")
-            rows = _cursor_rows_as_dicts(cursor)
-            row_count = rows[0].get(list(rows[0].keys())[0], 0) or 0 if rows else 0
-    except Exception as e:
-        debug(f"[schema_profiling._profile_table_sql_connector] row count failed: {table.name}: {e}")
-        row_count = 0
+    with connection.cursor() as cursor:
+        cursor.execute(f"SELECT COUNT(*) FROM {full_table}")
+        rows = _cursor_rows_as_dicts(cursor)
+        row_count = rows[0].get(list(rows[0].keys())[0], 0) or 0 if rows else 0
     table.row_count = row_count
     for col in table.columns.values():
         _profile_column_sql_connector(
@@ -900,30 +1073,31 @@ def _profile_table_sql_connector(
             table.name,
             row_count,
             dialect=dialect,
+            table_kind=table.kind,
+            deep_query_budget=deep_query_budget,
         )
     _profile_composite_descriptive_sql_connector(connection, catalog, schema_name, table, dialect=dialect)
     debug(f"[schema_profiling._profile_table_sql_connector] completed: {table.name}")
 
 
 def profile_schema_sql_connector(
-    connection: Any,
-    catalog: str,
-    schema_name: str,
-    schema: SchemaGraph,
-    *,
-    dialect: Dialect,
+    connection: Any, catalog: str, schema_name: str, schema: SchemaGraph, *, dialect: Dialect
 ) -> None:
     """Profile all tables in a Databricks schema via databricks-sql- connector."""
     debug(f"[schema_profiling.profile_schema_sql_connector] profiling {len(schema.tables)} tables")
+    deep_query_budget = _ProfilingDeepQueryBudget(PolicyConfig.PROFILING_SCHEMA_DEEP_QUERY_BUDGET)
     total = len(schema.tables)
-    for idx, table in enumerate(schema.tables.values(), start=1):
+    for idx, table_name in enumerate(sorted(schema.tables.keys(), key=str.lower), start=1):
+        table = schema.tables[table_name]
         notify(
             f"  Profiling [{idx}/{total}] {table.name}",
             stage="schema",
             code=DIAGNOSTIC_CODE_ENGINE_INFO,
             details=(("table", table.name), ("index", str(idx)), ("total", str(total))),
         )
-        _profile_table_sql_connector(connection, catalog, schema_name, table, dialect=dialect)
+        _profile_table_sql_connector(
+            connection, catalog, schema_name, table, dialect=dialect, deep_query_budget=deep_query_budget
+        )
     debug("[schema_profiling.profile_schema_sql_connector] completed")
 
 
@@ -1049,8 +1223,33 @@ def extract_tables_from_catalog_sql_connector(
     return tables
 
 
+def apply_catalog_descriptions_from_tables_meta(
+    schema: SchemaGraph,
+    tables_meta: dict[str, dict[str, Any]],
+) -> None:
+    """Apply catalog table and column comments through the description precedence ladder."""
+    for table_name, meta in tables_meta.items():
+        table = schema.tables.get(table_name)
+        if table is None:
+            continue
+        table_comment = meta.get("table_comment")
+        if table_comment is not None and str(table_comment).strip():
+            set_description(table, str(table_comment).strip(), DescriptionOwner.CATALOG)
+        column_comments = meta.get("column_comments") or {}
+        if not isinstance(column_comments, dict):
+            continue
+        for col_name, col_comment in column_comments.items():
+            col = table.columns.get(str(col_name))
+            if col is None:
+                continue
+            if col_comment is None or not str(col_comment).strip():
+                continue
+            set_description(col, str(col_comment).strip(), DescriptionOwner.CATALOG)
+
+
 def _enrich_fk_column_descriptions(schema: SchemaGraph) -> None:
     """Append navigational hints to FK column descriptions."""
+    forbidden_tokens = collect_schema_description_neutrality_forbidden_tokens(schema)
     for table in schema.tables.values():
         for col in table.columns.values():
             if not col.fk_target:
@@ -1064,22 +1263,27 @@ def _enrich_fk_column_descriptions(schema: SchemaGraph) -> None:
             descriptive_cols = [
                 c.name
                 for c in dst_table.columns.values()
-                if not c.is_primary_key and not c.is_foreign_key and c.role not in ("identifier", "")
+                if not c.is_primary_key
+                and not c.is_foreign_key
+                and c.role not in ("identifier", "")
+                and c.name not in forbidden_tokens
             ][:3]
             if not descriptive_cols:
                 descriptive_cols = [
-                    c.name for c in dst_table.columns.values() if not c.is_primary_key and not c.is_foreign_key
+                    c.name
+                    for c in dst_table.columns.values()
+                    if not c.is_primary_key and not c.is_foreign_key and c.name not in forbidden_tokens
                 ][:3]
+            join_target = sanitize_description_text(dst_table_name, forbidden_tokens) or dst_table_name
             if descriptive_cols:
-                suffix = f"join {dst_table_name} for {', '.join(descriptive_cols)}"
+                suffix = f"join {join_target} for {', '.join(descriptive_cols)}"
             else:
-                suffix = f"join {dst_table_name}"
+                suffix = f"join {join_target}"
+            suffix = sanitize_description_text(suffix, forbidden_tokens)
+            if not suffix:
+                continue
             existing = (col.description or "").rstrip(". ")
-            set_description(
-                col,
-                f"{existing} — {suffix}" if existing else suffix,
-                DescriptionOwner.PROFILE,
-            )
+            set_description(col, f"{existing} — {suffix}" if existing else suffix, DescriptionOwner.PROFILE)
 
 
 def _column_name_suggests_duration(name: str) -> bool:
@@ -1092,6 +1296,16 @@ def _column_name_suggests_year(name: str) -> bool:
     """Return True when a column name contains a year-like token."""
     lowered = (name or "").lower()
     return any(token in lowered for token in YEAR_LIKE_COLUMN_NAME_TOKENS)
+
+
+def _column_name_suggests_date(name: str) -> bool:
+    """Return True when a column name suggests a date/time value stored as text."""
+    lowered = (name or "").lower()
+    if lowered.endswith("_date") or lowered.endswith("_at") or lowered.endswith("_time"):
+        return True
+    if lowered.endswith("_timestamp") or lowered.startswith("date_"):
+        return True
+    return any(token in lowered for token in DATE_COLUMN_NAME_TOKENS)
 
 
 def _infer_column_role(col: ColumnMetadata) -> ColumnRole:
@@ -1110,6 +1324,9 @@ def _infer_column_role(col: ColumnMetadata) -> ColumnRole:
         return ColumnRole.BOOLEAN
 
     if col.value_type == "date":
+        return ColumnRole.TEMPORAL
+
+    if col.value_type == "string" and _column_name_suggests_date(col.name):
         return ColumnRole.TEMPORAL
 
     if col.value_type == "integer" and _column_name_suggests_duration(col.name):
@@ -1194,6 +1411,7 @@ def _validate_column_classification(col: ColumnMetadata, role: str) -> tuple[lis
 
     is_numeric = col.value_type in ("integer", "number")
     is_date_temporal = col.value_type == "date"
+    is_date_like_string = col.value_type == "string" and _column_name_suggests_date(col.name)
     is_duration_integer = col.value_type == "integer" and _column_name_suggests_duration(col.name)
     col_name_lower = col.name.lower()
     dtype = (col.data_type or "").upper()
@@ -1204,12 +1422,14 @@ def _validate_column_classification(col: ColumnMetadata, role: str) -> tuple[lis
     if role == ColumnRole.NUMERIC_CATEGORICAL.value and not is_numeric:
         hard_errors.append(f"{col.name}: NUMERIC_CATEGORICAL requires numeric type, got '{col.data_type}'")
 
-    if role == ColumnRole.AUDIT.value and not is_date_temporal:
+    if role == ColumnRole.AUDIT.value and not is_date_temporal and not is_date_like_string:
         hard_errors.append(f"{col.name}: AUDIT requires date/time type, got '{col.data_type}'")
 
     if role == ColumnRole.TEMPORAL.value:
         if is_date_temporal:
             pass
+        elif is_date_like_string:
+            soft_warnings.append(f"{col.name}: TEMPORAL on string column with date-like name")
         elif is_duration_integer:
             if _column_name_suggests_year(col.name):
                 soft_warnings.append(f"{col.name}: TEMPORAL on year-like integer column, recommend NUMERIC_CATEGORICAL")
@@ -1286,10 +1506,7 @@ def llm_classification_column_scope(schema: SchemaGraph) -> dict[str, frozenset[
 
 
 def _debug_trace_classification_scope(
-    schema: SchemaGraph,
-    scope: dict[str, frozenset[str]],
-    *,
-    log_sink: Callable[[str], None] | None = None,
+    schema: SchemaGraph, scope: dict[str, frozenset[str]], *, log_sink: Callable[[str], None] | None = None
 ) -> None:
     """Log profiling usability and LLM payload scope before schema classification."""
     total_columns = 0
@@ -1366,9 +1583,7 @@ def _deterministic_column_description(table_name: str, col: ColumnMetadata, role
 
 
 def _apply_deterministic_unscoped_column_profiles(
-    schema: SchemaGraph,
-    scope: dict[str, frozenset[str]],
-    skip_columns: set[tuple[str, str]],
+    schema: SchemaGraph, scope: dict[str, frozenset[str]], skip_columns: set[tuple[str, str]]
 ) -> int:
     """Assign heuristic roles and template descriptions to columns excluded from the LLM pass."""
     filled = 0
@@ -1471,49 +1686,99 @@ def _merge_classification_payloads(base: dict[str, Any], refined: dict[str, Any]
     return merged
 
 
-SCHEMA_NOTES_REFINE_SYSTEM: str = (
-    "You refine base_classification using domain_notes.\n\n"
-    "The base_classification was produced from profiling statistics and FK topology alone.\n"
-    "Apply domain_notes to tighten descriptions, adjust table_role and column roles where notes explicitly require, "
-    'and set column sensitivity to "restricted" or "hidden" only when domain_notes explicitly mark sensitive data for that column or category.\n'
-    "Preserve substantive keywords and meaning from base table and column descriptions.\n"
-    "Override table_role, column role, column description, table description, or sensitivity only when domain_notes are explicit; "
-    "when notes are silent, keep the base values.\n"
-    "Do not remove tables or columns from base_classification. Do not add new tables or columns.\n"
-    "Keep exactly the same table keys and column keys as base_classification.\n"
-    "Emit the full merged JSON with the same shape as base_classification.\n"
-    "Reason internally, output only JSON:\n"
-    '{"table1": {"table_role": "...", "description": "...", '
-    '"columns": {"col1": {"role": "...", "description": "...", "sensitivity": null}, ...}}, ...}'
-)
+def emit_description_enrichment_failed(scope: str, exc: Exception) -> None:
+    """Surface a failed LLM description refresh so it is not mistaken for a no-op."""
+    notify(
+        f"description enrichment failed ({scope}): {exc}",
+        stage="schema",
+        code=DIAGNOSTIC_CODE_DESCRIPTION_ENRICHMENT_FAILED,
+        level="warning",
+        details=(("scope", scope),),
+    )
 
-SCHEMA_CONSISTENCY_REFINE_SYSTEM: str = (
-    "You receive base_classification JSON describing every table and column. The user message contains only "
-    "base_classification under that key.\n\n"
-    "Preserve the base output unless you detect a genuine cross-table inconsistency — for example the same "
-    "column name and SQL data type assigned different roles in different tables. When you fix such an "
-    "inconsistency, align the conflicting entries to the role that best matches the shared name, type, and "
-    "FK topology.\n\n"
-    "Do not invent new descriptions: keep each table description and column description from the base unless a "
-    "detected inconsistency forces a minimal coordinated rewrite.\n"
-    "Do not change sensitivity values from the base.\n"
-    "Do not change column roles when the base assignment is already internally consistent.\n"
-    "Do not remove tables or columns from base_classification. Do not add new tables or columns.\n\n"
-    "Emit JSON identical in shape to base_classification.\n"
-    "Reason internally, output only JSON:\n"
-    '{"table1": {"table_role": "...", "description": "...", '
-    '"columns": {"col1": {"role": "...", "description": "...", "sensitivity": null}, ...}}, ...}'
-)
+
+def emit_description_enrichment_noop(scope: str) -> None:
+    """Surface a successful classify pass that produced no description updates."""
+    notify(
+        f"description enrichment produced no updates ({scope})",
+        stage="schema",
+        code=DIAGNOSTIC_CODE_DESCRIPTION_ENRICHMENT_NOOP,
+        level="info",
+        details=(("scope", scope),),
+    )
+
+
+def emit_schema_fk_catalog_absent_warning(dialect_name: str) -> None:
+    """Warn when catalog reflection yields no foreign keys and join edges may be inferred."""
+    notify(
+        f"{dialect_name}: catalog exposes no foreign keys; join graph edges may be inferred from samples "
+        "or operator overrides rather than enforced catalog metadata.",
+        stage="schema",
+        code=DIAGNOSTIC_CODE_SCHEMA_FK_CATALOG_ABSENT,
+        level="warning",
+        details=(("engine", dialect_name),),
+    )
+
+
+def schema_classification_content_hash(
+    schema: SchemaGraph,
+    notes_content: str | None,
+    column_scope: dict[str, frozenset[str]],
+) -> str:
+    """Return a stable digest over schema-classification inputs for disk cache lookup."""
+    notes_hash = hashlib.sha256((notes_content or "").encode("utf-8")).hexdigest()
+    payload = {
+        "effective_structural_hash": schema.effective_structural_hash or schema.structural_hash or "",
+        "profiling_hash": schema.profiling_hash or "",
+        "notes_hash": notes_hash,
+        "column_scope": {table: sorted(cols) for table, cols in sorted(column_scope.items())},
+    }
+    return hashlib.sha256(stable_json(payload).encode("utf-8")).hexdigest()
+
+
+def _schema_classification_cache_path(content_hash: str) -> Path | None:
+    schema_path = (EngineConfig.SCHEMA_JSON_PATH or "").strip()
+    if not schema_path:
+        return None
+    return Path(schema_path).parent / f"schema_classification_{content_hash[:32]}.json"
+
+
+def _load_schema_classification_cache(content_hash: str) -> dict[str, Any] | None:
+    path = _schema_classification_cache_path(content_hash)
+    if path is None or not path.is_file():
+        return None
+    try:
+        with path.open(encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or data.get("content_hash") != content_hash:
+        return None
+    payload = data.get("classifications")
+    return payload if isinstance(payload, dict) else None
+
+
+def _save_schema_classification_cache(content_hash: str, classifications: dict[str, Any]) -> None:
+    path = _schema_classification_cache_path(content_hash)
+    if path is None:
+        return
+    body = stable_json({"content_hash": content_hash, "classifications": classifications})
+    with artifact_lock(str(path.parent)):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(".tmp")
+        tmp_path.write_text(body, encoding="utf-8")
+        tmp_path.replace(path)
 
 
 def llm_classify_schema(
-    schema: SchemaGraph,
-    notes_content: str | None = None,
-    *,
-    column_scope: dict[str, frozenset[str]] | None = None,
+    schema: SchemaGraph, notes_content: str | None = None, *, column_scope: dict[str, frozenset[str]] | None = None
 ) -> dict[str, tuple[str, str, dict[str, tuple[str, str, str | None]]]]:
     """Classify table roles, column roles, descriptions, and sensitivity using a profiling-driven base pass, then an unconditional second LLM pass (notes-aware when domain notes are present, otherwise cross- table consistency refinement)."""
     scope = column_scope if column_scope is not None else llm_classification_column_scope(schema)
+    content_hash = schema_classification_content_hash(schema, notes_content, scope)
+    cached_payload = _load_schema_classification_cache(content_hash)
+    if cached_payload is not None:
+        return _normalize_llm_classification_payload(cached_payload)
     tables_data = []
     for table in schema.tables.values():
         scoped_names = scope.get(table.name, frozenset())
@@ -1599,6 +1864,7 @@ def llm_classify_schema(
         refined_payload = safe_json_loads(raw_refine)
         if refined_payload and isinstance(refined_payload, dict):
             final_payload = _merge_classification_payloads(base_payload, refined_payload)
+    _save_schema_classification_cache(content_hash, final_payload)
     return _normalize_llm_classification_payload(final_payload)
 
 
@@ -1625,7 +1891,9 @@ def apply_column_roles_llm(
     llm_success = 0
     success = False
     last_hard_errors: list[str] = []
-    max_attempts = QSimConfig.MAX_ROLE_CLASSIFICATION_RETRIES + 1
+    max_attempts = PolicyConfig.MAX_ROLE_CLASSIFICATION_RETRIES + 1
+    notes_stripped = (notes_content or "").strip()
+    description_owner = DescriptionOwner.NOTES if notes_stripped else DescriptionOwner.LLM_REFINEMENT
     for attempt in range(max_attempts):
         try:
             classifications = llm_classify_schema(schema, notes_content, column_scope=llm_column_scope)
@@ -1670,7 +1938,7 @@ def apply_column_roles_llm(
                     if can_overwrite_role(table.role_owner, RoleOwner.LLM):
                         table.role = table_role
                         table.role_owner = RoleOwner.LLM
-                    set_description(table, description, DescriptionOwner.LLM_REFINEMENT)
+                    set_description(table, description, description_owner)
                     table_role_counts[table_role] = table_role_counts.get(table_role, 0) + 1
                     for col in table.columns.values():
                         if col.name not in scoped_cols or col.name not in column_classifications:
@@ -1681,7 +1949,7 @@ def apply_column_roles_llm(
                         if can_overwrite_role(col.role_owner, RoleOwner.LLM):
                             col.role = role
                             col.role_owner = RoleOwner.LLM
-                        set_description(col, col_description, DescriptionOwner.LLM_REFINEMENT)
+                        set_description(col, col_description, description_owner)
                         set_sensitivity(col, sensitivity)
                         if col.is_primary_key or col.is_foreign_key:
                             if col.role != ColumnRole.IDENTIFIER.value and can_overwrite_role(
@@ -1719,11 +1987,7 @@ def apply_column_roles_llm(
                                 col.value_type == "integer"
                                 and _column_name_suggests_duration(col.name)
                                 and not _column_name_suggests_year(col.name)
-                                and col.role
-                                not in (
-                                    ColumnRole.TEMPORAL.value,
-                                    ColumnRole.IDENTIFIER.value,
-                                )
+                                and col.role not in (ColumnRole.TEMPORAL.value, ColumnRole.IDENTIFIER.value)
                                 and can_overwrite_role(col.role_owner, RoleOwner.PROFILE)
                             ):
                                 debug(
@@ -1918,7 +2182,7 @@ def assign_column_ops(schema: SchemaGraph) -> None:
                 col.valid_having_ops = ["=", "!=", "<", "<=", ">", ">="]
                 col.valid_aggregations = ["count"]
                 if vt == "date":
-                    col.valid_filter_ops = [
+                    col.valid_where_ops = [
                         "=",
                         "!=",
                         "<",
@@ -1930,7 +2194,7 @@ def assign_column_ops(schema: SchemaGraph) -> None:
                         "not in",
                     ] + null_ops
                 elif string:
-                    col.valid_filter_ops = [
+                    col.valid_where_ops = [
                         "=",
                         "!=",
                         "in",
@@ -1941,9 +2205,9 @@ def assign_column_ops(schema: SchemaGraph) -> None:
                         "not ilike",
                     ] + null_ops
                 else:
-                    col.valid_filter_ops = ["=", "!=", "in", "not in"] + null_ops
+                    col.valid_where_ops = ["=", "!=", "in", "not in"] + null_ops
             elif col.is_primary_key or col.is_foreign_key or role == ColumnRole.IDENTIFIER.value:
-                col.valid_filter_ops = [
+                col.valid_where_ops = [
                     "=",
                     "!=",
                     "<",
@@ -1957,7 +2221,7 @@ def assign_column_ops(schema: SchemaGraph) -> None:
                 col.valid_aggregations = ["count"]
                 col.valid_having_ops = ["=", "!=", "<", "<=", ">", ">="]
             elif role == ColumnRole.CATEGORICAL.value:
-                col.valid_filter_ops = [
+                col.valid_where_ops = [
                     "=",
                     "!=",
                     "in",
@@ -1970,7 +2234,7 @@ def assign_column_ops(schema: SchemaGraph) -> None:
                 col.valid_aggregations = ["count", "min", "max"]
                 col.valid_having_ops = ["=", "!=", "<", "<=", ">", ">="]
             elif role == ColumnRole.NUMERIC_CATEGORICAL.value:
-                col.valid_filter_ops = [
+                col.valid_where_ops = [
                     "=",
                     "!=",
                     "in",
@@ -1984,7 +2248,7 @@ def assign_column_ops(schema: SchemaGraph) -> None:
                 col.valid_aggregations = ["count", "min", "max"]
                 col.valid_having_ops = ["=", "!=", "<", "<=", ">", ">="]
             elif role == ColumnRole.NUMERIC_MEASURE.value:
-                col.valid_filter_ops = [
+                col.valid_where_ops = [
                     "=",
                     "!=",
                     "<",
@@ -1998,7 +2262,7 @@ def assign_column_ops(schema: SchemaGraph) -> None:
                 col.valid_aggregations = ["sum", "avg", "min", "max", "count"]
                 col.valid_having_ops = ["=", "!=", "<", "<=", ">", ">="]
             elif role == ColumnRole.TEMPORAL.value:
-                col.valid_filter_ops = [
+                col.valid_where_ops = [
                     "=",
                     "!=",
                     "<",
@@ -2012,11 +2276,11 @@ def assign_column_ops(schema: SchemaGraph) -> None:
                 col.valid_aggregations = ["min", "max", "count"]
                 col.valid_having_ops = ["=", "!=", "<", "<=", ">", ">="]
             elif role == ColumnRole.BOOLEAN.value:
-                col.valid_filter_ops = ["=", "!=", "in", "not in"] + null_ops
+                col.valid_where_ops = ["=", "!=", "in", "not in"] + null_ops
                 col.valid_aggregations = ["count"]
                 col.valid_having_ops = ["=", "!=", "<", "<=", ">", ">="]
             elif role == ColumnRole.FREE_TEXT.value:
-                col.valid_filter_ops = [
+                col.valid_where_ops = [
                     "like",
                     "ilike",
                     "not like",
@@ -2025,7 +2289,7 @@ def assign_column_ops(schema: SchemaGraph) -> None:
                 col.valid_aggregations = ["count"]
                 col.valid_having_ops = []
             else:
-                col.valid_filter_ops = ["=", "!="] + null_ops
+                col.valid_where_ops = ["=", "!="] + null_ops
                 col.valid_aggregations = ["count"]
                 col.valid_having_ops = ["=", "!=", "<", "<=", ">", ">="]
 
@@ -2036,14 +2300,14 @@ def assign_column_ops(schema: SchemaGraph) -> None:
                 is_arr, elt = True, "string"
             if is_arr and role != ColumnRole.AUDIT.value:
                 col.element_type = elt or "string"
-                col.valid_filter_ops = ["contains"] + null_ops
+                col.valid_where_ops = ["contains"] + null_ops
                 col.valid_aggregations = ["count"]
                 col.valid_having_ops = ["=", "!=", "<", "<=", ">", ">="]
             elif is_arr:
                 col.element_type = elt or "string"
 
             if not string:
-                col.valid_filter_ops = [op for op in col.valid_filter_ops if op not in string_only_ops]
+                col.valid_where_ops = [op for op in col.valid_where_ops if op not in string_only_ops]
             if not numeric:
                 col.valid_aggregations = [agg for agg in col.valid_aggregations if agg not in numeric_only_aggs]
 
@@ -2057,9 +2321,9 @@ def assign_column_ops(schema: SchemaGraph) -> None:
                         "is null",
                         "is not null",
                     }
-                    col.valid_filter_ops = [op for op in col.valid_filter_ops if op in pattern_ops]
+                    col.valid_where_ops = [op for op in col.valid_where_ops if op in pattern_ops]
                 else:
-                    col.valid_filter_ops = []
+                    col.valid_where_ops = []
 
     debug("[schema_profiling.assign_column_ops] completed")
 
@@ -2254,18 +2518,14 @@ def _partition_column_names_from_create_ddl(create_stmt_sql: str) -> list[str]:
     if spark_cols:
         return spark_cols
     match = re.search(
-        r"\bPARTITION\s+BY\s+(?:RANGE|LIST|HASH)\s*\(\s*([^)]+)\s*\)",
-        create_stmt_sql,
-        re.IGNORECASE | re.DOTALL,
+        r"\bPARTITION\s+BY\s+(?:RANGE|LIST|HASH)\s*\(\s*([^)]+)\s*\)", create_stmt_sql, re.IGNORECASE | re.DOTALL
     )
     if not match:
         return []
     return [c.strip().strip("`").strip('"') for c in match.group(1).split(",") if c.strip()]
 
 
-def _parse_catalog_constraints_from_ddl(
-    create_stmt: str,
-) -> tuple[list[str], list[dict[str, Any]], list[str]]:
+def _parse_catalog_constraints_from_ddl(create_stmt: str) -> tuple[list[str], list[dict[str, Any]], list[str]]:
     """Parse PRIMARY KEY, FOREIGN KEY, and single-column UNIQUE constraint fragments from DDL text."""
     primary_keys = []
     foreign_keys = []
@@ -2506,11 +2766,7 @@ def _parse_sql_file_via_llm(sql_content: str) -> dict[str, dict[str, Any]]:
     return out_tables
 
 
-def parse_sql_file(
-    sql_path: Path,
-    *,
-    reflected_schema: SchemaGraph | None = None,
-) -> dict[str, dict[str, Any]]:
+def parse_sql_file(sql_path: Path, *, reflected_schema: SchemaGraph | None = None) -> dict[str, dict[str, Any]]:
     """Parse CREATE TABLE and in-order ALTER TABLE DDL from a SQL file, with conditional LLM fallback."""
     with open(sql_path, encoding="utf-8-sig") as f:
         sql_content = f.read()
@@ -2530,7 +2786,7 @@ def parse_sql_file(
     if reflected_schema is not None and _schema_graph_has_structural_foreign_keys(reflected_schema):
         debug(
             "[schema_profiling.parse_sql_file] deterministic parsers returned 0 tables; "
-            "reflection already has FK edges — skipping DDL LLM fallback",
+            "reflection already has FK edges — skipping DDL LLM fallback"
         )
         return {}
 
@@ -2540,7 +2796,8 @@ def parse_sql_file(
 def _parse_sql_file_fallback(sql_content: str) -> dict[str, dict[str, Any]]:
     """Parse CREATE TABLE and ALTER TABLE metadata from DDL using the. active engine profile."""
     dialect_cls = get_dialect_class(EngineConfig.TYPE)
-    token = getattr(dialect_cls, "sqlglot_dialect", "postgres")
+    dialect_stub = dialect_cls.__new__(dialect_cls)
+    token = dialect_stub.sql_file_parse_dialect
     if token == "postgres":
         return _parse_sql_file_pglast_postgres(sql_content)
     return _parse_sql_file_sqlglot(sql_content, token)
@@ -2685,7 +2942,7 @@ def _parse_columns_and_constraints(
                         "src_cols": [col_name],
                         "dst_table": _trailing_table_identifier(inline_ref.group(1)),
                         "dst_cols": [c.strip().strip("`").strip('"') for c in inline_ref.group(2).split(",")],
-                    },
+                    }
                 )
 
     col_index = {name: idx for idx, name in enumerate(columns)}
@@ -2709,9 +2966,7 @@ def _extract_fk_definition(line: str) -> dict[str, Any] | None:
     """Extract a FOREIGN KEY definition from a DDL constraint line."""
     ref_table_segment = r"((?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)(?:\s*\.\s*(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*))*)"
     match = re.search(
-        r"FOREIGN\s+KEY\s*\(([^)]+)\)\s+REFERENCES\s+" + ref_table_segment + r"\s*\(([^)]+)\)",
-        line,
-        re.IGNORECASE,
+        r"FOREIGN\s+KEY\s*\(([^)]+)\)\s+REFERENCES\s+" + ref_table_segment + r"\s*\(([^)]+)\)", line, re.IGNORECASE
     )
     if match:
         return {
@@ -2722,11 +2977,7 @@ def _extract_fk_definition(line: str) -> dict[str, Any] | None:
     return None
 
 
-def _table_metadata_dict_from_ddl_parts(
-    table_name: str,
-    col_block: str,
-    full_create_sql: str,
-) -> dict[str, Any]:
+def _table_metadata_dict_from_ddl_parts(table_name: str, col_block: str, full_create_sql: str) -> dict[str, Any]:
     """Build a single-table schema metadata dict from column text and. full CREATE DDL."""
     columns, types, pks, fks, uniqs, col_nullable = _parse_columns_and_constraints(col_block)
     cat_pks, cat_fks, cat_uniqs = _parse_catalog_constraints_from_ddl(full_create_sql)
@@ -2929,8 +3180,8 @@ def _sqlglot_alter_target_table_name(alter: Any) -> str | None:
     return text or None
 
 
-def _sqlglot_column_def_name_type(col_def: Any) -> tuple[str, str] | None:
-    """Extract column name and Spark SQL type text from a sqlglot. `ColumnDef`."""
+def _sqlglot_column_def_name_type(col_def: Any, *, dialect_token: str) -> tuple[str, str] | None:
+    """Extract column name and dialect SQL type text from a sqlglot. `ColumnDef`."""
     ident = getattr(col_def, "this", None)
     col_name = getattr(ident, "name", None) if ident is not None else None
     if not isinstance(col_name, str) or not col_name.strip():
@@ -2938,7 +3189,7 @@ def _sqlglot_column_def_name_type(col_def: Any) -> tuple[str, str] | None:
     kind = getattr(col_def, "args", {}).get("kind")
     if kind is None:
         return None
-    type_sql = kind.sql(dialect="spark").strip().upper()
+    type_sql = kind.sql(dialect=dialect_token).strip().upper()
     if not type_sql:
         return None
     return col_name.strip(), type_sql
@@ -2987,10 +3238,7 @@ def _sqlglot_apply_constraint_node(tmeta: dict[str, Any], inner: Any) -> None:
         if not src_cols or parsed is None:
             return
         dst_table, dst_cols = parsed
-        _table_meta_append_foreign_key(
-            tmeta,
-            {"src_cols": src_cols, "dst_table": dst_table, "dst_cols": dst_cols},
-        )
+        _table_meta_append_foreign_key(tmeta, {"src_cols": src_cols, "dst_table": dst_table, "dst_cols": dst_cols})
         return
     if isinstance(inner, sqlglot.exp.UniqueColumnConstraint):
         schema = getattr(inner, "this", None)
@@ -3004,17 +3252,17 @@ def _sqlglot_apply_constraint_node(tmeta: dict[str, Any], inner: Any) -> None:
             _table_meta_extend_unique_columns(tmeta, cols)
 
 
-def _sqlglot_apply_alter_action(tmeta: dict[str, Any], action: Any) -> None:
+def _sqlglot_apply_alter_action(tmeta: dict[str, Any], action: Any, *, dialect_token: str) -> None:
     """Apply one sqlglot ALTER action to table metadata."""
     if isinstance(action, sqlglot.exp.ColumnDef):
-        parsed = _sqlglot_column_def_name_type(action)
+        parsed = _sqlglot_column_def_name_type(action, dialect_token=dialect_token)
         if parsed:
             _table_meta_append_column(tmeta, parsed[0], parsed[1])
         return
     if isinstance(action, sqlglot.exp.Schema):
         for e in getattr(action, "expressions", None) or ():
             if isinstance(e, sqlglot.exp.ColumnDef):
-                _sqlglot_apply_alter_action(tmeta, e)
+                _sqlglot_apply_alter_action(tmeta, e, dialect_token=dialect_token)
         return
     if isinstance(action, sqlglot.exp.AddConstraint):
         for c in getattr(action, "expressions", None) or ():
@@ -3024,7 +3272,7 @@ def _sqlglot_apply_alter_action(tmeta: dict[str, Any], action: Any) -> None:
                 _sqlglot_apply_constraint_node(tmeta, inner)
 
 
-def _apply_sqlglot_alter_table(tables: dict[str, dict[str, Any]], alter: Any) -> None:
+def _apply_sqlglot_alter_table(tables: dict[str, dict[str, Any]], alter: Any, *, dialect_token: str) -> None:
     """Apply a sqlglot `Alter` (TABLE) statement to `tables`."""
     if getattr(alter, "kind", None) != "TABLE":
         return
@@ -3036,7 +3284,7 @@ def _apply_sqlglot_alter_table(tables: dict[str, dict[str, Any]], alter: Any) ->
         debug(f"[schema_profiling._apply_sqlglot_alter_table] skip alter, unknown table: {table_name}")
         return
     for action in alter.actions:
-        _sqlglot_apply_alter_action(tmeta, action)
+        _sqlglot_apply_alter_action(tmeta, action, dialect_token=dialect_token)
 
 
 def _parse_sql_file_pglast_postgres(sql_content: str) -> dict[str, dict[str, Any]]:
@@ -3114,15 +3362,26 @@ def _parse_sql_file_sqlglot(sql_content: str, dialect_token: str) -> dict[str, d
             tables[table_name] = _table_metadata_dict_from_ddl_parts(table_name, col_block, full_stmt)
             continue
         if isinstance(stmt, sqlglot.exp.Alter):
-            _apply_sqlglot_alter_table(tables, stmt)
+            _apply_sqlglot_alter_table(tables, stmt, dialect_token=dialect_token)
 
     debug(f"[schema_profiling._parse_sql_file_sqlglot] complete ({dialect_token}): {len(tables)} tables")
     return tables
 
 
-def _parse_sql_file_sqlglot_spark(sql_content: str) -> dict[str, dict[str, Any]]:
-    """Parse Spark-style DDL via sqlglot (legacy alias)."""
-    return _parse_sql_file_sqlglot(sql_content, "spark")
+def value_overlap_stats_for_columns(
+    left: ColumnMetadata,
+    right: ColumnMetadata,
+) -> tuple[int, float] | None:
+    """Return intersection size and overlap ratio relative to the smaller ``value_overlap_sample``."""
+    s1 = set(left.value_overlap_sample or [])
+    s2 = set(right.value_overlap_sample or [])
+    if not s1 or not s2:
+        return None
+    smaller = min(len(s1), len(s2))
+    if smaller == 0:
+        return None
+    inter = len(s1 & s2)
+    return inter, inter / smaller
 
 
 def compute_semantic_profile_join_neighbors(sg: SchemaGraph) -> None:
@@ -3230,3 +3489,60 @@ def replay_user_semantic_neighbors_to_columns(sg: SchemaGraph) -> None:
     for tbl in sg.tables.values():
         for col in tbl.columns.values():
             col.semantic_join_neighbors = sorted(set(col.semantic_join_neighbors), key=lambda p: (p[0], p[1]))
+
+
+def collect_schema_description_neutrality_forbidden_tokens(graph: SchemaGraph) -> frozenset[str]:
+    """Collect physical catalog labels that must not appear in model- facing descriptions."""
+    tokens: set[str] = set()
+    for table in graph.tables.values():
+        original = (table.original_name or "").strip()
+        if original and original.lower() != table.name.lower():
+            tokens.add(original)
+        for col in table.columns.values():
+            col_original = (col.original_name or "").strip()
+            if col_original and col_original.lower() != col.name.lower():
+                tokens.add(col_original)
+    return frozenset(tokens)
+
+
+def description_neutrality_violations(text: str, forbidden_tokens: frozenset[str]) -> list[str]:
+    """Return forbidden tokens present in *text* using identifier word boundaries."""
+    cleaned = str(text or "").strip()
+    if not cleaned or not forbidden_tokens:
+        return []
+    hits: list[str] = []
+    for token in sorted(forbidden_tokens, key=len, reverse=True):
+        if not token:
+            continue
+        if re.search(rf"\b{re.escape(token)}\b", cleaned, flags=re.IGNORECASE):
+            hits.append(token)
+    return hits
+
+
+def sanitize_description_text(text: str, forbidden_tokens: frozenset[str]) -> str:
+    """Remove forbidden tokens from description prose while preserving readable remnants."""
+    cleaned = str(text or "").strip()
+    if not cleaned or not forbidden_tokens:
+        return cleaned
+    for token in sorted(forbidden_tokens, key=len, reverse=True):
+        if not token:
+            continue
+        cleaned = re.sub(rf"\b{re.escape(token)}\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" \t\n\r.,;:-—")
+    return cleaned
+
+
+def sanitize_schema_graph_descriptions(graph: SchemaGraph, forbidden_tokens: frozenset[str]) -> None:
+    """Strip neutrality violations from table and column descriptions in-place."""
+    if not forbidden_tokens:
+        return
+    for table in graph.tables.values():
+        if table.description:
+            table.description = sanitize_description_text(table.description, forbidden_tokens)
+            if not table.description:
+                table.description_owner = None
+        for col in table.columns.values():
+            if col.description:
+                col.description = sanitize_description_text(col.description, forbidden_tokens)
+                if not col.description:
+                    col.description_owner = None

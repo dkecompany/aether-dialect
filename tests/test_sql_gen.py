@@ -9,7 +9,6 @@ from aetherdialect._constants import JOIN_CHOICE_SCOPE_MAIN
 from aetherdialect._contracts_base import (
     ColumnRole,
     ExprValue,
-    FilterParam,
     HavingParam,
     JoinInjectionAlignmentError,
     JoinInjectionFailedError,
@@ -17,8 +16,14 @@ from aetherdialect._contracts_base import (
     MulGroup,
     NormalizedExpr,
     OrderByCol,
+    PredicateGroup,
+    WhereParam,
+    predicate_group_from_list,
 )
 from aetherdialect._contracts_core import (
+    FeedbackKind,
+    QuestionFeedbackEntry,
+    RejectionBucket,
     RuntimeCteStep,
     RuntimeIntent,
     SelectCol,
@@ -43,6 +48,7 @@ from aetherdialect._core_utils import (
 from aetherdialect._dialect import finalize_executable_sql
 from aetherdialect._dialect_postgres import PostgresDialect
 from aetherdialect._dialect_sqlglot_engines import DatabricksDialect
+from aetherdialect._templates import lookup_join_feedback_for_question, record_question_feedback
 from aetherdialect._sql_gen import (
     JOIN_PRIOR_FEEDBACK_HEADING,
     ScopeClass,
@@ -59,6 +65,7 @@ from aetherdialect._sql_gen import (
     _render_case_branch_sql,
     _render_case_when_sql,
     _render_group_sql,
+    _render_order_by_sql,
     _render_window_over_sql,
     _serialize_join_candidate_row,
     _try_ast_inject_joins,
@@ -82,6 +89,7 @@ from aetherdialect._sql_gen import (
     sql_gen_type_scope,
     tables_in_join_scope,
 )
+from tests.join_test_helpers import catalog_edge_kinds_for_signatures
 
 
 def _pg_render() -> PostgresDialect:
@@ -359,7 +367,7 @@ class TestCountDistinctConcatShapeA:
             select_cols=[SelectCol(expr=parsed)],
             group_by_cols=[NormalizedExpr.from_column("customers.id")],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         issues = validate_concat_mulgroups_in_runtime(intent, "main query")
         assert not issues
@@ -595,14 +603,14 @@ class TestCteToIntentForRanking:
             group_by_cols=[NormalizedExpr.from_column("t1.name")],
             output_columns=["id"],
             order_by_cols=[OrderByCol(expr=NormalizedExpr.from_column("t1.name"))],
-            filters_param=[FilterParam(left_expr=NormalizedExpr.from_column("t1.status"), op="=")],
+            where=predicate_group_from_list([WhereParam(left_expr=NormalizedExpr.from_column("t1.status"), op="=")]),
         )
         intent = cte_to_intent_for_ranking(cte)
         assert intent.tables == ["t1", "t2"]
         assert intent.grain == "grouped"
         assert len(intent.select_cols) == 1
         assert len(intent.group_by_cols) == 1
-        assert len(intent.filters_param) == 1
+        assert len(intent.where.leaves() if intent.where else []) == 1
         assert intent.cte_steps == []
 
     def test_preserves_limit(self):
@@ -641,7 +649,9 @@ class TestInjectJoinCanonicalStarOrder:
         det = "SELECT 1 FROM hub WHERE 1=1"
         sigs = [["zebra.z1->hub.h1", "apple.a1->hub.h1"]]
         dialect = PostgresDialect.__new__(PostgresDialect)
-        out = inject_join_into_deterministic_sql(det, sigs, None, dialect=dialect)
+        out = inject_join_into_deterministic_sql(
+            det, sigs, None, edge_kinds_ordered=catalog_edge_kinds_for_signatures(sigs), dialect=dialect
+        )
         assert "apple" in out and "zebra" in out
         assert out.lower().index("apple") < out.lower().index("zebra")
 
@@ -892,7 +902,7 @@ class TestJoinHintsMulti:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = join_hints_multi(schema, ["orders", "customers"], intent)
         assert result["candidates"][0]["candidate_id"] == "J01"
@@ -951,8 +961,8 @@ class TestBuildDeterministicSql:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
         )
         sql_heuristic = build_deterministic_sql(intent, None, schema, _pg_render())
         sql_driver = build_deterministic_sql(
@@ -975,8 +985,8 @@ class TestBuildDeterministicSql:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
         )
         sql = build_deterministic_sql(intent, dialect=_pg_render())
         assert "SELECT" in sql
@@ -1000,17 +1010,19 @@ class TestBuildDeterministicSql:
             ],
             group_by_cols=[NormalizedExpr(add_groups=[MulGroup(multiply=["t1.x"])], sub_groups=[])],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[
-                HavingParam(
-                    left_expr=NormalizedExpr(
-                        add_groups=[MulGroup(multiply=["t1.id"], agg_func="count")],
-                        sub_groups=[],
+            where=None,
+            having=predicate_group_from_list(
+                [
+                    HavingParam(
+                        left_expr=NormalizedExpr(
+                            add_groups=[MulGroup(multiply=["t1.id"], agg_func="count")],
+                            sub_groups=[],
+                        ),
+                        op=">",
+                        param_key="h1",
                     ),
-                    op=">",
-                    param_key="h1",
-                ),
-            ],
+                ]
+            ),
         )
         sql = build_deterministic_sql(intent, dialect=_pg_render())
         assert "GROUP BY" in sql
@@ -1027,14 +1039,16 @@ class TestBuildDeterministicSql:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr(add_groups=[MulGroup(multiply=["t1.d"])], sub_groups=[]),
-                    value_type="date_window",
-                    raw_value={"start": "2020-01-01", "end": "2020-12-31"},
-                ),
-            ],
-            having_param=[],
+            where=predicate_group_from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr(add_groups=[MulGroup(multiply=["t1.d"])], sub_groups=[]),
+                        value_type="date_window",
+                        raw_value={"start": "2020-01-01", "end": "2020-12-31"},
+                    ),
+                ]
+            ),
+            having=None,
         )
         sql = build_deterministic_sql(intent, dialect=_pg_render())
         assert ">=" in sql and "2020-01-01" in sql
@@ -1055,17 +1069,19 @@ class TestBuildDeterministicSql:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr(
-                        add_groups=[MulGroup(multiply=["payment.payment_date"])],
-                        sub_groups=[],
+            where=predicate_group_from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr(
+                            add_groups=[MulGroup(multiply=["payment.payment_date"])],
+                            sub_groups=[],
+                        ),
+                        value_type="date_window",
+                        raw_value={"unit": "day", "amount": 30},
                     ),
-                    value_type="date_window",
-                    raw_value={"unit": "day", "amount": 30},
-                ),
-            ],
-            having_param=[],
+                ]
+            ),
+            having=None,
         )
         sql_pg = build_deterministic_sql(intent, dialect=_pg_render())
         assert ">=" in sql_pg and "<=" in sql_pg
@@ -1092,8 +1108,8 @@ class TestBuildDeterministicSql:
             output_columns=["id", "total_amt"],
             group_by_cols=[NormalizedExpr(add_groups=[MulGroup(multiply=["t1.id"])], sub_groups=[])],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             column_map={},
             output_column_metadata={},
             description="",
@@ -1113,8 +1129,8 @@ class TestBuildDeterministicSql:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             cte_steps=[cte],
         )
         sql = build_deterministic_sql(intent, dialect=_pg_render())
@@ -1133,8 +1149,8 @@ class TestBuildDeterministicSql:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             limit=10,
         )
         sql = build_deterministic_sql(intent, dialect=_pg_render())
@@ -1155,8 +1171,8 @@ class TestBuildDeterministicSql:
                     direction="desc",
                 ),
             ],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
         )
         sql = build_deterministic_sql(intent, dialect=_pg_render())
         assert "ORDER BY" in sql
@@ -1204,8 +1220,8 @@ class TestBuildDeterministicSql:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             window_registry=[
                 WindowRegistryStep(
                     registry_id="w01",
@@ -1228,9 +1244,9 @@ class TestBuildJoinAstFromSignature:
 
         sig = ["orders.cid->customers.id"]
         from_t = "orders"
-        result = _join_edges_from_signature(sig, [""], from_t, None)
+        result = _join_edges_from_signature(sig, ["catalog_fk"], from_t, None)
         assert result is not None
-        edges, where_edges, extra_from = result
+        edges, where_edges, extra_from, _anti_join = result
         assert edges and isinstance(edges[0], JoinEdge)
         assert where_edges == []
         assert extra_from == []
@@ -1251,9 +1267,9 @@ class TestBuildJoinAstFromSignature:
 
         sig = ["orders.cid->customers.id"]
         from_t = "orders"
-        result = _join_edges_from_signature(sig, [""], from_t, None)
+        result = _join_edges_from_signature(sig, ["catalog_fk"], from_t, None)
         assert result is not None
-        edges, where_edges, extra_from = result
+        edges, where_edges, extra_from, _anti_join = result
         assert edges and isinstance(edges[0], JoinEdge)
         assert where_edges == []
         assert extra_from == []
@@ -1276,7 +1292,7 @@ class TestPartitionPathJoinVsWhere:
         from aetherdialect._sql_gen import _partition_path_join_vs_where
 
         sig = ["a.fk->b.id", "b.fk->c.id"]
-        kinds = ["catalog", "inferred"]
+        kinds = ["catalog_fk", "inferred_suffix_fk"]
         join_b, where_b = _partition_path_join_vs_where(sig, kinds)
         assert len(join_b) == 2
         assert where_b == []
@@ -1285,7 +1301,7 @@ class TestPartitionPathJoinVsWhere:
         from aetherdialect._sql_gen import _partition_path_join_vs_where
 
         sig = ["a.fk->b.id", "b.x->c.x"]
-        kinds = ["catalog", "semantic_profile"]
+        kinds = ["catalog_fk", "semantic_profile"]
         join_b, where_b = _partition_path_join_vs_where(sig, kinds)
         assert len(join_b) == 1
         assert join_b[0][1] == "a"
@@ -1300,21 +1316,19 @@ class TestPartitionPathJoinVsWhere:
         assert join_b == []
         assert len(where_b) == 1
 
-    def test_unknown_kind_defaults_to_join_bucket(self):
+    def test_unknown_kind_raises_join_injection_failed(self):
         from aetherdialect._sql_gen import _partition_path_join_vs_where
 
         sig = ["a.fk->b.id"]
-        join_b, where_b = _partition_path_join_vs_where(sig, ["mystery_kind"])
-        assert len(join_b) == 1
-        assert where_b == []
+        with pytest.raises(JoinInjectionFailedError, match=r"mystery_kind.*a\.fk->b\.id"):
+            _partition_path_join_vs_where(sig, ["mystery_kind"])
 
-    def test_missing_kind_defaults_to_join_bucket(self):
+    def test_missing_kind_raises_join_injection_failed(self):
         from aetherdialect._sql_gen import _partition_path_join_vs_where
 
         sig = ["a.fk->b.id", "b.fk->c.id"]
-        join_b, where_b = _partition_path_join_vs_where(sig, [])
-        assert len(join_b) == 2
-        assert where_b == []
+        with pytest.raises(JoinInjectionFailedError, match=r"missing.*b\.fk->c\.id"):
+            _partition_path_join_vs_where(sig, ["catalog_fk"])
 
 
 class TestJoinEdgesFromSignatureMixed:
@@ -1324,10 +1338,10 @@ class TestJoinEdgesFromSignatureMixed:
         from aetherdialect._sql_gen import _join_edges_from_signature
 
         sig = ["orders.cid->customers.id", "customers.email->ext.email"]
-        kinds = ["catalog", "semantic_profile"]
+        kinds = ["catalog_fk", "semantic_profile"]
         result = _join_edges_from_signature(sig, kinds, "orders", None)
         assert result is not None
-        join_edges, where_edges, extra_from = result
+        join_edges, where_edges, extra_from, _anti_join = result
         assert len(join_edges) == 1
         assert join_edges[0].table == "customers"
         assert len(where_edges) == 1
@@ -1339,7 +1353,7 @@ class TestJoinEdgesFromSignatureMixed:
         sig = ["a.x->b.x"]
         result = _join_edges_from_signature(sig, ["semantic_profile"], "a", None)
         assert result is not None
-        join_edges, where_edges, extra_from = result
+        join_edges, where_edges, extra_from, _anti_join = result
         assert join_edges == []
         assert len(where_edges) == 1
         assert "b" in extra_from
@@ -1351,7 +1365,7 @@ class TestJoinEdgesFromSignatureMixed:
 
         sig = ["film.parent_film_id->film.film_id"]
         with pytest.raises(NoJoinPathError):
-            _join_edges_from_signature(sig, ["catalog"], "film", None)
+            _join_edges_from_signature(sig, ["catalog_fk"], "film", None)
 
 
 class TestInjectJoinDeterministicSqlMixed:
@@ -1360,7 +1374,7 @@ class TestInjectJoinDeterministicSqlMixed:
     def test_fk_plus_semantic_emits_join_extra_from_and_where(self):
         det = "SELECT 1 FROM orders WHERE TRUE"
         sigs = [["orders.cid->customers.id", "customers.email->ext.email"]]
-        kinds = [["catalog", "semantic_profile"]]
+        kinds = [["catalog_fk", "semantic_profile"]]
         out = inject_join_into_deterministic_sql(
             det,
             sigs,
@@ -1378,7 +1392,9 @@ class TestInjectJoinDeterministicSqlMixed:
         det_sql = "SELECT t1.a\nFROM t1\nWHERE t1.a = :p1"
         sigs = [["t1.fk->t2.pk"]]
         dialect = PostgresDialect.__new__(PostgresDialect)
-        out = inject_join_into_deterministic_sql(det_sql, sigs, None, dialect=dialect)
+        out = inject_join_into_deterministic_sql(
+            det_sql, sigs, None, edge_kinds_ordered=catalog_edge_kinds_for_signatures(sigs), dialect=dialect
+        )
         low = out.lower()
         assert "join t2" in low
         assert "t1.fk" in low
@@ -1391,7 +1407,9 @@ class TestInjectJoinDeterministicSqlMixed:
         det_sql = "SELECT t1.a\nFROM t1\nWHERE x = :p1"
         sigs = [["t1.fk->t2.pk"]]
         dialect = PostgresDialect.__new__(PostgresDialect)
-        out = inject_join_into_deterministic_sql(det_sql, sigs, None, dialect=dialect)
+        out = inject_join_into_deterministic_sql(
+            det_sql, sigs, None, edge_kinds_ordered=catalog_edge_kinds_for_signatures(sigs), dialect=dialect
+        )
         low = out.lower()
         assert "join t2" in low
         assert "t1.fk" in low
@@ -1404,7 +1422,9 @@ class TestInjectJoinDeterministicSqlMixed:
         det_sql = "SELECT SUM(:s1 * t1.amt) + :s2 AS total\nFROM t1\nWHERE LOWER(t1.cat) = :p1"
         sigs = [["t1.fk->t2.pk"]]
         dialect = PostgresDialect.__new__(PostgresDialect)
-        out = inject_join_into_deterministic_sql(det_sql, sigs, None, dialect=dialect)
+        out = inject_join_into_deterministic_sql(
+            det_sql, sigs, None, edge_kinds_ordered=catalog_edge_kinds_for_signatures(sigs), dialect=dialect
+        )
         assert ":s1" in out
         assert ":s2" in out
         assert ":p1" in out
@@ -1417,7 +1437,9 @@ class TestInjectJoinDeterministicSqlMixed:
         det_sql = "SELECT `user`.id\nFROM `user`\nWHERE 1=1"
         sigs = [["user.fk->other.pk"]]
         dialect = DatabricksDialect.__new__(DatabricksDialect)
-        out = inject_join_into_deterministic_sql(det_sql, sigs, None, dialect=dialect)
+        out = inject_join_into_deterministic_sql(
+            det_sql, sigs, None, edge_kinds_ordered=catalog_edge_kinds_for_signatures(sigs), dialect=dialect
+        )
         assert "other" in out.lower()
         assert "fk" in out and "pk" in out
 
@@ -1453,7 +1475,9 @@ class TestInjectJoinDeterministicSqlMixed:
         det_sql = "WITH cte1 AS (\nSELECT x\nFROM a\n)\nSELECT cte1.x\nFROM cte1"
         sigs = [["a.fk->b.pk"], ["cte1.x->other.y"]]
         dialect = PostgresDialect.__new__(PostgresDialect)
-        out = inject_join_into_deterministic_sql(det_sql, sigs, None, dialect=dialect)
+        out = inject_join_into_deterministic_sql(
+            det_sql, sigs, None, edge_kinds_ordered=catalog_edge_kinds_for_signatures(sigs), dialect=dialect
+        )
         low = out.lower()
         assert "join b" in low
         assert "a.fk = b.pk" in low
@@ -1465,7 +1489,9 @@ class TestInjectJoinDeterministicSqlMixed:
         det_sql = "WITH emp_mgr AS (SELECT id, manager_id FROM employee)\nSELECT emp_mgr.id\nFROM emp_mgr"
         sigs = [[], ["emp_mgr.manager_id->employee.id"]]
         dialect = PostgresDialect.__new__(PostgresDialect)
-        out = inject_join_into_deterministic_sql(det_sql, sigs, schema=None, dialect=dialect)
+        out = inject_join_into_deterministic_sql(
+            det_sql, sigs, schema=None, edge_kinds_ordered=catalog_edge_kinds_for_signatures(sigs), dialect=dialect
+        )
         assert "join employee" in out.lower()
         assert "emp_mgr.manager_id" in out.replace(" ", "").lower()
 
@@ -1490,7 +1516,9 @@ class TestInjectJoinDeterministicSqlMixed:
         det_sql = 'WITH cte1 AS (\nSELECT "actor"."actor_id"\nFROM "actor"\n)\nSELECT "cte1"."actor_id"\nFROM cte1'
         sigs = [["actor.actor_id->film_actor.actor_id"], []]
         dialect = PostgresDialect.__new__(PostgresDialect)
-        out = inject_join_into_deterministic_sql(det_sql, sigs, None, dialect=dialect)
+        out = inject_join_into_deterministic_sql(
+            det_sql, sigs, None, edge_kinds_ordered=catalog_edge_kinds_for_signatures(sigs), dialect=dialect
+        )
         low = out.lower()
         assert "join" in low and "film_actor" in low
         assert "actor.actor_id" in low.replace('"', "").lower()
@@ -1543,8 +1571,8 @@ class TestReduceStructuralSqlPlaceholders:
             None,
             sqlglot_dialect="postgres",
         )
-        assert ":p1" not in out
-        assert "42" in out
+        assert ":p1" in out
+        assert "42" not in out
         assert ":s1" not in out
 
 
@@ -1590,7 +1618,7 @@ class TestJoinClauseKindAndSyntheticPaths:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("film.title"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte_step],
         )
         virt = {
@@ -1610,7 +1638,7 @@ class TestJoinClauseKindAndSyntheticPaths:
         assert any("virtual_pk_bridge" in k for k in kinds)
 
     def test_virtual_shared_pk_between_two_ctes_on_same_base_pk(self):
-        """Two CTEs inheriting the same physical PK column emit virtual_shared_pk (plan D.2)."""
+        """Two CTEs inheriting the same physical PK column emit virtual_shared_pk."""
         film_cols = {
             "FilmId": ColumnMetadata(
                 name="FilmId",
@@ -1697,33 +1725,34 @@ class TestJoinClausePartsWithBoolOpMatrix:
         assert out.count(" AND ") == 2
 
 
-class TestWhereChainBoolOpRendering:
-    """WHERE rendering preserves forward ``bool_op`` and ``filter_group`` parentheses."""
+class TestWherePredicateGroupRendering:
+    """WHERE rendering preserves PredicateGroup OR semantics and nested groups."""
 
-    def test_render_where_chain_emits_or_when_bool_op_is_or(self) -> None:
+    def test_render_where_chain_emits_or_when_group_op_is_or(self) -> None:
         dialect = PostgresDialect.__new__(PostgresDialect)
         sql = _build_deterministic_select_block(
             [SelectCol(expr=NormalizedExpr.from_column("t.a"))],
             ["t"],
             [],
             [],
-            [
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("t.a"),
-                    op="=",
-                    param_key="p1",
-                    value_type="string",
-                    bool_op="OR",
+            PredicateGroup(
+                op="or",
+                predicates=(
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("t.a"),
+                        op="=",
+                        param_key="p1",
+                        value_type="string",
+                    ),
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("t.b"),
+                        op="=",
+                        param_key="p2",
+                        value_type="string",
+                    ),
                 ),
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("t.b"),
-                    op="=",
-                    param_key="p2",
-                    value_type="string",
-                    bool_op="AND",
-                ),
-            ],
-            [],
+            ),
+            None,
             None,
             "row_level",
             dialect,
@@ -1731,40 +1760,47 @@ class TestWhereChainBoolOpRendering:
         assert "WHERE" in sql
         assert " OR " in sql
 
-    def test_render_where_chain_groups_filter_group_with_parens(self) -> None:
+    def test_render_where_chain_groups_nested_groups_with_parens(self) -> None:
         dialect = PostgresDialect.__new__(PostgresDialect)
         sql = _build_deterministic_select_block(
             [SelectCol(expr=NormalizedExpr.from_column("t.a"))],
             ["t"],
             [],
             [],
-            [
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("t.a"),
-                    op="=",
-                    param_key="p1",
-                    value_type="string",
-                    bool_op="AND",
-                    filter_group=0,
+            PredicateGroup(
+                op="or",
+                groups=(
+                    PredicateGroup(
+                        op="and",
+                        predicates=(
+                            WhereParam(
+                                left_expr=NormalizedExpr.from_column("t.a"),
+                                op="=",
+                                param_key="p1",
+                                value_type="string",
+                            ),
+                            WhereParam(
+                                left_expr=NormalizedExpr.from_column("t.b"),
+                                op="=",
+                                param_key="p2",
+                                value_type="string",
+                            ),
+                        ),
+                    ),
+                    PredicateGroup(
+                        op="and",
+                        predicates=(
+                            WhereParam(
+                                left_expr=NormalizedExpr.from_column("t.c"),
+                                op="=",
+                                param_key="p3",
+                                value_type="string",
+                            ),
+                        ),
+                    ),
                 ),
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("t.b"),
-                    op="=",
-                    param_key="p2",
-                    value_type="string",
-                    bool_op="OR",
-                    filter_group=0,
-                ),
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("t.c"),
-                    op="=",
-                    param_key="p3",
-                    value_type="string",
-                    bool_op="AND",
-                    filter_group=1,
-                ),
-            ],
-            [],
+            ),
+            None,
             None,
             "row_level",
             dialect,
@@ -2000,8 +2036,8 @@ class TestMergeJoinHintsNaScopesUsesMainKey:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t1.a"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
         )
         schema = SchemaGraph(
             tables={
@@ -2185,7 +2221,7 @@ class TestRenderCaseWhenSql:
     """CASE / WHEN rendering for SELECT."""
 
     def test_is_null_branch(self) -> None:
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.x"),
             op="is null",
             value_type="string",
@@ -2193,7 +2229,7 @@ class TestRenderCaseWhenSql:
         assert _render_case_branch_sql(fp) == "t.x IS NULL"
 
     def test_param_comparison(self) -> None:
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op="=",
             value_type="integer",
@@ -2202,7 +2238,7 @@ class TestRenderCaseWhenSql:
         assert _render_case_branch_sql(fp) == "t.a = :p1"
 
     def test_in_branch_renders_param_in_parens(self) -> None:
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.kind"),
             op="in",
             value_type="string",
@@ -2211,7 +2247,7 @@ class TestRenderCaseWhenSql:
         assert _render_case_branch_sql(fp) == "t.kind IN (:p1)"
 
     def test_not_in_branch_renders_param_in_parens(self) -> None:
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.kind"),
             op="not in",
             value_type="string",
@@ -2224,7 +2260,7 @@ class TestRenderCaseWhenSql:
             branches=[
                 CaseWhenBranch.from_dict(
                     {
-                        "condition": FilterParam(
+                        "condition": WhereParam(
                             left_expr=NormalizedExpr.from_column("t.flag"),
                             op="=",
                             param_key="p1",
@@ -2244,7 +2280,7 @@ class TestRenderCaseWhenSql:
         cw = CaseWhenExpr(
             branches=[
                 CaseWhenBranch(
-                    condition=FilterParam(
+                    condition=WhereParam(
                         left_expr=NormalizedExpr.from_column("t.flag"),
                         op="=",
                         param_key="p1",
@@ -2268,7 +2304,7 @@ class TestRenderSelectColCaseAndWindow:
         cw = CaseWhenExpr(
             branches=[
                 CaseWhenBranch(
-                    condition=FilterParam(
+                    condition=WhereParam(
                         left_expr=NormalizedExpr.from_column("t.ok"),
                         op="is not null",
                         value_type="string",
@@ -2334,15 +2370,17 @@ class TestBuildDeterministicSqlEdgeCases:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t1.name"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("t1.name"),
-                    op="like",
-                    value_type="string",
-                    param_key="pat",
-                )
-            ],
-            having_param=[],
+            where=predicate_group_from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("t1.name"),
+                        op="like",
+                        value_type="string",
+                        param_key="pat",
+                    )
+                ]
+            ),
+            having=None,
         )
         sql = build_deterministic_sql(intent, dialect=_pg_render())
         assert "LOWER" in sql
@@ -2355,15 +2393,17 @@ class TestBuildDeterministicSqlEdgeCases:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t1.name"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("t1.name"),
-                    op="ilike",
-                    value_type="string",
-                    param_key="p",
-                )
-            ],
-            having_param=[],
+            where=predicate_group_from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("t1.name"),
+                        op="ilike",
+                        value_type="string",
+                        param_key="p",
+                    )
+                ]
+            ),
+            having=None,
         )
         sql = build_deterministic_sql(intent, dialect=_pg_render())
         assert "ILIKE" in sql.upper()
@@ -2376,15 +2416,17 @@ class TestBuildDeterministicSqlEdgeCases:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t1.tags"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("t1.tags"),
-                    op="contains",
-                    value_type="array",
-                    param_key="tag",
-                )
-            ],
-            having_param=[],
+            where=predicate_group_from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("t1.tags"),
+                        op="contains",
+                        value_type="array",
+                        param_key="tag",
+                    )
+                ]
+            ),
+            having=None,
         )
         sql = build_deterministic_sql(intent, dialect=_pg_render())
         assert ":tag" in sql
@@ -2396,26 +2438,27 @@ class TestBuildDeterministicSqlEdgeCases:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t1.a"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("t1.a"),
-                    op="=",
-                    value_type="integer",
-                    param_key="p1",
-                    bool_op="OR",
+            where=PredicateGroup(
+                op="or",
+                predicates=(
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("t1.a"),
+                        op="=",
+                        value_type="integer",
+                        param_key="p1",
+                    ),
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("t1.b"),
+                        op="=",
+                        value_type="integer",
+                        param_key="p2",
+                    ),
                 ),
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("t1.b"),
-                    op="=",
-                    value_type="integer",
-                    param_key="p2",
-                    bool_op="AND",
-                ),
-            ],
-            having_param=[],
+            ),
+            having=None,
         )
         sql = build_deterministic_sql(intent, dialect=_pg_render())
-        assert "WHERE (" in sql
+        assert "WHERE" in sql
         assert " OR " in sql
 
     def test_order_by_resolves_from_anchor_case_insensitive(self) -> None:
@@ -2445,8 +2488,8 @@ class TestBuildDeterministicSqlEdgeCases:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("film.title"))],
             group_by_cols=[],
             order_by_cols=[OrderByCol(expr=NormalizedExpr.from_column("film.title"), direction="asc")],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
         )
         sql = build_deterministic_sql(intent, None, schema, _pg_render())
         assert 'FROM "film"' in sql
@@ -2458,7 +2501,9 @@ class TestInjectJoinStripsCommentWhenComplete:
     def test_marker_is_not_re_emitted(self) -> None:
         det = "SELECT a FROM t\n-- <JOIN: integrate from join candidates>\nWHERE 1=1"
         dialect = PostgresDialect.__new__(PostgresDialect)
-        out = inject_join_into_deterministic_sql(det, [["t.fk->u.pk"]], dialect=dialect)
+        out = inject_join_into_deterministic_sql(
+            det, [["t.fk->u.pk"]], edge_kinds_ordered=[["catalog_fk"]], dialect=dialect
+        )
         assert "<JOIN" not in out
 
 
@@ -2500,6 +2545,42 @@ class TestJoinChoicePromptAndValidation:
         )
         assert JOIN_PRIOR_FEEDBACK_HEADING in system
         assert "wrong dimension" in system
+        assert "scopes" in user
+
+    def test_join_feedback_injection_includes_verified_signature_when_present(self) -> None:
+        verified_sig = "orders.customer_id->customers.id"
+        store: dict = {"question_feedback": {}}
+        entry = QuestionFeedbackEntry(
+            summary="joined wrong dimension",
+            buckets=(RejectionBucket.WRONG_TABLES_OR_JOINS,),
+            kind=FeedbackKind.INTENT_REJECTED,
+            effective_structural_hash="h",
+            intent_structural_hash="ih",
+            intent_payload="{}",
+            created_at="t",
+            updated_at="t",
+            rejected_join_path_signature=(verified_sig,),
+        )
+        record_question_feedback(store, "q?", entry)
+        feedback_lines = lookup_join_feedback_for_question(store, "q?")
+        assert feedback_lines
+        assert verified_sig in feedback_lines[0]
+
+        scopes = [
+            {
+                "scope": JOIN_CHOICE_SCOPE_MAIN,
+                "tables": ["orders", "customers"],
+                "candidates": [{"candidate_id": "J01", "join_path_signature": [verified_sig]}],
+            },
+        ]
+        system, user = build_join_choice_prompt(
+            "q?",
+            "SELECT 1",
+            scopes,
+            prior_join_feedback=feedback_lines,
+        )
+        assert JOIN_PRIOR_FEEDBACK_HEADING in system
+        assert verified_sig in system
         assert "scopes" in user
 
     def test_parse_join_choice_payload(self) -> None:
@@ -2545,7 +2626,7 @@ class TestJoinChoicePromptAndValidation:
 
 
 class TestClassifyScopeCandidatesMatrix:
-    """``classify_scope_candidates`` coverage for plan D.8 disambiguation policy."""
+    """``classify_scope_candidates`` coverage for ambiguous join-path disambiguation."""
 
     @staticmethod
     def _fk(cid: str) -> dict[str, str]:
@@ -2587,7 +2668,7 @@ class TestClassifyScopeCandidatesMatrix:
 
 
 class TestVirtualFkShadowPath:
-    """Plan D.2: FK from a CTE column whose target is out of scope emits a shadow bridge."""
+    """FK from a CTE column whose target is out of scope emits a shadow bridge."""
 
     def test_shadow_fk_when_target_out_of_scope(self) -> None:
         """A CTE FK to an out-of-scope table is emitted as ``virtual_fk_shadow_path`` when it bridges a real path."""
@@ -2695,7 +2776,7 @@ class TestVirtualFkShadowPath:
 
 
 class TestVirtualSharedBase:
-    """Plan D.2: two CTEs with role (non-PK) over the same base column emit virtual_shared_base."""
+    """Two CTEs with role (non-PK) over the same base column emit virtual_shared_base."""
 
     def test_shared_base_when_both_have_fk_to_same_column(self) -> None:
         customer_cols = {
@@ -2889,7 +2970,7 @@ class TestMaybeRenderArrayUnnestSelect:
 class TestCandidateJoinPathsBridgeFallback:
     """``_candidate_join_paths_for_tables`` falls back when bridge tables are required."""
 
-    def test_bridge_path_when_direct_paths_exclude_extra_tables(self) -> None:
+    def test_bridge_path_when_direct_paths_exclude_bridge_tables(self) -> None:
         bridge_edge = {
             "src_table": "a",
             "src_cols": ["id"],
@@ -2945,7 +3026,7 @@ class TestRegistrySqlParity:
             select_cols=[SelectCol(expr=NormalizedExpr(column_ref="w01"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             window_registry=[
                 WindowRegistryStep(
                     registry_id="w01",
@@ -2978,6 +3059,7 @@ class TestPromotedSemanticEdgeFlowsThroughJoinHints:
                 distinct_count=100,
                 row_count=200,
                 null_ratio=0.0,
+                value_overlap_sample=["1", "2", "3", "4", "5"],
                 semantic_join_neighbors=[("right_tbl", "id" if right_is_pk else "other")],
             ),
         }
@@ -2990,6 +3072,7 @@ class TestPromotedSemanticEdgeFlowsThroughJoinHints:
                 distinct_count=100,
                 row_count=100,
                 null_ratio=0.0,
+                value_overlap_sample=["1", "2", "3", "4", "5"],
                 semantic_join_neighbors=([("left_tbl", "right_tbl_id")] if right_is_pk else []),
             ),
             "other": ColumnMetadata(
@@ -2999,6 +3082,7 @@ class TestPromotedSemanticEdgeFlowsThroughJoinHints:
                 distinct_count=50,
                 row_count=100,
                 null_ratio=0.0,
+                value_overlap_sample=["1", "2", "3", "4", "5"],
                 semantic_join_neighbors=([] if right_is_pk else [("left_tbl", "right_tbl_id")]),
             ),
         }
@@ -3234,6 +3318,8 @@ class TestVisibilityFilterInJoinPaths:
         }
         out = _serialize_join_candidate_row(row)
         assert out["candidate_id"] == "J01"
+        assert "edge_kinds" not in out
+        assert "candidate_tier" not in out
 
     def test_serialize_join_candidate_row_with_schema_visible_passes(self) -> None:
         """With schema kwarg, visible columns serialize normally."""
@@ -3260,3 +3346,104 @@ class TestVisibilityFilterInJoinPaths:
         }
         with pytest.raises(AssertionError, match="non-visible column"):
             _serialize_join_candidate_row(row, schema=sg)
+
+
+class TestOrderByNullPlacement:
+    @staticmethod
+    def _stub_dialect(engine: str):
+        from aetherdialect._dialect import get_dialect_class
+
+        dialect_cls = get_dialect_class(engine)
+        return dialect_cls.__new__(dialect_cls)
+
+    def test_postgresql_renders_native_nulls_last(self) -> None:
+        cols = [OrderByCol(expr=NormalizedExpr.from_column("t.n"), direction="ASC", nulls="last")]
+        sql = _render_order_by_sql(cols, self._stub_dialect("postgresql"))
+        assert "NULLS LAST" in sql
+
+    def test_mysql_renders_is_null_rewrite_for_nulls_first(self) -> None:
+        cols = [OrderByCol(expr=NormalizedExpr.from_column("t.n"), direction="ASC", nulls="first")]
+        sql = _render_order_by_sql(cols, self._stub_dialect("mysql"))
+        assert "IS NULL" in sql
+        assert "NULLS FIRST" not in sql
+
+    def test_window_and_outer_order_by_agree_on_null_placement(self) -> None:
+        dialect = self._stub_dialect("postgresql")
+        cols = [OrderByCol(expr=NormalizedExpr.from_column("t.n"), direction="DESC", nulls="first")]
+        outer = _render_order_by_sql(cols, dialect)
+        ws = WindowSpec(function="row_number", partition_by=[], order_by=cols, frame_kind="none")
+        window = _render_window_over_sql(ws, dialect)
+        assert "NULLS FIRST" in outer
+        assert outer.split("NULLS FIRST")[0].strip() in window
+
+    def test_nulls_first_round_trips_through_sql_import(self) -> None:
+        from sqlglot import parse_one
+
+        from aetherdialect._sql_to_intent_sqlglot import _window_sort_clause
+
+        order_node = parse_one("SELECT 1 ORDER BY t.n DESC NULLS FIRST").args["order"]
+        cols = _window_sort_clause(order_node, "postgres", {"t": "t"}, "t", {}, lambda: "p1", [], None)
+        assert cols is not None
+        assert cols[0].nulls == "first"
+        assert cols[0].direction == "DESC"
+
+
+class TestExtendedWindowFunctions:
+    """Rendering and import for ntile, percent_rank, cume_dist, and nth_value."""
+
+    def test_ntile_renders_with_bucket_count(self) -> None:
+        ws = WindowSpec(
+            function="ntile",
+            numeric_argument=4,
+            order_by=[OrderByCol(expr=NormalizedExpr.from_column("t.x"), direction="asc")],
+        )
+        compact = _render_window_over_sql(ws, _pg_render()).replace(" ", "")
+        assert "NTILE(4)" in compact
+
+    def test_percent_rank_renders_without_arguments(self) -> None:
+        ws = WindowSpec(
+            function="percent_rank",
+            order_by=[OrderByCol(expr=NormalizedExpr.from_column("t.x"), direction="asc")],
+        )
+        compact = _render_window_over_sql(ws, _pg_render()).replace(" ", "")
+        assert "PERCENT_RANK()" in compact
+
+    def test_cume_dist_renders_without_arguments(self) -> None:
+        ws = WindowSpec(
+            function="cume_dist",
+            order_by=[OrderByCol(expr=NormalizedExpr.from_column("t.x"), direction="asc")],
+        )
+        compact = _render_window_over_sql(ws, _pg_render()).replace(" ", "")
+        assert "CUME_DIST()" in compact
+
+    def test_nth_value_renders_expression_and_offset(self) -> None:
+        ws = WindowSpec(
+            function="nth_value",
+            argument=NormalizedExpr.from_column("t.y"),
+            numeric_argument=2,
+            order_by=[OrderByCol(expr=NormalizedExpr.from_column("t.x"), direction="asc")],
+        )
+        compact = _render_window_over_sql(ws, _pg_render()).replace(" ", "").replace('"', "")
+        assert "NTH_VALUE(t.y,2)" in compact
+
+    def test_ntile_integer_argument_round_trips_through_sql_import(self) -> None:
+        from sqlglot import exp, parse_one
+
+        from aetherdialect._sql_to_intent_sqlglot import _window_def_to_spec
+
+        window = parse_one("SELECT NTILE(4) OVER (ORDER BY t.x) FROM t").find(exp.Window)
+        ws = _window_def_to_spec(
+            window,
+            window.this,
+            "postgres",
+            {"t": "t"},
+            "t",
+            {},
+            lambda: "p1",
+            [],
+            None,
+        )
+        assert ws is not None
+        assert ws.function == "ntile"
+        assert ws.numeric_argument == 4
+        assert ws.argument is None

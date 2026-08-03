@@ -24,8 +24,8 @@ def test_deterministic_single_table_film_title(schema, t2s) -> None:
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("item.title"))],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
-        having_param=[],
+        where=None,
+        having=None,
     )
     store = empty_template_store(schema.effective_structural_hash)
     with patch("aetherdialect._pipeline.get_join_choice_from_llm", side_effect=_llm_forbidden):
@@ -52,8 +52,8 @@ def test_deterministic_film_language_join(schema, t2s) -> None:
         ],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
-        having_param=[],
+        where=None,
+        having=None,
     )
     store = empty_template_store(schema.effective_structural_hash)
     with patch("aetherdialect._pipeline.get_join_choice_from_llm", side_effect=_llm_forbidden):
