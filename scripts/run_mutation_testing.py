@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_BASELINE = REPO_ROOT / "dev_workspace" / "mutation_baseline.json"
+DEFAULT_BASELINE = REPO_ROOT / "scripts" / "mutation_baseline.json"
 PACKAGE_SRC = REPO_ROOT / "src" / "aetherdialect"
 
 TARGET_MODULES: tuple[str, ...] = (
@@ -239,7 +239,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--baseline",
         type=Path,
         default=DEFAULT_BASELINE,
-        help="Path to mutation_baseline.json (default: dev_workspace/mutation_baseline.json)",
+        help="Path to mutation_baseline.json (default: scripts/mutation_baseline.json)",
     )
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--init", action="store_true", help="Seed baseline structure with placeholder counts")

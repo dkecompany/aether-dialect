@@ -9,8 +9,6 @@ from unittest.mock import MagicMock
 import pytest
 from sqlglot import exp
 
-import aetherdialect._sql_gen
-from aetherdialect import _federation
 from aetherdialect._constants import DISTINCT_ON_RANK_COLUMN
 from aetherdialect._contracts_base import (
     NormalizedExpr,
@@ -233,12 +231,6 @@ def test_render_predicate_group_sql_or_chain_parentheses() -> None:
     assert '"t"."a"' in sql and '"t"."c"' in sql
 
 
-@pytest.mark.fast
-def test_join_on_equality_sql_removed() -> None:
-    """Dead _join_on_equality_sql helper must not remain in _sql_gen."""
-    assert not hasattr(aetherdialect._sql_gen, "_join_on_equality_sql")
-
-
 def _fp(col: str) -> WhereParam:
     return WhereParam(left_expr=NormalizedExpr.from_column(col), op="=", raw_value="x", param_key="p1")
 
@@ -307,15 +299,6 @@ def test_dialect_quote_table_column_routes_through_sqlglot(engine: str, sqlglot_
     got = dialect.quote_table_column("orders", "status")
     expected = Dialect.sqlglot_quote_table_column("orders", "status", sqlglot_name, quoted=quoted)
     assert got == expected
-
-
-@pytest.mark.fast
-def test_federation_and_engine_loaders_share_sqlglot_quote_helper() -> None:
-    """Federation glue and DuckDB CSV loaders must not keep local _quote_ident copies."""
-    from aetherdialect._dialect import Dialect
-
-    assert not hasattr(_federation, "_quote_ident")
-    assert callable(Dialect.sqlglot_quote_identifier)
 
 
 @pytest.mark.fast

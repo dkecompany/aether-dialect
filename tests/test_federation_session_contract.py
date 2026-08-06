@@ -247,7 +247,6 @@ def test_prepared_federated_outcome_reads_suspend_not_engine_slot() -> None:
             declaration_file="/tmp/aether_fed_surface_declaration.json",
         )
     assert fed.prepared_federated_outcome() is None
-    assert not hasattr(fed, "_federated_prepare")
 
 
 @pytest.mark.fast

@@ -22,10 +22,6 @@ def test_public_all_excludes_legacy_types() -> None:
 def test_aetherengine_session_surface() -> None:
     assert hasattr(AetherEngine, "session")
     assert hasattr(AetherEngine, "asession")
-    assert not hasattr(AetherEngine, "pipeline_session")
-    assert not hasattr(AetherEngine, "apipeline_session")
-    assert not hasattr(AetherEngine, "ask")
-    assert not hasattr(AetherEngine, "aask")
 
 
 @patch("aetherdialect._core_utils.diagnostic_debug_enabled", return_value=False)

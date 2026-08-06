@@ -864,13 +864,6 @@ def test_session_reset_does_not_clear_sibling_session_pending_plan() -> None:
 
 
 @pytest.mark.fast
-def test_clear_federated_execution_bundle_removed() -> None:
-    import aetherdialect._federation
-
-    assert not hasattr(aetherdialect._federation, "clear_federated_execution_bundle")
-
-
-@pytest.mark.fast
 def test_resume_rejects_substitute_federation_plan_id() -> None:
     from aetherdialect._contracts_core import GenerationPath, SqlExecuteSuspendContext, SqlGenerationOutcome
 

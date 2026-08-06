@@ -89,7 +89,7 @@ def cache_path(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> str:
 def test_export_apply_preserves_user_override_provenance(
     schema_graph: SchemaGraph, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """I1: USER_OVERRIDE description/role survives export and re- apply."""
+    """USER_OVERRIDE description/role survives export and re- apply."""
     monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
 
     apply_schema_overrides_to_graph(
@@ -128,7 +128,7 @@ def test_export_apply_preserves_user_override_provenance(
 def test_export_round_trip_does_not_invoke_llm_refinement(
     schema_graph: SchemaGraph, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """I1: unchanged export/apply must not call the description refiner."""
+    """Unchanged export/apply must not call the description refiner."""
     llm_calls: list[Any] = []
 
     def _fake_llm_chat(**kwargs: Any) -> str:
@@ -151,7 +151,7 @@ def test_export_round_trip_does_not_invoke_llm_refinement(
 def test_finalize_with_overrides_strict_raises_on_unknown_table(
     schema_graph: SchemaGraph, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """I2: sidecar replay must not silently skip unknown table references."""
+    """Sidecar replay must not silently skip unknown table references."""
     from aetherdialect._config import ConfigError
 
     monkeypatch.setattr(EngineConfig, "SCHEMA_JSON_PATH", str(tmp_path / "schema.json.gz"))
@@ -170,7 +170,7 @@ def test_finalize_with_overrides_strict_raises_on_unknown_table(
 def test_finalize_with_overrides_prunes_stale_table_keys(
     schema_graph: SchemaGraph, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """I2: replay prunes sidecar table keys that no longer exist on the graph."""
+    """Replay prunes sidecar table keys that no longer exist on the graph."""
     monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
     monkeypatch.setattr(EngineConfig, "SCHEMA_JSON_PATH", str(tmp_path / "schema.json.gz"))
     cache_path = tmp_path / "schema.json.gz"
@@ -199,7 +199,7 @@ def test_finalize_with_overrides_prunes_stale_table_keys(
 def test_apply_overrides_and_persist_updates_last_overrides_skipped(
     schema_graph: SchemaGraph, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """I2: direct owner apply records skipped entries on the graph."""
+    """Direct owner apply records skipped entries on the graph."""
     monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
     monkeypatch.setattr(EngineConfig, "SCHEMA_JSON_PATH", str(tmp_path / "schema.json.gz"))
     col = schema_graph.tables["customers"].columns["email"]
@@ -224,7 +224,7 @@ def test_apply_overrides_and_persist_updates_last_overrides_skipped(
 
 
 def test_hidden_column_override_is_not_applied(schema_graph: SchemaGraph, monkeypatch: pytest.MonkeyPatch) -> None:
-    """I4: hidden columns record a skip and must not keep the mutation."""
+    """Hidden columns record a skip and must not keep the mutation."""
     monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
     col = schema_graph.tables["customers"].columns["email"]
     prev_desc = col.description or ""
@@ -254,7 +254,7 @@ def test_hidden_column_override_is_not_applied(schema_graph: SchemaGraph, monkey
 def test_cache_hit_refreshes_profiling_when_live_row_counts_drift(
     schema_graph: SchemaGraph, cache_path: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """I7: cache hit must detect live row-count drift and re-profile."""
+    """Cache hit must detect live row-count drift and re-profile."""
     from aetherdialect._contracts_base import EngineContext
 
     ctx = EngineContext()
@@ -286,7 +286,7 @@ def test_cache_hit_refreshes_profiling_when_live_row_counts_drift(
 def test_sandbox_trust_does_not_skip_profiling_drift_refresh(
     schema_graph: SchemaGraph, cache_path: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """I7: SANDBOX_TRUST_SCHEMA_BASELINE must not bypass live profiling drift refresh."""
+    """SANDBOX_TRUST_SCHEMA_BASELINE must not bypass live profiling drift refresh."""
     from aetherdialect._contracts_base import EngineContext
 
     ctx = EngineContext()

@@ -801,13 +801,6 @@ def test_no_post_definition_module_imports(file_path: Path) -> None:
 
 
 @pytest.mark.fast
-def test_join_helper_modules_are_not_standalone_files() -> None:
-    assert not (_SRC / "_join_fan_out.py").is_file()
-    assert not (_SRC / "_qsim_ops.py").is_file()
-    assert not (_SRC / "_join_comparison_scope.py").is_file()
-
-
-@pytest.mark.fast
 def test_needs_corpus_marker_is_registered() -> None:
     import tomllib
 

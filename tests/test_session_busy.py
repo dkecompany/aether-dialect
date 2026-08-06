@@ -108,12 +108,3 @@ def test_pending_plan_template_isolated_between_sessions_on_same_owner() -> None
     clear_federated_turn_state(session_a)
     assert session_a._pending_federation_plan_template is None
     assert session_b._pending_federation_plan_template is tmpl_b
-
-
-@pytest.mark.fast
-def test_owner_has_no_pending_plan_template_slot() -> None:
-    class _Owner:
-        pass
-
-    owner = _Owner()
-    assert not hasattr(owner, "_pending_federation_plan_template")

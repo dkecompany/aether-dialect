@@ -424,7 +424,7 @@ def _parent_child_schema() -> SchemaGraph:
 
 
 class TestValidateCteEmissionReclassification:
-    """D5: engine-owned CTE emission mismatches are errors."""
+    """Engine-owned CTE emission mismatches are errors."""
 
     def test_coerce_cte_emission_rejects_model_scalar_subquery(self):
         assert CteEmissionKind.coerce("scalar_subquery") == CteEmissionKind.SCALAR_SUBQUERY

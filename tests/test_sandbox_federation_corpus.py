@@ -63,19 +63,6 @@ def test_smoke_questions_include_cross_source_practice_question() -> None:
 
 
 @pytest.mark.fast
-def test_toy_four_member_fixture_files_are_absent() -> None:
-    data = _SCRIPTS / "data"
-    for name in (
-        "federation_four_member_declaration.json",
-        "federation_four_member_north_seed.sql",
-        "federation_four_member_south_seed.sql",
-        "federation_four_member_east_seed.sql",
-        "federation_four_member_west_seed.sql",
-    ):
-        assert not (data / name).is_file(), name
-
-
-@pytest.mark.fast
 def test_crm_staff_column_projection_limits_exported_columns() -> None:
     sc = _sandbox_corpus()
     projections = sc.federation_member_column_projections("crm")

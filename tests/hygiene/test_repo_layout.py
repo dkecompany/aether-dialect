@@ -194,6 +194,55 @@ def test_src_never_traverses_above_package_root() -> None:
         pytest.fail("Package root escape(s) in src/aetherdialect:\n" + "\n".join(hits))
 
 
+_DEV_WORKSPACE_PATH_RE = re.compile(
+    (
+        r'(?:["\'])dev_workspace(?:["\'/\\])|(?:/|\\)dev_workspace(?:/|\\|$)|'
+        r'(?:["\'])dev_workspace["\']'
+    ),
+    re.IGNORECASE,
+)
+# Files that may mention ``dev_workspace`` only as a forbidden-pattern list for hygiene.
+_DEV_WORKSPACE_MENTION_ALLOWLIST = frozenset(
+    {
+        "tests/hygiene/test_repo_layout.py",
+        "tests/test_sync_to_public.py",
+    }
+)
+
+
+@pytest.mark.fast
+def test_shipped_trees_do_not_reference_dev_workspace() -> None:
+    """``tests/``, ``live_tests/``, ``scripts/``, and ``src/`` must not depend on ``dev_workspace``."""
+    hits: list[str] = []
+    roots = (
+        _ROOT / "src",
+        _ROOT / "scripts",
+        _ROOT / "tests",
+        _ROOT / "live_tests",
+    )
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            if path.suffix not in {".py", ".md", ".json", ".toml", ".yml", ".yaml", ".txt"}:
+                continue
+            rel = path.relative_to(_ROOT).as_posix()
+            if rel in _DEV_WORKSPACE_MENTION_ALLOWLIST:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            if _DEV_WORKSPACE_PATH_RE.search(text):
+                hits.append(rel)
+    if hits:
+        pytest.fail(
+            "dev_workspace reference(s) in shipped trees (use sync_to_public for private paths):\n" + "\n".join(hits)
+        )
+
+
 @pytest.mark.fast
 def test_package_root_escape_scanner_catches_violations() -> None:
     """Guardrail: extended scanner must fail on representative escape patterns."""

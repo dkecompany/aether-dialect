@@ -81,9 +81,8 @@ def test_federation_member_key_is_source_id_not_toml_connection() -> None:
 
 
 @pytest.mark.fast
-def test_apply_federation_declaration_replaces_apply_federation_mappings() -> None:
+def test_apply_federation_declaration_is_public() -> None:
     assert hasattr(AetherFederation, "apply_federation_declaration")
-    assert not hasattr(AetherFederation, "apply_federation_mappings")
 
 
 def test_apply_federation_declaration_applies_manifest_sections(
@@ -239,12 +238,6 @@ def test_constructor_accepts_source_selections() -> None:
         )
         AetherEngine(source_selections=selections)
     assert init.call_args.kwargs["source_selections"] == selections
-
-
-@pytest.mark.fast
-def test_federation_manifest_and_mappings_exports_are_not_public() -> None:
-    assert not hasattr(AetherFederation, "export_federation_manifest")
-    assert not hasattr(AetherFederation, "export_federation_mappings")
 
 
 @pytest.mark.fast

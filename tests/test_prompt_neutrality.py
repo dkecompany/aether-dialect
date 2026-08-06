@@ -6,7 +6,6 @@ import importlib
 import json
 import re
 from collections.abc import Iterable
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -291,23 +290,3 @@ def test_compose_prompt_on_composite_avoids_federation_wording() -> None:
     assert "federation" not in joined
     assert "logical union" not in joined
     assert "logical table mappings" not in joined
-
-
-@pytest.mark.fast
-def test_shipped_docs_and_code_do_not_reference_workspace_federated_md() -> None:
-    repo_root = Path(__file__).resolve().parents[1]
-    roots = (repo_root / "docs", repo_root / "src", repo_root / "tests")
-    patterns = ("dev_workspace/federated.md", "dev_workspace\\federated.md", "(federated.md)")
-    hits: list[str] = []
-    for root in roots:
-        for path in root.rglob("*"):
-            if not path.is_file():
-                continue
-            if path.suffix not in {".md", ".py", ".rst", ".txt"}:
-                continue
-            if path.resolve() == Path(__file__).resolve():
-                continue
-            text = path.read_text(encoding="utf-8")
-            if any(token in text for token in patterns):
-                hits.append(str(path.relative_to(repo_root)))
-    assert not hits

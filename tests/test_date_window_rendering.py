@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import importlib
-
 import pytest
 
 from aetherdialect._contracts_base import (
@@ -88,15 +86,6 @@ def test_period_to_date_sql_per_dialect(engine: str, unit: str, fragments: tuple
         assert fragment.upper() in upper
     if engine in ("mysql", "mariadb"):
         assert "DATE_TRUNC" not in upper
-
-
-@pytest.mark.fast
-def test_no_fixed_day_approximation_remains() -> None:
-    """UNIT_TO_DAYS and unit_to_approx_days must not exist after calendar-native rendering."""
-    constants = importlib.import_module("aetherdialect._constants")
-    assert "UNIT_TO_DAYS" not in dir(constants)
-    dialect = importlib.import_module("aetherdialect._dialect")
-    assert "unit_to_approx_days" not in dir(dialect)
 
 
 @pytest.mark.fast

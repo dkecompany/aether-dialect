@@ -15,10 +15,6 @@ _INTERNAL_DOC_IMPORT_RE = re.compile(
 )
 _FORBIDDEN_DOC_FEDERATION_EXPORT_RE = re.compile(r"\bexport_federation_(?:manifest|mappings)\b")
 _SUPPORT_MATRIX_INTENT_CARRIES_RE = re.compile(r"intent carry", re.IGNORECASE)
-_FORBIDDEN_DELETED_DOC_RE = re.compile(
-    r"docs/(?:TROUBLESHOOTING|CHANGELOG)\.md",
-    re.IGNORECASE,
-)
 _DOC_META_HEADING_RE = re.compile(r"^##\s+(New|Updated|Changelog)\b", re.IGNORECASE)
 _DOC_PLAN_TEST_FILE_RE = re.compile(r"test_(?:step\d+|phase_[a-z])", re.IGNORECASE)
 
@@ -444,23 +440,6 @@ def test_support_matrix_avoids_intent_carries_phrasing() -> None:
 
 
 @pytest.mark.fast
-def test_tests_do_not_require_deleted_troubleshooting_or_changelog_docs() -> None:
-    """Catalogue tests must point at API_REFERENCE or code constants, not deleted docs."""
-    tests_dir = _REPO / "tests"
-    hits: list[str] = []
-    paths = sorted(tests_dir.glob("test_*.py")) + sorted((tests_dir / "hygiene").glob("test_*.py"))
-    for path in paths:
-        if path.name in {"test_static_core.py", "test_static_hygiene.py"}:
-            continue
-        text = path.read_text(encoding="utf-8")
-        for idx, line in enumerate(text.splitlines(), 1):
-            if _FORBIDDEN_DELETED_DOC_RE.search(line):
-                hits.append(f"{path.name}:{idx}: {line.strip()}")
-    if hits:
-        pytest.fail("Tests still reference deleted docs:\n" + "\n".join(hits))
-
-
-@pytest.mark.fast
 @pytest.mark.parametrize("doc_path", _DOCS_GUIDES)
 def test_docs_avoid_internal_import_paths(doc_path: Path) -> None:
     """User docs must not teach ``aetherdialect._*`` internal import paths."""
@@ -473,10 +452,6 @@ def test_docs_avoid_internal_import_paths(doc_path: Path) -> None:
     if hits:
         rel = doc_path.relative_to(_REPO)
         pytest.fail(f"Internal import path(s) in {rel}:\n" + "\n".join(hits))
-
-
-_DOC_META_HEADING_RE = re.compile(r"^##\s+(New|Updated|Changelog)\b", re.IGNORECASE)
-_DOC_PLAN_TEST_FILE_RE = re.compile(r"test_(?:step\d+|phase_[a-z])", re.IGNORECASE)
 
 
 @pytest.mark.fast

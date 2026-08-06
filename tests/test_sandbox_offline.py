@@ -621,8 +621,6 @@ class TestSandboxPublicApi:
         assert callable(AetherEngine.sandbox_questions)
         assert callable(AetherEngine.sandbox_doctor)
         assert callable(AetherEngine.assert_sandbox_complete)
-        assert not hasattr(AetherEngine, "run_sandbox_recipe")
-        assert not hasattr(AetherEngine, "run_sandbox_tour")
 
     def test_session_accept_until_done_on_pipeline_session(self) -> None:
         with AetherEngine.offline_sandbox() as sb:

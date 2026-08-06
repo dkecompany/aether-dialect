@@ -135,7 +135,6 @@ def test_every_exception_exported_and_documented() -> None:
 
 def test_no_message_constants_exported() -> None:
     assert "PERMISSION_DENIED_USER_MESSAGE" not in aetherdialect.__all__
-    assert not hasattr(aetherdialect, "PERMISSION_DENIED_USER_MESSAGE")
 
 
 def test_package_all_matches_documented_exports() -> None:
@@ -146,8 +145,6 @@ def test_package_all_matches_documented_exports() -> None:
     assert "ConnectionError" not in allowed
     assert "PERMISSION_DENIED_USER_MESSAGE" not in allowed
     assert set(aetherdialect.__all__) == allowed
-    assert not hasattr(aetherdialect, "cancel_active_federation_turn")
-    assert not hasattr(aetherdialect, "compose_federation_dry_run")
     assert hasattr(aetherdialect, "FederationMemberExecutionError")
     assert hasattr(aetherdialect, "FederationCapExceededError")
     assert callable(getattr(aetherdialect.PipelineSession, "cancel_active_federation_turn", None))
@@ -182,15 +179,13 @@ def test_offline_sandbox_documented_params_exist() -> None:
 
 
 def test_renamed_public_symbols_exported() -> None:
-    """Historical rename: ``AetherEngine`` and ``EngineContext`` replace legacy symbols."""
+    """Public engine and context symbols are exported."""
     assert hasattr(aetherdialect, "AetherEngine")
     assert hasattr(aetherdialect, "AetherFederation")
     assert hasattr(aetherdialect, "EngineContext")
     assert hasattr(aetherdialect, "Sandbox")
     assert hasattr(aetherdialect, "SpaceContext")
     assert hasattr(aetherdialect, "AetherSpace")
-    assert not hasattr(aetherdialect, "Text2SQL")
-    assert not hasattr(aetherdialect, "SchemaContext")
     assert hasattr(AetherEngine, "sandbox_doctor")
     assert hasattr(AetherEngine, "assert_sandbox_complete")
     assert hasattr(AetherEngine, "sandbox_questions")

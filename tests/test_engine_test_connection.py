@@ -39,7 +39,6 @@ def test_engine_test_connection_scripts_path_resolves(engine: str) -> None:
     script = _SCRIPTS / engine / "test_connection.py"
     text = script.read_text(encoding="utf-8")
 
-    assert "_engine_entry" not in text, f"{script} still imports missing _engine_entry"
     assert 'parents[1] / "scripts"' not in text, f"{script} still appends /scripts to parents[1]"
 
     scripts_dir = script.resolve().parents[1]

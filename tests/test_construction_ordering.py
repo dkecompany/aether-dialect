@@ -126,7 +126,7 @@ def test_probe_cache_hit_finalizes_overrides_before_hash_assignment(
     cache_path: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """T44: probe cache-hit path must hash only after override replay."""
+    """Probe cache-hit path must hash only after override replay."""
     notes = ""
     ctx = EngineContext()
     probe = compute_dialect_probe(_ProbeCacheHitDialect(probe="probe_seed"), ctx)
@@ -146,7 +146,7 @@ def test_fingerprint_cache_hit_finalizes_overrides_before_hash_assignment(
     cache_path: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """T44: fingerprint self-check cache-hit path must hash only after override replay."""
+    """Fingerprint self-check cache-hit path must hash only after override replay."""
     notes = ""
     ctx = EngineContext()
     _save_fingerprint_cache(schema_graph, cache_path, notes=notes)
@@ -164,7 +164,7 @@ def test_save_schema_to_cache_preserves_migration_tier_until_policy_runs(
     schema_graph: SchemaGraph,
     tmp_path: Any,
 ) -> None:
-    """T45: save_schema_to_cache must not claim NO_CHANGE before apply_migration_policy."""
+    """save_schema_to_cache must not claim NO_CHANGE before apply_migration_policy."""
     cache_path = str(tmp_path / "schema_graph.json.gz")
     artifacts_dir = str(tmp_path)
     ctx = EngineContext()
@@ -197,7 +197,7 @@ def test_fresh_save_schema_to_cache_leaves_migration_tier_unset(
     schema_graph: SchemaGraph,
     tmp_path: Any,
 ) -> None:
-    """T45: first cache write must not pre-stamp NO_CHANGE on an empty manifest."""
+    """First cache write must not pre-stamp NO_CHANGE on an empty manifest."""
     cache_path = str(tmp_path / "schema_graph.json.gz")
     artifacts_dir = str(tmp_path)
     ctx = EngineContext()

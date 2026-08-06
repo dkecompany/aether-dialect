@@ -11,7 +11,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts" / "run_mutation_testing.py"
-BASELINE = REPO_ROOT / "dev_workspace" / "mutation_baseline.json"
+BASELINE = REPO_ROOT / "scripts" / "mutation_baseline.json"
 
 
 @pytest.mark.fast
@@ -27,7 +27,7 @@ def test_mutation_script_help_and_baseline_schema() -> None:
     assert proc.returncode == 0
     assert "mutation" in proc.stdout.lower()
 
-    assert BASELINE.is_file(), "dev_workspace/mutation_baseline.json must exist"
+    assert BASELINE.is_file(), "scripts/mutation_baseline.json must exist"
     doc = json.loads(BASELINE.read_text(encoding="utf-8"))
     assert doc["version"] == 1
     assert doc["tool"] == "mutmut"

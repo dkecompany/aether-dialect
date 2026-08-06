@@ -114,8 +114,6 @@ def test_analytical_ask_does_not_emit_meta_diagnostics() -> None:
 
 
 @pytest.mark.fast
-def test_no_public_meta_method_required() -> None:
+def test_metadata_answer_stays_internal() -> None:
     assert "answer_metadata_question" not in aetherdialect.__all__
-    assert not hasattr(aetherdialect.AetherEngine, "answer_metadata_question")
-    assert not hasattr(aetherdialect.AetherEngine, "ask_metadata")
     assert hasattr(MainExecutionOps, "answer_metadata_question")

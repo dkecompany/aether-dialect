@@ -3,9 +3,9 @@ repos:
     rev: v5.0.0
     hooks:
       - id: trailing-whitespace
-        exclude: ^(scripts/sandbox_staging/|dev_workspace/aether_artifacts/)
+        exclude: ^(scripts/sandbox_staging/)
       - id: end-of-file-fixer
-        exclude: ^(scripts/sandbox_staging/|dev_workspace/aether_artifacts/)
+        exclude: ^(scripts/sandbox_staging/)
       - id: check-yaml
       - id: check-toml
       - id: check-merge-conflict
