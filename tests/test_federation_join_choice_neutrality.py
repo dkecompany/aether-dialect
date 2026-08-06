@@ -9,7 +9,7 @@ import pytest
 
 from aetherdialect._contracts_core import FederatedPlan, RuntimeIntent, SourceStep
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._dialect import get_dialect
+from aetherdialect._dialect import DialectRegistry
 from aetherdialect._federation import parse_federation_manifest, plan_federated_intent, resolve_federated_combine
 from aetherdialect._pipeline import _federation_batch_member_join_presets
 from aetherdialect._sql_gen import build_join_choice_prompt
@@ -191,7 +191,7 @@ def test_batch_member_join_choice_scopes_are_opaque() -> None:
             "count rows",
             plan,
             fed.composite,
-            dialect=get_dialect("duckdb"),
+            dialect=DialectRegistry.get("duckdb"),
             dialects_by_source=None,
             manifest=fed.manifest,
             member_graphs=fed.member_graphs,

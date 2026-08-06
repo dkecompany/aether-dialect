@@ -9,13 +9,14 @@ import re
 from dataclasses import replace
 from typing import Any, cast
 
-from ._config import PolicyConfig, SeedWarmupConfig, llm_credentials_configured
+from ._config import EngineConfig, PolicyConfig, SeedWarmupConfig
 from ._constants import (
     AGG_PATTERN,
     DO_NOT_LEMMATIZE,
     IRREGULAR_PLURALS_MAP,
     NORMALIZATION_ALLOWED_INTRODUCED_TOKENS,
     NORMALIZATION_JACCARD_FLOOR,
+    PROMPT_SCALAR_VALUE_TYPES,
     QUESTION_CANONICALIZE_SYSTEM,
     QUESTION_FROM_SQL_SYSTEM,
     QUESTION_NORMALIZE_VOCABULARY_GUIDANCE,
@@ -40,14 +41,15 @@ from ._constants import (
     WARMUP_PARAPHRASES_BY_STYLE_SYSTEM,
 )
 from ._contracts_base import (
+    CteEmissionKind,
     HavingParam,
     LlmJsonExhausted,
     NormalizedExpr,
     OrderByCol,
+    PredicateGroup,
+    QuestionRoute,
+    QuestionValidationResult,
     WhereParam,
-    having_leaves,
-    predicate_group_from_list,
-    where_leaves,
 )
 from ._contracts_core import (
     ConcreteIntent,
@@ -56,10 +58,14 @@ from ._contracts_core import (
     RuntimeIntent,
     SelectCol,
     Template,
-    concrete_intent_to_runtime_skeleton,
 )
-from ._contracts_schema import CteOutputColumnMeta, SchemaGraph, SQLShape
+from ._contracts_schema import (
+    CteOutputColumnMeta,
+    SchemaGraph,
+    SQLShape,
+)
 from ._core_utils import (
+    build_case_folded_index,
     colmap_signature,
     debug,
     normalize_array_contains_param_value,
@@ -67,32 +73,32 @@ from ._core_utils import (
     sha256,
     stable_json,
 )
-from ._dialect import (
-    sql_count_outer_joins,
-    sql_has_aggregate,
-    sql_has_distinct,
-    sql_has_group_by,
-    sql_tables_referenced,
-)
+from ._dialect import Dialect
 from ._intent_resolve import join_path_key_concrete, join_path_key_runtime, sort_having, sort_where_predicates
-from ._llm_provider import llm_json
+from ._llm_provider import LLMProvider
 
 
-def validate_question(question: str) -> tuple[bool, str, str]:
-    """LLM gate: data question vs chitchat; typo fix; allowed vs restricted."""
+def validate_question(question: str) -> QuestionValidationResult:
+    """LLM gate: typo fix, refuse restricted/invalid, route analytical vs metadata questions."""
     try:
-        result = llm_json(QUESTION_VALIDATION_SYSTEM, question, task="default")
+        result = LLMProvider.json(QUESTION_VALIDATION_SYSTEM, question, task="default")
     except LlmJsonExhausted as exc:
         debug(f"[utils.validate_question] llm_json exhausted: {exc}")
-        return False, "invalid", question
+        return QuestionValidationResult(accepted=False, route=QuestionRoute.INVALID, corrected=question)
     query_type = str(result.get("query_type", "unspecified") or "").strip().lower()
+    if query_type == "allowed":
+        query_type = QuestionRoute.ANALYTICAL.value
     valid = str(result.get("valid_database_question", "") or "").strip().lower() == "yes"
-    corrected = result.get("corrected", question) or question
-    if query_type == "restricted":
-        return False, "restricted", corrected
+    corrected = str(result.get("corrected", question) or question)
+    if query_type == QuestionRoute.RESTRICTED.value:
+        return QuestionValidationResult(accepted=False, route=QuestionRoute.RESTRICTED, corrected=corrected)
     if not valid:
-        return False, "invalid", corrected
-    return True, "allowed", corrected
+        return QuestionValidationResult(accepted=False, route=QuestionRoute.INVALID, corrected=corrected)
+    if query_type == QuestionRoute.SCHEMA_CATALOG.value:
+        return QuestionValidationResult(accepted=True, route=QuestionRoute.SCHEMA_CATALOG, corrected=corrected)
+    if query_type == QuestionRoute.BUSINESS_KNOWLEDGE.value:
+        return QuestionValidationResult(accepted=True, route=QuestionRoute.BUSINESS_KNOWLEDGE, corrected=corrected)
+    return QuestionValidationResult(accepted=True, route=QuestionRoute.ANALYTICAL, corrected=corrected)
 
 
 def _suffix_lemmatize_token(token: str) -> str:
@@ -196,7 +202,7 @@ def normalize_question_via_llm(corrected: str, *, raw_original: str | None = Non
         "normalization_preferences": vocab_block,
     }
     try:
-        result = llm_json(QUESTION_CANONICALIZE_SYSTEM, stable_json(user_obj), task="default")
+        result = LLMProvider.json(QUESTION_CANONICALIZE_SYSTEM, stable_json(user_obj), task="default")
     except LlmJsonExhausted as exc:
         debug(f"[utils.normalize_question_via_llm] llm_json exhausted: {exc}")
         return corrected
@@ -210,19 +216,19 @@ def normalize_question_via_llm(corrected: str, *, raw_original: str | None = Non
 
 def sql_shape(sql: str, intent: RuntimeIntent, *, sqlglot_dialect: str) -> SQLShape:
     """Count joins, CTEs, filters, having, and structural flags from. *sql* and *intent* via AST."""
-    num_where = len(where_leaves(intent.where) or [])
-    num_having = len(having_leaves(intent.having) or [])
+    num_where = len(PredicateGroup.where_leaves(intent.where) or [])
+    num_having = len(PredicateGroup.having_leaves(intent.having) or [])
     for cte in intent.cte_steps or []:
-        num_where += len(where_leaves(cte.where) or [])
-        num_having += len(having_leaves(cte.having) or [])
+        num_where += len(PredicateGroup.where_leaves(cte.where) or [])
+        num_having += len(PredicateGroup.having_leaves(cte.having) or [])
     return SQLShape(
-        num_joins=sql_count_outer_joins(sql, sqlglot_dialect=sqlglot_dialect),
-        has_group_by=sql_has_group_by(sql, sqlglot_dialect=sqlglot_dialect),
-        has_agg=sql_has_aggregate(sql, sqlglot_dialect=sqlglot_dialect),
+        num_joins=Dialect.sql_count_outer_joins(sql, sqlglot_dialect=sqlglot_dialect),
+        has_group_by=Dialect.sql_has_group_by(sql, sqlglot_dialect=sqlglot_dialect),
+        has_agg=Dialect.sql_has_aggregate(sql, sqlglot_dialect=sqlglot_dialect),
         num_cte=len(intent.cte_steps or []),
         num_where=num_where,
         num_having=num_having,
-        has_distinct=sql_has_distinct(sql, sqlglot_dialect=sqlglot_dialect),
+        has_distinct=Dialect.sql_has_distinct(sql, sqlglot_dialect=sqlglot_dialect),
     )
 
 
@@ -245,16 +251,25 @@ def _levenshtein_distance(s1: str, s2: str) -> int:
 
 
 def _tokenize(q: str) -> list[str]:
-    """Lowercase ``[a-z0-9_]+`` tokens from *q*, suffix-lemmatized. except for ``DO_NOT_LEMMATIZE``, stripped of ``PolicyConfig.STOPWORDS``, then sorted for multiset comparison."""
+    """Unicode-aware tokens from *q*, suffix-lemmatized except for ``DO_NOT_LEMMATIZE``, stripped of ``PolicyConfig.STOPWORDS``, then sorted for multiset comparison."""
     out: list[str] = []
-    for raw in re.findall(r"[a-z0-9_]+", q.lower()):
-        if not raw:
-            continue
+    buf: list[str] = []
+    for ch in q.lower():
+        if ch.isalnum() or ch == "_":
+            buf.append(ch)
+        elif buf:
+            raw = "".join(buf)
+            buf.clear()
+            irr = IRREGULAR_PLURALS_MAP.get(raw, raw)
+            step = _suffix_lemmatize_token(irr)
+            if step not in PolicyConfig.STOPWORDS:
+                out.append(step)
+    if buf:
+        raw = "".join(buf)
         irr = IRREGULAR_PLURALS_MAP.get(raw, raw)
         step = _suffix_lemmatize_token(irr)
-        if step in PolicyConfig.STOPWORDS:
-            continue
-        out.append(step)
+        if step not in PolicyConfig.STOPWORDS:
+            out.append(step)
     return sorted(out)
 
 
@@ -364,6 +379,9 @@ def match_question_against_template_history(
     best_rank: tuple[int, int, int, str] | None = None
     for tpl in scan_templates:
         if tpl.trust_level < 1:
+            continue
+        approval = getattr(tpl, "approval_state", None)
+        if approval is not None and str(getattr(approval, "value", approval)).lower() == "pending":
             continue
         for idx, hist_q in enumerate(tpl.value_history.questions):
             if not hist_q:
@@ -491,8 +509,8 @@ def _normalize_cte_steps(steps: Any, available_ctes: dict[str, list[str]] | None
             select_cols = s.select_cols or []
             group_by_cols = s.group_by_cols or []
             output_columns = s.output_columns or []
-            where_params = where_leaves(s.where) or []
-            having_param = having_leaves(s.having) or []
+            where_params = PredicateGroup.where_leaves(s.where) or []
+            having_param = PredicateGroup.having_leaves(s.having) or []
             param_values = s.param_values or {}
             order_by_cols = s.order_by_cols or []
             limit = s.limit
@@ -500,7 +518,7 @@ def _normalize_cte_steps(steps: Any, available_ctes: dict[str, list[str]] | None
             output_column_metadata = s.output_column_metadata or {}
             chosen_join_candidate_id = s.chosen_join_candidate_id or ""
             chosen_join_path_signature = s.chosen_join_path_signature or []
-            emission = getattr(s, "emission", "join_table") or "join_table"
+            emission = CteEmissionKind.coerce(getattr(s, "emission", CteEmissionKind.JOIN_TABLE))
         elif isinstance(s, dict):
             cte_name = s.get("cte_name", "")
             tables = s.get("tables", [])
@@ -548,7 +566,7 @@ def _normalize_cte_steps(steps: Any, available_ctes: dict[str, list[str]] | None
             }
             chosen_join_candidate_id = s.get("chosen_join_candidate_id", "")
             chosen_join_path_signature = s.get("chosen_join_path_signature", [])
-            emission = s.get("emission", "join_table") or "join_table"
+            emission = CteEmissionKind.coerce(s.get("emission", CteEmissionKind.JOIN_TABLE))
         else:
             continue
         if not cte_name:
@@ -632,8 +650,8 @@ def _normalize_cte_steps(steps: Any, available_ctes: dict[str, list[str]] | None
             select_cols=normalized_select_cols,
             group_by_cols=group_by_cols,
             output_columns=list(str(c) for c in output_columns),
-            where=predicate_group_from_list(sort_where_predicates(normalized_fp)),
-            having=predicate_group_from_list(sort_having(normalized_hp)),
+            where=PredicateGroup.from_list(sort_where_predicates(normalized_fp)),
+            having=PredicateGroup.from_list(sort_having(normalized_hp)),
             param_values=param_values,
             order_by_cols=normalized_order_by,
             limit=limit,
@@ -675,7 +693,7 @@ def _normalize_cte_steps_for_key(
             "where": [
                 f.signature_key
                 for f in sorted(
-                    where_leaves(cte.where) or [],
+                    PredicateGroup.where_leaves(cte.where) or [],
                     key=lambda x: (
                         x.left_expr.signature_key,
                         x.op,
@@ -687,7 +705,7 @@ def _normalize_cte_steps_for_key(
             "having_param": [
                 h.signature_key
                 for h in sorted(
-                    having_leaves(cte.having) or [],
+                    PredicateGroup.having_leaves(cte.having) or [],
                     key=lambda x: (
                         x.left_expr.signature_key,
                         x.op,
@@ -709,10 +727,10 @@ def _normalize_cte_steps_for_key(
 def _contains_where_param_keys(intent: RuntimeIntent) -> set[str]:
     keys: set[str] = set()
     for cte in intent.cte_steps or []:
-        for fp in where_leaves(cte.where) or []:
+        for fp in PredicateGroup.where_leaves(cte.where) or []:
             if fp.op == "contains" and fp.param_key and fp.right_expr is None:
                 keys.add(fp.param_key)
-    for fp in where_leaves(intent.where) or []:
+    for fp in PredicateGroup.where_leaves(intent.where) or []:
         if fp.op == "contains" and fp.param_key and fp.right_expr is None:
             keys.add(fp.param_key)
     return keys
@@ -753,8 +771,8 @@ def _structural_intent_hash(intent: RuntimeIntent, *, include_join_skeleton: boo
             expected_rows = "many"
         debug(f"[utils.intent_key] inferred_expected_rows: grain={grain} -> expected_rows={expected_rows}")
 
-    filters_normalized = _normalize_where_predicates(where_leaves(intent.where) or [])
-    having_conditions_normalized = _normalize_having_conditions(having_leaves(intent.having) or [])
+    filters_normalized = _normalize_where_predicates(PredicateGroup.where_leaves(intent.where) or [])
+    having_conditions_normalized = _normalize_having_conditions(PredicateGroup.having_leaves(intent.having) or [])
     cte_steps_normalized = _normalize_cte_steps(intent.cte_steps or [])
     cte_steps_for_key = _normalize_cte_steps_for_key(cte_steps_normalized, include_join_skeleton=include_join_skeleton)
 
@@ -789,7 +807,7 @@ def body_similarity_key(intent: RuntimeIntent) -> str:
 
 def body_similarity_key_for_concrete(concrete: ConcreteIntent) -> str:
     """``body_similarity_key`` for a stored ``ConcreteIntent``."""
-    return body_similarity_key(concrete_intent_to_runtime_skeleton(concrete))
+    return body_similarity_key(concrete.to_runtime_skeleton())
 
 
 def template_instance_key_from_parts(
@@ -852,7 +870,7 @@ def template_instance_key_for_runtime(runtime: RuntimeIntent, sql_fp_val: str) -
 
 def extract_tables_from_sql(sql: str, known_tables: list[str], *, sqlglot_dialect: str) -> list[str]:
     """Subset of *known_tables* referenced as physical tables in *sql* via AST inspection. CTE definition names are excluded by :func:`aetherdialect._dialect.sql_tables_referenced`."""
-    referenced = sql_tables_referenced(sql, sqlglot_dialect=sqlglot_dialect)
+    referenced = Dialect.sql_tables_referenced(sql, sqlglot_dialect=sqlglot_dialect)
     hits = [t for t in known_tables if t.lower() in referenced]
     return sorted(set(hits))
 
@@ -970,7 +988,7 @@ def generate_question(
         },
     }
 
-    response = llm_json(system, stable_json(user_prompt), retries=1, task="synth_variety")
+    response = LLMProvider.json(system, stable_json(user_prompt), retries=1, task="synth_variety")
     question = response.get("question")
     ir = response.get("is_realistic", True)
     if isinstance(ir, str):
@@ -1059,7 +1077,16 @@ def schema_context_enriched_lines_for_tables(schema: SchemaGraph, tables: list[s
 
 def _phrase_jaccard_tokens(text: str) -> frozenset[str]:
     """Token set for paraphrase diversity scoring."""
-    words = re.findall(r"[a-z0-9]+", normalize_question(text))
+    words: list[str] = []
+    buf: list[str] = []
+    for ch in normalize_question(text):
+        if ch.isalnum():
+            buf.append(ch)
+        elif buf:
+            words.append("".join(buf))
+            buf.clear()
+    if buf:
+        words.append("".join(buf))
     return frozenset(words)
 
 
@@ -1115,7 +1142,7 @@ def generate_warmup_paraphrases_by_style(
     schema: SchemaGraph, tables: list[str], *, sql: str | None = None, seed_question: str | None = None
 ) -> dict[str, list[str]] | None:
     """LLM paraphrases grouped by every configured warmup style (up to policy max per style)."""
-    if not llm_credentials_configured():
+    if not EngineConfig.llm_credentials_configured():
         return None
     if not sql and not seed_question:
         return None
@@ -1133,7 +1160,9 @@ def generate_warmup_paraphrases_by_style(
     if seed_question:
         body["seed_question"] = seed_question
     try:
-        response = llm_json(WARMUP_PARAPHRASES_BY_STYLE_SYSTEM, stable_json(body), retries=1, task="synth_variety")
+        response = LLMProvider.json(
+            WARMUP_PARAPHRASES_BY_STYLE_SYSTEM, stable_json(body), retries=1, task="synth_variety"
+        )
     except (TypeError, ValueError, LlmJsonExhausted):
         return None
     raw = response.get("paraphrases_by_style")
@@ -1189,7 +1218,7 @@ def generate_warmup_questions_freeform(
     schema: SchemaGraph, tables: list[str], *, sql: str | None = None, seed_question: str | None = None
 ) -> list[str] | None:
     """Single-call NL question generation when styled paraphrase buckets are empty."""
-    if not llm_credentials_configured():
+    if not EngineConfig.llm_credentials_configured():
         return None
     if not sql and not seed_question:
         return None
@@ -1202,7 +1231,9 @@ def generate_warmup_questions_freeform(
     if seed_question:
         body["seed_question"] = seed_question
     try:
-        response = llm_json(WARMUP_FREEFORM_QUESTIONS_SYSTEM, stable_json(body), retries=0, task="synth_variety")
+        response = LLMProvider.json(
+            WARMUP_FREEFORM_QUESTIONS_SYSTEM, stable_json(body), retries=0, task="synth_variety"
+        )
     except LlmJsonExhausted:
         return None
     raw = response.get("questions")
@@ -1242,7 +1273,7 @@ def generate_question_from_sql(
     }
     user_prompt = stable_json(user_body)
 
-    response = llm_json(QUESTION_FROM_SQL_SYSTEM, user_prompt, retries=1, task="synth_variety")
+    response = LLMProvider.json(QUESTION_FROM_SQL_SYSTEM, user_prompt, retries=1, task="synth_variety")
     is_realistic = response.get("is_realistic", False)
     question = response.get("question", "")
     drop_reason = response.get("drop_reason")
@@ -1358,6 +1389,8 @@ def column_cached_distinct_values(schema: SchemaGraph, table: str, column: str) 
     column_meta = table_meta.columns.get(column)
     if column_meta is None:
         return []
+    if column_meta.prompt_value_type() not in PROMPT_SCALAR_VALUE_TYPES:
+        return []
     seen: set[str] = set()
     out: list[str] = []
     for source in (column_meta.value_overlap_sample or [], column_meta.frequent_values or []):
@@ -1423,7 +1456,7 @@ def morph_variants(token: str) -> list[str]:
 
 def _cache_canonical_index(cached: list[str]) -> dict[str, str]:
     """Map lowercase cached values to their canonical profiling spellings."""
-    return {value.lower(): value for value in cached}
+    return build_case_folded_index(cached, kind="cached value")
 
 
 def zero_row_where_remediation_candidates(literal: str, cached: list[str]) -> list[str]:
@@ -1477,7 +1510,7 @@ def patch_where_literal_on_intent(
 ) -> RuntimeIntent:
     """Return a deep copy of *intent* with one equality filter literal replaced."""
     patched = copy.deepcopy(intent)
-    for candidate in where_leaves(patched.where) or []:
+    for candidate in PredicateGroup.where_leaves(patched.where) or []:
         if not _where_param_matches(candidate, where_param):
             continue
         candidate.raw_value = canonical_value
@@ -1493,7 +1526,7 @@ def enumerate_zero_row_equality_where(
     """List equality filters whose literals are absent from cached distinct values."""
     param_values = _merge_intent_param_values(intent)
     targets: list[tuple[WhereParam, str, str, list[str]]] = []
-    for where_param in where_leaves(intent.where) or []:
+    for where_param in PredicateGroup.where_leaves(intent.where) or []:
         literal = _where_equality_literal(where_param, param_values)
         if literal is None:
             continue

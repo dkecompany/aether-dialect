@@ -222,9 +222,9 @@ def test_suggest_cross_source_mappings_rejects_sensitive_columns() -> None:
 def test_build_federation_source_runtimes_binds_per_source_dialects() -> None:
     from unittest.mock import MagicMock
 
-    from aetherdialect._dialect import get_dialect
+    from aetherdialect._dialect import DialectRegistry
     from aetherdialect._federation import build_federation_manifest_from_members
-    from aetherdialect._main_execution import _build_federation_source_runtimes
+    from aetherdialect._main_execution import MainExecutionOps
     from tests.conftest import duckdb_engine_identity
 
     members = {
@@ -247,8 +247,10 @@ def test_build_federation_source_runtimes_binds_per_source_dialects() -> None:
         members,
         declaration=parse_federation_manifest(_MANIFEST, include_derived_roster=True),
     )
-    default = get_dialect("duckdb")
-    runtimes = _build_federation_source_runtimes(manifest, None, default, default_identity=duckdb_engine_identity())
+    default = DialectRegistry.get("duckdb")
+    runtimes = MainExecutionOps._build_federation_source_runtimes(
+        manifest, None, default, default_identity=duckdb_engine_identity()
+    )
     assert set(runtimes) == {"alpha", "beta"}
     for runtime in runtimes.values():
         assert runtime.dialect is not None

@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aetherdialect._contracts_base import SensitivityClassification, set_sensitivity
+from aetherdialect._contracts_base import SensitivityClassification
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._dialect_sqlglot_engines import DuckDBDialect
 from aetherdialect._schema_catalog import _profile_column, _profile_table, profile_schema
@@ -41,7 +41,7 @@ def _recording_engine() -> tuple[MagicMock, list[str]]:
 
 def _users_table(*, email_sensitivity: str) -> TableMetadata:
     email = ColumnMetadata(name="email", data_type="varchar", value_type="string")
-    set_sensitivity(email, email_sensitivity)
+    SensitivityClassification.apply_to(email, email_sensitivity)
     return TableMetadata(
         name="users",
         columns={
@@ -131,7 +131,7 @@ def test_composite_descriptive_profiling_skips_sensitive_name_columns() -> None:
     engine, executed = _recording_engine()
     dialect = DuckDBDialect.__new__(DuckDBDialect)
     first_name = ColumnMetadata(name="first_name", data_type="varchar", value_type="string")
-    set_sensitivity(first_name, SensitivityClassification.HIDDEN)
+    SensitivityClassification.apply_to(first_name, SensitivityClassification.HIDDEN)
     last_name = ColumnMetadata(name="last_name", data_type="varchar", value_type="string")
     table = TableMetadata(
         name="people",

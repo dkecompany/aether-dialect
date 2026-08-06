@@ -10,20 +10,9 @@ from aetherdialect._contracts_base import (
     NormalizedExpr,
     PredicateGroup,
     WhereParam,
-    coerce_predicate_group,
-    map_predicate_group,
-    merge_predicate_groups,
-    normalize_predicate_group_cnf,
-    normalize_predicate_group_dnf,
-    parse_having_field,
-    parse_where_field,
-    partition_predicate_group,
-    predicate_group_from_legacy_flat_where_dicts,
-    predicate_group_from_list,
-    predicate_leaves,
 )
 from aetherdialect._contracts_core import RuntimeIntent, SelectCol
-from aetherdialect._dialect import get_dialect
+from aetherdialect._dialect import DialectRegistry
 from aetherdialect._sql_gen import render_predicate_clause, render_predicate_group_sql
 
 
@@ -48,7 +37,7 @@ def test_legacy_filters_param_migrates_to_where() -> None:
         {"left_expr": "t.b", "op": "=", "value": 2, "where_group": 1},
         {"left_expr": "t.c", "op": "=", "value": 3, "where_group": 2},
     ]
-    group = predicate_group_from_legacy_flat_where_dicts(legacy)
+    group = PredicateGroup.from_legacy_flat_where_dicts(legacy)
     assert group is not None
     assert group.op == "or"
     assert len(group.groups) == 2
@@ -74,7 +63,7 @@ def test_runtime_intent_accepts_where_field() -> None:
 @pytest.mark.fast
 def test_partition_predicate_group_splits_leaves() -> None:
     group = PredicateGroup(op="and", predicates=(_fp("t.a"), _fp("t.b")))
-    kept, dropped = partition_predicate_group(group, lambda p: p.left_expr.primary_column == "t.a")
+    kept, dropped = PredicateGroup.partition(group, lambda p: p.left_expr.primary_column == "t.a")
     assert kept is not None and dropped is not None
     assert [p.left_expr.primary_column for p in kept.leaves()] == ["t.a"]
     assert [p.left_expr.primary_column for p in dropped.leaves()] == ["t.b"]
@@ -90,7 +79,7 @@ def test_render_predicate_group_sql_parentheses() -> None:
         ),
     )
 
-    dialect = get_dialect("duckdb")
+    dialect = DialectRegistry.get("duckdb")
 
     def render_leaf(pred: WhereParam | HavingParam) -> str:
         return render_predicate_clause(pred, dialect)
@@ -111,39 +100,39 @@ def test_coerce_predicate_group_enforces_depth() -> None:
 
     nested = _deep_or_tree(MAX_PREDICATE_NESTING_DEPTH + 1)
     assert nested.depth() > MAX_PREDICATE_NESTING_DEPTH
-    coerced = coerce_predicate_group(nested)
+    coerced = PredicateGroup.coerce(nested)
     assert coerced is not None
     assert coerced.depth() <= MAX_PREDICATE_NESTING_DEPTH
 
 
 @pytest.mark.fast
 def test_merge_predicate_groups_flattens_same_op() -> None:
-    left = predicate_group_from_list([_fp("t.a")])
-    right = predicate_group_from_list([_fp("t.b")])
-    merged = merge_predicate_groups("and", [left, right])
+    left = PredicateGroup.from_list([_fp("t.a")])
+    right = PredicateGroup.from_list([_fp("t.b")])
+    merged = PredicateGroup.merge("and", [left, right])
     assert merged is not None
     assert [p.left_expr.primary_column for p in merged.leaves()] == ["t.a", "t.b"]
 
 
 @pytest.mark.fast
 def test_map_predicate_group_transforms_leaves() -> None:
-    group = predicate_group_from_list([_fp("t.a")])
-    mapped = map_predicate_group(group, lambda p: WhereParam(left_expr=p.left_expr, op="!=", raw_value=p.raw_value))
+    group = PredicateGroup.from_list([_fp("t.a")])
+    mapped = PredicateGroup.map(group, lambda p: WhereParam(left_expr=p.left_expr, op="!=", raw_value=p.raw_value))
     assert mapped is not None
     assert mapped.leaves()[0].op == "!="
 
 
 @pytest.mark.fast
 def test_parse_where_and_having_fields() -> None:
-    assert parse_where_field({"where": None}) is None
-    having = parse_having_field({"having_param": [{"left_expr": "COUNT(*)", "op": ">", "value": 1}]})
+    assert PredicateGroup.parse_where_field({"where": None}) is None
+    having = PredicateGroup.parse_having_field({"having_param": [{"left_expr": "COUNT(*)", "op": ">", "value": 1}]})
     assert having is not None
     assert isinstance(having.leaves()[0], HavingParam)
 
 
 @pytest.mark.fast
 def test_predicate_leaves_empty() -> None:
-    assert predicate_leaves(None) == []
+    assert PredicateGroup.predicate_leaves(None) == []
     intent = RuntimeIntent(
         tables=["t"],
         grain="row_level",
@@ -153,7 +142,7 @@ def test_predicate_leaves_empty() -> None:
         where=None,
         having=None,
     )
-    assert predicate_leaves(intent.where) == []
+    assert PredicateGroup.predicate_leaves(intent.where) == []
 
 
 @pytest.mark.fast
@@ -164,7 +153,7 @@ def test_normalize_predicate_group_cnf_nested_and_of_or() -> None:
         predicates=(_fp("t.a"),),
         groups=(PredicateGroup(op="or", predicates=(_fp("t.b"), _fp("t.c"))),),
     )
-    normalized = normalize_predicate_group_cnf(group)
+    normalized = PredicateGroup.normalize_cnf(group)
     assert normalized is not None
     assert normalized.op == "and"
     assert normalized.depth() <= MAX_PREDICATE_NESTING_DEPTH
@@ -184,7 +173,7 @@ def test_normalize_predicate_group_cnf_expands_and_children() -> None:
             PredicateGroup(op="and", predicates=(_fp("t.c"), _fp("t.d"))),
         ),
     )
-    normalized = normalize_predicate_group_cnf(group)
+    normalized = PredicateGroup.normalize_cnf(group)
     assert normalized is not None
     assert normalized.op == "and"
     assert len(normalized.groups) == 4
@@ -199,7 +188,7 @@ def test_normalize_predicate_group_cnf_expands_and_children() -> None:
 
 @pytest.mark.fast
 def test_coerce_predicate_group_prefers_cnf_when_shallower() -> None:
-    """coerce_predicate_group picks the shallower of DNF and CNF normal forms."""
+    """PredicateGroup.coerce picks the shallower of DNF and CNF normal forms."""
     group = PredicateGroup(
         op="and",
         groups=(
@@ -213,7 +202,7 @@ def test_coerce_predicate_group_prefers_cnf_when_shallower() -> None:
         ),
     )
     assert group.depth() == 3
-    coerced = coerce_predicate_group(group)
+    coerced = PredicateGroup.coerce(group)
     assert coerced is not None
     assert coerced.op == "or"
     assert coerced.depth() == 2
@@ -223,13 +212,13 @@ def test_coerce_predicate_group_prefers_cnf_when_shallower() -> None:
 
 @pytest.mark.fast
 def test_coerce_predicate_group_and_of_or_within_depth() -> None:
-    """coerce_predicate_group keeps AND-of-OR trees within nesting depth."""
+    """PredicateGroup.coerce keeps AND-of-OR trees within nesting depth."""
     group = PredicateGroup(
         op="and",
         predicates=(_fp("t.a"),),
         groups=(PredicateGroup(op="or", predicates=(_fp("t.b"), _fp("t.c"))),),
     )
-    coerced = coerce_predicate_group(group)
+    coerced = PredicateGroup.coerce(group)
     assert coerced is not None
     assert coerced.depth() <= MAX_PREDICATE_NESTING_DEPTH
     assert coerced.op == "and"
@@ -247,7 +236,7 @@ def test_normalize_predicate_group_cnf_and_of_or() -> None:
             PredicateGroup(op="or", predicates=(_fp("t.c"), _fp("t.d"))),
         ),
     )
-    normalized = normalize_predicate_group_cnf(group)
+    normalized = PredicateGroup.normalize_cnf(group)
     assert normalized is not None
     assert normalized.op == "and"
     assert len(normalized.groups) == 2
@@ -264,7 +253,7 @@ def test_normalize_predicate_group_cnf_lifts_leaf_predicates_into_or() -> None:
         predicates=(_fp("t.a"),),
         groups=(PredicateGroup(op="or", predicates=(_fp("t.b"), _fp("t.c"))),),
     )
-    normalized = normalize_predicate_group_cnf(group)
+    normalized = PredicateGroup.normalize_cnf(group)
     assert normalized is not None
     assert normalized.op == "and"
     assert len(normalized.groups) == 2
@@ -278,7 +267,7 @@ def test_normalize_predicate_group_cnf_flattens_single_and_child() -> None:
     """CNF collapses a single-child AND wrapper."""
     inner = PredicateGroup(op="or", predicates=(_fp("t.a"), _fp("t.b")))
     group = PredicateGroup(op="and", groups=(inner,))
-    normalized = normalize_predicate_group_cnf(group)
+    normalized = PredicateGroup.normalize_cnf(group)
     assert normalized is not None
     assert normalized.op == "or"
     assert [p.left_expr.primary_column for p in normalized.leaves()] == ["t.a", "t.b"]
@@ -286,7 +275,7 @@ def test_normalize_predicate_group_cnf_flattens_single_and_child() -> None:
 
 @pytest.mark.fast
 def test_normalize_predicate_group_cnf_empty_returns_none() -> None:
-    assert normalize_predicate_group_cnf(None) is None
+    assert PredicateGroup.normalize_cnf(None) is None
 
 
 @pytest.mark.fast
@@ -299,7 +288,7 @@ def test_normalize_predicate_group_dnf_or_of_and() -> None:
             PredicateGroup(op="and", predicates=(_fp("t.c"), _fp("t.d"))),
         ),
     )
-    normalized = normalize_predicate_group_dnf(group)
+    normalized = PredicateGroup.normalize_dnf(group)
     assert normalized is not None
     assert normalized.op == "or"
     assert len(normalized.groups) == 2
@@ -315,12 +304,12 @@ def test_render_predicate_group_sql_after_cnf_and_of_or() -> None:
         predicates=(_fp("t.a", value="1"),),
         groups=(PredicateGroup(op="or", predicates=(_fp("t.b", value="2"), _fp("t.c", value="3"))),),
     )
-    normalized = normalize_predicate_group_cnf(group)
+    normalized = PredicateGroup.normalize_cnf(group)
     assert normalized is not None
     assert normalized.op == "and"
     assert all(child.op == "or" for child in normalized.groups)
 
-    dialect = get_dialect("duckdb")
+    dialect = DialectRegistry.get("duckdb")
 
     def render_leaf(pred: WhereParam | HavingParam) -> str:
         return render_predicate_clause(pred, dialect)
@@ -349,7 +338,7 @@ def test_predicate_nesting_depth_four_raises_warning() -> None:
     issues = validate_predicate_nesting_depth(nested, None)
     assert any("nesting exceeds" in issue.message for issue in issues)
     assert any(issue.severity == "error" for issue in issues)
-    """coerce_predicate_group normalizes nested OR-of-AND trees."""
+    """PredicateGroup.coerce normalizes nested OR-of-AND trees."""
     group = PredicateGroup(
         op="or",
         groups=(
@@ -360,7 +349,7 @@ def test_predicate_nesting_depth_four_raises_warning() -> None:
             ),
         ),
     )
-    coerced = coerce_predicate_group(group)
+    coerced = PredicateGroup.coerce(group)
     assert coerced is not None
     assert coerced.op == "or"
     assert len(coerced.groups) == 2

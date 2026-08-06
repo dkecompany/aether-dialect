@@ -86,6 +86,34 @@ class TestDistinctOnRenderer:
         assert "customers" in compact and "id" in compact
         assert "distinct on" not in compact
 
+    def test_main_distinct_on_multiline_select_appends_rank_in_select_list(
+        self, simple_schema: SchemaGraph, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ROW_NUMBER must be appended to the SELECT list, not spliced onto the first line."""
+        from aetherdialect._sql_gen import _build_deterministic_select_block
+
+        intent = _distinct_on_intent()
+        multiline_core = "SELECT customers.id,\n       customers.name\nFROM customers"
+
+        original_build = _build_deterministic_select_block
+
+        def _fake_build(*args: object, **kwargs: object) -> str:
+            if not kwargs.get("for_cte"):
+                return multiline_core
+            return original_build(*args, **kwargs)
+
+        monkeypatch.setattr("aetherdialect._sql_gen._build_deterministic_select_block", _fake_build)
+        sql = build_deterministic_sql(intent, schema=simple_schema, dialect=_pg_render())
+        don_match = re.search(
+            rf"{DISTINCT_ON_CTE_NAME_PREFIX}\d+\s+AS\s+\((.*?)\)\s*SELECT",
+            sql,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        assert don_match is not None, sql
+        body = don_match.group(1)
+        assert re.search(r"customers\.name\s*,\s*row_number\s*\(", body, flags=re.IGNORECASE | re.DOTALL), body
+        assert "row_number()" in _norm(body).replace(" ", "")
+
     def test_allocates_non_colliding_don_name(self, simple_schema: SchemaGraph) -> None:
         intent = _distinct_on_intent()
         intent = RuntimeIntent(

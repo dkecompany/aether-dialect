@@ -8,12 +8,10 @@ from aetherdialect._contracts_base import (
     MulGroup,
     NormalizedExpr,
     OrderByCol,
+    PredicateGroup,
     SqlDiagnostic,
     SqlDiagnosticCode,
     WhereParam,
-    having_leaves,
-    predicate_group_from_list,
-    where_leaves,
 )
 from aetherdialect._contracts_core import (
     RuntimeCteStep,
@@ -495,7 +493,7 @@ class TestStripJoinConditionsFromIntent:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
         )
         result = strip_join_conditions(intent, fk_schema)
         assert len(result.where.leaves() if result.where else []) == 0
@@ -514,7 +512,7 @@ class TestStripJoinConditionsFromIntent:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
         )
         result = strip_join_conditions(intent, fk_schema)
         assert len(result.where.leaves() if result.where else []) == 1
@@ -828,7 +826,7 @@ class TestStripJoinConditionsEdgeCases:
             right_expr=NormalizedExpr.from_column("customers.id"),
             value_type="integer",
         )
-        cte = RuntimeCteStep(cte_name="cte1", where=predicate_group_from_list([fk_filter]))
+        cte = RuntimeCteStep(cte_name="cte1", where=PredicateGroup.from_list([fk_filter]))
         intent = RuntimeIntent(
             tables=["orders", "customers"],
             grain="row_level",
@@ -839,7 +837,7 @@ class TestStripJoinConditionsEdgeCases:
             cte_steps=[cte],
         )
         result = strip_join_conditions(intent, schema)
-        assert len(where_leaves(result.cte_steps[0].where) or []) == 0
+        assert len(PredicateGroup.where_leaves(result.cte_steps[0].where) or []) == 0
 
     def test_keeps_non_equality_join(self):
         """strip_join_conditions keeps non-equality operator."""
@@ -895,7 +893,7 @@ class TestStripJoinConditionsEdgeCases:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
         )
         result = strip_join_conditions(intent, schema)
         assert len(result.where.leaves() if result.where else []) == 1
@@ -1136,7 +1134,7 @@ class TestRepairFkFilterTypeMismatch:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("orders.category_id"),
@@ -1158,7 +1156,7 @@ class TestRepairFkFilterTypeMismatch:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("orders.category_id"),
@@ -1179,7 +1177,7 @@ class TestRepairFkFilterTypeMismatch:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("orders.amount"),
@@ -1252,7 +1250,7 @@ class TestRepairFkFilterTypeMismatch:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("orders.tag_id"),
@@ -1273,7 +1271,7 @@ class TestRepairFkFilterTypeMismatch:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("orders.category_id"),
@@ -1294,7 +1292,7 @@ class TestRepairFkFilterTypeMismatch:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("orders.status"),
@@ -1570,7 +1568,7 @@ class TestRepairFkFilterTypeMismatchCte:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("orders.category_id"),
@@ -1594,7 +1592,9 @@ class TestRepairFkFilterTypeMismatchCte:
             cte_steps=[cte],
         )
         result = repair_fk_where_type_mismatch(intent, fk_schema)
-        assert (where_leaves(result.cte_steps[0].where) or [])[0].left_expr.primary_column == "orders.category_id"
+        assert (PredicateGroup.where_leaves(result.cte_steps[0].where) or [])[
+            0
+        ].left_expr.primary_column == "orders.category_id"
         assert result.cte_steps[0].tables == cte.tables
 
     def test_cte_non_fk_filter_unchanged(self, fk_schema):
@@ -1605,7 +1605,7 @@ class TestRepairFkFilterTypeMismatchCte:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("orders.order_id"),
@@ -1629,7 +1629,9 @@ class TestRepairFkFilterTypeMismatchCte:
             cte_steps=[cte],
         )
         result = repair_fk_where_type_mismatch(intent, fk_schema)
-        assert (where_leaves(result.cte_steps[0].where) or [])[0].left_expr.primary_column == "orders.order_id"
+        assert (PredicateGroup.where_leaves(result.cte_steps[0].where) or [])[
+            0
+        ].left_expr.primary_column == "orders.order_id"
 
     def test_main_and_cte_both_rewired(self, fk_schema):
         """Both main and CTE FK filters are rewired."""
@@ -1639,7 +1641,7 @@ class TestRepairFkFilterTypeMismatchCte:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("orders.category_id"),
@@ -1659,7 +1661,7 @@ class TestRepairFkFilterTypeMismatchCte:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("orders.category_id"),
@@ -1673,7 +1675,9 @@ class TestRepairFkFilterTypeMismatchCte:
         )
         result = repair_fk_where_type_mismatch(intent, fk_schema)
         assert (result.where.leaves() if result.where else [])[0].left_expr.primary_column == "orders.category_id"
-        assert (where_leaves(result.cte_steps[0].where) or [])[0].left_expr.primary_column == "orders.category_id"
+        assert (PredicateGroup.where_leaves(result.cte_steps[0].where) or [])[
+            0
+        ].left_expr.primary_column == "orders.category_id"
         assert result.tables == intent.tables
         assert result.cte_steps[0].tables == cte.tables
 
@@ -1858,7 +1862,7 @@ class TestResolveFilterValueCase:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             having=None,
             param_values={},
             natural_language="Show PG-13 films",
@@ -1880,7 +1884,7 @@ class TestResolveFilterValueCase:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([cte_fp]),
+            where=PredicateGroup.from_list([cte_fp]),
             having=None,
             param_values={},
             output_columns=[],
@@ -1898,7 +1902,7 @@ class TestResolveFilterValueCase:
             natural_language="test",
         )
         result = resolve_where_value_case(intent, rating_schema, "test")
-        assert (where_leaves(result.cte_steps[0].where) or [])[0].raw_value == "R"
+        assert (PredicateGroup.where_leaves(result.cte_steps[0].where) or [])[0].raw_value == "R"
 
     def test_no_change_returns_same_intent(self, rating_schema):
         """When no corrections needed the original intent is returned."""
@@ -1914,7 +1918,7 @@ class TestResolveFilterValueCase:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             having=None,
             param_values={},
             natural_language="test",
@@ -1955,7 +1959,7 @@ class TestResolveFilterValueCase:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             having=None,
             param_values={},
             natural_language="Show PG-13 films",
@@ -2006,14 +2010,16 @@ class TestNormalizeInFilterTypes:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             having=None,
             param_values={},
             natural_language="test",
         )
         result = normalize_in_where_types(intent, int_col_schema)
-        assert [fp.raw_value for fp in (result.where.leaves() if result.where else [])] == [1, 2, 3]
-        assert all(fp.op == "=" for fp in (result.where.leaves() if result.where else []))
+        leaves = result.where.leaves() if result.where else []
+        assert len(leaves) == 1
+        assert leaves[0].op == "in"
+        assert leaves[0].raw_value == [1, 2, 3]
 
     def test_consolidates_string_list(self, int_col_schema):
         """String list on a string column is consolidated with quotes."""
@@ -2029,14 +2035,16 @@ class TestNormalizeInFilterTypes:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             having=None,
             param_values={},
             natural_language="test",
         )
         result = normalize_in_where_types(intent, int_col_schema)
-        assert [fp.raw_value for fp in (result.where.leaves() if result.where else [])] == ["Alice", "Bob"]
-        assert all(fp.op == "=" for fp in (result.where.leaves() if result.where else []))
+        leaves = result.where.leaves() if result.where else []
+        assert len(leaves) == 1
+        assert leaves[0].op == "in"
+        assert leaves[0].raw_value == ["Alice", "Bob"]
 
     def test_non_in_op_unchanged(self, int_col_schema):
         """Filters with non-IN ops are not touched."""
@@ -2052,7 +2060,7 @@ class TestNormalizeInFilterTypes:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             having=None,
             param_values={},
             natural_language="test",
@@ -2074,7 +2082,7 @@ class TestNormalizeInFilterTypes:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([cte_fp]),
+            where=PredicateGroup.from_list([cte_fp]),
             having=None,
             param_values={},
             output_columns=[],
@@ -2092,8 +2100,10 @@ class TestNormalizeInFilterTypes:
             natural_language="test",
         )
         result = normalize_in_where_types(intent, int_col_schema)
-        assert [fp.raw_value for fp in (where_leaves(result.cte_steps[0].where) or [])] == [10, 20]
-        assert all(fp.op == "=" for fp in (where_leaves(result.cte_steps[0].where) or []))
+        cte_leaves = PredicateGroup.where_leaves(result.cte_steps[0].where) or []
+        assert len(cte_leaves) == 1
+        assert cte_leaves[0].op == "in"
+        assert cte_leaves[0].raw_value == [10, 20]
 
 
 class TestNormalizeBooleanFilterValues:
@@ -2144,7 +2154,7 @@ class TestNormalizeBooleanFilterValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
         )
         result = normalize_boolean_where_values(intent, bool_schema)
         assert (result.where.leaves() if result.where else [])[0].raw_value is True
@@ -2164,7 +2174,7 @@ class TestNormalizeBooleanFilterValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
         )
         result = normalize_boolean_where_values(intent, bool_schema)
         assert (result.where.leaves() if result.where else [])[0].raw_value is False
@@ -2184,7 +2194,7 @@ class TestNormalizeBooleanFilterValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
         )
         result = normalize_boolean_where_values(intent, bool_schema)
         assert (result.where.leaves() if result.where else [])[0].raw_value is True
@@ -2204,7 +2214,7 @@ class TestNormalizeBooleanFilterValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
         )
         result = normalize_boolean_where_values(intent, bool_schema)
         assert (result.where.leaves() if result.where else [])[0].raw_value == "Alice"
@@ -2223,7 +2233,7 @@ class TestNormalizeBooleanFilterValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
         )
         result = normalize_boolean_where_values(intent, bool_schema)
         assert result is intent
@@ -2242,7 +2252,7 @@ class TestNormalizeBooleanFilterValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([cte_fp]),
+            where=PredicateGroup.from_list([cte_fp]),
             having=None,
             param_values={},
             output_columns=[],
@@ -2257,8 +2267,8 @@ class TestNormalizeBooleanFilterValues:
             cte_steps=[cte],
         )
         result = normalize_boolean_where_values(intent, bool_schema)
-        assert (where_leaves(result.cte_steps[0].where) or [])[0].raw_value is True
-        assert (where_leaves(result.cte_steps[0].where) or [])[0].value_type == "boolean"
+        assert (PredicateGroup.where_leaves(result.cte_steps[0].where) or [])[0].raw_value is True
+        assert (PredicateGroup.where_leaves(result.cte_steps[0].where) or [])[0].value_type == "boolean"
 
     def test_main_and_cte_both_normalised(self, bool_schema):
         """Both main and CTE boolean filters are normalised."""
@@ -2280,7 +2290,7 @@ class TestNormalizeBooleanFilterValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([cte_fp]),
+            where=PredicateGroup.from_list([cte_fp]),
             having=None,
             param_values={},
             output_columns=[],
@@ -2291,12 +2301,12 @@ class TestNormalizeBooleanFilterValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([main_fp]),
+            where=PredicateGroup.from_list([main_fp]),
             cte_steps=[cte],
         )
         result = normalize_boolean_where_values(intent, bool_schema)
         assert (result.where.leaves() if result.where else [])[0].raw_value is False
-        assert (where_leaves(result.cte_steps[0].where) or [])[0].raw_value is True
+        assert (PredicateGroup.where_leaves(result.cte_steps[0].where) or [])[0].raw_value is True
 
 
 class TestStripSpuriousGroupByHavingParam:
@@ -2317,7 +2327,7 @@ class TestStripSpuriousGroupByHavingParam:
             group_by_cols=[NormalizedExpr.from_column("orders.status")],
             order_by_cols=[],
             where=None,
-            having=predicate_group_from_list([hp]),
+            having=PredicateGroup.from_list([hp]),
         )
         result = strip_spurious_group_by(intent)
         assert len(result.group_by_cols) == 1
@@ -2338,7 +2348,7 @@ class TestStripSpuriousGroupByHavingParam:
             group_by_cols=[NormalizedExpr.from_column("orders.status")],
             order_by_cols=[],
             where=None,
-            having=predicate_group_from_list([hp]),
+            having=PredicateGroup.from_list([hp]),
         )
         result = strip_spurious_group_by(intent)
         assert result.group_by_cols == []
@@ -2360,7 +2370,7 @@ class TestStripSpuriousGroupByHavingParam:
             group_by_cols=[NormalizedExpr.from_column("items.category")],
             order_by_cols=[],
             where=None,
-            having=predicate_group_from_list([hp]),
+            having=PredicateGroup.from_list([hp]),
             param_values={},
             output_columns=[],
         )
@@ -2488,7 +2498,7 @@ class TestStripImpossibleHaving:
             group_by_cols=[NormalizedExpr.from_column("orders.status")],
             order_by_cols=[],
             where=None,
-            having=predicate_group_from_list([hp_bad, hp_good]),
+            having=PredicateGroup.from_list([hp_bad, hp_good]),
         )
         result = strip_impossible_having(intent)
         assert len(result.having.leaves() if result.having else []) == 1
@@ -2510,7 +2520,7 @@ class TestStripImpossibleHaving:
             group_by_cols=[],
             order_by_cols=[],
             where=None,
-            having=predicate_group_from_list([hp]),
+            having=PredicateGroup.from_list([hp]),
         )
         result = strip_impossible_having(intent)
         assert result is intent
@@ -2547,7 +2557,7 @@ class TestStripImpossibleHaving:
             group_by_cols=[NormalizedExpr.from_column("items.category")],
             order_by_cols=[],
             where=None,
-            having=predicate_group_from_list([hp_bad]),
+            having=PredicateGroup.from_list([hp_bad]),
             param_values={},
             output_columns=[],
         )
@@ -2561,7 +2571,7 @@ class TestStripImpossibleHaving:
             cte_steps=[cte],
         )
         result = strip_impossible_having(intent)
-        assert (having_leaves(result.cte_steps[0].having) or []) == []
+        assert (PredicateGroup.having_leaves(result.cte_steps[0].having) or []) == []
 
 
 class TestSanitizeTableNames:
@@ -2743,7 +2753,7 @@ class TestPruneUnreferencedTablesWithSchemaGraph:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("orders.order_id"),
@@ -2768,7 +2778,7 @@ class TestPruneUnreferencedTablesWithSchemaGraph:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("orders.order_id"),
@@ -2949,7 +2959,7 @@ class TestPruneWithFkFilterTarget:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("orders.customer_id"),
@@ -2974,7 +2984,7 @@ class TestPruneWithFkFilterTarget:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("orders.order_id"),
@@ -3124,7 +3134,7 @@ class TestRepairNullEqualityFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("orders.return_date"),
@@ -3148,7 +3158,7 @@ class TestRepairNullEqualityFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("orders.return_date"),
@@ -3171,7 +3181,7 @@ class TestRepairNullEqualityFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("orders.return_date"),
@@ -3195,7 +3205,7 @@ class TestRepairNullEqualityFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("orders.return_date"),
@@ -3217,7 +3227,7 @@ class TestRepairNullEqualityFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("orders.status"),
@@ -3239,7 +3249,7 @@ class TestRepairNullEqualityFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("a.fk_id"),
@@ -3268,7 +3278,7 @@ class TestRepairNullEqualityFilters:
                 RuntimeCteStep(
                     cte_name="cte1",
                     tables=["rental"],
-                    where=predicate_group_from_list(
+                    where=PredicateGroup.from_list(
                         [
                             WhereParam(
                                 left_expr=NormalizedExpr.from_column("rental.return_date"),
@@ -3282,7 +3292,7 @@ class TestRepairNullEqualityFilters:
             ],
         )
         result = repair_null_equality_where(intent)
-        assert (where_leaves(result.cte_steps[0].where) or [])[0].op == "is null"
+        assert (PredicateGroup.where_leaves(result.cte_steps[0].where) or [])[0].op == "is null"
 
     def test_having_equality_null_rewritten(self):
         """HAVING ``= NULL`` becomes ``is null`` like WHERE filters."""
@@ -3293,7 +3303,7 @@ class TestRepairNullEqualityFilters:
             group_by_cols=[],
             order_by_cols=[],
             where=None,
-            having=predicate_group_from_list(
+            having=PredicateGroup.from_list(
                 [
                     HavingParam(
                         left_expr=NormalizedExpr.from_column("orders.amount"),
@@ -3319,8 +3329,8 @@ class TestRepairNullEqualityLoopSafety:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(filters) if filters else None,
-            having=predicate_group_from_list(having) if having else None,
+            where=PredicateGroup.from_list(filters) if filters else None,
+            having=PredicateGroup.from_list(having) if having else None,
         )
 
     def test_filter_skips_when_param_key_set_string(self) -> None:
@@ -3334,8 +3344,8 @@ class TestRepairNullEqualityLoopSafety:
         intent = self._base_intent([fp])
         once = repair_null_equality_where(intent)
         twice = repair_null_equality_where(once)
-        assert (where_leaves(once.where) or [])[0].op == "="
-        assert (where_leaves(twice.where) or [])[0].op == "="
+        assert (PredicateGroup.where_leaves(once.where) or [])[0].op == "="
+        assert (PredicateGroup.where_leaves(twice.where) or [])[0].op == "="
 
     def test_filter_skips_when_param_key_set_integer(self) -> None:
         fp = WhereParam(
@@ -3380,12 +3390,12 @@ class TestRepairNullEqualityLoopSafety:
                 RuntimeCteStep(
                     cte_name="c1",
                     tables=["rental"],
-                    where=predicate_group_from_list([fp]),
+                    where=PredicateGroup.from_list([fp]),
                 ),
             ],
         )
         out = repair_null_equality_where(intent)
-        assert (where_leaves(out.cte_steps[0].where) or [])[0].op == "="
+        assert (PredicateGroup.where_leaves(out.cte_steps[0].where) or [])[0].op == "="
 
     def test_empty_param_key_still_rewrites_null_literal(self) -> None:
         fp = WhereParam(
@@ -3415,7 +3425,7 @@ class TestRepairNullEqualityFiltersContinued:
             group_by_cols=[],
             order_by_cols=[],
             where=None,
-            having=predicate_group_from_list(
+            having=PredicateGroup.from_list(
                 [
                     HavingParam(left_expr=count_expr, op="=", raw_value=3, value_type="number"),
                     HavingParam(left_expr=count_expr, op=">", raw_value=10, value_type="number"),
@@ -3435,7 +3445,7 @@ class TestRepairNullEqualityFiltersContinued:
             group_by_cols=[],
             order_by_cols=[],
             where=None,
-            having=predicate_group_from_list(
+            having=PredicateGroup.from_list(
                 [
                     HavingParam(
                         left_expr=NormalizedExpr.from_column("t.x"),
@@ -3722,7 +3732,7 @@ class TestRepairIntentPlaceholderTokens:
             select_cols=[SelectCol(expr=expr)],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("table_1.special_features"),
@@ -3871,18 +3881,18 @@ class TestDedupValueVsRightExpr:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp_m]),
+            where=PredicateGroup.from_list([fp_m]),
             cte_steps=[
                 RuntimeCteStep(
                     cte_name="c1",
                     tables=["t"],
-                    where=predicate_group_from_list([fp_c]),
+                    where=PredicateGroup.from_list([fp_c]),
                 ),
             ],
         )
         result = dedup_value_vs_right_expr(intent)
         assert (result.where.leaves() if result.where else [])[0].right_expr is None
-        assert (where_leaves(result.cte_steps[0].where) or [])[0].right_expr is None
+        assert (PredicateGroup.where_leaves(result.cte_steps[0].where) or [])[0].right_expr is None
 
 
 class TestDedupContradictoryFilters:
@@ -3917,7 +3927,7 @@ class TestDedupContradictoryFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(left_expr=col, op="=", raw_value=1, value_type="integer"),
                     WhereParam(left_expr=col, op=">=", raw_value=0, value_type="integer"),
@@ -3927,7 +3937,7 @@ class TestDedupContradictoryFilters:
                 RuntimeCteStep(
                     cte_name="c1",
                     tables=["t"],
-                    where=predicate_group_from_list(
+                    where=PredicateGroup.from_list(
                         [
                             WhereParam(left_expr=col, op="=", raw_value=2, value_type="integer"),
                             WhereParam(left_expr=col, op="<=", raw_value=9, value_type="integer"),
@@ -3938,7 +3948,7 @@ class TestDedupContradictoryFilters:
         )
         result = dedup_contradictory_where(intent)
         assert len(result.where.leaves() if result.where else []) == 1
-        assert len(where_leaves(result.cte_steps[0].where) or []) == 1
+        assert len(PredicateGroup.where_leaves(result.cte_steps[0].where) or []) == 1
 
 
 class TestQualifyTermBoundaries:
@@ -4168,7 +4178,7 @@ class TestNormalizeNullFilterValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("t.x"),
@@ -4196,7 +4206,7 @@ class TestNormalizeNullFilterValues:
                 RuntimeCteStep(
                     cte_name="c1",
                     tables=["t"],
-                    where=predicate_group_from_list(
+                    where=PredicateGroup.from_list(
                         [
                             WhereParam(
                                 left_expr=NormalizedExpr.from_column("t.x"),
@@ -4210,7 +4220,7 @@ class TestNormalizeNullFilterValues:
             ],
         )
         out = normalize_null_where_values(intent)
-        fp = (where_leaves(out.cte_steps[0].where) or [])[0]
+        fp = (PredicateGroup.where_leaves(out.cte_steps[0].where) or [])[0]
         assert fp.value_type == "null"
         assert fp.raw_value is None
 
@@ -4299,7 +4309,7 @@ class TestRepairArrayFiltersIntent:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
         )
         out = repair_array_where_intent(intent, array_schema)
         assert (out.where.leaves() if out.where else [])[0].op == "contains"
@@ -4319,7 +4329,7 @@ class TestRepairArrayFiltersIntent:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
         )
         out = repair_array_where_intent(intent, array_schema)
         assert len(out.where.leaves() if out.where else []) == 1
@@ -4340,7 +4350,7 @@ class TestRepairArrayFiltersIntent:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
         )
         out = repair_array_where_intent(intent, array_schema)
         assert (out.where.leaves() if out.where else []) == []
@@ -4358,7 +4368,7 @@ class TestRepairArrayFiltersIntent:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
         )
         out = repair_array_where_intent(intent, array_schema)
         assert len(out.where.leaves() if out.where else []) == 1
@@ -4377,16 +4387,16 @@ class TestRepairArrayFiltersIntent:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
         )
         out = repair_array_where_intent(intent, array_schema)
         assert (out.where.leaves() if out.where else [])[0].op == "contains"
 
 
 class TestDecomposeInNotInFilters:
-    """decompose_in_not_in_where expands short IN/NOT IN lists."""
+    """decompose_in_not_in_where keeps native IN/NOT IN lists."""
 
-    def test_in_list_becomes_or_chain(self):
+    def test_in_list_stays_native(self):
         fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.id"),
             op="in",
@@ -4399,18 +4409,16 @@ class TestDecomposeInNotInFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
         )
         out = decompose_in_not_in_where(intent)
         assert out.where is not None
-        assert out.where.op == "or"
-        assert len(out.where.predicates) == 3
-        assert out.where.predicates[0].op == "="
-        assert out.where.predicates[0].raw_value == 1
-        assert out.where.predicates[1].raw_value == 2
-        assert out.where.predicates[2].raw_value == 3
+        leaves = out.where.leaves() or []
+        assert len(leaves) == 1
+        assert leaves[0].op == "in"
+        assert leaves[0].raw_value == [1, 2, 3]
 
-    def test_not_in_list_becomes_and_chain_of_neq(self):
+    def test_not_in_list_stays_native(self):
         fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.code"),
             op="not in",
@@ -4423,16 +4431,16 @@ class TestDecomposeInNotInFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
         )
         out = decompose_in_not_in_where(intent)
         assert out.where is not None
-        assert out.where.op == "and"
-        assert len(out.where.predicates) == 2
-        assert out.where.predicates[0].op == "!="
-        assert out.where.predicates[1].op == "!="
+        leaves = out.where.leaves() or []
+        assert len(leaves) == 1
+        assert leaves[0].op == "not in"
+        assert leaves[0].raw_value == ["a", "b"]
 
-    def test_in_two_elements_or_between_last_keeps_chain_bool_op(self):
+    def test_in_two_elements_stays_native(self):
         fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.id"),
             op="in",
@@ -4445,14 +4453,15 @@ class TestDecomposeInNotInFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
         )
         out = decompose_in_not_in_where(intent)
         assert out.where is not None
-        assert out.where.op == "or"
-        assert len(out.where.predicates) == 2
+        leaves = out.where.leaves() or []
+        assert len(leaves) == 1
+        assert leaves[0].op == "in"
 
-    def test_not_in_three_elements_and_chain_last_bool_op(self):
+    def test_not_in_three_elements_stays_native(self):
         fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.code"),
             op="not in",
@@ -4465,12 +4474,13 @@ class TestDecomposeInNotInFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
         )
         out = decompose_in_not_in_where(intent)
         assert out.where is not None
-        assert out.where.op == "and"
-        assert len(out.where.predicates) == 3
+        leaves = out.where.leaves() or []
+        assert len(leaves) == 1
+        assert leaves[0].op == "not in"
 
     def test_long_list_not_expanded(self):
         vals = list(range(11))
@@ -4486,7 +4496,7 @@ class TestDecomposeInNotInFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
         )
         out = decompose_in_not_in_where(intent)
         assert len(out.where.leaves() if out.where else []) == 1
@@ -5085,7 +5095,7 @@ class TestDiagnosticRepairDispatch:
             select_cols=[SelectCol(expr=NormalizedExpr.from_agg("count", "customer.customer_id"))],
             group_by_cols=[NormalizedExpr.from_column("customer.email")],
             order_by_cols=[],
-            where=predicate_group_from_list([agg_filter]),
+            where=PredicateGroup.from_list([agg_filter]),
             having=None,
         )
         diag = SqlDiagnostic(
@@ -5143,7 +5153,7 @@ class TestDiagnosticRepairDispatch:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("customer.email"))],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([bound_filter, unbound_filter]),
+            where=PredicateGroup.from_list([bound_filter, unbound_filter]),
         )
         diag = SqlDiagnostic(
             code=SqlDiagnosticCode.PARAM_UNBOUND,
@@ -5262,7 +5272,7 @@ def test_align_filter_coerces_boolean_bindings_to_int_for_integer_column() -> No
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("customer.customer_id"))],
         group_by_cols=[],
         order_by_cols=[],
-        where=predicate_group_from_list([fp]),
+        where=PredicateGroup.from_list([fp]),
         param_values={"p1": True},
     )
     out = align_where_value_type_to_exprs(intent, schema)
@@ -5283,7 +5293,7 @@ def test_promote_temporal_keyword_rhs_binds_current_timestamp_as_keyword() -> No
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("tbl_a.col_date"))],
         group_by_cols=[],
         order_by_cols=[],
-        where=predicate_group_from_list([fp]),
+        where=PredicateGroup.from_list([fp]),
     )
     out = promote_temporal_keyword_rhs(intent)
     promoted = (out.where.leaves() if out.where else [])[0]

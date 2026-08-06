@@ -14,24 +14,20 @@ from unittest.mock import patch
 from aetherdialect._config import EngineConfig
 from aetherdialect._contracts_base import (
     NormalizedExpr,
+    PredicateGroup,
     WhereParam,
-    predicate_group_from_list,
 )
 from aetherdialect._contracts_core import (
     FeedbackKind,
+    LiveTestRunner,
     RuntimeIntent,
     SelectCol,
     Template,
     ValueHistory,
 )
 from aetherdialect._contracts_schema import TemplateStats
-from aetherdialect._live_testing import LiveTestRunner
 from aetherdialect._templates import (
-    empty_template_store,
-    insert_template,
-    record_question_feedback,
-    store_to_templates,
-    summarize_failure_for_memory,
+    TemplateOps,
 )
 from aetherdialect._utils import intent_key
 
@@ -51,7 +47,7 @@ def _question_feedback_entry_count(store: dict[str, Any]) -> int:
 
 def empty_store(effective_structural_hash: str):
     """Return a fresh empty partitioned template store (alias for :func:`empty_template_store`)."""
-    return empty_template_store(effective_structural_hash)
+    return TemplateOps.empty_template_store(effective_structural_hash)
 
 
 @contextmanager
@@ -67,11 +63,11 @@ def isolated_runner(schema: Any, schema_terms: set[str], t2s: Any, *, label: str
     os.makedirs(isolated_dir, exist_ok=True)
     EngineConfig.TEMPLATE_STORE_DIR = isolated_dir
     try:
-        store = empty_template_store(schema.effective_structural_hash)
+        store = TemplateOps.empty_template_store(schema.effective_structural_hash)
         runner = LiveTestRunner(
             schema=schema,
             store=store,
-            templates=store_to_templates(store),
+            templates=TemplateOps.store_to_templates(store),
             rejected={},
             schema_terms=set(schema_terms),
             csv_dir=t2s._artifacts_dir,
@@ -82,6 +78,25 @@ def isolated_runner(schema: Any, schema_terms: set[str], t2s: Any, *, label: str
         EngineConfig.TEMPLATE_STORE_DIR = original_dir
         if os.path.isdir(isolated_dir):
             shutil.rmtree(isolated_dir, ignore_errors=True)
+
+
+def run_isolated_scenario(
+    schema: Any,
+    schema_terms: set[str],
+    t2s: Any,
+    scenario: Any,
+    *,
+    label: str,
+) -> None:
+    """Run one scenario under ``isolated_runner`` and assert its expectations."""
+    from aetherdialect._live_testing import run_and_assert
+
+    with isolated_runner(schema, schema_terms, t2s, label=label) as runner:
+        run_and_assert(
+            runner,
+            scenario,
+            header=f"[isolated:{scenario.id}] {scenario.question}",
+        )
 
 
 def intent_rental_count_by_store() -> RuntimeIntent:
@@ -219,7 +234,7 @@ def intent_film_in_category(category_name: str) -> RuntimeIntent:
         ],
         group_by_cols=[],
         order_by_cols=[],
-        where=predicate_group_from_list(
+        where=PredicateGroup.from_list(
             [
                 WhereParam(
                     left_expr=NormalizedExpr.from_column("category.name"),
@@ -250,7 +265,7 @@ def seed_template(
     """Insert one template into *runner*'s store. When. *structural_override* is non-empty, each key replaces the matching entry in ``Template.structural_defaults`` after insertion so the stored value_history row differs from the structural default (the lever that routes fuzzy reuse through ``GenerationPath.FUZZY_REUSE_FULL_PARAMS``). Args: runner: Target ``LiveTestRunner`` whose store/templates are mutated. q_norm: Normalised seed question stored in ``value_history.questions``. intent: Seed intent whose ``param_values`` feed structural defaults. sql: Seed SQL (canonicalised + parameterised by ``insert_template``). trust_level: Stored ``Template.trust_level``; default is 1. stats: Optional ``TemplateStats``; default is ``accept=3, reject=0``. value_history: Optional pre-built history; default is a single row. structural_override: Optional ``s*`` overrides applied post-insert. template_source: Stored ``Template.source`` marker. Returns: The newly inserted or merged ``Template``."""
     if stats is None:
         stats = TemplateStats(accept=3, reject=0)
-    template = insert_template(
+    template = TemplateOps.insert_template(
         runner.store,
         runner.templates,
         runner.schema,
@@ -277,14 +292,14 @@ def seed_rejected(
     reason: str = "seeded rejection",
 ) -> SimpleNamespace:
     """Insert one ``INTENT_REJECTED`` question-feedback row into *runner*'s store."""
-    ent = summarize_failure_for_memory(
+    ent = TemplateOps.summarize_failure_for_memory(
         question=q_norm,
         intent=intent,
         kind=FeedbackKind.INTENT_REJECTED,
         schema_hash=runner.schema.effective_structural_hash,
         user_reason=reason,
     )
-    record_question_feedback(runner.store, q_norm, ent)
+    TemplateOps.record_question_feedback(runner.store, q_norm, ent)
     return SimpleNamespace(
         id=f"qf:{q_norm}",
         intent_key=intent_key(intent),
@@ -301,35 +316,31 @@ def seed_negative_memory(
     repeats: int = 1,
     q_norm: str | None = None,
 ) -> dict[str, str]:
-    """Seed validation-failure feedback rows for *intent* (penalty / hint paths). Each repeat appends one ``question_feedback`` row scoped to the runner schema so :func:`aetherdialect._templates.compute_question_feedback_penalty` observes the seed. Returns the computed keys (``ikey``, ``sql_fp``, ``colmap_sig``, ``q_norm``) for assertions."""
+    """Seed validation-failure feedback rows for *intent* (penalty / hint paths). Each repeat appends one ``question_feedback`` row scoped to the runner schema so :func:`aetherdialect._templates.TemplateOps.compute_question_feedback_penalty` observes the seed. Returns the computed keys (``ikey``, ``sql_fp``, ``colmap_sig``, ``q_norm``) for assertions."""
     from aetherdialect._core_utils import (
         canonicalize_sql,
         colmap_signature,
         normalize_sql,
     )
-    from aetherdialect._dialect import (
-        active_sqlglot_dialect,
-        compute_sql_fp,
-        parameter_abstract,
-    )
+    from aetherdialect._dialect import Dialect
 
     sql_canon = canonicalize_sql(sql)
     sql_norm = normalize_sql(sql_canon)
-    sql_param, _ = parameter_abstract(sql_norm, sqlglot_dialect=active_sqlglot_dialect())
+    sql_param, _ = Dialect.parameter_abstract(sql_norm, sqlglot_dialect=Dialect.active_sqlglot_dialect())
     ikey = intent_key(intent)
-    sql_fp = compute_sql_fp(sql_param, sqlglot_dialect=active_sqlglot_dialect())
+    sql_fp = Dialect.compute_sql_fp(sql_param, sqlglot_dialect=Dialect.active_sqlglot_dialect())
     cmap_sig = colmap_signature(intent.column_map)
     qn = q_norm or intent.natural_language or f"seed-negative-memory::{ikey}"
     eff = runner.schema.effective_structural_hash
     for _ in range(max(1, repeats)):
-        ent = summarize_failure_for_memory(
+        ent = TemplateOps.summarize_failure_for_memory(
             question=qn,
             intent=intent,
             kind=FeedbackKind.VALIDATION_FAILURE,
             schema_hash=eff,
             validator_errors=[reason],
         )
-        record_question_feedback(runner.store, qn, ent)
+        TemplateOps.record_question_feedback(runner.store, qn, ent)
     return {"ikey": ikey, "sql_fp": sql_fp, "colmap_sig": cmap_sig, "q_norm": qn}
 
 
@@ -844,6 +855,7 @@ __all__ = [
     "intent_store_staff_by_work",
     "isolated_runner",
     "rejected_for_intent",
+    "run_isolated_scenario",
     "seed_negative_memory",
     "seed_rejected",
     "seed_template",

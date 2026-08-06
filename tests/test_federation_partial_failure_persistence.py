@@ -30,7 +30,7 @@ def _seed_artifact_tree(tmp_path: Any, fed: TwoMemberFederation) -> dict[str, in
     persist_federation_tree(
         federation_dir,
         manifest=fed.manifest,
-        mappings=FederationMappings(version=1),
+        mappings=FederationMappings(version="0.2.1"),
         composite=fed.composite,
         member_graphs=fed.member_graphs,
     )

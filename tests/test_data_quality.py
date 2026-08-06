@@ -41,7 +41,7 @@ def _mock_llm_json(system: str, user: str, retries: int = 1, task: str = "defaul
 
 @pytest.fixture(autouse=True)
 def _patch_upload_llm() -> None:
-    with patch("aetherdialect._data_quality.llm_json", side_effect=_mock_llm_json):
+    with patch("aetherdialect._data_quality.LLMProvider.json", side_effect=_mock_llm_json):
         yield
 
 
@@ -229,7 +229,7 @@ def test_resolve_identifier_skips_llm_for_clean_names(monkeypatch: pytest.Monkey
     def _fail_llm(*_args: object, **_kwargs: object) -> dict[str, str]:
         raise AssertionError("llm_json should not be called for clean identifiers")
 
-    monkeypatch.setattr("aetherdialect._data_quality.llm_json", _fail_llm)
+    monkeypatch.setattr("aetherdialect._data_quality.LLMProvider.json", _fail_llm)
     reserved: set[str] = set()
     assert resolve_identifier_name("amount", kind="column", pinned_names={}, reserved=reserved) == "amount"
     assert resolve_identifier_name("order_date", kind="column", pinned_names={}, reserved=reserved) == "order_date"
@@ -359,7 +359,7 @@ def test_llm_interpret_bad_proposal_rejected(tmp_path: Path) -> None:
             return {"header_row": 999}
         return {}
 
-    with patch("aetherdialect._data_quality.llm_json", side_effect=_bad_interpret):
+    with patch("aetherdialect._data_quality.LLMProvider.json", side_effect=_bad_interpret):
         report = validate_upload_sources((path,), log_sink=lambda _msg: None)
     assert report.ok
 

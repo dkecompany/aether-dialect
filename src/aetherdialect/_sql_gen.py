@@ -3,20 +3,27 @@
 from __future__ import annotations
 
 import itertools
+import math
 from collections import defaultdict
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
-from typing import Any, Literal
+from datetime import datetime
+from decimal import Decimal
+from typing import Any, Literal, cast
 
 from sqlglot import exp, parse_one
 
 from ._config import PolicyConfig
 from ._constants import (
+    ANTI_JOIN_PRESENCE_COLUMN_SUFFIX,
     CANONICAL_FEEDBACK_DIALECT,
+    DEFAULT_NULL_ORDERING_ASC,
+    DEFAULT_NULL_ORDERING_DESC,
     DETERMINISTIC_PROBE_EDGE_KINDS,
     DIAGNOSTIC_CODE_JOIN_CANDIDATE_CAP,
+    DIAGNOSTIC_CODE_JOIN_NULLABLE_KEY,
     DIAGNOSTIC_CODE_JOIN_ORPHAN_RATE_HIGH,
     DIAGNOSTIC_CODE_JOIN_PATH_TIE_CEILING_EXCEEDED,
     DIAGNOSTIC_CODE_SEMANTIC_PROFILE_WHERE_EDGE,
@@ -29,56 +36,67 @@ from ._constants import (
     JOIN_PATH_EDGE_KIND_WHERE_BUCKET,
     JOIN_PATH_EDGE_KINDS,
     JOIN_PRIOR_FEEDBACK_HEADING,
+    REFUSAL_AMBIGUOUS_DATE_LITERAL_MESSAGE,
+    REFUSAL_NULL_IN_NEGATED_LIST_MESSAGE,
+    REFUSAL_SUBDAY_DATE_WINDOW_ON_DATE_COLUMN_MESSAGE,
     SCALAR_FUNCTIONS_LEADING_ARG,
     SQL_WINDOW_FUNCTION_UPPER,
-    anti_join_presence_column,
+    TIMESTAMP_COLUMN_DATA_TYPES,
 )
 from ._contracts_base import (
     PROBE_CTE_EMISSION_KINDS,
+    AmbiguousDateLiteralError,
     ClauseWidenedRowsetError,
     CteEmissionKind,
     HavingParam,
+    JoinCandidateCapExceededError,
     JoinColumnCountMismatchError,
+    JoinEdge,
     JoinInjectionAlignmentError,
     JoinInjectionFailedError,
     JoinPathTieCapExceededError,
+    JoinProbeEdgeKindMismatchError,
     LlmJsonExhausted,
     MulGroup,
     NoJoinPathError,
     NormalizedExpr,
+    NullInNegatedListError,
     OrderByCol,
     PredicateGroup,
+    RegistryRenderError,
     ScalarArg,
+    SchemaInvariantError,
+    SubdayDateWindowOnDateColumnError,
     WhereParam,
-    expr_registry_ref,
-    merge_predicate_groups,
-    predicate_group_from_list,
-    register_render_expr_sql,
 )
-from ._contracts_core import RuntimeCteStep, RuntimeIntent, ScopeClass, SelectCol, effective_select_parts
+from ._contracts_core import RuntimeCteStep, RuntimeIntent, ScopeClass, SelectCol
 from ._contracts_schema import (
+    CaseRegistryStep,
     CaseWhenExpr,
     SchemaGraph,
     VirtualTableSpec,
+    WindowRegistryStep,
     WindowSpec,
-    current_case_registry_steps,
-    current_window_registry_steps,
-    registry_render_scope,
 )
 from ._core_utils import (
+    active_federation_execution_context,
     debug,
+    escape_like_wildcards,
+    is_string_type,
     join_signature_tables,
     notify,
+    parse_iso_date_literal,
     pipeline_trace,
     prompt_cache_schema_scope,
     prompt_json,
+    render_sql_numeric_value,
     schema_prompt_cache_id,
     stable_json,
 )
-from ._dialect import Dialect, JoinEdge, get_dialect
-from ._dialect_postgres import append_pglast_select_targets
+from ._dialect import Dialect, DialectRegistry
+from ._dialect_postgres import PostgresDialect
 from ._intent_expr import extract_columns_from_expr
-from ._llm_provider import llm_json
+from ._llm_provider import LLMProvider
 from ._schema_catalog import value_overlap_stats_for_columns
 from ._schema_graph import join_path_pair_tie_count, stored_join_paths_for_pair
 from ._validation_schema import (
@@ -91,35 +109,16 @@ from ._validation_schema import (
 )
 
 
-class JoinCandidateCapExceededError(Exception):
-    """Raised when join path cross-product enumeration exceeds the refusal cap."""
-
-    def __init__(
-        self,
-        enumerated: int,
-        cap: int,
-        *,
-        tables: list[str] | None = None,
-        root: str | None = None,
-    ) -> None:
-        self.enumerated = enumerated
-        self.cap = cap
-        self.tables = list(tables) if tables is not None else None
-        self.root = root
-        tables_text = ",".join(self.tables) if self.tables else "?"
-        root_text = f" root={self.root!r}" if self.root else ""
-        super().__init__(
-            f"join candidate cross-product cap exceeded: {enumerated} paths (limit {cap}) tables={tables_text}{root_text}"
-        )
+def apply_negation_includes_unknown_sql(core_sql: str, left_sql: str, *, is_nullable: bool) -> str:
+    """When a negated comparison targets a nullable column, include rows where the value is unknown."""
+    if is_nullable:
+        return f"({core_sql} OR {left_sql} IS NULL)"
+    return core_sql
 
 
-class JoinProbeEdgeKindMismatchError(Exception):
-    """Raised when join path signature and edge-kind lists are not aligned."""
-
-    def __init__(self, signature_len: int, kinds_len: int) -> None:
-        self.signature_len = signature_len
-        self.kinds_len = kinds_len
-        super().__init__(f"join path edge_kinds length mismatch: {kinds_len} kinds for {signature_len} segments")
+def anti_join_presence_column(cte_name: str) -> str:
+    """Return the renderer-owned presence marker column for an anti-join CTE."""
+    return f"{cte_name}{ANTI_JOIN_PRESENCE_COLUMN_SUFFIX}"
 
 
 def _refuse_join_candidate_cap(
@@ -254,6 +253,61 @@ def _mulgroup_value_kind(g: MulGroup) -> str | None:
     if kinds <= {"number", "integer"}:
         return "number"
     return None
+
+
+def _expr_is_integer_operand(node: NormalizedExpr) -> bool:
+    """Return True when *node* contributes an integer-valued division operand."""
+    if node.column_ref:
+        schema = _SQL_GEN_SCHEMA.get()
+        if schema is None:
+            return False
+        cte_outputs = _SQL_GEN_CTE_OUTPUTS.get() or {}
+        return get_col_type(node.column_ref, schema, cte_outputs) == "integer"
+    if node.add_groups:
+        kind = _mulgroup_value_kind(node.add_groups[0])
+        if kind == "integer":
+            return True
+        g = node.add_groups[0]
+        if not extract_columns_from_expr(node) and g.coefficient != 1.0:
+            return float(g.coefficient).is_integer()
+    if node.add_values:
+        return all(
+            isinstance(v.value, int) or (isinstance(v.value, float) and float(cast(Any, v.value or 0)).is_integer())
+            for v in node.add_values
+        )
+    return False
+
+
+def _mulgroup_integer_division_operands(g: MulGroup) -> bool:
+    """Return True when every multiply and divide term is an integer operand."""
+    if not g.divide or not g.multiply:
+        return False
+    return all(_expr_is_integer_operand(term) for term in g.multiply + g.divide)
+
+
+def _mulgroup_exact_numeric_division_operands(g: MulGroup) -> bool:
+    """Return True when every column operand in a division is exact numeric."""
+    schema = _SQL_GEN_SCHEMA.get()
+    if schema is None:
+        return False
+    cte_outputs = _SQL_GEN_CTE_OUTPUTS.get() or {}
+    cols: list[str] = []
+    for term in g.multiply + g.divide:
+        cols.extend(extract_columns_from_expr(term))
+    if not cols:
+        return False
+    for col in cols:
+        meta = get_col_meta(col, schema, cte_outputs)
+        if meta is None or not meta.is_exact_numeric:
+            return False
+    return True
+
+
+def _true_division_cast_type(g: MulGroup) -> str:
+    """Return the cast target that preserves exactness for integer division."""
+    if _mulgroup_exact_numeric_division_operands(g):
+        return "DECIMAL"
+    return "DOUBLE"
 
 
 def _literal_param_is_integer_day(value: Any) -> bool:
@@ -422,9 +476,98 @@ def _analyze_join_topology(sig: list[str]) -> tuple[str, str, list[str]]:
     return ("linear", min(table_counts.keys(), key=str.lower), sorted(table_counts.keys(), key=str.lower))
 
 
-def _wrap_for_case_insensitive(expr: str, dialect: Dialect) -> str:
+def _wrap_for_case_insensitive(expr: str, dialect: Dialect, *, column_meta: Any | None = None) -> str:
     """Wrap expression for case-insensitive string comparison."""
+    if column_meta is not None and bool(getattr(column_meta, "is_case_insensitive_collation", False)):
+        pipeline_trace(
+            "pipeline.sql_gen.case_fold",
+            lambda: stable_json({"form": "skipped", "reason": "case_insensitive_collation", "expr": expr}),
+        )
+        return expr
+    pipeline_trace(
+        "pipeline.sql_gen.case_fold",
+        lambda: stable_json({"form": "lower_wrap", "expr": expr}),
+    )
     return dialect.render_case_insensitive_wrap(expr)
+
+
+def _wrap_for_fixed_width_text(expr: str, dialect: Dialect, *, column_meta: Any | None = None) -> str:
+    """Wrap expression to strip trailing padding from fixed-width text columns."""
+    if column_meta is None or not bool(getattr(column_meta, "is_fixed_width_text", False)):
+        return expr
+    pipeline_trace(
+        "pipeline.sql_gen.fixed_width_text",
+        lambda: stable_json({"form": "rtrim_wrap", "expr": expr}),
+    )
+    return dialect.render_fixed_width_text_wrap(expr)
+
+
+def _like_escape_suffix() -> str:
+    """Return the SQL suffix that treats ``%`` and ``_`` as literal characters."""
+    return " ESCAPE '\\\\'"
+
+
+def _finalize_like_predicate_sql(dialect: Dialect, sql: str) -> str:
+    return dialect.finalize_like_predicate_sql(sql)
+
+
+def _resolve_order_by_nulls(nulls: str | None, direction: str) -> str:
+    """Resolve explicit null placement, applying library defaults when unset."""
+    if nulls in ("first", "last"):
+        return nulls
+    dir_up = (direction or "ASC").strip().upper()
+    return DEFAULT_NULL_ORDERING_DESC if dir_up == "DESC" else DEFAULT_NULL_ORDERING_ASC
+
+
+def _expr_mentions_collation(expr: NormalizedExpr | None) -> bool:
+    """Return True when *expr* already carries an explicit ``COLLATE`` clause."""
+    if expr is None:
+        return False
+    if (expr.scalar_func or "").strip().lower() == "collate":
+        return True
+    raw = str(expr.raw_sql or "")
+    if "collate" in raw.lower():
+        return True
+    for group in (*expr.add_groups, *expr.sub_groups):
+        for mult in (*group.multiply, *group.divide):
+            if _expr_mentions_collation(mult):
+                return True
+    return False
+
+
+def _order_by_expr_is_text(
+    expr: NormalizedExpr,
+    schema: SchemaGraph | None,
+    cte_outputs: dict[str, Any] | None = None,
+) -> bool:
+    """Return True when *expr* orders by a text-typed column reference."""
+    if _expr_mentions_collation(expr):
+        return False
+    cols = extract_columns_from_expr(expr)
+    if len(cols) != 1 or schema is None:
+        return False
+    col_meta = get_col_meta(cols[0], schema, cte_outputs or {})
+    if col_meta is None:
+        return False
+    value_type = (getattr(col_meta, "value_type", None) or "").strip().lower()
+    if value_type in ("string", "categorical", "free_text", "enum"):
+        return True
+    return is_string_type(getattr(col_meta, "data_type", "") or "")
+
+
+def maybe_pin_order_expr_collation(
+    rendered: str,
+    expr: NormalizedExpr,
+    dialect: Dialect | None,
+    *,
+    pin_collation: bool,
+    schema: SchemaGraph | None,
+    cte_outputs: dict[str, Any] | None = None,
+) -> str:
+    """Apply deterministic ``COLLATE`` to a rendered ORDER BY expression when requested."""
+    if not pin_collation or dialect is None or not _order_by_expr_is_text(expr, schema, cte_outputs):
+        return rendered
+    return dialect.pin_deterministic_order_expr(rendered)
 
 
 def _phys_table_key(tbl: str) -> str:
@@ -443,7 +586,7 @@ def cte_emission_map(cte_steps: list[RuntimeCteStep] | None) -> dict[str, CteEmi
     for cte in cte_steps or []:
         name = (cte.cte_name or "").strip()
         if name:
-            out[name] = getattr(cte, "emission", "join_table") or "join_table"
+            out[name] = CteEmissionKind.coerce(getattr(cte, "emission", CteEmissionKind.JOIN_TABLE))
     return out
 
 
@@ -451,7 +594,7 @@ def probe_cte_names(cte_steps: list[RuntimeCteStep] | None) -> frozenset[str]:
     """Return CTE names whose emission is ``semi_join`` or ``anti_join``."""
     names: set[str] = set()
     for cte in cte_steps or []:
-        em = getattr(cte, "emission", "join_table") or "join_table"
+        em = CteEmissionKind.coerce(getattr(cte, "emission", CteEmissionKind.JOIN_TABLE)) or "join_table"
         if em in PROBE_CTE_EMISSION_KINDS:
             cn = (cte.cte_name or "").strip()
             if cn:
@@ -543,6 +686,32 @@ def _join_kind_for_edge(
     if fk_any and fk_nullable:
         return " LEFT"
     return " INNER"
+
+
+def _nullable_join_key_diagnostic_or_invariant(
+    join_tbl: str,
+    paired_tbl: str,
+    cols_on_join: list[str],
+    kind: str,
+    schema: SchemaGraph | None,
+) -> None:
+    """Emit ``JOIN_NULLABLE_KEY`` for nullable FK edges rendered as LEFT, or refuse INNER."""
+    fk_any, fk_nullable = _edge_fk_points_to_paired(join_tbl, paired_tbl, cols_on_join, schema)
+    if not fk_any or not fk_nullable:
+        return
+    kind_upper = kind.strip().upper()
+    if kind_upper == "INNER":
+        raise SchemaInvariantError(
+            f"inner join on nullable foreign key between {join_tbl!r} and {paired_tbl!r} silently drops unmatched rows"
+        )
+    if kind_upper == "LEFT":
+        notify(
+            (f"Nullable join key between {join_tbl} and {paired_tbl}: unmatched rows are preserved."),
+            stage="join",
+            code=DIAGNOSTIC_CODE_JOIN_NULLABLE_KEY,
+            level="info",
+            details=(("left_table", join_tbl), ("right_table", paired_tbl)),
+        )
 
 
 def _partition_path_join_vs_where(
@@ -666,7 +835,7 @@ def _join_edges_from_signature(
     preserve_tables: list[str] | None = None,
     probe_cte_names: frozenset[str] | None = None,
     dialect: Dialect | None = None,
-) -> tuple[list[JoinEdge], list[JoinEdge], list[str], list[str]] | None:
+) -> tuple[list[JoinEdge], list[JoinEdge], list[str], list[tuple[str, str]]] | None:
     """Resolve a join-path signature into JOIN edges, WHERE-bucket edges, extra FROM tables, and anti-join predicates."""
     if not from_table or not signature:
         return None
@@ -682,7 +851,7 @@ def _join_edges_from_signature(
     phys_instances: dict[str, list[str]] = defaultdict(list)
     phys_instances[anchor_key].append(_table_sql_token(anchor))
     join_edges: list[JoinEdge] = []
-    anti_join_predicates: list[str] = []
+    anti_join_predicates: list[tuple[str, str]] = []
     unused: list[tuple[int, str, str, list[str], list[str]]] = list(join_segments)
     if schema is not None:
         virtual_tables: set[str] = set(cte_emissions or {})
@@ -774,6 +943,7 @@ def _join_edges_from_signature(
             .upper()
             or "INNER"
         )
+        _nullable_join_key_diagnostic_or_invariant(join_tbl, paired_tbl, cols_on_join, kind_modifier, schema)
         join_edges.append(
             JoinEdge(
                 table=join_tbl,
@@ -785,10 +955,7 @@ def _join_edges_from_signature(
         if join_emission == "anti_join":
             tbl_tok = _table_sql_token(join_tbl)
             marker = anti_join_presence_column(tbl_tok)
-            if dialect is not None:
-                anti_join_predicates.append(f"{dialect.quote_table_column(tbl_tok, marker)} IS NULL")
-            else:
-                anti_join_predicates.append(f"{tbl_tok}.{marker} IS NULL")
+            anti_join_predicates.append((tbl_tok, marker))
         if left_is_preserved or kind_modifier == "LEFT":
             preserved_frontier.add(_phys_table_key(join_tbl))
             preserved_frontier.add(_phys_table_key(paired_tbl))
@@ -855,6 +1022,57 @@ def canonicalize_stored_join_path_signature(
     return _canonicalize_join_sig_segments(oriented)
 
 
+def _attach_anti_join_presence_predicates(dialect: Dialect, from_handle: Any, refs: list[tuple[str, str]]) -> bool:
+    """AND-inject anti-join presence ``IS NULL`` predicates without string round-trips."""
+    if not refs:
+        return True
+    attach_ast = getattr(dialect, "attach_where_is_null_columns", None)
+    if attach_ast is not None:
+        return bool(attach_ast(from_handle, refs))
+    if type(from_handle).__name__ == "SelectStmt":
+        return _pglast_attach_where_is_null_columns(from_handle, refs)
+    fragments = [f"{dialect.quote_table_column(tbl, col)} IS NULL" for tbl, col in refs]
+    return dialect.attach_where_sql_fragments(from_handle, fragments)
+
+
+def _pglast_attach_where_is_null_columns(from_handle: Any, refs: list[tuple[str, str]]) -> bool:
+    """AND-inject ``IS NULL`` predicates into a pglast ``SelectStmt`` carrier."""
+    try:
+        from pglast import ast as pg_ast
+        from pglast.enums import BoolExprType, NullTestType
+    except ImportError:
+        return False
+    new_preds: list[Any] = []
+    for tbl, col in refs:
+        _pg = cast(Any, pg_ast)
+        arg = _pg.ColumnRef(fields=(_pg.String(sval=tbl), _pg.String(sval=col)))
+        new_preds.append(_pg.NullTest(arg=arg, nulltesttype=NullTestType.IS_NULL))
+    if not new_preds:
+        return True
+    if len(new_preds) == 1:
+        new_pred: Any = new_preds[0]
+    else:
+        new_pred = cast(Any, pg_ast).BoolExpr(boolop=BoolExprType.AND_EXPR, args=tuple(new_preds))
+    existing_where = getattr(from_handle, "whereClause", None)
+    if existing_where is None:
+        merged: Any = new_pred
+    elif (
+        type(existing_where).__name__ == "BoolExpr" and getattr(existing_where, "boolop", None) == BoolExprType.AND_EXPR
+    ):
+        merged_args = tuple(getattr(existing_where, "args", ()) or ()) + tuple(new_preds)
+        merged = cast(Any, pg_ast).BoolExpr(boolop=BoolExprType.AND_EXPR, args=merged_args)
+    else:
+        merged = cast(Any, pg_ast).BoolExpr(
+            boolop=BoolExprType.AND_EXPR,
+            args=((existing_where, new_pred) if len(new_preds) == 1 else (existing_where, *new_preds)),
+        )
+    try:
+        from_handle.whereClause = merged
+    except Exception:
+        return False
+    return True
+
+
 def _try_ast_inject_joins(
     det_sql: str,
     join_sigs_ordered: list[list[str]],
@@ -884,7 +1102,7 @@ def _try_ast_inject_joins(
     per_slot_join: list[list[JoinEdge]] = []
     per_slot_where: list[list[JoinEdge]] = []
     per_slot_extra_from: list[list[str]] = []
-    per_slot_anti_join: list[list[str]] = []
+    per_slot_anti_join: list[list[tuple[str, str]]] = []
     for carrier, sig, kinds in zip(carriers, sigs_padded, kinds_padded, strict=True):
         if not sig:
             per_slot_join.append([])
@@ -932,7 +1150,7 @@ def _try_ast_inject_joins(
         if where_edges or extra_from:
             if not dialect.attach_extra_from_and_where(parsed, carrier, extra_from, where_edges):
                 return None
-        if anti_preds and not dialect.attach_where_sql_fragments(carrier, anti_preds):
+        if anti_preds and not _attach_anti_join_presence_predicates(dialect, carrier, anti_preds):
             return None
     try:
         return dialect.emit_sql(parsed)
@@ -1089,7 +1307,7 @@ def _candidate_join_paths_for_tables(
 
     def _merge_paths_cartesian(root: str, others: list[str], allow_bridges: bool) -> list[list[dict[str, Any]]]:
         """Merge shortest-path ties from root to every other table via. a. capped cross-product. Args: root: Root table for path lookup in ``schema.join_paths_multi``. others: Tables that must be connected via merged edges. allow_bridges: When false, path endpoints must stay within the intent table set. Returns: Distinct merged edge lists, each covering every required table when possible."""
-        max_out = max(1, int(PolicyConfig.JOIN_CANDIDATE_CROSS_PRODUCT_CAP))
+        max_out = max(1, int(cross_product_cap or PolicyConfig.JOIN_CANDIDATE_CROSS_PRODUCT_CAP))
         others_sorted = sorted(others)
         if not others_sorted:
             return [[]]
@@ -1110,6 +1328,10 @@ def _candidate_join_paths_for_tables(
             if not valid:
                 return []
             option_lists.append(valid)
+
+        product_size = math.prod(len(options) for options in option_lists)
+        if product_size > max_out:
+            _refuse_join_candidate_cap(product_size, max_out, tables=list(tables), root=root)
 
         out_merges: list[list[dict[str, Any]]] = []
         seen_sig: set[tuple[str, ...]] = set()
@@ -2141,7 +2363,7 @@ def join_scope_pass2_llm_scopes(
 ) -> list[dict[str, Any]]:
     """Build second-pass join-choice payloads with FK and semantic candidates for NA scopes."""
     out: list[dict[str, Any]] = []
-    for sk in na_scope_keys:
+    for sk in sorted(na_scope_keys):
         if sk == JOIN_CHOICE_SCOPE_MAIN:
             tables = list(tables_in_join_scope(intent.tables, schema, virtual_specs))
             cands = list(join_main.get("candidates") or [])
@@ -2208,6 +2430,14 @@ def _quote_simple_qualified_mul_token(term: str, dialect: Dialect | None) -> str
     return f"{dis}{dialect.quote_table_column(tbl, col)}"
 
 
+def _temporal_unit_from_args(args: list[ScalarArg] | None) -> str:
+    """Return the canonical temporal unit token from scalar-function args."""
+    if not args:
+        return "day"
+    raw = args[0]
+    return str(raw).strip().lower()
+
+
 def _render_scalar_func_args(func_name: str, args: list[ScalarArg] | None, param_keys: list[str] | None) -> list[str]:
     """Render scalar-function argument tokens, inlining literals when a. param key is absent."""
     out: list[str] = []
@@ -2265,24 +2495,38 @@ def _render_group_sql(g: MulGroup, dialect: Dialect | None = None) -> str:
     else:
         base = " * ".join(_render_mul_term(x, dialect) for x in g.multiply)
     if g.divide:
-        base = f"({base}) / ({' * '.join(_render_mul_term(x, dialect) for x in g.divide)})"
+        numerator_sql = base
+        if dialect is not None and dialect.integer_division_truncates and _mulgroup_integer_division_operands(g):
+            cast_type = _true_division_cast_type(g)
+            numerator_sql = f"CAST({numerator_sql} AS {cast_type})"
+        base = f"({numerator_sql}) / ({' * '.join(_render_mul_term(x, dialect) for x in g.divide)})"
     if g.coeff_param_key:
         base = f":{g.coeff_param_key} * {base}"
     elif g.coefficient != 1.0:
         base = f"{g.coefficient} * {base}"
     if g.inner_scalar_func:
-        iargs = _render_scalar_func_args(g.inner_scalar_func, g.inner_scalar_func_args, g.isarg_param_keys)
-        args_str = ", ".join(iargs)
-        if g.inner_scalar_func.lower() in SCALAR_FUNCTIONS_LEADING_ARG and args_str:
-            inner = f"{g.inner_scalar_func.upper()}({args_str}, {base})"
+        inner_fn = g.inner_scalar_func.lower()
+        if dialect is not None and inner_fn == "date_trunc":
+            unit = _temporal_unit_from_args(g.inner_scalar_func_args)
+            inner = dialect.render_date_trunc(unit, base)
+        elif dialect is not None and inner_fn == "date_part":
+            unit = _temporal_unit_from_args(g.inner_scalar_func_args)
+            inner = dialect.render_extract(unit, base)
         else:
-            inner = f"{g.inner_scalar_func.upper()}({base}{', ' + args_str if args_str else ''})"
+            iargs = _render_scalar_func_args(g.inner_scalar_func, g.inner_scalar_func_args, g.isarg_param_keys)
+            args_str = ", ".join(iargs)
+            if inner_fn in SCALAR_FUNCTIONS_LEADING_ARG and args_str:
+                inner = f"{g.inner_scalar_func.upper()}({args_str}, {base})"
+            else:
+                inner = f"{g.inner_scalar_func.upper()}({base}{', ' + args_str if args_str else ''})"
     else:
         inner = base
     if g.agg_func:
         if g.agg_func == "string_agg":
             sep_sql = f":{g.agg_sep_param_key}" if g.agg_sep_param_key else "','"
-            order_sql = _render_order_by_sql(list(g.agg_order_by), dialect) if g.agg_order_by else ""
+            order_sql = (
+                render_order_by_sql(list(g.agg_order_by), dialect, apply_null_defaults=False) if g.agg_order_by else ""
+            )
             if dialect is not None:
                 mid = dialect.render_string_agg(inner, sep_sql, order_sql)
             elif order_sql:
@@ -2306,11 +2550,15 @@ def _render_group_sql(g: MulGroup, dialect: Dialect | None = None) -> str:
     else:
         mid = inner
     if g.scalar_func:
+        scalar_fn = g.scalar_func.lower()
+        if dialect is not None and scalar_fn == "extract":
+            unit = _temporal_unit_from_args(g.scalar_func_args)
+            return dialect.render_extract(unit, mid)
         sargs = _render_scalar_func_args(g.scalar_func, g.scalar_func_args, g.sarg_param_keys)
         args_str = ", ".join(sargs)
-        if g.scalar_func.lower() == "extract" and args_str:
+        if scalar_fn == "extract" and args_str:
             return f"EXTRACT({args_str} FROM {mid})"
-        if g.scalar_func.lower() in SCALAR_FUNCTIONS_LEADING_ARG and args_str:
+        if scalar_fn in SCALAR_FUNCTIONS_LEADING_ARG and args_str:
             return f"{g.scalar_func.upper()}({args_str}, {mid})"
         return f"{g.scalar_func.upper()}({mid}{', ' + args_str if args_str else ''})"
     return mid
@@ -2324,12 +2572,12 @@ def _try_render_date_integer_day_expr(expr: NormalizedExpr, dialect: Dialect | N
         if not _operands_allow_date_integer_days(expr.add_groups[0], None, offset_literal=expr.add_values[0].value):
             return None
         base_sql = _render_group_sql(expr.add_groups[0], dialect)
-        return dialect.render_date_integer_days(base_sql, "+", str(int(expr.add_values[0].value)))
+        return dialect.render_date_integer_days(base_sql, "+", str(int(cast(Any, expr.add_values[0].value or 0))))
     if expr.sub_values and len(expr.add_groups) == 1 and not expr.sub_groups and not expr.add_values:
         if not _operands_allow_date_integer_days(expr.add_groups[0], None, offset_literal=expr.sub_values[0].value):
             return None
         base_sql = _render_group_sql(expr.add_groups[0], dialect)
-        return dialect.render_date_integer_days(base_sql, "-", str(int(expr.sub_values[0].value)))
+        return dialect.render_date_integer_days(base_sql, "-", str(int(cast(Any, expr.sub_values[0].value or 0))))
     if len(expr.add_groups) == 2 and not expr.sub_groups and not expr.add_values and not expr.sub_values:
         base_group = expr.add_groups[1]
         offset_group = expr.add_groups[0]
@@ -2355,19 +2603,19 @@ def _try_render_date_integer_day_expr(expr: NormalizedExpr, dialect: Dialect | N
 
 def render_expr_sql(expr: NormalizedExpr, dialect: Dialect | None = None) -> str:
     """Render a NormalizedExpr as a SQL fragment for expression guide."""
-    ref = expr_registry_ref(expr) or ""
+    ref = expr.registry_ref() or ""
     if ref.startswith("w"):
-        win_by = {s.registry_id: s for s in current_window_registry_steps()}
+        win_by = {s.registry_id: s for s in WindowRegistryStep.current_steps()}
         win_step = win_by.get(ref)
         if win_step is not None:
             return _render_window_over_sql(win_step.window_spec, dialect)
-        return "0"
+        raise RegistryRenderError(f"missing window registry id {ref!r}")
     if ref.startswith("c"):
-        case_by = {s.registry_id: s for s in current_case_registry_steps()}
+        case_by = {s.registry_id: s for s in CaseRegistryStep.current_steps()}
         case_step = case_by.get(ref)
         if case_step is not None:
             return _render_case_when_sql(case_step.case_when, dialect)
-        return "0"
+        raise RegistryRenderError(f"missing case registry id {ref!r}")
     sl = (expr.string_literal or "").strip()
     if sl:
         if dialect is not None:
@@ -2400,81 +2648,133 @@ def render_expr_sql(expr: NormalizedExpr, dialect: Dialect | None = None) -> str
     for g in expr.add_groups:
         parts.append(_render_group_sql(g, dialect))
     for v in expr.add_values:
-        parts.append(f":{v.param_key}" if v.param_key else str(v.value))
+        parts.append(
+            f":{v.param_key}"
+            if v.param_key
+            else render_sql_numeric_value(v.value)
+            if isinstance(v.value, (int, float, Decimal))
+            else str(v.value)
+        )
     sub_parts: list[str] = []
     for g in expr.sub_groups:
         sub_parts.append(_render_group_sql(g, dialect))
     for v in expr.sub_values:
-        sub_parts.append(f":{v.param_key}" if v.param_key else str(v.value))
+        sub_parts.append(
+            f":{v.param_key}"
+            if v.param_key
+            else render_sql_numeric_value(v.value)
+            if isinstance(v.value, (int, float, Decimal))
+            else str(v.value)
+        )
     result = " + ".join(parts) if parts else "0"
     if sub_parts:
         result = f"{result} - {' - '.join(sub_parts)}"
     if expr.inner_scalar_func and not any(g.inner_scalar_func for g in expr.add_groups):
-        iargs = _render_scalar_func_args(expr.inner_scalar_func, expr.inner_scalar_func_args, expr.isarg_param_keys)
-        args_str = ", ".join(iargs)
-        if expr.inner_scalar_func.lower() in SCALAR_FUNCTIONS_LEADING_ARG and args_str:
-            result = f"{expr.inner_scalar_func.upper()}({args_str}, {result})"
+        inner_fn = expr.inner_scalar_func.lower()
+        if dialect is not None and inner_fn == "date_trunc":
+            unit = _temporal_unit_from_args(expr.inner_scalar_func_args)
+            result = dialect.render_date_trunc(unit, result)
+        elif dialect is not None and inner_fn == "date_part":
+            unit = _temporal_unit_from_args(expr.inner_scalar_func_args)
+            result = dialect.render_extract(unit, result)
         else:
-            result = f"{expr.inner_scalar_func.upper()}({result}{', ' + args_str if args_str else ''})"
+            iargs = _render_scalar_func_args(expr.inner_scalar_func, expr.inner_scalar_func_args, expr.isarg_param_keys)
+            args_str = ", ".join(iargs)
+            if inner_fn in SCALAR_FUNCTIONS_LEADING_ARG and args_str:
+                result = f"{expr.inner_scalar_func.upper()}({args_str}, {result})"
+            else:
+                result = f"{expr.inner_scalar_func.upper()}({result}{', ' + args_str if args_str else ''})"
     if expr.agg_func and not any(g.agg_func for g in expr.add_groups):
         result = f"{expr.agg_func.upper()}({result})"
     if expr.scalar_func and not any(g.scalar_func for g in expr.add_groups):
-        sargs = _render_scalar_func_args(expr.scalar_func, expr.scalar_func_args, expr.sarg_param_keys)
-        args_str = ", ".join(sargs)
-        if expr.scalar_func.lower() == "extract" and args_str:
-            result = f"EXTRACT({args_str} FROM {result})"
-        elif expr.scalar_func.lower() in SCALAR_FUNCTIONS_LEADING_ARG and args_str:
-            result = f"{expr.scalar_func.upper()}({args_str}, {result})"
+        scalar_fn = expr.scalar_func.lower()
+        if dialect is not None and scalar_fn == "extract":
+            unit = _temporal_unit_from_args(expr.scalar_func_args)
+            result = dialect.render_extract(unit, result)
         else:
-            result = f"{expr.scalar_func.upper()}({result}{', ' + args_str if args_str else ''})"
+            sargs = _render_scalar_func_args(expr.scalar_func, expr.scalar_func_args, expr.sarg_param_keys)
+            args_str = ", ".join(sargs)
+            if scalar_fn == "extract" and args_str:
+                result = f"EXTRACT({args_str} FROM {result})"
+            elif scalar_fn in SCALAR_FUNCTIONS_LEADING_ARG and args_str:
+                result = f"{expr.scalar_func.upper()}({args_str}, {result})"
+            else:
+                result = f"{expr.scalar_func.upper()}({result}{', ' + args_str if args_str else ''})"
     return result
 
 
 def classify_cte_emission(cte: RuntimeCteStep, intent: RuntimeIntent, schema: SchemaGraph | None) -> CteEmissionKind:
     """Decide whether a CTE renders as a regular join table or a single- row CROSS JOIN scalar."""
-    explicit = getattr(cte, "emission", "join_table") or "join_table"
+    explicit = CteEmissionKind.coerce(getattr(cte, "emission", CteEmissionKind.JOIN_TABLE)) or "join_table"
     if explicit == "semi_join":
         if schema is not None and qualifies_as_semi_join_probe(cte, intent, schema):
-            return "semi_join"
+            return CteEmissionKind.SEMI_JOIN
     elif explicit == "anti_join":
-        return "anti_join"
+        return CteEmissionKind.ANTI_JOIN
     if (cte.grain or "") != "scalar":
-        return "join_table"
+        return CteEmissionKind.JOIN_TABLE
     if cte.limit is not None and cte.limit != 1:
-        return "join_table"
+        return CteEmissionKind.JOIN_TABLE
     outs = list(cte.output_columns or [])
     if len(outs) != 1:
-        return "join_table"
+        return CteEmissionKind.JOIN_TABLE
     cn = (cte.cte_name or "").strip()
     if not cn:
-        return "join_table"
+        return CteEmissionKind.JOIN_TABLE
     base_tables = [t for t in (cte.tables or []) if t]
     if len(base_tables) != 1:
-        return "join_table"
+        return CteEmissionKind.JOIN_TABLE
     sel_cols = list(cte.select_cols or [])
     if len(sel_cols) != 1:
-        return "join_table"
+        return CteEmissionKind.JOIN_TABLE
     if not sel_cols[0].is_aggregated:
-        return "join_table"
+        return CteEmissionKind.JOIN_TABLE
     if cte.group_by_cols:
-        return "join_table"
-    return "scalar_subquery"
+        return CteEmissionKind.JOIN_TABLE
+    return CteEmissionKind.SCALAR_SUBQUERY
 
 
-def _render_case_branch_sql(fp: WhereParam, dialect: Dialect | None = None) -> str:
+def _render_case_branch_sql(
+    fp: WhereParam,
+    dialect: Dialect | None = None,
+    *,
+    schema: SchemaGraph | None = None,
+    cte_outputs: dict[str, Any] | None = None,
+) -> str:
     """Render a single filter as a SQL predicate for CASE WHEN."""
     left = render_expr_sql(fp.left_expr, dialect)
     op = fp.op or "="
+    op_cmp = (fp.op or "").strip().lower()
     if fp.op in ("is null", "is not null"):
         return f"{left} {op.upper()}"
-    if fp.op == "between" and fp.param_key and fp.param_key_hi:
+    if op_cmp == "between" and fp.param_key and fp.param_key_hi:
         return f"{left} BETWEEN :{fp.param_key} AND :{fp.param_key_hi}"
+    if op_cmp == "not between" and fp.param_key and fp.param_key_hi:
+        core = f"{left} NOT BETWEEN :{fp.param_key} AND :{fp.param_key_hi}"
+        return _wrap_negation_includes_unknown(core, left, fp, schema=schema, cte_outputs=cte_outputs)
     if fp.op in ("in", "not in") and fp.param_key:
+        if op_cmp == "not in":
+            core = f"{left} NOT IN (:{fp.param_key})"
+            return _wrap_negation_includes_unknown(core, left, fp, schema=schema, cte_outputs=cte_outputs)
         return f"{left} {op.upper()} (:{fp.param_key})"
     if fp.right_expr:
-        return f"{left} {op} {render_expr_sql(fp.right_expr, dialect)}"
+        cmp_op = op
+        if op_cmp in ("!=", "<>"):
+            cmp_op = "<>"
+        core = f"{left} {cmp_op} {render_expr_sql(fp.right_expr, dialect)}"
+        if op_cmp in ("!=", "<>", "not in"):
+            return _wrap_negation_includes_unknown(core, left, fp, schema=schema, cte_outputs=cte_outputs)
+        return core
     if fp.param_key:
-        return f"{left} {op} :{fp.param_key}"
+        cmp_op = "<>" if op_cmp in ("!=", "<>") else op
+        if op_cmp in ("not like", "not ilike"):
+            like_op = "NOT LIKE" if op_cmp == "not like" else "NOT ILIKE"
+            core = f"{left} {like_op} :{fp.param_key}"
+            return _wrap_negation_includes_unknown(core, left, fp, schema=schema, cte_outputs=cte_outputs)
+        core = f"{left} {cmp_op} :{fp.param_key}"
+        if op_cmp in ("!=", "<>"):
+            return _wrap_negation_includes_unknown(core, left, fp, schema=schema, cte_outputs=cte_outputs)
+        return core
     raise ValueError(
         f"CASE branch missing right operand for {left!r} {op!r}: neither right_expr nor param_key set; "
         "upstream parameter allocation must bind a value for branch literals before rendering"
@@ -2540,7 +2840,7 @@ def _render_window_over_sql(ws: WindowSpec, dialect: Dialect | None = None) -> s
         pe = ", ".join(render_expr_sql(e, dialect) for e in ws.partition_by)
         over_parts.append(f"PARTITION BY {pe}")
     if ws.order_by:
-        over_parts.append(f"ORDER BY {_render_order_by_sql(list(ws.order_by), dialect)}")
+        over_parts.append(f"ORDER BY {render_order_by_sql(list(ws.order_by), dialect)}")
     inner = " ".join(over_parts)
     if ws.frame_kind in ("rows", "range") and ws.order_by:
         fk = "ROWS" if ws.frame_kind == "rows" else "RANGE"
@@ -2555,7 +2855,7 @@ def _render_window_over_sql(ws: WindowSpec, dialect: Dialect | None = None) -> s
 
 def render_select_col_sql(sc: SelectCol, dialect: Dialect | None = None) -> str:
     """Render a select column including optional CASE or window. function."""
-    parts = effective_select_parts(sc, None, None)
+    parts = sc.effective_parts(None, None)
     if parts.case_when is not None:
         return _render_case_when_sql(parts.case_when, dialect)
     if parts.window_spec is not None:
@@ -2682,7 +2982,9 @@ def render_feedback_sql(intent: RuntimeIntent, schema: SchemaGraph | None) -> st
     if schema is None:
         return None
     try:
-        return build_deterministic_sql(intent, schema=schema, dialect=get_dialect(CANONICAL_FEEDBACK_DIALECT))
+        return build_deterministic_sql(
+            intent, schema=schema, dialect=DialectRegistry.get_dialect(CANONICAL_FEEDBACK_DIALECT)
+        )
     except Exception:
         return None
 
@@ -2699,11 +3001,11 @@ def _anti_join_presence_where(tables: list[str], cte_emissions: dict[str, CteEmi
 
 
 def _aggregate_needs_zero_fill(expr: NormalizedExpr, preserved_tables: set[str]) -> bool:
-    """Return True when a count/sum aggregate references a non-preserved table while preservation is active."""
+    """Return True when a count aggregate references a non-preserved table while preservation is active."""
     if not preserved_tables:
         return False
     agg = (expr.agg_func or "").lower()
-    if agg not in ("count", "sum"):
+    if agg != "count":
         return False
     for col in extract_columns_from_expr(expr):
         if "." not in col:
@@ -2934,7 +3236,7 @@ def build_deterministic_sql(
             k: v for k, v in cte_join_signatures_for_from_anchor.items() if str(k).strip().lower() in keep_cte
         }
     if dialect is None:
-        dialect = get_dialect()
+        dialect = DialectRegistry.get_dialect()
     effective_main_sig = join_signature_for_from_anchor
     if not effective_main_sig and intent.chosen_join_path_signature:
         effective_main_sig = intent.chosen_join_path_signature
@@ -2962,7 +3264,8 @@ def build_deterministic_sql(
     scalar_cte_names: set[str] = {
         (cte.cte_name or "")
         for cte in cte_steps
-        if getattr(cte, "emission", "join_table") == "scalar_subquery" and cte.cte_name
+        if CteEmissionKind.coerce(getattr(cte, "emission", CteEmissionKind.JOIN_TABLE)) == "scalar_subquery"
+        and cte.cte_name
     }
 
     def _scalar_extras_for_scope(scope_tables: list[str] | None, anchor: str | None) -> list[str]:
@@ -2993,7 +3296,7 @@ def build_deterministic_sql(
         if emission == "anti_join" and cte.cte_name:
             presence = anti_join_presence_column(cte.cte_name)
             append_select.append(f"1 AS {presence}")
-        with registry_render_scope(cte.window_registry, cte.case_registry):
+        with WindowRegistryStep.render_scope(cte.window_registry, cte.case_registry):
             cte_where = cte.where
             cte_having = cte.having
             cte_distinct_on = list(cte.distinct_on or [])
@@ -3057,7 +3360,7 @@ def build_deterministic_sql(
     main_where = intent.where
     extra_filters = _anti_join_presence_where(intent.tables or [], cte_emissions)
     if extra_filters:
-        main_where = merge_predicate_groups("and", [main_where, predicate_group_from_list(extra_filters)])
+        main_where = PredicateGroup.merge("and", [main_where, PredicateGroup.from_list(extra_filters)])
     main_distinct_idx = intent.distinct_select_index
     if any(cte_emissions.get(t) == "anti_join" for t in (intent.tables or [])):
         if (intent.select_cols or []) and main_distinct_idx < 0:
@@ -3065,7 +3368,7 @@ def build_deterministic_sql(
     main_distinct_on = list(intent.distinct_on or [])
     main_order = list(intent.order_by_cols or [])
     main_limit = intent.limit
-    with registry_render_scope(intent.window_registry, intent.case_registry):
+    with WindowRegistryStep.render_scope(intent.window_registry, intent.case_registry):
         main_select_exprs = _render_select_column_exprs(
             intent.select_cols or [],
             dialect,
@@ -3096,25 +3399,22 @@ def build_deterministic_sql(
             reserved = {c.cte_name for c in cte_steps if c.cte_name}
             reserved.update(intent.planner_cte_names or [])
             don_name = _allocate_distinct_on_cte_name(reserved)
-            inner_sql = main_sql
+            don_body = append_distinct_on_rank_to_core_sql(
+                main_sql,
+                distinct_on=main_distinct_on,
+                order_by_cols=main_order,
+                dialect=dialect,
+            )
             outer_lines = [
                 f"SELECT {', '.join(main_select_exprs)}",
                 f"FROM {dialect.quote_schema_qualified(don_name)}",
                 f"WHERE {DISTINCT_ON_RANK_COLUMN} = 1",
             ]
             if main_order:
-                outer_lines.append(f"ORDER BY {_render_order_by_sql(main_order, dialect)}")
+                outer_lines.append(f"ORDER BY {render_order_by_sql(main_order, dialect)}")
             if main_limit:
                 outer_lines.append(f"LIMIT {main_limit}")
             main_sql = "\n".join(outer_lines)
-            rank_partition = ", ".join(render_expr_sql(expr, dialect) for expr in main_distinct_on)
-            rank_order = _render_order_by_sql(main_order, dialect)
-            rank_expr = (
-                f"ROW_NUMBER() OVER (PARTITION BY {rank_partition} ORDER BY {rank_order}) AS {DISTINCT_ON_RANK_COLUMN}"
-            )
-            inner_lines = inner_sql.split("\n")
-            inner_lines[0] = inner_lines[0] + ", " + rank_expr
-            don_body = "\n".join(inner_lines)
             if cte_clauses:
                 parts[-1] = parts[-1] + f",\n{don_name} AS (\n{don_body}\n)"
             else:
@@ -3135,7 +3435,8 @@ def _parse_select_list_expression(expr_sql: str, sqlglot_dialect: str) -> exp.Ex
     exprs = list(tree.args.get("expressions") or [])
     if len(exprs) != 1:
         return None
-    return exprs[0]
+    result: exp.Expression | None = exprs[0]
+    return result
 
 
 def _parse_predicate_fragment(frag: str, *, sqlglot_dialect: str = "") -> exp.Expression | None:
@@ -3147,7 +3448,8 @@ def _parse_predicate_fragment(frag: str, *, sqlglot_dialect: str = "") -> exp.Ex
     where = tree.args.get("where")
     if where is None:
         return None
-    return where.this
+    result: exp.Expression | None = where.this
+    return result
 
 
 def _emit_bool_ast_preserving_leaves(node: exp.Expression, leaves: dict[int, str]) -> str:
@@ -3210,7 +3512,7 @@ def _append_select_expressions(parsed: Any, expr_sqls: Sequence[str], dialect: D
         return True
     root = getattr(getattr(parsed, "root", None), "stmt", None)
     if root is not None and type(root).__name__ == "SelectStmt":
-        return append_pglast_select_targets(root, expr_sqls)
+        return PostgresDialect.append_pglast_select_targets(root, expr_sqls)
     return False
 
 
@@ -3283,7 +3585,7 @@ def _maybe_render_array_unnest_select(
         return None
     if not dialect.supports_unnest_select_item:
         return None
-    parts = effective_select_parts(sc, None, None)
+    parts = sc.effective_parts(None, None)
     if parts.window_spec or parts.case_when or sc.is_aggregated:
         return None
     col = parts.expr.primary_column
@@ -3309,6 +3611,28 @@ def _column_meta_for_predicate(
     return get_col_meta(cols[0], schema, cte_outputs or {})
 
 
+def _nullable_column_for_predicate(
+    pred: WhereParam | HavingParam, schema: SchemaGraph | None, cte_outputs: dict[str, Any] | None = None
+) -> bool:
+    column_meta = _column_meta_for_predicate(pred, schema, cte_outputs)
+    return column_meta is not None and bool(getattr(column_meta, "is_nullable", False))
+
+
+def _wrap_negation_includes_unknown(
+    core_sql: str,
+    left_sql: str,
+    pred: WhereParam | HavingParam,
+    *,
+    schema: SchemaGraph | None,
+    cte_outputs: dict[str, Any] | None = None,
+) -> str:
+    return apply_negation_includes_unknown_sql(
+        core_sql,
+        left_sql,
+        is_nullable=_nullable_column_for_predicate(pred, schema, cte_outputs),
+    )
+
+
 def _render_predicate_clause(
     pred: WhereParam | HavingParam,
     dialect: Dialect,
@@ -3323,6 +3647,7 @@ def _render_predicate_clause(
     op = pred.op or (">" if is_having else "=")
     op_cmp = (pred.op or "").strip().lower()
     relational_cmp = op_cmp in (">", "<", ">=", "<=", "=", "!=", "<>")
+    column_meta = _column_meta_for_predicate(pred, schema, cte_outputs)
     case_insensitive = pred.value_type == "string" and op_cmp not in (
         "is null",
         "is not null",
@@ -3332,13 +3657,22 @@ def _render_predicate_clause(
     )
     if pred.right_expr is not None and relational_cmp:
         case_insensitive = False
+    if column_meta is not None and column_meta.is_fixed_width_text:
+        left = _wrap_for_fixed_width_text(left, dialect, column_meta=column_meta)
     if case_insensitive:
-        left = _wrap_for_case_insensitive(left, dialect)
+        left = _wrap_for_case_insensitive(left, dialect, column_meta=column_meta)
     if op.lower() in ("is null", "is not null"):
         return f"{left} {op.upper()}"
     resolved = pred.resolved_value(param_values)
     if pred.value_type == "date_window" and isinstance(resolved, dict):
-        parts = _render_date_window_predicate(pred, left, dialect, param_values=param_values)
+        parts = _render_date_window_predicate(
+            pred,
+            left,
+            dialect,
+            param_values=param_values,
+            schema=schema,
+            cte_outputs=cte_outputs,
+        )
         return " AND ".join(parts) if parts else ""
     if pred.value_type == "date_diff" and isinstance(resolved, dict):
         rv = resolved
@@ -3374,35 +3708,116 @@ def _render_predicate_clause(
             return ""
         pk = pred.param_key
         column_meta = _column_meta_for_predicate(pred, schema, cte_outputs)
-        return dialect.render_array_contains(left, pk, column_meta=column_meta)
+        return dialect.render_array_contains(left, pk, column_meta=column_meta, value_type=pred.value_type or "string")
     if op_cmp in ("ilike", "not ilike") and not dialect.supports_ilike:
         like_op = "LIKE" if op_cmp == "ilike" else "NOT LIKE"
-        left_wrapped = _wrap_for_case_insensitive(left, dialect)
+        column_meta = _column_meta_for_predicate(pred, schema, cte_outputs)
+        left_wrapped = _wrap_for_case_insensitive(left, dialect, column_meta=column_meta)
         if pred.param_key:
-            return f"{left_wrapped} {like_op} LOWER(:{pred.param_key})"
+            core = _finalize_like_predicate_sql(
+                dialect,
+                f"{left_wrapped} {like_op} LOWER(:{pred.param_key}){_like_escape_suffix()}",
+            )
+            if op_cmp == "not ilike":
+                return _wrap_negation_includes_unknown(core, left, pred, schema=schema, cte_outputs=cte_outputs)
+            return core
         if pred.raw_value is not None:
-            escaped = str(pred.raw_value).replace("'", "''")
-            return f"{left_wrapped} {like_op} LOWER('{escaped}')"
+            escaped = escape_like_wildcards(str(pred.raw_value)).replace("'", "''")
+            core = _finalize_like_predicate_sql(
+                dialect,
+                f"{left_wrapped} {like_op} LOWER('{escaped}'){_like_escape_suffix()}",
+            )
+            if op_cmp == "not ilike":
+                return _wrap_negation_includes_unknown(core, left, pred, schema=schema, cte_outputs=cte_outputs)
+            return core
     if pred.right_expr:
         right = render_expr_sql(pred.right_expr, dialect)
         cmp_op = op
         op_lower = (pred.op or "").strip().lower()
         if op_lower == "in":
             cmp_op = "="
-        elif op_lower == "not in":
+        elif op_lower in ("not in", "!=", "<>"):
             cmp_op = "<>"
+        right_column_meta = None
+        if pred.right_expr is not None:
+            right_cols = extract_columns_from_expr(pred.right_expr)
+            if len(right_cols) == 1 and schema is not None:
+                right_column_meta = get_col_meta(right_cols[0], schema, cte_outputs or {})
+        if right_column_meta is not None and right_column_meta.is_fixed_width_text:
+            right = _wrap_for_fixed_width_text(right, dialect, column_meta=right_column_meta)
         if case_insensitive:
-            right = _wrap_for_case_insensitive(right, dialect)
-        return f"{left} {cmp_op} {right}"
+            right = _wrap_for_case_insensitive(right, dialect, column_meta=right_column_meta)
+        core = f"{left} {cmp_op} {right}"
+        if op_lower in ("not in", "!=", "<>"):
+            return _wrap_negation_includes_unknown(core, left, pred, schema=schema, cte_outputs=cte_outputs)
+        return core
     if (pred.op or "").lower() in ("in", "not in"):
         if not pred.param_key:
             return ""
+        if op_cmp == "not in":
+            resolved = pred.resolved_value(param_values)
+            if isinstance(resolved, list) and any(v is None for v in resolved):
+                raise NullInNegatedListError(
+                    pred.left_expr.primary_column or "column",
+                    REFUSAL_NULL_IN_NEGATED_LIST_MESSAGE,
+                )
+            core = f"{left} NOT IN (:{pred.param_key})"
+            return _wrap_negation_includes_unknown(core, left, pred, schema=schema, cte_outputs=cte_outputs)
         return f"{left} {op.upper()} (:{pred.param_key})"
+    if op_cmp == "not between" and pred.param_key:
+        param_key_hi = getattr(pred, "param_key_hi", None)
+        if param_key_hi:
+            core = f"{left} NOT BETWEEN :{pred.param_key} AND :{param_key_hi}"
+            return _wrap_negation_includes_unknown(core, left, pred, schema=schema, cte_outputs=cte_outputs)
     if pred.param_key:
         val_needs_lower = case_insensitive and op.lower() in ("like", "not like")
-        val_ref = f"LOWER(:{pred.param_key})" if val_needs_lower else f":{pred.param_key}"
-        return f"{left} {op} {val_ref}"
+        val_ref = f":{pred.param_key}"
+        if (
+            column_meta is not None
+            and column_meta.is_fixed_width_text
+            and op_cmp
+            in (
+                "=",
+                "!=",
+                "<>",
+                ">",
+                "<",
+                ">=",
+                "<=",
+            )
+        ):
+            val_ref = dialect.render_fixed_width_text_wrap(val_ref)
+        if op_cmp in ("ilike", "not ilike"):
+            core = _finalize_like_predicate_sql(
+                dialect, f"{left} {op.upper()} :{pred.param_key}{_like_escape_suffix()}"
+            )
+            if op_cmp == "not ilike":
+                return _wrap_negation_includes_unknown(core, left, pred, schema=schema, cte_outputs=cte_outputs)
+            return core
+        val_ref = f"LOWER(:{pred.param_key})" if val_needs_lower else val_ref
+        if val_needs_lower:
+            core = _finalize_like_predicate_sql(dialect, f"{left} {op} {val_ref}{_like_escape_suffix()}")
+            if op_cmp == "not like":
+                return _wrap_negation_includes_unknown(core, left, pred, schema=schema, cte_outputs=cte_outputs)
+            return core
+        cmp_op = "<>" if op_cmp in ("!=", "<>") else op
+        core = f"{left} {cmp_op} {val_ref}"
+        if op_cmp in ("!=", "<>"):
+            return _wrap_negation_includes_unknown(core, left, pred, schema=schema, cte_outputs=cte_outputs)
+        return core
     if pred.raw_value is not None:
+        if op_cmp in ("ilike", "not ilike"):
+            escaped = escape_like_wildcards(str(pred.raw_value)).replace("'", "''")
+            core = _finalize_like_predicate_sql(dialect, f"{left} {op.upper()} '{escaped}'{_like_escape_suffix()}")
+            if op_cmp == "not ilike":
+                return _wrap_negation_includes_unknown(core, left, pred, schema=schema, cte_outputs=cte_outputs)
+            return core
+        if case_insensitive and op.lower() in ("like", "not like"):
+            escaped = escape_like_wildcards(str(pred.raw_value)).replace("'", "''")
+            core = _finalize_like_predicate_sql(dialect, f"{left} {op} LOWER('{escaped}'){_like_escape_suffix()}")
+            if op_cmp == "not like":
+                return _wrap_negation_includes_unknown(core, left, pred, schema=schema, cte_outputs=cte_outputs)
+            return core
         return ""
     if is_having:
         return f"{left} {op} ?"
@@ -3433,7 +3848,7 @@ def _render_select_column_exprs(
                 rendered = unnest_sql
             else:
                 rendered = render_select_col_sql(sc, dialect)
-                parts = effective_select_parts(sc, None, None)
+                parts = sc.effective_parts(None, None)
                 if preservation_active and _aggregate_needs_zero_fill(parts.expr, preserved_set):
                     rendered = f"COALESCE({rendered}, 0)"
                 if output_aliases and idx < len(output_aliases):
@@ -3444,15 +3859,32 @@ def _render_select_column_exprs(
     return select_exprs
 
 
-def _render_order_by_sql(order_by_cols: list[OrderByCol], dialect: Dialect | None) -> str:
+def render_order_by_sql(
+    order_by_cols: list[OrderByCol],
+    dialect: Dialect | None,
+    *,
+    apply_null_defaults: bool = True,
+    pin_collation: bool = False,
+    schema: SchemaGraph | None = None,
+    cte_outputs: dict[str, Any] | None = None,
+) -> str:
     ob_exprs = []
     for obc in order_by_cols or []:
         rendered = render_expr_sql(obc.expr, dialect)
+        rendered = maybe_pin_order_expr_collation(
+            rendered,
+            obc.expr,
+            dialect,
+            pin_collation=pin_collation,
+            schema=schema,
+            cte_outputs=cte_outputs,
+        )
         direction = obc.direction.upper() if obc.direction else "ASC"
+        nulls = _resolve_order_by_nulls(obc.nulls, direction) if apply_null_defaults else obc.nulls
         if dialect is not None:
-            ob_exprs.append(dialect.render_order_by_col(rendered, direction, obc.nulls))
-        elif obc.nulls in ("first", "last"):
-            placement = "NULLS FIRST" if obc.nulls == "first" else "NULLS LAST"
+            ob_exprs.append(dialect.render_order_by_col(rendered, direction, nulls))
+        elif nulls in ("first", "last"):
+            placement = "NULLS FIRST" if nulls == "first" else "NULLS LAST"
             ob_exprs.append(f"{rendered} {direction} {placement}")
         else:
             ob_exprs.append(f"{rendered} {direction}")
@@ -3469,6 +3901,25 @@ def _allocate_distinct_on_cte_name(reserved: set[str]) -> str:
         idx += 1
 
 
+def append_distinct_on_rank_to_core_sql(
+    core_sql: str,
+    *,
+    distinct_on: list[NormalizedExpr],
+    order_by_cols: list[OrderByCol],
+    dialect: Dialect,
+) -> str:
+    """Append a ROW_NUMBER partition column to a core SELECT via the dialect AST."""
+    partition = ", ".join(render_expr_sql(expr, dialect) for expr in distinct_on)
+    order_sql = render_order_by_sql(order_by_cols, dialect)
+    rank_expr = f"ROW_NUMBER() OVER (PARTITION BY {partition} ORDER BY {order_sql}) AS {DISTINCT_ON_RANK_COLUMN}"
+    parsed = dialect.parse_select(core_sql)
+    if parsed is None:
+        raise ValueError("append_distinct_on_rank_to_core_sql: core_sql is not parseable as SELECT")
+    if not _append_select_expressions(parsed, [rank_expr], dialect):
+        raise ValueError("append_distinct_on_rank_to_core_sql: could not append rank expression")
+    return dialect.emit_sql(parsed)
+
+
 def wrap_core_sql_with_distinct_on(
     core_sql: str,
     *,
@@ -3479,15 +3930,13 @@ def wrap_core_sql_with_distinct_on(
     dialect: Dialect,
 ) -> str:
     """Wrap a core SELECT block with a ROW_NUMBER partition filter."""
-    partition = ", ".join(render_expr_sql(expr, dialect) for expr in distinct_on)
-    order_sql = _render_order_by_sql(order_by_cols, dialect)
-    rank_expr = f"ROW_NUMBER() OVER (PARTITION BY {partition} ORDER BY {order_sql}) AS {DISTINCT_ON_RANK_COLUMN}"
-    parsed = dialect.parse_select(core_sql)
-    if parsed is None:
-        raise ValueError("wrap_core_sql_with_distinct_on: core_sql is not parseable as SELECT")
-    if not _append_select_expressions(parsed, [rank_expr], dialect):
-        raise ValueError("wrap_core_sql_with_distinct_on: could not append rank expression")
-    inner_sql = dialect.emit_sql(parsed)
+    inner_sql = append_distinct_on_rank_to_core_sql(
+        core_sql,
+        distinct_on=distinct_on,
+        order_by_cols=order_by_cols,
+        dialect=dialect,
+    )
+    order_sql = render_order_by_sql(order_by_cols, dialect)
     outer_select = ", ".join(select_exprs)
     outer_parts = [
         f"SELECT {outer_select}",
@@ -3538,7 +3987,7 @@ def _build_deterministic_select_block(
                 rendered = unnest_sql
             else:
                 rendered = render_select_col_sql(sc, dialect)
-                parts = effective_select_parts(sc, None, None)
+                parts = sc.effective_parts(None, None)
                 if preservation_active and _aggregate_needs_zero_fill(parts.expr, preserved_set):
                     rendered = f"COALESCE({rendered}, 0)"
                 if output_aliases and idx < len(output_aliases):
@@ -3586,7 +4035,16 @@ def _build_deterministic_select_block(
             lines.append("HAVING " + having_sql)
 
         if order_by_cols:
-            lines.append("ORDER BY " + _render_order_by_sql(order_by_cols, dialect))
+            lines.append(
+                "ORDER BY "
+                + render_order_by_sql(
+                    order_by_cols,
+                    dialect,
+                    pin_collation=limit is not None,
+                    schema=schema,
+                    cte_outputs=cte_outputs,
+                )
+            )
 
         if limit:
             lines.append(f"LIMIT {limit}")
@@ -3596,7 +4054,7 @@ def _build_deterministic_select_block(
 
 def _effective_select_col_for_sql(sc: SelectCol) -> SelectCol:
     """Return a select column with registry references reduced to the. resolved base expression."""
-    parts = effective_select_parts(sc, None, None)
+    parts = sc.effective_parts(None, None)
     return SelectCol(expr=parts.expr)
 
 
@@ -3658,7 +4116,7 @@ def generate_col_alias(sc: SelectCol) -> str:
 
 def select_col_prefers_llm_display_alias(sc: SelectCol) -> bool:
     """Whether. :func:`aetherdialect._pipeline.enriched_display_alias_map` should ask the LLM for a display header."""
-    parts = effective_select_parts(sc, None, None)
+    parts = sc.effective_parts(None, None)
     if parts.case_when is not None:
         return True
     if parts.window_spec is not None:
@@ -3729,9 +4187,32 @@ def build_display_sql(
     return rendered if isinstance(rendered, str) and rendered else sql_param
 
 
-def _date_window_inclusive_upper_sql(left_rendered: str, unit: str, dialect: Dialect) -> str:
+def _date_window_inclusive_upper_sql(
+    left_rendered: str, unit: str, dialect: Dialect, *, anchor: datetime | None = None
+) -> str:
     """Upper inclusive anchor for relative ``date_window`` ranges (through the clock anchor for the unit class)."""
-    return dialect.render_date_window_inclusive_upper(left_rendered, unit)
+    return dialect.render_date_window_inclusive_upper(left_rendered, unit, anchor=anchor)
+
+
+def _resolve_date_window_anchor(anchor: datetime | None = None) -> datetime | None:
+    """Return an explicit or federated turn-start anchor for date-window rendering."""
+    if anchor is not None:
+        return anchor
+    ctx = active_federation_execution_context()
+    bind = getattr(ctx, "temporal_bind", None) if ctx is not None else None
+    if bind is None:
+        return None
+    return datetime.fromisoformat(bind.anchor_iso)
+
+
+def _column_is_date_only(column_meta: Any) -> bool:
+    """Return True when column metadata describes a date without time- of-day."""
+    data_type = str(getattr(column_meta, "data_type", "") or "").strip().lower()
+    if not data_type:
+        return False
+    if data_type in TIMESTAMP_COLUMN_DATA_TYPES or "timestamp" in data_type or data_type == "time":
+        return False
+    return data_type == "date" or data_type.startswith("date")
 
 
 def _render_date_window_predicate(
@@ -3740,23 +4221,40 @@ def _render_date_window_predicate(
     dialect: Dialect,
     *,
     param_values: Mapping[str, Any] | None = None,
+    schema: SchemaGraph | None = None,
+    cte_outputs: dict[str, Any] | None = None,
+    anchor: datetime | None = None,
 ) -> list[str]:
     """Render WHERE/HAVING clause part(s) for a date_window filter or. having condition."""
+    resolved_anchor = _resolve_date_window_anchor(anchor)
     resolved = pred.resolved_value(param_values)
     rv = resolved if isinstance(resolved, dict) else {}
     if "start" in rv and "end" in rv:
         start_val = rv["start"]
         end_val = rv["end"]
         if isinstance(start_val, str) and isinstance(end_val, str):
+            try:
+                start_parsed = parse_iso_date_literal(start_val)
+                end_parsed = parse_iso_date_literal(end_val)
+            except ValueError:
+                raise AmbiguousDateLiteralError(start_val, REFUSAL_AMBIGUOUS_DATE_LITERAL_MESSAGE) from None
             return [
-                f"{left_rendered} >= '{start_val}'",
-                f"{left_rendered} <= '{end_val}'",
+                f"{left_rendered} >= {dialect.render_date_literal(start_parsed)}",
+                f"{left_rendered} <= {dialect.render_date_literal(end_parsed)}",
             ]
     unit = str(rv.get("unit", "day") or "day")
     amt_raw = rv.get("amount")
     amount = int(amt_raw) if amt_raw is not None else 0
-    lower_sql = dialect.render_date_window(left_rendered, ">=", unit, amount)
-    upper_sql = _date_window_inclusive_upper_sql(left_rendered, unit, dialect)
+    if Dialect.relative_window_uses_timestamp(unit):
+        column_meta = _column_meta_for_predicate(pred, schema, cte_outputs)
+        if column_meta is not None and _column_is_date_only(column_meta):
+            col_name = pred.left_expr.primary_column or left_rendered
+            raise SubdayDateWindowOnDateColumnError(
+                col_name,
+                REFUSAL_SUBDAY_DATE_WINDOW_ON_DATE_COLUMN_MESSAGE,
+            )
+    lower_sql = dialect.render_date_window(left_rendered, ">=", unit, amount, anchor=resolved_anchor)
+    upper_sql = _date_window_inclusive_upper_sql(left_rendered, unit, dialect, anchor=resolved_anchor)
     return [lower_sql, upper_sql]
 
 
@@ -3861,6 +4359,25 @@ def _valid_join_choice_ids_from_candidates(candidates: list[dict[str, Any]]) -> 
     return frozenset(out)
 
 
+def _filter_llm_scopes_avoid_candidates(
+    llm_scopes: list[dict[str, Any]],
+    avoided_candidate_ids: frozenset[str],
+) -> list[dict[str, Any]]:
+    """Drop avoided join candidate ids from each scope before join- choice prompting."""
+    if not avoided_candidate_ids:
+        return llm_scopes
+    filtered: list[dict[str, Any]] = []
+    for block in llm_scopes:
+        cands = block.get("candidates") or []
+        kept = [
+            c
+            for c in cands
+            if isinstance(c, dict) and str(c.get("candidate_id", "")).strip() not in avoided_candidate_ids
+        ]
+        filtered.append({**block, "candidates": kept})
+    return filtered
+
+
 def _parse_join_choice_payload(parsed: dict[str, Any]) -> dict[str, str]:
     """Extract per-scope join choices from an LLM JSON object."""
     raw = parsed.get("choices")
@@ -3933,10 +4450,14 @@ def get_join_choice_from_llm(
     require_final: bool = False,
     schema: SchemaGraph | None = None,
     prior_join_feedback: list[str] | None = None,
+    avoided_candidate_ids: frozenset[str] | None = None,
 ) -> dict[str, str]:
     """Call LLM to get per-scope join candidate ids for the listed. scopes."""
     preset = dict(preset_choices or {})
     accept_na = dict(accept_na_by_scope or {})
+    avoid = avoided_candidate_ids or frozenset()
+    if avoid:
+        llm_scopes = _filter_llm_scopes_avoid_candidates(llm_scopes, avoid)
     if not llm_scopes:
         return preset
     required = frozenset(str(s["scope"]) for s in llm_scopes if s.get("scope") is not None)
@@ -3946,7 +4467,7 @@ def get_join_choice_from_llm(
                 system, user = build_join_choice_prompt(
                     q_norm, deterministic_sql, llm_scopes, schema=schema, prior_join_feedback=prior_join_feedback
                 )
-                parsed = llm_json(system, user, retries=1, task="join")
+                parsed = LLMProvider.json(system, user, retries=1, task="join")
             except LlmJsonExhausted as exc:
                 debug(f"[sql_gen.get_join_choice_from_llm] exhausted attempt {_attempt + 1}: {exc}")
                 continue
@@ -3995,7 +4516,7 @@ def get_join_choice_from_llm(
     return out
 
 
-register_render_expr_sql(render_expr_sql)
+NormalizedExpr.register_render_expr_sql(render_expr_sql)
 
 render_predicate_group_sql = _render_predicate_group_sql
 render_predicate_clause = _render_predicate_clause

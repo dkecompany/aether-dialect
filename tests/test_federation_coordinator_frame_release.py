@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import glob
+import os
+import tempfile
+
 import pandas as pd
 import pytest
 
@@ -90,3 +94,31 @@ def test_coordinator_releases_member_frames_during_registration() -> None:
     }
     execute_federation_coordinator(frames, plan, row_cap=100)
     assert frames == {}
+
+
+@pytest.mark.fast
+def test_coordinator_removes_owned_temp_directory_after_execute() -> None:
+    """Ephemeral coordinator temp dirs created under the system temp root are removed."""
+    manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
+    composite = compose_composite_graph(
+        {"a": _graph("left_t", source_id="a"), "b": _graph("right_t", source_id="b")},
+        manifest,
+    )
+    intent = RuntimeIntent(
+        tables=["left_t", "right_t"],
+        grain="many",
+        select_cols=[],
+        group_by_cols=[],
+        order_by_cols=[],
+        where=None,
+    )
+    plan = plan_federated_intent(intent, composite, manifest)
+    pattern = os.path.join(tempfile.gettempdir(), "aetherdialect_coordinator_temp_*")
+    before = set(glob.glob(pattern))
+    execute_federation_coordinator(
+        {"a": pd.DataFrame({"id": [1, 2]}), "b": pd.DataFrame({"id": [2]})},
+        plan,
+        row_cap=100,
+    )
+    after = set(glob.glob(pattern))
+    assert after == before

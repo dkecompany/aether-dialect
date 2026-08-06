@@ -11,9 +11,6 @@ from aetherdialect._contracts_base import (
     OrderByCol,
     PredicateGroup,
     WhereParam,
-    having_leaves,
-    predicate_group_from_list,
-    where_leaves,
 )
 from aetherdialect._contracts_core import (
     RuntimeCteStep,
@@ -616,7 +613,7 @@ class TestNormalizeIntentFiltersHavingsGroupAware:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fz, fa]),
+            where=PredicateGroup.from_list([fz, fa]),
         )
         result = normalize_where_havings(intent)
         assert (result.where.leaves() if result.where else [])[0].left_expr.primary_term == "t.a"
@@ -639,7 +636,7 @@ class TestNormalizeIntentFiltersHavingsGroupAware:
             group_by_cols=[],
             order_by_cols=[],
             where=None,
-            having=predicate_group_from_list([hz, ha]),
+            having=PredicateGroup.from_list([hz, ha]),
         )
         result = normalize_where_havings(intent)
         assert (result.having.leaves() if result.having else [])[0].left_expr.add_groups[0].agg_func == "count"
@@ -660,7 +657,7 @@ class TestNormalizeIntentFiltersHavingsGroupAware:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fz, fa]),
+            where=PredicateGroup.from_list([fz, fa]),
             having=None,
             param_values={},
             output_columns=[],
@@ -675,7 +672,7 @@ class TestNormalizeIntentFiltersHavingsGroupAware:
             cte_steps=[cte],
         )
         result = normalize_where_havings(intent)
-        assert (where_leaves(result.cte_steps[0].where) or [])[0].left_expr.primary_term == "t.a"
+        assert (PredicateGroup.where_leaves(result.cte_steps[0].where) or [])[0].left_expr.primary_term == "t.a"
 
     def test_cte_having_group_aware_sort(self):
         """CTE step having conditions are group-aware sorted."""
@@ -694,7 +691,7 @@ class TestNormalizeIntentFiltersHavingsGroupAware:
             group_by_cols=[],
             order_by_cols=[],
             where=None,
-            having=predicate_group_from_list([hz, ha]),
+            having=PredicateGroup.from_list([hz, ha]),
             param_values={},
             output_columns=[],
         )
@@ -708,7 +705,9 @@ class TestNormalizeIntentFiltersHavingsGroupAware:
             cte_steps=[cte],
         )
         result = normalize_where_havings(intent)
-        assert (having_leaves(result.cte_steps[0].having) or [])[0].left_expr.add_groups[0].agg_func == "count"
+        assert (PredicateGroup.having_leaves(result.cte_steps[0].having) or [])[0].left_expr.add_groups[
+            0
+        ].agg_func == "count"
 
     def test_dedup_respects_signature_in_pipeline(self):
         """Pipeline dedup removes filters with identical structural signatures."""
@@ -728,7 +727,7 @@ class TestNormalizeIntentFiltersHavingsGroupAware:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp1, fp2]),
+            where=PredicateGroup.from_list([fp1, fp2]),
         )
         result = normalize_where_havings(intent)
         assert len(result.where.leaves() if result.where else []) == 1
@@ -1068,7 +1067,7 @@ class TestNormalizeIntentFiltersHavings:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp, fp]),
+            where=PredicateGroup.from_list([fp, fp]),
         )
         result = normalize_where_havings(intent)
         assert len(result.where.leaves() if result.where else []) == 1
@@ -1082,7 +1081,7 @@ class TestNormalizeIntentFiltersHavings:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
         )
         result = normalize_where_havings(intent)
         assert (result.where.leaves() if result.where else [])[0].op == "="
@@ -1598,7 +1597,7 @@ class TestNormalizeCteNames:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("cte1.cte1"),
@@ -1630,7 +1629,7 @@ class TestNormalizeCteNames:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("cte1.avg_amount"),
@@ -1665,7 +1664,7 @@ class TestNormalizeCteNames:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr(raw_sql="cte1.cte1 > 1"),
@@ -1802,7 +1801,7 @@ class TestNormalizeCountStarEdgeCases:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
         )
         result = normalize_count_star(intent)
         assert term_strs((result.where.leaves() if result.where else [])[0].left_expr.add_groups[0].multiply) == [
@@ -1948,7 +1947,7 @@ class TestNormalizeIntentFiltersHavingsCte:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp, fp]),
+            where=PredicateGroup.from_list([fp, fp]),
             having=None,
             param_values={},
             output_columns=[],
@@ -1963,7 +1962,7 @@ class TestNormalizeIntentFiltersHavingsCte:
             cte_steps=[cte],
         )
         result = normalize_where_havings(intent)
-        assert len(where_leaves(result.cte_steps[0].where) or []) == 1
+        assert len(PredicateGroup.where_leaves(result.cte_steps[0].where) or []) == 1
 
     def test_cte_having_ops_normalised(self):
         """Operators in CTE havings are normalised."""
@@ -1979,7 +1978,7 @@ class TestNormalizeIntentFiltersHavingsCte:
             group_by_cols=[],
             order_by_cols=[],
             where=None,
-            having=predicate_group_from_list([hp]),
+            having=PredicateGroup.from_list([hp]),
             param_values={},
             output_columns=[],
         )
@@ -1993,7 +1992,7 @@ class TestNormalizeIntentFiltersHavingsCte:
             cte_steps=[cte],
         )
         result = normalize_where_havings(intent)
-        assert (having_leaves(result.cte_steps[0].having) or [])[0].op == "="
+        assert (PredicateGroup.having_leaves(result.cte_steps[0].having) or [])[0].op == "="
 
 
 class TestFilterAndHavingStructuralKeys:
@@ -2117,7 +2116,7 @@ class TestRewriteCteOutputRefsToAliases:
             cte_name="inner",
             tables=["orders"],
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.amount"))],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("inner.orders.amount"),
@@ -2138,7 +2137,7 @@ class TestRewriteCteOutputRefsToAliases:
             cte_steps=[cte],
         )
         result = rewrite_cte_output_refs_to_aliases(intent)
-        left = (where_leaves(result.cte_steps[0].where) or [])[0].left_expr
+        left = (PredicateGroup.where_leaves(result.cte_steps[0].where) or [])[0].left_expr
         assert left.primary_term == "inner.amt"
 
     def test_maps_inferred_alias_to_output_column(self):
@@ -2154,7 +2153,7 @@ class TestRewriteCteOutputRefsToAliases:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("cte1.film_count"),
@@ -2179,7 +2178,7 @@ class TestResolveWindowRegistryFilterRhs:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("orders.amount"),
@@ -2215,7 +2214,7 @@ class TestPromoteDateSubtractionToDateDiff:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=left,
@@ -2241,7 +2240,7 @@ class TestPromoteDateSubtractionToDateDiff:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=left,
@@ -2486,7 +2485,7 @@ class TestResolveCteColumnMapsExtended:
             cte_name="c1",
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.a"))],
             order_by_cols=[OrderByCol(expr=NormalizedExpr.from_column("a"), direction="ASC")],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("a"),
@@ -2495,7 +2494,7 @@ class TestResolveCteColumnMapsExtended:
                     )
                 ]
             ),
-            having=predicate_group_from_list(
+            having=PredicateGroup.from_list(
                 [
                     HavingParam(
                         left_expr=NormalizedExpr.from_agg("count", "a"),
@@ -2611,8 +2610,8 @@ class TestNormalizeCountStarExtended:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[OrderByCol(expr=NormalizedExpr(add_groups=[MulGroup(multiply=["COUNT(1)"])]))],
-            where=predicate_group_from_list([fp]),
-            having=predicate_group_from_list([hp]),
+            where=PredicateGroup.from_list([fp]),
+            having=PredicateGroup.from_list([hp]),
         )
         result = normalize_count_star(intent)
         assert term_strs(result.order_by_cols[0].expr.add_groups[0].multiply) == ["COUNT(*)"]
@@ -2646,8 +2645,8 @@ class TestSimplifyExprsExtended:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[OrderByCol(expr=expr, direction="DESC")],
-            where=predicate_group_from_list([fp]),
-            having=predicate_group_from_list([hp]),
+            where=PredicateGroup.from_list([fp]),
+            having=PredicateGroup.from_list([hp]),
         )
         result = simplify_exprs(intent)
         assert len(result.order_by_cols[0].expr.add_groups) == 1
@@ -2715,7 +2714,7 @@ class TestEnforceSchemaExtended:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
         )
         _, errors = check_qualified_refs_exist(intent, validate_schema)
         assert any("not_a_col" in e for e in errors)

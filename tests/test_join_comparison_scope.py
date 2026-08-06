@@ -7,9 +7,8 @@ import pytest
 from aetherdialect._constants import DIAGNOSTIC_CODE_COMPARISON_JOIN_DETOUR
 from aetherdialect._contracts_base import (
     ComparisonJoinScopeExceededError,
+    PredicateGroup,
     WhereParam,
-    predicate_group_from_list,
-    where_leaves,
 )
 from aetherdialect._contracts_core import NormalizedExpr, RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
@@ -77,7 +76,7 @@ def _linear_chain_schema() -> SchemaGraph:
 
 
 def _comparison_intent(*, select_from_d: bool = False) -> RuntimeIntent:
-    where = predicate_group_from_list(
+    where = PredicateGroup.from_list(
         [
             WhereParam(
                 left_expr=NormalizedExpr.from_column("a.x"),
@@ -158,7 +157,7 @@ def test_comparison_only_table_beyond_hop_ceiling_refuses() -> None:
         signature=signature,
         edge_kinds=kinds,
         from_anchor="a",
-        where_params=where_leaves(intent.where),
+        where_params=PredicateGroup.where_leaves(intent.where),
         having_params=[],
     )
     assert any(i.severity == "error" for i in issues)
@@ -172,7 +171,7 @@ def test_comparison_only_table_beyond_hop_ceiling_refuses() -> None:
             signature=signature,
             edge_kinds=kinds,
             from_anchor="a",
-            where_params=where_leaves(intent.where),
+            where_params=PredicateGroup.where_leaves(intent.where),
             having_params=[],
         )
 
@@ -187,7 +186,7 @@ def test_comparison_only_within_ceiling_emits_detour_diagnostic() -> None:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("a.x"))],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("a.x"),
@@ -207,7 +206,7 @@ def test_comparison_only_within_ceiling_emits_detour_diagnostic() -> None:
             signature=signature,
             edge_kinds=kinds,
             from_anchor="a",
-            where_params=where_leaves(intent.where),
+            where_params=PredicateGroup.where_leaves(intent.where),
             having_params=[],
         )
         diags = drain_diagnostic_collector()
@@ -222,7 +221,7 @@ def test_comparison_only_within_ceiling_emits_detour_diagnostic() -> None:
             signature=signature,
             edge_kinds=kinds,
             from_anchor="a",
-            where_params=where_leaves(intent.where),
+            where_params=PredicateGroup.where_leaves(intent.where),
             having_params=[],
         )
     )
@@ -241,7 +240,7 @@ def test_projected_table_at_same_hop_count_is_unaffected() -> None:
         signature=signature,
         edge_kinds=kinds,
         from_anchor="a",
-        where_params=where_leaves(intent.where),
+        where_params=PredicateGroup.where_leaves(intent.where),
         having_params=[],
     )
     assert issues == []
@@ -259,7 +258,7 @@ def test_extended_semantic_path_to_comparison_only_table_refuses() -> None:
         signature=signature,
         edge_kinds=kinds,
         from_anchor="a",
-        where_params=where_leaves(intent.where),
+        where_params=PredicateGroup.where_leaves(intent.where),
         having_params=[],
     )
     assert any("profile-inferred" in i.message for i in issues)

@@ -27,6 +27,8 @@ from aetherdialect._schema_catalog import (
     _profile_composite_descriptive,
     _profile_table,
     apply_catalog_descriptions_from_tables_meta,
+    apply_profile_timeout_to_dialect,
+    profile_schema,
 )
 from aetherdialect._schema_graph import _profile_table_clone
 
@@ -212,6 +214,74 @@ def test_maybe_set_profile_timeout_uses_dialect_override() -> None:
     assert executed == ["SET statement_timeout = 42"]
 
 
+def test_apply_profile_timeout_to_dialect_reaches_statement_timeout_helper() -> None:
+    executed: list[str] = []
+
+    class _Conn:
+        def execute(self, stmt, *_args, **_kwargs):
+            executed.append(str(stmt))
+
+    dialect = MagicMock()
+    dialect.profile_statement_timeout_sql.return_value = "SET statement_timeout = 9001"
+    apply_profile_timeout_to_dialect(dialect, 9001)
+    _maybe_set_profile_statement_timeout(_Conn(), dialect)
+    assert executed == ["SET statement_timeout = 9001"]
+
+
+def test_profile_schema_stamps_engine_profile_timeout_before_profiling() -> None:
+    executed: list[str] = []
+
+    class _Conn:
+        def execute(self, statement, *_args, **_kwargs):
+            executed.append(str(statement))
+
+            class _Result:
+                def fetchone(self):
+                    return (1, 1, 0)
+
+                def fetchall(self):
+                    return []
+
+                def scalar(self):
+                    return 1
+
+            return _Result()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    class _Engine:
+        profile_timeout_ms = 77
+
+        def connect(self):
+            return _Conn()
+
+    table = TableMetadata(
+        name="items",
+        columns={"id": ColumnMetadata(name="id", data_type="integer", sensitivity="none", value_type="integer")},
+        primary_key=["id"],
+        foreign_keys=[],
+    )
+    dialect = MagicMock()
+    dialect.quote_identifier.side_effect = lambda name: f'"{name}"'
+    dialect.qualified_table_ref.return_value = '"items"'
+    dialect.profiling_stats_sample_suffix.return_value = ""
+    dialect.profiling_stats_use_subquery_when_sampling.return_value = False
+    dialect.profile_statement_timeout_sql.return_value = "SET statement_timeout = 77"
+
+    profile_schema(
+        _Engine(),
+        __import__("aetherdialect._contracts_schema", fromlist=["SchemaGraph"]).SchemaGraph(
+            tables={"items": table}, join_paths_multi={}
+        ),
+        dialect,
+    )
+    assert executed and executed[0] == "SET statement_timeout = 77"
+
+
 def test_tables_meta_table_comment_becomes_catalog_description() -> None:
     meta = {
         "orders": {
@@ -261,7 +331,7 @@ def test_apply_column_roles_llm_with_notes_uses_notes_owner(monkeypatch: pytest.
         tables={"orders": table}, join_paths_multi={}
     )
 
-    def _fake_classify(_schema, notes_content=None, *, column_scope=None):
+    def _fake_classify(_schema, notes_content=None, *, column_scope=None, **kwargs):
         _ = notes_content, column_scope
         return {
             "orders": (

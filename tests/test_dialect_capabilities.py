@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import pytest
+import sqlglot
 
 from aetherdialect._constants import DIAGNOSTIC_CODE_SCHEMA_FK_CATALOG_ABSENT
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
@@ -14,7 +15,7 @@ from aetherdialect._core_utils import (
     set_diagnostic_collector,
     substitute_params,
 )
-from aetherdialect._dialect import Dialect, engine_supports_median, engine_supports_ordered_string_agg
+from aetherdialect._dialect import Dialect, DialectRegistry
 from aetherdialect._dialect_postgres import PostgresDialect
 from aetherdialect._dialect_sqlglot_engines import BigQueryDialect, MySQLDialect
 from aetherdialect._federation import stamp_federation_member_graph
@@ -58,9 +59,9 @@ def _two_table_graph(engine: str) -> SchemaGraph:
 
 @pytest.mark.fast
 def test_capability_flags_read_dialect_not_engine_denylist() -> None:
-    assert engine_supports_ordered_string_agg("databricks") is False
-    assert engine_supports_median("mysql") is False
-    assert engine_supports_median("postgresql") is True
+    assert DialectRegistry.engine_supports_ordered_string_agg("databricks") is False
+    assert DialectRegistry.engine_supports_median("mysql") is False
+    assert DialectRegistry.engine_supports_median("postgresql") is True
 
 
 @pytest.mark.fast
@@ -132,3 +133,36 @@ def test_substitute_params_uses_postgres_estring_for_backslashes() -> None:
     pg = PostgresDialect.__new__(PostgresDialect)
     sql = substitute_params("WHERE path = :p1", {"p1": r"a\b"}, dialect=pg)
     assert sql == r"WHERE path = E'a\\b'"
+
+
+@pytest.mark.fast
+@pytest.mark.parametrize("engine", DialectRegistry.list_engines())
+def test_declared_ilike_support_renders_valid_sql(engine: str) -> None:
+    """Every dialect's ILIKE declaration (or fallback) produces parser- valid SQL."""
+    from aetherdialect._contracts_base import MulGroup, NormalizedExpr, WhereParam
+    from aetherdialect._dialect import DialectRegistry
+    from aetherdialect._sql_gen import _render_predicate_clause
+
+    cls = DialectRegistry.get_class(engine)
+    dialect = cls.__new__(cls)
+    pred = WhereParam(
+        left_expr=NormalizedExpr(
+            add_groups=[MulGroup(multiply=["t.name"])],
+            sub_groups=[],
+        ),
+        value_type="string",
+        op="ilike",
+        param_key="p0",
+    )
+    fragment = _render_predicate_clause(pred, dialect)
+    assert fragment
+    parse_sql = substitute_params(f"SELECT 1 WHERE {fragment}", {"p0": "abc"}, dialect=dialect)
+    if " ESCAPE " in parse_sql.upper():
+        parse_sql = parse_sql.rsplit(" ESCAPE ", 1)[0]
+    sqlglot.parse_one(parse_sql, read=cls.sqlglot_dialect)
+    if dialect.supports_ilike:
+        assert "ILIKE" in fragment.upper()
+    else:
+        assert "ILIKE" not in fragment.upper()
+        assert "LOWER" in fragment.upper()
+        assert "LIKE" in fragment.upper()

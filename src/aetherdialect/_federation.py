@@ -7,6 +7,7 @@ import hashlib
 import importlib
 import json
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -14,26 +15,37 @@ import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, Protocol, cast
+from types import SimpleNamespace
+from typing import Any, Literal, cast
 
 import pandas as pd
 from platformdirs import user_data_dir
 from sqlalchemy import text
 
-import duckdb
-
-from ._config import CsvRuntimeConfig, EngineRuntimeConfig, PolicyConfig
+from ._config import CsvRuntimeConfig, EngineRuntimeConfig, FederationLimits, PolicyConfig
 from ._constants import (
+    AETHERSPACES_SEGMENT,
     ARROW_RESULT_READER_KINDS,
+    ARTIFACT_DIR_MODE,
     ARTIFACT_DIRECTORY_SEGMENT,
+    ARTIFACT_FILE_MODE,
     ARTIFACT_MANIFEST_FILENAME,
     ASK_PHASE_I,
+    DIAGNOSTIC_CODE_COORDINATOR_LIMITS,
     DIAGNOSTIC_CODE_ENUM_PROMPT_TRUNCATED,
+    DIAGNOSTIC_CODE_FEDERATION_COORDINATOR_ARROW_SPILL_FALLBACK,
+    DIAGNOSTIC_CODE_FEDERATION_COORDINATOR_DECIMAL_FALLBACK,
     DIAGNOSTIC_CODE_FEDERATION_MAPPING_DRIFT,
+    DIAGNOSTIC_CODE_FEDERATION_MEMBER_REMOVED,
+    DIAGNOSTIC_CODE_FEDERATION_MEMBER_TIMEZONE_MISMATCH,
+    DIAGNOSTIC_CODE_FEDERATION_REDUCTION_NULL_KEYS,
+    DIAGNOSTIC_CODE_FEDERATION_TIMESTAMP_NORMALISED,
+    DIAGNOSTIC_CODE_ROUNDING_MODE_MIXED,
     ENGINE_STORAGE_SLUG_MAX_CHARS,
     FEDERATION_ARTIFACT_FORMAT_VERSION,
+    FEDERATION_AVERAGE_SCALE_HEADROOM,
     FEDERATION_BASE_WHERE_OPS,
     FEDERATION_COMPOSITE_RECONCILIATION_NOTE,
     FEDERATION_COMPOSITE_SCHEMA_FILENAME,
@@ -46,12 +58,16 @@ from ._constants import (
     FEDERATION_COMPOSITION_PHASE_G,
     FEDERATION_COMPOSITION_PHASE_H,
     FEDERATION_CONNECTION_SLUG_NON_WORD_RE,
+    FEDERATION_COORDINATOR_DECIMAL_FALLBACK,
+    FEDERATION_COORDINATOR_DECIMAL_MAX_PRECISION,
     FEDERATION_COORDINATOR_DUCKDB_TYPE_MAP,
     FEDERATION_CROSS_SOURCE_JOIN_KINDS,
     FEDERATION_DECLARATION_TOP_LEVEL_KEYS,
     FEDERATION_DECLARATION_VERSION,
     FEDERATION_DECOMPOSABLE_CROSS_SOURCE_AGGS,
     FEDERATION_ENUM_PROMPT_CAP,
+    FEDERATION_JOIN_FEEDBACK_PREFIX,
+    FEDERATION_JOIN_FEEDBACK_SEGMENT,
     FEDERATION_MANIFEST_ALIAS_KEYS,
     FEDERATION_MANIFEST_COORDINATOR_KEYS,
     FEDERATION_MANIFEST_FILENAME,
@@ -69,12 +85,12 @@ from ._constants import (
     FEDERATION_MAPPINGS_FILENAME,
     FEDERATION_MAPPINGS_LOGICAL_COLUMN_KEYS,
     FEDERATION_MAPPINGS_LOGICAL_TABLE_KEYS,
-    FEDERATION_MAPPINGS_MIN_VERSION,
     FEDERATION_MAPPINGS_TABLE_MEMBER_KEYS,
     FEDERATION_MAPPINGS_TOP_LEVEL_KEYS,
     FEDERATION_MAPPINGS_VERSION,
     FEDERATION_MAX_JOIN_CANDIDATE_CAP,
     FEDERATION_MAX_JOIN_PATH_TIE_CAP,
+    FEDERATION_MEMBER_MANIFEST_FILENAME,
     FEDERATION_MIGRATION_MAP_FILENAME,
     FEDERATION_PLAN_ACCEPTED_QUESTIONS_CAP,
     FEDERATION_PLAN_TEMPLATE_FILE_CAP,
@@ -87,9 +103,14 @@ from ._constants import (
     FEDERATION_STORAGE_PREFIX,
     FEDERATION_STORAGE_SLUG_NON_ALNUM_RE,
     FEDERATION_TEMPLATES_SEGMENT,
+    FEDERATION_TIMEZONE_AWARE_DATA_TYPES,
+    FILE_ENGINE_NAMES,
+    INELIGIBLE_ANSWERABLE_HINTS_BY_CODE,
+    MASTER_AETHERSPACE_NAME,
     MIGRATION_MAP_ACTION_ABORT,
     MIGRATION_MAP_ACTION_DESTRUCTIVE,
     MIGRATION_MAP_ACTION_REMAP,
+    MIN_COMPATIBLE_PACKAGE_VERSION,
     REPHRASE_HINT_MESSAGES,
     SCHEMA_OVERRIDES_APPLIED_SUFFIX,
     SCHEMA_OVERRIDES_APPLIED_TIMESTAMP_FORMAT,
@@ -97,13 +118,13 @@ from ._constants import (
     TEMPLATE_STORE_SEGMENT,
     VALID_GRAINS,
     VALID_HAVING_OPS,
-    FederationTopologyChange,
-    anti_join_presence_column,
-    ineligible_answerable_hint_for_code,
-    is_file_engine,
 )
 from ._contracts_base import (
+    ArrayStorageKind,
+    ArtifactManifest,
+    BusinessKnowledgeEntry,
     ConfigError,
+    CteEmissionKind,
     DatabaseFeatureCapability,
     DescriptionOwner,
     EngineContext,
@@ -119,7 +140,9 @@ from ._contracts_base import (
     FederationMalformedMemberAnswerError,
     FederationManifest,
     FederationMappings,
+    FederationMappingsAppliedSidecarError,
     FederationMappingSuggestion,
+    FederationMemberEngine,
     FederationMemberExecutionError,
     FederationMemberProbeError,
     FederationMemberUnprofilableError,
@@ -131,16 +154,21 @@ from ._contracts_base import (
     FederationSourceBinding,
     FederationSourceLimits,
     FederationTableAlias,
+    FederationTopologyChange,
     FederationTopologyReport,
     FederationTurnCancelledError,
+    HavingParam,
     InferenceTag,
     LogicalColumnMapping,
     LogicalTableMapping,
     LogicalTableMember,
+    MemberEffectiveGrants,
     MigrationPendingError,
     MigrationTier,
+    MulGroup,
     NormalizedExpr,
     OrderByCol,
+    OrderByNullPlacement,
     OverrideReport,
     OwnerOnlyOperationError,
     PersistedFederationInspection,
@@ -148,14 +176,7 @@ from ._contracts_base import (
     SchemaRole,
     SensitivityClassification,
     SpaceContext,
-    coerce_cte_emission,
-    default_order_by_null_placement,
-    expr_registry_ref,
-    partition_predicate_group,
-    predicate_group_from_list,
-    resolve_descriptions,
-    resolve_federation_qualified_ref,
-    set_description,
+    WhereParam,
 )
 from ._contracts_core import (
     AnchoredTemporalBind,
@@ -167,7 +188,6 @@ from ._contracts_core import (
     FederationMemberResolvedLimits,
     FederationReducingEdge,
     FederationTableSet,
-    HavingParam,
     JoinSpec,
     ResidualSpec,
     RuntimeCteStep,
@@ -175,45 +195,42 @@ from ._contracts_core import (
     SelectCol,
     SourceStep,
     UnionSpec,
-    WhereParam,
 )
 from ._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, SQLShape, TableMetadata
 from ._core_utils import (
-    ArtifactManifest,
+    active_federation_limits,
     artifact_lock,
+    artifact_package_version_string,
+    coerce_format_version,
     cost_cap_active,
     debug,
     effective_structural_hash_fp,
     emit_ask_phase,
     emit_construction_phase,
+    format_versions_match,
+    mark_connection_poisoned,
+    normalize_question,
     notify,
+    parse_numeric_type_arguments,
     pipeline_trace,
     read_gzip_json,
     reconcile_execute_bind_params,
+    refresh_migration_simulation_caches,
+    require_driver,
+    sanitize_tenant_slug,
     stable_json,
     structural_hash_fp,
+    value_overlap_ratio_for_columns,
     wipe_filenames,
     write_gzip_json_atomic,
+    write_text_atomic,
 )
 from ._data_quality import parse_source_selections, validate_upload_sources
 from ._dialect import (
-    dialect_supports_ilike_semantics,
-    engine_supports_array_contains,
-    engine_supports_collation,
-    engine_supports_median,
-    engine_supports_ordered_string_agg,
-    engine_supports_stddev,
-    engine_supports_timestamptz_semantics,
-    engine_supports_unsigned_semantics,
-    engine_supports_variance,
-    engine_supports_window_frames,
-    extra_where_ops_for_engine,
-    get_dialect,
-    get_runtime_config_class,
-    list_engines,
-    member_supports_ilike_semantics,
-    sqlglot_quote_identifier,
+    Dialect,
+    DialectRegistry,
 )
+from ._dialect_sqlglot_helper import SqlglotEngineDialect
 from ._intent_expr import collect_intent_referenced_param_keys, extract_columns_from_expr
 from ._intent_repair import (
     collect_referenced_tables,
@@ -222,6 +239,7 @@ from ._intent_repair import (
     where_scope_registries_to_referenced,
 )
 from ._intent_resolve import check_qualified_refs_exist, join_path_segments_fingerprint_runtime
+from ._schema_build import resolve_federation_qualified_ref
 from ._schema_catalog import (
     assign_column_ops,
     description_neutrality_violations,
@@ -246,6 +264,7 @@ from ._schema_graph import (
     validate_scope_against_graph,
 )
 from ._schema_overrides import (
+    apply_document_business_knowledge,
     apply_schema_overrides_to_graph,
     compute_metadata_hash,
     dump_schema_overrides_to_path,
@@ -257,9 +276,12 @@ from ._schema_overrides import (
     user_added_pks_dump,
 )
 from ._sql_gen import (
+    anti_join_presence_column,
     generate_col_alias,
     get_join_choice_from_llm,
+    maybe_pin_order_expr_collation,
     render_expr_sql,
+    render_order_by_sql,
     render_predicate_clause,
     render_predicate_group_sql,
     render_select_col_sql,
@@ -267,18 +289,7 @@ from ._sql_gen import (
 )
 from ._utils import flatten_param_values, intent_key
 from ._validation_execute import validate_semantics, validate_sql
-
-
-def _predicate_where_leaves(where: PredicateGroup | None) -> list[WhereParam]:
-    if where is None:
-        return []
-    return [param for param in where.leaves() if isinstance(param, WhereParam)]
-
-
-def _predicate_having_leaves(having: PredicateGroup | None) -> list[HavingParam]:
-    if having is None:
-        return []
-    return [param for param in having.leaves() if isinstance(param, HavingParam)]
+from ._validation_schema import assert_residual_execution_parameters_validated
 
 
 def intersect_member_where_ops(
@@ -296,7 +307,7 @@ def intersect_member_where_ops(
                 extra_sets.append(frozenset(extra_fn()))
     elif engine_types_by_source:
         for engine_type in engine_types_by_source.values():
-            extra_sets.append(extra_where_ops_for_engine(engine_type))
+            extra_sets.append(DialectRegistry.extra_where_ops_for_engine(engine_type))
     if extra_sets:
         shared_extra = set(extra_sets[0])
         for extra in extra_sets[1:]:
@@ -305,16 +316,22 @@ def intersect_member_where_ops(
     if "ilike" not in allowed:
         if dialects_by_source:
             dialects = [d for d in dialects_by_source.values() if d is not None]
-            if dialects and all(dialect_supports_ilike_semantics(d) for d in dialects):
+            if dialects and all(DialectRegistry.dialect_supports_ilike_semantics(d) for d in dialects):
                 allowed.update({"ilike", "not ilike"})
         elif engine_types_by_source:
-            if all(member_supports_ilike_semantics(engine_type) for engine_type in engine_types_by_source.values()):
+            if all(
+                DialectRegistry.member_supports_ilike_semantics(engine_type)
+                for engine_type in engine_types_by_source.values()
+            ):
                 allowed.update({"ilike", "not ilike"})
     if dialects_by_source:
         if all(bool(getattr(d, "supports_array_contains", True)) for d in dialects_by_source.values() if d is not None):
             allowed.add("contains")
     elif engine_types_by_source:
-        if all(engine_supports_array_contains(engine_type) for engine_type in engine_types_by_source.values()):
+        if all(
+            DialectRegistry.engine_supports_array_contains(engine_type)
+            for engine_type in engine_types_by_source.values()
+        ):
             allowed.add("contains")
     return frozenset(allowed)
 
@@ -351,16 +368,22 @@ def intersect_member_dialect_capabilities(
         "supports_anti_join": True if ir_cap is None else ir_cap.supports_anti_join,
         "supports_predicate_nesting": True if ir_cap is None else ir_cap.supports_predicate_nesting,
         "supports_preserve_tables": True if ir_cap is None else ir_cap.supports_preserve_tables,
-        "supports_ordered_string_agg": _member_flag("supports_ordered_string_agg", engine_supports_ordered_string_agg),
-        "supports_median": _member_flag("supports_median", engine_supports_median),
-        "supports_stddev": _member_flag("supports_stddev", engine_supports_stddev),
-        "supports_variance": _member_flag("supports_variance", engine_supports_variance),
-        "supports_window_frames": _member_flag("supports_window_frames", engine_supports_window_frames),
-        "supports_array_contains": _member_flag("supports_array_contains", engine_supports_array_contains),
-        "supports_collation": _member_flag("supports_collation", engine_supports_collation),
-        "supports_unsigned_semantics": _member_flag("supports_unsigned_semantics", engine_supports_unsigned_semantics),
+        "supports_ordered_string_agg": _member_flag(
+            "supports_ordered_string_agg", DialectRegistry.engine_supports_ordered_string_agg
+        ),
+        "supports_median": _member_flag("supports_median", DialectRegistry.engine_supports_median),
+        "supports_stddev": _member_flag("supports_stddev", DialectRegistry.engine_supports_stddev),
+        "supports_variance": _member_flag("supports_variance", DialectRegistry.engine_supports_variance),
+        "supports_window_frames": _member_flag("supports_window_frames", DialectRegistry.engine_supports_window_frames),
+        "supports_array_contains": _member_flag(
+            "supports_array_contains", DialectRegistry.engine_supports_array_contains
+        ),
+        "supports_collation": _member_flag("supports_collation", DialectRegistry.engine_supports_collation),
+        "supports_unsigned_semantics": _member_flag(
+            "supports_unsigned_semantics", DialectRegistry.engine_supports_unsigned_semantics
+        ),
         "supports_timestamptz_semantics": _member_flag(
-            "supports_timestamptz_semantics", engine_supports_timestamptz_semantics
+            "supports_timestamptz_semantics", DialectRegistry.engine_supports_timestamptz_semantics
         ),
     }
 
@@ -377,13 +400,13 @@ def _member_where_ops_for_binding(
         extra_fn = getattr(dialect, "extra_where_ops", None)
         if callable(extra_fn):
             allowed.update(extra_fn())
-        if dialect_supports_ilike_semantics(dialect):
+        if DialectRegistry.dialect_supports_ilike_semantics(dialect):
             allowed.update({"ilike", "not ilike"})
     else:
-        allowed.update(extra_where_ops_for_engine(binding.engine))
-        if member_supports_ilike_semantics(binding.engine):
+        allowed.update(DialectRegistry.extra_where_ops_for_engine(binding.engine))
+        if DialectRegistry.member_supports_ilike_semantics(binding.engine):
             allowed.update({"ilike", "not ilike"})
-    if engine_supports_array_contains(binding.engine):
+    if DialectRegistry.engine_supports_array_contains(binding.engine):
         allowed.add("contains")
     return frozenset(allowed)
 
@@ -458,10 +481,10 @@ def _federation_member_lacking_ilike_semantics(
     for binding in manifest.sources:
         dialect = (dialects_by_source or {}).get(binding.source_id)
         if dialect is not None:
-            if not dialect_supports_ilike_semantics(dialect):
+            if not DialectRegistry.dialect_supports_ilike_semantics(dialect):
                 return binding.source_id
             continue
-        if not member_supports_ilike_semantics(binding.engine):
+        if not DialectRegistry.member_supports_ilike_semantics(binding.engine):
             return binding.source_id
     return None
 
@@ -476,7 +499,7 @@ def _federation_unsupported_operator_reason(
     caps = intersect_member_dialect_capabilities(dialects_by_source, engine_types_by_source=engine_types or None)
     allowed_where = caps.get("where_ops") or frozenset()
     allowed_having = caps["having_ops"]
-    for fp in _predicate_where_leaves(intent.where) or []:
+    for fp in PredicateGroup.where_leaves(intent.where) or []:
         op = str(fp.op or "").strip().lower()
         if op and op not in allowed_where:
             if op in ("ilike", "not ilike"):
@@ -492,7 +515,7 @@ def _federation_unsupported_operator_reason(
             if lacking is not None:
                 return _federation_member_capability_operator_reason("where", fp.op or op, lacking)
             return _federation_member_capability_operator_reason("where", fp.op or op, "unknown")
-    for hp in _predicate_having_leaves(intent.having) or []:
+    for hp in PredicateGroup.having_leaves(intent.having) or []:
         op = str(hp.op or "").strip().lower()
         if op and op not in allowed_having:
             lacking = _federation_member_lacking_having_op(op, manifest, dialects_by_source=dialects_by_source)
@@ -584,12 +607,44 @@ def _intent_uses_window_frames(intent: RuntimeIntent) -> bool:
 
 
 def _intent_uses_array_contains(intent: RuntimeIntent) -> bool:
-    for fp in _predicate_where_leaves(intent.where):
+    for fp in PredicateGroup.where_leaves(intent.where):
         if (fp.op or "").strip().lower() == "contains":
             return True
-    for hp in _predicate_having_leaves(intent.having):
+    for hp in PredicateGroup.having_leaves(intent.having):
         if (hp.op or "").strip().lower() == "contains":
             return True
+    return False
+
+
+def _expr_mentions_collation(expr: NormalizedExpr | None) -> bool:
+    if expr is None:
+        return False
+    if (expr.scalar_func or "").strip().lower() == "collate":
+        return True
+    raw = str(expr.raw_sql or "")
+    if "collate" in raw.lower():
+        return True
+    for group in (*expr.add_groups, *expr.sub_groups):
+        for mult in (*group.multiply, *group.divide):
+            if _expr_mentions_collation(mult):
+                return True
+    return False
+
+
+def _intent_uses_collation(intent: RuntimeIntent) -> bool:
+    for obc in intent.order_by_cols or []:
+        if _expr_mentions_collation(obc.expr):
+            return True
+    for sc in intent.select_cols or []:
+        if _expr_mentions_collation(sc.expr):
+            return True
+    for col in intent.group_by_cols or []:
+        if _expr_mentions_collation(col):
+            return True
+    for cte in intent.cte_steps or []:
+        for obc in cte.order_by_cols or []:
+            if _expr_mentions_collation(obc.expr):
+                return True
     return False
 
 
@@ -597,7 +652,8 @@ def _intent_column_data_types(
     intent: RuntimeIntent,
     schema: SchemaGraph,
     *,
-    predicate: Callable[[str], bool],
+    predicate: Callable[[str], bool] | None = None,
+    column_predicate: Callable[[ColumnMetadata], bool] | None = None,
 ) -> bool:
     refs: set[str] = set()
     for sc in intent.select_cols or []:
@@ -606,9 +662,9 @@ def _intent_column_data_types(
         refs.update(extract_columns_from_expr(col))
     for obc in intent.order_by_cols or []:
         refs.update(extract_columns_from_expr(obc.expr))
-    for fp in _predicate_where_leaves(intent.where):
+    for fp in PredicateGroup.where_leaves(intent.where):
         refs.update(extract_columns_from_expr(fp.left_expr))
-    for hp in _predicate_having_leaves(intent.having):
+    for hp in PredicateGroup.having_leaves(intent.having):
         refs.update(extract_columns_from_expr(hp.left_expr))
     for cref in refs:
         if "." not in cref:
@@ -618,7 +674,11 @@ def _intent_column_data_types(
         if table is None:
             continue
         col_meta = table.columns.get(column_name)
-        if col_meta is not None and predicate(str(col_meta.data_type or "")):
+        if col_meta is None:
+            continue
+        if column_predicate is not None and column_predicate(col_meta):
+            return True
+        if predicate is not None and predicate(str(col_meta.data_type or "")):
             return True
     return False
 
@@ -631,7 +691,7 @@ def _federation_ir_capability_reason(
 ) -> str | None:
     """Refuse IR shapes absent from the intersection of member capabilities."""
     for cte in intent.cte_steps or []:
-        emission = coerce_cte_emission(getattr(cte, "emission", "join_table"))
+        emission = CteEmissionKind.coerce(getattr(cte, "emission", "join_table"))
         if emission == "semi_join" and not cap.supports_semi_join:
             name = (cte.cte_name or "").strip() or "semi_join"
             return f"semi_join is not supported by all federation members: {name}"
@@ -652,13 +712,15 @@ def _federation_ir_capability_reason(
         return "window frames are not supported by all federation members"
     if _intent_uses_array_contains(intent) and not cap.supports_array_contains:
         return "array contains is not supported by all federation members"
+    if _intent_uses_collation(intent) and not cap.supports_collation:
+        return "collation is not supported by all federation members"
     if schema is not None:
         if not cap.supports_timestamptz_semantics and _intent_column_data_types(
-            intent, schema, predicate=lambda dt: "timestamptz" in dt.lower()
+            intent, schema, column_predicate=lambda col: col.is_timezone_aware
         ):
             return "timestamptz semantics are not supported by all federation members"
         if not cap.supports_unsigned_semantics and _intent_column_data_types(
-            intent, schema, predicate=lambda dt: "unsigned" in dt.lower()
+            intent, schema, column_predicate=lambda col: col.is_unsigned
         ):
             return "unsigned integer semantics are not supported by all federation members"
     nested_where = bool(intent.where and intent.where.depth() > 1)
@@ -765,7 +827,7 @@ def _cross_source_probe_cte_steps(
     driver_sources = {source_by_table.get(table, "") for table in driver_tables if source_by_table.get(table, "")}
     lifted: list[RuntimeCteStep] = []
     for cte in cte_steps:
-        emission = coerce_cte_emission(getattr(cte, "emission", "join_table"))
+        emission = CteEmissionKind.coerce(getattr(cte, "emission", "join_table"))
         if emission not in ("semi_join", "anti_join"):
             continue
         owner = owners.get(cte.cte_name or "")
@@ -778,8 +840,8 @@ def _cross_source_probe_cte_steps(
             intent.select_cols,
             intent.order_by_cols,
             intent.group_by_cols,
-            _predicate_where_leaves(intent.where),
-            _predicate_having_leaves(intent.having),
+            PredicateGroup.where_leaves(intent.where),
+            PredicateGroup.having_leaves(intent.having),
             window_registry=intent.window_registry,
             case_registry=intent.case_registry,
             include_unreferenced_registries=False,
@@ -797,10 +859,10 @@ def _cross_source_probe_cte_ineligible_reason(
         keys = _cte_probe_join_keys(cte)
         if not keys:
             name = (cte.cte_name or "").strip() or "probe"
-            return f"cross-source {coerce_cte_emission(getattr(cte, 'emission', 'join_table'))} requires declared join keys: {name}"
+            return f"cross-source {CteEmissionKind.coerce(getattr(cte, 'emission', 'join_table'))} requires declared join keys: {name}"
         if not manifest.cross_source_joins:
             name = (cte.cte_name or "").strip() or "probe"
-            return f"cross-source {coerce_cte_emission(getattr(cte, 'emission', 'join_table'))} requires declared join: {name}"
+            return f"cross-source {CteEmissionKind.coerce(getattr(cte, 'emission', 'join_table'))} requires declared join: {name}"
         covered = False
         key_cols = set(keys)
         for join in manifest.cross_source_joins:
@@ -809,7 +871,7 @@ def _cross_source_probe_cte_ineligible_reason(
                 break
         if not covered:
             name = (cte.cte_name or "").strip() or "probe"
-            emission = coerce_cte_emission(getattr(cte, "emission", "join_table"))
+            emission = CteEmissionKind.coerce(getattr(cte, "emission", "join_table"))
             return f"cross-source {emission} requires declared join keys: {name}"
     return None
 
@@ -903,8 +965,8 @@ def federation_plan_sql_shape(plan: FederatedPlan) -> SQLShape:
     has_distinct = False
     for step in plan.steps:
         sub = step.sub_intent
-        num_where += len((_predicate_where_leaves(sub.where)) or [])
-        num_having += len((_predicate_having_leaves(sub.having)) or [])
+        num_where += len((PredicateGroup.where_leaves(sub.where)) or [])
+        num_having += len((PredicateGroup.having_leaves(sub.having)) or [])
         num_cte += len(sub.cte_steps or [])
         if sub.group_by_cols:
             has_group_by = True
@@ -915,8 +977,8 @@ def federation_plan_sql_shape(plan: FederatedPlan) -> SQLShape:
             has_distinct = True
     residual = plan.residual
     if residual is not None:
-        num_where += len(_predicate_where_leaves(residual.where))
-        num_having += len(_predicate_having_leaves(residual.having))
+        num_where += len(PredicateGroup.where_leaves(residual.where))
+        num_having += len(PredicateGroup.having_leaves(residual.having))
         if residual.group_by_cols:
             has_group_by = True
         for sc in residual.select_cols:
@@ -996,7 +1058,7 @@ def federation_scaled_join_candidate_cap(member_count: int) -> int:
 
 def _intent_has_temporal_anchor_refs(intent: RuntimeIntent) -> bool:
     """Return True when *intent* uses relative date windows or clock keywords."""
-    for fp in _predicate_where_leaves(intent.where) or ():
+    for fp in PredicateGroup.where_leaves(intent.where) or ():
         if str(getattr(fp, "value_type", "") or "") == "date_window":
             return True
         right = getattr(fp, "right_expr", None)
@@ -1008,7 +1070,7 @@ def _intent_has_temporal_anchor_refs(intent: RuntimeIntent) -> bool:
             "sysdate",
         }:
             return True
-    for hp in _predicate_having_leaves(intent.having) or ():
+    for hp in PredicateGroup.having_leaves(intent.having) or ():
         if str(getattr(hp, "value_type", "") or "") == "date_window":
             return True
     return False
@@ -1020,8 +1082,123 @@ def resolve_anchored_temporal_bind(
     """Resolve a temporal reference once for federated member rendering. When the parent intent carries relative date-window or clock-keyword predicates, bind them to a single anchor at turn start so each member statement uses the same instant rather than re-evaluating per-member clock functions."""
     if not _intent_has_temporal_anchor_refs(intent):
         return None
-    anchor_dt = anchor or datetime.now(timezone.utc)
+    anchor_dt = anchor or datetime.now(UTC)
     return AnchoredTemporalBind(anchor_iso=anchor_dt.isoformat())
+
+
+def _manifest_binding_timezones(manifest: FederationManifest, source_ids: frozenset[str]) -> dict[str, str | None]:
+    return {
+        binding.source_id: binding.session_timezone for binding in manifest.sources if binding.source_id in source_ids
+    }
+
+
+def _distinct_member_timezones(tz_by_source: Mapping[str, str | None]) -> set[str]:
+    return {tz for tz in tz_by_source.values() if tz}
+
+
+def _temporal_predicate_columns(intent: RuntimeIntent) -> list[str]:
+    columns: list[str] = []
+    for fp in PredicateGroup.where_leaves(intent.where) or ():
+        if str(getattr(fp, "value_type", "") or "") != "date_window":
+            continue
+        left = getattr(fp, "left_expr", None)
+        if left is None:
+            continue
+        col = str(getattr(left, "column_ref", "") or getattr(left, "column", "") or "").strip()
+        if col:
+            columns.append(col.rsplit(".", 1)[-1])
+    for hp in PredicateGroup.having_leaves(intent.having) or ():
+        if str(getattr(hp, "value_type", "") or "") != "date_window":
+            continue
+        left = getattr(hp, "left_expr", None)
+        if left is None:
+            continue
+        col = str(getattr(left, "column_ref", "") or getattr(left, "column", "") or "").strip()
+        if col:
+            columns.append(col.rsplit(".", 1)[-1])
+    return columns
+
+
+def _cross_source_temporal_join_columns(
+    manifest: FederationManifest,
+    plan: FederatedPlan,
+    schema: SchemaGraph | None,
+) -> list[str]:
+    if schema is None or not plan.combine:
+        return []
+    source_ids = frozenset(step.source_id for step in plan.steps)
+    if len(source_ids) < 2:
+        return []
+    columns: list[str] = []
+    for join in manifest.cross_source_joins:
+        left_ref = resolve_federation_qualified_ref(join.left, manifest=manifest)
+        right_ref = resolve_federation_qualified_ref(join.right, manifest=manifest)
+        if left_ref.source_id not in source_ids or right_ref.source_id not in source_ids:
+            continue
+        temporal = False
+        for ref in (left_ref, right_ref):
+            table = schema.tables.get(ref.table)
+            if table is None:
+                continue
+            meta = table.columns.get(ref.column)
+            if meta is None:
+                continue
+            value_type = (meta.value_type or "").lower()
+            base = (meta.data_type or "").split("(", 1)[0].strip().lower()
+            if value_type in {"date", "timestamp", "temporal"} or base in {
+                "timestamp",
+                "timestamptz",
+                "datetime",
+                "datetimeoffset",
+                "date",
+            }:
+                temporal = True
+                break
+        if temporal:
+            columns.append(str(join.logical_key or left_ref.column or right_ref.column))
+    return columns
+
+
+def emit_federation_member_timezone_mismatch_diagnostics(
+    manifest: FederationManifest | None,
+    plan: FederatedPlan,
+    *,
+    schema: SchemaGraph | None = None,
+) -> None:
+    """Emit diagnostics when temporal work spans members with different session time zones."""
+    if manifest is None or plan.ineligible_reason or not plan.steps:
+        return
+    source_ids = frozenset(step.source_id for step in plan.steps)
+    tz_by_source = _manifest_binding_timezones(manifest, source_ids)
+    distinct_tz = _distinct_member_timezones(tz_by_source)
+    if len(distinct_tz) < 2:
+        return
+    parent_intent = plan.steps[0].sub_intent
+    logical_columns: list[str] = []
+    if _intent_has_temporal_anchor_refs(parent_intent):
+        logical_columns.extend(_temporal_predicate_columns(parent_intent))
+    logical_columns.extend(_cross_source_temporal_join_columns(manifest, plan, schema))
+    seen: set[str] = set()
+    for logical_column in logical_columns:
+        key = str(logical_column or "").strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        notify(
+            (
+                f"federation members use different session time zones for temporal column {key!r}; "
+                "coordinator transfer normalises timestamps to UTC"
+            ),
+            stage="federation",
+            code=DIAGNOSTIC_CODE_FEDERATION_MEMBER_TIMEZONE_MISMATCH,
+            level="info",
+            source_id="composite",
+            details=(
+                ("logical_column", key),
+                ("phase", "prepare"),
+                ("timezones", ",".join(sorted(distinct_tz))),
+            ),
+        )
 
 
 def _reject_unknown_keys(payload: Mapping[str, Any], allowed: frozenset[str], *, label: str) -> None:
@@ -1070,14 +1247,15 @@ def parse_federation_manifest(
         engine = str(entry.get("engine", "") or "").strip().lower()
         if not engine:
             raise FederationConfigError(f"source {source_id!r} requires engine")
-        if engine not in list_engines():
+        if engine not in DialectRegistry.list_engines():
             raise FederationConfigError(f"source {source_id!r} references unknown engine {engine!r}")
         connection = str(entry.get("connection", "") or "").strip()
         context = str(entry.get("context", "master") or "master").strip().lower() or "master"
-        role_raw = str(entry.get("role", "owner") or "owner").strip().lower()
-        if role_raw not in ("owner", "consumer"):
-            raise FederationConfigError(f"source {source_id!r} has invalid role: {role_raw!r}")
-        role = cast(SchemaRole, role_raw)
+        role_val = entry.get("role", "owner")
+        try:
+            role = SchemaRole.coerce(role_val)
+        except ValueError as exc:
+            raise FederationConfigError(f"source {source_id!r} has invalid role: {role_val!r}") from exc
         _assert_federation_member_role_is_owner(source_id, role)
         limits_obj = entry.get("limits")
         limits: FederationSourceLimits | None = None
@@ -1097,9 +1275,17 @@ def parse_federation_manifest(
                 max_query_cost_bytes=float(cost_bytes_raw) if cost_bytes_raw is not None else None,
                 profile_timeout_ms=int(profile_timeout_raw) if profile_timeout_raw is not None else None,
             )
+        session_timezone_raw = entry.get("session_timezone")
+        session_timezone = str(session_timezone_raw).strip() if session_timezone_raw else None
         sources.append(
             FederationSourceBinding(
-                source_id=source_id, engine=engine, connection=connection, context=context, role=role, limits=limits
+                source_id=source_id,
+                engine=engine,
+                connection=connection,
+                context=context,
+                role=role,
+                limits=limits,
+                session_timezone=session_timezone,
             )
         )
     namespace_raw = payload.get("table_namespace")
@@ -1216,7 +1402,8 @@ def federation_manifest_document(manifest: FederationManifest, *, include_derive
                 "engine": source.engine,
                 "connection": source.connection,
                 "context": source.context,
-                "role": source.role,
+                "role": source.role.value if isinstance(source.role, SchemaRole) else str(source.role),
+                "session_timezone": source.session_timezone,
                 "limits": (
                     {
                         "row_cap": source.limits.row_cap,
@@ -1322,11 +1509,10 @@ def parse_federation_mappings(raw: Mapping[str, Any] | str | bytes | None) -> Fe
     if not isinstance(payload, dict):
         raise FederationConfigError("federation mappings must be a JSON object")
     _reject_unknown_keys(payload, FEDERATION_MAPPINGS_TOP_LEVEL_KEYS, label="federation mappings")
-    version = int(payload.get("version", FEDERATION_MAPPINGS_VERSION))
-    if version < FEDERATION_MAPPINGS_MIN_VERSION or version > FEDERATION_MAPPINGS_VERSION:
+    version = coerce_format_version(payload.get("version", FEDERATION_MAPPINGS_VERSION))
+    if not format_versions_match(version, FEDERATION_MAPPINGS_VERSION):
         raise FederationConfigError(
-            f"unsupported federation mappings version {version}; "
-            f"supported versions are {FEDERATION_MAPPINGS_MIN_VERSION} through {FEDERATION_MAPPINGS_VERSION}"
+            f"unsupported federation mappings version {version!r}; this build expects {FEDERATION_MAPPINGS_VERSION!r}"
         )
     logical_columns: list[LogicalColumnMapping] = []
     for entry in payload.get("logical_columns", []) or []:
@@ -1446,16 +1632,11 @@ def parse_federation_declaration(
     if not isinstance(payload, dict):
         raise FederationConfigError("federation declaration must be a JSON object")
     _reject_unknown_keys(payload, FEDERATION_DECLARATION_TOP_LEVEL_KEYS, label="federation declaration")
-    declared_version = int(payload.get("version", FEDERATION_DECLARATION_VERSION))
-    if declared_version < FEDERATION_DECLARATION_VERSION:
+    declared_version = coerce_format_version(payload.get("version", FEDERATION_DECLARATION_VERSION))
+    if not format_versions_match(declared_version, FEDERATION_DECLARATION_VERSION):
         raise FederationDeclarationError(
-            f"unsupported federation declaration version {declared_version}; "
-            f"minimum supported version is {FEDERATION_DECLARATION_VERSION}"
-        )
-    if declared_version > FEDERATION_DECLARATION_VERSION:
-        raise FederationDeclarationError(
-            f"unsupported federation declaration version {declared_version}; "
-            f"maximum supported version is {FEDERATION_DECLARATION_VERSION}"
+            f"unsupported federation declaration version {declared_version!r}; "
+            f"this build expects {FEDERATION_DECLARATION_VERSION!r}"
         )
     manifest_payload = {k: payload[k] for k in payload if k in FEDERATION_MANIFEST_TOP_LEVEL_KEYS}
     mappings_payload = {k: payload[k] for k in payload if k in frozenset({"logical_columns", "logical_tables"})}
@@ -1608,7 +1789,11 @@ def _manifest_with_derived_roster(
         return manifest
     sources = manifest.sources or tuple(
         FederationSourceBinding(
-            source_id=str(source_id), engine="duckdb", connection=str(source_id), context="master", role="owner"
+            source_id=str(source_id),
+            engine="duckdb",
+            connection=str(source_id),
+            context="master",
+            role=SchemaRole.OWNER,
         )
         for source_id in source_ids
     )
@@ -1665,23 +1850,13 @@ def member_graphs_from_engines(members: Mapping[str, Any]) -> dict[str, SchemaGr
     return graphs
 
 
-class _FederationMemberEngine(Protocol):
-    """Minimal member-engine surface used when deriving federation source bindings."""
-
-    dialect: str
-    _connection: object
-    _context_name: object
-    _schema_role: object
-    _runtime_config: EngineRuntimeConfig | object | None
-
-
 def _assert_federation_member_role_is_owner(connection_name: str, role: SchemaRole) -> None:
     """Refuse federation members that are not owner engines."""
-    if role != "owner":
+    if role != SchemaRole.OWNER:
         raise FederationConfigError(f"federation member {connection_name!r} must be an owner engine; got role {role!r}")
 
 
-def binding_from_member_engine(connection_name: str, engine: _FederationMemberEngine) -> FederationSourceBinding:
+def binding_from_member_engine(connection_name: str, engine: FederationMemberEngine) -> FederationSourceBinding:
     """Derive a federation source binding from a configured member engine."""
     engine_type = str(getattr(engine, "dialect", "") or "").strip().lower()
     if not engine_type:
@@ -1699,17 +1874,22 @@ def binding_from_member_engine(connection_name: str, engine: _FederationMemberEn
         )
     connection = named_connection or source_id
     context = str(getattr(engine, "_context_name", "master") or "master").strip().lower() or "master"
-    role_raw = str(getattr(engine, "_schema_role", "owner") or "owner").strip().lower()
-    if role_raw not in ("owner", "consumer"):
-        raise FederationConfigError(f"member {connection_name!r} has invalid role: {role_raw!r}")
-    role = cast(SchemaRole, role_raw)
+    try:
+        role = SchemaRole.coerce(getattr(engine, "_schema_role", "owner"))
+    except ValueError as exc:
+        raise FederationConfigError(
+            f"member {connection_name!r} has invalid role: {getattr(engine, '_schema_role', None)!r}"
+        ) from exc
     _assert_federation_member_role_is_owner(source_id, role)
+    session_timezone_raw = getattr(engine, "_session_timezone", None)
+    session_timezone = str(session_timezone_raw).strip() if session_timezone_raw else None
     return FederationSourceBinding(
         source_id=source_id,
         engine=engine_type or "duckdb",
         connection=connection,
         context=context,
-        role=cast(SchemaRole, role_raw),
+        role=role,
+        session_timezone=session_timezone or None,
     )
 
 
@@ -1730,12 +1910,12 @@ def build_federation_manifest_from_members(
     if not graphs:
         raise FederationConfigError("federation requires member schema graphs")
     sources = tuple(binding_from_member_engine(name, engine) for name, engine in sorted(members.items()))
-    if sources and all(is_file_engine(binding.engine) for binding in sources):
+    if sources and all((binding.engine or "").strip().lower() in FILE_ENGINE_NAMES for binding in sources):
         raise FederationDeclarationError(
             "A federation whose members are all file engines is not supported; "
             "load uploads into one CSV engine instead."
         )
-    validate_federation_source_slug_uniqueness(sources)
+    validate_federation_source_slug_uniqueness(sources, federation_id=fed_id)
     member_ids = set(members)
     for alias in declaration.aliases:
         if alias.source not in member_ids:
@@ -1825,16 +2005,45 @@ def export_federation_declaration(
     return path
 
 
-def _plan_template_row_references_sources(row: Mapping[str, Any], source_ids: set[str]) -> bool:
-    """Return True when a stored plan template row references any of *source_ids*."""
+def _plan_template_row_steps_reference_sources(row: Mapping[str, Any], source_ids: set[str]) -> bool:
+    """Return True when any stored step fingerprint references a removed source."""
     steps_raw = row.get("step_fingerprints", [])
-    if not isinstance(steps_raw, list):
-        return False
-    for entry in steps_raw:
-        if isinstance(entry, (list, tuple)) and entry:
-            if str(entry[0]) in source_ids:
+    if isinstance(steps_raw, list):
+        for entry in steps_raw:
+            if isinstance(entry, (list, tuple)) and entry and str(entry[0]) in source_ids:
                 return True
     return False
+
+
+def _plan_template_row_references_sources(row: Mapping[str, Any], source_ids: set[str]) -> bool:
+    """Return True when a stored plan template row should be dropped for *source_ids*."""
+    if _plan_template_row_steps_reference_sources(row, source_ids):
+        return True
+    member_ids_raw = row.get("member_template_ids", [])
+    if isinstance(member_ids_raw, list):
+        for entry in member_ids_raw:
+            if isinstance(entry, (list, tuple)) and entry and str(entry[0]) in source_ids:
+                return True
+    return False
+
+
+def _sanitize_plan_template_row_member_template_ids(
+    row: dict[str, Any], removed_source_ids: set[str]
+) -> dict[str, Any] | None:
+    """Drop removed-source entries from ``member_template_ids`` on a surviving plan row."""
+    member_ids_raw = row.get("member_template_ids", [])
+    if not isinstance(member_ids_raw, list) or not member_ids_raw:
+        return None
+    kept = [
+        list(entry)
+        for entry in member_ids_raw
+        if not (isinstance(entry, (list, tuple)) and entry and str(entry[0]) in removed_source_ids)
+    ]
+    if len(kept) == len(member_ids_raw):
+        return None
+    updated = dict(row)
+    updated["member_template_ids"] = kept
+    return updated
 
 
 def federation_drifted_member_source_ids(
@@ -1902,12 +2111,22 @@ def prune_federation_plan_templates_for_sources(federation_dir: str, removed_sou
             raise FederationConfigError(f"corrupt federation plan templates file: {path!r}: {exc}") from exc
         if not isinstance(loaded, dict):
             raise FederationConfigError(f"federation plan templates file at {path!r} is not a JSON object")
-        kept = {
-            plan_id: row
-            for plan_id, row in loaded.items()
-            if not (isinstance(row, dict) and _plan_template_row_references_sources(row, removed_source_ids))
-        }
-        if len(kept) == len(loaded):
+        kept: dict[str, Any] = {}
+        changed = False
+        for plan_id, row in loaded.items():
+            if not isinstance(row, dict):
+                kept[plan_id] = row
+                continue
+            if _plan_template_row_steps_reference_sources(row, removed_source_ids):
+                changed = True
+                continue
+            sanitized = _sanitize_plan_template_row_member_template_ids(row, removed_source_ids)
+            if sanitized is not None:
+                kept[plan_id] = sanitized
+                changed = True
+            else:
+                kept[plan_id] = row
+        if not changed:
             return
         if kept:
             _write_federation_json_atomic(path, kept)
@@ -1926,6 +2145,7 @@ def _engine_context_for_schema_usability(ctx: FederationContext | EngineContext)
         allow_columns=ctx.allow_columns,
         include=ctx.include,
         notes_file=ctx.notes_file,
+        notes=ctx.notes,
     )
 
 
@@ -2078,6 +2298,7 @@ def compose_composite_graph(
             engine=_manifest_engine_for_source(manifest, source_id),
         )
     composite_names = _resolve_composite_table_names(member_graphs, manifest)
+    _assign_collapse_staging_composite_names(composite_names, mappings)
     validate_federation_mapping_members(member_graphs, mappings, composite_names, manifest)
     validate_declared_objects_against_member_grants(
         member_graphs,
@@ -2345,7 +2566,7 @@ def rescore_declared_mapping_drift(
     for col_map in mappings.logical_columns:
         if len(col_map.members) < 2:
             continue
-        overlap_samples: list[tuple[str, frozenset[str]]] = []
+        overlap_samples: list[tuple[str, ColumnMetadata]] = []
         for member_ref in col_map.members:
             table_name, column_name = split_qualified_column(member_ref, manifest=manifest)
             source_id = _physical_table_source(table_name, mappings)
@@ -2363,16 +2584,15 @@ def rescore_declared_mapping_drift(
             if meta is None:
                 drift.append(f"declared {col_map.logical!r}: missing column {member_ref!r} on {source_id!r}")
                 continue
-            sample = frozenset(str(v) for v in (meta.value_overlap_sample or []) if str(v))
-            if sample:
-                overlap_samples.append((source_id, sample))
+            if meta.value_overlap_sample:
+                overlap_samples.append((source_id, meta))
         if len(overlap_samples) < 2:
             continue
         min_overlap = 1.0
         for left_idx in range(len(overlap_samples)):
-            left_source, left_sample = overlap_samples[left_idx]
-            for right_source, right_sample in overlap_samples[left_idx + 1 :]:
-                ratio = _value_overlap_ratio(list(left_sample), list(right_sample))
+            left_source, left_meta = overlap_samples[left_idx]
+            for right_source, right_meta in overlap_samples[left_idx + 1 :]:
+                ratio = value_overlap_ratio_for_columns(left_meta, right_meta)
                 min_overlap = min(min_overlap, ratio)
                 if ratio < FEDERATION_MAPPING_VALUE_OVERLAP_FLOOR:
                     drift.append(
@@ -2565,7 +2785,7 @@ def _join_endpoint_is_many_side_of_fk(
 
 def _fk_points_to_parent(schema: SchemaGraph, child_tbl: str, parent_tbl: str, cols_on_child: list[str]) -> bool:
     validation_schema = importlib.import_module("aetherdialect._validation_schema")
-    return validation_schema._fk_points_to_parent(child_tbl, parent_tbl, cols_on_child, schema)
+    return cast(bool, validation_schema._fk_points_to_parent(child_tbl, parent_tbl, cols_on_child, schema))
 
 
 def _validate_cross_source_inner_join_keys(
@@ -2621,6 +2841,77 @@ def _validate_cross_source_join_key_unique(
         f"cross-source join key uniqueness could not be established for {qual!r} "
         f"on member {src!r} (join from {peer_qual!r}, logical column {logical!r})"
     )
+
+
+def _cross_source_join_key_exactness_mismatch(left_meta: ColumnMetadata, right_meta: ColumnMetadata) -> bool:
+    """Return True when two numeric join-key columns disagree on exactness."""
+    if not _column_metadata_is_numeric(left_meta) or not _column_metadata_is_numeric(right_meta):
+        return False
+    return left_meta.is_exact_numeric != right_meta.is_exact_numeric
+
+
+def _column_data_type_is_timezone_aware(data_type: str) -> bool:
+    raw = str(data_type or "").strip().lower()
+    if not raw:
+        return False
+    base = raw.split("(", 1)[0].strip()
+    if base in FEDERATION_TIMEZONE_AWARE_DATA_TYPES:
+        return True
+    return "with time zone" in raw
+
+
+def _column_metadata_is_timestamp_type(meta: ColumnMetadata) -> bool:
+    dtype = str(meta.data_type or "").strip().lower()
+    if not dtype:
+        return False
+    base = dtype.split("(", 1)[0].strip()
+    if base in {
+        "timestamp",
+        "timestamptz",
+        "datetime",
+        "datetime2",
+        "smalldatetime",
+        "datetimeoffset",
+        "timestamp_ntz",
+        "timestamp_tz",
+        "timestamp_ltz",
+    }:
+        return True
+    if base == "date":
+        return False
+    return "timestamp" in dtype or "datetime" in dtype
+
+
+def _column_metadata_timezone_awareness_mismatch(left_meta: ColumnMetadata, right_meta: ColumnMetadata) -> bool:
+    if not _column_metadata_is_timestamp_type(left_meta) or not _column_metadata_is_timestamp_type(right_meta):
+        return False
+    return left_meta.is_timezone_aware != right_meta.is_timezone_aware
+
+
+def _assert_union_column_timestamp_awareness_agrees(
+    candidates: Sequence[ColumnMetadata],
+    sources: Sequence[str],
+    label: str,
+) -> None:
+    for left_idx, left_meta in enumerate(candidates):
+        for right_idx in range(left_idx + 1, len(candidates)):
+            right_meta = candidates[right_idx]
+            if not _column_metadata_timezone_awareness_mismatch(left_meta, right_meta):
+                continue
+            left_qual = f"{sources[left_idx]}.{left_meta.name}"
+            right_qual = f"{sources[right_idx]}.{right_meta.name}"
+            raise FederationDeclarationError(
+                f"timestamp timezone awareness incompatible for {label}: "
+                f"{left_qual} ({left_meta.data_type}) vs {right_qual} ({right_meta.data_type})"
+            )
+
+
+def _column_metadata_is_numeric(meta: ColumnMetadata) -> bool:
+    value_type = (meta.value_type or "").strip().lower()
+    if value_type == "number":
+        return True
+    dtype = str(meta.data_type or "").lower()
+    return any(token in dtype for token in ("decimal", "numeric", "double", "float", "real", "number"))
 
 
 def validate_cross_source_keys_on_graph(
@@ -2710,6 +3001,20 @@ def validate_cross_source_keys_on_graph(
             raise FederationDeclarationError(
                 f"cross-source join key type incompatible for logical column {logical!r}: "
                 f"{left_qual!r} ({left_type}) vs {right_qual!r} ({right_type})"
+            )
+        if _cross_source_join_key_exactness_mismatch(left_meta, right_meta):
+            left_dtype = str(left_meta.data_type or left_type).strip()
+            right_dtype = str(right_meta.data_type or right_type).strip()
+            raise FederationDeclarationError(
+                f"cross-source join key exactness incompatible for logical column {logical!r}: "
+                f"{left_qual!r} ({left_dtype}) vs {right_qual!r} ({right_dtype})"
+            )
+        if _column_metadata_timezone_awareness_mismatch(left_meta, right_meta):
+            left_dtype = str(left_meta.data_type or left_type).strip()
+            right_dtype = str(right_meta.data_type or right_type).strip()
+            raise FederationDeclarationError(
+                f"timestamp timezone awareness incompatible for logical column {logical!r}: "
+                f"{left_qual!r} ({left_dtype}) vs {right_qual!r} ({right_dtype})"
             )
         join_kind = (kind or "inner").strip().lower()
         if join_kind == "inner":
@@ -2820,8 +3125,9 @@ def plan_federated_intent(
         raw_sql_reason = _unattributable_raw_sql_reason(intent)
         if raw_sql_reason:
             return FederatedPlan(steps=(), ineligible_reason=raw_sql_reason)
-        if _intent_lacks_column_member_coverage(intent, schema):
-            return FederatedPlan(steps=(), ineligible_reason="projection columns are not held by any single member")
+        coverage_reason = _intent_column_member_coverage_ineligible_reason(intent, schema)
+        if coverage_reason:
+            return FederatedPlan(steps=(), ineligible_reason=coverage_reason)
         clause_reason = _federation_clause_ineligible_reason(intent, manifest, mappings, source_by_table, schema=schema)
         if clause_reason:
             return FederatedPlan(steps=(), ineligible_reason=clause_reason)
@@ -2843,7 +3149,7 @@ def plan_federated_intent(
             steps=(), ineligible_reason="cross-source join path is not declared for referenced sources"
         )
     global _WINDOW_FINALITY_CTX
-    _WINDOW_FINALITY_CTX = _WindowFinalityContext(
+    _WINDOW_FINALITY_CTX = SimpleNamespace(
         manifest=manifest, schema=schema, combine=combine, source_by_table=source_by_table
     )
     try:
@@ -2908,6 +3214,7 @@ def plan_federated_intent(
         validate_federated_residual_aggregate_fan_out(plan, schema, manifest)
         validate_federation_coordinator_column_types(plan, schema, manifest=manifest)
         validate_federation_scalar_grain_member_frames(plan)
+        emit_federation_rounding_mode_mixed_diagnostics(manifest, plan, intent, schema=schema)
     return plan
 
 
@@ -3041,8 +3348,8 @@ def _spanning_cte_source_ids(
             cte.select_cols,
             cte.order_by_cols,
             cte.group_by_cols,
-            _predicate_where_leaves(cte.where),
-            _predicate_having_leaves(cte.having),
+            PredicateGroup.where_leaves(cte.where),
+            PredicateGroup.having_leaves(cte.having),
             window_registry=cte.window_registry,
             case_registry=cte.case_registry,
             include_unreferenced_registries=False,
@@ -3203,7 +3510,7 @@ def _collect_member_reducing_edges(
     if intent is not None and source_by_table is not None:
         owners = _assign_cte_sources(intent.cte_steps or (), source_by_table)
         for cte in intent.cte_steps or []:
-            if coerce_cte_emission(getattr(cte, "emission", "join_table")) != "semi_join":
+            if CteEmissionKind.coerce(getattr(cte, "emission", "join_table")) != "semi_join":
                 continue
             owner = owners.get(cte.cte_name or "")
             if not owner:
@@ -3292,12 +3599,6 @@ def member_stage_for_source(plan: FederatedPlan, source_id: str) -> FederatedSta
     return None
 
 
-@dataclass(frozen=True, slots=True)
-class _CombineJoinTree:
-    source_id: str
-    children: tuple[tuple[JoinSpec, _CombineJoinTree], ...] = ()
-
-
 def _combine_join_hub_source(join_specs: tuple[JoinSpec, ...], sources: set[str]) -> str:
     degree: dict[str, int] = {source_id: 0 for source_id in sources}
     for spec in join_specs:
@@ -3306,8 +3607,14 @@ def _combine_join_hub_source(join_specs: tuple[JoinSpec, ...], sources: set[str]
     return max(sources, key=lambda source_id: (degree.get(source_id, 0), source_id))
 
 
-def _build_combine_join_tree(join_specs: tuple[JoinSpec, ...], sources: set[str]) -> _CombineJoinTree:
+def _build_combine_join_tree(join_specs: tuple[JoinSpec, ...], sources: set[str]) -> Any:
     """Build a join tree from declared edges; refuse spanned sources without connectivity."""
+
+    @dataclass(frozen=True, slots=True)
+    class _CombineJoinTree:
+        source_id: str
+        children: tuple[tuple[JoinSpec, Any], ...] = ()
+
     if not join_specs:
         if len(sources) == 1:
             return _CombineJoinTree(source_id=next(iter(sources)))
@@ -3319,8 +3626,8 @@ def _build_combine_join_tree(join_specs: tuple[JoinSpec, ...], sources: set[str]
     root = _combine_join_hub_source(join_specs, sources)
     visited: set[str] = {root}
 
-    def walk(source_id: str) -> _CombineJoinTree:
-        children: list[tuple[JoinSpec, _CombineJoinTree]] = []
+    def walk(source_id: str) -> Any:
+        children: list[tuple[JoinSpec, Any]] = []
         for spec in sorted(adjacency.get(source_id, []), key=lambda item: (item.right_source, item.left_source)):
             other = spec.right_source if spec.left_source == source_id else spec.left_source
             if other in visited:
@@ -3339,7 +3646,7 @@ def _build_combine_join_tree(join_specs: tuple[JoinSpec, ...], sources: set[str]
 
 
 def _render_combine_tree_sql(
-    tree: _CombineJoinTree,
+    tree: Any,
     step_ids: Mapping[str, str],
     plan: FederatedPlan,
     *,
@@ -3405,17 +3712,14 @@ def _render_combine_tree_sql(
         )
         left_key_source = spec.left_source if spec.left_source == tree.source_id else child.source_id
         right_key_source = spec.right_source if spec.right_source == child.source_id else tree.source_id
-        left_expr = _coordinator_join_key_expr(
+        left_expr, right_expr = _coordinator_join_key_pair_exprs(
             left_alias,
             spec.left_key if left_key_source == tree.source_id else spec.right_key,
+            left_table=left_table,
+            right_alias="r",
+            right_key=spec.right_key if right_key_source == child.source_id else spec.left_key,
+            right_table=right_table,
             schema=schema,
-            table_name=left_table,
-        )
-        right_expr = _coordinator_join_key_expr(
-            "r",
-            spec.right_key if right_key_source == child.source_id else spec.left_key,
-            schema=schema,
-            table_name=right_table,
         )
         left_cols = _source_column_names_for_step(plan, tree.source_id if idx == 0 else child.source_id)
         right_cols = _source_column_names_for_step(plan, child.source_id)
@@ -3651,18 +3955,7 @@ def _member_stage_dependencies(
 
 _federated_stages_for_plan = plan_federated_stages
 
-
-@dataclass(frozen=True, slots=True)
-class _WindowFinalityContext:
-    """Join and schema facts used to decide whether a member window sees final rows."""
-
-    manifest: FederationManifest
-    schema: SchemaGraph
-    combine: tuple[JoinSpec, ...] | None
-    source_by_table: Mapping[str, str]
-
-
-_WINDOW_FINALITY_CTX: _WindowFinalityContext | None = None
+_WINDOW_FINALITY_CTX: Any | None = None
 
 
 def effective_union_specs(plan: FederatedPlan) -> tuple[UnionSpec, ...]:
@@ -3728,19 +4021,24 @@ def _apply_coordinator_probe_joins(
         if not keys:
             continue
         alias = (cte.cte_name or f"probe_{owner}").replace(".", "_")
-        distinct_keys = ", ".join(_quote_ident(key) for key in keys)
-        on_parts = [f"drv.{_quote_ident(key)} = {alias}.{_quote_ident(key)}" for key in keys]
-        emission = coerce_cte_emission(getattr(cte, "emission", "join_table"))
+        distinct_keys = ", ".join(Dialect.sqlglot_quote_identifier(key) for key in keys)
+        on_parts = [
+            f"drv.{Dialect.sqlglot_quote_identifier(key)} = {alias}.{Dialect.sqlglot_quote_identifier(key)}"
+            for key in keys
+        ]
+        emission = CteEmissionKind.coerce(getattr(cte, "emission", "join_table"))
         if emission == "semi_join":
             probe_subquery = f"(SELECT DISTINCT {distinct_keys} FROM {probe_rel})"
             sql = f"SELECT drv.* FROM ({sql}) AS drv INNER JOIN {probe_subquery} AS {alias} ON {' AND '.join(on_parts)}"
         elif emission == "anti_join":
             presence = anti_join_presence_column(alias)
-            anti_subquery = f"(SELECT DISTINCT {distinct_keys}, 1 AS {_quote_ident(presence)} FROM {probe_rel})"
+            anti_subquery = (
+                f"(SELECT DISTINCT {distinct_keys}, 1 AS {Dialect.sqlglot_quote_identifier(presence)} FROM {probe_rel})"
+            )
             sql = (
                 f"SELECT drv.* FROM ({sql}) AS drv "
                 f"LEFT JOIN {anti_subquery} AS {alias} ON {' AND '.join(on_parts)} "
-                f"WHERE {alias}.{_quote_ident(presence)} IS NULL"
+                f"WHERE {alias}.{Dialect.sqlglot_quote_identifier(presence)} IS NULL"
             )
     return sql
 
@@ -3771,7 +4069,7 @@ def render_federation_glue(
     base_sql = _apply_coordinator_probe_joins(
         base_sql, plan.lifted_probe_ctes, step_ids, source_by_table_from_schema(schema)
     )
-    return render_federation_residual_sql(base_sql, plan.residual, param_values=param_values)
+    return render_federation_residual_sql(base_sql, plan.residual, param_values=param_values, schema=schema)
 
 
 def _render_federation_combine_only_glue(
@@ -3870,7 +4168,7 @@ def validate_federated_residual_aggregate_fan_out(
             if not agg_source:
                 continue
             if kind == "inner":
-                targets = (
+                targets: tuple[tuple[str, str, str], ...] = (
                     (spec.left_source, spec.right_source, spec.right_key),
                     (spec.right_source, spec.left_source, spec.left_key),
                 )
@@ -3946,14 +4244,14 @@ def _residual_referenced_param_keys(residual: ResidualSpec | None) -> frozenset[
     if residual is None:
         return frozenset()
     keys: set[str] = set()
-    for fp in _predicate_where_leaves(residual.where):
+    for fp in PredicateGroup.where_leaves(residual.where):
         if fp.param_key:
             keys.add(fp.param_key)
         if fp.param_key_hi:
             keys.add(fp.param_key_hi)
         if fp.param_key_unit:
             keys.add(fp.param_key_unit)
-    for hp in _predicate_having_leaves(residual.having):
+    for hp in PredicateGroup.having_leaves(residual.having):
         if hp.param_key:
             keys.add(hp.param_key)
         if hp.param_key_unit:
@@ -3979,12 +4277,16 @@ def _explicit_residual_order_col(col: OrderByCol) -> OrderByCol:
     return OrderByCol(
         expr=col.expr,
         direction=col.direction,
-        nulls=default_order_by_null_placement(col.direction),
+        nulls=OrderByNullPlacement.default_for_direction(col.direction),
     )
 
 
 def render_federation_residual_sql(
-    base_sql: str, residual: ResidualSpec | None, *, param_values: Mapping[str, Any] | None = None
+    base_sql: str,
+    residual: ResidualSpec | None,
+    *,
+    param_values: Mapping[str, Any] | None = None,
+    schema: SchemaGraph | None = None,
 ) -> str:
     """Render coordinator residual clauses as DuckDB SQL wrapping *base_sql*. When *residual* is ``None`` or carries no clauses, returns *base_sql* unchanged. A limit-only residual without ``select_cols`` appends ``LIMIT`` directly; any other non-empty residual requires an explicit select projection and is rendered as ``SELECT ... FROM (<base_sql>) AS fed_base`` plus optional WHERE / GROUP BY / HAVING / ORDER BY / LIMIT. Args: base_sql: Inner SQL produced by the federation combine / member path. residual: Coordinator-spanning clauses, or ``None`` for a passthrough. param_values: Optional bind map used when rendering parameterised filter / having predicates. Defaults to an empty mapping. Returns: Either *base_sql* unchanged, *base_sql* with a trailing ``LIMIT``, or a full outer SELECT wrapping *base_sql* as ``fed_base``. Raises: FederationRuntimeError: *residual* has non-limit clauses (or a limit together with other clause kinds) but ``select_cols`` is empty."""
     if residual is None:
@@ -4003,7 +4305,7 @@ def render_federation_residual_sql(
     )
     if not has_clauses:
         return base_sql
-    dialect = get_dialect("duckdb")
+    dialect = DialectRegistry.get_dialect("duckdb")
     bind_values = dict(param_values or {})
     if not residual.select_cols:
         limit_only = (
@@ -4023,7 +4325,7 @@ def render_federation_residual_sql(
                 return f"{base_sql} LIMIT :{lpk}"
             return f"{base_sql} LIMIT {int(residual.limit)}"
         raise FederationRuntimeError("federated residual requires explicit select_cols projection")
-    select_exprs = [_render_residual_select_expr(sc, dialect) for sc in residual.select_cols]
+    select_exprs = [_render_residual_select_expr(sc, dialect, schema=schema) for sc in residual.select_cols]
     select_keyword = "SELECT DISTINCT" if residual.distinct_select_index >= 0 else "SELECT"
     parts = [f"{select_keyword} {', '.join(select_exprs)} FROM ({base_sql}) AS fed_base"]
 
@@ -4044,27 +4346,57 @@ def render_federation_residual_sql(
     if having_sql:
         parts.append("HAVING " + having_sql)
     if residual.order_by_cols:
-        ob_exprs = []
-        for obc in residual.order_by_cols:
-            explicit = _explicit_residual_order_col(obc)
-            rendered = render_expr_sql(explicit.expr, dialect)
-            direction = explicit.direction.upper() if explicit.direction else "ASC"
-            ob_exprs.append(dialect.render_order_by_col(rendered, direction, explicit.nulls))
-        parts.append("ORDER BY " + ", ".join(ob_exprs))
+        order_cols = [_explicit_residual_order_col(obc) for obc in residual.order_by_cols]
+        parts.append(
+            "ORDER BY "
+            + render_order_by_sql(
+                order_cols,
+                dialect,
+                pin_collation=True,
+                schema=schema,
+            )
+        )
     elif select_exprs:
+        pinned_exprs = []
+        for idx, expr_sql in enumerate(select_exprs):
+            source_expr = residual.select_cols[idx].expr if idx < len(residual.select_cols) else None
+            if source_expr is None:
+                pinned_exprs.append(expr_sql)
+                continue
+            pinned_exprs.append(
+                maybe_pin_order_expr_collation(
+                    expr_sql,
+                    source_expr,
+                    dialect,
+                    pin_collation=True,
+                    schema=schema,
+                )
+            )
         parts.append(
             "ORDER BY "
             + ", ".join(
-                dialect.render_order_by_col(expr, "ASC", default_order_by_null_placement("ASC"))
-                for expr in select_exprs
+                dialect.render_order_by_col(expr, "ASC", OrderByNullPlacement.default_for_direction("ASC"))
+                for expr in pinned_exprs
             )
         )
     elif residual.group_by_cols:
-        gb_exprs = [render_expr_sql(g, dialect) for g in residual.group_by_cols]
+        gb_exprs = []
+        for gb_expr in residual.group_by_cols:
+            rendered = render_expr_sql(gb_expr, dialect)
+            gb_exprs.append(
+                maybe_pin_order_expr_collation(
+                    rendered,
+                    gb_expr,
+                    dialect,
+                    pin_collation=True,
+                    schema=schema,
+                )
+            )
         parts.append(
             "ORDER BY "
             + ", ".join(
-                dialect.render_order_by_col(expr, "ASC", default_order_by_null_placement("ASC")) for expr in gb_exprs
+                dialect.render_order_by_col(expr, "ASC", OrderByNullPlacement.default_for_direction("ASC"))
+                for expr in gb_exprs
             )
         )
     if residual.limit is not None:
@@ -4078,7 +4410,7 @@ def render_federation_residual_sql(
         order_cols = [_explicit_residual_order_col(col) for col in residual.order_by_cols]
         if not order_cols:
             order_cols = [
-                OrderByCol(expr=expr, direction="ASC", nulls=default_order_by_null_placement("ASC"))
+                OrderByCol(expr=expr, direction="ASC", nulls=OrderByNullPlacement.default_for_direction("ASC"))
                 for expr in residual.distinct_on
             ]
         sql = wrap_core_sql_with_distinct_on(
@@ -4123,21 +4455,59 @@ def _cross_source_avg_decomposes_to_sum_count(
     )
 
 
-def _render_residual_select_expr(sc: SelectCol, dialect: Any) -> str:
+def _column_metadata_for_graph_ref(schema: SchemaGraph | None, col_ref: str) -> ColumnMetadata | None:
+    """Resolve column metadata for a qualified or bare column reference on *schema*."""
+    if schema is None:
+        return None
+    ref = str(col_ref or "").strip()
+    if not ref:
+        return None
+    if "." in ref:
+        table_name, col_name = ref.rsplit(".", 1)
+        table = schema.tables.get(table_name)
+        if table is not None and col_name in table.columns:
+            return table.columns[col_name]
+    for table in schema.tables.values():
+        if ref in table.columns:
+            return table.columns[ref]
+    return None
+
+
+def _federation_average_decimal_scale(source_scale: int | None) -> int:
+    """Return coordinator DECIMAL scale for a federated average over an exact column."""
+    scale = (source_scale or 0) + FEDERATION_AVERAGE_SCALE_HEADROOM
+    return min(scale, FEDERATION_COORDINATOR_DECIMAL_MAX_PRECISION)
+
+
+def _render_residual_select_expr(sc: SelectCol, dialect: Any, *, schema: SchemaGraph | None = None) -> str:
     """Render one residual projection, decomposing cross-source ``avg`` into sum and count."""
     func, has_distinct = _select_col_agg_meta(sc)
-    inner = _aggregate_inner_column(sc) if func else ""
-    if _cross_source_avg_decomposes_to_sum_count(func, inner=inner, has_distinct=has_distinct):
-        inner = _coordinator_residual_agg_inner(inner)
+    raw_inner = _aggregate_inner_column(sc) if func else ""
+    if _cross_source_avg_decomposes_to_sum_count(func, inner=raw_inner, has_distinct=has_distinct):
+        col_meta = _column_metadata_for_graph_ref(schema, raw_inner)
+        inner = _coordinator_residual_agg_inner(raw_inner)
         sum_sql = render_expr_sql(NormalizedExpr.from_column(f"sum({inner})"), dialect)
         count_sql = render_expr_sql(NormalizedExpr.from_column(f"count({inner})"), dialect)
         alias = (sc.output_alias or "").strip() or f"avg_{inner.replace('.', '_')}"
-        return f"CAST({sum_sql} AS DOUBLE) / NULLIF({count_sql}, 0) AS {_quote_ident(alias)}"
+        if col_meta is not None and col_meta.is_exact_numeric:
+            scale = _federation_average_decimal_scale(col_meta.numeric_scale)
+            precision = FEDERATION_COORDINATOR_DECIMAL_MAX_PRECISION
+            cast_type = f"DECIMAL({precision}, {scale})"
+            return (
+                f"CAST({sum_sql} AS {cast_type}) / NULLIF({count_sql}, 0) AS {Dialect.sqlglot_quote_identifier(alias)}"
+            )
+        return f"CAST({sum_sql} AS DOUBLE) / NULLIF({count_sql}, 0) AS {Dialect.sqlglot_quote_identifier(alias)}"
+    inner = raw_inner
     if func and inner:
-        inner_sql = "*" if inner == "*" else _quote_ident(_coordinator_residual_agg_inner(inner))
+        inner_sql = "*" if inner == "*" else Dialect.sqlglot_quote_identifier(_coordinator_residual_agg_inner(inner))
         distinct_kw = "DISTINCT " if has_distinct else ""
         alias = (sc.output_alias or "").strip() or f"{func}_{inner.replace('.', '_')}"
-        return f"{func}({distinct_kw}{inner_sql}) AS {_quote_ident(alias)}"
+        agg_core = f"{func}({distinct_kw}{inner_sql})"
+        round_args = _select_col_round_args(sc)
+        if round_args is not None:
+            args_sql = ", ".join(str(arg) for arg in round_args)
+            return f"ROUND({agg_core}, {args_sql}) AS {Dialect.sqlglot_quote_identifier(alias)}"
+        return f"{agg_core} AS {Dialect.sqlglot_quote_identifier(alias)}"
     return render_select_col_sql(sc, dialect)
 
 
@@ -4170,7 +4540,7 @@ def aggregate_identity_row_for_residual(residual: ResidualSpec) -> tuple[Any, ..
         if func == "count":
             values.append(0)
         elif func == "sum":
-            values.append(0)
+            values.append(None)
         elif func in {"avg", "min", "max"}:
             values.append(None)
         else:
@@ -4324,7 +4694,7 @@ def source_timeout_for_source(manifest: FederationManifest, source_id: str) -> i
     return resolve_member_limits_for_source(manifest, source_id).timeout_ms
 
 
-def member_guard_limit_kwargs(manifest: FederationManifest | None, source_id: str) -> dict[str, int | float]:
+def member_guard_limit_kwargs(manifest: FederationManifest | None, source_id: str) -> dict[str, int | float | None]:
     """Resolved per-member limits for guarded member SQL execution."""
     if manifest is None:
         return {}
@@ -4468,7 +4838,13 @@ def validate_federation_coordinator_column_types(
             data_type = str(column.data_type or "").strip()
             if not data_type:
                 continue
-            if _schema_column_duckdb_type(data_type) is None:
+            lossy_reason = _coordinator_column_type_lossy_reason(data_type, column_meta=column)
+            if lossy_reason:
+                raise FederationDeclarationError(
+                    f"federation coordinator column {col_name!r} has lossy data_type "
+                    f"{data_type!r} for member {step.source_id!r}: {lossy_reason}"
+                )
+            if _schema_column_duckdb_type(data_type, column_meta=column) is None:
                 raise FederationDeclarationError(
                     f"federation coordinator column {col_name!r} has unsupported data_type "
                     f"{data_type!r} for member {step.source_id!r}"
@@ -4547,11 +4923,15 @@ def federation_member_parallelism_cap(manifest: FederationManifest | None, step_
     return max(1, min(workers, cap))
 
 
-def validate_federation_source_slug_uniqueness(sources: Sequence[FederationSourceBinding]) -> None:
+def validate_federation_source_slug_uniqueness(
+    sources: Sequence[FederationSourceBinding],
+    *,
+    federation_id: str | None = None,
+) -> None:
     """Raise when two members resolve to the same artifact storage slug."""
     seen: dict[str, str] = {}
     for binding in sources:
-        slug = federation_source_storage_slug(binding)
+        slug = federation_source_storage_slug(binding, federation_id=federation_id)
         prior = seen.get(slug)
         if prior is not None and prior != binding.source_id:
             raise FederationConfigError(
@@ -4565,7 +4945,7 @@ def federation_member_connection_slug(manifest: FederationManifest | None, sourc
     if manifest is not None:
         for binding in manifest.sources:
             if binding.source_id == source_id:
-                return federation_source_storage_slug(binding)
+                return _legacy_federation_source_storage_slug(binding)
     return str(source_id)
 
 
@@ -4644,7 +5024,7 @@ def validate_federation_file_members(members: Mapping[str, Any]) -> None:
         if not engine_type:
             runtime_cfg = getattr(engine, "_runtime_config", None)
             engine_type = str(getattr(runtime_cfg, "engine", "") or "").strip().lower()
-        if not is_file_engine(engine_type):
+        if (engine_type or "").strip().lower() not in FILE_ENGINE_NAMES:
             continue
         runtime_cfg = getattr(engine, "_runtime_config", None)
         if runtime_cfg is None or not isinstance(runtime_cfg, CsvRuntimeConfig):
@@ -4664,6 +5044,7 @@ def _validate_probe_declared_schema_objects(
 ) -> None:
     """Verify declared federation tables and columns exist on member schema graphs."""
     mapping_sources = _mapping_member_source_by_table(mappings)
+    live_checks: list[tuple[str, str, str]] = []
     for table_map in mappings.logical_tables:
         for member in table_map.members:
             engine = members.get(member.source)
@@ -4675,11 +5056,13 @@ def _validate_probe_declared_schema_objects(
             if member.table not in graph.tables:
                 raise FederationConfigError(f"declared table {member.source}.{member.table} missing from member schema")
             src_table = graph.tables[member.table]
+            live_checks.append((member.source, member.table, ""))
             for _logical_col, phys_col in member.columns.items():
                 if phys_col not in src_table.columns:
                     raise FederationConfigError(
                         f"declared column {member.source}.{member.table}.{phys_col} missing from member schema"
                     )
+                live_checks.append((member.source, member.table, phys_col))
     for col_map in mappings.logical_columns:
         for qual in col_map.members:
             tbl, col = split_qualified_column(qual, manifest=manifest, source_by_table=mapping_sources)
@@ -4698,6 +5081,93 @@ def _validate_probe_declared_schema_objects(
                 raise FederationConfigError(f"declared table {source_id}.{tbl} missing from member schema")
             if col not in graph.tables[tbl].columns:
                 raise FederationConfigError(f"declared column {source_id}.{tbl}.{col} missing from member schema")
+            live_checks.append((source_id, tbl, col))
+    _probe_live_declared_schema_objects(members, live_checks)
+
+
+def _member_dialect_for_probe(engine: Any) -> Any | None:
+    runtime_cfg = getattr(engine, "_runtime_config", None)
+    engine_type = str(getattr(engine, "dialect", "") or "").strip().lower()
+    if not engine_type and runtime_cfg is not None:
+        engine_type = str(getattr(runtime_cfg, "engine", "") or "").strip().lower()
+    if engine_type:
+        stub = DialectRegistry.dialect_stub_for_engine(engine_type)
+        if stub is not None:
+            return stub
+    dialect = getattr(engine, "_dialect", None)
+    if dialect is not None:
+        return dialect
+    return None
+
+
+def _quote_probe_relation(dialect: Any | None, name: str) -> str:
+    if dialect is not None and hasattr(dialect, "quote_schema_qualified"):
+        return cast(str, dialect.quote_schema_qualified(name))
+    parts = [p for p in str(name).split(".") if p]
+    if not parts:
+        return str(name)
+    return ".".join(f'"{part}"' for part in parts)
+
+
+def _probe_live_declared_schema_objects(
+    members: Mapping[str, Any],
+    checks: Sequence[tuple[str, str, str]],
+) -> None:
+    """Verify declared tables/columns are readable from each member database."""
+    seen: set[tuple[str, str, str]] = set()
+    for source_id, table_name, column_name in checks:
+        key = (source_id, table_name, column_name)
+        if key in seen:
+            continue
+        seen.add(key)
+        engine = members.get(source_id)
+        if engine is None:
+            continue
+        engine_type = str(getattr(engine, "dialect", "") or "").strip().lower()
+        if not engine_type:
+            runtime_cfg = getattr(engine, "_runtime_config", None)
+            engine_type = str(getattr(runtime_cfg, "engine", "") or "").strip().lower()
+        if (engine_type or "").strip().lower() in FILE_ENGINE_NAMES:
+            continue
+        sa_engine = getattr(engine, "_execution_engine", None)
+        if sa_engine is None:
+            continue
+        dialect = _member_dialect_for_probe(engine)
+        quoted_table = _quote_probe_relation(dialect, table_name)
+        if column_name:
+            quoted_col = (
+                dialect.quote_identifier(column_name)
+                if dialect is not None and hasattr(dialect, "quote_identifier")
+                else f'"{column_name}"'
+            )
+            probe_sql = f"SELECT {quoted_col} FROM {quoted_table} WHERE FALSE"
+        else:
+            probe_sql = f"SELECT 1 FROM {quoted_table} WHERE FALSE"
+        try:
+            with sa_engine.connect() as conn:
+                conn.execute(text(probe_sql))
+        except Exception as exc:
+            raise FederationMemberProbeError(
+                REPHRASE_HINT_MESSAGES["federation_member_probe_failed"],
+                source_id=source_id,
+            ) from exc
+
+
+def _probe_member_session_timezone(conn: Any, engine: Any) -> str | None:
+    dialect = _member_dialect_for_probe(engine)
+    if dialect is None or not hasattr(dialect, "session_timezone_sql"):
+        return None
+    tz_sql = dialect.session_timezone_sql()
+    if not tz_sql:
+        return None
+    try:
+        row = conn.execute(text(tz_sql)).fetchone()
+    except Exception:
+        return None
+    if not row or row[0] is None:
+        return None
+    tz = str(row[0]).strip()
+    return tz or None
 
 
 def probe_federation_member_connections(
@@ -4714,24 +5184,39 @@ def probe_federation_member_connections(
         if not engine_type:
             runtime_cfg = getattr(engine, "_runtime_config", None)
             engine_type = str(getattr(runtime_cfg, "engine", "") or "").strip().lower()
-        if is_file_engine(engine_type):
+        if (engine_type or "").strip().lower() in FILE_ENGINE_NAMES:
             continue
-        sa_engine = getattr(engine, "_execution_engine", None)
+        live_attr = getattr(type(engine), "live_connection_handle", None)
+        if isinstance(live_attr, property):
+            sa_engine = engine.live_connection_handle
+        else:
+            sa_engine = getattr(engine, "_execution_engine", None)
         if sa_engine is None:
             raise FederationConfigError(f"federation member {connection_name!r} missing execution engine")
         try:
             with sa_engine.connect() as conn:
                 conn.execute(text("SELECT 1"))
+                session_timezone = _probe_member_session_timezone(conn, engine)
         except Exception as exc:
             raise FederationMemberProbeError(
                 REPHRASE_HINT_MESSAGES["federation_member_probe_failed"],
                 source_id=connection_name,
             ) from exc
+        engine._session_timezone = session_timezone
 
 
 def probe_federation_member_liveness(members: Mapping[str, Any]) -> None:
     """Re-check database-backed member connections before a federation turn."""
     probe_federation_member_connections(members)
+
+
+def federation_user_facing_ineligible_message(reason: str) -> str:
+    """Return neutral user-facing text for a planner ineligible reason."""
+    _ = reason
+    return (
+        "This question cannot be answered with the information currently available.\n\n"
+        "Try rephrasing to ask about tables and columns you can see in the schema."
+    )
 
 
 def federation_user_facing_error_message(exc: BaseException) -> str:
@@ -4764,6 +5249,7 @@ def federation_ineligible_reason_code(reason: str | None) -> str | None:
     if reason in exact_codes:
         return exact_codes[reason]
     prefix_codes = (
+        ("union logical column", "union_column_missing"),
         ("cross-source aggregate not supported:", "cross_source_aggregate"),
         ("cross-source OR filter is not supported:", "cross_source_or_filter"),
         ("cross-source where_group disjunction spans sources:", "cross_source_where_group_disjunction"),
@@ -4787,7 +5273,7 @@ def federation_ineligible_reason_code(reason: str | None) -> str | None:
             return code
     if "raw_sql" in reason or "unattributable" in reason:
         return "unattributable_raw_sql"
-    return "unknown"
+    return ArrayStorageKind.UNKNOWN
 
 
 def federation_ineligible_answerable_hint(reason: str | None) -> str | None:
@@ -4796,6 +5282,16 @@ def federation_ineligible_answerable_hint(reason: str | None) -> str | None:
     if not code:
         return None
     return ineligible_answerable_hint_for_code(code)
+
+
+def federation_coordinator_decimal_duckdb_type(precision: int, scale: int) -> str:
+    """Render a DuckDB ``DECIMAL`` type for coordinator transfer from member metadata."""
+    return f"DECIMAL({precision}, {scale})"
+
+
+def ineligible_answerable_hint_for_code(code: str) -> str | None:
+    """Return the nearest answerable rephrase hint for a federation ineligibility code."""
+    return INELIGIBLE_ANSWERABLE_HINTS_BY_CODE.get(code)
 
 
 def _dataframe_memory_bytes(frame: pd.DataFrame) -> int:
@@ -4811,15 +5307,91 @@ def _coordinator_member_memory_bytes(member: CoordinatorMemberFrame) -> int:
     return _dataframe_memory_bytes(member.table)
 
 
-def _schema_column_duckdb_type(data_type: str) -> str | None:
+def _schema_column_duckdb_type(
+    data_type: str,
+    *,
+    column_meta: ColumnMetadata | None = None,
+    column_name: str = "",
+    source_id: str = "",
+) -> str | None:
     """Map composite schema ``data_type`` text to a DuckDB column type."""
     raw = str(data_type or "").strip()
     if not raw:
-        return "VARCHAR"
+        return None
     base = raw.lower().split("(", 1)[0].strip()
     mapped = FEDERATION_COORDINATOR_DUCKDB_TYPE_MAP.get(base)
+    if callable(mapped):
+        precision = column_meta.numeric_precision if column_meta is not None else None
+        scale = column_meta.numeric_scale if column_meta is not None else None
+        if precision is None and scale is None:
+            precision, scale = parse_numeric_type_arguments(raw)
+        if precision is not None and scale is not None:
+            return mapped(precision, scale)
+        label = column_name or (column_meta.name if column_meta is not None else "")
+        if label:
+            notify(
+                (
+                    f"federation coordinator column {label!r} missing numeric precision/scale; "
+                    f"using {FEDERATION_COORDINATOR_DECIMAL_FALLBACK}"
+                ),
+                stage="federation",
+                code=DIAGNOSTIC_CODE_FEDERATION_COORDINATOR_DECIMAL_FALLBACK,
+                level="warning",
+                source_id=source_id,
+                details=(
+                    ("phase", "transfer"),
+                    ("column", label),
+                    ("data_type", raw),
+                    ("fallback_type", FEDERATION_COORDINATOR_DECIMAL_FALLBACK),
+                ),
+            )
+        return FEDERATION_COORDINATOR_DECIMAL_FALLBACK
     if mapped is not None:
+        if _column_data_type_is_timezone_aware(raw):
+            label = column_name or (column_meta.name if column_meta is not None else "")
+            if label:
+                notify(
+                    (
+                        f"federation coordinator normalised timestamp values for column {label!r} "
+                        "to UTC for coordinator transfer"
+                    ),
+                    stage="federation",
+                    code=DIAGNOSTIC_CODE_FEDERATION_TIMESTAMP_NORMALISED,
+                    level="info",
+                    source_id=source_id,
+                    details=(("phase", "transfer"), ("column", label)),
+                )
         return mapped
+    return None
+
+
+def _coordinator_column_type_lossy_reason(data_type: str, *, column_meta: ColumnMetadata | None = None) -> str | None:
+    """Return a refusal reason when *data_type* would be lossy in the coordinator frame."""
+    raw = str(data_type or "").strip()
+    if not raw:
+        return None
+    lowered = raw.lower()
+    base = lowered.split("(", 1)[0].strip()
+    if base in {"timestamptz", "timetz"} or "with time zone" in lowered:
+        return None
+    if base == "tinyint":
+        return "tinyint width is lossy in the federation coordinator"
+    if base in {"decimal", "numeric", "number", "money"}:
+        if column_meta is not None and column_meta.is_exact_numeric:
+            precision = column_meta.numeric_precision
+            scale = column_meta.numeric_scale
+            if precision is None or scale is None:
+                precision, scale = parse_numeric_type_arguments(raw)
+            if precision is not None and scale is not None:
+                return None
+        if "(" in lowered:
+            inner = lowered.split("(", 1)[1].rstrip(")").strip()
+            if inner and inner != "38,9" and inner != "38, 9":
+                return "decimal precision is lossy in the federation coordinator"
+        elif base == "money":
+            return None
+        else:
+            return "decimal precision is lossy in the federation coordinator"
     return None
 
 
@@ -4863,7 +5435,12 @@ def _coordinator_column_type_lookup(
             continue
         meta = resolved_table.columns.get(col)
         if meta is not None and str(meta.data_type or "").strip():
-            return _schema_column_duckdb_type(meta.data_type)
+            return _schema_column_duckdb_type(
+                meta.data_type,
+                column_meta=meta,
+                column_name=col,
+                source_id=source_id,
+            )
     return None
 
 
@@ -4926,13 +5503,47 @@ def _coordinator_relation_column_types_from_names(
                 lookup_col = col_name.rsplit(".", 1)[-1] if "." in col_name else col_name
                 meta = table_meta.columns.get(lookup_col) if table_meta is not None else None
                 data_type = str(meta.data_type or "").strip() if meta is not None else ""
-                if data_type and _schema_column_duckdb_type(data_type) is None:
+                if (
+                    data_type
+                    and _schema_column_duckdb_type(data_type, column_meta=meta, column_name=lookup_col) is None
+                ):
                     raise FederationDeclarationError(
                         f"federation coordinator column {lookup_col!r} has unsupported data_type "
                         f"{data_type!r} for member {source_id!r}"
                     )
-        types.append((col_name, _schema_column_duckdb_type("") or "VARCHAR"))
+                if data_type:
+                    mapped = _schema_column_duckdb_type(
+                        data_type, column_meta=meta, column_name=lookup_col, source_id=source_id
+                    )
+                    if mapped is not None:
+                        types.append((col_name, mapped))
+                        continue
+        types.append((col_name, "VARCHAR"))
     return types
+
+
+def _import_coordinator_duckdb() -> Any:
+    require_driver("duckdb")
+    return importlib.import_module("duckdb")
+
+
+def _coordinator_pyarrow_available() -> bool:
+    return importlib.util.find_spec("pyarrow") is not None
+
+
+def _emit_coordinator_arrow_spill_fallback(*, reg_name: str, row_count: int) -> None:
+    notify(
+        "federation coordinator PyArrow unavailable; using in-memory coordinator transfer",
+        stage="federation",
+        code=DIAGNOSTIC_CODE_FEDERATION_COORDINATOR_ARROW_SPILL_FALLBACK,
+        level="info",
+        source_id="coordinator",
+        details=(
+            ("phase", "transfer"),
+            ("relation", reg_name),
+            ("row_count", str(row_count)),
+        ),
+    )
 
 
 def _coordinator_duckdb_type_to_pyarrow(duckdb_type: str) -> Any:
@@ -4949,6 +5560,9 @@ def _coordinator_duckdb_type_to_pyarrow(duckdb_type: str) -> Any:
     if dtype.startswith("INTEGER") or dtype.startswith("INT"):
         return pa.int32()
     if dtype.startswith("DECIMAL") or dtype.startswith("NUMERIC"):
+        match = re.search(r"\((\d+)\s*,\s*(\d+)\)", dtype)
+        if match:
+            return pa.decimal128(int(match.group(1)), int(match.group(2)))
         return pa.decimal128(38, 9)
     if dtype.startswith("DOUBLE") or dtype.startswith("FLOAT8"):
         return pa.float64()
@@ -4956,6 +5570,8 @@ def _coordinator_duckdb_type_to_pyarrow(duckdb_type: str) -> Any:
         return pa.float32()
     if dtype.startswith("BOOL"):
         return pa.bool_()
+    if dtype.startswith("TIMESTAMP WITH TIME ZONE"):
+        return pa.timestamp("us", tz="UTC")
     if dtype.startswith("TIMESTAMP"):
         return pa.timestamp("us")
     if dtype == "DATE":
@@ -5006,8 +5622,8 @@ def _write_coordinator_spill_parquet_arrow(
 
 
 def _create_coordinator_typed_table_sql(reg_name: str, column_types: Sequence[tuple[str, str]]) -> str:
-    col_defs = ", ".join(f"{_quote_ident(col)} {dtype}" for col, dtype in column_types)
-    return f"CREATE OR REPLACE TABLE {_quote_ident(reg_name)} ({col_defs})"
+    col_defs = ", ".join(f"{Dialect.sqlglot_quote_identifier(col)} {dtype}" for col, dtype in column_types)
+    return f"CREATE OR REPLACE TABLE {Dialect.sqlglot_quote_identifier(reg_name)} ({col_defs})"
 
 
 def _insert_coordinator_typed_frame(
@@ -5017,8 +5633,8 @@ def _insert_coordinator_typed_frame(
         return
     columns = [col for col, _dtype in column_types]
     placeholders = ", ".join("?" for _ in columns)
-    col_sql = ", ".join(_quote_ident(col) for col in columns)
-    insert_sql = f"INSERT INTO {_quote_ident(reg_name)} ({col_sql}) VALUES ({placeholders})"
+    col_sql = ", ".join(Dialect.sqlglot_quote_identifier(col) for col in columns)
+    insert_sql = f"INSERT INTO {Dialect.sqlglot_quote_identifier(reg_name)} ({col_sql}) VALUES ({placeholders})"
     rows = frame.loc[:, columns].itertuples(index=False, name=None)
     conn.executemany(insert_sql, list(rows))
 
@@ -5055,11 +5671,14 @@ def _register_coordinator_frame(
     bounded = _enforce_federation_row_cap(member.table, row_cap, source_id=source_id)
     column_types = _coordinator_relation_column_types(bounded, str(source_id or ""), schema=schema, plan=plan)
     typed_select = ", ".join(
-        f"CAST({_quote_ident(col)} AS {dtype}) AS {_quote_ident(col)}" for col, dtype in column_types
+        f"CAST({Dialect.sqlglot_quote_identifier(col)} AS {dtype}) AS {Dialect.sqlglot_quote_identifier(col)}"
+        for col, dtype in column_types
     )
-    conn.execute(f"DROP TABLE IF EXISTS {_quote_ident(reg_name)}")
+    conn.execute(f"DROP TABLE IF EXISTS {Dialect.sqlglot_quote_identifier(reg_name)}")
     conn.execute(_create_coordinator_typed_table_sql(reg_name, column_types))
-    if len(bounded) <= spill_threshold:
+    if len(bounded) <= spill_threshold or not _coordinator_pyarrow_available():
+        if len(bounded) > spill_threshold and not _coordinator_pyarrow_available():
+            _emit_coordinator_arrow_spill_fallback(reg_name=reg_name, row_count=len(bounded))
         _insert_coordinator_typed_frame(conn, reg_name, bounded, column_types)
         return
     os.makedirs(spill_dir, exist_ok=True)
@@ -5068,7 +5687,7 @@ def _register_coordinator_frame(
     if spill_files_created is not None:
         spill_files_created.append(spill_path)
     conn.execute(
-        f"CREATE OR REPLACE VIEW {_quote_ident(reg_name)} AS "
+        f"CREATE OR REPLACE VIEW {Dialect.sqlglot_quote_identifier(reg_name)} AS "
         f"SELECT {typed_select} FROM read_parquet({_quote_sql_string(spill_path)})"
     )
 
@@ -5110,18 +5729,21 @@ def _register_coordinator_arrow_table(
         plan=plan,
     )
     typed_select = ", ".join(
-        f"CAST({_quote_ident(col)} AS {dtype}) AS {_quote_ident(col)}" for col, dtype in column_types
+        f"CAST({Dialect.sqlglot_quote_identifier(col)} AS {dtype}) AS {Dialect.sqlglot_quote_identifier(col)}"
+        for col, dtype in column_types
     )
     staging = f"__{reg_name}_arrow"
     try:
         conn.unregister(staging)
-    except Exception:
+    except (OSError, AttributeError, TypeError):
         pass
     conn.register(staging, arrow_table)
-    conn.execute(f"DROP TABLE IF EXISTS {_quote_ident(reg_name)}")
-    if row_count <= spill_threshold:
+    conn.execute(f"DROP TABLE IF EXISTS {Dialect.sqlglot_quote_identifier(reg_name)}")
+    if row_count <= spill_threshold or not _coordinator_pyarrow_available():
+        if row_count > spill_threshold and not _coordinator_pyarrow_available():
+            _emit_coordinator_arrow_spill_fallback(reg_name=reg_name, row_count=row_count)
         conn.execute(_create_coordinator_typed_table_sql(reg_name, column_types))
-        conn.execute(f"INSERT INTO {_quote_ident(reg_name)} SELECT {typed_select} FROM {staging}")
+        conn.execute(f"INSERT INTO {Dialect.sqlglot_quote_identifier(reg_name)} SELECT {typed_select} FROM {staging}")
         conn.unregister(staging)
         return
     os.makedirs(spill_dir, exist_ok=True)
@@ -5131,20 +5753,21 @@ def _register_coordinator_arrow_table(
         spill_files_created.append(spill_path)
     conn.unregister(staging)
     conn.execute(
-        f"CREATE OR REPLACE VIEW {_quote_ident(reg_name)} AS "
+        f"CREATE OR REPLACE VIEW {Dialect.sqlglot_quote_identifier(reg_name)} AS "
         f"SELECT {typed_select} FROM read_parquet({_quote_sql_string(spill_path)})"
     )
 
 
 def _quote_sql_string(value: str) -> str:
-    return "'" + str(value).replace("'", "''") + "'"
+    duckdb_cls = DialectRegistry.get_dialect_class("duckdb")
+    return duckdb_cls.__new__(duckdb_cls).quote_string_literal(value)
 
 
 def _validate_coordinator_glue_sql(
     sql: str, bind_map: Mapping[str, Any] | None, *, schema: SchemaGraph | None = None, conn: Any | None = None
 ) -> None:
     """Validate coordinator glue SQL through the DuckDB dialect gate."""
-    dialect = get_dialect("duckdb", native_connection=conn)
+    dialect = DialectRegistry.get_dialect("duckdb", native_connection=conn)
     ok, err, _cat, _diags = validate_sql(dialect, sql, dict(bind_map or {}), schema=schema)
     if not ok:
         raise FederationRuntimeError(f"coordinator glue validation failed: {err or 'invalid SQL'}")
@@ -5174,7 +5797,7 @@ def federation_plan_timeout_deadline(plan_timeout_ms: int | None, *, started_at:
     if not cost_cap_active(plan_timeout_ms):
         return None
     start = started_at if started_at is not None else time.perf_counter()
-    return start + (int(plan_timeout_ms) / 1000.0)
+    return start + (int(plan_timeout_ms or 0) / 1000.0)
 
 
 def enforce_federation_plan_timeout(deadline: float | None, *, started_at: float) -> None:
@@ -5187,6 +5810,25 @@ def enforce_federation_plan_timeout(deadline: float | None, *, started_at: float
         raise federation_plan_timeout_error(elapsed_ms, timeout_ms)
 
 
+def _coordinator_result_to_dataframe(result: Any) -> pd.DataFrame:
+    """Materialize coordinator DuckDB results without widening exact numerics to float. ``SessionStep.data`` may use object dtype for DECIMAL columns so Python :class:`decimal.Decimal` values and SQL NULL (``None``) survive egress."""
+    description = getattr(result, "description", None)
+    columns = [str(col[0]) for col in description] if description else []
+    if columns:
+        seen: dict[str, int] = {}
+        unique_columns: list[str] = []
+        for name in columns:
+            n = seen.get(name, 0)
+            seen[name] = n + 1
+            unique_columns.append(name if n == 0 else f"{name}_{n}")
+        columns = unique_columns
+    rows = result.fetchall() if hasattr(result, "fetchall") else []
+    if not rows:
+        return pd.DataFrame(columns=columns) if columns else pd.DataFrame()
+    frame = pd.DataFrame([tuple(row) for row in rows], columns=columns or None)
+    return frame
+
+
 def _execute_coordinator_sql_with_timeout(
     conn: Any,
     sql: str,
@@ -5196,15 +5838,20 @@ def _execute_coordinator_sql_with_timeout(
 ) -> Any:
     """Execute coordinator DuckDB SQL with an optional wall-clock timeout."""
     params = dict(bind_map or {})
-    if not cost_cap_active(timeout_ms):
-        return conn.execute(sql, params or {})
-    deadline = time.perf_counter() + (int(timeout_ms) / 1000.0)
+    exec_sql = sql
+    exec_args: dict[str, Any] | list[Any] = params
+    if params:
+        exec_sql, exec_args = SqlglotEngineDialect.bind_colon_parameters_for_duckdb(sql, params)
+    if timeout_ms is None or not cost_cap_active(timeout_ms):
+        return conn.execute(exec_sql, exec_args or {})
+    resolved_timeout_ms = int(timeout_ms)
+    deadline = time.perf_counter() + (resolved_timeout_ms / 1000.0)
     result_holder: list[Any] = []
     error_holder: list[BaseException] = []
 
     def _run() -> None:
         try:
-            result_holder.append(conn.execute(sql, params or {}))
+            result_holder.append(conn.execute(exec_sql, exec_args or {}))
         except BaseException as exc:
             error_holder.append(exc)
 
@@ -5216,14 +5863,15 @@ def _execute_coordinator_sql_with_timeout(
         if callable(interrupt):
             try:
                 interrupt()
-            except Exception:
+            except (OSError, AttributeError, RuntimeError, TypeError):
                 pass
+        mark_connection_poisoned(conn)
         worker.join(timeout=1.0)
-        raise federation_coordinator_timeout_error(int(timeout_ms))
+        raise federation_coordinator_timeout_error(resolved_timeout_ms)
     if error_holder:
         raise error_holder[0]
     if not result_holder:
-        raise federation_coordinator_timeout_error(int(timeout_ms))
+        raise federation_coordinator_timeout_error(resolved_timeout_ms)
     return result_holder[0]
 
 
@@ -5266,6 +5914,7 @@ def execute_federation_coordinator(
     row_cap: int | None = None,
     spill_row_threshold: int | None = None,
     spill_dir: str | None = None,
+    federation_dir: str | None = None,
     schema: SchemaGraph | None = None,
     param_values: Mapping[str, Any] | None = None,
     total_input_byte_cap: int | None = None,
@@ -5296,20 +5945,36 @@ def execute_federation_coordinator(
             source_by_table=source_by_table_from_schema(schema),
             semijoin_key_cap=key_cap,
         )
-    conn = duckdb.connect(":memory:")
-    step_ids: dict[str, str] = {}
-    owned_spill = spill_dir is None
-    spill_path = spill_dir or tempfile.mkdtemp(prefix="aetherdialect_fed_spill_")
-    os.makedirs(spill_path, mode=0o700, exist_ok=True)
+    conn = _import_coordinator_duckdb().connect(":memory:")
+    owned_coordinator_temp = False
+    coordinator_temp_directory = ""
+    owned_spill = False
+    spill_path = spill_dir or ""
     spill_files_created: list[str] = []
-    source_count = len(frames)
-    bind_map = coordinator_residual_bind_map(plan, dict(param_values or {}))
-    total_rows = 0
-    total_bytes = 0
-    member_row_counts = {
-        source_id: normalize_coordinator_member_input(frame).row_count() for source_id, frame in frames.items()
-    }
     try:
+        _, coordinator_temp_directory, _, owned_coordinator_temp = _configure_federation_coordinator_connection(
+            conn,
+            federation_dir=federation_dir,
+            spill_dir=spill_dir,
+        )
+        step_ids: dict[str, str] = {}
+        owned_spill = spill_dir is None
+        if spill_dir is None:
+            temp_root = tempfile.gettempdir()
+            _require_coordinator_temp_directory_writable(temp_root)
+            spill_path = tempfile.mkdtemp(prefix="aetherdialect_fed_spill_")
+        else:
+            spill_path = spill_dir
+        os.makedirs(spill_path, mode=0o700, exist_ok=True)
+        source_count = len(frames)
+        bind_map = coordinator_residual_bind_map(plan, dict(param_values or {}))
+        if schema is not None and plan.residual is not None:
+            assert_residual_execution_parameters_validated(plan.residual, bind_map, schema)
+        total_rows = 0
+        total_bytes = 0
+        member_row_counts = {
+            source_id: normalize_coordinator_member_input(frame).row_count() for source_id, frame in frames.items()
+        }
         for source_id in list(frames):
             frame = frames[source_id]
             member = normalize_coordinator_member_input(frame)
@@ -5358,7 +6023,9 @@ def execute_federation_coordinator(
                 select_kw = _render_combine_select_keyword(explicit_cols)
                 single_sql = f"SELECT {select_kw} FROM {only_reg}"
                 _validate_coordinator_glue_sql(single_sql, {}, schema=schema, conn=conn)
-                result = _execute_coordinator_sql_with_timeout(conn, single_sql, {}, timeout_ms=glue_timeout).fetchdf()
+                result = _coordinator_result_to_dataframe(
+                    _execute_coordinator_sql_with_timeout(conn, single_sql, {}, timeout_ms=glue_timeout)
+                )
                 result = _enforce_federation_row_cap(result, cap)
                 enforce_coordinator_result_grain(result, plan)
                 return result
@@ -5367,7 +6034,9 @@ def execute_federation_coordinator(
         exec_bind = reconcile_execute_bind_params(glue, bind_map) or {}
         _validate_coordinator_glue_sql(glue, exec_bind, schema=schema, conn=conn)
         try:
-            result = _execute_coordinator_sql_with_timeout(conn, glue, exec_bind, timeout_ms=glue_timeout).fetchdf()
+            result = _coordinator_result_to_dataframe(
+                _execute_coordinator_sql_with_timeout(conn, glue, exec_bind, timeout_ms=glue_timeout)
+            )
         except FederationCapExceededError:
             raise
         except Exception as exc:
@@ -5381,23 +6050,14 @@ def execute_federation_coordinator(
                 result = pd.DataFrame([identity])
         result = _enforce_federation_row_cap(result, cap)
         combine_row_count = len(result)
-        combine_glue = _render_federation_combine_only_glue(plan, step_ids, schema=schema)
-        if combine_glue:
-            try:
-                combine_row_count = len(
-                    _execute_coordinator_sql_with_timeout(
-                        conn, combine_glue, exec_bind, timeout_ms=glue_timeout
-                    ).fetchdf()
-                )
-            except Exception:
-                combine_row_count = len(result)
         validate_coordinator_join_fan_out(plan, member_row_counts, len(result), combine_row_count=combine_row_count)
-        validate_federated_residual_aggregate_fan_out(plan, schema)
+        if schema is not None:
+            validate_federated_residual_aggregate_fan_out(plan, schema)
         enforce_coordinator_result_grain(result, plan)
         return result
     finally:
         conn.close()
-        if owned_spill:
+        if owned_spill and spill_path:
             try:
                 shutil.rmtree(spill_path)
             except OSError as exc:
@@ -5410,6 +6070,11 @@ def execute_federation_coordinator(
                     raise FederationRuntimeError(
                         f"failed to clean federation coordinator spill file {created_path!r}: {exc}"
                     ) from exc
+        if owned_coordinator_temp and coordinator_temp_directory:
+            try:
+                shutil.rmtree(coordinator_temp_directory)
+            except OSError as exc:
+                raise FederationRuntimeError(f"failed to clean federation coordinator temp directory: {exc}") from exc
 
 
 def _assert_combine_join_plan_structure(plan: FederatedPlan) -> None:
@@ -5462,7 +6127,7 @@ def order_federation_execution_steps(
 
     def selectivity_score(step: SourceStep) -> tuple[int, int, float, int, int, str]:
         limit = int(step.sub_intent.limit) if step.sub_intent.limit else 0
-        filters = len(_predicate_where_leaves(step.sub_intent.where))
+        filters = len(PredicateGroup.where_leaves(step.sub_intent.where))
         grain_rank = 0 if (step.sub_intent.grain or "many") == "scalar" else 1
         limit_rank = limit if limit > 0 else 10**9
         rank = stage_rank.get(step.source_id, len(stage_rank))
@@ -5573,6 +6238,44 @@ def source_row_cap_for_source(manifest: FederationManifest, source_id: str) -> i
     return resolve_member_limits_for_source(manifest, source_id).row_cap
 
 
+def resolve_member_row_cap(
+    manifest: Any,
+    source_id: str,
+    limits: FederationLimits | None,
+) -> int | None:
+    """Resolve one member row cap: member declaration, then coordinator, then federation limits."""
+    member_cap: int | None = None
+    sources = getattr(manifest, "sources", None)
+    if isinstance(sources, Mapping):
+        binding = sources.get(source_id)
+        binding_limits = getattr(binding, "limits", None) if binding is not None else None
+        raw = getattr(binding_limits, "row_cap", None) if binding_limits is not None else None
+        if raw is not None:
+            member_cap = int(raw)
+    else:
+        for binding in sources or ():
+            if getattr(binding, "source_id", None) != source_id:
+                continue
+            binding_limits = getattr(binding, "limits", None)
+            raw = getattr(binding_limits, "row_cap", None) if binding_limits is not None else None
+            if raw is not None:
+                member_cap = int(raw)
+            break
+    if member_cap is not None:
+        return member_cap
+    coordinator = getattr(manifest, "coordinator", None)
+    if coordinator is not None:
+        for attr in ("default_source_row_cap", "row_cap"):
+            raw = getattr(coordinator, attr, None)
+            if raw is not None:
+                return int(raw)
+    if limits is not None:
+        member_row_cap = getattr(limits, "member_row_cap", None)
+        if member_row_cap is not None:
+            return int(member_row_cap)
+    return None
+
+
 def resolve_member_limits_for_source(manifest: FederationManifest, source_id: str) -> FederationMemberResolvedLimits:
     """Resolve per-member limits using member, coordinator, then global policy fallbacks."""
     binding_limits: FederationSourceLimits | None = None
@@ -5657,6 +6360,7 @@ def federation_coordinator_spill_dir(federation_dir: str | None) -> str | None:
     if not federation_dir or not str(federation_dir).strip():
         return None
     path = os.path.join(str(federation_dir), "coordinator_spill")
+    _require_coordinator_temp_directory_writable(path)
     if os.path.isdir(path):
         try:
             shutil.rmtree(path)
@@ -5664,6 +6368,115 @@ def federation_coordinator_spill_dir(federation_dir: str | None) -> str | None:
             raise FederationRuntimeError(f"failed to clean federation coordinator spill directory: {exc}") from exc
     os.makedirs(path, mode=0o700, exist_ok=True)
     return path
+
+
+def federation_coordinator_temp_dir(federation_dir: str | None) -> str | None:
+    """Return the DuckDB temp directory under a federation artifact tree."""
+    if not federation_dir or not str(federation_dir).strip():
+        return None
+    path = os.path.join(str(federation_dir), "coordinator_temp")
+    _require_coordinator_temp_directory_writable(path)
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    return path
+
+
+def _atomic_write_directory(path: str) -> tuple[str, str]:
+    """Resolve *path* absolutely and return ``(absolute_path, parent_directory)``."""
+    abs_path = os.path.abspath(path)
+    directory = os.path.dirname(abs_path) or "."
+    return abs_path, directory
+
+
+def _format_duckdb_byte_setting(byte_count: int) -> str:
+    """Format a byte count for DuckDB ``SET`` settings that accept size literals."""
+    if byte_count <= 0:
+        raise ValueError("byte_count must be positive")
+    gib = 1024**3
+    mib = 1024**2
+    if byte_count % gib == 0:
+        return f"{byte_count // gib}GB"
+    if byte_count % mib == 0:
+        return f"{byte_count // mib}MB"
+    return f"{byte_count}B"
+
+
+def _duckdb_sql_string_literal(value: str) -> str:
+    escaped = value.replace("\\", "/").replace("'", "''")
+    return f"'{escaped}'"
+
+
+def _resolve_coordinator_temp_directory(
+    limits: FederationLimits,
+    *,
+    federation_dir: str | None = None,
+    spill_dir: str | None = None,
+) -> tuple[str, bool]:
+    """Return ``(temp_directory, owned)`` where *owned* means the caller must delete it."""
+    if limits.coordinator_temp_dir:
+        path = os.path.abspath(limits.coordinator_temp_dir)
+        _require_coordinator_temp_directory_writable(path)
+        os.makedirs(path, mode=0o700, exist_ok=True)
+        return path, False
+    resolved_federation_dir = federation_dir
+    if resolved_federation_dir is None and spill_dir:
+        spill_abs = os.path.abspath(spill_dir)
+        if os.path.basename(os.path.normpath(spill_abs)) == "coordinator_spill":
+            resolved_federation_dir = os.path.dirname(spill_abs)
+    if resolved_federation_dir:
+        maybe_path = federation_coordinator_temp_dir(resolved_federation_dir)
+        if maybe_path:
+            return maybe_path, False
+    temp_root = tempfile.gettempdir()
+    _require_coordinator_temp_directory_writable(temp_root)
+    path = tempfile.mkdtemp(prefix="aetherdialect_coordinator_temp_")
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    return path, True
+
+
+def _effective_federation_limits() -> FederationLimits:
+    try:
+        return active_federation_limits()
+    except RuntimeError:
+        return FederationLimits()
+
+
+def _configure_federation_coordinator_connection(
+    conn: Any,
+    *,
+    federation_dir: str | None = None,
+    spill_dir: str | None = None,
+) -> tuple[str, str, int, bool]:
+    """Apply coordinator DuckDB limits; return memory, temp dir, threads, and temp ownership."""
+    limits = _effective_federation_limits()
+    temp_directory, owned_temp = _resolve_coordinator_temp_directory(
+        limits,
+        federation_dir=federation_dir,
+        spill_dir=spill_dir,
+    )
+    memory_report = "default"
+    if limits.coordinator_memory_limit_bytes is not None:
+        memory_report = _format_duckdb_byte_setting(int(limits.coordinator_memory_limit_bytes))
+        conn.execute(f"SET memory_limit={_duckdb_sql_string_literal(memory_report)}")
+    conn.execute(f"SET temp_directory={_duckdb_sql_string_literal(temp_directory)}")
+    threads = int(limits.coordinator_threads)
+    conn.execute(f"SET threads={threads}")
+    if limits.coordinator_spill_max_bytes is not None:
+        spill_literal = _format_duckdb_byte_setting(int(limits.coordinator_spill_max_bytes))
+        conn.execute(f"SET max_temp_directory_size={_duckdb_sql_string_literal(spill_literal)}")
+    notify(
+        "federation coordinator DuckDB limits configured",
+        stage="federation",
+        code=DIAGNOSTIC_CODE_COORDINATOR_LIMITS,
+        level="info",
+        source_id="coordinator",
+        details=(
+            ("phase", "plan"),
+            ("memory_limit", memory_report),
+            ("temp_directory", temp_directory),
+            ("threads", str(threads)),
+        ),
+    )
+    return memory_report, temp_directory, threads, owned_temp
 
 
 def semijoin_key_columns(plan: FederatedPlan, driving_source: str, target_source: str) -> tuple[str, str] | None:
@@ -5679,13 +6492,40 @@ def semijoin_key_columns(plan: FederatedPlan, driving_source: str, target_source
     return None
 
 
+def emit_federation_reduction_null_keys_diagnostic(
+    dropped_count: int,
+    *,
+    column: str,
+    source_id: str | None = None,
+) -> None:
+    """Emit when equality reduction drops rows whose join key is unknown."""
+    if dropped_count <= 0:
+        return
+    notify(
+        (f"federation reduction dropped {dropped_count} row(s) with unknown key on {column!r} before key transfer"),
+        stage="federation",
+        code=DIAGNOSTIC_CODE_FEDERATION_REDUCTION_NULL_KEYS,
+        level="info",
+        source_id=source_id,
+        details=(
+            ("phase", "prepare"),
+            ("dropped_count", str(dropped_count)),
+            ("column", column),
+        ),
+    )
+
+
 def distinct_semijoin_keys(frame: pd.DataFrame | CoordinatorMemberFrame, column: str, *, cap: int) -> list[Any] | None:
-    """Return distinct non-null keys when within *cap*; otherwise None (skip reduction)."""
+    """Return distinct non-null keys when within *cap*; otherwise None (skip reduction). Rows whose key is unknown cannot participate in equality reduction; null keys are dropped before transfer."""
     if isinstance(frame, CoordinatorMemberFrame):
         return _distinct_semijoin_keys_arrow(frame, column, cap=cap)
     if column not in frame.columns:
         return None
-    series = frame[column].dropna()
+    series = frame[column]
+    null_count = int(series.isna().sum())
+    if null_count:
+        emit_federation_reduction_null_keys_diagnostic(null_count, column=column)
+    series = series.dropna()
     if series.empty:
         return []
     keys = series.unique().tolist()
@@ -5713,6 +6553,9 @@ def _distinct_semijoin_keys_arrow(member: CoordinatorMemberFrame, column: str, *
         return None
     values = arrow_table.column(col_name)
     pc_ops = cast(Any, pc)
+    null_count = int(len(values) - len(pc_ops.drop_null(values)))
+    if null_count:
+        emit_federation_reduction_null_keys_diagnostic(null_count, column=column)
     filtered = pc_ops.drop_null(values)
     if len(filtered) == 0:
         return []
@@ -5774,7 +6617,7 @@ def _inject_reducing_key_where(
     fp = WhereParam(
         left_expr=NormalizedExpr.from_column(key_column), op="in", value_type=value_type, param_key=param_key
     )
-    filters = list((_predicate_where_leaves(sub_intent.where)) or [])
+    filters = list((PredicateGroup.where_leaves(sub_intent.where)) or [])
     filters.append(fp)
     merged_where = PredicateGroup(op="and", predicates=tuple(filters))
     param_values = dict(sub_intent.param_values or {})
@@ -5791,12 +6634,12 @@ def detect_federation_topology_change(
     added = declared - recorded
     removed = recorded - declared
     if added and removed:
-        return "mixed"
+        return FederationTopologyChange.MIXED
     if added:
-        return "add"
+        return FederationTopologyChange.ADD
     if removed:
-        return "remove"
-    return "none"
+        return FederationTopologyChange.REMOVE
+    return FederationTopologyChange.NONE
 
 
 def prune_federation_aliases(manifest: FederationManifest, *, active_source_ids: set[str]) -> FederationManifest:
@@ -5938,8 +6781,8 @@ def load_federation_migration_map(path: str) -> FederationMigrationMap | None:
 
 def parse_federation_migration_map(payload: Mapping[str, Any]) -> FederationMigrationMap:
     """Parse a federation migration map payload."""
-    version = int(payload.get("version", 0) or 0)
-    if version != 1:
+    version = coerce_format_version(payload.get("version", 0) or 0)
+    if version != "1" and not format_versions_match(version, "1"):
         raise MigrationPendingError("federation_migration_map.json: invalid or missing version")
     action = str(payload.get("action", "") or "").strip().lower()
     if action not in (MIGRATION_MAP_ACTION_REMAP, MIGRATION_MAP_ACTION_DESTRUCTIVE, MIGRATION_MAP_ACTION_ABORT):
@@ -5971,7 +6814,7 @@ def parse_federation_migration_map(payload: Mapping[str, Any]) -> FederationMigr
         if left and right:
             dropped.append((left, right))
     return FederationMigrationMap(
-        version=version,
+        version=1,
         action=action,
         qualified_column_renames=tuple(qualified),
         namespace_renames=tuple(namespace),
@@ -6056,7 +6899,7 @@ def archive_federation_migration_map_file(
     fed_map_path = Path(map_path)
     if not fed_map_path.is_file():
         return
-    ts = datetime.now(timezone.utc).strftime(SCHEMA_OVERRIDES_APPLIED_TIMESTAMP_FORMAT)
+    ts = datetime.now(UTC).strftime(SCHEMA_OVERRIDES_APPLIED_TIMESTAMP_FORMAT)
     target_dir = Path(archive_dir) if archive_dir is not None else fed_map_path.parent
     target_dir.mkdir(parents=True, exist_ok=True)
     applied_fed_map = target_dir / f"{fed_map_path.stem}.applied.json"
@@ -6074,6 +6917,9 @@ def clear_federation_plan_templates(federation_dir: str) -> None:
     path = federation_artifact_paths(federation_dir)["plan_templates"]
     if os.path.isfile(path):
         os.remove(path)
+    fb_dir = _federation_join_feedback_dir(federation_dir)
+    if os.path.isdir(fb_dir):
+        shutil.rmtree(fb_dir, ignore_errors=True)
 
 
 def clear_federation_composite_template_store(federation_dir: str) -> bool:
@@ -6087,14 +6933,257 @@ def clear_federation_composite_template_store(federation_dir: str) -> bool:
     return existed
 
 
+def _member_logical_table_names(manifest: FederationManifest, source_id: str) -> tuple[str, ...]:
+    """Return composite logical table names owned by *source_id*."""
+    names: set[str] = set()
+    for table_name, owner in manifest.table_namespace.items():
+        if owner == source_id:
+            names.add(table_name)
+    for alias in manifest.aliases:
+        if alias.source == source_id:
+            names.add(alias.alias)
+    return tuple(sorted(names))
+
+
+def _purge_dropped_tables_from_aetherspace_snapshots(
+    engine_dir: str,
+    dropped_tables: tuple[str, ...],
+) -> int:
+    """Remove dropped table references from persisted aetherspace snapshot JSON files."""
+    if not dropped_tables:
+        return 0
+    drop_tables = frozenset(dropped_tables)
+    root = os.path.join(engine_dir, AETHERSPACES_SEGMENT)
+    if not os.path.isdir(root):
+        return 0
+    updated = 0
+    for entry in os.listdir(root):
+        if Path(entry).suffix.lower() != ".json":
+            continue
+        stem = entry[: -len(".json")]
+        if not stem or stem == MASTER_AETHERSPACE_NAME:
+            continue
+        path = os.path.join(root, entry)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        tables = sorted({str(t) for t in (payload.get("tables") or ()) if str(t) not in drop_tables})
+        columns = sorted(
+            {
+                str(c)
+                for c in (payload.get("columns") or ())
+                if not (str(c).count(".") == 1 and str(c).split(".", 1)[0] in drop_tables)
+            }
+        )
+        table_descriptions = {
+            str(k): v
+            for k, v in dict(payload.get("table_descriptions") or {}).items()
+            if str(k) not in drop_tables and isinstance(v, str) and v.strip()
+        }
+        column_meta = {
+            str(k): v
+            for k, v in dict(payload.get("column_meta") or {}).items()
+            if not (str(k).count(".") == 1 and str(k).split(".", 1)[0] in drop_tables)
+        }
+        deny_objects = sorted({str(t) for t in (payload.get("deny_objects") or ()) if str(t) not in drop_tables})
+        deny_columns = sorted(
+            {
+                str(c)
+                for c in (payload.get("deny_columns") or ())
+                if not (str(c).count(".") == 1 and str(c).split(".", 1)[0] in drop_tables)
+            }
+        )
+        edited = {
+            **payload,
+            "tables": tables,
+            "columns": columns,
+            "table_descriptions": table_descriptions,
+            "column_meta": column_meta,
+            "deny_objects": deny_objects,
+            "deny_columns": deny_columns,
+        }
+        if edited == payload:
+            continue
+        abs_path, directory = _atomic_write_directory(path)
+        os.makedirs(directory, mode=ARTIFACT_DIR_MODE, exist_ok=True)
+        tmp_path: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=directory,
+                delete=False,
+            ) as tmp:
+                json.dump(edited, tmp, ensure_ascii=False, indent=2)
+                tmp_path = tmp.name
+            os.replace(tmp_path, abs_path)
+            updated += 1
+        except OSError:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+    return updated
+
+
+def _directory_tree_byte_size(path: str) -> int:
+    """Return the total byte size of a file or directory tree."""
+    if os.path.isfile(path):
+        try:
+            return os.path.getsize(path)
+        except OSError:
+            return 0
+    if not os.path.isdir(path):
+        return 0
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total
+
+
+def _directory_is_writable(path: str) -> bool:
+    abs_path = os.path.abspath(os.path.expanduser(str(path)))
+    target = abs_path if os.path.isdir(abs_path) else (os.path.dirname(abs_path) or abs_path)
+    if not os.path.isdir(target):
+        try:
+            os.makedirs(target, mode=0o700, exist_ok=True)
+        except OSError:
+            return False
+    if not os.access(target, os.W_OK):
+        return False
+    probe = os.path.join(target, ".aetherdialect_write_probe")
+    try:
+        with open(probe, "w", encoding="utf-8") as handle:
+            handle.write("")
+        os.remove(probe)
+    except OSError:
+        return False
+    return True
+
+
+def _require_writable_directory(path: str, *, message: str) -> None:
+    abs_path = os.path.abspath(os.path.expanduser(str(path)))
+    if not _directory_is_writable(abs_path):
+        raise ConfigError(message.format(path=abs_path))
+
+
+def _require_default_artifacts_root_writable(path: str) -> None:
+    _require_writable_directory(
+        path,
+        message=("default artifacts directory {path!r} is not writable; set an explicit artifacts_dir"),
+    )
+
+
+def _require_coordinator_temp_directory_writable(path: str) -> None:
+    _require_writable_directory(
+        path,
+        message=(
+            "coordinator temporary directory {path!r} is not writable; "
+            "set FederationLimits.coordinator_temp_dir or ensure the system temporary directory is writable"
+        ),
+    )
+
+
+def _federation_member_artifacts_root(artifacts_root: str | None) -> str:
+    if artifacts_root and str(artifacts_root).strip():
+        parent = os.path.abspath(os.path.expanduser(str(artifacts_root)))
+    else:
+        parent = user_data_dir(appname="aetherdialect", appauthor=False)
+        _require_default_artifacts_root_writable(parent)
+    return os.path.join(parent, ARTIFACT_DIRECTORY_SEGMENT)
+
+
+def _expected_member_artifacts_dir(
+    artifacts_root: str | None,
+    binding: FederationSourceBinding,
+    *,
+    federation_id: str | None = None,
+    storage_slug: str | None = None,
+) -> str:
+    if storage_slug:
+        return os.path.join(_federation_member_artifacts_root(artifacts_root), str(storage_slug))
+    return federation_source_artifacts_dir(artifacts_root, binding, federation_id=federation_id)
+
+
+def _assert_member_artifacts_dir_is_purgeable(
+    member_artifacts_dir: str,
+    *,
+    artifacts_root: str | None,
+    binding: FederationSourceBinding,
+    federation_id: str | None = None,
+    storage_slug: str | None = None,
+) -> None:
+    """Refuse to purge directories that are not federation member artifact trees."""
+    abs_member = os.path.abspath(os.path.expanduser(str(member_artifacts_dir)))
+    expected_slug = str(storage_slug or "").strip() or federation_source_storage_slug(
+        binding, federation_id=federation_id
+    )
+    if os.path.basename(abs_member) != expected_slug:
+        raise FederationConfigError(
+            f"refusing to purge unexpected federation member artifacts directory {member_artifacts_dir!r}; "
+            f"expected slug {expected_slug!r}"
+        )
+    if not expected_slug.startswith(FEDERATION_SOURCE_STORAGE_PREFIX):
+        raise FederationConfigError(
+            f"refusing to purge federation member artifacts directory without {FEDERATION_SOURCE_STORAGE_PREFIX!r} prefix: "
+            f"{member_artifacts_dir!r}"
+        )
+    if os.path.basename(os.path.dirname(abs_member)) != ARTIFACT_DIRECTORY_SEGMENT:
+        raise FederationConfigError(
+            f"refusing to purge federation member artifacts outside {ARTIFACT_DIRECTORY_SEGMENT!r} segment: "
+            f"{member_artifacts_dir!r}"
+        )
+    candidate_roots = [_federation_member_artifacts_root(artifacts_root)]
+    inferred_artifacts_root = os.path.dirname(os.path.dirname(abs_member))
+    if inferred_artifacts_root:
+        candidate_roots.append(_federation_member_artifacts_root(inferred_artifacts_root))
+    if not any(abs_member.startswith(root + os.sep) for root in candidate_roots):
+        raise FederationConfigError(
+            f"refusing to purge federation member artifacts outside expected root: {member_artifacts_dir!r}"
+        )
+
+
+def federation_member_artifacts_dir_for_purge(
+    artifacts_root: str | None,
+    binding: FederationSourceBinding,
+    *,
+    federation_id: str | None = None,
+    member_artifacts_dir: str | None = None,
+) -> str:
+    """Resolve the member artifact directory to purge, preferring a validated explicit path."""
+    binding_dir = federation_source_artifacts_dir(artifacts_root, binding, federation_id=federation_id)
+    candidate = str(member_artifacts_dir or "").strip()
+    if not candidate:
+        return binding_dir
+    try:
+        _assert_member_artifacts_dir_is_purgeable(
+            candidate,
+            artifacts_root=artifacts_root,
+            binding=binding,
+            federation_id=federation_id,
+        )
+    except FederationConfigError:
+        return binding_dir
+    return candidate
+
+
 def purge_federation_member_artifacts(
     federation_dir: str,
     *,
+    member_artifacts_dir: str,
     artifacts_root: str | None,
     source_id: str,
     member_engine: Any | None = None,
     manifest: FederationManifest | None = None,
-) -> None:
+    federation_id: str | None = None,
+    storage_slug: str | None = None,
+) -> tuple[str, int]:
     """Delete on-disk artifacts for one removed federation member and clear composite template shards."""
     binding: FederationSourceBinding | None = None
     if manifest is not None:
@@ -6110,18 +7199,90 @@ def purge_federation_member_artifacts(
             engine=str(getattr(member_engine, "dialect", "duckdb") or "duckdb") if member_engine else "duckdb",
             connection=source_id,
         )
+    fed_id = federation_id or (str(manifest.federation_id) if manifest is not None else None)
+    _assert_member_artifacts_dir_is_purgeable(
+        member_artifacts_dir,
+        artifacts_root=artifacts_root,
+        binding=binding,
+        federation_id=fed_id,
+        storage_slug=storage_slug,
+    )
+    abs_member = os.path.abspath(os.path.expanduser(str(member_artifacts_dir)))
+    bytes_reclaimed = _directory_tree_byte_size(abs_member)
     with artifact_lock(federation_dir):
-        member_dir = federation_source_artifacts_dir(artifacts_root, binding)
-        if os.path.isdir(member_dir):
-            shutil.rmtree(member_dir, ignore_errors=True)
         extra_dir = getattr(member_engine, "_artifacts_dir", None) if member_engine is not None else None
-        if (
-            extra_dir
-            and os.path.abspath(str(extra_dir)) != os.path.abspath(member_dir)
-            and os.path.isdir(str(extra_dir))
-        ):
+        if extra_dir and os.path.isdir(str(extra_dir)):
+            refresh_migration_simulation_caches(str(extra_dir))
+        if os.path.isdir(abs_member):
+            shutil.rmtree(abs_member, ignore_errors=True)
+        if extra_dir and os.path.abspath(str(extra_dir)) != abs_member and os.path.isdir(str(extra_dir)):
             shutil.rmtree(str(extra_dir), ignore_errors=True)
         clear_federation_composite_template_store(federation_dir)
+        dropped_tables = _member_logical_table_names(manifest, source_id) if manifest is not None else ()
+        if dropped_tables:
+            _purge_dropped_tables_from_aetherspace_snapshots(
+                federation_dir,
+                dropped_tables,
+            )
+        refresh_migration_simulation_caches(federation_dir)
+    return abs_member, bytes_reclaimed
+
+
+def purge_departed_federation_member_trees(
+    federation_dir: str,
+    *,
+    artifacts_root: str | None,
+    removed_source_ids: Sequence[str],
+) -> None:
+    """Remove artifact trees for federation members pruned during init- time shrink."""
+    if not removed_source_ids:
+        return
+    stored = _load_federation_artifact_manifest_dict(federation_artifact_paths(federation_dir)["artifact_manifest"])
+    federation_id = str((stored or {}).get("federation_id", "") or "").strip() or None
+    roster_by_source: dict[str, tuple[str, str, str, str]] = {}
+    try:
+        for row in load_persisted_federation_roster_rows(federation_dir):
+            roster_by_source[str(row[0])] = row
+    except FederationConfigError:
+        pass
+    for source_id in removed_source_ids:
+        sid = str(source_id)
+        roster_row = roster_by_source.get(sid)
+        if roster_row is not None:
+            connection = str(roster_row[1] or "")
+            storage_slug = str(roster_row[2] or "")
+            binding = FederationSourceBinding(
+                source_id=sid,
+                engine=_engine_type_from_federation_source_slug(storage_slug),
+                connection=connection or sid,
+            )
+        else:
+            storage_slug = ""
+            binding = FederationSourceBinding(source_id=sid, engine="duckdb", connection=sid)
+        member_dir = _expected_member_artifacts_dir(
+            artifacts_root,
+            binding,
+            federation_id=federation_id,
+            storage_slug=storage_slug or None,
+        )
+        removed_path, bytes_reclaimed = purge_federation_member_artifacts(
+            federation_dir,
+            member_artifacts_dir=member_dir,
+            artifacts_root=artifacts_root,
+            source_id=sid,
+            federation_id=federation_id,
+            storage_slug=storage_slug,
+        )
+        notify(
+            f"Removed federation member {sid!r} artifacts from {removed_path!r}",
+            stage="artifact",
+            code=DIAGNOSTIC_CODE_FEDERATION_MEMBER_REMOVED,
+            source_id=sid,
+            details=(
+                ("phase", "shrink"),
+                ("bytes_reclaimed", str(bytes_reclaimed)),
+            ),
+        )
 
 
 def _qualified_column_on_member_graphs(
@@ -6189,6 +7350,55 @@ def detect_broken_cross_source_joins(
         if not left_ok or not right_ok:
             broken.append((join.left, join.right))
     return tuple(broken)
+
+
+def _member_column_overlap_sample(
+    member_graphs: Mapping[str, SchemaGraph],
+    manifest: FederationManifest,
+    qualified: str,
+    *,
+    mappings: FederationMappings | None = None,
+) -> frozenset[str]:
+    table_name, column_name = split_qualified_column(qualified, manifest=manifest)
+    namespace = manifest.table_namespace or derive_table_namespace(member_graphs, mappings)
+    source_id = namespace.get(table_name, "")
+    if not source_id and mappings is not None:
+        source_id = _physical_table_source(table_name, mappings)
+    if not source_id:
+        return frozenset()
+    graph = member_graphs.get(source_id)
+    if graph is None:
+        return frozenset()
+    table = graph.tables.get(table_name)
+    if table is None:
+        return frozenset()
+    meta = table.columns.get(column_name)
+    if meta is None:
+        return frozenset()
+    return frozenset(str(value) for value in (meta.value_overlap_sample or []) if str(value))
+
+
+def detect_unmapped_cross_source_references(
+    member_graphs: Mapping[str, SchemaGraph],
+    manifest: FederationManifest,
+    *,
+    mappings: FederationMappings | None = None,
+) -> tuple[str, ...]:
+    """Report declared cross-source join child values absent from the parent value sample."""
+    messages: list[str] = []
+    for join in manifest.cross_source_joins:
+        left_sample = _member_column_overlap_sample(member_graphs, manifest, join.left, mappings=mappings)
+        right_sample = _member_column_overlap_sample(member_graphs, manifest, join.right, mappings=mappings)
+        if not left_sample or not right_sample:
+            continue
+        unmapped = sorted(left_sample - right_sample, key=str)
+        if not unmapped:
+            continue
+        preview = ", ".join(unmapped[:5])
+        if len(unmapped) > 5:
+            preview = f"{preview}, ..."
+        messages.append(f"cross_source_join {join.left!r} -> {join.right!r} has unmapped child values: {preview}")
+    return tuple(messages)
 
 
 def apply_federation_migration_map(
@@ -6267,7 +7477,7 @@ def federation_member_roster_rows(
             (
                 binding.source_id,
                 str(binding.connection or ""),
-                federation_source_storage_slug(binding),
+                federation_source_storage_slug(binding, federation_id=manifest.federation_id),
                 str(graph.schema_graph_id or ""),
             )
         )
@@ -6355,6 +7565,45 @@ def validate_federated_sub_intent(sub_intent: RuntimeIntent, member_schema: Sche
     return None
 
 
+def validate_federation_mappings_applied_sidecar(federation_dir: str, mappings: FederationMappings) -> None:
+    """Refuse when the applied mappings sidecar references mappings absent from the live file."""
+    paths = federation_artifact_paths(federation_dir)
+    applied_path = paths["mappings_applied"]
+    if not os.path.isfile(applied_path):
+        return
+    try:
+        with open(applied_path, encoding="utf-8") as handle:
+            applied = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise FederationMappingsAppliedSidecarError(
+            f"applied federation mappings sidecar at {applied_path!r} is unreadable: {exc}"
+        ) from exc
+    if not isinstance(applied, dict):
+        raise FederationMappingsAppliedSidecarError(
+            f"applied federation mappings sidecar at {applied_path!r} is not a JSON object"
+        )
+    live_columns = {col.logical for col in mappings.logical_columns}
+    for entry in applied.get("logical_columns", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        logical = str(entry.get("logical", "") or "").strip()
+        if logical and logical not in live_columns:
+            raise FederationMappingsAppliedSidecarError(
+                f"applied federation mappings sidecar references logical column {logical!r} "
+                f"absent from {paths['mappings']!r}"
+            )
+    live_tables = {table.logical for table in mappings.logical_tables}
+    for entry in applied.get("logical_tables", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        logical = str(entry.get("logical", "") or "").strip()
+        if logical and logical not in live_tables:
+            raise FederationMappingsAppliedSidecarError(
+                f"applied federation mappings sidecar references logical table {logical!r} "
+                f"absent from {paths['mappings']!r}"
+            )
+
+
 def write_federation_mappings_applied_sidecar(federation_dir: str, mappings: FederationMappings) -> None:
     """Persist the applied federation mappings sidecar under *federation_dir*."""
     paths = federation_artifact_paths(federation_dir)
@@ -6383,19 +7632,193 @@ def write_federation_mappings_applied_sidecar(federation_dir: str, mappings: Fed
 
 def _write_federation_json_atomic(path: str, payload: Mapping[str, Any]) -> None:
     """Atomically write a JSON artifact under *path*."""
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path) or None, prefix=".fed_tmp_", suffix=".json")
+    abs_path, directory = _atomic_write_directory(path)
+    os.makedirs(directory, mode=ARTIFACT_DIR_MODE, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".fed_tmp_", suffix=".json")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
             handle.write("\n")
-        os.replace(tmp_path, path)
+        os.replace(tmp_path, abs_path)
+        try:
+            os.chmod(abs_path, ARTIFACT_FILE_MODE)
+        except OSError:
+            pass
     except Exception:
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
         raise
+
+
+def _federation_persist_quad_coherent(federation_dir: str) -> bool:
+    """Return True when the four core federation artifacts form one committed set."""
+    paths = federation_artifact_paths(federation_dir)
+    keys = ("manifest", "mappings", "composite_schema", "artifact_manifest")
+    present = [key for key in keys if os.path.isfile(paths[key])]
+    if not present:
+        return True
+    if len(present) != len(keys):
+        return False
+    stored = _load_federation_artifact_manifest_dict(paths["artifact_manifest"])
+    if stored is None:
+        return False
+    try:
+        with open(paths["manifest"], encoding="utf-8") as handle:
+            manifest_payload = json.load(handle)
+        with open(paths["mappings"], encoding="utf-8") as handle:
+            mappings_payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(manifest_payload, dict) or not isinstance(mappings_payload, dict):
+        return False
+    try:
+        manifest = parse_federation_manifest(manifest_payload)
+        mappings = parse_federation_mappings(mappings_payload)
+    except FederationConfigError:
+        return False
+    if str(stored.get("manifest_hash", "") or "") != manifest_hash(manifest):
+        return False
+    if str(stored.get("mappings_hash", "") or "") != mappings_hash(mappings):
+        return False
+    return True
+
+
+def _backup_federation_live_artifact(path: str, federation_dir: str) -> str | None:
+    if not os.path.isfile(path):
+        return None
+    fd, backup = tempfile.mkstemp(prefix=".rollback_", dir=federation_dir)
+    os.close(fd)
+    shutil.copy2(path, backup)
+    return backup
+
+
+def _commit_federation_staged_replaces(
+    federation_dir: str,
+    staged_pairs: Sequence[tuple[str, str]],
+) -> None:
+    """Replace live federation artifacts from pre-staged paths; roll back on failure."""
+    backups: list[tuple[str | None, str]] = []
+    committed: list[str] = []
+    try:
+        for _staging, live in staged_pairs:
+            backups.append((_backup_federation_live_artifact(live, federation_dir), live))
+        for staging, live in staged_pairs:
+            if not os.path.isfile(staging):
+                raise FederationConfigError(f"federation staging file missing at {staging!r}")
+            os.replace(staging, live)
+            committed.append(live)
+            try:
+                os.chmod(live, ARTIFACT_FILE_MODE)
+            except OSError:
+                pass
+    except BaseException:
+        for backup, live in reversed(backups):
+            if live not in committed:
+                continue
+            if backup and os.path.isfile(backup):
+                os.replace(backup, live)
+            else:
+                try:
+                    os.remove(live)
+                except OSError:
+                    pass
+        raise
+    finally:
+        for backup, _live in backups:
+            if backup and os.path.isfile(backup):
+                try:
+                    os.unlink(backup)
+                except OSError:
+                    pass
+
+
+def _commit_federation_persist_quad(
+    federation_dir: str,
+    *,
+    manifest_path: str,
+    manifest_payload: Mapping[str, Any],
+    mappings_path: str,
+    mappings_payload: Mapping[str, Any],
+    composite_path: str,
+    composite_payload: Mapping[str, Any],
+    artifact_manifest_path: str,
+    artifact_manifest_payload: Mapping[str, Any],
+) -> None:
+    """Stage federation manifest, mappings, composite, and artifact manifest, then commit atomically."""
+    staging_dir = os.path.join(federation_dir, ".fed_quad_staging")
+    if os.path.isdir(staging_dir):
+        shutil.rmtree(staging_dir, ignore_errors=True)
+    os.makedirs(staging_dir, mode=ARTIFACT_DIR_MODE, exist_ok=True)
+    try:
+        manifest_staging = os.path.join(staging_dir, os.path.basename(manifest_path))
+        mappings_staging = os.path.join(staging_dir, os.path.basename(mappings_path))
+        composite_staging = os.path.join(staging_dir, os.path.basename(composite_path))
+        artifact_staging = os.path.join(staging_dir, os.path.basename(artifact_manifest_path))
+        _write_federation_json_atomic(manifest_staging, manifest_payload)
+        _write_federation_json_atomic(mappings_staging, mappings_payload)
+        write_gzip_json_atomic(composite_staging, composite_payload, sort_keys=True)
+        _write_federation_json_atomic(artifact_staging, artifact_manifest_payload)
+        _commit_federation_staged_replaces(
+            federation_dir,
+            (
+                (manifest_staging, manifest_path),
+                (mappings_staging, mappings_path),
+                (composite_staging, composite_path),
+                (artifact_staging, artifact_manifest_path),
+            ),
+        )
+    finally:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+
+
+def _federation_composite_hash_manifest_payload(stored: Mapping[str, Any], composite: SchemaGraph) -> dict[str, Any]:
+    semantic_edges_hash = federation_composite_semantic_edges_hash(composite)
+    composite.semantic_edges_hash = semantic_edges_hash
+    updated = dict(stored)
+    updated.update(
+        {
+            "schema_graph_id": str(composite.schema_graph_id or ""),
+            "structural_hash": str(composite.structural_hash or ""),
+            "profiling_hash": str(composite.profiling_hash or ""),
+            "scope_hash": str(composite.scope_hash or ""),
+            "effective_structural_hash": str(composite.effective_structural_hash or ""),
+            "notes_hash": str(composite.notes_hash or ""),
+            "semantic_edges_hash": semantic_edges_hash,
+            "ddl_probe_hash": str(composite.ddl_probe_hash or ""),
+            "schema_revision": int(getattr(composite, "schema_revision", 0) or 0),
+        }
+    )
+    return updated
+
+
+def _commit_federation_composite_hash_pair(federation_dir: str, composite: SchemaGraph) -> None:
+    paths = federation_artifact_paths(federation_dir)
+    stored = _load_federation_artifact_manifest_dict(paths["artifact_manifest"])
+    if stored is None:
+        return
+    staging_dir = os.path.join(federation_dir, ".fed_quad_staging")
+    if os.path.isdir(staging_dir):
+        shutil.rmtree(staging_dir, ignore_errors=True)
+    os.makedirs(staging_dir, mode=ARTIFACT_DIR_MODE, exist_ok=True)
+    try:
+        composite_staging = os.path.join(staging_dir, os.path.basename(paths["composite_schema"]))
+        artifact_staging = os.path.join(staging_dir, os.path.basename(paths["artifact_manifest"]))
+        write_gzip_json_atomic(composite_staging, composite.to_dict(), sort_keys=True)
+        _refresh_federation_artifact_manifest_hashes(federation_dir, composite)
+        if not os.path.isfile(artifact_staging):
+            payload = _federation_composite_hash_manifest_payload(stored, composite)
+            _write_federation_json_atomic(artifact_staging, payload)
+        _commit_federation_staged_replaces(
+            federation_dir,
+            (
+                (composite_staging, paths["composite_schema"]),
+                (artifact_staging, paths["artifact_manifest"]),
+            ),
+        )
+    finally:
+        shutil.rmtree(staging_dir, ignore_errors=True)
 
 
 def _normalize_stored_member_hash_row(row: Sequence[Any]) -> tuple[str, str, str, str, str, str]:
@@ -6470,32 +7893,35 @@ def manifest_hash(manifest: FederationManifest) -> str:
 
 def archive_federation_mappings_file(path: str) -> str:
     """Archive a federation mappings editor file to ``applied_federation_mappings.json``."""
-    if not path.endswith(".json"):
+    if Path(path).suffix.lower() != ".json":
         raise FederationConfigError(f"expected JSON editor file: {path!r}")
     directory = os.path.dirname(path) or "."
     archive = os.path.join(directory, FEDERATION_MAPPINGS_APPLIED_FILENAME)
     with open(path, encoding="utf-8") as src:
         content = src.read()
-    with open(archive, "w", encoding="utf-8") as dst:
-        dst.write(content)
+    write_text_atomic(archive, content)
     return archive
 
 
 def archive_federation_editor_file(path: str) -> str:
     """Archive an editor JSON file to ``*.applied.json`` and return archive path."""
-    if not path.endswith(".json"):
+    if Path(path).suffix.lower() != ".json":
         raise FederationConfigError(f"expected JSON editor file: {path!r}")
     archive = path.replace(".json", SCHEMA_OVERRIDES_APPLIED_SUFFIX)
     with open(path, encoding="utf-8") as src:
         content = src.read()
-    with open(archive, "w", encoding="utf-8") as dst:
-        dst.write(content)
+    write_text_atomic(archive, content)
     return archive
 
 
-def export_federation_composite_overrides(composite: SchemaGraph, target: str | os.PathLike[str]) -> Path:
+def export_federation_composite_overrides(
+    composite: SchemaGraph,
+    target: str | os.PathLike[str],
+    *,
+    business_knowledge: Sequence[BusinessKnowledgeEntry] | None = None,
+) -> Path:
     """Write composite schema overrides for review beside the federation composite graph."""
-    return dump_schema_overrides_to_path(composite, target)
+    return dump_schema_overrides_to_path(composite, Path(target), business_knowledge=business_knowledge)
 
 
 def _merge_override_document_with_sidecar(
@@ -6551,29 +7977,18 @@ def _refresh_federation_artifact_manifest_hashes(federation_dir: str, composite:
     stored = _load_federation_artifact_manifest_dict(paths["artifact_manifest"])
     if stored is None:
         return
-    semantic_edges_hash = federation_composite_semantic_edges_hash(composite)
-    composite.semantic_edges_hash = semantic_edges_hash
-    stored.update(
-        {
-            "schema_graph_id": str(composite.schema_graph_id or ""),
-            "structural_hash": str(composite.structural_hash or ""),
-            "profiling_hash": str(composite.profiling_hash or ""),
-            "scope_hash": str(composite.scope_hash or ""),
-            "effective_structural_hash": str(composite.effective_structural_hash or ""),
-            "notes_hash": str(composite.notes_hash or ""),
-            "semantic_edges_hash": semantic_edges_hash,
-            "ddl_probe_hash": str(composite.ddl_probe_hash or ""),
-            "schema_revision": int(getattr(composite, "schema_revision", 0) or 0),
-        }
-    )
-    _write_federation_json_atomic(paths["artifact_manifest"], stored)
+    payload = _federation_composite_hash_manifest_payload(stored, composite)
+    staging_dir = os.path.join(federation_dir, ".fed_quad_staging")
+    staged_manifest = os.path.join(staging_dir, os.path.basename(paths["artifact_manifest"]))
+    if os.path.isdir(staging_dir):
+        _write_federation_json_atomic(staged_manifest, payload)
+        return
+    _write_federation_json_atomic(paths["artifact_manifest"], payload)
 
 
 def _persist_federation_composite_schema_cache(federation_dir: str, composite: SchemaGraph) -> None:
-    composite_path = federation_artifact_paths(federation_dir)["composite_schema"]
     with artifact_lock(federation_dir):
-        write_gzip_json_atomic(composite_path, composite.to_dict(), sort_keys=True)
-    _refresh_federation_artifact_manifest_hashes(federation_dir, composite)
+        _commit_federation_composite_hash_pair(federation_dir, composite)
 
 
 def apply_federation_composite_overrides(
@@ -6585,12 +8000,31 @@ def apply_federation_composite_overrides(
 ) -> OverrideReport:
     """Apply an overrides editor file to the composite graph and persist replay state."""
     composite_path = federation_artifact_paths(federation_dir)["composite_schema"]
-    document = load_schema_overrides_file(overrides_path)
+    document = load_schema_overrides_file(Path(overrides_path))
     sidecar = load_overrides_sidecar(composite_path) or {}
     document = _merge_override_document_with_sidecar(document, sidecar)
     report = apply_schema_overrides_to_graph(composite, document, dialect=dialect, strict=True)
     document["foreign_keys_add"] = user_added_fks_dump(composite)
     document["primary_keys_add"] = user_added_pks_dump(composite)
+    bk_entries, bk_refined = apply_document_business_knowledge(document, composite)
+    report = OverrideReport(
+        table_edits=report.table_edits,
+        column_edits=report.column_edits,
+        fks_added=report.fks_added,
+        fks_endorsed=report.fks_endorsed,
+        fks_removed=report.fks_removed,
+        pks_added=report.pks_added,
+        pks_endorsed=report.pks_endorsed,
+        pks_blocked=report.pks_blocked,
+        changed_pk_blocks=report.changed_pk_blocks,
+        changed_fk_blocks=report.changed_fk_blocks,
+        coerced_columns=report.coerced_columns,
+        collapsed_inferences=report.collapsed_inferences,
+        descriptions_refined=report.descriptions_refined,
+        business_knowledge_refined=bk_refined,
+        business_knowledge_entries=bk_entries,
+        skipped=report.skipped,
+    )
     save_overrides_sidecar(
         composite_path,
         document,
@@ -6641,16 +8075,29 @@ def federation_artifact_paths(federation_dir: str) -> dict[str, str]:
     }
 
 
-def compute_federation_storage_dir(artifacts_root: str | None, federation_id: str) -> str:
+def compute_federation_storage_dir(
+    artifacts_root: str | None,
+    federation_id: str,
+    *,
+    tenant_slug: str | None = None,
+) -> str:
     """Return the absolute federation artifact directory ``fed_<federation_id>``."""
-    parent = (
-        os.path.abspath(os.path.expanduser(str(artifacts_root)))
-        if artifacts_root and str(artifacts_root).strip()
-        else user_data_dir(appname="aetherdialect", appauthor=False)
-    )
+    if artifacts_root and str(artifacts_root).strip():
+        parent = os.path.abspath(os.path.expanduser(str(artifacts_root)))
+    else:
+        parent = user_data_dir(appname="aetherdialect", appauthor=False)
+        _require_default_artifacts_root_writable(parent)
     safe_id = str(federation_id).strip()
     if not safe_id:
         raise FederationConfigError("federation_id must be non-empty")
+    if tenant_slug is not None and str(tenant_slug).strip():
+        tenant_segment = sanitize_tenant_slug(tenant_slug)
+        return os.path.join(
+            parent,
+            ARTIFACT_DIRECTORY_SEGMENT,
+            tenant_segment,
+            f"{FEDERATION_STORAGE_PREFIX}{safe_id}",
+        )
     return os.path.join(parent, ARTIFACT_DIRECTORY_SEGMENT, f"{FEDERATION_STORAGE_PREFIX}{safe_id}")
 
 
@@ -6671,12 +8118,9 @@ def source_ids_for_intent(
     return frozenset(sources)
 
 
-def _federation_artifact_format_version_from_manifest(stored: Mapping[str, Any]) -> int | None:
-    stored_fmt = stored.get("artifact_format_version")
-    try:
-        return int(stored_fmt) if stored_fmt is not None else None
-    except (TypeError, ValueError):
-        return None
+def _federation_artifact_format_version_from_manifest(stored: Mapping[str, Any]) -> str | None:
+    stored_fmt = coerce_format_version(stored.get("artifact_format_version"))
+    return stored_fmt or None
 
 
 def _raise_federation_artifact_format_version_mismatch(
@@ -6684,9 +8128,13 @@ def _raise_federation_artifact_format_version_mismatch(
     manifest_path: str,
     federation_dir: str,
 ) -> None:
-    stored_fmt = stored.get("artifact_format_version")
+    if _try_migrate_federation_artifact_format(federation_dir, stored):
+        reloaded = _load_federation_artifact_manifest_dict(manifest_path)
+        if reloaded is not None:
+            stored = reloaded
+    stored_fmt = coerce_format_version(stored.get("artifact_format_version"))
     found_fmt = _federation_artifact_format_version_from_manifest(stored)
-    if found_fmt != FEDERATION_ARTIFACT_FORMAT_VERSION:
+    if not format_versions_match(found_fmt, FEDERATION_ARTIFACT_FORMAT_VERSION):
         raise FederationConfigError(
             f"federation artifact manifest at {manifest_path!r} has "
             f"artifact_format_version {stored_fmt!r}; this build expects "
@@ -6694,6 +8142,178 @@ def _raise_federation_artifact_format_version_mismatch(
             f"directory {federation_dir!r} and re-run federation initialization "
             f"so the tree is rebuilt from scratch."
         )
+
+
+def _federation_join_feedback_dir(federation_dir: str) -> str:
+    return os.path.join(federation_dir, FEDERATION_TEMPLATES_SEGMENT, FEDERATION_JOIN_FEEDBACK_SEGMENT)
+
+
+def _federation_join_feedback_shard_path(federation_dir: str, part: int) -> str:
+    return os.path.join(
+        _federation_join_feedback_dir(federation_dir),
+        f"{FEDERATION_JOIN_FEEDBACK_PREFIX}{part:02x}.json.gz",
+    )
+
+
+def _federation_join_feedback_partition_number(q_norm: str) -> int:
+    return int(hashlib.sha256(q_norm.encode("utf-8")).hexdigest()[:2], 16)
+
+
+def _load_federation_join_feedback_shard(federation_dir: str, part: int) -> dict[str, list[str]]:
+    path = _federation_join_feedback_shard_path(federation_dir, part)
+    if not os.path.isfile(path):
+        return {}
+    try:
+        raw = read_gzip_json(path)
+    except (OSError, EOFError, json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        return {}
+    out: dict[str, list[str]] = {}
+    if isinstance(raw, dict):
+        for qk, rows in raw.items():
+            if isinstance(rows, list):
+                out[str(qk)] = [str(x) for x in rows if str(x).strip()]
+    return out
+
+
+def _write_federation_join_feedback_shard(federation_dir: str, part: int, payload: dict[str, list[str]]) -> None:
+    path = _federation_join_feedback_shard_path(federation_dir, part)
+    if not payload:
+        if os.path.isfile(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        return
+    os.makedirs(os.path.dirname(path), mode=ARTIFACT_DIR_MODE, exist_ok=True)
+    write_gzip_json_atomic(path, payload, sort_keys=True)
+
+
+def _lookup_federation_join_feedback_for_question(federation_dir: str, q_norm: str) -> list[str]:
+    part = _federation_join_feedback_partition_number(q_norm)
+    shard = _load_federation_join_feedback_shard(federation_dir, part)
+    return list(shard.get(q_norm, []))
+
+
+def _append_federation_join_feedback_for_question(federation_dir: str, q_norm: str, summary: str) -> None:
+    text = str(summary or "").strip()
+    if not text or not q_norm:
+        return
+    part = _federation_join_feedback_partition_number(q_norm)
+    shard = _load_federation_join_feedback_shard(federation_dir, part)
+    rows = list(shard.get(q_norm, []))
+    if text in rows:
+        return
+    rows.append(text)
+    shard[q_norm] = rows
+    _write_federation_join_feedback_shard(federation_dir, part, shard)
+
+
+def _migrate_federation_join_feedback_from_plans(federation_dir: str) -> dict[str, tuple[str, ...]]:
+    path = federation_artifact_paths(federation_dir)["plan_templates"]
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            loaded = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(loaded, dict):
+        return {}
+    migrated_rows: dict[str, tuple[str, ...]] = {}
+    cleaned: dict[str, Any] = {}
+    for plan_id, row in loaded.items():
+        if not isinstance(row, dict):
+            continue
+        join_fb = row.get("join_feedback")
+        if isinstance(join_fb, list) and join_fb:
+            question = str(row.get("question", "") or "")
+            q_norm = normalize_question(question) if question else ""
+            texts = tuple(str(item).strip() for item in join_fb if str(item).strip())
+            if texts:
+                migrated_rows[str(plan_id)] = texts
+            if q_norm:
+                for text in texts:
+                    _append_federation_join_feedback_for_question(federation_dir, q_norm, text)
+        cleaned_row = {k: v for k, v in row.items() if k != "join_feedback"}
+        cleaned[str(plan_id)] = cleaned_row
+    if migrated_rows:
+        with artifact_lock(federation_dir):
+            if cleaned:
+                _write_federation_json_atomic(path, cleaned)
+            elif os.path.isfile(path):
+                os.remove(path)
+    return migrated_rows
+
+
+def _migrate_federation_artifact_format_v10_to_v11(federation_dir: str) -> bool:
+    manifest_path = federation_artifact_paths(federation_dir)["artifact_manifest"]
+    stored = _load_federation_artifact_manifest_dict(manifest_path)
+    if stored is None:
+        return False
+    federation_id = str(stored.get("federation_id", "") or "").strip()
+    if not federation_id:
+        return False
+    artifacts_root = os.path.dirname(os.path.dirname(federation_dir))
+    roster_raw = stored.get("federation_member_roster")
+    if not isinstance(roster_raw, list):
+        roster_raw = []
+    migrated = False
+    updated_roster: list[list[str]] = []
+    for entry in roster_raw:
+        if not isinstance(entry, (list, tuple)) or len(entry) < 3:
+            continue
+        source_id = str(entry[0] or "").strip()
+        connection = str(entry[1] or "").strip()
+        storage_slug = str(entry[2] or "").strip()
+        schema_graph_id = str(entry[3] or "") if len(entry) >= 4 else ""
+        binding = FederationSourceBinding(
+            source_id=source_id,
+            engine=_engine_type_from_federation_source_slug(storage_slug),
+            connection=connection or source_id,
+        )
+        legacy_dir = _expected_member_artifacts_dir(artifacts_root, binding, storage_slug=storage_slug)
+        new_dir = federation_source_artifacts_dir(artifacts_root, binding, federation_id=federation_id)
+        new_slug = federation_source_storage_slug(binding, federation_id=federation_id)
+        needs_slug_update = storage_slug != new_slug
+        if os.path.abspath(legacy_dir) != os.path.abspath(new_dir) and os.path.isdir(legacy_dir):
+            os.makedirs(os.path.dirname(new_dir), mode=ARTIFACT_DIR_MODE, exist_ok=True)
+            if os.path.isdir(new_dir):
+                shutil.rmtree(new_dir, ignore_errors=True)
+            shutil.move(legacy_dir, new_dir)
+            migrated = True
+        target_dir = new_dir if os.path.isdir(new_dir) else legacy_dir
+        if needs_slug_update and os.path.isdir(target_dir):
+            write_federation_member_manifest(target_dir, binding, federation_id=federation_id)
+            migrated = True
+        updated_roster.append([source_id, connection, new_slug, schema_graph_id])
+    if not migrated:
+        return False
+    stored["federation_member_roster"] = updated_roster
+    stored["artifact_format_version"] = FEDERATION_ARTIFACT_FORMAT_VERSION
+    with artifact_lock(federation_dir):
+        _write_federation_json_atomic(manifest_path, stored)
+    return True
+
+
+def _migrate_federation_artifact_format_v9_to_v10(federation_dir: str) -> bool:
+    migrated_join = _migrate_federation_join_feedback_from_plans(federation_dir)
+    manifest_path = federation_artifact_paths(federation_dir)["artifact_manifest"]
+    stored = _load_federation_artifact_manifest_dict(manifest_path)
+    if stored is None:
+        return bool(migrated_join)
+    stored["artifact_format_version"] = FEDERATION_ARTIFACT_FORMAT_VERSION
+    with artifact_lock(federation_dir):
+        _write_federation_json_atomic(manifest_path, stored)
+    return True
+
+
+def _try_migrate_federation_artifact_format(federation_dir: str, stored: Mapping[str, Any]) -> bool:
+    """Return True only when an in-place migration updated *stored*. Package-symmetric string format versions have no legacy int ladder; mismatched trees fail closed at the caller's version gate."""
+    _ = federation_dir
+    found_fmt = _federation_artifact_format_version_from_manifest(stored)
+    if format_versions_match(found_fmt, FEDERATION_ARTIFACT_FORMAT_VERSION):
+        return False
+    return False
 
 
 def _load_federation_artifact_manifest_dict(manifest_path: str) -> dict[str, Any] | None:
@@ -6734,31 +8354,57 @@ def mappings_replay_matches(
     """
     paths = federation_artifact_paths(federation_dir)
     manifest_path = paths["artifact_manifest"]
+    if not _federation_persist_quad_coherent(federation_dir):
+        return False
     stored = _load_federation_artifact_manifest_dict(manifest_path)
     if stored is None:
         return False
     _raise_federation_artifact_format_version_mismatch(stored, manifest_path, federation_dir)
+    validate_federation_mappings_applied_sidecar(federation_dir, mappings)
     live_members = federation_member_hash_tuple(member_graphs, manifest)
     stored_members = stored.get("federation_members")
     if not isinstance(stored_members, list):
         return False
-    stored_tuple = tuple(_normalize_stored_member_hash_row(entry) for entry in stored_members)
+    active_ids = {binding.source_id for binding in manifest.sources}
+    if not active_ids:
+        active_ids = set(member_graphs.keys())
+    for entry in stored_members:
+        if isinstance(entry, (list, tuple)) and entry:
+            _normalize_stored_member_hash_row(entry)
+    stored_member_ids = {str(entry[0]) for entry in stored_members if isinstance(entry, (list, tuple)) and entry}
+    topology_shrink_only = bool(stored_member_ids - active_ids) and not (active_ids - stored_member_ids)
+    stored_tuple = tuple(
+        _normalize_stored_member_hash_row(entry)
+        for entry in stored_members
+        if isinstance(entry, (list, tuple)) and entry and str(entry[0]) in active_ids
+    )
     if stored_tuple != live_members:
         return False
-    stored_mappings_hash = str(stored.get("mappings_hash", "") or "")
-    stored_manifest_hash = str(stored.get("manifest_hash", "") or "")
-    if stored_mappings_hash != mappings_hash(mappings) or stored_manifest_hash != manifest_hash(manifest):
-        return False
+    if not topology_shrink_only:
+        stored_mappings_hash = str(stored.get("mappings_hash", "") or "")
+        if stored_mappings_hash != mappings_hash(mappings):
+            return False
+        stored_manifest_hash = str(stored.get("manifest_hash", "") or "")
+        if stored_manifest_hash != manifest_hash(manifest):
+            return False
     return True
 
 
 def federation_artifact_manifest_view(federation_dir: str) -> ArtifactManifest | None:
     """Build a migration-tier view of the federation composite artifact manifest."""
+    if not _federation_persist_quad_coherent(federation_dir):
+        return None
     stored_raw = _load_federation_artifact_manifest_dict(federation_artifact_paths(federation_dir)["artifact_manifest"])
     if stored_raw is None:
         return None
+    try:
+        ver = coerce_format_version(stored_raw.get("artifact_format_version", "0") or "0")
+    except (TypeError, ValueError):
+        ver = "0"
     return ArtifactManifest(
-        artifact_format_version=0,
+        artifact_format_version=ver,
+        created_with_package_version=str(stored_raw.get("created_with_package_version", "") or ""),
+        min_compatible_package_version=str(stored_raw.get("min_compatible_package_version", "") or ""),
         structural_hash=str(stored_raw.get("structural_hash", "") or ""),
         profiling_hash=str(stored_raw.get("profiling_hash", "") or ""),
         scope_hash=str(stored_raw.get("scope_hash", "") or ""),
@@ -6791,7 +8437,7 @@ def persist_federation_tree(
     mappings_editor_path: str | None = None,
 ) -> None:
     """Write federation manifest, mappings, composite graph, and artifact manifest."""
-    os.makedirs(federation_dir, exist_ok=True)
+    os.makedirs(federation_dir, mode=ARTIFACT_DIR_MODE, exist_ok=True)
     paths = federation_artifact_paths(federation_dir)
     manifest_payload = federation_manifest_document(manifest)
     mappings_payload = {
@@ -6825,6 +8471,8 @@ def persist_federation_tree(
     composite.semantic_edges_hash = semantic_edges_hash
     artifact_payload = {
         "artifact_format_version": FEDERATION_ARTIFACT_FORMAT_VERSION,
+        "created_with_package_version": artifact_package_version_string(),
+        "min_compatible_package_version": MIN_COMPATIBLE_PACKAGE_VERSION,
         "federation_id": manifest.federation_id,
         "manifest_hash": manifest_hash(manifest),
         "mappings_hash": mappings_hash(mappings),
@@ -6841,15 +8489,32 @@ def persist_federation_tree(
         "schema_revision": int(getattr(composite, "schema_revision", 0) or 0),
     }
     with artifact_lock(federation_dir):
-        _write_federation_json_atomic(paths["manifest"], manifest_payload)
-        _write_federation_json_atomic(paths["mappings"], mappings_payload)
-        write_gzip_json_atomic(paths["composite_schema"], composite.to_dict(), sort_keys=True)
-        _write_federation_json_atomic(paths["artifact_manifest"], artifact_payload)
+        _commit_federation_persist_quad(
+            federation_dir,
+            manifest_path=paths["manifest"],
+            manifest_payload=manifest_payload,
+            mappings_path=paths["mappings"],
+            mappings_payload=mappings_payload,
+            composite_path=paths["composite_schema"],
+            composite_payload=composite.to_dict(),
+            artifact_manifest_path=paths["artifact_manifest"],
+            artifact_manifest_payload=artifact_payload,
+        )
+        write_federation_mappings_applied_sidecar(federation_dir, mappings)
+        fed_id = str(manifest.federation_id or "").strip()
+        for binding in manifest.sources:
+            member_dir = federation_source_artifacts_dir(
+                os.path.dirname(os.path.dirname(federation_dir)),
+                binding,
+                federation_id=fed_id or None,
+            )
+            if os.path.isdir(member_dir):
+                write_federation_member_manifest(member_dir, binding, federation_id=fed_id)
     if manifest_editor_path and os.path.isfile(manifest_editor_path):
         archive_federation_editor_file(manifest_editor_path)
     if mappings_editor_path and os.path.isfile(mappings_editor_path):
         archive_federation_mappings_file(mappings_editor_path)
-    os.makedirs(os.path.dirname(paths["plan_templates"]), exist_ok=True)
+    os.makedirs(os.path.dirname(paths["plan_templates"]), mode=ARTIFACT_DIR_MODE, exist_ok=True)
 
 
 def load_federation_composite_graph(federation_dir: str) -> SchemaGraph | None:
@@ -6871,6 +8536,8 @@ def load_federation_composite_graph(federation_dir: str) -> SchemaGraph | None:
     """
     path = federation_artifact_paths(federation_dir)["composite_schema"]
     manifest_path = federation_artifact_paths(federation_dir)["artifact_manifest"]
+    if not _federation_persist_quad_coherent(federation_dir):
+        return None
     stored_manifest = _load_federation_artifact_manifest_dict(manifest_path)
     if stored_manifest is not None:
         _raise_federation_artifact_format_version_mismatch(stored_manifest, manifest_path, federation_dir)
@@ -6922,7 +8589,10 @@ def _engine_type_from_federation_source_slug(slug: str) -> str:
         return "duckdb"
     rest = text[len(FEDERATION_SOURCE_STORAGE_PREFIX) :]
     engine, _, _ = rest.partition("_")
-    return engine or "duckdb"
+    candidate = engine or "duckdb"
+    if candidate in DialectRegistry.list_engines():
+        return candidate
+    return "duckdb"
 
 
 def _binding_from_persisted_roster_row(row: Sequence[str]) -> FederationSourceBinding:
@@ -6939,13 +8609,15 @@ def _binding_from_persisted_roster_row(row: Sequence[str]) -> FederationSourceBi
         source_id=source_id,
         engine=_engine_type_from_federation_source_slug(storage_slug),
         connection=connection or source_id,
-        role="owner",
+        role=SchemaRole.OWNER,
     )
 
 
 def load_persisted_federation_roster_rows(federation_dir: str) -> tuple[tuple[str, str, str, str], ...]:
     """Load pinned roster rows from a federation artifact manifest."""
     paths = federation_artifact_paths(federation_dir)
+    if not _federation_persist_quad_coherent(federation_dir):
+        raise FederationConfigError(f"federation artifact tree at {federation_dir!r} is incomplete or torn")
     stored = _load_federation_artifact_manifest_dict(paths["artifact_manifest"])
     if stored is None:
         raise FederationConfigError(f"federation artifact tree not found at {federation_dir!r}")
@@ -7069,8 +8741,8 @@ def federation_plan_combine_hash(plan: FederatedPlan) -> str:
 def _residual_spec_hash_payload(residual: ResidualSpec | None) -> dict[str, Any]:
     if residual is None:
         return {"kind": "none"}
-    where_leaves = _predicate_where_leaves(residual.where)
-    having_leaves = _predicate_having_leaves(residual.having)
+    where_leaves = PredicateGroup.where_leaves(residual.where)
+    having_leaves = PredicateGroup.having_leaves(residual.having)
     return {
         "kind": "residual",
         "select_cols": [sc.expr.column_ref or sc.expr.primary_term for sc in residual.select_cols],
@@ -7144,9 +8816,11 @@ def federation_plan_step_fingerprints(
     intent_key_fn: Callable[[RuntimeIntent], str],
     manifest: FederationManifest | None = None,
     member_graphs: Mapping[str, SchemaGraph] | None = None,
+    temporal_bind: AnchoredTemporalBind | None = None,
 ) -> tuple[tuple[str, str], ...]:
     """Ordered per-source sub-intent fingerprints for template matching."""
     out: list[tuple[str, str]] = []
+    anchor_fp = temporal_bind.anchor_iso if temporal_bind is not None else ""
     for step in plan.steps:
         grain = step.sub_intent.grain or "row_level"
         if grain not in VALID_GRAINS:
@@ -7176,7 +8850,7 @@ def federation_plan_step_fingerprints(
                 step.source_id,
                 (
                     f"{intent_key_fn(step.sub_intent)}:{grain}:{params_fp}:{proj_fp}:{limits_fp}:"
-                    f"{schema_graph_id}:{join_fp}"
+                    f"{schema_graph_id}:{join_fp}:{anchor_fp}"
                 ),
             )
         )
@@ -7288,9 +8962,11 @@ def _enforce_federation_plan_template_file_cap(
     return existing
 
 
-def delete_federation_plan_template(federation_dir: str, plan_id: str, *, schema_role: SchemaRole = "owner") -> None:
+def delete_federation_plan_template(
+    federation_dir: str, plan_id: str, *, schema_role: SchemaRole = SchemaRole.OWNER
+) -> None:
     """Remove one federation plan template record when it has no accepted questions."""
-    if schema_role != "owner":
+    if schema_role != SchemaRole.OWNER:
         raise OwnerOnlyOperationError("delete_federation_plan_template")
     pid = str(plan_id or "").strip()
     if not federation_dir or not pid:
@@ -7315,7 +8991,7 @@ def delete_federation_plan_template(federation_dir: str, plan_id: str, *, schema
 
 
 def delete_unaccepted_federation_plan_template(
-    federation_dir: str, plan_id: str, *, schema_role: SchemaRole = "owner"
+    federation_dir: str, plan_id: str, *, schema_role: SchemaRole = SchemaRole.OWNER
 ) -> None:
     """Drop a plan record that was never credited with an accepted question."""
     if not federation_dir or not plan_id:
@@ -7327,46 +9003,49 @@ def delete_unaccepted_federation_plan_template(
 
 
 def save_federation_plan_template(
-    federation_dir: str, template: FederationPlanTemplate, *, schema_role: SchemaRole = "owner"
+    federation_dir: str, template: FederationPlanTemplate, *, schema_role: SchemaRole = SchemaRole.OWNER
 ) -> None:
     """Append or replace a federation plan template in the federation tree."""
-    if schema_role != "owner":
+    if schema_role != SchemaRole.OWNER:
         raise OwnerOnlyOperationError("save_federation_plan_template")
     paths = federation_artifact_paths(federation_dir)
-    os.makedirs(os.path.dirname(paths["plan_templates"]), exist_ok=True)
-    existing: dict[str, Any] = {}
-    if os.path.isfile(paths["plan_templates"]):
-        try:
-            with open(paths["plan_templates"], encoding="utf-8") as handle:
-                loaded = json.load(handle)
-            if isinstance(loaded, dict):
-                existing = loaded
-        except (OSError, json.JSONDecodeError) as exc:
-            raise FederationConfigError(
-                f"corrupt federation plan templates file: {paths['plan_templates']!r}: {exc}"
-            ) from exc
+    os.makedirs(os.path.dirname(paths["plan_templates"]), mode=ARTIFACT_DIR_MODE, exist_ok=True)
     bounded_accepted = _bound_federation_plan_accepted_questions(template.accepted_questions)
-    existing[template.plan_id] = {
-        "format_version": int(template.format_version),
+    row: dict[str, Any] = {
+        "format_version": coerce_format_version(template.format_version),
         "composite_schema_graph_id": template.composite_schema_graph_id,
         "intent_key": template.intent_key,
-        "step_fingerprints": [list(row) for row in template.step_fingerprints],
+        "step_fingerprints": [list(part) for part in template.step_fingerprints],
         "combine_hash": template.combine_hash,
         "question": template.question,
         "accepted_questions": list(bounded_accepted),
-        "member_template_ids": [list(row) for row in template.member_template_ids],
+        "member_template_ids": [list(part) for part in template.member_template_ids],
         "residual_hash": template.residual_hash,
-        "join_feedback": list(template.join_feedback),
         "manifest_hash": template.manifest_hash,
         "member_tuple_hash": template.member_tuple_hash,
     }
-    existing = _enforce_federation_plan_template_file_cap(existing, keep_plan_id=template.plan_id)
+    if template.join_feedback:
+        row["join_feedback"] = list(template.join_feedback)
     with artifact_lock(federation_dir):
+        existing: dict[str, Any] = {}
+        if os.path.isfile(paths["plan_templates"]):
+            try:
+                with open(paths["plan_templates"], encoding="utf-8") as handle:
+                    loaded = json.load(handle)
+                if isinstance(loaded, dict):
+                    existing = loaded
+            except (OSError, json.JSONDecodeError) as exc:
+                raise FederationConfigError(
+                    f"corrupt federation plan templates file: {paths['plan_templates']!r}: {exc}"
+                ) from exc
+        existing[template.plan_id] = row
+        existing = _enforce_federation_plan_template_file_cap(existing, keep_plan_id=template.plan_id)
         _write_federation_json_atomic(paths["plan_templates"], existing)
 
 
 def load_federation_plan_templates(federation_dir: str) -> dict[str, FederationPlanTemplate]:
     """Load federation plan templates keyed by plan id."""
+    migrated_join_feedback = _migrate_federation_join_feedback_from_plans(federation_dir)
     path = federation_artifact_paths(federation_dir)["plan_templates"]
     if not os.path.isfile(path):
         return {}
@@ -7380,6 +9059,12 @@ def load_federation_plan_templates(federation_dir: str) -> dict[str, FederationP
     out: dict[str, FederationPlanTemplate] = {}
     for plan_id, row in payload.items():
         if not isinstance(row, dict):
+            continue
+        try:
+            row_fmt = coerce_format_version(row.get("format_version", FEDERATION_PLAN_TEMPLATE_FORMAT_VERSION))
+        except (TypeError, ValueError):
+            continue
+        if not format_versions_match(row_fmt, FEDERATION_PLAN_TEMPLATE_FORMAT_VERSION):
             continue
         steps_raw = row.get("step_fingerprints", [])
         steps: list[tuple[str, str]] = []
@@ -7397,21 +9082,20 @@ def load_federation_plan_templates(federation_dir: str) -> dict[str, FederationP
             for entry in member_ids_raw:
                 if isinstance(entry, (list, tuple)) and len(entry) >= 2:
                     member_ids.append((str(entry[0]), str(entry[1])))
+        question_str = str(row.get("question", "") or "")
+        join_feedback = migrated_join_feedback.get(str(plan_id), ())
         out[str(plan_id)] = FederationPlanTemplate(
             plan_id=str(plan_id),
             composite_schema_graph_id=str(row.get("composite_schema_graph_id", "") or ""),
             intent_key=str(row.get("intent_key", "") or ""),
             step_fingerprints=tuple(steps),
             combine_hash=str(row.get("combine_hash", "") or ""),
-            question=str(row.get("question", "") or ""),
+            question=question_str,
             accepted_questions=accepted,
-            format_version=int(
-                row.get("format_version", FEDERATION_PLAN_TEMPLATE_FORMAT_VERSION)
-                or FEDERATION_PLAN_TEMPLATE_FORMAT_VERSION
-            ),
+            format_version=row_fmt,
             member_template_ids=tuple(member_ids),
             residual_hash=str(row.get("residual_hash", "") or ""),
-            join_feedback=tuple(str(x) for x in (row.get("join_feedback", []) or []) if str(x).strip()),
+            join_feedback=join_feedback,
             manifest_hash=str(row.get("manifest_hash", "") or ""),
             member_tuple_hash=str(row.get("member_tuple_hash", "") or ""),
         )
@@ -7424,11 +9108,11 @@ def credit_federation_plan_accept(
     q_norm: str,
     *,
     member_template_ids: Sequence[tuple[str, str]] | None = None,
-    schema_role: SchemaRole = "owner",
+    schema_role: SchemaRole = SchemaRole.OWNER,
     pending_plan_template: FederationPlanTemplate | None = None,
 ) -> None:
     """Record that *q_norm* accepted the federation plan *plan_id*."""
-    if schema_role != "owner":
+    if schema_role != SchemaRole.OWNER:
         raise OwnerOnlyOperationError("credit_federation_plan_accept")
     if not federation_dir or not plan_id or not q_norm:
         return
@@ -7463,43 +9147,78 @@ def credit_federation_plan_accept(
     save_federation_plan_template(federation_dir, updated, schema_role=schema_role)
 
 
-def record_federation_join_feedback(federation_dir: str, plan_id: str, summary: str) -> None:
-    """Persist cross-source join rejection feedback on the federation plan record."""
+def _federation_plan_question_norm(template: FederationPlanTemplate) -> str:
+    """Resolve the normalised question key used for plan-scoped join feedback."""
+    q_norm = normalize_question(template.question) if template.question else ""
+    if q_norm:
+        return q_norm
+    for raw in template.accepted_questions:
+        q_norm = normalize_question(raw)
+        if q_norm:
+            return q_norm
+    return ""
+
+
+def mirror_federation_plan_join_feedback(
+    federation_dir: str,
+    plan_id: str,
+    summary: str,
+) -> None:
+    """Mirror join feedback onto the federation plan template record."""
     text = str(summary or "").strip()
     if not federation_dir or not plan_id or not text:
         return
-    templates = load_federation_plan_templates(federation_dir)
-    template = templates.get(plan_id)
+    template = load_federation_plan_templates(federation_dir).get(plan_id)
     if template is None:
         return
-    if text in template.join_feedback:
+    existing = tuple(template.join_feedback)
+    if text in existing:
         return
-    updated = FederationPlanTemplate(
-        plan_id=template.plan_id,
-        composite_schema_graph_id=template.composite_schema_graph_id,
-        intent_key=template.intent_key,
-        step_fingerprints=template.step_fingerprints,
-        combine_hash=template.combine_hash,
-        question=template.question,
-        accepted_questions=template.accepted_questions,
-        member_template_ids=template.member_template_ids,
-        residual_hash=template.residual_hash,
-        join_feedback=(*template.join_feedback, text),
-        format_version=template.format_version,
-        manifest_hash=template.manifest_hash,
-        member_tuple_hash=template.member_tuple_hash,
+    save_federation_plan_template(
+        federation_dir,
+        replace(template, join_feedback=existing + (text,)),
     )
-    save_federation_plan_template(federation_dir, updated)
+
+
+def record_federation_join_feedback(
+    federation_dir: str,
+    plan_id: str,
+    summary: str,
+    *,
+    q_norm: str | None = None,
+) -> None:
+    """Persist cross-source join rejection feedback for the plan's question."""
+    text = str(summary or "").strip()
+    if not federation_dir or not plan_id or not text:
+        return
+    template = load_federation_plan_templates(federation_dir).get(plan_id)
+    if template is None:
+        return
+    resolved_q = normalize_question(q_norm or "") if q_norm else ""
+    if not resolved_q:
+        resolved_q = _federation_plan_question_norm(template)
+    if not resolved_q:
+        return
+    with artifact_lock(federation_dir):
+        if not template.question:
+            save_federation_plan_template(
+                federation_dir,
+                replace(template, question=resolved_q),
+            )
+        _append_federation_join_feedback_for_question(federation_dir, resolved_q, text)
 
 
 def lookup_federation_join_feedback(federation_dir: str, plan_id: str) -> list[str]:
-    """Return cross-source join feedback stored on a federation plan record."""
+    """Return cross-source join feedback stored for the federation plan's question."""
     if not federation_dir or not plan_id:
         return []
     template = load_federation_plan_templates(federation_dir).get(plan_id)
     if template is None:
         return []
-    return [str(x) for x in template.join_feedback if str(x).strip()]
+    q_norm = _federation_plan_question_norm(template)
+    if not q_norm:
+        return []
+    return _lookup_federation_join_feedback_for_question(federation_dir, q_norm)
 
 
 def _parse_coordinator_config(raw: Mapping[str, Any]) -> FederationCoordinatorConfig:
@@ -7562,20 +9281,91 @@ def _merge_column_metadata_strictest(candidates: Sequence[ColumnMetadata]) -> Co
             merged.role = None
         elif other.role and not merged.role:
             merged.role = other.role
-    merged_desc, merged_owner = resolve_descriptions(*((col.description, col.description_owner) for col in candidates))
+        if other.enum_type_name and merged.enum_type_name and other.enum_type_name != merged.enum_type_name:
+            merged.enum_type_name = None
+        elif other.enum_type_name and not merged.enum_type_name:
+            merged.enum_type_name = other.enum_type_name
+        if other.element_type and merged.element_type and other.element_type != merged.element_type:
+            merged.element_type = None
+        elif other.element_type and not merged.element_type:
+            merged.element_type = other.element_type
+        if (
+            other.boolean_truth_value
+            and merged.boolean_truth_value
+            and other.boolean_truth_value != merged.boolean_truth_value
+        ):
+            merged.boolean_truth_value = None
+        elif other.boolean_truth_value and not merged.boolean_truth_value:
+            merged.boolean_truth_value = other.boolean_truth_value
+        for neighbor in other.semantic_join_neighbors or []:
+            if neighbor not in merged.semantic_join_neighbors:
+                merged.semantic_join_neighbors.append(neighbor)
+    merged_desc, merged_owner = DescriptionOwner.resolve(
+        *((col.description, col.description_owner) for col in candidates)
+    )
     if merged_desc:
-        set_description(merged, merged_desc, merged_owner or DescriptionOwner.CATALOG)
+        DescriptionOwner.set_on(merged, merged_desc, merged_owner or DescriptionOwner.CATALOG)
     else:
         merged.description = ""
         merged.description_owner = None
     return merged
 
 
+def _scalar_field_values(candidates: Sequence[ColumnMetadata], field: str) -> set[Any]:
+    return {getattr(col, field) for col in candidates}
+
+
+def _normalized_string_values(candidates: Sequence[ColumnMetadata], field: str) -> set[str]:
+    return {
+        str(getattr(col, field) or "").strip().lower() for col in candidates if str(getattr(col, field) or "").strip()
+    }
+
+
+def _assert_collapsed_column_metadata_agrees(
+    candidates: Sequence[ColumnMetadata],
+    label: str,
+    *,
+    semantics: Literal["union", "replica"],
+) -> None:
+    """Raise when collapsed members disagree on mergeable column metadata fields."""
+    if len(candidates) <= 1:
+        return
+    scalar_fields: tuple[str, ...] = (
+        "value_type",
+        "is_nullable",
+        "is_unique",
+        "is_generated",
+        "is_identity",
+        "enum_type_name",
+        "element_type",
+        "boolean_truth_value",
+    )
+    if semantics == "replica":
+        scalar_fields = ("data_type",) + scalar_fields
+    for field in scalar_fields:
+        if field in {"data_type", "value_type", "enum_type_name", "element_type", "boolean_truth_value"}:
+            values = _normalized_string_values(candidates, field)
+            if not values:
+                continue
+        else:
+            values = _scalar_field_values(candidates, field)
+        if len(values) > 1:
+            raise FederationConfigError(f"{label}: collapsed members disagree on {field}: {sorted(values)!r}")
+    for field in ("valid_where_ops", "valid_aggregations", "valid_having_ops"):
+        signatures = {tuple(sorted(set(getattr(col, field) or []))) for col in candidates}
+        signatures.discard(())
+        if len(signatures) > 1:
+            raise FederationConfigError(f"{label}: collapsed members disagree on {field}")
+    if semantics == "replica":
+        for field in ("is_aggregatable_override", "is_groupable_override", "is_filterable_override"):
+            values = _scalar_field_values(candidates, field)
+            if len(values) > 1:
+                raise FederationConfigError(f"{label}: collapsed members disagree on {field}: {sorted(values)!r}")
+
+
 def _assert_replica_column_data_types_agree(candidates: Sequence[ColumnMetadata], label: str) -> None:
     """Raise when replica members disagree on column data_type."""
-    data_types = {str(col.data_type or "").strip().lower() for col in candidates if str(col.data_type or "").strip()}
-    if len(data_types) > 1:
-        raise FederationConfigError(f"{label}: replica members disagree on data_type: {sorted(data_types)!r}")
+    _assert_collapsed_column_metadata_agrees(candidates, label, semantics="replica")
 
 
 def _merge_column_metadata_union_statistics(
@@ -7617,13 +9407,13 @@ def _merge_column_metadata_union_statistics(
                 str(col.value_type or "").lower(),
             ),
         )
-        frequent: list[str] = []
+        merged_frequent: list[str] = []
         for col in ordered_candidates:
             for value in col.frequent_values or []:
                 token = str(value)
-                if token and token not in frequent:
-                    frequent.append(token)
-        merged.frequent_values = frequent
+                if token and token not in merged_frequent:
+                    merged_frequent.append(token)
+        merged.frequent_values = merged_frequent
         merged.value_overlap_sample = []
         merged.distinct_count = 0
         merged.min_val = None
@@ -7640,15 +9430,15 @@ def _merge_column_metadata_union_statistics(
             str(col.value_type or "").lower(),
         ),
     )
-    frequent: list[str] = []
+    frequent_values: list[str] = []
     overlap: list[str] = []
     min_vals: list[str] = []
     max_vals: list[str] = []
     for col in ordered_candidates:
         for value in col.frequent_values or []:
             token = str(value)
-            if token and token not in frequent:
-                frequent.append(token)
+            if token and token not in frequent_values:
+                frequent_values.append(token)
         for value in col.value_overlap_sample or []:
             token = str(value)
             if token and token not in overlap:
@@ -7657,7 +9447,7 @@ def _merge_column_metadata_union_statistics(
             min_vals.append(str(col.min_val))
         if col.max_val not in (None, ""):
             max_vals.append(str(col.max_val))
-    merged.frequent_values = frequent
+    merged.frequent_values = frequent_values
     merged.value_overlap_sample = sorted(overlap, key=str.lower)
     merged.distinct_count = 0
     if min_vals:
@@ -7717,6 +9507,71 @@ def _assert_partition_metadata_agrees(member_tables: Sequence[TableMetadata], lo
         raise FederationDeclarationError(
             f"logical table {logical!r} members disagree on partition or clustering metadata"
         )
+
+
+def _assert_collapsed_table_metadata_agrees(member_tables: Sequence[TableMetadata], logical: str) -> None:
+    for field in ("kind", "role", "distkey", "diststyle", "clustering_key", "quote_decision", "encoded"):
+        values = {getattr(table, field) for table in member_tables}
+        if len(values) > 1:
+            raise FederationDeclarationError(
+                f"logical table {logical!r} members disagree on {field}: {sorted(values, key=str)!r}"
+            )
+    for field in ("sortkey", "indexed_columns", "clustering_fields"):
+        signatures = {tuple(getattr(table, field) or []) for table in member_tables}
+        if len(signatures) > 1:
+            raise FederationDeclarationError(f"logical table {logical!r} members disagree on {field}")
+
+
+def _table_grain_signature(table: TableMetadata, logical_pk: Sequence[str]) -> str | None:
+    """Classify whether *table* rows are entity- or event-grained for *logical_pk*."""
+    pk = [col for col in logical_pk if col]
+    if not pk:
+        return "none"
+    if len(pk) == 1:
+        col_name = pk[0]
+        column = table.columns.get(col_name)
+        if column is None:
+            return None
+        if column.is_unique:
+            return "entity"
+        row_count = int(table.row_count or 0)
+        distinct = int(column.distinct_count or 0)
+        if row_count > 0 and distinct > 0:
+            return "entity" if distinct >= row_count else "event"
+        return None
+    if list(table.primary_key or []) != list(pk):
+        return None
+    row_count = int(table.row_count or 0)
+    if row_count <= 0:
+        return None
+    for col_name in pk:
+        column = table.columns.get(col_name)
+        if column is None:
+            return None
+        if column.is_unique:
+            continue
+        distinct = int(column.distinct_count or 0)
+        if distinct > 0 and distinct < row_count:
+            return "event"
+    return "entity"
+
+
+def _assert_member_grain_equivalence(
+    mapping: LogicalTableMapping,
+    member_tables: Sequence[TableMetadata],
+) -> None:
+    """Refuse replica/union collapse when members disagree on row grain."""
+    if len(member_tables) < 2:
+        return
+    signatures: dict[str, str] = {}
+    for member, table in zip(mapping.members, member_tables, strict=True):
+        logical_pk = _member_logical_primary_key(member, table)
+        signature = _table_grain_signature(table, logical_pk)
+        if signature is not None:
+            signatures[member.source] = signature
+    if len(set(signatures.values())) > 1:
+        detail = ", ".join(f"{source}={signature}" for source, signature in sorted(signatures.items()))
+        raise FederationDeclarationError(f"logical table {mapping.logical!r} members disagree on row grain: {detail}")
 
 
 def _member_logical_primary_key(member: LogicalTableMember, table: TableMetadata) -> list[str]:
@@ -7837,14 +9692,6 @@ def _filter_member_graphs_to_allow_scope(
             scope_descriptor=graph.scope_descriptor,
         )
     return filtered
-
-
-@dataclass(frozen=True)
-class MemberEffectiveGrants:
-    """Tables and columns a federation member role may read at composition time."""
-
-    tables: frozenset[str]
-    columns: frozenset[tuple[str, str]] | None = None
 
 
 def coerce_member_effective_grants(raw: Any) -> MemberEffectiveGrants | None:
@@ -8004,6 +9851,7 @@ def resolve_member_effective_grants(
     *,
     engine: Any | None = None,
     explicit: MemberEffectiveGrants | None = None,
+    allow_profiled_graph_fallback: bool = True,
 ) -> MemberEffectiveGrants:
     """Resolve effective grants for one federation member."""
     if explicit is not None:
@@ -8015,7 +9863,13 @@ def resolve_member_effective_grants(
         introspected = introspect_member_effective_grants(engine)
         if introspected is not None:
             return introspected
-    return member_effective_grants_from_graph(graph)
+    if allow_profiled_graph_fallback:
+        return member_effective_grants_from_graph(graph)
+    sid = str(source_id or "").strip() or "member"
+    raise FederationDeclarationError(
+        f"federation member {sid!r} live effective grants are unavailable; "
+        "profiled schema graphs cannot substitute for runtime read permissions"
+    )
 
 
 def validate_declared_objects_against_member_grants(
@@ -8035,11 +9889,13 @@ def validate_declared_objects_against_member_grants(
         graph = member_graphs.get(source_id)
         if graph is None:
             raise FederationDeclarationError(f"logical_tables member unresolved source: {source_id!r}")
+        engine = engines.get(source_id)
         grants = resolve_member_effective_grants(
             source_id,
             graph,
-            engine=engines.get(source_id),
+            engine=engine,
             explicit=explicit_grants.get(source_id),
+            allow_profiled_graph_fallback=engine is None,
         )
         for table_name, column_name in sorted(declared[source_id], key=lambda item: (item[0], item[1] or "")):
             if table_name not in graph.tables:
@@ -8137,9 +9993,9 @@ def reconcile_composite_classifications(
             if member_table is not None:
                 descriptions.append((member_table.description, member_table.description_owner))
                 roles.append(member_table.role)
-        agreed_desc, agreed_owner = resolve_descriptions(*descriptions)
+        agreed_desc, agreed_owner = DescriptionOwner.resolve(*descriptions)
         if agreed_desc:
-            set_description(table, agreed_desc, agreed_owner or DescriptionOwner.CATALOG)
+            DescriptionOwner.set_on(table, agreed_desc, agreed_owner or DescriptionOwner.CATALOG)
         else:
             distinct_descriptions = {(desc or "").strip() for desc, _ in descriptions if (desc or "").strip()}
             if len(distinct_descriptions) > 1:
@@ -8170,9 +10026,9 @@ def reconcile_composite_classifications(
                     continue
                 col_desc_candidates.append((member_col.description, member_col.description_owner))
                 col_roles.append(member_col.role)
-            agreed_col_desc, agreed_col_owner = resolve_descriptions(*col_desc_candidates)
+            agreed_col_desc, agreed_col_owner = DescriptionOwner.resolve(*col_desc_candidates)
             if agreed_col_desc:
-                set_description(col, agreed_col_desc, agreed_col_owner or DescriptionOwner.CATALOG)
+                DescriptionOwner.set_on(col, agreed_col_desc, agreed_col_owner or DescriptionOwner.CATALOG)
             else:
                 distinct_col_descriptions = {
                     (desc or "").strip() for desc, _ in col_desc_candidates if (desc or "").strip()
@@ -8187,8 +10043,8 @@ def reconcile_composite_classifications(
     for col_map in mappings.logical_columns:
         if not col_map.unify_in_graph:
             continue
-        roles = []
-        descriptions = []
+        member_col_roles: list[Any] = []
+        member_col_descriptions: list[Any] = []
         for qual in col_map.members:
             tbl, col_name = split_qualified_column(qual)
             table = composite.tables.get(tbl)
@@ -8197,9 +10053,9 @@ def reconcile_composite_classifications(
             col = table.columns.get(col_name) or table.columns.get(col_map.logical)
             if col is None:
                 continue
-            roles.append(col.role)
-            descriptions.append(col.description)
-        role_values = {role for role in roles if role}
+            member_col_roles.append(col.role)
+            member_col_descriptions.append((col.description, col.description_owner))
+        role_values = {role for role in member_col_roles if role}
         if len(role_values) > 1:
             for qual in col_map.members:
                 tbl, _ = split_qualified_column(qual)
@@ -8221,7 +10077,7 @@ def reconcile_composite_classifications(
         if table is None:
             continue
         if table_name in conflicts and table_desc:
-            set_description(table, table_desc, reconcile_owner)
+            DescriptionOwner.set_on(table, table_desc, reconcile_owner)
         if table_name in conflicts and table_role:
             table.role = table_role
         for col_name, (col_role, col_desc, _sensitivity) in col_classes.items():
@@ -8231,7 +10087,7 @@ def reconcile_composite_classifications(
             conflict_key = f"{table_name}.{col_name}"
             if conflict_key in conflicts:
                 if col_desc:
-                    set_description(col, col_desc, reconcile_owner)
+                    DescriptionOwner.set_on(col, col_desc, reconcile_owner)
                 if col_role:
                     col.role = col_role
     return True
@@ -8255,7 +10111,8 @@ def _referenced_columns_for_table(intent: RuntimeIntent, table_name: str) -> set
     return refs
 
 
-def _intent_lacks_column_member_coverage(intent: RuntimeIntent, schema: SchemaGraph) -> bool:
+def _intent_column_member_coverage_ineligible_reason(intent: RuntimeIntent, schema: SchemaGraph) -> str | None:
+    """Return an ineligible reason when referenced columns are not jointly held on one member."""
     for table_name in intent.tables or []:
         table = schema.tables.get(table_name)
         if table is None or not table.column_member_sources:
@@ -8264,13 +10121,29 @@ def _intent_lacks_column_member_coverage(intent: RuntimeIntent, schema: SchemaGr
         covered_cols = [col for col in needed if col in table.column_member_sources]
         if not covered_cols:
             continue
+        all_members: set[str] = set(table.member_source_ids or ())
+        if not all_members:
+            for member_holders in table.column_member_sources.values():
+                all_members.update(member_holders)
         common: set[str] | None = None
         for col_name in covered_cols:
             holders = set(table.column_member_sources.get(col_name, []))
             common = holders if common is None else common & holders
         if common is not None and not common:
-            return True
-    return False
+            for col_name in sorted(covered_cols):
+                holders = set(table.column_member_sources.get(col_name, []))
+                lacking = sorted(all_members - holders)
+                if lacking:
+                    return (
+                        f"union logical column {col_name!r} on {table_name!r} "
+                        f"is not present on members: {', '.join(lacking)}"
+                    )
+            return "projection columns are not held by any single member"
+    return None
+
+
+def _intent_lacks_column_member_coverage(intent: RuntimeIntent, schema: SchemaGraph) -> bool:
+    return _intent_column_member_coverage_ineligible_reason(intent, schema) is not None
 
 
 def _manifest_source_ids(manifest: FederationManifest, member_graphs: Mapping[str, SchemaGraph]) -> tuple[str, ...]:
@@ -8304,6 +10177,11 @@ def _resolve_composite_table_names(
                     f"federation member {source_id!r} has {len(alias_keys)} unresolved namespace alias(es) "
                     f"but only {len(unaliased)} unaliased physical table(s) to pair"
                 )
+            if len(unaliased) > len(alias_keys):
+                raise FederationConfigError(
+                    f"federation member {source_id!r} has {len(unaliased)} unaliased physical table(s) "
+                    f"but only {len(alias_keys)} namespace alias(es) to pair"
+                )
             for alias, phys in zip(sorted(alias_keys), unaliased, strict=False):
                 names[(source_id, phys)] = alias
         for phys_name in graph.tables:
@@ -8313,6 +10191,24 @@ def _resolve_composite_table_names(
             elif member_key not in names:
                 names[member_key] = phys_name
     return names
+
+
+def _assign_collapse_staging_composite_names(
+    composite_names: dict[tuple[str, str], str],
+    mappings: FederationMappings,
+) -> None:
+    """Give colliding members unique interim composite names before logical-table collapse."""
+    by_composite: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for member_key, composite in composite_names.items():
+        by_composite[composite].append(member_key)
+    for member_keys in by_composite.values():
+        if len(member_keys) <= 1:
+            continue
+        member_set = frozenset(member_keys)
+        if not _collision_resolved_by_logical_tables(member_set, mappings):
+            continue
+        for source_id, phys_name in sorted(member_keys):
+            composite_names[(source_id, phys_name)] = f"__federation_stage__{source_id}__{phys_name}"
 
 
 def _collision_resolved_by_logical_tables(members: frozenset[tuple[str, str]], mappings: FederationMappings) -> bool:
@@ -8433,14 +10329,21 @@ def _validate_union_member_disjointness(
                 f"union logical table {mapping.logical!r} missing key column {key_col!r} "
                 f"on member {member.source}.{member.table}"
             )
-        if int(meta.row_count or 0) > 0 or meta.value_overlap_sample:
+        effective_row_count = max(int(meta.row_count or 0), int(table.row_count or 0))
+        if effective_row_count > 0 or meta.value_overlap_sample:
             profiled = True
         member_metas.append((member.source, meta))
     if not profiled:
-        return
-    has_samples = any(bool(meta.value_overlap_sample) for _, meta in member_metas)
-    if not has_samples:
-        return
+        raise FederationDeclarationError(
+            f"union logical table {mapping.logical!r} disjointness could not be established for key "
+            f"{key_col!r}: members lack row_count or value_overlap_sample profiling"
+        )
+    missing_samples = [source for source, meta in member_metas if not meta.value_overlap_sample]
+    if missing_samples:
+        raise FederationDeclarationError(
+            f"union logical table {mapping.logical!r} disjointness could not be established for key "
+            f"{key_col!r}: members lack value_overlap_sample profiling: {', '.join(sorted(missing_samples))}"
+        )
     for left_idx, (left_source, left_meta) in enumerate(member_metas):
         left_sample = {str(value) for value in (left_meta.value_overlap_sample or []) if str(value)}
         for right_source, right_meta in member_metas[left_idx + 1 :]:
@@ -8475,6 +10378,8 @@ def _apply_logical_table_collapse(
         if not member_tables:
             continue
         _assert_partition_metadata_agrees(member_tables, mapping.logical)
+        _assert_collapsed_table_metadata_agrees(member_tables, mapping.logical)
+        _assert_member_grain_equivalence(mapping, member_tables)
         if mapping.semantics == "union":
             _validate_union_member_disjointness(mapping, member_tables)
         column_names = sorted({logical for member in mapping.members for logical in member.columns})
@@ -8507,10 +10412,10 @@ def _apply_logical_table_collapse(
                     sources.append(member.source)
             if not candidates:
                 continue
-            if mapping.semantics == "replica":
-                _assert_replica_column_data_types_agree(
-                    candidates, f"logical table {mapping.logical!r} column {col_name!r}"
-                )
+            label = f"logical table {mapping.logical!r} column {col_name!r}"
+            _assert_collapsed_column_metadata_agrees(candidates, label, semantics=mapping.semantics)
+            if mapping.semantics == "union":
+                _assert_union_column_timestamp_awareness_agrees(candidates, sources, label)
             merged_cols[col_name] = _merge_column_metadata_union_statistics(
                 candidates,
                 composite_semantics=mapping.semantics,
@@ -8539,9 +10444,10 @@ def _apply_logical_table_collapse(
         merged_foreign_keys = _merge_collapsed_foreign_keys(member_tables, mapping.logical, table_remap)
         _remap_fk_endpoints(tables, table_remap)
         primary = tables.get(mapping.logical)
-        collapsed_desc, collapsed_owner = resolve_descriptions(
+        collapsed_desc, collapsed_owner = DescriptionOwner.resolve(
             *((table.description, table.description_owner) for table in member_tables)
         )
+        template_table = member_tables[0]
         metadata_kwargs = {
             "name": mapping.logical,
             "columns": merged_cols,
@@ -8556,23 +10462,24 @@ def _apply_logical_table_collapse(
             "source_id": source_id,
             "member_source_ids": member_source_ids,
             "column_member_sources": column_member_sources,
-            "partition_columns": list(member_tables[0].partition_columns or []),
-            "partition_type": member_tables[0].partition_type,
-            "require_partition_filter": bool(member_tables[0].require_partition_filter),
-            "clustering_fields": list(member_tables[0].clustering_fields or []),
-            "clustering_key": member_tables[0].clustering_key,
-            "distkey": member_tables[0].distkey,
-            "sortkey": list(member_tables[0].sortkey or []),
-            "diststyle": member_tables[0].diststyle,
-            "indexed_columns": list(member_tables[0].indexed_columns or []),
-            "size_mb": member_tables[0].size_mb,
-            "encoded": member_tables[0].encoded,
-            "quote_decision": member_tables[0].quote_decision,
-            "role": member_tables[0].role,
+            "kind": template_table.kind,
+            "partition_columns": list(template_table.partition_columns or []),
+            "partition_type": template_table.partition_type,
+            "require_partition_filter": bool(template_table.require_partition_filter),
+            "clustering_fields": list(template_table.clustering_fields or []),
+            "clustering_key": template_table.clustering_key,
+            "distkey": template_table.distkey,
+            "sortkey": list(template_table.sortkey or []),
+            "diststyle": template_table.diststyle,
+            "indexed_columns": list(template_table.indexed_columns or []),
+            "size_mb": template_table.size_mb,
+            "encoded": template_table.encoded,
+            "quote_decision": template_table.quote_decision,
+            "role": template_table.role,
             "row_count": row_count,
-            "role_owner": member_tables[0].role_owner,
-            "composite_descriptive_ratios": dict(member_tables[0].composite_descriptive_ratios or {}),
-            "_user_semantic_neighbors": list(member_tables[0]._user_semantic_neighbors or []),
+            "role_owner": template_table.role_owner,
+            "composite_descriptive_ratios": dict(template_table.composite_descriptive_ratios or {}),
+            "_user_semantic_neighbors": list(template_table._user_semantic_neighbors or []),
         }
         if primary is None:
             tables[mapping.logical] = TableMetadata(
@@ -8584,7 +10491,7 @@ def _apply_logical_table_collapse(
             for key, value in metadata_kwargs.items():
                 setattr(primary, key, value)
             if collapsed_desc:
-                set_description(primary, collapsed_desc, collapsed_owner or DescriptionOwner.CATALOG)
+                DescriptionOwner.set_on(primary, collapsed_desc, collapsed_owner or DescriptionOwner.CATALOG)
         for name in remove_names:
             tables.pop(name, None)
 
@@ -8987,8 +10894,8 @@ def federation_table_set(
         list(intent.select_cols or []),
         list(intent.order_by_cols or []),
         list(intent.group_by_cols or []),
-        list(_predicate_where_leaves(intent.where) or []),
-        list(_predicate_having_leaves(intent.having) or []),
+        list(PredicateGroup.where_leaves(intent.where) or []),
+        list(PredicateGroup.having_leaves(intent.having) or []),
         window_registry=intent.window_registry,
         case_registry=intent.case_registry,
         include_unreferenced_registries=False,
@@ -9003,27 +10910,111 @@ def federation_table_set(
     return FederationTableSet(tables=frozenset(tables), source_by_table=source_by_table, sources=frozenset(sources))
 
 
-def _value_type_duckdb_cast(value_type: str) -> str | None:
-    """Map an intent ``value_type`` token to a DuckDB cast target for join keys."""
-    vt = str(value_type or "").strip().lower()
-    if vt == "integer":
+def _column_metadata_for_table_key(
+    schema: SchemaGraph | None, table_name: str | None, key: str
+) -> ColumnMetadata | None:
+    if schema is None or not table_name:
+        return None
+    table = schema.tables.get(table_name)
+    if table is None:
+        return None
+    return table.columns.get(key)
+
+
+def _harmonized_join_key_decimal_scale(
+    left_meta: ColumnMetadata | None, right_meta: ColumnMetadata | None
+) -> int | None:
+    if left_meta is None or right_meta is None:
+        return None
+    if not (left_meta.is_exact_numeric and right_meta.is_exact_numeric):
+        return None
+    return max(left_meta.numeric_scale or 0, right_meta.numeric_scale or 0)
+
+
+def _join_key_duckdb_cast_type(meta: ColumnMetadata, *, harmonized_scale: int | None = None) -> str | None:
+    """Map a join-key column to a DuckDB cast target."""
+    value_type = (meta.value_type or "").strip().lower()
+    if not value_type:
+        dtype = str(meta.data_type or "").lower()
+        if any(token in dtype for token in ("int", "bigint", "smallint")):
+            value_type = "integer"
+        elif any(token in dtype for token in ("decimal", "numeric", "double", "float", "real")):
+            value_type = "number"
+        elif any(token in dtype for token in ("date", "timestamp", "time")):
+            value_type = "date"
+        elif "bool" in dtype:
+            value_type = "boolean"
+        else:
+            return None
+    if value_type == "integer":
         return "BIGINT"
-    if vt == "number":
+    if value_type == "number":
+        if meta.is_exact_numeric:
+            precision = meta.numeric_precision
+            scale = meta.numeric_scale
+            if precision is None or scale is None:
+                precision, scale = parse_numeric_type_arguments(str(meta.data_type or ""))
+            if harmonized_scale is not None:
+                scale = harmonized_scale
+            if precision is None:
+                precision = FEDERATION_COORDINATOR_DECIMAL_MAX_PRECISION
+            if scale is None:
+                scale = 0
+            return f"DECIMAL({precision}, {scale})"
         return "DOUBLE"
-    if vt == "date":
+    if value_type == "date":
         return "TIMESTAMP"
-    if vt == "boolean":
+    if value_type == "boolean":
         return "BOOLEAN"
     return None
 
 
-def _coordinator_join_key_expr(alias: str, key: str, *, schema: SchemaGraph | None, table_name: str | None) -> str:
+def _coordinator_join_key_pair_exprs(
+    left_alias: str,
+    left_key: str,
+    *,
+    left_table: str | None,
+    right_alias: str,
+    right_key: str,
+    right_table: str | None,
+    schema: SchemaGraph | None,
+) -> tuple[str, str]:
+    """Render typed join-key expressions for both sides of a coordinator join."""
+    left_meta = _column_metadata_for_table_key(schema, left_table, left_key)
+    right_meta = _column_metadata_for_table_key(schema, right_table, right_key)
+    harmonized_scale = _harmonized_join_key_decimal_scale(left_meta, right_meta)
+    return (
+        _coordinator_join_key_expr(
+            left_alias,
+            left_key,
+            schema=schema,
+            table_name=left_table,
+            harmonized_scale=harmonized_scale,
+        ),
+        _coordinator_join_key_expr(
+            right_alias,
+            right_key,
+            schema=schema,
+            table_name=right_table,
+            harmonized_scale=harmonized_scale,
+        ),
+    )
+
+
+def _coordinator_join_key_expr(
+    alias: str,
+    key: str,
+    *,
+    schema: SchemaGraph | None,
+    table_name: str | None,
+    harmonized_scale: int | None = None,
+) -> str:
     """Render a typed coordinator join key expression for *alias*.*key*."""
-    ident = f"{alias}.{_quote_ident(key)}"
-    if schema is None or not table_name:
+    ident = f"{alias}.{Dialect.sqlglot_quote_identifier(key)}"
+    meta = _column_metadata_for_table_key(schema, table_name, key)
+    if meta is None:
         return ident
-    value_type = column_where_value_type(schema, table_name, key)
-    cast_type = _value_type_duckdb_cast(value_type)
+    cast_type = _join_key_duckdb_cast_type(meta, harmonized_scale=harmonized_scale)
     if cast_type is not None:
         return f"CAST({ident} AS {cast_type})"
     return ident
@@ -9080,12 +11071,12 @@ def _unattributable_raw_sql_reason(intent: RuntimeIntent) -> str | None:
     for group in intent.group_by_cols or []:
         if _expr_has_unattributable_raw_sql(group):
             return "expression contains unattributable raw_sql fragment"
-    for fp in _predicate_where_leaves(intent.where) or []:
+    for fp in PredicateGroup.where_leaves(intent.where) or []:
         if _expr_has_unattributable_raw_sql(fp.left_expr):
             return "expression contains unattributable raw_sql fragment"
         if fp.right_expr and _expr_has_unattributable_raw_sql(fp.right_expr):
             return "expression contains unattributable raw_sql fragment"
-    for hp in _predicate_having_leaves(intent.having) or []:
+    for hp in PredicateGroup.having_leaves(intent.having) or []:
         if _expr_has_unattributable_raw_sql(hp.left_expr):
             return "expression contains unattributable raw_sql fragment"
         if hp.right_expr and _expr_has_unattributable_raw_sql(hp.right_expr):
@@ -9278,8 +11269,8 @@ def _assign_cte_sources(cte_steps: Sequence[RuntimeCteStep], source_by_table: Ma
             cte.select_cols,
             cte.order_by_cols,
             cte.group_by_cols,
-            _predicate_where_leaves(cte.where),
-            _predicate_having_leaves(cte.having),
+            PredicateGroup.where_leaves(cte.where),
+            PredicateGroup.having_leaves(cte.having),
             window_registry=cte.window_registry,
             case_registry=cte.case_registry,
             include_unreferenced_registries=False,
@@ -9476,8 +11467,8 @@ def _partition_cte_steps_for_source(
             select_cols=cte_copy.select_cols,
             order_by_cols=cte_copy.order_by_cols,
             group_by_cols=cte_copy.group_by_cols,
-            where_params=(_predicate_where_leaves(cte_copy.where)),
-            having_param=(_predicate_having_leaves(cte_copy.having)),
+            where_params=(PredicateGroup.where_leaves(cte_copy.where)),
+            having_param=(PredicateGroup.having_leaves(cte_copy.having)),
             window_registry=cte_copy.window_registry,
             case_registry=cte_copy.case_registry,
         )
@@ -9522,8 +11513,8 @@ def _partition_registries_for_source(
         select_cols=intent.select_cols,
         order_by_cols=intent.order_by_cols,
         group_by_cols=intent.group_by_cols,
-        where_params=_predicate_where_leaves(intent.where),
-        having_param=_predicate_having_leaves(intent.having),
+        where_params=PredicateGroup.where_leaves(intent.where),
+        having_param=PredicateGroup.having_leaves(intent.having),
         window_registry=intent.window_registry,
         case_registry=intent.case_registry,
     )
@@ -9587,7 +11578,7 @@ def _combine_select_column_names(plan: FederatedPlan) -> list[str] | None:
             _add(_select_col_term(sc))
     residual = plan.residual
     if residual is not None:
-        for fp in _predicate_where_leaves(residual.where):
+        for fp in PredicateGroup.where_leaves(residual.where):
             left_ref = fp.left_expr.column_ref or fp.left_expr.primary_term or ""
             _add(left_ref)
             right_ref = getattr(fp.right_expr, "column_ref", None) or getattr(fp.right_expr, "primary_term", None) or ""
@@ -9621,7 +11612,7 @@ def _combine_select_column_names(plan: FederatedPlan) -> list[str] | None:
 def _render_combine_select_keyword(cols: list[str] | None) -> str:
     if not cols:
         raise FederationRuntimeError("federation combine requires explicit column projection")
-    return ", ".join(_quote_ident(col) for col in cols)
+    return ", ".join(Dialect.sqlglot_quote_identifier(col) for col in cols)
 
 
 def _render_join_select_keyword(
@@ -9631,7 +11622,7 @@ def _render_join_select_keyword(
         raise FederationRuntimeError("federation combine requires explicit column projection")
     exprs: list[str] = []
     for col in cols:
-        ident = _quote_ident(col)
+        ident = Dialect.sqlglot_quote_identifier(col)
         in_left = col in left_cols
         in_right = col in right_cols
         if in_left and in_right:
@@ -9655,7 +11646,7 @@ def _cross_source_where(
 ) -> list[WhereParam]:
     cross: list[WhereParam] = []
     registry_kw = _intent_registry_kw(intent)
-    for fp in _predicate_where_leaves(intent.where) or []:
+    for fp in PredicateGroup.where_leaves(intent.where) or []:
         refs = collect_referenced_tables([], [], [], [fp], [], **registry_kw)
         srcs = _sources_for_refs(refs, manifest, mappings, source_by_table, schema=schema)
         if len(srcs) > 1:
@@ -9673,7 +11664,7 @@ def _cross_source_having(
 ) -> list[HavingParam]:
     cross: list[HavingParam] = []
     registry_kw = _intent_registry_kw(intent)
-    for hp in _predicate_having_leaves(intent.having) or []:
+    for hp in PredicateGroup.having_leaves(intent.having) or []:
         refs = collect_referenced_tables([], [], [], [], [hp], **registry_kw)
         srcs = _sources_for_refs(refs, manifest, mappings, source_by_table, schema=schema)
         if len(srcs) > 1:
@@ -9826,8 +11817,8 @@ def _cross_source_scalar_subquery_ineligible_reason(
             cte.select_cols,
             cte.order_by_cols,
             cte.group_by_cols,
-            _predicate_where_leaves(cte.where),
-            _predicate_having_leaves(cte.having),
+            PredicateGroup.where_leaves(cte.where),
+            PredicateGroup.having_leaves(cte.having),
             window_registry=cte.window_registry,
             case_registry=cte.case_registry,
             include_unreferenced_registries=False,
@@ -10045,8 +12036,8 @@ def _build_source_sub_intent(
                 return False
         return True
 
-    local_where, _ = partition_predicate_group(intent.where, _predicate_local)
-    local_having, _ = partition_predicate_group(intent.having, _predicate_local)
+    local_where, _ = PredicateGroup.partition(intent.where, _predicate_local)
+    local_having, _ = PredicateGroup.partition(intent.having, _predicate_local)
     local_preserve_tables = sorted(
         {str(table).strip() for table in (intent.preserve_tables or []) if str(table).strip() in source_tables}
     )
@@ -10077,6 +12068,8 @@ def _build_source_sub_intent(
                 chosen_specs=chosen_specs,
             )
         sub = _strip_coordinator_clauses_from_sub_intent(sub)
+        if multi_source:
+            sub = _strip_member_round_from_sub_intent(sub)
         if chosen_specs:
             sub = replace(sub, order_by_cols=[])
     sub = _partition_registries_for_source(sub, source_id, source_by_table)
@@ -10124,6 +12117,16 @@ def _select_col_agg_meta(select_col: SelectCol) -> tuple[str | None, bool]:
     return None, False
 
 
+def _select_col_round_args(select_col: SelectCol) -> list[Any] | None:
+    """Return ``round`` precision args when the select column wraps an aggregate."""
+    for group in select_col.expr.add_groups or []:
+        if (group.scalar_func or "").strip().lower() == "round":
+            return list(group.scalar_func_args or [])
+    if (select_col.expr.scalar_func or "").strip().lower() == "round":
+        return list(select_col.expr.scalar_func_args or [])
+    return None
+
+
 def _select_col_agg_func(select_col: SelectCol) -> str | None:
     """Return the structured aggregate function name from select-column IR metadata."""
     func, _ = _select_col_agg_meta(select_col)
@@ -10142,7 +12145,7 @@ def _select_col_agg_label(select_col: SelectCol) -> str:
 
 def _is_sql_aggregate_select_col(select_col: SelectCol) -> bool:
     """Return True for SQL aggregate select columns, excluding bare registry refs."""
-    if expr_registry_ref(select_col.expr) is not None:
+    if select_col.expr.registry_ref() is not None:
         return False
     return _looks_aggregated(select_col)
 
@@ -10166,6 +12169,110 @@ def _strip_coordinator_clauses_from_sub_intent(intent: RuntimeIntent) -> Runtime
     if unchanged:
         return intent
     return replace(intent, limit=None, distinct_select_index=-1, distinct_on=[])
+
+
+def _strip_round_from_mulgroup(group: MulGroup) -> MulGroup:
+    """Drop a ``round`` scalar wrapper from one aggregate group for member decomposition."""
+    if (group.scalar_func or "").strip().lower() != "round":
+        return group
+    return replace(group, scalar_func=None, scalar_func_args=[], sarg_param_keys=[])
+
+
+def _strip_round_from_expr(expr: NormalizedExpr) -> NormalizedExpr:
+    """Remove ``round`` scalar wrappers from an expression tree."""
+    new_groups = [_strip_round_from_mulgroup(g) for g in (expr.add_groups or [])]
+    scalar_func = expr.scalar_func
+    scalar_func_args = expr.scalar_func_args
+    sarg_param_keys = expr.sarg_param_keys
+    changed = new_groups != list(expr.add_groups or [])
+    if (scalar_func or "").strip().lower() == "round":
+        scalar_func = None
+        scalar_func_args = []
+        sarg_param_keys = []
+        changed = True
+    if not changed:
+        return expr
+    return replace(
+        expr,
+        add_groups=new_groups,
+        scalar_func=scalar_func,
+        scalar_func_args=scalar_func_args,
+        sarg_param_keys=sarg_param_keys,
+    )
+
+
+def _strip_member_round_from_sub_intent(intent: RuntimeIntent) -> RuntimeIntent:
+    """Keep raw member aggregates; coordinator residual applies ``round`` once."""
+    new_select = [replace(sc, expr=_strip_round_from_expr(sc.expr)) for sc in (intent.select_cols or [])]
+    having_leaves = list(PredicateGroup.having_leaves(intent.having) or [])
+    new_having_leaves: list[HavingParam] = []
+    for hp in having_leaves:
+        stripped = _strip_round_from_expr(hp.left_expr)
+        new_having_leaves.append(replace(hp, left_expr=stripped) if stripped is not hp.left_expr else hp)
+    having_group = PredicateGroup.from_list(new_having_leaves)
+    if new_select == list(intent.select_cols or []) and having_group == intent.having:
+        return intent
+    return replace(intent, select_cols=new_select, having=having_group)
+
+
+def _expr_uses_round(expr: NormalizedExpr) -> bool:
+    if (expr.scalar_func or "").strip().lower() == "round":
+        return True
+    return any((g.scalar_func or "").strip().lower() == "round" for g in (expr.add_groups or []))
+
+
+def _intent_uses_round(intent: RuntimeIntent) -> bool:
+    for sc in intent.select_cols or []:
+        if _expr_uses_round(sc.expr):
+            return True
+    for hp in PredicateGroup.having_leaves(intent.having) or []:
+        if _expr_uses_round(hp.left_expr):
+            return True
+    return False
+
+
+def _rounded_logical_columns(intent: RuntimeIntent) -> list[str]:
+    columns: list[str] = []
+    for sc in intent.select_cols or []:
+        if not _expr_uses_round(sc.expr):
+            continue
+        for group in sc.expr.add_groups or []:
+            for term in group.multiply or []:
+                ref = (getattr(term, "column_ref", None) or "").strip()
+                if ref and "." in ref:
+                    columns.append(ref.rsplit(".", 1)[-1])
+    return list(dict.fromkeys(columns))
+
+
+def emit_federation_rounding_mode_mixed_diagnostics(
+    manifest: FederationManifest,
+    plan: FederatedPlan,
+    intent: RuntimeIntent,
+    *,
+    schema: SchemaGraph | None = None,
+) -> None:
+    """Emit ``ROUNDING_MODE_MIXED`` when federated members disagree on rounding tie-breaking."""
+    _ = plan, schema
+    if not _intent_uses_round(intent):
+        return
+    modes = {
+        str(src.engine).strip().lower(): DialectRegistry.engine_rounding_mode(str(src.engine))
+        for src in manifest.sources
+        if str(src.engine).strip()
+    }
+    if len(set(modes.values())) <= 1:
+        return
+    for logical_column in _rounded_logical_columns(intent):
+        notify(
+            (
+                f"federation rounding mode differs across members for logical column "
+                f"{logical_column!r}; coordinator applies half-up rounding"
+            ),
+            stage="federation",
+            code=DIAGNOSTIC_CODE_ROUNDING_MODE_MIXED,
+            level="warning",
+            details=(("logical_column", logical_column),),
+        )
 
 
 def _join_key_columns_for_source(
@@ -10356,15 +12463,15 @@ def _intent_exprs_local_to_tables(
     group_by_cols = [col for col in (intent.group_by_cols or []) if _expr_refs_local([], [], [col], [], [])]
     order_by_cols = [col for col in (intent.order_by_cols or []) if _expr_refs_local([], [col], [], [], [])]
     having_leaves = [
-        hp for hp in (_predicate_having_leaves(intent.having) or []) if _expr_refs_local([], [], [], [], [hp])
+        hp for hp in (PredicateGroup.having_leaves(intent.having) or []) if _expr_refs_local([], [], [], [], [hp])
     ]
-    having_group = predicate_group_from_list(having_leaves)
+    having_group = PredicateGroup.from_list(having_leaves)
     parent_refs = collect_referenced_tables(
         intent.select_cols,
         intent.order_by_cols,
         intent.group_by_cols,
-        _predicate_where_leaves(intent.where),
-        _predicate_having_leaves(intent.having),
+        PredicateGroup.where_leaves(intent.where),
+        PredicateGroup.having_leaves(intent.having),
     )
     parent_had_agg = any(_is_sql_aggregate_select_col(sc) for sc in (intent.select_cols or []))
     fold_to_residual = multi_source and (residual_fold or (intent.grain or "") == "scalar" or parent_had_agg)
@@ -10537,8 +12644,8 @@ def _residual_spec_for_intent(
             return _source_is_left_combine_nullable_side(next(iter(srcs)), combine)
         return False
 
-    _, residual_where = partition_predicate_group(intent.where, lambda param: not _predicate_spans_sources(param))
-    _, residual_having = partition_predicate_group(intent.having, lambda param: not _predicate_spans_sources(param))
+    _, residual_where = PredicateGroup.partition(intent.where, lambda param: not _predicate_spans_sources(param))
+    _, residual_having = PredicateGroup.partition(intent.having, lambda param: not _predicate_spans_sources(param))
     distinct_on: tuple[NormalizedExpr, ...] = ()
     if intent.distinct_on and _distinct_on_spans_sources(intent, manifest, mappings, source_by_table, schema=schema):
         distinct_on = tuple(intent.distinct_on)
@@ -10569,11 +12676,11 @@ def _residual_spec_for_intent(
         promoted: list[SelectCol] = list(select_cols)
         seen_refs: set[str] = set()
         for sc in select_cols:
-            ref = expr_registry_ref(sc.expr)
+            ref = sc.expr.registry_ref()
             if ref:
                 seen_refs.add(ref)
         for sc in intent.select_cols or []:
-            ref = expr_registry_ref(sc.expr)
+            ref = sc.expr.registry_ref()
             if ref and ref in window_ids and ref not in seen_refs:
                 promoted.append(sc)
                 seen_refs.add(ref)
@@ -10848,7 +12955,7 @@ def _federation_connection_slug_fields(
 ) -> dict[str, str]:
     """Resolve slug fields for a federation binding, honouring an explicit connection handle."""
     conn = str(connection or "").strip()
-    fields = dict(runtime_cls.connection_slug_fields())
+    fields = dict(runtime_cls().connection_slug_fields())
     if not conn:
         return fields
     slug_keys = runtime_cls.connection_slug_keys()
@@ -10859,12 +12966,31 @@ def _federation_connection_slug_fields(
     return fields
 
 
-def federation_source_storage_slug(binding: FederationSourceBinding) -> str:
+def federation_source_storage_slug(
+    binding: FederationSourceBinding,
+    *,
+    federation_id: str | None = None,
+) -> str:
     """Resolve the per-source artifact directory slug for a federation binding."""
+    fed_id = str(federation_id or "").strip()
+    source_id = str(binding.source_id or "").strip()
+    if fed_id and source_id:
+        safe_fed = _federation_storage_slug_fragment(fed_id, fallback="fed")
+        safe_src = _federation_storage_slug_fragment(source_id, fallback="src")
+        slug = f"{FEDERATION_SOURCE_STORAGE_PREFIX}{safe_fed}_{safe_src}"
+        if len(slug) > int(ENGINE_STORAGE_SLUG_MAX_CHARS):
+            digest = hashlib.sha256(slug.encode("utf-8")).hexdigest()[:24]
+            slug = f"{FEDERATION_SOURCE_STORAGE_PREFIX}{safe_fed}_{digest}"
+        return slug
+    return _legacy_federation_source_storage_slug(binding)
+
+
+def _legacy_federation_source_storage_slug(binding: FederationSourceBinding) -> str:
+    """Resolve the legacy engine/connection artifact slug for a federation binding."""
     engine = str(binding.engine or "duckdb").strip().lower()
     connection = str(binding.connection or "").strip()
     try:
-        runtime_cls = cast(type[EngineRuntimeConfig], get_runtime_config_class(engine))
+        runtime_cls = cast(type[EngineRuntimeConfig], DialectRegistry.get_runtime_config_class(engine))
     except ValueError:
         conn = (connection or engine).strip().lower()
         safe = FEDERATION_CONNECTION_SLUG_NON_WORD_RE.sub("_", conn).strip("_") or "source"
@@ -10880,27 +13006,100 @@ def federation_source_storage_slug(binding: FederationSourceBinding) -> str:
     return slug
 
 
-def federation_source_artifacts_dir(artifacts_root: str | None, binding: FederationSourceBinding) -> str:
+def federation_source_artifacts_dir(
+    artifacts_root: str | None,
+    binding: FederationSourceBinding,
+    *,
+    federation_id: str | None = None,
+) -> str:
     """Return the artifact directory for one federation member source."""
-    parent = (
-        os.path.abspath(os.path.expanduser(str(artifacts_root)))
-        if artifacts_root and str(artifacts_root).strip()
-        else user_data_dir(appname="aetherdialect", appauthor=False)
+    parent = _federation_member_artifacts_root(artifacts_root)
+    return os.path.join(parent, federation_source_storage_slug(binding, federation_id=federation_id))
+
+
+def _federation_member_manifest_path(member_dir: str) -> str:
+    return os.path.join(member_dir, FEDERATION_MEMBER_MANIFEST_FILENAME)
+
+
+def write_federation_member_manifest(
+    member_dir: str,
+    binding: FederationSourceBinding,
+    *,
+    federation_id: str,
+) -> None:
+    """Persist engine identity for a federation member artifact tree."""
+    os.makedirs(member_dir, mode=ARTIFACT_DIR_MODE, exist_ok=True)
+    payload = {
+        "federation_id": str(federation_id or "").strip(),
+        "source_id": str(binding.source_id or "").strip(),
+        "engine": str(binding.engine or "").strip().lower(),
+        "connection": str(binding.connection or "").strip(),
+    }
+    _write_federation_json_atomic(_federation_member_manifest_path(member_dir), payload)
+
+
+def load_federation_member_manifest(member_dir: str) -> dict[str, Any] | None:
+    """Load a federation member manifest when present."""
+    path = _federation_member_manifest_path(member_dir)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise FederationConfigError(f"federation member manifest at {path!r} is unreadable: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise FederationConfigError(f"federation member manifest at {path!r} is not a JSON object")
+    return payload
+
+
+def detect_federation_member_engine_drift(
+    binding: FederationSourceBinding,
+    member_dir: str,
+    *,
+    federation_id: str | None = None,
+) -> bool:
+    """Return True when the live binding disagrees with the stored member manifest."""
+    stored = load_federation_member_manifest(member_dir)
+    if stored is None:
+        return False
+    fed_id = str(federation_id or "").strip()
+    if fed_id and str(stored.get("federation_id", "") or "").strip() not in ("", fed_id):
+        return True
+    if str(stored.get("source_id", "") or "").strip() != str(binding.source_id or "").strip():
+        return True
+    stored_engine = str(stored.get("engine", "") or "").strip().lower()
+    live_engine = str(binding.engine or "").strip().lower()
+    if stored_engine and live_engine and stored_engine != live_engine:
+        return True
+    stored_connection = str(stored.get("connection", "") or "").strip()
+    live_connection = str(binding.connection or "").strip()
+    if stored_connection and live_connection and stored_connection != live_connection:
+        return True
+    return False
+
+
+def _federation_member_schema_graph_path(
+    artifacts_root: str | None,
+    binding: FederationSourceBinding,
+    *,
+    federation_id: str | None = None,
+) -> str:
+    return os.path.join(
+        federation_source_artifacts_dir(artifacts_root, binding, federation_id=federation_id),
+        "schema_graph.json.gz",
     )
-    return os.path.join(parent, ARTIFACT_DIRECTORY_SEGMENT, federation_source_storage_slug(binding))
-
-
-def _federation_member_schema_graph_path(artifacts_root: str | None, binding: FederationSourceBinding) -> str:
-    return os.path.join(federation_source_artifacts_dir(artifacts_root, binding), "schema_graph.json.gz")
 
 
 def _load_federation_member_schema_graph(
     artifacts_root: str | None,
     binding: FederationSourceBinding,
+    *,
+    federation_id: str | None = None,
 ) -> SchemaGraph:
     """Load one stored member schema graph, surfacing unreadable or unprofiled artifacts."""
     source_id = str(binding.source_id or "").strip()
-    path = _federation_member_schema_graph_path(artifacts_root, binding)
+    path = _federation_member_schema_graph_path(artifacts_root, binding, federation_id=federation_id)
     if not os.path.isfile(path):
         raise FederationMemberUnprofilableError(
             f"federation member {source_id!r} stored schema graph is missing at {path!r}",
@@ -10935,11 +13134,18 @@ def _load_federation_member_schema_graph(
 def load_federation_member_graphs(artifacts_root: str | None, manifest: FederationManifest) -> dict[str, SchemaGraph]:
     """Load per-source schema graphs from member artifact trees when present."""
     graphs: dict[str, SchemaGraph] = {}
+    fed_id = str(manifest.federation_id or "").strip() or None
     for binding in manifest.sources:
-        path = _federation_member_schema_graph_path(artifacts_root, binding)
+        path = _federation_member_schema_graph_path(artifacts_root, binding, federation_id=fed_id)
         if not os.path.isfile(path):
             continue
-        graphs[binding.source_id] = _load_federation_member_schema_graph(artifacts_root, binding)
+        member_dir = federation_source_artifacts_dir(artifacts_root, binding, federation_id=fed_id)
+        with artifact_lock(member_dir):
+            graphs[binding.source_id] = _load_federation_member_schema_graph(
+                artifacts_root,
+                binding,
+                federation_id=fed_id,
+            )
     return graphs
 
 
@@ -11016,6 +13222,10 @@ def _value_overlap_ratio(left: Sequence[str], right: Sequence[str]) -> float:
     return inter / float(min(len(s1), len(s2)))
 
 
+def _value_overlap_ratio_for_columns(left: ColumnMetadata, right: ColumnMetadata) -> float:
+    return value_overlap_ratio_for_columns(left, right)
+
+
 def _mapping_suggestion_cutoff(*, same_source: bool) -> float:
     if same_source:
         return PolicyConfig.FEDERATION_MAPPING_SUGGESTION_WITHIN_SOURCE_CUTOFF
@@ -11030,7 +13240,7 @@ def _cross_source_column_suggestion_score(
     if left.sensitivity != SensitivityClassification.NONE or right.sensitivity != SensitivityClassification.NONE:
         return 0.0
     name_score = _name_similarity(left_name, right_name)
-    overlap = _value_overlap_ratio(left.value_overlap_sample, right.value_overlap_sample)
+    overlap = _value_overlap_ratio_for_columns(left, right)
     if overlap < FEDERATION_MAPPING_VALUE_OVERLAP_FLOOR and name_score < FEDERATION_MAPPING_NAME_SCORE_FLOOR:
         return 0.0
     return min(
@@ -11162,7 +13372,7 @@ def persist_federation_mapping_suggestions_cache(
     path = federation_artifact_paths(federation_dir).get("mapping_suggestions_cache", "")
     if not path:
         return
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.makedirs(os.path.dirname(path), mode=ARTIFACT_DIR_MODE, exist_ok=True)
     payload = {
         "member_tuple_hash": member_tuple_hash_value,
         "suggestions": [
@@ -11221,6 +13431,3 @@ def export_federation_migration_map_skeleton(
         handle.write("\n")
         handle.write("\n")
     return path
-
-
-_quote_ident = sqlglot_quote_identifier

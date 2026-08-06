@@ -35,7 +35,7 @@ def test_member_foreign_key_override_to_other_member_table_names_manifest_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+    monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
     graph = _member_graph()
     editor = tmp_path / "schema_overrides.json"
     editor.write_text(

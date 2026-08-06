@@ -29,7 +29,7 @@ from tests.test_aether_federation_public_surface import (
 )
 
 _MAPPINGS_PAYLOAD = {
-    "version": 2,
+    "version": "0.2.1",
     "logical_tables": [],
     "logical_columns": [],
 }
@@ -144,7 +144,7 @@ def test_parse_federation_mappings_rejects_unknown_version() -> None:
 @pytest.mark.fast
 def test_export_declaration_round_trips_empty_logical_sections() -> None:
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
-    mappings = FederationMappings(version=2)
+    mappings = FederationMappings(version="0.2.1")
     doc = federation_declaration_document(manifest, mappings)
     assert "logical_columns" in doc
     assert "logical_tables" in doc
@@ -158,7 +158,7 @@ def test_export_declaration_round_trips_empty_logical_sections() -> None:
 def test_export_union_omits_empty_authoritative_source() -> None:
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
     mappings = FederationMappings(
-        version=2,
+        version="0.2.1",
         logical_tables=(
             __import__("aetherdialect._contracts_base", fromlist=["LogicalTableMapping"]).LogicalTableMapping(
                 logical="payment",

@@ -29,6 +29,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+
+      - run: pip install ".[dev]"
+
+      - name: Build distribution
+        run: python -m build
+
+      - name: Twine check
+        run: twine check dist/*
 
       - name: Create tag and release
         env:
@@ -49,4 +58,5 @@ jobs:
             --target "$COMMIT_SHA" \
             --title "$TAG" \
             --generate-notes \
-            --latest
+            --latest \
+            dist/*

@@ -46,7 +46,7 @@ def test_compose_sets_composite_notes_sha256_from_federation_notes() -> None:
     composite = compose_composite_graph(
         _members(),
         manifest,
-        FederationMappings(version=1),
+        FederationMappings(version="0.2.1"),
         notes_content=notes,
     )
     assert composite.notes_sha256 == hashlib.sha256(notes.encode("utf-8")).hexdigest()

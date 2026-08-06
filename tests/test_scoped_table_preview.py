@@ -14,7 +14,6 @@ from aetherdialect._contracts_base import (
     FederationContext,
     SensitivityClassification,
     TablePreviewResult,
-    set_sensitivity,
 )
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._federation import compose_composite_graph, parse_federation_manifest
@@ -74,7 +73,7 @@ def test_preview_table_returns_bounded_rows_on_engine() -> None:
 @pytest.mark.fast
 def test_preview_omits_hidden_columns() -> None:
     hidden_col = ColumnMetadata(name="secret_col", data_type="varchar")
-    set_sensitivity(hidden_col, SensitivityClassification.HIDDEN)
+    SensitivityClassification.apply_to(hidden_col, SensitivityClassification.HIDDEN)
     visible_col = ColumnMetadata(name="id", data_type="integer", is_primary_key=True)
     preview = _preview_table(
         "tbl_a",
@@ -154,12 +153,16 @@ def test_federation_preview_respects_scope() -> None:
     fed._apply_init_bundle(bundle)
     fed._members = {"a": left_member, "b": right_member}
     fed._federation_member_graphs = {"a": left_graph, "b": right_graph}
-    with patch("aetherdialect._main_execution._resolve_preview_scope_context", return_value=scoped_context):
+    with patch(
+        "aetherdialect._main_execution.MainExecutionOps._resolve_preview_scope_context", return_value=scoped_context
+    ):
         with patch("aetherdialect._main_execution.validate_sql", return_value=(True, None, None, [])):
             allowed = fed.preview_table("left_t", limit=2)
     assert allowed.columns == ("id",)
     assert len(allowed.rows) == 2
-    with patch("aetherdialect._main_execution._resolve_preview_scope_context", return_value=scoped_context):
+    with patch(
+        "aetherdialect._main_execution.MainExecutionOps._resolve_preview_scope_context", return_value=scoped_context
+    ):
         with pytest.raises(AccessError, match=PERMISSION_DENIED_USER_MESSAGE):
             fed.preview_table("right_t", limit=2)
 

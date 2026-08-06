@@ -9,10 +9,10 @@ import pytest
 
 from aetherdialect._contracts_core import RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._dialect import compute_sql_fp, sqlglot_dialect_for_engine
+from aetherdialect._dialect import Dialect, DialectRegistry
 from aetherdialect._intent_process import NormalizedExpr
 from aetherdialect._schema_graph import recompute_join_paths_multi
-from aetherdialect._templates import _template_from_store_dict, empty_template_store, insert_template
+from aetherdialect._templates import TemplateOps, TemplateStoreView
 
 
 def _member_schema(source_id: str) -> SchemaGraph:
@@ -44,9 +44,9 @@ def test_member_template_sql_fp_unchanged_after_postgresql_coordinator_reload() 
         where=None,
     )
     mysql_dialect = SimpleNamespace(engine="mysql")
-    store = empty_template_store(schema.schema_graph_id)
+    store = TemplateOps.empty_template_store(schema.schema_graph_id)
     templates: dict = {}
-    tmpl = insert_template(
+    tmpl = TemplateOps.insert_template(
         store,
         templates,
         schema,
@@ -58,15 +58,18 @@ def test_member_template_sql_fp_unchanged_after_postgresql_coordinator_reload() 
         federation_plan_id="plan1",
         federation_plan_only=True,
     )
-    expected_fp = compute_sql_fp(tmpl.sql_param, sqlglot_dialect=sqlglot_dialect_for_engine("mysql"))
+    expected_fp = Dialect.compute_sql_fp(
+        tmpl.sql_param, sqlglot_dialect=DialectRegistry.sqlglot_dialect_for_engine("mysql")
+    )
     assert tmpl.sql_fp == expected_fp
     assert tmpl.member_engine == "mysql"
 
     raw = tmpl.to_dict()
     with patch(
-        "aetherdialect._templates.active_sqlglot_dialect", return_value=sqlglot_dialect_for_engine("postgresql")
+        "aetherdialect._templates.Dialect.active_sqlglot_dialect",
+        return_value=DialectRegistry.sqlglot_dialect_for_engine("postgresql"),
     ):
-        reloaded = _template_from_store_dict(tmpl.id, raw)
+        reloaded = TemplateStoreView._template_from_store_dict(tmpl.id, raw)
     assert reloaded is not None
     assert reloaded.sql_fp == expected_fp
     assert reloaded.member_engine == "mysql"

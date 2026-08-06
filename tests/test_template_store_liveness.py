@@ -24,13 +24,9 @@ from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph,
 from aetherdialect._core_utils import read_artifact_manifest, read_gzip_json, write_gzip_json_atomic
 from aetherdialect._intent_process import NormalizedExpr
 from aetherdialect._templates import (
-    empty_template_store,
-    load_template_store,
-    save_template_store,
-    template_is_live,
-    template_partition_number,
-    template_schema_refs,
-    templates_to_store,
+    TemplateOps,
+    TemplateRefs,
+    TemplateStoreView,
 )
 
 
@@ -181,7 +177,7 @@ def _tiny_schema(*, id_type: str = "integer") -> SchemaGraph:
 
 @pytest.mark.fast
 def test_template_schema_refs_collects_cte_join_segments() -> None:
-    refs = template_schema_refs(_cte_join_template())
+    refs = TemplateRefs.template_schema_refs(_cte_join_template())
     assert _seg("a", "b_id", "b", "id") in refs.fk_edges
     assert _seg("b", "c_id", "c", "id") in refs.fk_edges
 
@@ -190,7 +186,7 @@ def test_template_schema_refs_collects_cte_join_segments() -> None:
 def test_template_is_live_rejects_stale_cte_join_segment() -> None:
     tmpl = _cte_join_template()
     schema = _three_hop_schema()
-    live = template_is_live(template_schema_refs(tmpl), schema)
+    live = TemplateRefs.template_is_live(TemplateRefs.template_schema_refs(tmpl), schema)
     assert live[0] is True
 
     stale_tables = {
@@ -210,7 +206,7 @@ def test_template_is_live_rejects_stale_cte_join_segment() -> None:
         "d": schema.join_paths_multi["d"],
     }
     stale_schema = replace(schema, tables=stale_tables, join_paths_multi=stale_paths)
-    dead = template_is_live(template_schema_refs(tmpl), stale_schema)
+    dead = TemplateRefs.template_is_live(TemplateRefs.template_schema_refs(tmpl), stale_schema)
     assert dead[0] is False
     assert any(r.startswith("stale_join_path:") or r.startswith("missing_join_segment:") for r in dead[1])
 
@@ -218,9 +214,11 @@ def test_template_is_live_rejects_stale_cte_join_segment() -> None:
 @pytest.mark.fast
 def test_template_is_live_rejects_column_type_mismatch() -> None:
     tmpl = _typed_template(col_type="integer")
-    ok, reasons = template_is_live(template_schema_refs(tmpl), _tiny_schema(id_type="integer"))
+    ok, reasons = TemplateRefs.template_is_live(
+        TemplateRefs.template_schema_refs(tmpl), _tiny_schema(id_type="integer")
+    )
     assert ok is True
-    bad, reasons = template_is_live(template_schema_refs(tmpl), _tiny_schema(id_type="text"))
+    bad, reasons = TemplateRefs.template_is_live(TemplateRefs.template_schema_refs(tmpl), _tiny_schema(id_type="text"))
     assert bad is False
     assert any(r.startswith("column_type_mismatch:") for r in reasons)
 
@@ -256,7 +254,7 @@ def test_template_is_live_rejects_join_path_not_current_in_join_paths_multi() ->
             "d": schema.join_paths_multi["d"],
         },
     )
-    ok, reasons = template_is_live(template_schema_refs(tmpl), pairwise_only)
+    ok, reasons = TemplateRefs.template_is_live(TemplateRefs.template_schema_refs(tmpl), pairwise_only)
     assert ok is False
     assert any(r.startswith("stale_join_path:") for r in reasons)
 
@@ -268,33 +266,38 @@ def test_remove_template_compacts_empty_shard_file(tmp_path, monkeypatch) -> Non
     os.makedirs(store_dir, exist_ok=True)
     monkeypatch.setattr(EngineConfig, "TEMPLATE_STORE_DIR", str(tmp_path / "intent_templates"))
     tmpl = _typed_template()
-    view = empty_template_store(tmpl.schema_graph_id)
-    templates_to_store(view, {tmpl.id: tmpl})
-    save_template_store(view)
-    part = template_partition_number(tmpl.id)
+    view = TemplateOps.empty_template_store(tmpl.schema_graph_id)
+    TemplateOps.templates_to_store(view, {tmpl.id: tmpl})
+    TemplateOps.save_template_store(view)
+    part = TemplateStoreView.template_partition_number(tmpl.id)
     part_path = os.path.join(store_dir, f"{TEMPLATE_STORE_PARTITION_PREFIX}{part:02x}.json.gz")
     assert os.path.isfile(part_path)
     view.remove_template_id(tmpl.id)
-    save_template_store(view)
+    TemplateOps.save_template_store(view)
     assert not os.path.isfile(part_path)
 
 
 @pytest.mark.fast
 def test_prune_caps_template_count(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(PolicyConfig, "REGENERATE_TEMPLATE_STORE", False)
-    monkeypatch.setattr("aetherdialect._templates.TEMPLATE_STORE_MAX_TEMPLATE_COUNT", 3)
+    from aetherdialect._config import EngineLimits
+
+    monkeypatch.setattr(
+        "aetherdialect._templates.TemplateOps._resolve_engine_limits",
+        lambda: EngineLimits(template_store_max_count=3),
+    )
     store_dir = str(tmp_path / "intent_templates")
     os.makedirs(store_dir, exist_ok=True)
     monkeypatch.setattr(EngineConfig, "TEMPLATE_STORE_DIR", store_dir)
     cap = 3
-    view = empty_template_store("sg_test000000000001__abcd1234")
+    view = TemplateOps.empty_template_store("sg_test000000000001__abcd1234")
     templates: dict[str, Template] = {}
     for i in range(cap + 2):
         tid = f"T{i:04d}"
         templates[tid] = replace(_typed_template(), id=tid, trust_level=1 if i < cap else 3)
-    templates_to_store(view, templates)
-    save_template_store(view)
-    loaded = load_template_store("sg_test000000000001__abcd1234", schema=None)
+    TemplateOps.templates_to_store(view, templates)
+    TemplateOps.save_template_store(view)
+    loaded = TemplateOps.load_template_store("sg_test000000000001__abcd1234", schema=None)
     assert len(loaded.partition_map) <= cap
     assert "T0000" not in loaded.partition_map
     assert f"T{cap + 1:04d}" in loaded.partition_map
@@ -303,7 +306,12 @@ def test_prune_caps_template_count(tmp_path, monkeypatch) -> None:
 @pytest.mark.fast
 def test_prune_value_history_rows_caps_per_template(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(PolicyConfig, "REGENERATE_TEMPLATE_STORE", False)
-    monkeypatch.setattr("aetherdialect._templates.TEMPLATE_VALUE_HISTORY_MAX_ROWS", 4)
+    from aetherdialect._config import EngineLimits
+
+    monkeypatch.setattr(
+        "aetherdialect._templates.TemplateOps._resolve_engine_limits",
+        lambda: EngineLimits(template_value_history_depth=4),
+    )
     store_dir = str(tmp_path / "intent_templates")
     os.makedirs(store_dir, exist_ok=True)
     monkeypatch.setattr(EngineConfig, "TEMPLATE_STORE_DIR", store_dir)
@@ -315,10 +323,10 @@ def test_prune_value_history_rows_caps_per_template(tmp_path, monkeypatch) -> No
         natural_language=["nl"] * len(questions),
     )
     tmpl = replace(_typed_template(), value_history=vh)
-    view = empty_template_store(tmpl.schema_graph_id)
-    templates_to_store(view, {tmpl.id: tmpl})
-    save_template_store(view)
-    loaded = load_template_store(tmpl.schema_graph_id, schema=None)
+    view = TemplateOps.empty_template_store(tmpl.schema_graph_id)
+    TemplateOps.templates_to_store(view, {tmpl.id: tmpl})
+    TemplateOps.save_template_store(view)
+    loaded = TemplateOps.load_template_store(tmpl.schema_graph_id, schema=None)
     stored = loaded.get_template(tmpl.id)
     assert stored is not None
     assert len(stored.value_history.questions) == cap
@@ -332,14 +340,14 @@ def test_load_detects_cross_shard_partition_map_mismatch(tmp_path, monkeypatch) 
     os.makedirs(store_dir, exist_ok=True)
     monkeypatch.setattr(EngineConfig, "TEMPLATE_STORE_DIR", str(tmp_path / "intent_templates"))
     tmpl = _typed_template()
-    view = empty_template_store(tmpl.schema_graph_id)
-    templates_to_store(view, {tmpl.id: tmpl})
-    save_template_store(view)
+    view = TemplateOps.empty_template_store(tmpl.schema_graph_id)
+    TemplateOps.templates_to_store(view, {tmpl.id: tmpl})
+    TemplateOps.save_template_store(view)
     hdr_path = os.path.join(store_dir, TEMPLATE_STORE_HEADER_FILENAME)
     header = read_gzip_json(hdr_path)
     header["partition_map"]["TGHOST"] = header["partition_map"][tmpl.id]
     write_gzip_json_atomic(hdr_path, header, sort_keys=True)
-    loaded = load_template_store(tmpl.schema_graph_id, schema=None)
+    loaded = TemplateOps.load_template_store(tmpl.schema_graph_id, schema=None)
     assert "TGHOST" not in loaded.partition_map
     assert tmpl.id in loaded.partition_map
 
@@ -363,9 +371,9 @@ def test_save_refreshes_manifest_structural_and_profiling_hashes(tmp_path, monke
     write_gzip_json_atomic(schema_path, schema.to_dict(), sort_keys=True)
     monkeypatch.setattr(EngineConfig, "SCHEMA_JSON_PATH", schema_path)
     tmpl = replace(_typed_template(), schema_graph_id=schema.schema_graph_id)
-    view = empty_template_store(schema.schema_graph_id)
-    templates_to_store(view, {tmpl.id: tmpl})
-    save_template_store(view)
+    view = TemplateOps.empty_template_store(schema.schema_graph_id)
+    TemplateOps.templates_to_store(view, {tmpl.id: tmpl})
+    TemplateOps.save_template_store(view)
     manifest = read_artifact_manifest(artifacts)
     assert manifest is not None
     assert manifest.structural_hash == "struct_abc"

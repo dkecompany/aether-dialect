@@ -13,7 +13,7 @@ from aetherdialect._contracts_base import EngineContext, PhaseProgressEvent
 from aetherdialect._contracts_schema import SchemaGraph
 from aetherdialect._core_utils import emit_ask_phase, emit_construction_phase
 from aetherdialect._dialect import Dialect
-from aetherdialect._main_execution import PipelineSession, PipelineSuspended
+from aetherdialect._main_execution import PipelineSession
 from aetherdialect._schema_overrides import build_schema_graph_with_diff
 from tests.test_aetherdialect import _make_aether_stub
 
@@ -144,12 +144,11 @@ def test_pipeline_session_wires_ask_phase_callback() -> None:
     events: list[PhaseProgressEvent] = []
     engine = _make_aether_stub(_ask_phase_callback=lambda ev: events.append(ev))
     session = PipelineSession(engine)
-    suspended = PipelineSuspended("intent_confirm", "confirm?", None)
 
     def ask_side_effect(*_args: object, **_kwargs: object) -> None:
         emit_ask_phase(ASK_PHASE_B)
 
-    with patch("aetherdialect._main_execution.interactive_run_once", side_effect=ask_side_effect):
+    with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once", side_effect=ask_side_effect):
         session.ask("how many rentals")
 
     assert any(ev.phase == ASK_PHASE_B for ev in events)

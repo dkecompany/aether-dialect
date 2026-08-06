@@ -22,11 +22,8 @@ from aetherdialect._core_utils import read_gzip_json, write_gzip_json_atomic
 from aetherdialect._intent_process import NormalizedExpr
 from aetherdialect._schema_graph import recompute_join_paths_multi
 from aetherdialect._templates import (
-    empty_template_store,
-    load_template_store,
-    save_template_store,
-    template_partition_number,
-    templates_to_store,
+    TemplateOps,
+    TemplateStoreView,
 )
 
 
@@ -87,15 +84,15 @@ def test_load_reconciles_live_templates_on_schema_graph_id_mismatch(tmp_path, mo
     monkeypatch.setattr(EngineConfig, "TEMPLATE_STORE_DIR", str(tmp_path / "intent_templates"))
     tmpl = _typed_template()
     old_id = tmpl.schema_graph_id
-    view = empty_template_store(old_id)
-    templates_to_store(view, {tmpl.id: tmpl})
-    save_template_store(view)
+    view = TemplateOps.empty_template_store(old_id)
+    TemplateOps.templates_to_store(view, {tmpl.id: tmpl})
+    TemplateOps.save_template_store(view)
 
     new_schema = _tiny_schema(schema_graph_id="sg_new000000000002__efgh5678")
-    loaded = load_template_store(new_schema.schema_graph_id, new_schema)
+    loaded = TemplateOps.load_template_store(new_schema.schema_graph_id, new_schema)
     assert tmpl.id in loaded.partition_map
     assert loaded.schema_graph_id == new_schema.schema_graph_id
-    reloaded = load_template_store(new_schema.schema_graph_id, schema=None)
+    reloaded = TemplateOps.load_template_store(new_schema.schema_graph_id, schema=None)
     assert tmpl.id in reloaded.partition_map
     assert reloaded.schema_graph_id == new_schema.schema_graph_id
 
@@ -103,17 +100,21 @@ def test_load_reconciles_live_templates_on_schema_graph_id_mismatch(tmp_path, mo
 @pytest.mark.fast
 def test_prune_enforces_template_count_and_disk_size_on_save(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(PolicyConfig, "REGENERATE_TEMPLATE_STORE", False)
-    monkeypatch.setattr("aetherdialect._templates.TEMPLATE_STORE_MAX_TEMPLATE_COUNT", 2)
-    monkeypatch.setattr("aetherdialect._templates.TEMPLATE_STORE_MAX_DISK_BYTES", 512)
+    from aetherdialect._config import EngineLimits
+
+    monkeypatch.setattr(
+        "aetherdialect._templates.TemplateOps._resolve_engine_limits",
+        lambda: EngineLimits(template_store_max_count=2, template_store_max_disk_bytes=512),
+    )
     store_dir = str(tmp_path / "intent_templates")
     os.makedirs(store_dir, exist_ok=True)
     monkeypatch.setattr(EngineConfig, "TEMPLATE_STORE_DIR", store_dir)
     graph_id = "sg_test000000000001__abcd1234"
-    view = empty_template_store(graph_id)
+    view = TemplateOps.empty_template_store(graph_id)
     templates = {f"T{i:04d}": replace(_typed_template(tid=f"T{i:04d}"), trust_level=i) for i in range(5)}
-    templates_to_store(view, templates)
-    save_template_store(view)
-    loaded = load_template_store(graph_id, schema=None)
+    TemplateOps.templates_to_store(view, templates)
+    TemplateOps.save_template_store(view)
+    loaded = TemplateOps.load_template_store(graph_id, schema=None)
     assert len(loaded.partition_map) <= 2
     assert "T0000" not in loaded.partition_map
     assert "T0004" in loaded.partition_map
@@ -126,18 +127,18 @@ def test_load_repairs_uncommitted_shard_bodies_not_in_header(tmp_path, monkeypat
     os.makedirs(store_dir, exist_ok=True)
     monkeypatch.setattr(EngineConfig, "TEMPLATE_STORE_DIR", str(tmp_path / "intent_templates"))
     tmpl = _typed_template()
-    view = empty_template_store(tmpl.schema_graph_id)
-    templates_to_store(view, {tmpl.id: tmpl})
-    save_template_store(view)
+    view = TemplateOps.empty_template_store(tmpl.schema_graph_id)
+    TemplateOps.templates_to_store(view, {tmpl.id: tmpl})
+    TemplateOps.save_template_store(view)
 
     ghost = replace(_typed_template(tid="TGHOST"), trust_level=9)
-    part = template_partition_number(tmpl.id)
+    part = TemplateStoreView.template_partition_number(tmpl.id)
     part_path = os.path.join(store_dir, f"{TEMPLATE_STORE_PARTITION_PREFIX}{part:02x}.json.gz")
     shard = read_gzip_json(part_path)
     shard[ghost.id] = ghost.to_dict()
     write_gzip_json_atomic(part_path, shard, sort_keys=True)
 
-    loaded = load_template_store(tmpl.schema_graph_id, schema=None)
+    loaded = TemplateOps.load_template_store(tmpl.schema_graph_id, schema=None)
     assert ghost.id not in loaded.partition_map
     assert tmpl.id in loaded.partition_map
     shard_after = read_gzip_json(part_path)
@@ -151,13 +152,13 @@ def test_partial_save_crash_leaves_consistent_state_on_reload(tmp_path, monkeypa
     os.makedirs(store_dir, exist_ok=True)
     monkeypatch.setattr(EngineConfig, "TEMPLATE_STORE_DIR", str(tmp_path / "intent_templates"))
     graph_id = "sg_test000000000001__abcd1234"
-    view = empty_template_store(graph_id)
+    view = TemplateOps.empty_template_store(graph_id)
     first = _typed_template(tid="T0001")
-    templates_to_store(view, {first.id: first})
-    save_template_store(view)
+    TemplateOps.templates_to_store(view, {first.id: first})
+    TemplateOps.save_template_store(view)
 
     second = replace(_typed_template(tid="T0002"), trust_level=2)
-    templates_to_store(view, {first.id: first, second.id: second})
+    TemplateOps.templates_to_store(view, {first.id: first, second.id: second})
     original_replace = os.replace
     calls: list[tuple[str, str]] = []
 
@@ -169,9 +170,9 @@ def test_partial_save_crash_leaves_consistent_state_on_reload(tmp_path, monkeypa
 
     with patch("aetherdialect._templates.os.replace", side_effect=_replace_after_shard):
         with pytest.raises(OSError, match="simulated crash"):
-            save_template_store(view)
+            TemplateOps.save_template_store(view)
 
-    loaded = load_template_store(graph_id, schema=None)
+    loaded = TemplateOps.load_template_store(graph_id, schema=None)
     assert loaded.partition_map.keys() <= {"T0001"}
     assert "T0002" not in loaded.partition_map
     assert loaded.get_template("T0001") is not None

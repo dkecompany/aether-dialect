@@ -37,7 +37,7 @@ from aetherdialect._federation import (
     validate_federation_migration_map,
 )
 from aetherdialect._schema_graph import recompute_join_paths_multi
-from aetherdialect._templates import empty_template_store_for_space, save_template_store
+from aetherdialect._templates import TemplateOps
 from tests.federation_helpers import enriched_manifest, write_federation_declaration_file
 
 
@@ -254,16 +254,16 @@ def test_federation_destructive_migration_clears_composite_templates(tmp_path: P
     persist_federation_tree(
         fed_dir,
         manifest=manifest,
-        mappings=FederationMappings(version=1),
+        mappings=FederationMappings(version="0.2.1"),
         composite=composite,
         member_graphs=members,
     )
-    store = empty_template_store_for_space(str(composite.schema_graph_id), artifacts_dir=fed_dir)
-    save_template_store(store)
+    store = TemplateOps.empty_template_store_for_space(str(composite.schema_graph_id), artifacts_dir=fed_dir)
+    TemplateOps.save_template_store(store)
     assert (Path(fed_dir) / "intent_templates").is_dir()
 
-    migration = parse_federation_migration_map({"version": 1, "action": "destructive"})
-    apply_federation_migration_map(migration, manifest, FederationMappings(version=1), fed_dir)
+    migration = parse_federation_migration_map({"version": "1", "action": "destructive"})
+    apply_federation_migration_map(migration, manifest, FederationMappings(version="0.2.1"), fed_dir)
 
     assert not (Path(fed_dir) / "intent_templates").exists()
     assert clear_federation_composite_template_store(fed_dir) is False
@@ -280,7 +280,7 @@ def test_validate_federation_migration_map_stale_rename() -> None:
     live = dict(members)
     migration = parse_federation_migration_map(
         {
-            "version": 1,
+            "version": "1",
             "action": "remap",
             "qualified_column_renames": [{"from": "entity_a.missing", "to": "entity_a.email"}],
         }

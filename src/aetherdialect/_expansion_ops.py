@@ -10,15 +10,76 @@ from typing import Any, cast
 
 from ._config import SeedWarmupConfig
 from ._constants import (
+    AGG_CHANGE,
+    BRIDGE_INTERMEDIATE_ADD,
     CASE_ADD_OPS,
+    CASE_CATEGORICAL_ADD,
+    COUNT_DISTINCT_ADD,
     CTE_ADD_OPS,
+    CTE_SCALAR_THRESHOLD,
+    CTE_UNNEST_ADD,
+    CTE_WRAP_GROUPED,
+    DIMENSION_SWAP,
+    DISTINCT_ADD,
+    DISTINCT_REMOVE,
+    EMI_MUTATE,
     EXPANSION_SUBTREE_POOL_MAX,
+    GROUPBY_ADD,
+    GROUPBY_REMOVE,
     HAVING_ADD_OPS,
+    HAVING_EXPR_ADD,
+    HAVING_MATCH_SELECT_AGG,
+    HAVING_REMOVE,
+    HAVING_VALUE_ADD,
+    INCLUDE_GOLD,
+    JOIN_DIMENSION_ADD,
+    JOIN_FACT_ADD,
+    LIMIT_ADD,
+    LIMIT_REMOVE,
+    MULTI_CTE_CHAIN_ADD,
+    NUM_ABS_WHERE,
+    NUM_ROUND_SELECT,
+    ORDERBY_ADD,
+    ORDERBY_REMOVE,
+    ORDERBY_WINDOW_COL_ADD,
+    SELECT_CASE_LABEL_ADD,
+    SELECT_COALESCE_ADD,
+    SELECT_COL_TRIM,
+    SELECT_EXPR_PAIR_MULTIPLY,
+    SELECT_STRING_SCALAR_ADD,
+    SELF_JOIN_CTE_ADD,
+    SPLICE_HAVING_SUBTREE,
+    SPLICE_SUBTREE,
+    SPLICE_WINDOW_SUBTREE,
+    TABLE_REMOVE,
+    TEMP_DATE_DIFF_WHERE,
+    TEMP_DATE_TRUNC_GROUPBY,
+    TEMP_DATE_WINDOW_WHERE,
+    TEMP_EXTRACT_GROUPBY,
+    TEMP_EXTRACT_WHERE,
+    WHERE_ADD,
+    WHERE_ARRAY_CONTAINS_ADD,
+    WHERE_EXPR_ADD,
+    WHERE_ILIKE_ADD,
+    WHERE_IN_LIST_ADD,
+    WHERE_LIKE_ADD,
+    WHERE_NOT_NULL_ADD,
+    WHERE_NULL_ADD,
+    WHERE_OR_GROUP,
+    WHERE_REMOVE,
     WINDOW_ADD_OPS,
-    ExpansionOperatorId,
+    WINDOW_AVG_PARTITION_ADD,
+    WINDOW_DENSE_RANK_ADD,
+    WINDOW_LAG_ADD,
+    WINDOW_LEAD_ADD,
+    WINDOW_RANK_ADD,
+    WINDOW_RANK_FUNC_ADD,
+    WINDOW_STRIP,
+    WINDOW_SUM_PARTITION_ADD,
 )
 from ._contracts_base import (
     ColumnRole,
+    CteEmissionKind,
     ExprValue,
     HavingParam,
     MulGroup,
@@ -28,18 +89,12 @@ from ._contracts_base import (
     RawValue,
     TableRole,
     WhereParam,
-    expr_registry_ref,
-    having_leaves,
-    merge_predicate_groups,
-    predicate_group_from_list,
-    where_leaves,
 )
 from ._contracts_core import (
     RuntimeCteStep,
     RuntimeIntent,
     SeedWarmupIntent,
     SelectCol,
-    classify_seed_warmup_intent_complexity,
 )
 from ._contracts_schema import (
     CaseRegistryStep,
@@ -51,8 +106,8 @@ from ._contracts_schema import (
     WindowRegistryStep,
     WindowSpec,
 )
-from ._core_utils import debug
-from ._dialect import extra_where_ops_for_engine
+from ._core_utils import column_has_unknown_value_type, debug, escape_sql_string_literal_body_base, stable_bucket
+from ._dialect import DialectRegistry
 from ._intent_expr import extract_columns_from_expr, replace_refs_in_expr
 from ._intent_process import apply_deterministic_repairs
 from ._intent_repair import drop_invalid_case_registry_entries, repair_case_when_intent
@@ -73,31 +128,31 @@ def expansion_compatible(parent: SeedWarmupIntent, candidate_op: str) -> bool:
     """Return whether ``candidate_op`` may be applied given the parent expansion path."""
     path = _expansion_path_ops(parent)
     path_set = set(path)
-    if candidate_op in WINDOW_ADD_OPS and ExpansionOperatorId.DISTINCT_ADD in path_set:
+    if candidate_op in WINDOW_ADD_OPS and DISTINCT_ADD in path_set:
         return False
     if candidate_op in CASE_ADD_OPS and any(op in WINDOW_ADD_OPS for op in path_set):
         return False
-    if candidate_op in CTE_ADD_OPS and ExpansionOperatorId.DISTINCT_ADD in path_set:
+    if candidate_op in CTE_ADD_OPS and DISTINCT_ADD in path_set:
         return False
     if candidate_op in WINDOW_ADD_OPS and any(op in WINDOW_ADD_OPS for op in path_set):
         return False
-    if candidate_op == ExpansionOperatorId.EMI_MUTATE:
-        if ExpansionOperatorId.EMI_MUTATE in path_set or ExpansionOperatorId.WHERE_OR_GROUP in path_set:
+    if candidate_op == EMI_MUTATE:
+        if EMI_MUTATE in path_set or WHERE_OR_GROUP in path_set:
             return False
-    if candidate_op == ExpansionOperatorId.WHERE_OR_GROUP and ExpansionOperatorId.EMI_MUTATE in path_set:
+    if candidate_op == WHERE_OR_GROUP and EMI_MUTATE in path_set:
         return False
-    if candidate_op == ExpansionOperatorId.GROUPBY_REMOVE and any(op in HAVING_ADD_OPS for op in path_set):
+    if candidate_op == GROUPBY_REMOVE and any(op in HAVING_ADD_OPS for op in path_set):
         return False
-    if candidate_op.startswith("JOIN_") and ExpansionOperatorId.CTE_UNNEST_ADD in path_set:
+    if candidate_op.startswith("JOIN_") and CTE_UNNEST_ADD in path_set:
         if len(parent.tables or []) >= 2:
             return False
     if candidate_op in CASE_ADD_OPS and len(parent.case_registry or []) > 0:
         return False
     if candidate_op in WINDOW_ADD_OPS and len(parent.window_registry or []) > 0:
         return False
-    if not SeedWarmupConfig.ALLOW_HAVING_EXPR_EXPANSION and candidate_op == ExpansionOperatorId.HAVING_EXPR_ADD:
+    if not SeedWarmupConfig.ALLOW_HAVING_EXPR_EXPANSION and candidate_op == HAVING_EXPR_ADD:
         return False
-    if not SeedWarmupConfig.ALLOW_EMI_MUTATE_EXPANSION and candidate_op == ExpansionOperatorId.EMI_MUTATE:
+    if not SeedWarmupConfig.ALLOW_EMI_MUTATE_EXPANSION and candidate_op == EMI_MUTATE:
         return False
     return True
 
@@ -122,15 +177,24 @@ def _accept_expansion_variant(
     return var
 
 
-_EXPANSION_SUBTREE_POOL: list[SeedWarmupIntent] = []
+_EXPANSION_SUBTREE_POOL: dict[str, list[SeedWarmupIntent]] = {}
 
 
-def _record_expansion_subtree_pool(intent: SeedWarmupIntent) -> None:
-    """Append a validated expansion snapshot for splice reuse when under the pool cap."""
-    global _EXPANSION_SUBTREE_POOL
-    if len(_EXPANSION_SUBTREE_POOL) >= EXPANSION_SUBTREE_POOL_MAX:
+def clear_expansion_subtree_pool(pool_key: str | None = None) -> None:
+    """Drop expansion subtree snapshots for *pool_key*, or every key when *pool_key* is omitted."""
+    if pool_key is None:
+        _EXPANSION_SUBTREE_POOL.clear()
         return
-    _EXPANSION_SUBTREE_POOL.append(copy.deepcopy(intent))
+    _EXPANSION_SUBTREE_POOL.pop(str(pool_key), None)
+
+
+def _record_expansion_subtree_pool(intent: SeedWarmupIntent, *, pool_key: str = "") -> None:
+    """Append a validated expansion snapshot for splice reuse when under the pool cap."""
+    key = str(pool_key or "")
+    pool = _EXPANSION_SUBTREE_POOL.setdefault(key, [])
+    if len(pool) >= EXPANSION_SUBTREE_POOL_MAX:
+        return
+    pool.append(copy.deepcopy(intent))
 
 
 def _join_path_in_multi(schema: SchemaGraph, a: str, b: str) -> bool:
@@ -146,7 +210,7 @@ def _join_path_in_multi(schema: SchemaGraph, a: str, b: str) -> bool:
 
 def _tier_expansion_sort_key(intent: SeedWarmupIntent, counts: dict[str, int], denom: int) -> tuple[float, str]:
     """Higher debt against target tier proportions sorts earlier for coverage-guided expansion."""
-    tier = classify_seed_warmup_intent_complexity(intent).value
+    tier = intent.complexity_tier().value
     tgt = SeedWarmupConfig.COMPLEXITY_TARGET_PROPORTIONS.get(tier, 0.2)
     obs = counts.get(tier, 0) / max(denom, 1)
     debt = max(0.0, tgt - obs)
@@ -247,7 +311,7 @@ def _intent_has_window_select(intent: SeedWarmupIntent) -> bool:
     """Return True when the intent declares window functions via. ``window_registry`` or select refs."""
     if intent.window_registry:
         return True
-    return any((expr_registry_ref(sc.expr) or "").startswith("w") for sc in (intent.select_cols or []))
+    return any((sc.expr.registry_ref() or "").startswith("w") for sc in (intent.select_cols or []))
 
 
 def _get_table_role(schema: SchemaGraph, table: str) -> str | None:
@@ -272,7 +336,7 @@ def _build_column_metadata(schema: SchemaGraph) -> dict[str, dict[str, dict[str,
             result[table_name][col_name] = {
                 "data_type": col.data_type,
                 "role": col.role,
-                "nullable": col.null_ratio > 0.0,
+                "nullable": (col.null_ratio is not None and col.null_ratio > 0.0),
                 "cardinality": getattr(col, "cardinality", None),
                 "value_type": (col.value_type or "").strip().lower(),
                 "is_foreign_key": bool(col.is_foreign_key),
@@ -337,6 +401,7 @@ def _get_filterable_columns(schema: SchemaGraph, table_name: str) -> list[str]:
         f"{table_name}.{c}"
         for c, col in table.columns.items()
         if col.is_visible
+        and not column_has_unknown_value_type(col)
         and col.role in (ColumnRole.CATEGORICAL.value, ColumnRole.TEMPORAL.value, ColumnRole.IDENTIFIER.value)
     ]
 
@@ -434,9 +499,9 @@ def _rewrite_table_qualifier(intent: SeedWarmupIntent, old_table: str, new_table
         _note_expr(g)
     for ob in intent.order_by_cols or []:
         _note_expr(ob.expr)
-    for fp in where_leaves(intent.where) or []:
+    for fp in PredicateGroup.where_leaves(intent.where) or []:
         _note_where(fp)
-    for hp in having_leaves(intent.having) or []:
+    for hp in PredicateGroup.having_leaves(intent.having) or []:
         _note_expr(hp.left_expr)
         if hp.right_expr:
             _note_expr(hp.right_expr)
@@ -486,7 +551,7 @@ def _rewrite_table_qualifier(intent: SeedWarmupIntent, old_table: str, new_table
                     left_expr=_rex(fp.left_expr) or fp.left_expr,
                     right_expr=_rex(fp.right_expr) if fp.right_expr else None,
                 )
-                for fp in where_leaves(intent.where)
+                for fp in PredicateGroup.where_leaves(intent.where)
             ),
         )
     if intent.having is not None:
@@ -498,7 +563,7 @@ def _rewrite_table_qualifier(intent: SeedWarmupIntent, old_table: str, new_table
                     left_expr=_rex(hp.left_expr) or hp.left_expr,
                     right_expr=_rex(hp.right_expr) if hp.right_expr else None,
                 )
-                for hp in having_leaves(intent.having)
+                for hp in PredicateGroup.having_leaves(intent.having)
             ),
         )
     new_wr: list[WindowRegistryStep] = []
@@ -558,7 +623,7 @@ def _where_add(
     intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """WHERE_ADD: add one value-based filter per filterable column not yet filtered."""
-    current_where_cols = {f.left_expr.primary_column for f in (where_leaves(intent.where) or [])}
+    current_where_cols = {f.left_expr.primary_column for f in (PredicateGroup.where_leaves(intent.where) or [])}
     if len(current_where_cols) >= SeedWarmupConfig.MAX_WHERE_PREDICATES:
         return []
 
@@ -579,10 +644,8 @@ def _where_add(
                 value_type=vtype,
                 param_key=f"f_{col.replace('.', '_')}",
             )
-            new_intent.where = merge_predicate_groups(
-                "and", [new_intent.where, predicate_group_from_list([new_filter])]
-            )
-            _add_expansion_metadata(new_intent, ExpansionOperatorId.WHERE_ADD)
+            new_intent.where = PredicateGroup.merge("and", [new_intent.where, PredicateGroup.from_list([new_filter])])
+            _add_expansion_metadata(new_intent, WHERE_ADD)
             results.append(new_intent)
     return results
 
@@ -592,7 +655,7 @@ def _where_expr_add(
 ) -> list[SeedWarmupIntent]:
     """WHERE_EXPR_ADD: add column-vs-column comparisons for same-type column pairs."""
     existing = set()
-    for f in where_leaves(intent.where) or []:
+    for f in PredicateGroup.where_leaves(intent.where) or []:
         if f.right_expr:
             existing.add((f.left_expr.primary_column, f.op, f.right_expr.primary_column))
     if len(existing) >= SeedWarmupConfig.MAX_EXPR_COMPARISONS:
@@ -641,10 +704,10 @@ def _where_expr_add(
                     value_type="column",
                     param_key="",
                 )
-                new_intent.where = merge_predicate_groups(
-                    "and", [new_intent.where, predicate_group_from_list([new_filter])]
+                new_intent.where = PredicateGroup.merge(
+                    "and", [new_intent.where, PredicateGroup.from_list([new_filter])]
                 )
-                _add_expansion_metadata(new_intent, ExpansionOperatorId.WHERE_EXPR_ADD)
+                _add_expansion_metadata(new_intent, WHERE_EXPR_ADD)
                 results.append(new_intent)
     return results
 
@@ -684,7 +747,7 @@ def _agg_change(
                     new_expr = _swap_agg_func(s.expr, new_agg)
                     new_intent.select_cols[i] = SelectCol(expr=new_expr)
                     break
-            _add_expansion_metadata(new_intent, ExpansionOperatorId.AGG_CHANGE)
+            _add_expansion_metadata(new_intent, AGG_CHANGE)
             results.append(new_intent)
     return results
 
@@ -700,7 +763,7 @@ def _groupby_add(
         return []
 
     has_agg_sel = any(sc.is_aggregated for sc in intent.select_cols or [])
-    has_hav = len(having_leaves(intent.having) or []) > 0
+    has_hav = len(PredicateGroup.having_leaves(intent.having) or []) > 0
     if not has_agg_sel and not has_hav:
         return []
 
@@ -715,7 +778,7 @@ def _groupby_add(
             )
             if new_intent.grain == "row_level":
                 new_intent.grain = "grouped"
-            _add_expansion_metadata(new_intent, ExpansionOperatorId.GROUPBY_ADD)
+            _add_expansion_metadata(new_intent, GROUPBY_ADD)
             results.append(new_intent)
     return results
 
@@ -744,7 +807,7 @@ def _orderby_add(
             new_intent = copy.deepcopy(intent)
             new_order = OrderByCol(expr=NormalizedExpr.from_column(col), direction=direction)
             new_intent.order_by_cols = list(new_intent.order_by_cols or []) + [new_order]
-            _add_expansion_metadata(new_intent, ExpansionOperatorId.ORDERBY_ADD)
+            _add_expansion_metadata(new_intent, ORDERBY_ADD)
             results.append(new_intent)
     return results
 
@@ -755,7 +818,7 @@ def _having_value_add(
     """HAVING_VALUE_ADD: add `HAVING` with a value threshold for grouped intents."""
     if intent.grain != "grouped" or not intent.group_by_cols:
         return []
-    existing = {(h.left_expr.primary_term, h.op) for h in (having_leaves(intent.having) or [])}
+    existing = {(h.left_expr.primary_term, h.op) for h in (PredicateGroup.having_leaves(intent.having) or [])}
     numeric_targets: list[str] = []
     for tbl in intent.tables or []:
         numeric_targets.extend(_get_numeric_measure_columns(schema, tbl))
@@ -777,10 +840,8 @@ def _having_value_add(
                 value_type="number",
                 param_key=f"h_{agg_func}_{op.replace('<', 'lt').replace('>', 'gt').replace('=', 'e')}",
             )
-            new_intent.having = merge_predicate_groups(
-                "and", [new_intent.having, predicate_group_from_list([new_having])]
-            )
-            _add_expansion_metadata(new_intent, ExpansionOperatorId.HAVING_VALUE_ADD)
+            new_intent.having = PredicateGroup.merge("and", [new_intent.having, PredicateGroup.from_list([new_having])])
+            _add_expansion_metadata(new_intent, HAVING_VALUE_ADD)
             results.append(new_intent)
     return results
 
@@ -791,7 +852,7 @@ def _having_expr_add(
     """HAVING_EXPR_ADD: add `HAVING` aggregate-vs-aggregate comparisons for grouped intents."""
     if intent.grain != "grouped" or not intent.group_by_cols:
         return []
-    existing = {(h.left_expr.primary_term, h.op) for h in (having_leaves(intent.having) or [])}
+    existing = {(h.left_expr.primary_term, h.op) for h in (PredicateGroup.having_leaves(intent.having) or [])}
     agg_cols = [sc.expr.primary_column for sc in (intent.select_cols or []) if sc.is_aggregated]
     numeric_targets: list[str] = []
     for tbl in intent.tables or []:
@@ -824,8 +885,8 @@ def _having_expr_add(
             value_type="expression",
             param_key="",
         )
-        new_intent.having = merge_predicate_groups("and", [new_intent.having, predicate_group_from_list([new_having])])
-        _add_expansion_metadata(new_intent, ExpansionOperatorId.HAVING_EXPR_ADD)
+        new_intent.having = PredicateGroup.merge("and", [new_intent.having, PredicateGroup.from_list([new_having])])
+        _add_expansion_metadata(new_intent, HAVING_EXPR_ADD)
         results.append(new_intent)
     return results
 
@@ -834,15 +895,15 @@ def _where_remove(
     intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """WHERE_REMOVE: remove each filter one at a time."""
-    current = where_leaves(intent.where) or []
+    current = PredicateGroup.where_leaves(intent.where) or []
     if not current:
         return []
     results: list[SeedWarmupIntent] = []
     for i in range(len(current)):
         new_intent = copy.deepcopy(intent)
-        _where_leaves = list(where_leaves(new_intent.where) or [])
-        new_intent.where = predicate_group_from_list(_where_leaves[:i] + _where_leaves[i + 1 :])
-        _add_expansion_metadata(new_intent, ExpansionOperatorId.WHERE_REMOVE)
+        _where_leaves = list(PredicateGroup.where_leaves(new_intent.where) or [])
+        new_intent.where = PredicateGroup.from_list(_where_leaves[:i] + _where_leaves[i + 1 :])
+        _add_expansion_metadata(new_intent, WHERE_REMOVE)
         results.append(new_intent)
     return results
 
@@ -859,7 +920,7 @@ def _groupby_remove(
         new_intent = copy.deepcopy(intent)
         ng = list(new_intent.group_by_cols or [])
         new_intent.group_by_cols = [g for g in ng if g.primary_column != gb.primary_column]
-        _add_expansion_metadata(new_intent, ExpansionOperatorId.GROUPBY_REMOVE)
+        _add_expansion_metadata(new_intent, GROUPBY_REMOVE)
         results.append(new_intent)
     return results
 
@@ -868,15 +929,15 @@ def _having_remove(
     intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """HAVING_REMOVE: remove each `HAVING` condition one at a time."""
-    current = having_leaves(intent.having) or []
+    current = PredicateGroup.having_leaves(intent.having) or []
     if not current:
         return []
     results: list[SeedWarmupIntent] = []
     for i in range(len(current)):
         new_intent = copy.deepcopy(intent)
-        _having_leaves = list(having_leaves(new_intent.having) or [])
-        new_intent.having = predicate_group_from_list(_having_leaves[:i] + _having_leaves[i + 1 :])
-        _add_expansion_metadata(new_intent, ExpansionOperatorId.HAVING_REMOVE)
+        _having_leaves = list(PredicateGroup.having_leaves(new_intent.having) or [])
+        new_intent.having = PredicateGroup.from_list(_having_leaves[:i] + _having_leaves[i + 1 :])
+        _add_expansion_metadata(new_intent, HAVING_REMOVE)
         results.append(new_intent)
     return results
 
@@ -911,7 +972,7 @@ def _join_dimension_add(
                 continue
             new_intent = copy.deepcopy(intent)
             new_intent.tables = sorted(new_tables)
-            _add_expansion_metadata(new_intent, ExpansionOperatorId.JOIN_DIMENSION_ADD)
+            _add_expansion_metadata(new_intent, JOIN_DIMENSION_ADD)
             results.append(new_intent)
     return results
 
@@ -948,7 +1009,7 @@ def _join_fact_add(
             seen_targets.add(target)
             new_intent = copy.deepcopy(intent)
             new_intent.tables = sorted(new_tables)
-            _add_expansion_metadata(new_intent, ExpansionOperatorId.JOIN_FACT_ADD)
+            _add_expansion_metadata(new_intent, JOIN_FACT_ADD)
             results.append(new_intent)
 
         for other_table, other_fks in fk_map.items():
@@ -971,7 +1032,7 @@ def _join_fact_add(
                     seen_targets.add(other_table)
                     new_intent = copy.deepcopy(intent)
                     new_intent.tables = sorted(new_tables)
-                    _add_expansion_metadata(new_intent, ExpansionOperatorId.JOIN_FACT_ADD)
+                    _add_expansion_metadata(new_intent, JOIN_FACT_ADD)
                     results.append(new_intent)
                     break
     return results
@@ -1005,7 +1066,7 @@ def _dimension_swap(
             new_intent.tables = sorted(new_tables)
             if not _rewrite_table_qualifier(new_intent, table, dim, schema):
                 continue
-            _add_expansion_metadata(new_intent, ExpansionOperatorId.DIMENSION_SWAP)
+            _add_expansion_metadata(new_intent, DIMENSION_SWAP)
             results.append(new_intent)
     return results
 
@@ -1078,16 +1139,16 @@ def _table_remove(
             return False
 
         new_filters: list[WhereParam] = []
-        for f in where_leaves(new_intent.where) or []:
+        for f in PredicateGroup.where_leaves(new_intent.where) or []:
             if _table_from_column_ref(f.left_expr.primary_column) not in ts:
                 continue
             if f.right_expr and _table_from_column_ref(f.right_expr.primary_column) == table:
                 continue
             new_filters.append(f)
-        new_intent.where = predicate_group_from_list(new_filters)
+        new_intent.where = PredicateGroup.from_list(new_filters)
 
-        new_intent.having = predicate_group_from_list(
-            [h for h in (having_leaves(new_intent.having) or []) if not _having_refs_removed_table(h)]
+        new_intent.having = PredicateGroup.from_list(
+            [h for h in (PredicateGroup.having_leaves(new_intent.having) or []) if not _having_refs_removed_table(h)]
         )
 
         dropped_win: set[str] = {
@@ -1113,7 +1174,7 @@ def _table_remove(
             _dropped_case: set[str] = dropped_case,
             _ts: set[str] = ts,
         ) -> bool:
-            rid = expr_registry_ref(o.expr) or ""
+            rid = o.expr.registry_ref() or ""
             if rid.startswith("w") and rid in _dropped_win:
                 return False
             if rid.startswith("c") and rid in _dropped_case:
@@ -1130,7 +1191,7 @@ def _table_remove(
             _dropped_case: set[str] = dropped_case,
             _ts: set[str] = ts,
         ) -> bool:
-            rid = expr_registry_ref(sc.expr) or ""
+            rid = sc.expr.registry_ref() or ""
             if rid.startswith("w") and rid in _dropped_win:
                 return False
             if rid.startswith("c") and rid in _dropped_case:
@@ -1144,7 +1205,7 @@ def _table_remove(
         new_intent.select_cols = [sc for sc in (new_intent.select_cols or []) if _select_keeps(sc)]
         if not new_intent.select_cols:
             continue
-        _add_expansion_metadata(new_intent, ExpansionOperatorId.TABLE_REMOVE)
+        _add_expansion_metadata(new_intent, TABLE_REMOVE)
         results.append(new_intent)
     return results
 
@@ -1173,7 +1234,7 @@ def _bridge_intermediate_add(
             continue
         new_intent = copy.deepcopy(intent)
         new_intent.tables = sorted(new_tables)
-        _add_expansion_metadata(new_intent, ExpansionOperatorId.BRIDGE_INTERMEDIATE_ADD)
+        _add_expansion_metadata(new_intent, BRIDGE_INTERMEDIATE_ADD)
         results.append(new_intent)
     return results
 
@@ -1183,7 +1244,7 @@ def _include_gold(
 ) -> list[SeedWarmupIntent]:
     """INCLUDE_GOLD: include the gold intent unchanged with expansion metadata stamped."""
     gold_copy = copy.deepcopy(intent)
-    _add_expansion_metadata(gold_copy, ExpansionOperatorId.INCLUDE_GOLD)
+    _add_expansion_metadata(gold_copy, INCLUDE_GOLD)
     return [gold_copy]
 
 
@@ -1206,7 +1267,7 @@ def _temp_extract_groupby(
                 )
                 if new_intent.grain == "row_level":
                     new_intent.grain = "grouped"
-                _add_expansion_metadata(new_intent, ExpansionOperatorId.TEMP_EXTRACT_GROUPBY)
+                _add_expansion_metadata(new_intent, TEMP_EXTRACT_GROUPBY)
                 results.append(new_intent)
     return results
 
@@ -1230,7 +1291,7 @@ def _temp_date_trunc_groupby(
                 )
                 if new_intent.grain == "row_level":
                     new_intent.grain = "grouped"
-                _add_expansion_metadata(new_intent, ExpansionOperatorId.TEMP_DATE_TRUNC_GROUPBY)
+                _add_expansion_metadata(new_intent, TEMP_DATE_TRUNC_GROUPBY)
                 results.append(new_intent)
     return results
 
@@ -1239,7 +1300,7 @@ def _temp_date_window_filter(
     intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """TEMP_DATE_WINDOW_WHERE: add `date_window` filters on temporal columns using config presets."""
-    current_where_cols = {f.left_expr.primary_column for f in (where_leaves(intent.where) or [])}
+    current_where_cols = {f.left_expr.primary_column for f in (PredicateGroup.where_leaves(intent.where) or [])}
     if len(current_where_cols) >= SeedWarmupConfig.MAX_WHERE_PREDICATES:
         return []
     results: list[SeedWarmupIntent] = []
@@ -1256,10 +1317,10 @@ def _temp_date_window_filter(
                     param_key="",
                     raw_value=dict(preset),
                 )
-                new_intent.where = merge_predicate_groups(
-                    "and", [new_intent.where, predicate_group_from_list([new_filter])]
+                new_intent.where = PredicateGroup.merge(
+                    "and", [new_intent.where, PredicateGroup.from_list([new_filter])]
                 )
-                _add_expansion_metadata(new_intent, ExpansionOperatorId.TEMP_DATE_WINDOW_WHERE)
+                _add_expansion_metadata(new_intent, TEMP_DATE_WINDOW_WHERE)
                 results.append(new_intent)
     return results
 
@@ -1268,7 +1329,7 @@ def _temp_date_diff_filter(
     intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """TEMP_DATE_DIFF_WHERE: add `date_diff` filters on temporal columns using config presets."""
-    current_where_cols = {f.left_expr.primary_column for f in (where_leaves(intent.where) or [])}
+    current_where_cols = {f.left_expr.primary_column for f in (PredicateGroup.where_leaves(intent.where) or [])}
     if len(current_where_cols) >= SeedWarmupConfig.MAX_WHERE_PREDICATES:
         return []
     results: list[SeedWarmupIntent] = []
@@ -1285,10 +1346,10 @@ def _temp_date_diff_filter(
                     param_key="",
                     raw_value=dict(preset),
                 )
-                new_intent.where = merge_predicate_groups(
-                    "and", [new_intent.where, predicate_group_from_list([new_filter])]
+                new_intent.where = PredicateGroup.merge(
+                    "and", [new_intent.where, PredicateGroup.from_list([new_filter])]
                 )
-                _add_expansion_metadata(new_intent, ExpansionOperatorId.TEMP_DATE_DIFF_WHERE)
+                _add_expansion_metadata(new_intent, TEMP_DATE_DIFF_WHERE)
                 results.append(new_intent)
     return results
 
@@ -1310,7 +1371,7 @@ def _num_round_select(
         new_intent = copy.deepcopy(intent)
         new_expr = replace(new_intent.select_cols[idx].expr, scalar_func="round", scalar_func_args=[0])
         new_intent.select_cols[idx] = SelectCol(expr=new_expr)
-        _add_expansion_metadata(new_intent, ExpansionOperatorId.NUM_ROUND_SELECT)
+        _add_expansion_metadata(new_intent, NUM_ROUND_SELECT)
         results.append(new_intent)
     return results
 
@@ -1320,7 +1381,7 @@ def _num_abs_filter(
 ) -> list[SeedWarmupIntent]:
     """NUM_ABS_WHERE: wrap numeric filter left-hand expressions with `abs` for range operators."""
     results: list[SeedWarmupIntent] = []
-    for idx, f in enumerate(where_leaves(intent.where) or []):
+    for idx, f in enumerate(PredicateGroup.where_leaves(intent.where) or []):
         if f.op not in (">", "<", ">=", "<="):
             continue
         if f.left_expr.scalar_func == "abs":
@@ -1334,11 +1395,11 @@ def _num_abs_filter(
         if col_info.get("role") != ColumnRole.NUMERIC_MEASURE.value:
             continue
         new_intent = copy.deepcopy(intent)
-        _where_leaves = list(where_leaves(new_intent.where) or [])
+        _where_leaves = list(PredicateGroup.where_leaves(new_intent.where) or [])
         new_expr = replace(_where_leaves[idx].left_expr, scalar_func="abs")
         _where_leaves[idx] = replace(_where_leaves[idx], left_expr=new_expr)
-        new_intent.where = predicate_group_from_list(_where_leaves)
-        _add_expansion_metadata(new_intent, ExpansionOperatorId.NUM_ABS_WHERE)
+        new_intent.where = PredicateGroup.from_list(_where_leaves)
+        _add_expansion_metadata(new_intent, NUM_ABS_WHERE)
         results.append(new_intent)
     return results
 
@@ -1352,7 +1413,7 @@ def _distinct_add(
     new_intent = copy.deepcopy(intent)
     new_intent.distinct_select_index = 0
     _strip_order_by_for_distinct_select(new_intent)
-    _add_expansion_metadata(new_intent, ExpansionOperatorId.DISTINCT_ADD)
+    _add_expansion_metadata(new_intent, DISTINCT_ADD)
     return [new_intent]
 
 
@@ -1366,7 +1427,7 @@ def _limit_add(
     for val in SeedWarmupConfig.LIMIT_EXPANSION_VALUES:
         new_intent = copy.deepcopy(intent)
         new_intent.limit = val
-        _add_expansion_metadata(new_intent, ExpansionOperatorId.LIMIT_ADD)
+        _add_expansion_metadata(new_intent, LIMIT_ADD)
         results.append(new_intent)
     return results
 
@@ -1375,7 +1436,7 @@ def _where_or_group(
     intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
     """WHERE_OR_GROUP: convert pairs of existing conjunctive filters into OR groups."""
-    filters = where_leaves(intent.where) or []
+    filters = PredicateGroup.where_leaves(intent.where) or []
     if len(filters) < 2:
         return []
     results: list[SeedWarmupIntent] = []
@@ -1389,13 +1450,13 @@ def _where_or_group(
             if fj.value_type in ("date_window", "date_diff"):
                 continue
             new_intent = copy.deepcopy(intent)
-            _where_leaves = list(where_leaves(new_intent.where) or [])
+            _where_leaves = list(PredicateGroup.where_leaves(new_intent.where) or [])
             new_fi, new_fj = _where_leaves[i], _where_leaves[j]
             del _where_leaves[j]
             del _where_leaves[i]
             or_group = PredicateGroup(op="or", predicates=(new_fi, new_fj))
-            new_intent.where = merge_predicate_groups("and", [predicate_group_from_list(_where_leaves), or_group])
-            _add_expansion_metadata(new_intent, ExpansionOperatorId.WHERE_OR_GROUP)
+            new_intent.where = PredicateGroup.merge("and", [PredicateGroup.from_list(_where_leaves), or_group])
+            _add_expansion_metadata(new_intent, WHERE_OR_GROUP)
             results.append(new_intent)
     return results
 
@@ -1421,7 +1482,7 @@ def _window_rank_add(
         order_by=[OrderByCol(expr=copy.deepcopy(agg_sc.expr), direction="DESC")],
     )
     _append_window_registry_column(new_intent, ws)
-    _add_expansion_metadata(new_intent, ExpansionOperatorId.WINDOW_RANK_ADD)
+    _add_expansion_metadata(new_intent, WINDOW_RANK_ADD)
     fin = _finalize_registry_touch_seed(new_intent, _schema)
     return [fin] if fin is not None else []
 
@@ -1448,7 +1509,7 @@ def _window_sum_partition_add(
                     argument=NormalizedExpr.from_column(measure),
                 )
                 _append_window_registry_column(new_intent, ws)
-                _add_expansion_metadata(new_intent, ExpansionOperatorId.WINDOW_SUM_PARTITION_ADD)
+                _add_expansion_metadata(new_intent, WINDOW_SUM_PARTITION_ADD)
                 fin = _finalize_registry_touch_seed(new_intent, schema)
                 if fin is not None:
                     results.append(fin)
@@ -1483,7 +1544,7 @@ def _select_expr_pair_multiply(
                 ]
             )
             new_intent.select_cols = list(new_intent.select_cols or []) + [SelectCol(expr=composed)]
-            _add_expansion_metadata(new_intent, ExpansionOperatorId.SELECT_EXPR_PAIR_MULTIPLY)
+            _add_expansion_metadata(new_intent, SELECT_EXPR_PAIR_MULTIPLY)
             results.append(new_intent)
     return results
 
@@ -1508,7 +1569,7 @@ def _select_case_label_add(
             branch = CaseWhenBranch(condition=cond, result=NormalizedExpr(add_values=[ExprValue(value=1.0)]))
             cw = CaseWhenExpr(branches=[branch], else_result=NormalizedExpr(add_values=[ExprValue(value=0.0)]))
             _append_case_registry_column(new_intent, cw)
-            _add_expansion_metadata(new_intent, ExpansionOperatorId.SELECT_CASE_LABEL_ADD)
+            _add_expansion_metadata(new_intent, SELECT_CASE_LABEL_ADD)
             fin = _finalize_registry_touch_seed(new_intent, schema)
             if fin is not None:
                 results.append(fin)
@@ -1541,7 +1602,7 @@ def _window_lag_add(
                     argument=NormalizedExpr.from_column(measure),
                 )
                 _append_window_registry_column(new_intent, ws)
-                _add_expansion_metadata(new_intent, ExpansionOperatorId.WINDOW_LAG_ADD)
+                _add_expansion_metadata(new_intent, WINDOW_LAG_ADD)
                 fin = _finalize_registry_touch_seed(new_intent, schema)
                 if fin is not None:
                     results.append(fin)
@@ -1564,7 +1625,7 @@ def _window_lead_add(
                 new_wr.append(step)
         vc.window_registry = new_wr
         vc.expansion_metadata = None
-        _add_expansion_metadata(vc, ExpansionOperatorId.WINDOW_LEAD_ADD)
+        _add_expansion_metadata(vc, WINDOW_LEAD_ADD)
         fin = _finalize_registry_touch_seed(vc, schema)
         if fin is not None:
             results.append(fin)
@@ -1576,9 +1637,9 @@ def _where_ilike_add(
 ) -> list[SeedWarmupIntent]:
     """Add case-insensitive `ilike` filters on categorical string. columns (PostgreSQL only)."""
     _ = column_metadata
-    if "ilike" not in extra_where_ops_for_engine():
+    if "ilike" not in DialectRegistry.extra_where_ops_for_engine():
         return []
-    current_where_cols = {f.left_expr.primary_column for f in (where_leaves(intent.where) or [])}
+    current_where_cols = {f.left_expr.primary_column for f in (PredicateGroup.where_leaves(intent.where) or [])}
     if len(current_where_cols) >= SeedWarmupConfig.MAX_WHERE_PREDICATES:
         return []
     results: list[SeedWarmupIntent] = []
@@ -1597,10 +1658,8 @@ def _where_ilike_add(
             new_filter = WhereParam(
                 left_expr=NormalizedExpr.from_column(full), op="ilike", value_type="string", param_key=f"ilk_{col_name}"
             )
-            new_intent.where = merge_predicate_groups(
-                "and", [new_intent.where, predicate_group_from_list([new_filter])]
-            )
-            _add_expansion_metadata(new_intent, ExpansionOperatorId.WHERE_ILIKE_ADD)
+            new_intent.where = PredicateGroup.merge("and", [new_intent.where, PredicateGroup.from_list([new_filter])])
+            _add_expansion_metadata(new_intent, WHERE_ILIKE_ADD)
             results.append(new_intent)
     return results
 
@@ -1610,7 +1669,7 @@ def _where_array_contains_add(
 ) -> list[SeedWarmupIntent]:
     """Add `contains` filters for columns that declare an array. `element_type`."""
     _ = column_metadata
-    current_where_cols = {f.left_expr.primary_column for f in (where_leaves(intent.where) or [])}
+    current_where_cols = {f.left_expr.primary_column for f in (PredicateGroup.where_leaves(intent.where) or [])}
     if len(current_where_cols) >= SeedWarmupConfig.MAX_WHERE_PREDICATES:
         return []
     results: list[SeedWarmupIntent] = []
@@ -1630,10 +1689,8 @@ def _where_array_contains_add(
                 value_type="array",
                 param_key=f"arr_{col_name}",
             )
-            new_intent.where = merge_predicate_groups(
-                "and", [new_intent.where, predicate_group_from_list([new_filter])]
-            )
-            _add_expansion_metadata(new_intent, ExpansionOperatorId.WHERE_ARRAY_CONTAINS_ADD)
+            new_intent.where = PredicateGroup.merge("and", [new_intent.where, PredicateGroup.from_list([new_filter])])
+            _add_expansion_metadata(new_intent, WHERE_ARRAY_CONTAINS_ADD)
             results.append(new_intent)
     return results
 
@@ -1648,7 +1705,7 @@ def _orderby_remove(
         return []
     new_intent = copy.deepcopy(intent)
     new_intent.order_by_cols = ob[:-1]
-    _add_expansion_metadata(new_intent, ExpansionOperatorId.ORDERBY_REMOVE)
+    _add_expansion_metadata(new_intent, ORDERBY_REMOVE)
     return [new_intent]
 
 
@@ -1661,7 +1718,7 @@ def _limit_remove(
         return []
     new_intent = copy.deepcopy(intent)
     new_intent.limit = None
-    _add_expansion_metadata(new_intent, ExpansionOperatorId.LIMIT_REMOVE)
+    _add_expansion_metadata(new_intent, LIMIT_REMOVE)
     return [new_intent]
 
 
@@ -1674,7 +1731,7 @@ def _select_col_trim(
     non_agg_idx = [
         i
         for i, sc in enumerate(scs)
-        if not sc.is_aggregated and not (expr_registry_ref(sc.expr) or "").startswith(("w", "c"))
+        if not sc.is_aggregated and not (sc.expr.registry_ref() or "").startswith(("w", "c"))
     ]
     if len(non_agg_idx) < 2:
         return []
@@ -1682,7 +1739,7 @@ def _select_col_trim(
     for idx in non_agg_idx:
         new_intent = copy.deepcopy(intent)
         new_intent.select_cols = [c for j, c in enumerate(scs) if j != idx]
-        _add_expansion_metadata(new_intent, ExpansionOperatorId.SELECT_COL_TRIM)
+        _add_expansion_metadata(new_intent, SELECT_COL_TRIM)
         results.append(new_intent)
     return results
 
@@ -1696,7 +1753,7 @@ def _window_strip(
     reg_by = {s.registry_id: s for s in (intent.window_registry or [])}
 
     def _pure_rank_registry_col(sc: SelectCol) -> bool:
-        rid = expr_registry_ref(sc.expr) or ""
+        rid = sc.expr.registry_ref() or ""
         if not rid.startswith("w"):
             return False
         step = reg_by.get(rid)
@@ -1717,7 +1774,7 @@ def _window_strip(
     kept: list[SelectCol] = []
     for sc in scs:
         if _pure_rank_registry_col(sc):
-            rid = expr_registry_ref(sc.expr) or ""
+            rid = sc.expr.registry_ref() or ""
             if rid:
                 dropped_ids.add(rid)
             continue
@@ -1725,11 +1782,11 @@ def _window_strip(
     new_intent.select_cols = kept
     new_intent.window_registry = [s for s in (new_intent.window_registry or []) if s.registry_id not in dropped_ids]
     new_intent.order_by_cols = [
-        o for o in (new_intent.order_by_cols or []) if (expr_registry_ref(o.expr) or "") not in dropped_ids
+        o for o in (new_intent.order_by_cols or []) if (o.expr.registry_ref() or "") not in dropped_ids
     ]
     if len(new_intent.select_cols) == len(scs):
         return []
-    _add_expansion_metadata(new_intent, ExpansionOperatorId.WINDOW_STRIP)
+    _add_expansion_metadata(new_intent, WINDOW_STRIP)
     fin = _finalize_registry_touch_seed(new_intent, schema)
     return [fin] if fin is not None else []
 
@@ -1743,7 +1800,7 @@ def _distinct_remove(
         return []
     new_intent = copy.deepcopy(intent)
     new_intent.distinct_select_index = -1
-    _add_expansion_metadata(new_intent, ExpansionOperatorId.DISTINCT_REMOVE)
+    _add_expansion_metadata(new_intent, DISTINCT_REMOVE)
     return [new_intent]
 
 
@@ -1752,24 +1809,27 @@ def _splice_subtree(
     schema: SchemaGraph,
     column_metadata: dict[str, dict[str, dict[str, Any]]],
     fk_map: dict[str, list[dict[str, str]]],
+    *,
+    pool_key: str = "",
 ) -> list[SeedWarmupIntent]:
     """Borrow one filter predicate from the subtree pool when table. overlap exists."""
     _ = schema, fk_map, column_metadata
-    if not _EXPANSION_SUBTREE_POOL:
+    pool = _EXPANSION_SUBTREE_POOL.get(str(pool_key or ""), [])
+    if not pool:
         return []
-    idx = hash(intent.intent_id or "") % len(_EXPANSION_SUBTREE_POOL)
-    donor = _EXPANSION_SUBTREE_POOL[idx]
-    fps = where_leaves(donor.where) or []
+    idx = stable_bucket(intent.intent_id or "", len(pool))
+    donor = pool[idx]
+    fps = PredicateGroup.where_leaves(donor.where) or []
     if not fps:
         return []
     overlap = set(intent.tables or []) & set(donor.tables or [])
     if not overlap:
         return []
     new_intent = copy.deepcopy(intent)
-    new_intent.where = merge_predicate_groups(
-        "and", [new_intent.where, predicate_group_from_list([copy.deepcopy(fps[0])])]
+    new_intent.where = PredicateGroup.merge(
+        "and", [new_intent.where, PredicateGroup.from_list([copy.deepcopy(fps[0])])]
     )
-    _add_expansion_metadata(new_intent, ExpansionOperatorId.SPLICE_SUBTREE)
+    _add_expansion_metadata(new_intent, SPLICE_SUBTREE)
     return [new_intent]
 
 
@@ -1778,7 +1838,7 @@ def _where_null_add(
 ) -> list[SeedWarmupIntent]:
     """WHERE_NULL_ADD: add IS NULL filters on nullable columns."""
     _ = schema
-    current_where_cols = {f.left_expr.primary_column for f in (where_leaves(intent.where) or [])}
+    current_where_cols = {f.left_expr.primary_column for f in (PredicateGroup.where_leaves(intent.where) or [])}
     if len(current_where_cols) >= SeedWarmupConfig.MAX_WHERE_PREDICATES:
         return []
     results: list[SeedWarmupIntent] = []
@@ -1791,11 +1851,11 @@ def _where_null_add(
             if not meta.get("nullable"):
                 continue
             new_intent = copy.deepcopy(intent)
-            new_intent.where = merge_predicate_groups(
+            new_intent.where = PredicateGroup.merge(
                 "and",
                 [
                     new_intent.where,
-                    predicate_group_from_list(
+                    PredicateGroup.from_list(
                         [
                             WhereParam(
                                 left_expr=NormalizedExpr.from_column(col),
@@ -1807,7 +1867,7 @@ def _where_null_add(
                     ),
                 ],
             )
-            _add_expansion_metadata(new_intent, ExpansionOperatorId.WHERE_NULL_ADD)
+            _add_expansion_metadata(new_intent, WHERE_NULL_ADD)
             results.append(new_intent)
     return results
 
@@ -1817,7 +1877,7 @@ def _where_not_null_add(
 ) -> list[SeedWarmupIntent]:
     """WHERE_NOT_NULL_ADD: add IS NOT NULL filters on nullable columns."""
     _ = schema
-    current_where_cols = {f.left_expr.primary_column for f in (where_leaves(intent.where) or [])}
+    current_where_cols = {f.left_expr.primary_column for f in (PredicateGroup.where_leaves(intent.where) or [])}
     if len(current_where_cols) >= SeedWarmupConfig.MAX_WHERE_PREDICATES:
         return []
     results: list[SeedWarmupIntent] = []
@@ -1830,11 +1890,11 @@ def _where_not_null_add(
             if not meta.get("nullable"):
                 continue
             new_intent = copy.deepcopy(intent)
-            new_intent.where = merge_predicate_groups(
+            new_intent.where = PredicateGroup.merge(
                 "and",
                 [
                     new_intent.where,
-                    predicate_group_from_list(
+                    PredicateGroup.from_list(
                         [
                             WhereParam(
                                 left_expr=NormalizedExpr.from_column(col),
@@ -1846,7 +1906,7 @@ def _where_not_null_add(
                     ),
                 ],
             )
-            _add_expansion_metadata(new_intent, ExpansionOperatorId.WHERE_NOT_NULL_ADD)
+            _add_expansion_metadata(new_intent, WHERE_NOT_NULL_ADD)
             results.append(new_intent)
     return results
 
@@ -1856,7 +1916,7 @@ def _where_in_list_add(
 ) -> list[SeedWarmupIntent]:
     """WHERE_IN_LIST_ADD: add IN-list filters using profiled categorical samples."""
     _ = schema
-    current_where_cols = {f.left_expr.primary_column for f in (where_leaves(intent.where) or [])}
+    current_where_cols = {f.left_expr.primary_column for f in (PredicateGroup.where_leaves(intent.where) or [])}
     if len(current_where_cols) >= SeedWarmupConfig.MAX_WHERE_PREDICATES:
         return []
     results: list[SeedWarmupIntent] = []
@@ -1876,11 +1936,11 @@ def _where_in_list_add(
                 continue
             pick = [str(v) for v in samples[:3]]
             new_intent = copy.deepcopy(intent)
-            new_intent.where = merge_predicate_groups(
+            new_intent.where = PredicateGroup.merge(
                 "and",
                 [
                     new_intent.where,
-                    predicate_group_from_list(
+                    PredicateGroup.from_list(
                         [
                             WhereParam(
                                 left_expr=NormalizedExpr.from_column(col),
@@ -1893,7 +1953,7 @@ def _where_in_list_add(
                     ),
                 ],
             )
-            _add_expansion_metadata(new_intent, ExpansionOperatorId.WHERE_IN_LIST_ADD)
+            _add_expansion_metadata(new_intent, WHERE_IN_LIST_ADD)
             results.append(new_intent)
     return results
 
@@ -1903,7 +1963,7 @@ def _where_like_add(
 ) -> list[SeedWarmupIntent]:
     """WHERE_LIKE_ADD: add LIKE pattern filters on categorical string columns."""
     _ = schema
-    current_where_cols = {f.left_expr.primary_column for f in (where_leaves(intent.where) or [])}
+    current_where_cols = {f.left_expr.primary_column for f in (PredicateGroup.where_leaves(intent.where) or [])}
     if len(current_where_cols) >= SeedWarmupConfig.MAX_WHERE_PREDICATES:
         return []
     results: list[SeedWarmupIntent] = []
@@ -1921,11 +1981,11 @@ def _where_like_add(
                 continue
             pattern = f"%{sample[:3]}%"
             new_intent = copy.deepcopy(intent)
-            new_intent.where = merge_predicate_groups(
+            new_intent.where = PredicateGroup.merge(
                 "and",
                 [
                     new_intent.where,
-                    predicate_group_from_list(
+                    PredicateGroup.from_list(
                         [
                             WhereParam(
                                 left_expr=NormalizedExpr.from_column(col),
@@ -1938,7 +1998,7 @@ def _where_like_add(
                     ),
                 ],
             )
-            _add_expansion_metadata(new_intent, ExpansionOperatorId.WHERE_LIKE_ADD)
+            _add_expansion_metadata(new_intent, WHERE_LIKE_ADD)
             results.append(new_intent)
     return results
 
@@ -1953,7 +2013,7 @@ def _having_match_select_agg(
     agg_cols = [sc for sc in (intent.select_cols or []) if sc.is_aggregated]
     if not agg_cols:
         return []
-    existing = {(h.left_expr.primary_term, h.op) for h in (having_leaves(intent.having) or [])}
+    existing = {(h.left_expr.primary_term, h.op) for h in (PredicateGroup.having_leaves(intent.having) or [])}
     results: list[SeedWarmupIntent] = []
     for sc in agg_cols:
         left_term = sc.expr.primary_term
@@ -1969,10 +2029,8 @@ def _having_match_select_agg(
                 value_type="number",
                 param_key=f"hmatch_{op.replace('<', 'lt').replace('>', 'gt').replace('=', 'e')}",
             )
-            new_intent.having = merge_predicate_groups(
-                "and", [new_intent.having, predicate_group_from_list([new_having])]
-            )
-            _add_expansion_metadata(new_intent, ExpansionOperatorId.HAVING_MATCH_SELECT_AGG)
+            new_intent.having = PredicateGroup.merge("and", [new_intent.having, PredicateGroup.from_list([new_having])])
+            _add_expansion_metadata(new_intent, HAVING_MATCH_SELECT_AGG)
             results.append(new_intent)
     return results
 
@@ -1992,7 +2050,7 @@ def _count_distinct_add(
                 ]
             )
             new_intent.select_cols = list(new_intent.select_cols or []) + [SelectCol(expr=expr)]
-            _add_expansion_metadata(new_intent, ExpansionOperatorId.COUNT_DISTINCT_ADD)
+            _add_expansion_metadata(new_intent, COUNT_DISTINCT_ADD)
             results.append(new_intent)
     return results
 
@@ -2021,10 +2079,14 @@ def _case_categorical_add(
                 param_key=f"case_cat_{col.replace('.', '_')}",
                 raw_value=label_val,
             )
-            branch = CaseWhenBranch(condition=cond, result=NormalizedExpr(raw_sql=f"'label_{label_val[:12]}'"))
+            label_literal = escape_sql_string_literal_body_base(f"label_{label_val[:12]}")
+            branch = CaseWhenBranch(
+                condition=cond,
+                result=NormalizedExpr(raw_sql=f"'{label_literal}'"),
+            )
             cw = CaseWhenExpr(branches=[branch], else_result=NormalizedExpr(raw_sql="'other'"))
             _append_case_registry_column(new_intent, cw)
-            _add_expansion_metadata(new_intent, ExpansionOperatorId.CASE_CATEGORICAL_ADD)
+            _add_expansion_metadata(new_intent, CASE_CATEGORICAL_ADD)
             fin = _finalize_registry_touch_seed(new_intent, schema)
             if fin is not None:
                 results.append(fin)
@@ -2054,13 +2116,13 @@ def _cte_wrap_grouped(
         where=copy.deepcopy(intent.where),
         having=copy.deepcopy(intent.having),
         grain="grouped",
-        emission="join_table",
+        emission=CteEmissionKind.JOIN_TABLE,
     )
     new_intent.cte_steps = [cte_step]
     new_intent.tables = ["cte1"]
     new_intent.where = None
     new_intent.having = None
-    _add_expansion_metadata(new_intent, ExpansionOperatorId.CTE_WRAP_GROUPED)
+    _add_expansion_metadata(new_intent, CTE_WRAP_GROUPED)
     return [new_intent]
 
 
@@ -2089,16 +2151,16 @@ def _cte_scalar_threshold(
                 tables=[table],
                 select_cols=[SelectCol(expr=agg_expr)],
                 grain="scalar",
-                emission="scalar_subquery",
+                emission=CteEmissionKind.SCALAR_SUBQUERY,
                 output_columns=["threshold"],
             )
             new_intent = copy.deepcopy(intent)
             new_intent.cte_steps = [cte_step]
-            new_intent.where = merge_predicate_groups(
+            new_intent.where = PredicateGroup.merge(
                 "and",
                 [
                     new_intent.where,
-                    predicate_group_from_list(
+                    PredicateGroup.from_list(
                         [
                             WhereParam(
                                 left_expr=NormalizedExpr.from_column(measure),
@@ -2111,7 +2173,7 @@ def _cte_scalar_threshold(
                     ),
                 ],
             )
-            _add_expansion_metadata(new_intent, ExpansionOperatorId.CTE_SCALAR_THRESHOLD)
+            _add_expansion_metadata(new_intent, CTE_SCALAR_THRESHOLD)
             results.append(new_intent)
     return results
 
@@ -2147,7 +2209,7 @@ def _window_dense_rank_add(
 ) -> list[SeedWarmupIntent]:
     """WINDOW_DENSE_RANK_ADD: add ``dense_rank`` over group keys ordered by a select aggregate."""
     _ = column_metadata
-    return _window_rank_variant_add(intent, schema, "dense_rank", ExpansionOperatorId.WINDOW_DENSE_RANK_ADD)
+    return _window_rank_variant_add(intent, schema, "dense_rank", WINDOW_DENSE_RANK_ADD)
 
 
 def _window_rank_func_add(
@@ -2155,7 +2217,7 @@ def _window_rank_func_add(
 ) -> list[SeedWarmupIntent]:
     """WINDOW_RANK_FUNC_ADD: add ``rank`` over group keys ordered by a select aggregate."""
     _ = column_metadata
-    return _window_rank_variant_add(intent, schema, "rank", ExpansionOperatorId.WINDOW_RANK_FUNC_ADD)
+    return _window_rank_variant_add(intent, schema, "rank", WINDOW_RANK_FUNC_ADD)
 
 
 def _window_avg_partition_add(
@@ -2181,7 +2243,7 @@ def _window_avg_partition_add(
                     argument=NormalizedExpr.from_column(measure),
                 )
                 _append_window_registry_column(new_intent, ws)
-                _add_expansion_metadata(new_intent, ExpansionOperatorId.WINDOW_AVG_PARTITION_ADD)
+                _add_expansion_metadata(new_intent, WINDOW_AVG_PARTITION_ADD)
                 fin = _finalize_registry_touch_seed(new_intent, schema)
                 if fin is not None:
                     results.append(fin)
@@ -2204,7 +2266,7 @@ def _orderby_window_columndd(
     new_intent.order_by_cols = list(new_intent.order_by_cols or []) + [
         OrderByCol(expr=NormalizedExpr.from_column(wid), direction="DESC"),
     ]
-    _add_expansion_metadata(new_intent, ExpansionOperatorId.ORDERBY_WINDOW_COL_ADD)
+    _add_expansion_metadata(new_intent, ORDERBY_WINDOW_COL_ADD)
     return [new_intent]
 
 
@@ -2229,7 +2291,7 @@ def _select_coalesce_add(
                 sarg_param_keys=[f"coalesce_zero_{col.replace('.', '_')}"],
             )
             new_intent.select_cols = list(new_intent.select_cols or []) + [SelectCol(expr=coalesce_expr)]
-            _add_expansion_metadata(new_intent, ExpansionOperatorId.SELECT_COALESCE_ADD)
+            _add_expansion_metadata(new_intent, SELECT_COALESCE_ADD)
             results.append(new_intent)
     return results
 
@@ -2247,7 +2309,7 @@ def _select_string_scalar_add(
             new_intent = copy.deepcopy(intent)
             upper_expr = replace(NormalizedExpr.from_column(col), scalar_func="upper")
             new_intent.select_cols = list(new_intent.select_cols or []) + [SelectCol(expr=upper_expr)]
-            _add_expansion_metadata(new_intent, ExpansionOperatorId.SELECT_STRING_SCALAR_ADD)
+            _add_expansion_metadata(new_intent, SELECT_STRING_SCALAR_ADD)
             results.append(new_intent)
     return results
 
@@ -2257,7 +2319,7 @@ def _temp_extract_filter(
 ) -> list[SeedWarmupIntent]:
     """TEMP_EXTRACT_WHERE: filter on ``extract(year)`` of a temporal column."""
     _ = column_metadata
-    current_where_cols = {f.left_expr.primary_column for f in (where_leaves(intent.where) or [])}
+    current_where_cols = {f.left_expr.primary_column for f in (PredicateGroup.where_leaves(intent.where) or [])}
     if len(current_where_cols) >= SeedWarmupConfig.MAX_WHERE_PREDICATES:
         return []
     results: list[SeedWarmupIntent] = []
@@ -2273,11 +2335,11 @@ def _temp_extract_filter(
                     year_val = sample[:4]
             extract_expr = replace(NormalizedExpr.from_column(col), scalar_func="extract", scalar_func_args=["year"])
             new_intent = copy.deepcopy(intent)
-            new_intent.where = merge_predicate_groups(
+            new_intent.where = PredicateGroup.merge(
                 "and",
                 [
                     new_intent.where,
-                    predicate_group_from_list(
+                    PredicateGroup.from_list(
                         [
                             WhereParam(
                                 left_expr=extract_expr,
@@ -2290,7 +2352,7 @@ def _temp_extract_filter(
                     ),
                 ],
             )
-            _add_expansion_metadata(new_intent, ExpansionOperatorId.TEMP_EXTRACT_WHERE)
+            _add_expansion_metadata(new_intent, TEMP_EXTRACT_WHERE)
             results.append(new_intent)
     return results
 
@@ -2317,13 +2379,13 @@ def _multi_cte_chain_add(
         where=None,
         having=None,
         grain="grouped",
-        emission="join_table",
+        emission=CteEmissionKind.JOIN_TABLE,
     )
     new_intent.cte_steps = list(new_intent.cte_steps or []) + [second]
     new_intent.tables = ["cte2"]
     new_intent.where = None
     new_intent.having = None
-    _add_expansion_metadata(new_intent, ExpansionOperatorId.MULTI_CTE_CHAIN_ADD)
+    _add_expansion_metadata(new_intent, MULTI_CTE_CHAIN_ADD)
     return [new_intent]
 
 
@@ -2335,14 +2397,14 @@ def _emi_equivalence_augment(
 ) -> list[SeedWarmupIntent]:
     """Duplicate an existing AND filter to preserve row sets under. conjunctive semantics."""
     _ = schema, fk_map, column_metadata
-    fps = where_leaves(intent.where) or []
+    fps = PredicateGroup.where_leaves(intent.where) or []
     if not fps:
         return []
     new_intent = copy.deepcopy(intent)
-    new_intent.where = merge_predicate_groups(
-        "and", [new_intent.where, predicate_group_from_list([copy.deepcopy(fps[0])])]
+    new_intent.where = PredicateGroup.merge(
+        "and", [new_intent.where, PredicateGroup.from_list([copy.deepcopy(fps[0])])]
     )
-    _add_expansion_metadata(new_intent, ExpansionOperatorId.EMI_MUTATE)
+    _add_expansion_metadata(new_intent, EMI_MUTATE)
     return [new_intent]
 
 
@@ -2355,73 +2417,74 @@ def _expansion_noop(
 
 
 def _build_operator_registry(
-    column_metadata: dict[str, dict[str, dict[str, Any]]], fk_map: dict[str, list[dict[str, str]]]
+    column_metadata: dict[str, dict[str, dict[str, Any]]],
+    fk_map: dict[str, list[dict[str, str]]],
+    *,
+    pool_key: str = "",
 ) -> dict[str, Any]:
     """Build the registry mapping operator ids to callables."""
     return {
-        ExpansionOperatorId.WHERE_ADD: lambda i, s: _where_add(i, s, column_metadata),
-        ExpansionOperatorId.WHERE_EXPR_ADD: lambda i, s: _where_expr_add(i, s, column_metadata),
-        ExpansionOperatorId.AGG_CHANGE: lambda i, s: _agg_change(i, s, column_metadata),
-        ExpansionOperatorId.GROUPBY_ADD: lambda i, s: _groupby_add(i, s, column_metadata),
-        ExpansionOperatorId.ORDERBY_ADD: lambda i, s: _orderby_add(i, s, column_metadata),
-        ExpansionOperatorId.HAVING_VALUE_ADD: lambda i, s: _having_value_add(i, s, column_metadata),
-        ExpansionOperatorId.HAVING_EXPR_ADD: lambda i, s: _having_expr_add(i, s, column_metadata),
-        ExpansionOperatorId.WHERE_REMOVE: lambda i, s: _where_remove(i, s, column_metadata),
-        ExpansionOperatorId.GROUPBY_REMOVE: lambda i, s: _groupby_remove(i, s, column_metadata),
-        ExpansionOperatorId.HAVING_REMOVE: lambda i, s: _having_remove(i, s, column_metadata),
-        ExpansionOperatorId.JOIN_DIMENSION_ADD: lambda i, s: _join_dimension_add(i, s, fk_map, column_metadata),
-        ExpansionOperatorId.JOIN_FACT_ADD: lambda i, s: _join_fact_add(i, s, fk_map, column_metadata),
-        ExpansionOperatorId.DIMENSION_SWAP: lambda i, s: _dimension_swap(i, s, fk_map, column_metadata),
-        ExpansionOperatorId.TABLE_REMOVE: lambda i, s: _table_remove(i, s, fk_map, column_metadata),
-        ExpansionOperatorId.BRIDGE_INTERMEDIATE_ADD: lambda i, s: _bridge_intermediate_add(
-            i, s, fk_map, column_metadata
-        ),
-        ExpansionOperatorId.INCLUDE_GOLD: lambda i, s: _include_gold(i, s, column_metadata),
-        ExpansionOperatorId.TEMP_EXTRACT_GROUPBY: lambda i, s: _temp_extract_groupby(i, s, column_metadata),
-        ExpansionOperatorId.TEMP_DATE_TRUNC_GROUPBY: lambda i, s: _temp_date_trunc_groupby(i, s, column_metadata),
-        ExpansionOperatorId.TEMP_DATE_WINDOW_WHERE: lambda i, s: _temp_date_window_filter(i, s, column_metadata),
-        ExpansionOperatorId.TEMP_DATE_DIFF_WHERE: lambda i, s: _temp_date_diff_filter(i, s, column_metadata),
-        ExpansionOperatorId.NUM_ROUND_SELECT: lambda i, s: _num_round_select(i, s, column_metadata),
-        ExpansionOperatorId.NUM_ABS_WHERE: lambda i, s: _num_abs_filter(i, s, column_metadata),
-        ExpansionOperatorId.DISTINCT_ADD: lambda i, s: _distinct_add(i, s, column_metadata),
-        ExpansionOperatorId.LIMIT_ADD: lambda i, s: _limit_add(i, s, column_metadata),
-        ExpansionOperatorId.WHERE_OR_GROUP: lambda i, s: _where_or_group(i, s, column_metadata),
-        ExpansionOperatorId.SELECT_EXPR_PAIR_MULTIPLY: lambda i, s: _select_expr_pair_multiply(i, s, column_metadata),
-        ExpansionOperatorId.WINDOW_RANK_ADD: lambda i, s: _window_rank_add(i, s, column_metadata),
-        ExpansionOperatorId.WINDOW_SUM_PARTITION_ADD: lambda i, s: _window_sum_partition_add(i, s, column_metadata),
-        ExpansionOperatorId.SELECT_CASE_LABEL_ADD: lambda i, s: _select_case_label_add(i, s, column_metadata),
-        ExpansionOperatorId.WINDOW_LAG_ADD: lambda i, s: _window_lag_add(i, s, column_metadata),
-        ExpansionOperatorId.WINDOW_LEAD_ADD: lambda i, s: _window_lead_add(i, s, column_metadata),
-        ExpansionOperatorId.WHERE_ILIKE_ADD: lambda i, s: _where_ilike_add(i, s, column_metadata),
-        ExpansionOperatorId.WHERE_ARRAY_CONTAINS_ADD: lambda i, s: _where_array_contains_add(i, s, column_metadata),
-        ExpansionOperatorId.ORDERBY_REMOVE: lambda i, s: _orderby_remove(i, s, column_metadata),
-        ExpansionOperatorId.LIMIT_REMOVE: lambda i, s: _limit_remove(i, s, column_metadata),
-        ExpansionOperatorId.SELECT_COL_TRIM: lambda i, s: _select_col_trim(i, s, column_metadata),
-        ExpansionOperatorId.WINDOW_STRIP: lambda i, s: _window_strip(i, s, column_metadata),
-        ExpansionOperatorId.DISTINCT_REMOVE: lambda i, s: _distinct_remove(i, s, column_metadata),
-        ExpansionOperatorId.SPLICE_SUBTREE: lambda i, s: _splice_subtree(i, s, column_metadata, fk_map),
-        ExpansionOperatorId.EMI_MUTATE: lambda i, s: _emi_equivalence_augment(i, s, column_metadata, fk_map),
-        ExpansionOperatorId.WHERE_NULL_ADD: lambda i, s: _where_null_add(i, s, column_metadata),
-        ExpansionOperatorId.WHERE_NOT_NULL_ADD: lambda i, s: _where_not_null_add(i, s, column_metadata),
-        ExpansionOperatorId.WHERE_IN_LIST_ADD: lambda i, s: _where_in_list_add(i, s, column_metadata),
-        ExpansionOperatorId.WHERE_LIKE_ADD: lambda i, s: _where_like_add(i, s, column_metadata),
-        ExpansionOperatorId.HAVING_MATCH_SELECT_AGG: lambda i, s: _having_match_select_agg(i, s, column_metadata),
-        ExpansionOperatorId.COUNT_DISTINCT_ADD: lambda i, s: _count_distinct_add(i, s, column_metadata),
-        ExpansionOperatorId.CASE_CATEGORICAL_ADD: lambda i, s: _case_categorical_add(i, s, column_metadata),
-        ExpansionOperatorId.CTE_WRAP_GROUPED: lambda i, s: _cte_wrap_grouped(i, s, column_metadata),
-        ExpansionOperatorId.CTE_SCALAR_THRESHOLD: lambda i, s: _cte_scalar_threshold(i, s, column_metadata),
-        ExpansionOperatorId.WINDOW_DENSE_RANK_ADD: lambda i, s: _window_dense_rank_add(i, s, column_metadata),
-        ExpansionOperatorId.WINDOW_RANK_FUNC_ADD: lambda i, s: _window_rank_func_add(i, s, column_metadata),
-        ExpansionOperatorId.WINDOW_AVG_PARTITION_ADD: lambda i, s: _window_avg_partition_add(i, s, column_metadata),
-        ExpansionOperatorId.ORDERBY_WINDOW_COL_ADD: lambda i, s: _orderby_window_columndd(i, s, column_metadata),
-        ExpansionOperatorId.SELECT_COALESCE_ADD: lambda i, s: _select_coalesce_add(i, s, column_metadata),
-        ExpansionOperatorId.SELECT_STRING_SCALAR_ADD: lambda i, s: _select_string_scalar_add(i, s, column_metadata),
-        ExpansionOperatorId.TEMP_EXTRACT_WHERE: lambda i, s: _temp_extract_filter(i, s, column_metadata),
-        ExpansionOperatorId.CTE_UNNEST_ADD: lambda i, s: _expansion_noop(i, s, column_metadata),
-        ExpansionOperatorId.SELF_JOIN_CTE_ADD: lambda i, s: _expansion_noop(i, s, column_metadata),
-        ExpansionOperatorId.MULTI_CTE_CHAIN_ADD: lambda i, s: _multi_cte_chain_add(i, s, column_metadata),
-        ExpansionOperatorId.SPLICE_HAVING_SUBTREE: lambda i, s: _expansion_noop(i, s, column_metadata),
-        ExpansionOperatorId.SPLICE_WINDOW_SUBTREE: lambda i, s: _expansion_noop(i, s, column_metadata),
+        WHERE_ADD: lambda i, s: _where_add(i, s, column_metadata),
+        WHERE_EXPR_ADD: lambda i, s: _where_expr_add(i, s, column_metadata),
+        AGG_CHANGE: lambda i, s: _agg_change(i, s, column_metadata),
+        GROUPBY_ADD: lambda i, s: _groupby_add(i, s, column_metadata),
+        ORDERBY_ADD: lambda i, s: _orderby_add(i, s, column_metadata),
+        HAVING_VALUE_ADD: lambda i, s: _having_value_add(i, s, column_metadata),
+        HAVING_EXPR_ADD: lambda i, s: _having_expr_add(i, s, column_metadata),
+        WHERE_REMOVE: lambda i, s: _where_remove(i, s, column_metadata),
+        GROUPBY_REMOVE: lambda i, s: _groupby_remove(i, s, column_metadata),
+        HAVING_REMOVE: lambda i, s: _having_remove(i, s, column_metadata),
+        JOIN_DIMENSION_ADD: lambda i, s: _join_dimension_add(i, s, fk_map, column_metadata),
+        JOIN_FACT_ADD: lambda i, s: _join_fact_add(i, s, fk_map, column_metadata),
+        DIMENSION_SWAP: lambda i, s: _dimension_swap(i, s, fk_map, column_metadata),
+        TABLE_REMOVE: lambda i, s: _table_remove(i, s, fk_map, column_metadata),
+        BRIDGE_INTERMEDIATE_ADD: lambda i, s: _bridge_intermediate_add(i, s, fk_map, column_metadata),
+        INCLUDE_GOLD: lambda i, s: _include_gold(i, s, column_metadata),
+        TEMP_EXTRACT_GROUPBY: lambda i, s: _temp_extract_groupby(i, s, column_metadata),
+        TEMP_DATE_TRUNC_GROUPBY: lambda i, s: _temp_date_trunc_groupby(i, s, column_metadata),
+        TEMP_DATE_WINDOW_WHERE: lambda i, s: _temp_date_window_filter(i, s, column_metadata),
+        TEMP_DATE_DIFF_WHERE: lambda i, s: _temp_date_diff_filter(i, s, column_metadata),
+        NUM_ROUND_SELECT: lambda i, s: _num_round_select(i, s, column_metadata),
+        NUM_ABS_WHERE: lambda i, s: _num_abs_filter(i, s, column_metadata),
+        DISTINCT_ADD: lambda i, s: _distinct_add(i, s, column_metadata),
+        LIMIT_ADD: lambda i, s: _limit_add(i, s, column_metadata),
+        WHERE_OR_GROUP: lambda i, s: _where_or_group(i, s, column_metadata),
+        SELECT_EXPR_PAIR_MULTIPLY: lambda i, s: _select_expr_pair_multiply(i, s, column_metadata),
+        WINDOW_RANK_ADD: lambda i, s: _window_rank_add(i, s, column_metadata),
+        WINDOW_SUM_PARTITION_ADD: lambda i, s: _window_sum_partition_add(i, s, column_metadata),
+        SELECT_CASE_LABEL_ADD: lambda i, s: _select_case_label_add(i, s, column_metadata),
+        WINDOW_LAG_ADD: lambda i, s: _window_lag_add(i, s, column_metadata),
+        WINDOW_LEAD_ADD: lambda i, s: _window_lead_add(i, s, column_metadata),
+        WHERE_ILIKE_ADD: lambda i, s: _where_ilike_add(i, s, column_metadata),
+        WHERE_ARRAY_CONTAINS_ADD: lambda i, s: _where_array_contains_add(i, s, column_metadata),
+        ORDERBY_REMOVE: lambda i, s: _orderby_remove(i, s, column_metadata),
+        LIMIT_REMOVE: lambda i, s: _limit_remove(i, s, column_metadata),
+        SELECT_COL_TRIM: lambda i, s: _select_col_trim(i, s, column_metadata),
+        WINDOW_STRIP: lambda i, s: _window_strip(i, s, column_metadata),
+        DISTINCT_REMOVE: lambda i, s: _distinct_remove(i, s, column_metadata),
+        SPLICE_SUBTREE: lambda i, s: _splice_subtree(i, s, column_metadata, fk_map, pool_key=pool_key),
+        EMI_MUTATE: lambda i, s: _emi_equivalence_augment(i, s, column_metadata, fk_map),
+        WHERE_NULL_ADD: lambda i, s: _where_null_add(i, s, column_metadata),
+        WHERE_NOT_NULL_ADD: lambda i, s: _where_not_null_add(i, s, column_metadata),
+        WHERE_IN_LIST_ADD: lambda i, s: _where_in_list_add(i, s, column_metadata),
+        WHERE_LIKE_ADD: lambda i, s: _where_like_add(i, s, column_metadata),
+        HAVING_MATCH_SELECT_AGG: lambda i, s: _having_match_select_agg(i, s, column_metadata),
+        COUNT_DISTINCT_ADD: lambda i, s: _count_distinct_add(i, s, column_metadata),
+        CASE_CATEGORICAL_ADD: lambda i, s: _case_categorical_add(i, s, column_metadata),
+        CTE_WRAP_GROUPED: lambda i, s: _cte_wrap_grouped(i, s, column_metadata),
+        CTE_SCALAR_THRESHOLD: lambda i, s: _cte_scalar_threshold(i, s, column_metadata),
+        WINDOW_DENSE_RANK_ADD: lambda i, s: _window_dense_rank_add(i, s, column_metadata),
+        WINDOW_RANK_FUNC_ADD: lambda i, s: _window_rank_func_add(i, s, column_metadata),
+        WINDOW_AVG_PARTITION_ADD: lambda i, s: _window_avg_partition_add(i, s, column_metadata),
+        ORDERBY_WINDOW_COL_ADD: lambda i, s: _orderby_window_columndd(i, s, column_metadata),
+        SELECT_COALESCE_ADD: lambda i, s: _select_coalesce_add(i, s, column_metadata),
+        SELECT_STRING_SCALAR_ADD: lambda i, s: _select_string_scalar_add(i, s, column_metadata),
+        TEMP_EXTRACT_WHERE: lambda i, s: _temp_extract_filter(i, s, column_metadata),
+        CTE_UNNEST_ADD: lambda i, s: _expansion_noop(i, s, column_metadata),
+        SELF_JOIN_CTE_ADD: lambda i, s: _expansion_noop(i, s, column_metadata),
+        MULTI_CTE_CHAIN_ADD: lambda i, s: _multi_cte_chain_add(i, s, column_metadata),
+        SPLICE_HAVING_SUBTREE: lambda i, s: _expansion_noop(i, s, column_metadata),
+        SPLICE_WINDOW_SUBTREE: lambda i, s: _expansion_noop(i, s, column_metadata),
     }
 
 
@@ -2472,7 +2535,7 @@ def _expand_single_depth(
                 if var_key in seen_keys:
                     continue
                 seen_keys.add(var_key)
-                if var.expansion_metadata and var.expansion_metadata.operator == ExpansionOperatorId.INCLUDE_GOLD:
+                if var.expansion_metadata and var.expansion_metadata.operator == INCLUDE_GOLD:
                     var.source = intent.source
                 else:
                     var.source = source_tag
@@ -2485,6 +2548,8 @@ def expand_gold_intents(
     schema: SchemaGraph,
     limits: SchemaLimits | None = None,
     max_depth: int | None = None,
+    *,
+    pool_key: str | None = None,
 ) -> list[SeedWarmupIntent]:
     """Expand gold intents into synthetic intents via multi-depth. deterministic expansion."""
     if limits is not None:
@@ -2503,9 +2568,10 @@ def expand_gold_intents(
 
     debug(f"expand_gold_intents: expanding {len(gold_intents)} gold intents with max_depth={max_depth}")
 
+    active_pool_key = str(pool_key or "")
     column_metadata = _build_column_metadata(schema)
     fk_map = _build_fk_map(schema)
-    operators = _build_operator_registry(column_metadata, fk_map)
+    operators = _build_operator_registry(column_metadata, fk_map, pool_key=active_pool_key)
 
     seen_keys: set[str] = set()
     for gold in gold_intents:
@@ -2513,7 +2579,7 @@ def expand_gold_intents(
 
     tier_counts: defaultdict[str, int] = defaultdict(int)
     for gold in gold_intents:
-        tier_counts[classify_seed_warmup_intent_complexity(gold).value] += 1
+        tier_counts[gold.complexity_tier().value] += 1
 
     current_layer = list(gold_intents)
     all_synthetic: list[SeedWarmupIntent] = []
@@ -2528,8 +2594,8 @@ def expand_gold_intents(
         if not new_variants:
             break
         for var in new_variants:
-            tier_counts[classify_seed_warmup_intent_complexity(var).value] += 1
-            _record_expansion_subtree_pool(var)
+            tier_counts[var.complexity_tier().value] += 1
+            _record_expansion_subtree_pool(var, pool_key=active_pool_key)
         all_synthetic.extend(new_variants)
         current_layer = new_variants
 

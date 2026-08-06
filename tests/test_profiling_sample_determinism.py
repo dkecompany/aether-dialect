@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from aetherdialect._constants import DEFAULT_RANDOM_SEED
-from aetherdialect._dialect import Dialect, get_dialect_class, get_registered_engines
+from aetherdialect._dialect import Dialect, DialectRegistry
 from aetherdialect._schema_catalog import _build_profile_stats_sql
 
 
@@ -35,10 +35,10 @@ def test_default_dialect_sample_suffix_uses_ordered_limit_not_bare_row_cap() -> 
     assert "LIMIT 10000" in stats_sql
 
 
-@pytest.mark.parametrize("engine", get_registered_engines())
+@pytest.mark.parametrize("engine", DialectRegistry.get_registered_engines())
 def test_profiling_sample_engine_behavior_documented(engine: str) -> None:
     """Document which engines honor random_seed vs probabilistic sampling."""
-    dialect = get_dialect_class(engine).__new__(get_dialect_class(engine))
+    dialect = DialectRegistry.get_class(engine).__new__(DialectRegistry.get_class(engine))
     suffix = dialect.profiling_stats_sample_suffix(
         use_sample=True,
         row_count=250_000,

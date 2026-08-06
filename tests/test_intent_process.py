@@ -15,8 +15,6 @@ from aetherdialect._contracts_base import (
     OrderByCol,
     PredicateGroup,
     WhereParam,
-    predicate_group_from_list,
-    where_leaves,
 )
 from aetherdialect._contracts_core import (
     ConcreteIntent,
@@ -27,8 +25,6 @@ from aetherdialect._contracts_core import (
     Template,
     UnionSelectColumnDelta,
     ValueHistory,
-    concrete_intent_to_runtime_skeleton,
-    runtime_intent_to_concrete,
 )
 from aetherdialect._contracts_schema import (
     CaseRegistryStep,
@@ -302,7 +298,7 @@ class TestFormatRepairLoop:
                 "select_cols": ["film.film_id"],
             }
         )
-        with patch("aetherdialect._intent_process.llm_chat") as chat:
+        with patch("aetherdialect._intent_process.LLMProvider.chat") as chat:
             intent, calls = _format_repair_loop("sys", raw, "q", max_retries=3)
         assert calls == 0
         assert chat.call_count == 0
@@ -324,7 +320,7 @@ class TestFormatRepairLoop:
                 "select_cols": ["film.film_id"],
             }
         )
-        with patch("aetherdialect._intent_process.llm_chat", return_value=good) as chat:
+        with patch("aetherdialect._intent_process.LLMProvider.chat", return_value=good) as chat:
             intent, calls = _format_repair_loop("sys", bad, "q", max_retries=3)
         assert calls == 1
         assert chat.call_count == 1
@@ -658,7 +654,7 @@ class TestComputeFiltersSimilarity:
             op="=",
             value_type="string",
         )
-        g_and = predicate_group_from_list([fp1, fp2])
+        g_and = PredicateGroup.from_list([fp1, fp2])
         g_or = PredicateGroup(op="or", predicates=(fp1, fp2))
         keys = {fp1.signature_key, fp2.signature_key}
         score = _jaccard(keys, keys)
@@ -696,7 +692,7 @@ class TestComputeHavingSimilarity:
             op=">",
             value_type="number",
         )
-        g_and = predicate_group_from_list([hp1, hp2])
+        g_and = PredicateGroup.from_list([hp1, hp2])
         g_or = PredicateGroup(op="or", predicates=(hp1, hp2))
         keys = {hp1.signature_key, hp2.signature_key}
         score = _jaccard(keys, keys)
@@ -1473,7 +1469,7 @@ class TestCteTablesStructuralBodyMatch:
         base = _runtime(["film"], [sc])
         left = replace(base, cte_steps=[cte_x])
         right = replace(base, cte_steps=[cte_y])
-        concrete = runtime_intent_to_concrete(left, "cid")
+        concrete = left.to_concrete("cid")
         assert not _structural_body_matches(right, concrete)
 
 
@@ -1715,7 +1711,7 @@ class TestNormalizeCteOutputAliases:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("cte1.category_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("cte1.film_count"),
@@ -1971,7 +1967,7 @@ class TestApplyPostProcessingMissingParams:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.a"))],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             having=None,
             param_values={},
             natural_language="",
@@ -1991,14 +1987,14 @@ class TestFormatRepairLoopEdgeCases:
                 "select_cols": ["film.film_id"],
             }
         )
-        with patch("aetherdialect._intent_process.llm_chat", return_value=good) as chat:
+        with patch("aetherdialect._intent_process.LLMProvider.chat", return_value=good) as chat:
             intent, calls = _format_repair_loop("sys", "not json {", "q", max_retries=3)
         assert calls == 1
         assert chat.call_count == 1
         assert intent is not None
 
     def test_exhausted_retries_returns_last_parse_attempt(self):
-        with patch("aetherdialect._intent_process.llm_chat", return_value="still not json") as chat:
+        with patch("aetherdialect._intent_process.LLMProvider.chat", return_value="still not json") as chat:
             intent, calls = _format_repair_loop("sys", "{broken", "q", max_retries=2)
         assert calls == 2
         assert chat.call_count == 2
@@ -2189,7 +2185,7 @@ class TestFindTrustedTemplateMatchUnionFamilyIntentKey:
         t1 = make_tpl("TAAA", sig1, "ik1")
         t2 = make_tpl("TZZZ", sig2, "ik2")
 
-        rt2 = concrete_intent_to_runtime_skeleton(sig2)
+        rt2 = sig2.to_runtime_skeleton()
         bk2 = body_similarity_key(rt2)
         jk2 = join_path_key_runtime(rt2)
         ik2 = intent_key(rt2)
@@ -2253,7 +2249,7 @@ class TestFindTrustedTemplateMatchUnionFamilyIntentKey:
 
         t1 = make_tpl("TAAA", sig1, "ik1")
         t2 = make_tpl("TZZZ", sig2, "ik2")
-        rt2 = concrete_intent_to_runtime_skeleton(sig2)
+        rt2 = sig2.to_runtime_skeleton()
         bk2 = body_similarity_key(rt2)
         jk2 = join_path_key_runtime(rt2)
         ik2 = intent_key(rt2)
@@ -2507,7 +2503,7 @@ class TestApplyPostProcessingIdempotence:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("film.title"))],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             having=None,
             param_values={},
             natural_language="q",
@@ -2518,7 +2514,7 @@ class TestApplyPostProcessingIdempotence:
         assert not any(i.severity == "error" for i in issues1)
         assert out1.param_values
         first_key = next(iter(out1.param_values))
-        assert (where_leaves(out1.where) or [])[0].raw_value is None
+        assert (PredicateGroup.where_leaves(out1.where) or [])[0].raw_value is None
         out2, issues2 = _apply_post_processing(out1, schema, "q")
         assert out2 is not None
         assert not any(i.severity == "error" for i in issues2)
@@ -2630,7 +2626,7 @@ class TestSchemaInvalidContinuesPipeline:
                 )
             return "{}"
 
-        with patch("aetherdialect._intent_process.llm_chat", side_effect=_fake_llm):
+        with patch("aetherdialect._intent_process.LLMProvider.chat", side_effect=_fake_llm):
             try:
                 full_intent_parse("list customers", schema_graph, max_retries=0)
             except Exception:

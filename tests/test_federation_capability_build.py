@@ -6,8 +6,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aetherdialect._contracts_base import PredicateGroup
-from aetherdialect._contracts_core import RuntimeCteStep, RuntimeIntent, SelectCol, WhereParam
+from aetherdialect._contracts_base import PredicateGroup, WhereParam
+from aetherdialect._contracts_core import (
+    RuntimeCteStep,
+    RuntimeIntent,
+    SelectCol,
+)
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._federation import (
     _coordinator_promotes_spanning_windows,
@@ -240,7 +244,7 @@ def _eligibility_graph(table: str, source_id: str) -> SchemaGraph:
 
 
 def test_federation_eligibility_checked_before_intent_confirm() -> None:
-    from aetherdialect._main_execution import _check_federation_eligibility_before_confirm
+    from aetherdialect._main_execution import MainExecutionOps
 
     manifest = parse_federation_manifest(_CROSS_SOURCE_MANIFEST, include_derived_roster=True)
     composite = compose_composite_graph(
@@ -278,9 +282,9 @@ def test_federation_eligibility_checked_before_intent_confirm() -> None:
     owner._federation_mappings = None
     choice_port = MagicMock(_owner=owner)
 
-    with patch("aetherdialect._main_execution._handle_federation_ineligible_plan") as mock_handle:
+    with patch("aetherdialect._main_execution.MainExecutionOps._handle_federation_ineligible_plan") as mock_handle:
         assert (
-            _check_federation_eligibility_before_confirm(
+            MainExecutionOps._check_federation_eligibility_before_confirm(
                 ineligible_intent,
                 composite,
                 {},
@@ -293,7 +297,7 @@ def test_federation_eligibility_checked_before_intent_confirm() -> None:
         assert plan.ineligible_reason == "cross-source OR filter is not supported: ta.id = tb.id"
 
     assert (
-        _check_federation_eligibility_before_confirm(
+        MainExecutionOps._check_federation_eligibility_before_confirm(
             eligible_intent,
             composite,
             {},
@@ -304,7 +308,7 @@ def test_federation_eligibility_checked_before_intent_confirm() -> None:
 
     non_fed_port = MagicMock(_owner=MagicMock(_is_aether_federation=False))
     assert (
-        _check_federation_eligibility_before_confirm(
+        MainExecutionOps._check_federation_eligibility_before_confirm(
             ineligible_intent,
             composite,
             {},

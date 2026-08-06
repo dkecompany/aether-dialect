@@ -5,14 +5,14 @@ from __future__ import annotations
 import pytest
 
 from aetherdialect._contracts_base import ConfigError, SpaceContext
-from aetherdialect._main_execution import intersect_space_scope
+from aetherdialect._main_execution import MainExecutionOps
 
 
 @pytest.mark.fast
 def test_ephemeral_narrows_table_allow_list() -> None:
     base_tables = frozenset({"a", "b", "c"})
     ephemeral = SpaceContext(tables=frozenset({"a", "b"}))
-    tables, columns, deny_objects, deny_columns = intersect_space_scope(
+    tables, columns, deny_objects, deny_columns = MainExecutionOps.intersect_space_scope(
         base_tables,
         frozenset(),
         frozenset(),
@@ -29,7 +29,7 @@ def test_ephemeral_narrows_table_allow_list() -> None:
 def test_ephemeral_cannot_widen_beyond_base() -> None:
     base_tables = frozenset({"a", "b"})
     ephemeral = SpaceContext(tables=frozenset({"a", "b", "c"}))
-    tables, columns, deny_objects, deny_columns = intersect_space_scope(
+    tables, columns, deny_objects, deny_columns = MainExecutionOps.intersect_space_scope(
         base_tables,
         frozenset(),
         frozenset(),
@@ -50,7 +50,7 @@ def test_deny_lists_union() -> None:
         deny_objects=frozenset({"y"}),
         deny_columns=frozenset({"u.token"}),
     )
-    tables, columns, deny_objects, deny_columns = intersect_space_scope(
+    tables, columns, deny_objects, deny_columns = MainExecutionOps.intersect_space_scope(
         frozenset({"a", "b"}),
         frozenset(),
         base_deny_objects,
@@ -71,7 +71,7 @@ def test_empty_ephemeral_is_identity() -> None:
     base_deny_columns = frozenset({"a.secret"})
 
     for ephemeral in (None, SpaceContext()):
-        tables, columns, deny_objects, deny_columns = intersect_space_scope(
+        tables, columns, deny_objects, deny_columns = MainExecutionOps.intersect_space_scope(
             base_tables,
             base_columns,
             base_deny_objects,
@@ -88,7 +88,7 @@ def test_empty_ephemeral_is_identity() -> None:
 def test_column_allow_intersection() -> None:
     base_columns = frozenset({"a.id", "b.id"})
     ephemeral = SpaceContext(columns=frozenset({"a.id"}))
-    tables, columns, deny_objects, deny_columns = intersect_space_scope(
+    tables, columns, deny_objects, deny_columns = MainExecutionOps.intersect_space_scope(
         frozenset(),
         base_columns,
         frozenset(),
@@ -105,7 +105,7 @@ def test_column_allow_intersection() -> None:
 def test_allow_deny_overlap_raises() -> None:
     ephemeral = SpaceContext(tables=frozenset({"a"}))
     with pytest.raises(ConfigError, match="tables and deny_objects overlap"):
-        intersect_space_scope(
+        MainExecutionOps.intersect_space_scope(
             frozenset({"a", "b"}),
             frozenset(),
             frozenset({"a"}),

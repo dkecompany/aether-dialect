@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from aetherdialect._contracts_base import (
     NormalizedExpr,
+    PredicateGroup,
     WhereParam,
-    predicate_group_from_list,
 )
 from aetherdialect._contracts_core import (
     RuntimeIntent,
@@ -103,7 +103,7 @@ def test_normalize_assigns_param_keys(schema_graph: SchemaGraph) -> None:
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("customers.customer_id"))],
         group_by_cols=[],
         order_by_cols=[],
-        where=predicate_group_from_list(
+        where=PredicateGroup.from_list(
             [
                 WhereParam(
                     left_expr=NormalizedExpr.from_column("customers.customer_id"),

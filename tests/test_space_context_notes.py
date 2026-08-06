@@ -24,12 +24,10 @@ from aetherdialect._contracts_base import (
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._core_utils import load_runtime_config
 from aetherdialect._federation import compose_composite_graph, parse_federation_manifest, parse_federation_mappings
-from aetherdialect._main_execution import (
-    load_aetherspace_snapshot,
-    save_aetherspace_snapshot,
-)
+from aetherdialect._main_execution import MainExecutionOps
 from aetherdialect._schema_graph import recompute_join_paths_multi
-from aetherdialect._templates import empty_template_store
+from aetherdialect._templates import TemplateOps
+from tests.federation_helpers import union_member_graph_pair
 
 
 @pytest.mark.fast
@@ -45,16 +43,16 @@ def test_blank_notes_file_raises_config_error_on_all_three_contexts() -> None:
 @pytest.mark.fast
 def test_old_version_aetherspace_snapshot_raises_version_mismatch(tmp_path: Path) -> None:
     engine_dir = str(tmp_path)
-    assert load_aetherspace_snapshot(engine_dir, "missing") is None
+    assert MainExecutionOps.load_aetherspace_snapshot(engine_dir, "missing") is None
     stale = {
-        "version": AETHERSPACE_ARTIFACT_VERSION - 1,
+        "version": "0.0.0",
         "tables": ["film"],
         "columns": ["film.film_id"],
         "notes": None,
     }
-    save_aetherspace_snapshot(engine_dir, "stale", stale)
+    MainExecutionOps.save_aetherspace_snapshot(engine_dir, "stale", stale)
     with pytest.raises(ConfigError, match=r"version .*2") as exc_info:
-        load_aetherspace_snapshot(engine_dir, "stale")
+        MainExecutionOps.load_aetherspace_snapshot(engine_dir, "stale")
     msg = str(exc_info.value)
     assert str(AETHERSPACE_ARTIFACT_VERSION) in msg
     assert "Delete" in msg
@@ -102,7 +100,7 @@ def test_federation_aetherspace_accepts_notes_file_on_space_context(tmp_path: Pa
         {"a": _graph("left_t", "a"), "b": _graph("right_t", "b")},
         manifest,
     )
-    store = empty_template_store(str(composite.schema_graph_id))
+    store = TemplateOps.empty_template_store(str(composite.schema_graph_id))
     llm_exec = load_runtime_config(merged_env={})
     member = MagicMock()
     member.dialect = "duckdb"
@@ -138,7 +136,7 @@ def test_federation_aetherspace_accepts_notes_file_on_space_context(tmp_path: Pa
         schema_terms=set(),
         schema_stats={"table_count": 2},
         federation_manifest=manifest,
-        federation_mappings=FederationMappings(version=2),
+        federation_mappings=FederationMappings(version="0.2.1"),
         federation_member_graphs={"a": _graph("left_t", "a"), "b": _graph("right_t", "b")},
         federation_storage_dir=arts,
         federation_source_runtimes={
@@ -159,7 +157,7 @@ def test_federation_aetherspace_accepts_notes_file_on_space_context(tmp_path: Pa
     )
     assert desc.notes is not None
     assert "join key" in desc.notes
-    snap = load_aetherspace_snapshot(arts, "left_only")
+    snap = MainExecutionOps.load_aetherspace_snapshot(arts, "left_only")
     assert snap is not None
     assert snap["notes_hash"] == hashlib.sha256(b"left_t.id is the join key.\n").hexdigest()
     assert snap["version"] == AETHERSPACE_ARTIFACT_VERSION
@@ -201,7 +199,7 @@ def test_federation_aetherspace_definition_rejects_collapsed_member_table(tmp_pa
     )
     mappings = parse_federation_mappings(
         {
-            "version": 2,
+            "version": "0.2.1",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -215,12 +213,8 @@ def test_federation_aetherspace_definition_rejects_collapsed_member_table(tmp_pa
             "logical_columns": [],
         }
     )
-    composite = compose_composite_graph(
-        {"a": _graph("payment_a", "a"), "b": _graph("payment_b", "b")},
-        manifest,
-        mappings,
-    )
-    store = empty_template_store(str(composite.schema_graph_id))
+    composite = compose_composite_graph(union_member_graph_pair("payment_a", "payment_b"), manifest, mappings)
+    store = TemplateOps.empty_template_store(str(composite.schema_graph_id))
     llm_exec = load_runtime_config(merged_env={})
     member = MagicMock()
     member.dialect = "duckdb"
@@ -257,7 +251,7 @@ def test_federation_aetherspace_definition_rejects_collapsed_member_table(tmp_pa
         schema_stats={"table_count": 1},
         federation_manifest=manifest,
         federation_mappings=mappings,
-        federation_member_graphs={"a": _graph("payment_a", "a"), "b": _graph("payment_b", "b")},
+        federation_member_graphs=union_member_graph_pair("payment_a", "payment_b"),
         federation_storage_dir=arts,
         federation_source_runtimes={
             "a": MagicMock(source_id="a", dialect=MagicMock(), sqlalchemy_engine=None, native_connection=None),

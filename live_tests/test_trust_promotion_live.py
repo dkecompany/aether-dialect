@@ -3,14 +3,10 @@
 from __future__ import annotations
 
 from aetherdialect._config import PolicyConfig
-from aetherdialect._contracts_core import FeedbackCounts
+from aetherdialect._contracts_core import FeedbackCounts, LiveTestRunner
 from aetherdialect._contracts_schema import TemplateStats
-from aetherdialect._live_testing import LiveTestRunner
 from aetherdialect._templates import (
-    insert_template,
-    promote_trust,
-    record_per_question_feedback,
-    record_template_feedback,
+    TemplateOps,
 )
 
 from ._seed_helpers import (
@@ -24,7 +20,7 @@ from ._seed_helpers import (
 
 def _merge_same_template(runner: LiveTestRunner, q_norm: str) -> None:
     """Call ``insert_template`` with the seeded fingerprint to trigger ``_merge_accept``."""
-    insert_template(
+    TemplateOps.insert_template(
         runner.store,
         runner.templates,
         runner.schema,
@@ -93,10 +89,10 @@ def test_seeded_promotion_when_per_pair_accepts_meets_threshold(schema, schema_t
         tmpl = runner.templates[tid]
         q_norm = "list customer first names"
         for _ in range(PolicyConfig.TRUST_PROMOTE_PER_QUESTION_ACCEPTS):
-            record_template_feedback(tmpl, accept=True)
-            record_per_question_feedback(tmpl, q_norm, accept=True, path=1)
+            TemplateOps.record_template_feedback(tmpl, accept=True)
+            TemplateOps.record_per_question_feedback(tmpl, q_norm, accept=True, path=1)
 
-        promoted = promote_trust(tmpl, q_norm)
+        promoted = TemplateOps.promote_trust(tmpl, q_norm)
 
         assert promoted is True, (
             f"[TC-PROMOTE-OK] expected promote_trust True; trust={tmpl.trust_level} "
@@ -118,11 +114,11 @@ def test_seeded_promotion_blocked_by_excess_reject_ratio(schema, schema_terms, t
         tmpl = runner.templates[tid]
         q_norm = "list customer first names"
         for _ in range(PolicyConfig.TRUST_PROMOTE_PER_QUESTION_ACCEPTS):
-            record_per_question_feedback(tmpl, q_norm, accept=True, path=1)
+            TemplateOps.record_per_question_feedback(tmpl, q_norm, accept=True, path=1)
         tmpl.stats.accept = 1
         tmpl.stats.reject = 9
 
-        promoted = promote_trust(tmpl, q_norm)
+        promoted = TemplateOps.promote_trust(tmpl, q_norm)
 
         assert promoted is False, (
             f"[TC-PROMOTE-BLOCKED] expected promote_trust False under reject ratio "
@@ -140,8 +136,8 @@ def test_seeded_reject_increments_pair_counts(schema, schema_terms, t2s) -> None
         before = snapshot_store(runner)
         before_pair = before["feedback_by_question_by_id"][tid][q_norm]
 
-        record_template_feedback(tmpl, accept=False)
-        record_per_question_feedback(tmpl, q_norm, accept=False, path=1)
+        TemplateOps.record_template_feedback(tmpl, accept=False)
+        TemplateOps.record_per_question_feedback(tmpl, q_norm, accept=False, path=1)
 
         after_pair = (
             tmpl.feedback_by_question[q_norm].accepts,
@@ -165,5 +161,5 @@ def test_seeded_promotion_no_op_without_q_norm(schema, schema_terms, t2s) -> Non
         tid = runner.seeded_ids["cold_templates"]["first_names_cold"]
         tmpl = runner.templates[tid]
 
-        assert promote_trust(tmpl, "") is False
+        assert TemplateOps.promote_trust(tmpl, "") is False
         assert tmpl.trust_level == 1

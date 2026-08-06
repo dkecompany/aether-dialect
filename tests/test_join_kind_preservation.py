@@ -8,7 +8,6 @@ from aetherdialect._constants import (
     ANTI_JOIN_PRESENCE_COLUMN_SUFFIX,
     DIAGNOSTIC_CODE_JOIN_ORPHAN_RATE_HIGH,
     JOIN_ORPHAN_RATE_DIAGNOSTIC_FLOOR,
-    anti_join_presence_column,
 )
 from aetherdialect._contracts_base import MulGroup, NoJoinPathError, NormalizedExpr
 from aetherdialect._contracts_core import RuntimeCteStep, RuntimeIntent, SelectCol
@@ -18,11 +17,12 @@ from aetherdialect._core_utils import (
     reset_diagnostic_collector,
     set_diagnostic_collector,
 )
-from aetherdialect._dialect import get_dialect
+from aetherdialect._dialect import DialectRegistry
 from aetherdialect._schema_graph import recompute_join_paths_multi
 from aetherdialect._sql_gen import (
     _join_edges_from_signature,
     _join_kind_for_edge,
+    anti_join_presence_column,
     build_deterministic_sql,
     collapse_probe_edge_candidate_variation,
     emit_join_orphan_rate_diagnostics,
@@ -202,9 +202,9 @@ class TestPreserveTablesJoinPath:
             preserve_tables=["a"],
             chosen_join_path_signature=sig,
         )
-        sql = build_deterministic_sql(intent, schema=schema, dialect=get_dialect("sqlite"))
+        sql = build_deterministic_sql(intent, schema=schema, dialect=DialectRegistry.get("sqlite"))
         assert "COALESCE(COUNT" in sql and ", 0)" in sql
-        assert "COALESCE(SUM" in sql
+        assert "COALESCE(SUM" not in sql.upper()
 
 
 class TestProbeCteConstraints:
@@ -262,7 +262,7 @@ class TestAntiJoinMarkerRendering:
             where=None,
             cte_steps=[cte],
         )
-        sql = build_deterministic_sql(intent, schema=_parent_child_schema(), dialect=get_dialect("sqlite"))
+        sql = build_deterministic_sql(intent, schema=_parent_child_schema(), dialect=DialectRegistry.get("sqlite"))
         marker = anti_join_presence_column("missing_orders")
         assert f"1 AS {marker}" in sql
         assert marker.endswith(ANTI_JOIN_PRESENCE_COLUMN_SUFFIX)
@@ -274,7 +274,7 @@ class TestAntiJoinMarkerRendering:
             det,
             sig,
             edge_kinds_ordered=catalog_edge_kinds_for_signatures(sig),
-            dialect=get_dialect("sqlite"),
+            dialect=DialectRegistry.get("sqlite"),
             cte_emissions={"missing_orders": "anti_join"},
         )
         marker = anti_join_presence_column("missing_orders")
@@ -296,7 +296,7 @@ class TestZeroFillAggregates:
             where=None,
             preserve_tables=["parent"],
         )
-        sql = build_deterministic_sql(intent, schema=_parent_child_schema(), dialect=get_dialect("sqlite"))
+        sql = build_deterministic_sql(intent, schema=_parent_child_schema(), dialect=DialectRegistry.get("sqlite"))
         assert "COALESCE(COUNT" in sql and ", 0)" in sql
 
 

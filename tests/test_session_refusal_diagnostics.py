@@ -12,30 +12,32 @@ from aetherdialect._constants import (
     DIAGNOSTIC_CODE_REFUSAL_CTE_CAP,
     DIAGNOSTIC_CODE_REFUSAL_HOP_CEILING,
     DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_UNAVAILABLE,
+    DIAGNOSTIC_CODE_REFUSAL_NULL_IN_NEGATED_LIST,
+    REFUSAL_CATALOGUE,
     REFUSAL_DIAGNOSTIC_CODES,
+    REFUSAL_NULL_IN_NEGATED_LIST_MESSAGE,
 )
 from aetherdialect._contracts_base import (
     AggregateJoinFanOutError,
     ComparisonJoinScopeExceededError,
     FailureCategory,
     NoJoinPathError,
+    NullInNegatedListError,
 )
 from aetherdialect._contracts_core import GenerationPath, RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, IntentIssue, SchemaGraph, TableMetadata
 from aetherdialect._core_utils import (
+    emit_session_refusal_diagnostic,
+    refusal_diagnostic_code_for_exception,
+    refusal_diagnostic_code_for_federation_reason,
+    refusal_diagnostic_code_for_intent_issue,
     reset_diagnostic_collector,
     set_diagnostic_collector,
 )
 from aetherdialect._intent_process import NormalizedExpr
 from aetherdialect._main_execution import PipelineSession
 from aetherdialect._pipeline import _join_path_failure_outcome
-from aetherdialect._refusal_diagnostics import (
-    emit_session_refusal_diagnostic,
-    refusal_diagnostic_code_for_exception,
-    refusal_diagnostic_code_for_federation_reason,
-    refusal_diagnostic_code_for_intent_issue,
-)
-from aetherdialect._templates import empty_template_store
+from aetherdialect._templates import TemplateOps
 
 
 @pytest.mark.fast
@@ -51,6 +53,10 @@ from aetherdialect._templates import empty_template_store
             ComparisonJoinScopeExceededError("main query", "exceeding the limit of 3"),
             DIAGNOSTIC_CODE_REFUSAL_HOP_CEILING,
         ),
+        (
+            NullInNegatedListError("t.status", REFUSAL_NULL_IN_NEGATED_LIST_MESSAGE),
+            DIAGNOSTIC_CODE_REFUSAL_NULL_IN_NEGATED_LIST,
+        ),
     ],
 )
 def test_refusal_diagnostic_code_for_exception(exc: Exception, expected: str) -> None:
@@ -64,6 +70,7 @@ def test_refusal_diagnostic_code_for_exception(exc: Exception, expected: str) ->
         ("cte_step_count_exceeded", DIAGNOSTIC_CODE_REFUSAL_CTE_CAP),
         ("cte_reference_depth_exceeded", DIAGNOSTIC_CODE_REFUSAL_CTE_CAP),
         ("comparison_join_hop_ceiling", DIAGNOSTIC_CODE_REFUSAL_HOP_CEILING),
+        ("null_in_negated_list", DIAGNOSTIC_CODE_REFUSAL_NULL_IN_NEGATED_LIST),
     ],
 )
 def test_refusal_diagnostic_code_for_intent_issue(issue_id: str, expected: str) -> None:
@@ -87,15 +94,7 @@ def test_refusal_diagnostic_code_for_federation_capability_reason() -> None:
 
 @pytest.mark.fast
 def test_refusal_diagnostic_codes_cover_catalogue() -> None:
-    assert REFUSAL_DIAGNOSTIC_CODES == frozenset(
-        {
-            DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_UNAVAILABLE,
-            DIAGNOSTIC_CODE_REFUSAL_AGGREGATE_FAN_OUT,
-            DIAGNOSTIC_CODE_REFUSAL_HOP_CEILING,
-            DIAGNOSTIC_CODE_REFUSAL_CTE_CAP,
-            DIAGNOSTIC_CODE_REFUSAL_CAPABILITY_GAP,
-        }
-    )
+    assert REFUSAL_DIAGNOSTIC_CODES == frozenset(REFUSAL_CATALOGUE.keys())
 
 
 @pytest.mark.fast
@@ -132,7 +131,7 @@ def test_join_path_failure_outcome_emits_refusal_diagnostic() -> None:
     try:
         with (
             patch("aetherdialect._pipeline.print_rephrase_hint"),
-            patch("aetherdialect._pipeline.save_template_store"),
+            patch("aetherdialect._templates.TemplateOps.save_template_store"),
         ):
             outcome = _join_path_failure_outcome(
                 exc,
@@ -170,7 +169,7 @@ def _session_owner() -> MagicMock:
     owner = MagicMock()
     owner._schema_graph = MagicMock()
     owner._schema_graph.effective_structural_hash = "test_hash"
-    owner._store = empty_template_store("test_hash")
+    owner._store = TemplateOps.empty_template_store("test_hash")
     owner._templates = {}
     owner._rejected = {}
     owner._schema_terms = set()

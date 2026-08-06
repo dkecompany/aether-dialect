@@ -8,7 +8,7 @@ import pytest
 
 from aetherdialect._config import PolicyConfig
 from aetherdialect._contracts_schema import ColumnMetadata
-from aetherdialect._dialect import get_dialect_class
+from aetherdialect._dialect import DialectRegistry
 from aetherdialect._dialect_sqlglot_engines import DatabricksDialect
 from aetherdialect._schema_catalog import (
     _column_value_overlap_eligible,
@@ -147,7 +147,7 @@ def test_value_overlap_eligible_for_high_cardinality_primary_key() -> None:
     ],
 )
 def test_profiling_stats_sample_suffix_defined_per_engine(engine: str) -> None:
-    dialect = get_dialect_class(engine).__new__(get_dialect_class(engine))
+    dialect = DialectRegistry.get_class(engine).__new__(DialectRegistry.get_class(engine))
     suffix = dialect.profiling_stats_sample_suffix(
         use_sample=True,
         row_count=200_000,

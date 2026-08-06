@@ -14,7 +14,7 @@ def test_unsupported_logical_table_semantics_names_supported_set(semantics: str)
     with pytest.raises(FederationConfigError) as exc_info:
         parse_federation_mappings(
             {
-                "version": 2,
+                "version": "0.2.1",
                 "logical_tables": [
                     {
                         "logical": "orders",

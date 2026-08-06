@@ -84,10 +84,10 @@ def test_refresh_connection_uses_token_provider_when_credentials_omitted() -> No
 
 @pytest.mark.fast
 def test_resolve_connection_credentials_consults_token_provider() -> None:
-    from aetherdialect._main_execution import resolve_connection_credentials
+    from aetherdialect._main_execution import MainExecutionOps
 
     provider = MagicMock(return_value="broker-token")
-    assert resolve_connection_credentials(None, provider) == "broker-token"
+    assert MainExecutionOps.resolve_connection_credentials(None, provider) == "broker-token"
     provider.assert_called_once_with()
 
 

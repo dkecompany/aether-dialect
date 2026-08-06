@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import pytest
 
-from aetherdialect._contracts_base import WhereParam, predicate_group_from_list
+from aetherdialect._contracts_base import (
+    PredicateGroup,
+    WhereParam,
+)
 from aetherdialect._contracts_core import RuntimeIntent
 from aetherdialect._federation import (
     _federation_unsupported_operator_reason,
@@ -35,7 +38,7 @@ def test_unsupported_contains_names_lacking_member_and_resolves_member_capabilit
         select_cols=[],
         group_by_cols=[],
         order_by_cols=[],
-        where=predicate_group_from_list(
+        where=PredicateGroup.from_list(
             [
                 WhereParam(
                     left_expr=NormalizedExpr.from_column("ta.tags"),
@@ -80,7 +83,7 @@ def test_unsupported_having_operator_names_lacking_member() -> None:
         group_by_cols=[],
         order_by_cols=[],
         where=None,
-        having=predicate_group_from_list(
+        having=PredicateGroup.from_list(
             [
                 HavingParam(
                     left_expr=NormalizedExpr.from_agg("count", "ta.id"),

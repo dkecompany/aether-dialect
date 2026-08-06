@@ -14,8 +14,6 @@ Teams need answers from relational data without shipping opaque generated SQL. A
 
 ```bash
 pip install aetherdialect
-pip install "aetherdialect[sqlite]"       # SQLite (stdlib driver)
-pip install "aetherdialect[duckdb]"       # DuckDB
 pip install "aetherdialect[mysql]"        # MySQL
 pip install "aetherdialect[mariadb]"      # MariaDB
 pip install "aetherdialect[sqlserver]"    # SQL Server (pyodbc)
@@ -24,10 +22,10 @@ pip install "aetherdialect[redshift]"     # Amazon Redshift
 pip install "aetherdialect[databricks]"   # Databricks
 pip install "aetherdialect[snowflake]"    # Snowflake
 pip install "aetherdialect[bigquery]"     # Google BigQuery
-pip install "aetherdialect[duckdb,postgresql]"  # pick any subset
+pip install "aetherdialect[mysql,postgresql]"  # pick any subset
 ```
 
-Requires Python 3.10 or newer. Configure the LLM and database via a TOML `config_file` (recommended) and/or process environment; the full key list lives in the [API reference](https://github.com/dkecompany/aether-dialect/blob/main/docs/API_REFERENCE.md).
+Requires Python 3.11 or newer. SQLite and DuckDB need no extra install. Configure the LLM and database via a TOML `config_file` (recommended) and/or process environment; the full key list lives in the [API reference](https://github.com/dkecompany/aether-dialect/blob/main/docs/API_REFERENCE.md).
 
 ## Quick start
 

@@ -6,34 +6,22 @@ import hashlib
 import os
 import re
 from dataclasses import dataclass, field, replace
-from typing import Any, Literal, Protocol, cast
+from typing import Any, cast
 
 import sqlglot
 
-from ._config import EngineConfig, SeedWarmupConfig
+from ._config import SeedWarmupConfig
 from ._constants import (
-    BIGQUERY_QUERY_LOG_AVAILABILITY_SQL,
-    BIGQUERY_QUERY_LOG_FETCH_SQL,
-    MYSQL_QUERY_LOG_AVAILABILITY_SQL,
-    MYSQL_QUERY_LOG_FETCH_SQL,
     PG_LAST_WINDOW_FRAME_OPTIONS_INLINE_DEFAULT,
     PG_LAST_WINDOW_FRAME_OPTIONS_RANGE_UNBOUNDED_CURRENT,
     PG_LAST_WINDOW_FRAME_OPTIONS_ROWS_OFFSET_CURRENT,
     PG_LAST_WINDOW_FRAME_OPTIONS_ROWS_UNBOUNDED_PAIR,
     PG_SIMPLE_AGG_NAMES,
-    REDSHIFT_QUERY_LOG_AVAILABILITY_SQL,
-    REDSHIFT_QUERY_LOG_FETCH_SQL,
     SELF_JOIN_CTE_NAME_PREFIX,
-    SNOWFLAKE_QUERY_LOG_AVAILABILITY_SQL,
-    SNOWFLAKE_QUERY_LOG_FETCH_SQL,
     SQL_TO_INTENT_LIMIT_OFFSET_PARAM_KEY,
     SQL_TO_INTENT_LITERAL_PLACEHOLDER_NUM,
     SQL_TO_INTENT_LITERAL_PLACEHOLDER_STR,
     SQL_TO_INTENT_PARAM_KEY_PREFIX,
-    SQLSERVER_QUERY_LOG_AVAILABILITY_SQL,
-    SQLSERVER_QUERY_LOG_FETCH_SQL,
-    SQLSERVER_QUERY_STORE_AVAILABILITY_SQL,
-    SQLSERVER_QUERY_STORE_FETCH_SQL,
     WARMUP_ROUND_TRIP_CARDINALITY_TOLERANCE,
     WARMUP_ROUND_TRIP_LIMIT,
     WINDOW_DEFAULT_FRAME_END_WITH_ORDER,
@@ -48,14 +36,18 @@ from ._contracts_base import (
     MulGroup,
     NormalizedExpr,
     OrderByCol,
+    OrderByNullPlacement,
     PredicateGroup,
+    QueryLogSource,
     WhereParam,
     WindowFrameKind,
-    having_leaves,
-    predicate_group_from_list,
-    where_leaves,
 )
-from ._contracts_core import RuntimeCteStep, RuntimeIntent, SeedWarmupIntent, SelectCol, runtime_intent_to_concrete
+from ._contracts_core import (
+    RuntimeCteStep,
+    RuntimeIntent,
+    SeedWarmupIntent,
+    SelectCol,
+)
 from ._contracts_schema import (
     CaseRegistryStep,
     CaseWhenBranch,
@@ -64,9 +56,9 @@ from ._contracts_schema import (
     WindowRegistryStep,
     WindowSpec,
 )
-from ._core_utils import sha256, stable_json
-from ._dialect import get_dialect_class
-from ._dialect_postgres import pg_columnref_to_pair, pg_funcname
+from ._core_utils import parse_sql_numeric_literal, sha256, stable_json
+from ._dialect import DialectRegistry
+from ._dialect_postgres import PostgresDialect
 from ._intent_process import apply_deterministic_repairs, cte_structural_signature, union_runtime_concrete_compatibility
 from ._intent_resolve import check_qualified_refs_exist
 from ._sql_gen import build_deterministic_sql
@@ -178,26 +170,27 @@ except ImportError:
     SubLinkType = None
 
 
-@dataclass
-class _PgExtra:
-    """Per-select conversion scratch space for qualifier swaps and. registry emission."""
+def _new_pg_extra() -> Any:
+    """Return per-select conversion scratch space for qualifier swaps and registry emission."""
 
-    qual_swap: dict[str, str] = field(default_factory=dict)
-    case_registry: list[CaseRegistryStep] = field(default_factory=list)
-    window_registry: list[WindowRegistryStep] = field(default_factory=list)
-    self_join_steps: list[RuntimeCteStep] = field(default_factory=list)
-    case_counter: int = 0
-    window_counter: int = 0
+    @dataclass
+    class _PgExtraLocal:
+        qual_swap: dict[str, str] = field(default_factory=dict)
+        case_registry: list[CaseRegistryStep] = field(default_factory=list)
+        window_registry: list[WindowRegistryStep] = field(default_factory=list)
+        self_join_steps: list[RuntimeCteStep] = field(default_factory=list)
+        case_counter: int = 0
+        window_counter: int = 0
 
-    def next_case_id(self) -> str:
-        """Reserve the next sequential CASE registry identifier."""
-        self.case_counter += 1
-        return f"c{self.case_counter:02d}"
+        def next_case_id(self) -> str:
+            self.case_counter += 1
+            return f"c{self.case_counter:02d}"
 
-    def next_window_id(self) -> str:
-        """Reserve the next sequential window registry identifier."""
-        self.window_counter += 1
-        return f"w{self.window_counter:02d}"
+        def next_window_id(self) -> str:
+            self.window_counter += 1
+            return f"w{self.window_counter:02d}"
+
+    return _PgExtraLocal()
 
 
 def _normalize_window_spec_ansi_defaults(ws: WindowSpec) -> WindowSpec:
@@ -235,10 +228,10 @@ def _cte_body_shell_key(step: RuntimeCteStep) -> str:
     parts: list[str] = [
         step.grain or "row_level",
         ",".join(sorted(step.tables or [])),
-        ",".join(sorted(f.signature_key for f in (where_leaves(step.where) or []))),
+        ",".join(sorted(f.signature_key for f in (PredicateGroup.where_leaves(step.where) or []))),
         ",".join(sorted(g.signature_key for g in (step.group_by_cols or []))),
         ",".join(sorted(o.signature_key for o in (step.order_by_cols or []))),
-        ",".join(sorted(h.signature_key for h in (having_leaves(step.having) or []))),
+        ",".join(sorted(h.signature_key for h in (PredicateGroup.having_leaves(step.having) or []))),
         ",".join(sorted(s.signature_key for s in (step.window_registry or []))),
         ",".join(sorted(s.signature_key for s in (step.case_registry or []))),
     ]
@@ -281,7 +274,7 @@ def _merge_union_compatible_cte_cluster(cluster: list[RuntimeCteStep]) -> list[R
                 a, b = pending[i], pending[j]
                 ra = _runtime_intent_from_cte_step(a)
                 rb = _runtime_intent_from_cte_step(b)
-                conc = runtime_intent_to_concrete(ra, "cte_dedup")
+                conc = ra.to_concrete("cte_dedup")
                 row = union_runtime_concrete_compatibility(rb, conc)
                 if row is None:
                     continue
@@ -352,16 +345,6 @@ def _dedup_case_registry(intent: RuntimeIntent) -> RuntimeIntent:
     if len(kept) == len(cr):
         return intent
     return replace(intent, case_registry=kept)
-
-
-@dataclass(frozen=True)
-class _ConverterResult:
-    """One SQL string converted to a RuntimeIntent or a structured failure."""
-
-    sql_hash: str
-    intent: RuntimeIntent | None
-    failure_code: str | None
-    failure_detail: str
 
 
 def _hash_sql(sql: str) -> str:
@@ -483,7 +466,7 @@ def _pg_convert_select_stmt(
         allowed_cte = allowed_cte | prior
 
     body_pair = _pg_runtime_intent_body_from_select(
-        sel, schema, param_store, next_lit_key, frozenset(allowed_cte), _PgExtra()
+        sel, schema, param_store, next_lit_key, frozenset(allowed_cte), _new_pg_extra()
     )
     body, sj_body = body_pair
     if body is None:
@@ -540,7 +523,7 @@ def _pg_materialize_cte_body(
         param_store,
         next_lit_key,
         frozenset(allowed_here),
-        _PgExtra(),
+        _new_pg_extra(),
         correlated_aliases=correlated_aliases,
     )
     body, sj_local = body_pair
@@ -637,7 +620,7 @@ def _pg_count_alias_refs(sel: Any, alias: str) -> int:
     def visit(node: Any) -> None:
         nonlocal n
         if isinstance(node, ColumnRef):
-            pr = pg_columnref_to_pair(node)
+            pr = PostgresDialect.pg_columnref_to_pair(node)
             if pr and pr[0] == alias:
                 n += 1
 
@@ -700,7 +683,7 @@ def _pg_try_lift_from_subqueries(
     sel: Any,
     schema: SchemaGraph,
     allowed_cte: frozenset[str],
-    pgx: _PgExtra,
+    pgx: Any,
     param_store: dict[str, Any],
     next_lit_key: Any,
 ) -> bool:
@@ -762,7 +745,7 @@ def _pg_try_lift_from_subqueries(
     return True
 
 
-def _pg_try_lift_self_join(sel: Any, schema_tables: set[str], allowed_cte: frozenset[str], pgx: _PgExtra) -> bool:
+def _pg_try_lift_self_join(sel: Any, schema_tables: set[str], allowed_cte: frozenset[str], pgx: Any) -> bool:
     """Detect a two-alias self-join on one physical table and lift the. lighter branch into a CTE step."""
     if not isinstance(sel, SelectStmt) or not getattr(sel, "fromClause", None):
         return True
@@ -810,7 +793,7 @@ def _pg_runtime_intent_body_from_select(
     param_store: dict[str, Any],
     next_lit_key: Any,
     allowed_cte: frozenset[str],
-    pg_extra: _PgExtra | None = None,
+    pg_extra: Any | None = None,
     *,
     correlated_aliases: dict[str, str] | None = None,
 ) -> tuple[RuntimeIntent | None, list[RuntimeCteStep]]:
@@ -824,7 +807,7 @@ def _pg_runtime_intent_body_from_select(
     if getattr(sel, "intoClause", None):
         return None, []
     schema_tables = set(schema.tables.keys())
-    pgx = pg_extra if pg_extra is not None else _PgExtra()
+    pgx = pg_extra if pg_extra is not None else _new_pg_extra()
     if not _pg_try_lift_from_subqueries(sel, schema, allowed_cte, pgx, param_store, next_lit_key):
         return None, []
     extra_allowed = frozenset(set(allowed_cte) | {s.cte_name for s in pgx.self_join_steps})
@@ -852,7 +835,9 @@ def _pg_runtime_intent_body_from_select(
             return None, []
         select_cols.append(SelectCol(expr=ex))
 
-    distinct_idx = _pg_distinct_select_index(sel, alias_map, single_alias, select_cols, pgx)
+    distinct_idx, distinct_on = _pg_distinct_fields(
+        sel, alias_map, single_alias, select_cols, param_store, next_lit_key, pgx
+    )
 
     where_group: PredicateGroup | None = None
     if getattr(sel, "whereClause", None):
@@ -918,12 +903,13 @@ def _pg_runtime_intent_body_from_select(
         group_by_cols=group_by_cols,
         order_by_cols=order_by_cols,
         where=where_group,
-        having=predicate_group_from_list(having_param),
+        having=PredicateGroup.from_list(having_param),
         param_values={},
         cte_steps=[],
         natural_language="",
         limit=limit_val,
         distinct_select_index=distinct_idx,
+        distinct_on=distinct_on,
         window_registry=list(pgx.window_registry),
         case_registry=list(pgx.case_registry),
     )
@@ -931,10 +917,10 @@ def _pg_runtime_intent_body_from_select(
 
 
 def _pg_qual_column_name(
-    colref: Any, alias_map: dict[str, str], single_alias: str | None, pgx: _PgExtra | None = None
+    colref: Any, alias_map: dict[str, str], single_alias: str | None, pgx: Any | None = None
 ) -> str | None:
     """Turn ``ColumnRef`` into ``qual.col`` using FROM aliases."""
-    pair = pg_columnref_to_pair(colref)
+    pair = PostgresDialect.pg_columnref_to_pair(colref)
     if pair is None:
         return None
     pre, col = pair
@@ -970,28 +956,57 @@ def _pg_map_where_scalar_op(op_raw: str | None) -> str | None:
     }.get(key)
 
 
+def _pg_distinct_fields(
+    sel: Any,
+    alias_map: dict[str, str],
+    single_alias: str | None,
+    select_cols: list[SelectCol],
+    param_store: dict[str, Any],
+    next_lit_key: Any,
+    pgx: Any | None = None,
+) -> tuple[int, list[NormalizedExpr]]:
+    """Return ``(distinct_select_index, distinct_on)`` from ``distinctClause``."""
+    dc = getattr(sel, "distinctClause", None)
+    if not dc:
+        return -1, []
+    if len(dc) == 1 and dc[0] is None:
+        return 0, []
+    distinct_on: list[NormalizedExpr] = []
+    for dexpr in dc:
+        if dexpr is None:
+            continue
+        ex = _pg_expr_full(
+            dexpr,
+            alias_map,
+            single_alias,
+            param_store,
+            next_lit_key,
+            pgx,
+            select_cols=select_cols,
+        )
+        if ex is None and isinstance(dexpr, ColumnRef):
+            qn = _pg_qual_column_name(dexpr, alias_map, single_alias, pgx)
+            if qn:
+                ex = NormalizedExpr.from_column(qn)
+        if ex is not None:
+            distinct_on.append(ex)
+    if distinct_on:
+        return -1, distinct_on
+    return 0, []
+
+
 def _pg_distinct_select_index(
     sel: Any,
     alias_map: dict[str, str],
     single_alias: str | None,
     select_cols: list[SelectCol],
-    pgx: _PgExtra | None = None,
+    pgx: Any | None = None,
 ) -> int:
-    """Derive ``distinct_select_index`` from ``distinctClause`` when parsable."""
-    dc = getattr(sel, "distinctClause", None)
-    if not dc:
+    """Derive ``distinct_select_index`` from plain ``DISTINCT`` (not ``DISTINCT ON``)."""
+    idx, distinct_on = _pg_distinct_fields(sel, alias_map, single_alias, select_cols, {}, lambda: "", pgx)
+    if distinct_on:
         return -1
-    if len(dc) == 1 and dc[0] is None:
-        return 0
-    for dexpr in dc:
-        if isinstance(dexpr, ColumnRef):
-            qn = _pg_qual_column_name(dexpr, alias_map, single_alias, pgx)
-            if qn:
-                for j, sc in enumerate(select_cols):
-                    cr = (sc.expr.column_ref or "").strip()
-                    if cr == qn:
-                        return j
-    return 0
+    return idx
 
 
 def _pg_having_to_params(
@@ -1000,7 +1015,7 @@ def _pg_having_to_params(
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Any,
-    pgx: _PgExtra | None = None,
+    pgx: Any | None = None,
 ) -> list[HavingParam] | None:
     """Extract ``HavingParam`` rows from ``HAVING`` (``AND`` chains; aggregate left, literal/column right)."""
     if isinstance(having, BoolExpr) and having.boolop != BoolExprType.AND_EXPR:
@@ -1108,7 +1123,7 @@ def _pg_const_payload(node: Any) -> tuple[Any, str, str] | None:
     if vk == "Integer":
         return int(v.ival), "integer", SQL_TO_INTENT_LITERAL_PLACEHOLDER_NUM
     if vk == "Float":
-        return float(v.fval), "number", SQL_TO_INTENT_LITERAL_PLACEHOLDER_NUM
+        return parse_sql_numeric_literal(str(v.fval)), "number", SQL_TO_INTENT_LITERAL_PLACEHOLDER_NUM
     if vk == "String":
         return str(v.sval), "string", SQL_TO_INTENT_LITERAL_PLACEHOLDER_STR
     if vk == "Boolean":
@@ -1129,7 +1144,7 @@ def _pg_expr_leaf(
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Any,
-    pgx: _PgExtra | None = None,
+    pgx: Any | None = None,
 ) -> NormalizedExpr | None:
     """Recognise column refs or literals for projections / predicates."""
     if isinstance(node, ColumnRef):
@@ -1262,7 +1277,7 @@ def _pg_window_partition_exprs(
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Any,
-    pgx: _PgExtra | None,
+    pgx: Any | None,
 ) -> list[NormalizedExpr] | None:
     """Convert ``PARTITION BY`` expressions."""
     out: list[NormalizedExpr] = []
@@ -1291,7 +1306,7 @@ def _pg_order_col_from_sortby(
     param_store: dict[str, Any],
     next_lit_key: Any,
     select_cols: list[SelectCol],
-    pgx: _PgExtra | None,
+    pgx: Any | None,
 ) -> OrderByCol | None:
     """Convert one pglast ``SortBy`` node to ``OrderByCol``."""
     if not isinstance(sb, SortBy):
@@ -1319,12 +1334,12 @@ def _pg_order_col_from_sortby(
         return None
     direnum = getattr(sb, "sortby_dir", SortByDir.SORTBY_DEFAULT)
     direction = "DESC" if direnum == SortByDir.SORTBY_DESC else "ASC"
-    nulls_placement: Literal["first", "last"] | None = None
+    nulls_placement: OrderByNullPlacement | None = None
     nulls_enum = getattr(sb, "sortby_nulls", None)
     if nulls_enum == SortByNulls.SORTBY_NULLS_FIRST:
-        nulls_placement = "first"
+        nulls_placement = OrderByNullPlacement.FIRST
     elif nulls_enum == SortByNulls.SORTBY_NULLS_LAST:
-        nulls_placement = "last"
+        nulls_placement = OrderByNullPlacement.LAST
     return OrderByCol(expr=ex, direction=direction, nulls=nulls_placement)
 
 
@@ -1335,7 +1350,7 @@ def _pg_window_sort_clause(
     param_store: dict[str, Any],
     next_lit_key: Any,
     select_cols: list[SelectCol],
-    pgx: _PgExtra | None,
+    pgx: Any | None,
 ) -> list[OrderByCol] | None:
     """Convert ``ORDER BY`` inside ``OVER``."""
     out: list[OrderByCol] = []
@@ -1355,7 +1370,7 @@ def _pg_window_def_to_spec(
     param_store: dict[str, Any],
     next_lit_key: Any,
     select_cols: list[SelectCol],
-    pgx: _PgExtra | None,
+    pgx: Any | None,
 ) -> WindowSpec | None:
     """Build ``WindowSpec`` from an inline ``WindowDef``."""
     if wdef is None:
@@ -1364,7 +1379,7 @@ def _pg_window_def_to_spec(
         return None
     if not isinstance(fn, FuncCall):
         return None
-    raw = (pg_funcname(fn) or "").strip().lower()
+    raw = (PostgresDialect.pg_funcname(fn) or "").strip().lower()
     fn_name = raw.split(".")[-1] if raw else ""
     if not fn_name:
         return None
@@ -1421,23 +1436,23 @@ def _pg_window_def_to_spec(
         if arg_expr is None:
             return None
     fo = int(getattr(wdef, "frameOptions", 0) or 0)
-    frame_kind: WindowFrameKind = "none"
+    frame_kind: WindowFrameKind = WindowFrameKind.NONE
     frame_start: str | None = None
     frame_end: str | None = None
     frame_start_offset: int | None = None
     frame_end_offset: int | None = None
     if fo == PG_LAST_WINDOW_FRAME_OPTIONS_INLINE_DEFAULT:
-        frame_kind = "none"
+        frame_kind = WindowFrameKind.NONE
     elif fo == PG_LAST_WINDOW_FRAME_OPTIONS_ROWS_UNBOUNDED_PAIR:
-        frame_kind = "rows"
+        frame_kind = WindowFrameKind.ROWS
         frame_start = "UNBOUNDED PRECEDING"
         frame_end = "UNBOUNDED FOLLOWING"
     elif fo == PG_LAST_WINDOW_FRAME_OPTIONS_RANGE_UNBOUNDED_CURRENT:
-        frame_kind = "range"
+        frame_kind = WindowFrameKind.RANGE
         frame_start = "UNBOUNDED PRECEDING"
         frame_end = "CURRENT ROW"
     elif fo == PG_LAST_WINDOW_FRAME_OPTIONS_ROWS_OFFSET_CURRENT:
-        frame_kind = "rows"
+        frame_kind = WindowFrameKind.ROWS
         off = _pg_const_int_only(getattr(wdef, "startOffset", None))
         if off is None:
             return None
@@ -1468,7 +1483,7 @@ def _pg_funcall_with_over_to_registry_step(
     param_store: dict[str, Any],
     next_lit_key: Any,
     select_cols: list[SelectCol],
-    pgx: _PgExtra,
+    pgx: Any,
 ) -> NormalizedExpr | None:
     """Emit ``WindowRegistryStep`` for ``FuncCall`` with ``OVER``."""
     if not isinstance(fn, FuncCall) or not getattr(fn, "over", None):
@@ -1487,7 +1502,7 @@ def _pg_caseexpr_to_registry_step(
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Any,
-    pgx: _PgExtra,
+    pgx: Any,
 ) -> NormalizedExpr | None:
     """Emit ``CaseRegistryStep`` for ``CaseExpr``."""
     if not isinstance(node, CaseExpr):
@@ -1542,7 +1557,7 @@ def _pg_coalesce_to_expr(
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Any,
-    pgx: _PgExtra | None,
+    pgx: Any | None,
 ) -> NormalizedExpr | None:
     """Map ``CoalesceExpr`` to ``NormalizedExpr``."""
     if not isinstance(node, CoalesceExpr):
@@ -1605,7 +1620,7 @@ def _pg_expr_full(
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Any,
-    pgx: _PgExtra | None = None,
+    pgx: Any | None = None,
     *,
     allow_aggregate: bool = True,
     allow_window: bool = True,
@@ -1636,7 +1651,7 @@ def _pg_expr_full(
             agg = _pg_aggregate_funcall_to_expr(node, alias_map, single_alias, param_store, next_lit_key, pgx)
             if agg is not None:
                 return agg
-        raw = (pg_funcname(node) or "").strip().lower()
+        raw = (PostgresDialect.pg_funcname(node) or "").strip().lower()
         fn_name = raw.split(".")[-1] if raw else ""
         if fn_name == "extract":
             parts = list(node.args or ())
@@ -1801,12 +1816,12 @@ def _pg_aggregate_funcall_to_expr(
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Any,
-    pgx: _PgExtra | None = None,
+    pgx: Any | None = None,
 ) -> NormalizedExpr | None:
     """Map aggregate ``FuncCall`` nodes to ``NormalizedExpr``."""
     if not isinstance(fn, FuncCall):
         return None
-    raw = (pg_funcname(fn) or "").strip().lower()
+    raw = (PostgresDialect.pg_funcname(fn) or "").strip().lower()
     fn_name = raw.split(".")[-1] if raw else ""
     if fn_name not in PG_SIMPLE_AGG_NAMES:
         return None
@@ -1838,7 +1853,7 @@ def _pg_res_target_to_expr(
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Any,
-    pgx: _PgExtra | None = None,
+    pgx: Any | None = None,
     select_cols: list[SelectCol] | None = None,
 ) -> NormalizedExpr | None:
     """Convert ``ResTarget.val`` including arithmetic, CASE, windows, and aggregates."""
@@ -1902,7 +1917,7 @@ def _pg_sublink_to_where(
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Any,
-    pgx: _PgExtra,
+    pgx: Any,
     allowed_cte: frozenset[str],
     schema: SchemaGraph,
 ) -> WhereParam | None:
@@ -2013,7 +2028,7 @@ def _pg_single_predicate_to_where(
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Any,
-    pgx: _PgExtra | None = None,
+    pgx: Any | None = None,
     *,
     allowed_cte: frozenset[str] | None = None,
     schema: SchemaGraph | None = None,
@@ -2211,7 +2226,7 @@ def _pg_walk_bool_to_predicate_group(
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Any,
-    pgx: _PgExtra | None = None,
+    pgx: Any | None = None,
     allowed_cte: frozenset[str] | None = None,
     schema: SchemaGraph | None = None,
 ) -> PredicateGroup | None:
@@ -2287,7 +2302,7 @@ def _pg_walk_bool_to_where_groups(
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Any,
-    pgx: _PgExtra | None = None,
+    pgx: Any | None = None,
     allowed_cte: frozenset[str] | None = None,
     schema: SchemaGraph | None = None,
 ) -> list[WhereParam] | None:
@@ -2306,7 +2321,7 @@ def _pg_where_to_predicate_group(
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Any,
-    pgx: _PgExtra | None = None,
+    pgx: Any | None = None,
     allowed_cte: frozenset[str] | None = None,
     schema: SchemaGraph | None = None,
 ) -> PredicateGroup | None:
@@ -2322,7 +2337,7 @@ def _pg_where_to_where_params(
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Any,
-    pgx: _PgExtra | None = None,
+    pgx: Any | None = None,
     allowed_cte: frozenset[str] | None = None,
     schema: SchemaGraph | None = None,
 ) -> list[WhereParam] | None:
@@ -2351,7 +2366,7 @@ def _pg_group_clause(
     select_cols: list[SelectCol],
     param_store: dict[str, Any],
     next_lit_key: Any,
-    pgx: _PgExtra | None = None,
+    pgx: Any | None = None,
 ) -> list[NormalizedExpr] | None:
     """Convert ``GROUP BY`` list: columns, ordinals, or leaf expressions."""
     out: list[NormalizedExpr] = []
@@ -2391,7 +2406,7 @@ def _pg_sort_clause(
     param_store: dict[str, Any],
     next_lit_key: Any,
     select_cols: list[SelectCol],
-    pgx: _PgExtra | None = None,
+    pgx: Any | None = None,
 ) -> list[OrderByCol] | None:
     """Convert ``ORDER BY`` using column refs, ordinals, or leaf expressions."""
     out: list[OrderByCol] = []
@@ -2443,25 +2458,6 @@ def _check_round_trip_shape(
     return a.num_joins == b.num_joins and a.has_group_by == b.has_group_by and a.has_agg == b.has_agg
 
 
-def databricks_plan_rows_from_explain_text(payload: str) -> float | None:
-    """Extract a coarse row-count estimate from Spark/Databricks. ``EXPLAIN COST`` text."""
-    if not payload:
-        return None
-    for pat in (
-        r"(?i)Statistics\s*\([^)]*rowCount\s*=\s*(\d+)",
-        r"(?i)rowCount[=:\s]+(\d+)",
-        r"(?i)numRows[=:\s]+(\d+)",
-        r"(?i)rows[=:\s]+(\d+)",
-    ):
-        m = re.search(pat, payload)
-        if m:
-            try:
-                return float(m.group(1))
-            except (TypeError, ValueError):
-                continue
-    return None
-
-
 def _check_round_trip_intent_parity(
     intent: RuntimeIntent, schema: SchemaGraph, dialect: Any, sqlglot_read: str
 ) -> bool:
@@ -2495,10 +2491,16 @@ def _check_round_trip_execute(
     return abs(r0 - r1) / denom <= tol
 
 
-def convert_sql_to_intent(
-    sql: str, schema: SchemaGraph, dialect: Any, *, verify_via_execute: bool = True
-) -> _ConverterResult:
+def convert_sql_to_intent(sql: str, schema: SchemaGraph, dialect: Any, *, verify_via_execute: bool = True) -> Any:
     """Convert one SQL statement to a RuntimeIntent and validate the. round trip."""
+
+    @dataclass(frozen=True)
+    class _ConverterResult:
+        sql_hash: str
+        intent: RuntimeIntent | None
+        failure_code: str | None
+        failure_detail: str
+
     h = _hash_sql(sql)
     sqlglot_read = _infer_sqlglot_read(dialect)
     intent: RuntimeIntent | None
@@ -2540,10 +2542,10 @@ def _union_merge_bucket_key(intent: RuntimeIntent) -> str:
         "tables": sorted(intent.tables or []),
         "grain": intent.grain or "row_level",
         "distinct_select_index": int(intent.distinct_select_index),
-        "filters": sorted(f.signature_key for f in (where_leaves(intent.where) or [])),
+        "filters": sorted(f.signature_key for f in (PredicateGroup.where_leaves(intent.where) or [])),
         "group_by_cols": sorted(g.signature_key for g in (intent.group_by_cols or [])),
         "order_by_cols": sorted(o.signature_key for o in (intent.order_by_cols or [])),
-        "having_param": sorted(h.signature_key for h in (having_leaves(intent.having) or [])),
+        "having_param": sorted(h.signature_key for h in (PredicateGroup.having_leaves(intent.having) or [])),
         "cte_steps": cte_structural_signature(intent.cte_steps or []),
         "window_registry": sorted(w.signature_key for w in (intent.window_registry or [])),
         "case_registry": sorted(c.signature_key for c in (intent.case_registry or [])),
@@ -2562,7 +2564,7 @@ def _merge_union_compatible_intents(cluster: list[RuntimeIntent]) -> list[Runtim
         for i in range(len(pending)):
             for j in range(i + 1, len(pending)):
                 a, b = pending[i], pending[j]
-                conc = runtime_intent_to_concrete(a, "sql_hist_dedup")
+                conc = a.to_concrete("sql_hist_dedup")
                 row = union_runtime_concrete_compatibility(b, conc)
                 if row is None:
                     continue
@@ -2670,301 +2672,16 @@ def seed_warmup_intent_from_runtime_intent(rt: RuntimeIntent, *, intent_id: str,
     )
 
 
-class _QueryLogSource(Protocol):
-    """Read-only fetcher of historical SQL statements."""
-
-    def is_available(self, conn: Any) -> bool:
-        """Return True when the source can run against *conn*."""
-        ...
-
-    def fetch(
-        self, conn: Any, *, lookback_days: int, max_queries: int, min_runs: int, user_filter: str | None
-    ) -> list[str]:
-        """Return distinct SQL texts newest-first within policy caps."""
-        ...
-
-
-def _stable_sql_text_for_history(sql_text: str) -> str:
-    """Replace inline numeric and single-quoted literals so hashed. snapshots stay stable."""
-    s = re.sub(r"\b\d+\.\d+\b", "<num>", sql_text)
-    s = re.sub(r"\b\d+\b", "<num>", s)
-    s = re.sub(r"'(?:[^']|'')*'", "<str>", s)
-    return s
-
-
-@dataclass(frozen=True)
-class NoOpQueryLogSource:
-    """Query-log source that reports unavailable and returns no historical SQL."""
-
-    def is_available(self, conn: Any) -> bool:
-        """Return False because the engine has no query-history catalog."""
-        _ = conn
-        return False
-
-    def fetch(
-        self, conn: Any, *, lookback_days: int, max_queries: int, min_runs: int, user_filter: str | None
-    ) -> list[str]:
-        """Return an empty list because query history is not supported."""
-        _ = conn, lookback_days, max_queries, min_runs, user_filter
-        return []
-
-
-@dataclass(frozen=True)
-class DatabricksQueryLogSource:
-    """Databricks query history fetcher."""
-
-    def is_available(self, conn: Any) -> bool:
-        """Return True when a Databricks session handle is present."""
-        del conn
-        return True
-
-    def fetch(
-        self, conn: Any, *, lookback_days: int, max_queries: int, min_runs: int, user_filter: str | None
-    ) -> list[str]:
-        """Fetch SQL texts from system tables when permitted."""
-        del min_runs
-        try:
-            cur = conn.cursor()
-        except Exception:
-            return []
-        parts = [
-            "SELECT statement_text AS q",
-            "FROM system.query.history",
-            "WHERE start_time >= date_sub(current_timestamp(), CAST(%s AS INT))",
-        ]
-        bind: list[Any] = [int(lookback_days)]
-        if user_filter:
-            parts.append("AND user_name = %s")
-            bind.append(str(user_filter))
-        parts.append("ORDER BY start_time DESC NULLS LAST")
-        parts.append("LIMIT %s")
-        bind.append(int(max_queries))
-        stmt = " ".join(parts)
-        try:
-            cur.execute(stmt, tuple(bind))
-            rows = cur.fetchall() or []
-        except Exception:
-            try:
-                cur.close()
-            except Exception:
-                pass
-            return []
-        try:
-            cur.close()
-        except Exception:
-            pass
-        out: list[str] = []
-        for row in rows:
-            if not row:
-                continue
-            raw_q = row[0]
-            if raw_q is None:
-                continue
-            out.append(_stable_sql_text_for_history(str(raw_q)))
-        return out
-
-
-def _bind_int_named_params(sql: str, params: dict[str, int]) -> str:
-    """Substitute ``:name`` placeholders with integer literals for driver-agnostic execution."""
-    out = sql
-    for key, val in params.items():
-        out = out.replace(f":{key}", str(int(val)))
-    return out
-
-
-def _query_log_fetch_rows(conn: Any, stmt: str) -> list[tuple[Any, ...]]:
-    """Execute *stmt* on *conn* and return rows, swallowing driver errors."""
-    try:
-        cur = conn.cursor()
-    except Exception:
-        return []
-    try:
-        cur.execute(stmt)
-        rows = cur.fetchall() or []
-    except Exception:
-        try:
-            cur.close()
-        except Exception:
-            pass
-        return []
-    try:
-        cur.close()
-    except Exception:
-        pass
-    return list(rows)
-
-
-def _query_log_sql_texts(rows: list[tuple[Any, ...]]) -> list[str]:
-    """Extract and stabilize SQL text from the first column of each row."""
-    out: list[str] = []
-    for row in rows:
-        if not row:
-            continue
-        raw_q = row[0]
-        if raw_q is None:
-            continue
-        out.append(_stable_sql_text_for_history(str(raw_q)))
-    return out
-
-
-@dataclass(frozen=True)
-class MySQLQueryLogSource:
-    """MySQL performance_schema-backed query log."""
-
-    def is_available(self, conn: Any) -> bool:
-        """Return True when ``events_statements_history`` consumer is enabled."""
-        if conn is None:
-            return False
-        rows = _query_log_fetch_rows(conn, MYSQL_QUERY_LOG_AVAILABILITY_SQL)
-        return bool(rows)
-
-    def fetch(
-        self, conn: Any, *, lookback_days: int, max_queries: int, min_runs: int, user_filter: str | None
-    ) -> list[str]:
-        """Fetch recent statement digests from performance_schema."""
-        del min_runs, user_filter
-        lookback_microseconds = int(lookback_days) * 86400 * 1_000_000
-        stmt = _bind_int_named_params(
-            MYSQL_QUERY_LOG_FETCH_SQL,
-            {
-                "lookback_microseconds": lookback_microseconds,
-                "max_queries": int(max_queries),
-            },
-        )
-        return _query_log_sql_texts(_query_log_fetch_rows(conn, stmt))
-
-
-@dataclass(frozen=True)
-class RedshiftQueryLogSource:
-    """Redshift ``svl_qlog`` query log."""
-
-    def is_available(self, conn: Any) -> bool:
-        """Return True when ``stl_query`` is readable."""
-        if conn is None:
-            return False
-        rows = _query_log_fetch_rows(conn, REDSHIFT_QUERY_LOG_AVAILABILITY_SQL)
-        return bool(rows)
-
-    def fetch(
-        self, conn: Any, *, lookback_days: int, max_queries: int, min_runs: int, user_filter: str | None
-    ) -> list[str]:
-        """Fetch recent query texts from ``svl_qlog``."""
-        del min_runs, user_filter
-        stmt = _bind_int_named_params(
-            REDSHIFT_QUERY_LOG_FETCH_SQL, {"lookback_days": int(lookback_days), "max_queries": int(max_queries)}
-        )
-        return _query_log_sql_texts(_query_log_fetch_rows(conn, stmt))
-
-
-@dataclass(frozen=True)
-class SQLServerQueryLogSource:
-    """SQL Server Query Store or ``sys.dm_exec_query_stats`` query log."""
-
-    def _query_store_available(self, conn: Any) -> bool:
-        """Return True when Query Store is enabled for the current database."""
-        if conn is None:
-            return False
-        try:
-            cur = conn.cursor()
-            cur.execute(SQLSERVER_QUERY_STORE_AVAILABILITY_SQL)
-            rows = cur.fetchall() or []
-            cur.close()
-            return bool(rows)
-        except Exception:
-            return False
-
-    def is_available(self, conn: Any) -> bool:
-        """Return True when Query Store or DMVs are readable."""
-        if conn is None:
-            return False
-        if self._query_store_available(conn):
-            return True
-        try:
-            cur = conn.cursor()
-            cur.execute(SQLSERVER_QUERY_LOG_AVAILABILITY_SQL)
-            cur.close()
-            return True
-        except Exception:
-            return False
-
-    def fetch(
-        self, conn: Any, *, lookback_days: int, max_queries: int, min_runs: int, user_filter: str | None
-    ) -> list[str]:
-        """Fetch recent statement texts from Query Store, falling back to DMVs."""
-        del min_runs, user_filter
-        if self._query_store_available(conn):
-            stmt = _bind_int_named_params(
-                SQLSERVER_QUERY_STORE_FETCH_SQL.replace(
-                    "SELECT DISTINCT", f"SELECT DISTINCT TOP ({int(max_queries)})", 1
-                ),
-                {"lookback_days": int(lookback_days)},
-            )
-            return _query_log_sql_texts(_query_log_fetch_rows(conn, stmt))
-        dmv_stmt = SQLSERVER_QUERY_LOG_FETCH_SQL.replace(
-            "SELECT DISTINCT", f"SELECT DISTINCT TOP ({int(max_queries)})", 1
-        )
-        return _query_log_sql_texts(_query_log_fetch_rows(conn, dmv_stmt))
-
-
-@dataclass(frozen=True)
-class SnowflakeQueryLogSource:
-    """Snowflake ``INFORMATION_SCHEMA.QUERY_HISTORY`` fetcher."""
-
-    def is_available(self, conn: Any) -> bool:
-        """Return True when query history is readable."""
-        if conn is None:
-            return False
-        rows = _query_log_fetch_rows(conn, SNOWFLAKE_QUERY_LOG_AVAILABILITY_SQL)
-        return bool(rows)
-
-    def fetch(
-        self, conn: Any, *, lookback_days: int, max_queries: int, min_runs: int, user_filter: str | None
-    ) -> list[str]:
-        """Fetch successful query texts from Snowflake query history."""
-        del min_runs, user_filter
-        stmt = _bind_int_named_params(
-            SNOWFLAKE_QUERY_LOG_FETCH_SQL, {"lookback_days": int(lookback_days), "max_queries": int(max_queries)}
-        )
-        return _query_log_sql_texts(_query_log_fetch_rows(conn, stmt))
-
-
-@dataclass(frozen=True)
-class BigQueryQueryLogSource:
-    """BigQuery ``INFORMATION_SCHEMA.JOBS`` query log."""
-
-    def is_available(self, conn: Any) -> bool:
-        """Return True when the project jobs view is readable."""
-        if conn is None:
-            return False
-        project = str(getattr(EngineConfig.RUNTIME, "PROJECT", None) or "").strip()
-        if not project:
-            return False
-        stmt = BIGQUERY_QUERY_LOG_AVAILABILITY_SQL.format(project=project)
-        rows = _query_log_fetch_rows(conn, stmt)
-        return bool(rows)
-
-    def fetch(
-        self, conn: Any, *, lookback_days: int, max_queries: int, min_runs: int, user_filter: str | None
-    ) -> list[str]:
-        """Fetch completed job query texts from ``INFORMATION_SCHEMA.JOBS``."""
-        del min_runs, user_filter
-        project = str(getattr(EngineConfig.RUNTIME, "PROJECT", None) or "").strip()
-        if not project:
-            return []
-        stmt = _bind_int_named_params(
-            BIGQUERY_QUERY_LOG_FETCH_SQL.format(project=project),
-            {"lookback_days": int(lookback_days), "max_queries": int(max_queries)},
-        )
-        return _query_log_sql_texts(_query_log_fetch_rows(conn, stmt))
+_QueryLogSource = QueryLogSource
 
 
 def fetch_query_log(
     dialect_name: str, conn: Any, *, lookback_days: int, max_queries: int, min_runs: int, user_filter: str | None
 ) -> list[str]:
-    """Dispatch to the dialect-appropriate :class:`_QueryLogSource` implementation."""
+    """Dispatch to the dialect-appropriate :class:`QueryLogSource` implementation."""
     dn = str(dialect_name).strip().lower()
     try:
-        dialect_cls = get_dialect_class(dn)
+        dialect_cls = DialectRegistry.get_dialect_class(dn)
     except ValueError:
         return []
     probe = dialect_cls.__new__(dialect_cls)
@@ -2973,9 +2690,8 @@ def fetch_query_log(
         return []
     if not src.is_available(conn):
         return []
-    return cast(
-        list[str],
+    return list(
         src.fetch(
             conn, lookback_days=lookback_days, max_queries=max_queries, min_runs=min_runs, user_filter=user_filter
-        ),
+        )
     )

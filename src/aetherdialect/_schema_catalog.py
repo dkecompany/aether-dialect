@@ -5,9 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import sqlglot
 from sqlalchemy import text
@@ -19,6 +19,7 @@ from ._constants import (
     BOOLEAN_NEGATION_PREFIXES,
     BOOLEAN_NEGATION_SUFFIXES,
     BOOLEAN_TRUTH_PATTERN_MAP,
+    BUSINESS_KNOWLEDGE_NOTES_EXTRACT_SYSTEM,
     COLUMN_DEFINITION_STOP_WORDS,
     DATE_COLUMN_NAME_TOKENS,
     DEFAULT_RANDOM_SEED,
@@ -28,36 +29,45 @@ from ._constants import (
     DIAGNOSTIC_CODE_DESCRIPTION_ENRICHMENT_NOOP,
     DIAGNOSTIC_CODE_ENGINE_INFO,
     DIAGNOSTIC_CODE_SCHEMA_FK_CATALOG_ABSENT,
+    DIAGNOSTIC_CODE_SCHEMA_ROLE_TYPE_COERCED,
+    DIAGNOSTIC_CODE_SCHEMA_UNKNOWN_TYPE_UNUSABLE,
     DURATION_COLUMN_NAME_TOKENS,
+    JSON_COLUMN_TYPE_TOKENS,
     NAME_COLUMN_PATTERN,
     ROLE_VALUE_TYPE_COMPAT,
+    SCHEMA_CLASSIFY_ERROR_DETAIL_CAP,
+    SCHEMA_CLASSIFY_SYSTEM,
     SCHEMA_CONSISTENCY_REFINE_SYSTEM,
     SCHEMA_NOTES_REFINE_SYSTEM,
+    UNKNOWN_VALUE_TYPE,
     VALID_SENSITIVITY_LEVELS,
     YEAR_LIKE_COLUMN_NAME_TOKENS,
 )
 from ._contracts_base import (
+    BusinessKnowledgeEntry,
+    BusinessKnowledgeKind,
     ColumnRole,
     ConfigError,
     DescriptionOwner,
     RoleOwner,
     SensitivityClassification,
-    can_overwrite_role,
-    set_description,
-    set_sensitivity,
+    TableKind,
 )
 from ._contracts_schema import CatalogStructuralConstraintsIndex, ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
 from ._core_utils import (
     artifact_lock,
+    column_has_unknown_value_type,
     cost_cap_active,
     debug,
     diagnostic_debug_enabled,
+    normalize_column_type,
+    normalized_value_overlap_sets,
     notify,
     safe_json_loads,
     stable_json,
 )
-from ._dialect import Dialect, get_dialect_class
-from ._llm_provider import llm_chat
+from ._dialect import Dialect, DialectRegistry
+from ._llm_provider import LLMProvider
 
 _pglast_module: Any | None = None
 AlterTableStmt: type[Any] | None = None
@@ -92,7 +102,7 @@ def _pglast_raw_stream_render(node: Any) -> str:
     return str(RawStream()(node)).strip()
 
 
-def _resolve_profile_timeout_ms(dialect_or_engine: Any) -> int | None:
+def resolve_profile_timeout_ms(dialect_or_engine: Any) -> int | None:
     """Return the profiling statement timeout for *dialect_or_engine*, preferring per-dialect overrides."""
     for candidate in (dialect_or_engine, getattr(dialect_or_engine, "dialect", None)):
         if candidate is None:
@@ -101,6 +111,24 @@ def _resolve_profile_timeout_ms(dialect_or_engine: Any) -> int | None:
         if override is not None:
             return int(override)
     return PolicyConfig.PROFILE_TIMEOUT_MS
+
+
+def apply_profile_timeout_to_dialect(dialect: Any, profile_timeout_ms: int | None) -> None:
+    """Stamp per-member ``profile_timeout_ms`` onto *dialect* for schema profiling."""
+    if profile_timeout_ms is None:
+        return
+    dialect.profile_timeout_ms = int(profile_timeout_ms)
+
+
+def _stamp_profile_timeout_from_engine(dialect: Dialect, engine: Any) -> None:
+    """Prefer engine- or dialect-level ``profile_timeout_ms`` before profiling a schema graph."""
+    for candidate in (engine, getattr(engine, "_dialect", None), dialect):
+        if candidate is None:
+            continue
+        override = getattr(candidate, "profile_timeout_ms", None)
+        if override is not None:
+            apply_profile_timeout_to_dialect(dialect, int(override))
+            return
 
 
 def _maybe_set_profile_statement_timeout(conn: Any, dialect_or_engine: Any) -> None:
@@ -112,7 +140,7 @@ def _maybe_set_profile_statement_timeout(conn: Any, dialect_or_engine: Any) -> N
             dialect = eng
         else:
             return
-    tm = _resolve_profile_timeout_ms(dialect_or_engine)
+    tm = resolve_profile_timeout_ms(dialect_or_engine)
     if tm is None or not cost_cap_active(tm):
         return
     sql = dialect.profile_statement_timeout_sql(int(tm))
@@ -121,7 +149,7 @@ def _maybe_set_profile_statement_timeout(conn: Any, dialect_or_engine: Any) -> N
 
 
 def collect_profiling_frequent_values(raw: list[Any] | None) -> list[str]:
-    """Return distinct non-empty profiling values in first-seen order, capped at ``CATEGORICAL_SAMPLE_SIZE``."""
+    """Return distinct profiling values in first-seen order, capped at ``CATEGORICAL_SAMPLE_SIZE``."""
     if not raw:
         return []
     seen: set[str] = set()
@@ -131,7 +159,7 @@ def collect_profiling_frequent_values(raw: list[Any] | None) -> list[str]:
         if v is None:
             continue
         s = str(v).strip()
-        if not s or s in seen:
+        if s in seen:
             continue
         seen.add(s)
         out.append(s)
@@ -180,21 +208,24 @@ def _normalize_profiling_sample_clause(qcol: str, sample_clause: str) -> str:
     return sample_clause
 
 
-class _ProfilingDeepQueryBudget:
-    """Schema-wide cap on expensive per-column profiling queries (min/max, frequent values, mode)."""
+def _new_profiling_deep_query_budget(limit: int | None) -> Any:
+    """Return a schema-wide cap on expensive per-column profiling queries."""
 
-    __slots__ = ("_remaining",)
+    class _ProfilingDeepQueryBudget:
+        __slots__ = ("_remaining",)
 
-    def __init__(self, limit: int | None) -> None:
-        self._remaining = limit
+        def __init__(self, budget_limit: int | None) -> None:
+            self._remaining = budget_limit
 
-    def allow(self, cost: int = 1) -> bool:
-        if self._remaining is None:
+        def allow(self, cost: int = 1) -> bool:
+            if self._remaining is None:
+                return True
+            if self._remaining < cost:
+                return False
+            self._remaining -= cost
             return True
-        if self._remaining < cost:
-            return False
-        self._remaining -= cost
-        return True
+
+    return _ProfilingDeepQueryBudget(limit)
 
 
 def _resolve_profiling_sample_params(
@@ -203,7 +234,7 @@ def _resolve_profiling_sample_params(
     use_sample: bool,
     row_count: int,
     sample_size: int,
-    table_kind: Literal["table", "view"],
+    table_kind: TableKind,
 ) -> tuple[str, bool]:
     """Return sampling suffix and subquery flag, with ordered-limit fallback when sampling is required but unsupported."""
     if not use_sample:
@@ -286,7 +317,7 @@ def _build_composite_descriptive_sql(
     qtbl: str,
     *,
     row_count: int,
-    table_kind: Literal["table", "view"],
+    table_kind: TableKind,
     sample_threshold: int | None = None,
     sample_size: int | None = None,
 ) -> str:
@@ -313,10 +344,24 @@ def _build_composite_descriptive_sql(
 
 
 def _build_value_overlap_sample_sql(
-    dialect: Dialect, qcol: str, qtbl: str, limit: int, *, sample_clause: str = "", use_subquery: bool = False
+    dialect: Dialect,
+    qcol: str,
+    qtbl: str,
+    limit: int,
+    *,
+    sample_clause: str = "",
+    use_subquery: bool = False,
+    fixed_width: bool = False,
 ) -> str:
     """Build an ascending distinct overlap sample with optional table sampling."""
-    cast_expr = dialect.profiling_text_cast_sql("t.c")
+
+    def _overlap_cast(expr: str) -> str:
+        cast_expr = dialect.profiling_text_cast_sql(expr)
+        if fixed_width:
+            cast_expr = dialect.render_fixed_width_text_wrap(cast_expr)
+        return cast_expr
+
+    cast_expr = _overlap_cast("t.c")
     if sample_clause and use_subquery:
         sample_clause = _normalize_profiling_sample_clause(qcol, sample_clause)
         return (
@@ -324,8 +369,9 @@ def _build_value_overlap_sample_sql(
             f"(SELECT {qcol} AS c FROM {qtbl} {sample_clause}) t "
             f"WHERE t.c IS NOT NULL ORDER BY v ASC LIMIT {limit}"
         )
+    overlap_cast = _overlap_cast(qcol)
     return (
-        f"SELECT DISTINCT {dialect.profiling_text_cast_sql(qcol)} AS v FROM {qtbl} {sample_clause} "
+        f"SELECT DISTINCT {overlap_cast} AS v FROM {qtbl} {sample_clause} "
         f"WHERE {qcol} IS NOT NULL ORDER BY v ASC LIMIT {limit}"
     )
 
@@ -363,9 +409,56 @@ def _build_array_element_distinct_sql(
     )
 
 
+def _column_is_binary_value_type(col: ColumnMetadata) -> bool:
+    """Return True when profiling must not read stored byte payloads."""
+    return (col.value_type or "").strip().lower() == "binary"
+
+
+def _column_is_unknown_value_type(col: ColumnMetadata) -> bool:
+    """Return True when the column type is not mapped to a known value- type bucket."""
+    return column_has_unknown_value_type(col)
+
+
+def _mark_unknown_column_profile_skipped(col: ColumnMetadata, row_count: int) -> None:
+    """Record an unknown-typed column as profiled without value sampling."""
+    col.profile_skipped_reason = "unknown"
+    col.row_count = row_count
+    col.distinct_count = 0
+    col.distinct_ratio = None
+    col.null_ratio = None
+    col.distinct_from_sample = False
+    col.min_val = None
+    col.max_val = None
+    col.frequent_values = []
+    col.value_overlap_sample = []
+    col.mode_frequency_ratio = 0.0
+
+
+def _mark_binary_column_profile_skipped(col: ColumnMetadata, row_count: int) -> None:
+    """Record a binary column as profiled without scanning stored bytes."""
+    col.profile_skipped_reason = "binary"
+    col.row_count = row_count
+    col.distinct_count = 0
+    col.distinct_ratio = None
+    col.null_ratio = None
+    col.distinct_from_sample = False
+    col.min_val = None
+    col.max_val = None
+    col.frequent_values = []
+    col.value_overlap_sample = []
+    col.mode_frequency_ratio = 0.0
+    col.profile_failed = False
+
+
 def _column_profiling_excluded(col: ColumnMetadata) -> bool:
     """Return True when profiling must not read column values from the database."""
     return col.sensitivity != SensitivityClassification.NONE
+
+
+def _apply_collation_overlap_semantics(dialect: Dialect, col: ColumnMetadata) -> None:
+    """Resolve per-column collation semantics used by overlap comparison."""
+    col.is_case_insensitive_collation = dialect.column_is_case_insensitive_collation(col)
+    col.overlap_comparison = "case_folded" if col.is_case_insensitive_collation else "exact"
 
 
 def _profile_column(
@@ -377,12 +470,20 @@ def _profile_column(
     sample_threshold: int | None = None,
     sample_size: int | None = None,
     *,
-    table_kind: Literal["table", "view"] = "table",
-    deep_query_budget: _ProfilingDeepQueryBudget | None = None,
+    table_kind: TableKind = TableKind.TABLE,
+    deep_query_budget: Any | None = None,
 ) -> None:
     """Profile a single column and update its metadata in-place."""
     if _column_profiling_excluded(col):
         debug(f"[schema_profiling.profile_column] skipping sensitive column {table_name}.{col.name}")
+        return
+    if _column_is_binary_value_type(col):
+        _mark_binary_column_profile_skipped(col, row_count)
+        debug(f"[schema_profiling.profile_column] skipping binary column {table_name}.{col.name}")
+        return
+    if _column_is_unknown_value_type(col):
+        _mark_unknown_column_profile_skipped(col, row_count)
+        debug(f"[schema_profiling.profile_column] skipping unknown-type column {table_name}.{col.name}")
         return
     debug(f"[schema_profiling.profile_column] profiling {table_name}.{col.name}")
     if sample_threshold is None:
@@ -390,9 +491,10 @@ def _profile_column(
     if sample_size is None:
         sample_size = PolicyConfig.PROFILING_SAMPLE_SIZE
     if deep_query_budget is None:
-        deep_query_budget = _ProfilingDeepQueryBudget(None)
+        deep_query_budget = _new_profiling_deep_query_budget(None)
 
     col.row_count = row_count
+    _apply_collation_overlap_semantics(dialect, col)
     use_sample = row_count > sample_threshold
     qcol = dialect.quote_identifier(col.name)
     qtbl = dialect.qualified_table_ref(table_name, kind=table_kind)
@@ -413,13 +515,13 @@ def _profile_column(
             )
 
             result = conn.execute(text(stats_sql)).fetchone()
-            cnt = result[0] if result[0] is not None else 0
-            dist = result[1] if result[1] is not None else 0
-            nulls = result[2] if result[2] is not None else 0
+            cnt = int(result[0] or 0)
+            dist = int(result[1] or 0)
+            nulls = int(result[2] or 0)
 
             col.distinct_count = dist
-            col.distinct_ratio = dist / cnt if cnt > 0 else 0.0
-            col.null_ratio = nulls / cnt if cnt > 0 else 0.0
+            col.distinct_ratio = dist / cnt if cnt > 0 else None
+            col.null_ratio = nulls / cnt if cnt > 0 else None
             col.distinct_from_sample = bool(use_sample)
 
             if (col.value_type in ("integer", "number") or col.value_type == "date") and deep_query_budget.allow():
@@ -451,12 +553,18 @@ def _profile_column(
                 else:
                     col.mode_frequency_ratio = 0.0
 
-            if _column_value_overlap_eligible(col):
+            if _column_value_overlap_eligible(col) and deep_query_budget.allow():
                 cap = PolicyConfig.VALUE_OVERLAP_SAMPLE_LIMIT
                 if _column_low_cardinality_catalog_eligible(col, cnt):
                     cap = PolicyConfig.LOW_CARDINALITY_FULL_VALUES_LIMIT
                 overlap_sql = _build_value_overlap_sample_sql(
-                    dialect, qcol, qtbl, cap, sample_clause=sample_clause, use_subquery=use_subquery
+                    dialect,
+                    qcol,
+                    qtbl,
+                    cap,
+                    sample_clause=sample_clause,
+                    use_subquery=use_subquery,
+                    fixed_width=col.is_fixed_width_text,
                 )
                 overlap_rows = conn.execute(text(overlap_sql)).fetchall()
                 col.value_overlap_sample = [str(r[0]) for r in overlap_rows if r[0] is not None]
@@ -500,13 +608,17 @@ def _record_column_profile_failure(table_name: str, col: ColumnMetadata, exc: Ex
 
 def _column_value_overlap_eligible(col: ColumnMetadata) -> bool:
     """Return True when distinct-value sampling supports overlap checks."""
+    if _column_is_binary_value_type(col):
+        return False
+    if _column_is_unknown_value_type(col):
+        return False
     if col.distinct_count <= 0:
         return False
     vt = (col.value_type or "").lower()
-    if vt in ("blob", "binary"):
-        return False
     if col.is_primary_key or col.is_foreign_key or vt == "identifier":
         return True
+    if col.is_fixed_width_text:
+        return False
     if col.distinct_count > PolicyConfig.VALUE_OVERLAP_SAMPLE_LIMIT * 20:
         return False
     if vt in ("string", "categorical", "free_text", "date"):
@@ -518,10 +630,11 @@ def _column_value_overlap_eligible(col: ColumnMetadata) -> bool:
 
 def _column_frequent_values_eligible(col: ColumnMetadata) -> bool:
     """Return True when frequency-ordered value sampling is useful."""
-    if col.distinct_count <= 0:
+    if _column_is_binary_value_type(col):
         return False
-    vt = (col.value_type or "").lower()
-    return vt not in ("blob", "binary")
+    if _column_is_unknown_value_type(col):
+        return False
+    return col.distinct_count > 0
 
 
 def _composite_descriptive_name_columns(table: TableMetadata) -> list[str]:
@@ -596,13 +709,14 @@ def _profile_composite_descriptive(dialect: Dialect, engine: Any, table: TableMe
                         row_count=row_count,
                         table_kind=table.kind,
                     )
-                    composite_distinct = conn.execute(text(sql)).scalar() or 0
-                    ratio = composite_distinct / row_count
-                    table.composite_descriptive_ratios[(c1, c2)] = ratio
-                    debug(
-                        f"[schema_profiling._profile_composite_descriptive] "
-                        f"{table.name}.({c1}, {c2}) composite_ratio={ratio:.4f}"
-                    )
+                    composite_distinct = int(conn.execute(text(sql)).scalar() or 0)
+                    ratio = composite_distinct / row_count if row_count > 0 else None
+                    if ratio is not None:
+                        table.composite_descriptive_ratios[(c1, c2)] = ratio
+                        debug(
+                            f"[schema_profiling._profile_composite_descriptive] "
+                            f"{table.name}.({c1}, {c2}) composite_ratio={ratio:.4f}"
+                        )
     except Exception as exc:
         _record_composite_descriptive_profile_failure(table, name_cols, exc)
 
@@ -612,17 +726,17 @@ def _profile_table(
     engine: Any,
     table: TableMetadata,
     *,
-    deep_query_budget: _ProfilingDeepQueryBudget | None = None,
+    deep_query_budget: Any | None = None,
 ) -> None:
     """Profile all columns in a table and update metadata in-place."""
     debug(f"[schema_profiling.profile_table] profiling {table.name} ({len(table.columns)} columns)")
     if deep_query_budget is None:
-        deep_query_budget = _ProfilingDeepQueryBudget(PolicyConfig.PROFILING_SCHEMA_DEEP_QUERY_BUDGET)
+        deep_query_budget = _new_profiling_deep_query_budget(PolicyConfig.PROFILING_SCHEMA_DEEP_QUERY_BUDGET)
     with engine.connect() as conn:
         _maybe_set_profile_statement_timeout(conn, dialect)
         full_table = dialect.qualified_table_ref(table.name, kind=table.kind)
         count_sql = f"SELECT COUNT(*) FROM {full_table}"
-        row_count = conn.execute(text(count_sql)).scalar() or 0
+        row_count = int(conn.execute(text(count_sql)).scalar() or 0)
         table.row_count = row_count
 
     for col in table.columns.values():
@@ -643,8 +757,9 @@ def _profile_table(
 
 def profile_schema(engine: Any, schema: SchemaGraph, dialect: Dialect) -> None:
     """Profile all tables in a schema and update metadata in-place."""
+    _stamp_profile_timeout_from_engine(dialect, engine)
     debug(f"[schema_profiling.profile_schema] profiling {len(schema.tables)} tables")
-    deep_query_budget = _ProfilingDeepQueryBudget(PolicyConfig.PROFILING_SCHEMA_DEEP_QUERY_BUDGET)
+    deep_query_budget = _new_profiling_deep_query_budget(PolicyConfig.PROFILING_SCHEMA_DEEP_QUERY_BUDGET)
     total = len(schema.tables)
     for idx, table_name in enumerate(sorted(schema.tables.keys(), key=str.lower), start=1):
         table = schema.tables[table_name]
@@ -669,19 +784,28 @@ def _profile_column_spark(
     sample_size: int | None = None,
     *,
     dialect: Dialect,
-    table_kind: Literal["table", "view"] = "table",
-    deep_query_budget: _ProfilingDeepQueryBudget | None = None,
+    table_kind: TableKind = TableKind.TABLE,
+    deep_query_budget: Any | None = None,
 ) -> None:
     """Profile a single column from a Databricks table via Spark SQL. and. update metadata in-place."""
+    if _column_is_binary_value_type(col):
+        _mark_binary_column_profile_skipped(col, row_count)
+        debug(f"[schema_profiling.profile_column_spark] skipping binary column {table_name}.{col.name}")
+        return
+    if _column_is_unknown_value_type(col):
+        _mark_unknown_column_profile_skipped(col, row_count)
+        debug(f"[schema_profiling.profile_column_spark] skipping unknown-type column {table_name}.{col.name}")
+        return
     debug(f"[schema_profiling.profile_column_spark] profiling {table_name}.{col.name}")
     if sample_threshold is None:
         sample_threshold = PolicyConfig.PROFILING_SAMPLE_THRESHOLD
     if sample_size is None:
         sample_size = PolicyConfig.PROFILING_SAMPLE_SIZE
     if deep_query_budget is None:
-        deep_query_budget = _ProfilingDeepQueryBudget(None)
+        deep_query_budget = _new_profiling_deep_query_budget(None)
 
     col.row_count = row_count
+    _apply_collation_overlap_semantics(dialect, col)
     use_sample = row_count > sample_threshold
     qcol = dialect.quote_identifier(col.name)
 
@@ -713,13 +837,13 @@ def _profile_column_spark(
             """
 
         result = spark.sql(stats_sql).collect()[0]
-        cnt = result["cnt"] if result["cnt"] is not None else 0
-        dist = result["dist"] if result["dist"] is not None else 0
-        nulls = result["nulls"] if result["nulls"] is not None else 0
+        cnt = int(result["cnt"] or 0)
+        dist = int(result["dist"] or 0)
+        nulls = int(result["nulls"] or 0)
 
         col.distinct_count = dist
-        col.distinct_ratio = dist / cnt if cnt > 0 else 0.0
-        col.null_ratio = nulls / cnt if cnt > 0 else 0.0
+        col.distinct_ratio = dist / cnt if cnt > 0 else None
+        col.null_ratio = nulls / cnt if cnt > 0 else None
         col.distinct_from_sample = bool(use_sample)
 
         if (col.value_type in ("integer", "number") or col.value_type == "date") and deep_query_budget.allow():
@@ -751,10 +875,12 @@ def _profile_column_spark(
             else:
                 col.mode_frequency_ratio = 0.0
 
-        if _column_value_overlap_eligible(col):
+        if _column_value_overlap_eligible(col) and deep_query_budget.allow():
             cap = PolicyConfig.VALUE_OVERLAP_SAMPLE_LIMIT
             overlap_sample = f" {sample_clause}" if sample_clause else ""
             cast_expr = dialect.profiling_text_cast_sql(qcol)
+            if col.is_fixed_width_text:
+                cast_expr = dialect.render_fixed_width_text_wrap(cast_expr)
             sem_sql = (
                 f"SELECT DISTINCT {cast_expr} AS v FROM {full_table}{overlap_sample} "
                 f"WHERE {qcol} IS NOT NULL ORDER BY v ASC LIMIT {cap}"
@@ -790,13 +916,14 @@ def _profile_composite_descriptive_spark(
                     row_count=row_count,
                     table_kind=table.kind,
                 )
-                composite_distinct = spark.sql(sql).collect()[0][0] or 0
-                ratio = composite_distinct / row_count
-                table.composite_descriptive_ratios[(c1, c2)] = ratio
-                debug(
-                    f"[schema_profiling._profile_composite_descriptive_spark] "
-                    f"{table.name}.({c1}, {c2}) composite_ratio={ratio:.4f}"
-                )
+                composite_distinct = int(spark.sql(sql).collect()[0][0] or 0)
+                ratio = composite_distinct / row_count if row_count > 0 else None
+                if ratio is not None:
+                    table.composite_descriptive_ratios[(c1, c2)] = ratio
+                    debug(
+                        f"[schema_profiling._profile_composite_descriptive_spark] "
+                        f"{table.name}.({c1}, {c2}) composite_ratio={ratio:.4f}"
+                    )
     except Exception as exc:
         _record_composite_descriptive_profile_failure(table, name_cols, exc)
 
@@ -808,16 +935,16 @@ def _profile_table_spark(
     table: TableMetadata,
     *,
     dialect: Dialect,
-    deep_query_budget: _ProfilingDeepQueryBudget | None = None,
+    deep_query_budget: Any | None = None,
 ) -> None:
     """Profile all columns in a Databricks table via Spark queries."""
     debug(f"[schema_profiling.profile_table_spark] profiling {table.name} ({len(table.columns)} columns)")
     if deep_query_budget is None:
-        deep_query_budget = _ProfilingDeepQueryBudget(PolicyConfig.PROFILING_SCHEMA_DEEP_QUERY_BUDGET)
+        deep_query_budget = _new_profiling_deep_query_budget(PolicyConfig.PROFILING_SCHEMA_DEEP_QUERY_BUDGET)
     try:
         full_table = dialect.qualified_table_ref(table.name)
         count_sql = f"SELECT COUNT(*) FROM {full_table}"
-        row_count = spark.sql(count_sql).collect()[0][0] or 0
+        row_count = int(spark.sql(count_sql).collect()[0][0] or 0)
         table.row_count = row_count
     except Exception as e:
         raise ConfigError(f"schema profiling failed for {table.name}: {e}") from e
@@ -843,7 +970,7 @@ def _profile_table_spark(
 def profile_schema_spark(spark: Any, catalog: str, schema_name: str, schema: SchemaGraph, *, dialect: Dialect) -> None:
     """Profile all tables in a Databricks schema via Spark queries."""
     debug(f"[schema_profiling.profile_schema_spark] profiling {len(schema.tables)} tables")
-    deep_query_budget = _ProfilingDeepQueryBudget(PolicyConfig.PROFILING_SCHEMA_DEEP_QUERY_BUDGET)
+    deep_query_budget = _new_profiling_deep_query_budget(PolicyConfig.PROFILING_SCHEMA_DEEP_QUERY_BUDGET)
     total = len(schema.tables)
     for idx, table_name in enumerate(sorted(schema.tables.keys(), key=str.lower), start=1):
         table = schema.tables[table_name]
@@ -904,17 +1031,26 @@ def _profile_column_sql_connector(
     sample_size: int | None = None,
     *,
     dialect: Dialect,
-    table_kind: Literal["table", "view"] = "table",
-    deep_query_budget: _ProfilingDeepQueryBudget | None = None,
+    table_kind: TableKind = TableKind.TABLE,
+    deep_query_budget: Any | None = None,
 ) -> None:
     """Profile a single column via databricks-sql-connector and update. metadata in-place."""
+    if _column_is_binary_value_type(col):
+        _mark_binary_column_profile_skipped(col, row_count)
+        debug(f"[schema_profiling.profile_column_sql_connector] skipping binary column {table_name}.{col.name}")
+        return
+    if _column_is_unknown_value_type(col):
+        _mark_unknown_column_profile_skipped(col, row_count)
+        debug(f"[schema_profiling.profile_column_sql_connector] skipping unknown-type column {table_name}.{col.name}")
+        return
     if sample_threshold is None:
         sample_threshold = PolicyConfig.PROFILING_SAMPLE_THRESHOLD
     if sample_size is None:
         sample_size = PolicyConfig.PROFILING_SAMPLE_SIZE
     if deep_query_budget is None:
-        deep_query_budget = _ProfilingDeepQueryBudget(None)
+        deep_query_budget = _new_profiling_deep_query_budget(None)
     col.row_count = row_count
+    _apply_collation_overlap_semantics(dialect, col)
     use_sample = row_count > sample_threshold
     full_table = dialect.qualified_table_ref(table_name, kind=table_kind)
     sample_clause, use_subquery = _resolve_profiling_sample_params(
@@ -949,12 +1085,12 @@ def _profile_column_sql_connector(
             stats_nulls = 0
             if rows:
                 r = rows[0]
-                cnt = r.get("cnt") if r.get("cnt") is not None else 0
-                dist = r.get("dist") if r.get("dist") is not None else 0
-                nulls = r.get("nulls") if r.get("nulls") is not None else 0
+                cnt = int(r.get("cnt") or 0)
+                dist = int(r.get("dist") or 0)
+                nulls = int(r.get("nulls") or 0)
                 col.distinct_count = dist
-                col.distinct_ratio = dist / cnt if cnt > 0 else 0.0
-                col.null_ratio = nulls / cnt if cnt > 0 else 0.0
+                col.distinct_ratio = dist / cnt if cnt > 0 else None
+                col.null_ratio = nulls / cnt if cnt > 0 else None
                 col.distinct_from_sample = bool(use_sample)
                 stats_cnt = cnt
                 stats_nulls = nulls
@@ -989,10 +1125,12 @@ def _profile_column_sql_connector(
                     col.mode_frequency_ratio = float(top_freq) / float(non_null) if top_freq else 0.0
                 else:
                     col.mode_frequency_ratio = 0.0
-            if _column_value_overlap_eligible(col):
+            if _column_value_overlap_eligible(col) and deep_query_budget.allow():
                 cap = PolicyConfig.VALUE_OVERLAP_SAMPLE_LIMIT
                 overlap_sample = f" {sample_clause}" if sample_clause else ""
                 cast_expr = dialect.profiling_text_cast_sql(qcol)
+                if col.is_fixed_width_text:
+                    cast_expr = dialect.render_fixed_width_text_wrap(cast_expr)
                 sem_sql = (
                     f"SELECT DISTINCT {cast_expr} AS v FROM {full_table}{overlap_sample} "
                     f"WHERE {qcol} IS NOT NULL ORDER BY v ASC LIMIT {cap}"
@@ -1032,15 +1170,14 @@ def _profile_composite_descriptive_sql_connector(
                     )
                     cursor.execute(sql)
                     rows = _cursor_rows_as_dicts(cursor)
-                    composite_distinct = 0
-                    if rows and rows[0]:
-                        composite_distinct = list(rows[0].values())[0] or 0
-                    ratio = composite_distinct / row_count
-                    table.composite_descriptive_ratios[(c1, c2)] = ratio
-                    debug(
-                        f"[schema_profiling._profile_composite_descriptive_sql_connector] "
-                        f"{table.name}.({c1}, {c2}) composite_ratio={ratio:.4f}"
-                    )
+                    composite_distinct = int(list(rows[0].values())[0] or 0) if rows and rows[0] else 0
+                    ratio = composite_distinct / row_count if row_count > 0 else None
+                    if ratio is not None:
+                        table.composite_descriptive_ratios[(c1, c2)] = ratio
+                        debug(
+                            f"[schema_profiling._profile_composite_descriptive_sql_connector] "
+                            f"{table.name}.({c1}, {c2}) composite_ratio={ratio:.4f}"
+                        )
     except Exception as exc:
         _record_composite_descriptive_profile_failure(table, name_cols, exc)
 
@@ -1052,17 +1189,17 @@ def _profile_table_sql_connector(
     table: TableMetadata,
     *,
     dialect: Dialect,
-    deep_query_budget: _ProfilingDeepQueryBudget | None = None,
+    deep_query_budget: Any | None = None,
 ) -> None:
     """Profile all columns in a Databricks table via databricks-sql- connector."""
     debug(f"[schema_profiling._profile_table_sql_connector] profiling {table.name}")
     if deep_query_budget is None:
-        deep_query_budget = _ProfilingDeepQueryBudget(PolicyConfig.PROFILING_SCHEMA_DEEP_QUERY_BUDGET)
+        deep_query_budget = _new_profiling_deep_query_budget(PolicyConfig.PROFILING_SCHEMA_DEEP_QUERY_BUDGET)
     full_table = dialect.qualified_table_ref(table.name)
     with connection.cursor() as cursor:
         cursor.execute(f"SELECT COUNT(*) FROM {full_table}")
         rows = _cursor_rows_as_dicts(cursor)
-        row_count = rows[0].get(list(rows[0].keys())[0], 0) or 0 if rows else 0
+        row_count = int(rows[0].get(list(rows[0].keys())[0], 0) or 0) if rows else 0
     table.row_count = row_count
     for col in table.columns.values():
         _profile_column_sql_connector(
@@ -1085,7 +1222,7 @@ def profile_schema_sql_connector(
 ) -> None:
     """Profile all tables in a Databricks schema via databricks-sql- connector."""
     debug(f"[schema_profiling.profile_schema_sql_connector] profiling {len(schema.tables)} tables")
-    deep_query_budget = _ProfilingDeepQueryBudget(PolicyConfig.PROFILING_SCHEMA_DEEP_QUERY_BUDGET)
+    deep_query_budget = _new_profiling_deep_query_budget(PolicyConfig.PROFILING_SCHEMA_DEEP_QUERY_BUDGET)
     total = len(schema.tables)
     for idx, table_name in enumerate(sorted(schema.tables.keys(), key=str.lower), start=1):
         table = schema.tables[table_name]
@@ -1193,7 +1330,7 @@ def extract_tables_from_catalog_sql_connector(
                 v = r.get("value")
                 if k is not None:
                     properties[k] = v
-        except Exception:
+        except (AttributeError, KeyError, TypeError, ValueError):
             pass
         table_comment = None
         try:
@@ -1205,7 +1342,7 @@ def extract_tables_from_catalog_sql_connector(
                 if cname == "Comment":
                     table_comment = r.get("data_type")
                     break
-        except Exception:
+        except (AttributeError, KeyError, TypeError, ValueError):
             pass
         tables[table_name] = {
             "table_name_original": table_name,
@@ -1234,7 +1371,7 @@ def apply_catalog_descriptions_from_tables_meta(
             continue
         table_comment = meta.get("table_comment")
         if table_comment is not None and str(table_comment).strip():
-            set_description(table, str(table_comment).strip(), DescriptionOwner.CATALOG)
+            DescriptionOwner.set_on(table, str(table_comment).strip(), DescriptionOwner.CATALOG)
         column_comments = meta.get("column_comments") or {}
         if not isinstance(column_comments, dict):
             continue
@@ -1244,7 +1381,7 @@ def apply_catalog_descriptions_from_tables_meta(
                 continue
             if col_comment is None or not str(col_comment).strip():
                 continue
-            set_description(col, str(col_comment).strip(), DescriptionOwner.CATALOG)
+            DescriptionOwner.set_on(col, str(col_comment).strip(), DescriptionOwner.CATALOG)
 
 
 def _enrich_fk_column_descriptions(schema: SchemaGraph) -> None:
@@ -1283,7 +1420,7 @@ def _enrich_fk_column_descriptions(schema: SchemaGraph) -> None:
             if not suffix:
                 continue
             existing = (col.description or "").rstrip(". ")
-            set_description(col, f"{existing} — {suffix}" if existing else suffix, DescriptionOwner.PROFILE)
+            DescriptionOwner.set_on(col, f"{existing} — {suffix}" if existing else suffix, DescriptionOwner.PROFILE)
 
 
 def _column_name_suggests_duration(name: str) -> bool:
@@ -1343,12 +1480,11 @@ def _infer_column_role(col: ColumnMetadata) -> ColumnRole:
     ):
         return ColumnRole.FREE_TEXT
 
-    if col.distinct_ratio >= PolicyConfig.IDENTIFIER_MIN_UNIQUENESS:
+    if col.distinct_ratio is not None and col.distinct_ratio >= PolicyConfig.IDENTIFIER_MIN_UNIQUENESS:
         return ColumnRole.FREE_TEXT
 
-    is_categorical = (
-        col.distinct_count <= PolicyConfig.CATEGORICAL_MAX_CARDINALITY
-        or col.distinct_ratio <= PolicyConfig.CATEGORICAL_MAX_RATIO
+    is_categorical = col.distinct_count <= PolicyConfig.CATEGORICAL_MAX_CARDINALITY or (
+        col.distinct_ratio is not None and col.distinct_ratio <= PolicyConfig.CATEGORICAL_MAX_RATIO
     )
     if is_categorical:
         if col.value_type in ("integer", "number"):
@@ -1409,42 +1545,6 @@ def _validate_column_classification(col: ColumnMetadata, role: str) -> tuple[lis
     hard_errors = []
     soft_warnings = []
 
-    is_numeric = col.value_type in ("integer", "number")
-    is_date_temporal = col.value_type == "date"
-    is_date_like_string = col.value_type == "string" and _column_name_suggests_date(col.name)
-    is_duration_integer = col.value_type == "integer" and _column_name_suggests_duration(col.name)
-    col_name_lower = col.name.lower()
-    dtype = (col.data_type or "").upper()
-
-    if role == ColumnRole.NUMERIC_MEASURE.value and not is_numeric:
-        hard_errors.append(f"{col.name}: NUMERIC_MEASURE requires numeric type, got '{col.data_type}'")
-
-    if role == ColumnRole.NUMERIC_CATEGORICAL.value and not is_numeric:
-        hard_errors.append(f"{col.name}: NUMERIC_CATEGORICAL requires numeric type, got '{col.data_type}'")
-
-    if role == ColumnRole.AUDIT.value and not is_date_temporal and not is_date_like_string:
-        hard_errors.append(f"{col.name}: AUDIT requires date/time type, got '{col.data_type}'")
-
-    if role == ColumnRole.TEMPORAL.value:
-        if is_date_temporal:
-            pass
-        elif is_date_like_string:
-            soft_warnings.append(f"{col.name}: TEMPORAL on string column with date-like name")
-        elif is_duration_integer:
-            if _column_name_suggests_year(col.name):
-                soft_warnings.append(f"{col.name}: TEMPORAL on year-like integer column, recommend NUMERIC_CATEGORICAL")
-        elif col.value_type == "integer":
-            if "year" in col_name_lower or "DOMAIN" in dtype or "YEAR" in dtype:
-                soft_warnings.append(f"{col.name}: TEMPORAL on year/domain column, recommend NUMERIC_CATEGORICAL")
-            else:
-                hard_errors.append(
-                    f"{col.name}: TEMPORAL on integer requires duration-style column name, got '{col.data_type}'"
-                )
-        else:
-            hard_errors.append(
-                f"{col.name}: TEMPORAL requires date/time or duration integer type, got '{col.data_type}'"
-            )
-
     if role == ColumnRole.BOOLEAN.value and col.distinct_count and col.distinct_count > 2:
         hard_errors.append(f"{col.name}: BOOLEAN requires distinct_count <= 2, got {col.distinct_count}")
 
@@ -1457,24 +1557,65 @@ def _validate_column_classification(col: ColumnMetadata, role: str) -> tuple[lis
     if role == ColumnRole.IDENTIFIER.value and not col.is_primary_key and not col.is_foreign_key:
         soft_warnings.append(f"{col.name}: IDENTIFIER on non-PK/FK column")
 
+    if role == ColumnRole.TEMPORAL.value:
+        is_date_like_string = col.value_type == "string" and _column_name_suggests_date(col.name)
+        is_duration_integer = col.value_type == "integer" and _column_name_suggests_duration(col.name)
+        is_year_integer = col.value_type == "integer" and _column_name_suggests_year(col.name)
+        if is_date_like_string:
+            soft_warnings.append(f"{col.name}: TEMPORAL on string column with date-like name")
+        elif is_duration_integer and is_year_integer:
+            soft_warnings.append(f"{col.name}: TEMPORAL on year-like integer column, recommend NUMERIC_CATEGORICAL")
+        elif is_year_integer:
+            soft_warnings.append(f"{col.name}: TEMPORAL on year-like integer column, recommend NUMERIC_CATEGORICAL")
+
     return hard_errors, soft_warnings
 
 
+def _coerce_llm_assigned_role(col: ColumnMetadata, requested_role: str) -> str:
+    """Return a role compatible with ``col.value_type``, coercing via profile heuristics when needed."""
+    role = (requested_role or "").strip().lower()
+    if not role:
+        return _infer_column_role(col).value
+    value_type = (col.value_type or "").strip().lower()
+    if not value_type:
+        return role
+    allowed = ROLE_VALUE_TYPE_COMPAT.get(role)
+    if allowed is None or value_type in allowed:
+        return role
+    fallback = _infer_column_role(col).value
+    notify(
+        f"Column {col.name}: role {role!r} incompatible with value_type {value_type!r}; using {fallback!r}.",
+        stage="schema",
+        code=DIAGNOSTIC_CODE_SCHEMA_ROLE_TYPE_COERCED,
+        level="info",
+        details=(
+            ("requested_role", role),
+            ("value_type", value_type),
+            ("fallback_role", fallback),
+        ),
+    )
+    return fallback
+
+
 def _build_column_profile_for_llm(col: ColumnMetadata) -> dict[str, Any]:
-    """Build a column profile dict for inclusion in the LLM. classification prompt."""
+    """Build a column profile dict for inclusion in the LLM classification prompt."""
+    value_type = (col.value_type or "").strip().lower()
+    if not value_type:
+        value_type = UNKNOWN_VALUE_TYPE
     profile = {
         "name": col.name,
-        "data_type": col.data_type,
+        "value_type": value_type,
         "is_primary_key": col.is_primary_key,
         "is_foreign_key": col.is_foreign_key,
     }
     hints: dict[str, Any] = {}
-    if col.distinct_count is not None:
-        hints["distinct_count"] = col.distinct_count
-    if col.distinct_ratio is not None:
-        hints["distinct_ratio"] = round(col.distinct_ratio, 3)
-    if col.null_ratio is not None:
-        hints["null_ratio"] = round(col.null_ratio, 3)
+    if not _column_is_binary_value_type(col):
+        if col.distinct_count is not None:
+            hints["distinct_count"] = col.distinct_count
+        if col.distinct_ratio is not None:
+            hints["distinct_ratio"] = round(col.distinct_ratio, 3)
+        if col.null_ratio is not None:
+            hints["null_ratio"] = round(col.null_ratio, 3)
     if hints:
         profile["profile_hints"] = hints
     return profile
@@ -1482,13 +1623,15 @@ def _build_column_profile_for_llm(col: ColumnMetadata) -> dict[str, Any]:
 
 def _column_usability_diagnostics(col: ColumnMetadata) -> tuple[bool, str]:
     """Return whether the column is LLM-classifiable and a short reason string for tracing."""
+    if column_has_unknown_value_type(col):
+        return False, "unknown_value_type"
     if col.is_primary_key or col.is_foreign_key:
         return True, "key_column"
     if col.usable_override is True:
         return True, "usable_override"
     if col.distinct_count is not None and col.distinct_count <= 1:
         return False, f"distinct_count={col.distinct_count}<=1"
-    if col.null_ratio >= PolicyConfig.UNUSABLE_NULL_RATIO_THRESHOLD:
+    if col.null_ratio is not None and col.null_ratio >= PolicyConfig.UNUSABLE_NULL_RATIO_THRESHOLD:
         return False, f"null_ratio={col.null_ratio:.3f}>={PolicyConfig.UNUSABLE_NULL_RATIO_THRESHOLD}"
     if col.mode_frequency_ratio >= PolicyConfig.SENTINEL_MODE_FREQUENCY_THRESHOLD:
         return False, (
@@ -1593,11 +1736,11 @@ def _apply_deterministic_unscoped_column_profiles(
             if col.name in scoped or (table.name, col.name) in skip_columns:
                 continue
             role = _infer_column_role(col)
-            if can_overwrite_role(col.role_owner, RoleOwner.PROFILE):
+            if RoleOwner.can_overwrite(col.role_owner, RoleOwner.PROFILE):
                 col.role = role.value
                 col.role_owner = RoleOwner.PROFILE
             description = _deterministic_column_description(table.name, col, role.value)
-            if set_description(col, description, DescriptionOwner.PROFILE):
+            if DescriptionOwner.set_on(col, description, DescriptionOwner.PROFILE):
                 filled += 1
             debug(
                 f"[apply_column_roles_llm] deterministic_profile {table.name}.{col.name} "
@@ -1612,7 +1755,8 @@ def _column_classification_description(classification: Any) -> str:
     """Read the column description string from a raw LLM column classification object."""
     if not isinstance(classification, dict):
         return ""
-    return str(classification.get("description", "")).strip()
+
+    return SchemaGraph.scrub_schema_prose_for_prompt(str(classification.get("description", "")).strip())
 
 
 def _normalize_llm_classification_payload(
@@ -1629,6 +1773,8 @@ def _normalize_llm_classification_payload(
         if table_role not in valid_table_roles:
             table_role = "unknown"
         description = str(table_data.get("description", "")).strip()
+
+        description = SchemaGraph.scrub_schema_prose_for_prompt(description)
         columns_data = table_data.get("columns", {})
         column_classifications: dict[str, tuple[str, str, str | None]] = {}
         for col_name, classification in columns_data.items():
@@ -1720,6 +1866,29 @@ def emit_schema_fk_catalog_absent_warning(dialect_name: str) -> None:
     )
 
 
+def emit_schema_unknown_type_unusable_warnings(schema: SchemaGraph) -> None:
+    """Emit construction diagnostics for columns whose physical type is unsupported."""
+    for tname in sorted(schema.tables):
+        table = schema.tables[tname]
+        for col_name in sorted(table.columns):
+            col = table.columns[col_name]
+            if not column_has_unknown_value_type(col):
+                continue
+            raw_type = (col.data_type or "unknown").strip() or "unknown"
+            notify(
+                f"{tname}.{col_name}: unsupported column type {raw_type!r} (excluded from LLM scope).",
+                stage="schema",
+                code=DIAGNOSTIC_CODE_SCHEMA_UNKNOWN_TYPE_UNUSABLE,
+                level="warning",
+                details=(
+                    ("table", tname),
+                    ("column", col_name),
+                    ("data_type", raw_type),
+                    ("value_type", UNKNOWN_VALUE_TYPE),
+                ),
+            )
+
+
 def schema_classification_content_hash(
     schema: SchemaGraph,
     notes_content: str | None,
@@ -1771,13 +1940,19 @@ def _save_schema_classification_cache(content_hash: str, classifications: dict[s
 
 
 def llm_classify_schema(
-    schema: SchemaGraph, notes_content: str | None = None, *, column_scope: dict[str, frozenset[str]] | None = None
+    schema: SchemaGraph,
+    notes_content: str | None = None,
+    *,
+    column_scope: dict[str, frozenset[str]] | None = None,
+    cache_payload_out: list[dict[str, Any]] | None = None,
 ) -> dict[str, tuple[str, str, dict[str, tuple[str, str, str | None]]]]:
     """Classify table roles, column roles, descriptions, and sensitivity using a profiling-driven base pass, then an unconditional second LLM pass (notes-aware when domain notes are present, otherwise cross- table consistency refinement)."""
     scope = column_scope if column_scope is not None else llm_classification_column_scope(schema)
     content_hash = schema_classification_content_hash(schema, notes_content, scope)
     cached_payload = _load_schema_classification_cache(content_hash)
     if cached_payload is not None:
+        if cache_payload_out is not None:
+            cache_payload_out.append(cached_payload)
         return _normalize_llm_classification_payload(cached_payload)
     tables_data = []
     for table in schema.tables.values():
@@ -1795,58 +1970,9 @@ def llm_classify_schema(
                 "columns": column_profiles,
             }
         )
-    system_base = (
-        "Classify every table's role and every column listed in the input for each table.\n\n"
-        "INPUT SCOPE:\n"
-        "Each table object lists only the columns you must classify under columns. "
-        "Return JSON with exactly those table keys. For each table, include exactly those column keys under columns — "
-        "no additional columns and no omissions.\n\n"
-        "TABLE ROLES:\n"
-        "- dimension: reference/lookup table referenced by others, descriptive attributes\n"
-        "- fact: transactional/event table with FKs to dimensions, contains measures\n"
-        "- bridge: junction table for many-to-many, mostly FKs, few own columns\n"
-        "- unknown: cannot confidently classify\n"
-        "Use FK topology: tables referenced by many others are dimension; tables with many outbound FKs are fact; tables with only 2+ FKs and minimal columns are bridge.\n\n"
-        "COLUMN ROLE DECISION PRIORITY (evaluate in order, first match wins):\n"
-        "1. is_primary_key or is_foreign_key → identifier\n"
-        "2. data_type is date/time/timestamp → temporal (unless name clearly marks audit-only system timestamp like last_update → audit)\n"
-        "3. name suggests binary state (is_*, has_*, active) and distinct_count = 2 → boolean\n"
-        "4. numeric and name suggests quantity/amount/price/count/size/distance → numeric_measure (integer or decimal — data type does not restrict this)\n"
-        "4b. numeric integer and name suggests duration/period/lead_time/lag/tenure/offset in time units → temporal (integer columns only)\n"
-        "5. numeric and name suggests code/rating/level/rank/status/tier/year → numeric_categorical\n"
-        "6. numeric with no clear name signal → numeric_measure (default for numeric)\n"
-        "7. text and very high distinct_ratio → free_text\n"
-        "8. text → categorical (default for text)\n\n"
-        "AMBIGUOUS TWO-VALUE COLUMNS:\n"
-        "When a column has exactly two sampled categorical values (e.g. positive/negative-style pairs), do not assume boolean unless name, type, FK topology, and profile_hints clearly support a flag.\n\n"
-        "PROFILE HINTS (supporting evidence only — never override name/type signals):\n"
-        "Each column may include a profile_hints object with distinct_count, distinct_ratio, and null_ratio. Use these to confirm or disambiguate when name and type are ambiguous.\n"
-        "Do NOT use profile_hints as the primary reason to choose a role.\n\n"
-        "CROSS-TABLE CONSISTENCY:\n"
-        "- Columns with the same name and data type across tables MUST receive the same role.\n"
-        "- Deduce roles from names, types, FK topology, and profile_hints using the priority above.\n\n"
-        "COLUMN DESCRIPTIONS:\n"
-        "For each column, provide a short semantic description (max 8 words) describing what the column represents in business terms. Every column object MUST include a non-empty description.\n"
-        "Role-based guidance for column descriptions:\n"
-        "- identifier columns: describe what entity the ID refers to.\n"
-        "- numeric_measure columns: state the unit or what is measured.\n"
-        "- categorical columns: mention common category values or groupings.\n"
-        "- temporal columns with type date: state what event the date/time marks.\n"
-        "- temporal columns with type integer: state that the column holds a day-count or period length (not a calendar date).\n"
-        "- audit columns: state that the column records when a row was last changed by the system.\n"
-        "- boolean columns: describe the yes/no condition.\n"
-        "- FK columns: MUST state what business data the target table provides when joined. Name the key descriptive columns on the target table (e.g. 'links to target_table for name, title, description').\n\n"
-        "TABLE DESCRIPTIONS:\n"
-        "For each table provide a one-line business purpose that includes: (a) what entity or event the table represents, (b) which related tables it connects to via foreign keys, and (c) the notable descriptive or measure columns it provides that users commonly ask about. Every table MUST include a non-empty description.\n\n"
-        "SENSITIVITY (per column, optional):\n"
-        'Include "sensitivity" in each column object: always null in this pass.\n'
-        'A later second-pass refine step may set "restricted" or "hidden" only when domain notes explicitly require it.\n\n'
-        "Reason internally, output only JSON:\n"
-        '{"table1": {"table_role": "...", "description": "...", '
-        '"columns": {"col1": {"role": "...", "description": "...", "sensitivity": null}, ...}}, ...}'
-    )
+    system_base = SCHEMA_CLASSIFY_SYSTEM
     user = stable_json({"tables": tables_data})
-    raw_base = llm_chat(system_base, user, timeout=360.0, task="schema_base")
+    raw_base = LLMProvider.chat(system_base, user, timeout=360.0, task="schema_base")
     base_payload = safe_json_loads(raw_base)
     if not base_payload or not isinstance(base_payload, dict):
         raise ValueError(f"LLM returned invalid JSON for schema classification (base): {raw_base[:200]}")
@@ -1854,17 +1980,18 @@ def llm_classify_schema(
     final_payload: dict[str, Any] = base_payload
     if notes_stripped:
         user_refine = stable_json({"base_classification": base_payload, "domain_notes": notes_stripped})
-        raw_refine = llm_chat(SCHEMA_NOTES_REFINE_SYSTEM, user_refine, timeout=360.0, task="schema")
+        raw_refine = LLMProvider.chat(SCHEMA_NOTES_REFINE_SYSTEM, user_refine, timeout=360.0, task="schema")
         refined_payload = safe_json_loads(raw_refine)
         if refined_payload and isinstance(refined_payload, dict):
             final_payload = _merge_classification_payloads(base_payload, refined_payload)
     else:
         user_refine = stable_json({"base_classification": base_payload})
-        raw_refine = llm_chat(SCHEMA_CONSISTENCY_REFINE_SYSTEM, user_refine, timeout=360.0, task="schema")
+        raw_refine = LLMProvider.chat(SCHEMA_CONSISTENCY_REFINE_SYSTEM, user_refine, timeout=360.0, task="schema")
         refined_payload = safe_json_loads(raw_refine)
         if refined_payload and isinstance(refined_payload, dict):
             final_payload = _merge_classification_payloads(base_payload, refined_payload)
-    _save_schema_classification_cache(content_hash, final_payload)
+    if cache_payload_out is not None:
+        cache_payload_out.append(final_payload)
     return _normalize_llm_classification_payload(final_payload)
 
 
@@ -1885,6 +2012,7 @@ def apply_column_roles_llm(
         f"  Classifying {len(schema.tables)} tables / {total_columns} columns via LLM (this can take a minute)..."
     )
     llm_column_scope = llm_classification_column_scope(schema)
+    classification_cache_hash = schema_classification_content_hash(schema, notes_content, llm_column_scope)
     _debug_trace_classification_scope(schema, llm_column_scope, log_sink=sink_call)
     role_counts: dict[str, int] = {}
     table_role_counts: dict[str, int] = {}
@@ -1895,8 +2023,14 @@ def apply_column_roles_llm(
     notes_stripped = (notes_content or "").strip()
     description_owner = DescriptionOwner.NOTES if notes_stripped else DescriptionOwner.LLM_REFINEMENT
     for attempt in range(max_attempts):
+        cache_payload_holder: list[dict[str, Any]] = []
         try:
-            classifications = llm_classify_schema(schema, notes_content, column_scope=llm_column_scope)
+            classifications = llm_classify_schema(
+                schema,
+                notes_content,
+                column_scope=llm_column_scope,
+                cache_payload_out=cache_payload_holder,
+            )
             all_hard_errors = []
             all_soft_warnings = []
             for table in schema.tables.values():
@@ -1935,10 +2069,10 @@ def apply_column_roles_llm(
                 scoped_cols = llm_column_scope.get(table.name, frozenset())
                 if table.name in classifications:
                     table_role, description, column_classifications = classifications[table.name]
-                    if can_overwrite_role(table.role_owner, RoleOwner.LLM):
+                    if RoleOwner.can_overwrite(table.role_owner, RoleOwner.LLM):
                         table.role = table_role
                         table.role_owner = RoleOwner.LLM
-                    set_description(table, description, description_owner)
+                    DescriptionOwner.set_on(table, description, description_owner)
                     table_role_counts[table_role] = table_role_counts.get(table_role, 0) + 1
                     for col in table.columns.values():
                         if col.name not in scoped_cols or col.name not in column_classifications:
@@ -1946,13 +2080,16 @@ def apply_column_roles_llm(
                         if (table.name, col.name) in skip_columns:
                             continue
                         role, col_description, sensitivity = column_classifications[col.name]
-                        if can_overwrite_role(col.role_owner, RoleOwner.LLM):
+                        requested_role = role
+                        role = _coerce_llm_assigned_role(col, role)
+                        role_owner = RoleOwner.PROFILE if role != requested_role else RoleOwner.LLM
+                        if RoleOwner.can_overwrite(col.role_owner, role_owner):
                             col.role = role
-                            col.role_owner = RoleOwner.LLM
-                        set_description(col, col_description, description_owner)
-                        set_sensitivity(col, sensitivity)
+                            col.role_owner = role_owner
+                        DescriptionOwner.set_on(col, col_description, description_owner)
+                        SensitivityClassification.apply_to(col, sensitivity)
                         if col.is_primary_key or col.is_foreign_key:
-                            if col.role != ColumnRole.IDENTIFIER.value and can_overwrite_role(
+                            if col.role != ColumnRole.IDENTIFIER.value and RoleOwner.can_overwrite(
                                 col.role_owner, RoleOwner.PK_FK_COERCION
                             ):
                                 debug(
@@ -1963,7 +2100,7 @@ def apply_column_roles_llm(
                         else:
                             bl_pat, bl_truth = _has_boolean_like_values(col)
                             if bl_pat:
-                                if col.role != ColumnRole.BOOLEAN.value and can_overwrite_role(
+                                if col.role != ColumnRole.BOOLEAN.value and RoleOwner.can_overwrite(
                                     col.role_owner, RoleOwner.BOOLEAN_COERCION
                                 ):
                                     debug(
@@ -1976,7 +2113,7 @@ def apply_column_roles_llm(
                                 col.value_type == "date"
                                 and col.role != ColumnRole.AUDIT.value
                                 and col.role != ColumnRole.TEMPORAL.value
-                                and can_overwrite_role(col.role_owner, RoleOwner.PROFILE)
+                                and RoleOwner.can_overwrite(col.role_owner, RoleOwner.PROFILE)
                             ):
                                 debug(
                                     f"[apply_column_roles_llm] override {table.name}.{col.name}: {col.role} → temporal (date type)"
@@ -1988,7 +2125,7 @@ def apply_column_roles_llm(
                                 and _column_name_suggests_duration(col.name)
                                 and not _column_name_suggests_year(col.name)
                                 and col.role not in (ColumnRole.TEMPORAL.value, ColumnRole.IDENTIFIER.value)
-                                and can_overwrite_role(col.role_owner, RoleOwner.PROFILE)
+                                and RoleOwner.can_overwrite(col.role_owner, RoleOwner.PROFILE)
                             ):
                                 debug(
                                     f"[apply_column_roles_llm] override {table.name}.{col.name}: {col.role} → temporal (duration integer)"
@@ -2000,19 +2137,29 @@ def apply_column_roles_llm(
             success = True
             llm_success = len(schema.tables)
             debug("[apply_column_roles_llm] two-phase classification successful")
+            if cache_payload_holder:
+                _save_schema_classification_cache(classification_cache_hash, cache_payload_holder[0])
             break
         except Exception as e:
             last_hard_errors = [str(e)]
             debug(f"[apply_column_roles_llm] attempt {attempt + 1}/{max_attempts} failed: {e}")
             continue
     if not success:
-        detail = "; ".join(last_hard_errors[:10])
-        if len(last_hard_errors) > 10:
+        detail_cap = SCHEMA_CLASSIFY_ERROR_DETAIL_CAP
+        detail = "; ".join(last_hard_errors[:detail_cap])
+        if len(last_hard_errors) > detail_cap:
             detail = f"{detail}; ... ({len(last_hard_errors)} total)"
-        raise RuntimeError(
-            f"Schema LLM classification failed after {max_attempts} attempt(s); "
-            f"every LLM-scoped table and column must receive a non-empty description. {detail}"
-        )
+        role_type_hits = any("BOOLEAN requires" in e for e in last_hard_errors)
+        description_hits = any("description" in e.lower() for e in last_hard_errors)
+        if role_type_hits and not description_hits:
+            category = "role/type compatibility failures"
+        elif description_hits and not role_type_hits:
+            category = "missing descriptions"
+        elif role_type_hits and description_hits:
+            category = "role/type compatibility and missing description failures"
+        else:
+            category = "classification structural failures"
+        raise RuntimeError(f"Schema LLM classification failed after {max_attempts} attempt(s); {category}. {detail}")
     _apply_deterministic_unscoped_column_profiles(schema, llm_column_scope, skip_columns)
     debug(f"[apply_column_roles_llm] completed: {llm_success} LLM-classified tables")
     debug(f"[apply_column_roles_llm] table distribution: {table_role_counts}")
@@ -2069,6 +2216,80 @@ def apply_column_roles_llm(
         debug(f"[apply_column_roles_llm] role/value_type mismatches corrected: {role_value_type_mismatches}")
 
 
+def schema_name_dump_for_business_knowledge(schema: SchemaGraph) -> tuple[str, ...]:
+    """Return sorted qualified table and ``table.column`` names for Pass B filtering."""
+    names: list[str] = []
+    for table_name, table in sorted(schema.tables.items()):
+        names.append(str(table_name))
+        for col_name in sorted(table.columns.keys()):
+            names.append(f"{table_name}.{col_name}")
+    return tuple(names)
+
+
+def filter_schema_anchored_business_knowledge(
+    entries: Sequence[BusinessKnowledgeEntry],
+    schema: SchemaGraph,
+) -> tuple[BusinessKnowledgeEntry, ...]:
+    """Drop entries whose key or text matches a schema table or ``table.column`` name."""
+    name_set = {n.lower() for n in schema_name_dump_for_business_knowledge(schema)}
+    kept: list[BusinessKnowledgeEntry] = []
+    for entry in entries:
+        key_l = entry.key.lower()
+        text_l = entry.text.lower()
+        anchored = False
+        for name in name_set:
+            if name == key_l or name in text_l or f" {name} " in f" {text_l} ":
+                anchored = True
+                break
+            if "." not in name and re.search(rf"\b{re.escape(name)}\b", text_l):
+                anchored = True
+                break
+        if not anchored:
+            kept.append(entry)
+    return tuple(kept)
+
+
+def extract_business_knowledge_from_notes(
+    notes_content: str | None,
+    schema: SchemaGraph,
+) -> tuple[BusinessKnowledgeEntry, ...]:
+    """Pass B: extract business-knowledge entries from notes, dropping schema-anchored lines. When notes are empty or credentials are unavailable, returns an empty tuple (version-0 BK)."""
+    notes_stripped = (notes_content or "").strip()
+    if not notes_stripped:
+        return ()
+    if not EngineConfig.llm_credentials_configured():
+        return ()
+    schema_names = list(schema_name_dump_for_business_knowledge(schema))
+    user_payload = stable_json({"domain_notes": notes_stripped, "schema_names": schema_names})
+    raw = LLMProvider.chat(BUSINESS_KNOWLEDGE_NOTES_EXTRACT_SYSTEM, user_payload, timeout=360.0, task="schema")
+    parsed = safe_json_loads(raw)
+    if not isinstance(parsed, list):
+        return ()
+    allowed_kinds = {member.value for member in BusinessKnowledgeKind}
+    candidates: list[BusinessKnowledgeEntry] = []
+    seen: set[str] = set()
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "").strip()
+        text_val = str(item.get("text") or "").strip()
+        kind = (
+            str(item.get("kind") or BusinessKnowledgeKind.GLOSSARY.value).strip()
+            or BusinessKnowledgeKind.GLOSSARY.value
+        )
+        if not key or not text_val or key in seen:
+            continue
+        if kind not in allowed_kinds:
+            kind = BusinessKnowledgeKind.GLOSSARY.value
+        try:
+            entry = BusinessKnowledgeEntry.normalize(BusinessKnowledgeEntry(key=key, text=text_val, kind=kind))
+        except ConfigError:
+            continue
+        seen.add(entry.key)
+        candidates.append(entry)
+    return filter_schema_anchored_business_knowledge(tuple(candidates), schema)
+
+
 def _strip_leading_articles(value: str) -> str:
     """Lowercase strip and remove leading ``a`` / ``an`` prefixes for comparison."""
     s = value.lower().strip()
@@ -2093,7 +2314,7 @@ def _coerce_zero_one_column(col: ColumnMetadata) -> bool:
             return False
     if bucket != {"z", "o"}:
         return False
-    if can_overwrite_role(col.role_owner, RoleOwner.BOOLEAN_COERCION):
+    if RoleOwner.can_overwrite(col.role_owner, RoleOwner.BOOLEAN_COERCION):
         col.role = ColumnRole.BOOLEAN.value
         col.role_owner = RoleOwner.BOOLEAN_COERCION
         for v in col.frequent_values:
@@ -2115,26 +2336,26 @@ def _coerce_antonym_pair_column(col: ColumnMetadata) -> bool:
         return False
     for prefix in BOOLEAN_NEGATION_PREFIXES:
         if len(a) >= BOOLEAN_ANTONYM_MIN_STEM_LEN and b == prefix + a:
-            if can_overwrite_role(col.role_owner, RoleOwner.BOOLEAN_COERCION):
+            if RoleOwner.can_overwrite(col.role_owner, RoleOwner.BOOLEAN_COERCION):
                 col.role = ColumnRole.BOOLEAN.value
                 col.role_owner = RoleOwner.BOOLEAN_COERCION
                 col.boolean_truth_value = str(raw_a).strip()
             return True
         if len(b) >= BOOLEAN_ANTONYM_MIN_STEM_LEN and a == prefix + b:
-            if can_overwrite_role(col.role_owner, RoleOwner.BOOLEAN_COERCION):
+            if RoleOwner.can_overwrite(col.role_owner, RoleOwner.BOOLEAN_COERCION):
                 col.role = ColumnRole.BOOLEAN.value
                 col.role_owner = RoleOwner.BOOLEAN_COERCION
                 col.boolean_truth_value = str(raw_b).strip()
             return True
     for suffix in BOOLEAN_NEGATION_SUFFIXES:
         if len(a) >= BOOLEAN_ANTONYM_MIN_STEM_LEN and b == a + suffix:
-            if can_overwrite_role(col.role_owner, RoleOwner.BOOLEAN_COERCION):
+            if RoleOwner.can_overwrite(col.role_owner, RoleOwner.BOOLEAN_COERCION):
                 col.role = ColumnRole.BOOLEAN.value
                 col.role_owner = RoleOwner.BOOLEAN_COERCION
                 col.boolean_truth_value = str(raw_a).strip()
             return True
         if len(b) >= BOOLEAN_ANTONYM_MIN_STEM_LEN and a == b + suffix:
-            if can_overwrite_role(col.role_owner, RoleOwner.BOOLEAN_COERCION):
+            if RoleOwner.can_overwrite(col.role_owner, RoleOwner.BOOLEAN_COERCION):
                 col.role = ColumnRole.BOOLEAN.value
                 col.role_owner = RoleOwner.BOOLEAN_COERCION
                 col.boolean_truth_value = str(raw_b).strip()
@@ -2150,7 +2371,7 @@ def apply_boolean_coercion_pass(schema: SchemaGraph) -> None:
                 continue
             bl_pat, bl_truth = _has_boolean_like_values(col)
             if bl_pat:
-                if col.role != ColumnRole.BOOLEAN.value and can_overwrite_role(
+                if col.role != ColumnRole.BOOLEAN.value and RoleOwner.can_overwrite(
                     col.role_owner, RoleOwner.BOOLEAN_COERCION
                 ):
                     col.role = ColumnRole.BOOLEAN.value
@@ -2296,7 +2517,7 @@ def assign_column_ops(schema: SchemaGraph) -> None:
             is_arr, elt = array_element_type_from_data_type(col.data_type)
             if not is_arr and looks_like_json_array_values(col.frequent_values):
                 is_arr, elt = True, "string"
-            if not is_arr and (col.data_type or "").strip().lower() == "json":
+            if not is_arr and normalize_column_type(col.data_type or "") in JSON_COLUMN_TYPE_TOKENS:
                 is_arr, elt = True, "string"
             if is_arr and role != ColumnRole.AUDIT.value:
                 col.element_type = elt or "string"
@@ -2739,7 +2960,7 @@ def _parse_sql_file_via_llm(sql_content: str) -> dict[str, dict[str, Any]]:
         }
     )
 
-    response = llm_chat(system, user, task="ddl")
+    response = LLMProvider.chat(system, user, task="ddl")
     parsed = safe_json_loads(response)
 
     if not isinstance(parsed, dict) or "tables" not in parsed:
@@ -2773,15 +2994,21 @@ def parse_sql_file(sql_path: Path, *, reflected_schema: SchemaGraph | None = Non
 
     debug(f"[schema_profiling.parse_sql_file] reading: {len(sql_content)} chars")
 
+    def _finalize(tables: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        if tables:
+            _enrich_ddl_comments_from_create_statements(tables, sql_content)
+            _merge_ddl_comment_on_statements(tables, sql_content)
+        return tables
+
     tables = _parse_sql_file_fallback(sql_content)
     if tables:
         debug(f"[schema_profiling.parse_sql_file] ddl_parser parsed: {len(tables)} tables")
-        return tables
+        return _finalize(tables)
 
     tables = _parse_sql_file_regex_reflect(sql_content)
     if tables:
         debug(f"[schema_profiling.parse_sql_file] regex_reflect parsed: {len(tables)} tables")
-        return tables
+        return _finalize(tables)
 
     if reflected_schema is not None and _schema_graph_has_structural_foreign_keys(reflected_schema):
         debug(
@@ -2790,12 +3017,12 @@ def parse_sql_file(sql_path: Path, *, reflected_schema: SchemaGraph | None = Non
         )
         return {}
 
-    return _parse_sql_file_via_llm(sql_content)
+    return _finalize(_parse_sql_file_via_llm(sql_content))
 
 
 def _parse_sql_file_fallback(sql_content: str) -> dict[str, dict[str, Any]]:
     """Parse CREATE TABLE and ALTER TABLE metadata from DDL using the. active engine profile."""
-    dialect_cls = get_dialect_class(EngineConfig.TYPE)
+    dialect_cls = DialectRegistry.get_dialect_class(EngineConfig.TYPE)
     dialect_stub = dialect_cls.__new__(dialect_cls)
     token = dialect_stub.sql_file_parse_dialect
     if token == "postgres":
@@ -2878,9 +3105,137 @@ def _infer_column_line_nullable(line_upper: str) -> bool:
     return True
 
 
+def _unescape_sql_string_literal(text: str) -> str:
+    return text.replace("''", "'").replace('""', '"')
+
+
+def _extract_sql_quoted_literal(fragment: str) -> str | None:
+    fragment = fragment.strip()
+    if fragment.startswith("'") and fragment.endswith("'") and len(fragment) >= 2:
+        return _unescape_sql_string_literal(fragment[1:-1])
+    if fragment.startswith('"') and fragment.endswith('"') and len(fragment) >= 2:
+        return _unescape_sql_string_literal(fragment[1:-1])
+    return None
+
+
+def _extract_inline_comment_suffix(line: str) -> str | None:
+    match = re.search(
+        r"\bCOMMENT\b\s+('(?:''|[^'])*'|\"(?:\"\"|[^\"])*\")",
+        line,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    literal = _extract_sql_quoted_literal(match.group(1))
+    return literal.strip() if literal else None
+
+
+def _extract_create_table_comment(full_create_sql: str) -> str | None:
+    match = re.search(
+        r"\)\s*COMMENT\s*=?\s*('(?:''|[^'])*'|\"(?:\"\"|[^\"])*\")",
+        full_create_sql,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return None
+    literal = _extract_sql_quoted_literal(match.group(1))
+    return literal.strip() if literal else None
+
+
+def _normalize_ddl_table_name(raw: str) -> str:
+    name = raw.strip().strip('`"[]')
+    if "." in name:
+        return name.split(".")[-1].strip('`"[]')
+    return name
+
+
+def _merge_ddl_comment_on_statements(tables: dict[str, dict[str, Any]], sql_content: str) -> None:
+    """Merge standalone ``COMMENT ON`` DDL into parsed table metadata."""
+    for match in re.finditer(
+        r"COMMENT\s+ON\s+TABLE\s+([\w.`\"\[\]]+(?:\.[\w.`\"\[\]]+)?)\s+IS\s+('(?:''|[^'])*'|\"(?:\"\"|[^\"])*\")",
+        sql_content,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        tname = _normalize_ddl_table_name(match.group(1))
+        literal = _extract_sql_quoted_literal(match.group(2))
+        if not tname or not literal:
+            continue
+        entry = tables.setdefault(
+            tname,
+            {
+                "table_name_original": tname,
+                "column_names_original": [],
+                "column_types": [],
+                "primary_keys": [],
+                "foreign_keys": [],
+            },
+        )
+        entry["table_comment"] = literal.strip()
+    for match in re.finditer(
+        r"COMMENT\s+ON\s+COLUMN\s+([\w.`\"\[\]]+(?:\.[\w.`\"\[\]]+)?)\s+IS\s+('(?:''|[^'])*'|\"(?:\"\"|[^\"])*\")",
+        sql_content,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        ref = match.group(1)
+        literal = _extract_sql_quoted_literal(match.group(2))
+        if not literal:
+            continue
+        parts = ref.replace('"', "").replace("`", "").split(".")
+        if len(parts) < 2:
+            continue
+        tname = _normalize_ddl_table_name(parts[-2])
+        cname = parts[-1].strip('`"[]')
+        entry = tables.setdefault(
+            tname,
+            {
+                "table_name_original": tname,
+                "column_names_original": [],
+                "column_types": [],
+                "primary_keys": [],
+                "foreign_keys": [],
+            },
+        )
+        comments = entry.setdefault("column_comments", {})
+        if isinstance(comments, dict):
+            comments[cname] = literal.strip()
+
+
+def _enrich_ddl_comments_from_create_statements(tables: dict[str, dict[str, Any]], sql_content: str) -> None:
+    """Merge inline CREATE TABLE comment metadata into parser output."""
+    pattern = re.compile(
+        r"CREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMPORARY\s+|TEMP\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+        r"([\w.`\"\[\]]+(?:\.[\w.`\"\[\]]+)?)\s*\(",
+        re.IGNORECASE | re.DOTALL,
+    )
+    for match in pattern.finditer(sql_content):
+        tname = _normalize_ddl_table_name(match.group(1))
+        if not tname or tname not in tables:
+            continue
+        open_idx = match.end() - 1
+        span = _balanced_paren_span(sql_content, open_idx)
+        if span is None:
+            continue
+        _open_idx, end_after = span
+        inner = sql_content[open_idx + 1 : end_after - 1]
+        stmt_end = sql_content.find(";", end_after)
+        if stmt_end == -1:
+            stmt_end = len(sql_content)
+        create_stmt = sql_content[match.start() : stmt_end]
+        parts = _table_metadata_dict_from_ddl_parts(tname, inner, create_stmt)
+        entry = tables[tname]
+        table_comment = parts.get("table_comment")
+        if table_comment:
+            entry["table_comment"] = table_comment
+        col_comments = parts.get("column_comments") or {}
+        if col_comments:
+            merged = dict(entry.get("column_comments") or {})
+            merged.update(col_comments)
+            entry["column_comments"] = merged
+
+
 def _parse_columns_and_constraints(
     col_block: str,
-) -> tuple[list[str], list[str], list[str], list[dict[str, Any]], list[str], list[bool]]:
+) -> tuple[list[str], list[str], list[str], list[dict[str, Any]], list[str], list[bool], dict[str, str]]:
     """Parse column definitions and constraints from a column block. string."""
     lines = [line.strip() for line in _split_by_top_level_comma(col_block)]
 
@@ -2890,6 +3245,7 @@ def _parse_columns_and_constraints(
     fks = []
     unique_cols: list[str] = []
     column_is_nullable: list[bool] = []
+    column_comments: dict[str, str] = {}
 
     for line in lines:
         line_upper = line.upper()
@@ -2922,6 +3278,9 @@ def _parse_columns_and_constraints(
         columns.append(col_name)
         types.append(col_type)
         column_is_nullable.append(_infer_column_line_nullable(line_upper))
+        inline_comment = _extract_inline_comment_suffix(line)
+        if inline_comment:
+            column_comments[col_name] = inline_comment
 
         type_word_count = len(col_type.split())
         line_tokens = line.split()
@@ -2951,7 +3310,7 @@ def _parse_columns_and_constraints(
         if idx is not None:
             column_is_nullable[idx] = False
 
-    return columns, types, pks, fks, unique_cols, column_is_nullable
+    return columns, types, pks, fks, unique_cols, column_is_nullable, column_comments
 
 
 def _extract_pk_columns(line: str) -> list[str]:
@@ -2979,7 +3338,7 @@ def _extract_fk_definition(line: str) -> dict[str, Any] | None:
 
 def _table_metadata_dict_from_ddl_parts(table_name: str, col_block: str, full_create_sql: str) -> dict[str, Any]:
     """Build a single-table schema metadata dict from column text and. full CREATE DDL."""
-    columns, types, pks, fks, uniqs, col_nullable = _parse_columns_and_constraints(col_block)
+    columns, types, pks, fks, uniqs, col_nullable, column_comments = _parse_columns_and_constraints(col_block)
     cat_pks, cat_fks, cat_uniqs = _parse_catalog_constraints_from_ddl(full_create_sql)
     merged_pks = list(dict.fromkeys(pks + cat_pks))
     merged_uniqs = list(dict.fromkeys(uniqs + cat_uniqs))
@@ -2991,6 +3350,7 @@ def _table_metadata_dict_from_ddl_parts(table_name: str, col_block: str, full_cr
             seen_fk.add(key)
             merged_fks.append(fk)
     partition_cols = _partition_column_names_from_create_ddl(full_create_sql)
+    table_comment = _extract_create_table_comment(full_create_sql)
     return {
         "table_name_original": table_name,
         "column_names_original": columns,
@@ -3000,6 +3360,8 @@ def _table_metadata_dict_from_ddl_parts(table_name: str, col_block: str, full_cr
         "foreign_keys": merged_fks,
         "unique_columns": merged_uniqs,
         "partition_columns": partition_cols,
+        "table_comment": table_comment,
+        "column_comments": column_comments,
     }
 
 
@@ -3373,8 +3735,7 @@ def value_overlap_stats_for_columns(
     right: ColumnMetadata,
 ) -> tuple[int, float] | None:
     """Return intersection size and overlap ratio relative to the smaller ``value_overlap_sample``."""
-    s1 = set(left.value_overlap_sample or [])
-    s2 = set(right.value_overlap_sample or [])
+    s1, s2, _ = normalized_value_overlap_sets(left, right)
     if not s1 or not s2:
         return None
     smaller = min(len(s1), len(s2))
@@ -3408,14 +3769,15 @@ def compute_semantic_profile_join_neighbors(sg: SchemaGraph) -> None:
     entries: list[tuple[str, str, ColumnMetadata]] = []
     for tname, tbl in sg.tables.items():
         for cname, cmeta in tbl.columns.items():
+            if column_has_unknown_value_type(cmeta):
+                continue
             if (cmeta.value_type or "").strip().lower() != "string":
                 continue
             if cmeta.value_overlap_sample:
                 entries.append((tname, cname, cmeta))
 
     for i, (t1, c1, m1) in enumerate(entries):
-        s1 = set(m1.value_overlap_sample)
-        if not s1:
+        if not m1.value_overlap_sample:
             continue
         anchor1 = bool(m1.is_primary_key) or bool(m1.is_unique)
         for t2, c2, m2 in entries[i + 1 :]:
@@ -3426,8 +3788,11 @@ def compute_semantic_profile_join_neighbors(sg: SchemaGraph) -> None:
                 continue
             if (t1, c1, t2, c2) in fk_column_pairs:
                 continue
-            s2 = set(m2.value_overlap_sample)
-            if not s2:
+            if not m2.value_overlap_sample:
+                continue
+
+            s1, s2, _ = normalized_value_overlap_sets(m1, m2)
+            if not s1 or not s2:
                 continue
             smaller = min(len(s1), len(s2))
             if smaller < min_distinct:

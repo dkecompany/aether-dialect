@@ -22,6 +22,8 @@ _INTERNAL_IR_TERMS = (
     "window_registry",
     "numeric_argument",
     "What the intent carries",
+    "intent carries",
+    "intent carry",
 )
 
 _ORDINARY_SQL_CAPABILITY_ROWS = (
@@ -73,6 +75,26 @@ def test_support_matrix_no_internal_representation_column() -> None:
     assert "What the intent carries" not in supported
     found = [term for term in _INTERNAL_IR_TERMS if term in supported]
     assert not found, f"internal IR terms in supported constructs: {found}"
+
+
+@pytest.mark.fast
+def test_support_matrix_no_intent_carries_phrasing() -> None:
+    """Dialect notes and legend avoid internal 'intent carries' phrasing."""
+    text = _matrix_text().lower()
+    assert "intent carries" not in text
+    assert "intent carry" not in text
+    assert "metadata and intent align" not in text
+
+
+@pytest.mark.fast
+@pytest.mark.parametrize(
+    "guide_name",
+    ("USER_GUIDE.md", "INTEGRATOR_GUIDE.md", "SANDBOX.md"),
+)
+def test_s2_user_guides_avoid_intent_carries_phrasing(guide_name: str) -> None:
+    text = (_REPO / "docs" / guide_name).read_text(encoding="utf-8").lower()
+    assert "intent carries" not in text
+    assert "intent carry" not in text
 
 
 @pytest.mark.fast
@@ -214,3 +236,51 @@ def test_support_matrix_legend_matches_engine_capability_cells() -> None:
 
     undefined = [cell for cell in sorted(distinct_cells) if not _cell_covered(cell)]
     assert not undefined, f"engine table cells lack legend definitions: {undefined}"
+
+
+def _dialect_section(text: str, heading: str) -> str:
+    start = text.index(heading)
+    next_heading = text.index("### ", start + len(heading))
+    return text[start:next_heading]
+
+
+@pytest.mark.fast
+def test_required_capability_notes_present() -> None:
+    """Dialect notes document per-engine IR refusals; capability table cells match runtime backends."""
+    text = _matrix_text()
+    table = _engine_capabilities_table(text)
+
+    mysql = _dialect_section(text, "### MySQL")
+    mariadb = _dialect_section(text, "### MariaDB")
+    databricks = _dialect_section(text, "### Databricks")
+    sqlite = _dialect_section(text, "### SQLite")
+    csv = _dialect_section(text, "### CSV (`csv`)")
+    sqlserver = _dialect_section(text, "### SQL Server")
+
+    assert "median" in mysql.lower() and "not supported" in mysql.lower()
+    assert "median" in mariadb.lower() and "not supported" in mariadb.lower()
+
+    assert "ordered string" in databricks.lower() and "not supported" in databricks.lower()
+
+    for section in (sqlite, csv):
+        lowered = section.lower()
+        assert "stddev" in lowered and "variance" in lowered
+        assert "array_contains" in lowered and "not supported" in lowered
+
+    assert "window frame" in csv.lower() and "not supported" in csv.lower()
+
+    sqlserver_lower = sqlserver.lower()
+    assert "array_contains" in sqlserver_lower and "not supported" in sqlserver_lower
+    assert "openjson" in sqlserver_lower and "unnest" in sqlserver_lower
+
+    assert "sqlglot" in databricks.lower() and "databricks" in databricks.lower()
+    assert "spark dialect" not in databricks.lower()
+
+    result_row = next(line for line in table.splitlines() if line.startswith("| Result reader backends"))
+    cells = [cell.strip() for cell in result_row.strip("|").split("|")]
+    assert cells[9] == "connector -> SQLAlchemy -> Spark"
+    assert cells[4] == "connector -> SQLAlchemy"
+    assert cells[5] == "connector -> SQLAlchemy"
+    assert cells[8] == "connector -> SQLAlchemy"
+
+    assert "non-file" in csv.lower()

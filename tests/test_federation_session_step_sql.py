@@ -1,4 +1,4 @@
-"""Federated session steps expose member SQL through the bundle, not a display placeholder."""
+"""Federated session steps expose member SQL as a source_id mapping (or a single string)."""
 
 from __future__ import annotations
 
@@ -8,14 +8,13 @@ import pytest
 
 from aetherdialect._contracts_core import FederatedSqlBundle, FederatedStatementRecord, GenerationPath
 from aetherdialect._main_execution import (
+    MainExecutionOps,
     PipelineSession,
-    _federation_session_step_sql,
-    _resolved_session_step_sql,
 )
 
 
 @pytest.mark.fast
-def test_multi_member_federated_step_has_null_sql_and_nonempty_bundle() -> None:
+def test_multi_member_federated_step_has_member_sql_mapping_and_bundle() -> None:
     bundle = FederatedSqlBundle(
         statements=(
             FederatedStatementRecord(source_id="a", engine="duckdb", statement="SELECT id FROM left_t"),
@@ -39,7 +38,7 @@ def test_multi_member_federated_step_has_null_sql_and_nonempty_bundle() -> None:
         "generation_path": GenerationPath.FEDERATION_PLAN,
     }
     step = sess._completed_step()
-    assert step.sql is None
+    assert step.sql == {"a": "SELECT id FROM left_t", "b": "SELECT id FROM right_t"}
     assert step.federated_bundle is bundle
     assert len(step.federated_bundle.statements) == 2
 
@@ -51,11 +50,14 @@ def test_single_member_federated_step_carries_member_statement_sql() -> None:
         display_sql="SELECT id FROM left_t",
         column_names=("id",),
     )
-    assert _federation_session_step_sql(federated_bundle=bundle) == "SELECT id FROM left_t"
-    assert _resolved_session_step_sql("SELECT display", federated_bundle=bundle) == "SELECT id FROM left_t"
+    assert MainExecutionOps._federation_session_step_sql(federated_bundle=bundle) == "SELECT id FROM left_t"
+    assert (
+        MainExecutionOps._resolved_session_step_sql("SELECT display", federated_bundle=bundle)
+        == "SELECT id FROM left_t"
+    )
 
 
 @pytest.mark.fast
 def test_single_engine_step_keeps_display_sql() -> None:
-    assert _resolved_session_step_sql("SELECT 1") == "SELECT 1"
-    assert _federation_session_step_sql() is None
+    assert MainExecutionOps._resolved_session_step_sql("SELECT 1") == "SELECT 1"
+    assert MainExecutionOps._federation_session_step_sql() is None

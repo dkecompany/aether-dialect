@@ -7,7 +7,7 @@ import pytest
 from aetherdialect._config import EngineConfig
 from aetherdialect._contracts_base import LlmExecutionConfig
 from aetherdialect._core_utils import llm_execution_scope
-from aetherdialect._llm_provider import _build_client, _clients, clear_llm_clients
+from aetherdialect._llm_provider import LLMProvider, _clients
 
 
 def _azure_llm_cfg(api_key: str) -> LlmExecutionConfig:
@@ -60,9 +60,9 @@ def test_distinct_api_tokens_get_distinct_cached_clients(monkeypatch: pytest.Mon
     monkeypatch.setattr("aetherdialect._llm_provider.OpenAI", FakeOpenAI)
 
     EngineConfig.API_TOKEN = "tenant-a-token"
-    client_a = _build_client("openai")
+    client_a = LLMProvider._build_client("openai")
     EngineConfig.API_TOKEN = "tenant-b-token"
-    client_b = _build_client("openai")
+    client_b = LLMProvider._build_client("openai")
 
     assert client_a is not client_b
     assert created_keys == ["tenant-a-token", "tenant-b-token"]
@@ -73,17 +73,17 @@ def test_distinct_api_tokens_get_distinct_cached_clients(monkeypatch: pytest.Mon
 @pytest.mark.usefixtures("_restore_llm_client_cache", "_openai_provider")
 def test_clear_llm_clients_preserves_other_credential_identities() -> None:
     EngineConfig.API_TOKEN = "tenant-a-token"
-    client_a = _build_client("openai")
+    client_a = LLMProvider._build_client("openai")
     EngineConfig.API_TOKEN = "tenant-b-token"
-    client_b = _build_client("openai")
+    client_b = LLMProvider._build_client("openai")
     assert len(_clients) == 2
 
-    clear_llm_clients()
+    LLMProvider.clear_llm_clients()
 
     assert client_a in _clients.values()
     assert client_b not in _clients.values()
     EngineConfig.API_TOKEN = "tenant-b-token"
-    client_b_again = _build_client("openai")
+    client_b_again = LLMProvider._build_client("openai")
     assert client_b_again is not client_b
 
 
@@ -100,9 +100,9 @@ def test_azure_clients_on_same_endpoint_differ_by_api_key(monkeypatch: pytest.Mo
     EngineConfig.LLM_PROVIDER = "azure"
 
     with llm_execution_scope(_azure_llm_cfg("tenant-a-key")):
-        client_a = _build_client("azure")
+        client_a = LLMProvider._build_client("azure")
     with llm_execution_scope(_azure_llm_cfg("tenant-b-key")):
-        client_b = _build_client("azure")
+        client_b = LLMProvider._build_client("azure")
 
     assert client_a is not client_b
     assert created_keys == ["tenant-a-key", "tenant-b-key"]

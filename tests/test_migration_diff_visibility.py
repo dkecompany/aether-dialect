@@ -1,4 +1,4 @@
-"""T1: diff_schemas must surface nullability/uniqueness; empty diff with hash mismatch is fatal."""
+"""diff_schemas must surface nullability/uniqueness; empty diff with hash mismatch is fatal."""
 
 from __future__ import annotations
 

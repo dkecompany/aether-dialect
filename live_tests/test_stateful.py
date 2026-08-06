@@ -6,10 +6,7 @@ from unittest.mock import patch
 
 from aetherdialect._contracts_schema import TemplateStats
 from aetherdialect._templates import (
-    load_template_store,
-    save_template_store,
-    store_to_templates,
-    templates_to_store,
+    TemplateOps,
 )
 
 from ._seed_helpers import (
@@ -23,7 +20,7 @@ from ._seed_helpers import (
 )
 
 
-@patch("aetherdialect._templates.llm_credentials_configured", return_value=False)
+@patch("aetherdialect._config.EngineConfig.llm_credentials_configured", return_value=False)
 def test_store_persistence_roundtrip(_mock_no_llm, schema, schema_terms, t2s) -> None:
     """Seed a full-shape store on disk, then reload it and assert every section survives. Covers accepted templates and ``question_feedback`` rows (rejections, validation failures, penalties) so regressions in ``save_template_store`` / ``load_template_store`` are caught at the live layer."""
     with isolated_runner(schema, schema_terms, t2s, label="persist_rt") as runner:
@@ -57,12 +54,12 @@ def test_store_persistence_roundtrip(_mock_no_llm, schema, schema_terms, t2s) ->
             q_norm="unparseable seeded request",
         )
 
-        templates_to_store(runner.store, runner.templates)
-        save_template_store(runner.store)
-        reloaded = load_template_store(runner.schema.effective_structural_hash, runner.schema)
+        TemplateOps.templates_to_store(runner.store, runner.templates)
+        TemplateOps.save_template_store(runner.store)
+        reloaded = TemplateOps.load_template_store(runner.schema.effective_structural_hash, runner.schema)
 
         assert accepted.id in reloaded["templates"], reloaded["templates"].keys()
-        reloaded_templates = store_to_templates(reloaded)
+        reloaded_templates = TemplateOps.store_to_templates(reloaded)
         assert reloaded_templates[accepted.id].trust_level == 2
         assert reloaded_templates[accepted.id].stats == TemplateStats(accept=5, reject=1)
 
@@ -94,10 +91,10 @@ def test_seeded_per_pair_state_survives_save_load(schema, schema_terms, t2s) -> 
             qn: (fc.accepts, fc.rejects, fc.last_path) for qn, fc in runner.templates[tid].feedback_by_question.items()
         }
 
-        templates_to_store(runner.store, runner.templates)
-        save_template_store(runner.store)
-        reloaded = load_template_store(runner.schema.effective_structural_hash, runner.schema)
-        reloaded_templates = store_to_templates(reloaded)
+        TemplateOps.templates_to_store(runner.store, runner.templates)
+        TemplateOps.save_template_store(runner.store)
+        reloaded = TemplateOps.load_template_store(runner.schema.effective_structural_hash, runner.schema)
+        reloaded_templates = TemplateOps.store_to_templates(reloaded)
 
         _missing_template_msg = f"[PER-PAIR] template {tid!r} missing after reload; got {sorted(reloaded_templates)!r}"
         assert tid in reloaded_templates, _missing_template_msg

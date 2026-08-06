@@ -27,7 +27,7 @@ from tests.test_aether_federation_public_surface import (
 )
 
 _MAPPINGS_PAYLOAD = {
-    "version": 2,
+    "version": "0.2.1",
     "logical_tables": [
         {
             "logical": "payment",
@@ -76,7 +76,7 @@ def test_export_federation_declaration_round_trips_through_parser(
 
 def test_federation_declaration_document_omits_derived_roster_fields() -> None:
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
-    mappings = FederationMappings(version=2)
+    mappings = FederationMappings(version="0.2.1")
     doc = federation_declaration_document(manifest, mappings)
     assert "sources" not in doc
     assert "table_namespace" not in doc
@@ -118,7 +118,7 @@ def test_in_memory_mappings_override_declaration_file_on_recompose(tmp_path: Pat
         manifest,
     )
     bundle = _init_bundle(manifest, composite)
-    override_mappings = FederationMappings(version=2, logical_tables=(), logical_columns=())
+    override_mappings = FederationMappings(version="0.2.1", logical_tables=(), logical_columns=())
     captured: dict[str, object] = {}
 
     def _capture_init(*args: object, **kwargs: object) -> object:

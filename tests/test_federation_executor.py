@@ -7,7 +7,7 @@ import pytest
 
 from aetherdialect._contracts_core import FederatedPrepareOutcome, RuntimeIntent
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._dialect import get_dialect
+from aetherdialect._dialect import DialectRegistry
 from aetherdialect._federation import (
     FederationInvariantError,
     FederationRuntimeError,
@@ -20,7 +20,7 @@ from aetherdialect._federation import (
     render_federation_glue,
     revalidate_prepared_federation_plan,
 )
-from aetherdialect._main_execution import _build_federation_source_runtimes
+from aetherdialect._main_execution import MainExecutionOps
 from aetherdialect._pipeline import execute_federated_prepare
 from aetherdialect._schema_graph import recompute_join_paths_multi
 from aetherdialect._utils import intent_key
@@ -253,8 +253,8 @@ def test_federation_member_probe_qualification_uses_attached_schema() -> None:
     connection = duckdb.connect(":memory:")
     connection.execute("ATTACH ':memory:' AS ext_schema")
     connection.execute("CREATE TABLE ext_schema.right_t (id INTEGER)")
-    default = get_dialect("duckdb")
-    runtimes = _build_federation_source_runtimes(
+    default = DialectRegistry.get("duckdb")
+    runtimes = MainExecutionOps._build_federation_source_runtimes(
         manifest,
         None,
         default,

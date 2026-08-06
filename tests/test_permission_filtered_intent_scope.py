@@ -37,25 +37,19 @@ def _owner_graph() -> SchemaGraph:
 
 class TestResolveIntentVisibleObjects:
     def test_execution_scope_used_when_space_absent(self) -> None:
-        from aetherdialect._contracts_schema import resolve_intent_visible_objects
-
-        assert resolve_intent_visible_objects(
+        assert SchemaGraph.resolve_intent_visible_objects(
             visible_objects=None,
             execution_visible_objects=frozenset({"a"}),
         ) == frozenset({"a"})
 
     def test_space_scope_intersects_execution_scope(self) -> None:
-        from aetherdialect._contracts_schema import resolve_intent_visible_objects
-
-        assert resolve_intent_visible_objects(
+        assert SchemaGraph.resolve_intent_visible_objects(
             visible_objects=frozenset({"a", "c"}),
             execution_visible_objects=frozenset({"a", "b"}),
         ) == frozenset({"a"})
 
     def test_space_scope_preserved_for_owner(self) -> None:
-        from aetherdialect._contracts_schema import resolve_intent_visible_objects
-
-        assert resolve_intent_visible_objects(
+        assert SchemaGraph.resolve_intent_visible_objects(
             visible_objects=frozenset({"a"}),
             execution_visible_objects=None,
         ) == frozenset({"a"})

@@ -7,14 +7,14 @@ from unittest.mock import MagicMock
 import pytest
 
 from aetherdialect._contracts_base import (
+    CteEmissionKind,
     FailureCategory,
     MulGroup,
     NormalizedExpr,
+    PredicateGroup,
     SqlDiagnostic,
     SqlDiagnosticCode,
     WhereParam,
-    coerce_cte_emission,
-    predicate_group_from_list,
 )
 from aetherdialect._contracts_core import (
     RuntimeCteStep,
@@ -427,7 +427,7 @@ class TestValidateCteEmissionReclassification:
     """D5: engine-owned CTE emission mismatches are errors."""
 
     def test_coerce_cte_emission_rejects_model_scalar_subquery(self):
-        assert coerce_cte_emission("scalar_subquery") == "join_table"
+        assert CteEmissionKind.coerce("scalar_subquery") == CteEmissionKind.SCALAR_SUBQUERY
 
     def test_model_declared_scalar_subquery_is_forbidden(self):
         cte = RuntimeCteStep(
@@ -612,7 +612,7 @@ class TestValidateMainQueryCteUsage:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("cte1.total"))],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("cte1.bad_col"),

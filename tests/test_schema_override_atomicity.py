@@ -76,7 +76,7 @@ def test_apply_schema_overrides_to_graph_live_graph_consistent_mid_apply(
         return real_recompute(tables, **kwargs)
 
     monkeypatch.setattr("aetherdialect._schema_overrides.recompute_join_paths_multi", probe_recompute)
-    monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+    monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
     report = apply_schema_overrides_to_graph(
         schema_graph,
         _ov_doc(
@@ -94,11 +94,11 @@ def test_apply_schema_overrides_to_graph_live_graph_consistent_mid_apply(
     assert all(pre_recompute_checks)
 
 
-def test_apply_schema_overrides_acquires_pipeline_writer_lock(
+def test_apply_overrides_acquires_pipeline_writer_lock(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Owner apply_schema_overrides must serialize on the pipeline writer lock."""
+    """Owner apply_overrides must serialize on the pipeline writer lock."""
     art_dir = tmp_path / "artifacts"
     art_dir.mkdir()
     (art_dir / "schema_overrides.json").write_text(json.dumps({"tables": {}}), encoding="utf-8")
@@ -133,6 +133,6 @@ def test_apply_schema_overrides_acquires_pipeline_writer_lock(
             collapsed_inferences=0,
         ),
     ):
-        engine.apply_schema_overrides()
+        engine.apply_overrides()
 
     assert acquired == [True]

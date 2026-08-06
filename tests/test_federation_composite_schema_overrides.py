@@ -46,13 +46,11 @@ def _graph(table: str, *, source_id: str) -> SchemaGraph:
 
 
 def test_federation_method_semantics_schema_overrides_are_both_scoped() -> None:
-    assert FEDERATION_METHOD_SEMANTICS["export_schema_overrides"] == "both"
-    assert FEDERATION_METHOD_SEMANTICS["apply_schema_overrides"] == "both"
+    assert FEDERATION_METHOD_SEMANTICS["export_overrides"] == "both"
+    assert FEDERATION_METHOD_SEMANTICS["apply_overrides"] == "both"
 
 
-def test_export_schema_overrides_without_connection_targets_composite(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_export_overrides_without_connection_targets_composite(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
     members = {"a": _graph("left_t", source_id="a"), "b": _graph("right_t", source_id="b")}
     composite = compose_composite_graph(members, manifest)
@@ -61,7 +59,7 @@ def test_export_schema_overrides_without_connection_targets_composite(
     persist_federation_tree(
         str(fed_dir),
         manifest=manifest,
-        mappings=FederationMappings(version=1),
+        mappings=FederationMappings(version="0.2.1"),
         composite=composite,
         member_graphs=members,
     )
@@ -75,7 +73,7 @@ def test_export_schema_overrides_without_connection_targets_composite(
             artifacts_dir=str(tmp_path),
         )
     monkeypatch.chdir(tmp_path)
-    out = fed.export_schema_overrides()
+    out = fed.export_overrides()
     assert out.resolve() == (Path(fed._artifacts_dir) / SCHEMA_OVERRIDES_DEFAULT_FILENAME).resolve()
     payload = json.loads(out.read_text(encoding="utf-8"))
     readonly_tables = {row["name"]: row for row in payload["_readonly"]["tables_current"]}
@@ -83,7 +81,7 @@ def test_export_schema_overrides_without_connection_targets_composite(
 
 
 def test_apply_federation_composite_overrides_persists_sidecar(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+    monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
     members = {"a": _graph("left_t", source_id="a"), "b": _graph("right_t", source_id="b")}
     composite = compose_composite_graph(members, manifest)
@@ -91,7 +89,7 @@ def test_apply_federation_composite_overrides_persists_sidecar(tmp_path: Path, m
     persist_federation_tree(
         str(fed_dir),
         manifest=manifest,
-        mappings=FederationMappings(version=1),
+        mappings=FederationMappings(version="0.2.1"),
         composite=composite,
         member_graphs=members,
     )
@@ -121,7 +119,7 @@ def test_apply_federation_composite_overrides_persists_sidecar(tmp_path: Path, m
 def test_finalize_federation_composite_overrides_replays_after_recompose(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+    monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
     members = {"a": _graph("left_t", source_id="a"), "b": _graph("right_t", source_id="b")}
     composite = compose_composite_graph(members, manifest)
@@ -129,11 +127,10 @@ def test_finalize_federation_composite_overrides_replays_after_recompose(
     persist_federation_tree(
         str(fed_dir),
         manifest=manifest,
-        mappings=FederationMappings(version=1),
+        mappings=FederationMappings(version="0.2.1"),
         composite=composite,
         member_graphs=members,
     )
-    composite_path = federation_artifact_paths(str(fed_dir))["composite_schema"]
     editor = tmp_path / SCHEMA_OVERRIDES_DEFAULT_FILENAME
     editor.write_text(
         json.dumps(
@@ -158,5 +155,5 @@ def test_finalize_federation_composite_overrides_replays_after_recompose(
 def test_member_schema_overrides_still_dispatch_with_connection_name() -> None:
     fed = _fed()
     member = fed._members["conn_a"]
-    fed.export_schema_overrides("conn_a")
-    member.export_schema_overrides.assert_called_once()
+    fed.export_overrides("conn_a")
+    member.export_overrides.assert_called_once()

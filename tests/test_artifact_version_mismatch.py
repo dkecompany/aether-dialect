@@ -26,10 +26,7 @@ from aetherdialect._federation import (
     persist_federation_tree,
 )
 from aetherdialect._main_execution import (
-    load_aetherspace_snapshot,
-    load_schema_context_cache,
-    save_aetherspace_snapshot,
-    write_schema_context_cache,
+    MainExecutionOps,
 )
 from aetherdialect._schema_build import overrides_sidecar_path
 from aetherdialect._schema_graph import recompute_join_paths_multi
@@ -70,25 +67,25 @@ _FED_MANIFEST = {
 @pytest.mark.fast
 def test_aetherspace_snapshot_version_mismatch_distinct_from_missing(tmp_path: Path) -> None:
     engine_dir = str(tmp_path)
-    assert load_aetherspace_snapshot(engine_dir, "films") is None
+    assert MainExecutionOps.load_aetherspace_snapshot(engine_dir, "films") is None
 
     current = {
         "version": AETHERSPACE_ARTIFACT_VERSION,
         "tables": ["film"],
         "columns": ["film.film_id"],
     }
-    save_aetherspace_snapshot(engine_dir, "films", current)
-    loaded = load_aetherspace_snapshot(engine_dir, "films")
+    MainExecutionOps.save_aetherspace_snapshot(engine_dir, "films", current)
+    loaded = MainExecutionOps.load_aetherspace_snapshot(engine_dir, "films")
     assert loaded is not None
     assert loaded["tables"] == ["film"]
 
     wrong = dict(current)
-    wrong["version"] = AETHERSPACE_ARTIFACT_VERSION + 99
-    save_aetherspace_snapshot(engine_dir, "stale", wrong)
+    wrong["version"] = "9.9.9"
+    MainExecutionOps.save_aetherspace_snapshot(engine_dir, "stale", wrong)
     with pytest.raises(ConfigError, match=r"version .*" + str(AETHERSPACE_ARTIFACT_VERSION)) as exc_info:
-        load_aetherspace_snapshot(engine_dir, "stale")
+        MainExecutionOps.load_aetherspace_snapshot(engine_dir, "stale")
     msg = str(exc_info.value)
-    assert str(AETHERSPACE_ARTIFACT_VERSION + 99) in msg
+    assert "9.9.9" in msg
     assert str(AETHERSPACE_ARTIFACT_VERSION) in msg
     assert "Delete" in msg
 
@@ -96,22 +93,22 @@ def test_aetherspace_snapshot_version_mismatch_distinct_from_missing(tmp_path: P
 @pytest.mark.fast
 def test_schema_context_cache_version_mismatch_distinct_from_missing(tmp_path: Path) -> None:
     adir = str(tmp_path)
-    assert load_schema_context_cache(adir) is None
+    assert MainExecutionOps.load_schema_context_cache(adir) is None
 
     ctx = EngineContext(allow_objects=frozenset({"public.t"}))
-    write_schema_context_cache(adir, ctx)
-    loaded = load_schema_context_cache(adir)
+    MainExecutionOps.write_schema_context_cache(adir, ctx)
+    loaded = MainExecutionOps.load_schema_context_cache(adir)
     assert loaded is not None
     assert "public.t" in loaded.allow_objects
 
     cache_path = os.path.join(adir, "schema_context.json")
     with open(cache_path, encoding="utf-8") as fh:
         payload = json.load(fh)
-    payload["version"] = 999
+    payload["version"] = "9.9.9"
     with open(cache_path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh)
-    with pytest.raises(ConfigError, match=r"version .*999") as exc_info:
-        load_schema_context_cache(adir)
+    with pytest.raises(ConfigError, match=r"version .*9\.9\.9") as exc_info:
+        MainExecutionOps.load_schema_context_cache(adir)
     msg = str(exc_info.value)
     assert str(SCHEMA_CONTEXT_CACHE_VERSION) in msg
     assert "Delete" in msg
@@ -119,14 +116,14 @@ def test_schema_context_cache_version_mismatch_distinct_from_missing(tmp_path: P
 
 @pytest.mark.fast
 def test_schema_context_cache_rejects_include_both(tmp_path: Path) -> None:
-    from aetherdialect._main_execution import load_schema_context_cache
+    from aetherdialect._main_execution import MainExecutionOps
 
     adir = str(tmp_path)
-    cache_path = tmp_path / "schema_context.json"
+    cache_path = Path(adir) / "schema_context.json"
     cache_path.write_text(
         json.dumps(
             {
-                "version": 4,
+                "version": "0.2.1",
                 "include": "both",
                 "allow_objects": [],
                 "deny_objects": [],
@@ -137,7 +134,7 @@ def test_schema_context_cache_rejects_include_both(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     with pytest.raises(ConfigError, match="include must be tables or views"):
-        load_schema_context_cache(adir)
+        MainExecutionOps.load_schema_context_cache(adir)
 
 
 @pytest.mark.fast
@@ -157,7 +154,7 @@ def test_schema_context_cache_legacy_v3_is_mismatch(tmp_path: Path) -> None:
             fh,
         )
     with pytest.raises(ConfigError, match=r"version .*3") as exc_info:
-        load_schema_context_cache(adir)
+        MainExecutionOps.load_schema_context_cache(adir)
     assert str(SCHEMA_CONTEXT_CACHE_VERSION) in str(exc_info.value)
 
 
@@ -183,12 +180,12 @@ def test_overrides_sidecar_version_mismatch_distinct_from_missing(tmp_path: Path
     sidecar = overrides_sidecar_path(cache_path)
     with sidecar.open(encoding="utf-8") as fh:
         payload = json.load(fh)
-    payload["version"] = SCHEMA_OVERRIDES_VERSION + 50
+    payload["version"] = "9.9.9"
     sidecar.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ConfigError, match=r"version .*") as exc_info:
         load_overrides_sidecar(cache_path)
     msg = str(exc_info.value)
-    assert str(SCHEMA_OVERRIDES_VERSION + 50) in msg
+    assert "9.9.9" in msg
     assert str(SCHEMA_OVERRIDES_VERSION) in msg
     assert "Delete" in msg
 
@@ -196,7 +193,7 @@ def test_overrides_sidecar_version_mismatch_distinct_from_missing(tmp_path: Path
 @pytest.mark.fast
 def test_mappings_replay_matches_version_mismatch_distinct_from_missing() -> None:
     manifest = parse_federation_manifest(_FED_MANIFEST, include_derived_roster=True)
-    mappings = FederationMappings(version=2)
+    mappings = FederationMappings(version="0.2.1")
     members = {"a": _member_graph("left_t", "a"), "b": _member_graph("right_t", "b")}
     with tempfile.TemporaryDirectory() as tmp:
         assert mappings_replay_matches(tmp, members, manifest, mappings) is False
@@ -214,7 +211,7 @@ def test_mappings_replay_matches_version_mismatch_distinct_from_missing() -> Non
         manifest_path = federation_artifact_paths(tmp)["artifact_manifest"]
         with open(manifest_path, encoding="utf-8") as handle:
             stored = json.load(handle)
-        wrong = FEDERATION_ARTIFACT_FORMAT_VERSION + 7
+        wrong = "9.9.9"
         stored["artifact_format_version"] = wrong
         with open(manifest_path, "w", encoding="utf-8") as handle:
             json.dump(stored, handle)
@@ -229,7 +226,7 @@ def test_mappings_replay_matches_version_mismatch_distinct_from_missing() -> Non
 @pytest.mark.fast
 def test_load_federation_composite_graph_version_mismatch_distinct_from_missing() -> None:
     manifest = parse_federation_manifest(_FED_MANIFEST, include_derived_roster=True)
-    mappings = FederationMappings(version=2)
+    mappings = FederationMappings(version="0.2.1")
     members = {"a": _member_graph("left_t", "a"), "b": _member_graph("right_t", "b")}
     with tempfile.TemporaryDirectory() as tmp:
         assert load_federation_composite_graph(tmp) is None
@@ -249,7 +246,7 @@ def test_load_federation_composite_graph_version_mismatch_distinct_from_missing(
         manifest_path = federation_artifact_paths(tmp)["artifact_manifest"]
         with open(manifest_path, encoding="utf-8") as handle:
             stored = json.load(handle)
-        wrong = FEDERATION_ARTIFACT_FORMAT_VERSION + 3
+        wrong = "9.9.9"
         stored["artifact_format_version"] = wrong
         with open(manifest_path, "w", encoding="utf-8") as handle:
             json.dump(stored, handle)

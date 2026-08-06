@@ -14,7 +14,7 @@ from aetherdialect._constants import FEDERATION_ARTIFACT_FORMAT_VERSION
 from aetherdialect._contracts_base import FederationMappings, LogicalIntent, MulGroup
 from aetherdialect._contracts_core import RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._dialect import get_dialect
+from aetherdialect._dialect import DialectRegistry
 from aetherdialect._federation import (
     FederationConfigError,
     compose_composite_graph,
@@ -28,13 +28,18 @@ from aetherdialect._federation import (
     plan_federated_intent,
 )
 from aetherdialect._intent_process import NormalizedExpr
-from aetherdialect._main_execution import _build_federation_source_runtimes, _federation_single_source_sql_context
+from aetherdialect._main_execution import MainExecutionOps
 from aetherdialect._pipeline import generate_and_validate_sql, prepare_federated_sql_plan
 from aetherdialect._schema_graph import recompute_join_paths_multi
 from aetherdialect._sql_gen import build_deterministic_sql
-from aetherdialect._templates import empty_template_store
+from aetherdialect._templates import TemplateOps
 from tests.conftest import duckdb_engine_identity
-from tests.federation_helpers import build_two_member_federation, enriched_manifest, federation_member_graph
+from tests.federation_helpers import (
+    build_two_member_federation,
+    enriched_manifest,
+    federation_member_graph,
+    stamp_sandbox_payment_union_profiling,
+)
 from tests.test_federation_single_source import (
     _composed_manifest,
     _member_graphs,
@@ -271,7 +276,7 @@ def test_degenerate_scalar_sum_agrees_between_direct_sql_and_coordinator() -> No
     assert federation_plan_is_degenerate(plan)
     member_frame = pd.DataFrame({"id": [1, 2, 3], "amount": [10.0, 20.5, 4.5]})
     expected = float(member_frame["amount"].sum())
-    dialect = get_dialect("duckdb")
+    dialect = DialectRegistry.get("duckdb")
     direct_sql = build_deterministic_sql(intent, schema=members["a"], dialect=dialect)
     federated_sql = build_deterministic_sql(plan.steps[0].sub_intent, schema=members["a"], dialect=dialect)
     duckdb = pytest.importorskip("duckdb")
@@ -300,11 +305,11 @@ def test_degenerate_federated_prepare_matches_direct_member_sql() -> None:
     )
     plan = plan_federated_intent(intent, composite, manifest)
     assert federation_plan_is_degenerate(plan)
-    default = get_dialect("duckdb")
-    runtimes = _build_federation_source_runtimes(
+    default = DialectRegistry.get("duckdb")
+    runtimes = MainExecutionOps._build_federation_source_runtimes(
         _runtime_manifest(), None, default, default_identity=duckdb_engine_identity()
     )
-    store = empty_template_store(composite.schema_graph_id)
+    store = TemplateOps.empty_template_store(composite.schema_graph_id)
     with patch(
         "aetherdialect._pipeline._run_sql_validation_cascade",
         return_value=(True, "", None, []),
@@ -315,7 +320,7 @@ def test_degenerate_federated_prepare_matches_direct_member_sql() -> None:
             _federation_dialects = {sid: runtime.dialect for sid, runtime in runtimes.items()}
 
         owner = _Owner()
-        single_source = _federation_single_source_sql_context(
+        single_source = MainExecutionOps._federation_single_source_sql_context(
             owner,
             intent,
             composite,
@@ -356,7 +361,7 @@ def test_degenerate_federated_prepare_matches_direct_member_sql() -> None:
 def test_federation_artifact_version_mismatch_rejects_stale_tree() -> None:
     """Persisted federation trees with an outdated artifact_format_version must fail closed."""
     fed = build_two_member_federation()
-    mappings = FederationMappings(version=2)
+    mappings = FederationMappings(version="0.2.1")
     with tempfile.TemporaryDirectory() as tmp:
         persist_federation_tree(
             tmp,
@@ -368,7 +373,7 @@ def test_federation_artifact_version_mismatch_rejects_stale_tree() -> None:
         manifest_path = federation_artifact_paths(tmp)["artifact_manifest"]
         with open(manifest_path, encoding="utf-8") as handle:
             stored = json.load(handle)
-        stored["artifact_format_version"] = FEDERATION_ARTIFACT_FORMAT_VERSION - 1
+        stored["artifact_format_version"] = "0.0.0"
         with open(manifest_path, "w", encoding="utf-8") as handle:
             json.dump(stored, handle)
         with pytest.raises(FederationConfigError, match=r"artifact_format_version") as exc_info:
@@ -443,6 +448,7 @@ def test_federation_sandbox_offline_smoke_when_seeds_exist() -> None:
 
     manifest, mappings = parse_federation_declaration(json.loads(declaration_path.read_text(encoding="utf-8")))
     members = _sandbox_federation_member_graphs()
+    stamp_sandbox_payment_union_profiling(members)
     composite = compose_composite_graph(members, manifest, mappings)
     assert composite.tables["rental"].source_id == "storefront"
     assert composite.tables["inventory"].source_id == "catalog"
@@ -450,8 +456,8 @@ def test_federation_sandbox_offline_smoke_when_seeds_exist() -> None:
     _assert_payload_has_no_source_leaks(composite.schema_literal_json)
 
     runtime_manifest = enriched_manifest(members, manifest, member_graphs=members, mappings=mappings)
-    runtimes = _build_federation_source_runtimes(
-        runtime_manifest, None, get_dialect("duckdb"), default_identity=duckdb_engine_identity()
+    runtimes = MainExecutionOps._build_federation_source_runtimes(
+        runtime_manifest, None, DialectRegistry.get("duckdb"), default_identity=duckdb_engine_identity()
     )
     assert set(runtimes) == {"storefront", "catalog", "logistics", "crm"}
 
@@ -511,6 +517,7 @@ def test_federation_batch_join_choice_attribution_phase() -> None:
     )
     from aetherdialect._pipeline import _federation_batch_member_join_presets
 
+    reset_llm_usage_accumulator()
     fed = build_two_member_federation()
     plan = FederatedPlan(
         steps=(
@@ -562,7 +569,7 @@ def test_federation_batch_join_choice_attribution_phase() -> None:
                     "count rows",
                     plan,
                     fed.composite,
-                    dialect=get_dialect("duckdb"),
+                    dialect=DialectRegistry.get("duckdb"),
                     dialects_by_source=None,
                     manifest=fed.manifest,
                     member_graphs=fed.member_graphs,
@@ -570,7 +577,9 @@ def test_federation_batch_join_choice_attribution_phase() -> None:
                 )
             records = drain_llm_usage_records()
     assert records
-    assert records[0].phase == "join_choice"
+    join_records = [row for row in records if row.task == "join_choice"]
+    assert join_records
+    assert join_records[0].phase == "join_choice"
     reset_llm_usage_accumulator()
 
 
@@ -581,6 +590,7 @@ def test_sandbox_replica_mappings_compose() -> None:
         json.loads((_DATA_ROOT / "federation_declaration.json").read_text(encoding="utf-8")),
     )
     members = _sandbox_federation_member_graphs()
+    stamp_sandbox_payment_union_profiling(members)
     composite = compose_composite_graph(members, manifest, mappings)
     assert "customer" in composite.tables
     assert set(composite.tables["customer"].member_source_ids) == {"storefront", "crm"}

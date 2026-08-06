@@ -10,14 +10,14 @@ import pytest
 from aetherdialect._contracts_base import SessionNotice, SessionStep, SpaceContext
 from aetherdialect._main_execution import SESSION_KIND_RESULT, PipelineSession
 from aetherdialect._pipeline import PIPELINE_SUSPEND_ID_INTENT_CONFIRM, PipelineSuspended
-from aetherdialect._templates import empty_template_store
+from aetherdialect._templates import TemplateOps
 
 
 def _session_owner() -> MagicMock:
     owner = MagicMock()
     owner._schema_graph = MagicMock()
     owner._schema_graph.effective_structural_hash = "test_hash"
-    owner._store = empty_template_store("test_hash")
+    owner._store = TemplateOps.empty_template_store("test_hash")
     owner._templates = {}
     owner._rejected = {}
     owner._schema_terms = set()
@@ -26,15 +26,30 @@ def _session_owner() -> MagicMock:
     owner._sandbox_closed = False
     owner._pipeline_writer_lock = None
     owner._artifacts_dir = None
+    owner._store_by_space = {}
+    owner._templates_by_space = {}
+
+    def _open_session(**kwargs):
+        return PipelineSession(
+            owner,
+            mode=kwargs.get("mode", "writer"),
+            space_name=str(kwargs.get("space", "master")),
+            data_row_cap=kwargs.get("data_row_cap"),
+        )
+
+    owner.session = MagicMock(side_effect=_open_session)
     return owner
 
 
 @pytest.mark.fast
 def test_session_ephemeral_scope_narrows_tables() -> None:
-    from aetherdialect._main_execution import PipelineSession, intersect_space_scope
+    from aetherdialect._main_execution import (
+        MainExecutionOps,
+        PipelineSession,
+    )
 
     owner = _session_owner()
-    tables, columns, deny_obj, deny_col = intersect_space_scope(
+    tables, columns, deny_obj, deny_col = MainExecutionOps.intersect_space_scope(
         frozenset({"film", "customer"}),
         frozenset(),
         frozenset(),
@@ -54,10 +69,13 @@ def test_session_ephemeral_scope_narrows_tables() -> None:
 
 @pytest.mark.fast
 def test_session_ephemeral_scope_cannot_widen() -> None:
-    from aetherdialect._main_execution import PipelineSession, intersect_space_scope
+    from aetherdialect._main_execution import (
+        MainExecutionOps,
+        PipelineSession,
+    )
 
     owner = _session_owner()
-    tables, columns, deny_obj, deny_col = intersect_space_scope(
+    tables, columns, deny_obj, deny_col = MainExecutionOps.intersect_space_scope(
         frozenset({"film"}),
         frozenset(),
         frozenset(),
@@ -80,7 +98,7 @@ def test_pipeline_session_export_and_restore_suspended_state() -> None:
     owner = _session_owner()
     sess = PipelineSession(owner)
     suspended = PipelineSuspended(PIPELINE_SUSPEND_ID_INTENT_CONFIRM, "confirm?", None)
-    with patch("aetherdialect._main_execution.interactive_run_once", side_effect=suspended):
+    with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once", side_effect=suspended):
         sess.ask("list films")
     payload = sess.export_serialized_state()
     restored = PipelineSession.restore_serialized_state(owner, payload)
@@ -119,7 +137,7 @@ def test_data_row_cap_sets_truncated_flag() -> None:
 
 @pytest.mark.fast
 def test_session_step_roundtrip_includes_notices_and_truncated() -> None:
-    from aetherdialect._main_execution import deserialize_session_step, serialize_session_step
+    from aetherdialect._main_execution import MainExecutionOps
 
     step = SessionStep(
         done=True,
@@ -129,6 +147,6 @@ def test_session_step_roundtrip_includes_notices_and_truncated() -> None:
         notices=(SessionNotice(code="turn_saved", level="info", message="Saved."),),
         data_truncated=True,
     )
-    restored = deserialize_session_step(serialize_session_step(step))
+    restored = MainExecutionOps.deserialize_session_step(MainExecutionOps.serialize_session_step(step))
     assert restored.data_truncated is True
     assert restored.notices[0].code == "turn_saved"

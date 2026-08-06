@@ -5,13 +5,16 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 from aetherdialect import SessionStep
-from aetherdialect._contracts_base import NormalizedExpr, ParameterBinding, WhereParam, predicate_group_from_list
+from aetherdialect._contracts_base import (
+    NormalizedExpr,
+    ParameterBinding,
+    PredicateGroup,
+    WhereParam,
+)
 from aetherdialect._contracts_core import ConcreteIntent, Template, ValueHistory
 from aetherdialect._contracts_schema import SQLShape, TemplateStats
 from aetherdialect._templates import (
-    build_parameter_bindings,
-    handles_referenced_in_sql_param,
-    resolve_template_for_question,
+    TemplateOps,
 )
 
 
@@ -23,7 +26,7 @@ def _minimal_template(*, question: str = "count of item in category x") -> Templ
         select_cols=[],
         group_by_cols=[],
         order_by_cols=[],
-        where=predicate_group_from_list(
+        where=PredicateGroup.from_list(
             [
                 WhereParam(
                     left_expr=NormalizedExpr.from_column("t1.category"),
@@ -55,12 +58,12 @@ def _minimal_template(*, question: str = "count of item in category x") -> Templ
 
 
 def test_handles_referenced_in_sql_param_orders_p_before_s() -> None:
-    assert handles_referenced_in_sql_param("WHERE a = :p2 AND limit :s1 AND b = :p1") == ("p1", "p2", "s1")
+    assert TemplateOps.handles_referenced_in_sql_param("WHERE a = :p2 AND limit :s1 AND b = :p1") == ("p1", "p2", "s1")
 
 
 def test_resolve_template_for_question_exact_match() -> None:
     tmpl = _minimal_template()
-    resolved = resolve_template_for_question("count of item in category x", {"T0001": tmpl})
+    resolved = TemplateOps.resolve_template_for_question("count of item in category x", {"T0001": tmpl})
     assert resolved is not None
     found, idx = resolved
     assert found.id == "T0001"
@@ -71,7 +74,7 @@ def test_build_parameter_bindings_uses_cached_display_names() -> None:
     tmpl = _minimal_template()
     schema = MagicMock()
     schema.tables = {}
-    bindings = build_parameter_bindings(
+    bindings = TemplateOps.build_parameter_bindings(
         tmpl,
         history_index=0,
         schema=schema,
@@ -82,6 +85,7 @@ def test_build_parameter_bindings_uses_cached_display_names() -> None:
         handle="p1",
         current_value="x",
         display_name="category",
+        column_expr="t1.category",
     )
 
 

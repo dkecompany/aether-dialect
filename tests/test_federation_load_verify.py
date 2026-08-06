@@ -114,7 +114,6 @@ def test_federation_verify_postgresql_partition_counts_partition_tables(loader) 
     from sandbox_corpus import federation_partition_tables
 
     partition = federation_partition_tables("storefront")
-    counts = {table: 10 for table in partition}
     mock_conn = MagicMock()
     mock_conn.execute.return_value.scalar_one.side_effect = [10] * len(partition)
     mock_engine = MagicMock()
@@ -125,7 +124,7 @@ def test_federation_verify_postgresql_partition_counts_partition_tables(loader) 
     with (
         patch.object(loader, "load_env_file"),
         patch.object(pg_cfg, "apply_environment"),
-        patch.object(pg_cfg, "db_url", return_value="postgresql+psycopg2://localhost/test"),
+        patch.object(pg_cfg, "db_url", return_value="postgresql+psycopg://localhost/test"),
         patch.object(loader, "create_engine", return_value=mock_engine),
     ):
         loader._verify_federation_postgresql_partition(

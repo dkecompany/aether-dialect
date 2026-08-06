@@ -116,7 +116,9 @@ def test_plan_stages_include_reducing_edges_and_spanning_cte() -> None:
         source_by_table=source_by_table,
         manifest=manifest,
     )
-    reducing = _collect_member_reducing_edges(manifest, FederationMappings(version=2), sources, intent, source_by_table)
+    reducing = _collect_member_reducing_edges(
+        manifest, FederationMappings(version="0.2.1"), sources, intent, source_by_table
+    )
     assert reducing
     member_stages = [stage for stage in stages if stage.kind == "member"]
     assert any(stage.reducing_edges for stage in member_stages)

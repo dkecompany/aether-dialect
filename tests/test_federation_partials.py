@@ -13,7 +13,11 @@ from aetherdialect._constants import (
     FEDERATION_COMPOSITE_RECONCILIATION_NOTE,
     REPHRASE_HINT_MESSAGES,
 )
-from aetherdialect._contracts_base import FederationSourceBinding, WhereParam, predicate_group_from_list
+from aetherdialect._contracts_base import (
+    FederationSourceBinding,
+    PredicateGroup,
+    WhereParam,
+)
 from aetherdialect._contracts_core import (
     FederationExecutionContext,
     GenerationPath,
@@ -49,14 +53,9 @@ from aetherdialect._federation import (
     schema_spans_multiple_sources,
     validate_federation_source_slug_uniqueness,
 )
-from aetherdialect._main_execution import (
-    _federation_gate_kwargs_by_source,
-    _session_space_name_for_federation,
-    _sql_execute_suspend_context,
-    federation_stores_by_source,
-    snapshot_turn_policy,
-)
+from aetherdialect._main_execution import MainExecutionOps
 from aetherdialect._schema_graph import recompute_join_paths_multi
+from tests.federation_helpers import stamp_sandbox_payment_union_profiling
 
 
 def _graph(table: str, *, source_id: str) -> SchemaGraph:
@@ -283,6 +282,7 @@ def test_sandbox_replica_mappings_compose() -> None:
             join_paths_multi=recompute_join_paths_multi({}),
         ),
     }
+    stamp_sandbox_payment_union_profiling(members)
     composite = compose_composite_graph(members, manifest, mappings)
     assert "customer" in composite.tables
     assert set(composite.tables["customer"].member_source_ids) == {"storefront", "crm"}
@@ -295,7 +295,7 @@ def test_replica_mapping_requires_authoritative_source() -> None:
     with pytest.raises(FederationConfigError, match="authoritative_source"):
         parse_federation_mappings(
             {
-                "version": 2,
+                "version": "0.2.1",
                 "logical_tables": [
                     {
                         "logical": "entity",
@@ -410,7 +410,7 @@ def test_gate_kwargs_load_named_context_from_member_tree(tmp_path) -> None:
     member_dir = tmp_path / "aetherdialect" / "conn_alpha"
     member_dir.mkdir(parents=True)
     context_payload = {
-        "version": 2,
+        "version": "0.2.1",
         "allow_objects": ["entity_a"],
         "deny_objects": [],
         "deny_columns": [],
@@ -421,7 +421,7 @@ def test_gate_kwargs_load_named_context_from_member_tree(tmp_path) -> None:
     owner._artifacts_root = tmp_path
     owner._runtime_config = MagicMock(engine_context=MagicMock())
     owner._federation_source_runtimes = {"alpha": MagicMock(artifacts_dir=str(member_dir))}
-    gates = _federation_gate_kwargs_by_source(owner, None, manifest)
+    gates = MainExecutionOps._federation_gate_kwargs_by_source(owner, None, manifest)
     assert "entity_a" in gates["alpha"]["schema_context"].allow_objects
 
 
@@ -436,8 +436,8 @@ def test_federation_stores_honor_session_space_name() -> None:
             captured["space_name"] = kwargs.get("space_name", "")
             return MagicMock()
 
-        mp.setattr("aetherdialect._main_execution.load_template_store", _fake_load)
-        federation_stores_by_source(owner, graphs, space_name="sales")
+        mp.setattr("aetherdialect._templates.TemplateOps.load_template_store", _fake_load)
+        MainExecutionOps.federation_stores_by_source(owner, graphs, space_name="sales")
         assert captured["space_name"] == "sales"
 
 
@@ -446,7 +446,7 @@ def test_session_space_name_prefers_choice_port() -> None:
     port.space_name = "finance"
     owner = MagicMock()
     owner._context_name = "master"
-    assert _session_space_name_for_federation(owner, port) == "finance"
+    assert MainExecutionOps._session_space_name_for_federation(owner, port) == "finance"
 
 
 def test_resolve_anchored_temporal_bind_for_date_window() -> None:
@@ -456,7 +456,7 @@ def test_resolve_anchored_temporal_bind_for_date_window() -> None:
         select_cols=[],
         group_by_cols=[],
         order_by_cols=[],
-        where=predicate_group_from_list(
+        where=PredicateGroup.from_list(
             [
                 WhereParam(
                     left_expr={"column_ref": "orders.created_at"},
@@ -525,7 +525,7 @@ def test_missing_member_store_raises_instead_of_composite_fallback() -> None:
     owner._federation_source_runtimes = {}
     graphs = {"a": _graph("left_t", source_id="a")}
     with pytest.raises(FederationConfigError, match="member store missing"):
-        federation_stores_by_source(owner, graphs)
+        MainExecutionOps.federation_stores_by_source(owner, graphs)
 
 
 def test_compare_replica_member_parity_detects_column_drift() -> None:
@@ -549,7 +549,7 @@ def test_compare_replica_member_parity_detects_column_drift() -> None:
     }
     mappings = parse_federation_mappings(
         {
-            "version": 2,
+            "version": "0.2.1",
             "logical_tables": [
                 {
                     "logical": "entity",
@@ -596,7 +596,7 @@ def test_execute_suspend_context_snapshots_turn_policy() -> None:
         where=None,
     )
     gen_out = SqlGenerationOutcome("", True, GenerationPath.INTENT_DIRECT_MATCH, None)
-    ctx = _sql_execute_suspend_context(
+    ctx = MainExecutionOps._sql_execute_suspend_context(
         snap,
         "SELECT 1",
         None,
@@ -605,7 +605,7 @@ def test_execute_suspend_context_snapshots_turn_policy() -> None:
         False,
         intent,
     )
-    policy = snapshot_turn_policy()
+    policy = MainExecutionOps.snapshot_turn_policy()
     assert ctx.turn_policy is not None
     assert ctx.turn_policy.max_compose_repairs == policy.max_compose_repairs
 

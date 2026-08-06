@@ -14,7 +14,12 @@ from aetherdialect._federation import (
     reconcile_composite_classifications,
 )
 from aetherdialect._schema_build import tables_meta_to_schema_graph
-from aetherdialect._schema_catalog import apply_catalog_descriptions_from_tables_meta, apply_column_roles_llm
+from aetherdialect._schema_catalog import (
+    apply_catalog_descriptions_from_tables_meta,
+    apply_column_roles_llm,
+    parse_sql_file,
+)
+from tests.federation_helpers import stamp_union_disjointness_profiling
 
 
 def _payment_union_fixtures(
@@ -66,9 +71,13 @@ def _payment_union_fixtures(
             join_paths_multi={},
         ),
     }
+    stamp_union_disjointness_profiling(members["a"].tables["payment"], key_col="id", overlap_sample=("a1",))
+    stamp_union_disjointness_profiling(members["b"].tables["payment"], key_col="id", overlap_sample=("b1",))
+    members["a"].tables["payment"].row_count = 1
+    members["b"].tables["payment"].row_count = 1
     mappings = parse_federation_mappings(
         {
-            "version": 2,
+            "version": "0.2.1",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -82,6 +91,43 @@ def _payment_union_fixtures(
         },
     )
     return manifest, members, mappings
+
+
+@pytest.mark.fast
+def test_sql_file_ddl_comments_become_catalog_descriptions(tmp_path) -> None:
+    ddl = """
+    CREATE TABLE orders (
+        id INT PRIMARY KEY COMMENT 'Order surrogate key',
+        amount DECIMAL(10,2)
+    ) COMMENT='Customer purchase records';
+    COMMENT ON COLUMN orders.amount IS 'Purchase amount';
+    """
+    sql_path = tmp_path / "schema.sql"
+    sql_path.write_text(ddl, encoding="utf-8")
+    tables = parse_sql_file(sql_path)
+    assert tables["orders"]["table_comment"] == "Customer purchase records"
+    assert tables["orders"]["column_comments"]["id"] == "Order surrogate key"
+    assert tables["orders"]["column_comments"]["amount"] == "Purchase amount"
+
+    sg = tables_meta_to_schema_graph(tables)
+    assert sg.tables["orders"].description == "Customer purchase records"
+    assert sg.tables["orders"].description_owner == DescriptionOwner.CATALOG
+    assert sg.tables["orders"].columns["id"].description == "Order surrogate key"
+    assert sg.tables["orders"].columns["amount"].description == "Purchase amount"
+
+
+@pytest.mark.fast
+def test_sql_file_catalog_descriptions_respect_higher_owner(tmp_path) -> None:
+    ddl = "CREATE TABLE orders (id INT PRIMARY KEY) COMMENT='Catalog text';"
+    sql_path = tmp_path / "schema.sql"
+    sql_path.write_text(ddl, encoding="utf-8")
+    tables = parse_sql_file(sql_path)
+    sg = tables_meta_to_schema_graph({k: {**v, "table_comment": None} for k, v in tables.items()})
+    sg.tables["orders"].description = "User text"
+    sg.tables["orders"].description_owner = DescriptionOwner.USER_OVERRIDE
+    apply_catalog_descriptions_from_tables_meta(sg, tables)
+    assert sg.tables["orders"].description == "User text"
+    assert sg.tables["orders"].description_owner == DescriptionOwner.USER_OVERRIDE
 
 
 @pytest.mark.fast
@@ -132,7 +178,7 @@ def test_apply_column_roles_llm_with_notes_writes_notes_owner(monkeypatch: pytes
     )
     sg = SchemaGraph(tables={"orders": table}, join_paths_multi={})
 
-    def _fake_classify(_schema, notes_content=None, *, column_scope=None):
+    def _fake_classify(_schema, notes_content=None, *, column_scope=None, **kwargs):
         _ = notes_content, column_scope
         return {
             "orders": (

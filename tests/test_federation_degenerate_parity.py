@@ -7,7 +7,13 @@ from unittest.mock import patch
 
 import pytest
 
-from aetherdialect._contracts_base import MulGroup, NormalizedExpr, OrderByCol, WhereParam, predicate_group_from_list
+from aetherdialect._contracts_base import (
+    MulGroup,
+    NormalizedExpr,
+    OrderByCol,
+    PredicateGroup,
+    WhereParam,
+)
 from aetherdialect._contracts_core import RuntimeCteStep, RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import (
     ColumnMetadata,
@@ -17,13 +23,13 @@ from aetherdialect._contracts_schema import (
     WindowRegistryStep,
     WindowSpec,
 )
-from aetherdialect._dialect import get_dialect, get_dialect_class
+from aetherdialect._dialect import DialectRegistry
 from aetherdialect._federation import federation_plan_is_degenerate, parse_federation_manifest, plan_federated_intent
-from aetherdialect._main_execution import _build_federation_source_runtimes, _federation_single_source_sql_context
+from aetherdialect._main_execution import MainExecutionOps
 from aetherdialect._pipeline import generate_and_validate_sql, prepare_federated_sql_plan
 from aetherdialect._schema_graph import recompute_join_paths_multi
 from aetherdialect._sql_gen import build_deterministic_sql
-from aetherdialect._templates import empty_template_store
+from aetherdialect._templates import TemplateOps
 from tests.conftest import duckdb_engine_identity
 from tests.test_federation_single_source import _composed_manifest, _member_graphs, _runtime_manifest
 
@@ -71,7 +77,7 @@ def _member_graph(table: str, source_id: str, *, extra_tables: dict[str, TableMe
 
 
 def _dialect_for_engine(engine: str):
-    dialect_cls = get_dialect_class(engine)
+    dialect_cls = DialectRegistry.get_class(engine)
     dialect = dialect_cls.__new__(dialect_cls)
     if engine == "databricks":
         dialect.config = SimpleNamespace(CATALOG="test_catalog", SCHEMA="test_schema")
@@ -133,7 +139,7 @@ def _intent_for_shape(shape: str) -> RuntimeIntent:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("left_t.id"))],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("left_t.id"),
@@ -261,14 +267,14 @@ def test_degenerate_prepare_matches_direct_member_sql(engine: str) -> None:
     )
     plan = plan_federated_intent(intent, composite, manifest)
     assert federation_plan_is_degenerate(plan)
-    default = get_dialect(engine) if engine == "duckdb" else _dialect_for_engine(engine)
-    runtimes = _build_federation_source_runtimes(
+    default = DialectRegistry.get(engine) if engine == "duckdb" else _dialect_for_engine(engine)
+    runtimes = MainExecutionOps._build_federation_source_runtimes(
         _runtime_manifest(),
         None,
         default,
         default_identity=duckdb_engine_identity(),
     )
-    store = empty_template_store(composite.schema_graph_id)
+    store = TemplateOps.empty_template_store(composite.schema_graph_id)
     with patch(
         "aetherdialect._pipeline._run_sql_validation_cascade",
         return_value=(True, "", None, []),
@@ -279,7 +285,7 @@ def test_degenerate_prepare_matches_direct_member_sql(engine: str) -> None:
             _federation_dialects = {sid: runtime.dialect for sid, runtime in runtimes.items()}
 
         owner = _Owner()
-        single_source = _federation_single_source_sql_context(
+        single_source = MainExecutionOps._federation_single_source_sql_context(
             owner,
             intent,
             composite,
@@ -337,14 +343,14 @@ def test_degenerate_prepare_uses_unscoped_template_learning_kwargs() -> None:
     )
     plan = plan_federated_intent(intent, composite, manifest)
     assert federation_plan_is_degenerate(plan)
-    default = get_dialect("duckdb")
-    runtimes = _build_federation_source_runtimes(
+    default = DialectRegistry.get("duckdb")
+    runtimes = MainExecutionOps._build_federation_source_runtimes(
         _runtime_manifest(),
         None,
         default,
         default_identity=duckdb_engine_identity(),
     )
-    store = empty_template_store(composite.schema_graph_id)
+    store = TemplateOps.empty_template_store(composite.schema_graph_id)
     captured: list[dict[str, object]] = []
 
     def _capture_gen(*args, **kwargs):

@@ -49,7 +49,7 @@ def test_declared_cross_source_join_kind_reaches_materialized_edge(kind: str) ->
         },
         include_derived_roster=True,
     )
-    mappings = parse_federation_mappings({"version": 1, "logical_columns": []})
+    mappings = parse_federation_mappings({"version": "0.2.1", "logical_columns": []})
     edges = _materialize_cross_source_edges(manifest, mappings)
     declared = [edge for edge in edges if edge.inference_tag == InferenceTag.CROSS_SOURCE]
     assert len(declared) == 1

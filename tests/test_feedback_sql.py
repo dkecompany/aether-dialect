@@ -10,7 +10,7 @@ from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMe
 from aetherdialect._intent_process import NormalizedExpr
 from aetherdialect._schema_graph import recompute_join_paths_multi
 from aetherdialect._sql_gen import render_feedback_sql
-from aetherdialect._templates import summarize_failure_for_memory
+from aetherdialect._templates import TemplateOps
 
 
 def _simple_intent() -> RuntimeIntent:
@@ -44,9 +44,9 @@ class TestSummarizeFailureForMemorySqlBoundary:
             captured["user"] = user
             return '{"summary":"wrong table","bucket":"WRONG_TABLES_OR_JOINS"}'
 
-        with patch("aetherdialect._templates.llm_credentials_configured", return_value=True):
-            with patch("aetherdialect._templates.llm_chat", side_effect=_fake_llm):
-                entry = summarize_failure_for_memory(
+        with patch("aetherdialect._config.EngineConfig.llm_credentials_configured", return_value=True):
+            with patch("aetherdialect._templates.LLMProvider.chat", side_effect=_fake_llm):
+                entry = TemplateOps.summarize_failure_for_memory(
                     question="q",
                     intent=_simple_intent(),
                     kind=FeedbackKind.INTENT_REJECTED,
@@ -59,8 +59,8 @@ class TestSummarizeFailureForMemorySqlBoundary:
         assert entry.summary
 
     def test_persisted_entry_has_no_sql(self) -> None:
-        with patch("aetherdialect._templates.llm_credentials_configured", return_value=False):
-            entry = summarize_failure_for_memory(
+        with patch("aetherdialect._config.EngineConfig.llm_credentials_configured", return_value=False):
+            entry = TemplateOps.summarize_failure_for_memory(
                 question="q",
                 intent=_simple_intent(),
                 kind=FeedbackKind.INTENT_REJECTED,
@@ -80,9 +80,9 @@ class TestSummarizeFailureForMemorySqlBoundary:
             captured["user"] = user
             return '{"summary":"bad","bucket":"OTHER"}'
 
-        with patch("aetherdialect._templates.llm_credentials_configured", return_value=True):
-            with patch("aetherdialect._templates.llm_chat", side_effect=_fake_llm):
-                entry = summarize_failure_for_memory(
+        with patch("aetherdialect._config.EngineConfig.llm_credentials_configured", return_value=True):
+            with patch("aetherdialect._templates.LLMProvider.chat", side_effect=_fake_llm):
+                entry = TemplateOps.summarize_failure_for_memory(
                     question="q",
                     intent=intent,
                     kind=FeedbackKind.INTENT_REJECTED,

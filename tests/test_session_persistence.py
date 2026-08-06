@@ -5,14 +5,9 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from aetherdialect._constants import SESSION_PERSISTENCE_FORMAT_VERSION
+from aetherdialect._constants import SESSION_PERSISTENCE_FORMAT_VERSION, SUSPEND_STATE_FORMAT_VERSION
 from aetherdialect._contracts_base import ConfigError, Diagnostic, IntentSummary, SessionStep
-from aetherdialect._main_execution import (
-    deserialize_session_step,
-    deserialize_suspended_state,
-    serialize_session_step,
-    serialize_suspended_state,
-)
+from aetherdialect._main_execution import MainExecutionOps
 
 
 def _sample_step(*, with_data: bool = False) -> SessionStep:
@@ -57,17 +52,17 @@ def _sample_step(*, with_data: bool = False) -> SessionStep:
 @pytest.mark.fast
 def test_session_step_roundtrip_without_dataframe() -> None:
     step = _sample_step(with_data=False)
-    payload = serialize_session_step(step)
+    payload = MainExecutionOps.serialize_session_step(step)
     assert payload["format_version"] == SESSION_PERSISTENCE_FORMAT_VERSION
-    restored = deserialize_session_step(payload)
+    restored = MainExecutionOps.deserialize_session_step(payload)
     assert restored == step
 
 
 @pytest.mark.fast
 def test_session_step_roundtrip_with_dataframe() -> None:
     step = _sample_step(with_data=True)
-    payload = serialize_session_step(step)
-    restored = deserialize_session_step(payload)
+    payload = MainExecutionOps.serialize_session_step(step)
+    restored = MainExecutionOps.deserialize_session_step(payload)
     assert restored.done == step.done
     assert restored.kind == step.kind
     assert restored.sql == step.sql
@@ -81,40 +76,65 @@ def test_session_step_roundtrip_with_dataframe() -> None:
 @pytest.mark.fast
 def test_session_step_version_mismatch_refuses() -> None:
     step = _sample_step(with_data=False)
-    payload = serialize_session_step(step)
-    payload["format_version"] = SESSION_PERSISTENCE_FORMAT_VERSION + 1
+    payload = MainExecutionOps.serialize_session_step(step)
+    payload["format_version"] = "9.9.9"
     with pytest.raises((ValueError, ConfigError), match=r"format_version"):
-        deserialize_session_step(payload)
+        MainExecutionOps.deserialize_session_step(payload)
 
 
 @pytest.mark.fast
-def test_suspended_state_roundtrip() -> None:
-    payload = serialize_suspended_state(
+def test_suspended_state_roundtrip(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Payload:
+        suspended_at = None
+
+    monkeypatch.setattr(
+        MainExecutionOps,
+        "_serialize_pipeline_suspend_payload",
+        lambda state_id, payload: {"type": "intent_confirm"},
+    )
+    monkeypatch.setattr(
+        MainExecutionOps,
+        "_deserialize_pipeline_suspend_payload",
+        lambda state_id, raw, *, owner=None: _Payload(),
+    )
+    payload = MainExecutionOps.serialize_suspended_state(
         state_id="intent_confirm",
         message="Confirm intent?",
         choice_queue=[("intent_confirm", "y"), ("execute", "n")],
         turn_question="show customers",
         resume_choice_stage_id="intent_confirm",
+        suspend_payload=_Payload(),
+        policy_ttl_seconds=120,
     )
-    assert payload["format_version"] == SESSION_PERSISTENCE_FORMAT_VERSION
-    restored = deserialize_suspended_state(payload)
-    assert restored == {
-        "state_id": "intent_confirm",
-        "message": "Confirm intent?",
-        "choice_queue": [("intent_confirm", "y"), ("execute", "n")],
-        "turn_question": "show customers",
-        "resume_choice_stage_id": "intent_confirm",
-    }
+    assert payload["format_version"] == SUSPEND_STATE_FORMAT_VERSION
+    assert "payload" in payload
+    restored = MainExecutionOps.deserialize_suspended_state(payload)
+    assert restored["state_id"] == "intent_confirm"
+    assert restored["message"] == "Confirm intent?"
+    assert restored["choice_queue"] == [("intent_confirm", "y"), ("execute", "n")]
+    assert restored["turn_question"] == "show customers"
+    assert restored["resume_choice_stage_id"] == "intent_confirm"
+    assert restored["policy_ttl_seconds"] == 120
+    assert restored["suspend_payload"] is not None
 
 
 @pytest.mark.fast
-def test_suspended_state_version_mismatch_refuses() -> None:
-    payload = serialize_suspended_state(
+def test_suspended_state_version_mismatch_refuses(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Payload:
+        suspended_at = None
+
+    monkeypatch.setattr(
+        MainExecutionOps,
+        "_serialize_pipeline_suspend_payload",
+        lambda state_id, payload: {"type": "execute"},
+    )
+    payload = MainExecutionOps.serialize_suspended_state(
         state_id="execute",
         message="Run SQL?",
         choice_queue=[],
         turn_question=None,
+        suspend_payload=_Payload(),
     )
-    payload["format_version"] = SESSION_PERSISTENCE_FORMAT_VERSION + 2
+    payload["format_version"] = "9.9.9"
     with pytest.raises((ValueError, ConfigError), match=r"format_version"):
-        deserialize_suspended_state(payload)
+        MainExecutionOps.deserialize_suspended_state(payload)

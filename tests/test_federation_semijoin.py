@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from aetherdialect._contracts_base import FederationPlanTemplate, where_leaves
+from aetherdialect._contracts_base import FederationPlanTemplate, PredicateGroup
 from aetherdialect._contracts_core import JoinSpec, RuntimeIntent, SourceStep
 from aetherdialect._federation import (
     distinct_semijoin_keys,
@@ -34,7 +34,7 @@ def test_inject_semijoin_where_appends_in_clause() -> None:
         where=None,
     )
     updated = inject_semijoin_where(intent, "id", [1, 2])
-    leaves = where_leaves(updated.where) or []
+    leaves = PredicateGroup.where_leaves(updated.where) or []
     assert len(leaves) == 1
     assert leaves[0].op == "in"
 
@@ -49,7 +49,7 @@ def test_inject_semijoin_where_empty_keys_uses_sentinel() -> None:
         where=None,
     )
     updated = inject_semijoin_where(intent, "id", [], value_type="integer")
-    fp = (where_leaves(updated.where) or [])[0]
+    fp = (PredicateGroup.where_leaves(updated.where) or [])[0]
     assert fp.op == "in"
     assert fp.value_type == "integer"
     assert fp.param_key == "p1"

@@ -10,7 +10,7 @@ from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMe
 from aetherdialect._core_utils import load_runtime_config
 from aetherdialect._federation import FederationManifest, compose_composite_graph, parse_federation_manifest
 from aetherdialect._schema_graph import recompute_join_paths_multi
-from aetherdialect._templates import empty_template_store
+from aetherdialect._templates import TemplateOps
 
 
 def _graph(table: str, *, source_id: str) -> SchemaGraph:
@@ -61,7 +61,7 @@ def _minimal_member() -> MagicMock:
 
 
 def _init_bundle(manifest: FederationManifest, composite: SchemaGraph) -> AetherFederationInitResult:
-    store = empty_template_store(str(composite.schema_graph_id))
+    store = TemplateOps.empty_template_store(str(composite.schema_graph_id))
     return AetherFederationInitResult(
         runtime_config=RuntimeConfig(
             engine="duckdb",
@@ -79,7 +79,7 @@ def _init_bundle(manifest: FederationManifest, composite: SchemaGraph) -> Aether
         schema_terms=set(),
         schema_stats={"table_count": 2, "total_filterable": 2},
         federation_manifest=manifest,
-        federation_mappings=FederationMappings(version=2),
+        federation_mappings=FederationMappings(version="0.2.1"),
         federation_member_graphs={
             "a": _graph("left_t", source_id="a"),
             "b": _graph("right_t", source_id="b"),

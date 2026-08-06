@@ -13,7 +13,10 @@ from aetherdialect._contracts_base import (
     FederationPartialFailureError,
 )
 from aetherdialect._federation import federation_user_facing_error_message, probe_federation_member_connections
-from aetherdialect._main_execution import PipelineSession, _federation_error_diagnostics
+from aetherdialect._main_execution import (
+    MainExecutionOps,
+    PipelineSession,
+)
 
 
 @pytest.mark.fast
@@ -70,7 +73,7 @@ def test_federation_error_diagnostics_use_sanitized_message() -> None:
         limit_key="semijoin_key_cap",
         source_id="b",
     )
-    diags = _federation_error_diagnostics(exc)
+    diags = MainExecutionOps._federation_error_diagnostics(exc)
     assert len(diags) == 1
     user_message = federation_user_facing_error_message(exc)
     assert diags[0].message == user_message

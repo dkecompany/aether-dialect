@@ -35,15 +35,12 @@ from aetherdialect._intent_process import (
     logical_intent_to_serialisable,
     parse_logical_intent_response,
 )
-from aetherdialect._llm_provider import _azure_deployment_for_model
+from aetherdialect._llm_provider import LLMProvider
 from aetherdialect._main_execution import (
     PIPELINE_SUSPEND_ID_INTENT_CONFIRM,
     PipelineSuspended,
 )
-from aetherdialect._templates import (
-    collect_question_feedback_for_prompt,
-    compute_question_feedback_penalty,
-)
+from aetherdialect._templates import TemplateOps
 
 
 class TestInterpretGroundLogicalPromptAndRoundTrip:
@@ -187,12 +184,12 @@ class TestQuestionFeedbackCollection:
 
     def test_collect_includes_matching_rows(self) -> None:
         store = {"question_feedback": {"q": [self._entry()]}}
-        rows = collect_question_feedback_for_prompt(store, "q", "h")
+        rows = TemplateOps.collect_question_feedback_for_prompt(store, "q", "h")
         assert len(rows) == 1
 
     def test_penalty_counts_matching_rows(self) -> None:
         store = {"question_feedback": {"q": [self._entry()]}}
-        p = compute_question_feedback_penalty(store, "q", "h")
+        p = TemplateOps.compute_question_feedback_penalty(store, "q", "h")
         assert p > 0
 
 
@@ -216,9 +213,9 @@ class TestAzureDeploymentResolution:
             explain_timeout_ms=None,
         )
         with llm_execution_scope(cfg):
-            assert _azure_deployment_for_model("gpt-4.1-nano") == "D4O"
-            assert _azure_deployment_for_model("gpt-5.4-nano") == "D4O"
-            assert _azure_deployment_for_model("gpt-5.4-mini") == "D54"
+            assert LLMProvider._azure_deployment_for_model("gpt-4.1-nano") == "D4O"
+            assert LLMProvider._azure_deployment_for_model("gpt-5.4-nano") == "D4O"
+            assert LLMProvider._azure_deployment_for_model("gpt-5.4-mini") == "D54"
 
 
 class TestIntentSummarySessionKinds:
@@ -299,14 +296,12 @@ class TestEmitRuntimeConfigOverrideDiagnostics:
             reset_diagnostic_collector,
             set_diagnostic_collector,
         )
-        from aetherdialect._main_execution import (
-            _emit_runtime_config_override_diagnostics,
-        )
+        from aetherdialect._main_execution import MainExecutionOps
 
         buf: list = []
         tok = set_diagnostic_collector(buf)
         try:
-            _emit_runtime_config_override_diagnostics(frozenset({"b_field", "a_field"}))
+            MainExecutionOps._emit_runtime_config_override_diagnostics(frozenset({"b_field", "a_field"}))
         finally:
             reset_diagnostic_collector(tok)
         codes = [getattr(d, "code", "") for d in buf]
@@ -320,10 +315,10 @@ class TestMakeIntentIssueStageAttribution:
     def test_known_issue_ids(self) -> None:
         from aetherdialect._constants import STAGE_ATTRIBUTION_TABLE
         from aetherdialect._contracts_base import FailureCategory
-        from aetherdialect._contracts_schema import make_intent_issue
+        from aetherdialect._contracts_schema import IntentIssue
 
         for issue_id, environment in STAGE_ATTRIBUTION_TABLE.items():
-            iss = make_intent_issue(
+            iss = IntentIssue.make(
                 issue_id=issue_id,
                 category=FailureCategory.UNKNOWN_COLUMN,
                 severity="error",
@@ -340,12 +335,12 @@ class TestRefinementContinuationTerminalError:
 
         from aetherdialect._contracts_core import QuestionFormStorage, RefinementContext
         from aetherdialect._main_execution import SESSION_KIND_ERROR, PipelineSession
-        from aetherdialect._templates import empty_template_store
+        from aetherdialect._templates import TemplateOps
 
         owner = MagicMock()
         owner._dialect = MagicMock()
         owner._schema_graph = MagicMock()
-        owner._store = empty_template_store("h")
+        owner._store = TemplateOps.empty_template_store("h")
         owner._templates = {}
         owner._rejected = {}
         owner._schema_terms = set()
@@ -355,7 +350,7 @@ class TestRefinementContinuationTerminalError:
         sess._refinement_ctx = RefinementContext("q1", form_storage=QuestionFormStorage(corrected="q1"))
         with (
             patch(
-                "aetherdialect._main_execution._interactive_run_intent_pass",
+                "aetherdialect._main_execution.MainExecutionOps._interactive_run_intent_pass",
                 return_value=False,
             ),
             patch(
@@ -374,7 +369,7 @@ class TestLlmTaskDeploymentMatrix:
     def test_all_task_labels_resolve(self) -> None:
         from aetherdialect._contracts_base import LlmExecutionConfig
         from aetherdialect._core_utils import llm_execution_scope
-        from aetherdialect._llm_provider import _azure_deployment_for_model, _task_model_for_profile
+        from aetherdialect._llm_provider import LLMProvider
 
         cfg = LlmExecutionConfig(
             azure_endpoint="x",
@@ -405,8 +400,8 @@ class TestLlmTaskDeploymentMatrix:
         )
         with llm_execution_scope(cfg):
             for task in tasks:
-                mid = _task_model_for_profile(task)
-                dep = _azure_deployment_for_model(mid)
+                mid = LLMProvider._task_model_for_profile(task)
+                dep = LLMProvider._azure_deployment_for_model(mid)
                 assert dep in {"DM0", "DM2"}
 
 
@@ -516,7 +511,7 @@ class TestFullIntentParseInterpretGroundRetryDiagnostic:
         tok = set_diagnostic_collector(buf)
         try:
             with (
-                patch("aetherdialect._intent_process.llm_chat", side_effect=list(llm_seq)),
+                patch("aetherdialect._intent_process.LLMProvider.chat", side_effect=list(llm_seq)),
                 patch(
                     "aetherdialect._intent_process._format_repair_loop",
                     return_value=(stub_intent, 0),

@@ -7,7 +7,6 @@ import pytest
 from aetherdialect import AetherEngine
 from aetherdialect._constants import PERMISSION_DENIED_USER_MESSAGE
 from aetherdialect._contracts_base import (
-    AccessError,
     ConfigError,
     EngineContext,
     OwnerOnlyOperationError,
@@ -110,10 +109,9 @@ class TestConsumerPguser2Grants:
         assert "item" in visible
         assert "item" in _RENTAL_SHOP_CONSUMER_ALLOW_OBJECTS
 
-    def test_execute_sql_staff_blocked(self, t2s_consumer_pguser2: AetherEngine) -> None:
-        """Direct execute_sql on a forbidden table is blocked for consumer."""
-        with pytest.raises(AccessError, match="administrator"):
-            t2s_consumer_pguser2.execute_sql("SELECT staff_id FROM staff LIMIT 1")
+    def test_execute_sql_removed_from_public_api(self, t2s_consumer_pguser2: AetherEngine) -> None:
+        """Raw execute_sql is not part of the public engine surface."""
+        assert not hasattr(t2s_consumer_pguser2, "execute_sql")
 
 
 class TestAetherSpacePostgres:
@@ -151,7 +149,7 @@ class TestNamedEngineContext:
             "team_retail_persist",
             EngineContext(allow_objects=_RENTAL_SHOP_CONSUMER_ALLOW_OBJECTS),
         )
-        names = t2s_rbac_owner.list_engine_contexts()
+        names = t2s_rbac_owner.list_contexts()
         assert "team_retail_persist" in names
 
     def test_consumer_consumes_named_context_by_name(
@@ -189,12 +187,12 @@ class TestNamedEngineContext:
         self,
         t2s_rbac_owner: AetherEngine,
     ) -> None:
-        """export_engine_context dumps a persisted named context."""
+        """export_context dumps a persisted named context."""
         t2s_rbac_owner.engine_context(
             "export_probe",
             EngineContext(allow_objects=frozenset({"film"})),
         )
-        path = t2s_rbac_owner.export_engine_context("export_probe")
+        path = t2s_rbac_owner.export_context("export_probe")
         assert path.is_file()
 
 

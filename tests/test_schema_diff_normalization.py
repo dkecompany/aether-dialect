@@ -1,12 +1,12 @@
-"""T10: semantically identical catalog types must not surface as redeclared_columns or hash drift."""
+"""Semantically identical catalog types must not surface as redeclared_columns or hash drift."""
 
 from __future__ import annotations
 
 import pytest
 
-from aetherdialect._contracts_base import ColumnRole, data_type_to_value_type
+from aetherdialect._contracts_base import ColumnRole
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import structural_hash_fp
+from aetherdialect._core_utils import data_type_to_value_type, structural_hash_fp
 from aetherdialect._schema_graph import diff_schemas, tables_structural_payload
 
 

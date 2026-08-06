@@ -11,31 +11,26 @@ from aetherdialect._config import EngineConfig
 from aetherdialect._constants import SESSION_KIND_AWAITING_SQL_CONFIRM
 from aetherdialect._contracts_base import MockFixtureMissingError
 from aetherdialect._contracts_core import QuestionFormStorage, RuntimeIntent, ValueHistory
-from aetherdialect._llm_provider import reset_mock_provider
+from aetherdialect._llm_provider import MockProvider
 from aetherdialect._templates import (
-    _append_runtime_paraphrase_variants,
-    clear_sandbox_paraphrase_source,
-    insert_template,
-    record_value_history_on_accept,
-    resolve_param_display_names,
-    set_sandbox_paraphrase_source,
+    TemplateOps,
 )
 from tests.test_reuse_saved_question import _minimal_template
 
 
 @pytest.fixture(autouse=True)
 def _reset_paraphrase_registry() -> None:
-    clear_sandbox_paraphrase_source()
+    TemplateOps.clear_sandbox_paraphrase_source()
     yield
-    clear_sandbox_paraphrase_source()
-    reset_mock_provider()
+    TemplateOps.clear_sandbox_paraphrase_source()
+    MockProvider.reset_mock_provider()
 
 
 @pytest.mark.fast
 def test_append_runtime_paraphrase_variants_injects_bundled_rows(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(EngineConfig, "LLM_PROVIDER", "mock")
     canonical = "How many books do we have?"
-    set_sandbox_paraphrase_source(
+    TemplateOps.set_sandbox_paraphrase_source(
         {
             canonical: [
                 "What is the total number of books?",
@@ -50,7 +45,7 @@ def test_append_runtime_paraphrase_variants_injects_bundled_rows(monkeypatch: py
         accept_counts=[1],
     )
     schema = MagicMock()
-    _append_runtime_paraphrase_variants(
+    TemplateOps._append_runtime_paraphrase_variants(
         vh,
         canonical,
         {"s1": 10},
@@ -60,7 +55,7 @@ def test_append_runtime_paraphrase_variants_injects_bundled_rows(monkeypatch: py
     )
     assert "What is the total number of books?" in vh.questions
     assert "Book count please" in vh.questions
-    _append_runtime_paraphrase_variants(
+    TemplateOps._append_runtime_paraphrase_variants(
         vh,
         canonical,
         {"s1": 10},
@@ -82,7 +77,7 @@ def test_append_runtime_paraphrase_variants_noop_without_registry(monkeypatch: p
         accept_counts=[1],
     )
     schema = MagicMock()
-    _append_runtime_paraphrase_variants(
+    TemplateOps._append_runtime_paraphrase_variants(
         vh,
         canonical,
         {"s1": 10},
@@ -102,10 +97,10 @@ def test_resolve_param_display_names_uses_fixture_under_mock(monkeypatch: pytest
     schema = MagicMock()
     schema.tables = {}
     with patch(
-        "aetherdialect._templates.llm_chat",
+        "aetherdialect._templates.LLMProvider.chat",
         return_value='{"display_names":{"p1":"Item category"}}',
     ):
-        names = resolve_param_display_names(
+        names = TemplateOps.resolve_param_display_names(
             tmpl,
             {
                 "p1": MagicMock(
@@ -142,10 +137,10 @@ def test_resolve_param_display_names_falls_back_on_missing_fixture(monkeypatch: 
         unit_handle="",
     )
     with patch(
-        "aetherdialect._templates.llm_chat",
+        "aetherdialect._templates.LLMProvider.chat",
         side_effect=MockFixtureMissingError(task="default", system="s", user="u"),
     ):
-        names = resolve_param_display_names(
+        names = TemplateOps.resolve_param_display_names(
             tmpl,
             {"p1": slot_meta},
             {"p1": "x"},
@@ -194,7 +189,7 @@ def test_record_value_history_on_accept_raises_normalized(monkeypatch: pytest.Mo
     normalized = "normalized question form"
     vh = ValueHistory(param_values=[], questions=[], natural_language=[])
     form_storage = QuestionFormStorage(corrected=canonical, normalized_optional=normalized)
-    record_value_history_on_accept(
+    TemplateOps.record_value_history_on_accept(
         vh,
         param_values={"p1": "x"},
         natural_language="nl",
@@ -216,7 +211,7 @@ def test_insert_template_record_accept_primary_not_double_counted(
     canonical = "How many books do we have?"
     normalized = "book count"
     paraphrase = "What is the total number of books?"
-    set_sandbox_paraphrase_source({canonical: [paraphrase]})
+    TemplateOps.set_sandbox_paraphrase_source({canonical: [paraphrase]})
     form_storage = QuestionFormStorage(corrected=canonical, normalized_optional=normalized)
     intent = RuntimeIntent(
         tables=["orders"],
@@ -229,7 +224,7 @@ def test_insert_template_record_accept_primary_not_double_counted(
     )
     store: dict[str, object] = {"next_id": 1}
     templates: dict[str, object] = {}
-    tmpl = insert_template(
+    tmpl = TemplateOps.insert_template(
         store,
         templates,
         schema_graph,
@@ -270,7 +265,7 @@ def test_insert_template_record_accept_without_registry_raises_normalized_only(
     )
     store: dict[str, object] = {"next_id": 1}
     templates: dict[str, object] = {}
-    tmpl = insert_template(
+    tmpl = TemplateOps.insert_template(
         store,
         templates,
         schema_graph,

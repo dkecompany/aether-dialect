@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import pytest
 
-from aetherdialect._contracts_base import FederationConfigError, WhereParam, predicate_group_from_list
+from aetherdialect._contracts_base import (
+    FederationConfigError,
+    PredicateGroup,
+    WhereParam,
+)
 from aetherdialect._contracts_core import RuntimeIntent
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._federation import (
@@ -88,7 +92,7 @@ def test_plan_federated_intent_allows_ilike_with_mixed_member_capabilities() -> 
         select_cols=[],
         group_by_cols=[],
         order_by_cols=[],
-        where=predicate_group_from_list(
+        where=PredicateGroup.from_list(
             [
                 WhereParam(
                     left_expr=NormalizedExpr.from_column("left_t.name"),
@@ -154,14 +158,14 @@ def test_federation_refuses_ilike_when_member_lacks_native_and_wrap(monkeypatch:
     def _member_semantics(engine_type: str) -> bool:
         return engine_type != "bigquery"
 
-    monkeypatch.setattr("aetherdialect._federation.member_supports_ilike_semantics", _member_semantics)
+    monkeypatch.setattr("aetherdialect._dialect.DialectRegistry.member_supports_ilike_semantics", _member_semantics)
     intent = RuntimeIntent(
         tables=["left_t"],
         grain="many",
         select_cols=[],
         group_by_cols=[],
         order_by_cols=[],
-        where=predicate_group_from_list(
+        where=PredicateGroup.from_list(
             [
                 WhereParam(
                     left_expr=NormalizedExpr.from_column("left_t.name"),
@@ -181,7 +185,7 @@ def test_federation_refuses_ilike_when_member_lacks_native_and_wrap(monkeypatch:
 @pytest.mark.fast
 def test_ilike_renders_native_on_postgresql_and_wrap_on_bigquery() -> None:
     from aetherdialect._contracts_core import WhereParam
-    from aetherdialect._dialect import get_dialect_class
+    from aetherdialect._dialect import DialectRegistry
     from aetherdialect._sql_gen import _render_predicate_clause
 
     pred = WhereParam(
@@ -190,8 +194,8 @@ def test_ilike_renders_native_on_postgresql_and_wrap_on_bigquery() -> None:
         value_type="string",
         param_key="pat",
     )
-    pg = object.__new__(get_dialect_class("postgresql"))
-    bq = object.__new__(get_dialect_class("bigquery"))
+    pg = object.__new__(DialectRegistry.get_dialect_class("postgresql"))
+    bq = object.__new__(DialectRegistry.get_dialect_class("bigquery"))
     pg_sql = _render_predicate_clause(pred, pg)
     bq_sql = _render_predicate_clause(pred, bq)
     assert "ILIKE" in pg_sql.upper()
@@ -199,7 +203,8 @@ def test_ilike_renders_native_on_postgresql_and_wrap_on_bigquery() -> None:
     assert "ILIKE" not in bq_sql.upper()
     assert "LOWER" in bq_sql.upper()
     assert "LIKE" in bq_sql.upper()
-    assert "LOWER(:pat)" in bq_sql.replace(" ", "")
+    bq_norm = bq_sql.replace(" ", "")
+    assert "LOWER(:pat)" in bq_norm or "LOWER(@pat)" in bq_norm
 
 
 @pytest.mark.fast
@@ -234,7 +239,7 @@ def test_rescore_declared_mapping_drift_reports_value_overlap_collapse() -> None
     }
     mappings = parse_federation_mappings(
         {
-            "version": 2,
+            "version": "0.2.1",
             "logical_columns": [
                 {
                     "logical": "entity_id",

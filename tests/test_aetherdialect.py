@@ -17,9 +17,9 @@ from aetherdialect._contracts_base import (
     LLMConfig,
     NormalizedExpr,
     OrderByCol,
+    PredicateGroup,
     RuntimeConfig,
     WhereParam,
-    predicate_group_from_list,
 )
 from aetherdialect._contracts_core import (
     RuntimeIntent,
@@ -29,7 +29,7 @@ from aetherdialect._contracts_schema import (
     QSimSummary,
 )
 from aetherdialect._core_utils import load_runtime_config
-from aetherdialect._templates import empty_template_store
+from aetherdialect._templates import TemplateOps
 
 
 def _sample_llm_execution():
@@ -50,7 +50,7 @@ def _make_aether_stub(**overrides):
         _schema_graph=MagicMock(),
         _dialect=MagicMock(),
         _artifacts_dir=Path("/tmp/aether"),
-        _store=empty_template_store("unit_test_eff"),
+        _store=TemplateOps.empty_template_store("unit_test_eff"),
         _templates={},
         _rejected={},
         _schema_terms=set(),
@@ -66,6 +66,7 @@ def _make_aether_stub(**overrides):
         _token_provider=None,
         _native_connection=None,
         _sandbox_closed=False,
+        _tenant_slug=None,
     )
     defaults.update(overrides)
 
@@ -130,13 +131,13 @@ class TestGetQsimSummary:
 class TestEnsureLlm:
     """Tests for ``AetherEngine._ensure_llm``."""
 
-    @patch("aetherdialect.aetherdialect.llm_credentials_configured", return_value=False)
+    @patch("aetherdialect._config.EngineConfig.llm_credentials_configured", return_value=False)
     def test_no_credentials_raises_config_error(self, _mock_lc: MagicMock) -> None:
         t = _make_aether_stub()
         with pytest.raises(ConfigError, match="LLM is not configured"):
             t._ensure_llm()
 
-    @patch("aetherdialect.aetherdialect.llm_credentials_configured", return_value=True)
+    @patch("aetherdialect._config.EngineConfig.llm_credentials_configured", return_value=True)
     def test_configured_passes(self, _mock_lc: MagicMock) -> None:
         t = _make_aether_stub()
         t._ensure_llm()
@@ -450,7 +451,7 @@ class TestBuildIntentSummary:
     """Smoke test for session intent summary projection."""
 
     def test_build_intent_summary_fields(self) -> None:
-        from aetherdialect._main_execution import _build_intent_summary
+        from aetherdialect._main_execution import MainExecutionOps
 
         intent = RuntimeIntent(
             tables=["t1"],
@@ -458,7 +459,7 @@ class TestBuildIntentSummary:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t1.id"))],
             group_by_cols=[NormalizedExpr.from_column("t1.region")],
             order_by_cols=[OrderByCol(expr=NormalizedExpr.from_column("t1.id"), direction="desc")],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("t1.status"),
@@ -470,7 +471,7 @@ class TestBuildIntentSummary:
             natural_language="  headline  ",
             limit=10,
         )
-        s = _build_intent_summary(intent)
+        s = MainExecutionOps._build_intent_summary(intent)
         assert s.tables == ("t1",)
         assert s.limit == 10
         assert s.natural_language == "headline"

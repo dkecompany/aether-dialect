@@ -260,3 +260,39 @@ def test_sequential_staged_cancel_calls_cancel_statement() -> None:
     assert len(worker_error) == 1
     assert type(worker_error[0]) is FederationTurnCancelledError
     member_dialect.cancel_statement.assert_called()
+
+
+@pytest.mark.fast
+def test_sqlalchemy_backend_cancel_invokes_connection_cancel() -> None:
+    from aetherdialect._dialect_sqlglot_helper import SqlAlchemyResultBackend
+
+    raw_conn = MagicMock()
+    sa_conn = MagicMock()
+    sa_conn.connection = raw_conn
+    engine = MagicMock()
+    engine.connect.return_value.__enter__.return_value = sa_conn
+    engine.connect.return_value.__exit__.return_value = None
+    backend = SqlAlchemyResultBackend(engine, dialect_name="postgresql")
+
+    hang = threading.Event()
+    started = threading.Event()
+
+    def _slow_execute(*_args: object, **_kwargs: object) -> MagicMock:
+        started.set()
+        hang.wait(timeout=2.0)
+        result = MagicMock()
+        result.fetchmany.side_effect = [[(1,)], []]
+        return result
+
+    sa_conn.execute.side_effect = _slow_execute
+
+    def _run() -> None:
+        backend.fetch_rows("SELECT pg_sleep(30)")
+
+    worker = threading.Thread(target=_run)
+    worker.start()
+    assert started.wait(timeout=2.0)
+    backend.cancel_statement()
+    hang.set()
+    worker.join(timeout=2.0)
+    raw_conn.cancel.assert_called_once()

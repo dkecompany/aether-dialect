@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from collections.abc import Mapping
@@ -39,6 +40,95 @@ class TwoMemberFederation:
     right_source: str = "b"
     left_table: str = "left_t"
     right_table: str = "right_t"
+
+
+def union_disjointness_key_column(
+    *,
+    name: str = "id",
+    data_type: str = "integer",
+    overlap_sample: tuple[str, ...] | list[str],
+    row_count: int | None = None,
+    **kwargs: Any,
+) -> ColumnMetadata:
+    """Build a union key column with disjointness profiling required for union collapse."""
+    sample = list(overlap_sample)
+    rc = row_count if row_count is not None else max(len(sample), 1)
+    return ColumnMetadata(
+        name=name,
+        data_type=data_type,
+        sensitivity="none",
+        is_primary_key=kwargs.pop("is_primary_key", True),
+        value_overlap_sample=sample,
+        row_count=rc,
+        distinct_count=rc,
+        **kwargs,
+    )
+
+
+def stamp_union_disjointness_profiling(
+    table: TableMetadata,
+    *,
+    key_col: str = "id",
+    overlap_sample: tuple[str, ...] | list[str],
+    row_count: int | None = None,
+) -> None:
+    """Stamp union key disjointness profiling onto an existing member table."""
+    sample = list(overlap_sample)
+    rc = row_count if row_count is not None else max(int(table.row_count or 0), len(sample), 1)
+    table.row_count = rc
+    col = table.columns.get(key_col)
+    if col is None:
+        table.columns[key_col] = union_disjointness_key_column(
+            name=key_col,
+            overlap_sample=sample,
+            row_count=rc,
+        )
+        return
+    col = copy.deepcopy(col)
+    table.columns[key_col] = col
+    col.value_overlap_sample = sample
+    col.row_count = rc
+    col.distinct_count = max(int(col.distinct_count or 0), len(sample))
+
+
+def stamp_sandbox_payment_union_profiling(members: Mapping[str, SchemaGraph]) -> None:
+    """Stamp disjointness profiling for the sandbox payment union across three members."""
+    for source_id, table_name, key_col, samples in (
+        ("storefront", "payment", "amount", ("sf_a1", "sf_a2")),
+        ("catalog", "payment", "amount", ("cat_a1", "cat_a2")),
+        ("logistics", "receipts", "amt", ("log_a1", "log_a2")),
+    ):
+        table = members[source_id].tables[table_name]
+        table.columns = copy.deepcopy(table.columns)
+        stamp_union_disjointness_profiling(table, key_col=key_col, overlap_sample=samples)
+
+
+def union_member_graph_pair(
+    left_table: str,
+    right_table: str,
+    *,
+    left_source: str = "a",
+    right_source: str = "b",
+    left_samples: tuple[str, ...] = ("1", "2"),
+    right_samples: tuple[str, ...] = ("3", "4"),
+) -> dict[str, SchemaGraph]:
+    """Build two one-table member graphs with union disjointness profiling on ``id``."""
+    left_tbl = federation_member_table(left_table, source_id=left_source)
+    right_tbl = federation_member_table(right_table, source_id=right_source)
+    stamp_union_disjointness_profiling(left_tbl, overlap_sample=left_samples)
+    stamp_union_disjointness_profiling(right_tbl, overlap_sample=right_samples)
+    return {
+        left_source: federation_member_graph(
+            left_table,
+            source_id=left_source,
+            columns=left_tbl.columns,
+        ),
+        right_source: federation_member_graph(
+            right_table,
+            source_id=right_source,
+            columns=right_tbl.columns,
+        ),
+    }
 
 
 def federation_member_table(
@@ -262,9 +352,9 @@ def hash_directory_tree(root: Path) -> str:
 
 def template_store_partition_count(artifacts_dir: str, graph: SchemaGraph) -> int:
     """Return the number of template partitions persisted for *graph*."""
-    from aetherdialect._templates import load_template_store
+    from aetherdialect._templates import TemplateOps
 
-    store = load_template_store(str(graph.schema_graph_id), graph, artifacts_dir=artifacts_dir)
+    store = TemplateOps.load_template_store(str(graph.schema_graph_id), graph, artifacts_dir=artifacts_dir)
     return len(store.partition_map)
 
 
@@ -275,14 +365,18 @@ def seed_member_template_stores(
 ) -> None:
     """Persist empty on-disk template stores for every federation member."""
     from aetherdialect._federation import federation_source_artifacts_dir
-    from aetherdialect._templates import empty_template_store_for_space, save_template_store
+    from aetherdialect._templates import TemplateOps
 
     for binding in manifest.sources:
         graph = member_graphs[binding.source_id]
-        artifacts_dir = federation_source_artifacts_dir(artifacts_root, binding)
+        artifacts_dir = federation_source_artifacts_dir(
+            artifacts_root,
+            binding,
+            federation_id=str(manifest.federation_id or "") or None,
+        )
         Path(artifacts_dir).mkdir(parents=True, exist_ok=True)
-        store = empty_template_store_for_space(str(graph.schema_graph_id), artifacts_dir=artifacts_dir)
-        save_template_store(store)
+        store = TemplateOps.empty_template_store_for_space(str(graph.schema_graph_id), artifacts_dir=artifacts_dir)
+        TemplateOps.save_template_store(store)
 
 
 def build_staged_two_member_prepare_outcome(

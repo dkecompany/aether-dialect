@@ -15,7 +15,7 @@ from aetherdialect._core_utils import (
     prompt_cache_schema_scope,
     schema_prompt_cache_id,
 )
-from aetherdialect._llm_provider import resolve_prompt_cache_key
+from aetherdialect._llm_provider import LLMProvider
 from aetherdialect._schema_graph import assign_schema_graph_hashes, tables_descriptions_payload
 
 
@@ -103,7 +103,16 @@ def test_resolve_prompt_cache_key_uses_description_fingerprint() -> None:
     cache_id = schema_prompt_cache_id(graph)
     assert cache_id is not None
     with prompt_cache_schema_scope(cache_id):
-        assert resolve_prompt_cache_key("intent") == f"intent:{cache_id}"
+        key = LLMProvider.resolve_prompt_cache_key("intent")
+    assert key is not None
+    assert len(key) <= 64
+    raw = f"intent:{cache_id}"
+    if len(raw) <= 64:
+        assert key == raw
+    else:
+        import hashlib
+
+        assert key == f"intent:{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:24]}"
 
 
 def test_descriptions_hash_fp_stable_for_same_content() -> None:

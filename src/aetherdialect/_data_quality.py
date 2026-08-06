@@ -3,15 +3,22 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import importlib
 import io
 import os
+import random
 import re
+import shutil
+import tempfile
 from collections.abc import Callable, Mapping, Sequence
+from datetime import date, datetime
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
+from ._config import EngineLimits, PolicyConfig
 from ._constants import (
+    BARE_SCALAR_NUMBER_RE,
     CSV_IDENTIFIER_NAMING_SCHEMA,
     CSV_IDENTIFIER_NAMING_SYSTEM,
     DATA_QUALITY_DETAIL_CANDIDATE_HEADER_ROW,
@@ -63,11 +70,44 @@ from ._constants import (
     DIAGNOSTIC_CODE_DATA_QUALITY_AUTO_CORRECTED,
     DIAGNOSTIC_CODE_DATA_QUALITY_AUTO_READ,
     DIAGNOSTIC_CODE_DATA_QUALITY_BLOCKING,
+    DIAGNOSTIC_CODE_UPLOAD_TRANSFORM_APPLIED,
+    DIAGNOSTIC_CODE_UPLOAD_TRANSFORM_REJECTED,
+    DIAGNOSTIC_CODE_UPLOAD_UNIT_AFFIX_STRIPPED,
+    ISO_DATE_RE,
+    ISO_TIMESTAMP_RE,
+    REVIEW_GATED_UPLOAD_COLUMN_TRANSFORMS,
+    UPLOAD_BAND_VALUE_MAP_MAX_DISTINCT,
+    UPLOAD_COLUMN_TRANSFORM_IDS,
+    UPLOAD_COLUMN_TRANSFORMS_SCHEMA,
+    UPLOAD_COLUMN_TRANSFORMS_SYSTEM,
+    UPLOAD_CURRENCY_AFFIX_TOKENS,
+    UPLOAD_INTERPRET_MAX_ROWS,
+    UPLOAD_INTERPRET_SCHEMA,
+    UPLOAD_INTERPRET_SYSTEM,
+    UPLOAD_SAMPLE_MAX_ROWS,
+    UPLOAD_SCALAR_AFFIX_TOKENS_SORTED,
+    UPLOAD_SCALAR_BAND_PATTERNS,
+    UPLOAD_SUMMARY_SCHEMA,
+    UPLOAD_SUMMARY_SYSTEM,
 )
-from ._contracts_base import ConfigError, DataQualityReport, Diagnostic
-from ._contracts_schema import CsvSourceSelection, PreparedRelation, SchemaGraph, SheetGrid
-from ._core_utils import debug, notify, stable_json
-from ._llm_provider import llm_json
+from ._contracts_base import (
+    ConfigError,
+    DataQualityReport,
+    Diagnostic,
+    DiagnosticSeverity,
+    UploadColumnTransformId,
+)
+from ._contracts_schema import (
+    CsvSourceSelection,
+    PreparedRelation,
+    ScalarAffixColumnPlan,
+    SchemaGraph,
+    SheetGrid,
+)
+from ._core_utils import active_engine_limits, debug, notify, require_driver, stable_json
+from ._llm_provider import LLMProvider
+
+_XLSX_DECLARED_COLUMN_TYPES: dict[tuple[str, str], tuple[str, ...]] = {}
 
 
 def parse_source_selections(raw: Mapping[str, Mapping[str, Any]]) -> dict[str, CsvSourceSelection]:
@@ -92,6 +132,12 @@ def parse_source_selections(raw: Mapping[str, Mapping[str, Any]]) -> dict[str, C
             append_regions = tuple(str(item).strip() for item in append_raw if str(item).strip())
         else:
             append_regions = ()
+        transforms_raw = body.get("column_transforms", ())
+        column_transforms: list[Mapping[str, Any]] = []
+        if isinstance(transforms_raw, Sequence) and not isinstance(transforms_raw, (str, bytes)):
+            for item in transforms_raw:
+                if isinstance(item, Mapping):
+                    column_transforms.append(dict(item))
         out[str(name)] = CsvSourceSelection(
             sheet=str(body.get("sheet", "") or ""),
             header_row=header_row,
@@ -99,6 +145,7 @@ def parse_source_selections(raw: Mapping[str, Mapping[str, Any]]) -> dict[str, C
             table_range=str(body.get("table_range", "") or ""),
             merge_regions=merge_regions,
             append_regions=append_regions,
+            column_transforms=tuple(column_transforms),
         )
     return out
 
@@ -505,12 +552,53 @@ def grid_to_relation(
             value = padded[col_idx] if col_idx < len(padded) else ""
             if value.strip():
                 samples_by_col[col_idx].append(value)
+    affix_plans: list[ScalarAffixColumnPlan | None] = []
     for col_idx in range(width):
-        types.append(_infer_duckdb_column_type(samples_by_col[col_idx]))
+        cache_key = (str(grid.source_path.resolve()), grid.sheet_name)
+        declared = _XLSX_DECLARED_COLUMN_TYPES.get(cache_key)
+        if declared is not None and col_idx < len(declared):
+            affix_plans.append(None)
+        else:
+            affix_plans.append(_plan_scalar_affix_column(samples_by_col[col_idx]))
+    for col_idx in range(width):
+        affix_plan = affix_plans[col_idx]
+        cache_key = (str(grid.source_path.resolve()), grid.sheet_name)
+        declared = _XLSX_DECLARED_COLUMN_TYPES.get(cache_key)
+        if declared is not None and col_idx < len(declared):
+            types.append(declared[col_idx])
+        elif affix_plan is not None:
+            types.append(affix_plan.duckdb_type)
+        else:
+            types.append(infer_duckdb_column_type(samples_by_col[col_idx]))
+    unit_labels: list[str] = []
+    for col_idx in range(width):
+        affix_plan = affix_plans[col_idx]
+        if affix_plan is not None:
+            unit_labels.append(affix_plan.unit_label)
+            notify(
+                f"Stripped unit affix {affix_plan.unit_label!r} from column {column_names[col_idx]!r}.",
+                stage="data_quality",
+                code=DIAGNOSTIC_CODE_UPLOAD_UNIT_AFFIX_STRIPPED,
+                level="info",
+                details=(
+                    ("column", column_names[col_idx]),
+                    ("unit", affix_plan.unit_label),
+                    ("location", _grid_location_prefix(grid)),
+                ),
+            )
+        else:
+            unit_labels.append("")
     rows: list[dict[str, str]] = []
     for row in data_rows:
         padded = _pad_row(row, width)
-        row_map = {column_names[idx]: padded[idx] for idx in range(width)}
+        row_map: dict[str, str] = {}
+        for col_idx in range(width):
+            raw = padded[col_idx] if col_idx < len(padded) else ""
+            affix_plan = affix_plans[col_idx]
+            if affix_plan is not None and raw.strip():
+                row_map[column_names[col_idx]] = _strip_scalar_affix_cell(raw, affix_plan)
+            else:
+                row_map[column_names[col_idx]] = raw
         if any(str(v).strip() for v in row_map.values()):
             rows.append(row_map)
     original_table_label = _table_original_label(grid)
@@ -522,6 +610,7 @@ def grid_to_relation(
         columns=tuple(column_names),
         original_column_labels=tuple(original_column_labels),
         column_types=tuple(types),
+        column_unit_labels=tuple(unit_labels),
         rows=tuple(rows),
     )
 
@@ -609,7 +698,22 @@ def validate_upload_sources(
                 relation_names[relation.lower()] = relation
     blocking = [issue for issue in all_issues if _issue_is_blocking(issue)]
     ok = not blocking and not any(_issue_requires_review(issue) for issue in all_issues)
+    suggested = _suggested_selections_from_issues(paths, all_issues)
+    if PolicyConfig.TABULAR_LLM_ASSIST:
+        suggested = _enrich_suggested_selections_with_column_transforms(
+            paths,
+            selections,
+            suggested,
+        )
     narrative = _build_narrative(paths, all_issues, ok=ok)
+    if PolicyConfig.TABULAR_LLM_ASSIST and ok:
+        narrative = _llm_upload_summary_narrative(
+            paths,
+            all_issues,
+            suggested,
+            ok=ok,
+            fallback=narrative,
+        )
     for issue in all_issues:
         notify(
             issue.message,
@@ -619,7 +723,6 @@ def validate_upload_sources(
             details=issue.details,
         )
     sink(narrative)
-    suggested = _suggested_selections_from_issues(paths, all_issues)
     return DataQualityReport(
         ok=ok,
         issues=tuple(all_issues),
@@ -764,11 +867,15 @@ def prepare_relations_for_paths(
                     col_reserved.add(col_name)
                     column_names.append(col_name)
                 relations.append(
-                    grid_to_relation(
-                        region_grid,
-                        relation_name=relation_name,
-                        column_names=column_names,
-                        original_column_labels=header_labels,
+                    _finalize_prepared_relation(
+                        grid_to_relation(
+                            region_grid,
+                            relation_name=relation_name,
+                            column_names=column_names,
+                            original_column_labels=header_labels,
+                        ),
+                        region_grid=region_grid,
+                        selection=selection,
                     )
                 )
     return relations
@@ -891,10 +998,80 @@ def _header_row_score(
 
 
 def _looks_numeric_header_cell(value: str) -> bool:
+    if _plan_scalar_affix_column([value]) is not None:
+        return True
     return _value_kind(value) in {"int", "float"}
 
 
+def _is_date_only_excel_format(number_format: str) -> bool:
+    fmt = (number_format or "").lower()
+    if not fmt or fmt == "general":
+        return False
+    if not any(ch in fmt for ch in "ymd"):
+        return False
+    time_markers = ("h", "s", ":", "am/pm", "a/p", "[h]")
+    return not any(marker in fmt for marker in time_markers)
+
+
+def _format_datetime_value(value: datetime, *, date_only: bool) -> str:
+    if date_only:
+        return value.date().isoformat()
+    return value.isoformat(timespec="seconds")
+
+
+def excel_cell_to_text(cell: object) -> str:
+    value = getattr(cell, "value", cell)
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        number_format = str(getattr(cell, "number_format", "") or "")
+        date_only = _is_date_only_excel_format(number_format) and not (
+            value.hour or value.minute or value.second or value.microsecond
+        )
+        return _format_datetime_value(value, date_only=date_only)
+    if isinstance(value, date):
+        return value.isoformat()
+    number_format = str(getattr(cell, "number_format", "") or "")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        numbers = importlib.import_module("openpyxl.styles.numbers")
+        if numbers.is_date_format(number_format):
+            from_excel = importlib.import_module("openpyxl.utils.datetime").from_excel
+            parsed = from_excel(value)
+            if isinstance(parsed, datetime):
+                return _format_datetime_value(
+                    parsed,
+                    date_only=_is_date_only_excel_format(number_format),
+                )
+            if isinstance(parsed, date):
+                return parsed.isoformat()
+    return str(value)
+
+
+def _temporal_sample_kind(value: str) -> str | None:
+    text = value.strip()
+    if ISO_DATE_RE.match(text):
+        return "date"
+    if ISO_TIMESTAMP_RE.match(text):
+        return "timestamp"
+    return None
+
+
+def _xlsx_declared_column_types(path: Path, sheet_name: str, rows: Sequence[Sequence[str]]) -> tuple[str, ...]:
+    if not rows:
+        return ()
+    width = max(len(row) for row in rows)
+    samples_by_col: list[list[str]] = [[] for _ in range(width)]
+    for row in rows[1:]:
+        padded = _pad_row(tuple(row), width)
+        for col_idx in range(width):
+            value = padded[col_idx] if col_idx < len(padded) else ""
+            if value.strip():
+                samples_by_col[col_idx].append(value)
+    return tuple(infer_duckdb_column_type(samples) for samples in samples_by_col)
+
+
 def _load_xlsx_grids(path: Path) -> list[SheetGrid]:
+    require_driver("csv")
     openpyxl = importlib.import_module("openpyxl")
     try:
         workbook = openpyxl.load_workbook(path, read_only=False, data_only=True)
@@ -910,10 +1087,14 @@ def _load_xlsx_grids(path: Path) -> list[SheetGrid]:
             if getattr(worksheet, "sheet_state", "visible") != "visible":
                 continue
             rows: list[tuple[str, ...]] = []
-            for values in worksheet.iter_rows(values_only=True):
-                if values is None:
+            for row_cells in worksheet.iter_rows():
+                if row_cells is None:
                     continue
-                rows.append(tuple("" if cell is None else str(cell) for cell in values))
+                rows.append(tuple(excel_cell_to_text(cell) for cell in row_cells))
+            if rows:
+                _XLSX_DECLARED_COLUMN_TYPES[(str(path.resolve()), str(sheet_name))] = _xlsx_declared_column_types(
+                    path, str(sheet_name), rows
+                )
             merged = tuple(str(item) for item in getattr(worksheet.merged_cells, "ranges", ()))
             tables = tuple(str(item) for item in getattr(worksheet, "tables", {}).keys())
             table_ranges = tuple(str(table.ref) for table in getattr(worksheet, "tables", {}).values())
@@ -1451,7 +1632,7 @@ def _issue_severity(issue: Diagnostic) -> str:
     code = _issue_detail(issue, "issue_code", "")
     if code in DATA_QUALITY_ISSUE_SEVERITY:
         return DATA_QUALITY_ISSUE_SEVERITY[code]
-    return issue.level
+    return issue.level.value if isinstance(issue.level, DiagnosticSeverity) else str(issue.level)
 
 
 def _column_key_from_location(location: str) -> str | None:
@@ -1624,7 +1805,20 @@ def _column_value_issues(
             )
         )
     kind_flags = _storage_kinds(samples)
-    if len(kind_flags) > 1:
+    temporal_and_text = "temporal" in kind_flags and "text" in kind_flags
+    if temporal_and_text:
+        issues.append(
+            _make_issue(
+                code="mixed_temporal_text",
+                level="review",
+                message=(f"Column {col_ref} mixes dates with text values; keeping the column as text."),
+                location=col_loc,
+                blocking=False,
+                review=True,
+                extra_details=(("issue_code", DATA_QUALITY_ISSUE_MIXED_TYPES),),
+            )
+        )
+    elif len(kind_flags) > 1:
         issues.append(
             _make_issue(
                 code=DATA_QUALITY_ISSUE_MIXED_TYPES,
@@ -1634,7 +1828,7 @@ def _column_value_issues(
                 blocking=True,
             )
         )
-    if any(_looks_number_as_text(value) for value in samples):
+    if any(_looks_number_as_text(value) for value in samples) and _plan_scalar_affix_column(samples) is None:
         issues.append(
             _make_issue(
                 code=DATA_QUALITY_ISSUE_NUMBER_AS_TEXT,
@@ -1813,6 +2007,8 @@ def _first_nonempty_cell(row: Sequence[str]) -> str:
 
 
 def _storage_kinds(samples: Sequence[str]) -> set[str]:
+    if _plan_scalar_affix_column(samples) is not None:
+        return {"number"}
     kinds: set[str] = set()
     for value in samples:
         if not value.strip():
@@ -1820,6 +2016,8 @@ def _storage_kinds(samples: Sequence[str]) -> set[str]:
         kind = _value_kind(value)
         if kind in {"int", "float"}:
             kinds.add("number")
+        elif kind in {"date", "timestamp"}:
+            kinds.add("temporal")
         elif kind != "empty":
             kinds.add(kind)
     return kinds
@@ -1842,12 +2040,19 @@ def _value_kind(value: str) -> str:
         pass
     if text.lower() in ("true", "false", "yes", "no"):
         return "bool"
+    temporal_kind = _temporal_sample_kind(text)
+    if temporal_kind == "date":
+        return "date"
+    if temporal_kind == "timestamp":
+        return "timestamp"
     return "text"
 
 
 def _looks_number_as_text(value: str) -> bool:
     text = value.strip()
     if not text:
+        return False
+    if _plan_scalar_affix_column([text]) is not None:
         return False
     if any(ch.isalpha() for ch in text):
         return False
@@ -1860,10 +2065,154 @@ def _looks_number_as_text(value: str) -> bool:
     return False
 
 
-def _infer_duckdb_column_type(samples: Sequence[str]) -> str:
+def _scalar_value_has_band_marker(text: str) -> bool:
+    return any(pattern.search(text) for pattern in UPLOAD_SCALAR_BAND_PATTERNS)
+
+
+def _is_bare_scalar_number(text: str) -> bool:
+    return bool(BARE_SCALAR_NUMBER_RE.match(text.strip()))
+
+
+def _find_scalar_affix_spans(text: str) -> list[tuple[int, int, str]]:
+    spans: list[tuple[int, int, str]] = []
+    index = 0
+    while index < len(text):
+        matched: str | None = None
+        for token in UPLOAD_SCALAR_AFFIX_TOKENS_SORTED:
+            if text.startswith(token, index):
+                matched = token
+                break
+        if matched is None:
+            index += 1
+            continue
+        spans.append((index, index + len(matched), matched))
+        index += len(matched)
+    return spans
+
+
+def _strip_scalar_affix_spans(text: str, spans: Sequence[tuple[int, int, str]]) -> str:
+    if not spans:
+        return text.strip()
+    parts: list[str] = []
+    cursor = 0
+    for start, end, _token in spans:
+        parts.append(text[cursor:start])
+        cursor = end
+    parts.append(text[cursor:])
+    return "".join(parts).strip()
+
+
+def _parse_scalar_affix_cell(text: str) -> tuple[str, frozenset[str], bool] | None:
+    raw = text.strip()
+    if not raw or _scalar_value_has_band_marker(raw):
+        return None
+    if _is_bare_scalar_number(raw):
+        return raw.replace(",", ""), frozenset(), False
+    spans = _find_scalar_affix_spans(raw)
+    if not spans:
+        return None
+    stripped = _strip_scalar_affix_spans(raw, spans)
+    if any(char.isalpha() for char in stripped):
+        return None
+    if not _is_bare_scalar_number(stripped):
+        return None
+    tokens = frozenset(token for _start, _end, token in spans)
+    has_percent = "%" in tokens
+    numeric = stripped.replace(",", "")
+    if has_percent:
+        return numeric, tokens, True
+    return numeric, tokens, False
+
+
+def _infer_numeric_duckdb_type(values: Sequence[str]) -> str:
+    non_empty = [str(value).strip() for value in values if str(value).strip()]
+    if not non_empty:
+        return "VARCHAR"
+    try:
+        if all("." not in value and "e" not in value.lower() for value in non_empty) and all(
+            int(value) for value in non_empty
+        ):
+            return "INTEGER"
+    except ValueError:
+        pass
+    try:
+        if all(float(value) for value in non_empty):
+            return "DOUBLE"
+    except ValueError:
+        pass
+    return "VARCHAR"
+
+
+def _plan_scalar_affix_column(samples: Sequence[str]) -> ScalarAffixColumnPlan | None:
+    non_empty = [str(value).strip() for value in samples if str(value).strip()]
+    if not non_empty:
+        return None
+    currency_tokens: set[str] = set()
+    has_percent = False
+    stripped_values: list[str] = []
+    for value in non_empty:
+        parsed = _parse_scalar_affix_cell(value)
+        if parsed is None:
+            return None
+        numeric, tokens, cell_has_percent = parsed
+        currency_tokens.update(token for token in tokens if token in UPLOAD_CURRENCY_AFFIX_TOKENS)
+        has_percent = has_percent or cell_has_percent or "%" in tokens
+        if has_percent and not cell_has_percent and "%" not in tokens and _is_bare_scalar_number(value):
+            try:
+                fraction = float(numeric)
+            except ValueError:
+                return None
+            if not 0 <= fraction <= 1:
+                return None
+        stripped_values.append(numeric)
+    if len(currency_tokens) > 1:
+        return None
+    duckdb_type = _infer_numeric_duckdb_type(stripped_values)
+    if duckdb_type == "VARCHAR":
+        return None
+    if currency_tokens:
+        unit_label = sorted(currency_tokens, key=len, reverse=True)[0]
+    elif has_percent:
+        unit_label = "%"
+    else:
+        return None
+    return ScalarAffixColumnPlan(
+        duckdb_type=duckdb_type,
+        unit_label=unit_label,
+        has_percent=has_percent,
+    )
+
+
+def _strip_scalar_affix_cell(value: str, plan: ScalarAffixColumnPlan) -> str:
+    parsed = _parse_scalar_affix_cell(value)
+    if parsed is None:
+        return value
+    numeric, _tokens, _cell_has_percent = parsed
+    if plan.has_percent and "%" not in value and _is_bare_scalar_number(value):
+        try:
+            fraction = float(numeric)
+        except ValueError:
+            return numeric
+        if 0 <= fraction <= 1:
+            return numeric
+    return numeric
+
+
+def infer_duckdb_column_type(samples: Sequence[str]) -> str:
     non_empty = [str(v).strip() for v in samples if str(v).strip()]
     if not non_empty:
         return "VARCHAR"
+    affix_plan = _plan_scalar_affix_column(non_empty)
+    if affix_plan is not None:
+        return affix_plan.duckdb_type
+    temporal_kinds = {_temporal_sample_kind(value) for value in non_empty}
+    temporal_kinds.discard(None)
+    if temporal_kinds:
+        if any(_temporal_sample_kind(value) is None for value in non_empty):
+            return "VARCHAR"
+        if temporal_kinds == {"date"}:
+            return "DATE"
+        return "TIMESTAMP"
     if all(v.lower() in ("1", "0", "true", "false", "t", "f", "yes", "no") for v in non_empty):
         return "BOOLEAN"
     try:
@@ -1915,6 +2264,7 @@ def _make_issue(
         code=resolved_code,
         message=message,
         details=tuple(details),
+        phase="data_quality",
     )
 
 
@@ -1946,18 +2296,763 @@ def _build_narrative(paths: Sequence[Path], issues: Sequence[Diagnostic], *, ok:
     )
 
 
-def inspect_tabular_upload(
-    path: str | os.PathLike[str] | Path,
+def _upload_file_content_seed(path: Path) -> int:
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    return int(digest[:8], 16)
+
+
+def _relation_column_name_for_label(relation: PreparedRelation, label: str) -> str | None:
+    labels = relation.original_column_labels
+    names = relation.columns
+    for idx, header_label in enumerate(labels):
+        if header_label == label:
+            return names[idx]
+    if label in names:
+        return label
+    return None
+
+
+def _relation_label_for_column_name(relation: PreparedRelation, column_name: str) -> str:
+    names = relation.columns
+    labels = relation.original_column_labels
+    for idx, name in enumerate(names):
+        if name == column_name:
+            return labels[idx]
+    return column_name
+
+
+def _relation_column_values(relation: PreparedRelation, column_name: str) -> list[str]:
+    return [str(row.get(column_name, "")) for row in relation.rows]
+
+
+def _column_distinct_values(values: Sequence[str]) -> tuple[str, ...]:
+    seen: list[str] = []
+    observed: set[str] = set()
+    for value in values:
+        text = str(value).strip()
+        if not text or text in observed:
+            continue
+        observed.add(text)
+        seen.append(text)
+    return tuple(seen)
+
+
+def _build_upload_sample_payload(
+    grid: SheetGrid,
+    path: Path,
     *,
+    max_rows: int,
+    include_distinct_values: bool,
+) -> dict[str, Any]:
+    header_labels = list(grid.cells[0]) if grid.cells else []
+    data_rows = list(grid.cells[1:])
+    seed = _upload_file_content_seed(path)
+    rng = random.Random(seed)
+    indices = list(range(len(data_rows)))
+    rng.shuffle(indices)
+    chosen = indices[:max_rows]
+    sample_rows: list[dict[str, str]] = []
+    for row_idx in chosen:
+        row = _pad_row(data_rows[row_idx], len(header_labels))
+        sample_rows.append({header_labels[col_idx]: row[col_idx] for col_idx in range(len(header_labels))})
+    payload: dict[str, Any] = {
+        "header_labels": header_labels,
+        "sample_rows": sample_rows,
+        "location": _grid_location_prefix(grid),
+    }
+    if include_distinct_values:
+        column_distinct_values: dict[str, list[str]] = {}
+        for col_idx, label in enumerate(header_labels):
+            values = []
+            for row in data_rows:
+                padded = _pad_row(row, len(header_labels))
+                value = padded[col_idx] if col_idx < len(padded) else ""
+                if str(value).strip():
+                    values.append(str(value))
+            distinct = _column_distinct_values(values)
+            if distinct and len(distinct) <= UPLOAD_BAND_VALUE_MAP_MAX_DISTINCT:
+                column_distinct_values[label] = list(distinct)
+        payload["column_distinct_values"] = column_distinct_values
+    return payload
+
+
+def _build_upload_column_transform_payload(grid: SheetGrid, path: Path) -> dict[str, Any]:
+    payload = _build_upload_sample_payload(
+        grid,
+        path,
+        max_rows=UPLOAD_SAMPLE_MAX_ROWS,
+        include_distinct_values=True,
+    )
+    payload["upload_transform_ids"] = list(UPLOAD_COLUMN_TRANSFORM_IDS)
+    payload["column_transforms_schema"] = UPLOAD_COLUMN_TRANSFORMS_SCHEMA
+    return payload
+
+
+def _build_upload_interpret_payload(grid: SheetGrid, path: Path) -> dict[str, Any]:
+    payload = _build_upload_sample_payload(
+        grid,
+        path,
+        max_rows=UPLOAD_INTERPRET_MAX_ROWS,
+        include_distinct_values=False,
+    )
+    payload["upload_interpret_schema"] = UPLOAD_INTERPRET_SCHEMA
+    return payload
+
+
+def _llm_upload_interpret(payload: Mapping[str, Any]) -> dict[str, Any]:
+    body = stable_json(dict(payload))
+    try:
+        response = LLMProvider.json(UPLOAD_INTERPRET_SYSTEM, body, retries=0, task="upload_interpret")
+    except Exception as exc:
+        debug(f"[data_quality._llm_upload_interpret] llm unavailable: {exc!r}")
+        return {}
+    out: dict[str, Any] = {}
+    header_row = response.get("header_row")
+    if header_row is not None:
+        out["header_row"] = int(header_row)
+    table_range = str(response.get("table_range", "")).strip()
+    if table_range:
+        out["table_range"] = table_range
+    append_raw = response.get("append_regions")
+    if isinstance(append_raw, Sequence) and not isinstance(append_raw, (str, bytes)):
+        append_regions = [str(item).strip() for item in append_raw if str(item).strip()]
+        if append_regions:
+            out["append_regions"] = append_regions
+    merge_raw = response.get("merge_regions")
+    if isinstance(merge_raw, Sequence) and not isinstance(merge_raw, (str, bytes)):
+        merge_regions = [str(item).strip() for item in merge_raw if str(item).strip()]
+        if merge_regions:
+            out["merge_regions"] = merge_regions
+    return out
+
+
+def _normalize_column_transform(raw: Mapping[str, Any]) -> dict[str, Any] | None:
+    transform_id = str(raw.get("transform_id", "")).strip()
+    if transform_id not in UPLOAD_COLUMN_TRANSFORM_IDS:
+        return None
+    params_raw = raw.get("params", {})
+    params = dict(params_raw) if isinstance(params_raw, Mapping) else {}
+    requires_review = bool(raw.get("requires_review", False))
+    if transform_id in REVIEW_GATED_UPLOAD_COLUMN_TRANSFORMS:
+        requires_review = True
+    normalized: dict[str, Any] = {
+        "transform_id": transform_id,
+        "requires_review": requires_review,
+        "params": params,
+    }
+    column = str(raw.get("column", "")).strip()
+    if column:
+        normalized["column"] = column
+    return normalized
+
+
+def _llm_upload_column_transforms(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    body = stable_json(dict(payload))
+    try:
+        response = LLMProvider.json(
+            UPLOAD_COLUMN_TRANSFORMS_SYSTEM,
+            body,
+            retries=0,
+            task="upload_column_transforms",
+        )
+    except Exception as exc:
+        debug(f"[data_quality._llm_upload_column_transforms] llm unavailable: {exc!r}")
+        return []
+    raw_transforms = response.get("column_transforms", [])
+    if not isinstance(raw_transforms, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in raw_transforms:
+        if not isinstance(item, Mapping):
+            continue
+        normalized = _normalize_column_transform(item)
+        if normalized is not None:
+            out.append(normalized)
+    return out
+
+
+def _llm_upload_summary_narrative(
+    paths: Sequence[Path],
+    issues: Sequence[Diagnostic],
+    suggested: Mapping[str, Mapping[str, Any]],
+    *,
+    ok: bool,
+    fallback: str,
+) -> str:
+    issue_rows: list[dict[str, str]] = []
+    for issue in issues:
+        issue_rows.append(
+            {
+                "code": issue.code,
+                "message": issue.message,
+                "level": issue.level,
+            }
+        )
+    payload = stable_json(
+        {
+            "paths": [path.name for path in paths],
+            "ok": ok,
+            "issues": issue_rows,
+            "suggested_selections": dict(suggested),
+            "upload_summary_schema": UPLOAD_SUMMARY_SCHEMA,
+        }
+    )
+    try:
+        response = LLMProvider.json(UPLOAD_SUMMARY_SYSTEM, payload, retries=0, task="upload_summary")
+    except Exception as exc:
+        debug(f"[data_quality._llm_upload_summary_narrative] llm unavailable: {exc!r}")
+        return fallback
+    summary = str(response.get("summary", "")).strip()
+    return summary or fallback
+
+
+def _enrich_suggested_selections_with_column_transforms(
+    paths: Sequence[Path],
+    selections: Mapping[str, CsvSourceSelection],
+    suggested: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    out = dict(suggested)
+    for path in paths:
+        selection = selections.get(path.name)
+        if selection and selection.column_transforms:
+            continue
+        try:
+            grids = load_source_grids(path, selection=selection)
+        except ValueError:
+            continue
+        for grid in grids:
+            normalized = normalize_grid(grid, normalize_cell_newlines=True)
+            working = normalized
+            working, _ = apply_structural_fixes(working)
+            region_iter, region_issues = _regions_for_grid(working, selection)
+            if any(_issue_is_blocking(issue) for issue in region_issues):
+                continue
+            for region_grid, _region_index, _region_count in region_iter:
+                issues = detect_grid_issues(region_grid)
+                if any(_issue_is_blocking(issue) for issue in issues):
+                    continue
+                entry = dict(out.get(path.name, {}))
+                if PolicyConfig.TABULAR_LLM_ASSIST and selection is None:
+                    interpret_payload = _build_upload_interpret_payload(region_grid, path)
+                    interpret_hints = _llm_upload_interpret(interpret_payload)
+                    for key, value in interpret_hints.items():
+                        entry.setdefault(key, value)
+                payload = _build_upload_column_transform_payload(region_grid, path)
+                proposals = _llm_upload_column_transforms(payload)
+                review_transforms = [item for item in proposals if item.get("requires_review")]
+                if review_transforms:
+                    entry["column_transforms"] = review_transforms
+                if entry:
+                    out[path.name] = entry
+    return out
+
+
+def _notify_transform_rejected(transform_id: str, relation: PreparedRelation, reason: str) -> None:
+    notify(
+        f"Rejected upload column transform {transform_id!r}: {reason}",
+        stage="data_quality",
+        code=DIAGNOSTIC_CODE_UPLOAD_TRANSFORM_REJECTED,
+        level="info",
+        details=(
+            ("transform_id", transform_id),
+            ("relation", relation.relation_name),
+            ("reason", reason),
+        ),
+    )
+
+
+def _notify_transform_applied(transform_id: str, relation: PreparedRelation) -> None:
+    notify(
+        f"Applied upload column transform {transform_id!r} on relation {relation.relation_name!r}.",
+        stage="data_quality",
+        code=DIAGNOSTIC_CODE_UPLOAD_TRANSFORM_APPLIED,
+        level="info",
+        details=(
+            ("transform_id", transform_id),
+            ("relation", relation.relation_name),
+        ),
+    )
+
+
+def _verify_proposed_affix_strip(values: Sequence[str], affix_token: str) -> bool:
+    if not affix_token:
+        return False
+    for value in values:
+        text = str(value).strip()
+        if not text:
+            continue
+        if _is_bare_scalar_number(text):
+            continue
+        if text.startswith(affix_token):
+            remainder = text[len(affix_token) :].strip().replace(",", "")
+            if not _is_bare_scalar_number(remainder):
+                return False
+            continue
+        return False
+    return True
+
+
+def _apply_proposed_affix_strip(value: str, affix_token: str) -> str:
+    text = str(value).strip()
+    if not text:
+        return ""
+    if _is_bare_scalar_number(text):
+        return text.replace(",", "")
+    if text.startswith(affix_token):
+        remainder = text[len(affix_token) :].strip().replace(",", "")
+        return remainder
+    return value
+
+
+def _verify_band_value_map(values: Sequence[str], value_map: Mapping[str, str]) -> bool:
+    if not value_map:
+        return False
+    for value in values:
+        text = str(value).strip()
+        if not text:
+            continue
+        if text not in value_map:
+            return False
+    return True
+
+
+def _verify_keep_canonical_columns(
+    relation: PreparedRelation, canonical_label: str, alias_labels: Sequence[str]
+) -> bool:
+    canonical_name = _relation_column_name_for_label(relation, canonical_label)
+    if canonical_name is None:
+        return False
+    alias_names: list[str] = []
+    for label in alias_labels:
+        name = _relation_column_name_for_label(relation, label)
+        if name is None:
+            return False
+        alias_names.append(name)
+    canon_to_alias: dict[str, str] = {}
+    alias_to_canon: dict[str, str] = {}
+    for row in relation.rows:
+        canonical_value = str(row.get(canonical_name, "")).strip()
+        for alias_name in alias_names:
+            alias_value = str(row.get(alias_name, "")).strip()
+            if not canonical_value and not alias_value:
+                continue
+            if canonical_value in canon_to_alias and canon_to_alias[canonical_value] != alias_value:
+                return False
+            canon_to_alias[canonical_value] = alias_value
+            if alias_value in alias_to_canon and alias_to_canon[alias_value] != canonical_value:
+                return False
+            alias_to_canon[alias_value] = canonical_value
+    return True
+
+
+def _verify_derive_by_pattern(relation: PreparedRelation, params: Mapping[str, Any]) -> bool:
+    source_label = str(params.get("source_column", "")).strip()
+    target_label = str(params.get("target_column", "")).strip()
+    pattern_text = str(params.get("pattern", "")).strip()
+    if not source_label or not target_label or not pattern_text:
+        return False
+    source_name = _relation_column_name_for_label(relation, source_label)
+    target_name = _relation_column_name_for_label(relation, target_label)
+    if source_name is None or target_name is None:
+        return False
+    try:
+        pattern = re.compile(pattern_text)
+    except re.error:
+        return False
+    for row in relation.rows:
+        source_value = str(row.get(source_name, "")).strip()
+        if not source_value:
+            continue
+        match = pattern.search(source_value)
+        if match is None:
+            return False
+        if match.lastindex:
+            derived = match.group(1)
+        else:
+            derived = match.group(0)
+        if not str(derived).strip():
+            return False
+    return True
+
+
+def _verify_null_tokens(values: Sequence[str], tokens: Sequence[str]) -> bool:
+    token_set = {str(token).strip().lower() for token in tokens if str(token).strip()}
+    if not token_set:
+        return False
+    return True
+
+
+def _verify_drop_empty_columns(relation: PreparedRelation, labels: Sequence[str]) -> bool:
+    for label in labels:
+        column_name = _relation_column_name_for_label(relation, label)
+        if column_name is None:
+            return False
+        if any(str(row.get(column_name, "")).strip() for row in relation.rows):
+            return False
+    return bool(labels)
+
+
+def _verify_parse_temporal(values: Sequence[str], date_format: str) -> bool:
+    if not date_format:
+        return False
+    for value in values:
+        text = str(value).strip()
+        if not text:
+            continue
+        try:
+            datetime.strptime(text, date_format)
+        except ValueError:
+            return False
+    return True
+
+
+def _verify_column_transform(relation: PreparedRelation, transform: Mapping[str, Any]) -> bool:
+    transform_id = str(transform.get("transform_id", ""))
+    params = transform.get("params", {})
+    if not isinstance(params, Mapping):
+        params = {}
+    column_label = str(transform.get("column", "")).strip()
+    if transform_id == UploadColumnTransformId.STRIP_NUMERIC_AFFIX.value:
+        column_name = _relation_column_name_for_label(relation, column_label)
+        if column_name is None:
+            return False
+        affix_token = str(params.get("affix_token", ""))
+        return _verify_proposed_affix_strip(_relation_column_values(relation, column_name), affix_token)
+    if transform_id == UploadColumnTransformId.BAND_VALUE_MAP.value:
+        column_name = _relation_column_name_for_label(relation, column_label)
+        if column_name is None:
+            return False
+        value_map_raw = params.get("value_map", {})
+        if not isinstance(value_map_raw, Mapping):
+            return False
+        value_map = {str(key): str(value) for key, value in value_map_raw.items()}
+        distinct_count = len(_column_distinct_values(_relation_column_values(relation, column_name)))
+        if distinct_count > UPLOAD_BAND_VALUE_MAP_MAX_DISTINCT:
+            return False
+        return _verify_band_value_map(_relation_column_values(relation, column_name), value_map)
+    if transform_id == UploadColumnTransformId.KEEP_CANONICAL_COLUMNS.value:
+        canonical_label = str(params.get("canonical_column", "")).strip()
+        alias_raw = params.get("alias_columns", ())
+        alias_labels = (
+            [str(item).strip() for item in alias_raw]
+            if isinstance(alias_raw, Sequence) and not isinstance(alias_raw, (str, bytes))
+            else []
+        )
+        return _verify_keep_canonical_columns(relation, canonical_label, alias_labels)
+    if transform_id == UploadColumnTransformId.DERIVE_BY_PATTERN.value:
+        return _verify_derive_by_pattern(relation, params)
+    if transform_id == UploadColumnTransformId.NULL_TOKENS.value:
+        column_name = _relation_column_name_for_label(relation, column_label)
+        if column_name is None:
+            return False
+        tokens_raw = params.get("tokens", ())
+        tokens = (
+            [str(item) for item in tokens_raw]
+            if isinstance(tokens_raw, Sequence) and not isinstance(tokens_raw, (str, bytes))
+            else []
+        )
+        return _verify_null_tokens(_relation_column_values(relation, column_name), tokens)
+    if transform_id == UploadColumnTransformId.DROP_EMPTY_COLUMNS.value:
+        labels_raw = params.get("columns", ())
+        labels = (
+            [str(item).strip() for item in labels_raw]
+            if isinstance(labels_raw, Sequence) and not isinstance(labels_raw, (str, bytes))
+            else []
+        )
+        return _verify_drop_empty_columns(relation, labels)
+    if transform_id == UploadColumnTransformId.PARSE_TEMPORAL.value:
+        column_name = _relation_column_name_for_label(relation, column_label)
+        if column_name is None:
+            return False
+        date_format = str(params.get("date_format", "")).strip()
+        return _verify_parse_temporal(_relation_column_values(relation, column_name), date_format)
+    return False
+
+
+def _apply_column_transform(relation: PreparedRelation, transform: Mapping[str, Any]) -> PreparedRelation:
+    transform_id = str(transform.get("transform_id", ""))
+    params = transform.get("params", {})
+    if not isinstance(params, Mapping):
+        params = {}
+    column_label = str(transform.get("column", "")).strip()
+    rows = [dict(row) for row in relation.rows]
+    columns = list(relation.columns)
+    labels = list(relation.original_column_labels)
+    types = list(relation.column_types)
+    unit_labels = list(relation.column_unit_labels)
+    name_to_index = {name: idx for idx, name in enumerate(columns)}
+
+    if transform_id == UploadColumnTransformId.STRIP_NUMERIC_AFFIX.value:
+        column_name = _relation_column_name_for_label(relation, column_label)
+        if column_name is None:
+            return relation
+        affix_token = str(params.get("affix_token", ""))
+        for row in rows:
+            row[column_name] = _apply_proposed_affix_strip(row.get(column_name, ""), affix_token)
+        col_idx = name_to_index[column_name]
+        samples = [str(row[column_name]) for row in rows if str(row[column_name]).strip()]
+        types[col_idx] = _infer_numeric_duckdb_type(samples)
+        unit_labels[col_idx] = affix_token
+    elif transform_id == UploadColumnTransformId.BAND_VALUE_MAP.value:
+        column_name = _relation_column_name_for_label(relation, column_label)
+        if column_name is None:
+            return relation
+        value_map_raw = params.get("value_map", {})
+        value_map = (
+            {str(key): str(value) for key, value in value_map_raw.items()} if isinstance(value_map_raw, Mapping) else {}
+        )
+        for row in rows:
+            raw = str(row.get(column_name, "")).strip()
+            row[column_name] = value_map.get(raw, raw)
+    elif transform_id == UploadColumnTransformId.KEEP_CANONICAL_COLUMNS.value:
+        _canonical_label = str(params.get("canonical_column", "")).strip()
+        alias_raw = params.get("alias_columns", ())
+        alias_labels = (
+            [str(item).strip() for item in alias_raw]
+            if isinstance(alias_raw, Sequence) and not isinstance(alias_raw, (str, bytes))
+            else []
+        )
+        drop_names = []
+        for alias_label in alias_labels:
+            alias_name = _relation_column_name_for_label(relation, alias_label)
+            if alias_name is not None:
+                drop_names.append(alias_name)
+        keep_indices = [idx for idx, name in enumerate(columns) if name not in drop_names]
+        columns = [columns[idx] for idx in keep_indices]
+        labels = [labels[idx] for idx in keep_indices]
+        types = [types[idx] for idx in keep_indices]
+        unit_labels = [unit_labels[idx] for idx in keep_indices]
+        for row in rows:
+            for drop_name in drop_names:
+                row.pop(drop_name, None)
+    elif transform_id == UploadColumnTransformId.DERIVE_BY_PATTERN.value:
+        source_label = str(params.get("source_column", "")).strip()
+        target_label = str(params.get("target_column", "")).strip()
+        pattern_text = str(params.get("pattern", "")).strip()
+        source_name = _relation_column_name_for_label(relation, source_label)
+        target_name = _relation_column_name_for_label(relation, target_label)
+        if source_name is None or target_name is None:
+            return relation
+        pattern = re.compile(pattern_text)
+        for row in rows:
+            source_value = str(row.get(source_name, "")).strip()
+            if not source_value:
+                row[target_name] = ""
+                continue
+            match = pattern.search(source_value)
+            if match is None:
+                continue
+            row[target_name] = match.group(1) if match.lastindex else match.group(0)
+    elif transform_id == UploadColumnTransformId.NULL_TOKENS.value:
+        column_name = _relation_column_name_for_label(relation, column_label)
+        if column_name is None:
+            return relation
+        tokens_raw = params.get("tokens", ())
+        tokens = (
+            {str(item).strip().lower() for item in tokens_raw if str(item).strip()}
+            if isinstance(tokens_raw, Sequence) and not isinstance(tokens_raw, (str, bytes))
+            else set()
+        )
+        for row in rows:
+            raw = str(row.get(column_name, "")).strip()
+            if raw.lower() in tokens:
+                row[column_name] = ""
+    elif transform_id == UploadColumnTransformId.DROP_EMPTY_COLUMNS.value:
+        labels_raw = params.get("columns", ())
+        drop_labels = (
+            [str(item).strip() for item in labels_raw]
+            if isinstance(labels_raw, Sequence) and not isinstance(labels_raw, (str, bytes))
+            else []
+        )
+        drop_names = []
+        for label in drop_labels:
+            name = _relation_column_name_for_label(relation, label)
+            if name is not None:
+                drop_names.append(name)
+        keep_indices = [idx for idx, name in enumerate(columns) if name not in drop_names]
+        columns = [columns[idx] for idx in keep_indices]
+        labels = [labels[idx] for idx in keep_indices]
+        types = [types[idx] for idx in keep_indices]
+        unit_labels = [unit_labels[idx] for idx in keep_indices]
+        for row in rows:
+            for drop_name in drop_names:
+                row.pop(drop_name, None)
+    elif transform_id == UploadColumnTransformId.PARSE_TEMPORAL.value:
+        column_name = _relation_column_name_for_label(relation, column_label)
+        if column_name is None:
+            return relation
+        date_format = str(params.get("date_format", "")).strip()
+        col_idx = name_to_index[column_name]
+        for row in rows:
+            raw = str(row.get(column_name, "")).strip()
+            if not raw:
+                continue
+            parsed = datetime.strptime(raw, date_format)
+            if date_format.endswith("%H:%M:%S") or "%H" in date_format:
+                row[column_name] = parsed.strftime("%Y-%m-%dT%H:%M:%S")
+                types[col_idx] = "TIMESTAMP"
+            else:
+                row[column_name] = parsed.date().isoformat()
+                types[col_idx] = "DATE"
+
+    return PreparedRelation(
+        relation_name=relation.relation_name,
+        source_path=relation.source_path,
+        sheet_name=relation.sheet_name,
+        original_table_label=relation.original_table_label,
+        columns=tuple(columns),
+        original_column_labels=tuple(labels),
+        column_types=tuple(types),
+        column_unit_labels=tuple(unit_labels),
+        rows=tuple(rows),
+    )
+
+
+def _apply_column_transforms_on_relation(
+    relation: PreparedRelation,
+    transforms: Sequence[Mapping[str, Any]],
+) -> PreparedRelation:
+    current = relation
+    for transform in transforms:
+        transform_id = str(transform.get("transform_id", ""))
+        if not _verify_column_transform(current, transform):
+            _notify_transform_rejected(transform_id, current, "full-column verification failed")
+            continue
+        current = _apply_column_transform(current, transform)
+        _notify_transform_applied(transform_id, current)
+    return current
+
+
+def _pending_column_transforms_for_relation(
+    region_grid: SheetGrid,
+    path: Path,
+    selection: CsvSourceSelection | None,
+) -> list[dict[str, Any]]:
+    if selection and selection.column_transforms:
+        out: list[dict[str, Any]] = []
+        for item in selection.column_transforms:
+            normalized = _normalize_column_transform(item)
+            if normalized is not None:
+                out.append(normalized)
+        return out
+    if not PolicyConfig.TABULAR_LLM_ASSIST:
+        return []
+    payload = _build_upload_column_transform_payload(region_grid, path)
+    proposals = _llm_upload_column_transforms(payload)
+    return [item for item in proposals if not item.get("requires_review")]
+
+
+def _finalize_prepared_relation(
+    relation: PreparedRelation,
+    *,
+    region_grid: SheetGrid,
+    selection: CsvSourceSelection | None,
+) -> PreparedRelation:
+    transforms = _pending_column_transforms_for_relation(region_grid, relation.source_path, selection)
+    if not transforms:
+        return relation
+    return _apply_column_transforms_on_relation(relation, transforms)
+
+
+def _infer_upload_suffix(data: bytes, filename: str | None) -> str:
+    if filename:
+        suffix = Path(filename).suffix.lower()
+        if suffix in {".csv", ".xlsx"}:
+            return suffix
+    if data.startswith(b"PK\x03\x04"):
+        return ".xlsx"
+    return ".csv"
+
+
+def _upload_engine_limits() -> EngineLimits:
+    try:
+        return active_engine_limits()
+    except RuntimeError:
+        return EngineLimits()
+
+
+def _enforce_upload_byte_limit(size: int) -> None:
+    max_bytes = _upload_engine_limits().max_upload_bytes
+    if size > max_bytes:
+        raise ConfigError(f"upload size {size} bytes exceeds max_upload_bytes ({max_bytes})")
+
+
+def _read_upload_source_bytes(source: IO[bytes] | IO[str]) -> bytes:
+    if hasattr(source, "seek"):
+        try:
+            source.seek(0)
+        except (OSError, io.UnsupportedOperation):
+            pass
+    payload = source.read()
+    if isinstance(payload, str):
+        data = payload.encode("utf-8")
+    else:
+        data = bytes(payload)
+    _enforce_upload_byte_limit(len(data))
+    return data
+
+
+def _upload_display_name(data: bytes, filename: str | None) -> str:
+    suffix = _infer_upload_suffix(data, filename)
+    if filename:
+        display_name = Path(filename).name
+        if not display_name:
+            display_name = f"upload{suffix}"
+    else:
+        display_name = f"upload{suffix}"
+    if not display_name.lower().endswith(suffix):
+        display_name = f"{Path(display_name).stem}{suffix}"
+    return display_name
+
+
+def _materialize_upload_bytes(data: bytes, filename: str | None) -> tuple[Path, Path]:
+    _enforce_upload_byte_limit(len(data))
+    display_name = _upload_display_name(data, filename)
+    temp_dir = Path(tempfile.mkdtemp(prefix=".aetherdialect_upload_"))
+    temp_path = temp_dir / display_name
+    temp_path.write_bytes(data)
+    return temp_path, temp_dir
+
+
+def _resolve_tabular_upload_path(
+    source: str | os.PathLike[str] | bytes | bytearray | memoryview | IO[bytes] | IO[str],
+    *,
+    filename: str | None = None,
+) -> tuple[Path, Path | None]:
+    """Return ``(resolved_path, temp_dir_to_cleanup)`` for one upload source."""
+    if isinstance(source, (str, os.PathLike)):
+        return Path(os.fspath(source)), None
+    if isinstance(source, (bytes, bytearray, memoryview)):
+        return _materialize_upload_bytes(bytes(source), filename)
+    if hasattr(source, "read"):
+        upload_name = filename
+        if upload_name is None:
+            obj_name = getattr(source, "name", None)
+            if isinstance(obj_name, str) and obj_name and obj_name not in {"<stdin>", "<stdout>", "<stderr>"}:
+                upload_name = Path(obj_name).name
+        return _materialize_upload_bytes(_read_upload_source_bytes(source), upload_name)
+    raise TypeError(
+        "inspect_tabular_upload expects a path, bytes, or a readable file-like object",
+    )
+
+
+def inspect_tabular_upload(
+    source: str | os.PathLike[str] | bytes | bytearray | memoryview | IO[bytes] | IO[str],
+    *,
+    filename: str | None = None,
     log_sink: Callable[[str], None] | None = None,
 ) -> DataQualityReport:
     """Inspect one CSV or Excel upload without constructing an engine."""
-    resolved = Path(os.fspath(path))
-    report = validate_upload_sources((resolved,), log_sink=log_sink or (lambda _msg: None))
-    for issue in report.issues:
-        if _issue_severity(issue) == DATA_QUALITY_SEVERITY_FATAL:
-            raise ConfigError(issue.message)
-    return report
+    resolved, temp_dir = _resolve_tabular_upload_path(source, filename=filename)
+    try:
+        report = validate_upload_sources((resolved,), log_sink=log_sink or (lambda _msg: None))
+        for issue in report.issues:
+            if _issue_severity(issue) == DATA_QUALITY_SEVERITY_FATAL:
+                raise ConfigError(issue.message)
+        return report
+    finally:
+        if temp_dir is not None:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def _suggested_selections_from_issues(
@@ -2024,7 +3119,7 @@ def _llm_identifier(label: str, *, kind: str) -> str:
         }
     )
     try:
-        response = llm_json(CSV_IDENTIFIER_NAMING_SYSTEM, payload, retries=0, task="default")
+        response = LLMProvider.json(CSV_IDENTIFIER_NAMING_SYSTEM, payload, retries=0, task="default")
     except Exception as exc:
         debug(f"[data_quality._llm_identifier] llm unavailable: {exc!r}")
         return ""
@@ -2037,6 +3132,7 @@ def _llm_identifier(label: str, *, kind: str) -> str:
 def _workbook_has_multiple_sheets(path: Path) -> bool:
     if path.suffix.lower() != ".xlsx":
         return False
+    require_driver("csv")
     openpyxl = importlib.import_module("openpyxl")
     workbook = openpyxl.load_workbook(path, read_only=True)
     try:

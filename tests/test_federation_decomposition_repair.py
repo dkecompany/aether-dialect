@@ -20,7 +20,6 @@ from aetherdialect._contracts_base import (
     HavingParam,
     PredicateGroup,
     WhereParam,
-    predicate_group_from_list,
 )
 from aetherdialect._contracts_core import (
     ConcreteIntent,
@@ -44,15 +43,10 @@ from aetherdialect._federation import (
     save_federation_plan_template,
 )
 from aetherdialect._intent_process import NormalizedExpr
-from aetherdialect._main_execution import (
-    _complete_interactive_execute,
-    _run_sql_execution_for_gen_out,
-    _sql_execute_suspend_context,
-    _verify_federation_execute_resume,
-)
+from aetherdialect._main_execution import MainExecutionOps
 from aetherdialect._pipeline import replay_federated_prepare_from_plan_template
 from aetherdialect._schema_graph import recompute_join_paths_multi
-from aetherdialect._templates import empty_template_store
+from aetherdialect._templates import TemplateOps
 
 
 def _graph(table: str, *, source_id: str) -> SchemaGraph:
@@ -215,7 +209,7 @@ def test_verify_federation_execute_resume_rejects_plan_id_mismatch() -> None:
         federation_plan_id="other",
     )
     with pytest.raises(FederationInvariantError, match="plan id mismatch"):
-        _verify_federation_execute_resume(ctx)
+        MainExecutionOps._verify_federation_execute_resume(ctx)
 
 
 def test_run_sql_execution_for_gen_out_uses_federated_coordinator() -> None:
@@ -248,7 +242,7 @@ def test_run_sql_execution_for_gen_out_uses_federated_coordinator() -> None:
     owner._federation_storage_dir = None
     with patch("aetherdialect._main_execution.execute_federated_prepare") as mock_exec:
         mock_exec.return_value = MagicMock(rows=[(1,)], bundle=MagicMock())
-        rows, _bundle = _run_sql_execution_for_gen_out(
+        rows, _bundle = MainExecutionOps._run_sql_execution_for_gen_out(
             intent=sub_intent,
             exec_schema=composite,
             exec_dialect=MagicMock(),
@@ -289,7 +283,7 @@ def test_complete_interactive_execute_uses_suspend_federated_prepare() -> None:
     snap.schema_terms = set()
     snap.dialect = MagicMock()
     snap.schema = composite
-    ctx = _sql_execute_suspend_context(
+    ctx = MainExecutionOps._sql_execute_suspend_context(
         snap,
         "display",
         None,
@@ -308,9 +302,11 @@ def test_complete_interactive_execute_uses_suspend_federated_prepare() -> None:
     owner._federation_storage_dir = None
     session = MagicMock()
     session._owner = owner
-    with patch("aetherdialect._main_execution._run_sql_execution_for_gen_out", return_value=([(1,)], None)) as mock_run:
-        with patch("aetherdialect._main_execution._offer_sql_feedback_after_execute"):
-            _complete_interactive_execute(ctx, "y", choice_port=session)
+    with patch(
+        "aetherdialect._main_execution.MainExecutionOps._run_sql_execution_for_gen_out", return_value=([(1,)], None)
+    ) as mock_run:
+        with patch("aetherdialect._main_execution.MainExecutionOps._offer_sql_feedback_after_execute"):
+            MainExecutionOps._complete_interactive_execute(ctx, "y", choice_port=session)
     mock_run.assert_called_once()
     assert mock_run.call_args.kwargs["federated_prepare"] is fed_prep
 
@@ -352,7 +348,7 @@ def test_generate_and_validate_sql_rejects_unsupported_federation_filter_op() ->
         select_cols=[],
         group_by_cols=[],
         order_by_cols=[],
-        where=predicate_group_from_list(
+        where=PredicateGroup.from_list(
             [
                 WhereParam(
                     left_expr=NormalizedExpr.from_column("left_t.id"),
@@ -387,17 +383,39 @@ def test_cross_source_having_routes_to_residual() -> None:
         tables={
             "left_t": TableMetadata(
                 name="left_t",
-                columns={"id": ColumnMetadata(name="id", data_type="integer", sensitivity="none")},
+                columns={
+                    "id": ColumnMetadata(
+                        name="id",
+                        data_type="integer",
+                        sensitivity="none",
+                        is_primary_key=True,
+                        is_unique=True,
+                        row_count=10,
+                        distinct_count=10,
+                    )
+                },
                 primary_key=["id"],
                 foreign_keys=[],
                 source_id="a",
+                row_count=10,
             ),
             "right_t": TableMetadata(
                 name="right_t",
-                columns={"id": ColumnMetadata(name="id", data_type="integer", sensitivity="none")},
+                columns={
+                    "id": ColumnMetadata(
+                        name="id",
+                        data_type="integer",
+                        sensitivity="none",
+                        is_primary_key=True,
+                        is_unique=True,
+                        row_count=10,
+                        distinct_count=10,
+                    )
+                },
                 primary_key=["id"],
                 foreign_keys=[],
                 source_id="b",
+                row_count=10,
             ),
         },
         join_paths_multi={},
@@ -405,11 +423,11 @@ def test_cross_source_having_routes_to_residual() -> None:
     intent = RuntimeIntent(
         tables=["left_t", "right_t"],
         grain="grouped",
-        select_cols=[SelectCol(expr=NormalizedExpr.from_agg("count", "left_t.id"))],
+        select_cols=[SelectCol(expr=NormalizedExpr.from_agg("max", "left_t.id"))],
         group_by_cols=[NormalizedExpr.from_column("right_t.id")],
         order_by_cols=[],
         where=None,
-        having=predicate_group_from_list(
+        having=PredicateGroup.from_list(
             [
                 HavingParam(
                     left_expr=NormalizedExpr.from_column("left_t.id"),
@@ -586,7 +604,7 @@ def test_federation_residual_column_headers_from_select_cols() -> None:
 
 
 def test_insert_template_stamps_member_source_id() -> None:
-    from aetherdialect._templates import insert_template
+    from aetherdialect._templates import TemplateOps
 
     composite = _graph("left_t", source_id="a")
     intent = RuntimeIntent(
@@ -599,7 +617,7 @@ def test_insert_template_stamps_member_source_id() -> None:
     )
     store = {"templates": {}, "question_feedback": {}, "next_id": 1}
     templates: dict = {}
-    tmpl = insert_template(
+    tmpl = TemplateOps.insert_template(
         store,
         templates,
         composite,
@@ -643,7 +661,7 @@ def test_cross_source_join_feedback_routes_to_plan_store() -> None:
         )
         ctx.sql = "sql"
         ctx.schema = _graph("left_t", source_id="a")
-        ctx.store = empty_template_store("cg1")
+        ctx.store = TemplateOps.empty_template_store("cg1")
         ctx.templates = dict(ctx.store["templates"])
         ctx.rejected = {}
         ctx.q_norm = "q"
@@ -652,7 +670,7 @@ def test_cross_source_join_feedback_routes_to_plan_store() -> None:
         ctx.matched_rejected_template = None
         ctx.dialect = MagicMock()
         ctx.structural_match_templates = None
-        with patch("aetherdialect._pipeline.summarize_failure_for_memory") as mock_summary:
+        with patch("aetherdialect._templates.TemplateOps.summarize_failure_for_memory") as mock_summary:
             mock_summary.return_value = MagicMock(
                 summary="wrong declared join",
                 buckets=(RejectionBucket.WRONG_TABLES_OR_JOINS,),
@@ -681,10 +699,10 @@ def test_apply_federation_migration_remap_clears_plan_templates_and_writes_sidec
     )
 
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
-    mappings = FederationMappings(version=1)
+    mappings = FederationMappings(version="0.2.1")
     migration = parse_federation_migration_map(
         {
-            "version": 1,
+            "version": "1",
             "action": "remap",
             "qualified_column_renames": [
                 {"from": "left_t.id", "to": "left_t.identifier"},
@@ -804,7 +822,7 @@ def test_single_source_federated_intent_has_one_plan_step() -> None:
 @pytest.mark.fast
 def test_single_source_federated_plan_byte_identical_sql() -> None:
     """A one-node federated plan renders the same SQL as the standalone member engine."""
-    from aetherdialect._dialect import get_dialect
+    from aetherdialect._dialect import DialectRegistry
     from aetherdialect._federation import plan_federated_intent
     from aetherdialect._sql_gen import build_deterministic_sql
 
@@ -829,7 +847,7 @@ def test_single_source_federated_plan_byte_identical_sql() -> None:
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("left_t.id"))],
         group_by_cols=[],
         order_by_cols=[],
-        where=predicate_group_from_list(
+        where=PredicateGroup.from_list(
             [
                 WhereParam(
                     left_expr=NormalizedExpr.from_column("left_t.id"),
@@ -844,7 +862,7 @@ def test_single_source_federated_plan_byte_identical_sql() -> None:
     )
     plan = plan_federated_intent(intent, composite, manifest, member_graphs={"a": member_schema})
     assert len(plan.steps) == 1
-    dialect = get_dialect("duckdb")
+    dialect = DialectRegistry.get("duckdb")
     standalone_sql = build_deterministic_sql(intent, schema=member_schema, dialect=dialect)
     federated_sql = build_deterministic_sql(plan.steps[0].sub_intent, schema=member_schema, dialect=dialect)
     assert federated_sql == standalone_sql
@@ -861,7 +879,7 @@ def test_narrow_bind_map_for_sub_intent_keeps_referenced_keys_only() -> None:
         select_cols=[],
         group_by_cols=[],
         order_by_cols=[],
-        where=predicate_group_from_list(
+        where=PredicateGroup.from_list(
             [
                 WhereParam(
                     left_expr=NormalizedExpr.from_column("left_t.id"),
@@ -884,7 +902,7 @@ def test_narrow_bind_map_for_sub_intent_keeps_referenced_keys_only() -> None:
 def test_collect_param_slot_meta_includes_structural_keys() -> None:
     from aetherdialect._contracts_core import ConcreteIntent
     from aetherdialect._intent_expr import extract_structural_params
-    from aetherdialect._templates import _collect_param_slot_meta
+    from aetherdialect._templates import TemplateOps
 
     runtime = RuntimeIntent(
         tables=["left_t"],
@@ -908,7 +926,7 @@ def test_collect_param_slot_meta_includes_structural_keys() -> None:
         limit_param_key=tagged.limit_param_key,
         param_values=tagged.param_values,
     )
-    slots = _collect_param_slot_meta(intent_sig)
+    slots = TemplateOps._collect_param_slot_meta(intent_sig)
     assert tagged.limit_param_key in slots
 
 
@@ -924,7 +942,7 @@ def test_render_federation_residual_sql_binds_filter_values() -> None:
     )
     residual = ResidualSpec(
         select_cols=(SelectCol(expr=NormalizedExpr.from_column("left_t.id")),),
-        where=predicate_group_from_list([fp]),
+        where=PredicateGroup.from_list([fp]),
     )
     sql = render_federation_residual_sql(
         "SELECT * FROM src_a",
@@ -1026,7 +1044,7 @@ def test_unattributable_raw_sql_marks_plan_ineligible() -> None:
     )
 
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
-    mappings = FederationMappings(version=2)
+    mappings = FederationMappings(version="0.2.1")
     schema_a = _graph("left_t", source_id="a")
     schema_b = _graph("right_t", source_id="b")
     schema = SchemaGraph(
@@ -1056,8 +1074,18 @@ def test_probe_federation_member_connections_executes_select_one() -> None:
     mock_engine.dialect = "postgresql"
     mock_conn = MagicMock()
     mock_engine._execution_engine.connect.return_value.__enter__.return_value = mock_conn
+
+    def fake_execute(stmt: object) -> MagicMock:
+        sql = str(stmt)
+        result = MagicMock()
+        if "current_setting" in sql.lower():
+            result.fetchone.return_value = ("UTC",)
+        return result
+
+    mock_conn.execute.side_effect = fake_execute
     probe_federation_member_connections({"storefront": mock_engine})
-    mock_conn.execute.assert_called_once()
+    assert mock_conn.execute.call_count == 2
+    assert mock_engine._session_timezone == "UTC"
 
 
 def test_rewrite_logical_references_updates_cte_column_maps() -> None:
@@ -1067,7 +1095,7 @@ def test_rewrite_logical_references_updates_cte_column_maps() -> None:
 
     schema = _graph("left_t", source_id="a")
     mappings = FederationMappings(
-        version=2,
+        version="0.2.1",
         logical_tables=[
             LogicalTableMapping(
                 logical="left_t",
@@ -1269,7 +1297,7 @@ def test_extract_fuzzy_reuse_params_uses_intent_slots_not_sql() -> None:
         select_cols=[],
         group_by_cols=[],
         order_by_cols=[],
-        where=predicate_group_from_list(
+        where=PredicateGroup.from_list(
             [
                 WhereParam(
                     left_expr=NormalizedExpr.from_column("left_t.name"),
@@ -1304,7 +1332,7 @@ def test_extract_fuzzy_reuse_params_uses_intent_slots_not_sql() -> None:
         captured["user"] = user
         return '{"param_values": {"p1": "Comedy"}}'
 
-    with patch("aetherdialect._pipeline.llm_chat", side_effect=fake_llm_chat):
+    with patch("aetherdialect._pipeline.LLMProvider.chat", side_effect=fake_llm_chat):
         result = extract_fuzzy_reuse_params(
             "comedy films",
             template,
@@ -1398,7 +1426,7 @@ def test_execute_reuse_with_params_uses_federated_residual_headers() -> None:
         schema_graph_id="sg_a_left_t",
         effective_structural_hash="eff_a_left_t",
     )
-    store = empty_template_store(schema.schema_graph_id)
+    store = TemplateOps.empty_template_store(schema.schema_graph_id)
     with patch("aetherdialect._pipeline._run_sql_validation_cascade", return_value=(True, None, None, ())):
         with patch("aetherdialect._pipeline._should_prompt_direct_reuse_user", return_value=False):
             with patch("aetherdialect._pipeline.print_query_result") as mock_print:

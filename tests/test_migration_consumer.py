@@ -20,12 +20,7 @@ from aetherdialect._contracts_schema import (
 )
 from aetherdialect._core_utils import write_artifact_manifest
 from aetherdialect._templates import (
-    _load_partitioned_view_unlocked,
-    apply_migration_policy,
-    empty_template_store,
-    save_template_store,
-    template_store_dir_for_space,
-    templates_to_store,
+    TemplateOps,
 )
 
 
@@ -84,14 +79,14 @@ def _make_template(tid: str, table: str, column: str) -> Template:
 
 def _seed_store(artifacts_dir: str, schema: SchemaGraph, templates: dict[str, Template]) -> None:
     os.makedirs(artifacts_dir, exist_ok=True)
-    store_dir = template_store_dir_for_space(artifacts_dir, "master")
+    store_dir = TemplateOps.template_store_dir_for_space(artifacts_dir, "master")
     os.makedirs(store_dir, exist_ok=True)
     prev = EngineConfig.TEMPLATE_STORE_DIR
     EngineConfig.TEMPLATE_STORE_DIR = store_dir
     try:
-        store = empty_template_store("eff_old")
-        templates_to_store(store, templates)
-        save_template_store(store)
+        store = TemplateOps.empty_template_store("eff_old")
+        TemplateOps.templates_to_store(store, templates)
+        TemplateOps.save_template_store(store)
     finally:
         EngineConfig.TEMPLATE_STORE_DIR = prev
     write_artifact_manifest(
@@ -106,8 +101,8 @@ def _seed_store(artifacts_dir: str, schema: SchemaGraph, templates: dict[str, Te
 
 
 def _reload_store(artifacts_dir: str):
-    store_dir = template_store_dir_for_space(artifacts_dir, "master")
-    return _load_partitioned_view_unlocked(store_dir)
+    store_dir = TemplateOps.template_store_dir_for_space(artifacts_dir, "master")
+    return TemplateOps._load_partitioned_view_unlocked(store_dir)
 
 
 @pytest.mark.fast
@@ -117,7 +112,7 @@ def test_allow_destructive_false_blocks_surgical_drop(tmp_path) -> None:
     _seed_store(str(tmp_path), schema, {"T0001": t})
     diff = SchemaDiff(per_table={"orders": TableDiff(dropped_columns=("amount",))})
 
-    report = apply_migration_policy(str(tmp_path), schema, schema_diff=diff, allow_destructive=False)
+    report = TemplateOps.apply_migration_policy(str(tmp_path), schema, schema_diff=diff, allow_destructive=False)
 
     assert report.tier == MigrationTier.NO_CHANGE
     assert report.surgically_invalidated == 0
@@ -139,7 +134,7 @@ def test_allow_destructive_false_blocks_table_drop(tmp_path) -> None:
     _seed_store(str(tmp_path), schema, {"T0001": t_orders, "T0002": t_customers})
     diff = SchemaDiff(dropped_tables=("orders",))
 
-    report = apply_migration_policy(str(tmp_path), schema, schema_diff=diff, allow_destructive=False)
+    report = TemplateOps.apply_migration_policy(str(tmp_path), schema, schema_diff=diff, allow_destructive=False)
 
     assert report.tier == MigrationTier.NO_CHANGE
     assert report.surgically_invalidated == 0

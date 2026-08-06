@@ -9,14 +9,14 @@ import pytest
 
 from aetherdialect._contracts_base import SessionActiveError
 from aetherdialect._main_execution import PipelineSession
-from aetherdialect._templates import empty_template_store
+from aetherdialect._templates import TemplateOps
 
 
 def _session_owner() -> MagicMock:
     owner = MagicMock()
     owner._schema_graph = MagicMock()
     owner._schema_graph.effective_structural_hash = "test_hash"
-    owner._store = empty_template_store("test_hash")
+    owner._store = TemplateOps.empty_template_store("test_hash")
     owner._templates = {}
     owner._rejected = {}
     owner._schema_terms = set()
@@ -44,7 +44,7 @@ def test_concurrent_ask_raises_session_active_error() -> None:
         release_drive.wait(timeout=5)
 
     def run_ask() -> None:
-        with patch("aetherdialect._main_execution.interactive_run_once", side_effect=block_run):
+        with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once", side_effect=block_run):
             session.ask("question")
 
     def run_second_ask() -> None:
@@ -68,13 +68,13 @@ def test_concurrent_ask_raises_session_active_error() -> None:
 
 @pytest.mark.fast
 def test_reader_turn_holds_pipeline_lock() -> None:
-    """Reader-mode turns acquire the owner pipeline lock for synchronized reload."""
+    """Reader-mode turns reload learning without taking the owner pipeline writer lock."""
     owner = _session_owner()
     lock = MagicMock()
     owner._pipeline_writer_lock = lock
 
     session = PipelineSession(owner, mode="reader")
-    with patch("aetherdialect._main_execution.interactive_run_once"):
+    with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once"):
         session.ask("show rows")
 
-    lock.__enter__.assert_called_once()
+    lock.__enter__.assert_not_called()

@@ -106,9 +106,9 @@ def test_partition_seed_export_strips_cross_partition_foreign_keys() -> None:
 @pytest.mark.fast
 def test_default_federation_member_specs_list_four_partition_seeds(tmp_path: Path) -> None:
     from aetherdialect._constants import SANDBOX_BUNDLED_MEMBER_SEEDS
-    from aetherdialect._sandbox import _default_federation_member_specs
+    from aetherdialect._sandbox import Sandbox
 
     for _member_name, seed_name in SANDBOX_BUNDLED_MEMBER_SEEDS:
         (tmp_path / seed_name).write_text("-- stub", encoding="utf-8")
-    specs = _default_federation_member_specs(tmp_path)
+    specs = Sandbox._default_federation_member_specs(tmp_path)
     assert [name for name, _path in specs] == [name for name, _seed in SANDBOX_BUNDLED_MEMBER_SEEDS]

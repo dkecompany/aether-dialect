@@ -7,6 +7,8 @@ import json
 import math
 import os
 import random
+from collections.abc import Mapping
+from contextvars import ContextVar, Token
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta
 from itertools import combinations
@@ -39,9 +41,8 @@ from ._contracts_base import (
     ComplexityTier,
     DatabaseFeatureCapability,
     LlmJsonExhausted,
-    rebalance_complexity_target_proportions,
 )
-from ._contracts_core import feasible_features_for_capability
+from ._contracts_core import PipelineFeatureSpec
 from ._contracts_schema import (
     QSimHaving,
     QSimIntent,
@@ -52,14 +53,106 @@ from ._contracts_schema import (
     SkeletonLimits,
     SkeletonPool,
     ValueDomain,
-    classify_qsim_intent_complexity,
-    classify_qsim_skeleton_complexity,
-    qsim_intent_matches_target_tier,
 )
-from ._core_utils import artifact_lock, debug, intent_id, read_gzip_json, write_gzip_json_atomic
-from ._llm_provider import llm_json
+from ._core_utils import artifact_lock, debug, intent_id, read_gzip_json, stable_bucket, write_gzip_json_atomic
+from ._llm_provider import LLMProvider
 
-_SKELETON_CACHE: dict[tuple[str, frozenset[str]], list[QSimSkeleton]] = {}
+_active_qsim_engine_owner: ContextVar[object | None] = ContextVar("aetherdialect_qsim_engine_owner", default=None)
+_skeleton_cache: dict[tuple[str, frozenset[str]], list[QSimSkeleton]] = {}
+_engine_skeleton_caches: dict[int, dict[tuple[str, frozenset[str]], list[QSimSkeleton]]] = {0: _skeleton_cache}
+
+
+def register_engine_skeleton_cache_owner(owner: object) -> None:
+    """Attach an empty in-memory skeleton cache to *owner*."""
+    _engine_skeleton_caches[id(owner)] = {}
+
+
+def drop_engine_skeleton_cache_owner(owner: object) -> None:
+    """Drop the in-memory skeleton cache for *owner*."""
+    _engine_skeleton_caches.pop(id(owner), None)
+
+
+def push_qsim_engine_owner(owner: object) -> Token[object | None]:
+    """Bind *owner* as the active QSim cache scope for nested skeleton generation."""
+    return _active_qsim_engine_owner.set(owner)
+
+
+def pop_qsim_engine_owner(token: Token[object | None]) -> None:
+    """Restore the prior QSim cache owner after :func:`push_qsim_engine_owner`."""
+    _active_qsim_engine_owner.reset(token)
+
+
+def engine_skeleton_cache() -> dict[tuple[str, frozenset[str]], list[QSimSkeleton]]:
+    """Return the skeleton cache for the active engine owner (or process default)."""
+    owner = _active_qsim_engine_owner.get()
+    if owner is None:
+        return _skeleton_cache
+    return _engine_skeleton_caches.setdefault(id(owner), {})
+
+
+def clear_engine_skeleton_cache(owner: object | None = None) -> None:
+    """Clear skeleton cache entries for *owner*, the active owner, or the process default."""
+    target = owner if owner is not None else _active_qsim_engine_owner.get()
+    if target is None:
+        _skeleton_cache.clear()
+        return
+    _engine_skeleton_caches[id(target)] = {}
+
+
+def _tier_feasible_for_capability(tier_key: str, cap: DatabaseFeatureCapability) -> bool:
+    """Return whether a complexity tier remains achievable on this database snapshot."""
+    if cap.table_count <= 0:
+        return False
+    if tier_key == ComplexityTier.SIMPLE.value:
+        return True
+    if tier_key == ComplexityTier.MODERATE.value:
+        return cap.table_count >= 1
+    if tier_key == ComplexityTier.COMPLEX.value:
+        return (
+            cap.max_tables_on_any_join_path >= 3
+            or (cap.table_count >= 2 and cap.fk_edge_count >= 1)
+            or (cap.has_numeric_measures and cap.table_count >= 1)
+        )
+    if tier_key == ComplexityTier.HIGHLY_COMPLEX.value:
+        return (
+            cap.max_fk_chain_depth >= 2
+            or cap.has_self_referential_fk
+            or cap.max_tables_on_any_join_path >= 4
+            or (cap.max_tables_on_any_join_path >= 3 and cap.has_window_capable_table_sets)
+        )
+    return False
+
+
+def rebalance_complexity_target_proportions(
+    proportions: Mapping[str, float], cap: DatabaseFeatureCapability
+) -> dict[str, float]:
+    """Zero unreachable tier mass and renormalize remaining targets for QSim and warmup budgets."""
+    keys = [
+        ComplexityTier.SIMPLE.value,
+        ComplexityTier.MODERATE.value,
+        ComplexityTier.COMPLEX.value,
+        ComplexityTier.HIGHLY_COMPLEX.value,
+    ]
+    feas = {k: _tier_feasible_for_capability(k, cap) for k in keys}
+    raw_mass = sum(max(0.0, float(proportions.get(k, 0.0))) for k in keys if feas[k])
+    if raw_mass <= 0.0:
+        active = [k for k in keys if feas[k]]
+        if not active:
+            return {k: 0.25 for k in keys}
+        u = 1.0 / float(len(active))
+        return {k: (u if k in active else 0.0) for k in keys}
+    out: dict[str, float] = {}
+    for k in keys:
+        if feas[k]:
+            out[k] = max(0.0, float(proportions.get(k, 0.0))) / raw_mass
+        else:
+            out[k] = 0.0
+    s = sum(out.values())
+    if s <= 0.0:
+        active = [k for k in keys if feas[k]]
+        u = 1.0 / float(len(active))
+        return {k: (u if k in active else 0.0) for k in keys}
+    return {k: (v / s) for k, v in out.items()}
 
 
 def _skeleton_schema_key(schema: SchemaGraph) -> str:
@@ -83,7 +176,7 @@ def _skeleton_cache_for_schema(schema: SchemaGraph) -> dict[frozenset[str], list
     schema_key = _skeleton_schema_key(schema)
     return {
         table_key: skeletons
-        for (cached_schema_key, table_key), skeletons in _SKELETON_CACHE.items()
+        for (cached_schema_key, table_key), skeletons in engine_skeleton_cache().items()
         if cached_schema_key == schema_key
     }
 
@@ -119,7 +212,7 @@ def _store_skeleton_cache_entries(schema: SchemaGraph, skeletons_data: dict[str,
     for table_key_str, skel_list in skeletons_data.items():
         table_key = frozenset(table_key_str.split("|"))
         cache_key = _skeleton_cache_key(schema, list(table_key))
-        _SKELETON_CACHE[cache_key] = _deserialize_skeleton_entries(skel_list)
+        engine_skeleton_cache()[cache_key] = _deserialize_skeleton_entries(skel_list)
 
 
 def build_fk_adjacency(schema: SchemaGraph) -> dict[str, set[str]]:
@@ -315,12 +408,10 @@ def compute_intent_id(intent_dict: dict[str, Any]) -> str:
 
 def generate_all_skeletons(tables: list[str], schema: SchemaGraph, column_roles: dict[str, str]) -> list[QSimSkeleton]:
     """Generate all valid structural `QSimSkeleton` instances for a. table set."""
-    global _SKELETON_CACHE
-
     cache_key = _skeleton_cache_key(schema, tables)
-    if cache_key in _SKELETON_CACHE:
-        debug(f"[{QSIM_PHASE_B}]  cache_hit: {len(_SKELETON_CACHE[cache_key])} skeletons")
-        return _SKELETON_CACHE[cache_key]
+    if cache_key in engine_skeleton_cache():
+        debug(f"[{QSIM_PHASE_B}]  cache_hit: {len(engine_skeleton_cache()[cache_key])} skeletons")
+        return engine_skeleton_cache()[cache_key]
 
     limits = _compute_skeleton_limits(tables, schema, column_roles)
     max_where_predicates = limits.max_where_predicates
@@ -361,7 +452,7 @@ def generate_all_skeletons(tables: list[str], schema: SchemaGraph, column_roles:
                                     )
                                 )
 
-    _SKELETON_CACHE[cache_key] = skeletons
+    engine_skeleton_cache()[cache_key] = skeletons
 
     debug(
         f"[{QSIM_PHASE_B}]  created {len(skeletons)} skeletons for tables={tables}, max_where_predicates={max_where_predicates}, max_groupby={max_groupby}, max_having={max_having}"
@@ -373,8 +464,6 @@ def load_or_create_skeletons(
     schema: SchemaGraph, column_roles: dict[str, str]
 ) -> dict[frozenset[str], list[QSimSkeleton]]:
     """Load the skeleton cache from disk or generate and persist it."""
-    global _SKELETON_CACHE
-
     skeleton_path = QSimConfig.SKELETONS_JSON_PATH
     adir = os.path.dirname(os.path.abspath(skeleton_path))
     with artifact_lock(adir):
@@ -385,8 +474,6 @@ def _load_or_create_skeletons_locked(
     schema: SchemaGraph, column_roles: dict[str, str], skeleton_path: str
 ) -> dict[frozenset[str], list[QSimSkeleton]]:
     """Body of :func:`load_or_create_skeletons` executed under the artifacts-dir lock."""
-    global _SKELETON_CACHE
-
     if not PolicyConfig.REGENERATE_SKELETON_CACHE and os.path.exists(skeleton_path):
         try:
             cache_data = read_gzip_json(skeleton_path)
@@ -552,7 +639,7 @@ def _sample_categorical(domain: ValueDomain, variant_idx: int) -> str | None:
     """Pick a categorical value from `domain` by `variant_idx`."""
     values_list = domain.values
     if values_list:
-        base = hash(tuple(values_list)) % len(values_list)
+        base = stable_bucket(repr(tuple(values_list)), len(values_list))
         idx = (base + variant_idx) % len(values_list)
         return values_list[idx]
     if domain.min_val is not None and domain.max_val is not None:
@@ -1169,7 +1256,7 @@ def _tier_spec_lines(target: ComplexityTier) -> tuple[str, str]:
 
 def _advanced_feature_allowed(feature_id: str, cap: DatabaseFeatureCapability) -> bool:
     """Return whether an advanced feature remains plausible on this schema snapshot."""
-    return feature_id in feasible_features_for_capability(cap)
+    return feature_id in PipelineFeatureSpec.feasible_features_for_capability(cap)
 
 
 def _advanced_feature_prompt_block(cap: DatabaseFeatureCapability) -> str:
@@ -1210,7 +1297,7 @@ def append_advanced_skeleton_variants(
 ) -> list[QSimSkeleton]:
     """Append skeleton clones tagged with schema-feasible advanced feature slots."""
     qsim_ids = {spec.feature_id for spec in QSIM_SUPPORTED_ADVANCED_FEATURES}
-    feasible = feasible_features_for_capability(cap) & qsim_ids
+    feasible = PipelineFeatureSpec.feasible_features_for_capability(cap) & qsim_ids
     if not feasible:
         return skeletons
     out = list(skeletons)
@@ -1265,7 +1352,7 @@ def _build_merged_tier_buckets(
             ts = tk.split("|")
             for tier_dict in (pool.tier_a_by_table_set, pool.tier_b_by_table_set, pool.tier_c_by_table_set):
                 for skel in tier_dict[tk]:
-                    ct = classify_qsim_skeleton_complexity(skel)
+                    ct = skel.complexity_tier()
                     merged[ct.value].append((skel, ts))
     for k in merged:
         random.shuffle(merged[k])
@@ -1522,7 +1609,7 @@ def _llm_fill_intent(
             prompt_with_context = f"{user_prompt}\n\n    PREVIOUS ATTEMPT FAILED: {last_failure_reason}\n    Please fix this issue in your response."
 
         try:
-            result = llm_json(QSIM_FILL_SYSTEM, prompt_with_context, task="synth")
+            result = LLMProvider.json(QSIM_FILL_SYSTEM, prompt_with_context, task="synth")
         except LlmJsonExhausted as exc:
             last_failure_reason = f"LLM returned no parseable JSON ({exc})"
             failure_context = None
@@ -1563,8 +1650,8 @@ def _llm_fill_intent(
 
         if isinstance(parse_result, QSimIntent):
             if target_tier is not None:
-                classified = classify_qsim_intent_complexity(parse_result)
-                if not qsim_intent_matches_target_tier(classified, target_tier):
+                classified = parse_result.complexity_tier()
+                if not QSimIntent.matches_target_tier(classified, target_tier):
                     last_failure_reason = f"tier_conformance: classified={classified.value} target={target_tier.value}"
                     failure_context = None
                     debug(
@@ -1949,8 +2036,16 @@ def _generate_question_from_intent(intent: QSimIntent, schema: SchemaGraph) -> s
         having_descriptions.append({"expression": h.expression, "condition": cond})
 
     generate_question = importlib.import_module("aetherdialect._utils").generate_question
-    return generate_question(
-        intent.tables, intent.select_cols, filter_descriptions, intent.group_by_cols, having_descriptions, schema
+    return cast(
+        str | None,
+        generate_question(
+            intent.tables,
+            intent.select_cols,
+            filter_descriptions,
+            intent.group_by_cols,
+            having_descriptions,
+            schema,
+        ),
     )
 
 

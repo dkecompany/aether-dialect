@@ -2,55 +2,323 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from enum import Enum
+from decimal import Decimal
+from enum import Enum, StrEnum
 from typing import Any, ClassVar, Literal, Protocol, cast
 
 import pandas
 
 from ._constants import (
+    BUSINESS_KNOWLEDGE_COLUMN_REF_RE,
+    BUSINESS_KNOWLEDGE_DEFAULT_KIND,
     COLUMN_TYPE_TO_VALUE_TYPE,
     CONFIG_ERROR_SCHEMA_CONTEXT_COLUMN_SPEC,
     DATE_TYPE_TOKENS,
-    FEDERATION_MAPPINGS_VERSION,
-    FEDERATION_QUALIFIED_COLUMN_REF_RE,
-    FEDERATION_QUALIFIED_THREE_PART_REF_RE,
+    DEFAULT_NULL_ORDERING_ASC,
+    DEFAULT_NULL_ORDERING_DESC,
+    DESCRIPTION_OWNER_VALUES,
+    DIAGNOSTIC_CODE_REFUSAL_CLAUSE_WIDENED_ROWSET,
+    DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_TIE_CAP,
+    DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_UNAVAILABLE,
+    DIAGNOSTIC_CODE_REFUSAL_PROBE_CTE_PLACEMENT,
+    FEDERATION_TIMEZONE_AWARE_DATA_TYPES,
+    FIXED_WIDTH_TEXT_BASE_TYPES,
     INFERENCE_TAG_VALUES,
+    MAX_FLOAT_SAFE_INTEGER,
     MAX_PREDICATE_NESTING_DEPTH,
+    MYSQL_TIMESTAMP_ENGINES,
+    NUMERIC_TYPE_ARGUMENTS_RE,
     NUMERIC_TYPE_TOKENS,
     OP_FLIP,
     PK_INFERENCE_TAG_VALUES,
     RAW_SQL_AGG_OR_WINDOW_RE,
+    REFUSAL_CATALOGUE,
     REGISTRY_REF_TOKEN_RE,
     ROLE_OWNER_VALUES,
     STRING_TYPE_TOKENS,
     STRUCTURAL_DATA_TYPE_CANONICAL,
+    UNSIGNED_INTEGER_TYPE_MAX,
 )
 
 
-def normalize_column_type(col_type: str) -> str:
-    """Lowercase a SQL type and remove `(n)` / `(n,m)` parameter lists."""
-    normalized = col_type.lower().strip()
-    normalized = re.sub(r"\(\d+(?:,\s*\d+)?\)", "", normalized)
-    normalized = normalized.strip()
-    return normalized
+class SchemaInclude(StrEnum):
+    """Catalog reflection include mode for tables versus views."""
+
+    TABLES = "tables"
+    VIEWS = "views"
+
+    @classmethod
+    def coerce(cls, raw: Any) -> SchemaInclude:
+        """Normalize a stored include string to a supported literal."""
+        if isinstance(raw, cls):
+            return raw
+        s = str(raw or "").strip()
+        for member in cls:
+            if member.value == s:
+                return member
+        if s.endswith(".TABLES"):
+            return cls.TABLES
+        if s.endswith(".VIEWS"):
+            return cls.VIEWS
+        return cls.TABLES
 
 
-def structural_data_type_key(data_type: str) -> str:
-    """Return a canonical catalog-type token for structural diff and hashing."""
-    normalized = normalize_column_type(data_type)
-    if not normalized:
-        return normalized
-    return STRUCTURAL_DATA_TYPE_CANONICAL.get(normalized, normalized)
+class SchemaRole(StrEnum):
+    """Artifact ownership role for construction and write gates."""
+
+    OWNER = "owner"
+    CONSUMER = "consumer"
+
+    @classmethod
+    def coerce(cls, raw: Any) -> SchemaRole:
+        """Normalize a stored or in-process role value to a ``SchemaRole`` member."""
+        if isinstance(raw, cls):
+            return raw
+        s = str(getattr(raw, "value", raw) or "").strip().lower()
+        for member in cls:
+            if member.value == s:
+                return member
+        if s.endswith(".owner"):
+            return cls.OWNER
+        if s.endswith(".consumer"):
+            return cls.CONSUMER
+        raise ValueError(f"invalid schema role: {raw!r}")
 
 
-SchemaInclude = Literal["tables", "views"]
-SchemaRole = Literal["owner", "consumer"]
+class ApprovalState(StrEnum):
+    """Registry approval gate for silent reuse and ``execute_template``."""
+
+    APPROVED = "approved"
+    PENDING = "pending"
 
 
-class ComplexityTier(str, Enum):
+class BusinessKnowledgeKind(StrEnum):
+    """Closed vocabulary for business-knowledge entry kinds."""
+
+    GLOSSARY = "glossary"
+    POLICY = "policy"
+    METRIC = "metric"
+    SYNONYM = "synonym"
+    CAVEAT = "caveat"
+
+
+class QuestionRoute(StrEnum):
+    """Validation gate route for an ask turn."""
+
+    ANALYTICAL = "analytical"
+    SCHEMA_CATALOG = "schema_catalog"
+    BUSINESS_KNOWLEDGE = "business_knowledge"
+    RESTRICTED = "restricted"
+    INVALID = "invalid"
+
+
+@dataclass(frozen=True, slots=True)
+class QuestionValidationResult:
+    """Result of the ask-path question validation LLM gate."""
+
+    accepted: bool
+    route: QuestionRoute
+    corrected: str
+
+
+class ResultReaderKind(StrEnum):
+    """Row-fetch backend identifier used by dialect execution paths."""
+
+    SQLALCHEMY = "sqlalchemy"
+    SPARK = "spark"
+    CONNECTOR = "connector"
+    BQ_CLIENT = "bq_client"
+    BQ_STORAGE = "bq_storage"
+    SNOWFLAKE_ARROW = "snowflake_arrow"
+
+
+class FederationMethodScope(StrEnum):
+    """Which federation surface a public method may target."""
+
+    COMPOSITE = "composite"
+    MEMBER = "member"
+    BOTH = "both"
+    UNSUPPORTED = "unsupported"
+
+
+class FederationTopologyChange(StrEnum):
+    """Roster delta between recorded federation members and the manifest."""
+
+    NONE = "none"
+    ADD = "add"
+    REMOVE = "remove"
+    MIXED = "mixed"
+
+
+class TableKind(StrEnum):
+    """Reflected relation kind from information_schema / engine catalogs."""
+
+    TABLE = "table"
+    VIEW = "view"
+    MATERIALIZED_VIEW = "materialized_view"
+
+
+class ArrayStorageKind(StrEnum):
+    """How array-valued columns are physically stored for containment ops."""
+
+    NATIVE_ARRAY = "native_array"
+    JSON_TEXT_ARRAY = "json_text_array"
+    UNKNOWN = "unknown"
+
+
+class OverlapComparison(StrEnum):
+    """Value-overlap comparison rule when pairing profiled columns."""
+
+    EXACT = "exact"
+    CASE_FOLDED = "case_folded"
+
+
+class FeedbackMode(StrEnum):
+    """Whether interactive feedback is collected live or deferred in tests."""
+
+    LIVE = "live"
+    DEFERRED_TEST = "deferred_test"
+
+
+class SandboxPreset(StrEnum):
+    """Closed-world sandbox construction preset."""
+
+    OWNER_WRITER = "owner_writer"
+    CONSUMER_READER = "consumer_reader"
+    FEDERATION = "federation"
+
+    @classmethod
+    def coerce(cls, raw: Any) -> SandboxPreset:
+        """Normalize a sandbox preset label to a supported member."""
+        if isinstance(raw, cls):
+            return raw
+        s = str(raw or "").strip()
+        for member in cls:
+            if member.value == s:
+                return member
+        raise ValueError(f"unsupported sandbox preset: {raw!r}")
+
+
+class SandboxBuildSection(StrEnum):
+    """Named sandbox corpus build section."""
+
+    VALIDATION_FAILURES = "validation_failures"
+    FEEDBACK_SAMPLES = "feedback_samples"
+
+    @classmethod
+    def coerce(cls, raw: Any) -> SandboxBuildSection:
+        """Normalize a sandbox build-section label to a supported member."""
+        if isinstance(raw, cls):
+            return raw
+        s = str(raw or "").strip()
+        for member in cls:
+            if member.value == s:
+                return member
+        raise ValueError(f"unsupported sandbox build section: {raw!r}")
+
+
+class SandboxLlmMode(StrEnum):
+    """Whether the sandbox LLM path is mocked or networked."""
+
+    MOCK = "mock"
+    NETWORK = "network"
+
+    @classmethod
+    def coerce(cls, raw: Any) -> SandboxLlmMode:
+        """Normalize a sandbox LLM mode label to a supported member."""
+        if isinstance(raw, cls):
+            return raw
+        s = str(raw or "").strip()
+        for member in cls:
+            if member.value == s:
+                return member
+        raise ValueError(f"unsupported sandbox llm mode: {raw!r}")
+
+
+class WindowOperatorKind(StrEnum):
+    """Window-operator family for operator feature vectors."""
+
+    NONE = "none"
+    RANK = "rank"
+    AGGREGATE = "aggregate"
+    NAVIGATE = "navigate"
+
+
+class OrderByNullPlacement(StrEnum):
+    """NULL ordering placement for ORDER BY."""
+
+    FIRST = "first"
+    LAST = "last"
+
+    @classmethod
+    def default_for_direction(cls, direction: str) -> OrderByNullPlacement:
+        """Return DuckDB/PostgreSQL default null placement for an ORDER BY direction."""
+        dir_up = (direction or "ASC").strip().upper()
+        return cls(DEFAULT_NULL_ORDERING_DESC) if dir_up == "DESC" else cls(DEFAULT_NULL_ORDERING_ASC)
+
+    @classmethod
+    def coerce(cls, raw: Any) -> OrderByNullPlacement | None:
+        """Normalize optional ORDER BY null-placement to ``first``, ``last``, or ``None``."""
+        if raw in (cls.FIRST, cls.LAST, "first", "last"):
+            return cls(str(raw))
+        return None
+
+
+class CteEmissionKind(StrEnum):
+    """How a runtime CTE is emitted into the carrier SELECT."""
+
+    JOIN_TABLE = "join_table"
+    SCALAR_SUBQUERY = "scalar_subquery"
+    SEMI_JOIN = "semi_join"
+    ANTI_JOIN = "anti_join"
+
+    @classmethod
+    def coerce(cls, raw: Any) -> CteEmissionKind:
+        """Normalize a stored emission string to a supported literal."""
+        if isinstance(raw, cls):
+            return raw
+        s = str(raw or "").strip()
+        for member in cls:
+            if member.value == s:
+                return member
+        return cls.JOIN_TABLE
+
+
+class WindowFrameKind(StrEnum):
+    """Window frame mode for PARTITION/ORDER windows."""
+
+    ROWS = "rows"
+    RANGE = "range"
+    NONE = "none"
+
+    @classmethod
+    def coerce(cls, raw: Any) -> WindowFrameKind:
+        """Normalize a window frame kind string to a supported member."""
+        if isinstance(raw, cls):
+            return raw
+        s = str(raw or "").strip()
+        for member in cls:
+            if member.value == s:
+                return member
+        return cls.NONE
+
+
+@dataclass(frozen=True, slots=True)
+class JoinEdge:
+    """One JOIN to attach to a carrier SELECT. ``table`` is the bare physical table name being joined in. ``alias`` is the AS-alias used when the same physical table appears multiple times (self-join); ``None`` for a single-instance join. ``kind`` is ``"INNER"`` or ``"LEFT"``. Each ``on_terms`` tuple is ``(left_token, left_col, right_token, right_col)`` where the tokens are the table name or alias to qualify the column with in the ``ON`` clause."""
+
+    table: str
+    alias: str | None
+    kind: Literal["INNER", "LEFT"]
+    on_terms: tuple[tuple[str, str, str, str], ...] = field(default_factory=tuple)
+
+
+class ComplexityTier(StrEnum):
     """Workload complexity band for QSim sampling and seed-warmup stratification."""
 
     SIMPLE = "simple"
@@ -59,7 +327,7 @@ class ComplexityTier(str, Enum):
     HIGHLY_COMPLEX = "highly_complex"
 
 
-class WarmupStyle(str, Enum):
+class WarmupStyle(StrEnum):
     """Canonical warmup NL style keys aligned with SeedWarmupConfig.WARMUP_QUESTION_STYLES."""
 
     FORMAL = "formal"
@@ -74,35 +342,51 @@ class WarmupStyle(str, Enum):
     VERBOSE = "verbose"
 
 
-class SensitivityClassification(str, Enum):
+class SensitivityClassification(StrEnum):
     """Single-column sensitivity tier for projection, filtering, and LLM visibility."""
 
     NONE = "none"
     RESTRICTED = "restricted"
     HIDDEN = "hidden"
 
-
-def coerce_sensitivity_classification(raw: Any) -> SensitivityClassification | None:
-    """Parse :class:`SensitivityClassification` tokens from overrides JSON or other string inputs."""
-    if raw is None:
+    @classmethod
+    def coerce(cls, raw: Any) -> SensitivityClassification | None:
+        """Parse :class:`SensitivityClassification` tokens from overrides JSON or other string inputs."""
+        if raw is None:
+            return None
+        if isinstance(raw, cls):
+            return raw
+        s = str(raw).strip().lower()
+        if not s:
+            return None
+        for m in cls:
+            if m.value == s:
+                return m
         return None
-    if isinstance(raw, SensitivityClassification):
-        return raw
-    s = str(raw).strip().lower()
-    if not s:
-        return None
-    for m in SensitivityClassification:
-        if m.value == s:
-            return m
-    return None
+
+    @classmethod
+    def from_dict(cls, d: Mapping[str, Any]) -> SensitivityClassification:
+        """Resolve a persisted ``sensitivity`` key into a :class:`SensitivityClassification`."""
+        return cls.coerce(d.get("sensitivity")) or cls.NONE
+
+    @classmethod
+    def apply_to(cls, col: Any, value: SensitivityClassification | str | None) -> None:
+        """Single writer for column sensitivity; clears profile samples when not NONE."""
+        if value is None or (isinstance(value, str) and not str(value).strip()):
+            resolved = cls.NONE
+        elif isinstance(value, cls):
+            resolved = value
+        else:
+            resolved = cls.coerce(str(value).strip().lower()) or cls.NONE
+        col.sensitivity = resolved
+        if resolved != cls.NONE:
+            col.frequent_values = []
+            col.value_overlap_sample = []
+            col.min_val = None
+            col.max_val = None
 
 
-def column_sensitivity_from_dict(d: Mapping[str, Any]) -> SensitivityClassification:
-    """Resolve a persisted ``sensitivity`` key into a :class:`SensitivityClassification`."""
-    return coerce_sensitivity_classification(d.get("sensitivity")) or SensitivityClassification.NONE
-
-
-class NoveltyBand(str, Enum):
+class NoveltyBand(StrEnum):
     """Expansion-depth novelty band for anchor-lattice sharing."""
 
     LOW = "low"
@@ -110,7 +394,7 @@ class NoveltyBand(str, Enum):
     HIGH = "high"
 
 
-class WorkloadFamily(str, Enum):
+class WorkloadFamily(StrEnum):
     """High-level analyst workload shapes for sampling and lattice keys."""
 
     STATUS_REPORT = "status_report"
@@ -124,9 +408,6 @@ class WorkloadFamily(str, Enum):
     EXTRACT = "extract"
     LIFECYCLE_COHORT = "lifecycle_cohort"
     EXPLORATION_FOLLOWUP = "exploration_followup"
-
-
-WindowOperatorKind = Literal["none", "rank", "aggregate", "navigate"]
 
 
 @dataclass(frozen=True)
@@ -202,68 +483,6 @@ class DatabaseFeatureCapability:
     supports_collation: bool = True
     supports_unsigned_semantics: bool = True
     supports_timestamptz_semantics: bool = True
-
-
-def default_order_by_null_placement(direction: str) -> OrderByNullPlacement:
-    """Return DuckDB/PostgreSQL default null placement for an ORDER BY direction."""
-    dir_up = (direction or "ASC").strip().upper()
-    return "first" if dir_up == "DESC" else "last"
-
-
-def _tier_feasible_for_capability(tier_key: str, cap: DatabaseFeatureCapability) -> bool:
-    """Return whether a complexity tier remains achievable on this. database snapshot. Args: tier_key: One of ``simple``, ``moderate``, ``complex``, ``highly_complex``. cap: Capability snapshot from :func:`compute_database_feature_capability`. Returns: False when structural prerequisites for that tier are absent."""
-    if cap.table_count <= 0:
-        return False
-    if tier_key == ComplexityTier.SIMPLE.value:
-        return True
-    if tier_key == ComplexityTier.MODERATE.value:
-        return cap.table_count >= 1
-    if tier_key == ComplexityTier.COMPLEX.value:
-        return (
-            cap.max_tables_on_any_join_path >= 3
-            or (cap.table_count >= 2 and cap.fk_edge_count >= 1)
-            or (cap.has_numeric_measures and cap.table_count >= 1)
-        )
-    if tier_key == ComplexityTier.HIGHLY_COMPLEX.value:
-        return (
-            cap.max_fk_chain_depth >= 2
-            or cap.has_self_referential_fk
-            or cap.max_tables_on_any_join_path >= 4
-            or (cap.max_tables_on_any_join_path >= 3 and cap.has_window_capable_table_sets)
-        )
-    return False
-
-
-def rebalance_complexity_target_proportions(
-    proportions: Mapping[str, float], cap: DatabaseFeatureCapability
-) -> dict[str, float]:
-    """Zero unreachable tier mass and renormalize remaining targets for. QSim and warmup budgets. Args: proportions: Named tier weights summing to approximately one. cap: Live capability snapshot for structural feasibility. Returns: Renormalized tier weights over feasible tiers only."""
-    keys = [
-        ComplexityTier.SIMPLE.value,
-        ComplexityTier.MODERATE.value,
-        ComplexityTier.COMPLEX.value,
-        ComplexityTier.HIGHLY_COMPLEX.value,
-    ]
-    feas = {k: _tier_feasible_for_capability(k, cap) for k in keys}
-    raw_mass = sum(max(0.0, float(proportions.get(k, 0.0))) for k in keys if feas[k])
-    if raw_mass <= 0.0:
-        active = [k for k in keys if feas[k]]
-        if not active:
-            return {k: 0.25 for k in keys}
-        u = 1.0 / float(len(active))
-        return {k: (u if k in active else 0.0) for k in keys}
-    out: dict[str, float] = {}
-    for k in keys:
-        if feas[k]:
-            out[k] = max(0.0, float(proportions.get(k, 0.0))) / raw_mass
-        else:
-            out[k] = 0.0
-    s = sum(out.values())
-    if s <= 0.0:
-        active = [k for k in keys if feas[k]]
-        u = 1.0 / float(len(active))
-        return {k: (u if k in active else 0.0) for k in keys}
-    return {k: (v / s) for k, v in out.items()}
 
 
 @dataclass(frozen=True)
@@ -376,7 +595,7 @@ QSIM_COMPLEXITY_TIER_SPECS: tuple[_ComplexityTierSpec, ...] = (
 )
 
 
-class FailureCategory(str, Enum):
+class FailureCategory(StrEnum):
     """Primary taxonomy for validation issues, rejections, avoid-example summaries, and intent failure log rows."""
 
     ACCESS_POLICY = "access_policy"
@@ -409,6 +628,9 @@ class FailureCategory(str, Enum):
     EXECUTION_SEMANTIC_ERROR = "execution_semantic_error"
     EXECUTION_COST_EXCEEDED = "execution_cost_exceeded"
     EXECUTION_TIMEOUT = "execution_timeout"
+    INTENT_ERROR = "intent_error"
+    PERMISSION_ERROR = "permission_error"
+    TRANSPORT_AUTH = "transport_auth"
     WHERE_AGGREGATION = "where_aggregation"
     WHERE_SEMANTIC = "where_semantic"
     WHERE_STRUCTURE = "where_structure"
@@ -465,37 +687,57 @@ class FailureCategory(str, Enum):
     WRONG_SORT_OR_LIMIT = "wrong_sort_or_limit"
     WRONG_TABLES = "wrong_tables"
     WRONG_TIME_WINDOW = "wrong_time_window"
+    FEDERATION_TURN_CANCELLED = "federation_turn_cancelled"
+    TURN_CANCELLED = "cancelled"
+    META_ERROR = "meta_error"
+
+    @classmethod
+    def parse(cls, raw: FailureCategory | str | None) -> FailureCategory | None:
+        """Map a free-form category string to ``FailureCategory``."""
+        if raw is None:
+            return None
+        if isinstance(raw, cls):
+            return raw
+        v = str(raw).strip()
+        if not v:
+            return None
+        try:
+            return cls(v)
+        except ValueError:
+            return cls.OTHER
 
 
 _FAILURE_CATEGORY_MEMBER_ORDER: tuple[FailureCategory, ...] = tuple(FailureCategory)
 
 
-def parse_failure_category(raw: FailureCategory | str | None) -> FailureCategory | None:
-    """
-    Map a free-form category string to ``FailureCategory``.
+class DiagnosticSeverity(StrEnum):
+    """Closed severity set for session diagnostics."""
 
-    Args:
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
 
-        raw: Category from validation, classifier, or legacy payloads.
+    @classmethod
+    def coerce(cls, level: DiagnosticSeverity | str) -> DiagnosticSeverity:
+        """Normalize a severity value to a catalogue member."""
+        if isinstance(level, cls):
+            return level
+        normalized = str(level).strip().lower()
+        if normalized in {"warn", "_error"}:
+            raise ValueError(f"invalid diagnostic severity: {level!r}")
+        if normalized == "advisory":
+            return cls.INFO
+        if normalized == "review":
+            return cls.WARNING
+        if normalized in {"blocking", "fatal"}:
+            return cls.ERROR
+        try:
+            return cls(normalized)
+        except ValueError as exc:
+            raise ValueError(f"invalid diagnostic severity: {level!r}") from exc
 
-    Returns:
 
-        ``None`` when *raw* is empty; otherwise the matching enum member or ``OTHER``.
-    """
-    if raw is None:
-        return None
-    if isinstance(raw, FailureCategory):
-        return raw
-    v = str(raw).strip()
-    if not v:
-        return None
-    try:
-        return FailureCategory(v)
-    except ValueError:
-        return FailureCategory.OTHER
-
-
-class SqlDiagnosticCode(str, Enum):
+class SqlDiagnosticCode(StrEnum):
     """Structured codes emitted by AST validation and EXPLAIN-plan diagnostics across registered dialects."""
 
     AST_PARSE_FAILED = "ast_parse_failed"
@@ -522,10 +764,159 @@ class SqlDiagnosticCode(str, Enum):
     EXPLAIN_CARTESIAN_JOIN = "explain_cartesian_join"
     EXPLAIN_ZERO_ESTIMATE = "explain_zero_estimate"
     EXPLAIN_SEQ_SCAN_INDEXED = "explain_seq_scan_indexed"
-    EXPLAIN_TYPE_MISMATCH = "explain_type_mismatch"
-    EXPLAIN_PERMISSION_DENIED = "explain_permission_denied"
+    EXPLAIN_SORT_SPILL = "explain_sort_spill"
+    EXPLAIN_TEMPORARY_TABLE = "explain_temporary_table"
     EXPLAIN_OTHER = "explain_other"
     EXPLAIN_COST_EXCEEDED = "explain_cost_exceeded"
+
+
+class DiagnosticCode(StrEnum):
+    """Unified catalogue of session and SQL diagnostic codes."""
+
+    DIAGNOSTIC_CODE_ARTIFACTS_DIR_NOT_LOCAL = "ARTIFACTS_DIR_NOT_LOCAL"
+    DIAGNOSTIC_CODE_ARTIFACT_GROWTH = "ARTIFACT_GROWTH"
+    DIAGNOSTIC_CODE_ARTIFACT_LIMIT_NEAR = "ARTIFACT_LIMIT_NEAR"
+    DIAGNOSTIC_CODE_CANCEL_NOT_SUPPORTED = "CANCEL_NOT_SUPPORTED"
+    DIAGNOSTIC_CODE_COLUMN_CHARSET_MISMATCH = "COLUMN_CHARSET_MISMATCH"
+    DIAGNOSTIC_CODE_COLUMN_PROFILE_FAILED = "COLUMN_PROFILE_FAILED"
+    DIAGNOSTIC_CODE_COMPARISON_JOIN_DETOUR = "COMPARISON_JOIN_DETOUR"
+    DIAGNOSTIC_CODE_COMPOSE_REPAIR = "COMPOSE_REPAIR"
+    DIAGNOSTIC_CODE_COMPOSITE_DESCRIPTIVE_PROFILE_FAILED = "COMPOSITE_DESCRIPTIVE_PROFILE_FAILED"
+    DIAGNOSTIC_CODE_CONFIGURATION_KEY_IGNORED = "CONFIGURATION_KEY_IGNORED"
+    DIAGNOSTIC_CODE_CONFIG_FILE_VALUE_APPLIED = "CONFIG_FILE_VALUE_APPLIED"
+    DIAGNOSTIC_CODE_COORDINATOR_LIMITS = "COORDINATOR_LIMITS"
+    DIAGNOSTIC_CODE_DATA_QUALITY_ADVISORY = "DATA_QUALITY_ADVISORY"
+    DIAGNOSTIC_CODE_DATA_QUALITY_AUTO_CORRECTED = "DATA_QUALITY_AUTO_CORRECTED"
+    DIAGNOSTIC_CODE_DATA_QUALITY_AUTO_READ = "DATA_QUALITY_AUTO_READ"
+    DIAGNOSTIC_CODE_DATA_QUALITY_BLOCKING = "DATA_QUALITY_BLOCKING"
+    DIAGNOSTIC_CODE_DESCRIPTION_ENRICHMENT_FAILED = "DESCRIPTION_ENRICHMENT_FAILED"
+    DIAGNOSTIC_CODE_DESCRIPTION_ENRICHMENT_NOOP = "DESCRIPTION_ENRICHMENT_NOOP"
+    DIAGNOSTIC_CODE_DESCRIPTION_PROMPT_TRUNCATED = "DESCRIPTION_PROMPT_TRUNCATED"
+    DIAGNOSTIC_CODE_ENGINE_INFO = "ENGINE_INFO"
+    DIAGNOSTIC_CODE_ENUM_PROMPT_TRUNCATED = "ENUM_PROMPT_TRUNCATED"
+    DIAGNOSTIC_CODE_FALLBACK_FRESH_RESTART = "FALLBACK_FRESH_RESTART"
+    DIAGNOSTIC_CODE_FEDERATION_CAP_EXCEEDED = "FEDERATION_CAP_EXCEEDED"
+    DIAGNOSTIC_CODE_FEDERATION_COORDINATOR_ARROW_SPILL_FALLBACK = "FEDERATION_COORDINATOR_ARROW_SPILL_FALLBACK"
+    DIAGNOSTIC_CODE_FEDERATION_COORDINATOR_DECIMAL_FALLBACK = "FEDERATION_COORDINATOR_DECIMAL_FALLBACK"
+    DIAGNOSTIC_CODE_FEDERATION_COORDINATOR_EXECUTED = "FEDERATION_COORDINATOR_EXECUTED"
+    DIAGNOSTIC_CODE_FEDERATION_INELIGIBLE = "FEDERATION_INELIGIBLE"
+    DIAGNOSTIC_CODE_FEDERATION_JOIN_CANDIDATE_CAP = "FEDERATION_JOIN_CANDIDATE_CAP"
+    DIAGNOSTIC_CODE_FEDERATION_JOIN_FAN_OUT = "FEDERATION_JOIN_FAN_OUT"
+    DIAGNOSTIC_CODE_FEDERATION_MALFORMED_MEMBER_ANSWER = "FEDERATION_MALFORMED_MEMBER_ANSWER"
+    DIAGNOSTIC_CODE_FEDERATION_MAPPING_DRIFT = "FEDERATION_MAPPING_DRIFT"
+    DIAGNOSTIC_CODE_FEDERATION_MEMBER_EXECUTED = "FEDERATION_MEMBER_EXECUTED"
+    DIAGNOSTIC_CODE_FEDERATION_MEMBER_FAILED = "FEDERATION_MEMBER_FAILED"
+    DIAGNOSTIC_CODE_FEDERATION_MEMBER_PROBE_FAILED = "FEDERATION_MEMBER_PROBE_FAILED"
+    DIAGNOSTIC_CODE_FEDERATION_MEMBER_GENERATED = "FEDERATION_MEMBER_GENERATED"
+    DIAGNOSTIC_CODE_FEDERATION_MEMBER_REMOVED = "FEDERATION_MEMBER_REMOVED"
+    DIAGNOSTIC_CODE_FEDERATION_MEMBER_TIMEZONE_MISMATCH = "FEDERATION_MEMBER_TIMEZONE_MISMATCH"
+    DIAGNOSTIC_CODE_FEDERATION_PARTIAL_FAILURE = "FEDERATION_PARTIAL_FAILURE"
+    DIAGNOSTIC_CODE_FEDERATION_PLAN_REPLAY = "FEDERATION_PLAN_REPLAY"
+    DIAGNOSTIC_CODE_FEDERATION_POOL_UNDERSIZED = "FEDERATION_POOL_UNDERSIZED"
+    DIAGNOSTIC_CODE_FEDERATION_REDUCTION_NULL_KEYS = "FEDERATION_REDUCTION_NULL_KEYS"
+    DIAGNOSTIC_CODE_FEDERATION_SEMIJOIN_SKIPPED = "FEDERATION_SEMIJOIN_SKIPPED"
+    DIAGNOSTIC_CODE_FEDERATION_SOURCES_QUERIED = "FEDERATION_SOURCES_QUERIED"
+    DIAGNOSTIC_CODE_FEDERATION_TIMESTAMP_NORMALISED = "FEDERATION_TIMESTAMP_NORMALISED"
+    DIAGNOSTIC_CODE_FEDERATION_TIME_ANCHOR = "FEDERATION_TIME_ANCHOR"
+    DIAGNOSTIC_CODE_FEDERATION_TURN_CANCELLED = "FEDERATION_TURN_CANCELLED"
+    DIAGNOSTIC_CODE_INTERPRET_GROUND_RETRY = "INTERPRET_GROUND_RETRY"
+    DIAGNOSTIC_CODE_JOIN_CANDIDATE_CAP = "JOIN_CANDIDATE_CAP"
+    DIAGNOSTIC_CODE_JOIN_NULLABLE_KEY = "JOIN_NULLABLE_KEY"
+    DIAGNOSTIC_CODE_JOIN_ORPHAN_RATE_HIGH = "JOIN_ORPHAN_RATE_HIGH"
+    DIAGNOSTIC_CODE_JOIN_PATH_TIE_CEILING_EXCEEDED = "JOIN_PATH_TIE_CEILING_EXCEEDED"
+    DIAGNOSTIC_CODE_LARGE_RESULT_WARNING = "LARGE_RESULT_WARNING"
+    DIAGNOSTIC_CODE_LLM_TURN_COST = "LLM_TURN_COST"
+    DIAGNOSTIC_CODE_MATERIALIZED_VIEW_ANSWER = "MATERIALIZED_VIEW_ANSWER"
+    DIAGNOSTIC_CODE_MEMBER_LIMIT_NARROWED = "MEMBER_LIMIT_NARROWED"
+    DIAGNOSTIC_CODE_MIGRATION_CHECKPOINT_ORPHANED = "MIGRATION_CHECKPOINT_ORPHANED"
+    DIAGNOSTIC_CODE_OVERRIDE_NEEDS_RECONFIRMATION = "OVERRIDE_NEEDS_RECONFIRMATION"
+    DIAGNOSTIC_CODE_PK_INFERENCE_PROMPT = "PK_INFERENCE_PROMPT"
+    DIAGNOSTIC_CODE_PROFILE_TABLE_CLONE_FAILED = "PROFILE_TABLE_CLONE_FAILED"
+    DIAGNOSTIC_CODE_REDUNDANT_JOIN_WHERE_DROPPED = "REDUNDANT_JOIN_WHERE_DROPPED"
+    DIAGNOSTIC_CODE_REDUNDANT_KEY_JOIN_CAP_REACHED = "REDUNDANT_KEY_JOIN_CAP_REACHED"
+    DIAGNOSTIC_CODE_REDUNDANT_KEY_JOIN_ELIMINATED = "REDUNDANT_KEY_JOIN_ELIMINATED"
+    DIAGNOSTIC_CODE_REFUSAL_AGGREGATE_FAN_OUT = "REFUSAL_AGGREGATE_FAN_OUT"
+    DIAGNOSTIC_CODE_REFUSAL_AMBIGUOUS_DATE_LITERAL = "REFUSAL_AMBIGUOUS_DATE_LITERAL"
+    DIAGNOSTIC_CODE_REFUSAL_CAPABILITY_GAP = "REFUSAL_CAPABILITY_GAP"
+    DIAGNOSTIC_CODE_REFUSAL_CTE_CAP = "REFUSAL_CTE_CAP"
+    DIAGNOSTIC_CODE_REFUSAL_HOP_CEILING = "REFUSAL_HOP_CEILING"
+    DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_UNAVAILABLE = "REFUSAL_JOIN_PATH_UNAVAILABLE"
+    DIAGNOSTIC_CODE_REFUSAL_NULL_IN_NEGATED_LIST = "REFUSAL_NULL_IN_NEGATED_LIST"
+    DIAGNOSTIC_CODE_REFUSAL_OPAQUE_EXPR = "REFUSAL_OPAQUE_EXPR"
+    DIAGNOSTIC_CODE_REFUSAL_SUBDAY_DATE_WINDOW_ON_DATE_COLUMN = "REFUSAL_SUBDAY_DATE_WINDOW_ON_DATE_COLUMN"
+    DIAGNOSTIC_CODE_REFUSAL_UNION_COLUMN_MISSING = "REFUSAL_UNION_COLUMN_MISSING"
+    DIAGNOSTIC_CODE_REFUSAL_UNSUPPORTED_COLUMN_TYPE = "REFUSAL_UNSUPPORTED_COLUMN_TYPE"
+    DIAGNOSTIC_CODE_REFUSAL_NOT_AVAILABLE_IN_CONTEXT = "REFUSAL_NOT_AVAILABLE_IN_CONTEXT"
+    DIAGNOSTIC_CODE_REFUSAL_PERMISSION_DENIED = "REFUSAL_PERMISSION_DENIED"
+    DIAGNOSTIC_CODE_REFUSAL_SCOPE_VIOLATION = "REFUSAL_SCOPE_VIOLATION"
+    DIAGNOSTIC_CODE_REFUSAL_INVALID_QUESTION = "REFUSAL_INVALID_QUESTION"
+    DIAGNOSTIC_CODE_REFUSAL_PARSE_FAILURE = "REFUSAL_PARSE_FAILURE"
+    DIAGNOSTIC_CODE_REFUSAL_DECLINED_SCHEMA = "REFUSAL_DECLINED_SCHEMA"
+    DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_TIE_CAP = "REFUSAL_JOIN_PATH_TIE_CAP"
+    DIAGNOSTIC_CODE_REFUSAL_CLAUSE_WIDENED_ROWSET = "REFUSAL_CLAUSE_WIDENED_ROWSET"
+    DIAGNOSTIC_CODE_REFUSAL_PROBE_CTE_PLACEMENT = "REFUSAL_PROBE_CTE_PLACEMENT"
+    DIAGNOSTIC_CODE_REUSE_HIT = "REUSE_HIT"
+    DIAGNOSTIC_CODE_REUSE_MISS = "REUSE_MISS"
+    DIAGNOSTIC_CODE_ROUNDING_MODE_MIXED = "ROUNDING_MODE_MIXED"
+    DIAGNOSTIC_CODE_SCHEMA_FK_CATALOG_ABSENT = "SCHEMA_FK_CATALOG_ABSENT"
+    DIAGNOSTIC_CODE_SCHEMA_ROLE_TYPE_COERCED = "SCHEMA_ROLE_TYPE_COERCED"
+    DIAGNOSTIC_CODE_SCHEMA_UNKNOWN_TYPE_UNUSABLE = "SCHEMA_UNKNOWN_TYPE_UNUSABLE"
+    DIAGNOSTIC_CODE_UPLOAD_UNIT_AFFIX_STRIPPED = "UPLOAD_UNIT_AFFIX_STRIPPED"
+    DIAGNOSTIC_CODE_UPLOAD_TRANSFORM_REJECTED = "UPLOAD_TRANSFORM_REJECTED"
+    DIAGNOSTIC_CODE_UPLOAD_TRANSFORM_APPLIED = "UPLOAD_TRANSFORM_APPLIED"
+    DIAGNOSTIC_CODE_SCHEMA_OVERRIDE_SKIP = "SCHEMA_OVERRIDE_SKIP"
+    DIAGNOSTIC_CODE_SEMANTIC_PROFILE_WHERE_EDGE = "SEMANTIC_PROFILE_WHERE_EDGE"
+    DIAGNOSTIC_CODE_SENSITIVITY_GATE_HIT = "SENSITIVITY_GATE_HIT"
+    DIAGNOSTIC_CODE_SQL_PARSE_FAILED = "SQL_PARSE_FAILED"
+    DIAGNOSTIC_CODE_STALE_ARTIFACT_LOCK = "STALE_ARTIFACT_LOCK"
+    DIAGNOSTIC_CODE_TEMPLATE_REMAP_DIVERGED = "TEMPLATE_REMAP_DIVERGED"
+    DIAGNOSTIC_CODE_TEMPLATE_STORE_ORPHANED = "TEMPLATE_STORE_ORPHANED"
+    DIAGNOSTIC_CODE_WRITE_QUEUE_CORRUPT = "WRITE_QUEUE_CORRUPT"
+    DIAGNOSTIC_CODE_WRITE_QUEUE_FULL = "WRITE_QUEUE_FULL"
+    DIAGNOSTIC_CODE_ZERO_ROW_WHERE_AUTO_FIXED = "ZERO_ROW_WHERE_AUTO_FIXED"
+    DIAGNOSTIC_CODE_ZERO_ROW_WHERE_SUGGESTION = "ZERO_ROW_WHERE_SUGGESTION"
+    AST_PARSE_FAILED = "ast_parse_failed"
+    MULTIPLE_STATEMENTS = "multiple_statements"
+    NOT_SELECT = "not_select"
+    SUBQUERY_NOT_ALLOWED = "subquery_not_allowed"
+    LATERAL_NOT_ALLOWED = "lateral_not_allowed"
+    CROSS_JOIN_NOT_ALLOWED = "cross_join_not_allowed"
+    USING_NOT_ALLOWED = "using_not_allowed"
+    SELF_JOIN_NOT_ALLOWED = "self_join_not_allowed"
+    EXISTS_NOT_ALLOWED = "exists_not_allowed"
+    FORBIDDEN_STRUCTURE = "forbidden_structure"
+    NO_ROOT = "no_root"
+    UNKNOWN_TABLE = "unknown_table"
+    UNKNOWN_COLUMN = "unknown_column"
+    AMBIGUOUS_COLUMN = "ambiguous_column"
+    UNKNOWN_CTE = "unknown_cte"
+    CTE_UNREFERENCED = "cte_unreferenced"
+    PARAM_UNBOUND = "param_unbound"
+    PARAM_UNDECLARED = "param_undeclared"
+    NON_GROUPED_SELECT_COL = "non_grouped_select_col"
+    AGG_IN_WHERE = "agg_in_where"
+    HAVING_WITHOUT_GROUP = "having_without_group"
+    EXPLAIN_CARTESIAN_JOIN = "explain_cartesian_join"
+    EXPLAIN_ZERO_ESTIMATE = "explain_zero_estimate"
+    EXPLAIN_SEQ_SCAN_INDEXED = "explain_seq_scan_indexed"
+    EXPLAIN_SORT_SPILL = "explain_sort_spill"
+    EXPLAIN_TEMPORARY_TABLE = "explain_temporary_table"
+    EXPLAIN_OTHER = "explain_other"
+    EXPLAIN_COST_EXCEEDED = "explain_cost_exceeded"
+
+
+class UploadColumnTransformId(StrEnum):
+    """Closed vocabulary for upload column transform proposals."""
+
+    PARSE_TEMPORAL = "parse_temporal"
+    STRIP_NUMERIC_AFFIX = "strip_numeric_affix"
+    BAND_BOUNDS = "band_bounds"
+    BAND_VALUE_MAP = "band_value_map"
+    KEEP_CANONICAL_COLUMNS = "keep_canonical_columns"
+    DERIVE_BY_PATTERN = "derive_by_pattern"
+    DROP_EMPTY_COLUMNS = "drop_empty_columns"
+    NULL_TOKENS = "null_tokens"
+    UNPIVOT_COLUMNS = "unpivot_columns"
 
 
 @dataclass(frozen=True)
@@ -539,16 +930,162 @@ class SqlDiagnostic:
     details: Mapping[str, str] = field(default_factory=dict)
 
 
-def norm_schema_identifier(name: str, *, what: str) -> str:
-    """Lowercase and strip *name*; raise when empty after strip."""
-    s = str(name).strip().lower()
-    if not s:
-        raise ValueError(f"{what} must be non-empty")
-    return s
+class AetherError(Exception):
+    """Root exception for all library failures. Catch this type for a single handler over every ``aetherdialect`` error."""
 
 
-class ConfigError(ValueError):
+class ConfigError(AetherError, ValueError):
     """Raised when environment variables or static configuration are missing or contradictory."""
+
+    data_quality_report: DataQualityReport | None = None
+
+
+class SchemaNaming:
+    """Normalize schema identifiers and scope column specs."""
+
+    @staticmethod
+    def norm_schema_identifier(name: str, *, what: str) -> str:
+        """Lowercase and strip *name*; raise when empty after strip."""
+        s = str(name).strip().lower()
+        if not s:
+            raise ValueError(f"{what} must be non-empty")
+        return s
+
+    @staticmethod
+    def normalize_scope_column_spec(spec: str, *, field: str) -> str:
+        """Normalize a ``table.column`` or ``source.table.column`` scope column spec."""
+        raw = str(spec).strip()
+        parts = raw.split(".")
+        if len(parts) == 2:
+            tbl_raw, col_raw = parts
+        elif len(parts) == 3:
+            _source_raw, tbl_raw, col_raw = parts
+        else:
+            raise ConfigError(CONFIG_ERROR_SCHEMA_CONTEXT_COLUMN_SPEC.format(spec=spec))
+        tbl = SchemaNaming.norm_schema_identifier(tbl_raw, what=f"{field} table")
+        col = SchemaNaming.norm_schema_identifier(col_raw, what=f"{field} column")
+        if tbl == "*":
+            return f"*.{col}"
+        return f"{tbl}.{col}"
+
+
+class ColumnTypeSemantics:
+    """SQL column type normalization and semantic classification."""
+
+    @staticmethod
+    def normalize_column_type(col_type: str) -> str:
+        """Lowercase a SQL type and remove `(n)` / `(n,m)` parameter lists."""
+        normalized, _precision, _scale = ColumnTypeSemantics.split_column_type(col_type)
+        return normalized
+
+    @staticmethod
+    def split_column_type(col_type: str) -> tuple[str, int | None, int | None]:
+        """Lowercase a SQL type, strip parameter lists for lookup, and return parsed precision and scale."""
+        normalized = col_type.lower().strip()
+        match = NUMERIC_TYPE_ARGUMENTS_RE.search(normalized)
+        precision = int(match.group(1)) if match else None
+        scale = int(match.group(2)) if match and match.group(2) is not None else None
+        normalized = re.sub(r"\(\d+(?:,\s*\d+)?\)", "", normalized)
+        normalized = normalized.strip()
+        return normalized, precision, scale
+
+    @staticmethod
+    def structural_data_type_key(data_type: str) -> str:
+        """Return a canonical catalog-type token for structural diff and hashing."""
+        normalized = ColumnTypeSemantics.normalize_column_type(data_type)
+        if not normalized:
+            return normalized
+        return STRUCTURAL_DATA_TYPE_CANONICAL.get(normalized, normalized)
+
+    @staticmethod
+    def column_is_unsigned_from_data_type(
+        data_type: str,
+        *,
+        reflected_unsigned: bool | None = None,
+    ) -> bool:
+        """Return whether a SQL column type carries unsigned integer semantics."""
+        if reflected_unsigned is not None:
+            return bool(reflected_unsigned)
+        return "unsigned" in str(data_type or "").lower()
+
+    @staticmethod
+    def column_is_fixed_width_text_from_data_type(data_type: str) -> bool:
+        """Return whether a SQL column type is fixed-width character text (CHAR/NCHAR)."""
+        if not str(data_type or "").strip():
+            return False
+        base = ColumnTypeSemantics.normalize_column_type(data_type)
+        return base in FIXED_WIDTH_TEXT_BASE_TYPES
+
+    @staticmethod
+    def column_timezone_aware_from_data_type(
+        data_type: str,
+        *,
+        engine: str | None = None,
+    ) -> bool:
+        """Return whether a SQL temporal type preserves timezone offsets."""
+        raw = str(data_type or "").strip().lower()
+        if not raw:
+            return False
+        base = raw.split("(", 1)[0].strip()
+        if base in FEDERATION_TIMEZONE_AWARE_DATA_TYPES:
+            return True
+        if "with time zone" in raw:
+            return True
+        if base == "timestamp":
+            engine_norm = str(engine or "").strip().lower()
+            return engine_norm in MYSQL_TIMESTAMP_ENGINES
+        return False
+
+    @staticmethod
+    def column_unsigned_near_type_max(meta: Any) -> bool:
+        """Return whether profiled maxima exceed float-safe range or approach an unsigned ceiling."""
+        if not getattr(meta, "is_unsigned", False) or getattr(meta, "max_val", None) in (None, ""):
+            return False
+        try:
+            profiled_max = int(str(meta.max_val).strip())
+        except (TypeError, ValueError):
+            return False
+        if profiled_max > MAX_FLOAT_SAFE_INTEGER:
+            return True
+        base = ColumnTypeSemantics.normalize_column_type(meta.data_type)
+        type_max = UNSIGNED_INTEGER_TYPE_MAX.get(base)
+        if type_max is None:
+            return False
+        margin = max(1, type_max // 100)
+        return profiled_max >= type_max - margin
+
+    @staticmethod
+    def is_numeric_type(data_type: str) -> bool:
+        """Return whether a SQL data type string looks numeric."""
+        dt = data_type.lower()
+        return any(t in dt for t in NUMERIC_TYPE_TOKENS)
+
+    @staticmethod
+    def is_string_type(data_type: str) -> bool:
+        """Return whether a SQL data type string looks string-like."""
+        dt = data_type.lower()
+        return any(t in dt for t in STRING_TYPE_TOKENS)
+
+    @staticmethod
+    def is_date_type(data_type: str) -> bool:
+        """Return whether a SQL data type string looks date- or time- like."""
+        dt = data_type.lower()
+        return any(t in dt for t in DATE_TYPE_TOKENS)
+
+    @staticmethod
+    def data_type_to_value_type(data_type: str) -> str:
+        """Map a SQL data type string to a prompt/value-type token."""
+        normalized = ColumnTypeSemantics.normalize_column_type(data_type)
+        vt = COLUMN_TYPE_TO_VALUE_TYPE.get(normalized)
+        if vt:
+            return vt
+        if ColumnTypeSemantics.is_numeric_type(data_type):
+            return "number"
+        if ColumnTypeSemantics.is_date_type(data_type):
+            return "date"
+        if ColumnTypeSemantics.is_string_type(data_type):
+            return "string"
+        return ArrayStorageKind.UNKNOWN
 
 
 @dataclass(frozen=True, slots=True)
@@ -573,11 +1110,13 @@ class EngineIdentity:
     """Bound engine type and runtime config for one engine instance or federated source."""
 
     engine_type: str
-    runtime_config: type
+    runtime_config: Any
 
 
 class InteractiveChoicePort(Protocol):
     """Bridges yes/no prompts to a session queue or stdin."""
+
+    _pending_federation_plan_template: Any
 
     def has_pending_choice(self) -> bool:
         """Return True when at least one queued answer is available for the next prompt."""
@@ -585,6 +1124,46 @@ class InteractiveChoicePort(Protocol):
 
     def take_yes_no(self, stage: str, prompt: str, options: list[str], silent_no: bool = False) -> str | None:
         """Return a normalised choice or raise ``PipelineSuspended`` when the queue is empty."""
+        ...
+
+
+class QueryLogSource(Protocol):
+    """Read-only fetcher of historical SQL statements from an engine query log."""
+
+    def is_available(self, conn: Any) -> bool:
+        """Return True when the source can run against *conn*."""
+        ...
+
+    def fetch(
+        self, conn: Any, *, lookback_days: int, max_queries: int, min_runs: int, user_filter: str | None
+    ) -> list[str]:
+        """Return distinct SQL texts newest-first within policy caps."""
+        ...
+
+
+class ResultBackendPort(Protocol):
+    """Typing port for dialect row-fetch backends. Concrete ABC lives in ``_dialect_sqlglot_helper``."""
+
+    kind: ResultReaderKind
+
+    def fetch_rows(
+        self, sql: str, params: dict[str, Any] | None = None, *, timeout_ms: int | None = None
+    ) -> list[tuple[Any, ...]]:
+        """Execute *sql* and return result rows as tuples."""
+        ...
+
+    def fetch_arrow_table(
+        self, sql: str, params: dict[str, Any] | None = None, *, timeout_ms: int | None = None
+    ) -> Any:
+        """Execute *sql* and return a PyArrow table when the driver supports it."""
+        ...
+
+    def cancel_statement(self) -> None:
+        """Cancel an in-flight statement when the driver supports it."""
+        ...
+
+    def fetch_first_column_text(self, sql: str, params: dict[str, Any] | None = None) -> str:
+        """Execute *sql* and join the first column of each row into newline-separated text."""
         ...
 
 
@@ -604,17 +1183,49 @@ class RephraseHint(Enum):
     FEDERATION_TURN_CANCELLED = "federation_turn_cancelled"
 
 
+@dataclass(frozen=True)
+class RefusalCatalogueEntry:
+    """User-facing refusal text and reformulation hint for one catalogue code."""
+
+    user_text: str
+    reformulation_hint: str
+
+
+class RefusalCondition(StrEnum):
+    """Enumerated refusal conditions mapped to stable diagnostic codes."""
+
+    PERMISSION_DENIAL = "permission_denial"
+    SCOPE_VIOLATION = "scope_violation"
+    INVALID_QUESTION = "invalid_question"
+    PARSE_FAILURE = "parse_failure"
+    DECLINED_SCHEMA = "declined_schema"
+    TIE_CAP_EXHAUSTION = "tie_cap_exhaustion"
+    WIDENED_CLAUSE_REFUSAL = "widened_clause_refusal"
+    PROBE_PLACEMENT = "probe_placement"
+    UNSUPPORTED_COLUMN_TYPE = "unsupported_column_type"
+    NULL_IN_NEGATED_LIST = "null_in_negated_list"
+    AMBIGUOUS_DATE_LITERAL = "ambiguous_date_literal"
+    UNION_COLUMN_MISSING = "union_column_missing"
+    JOIN_PATH_UNAVAILABLE = "join_path_unavailable"
+    AGGREGATE_FAN_OUT = "aggregate_fan_out"
+    HOP_CEILING = "hop_ceiling"
+    CTE_CAP = "cte_cap"
+    CAPABILITY_GAP = "capability_gap"
+    NOT_AVAILABLE_IN_CONTEXT = "not_available_in_context"
+    SUBDAY_DATE_WINDOW = "subday_date_window"
+
+
 _mock_fixture_recorded_corpus_count: Any = None
 
 
-def register_mock_fixture_recorded_corpus_count(fn: Any) -> None:
-    """Register sandbox recorded-corpus count provider for :class:`MockFixtureMissingError` messages."""
-    global _mock_fixture_recorded_corpus_count
-    _mock_fixture_recorded_corpus_count = fn
-
-
-class MockFixtureMissingError(RuntimeError):
+class MockFixtureMissingError(AetherError, RuntimeError):
     """Raised when the mock provider has no fixture for the requested LLM call."""
+
+    @classmethod
+    def register_recorded_corpus_count(cls, fn: Any) -> None:
+        """Register sandbox recorded-corpus count provider for error messages."""
+        global _mock_fixture_recorded_corpus_count
+        _mock_fixture_recorded_corpus_count = fn
 
     def __init__(self, *, task: str, system: str, user: str) -> None:
         self.task = task
@@ -627,7 +1238,7 @@ class MockFixtureMissingError(RuntimeError):
             super().__init__(
                 "Sandbox is in recorded-corpus mode "
                 f"({recorded_count} questions available). "
-                "Ask a recorded question or call sandbox_questions(). "
+                "Ask a recorded question or call Sandbox.sandbox_questions(). "
                 f"No mock fixture for task={task!r}.",
             )
             return
@@ -652,22 +1263,22 @@ class OwnerOnlyOperationError(ConfigError):
     """Raised when a consumer-role instance attempts a schema-identity mutation."""
 
     def __init__(self, operation: str) -> None:
-        super().__init__(f"Operation {operation!r} requires role='owner'; this instance is a consumer.")
+        super().__init__(f"Operation {operation!r} requires role=SchemaRole.OWNER; this instance is a consumer.")
 
 
-class MigrationPendingError(ValueError):
+class MigrationPendingError(AetherError, ValueError):
     """Init terminated because schema_migration_map.json is required, malformed, missing after export, or conflicts with validation."""
 
 
-class ConnectionError(OSError):
+class DatabaseConnectionError(AetherError, OSError):
     """Raised when the database driver rejects a connection attempt."""
 
 
-class RetryableError(Exception):
-    """Marker base class for transient failures that may succeed on retry. Concrete subclasses combine this marker with :class:`ConnectionError`, :class:`RuntimeError`, etc. Integrators may use ``isinstance(exc, RetryableError)`` without inspecting messages."""
+class RetryableError(AetherError):
+    """Marker base class for transient failures that may succeed on retry. Concrete subclasses combine this marker with :class:`DatabaseConnectionError`, :class:`RuntimeError`, etc. Integrators may use ``isinstance(exc, RetryableError)`` without inspecting messages."""
 
 
-class DatabasePingFailed(ConnectionError, RetryableError):
+class DatabasePingFailed(DatabaseConnectionError, RetryableError):
     """Raised when a trivial ``SELECT 1`` ping fails after retries (network blips, overload)."""
 
 
@@ -679,19 +1290,72 @@ class StatementTimeoutError(RuntimeError, RetryableError):
     """Raised when the database aborts work due to ``statement_timeout`` or warehouse timeouts."""
 
 
-class SchemaAccessError(ValueError):
+class DatabaseErrorClassification(StrEnum):
+    """Driver failure permanence classification attached to :class:`DatabaseExecutionError`."""
+
+    TRANSIENT = "transient"
+    PERMANENT = "permanent"
+    UNKNOWN = "unknown"
+
+
+class DatabaseExecutionError(AetherError):
+    """Raised when a database driver fails during statement execution after connect succeeds."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        driver_class: str | None = None,
+        classification: str | DatabaseErrorClassification | None = None,
+        retryable: bool = False,
+        driver_detail: Mapping[str, Any] | None = None,
+    ) -> None:
+        self.driver_class = driver_class
+        self.classification = (
+            classification.value if isinstance(classification, DatabaseErrorClassification) else classification
+        )
+        self.retryable = bool(retryable)
+        self.driver_detail = dict(driver_detail) if driver_detail is not None else None
+        super().__init__(message)
+
+
+class RetryableDatabaseExecutionError(DatabaseExecutionError, RetryableError):
+    """Transient database execution failure that may succeed on retry."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        driver_class: str | None = None,
+        classification: str | DatabaseErrorClassification | None = None,
+        driver_detail: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(
+            message,
+            driver_class=driver_class,
+            classification=classification,
+            retryable=True,
+            driver_detail=driver_detail,
+        )
+
+
+class SchemaAccessError(AetherError, ValueError):
     """Raised when credentials cannot read the requested scope or the graph is unusable. Covers catalog reflection, construction invariants, and scope configuration at init. Runtime ``EXPLAIN`` / ``execute`` permission denial is raised as :class:`AccessError`, which is a subclass so integrators may catch this type for every access denial surface."""
 
 
-class SessionActiveError(RuntimeError):
+class SessionActiveError(AetherError, RuntimeError):
     """Raised when ``PipelineSession.ask`` is called while a turn is already in progress."""
 
 
-class SessionTurnCancelledError(Exception):
+class SuspendedSessionExpiredError(SessionActiveError):
+    """Raised when a suspended turn exceeds ``EngineLimits.suspended_session_ttl_seconds``."""
+
+
+class SessionTurnCancelledError(AetherError):
     """Raised when a programmatic session turn is cancelled cooperatively."""
 
 
-class SchemaInvariantError(RuntimeError):
+class SchemaInvariantError(AetherError, RuntimeError):
     """Raised by :func:`assert_schema_invariants` when the canonical containers fall out of sync. Indicates a programmer error elsewhere in the build pipeline: e.g. an FK referencing a missing column, a PK column missing from its table, an unwired column-table back reference, or a stale canonical-bearer index. Always indicates the offending source-of-truth has been violated and never represents a recoverable runtime condition."""
 
 
@@ -709,7 +1373,7 @@ class ResolvedQualifiedRef:
 class FederationTopologyReport:
     """Outcome of reconciling recorded federation members against the manifest."""
 
-    change: Literal["none", "add", "remove", "mixed"]
+    change: FederationTopologyChange
     added_source_ids: tuple[str, ...] = ()
     removed_source_ids: tuple[str, ...] = ()
     plan_templates_invalidated: bool = False
@@ -732,6 +1396,10 @@ class FederationConfigError(ConfigError):
 
 class FederationDeclarationError(FederationConfigError):
     """Raised when federation declarations fail validation at build or registration time."""
+
+
+class FederationMappingsAppliedSidecarError(FederationConfigError):
+    """Raised when the applied federation mappings sidecar disagrees with the mappings file."""
 
 
 class FederationIneligibleError(ConfigError):
@@ -764,7 +1432,7 @@ class FederationPartialFailureError(FederationRuntimeError):
         retryable: bool = False,
     ) -> FederationPartialFailureError:
         if retryable:
-            return FederationRuntimeError.__new__(_RetryableFederationPartialFailureError)
+            return FederationRuntimeError.__new__(RetryableFederationPartialFailureError)
         return FederationRuntimeError.__new__(cls)
 
     def __init__(
@@ -783,7 +1451,7 @@ class FederationPartialFailureError(FederationRuntimeError):
         super().__init__(message)
 
 
-class _RetryableFederationPartialFailureError(FederationPartialFailureError, RetryableError):
+class RetryableFederationPartialFailureError(FederationPartialFailureError, RetryableError):
     """Partial federation failure that may succeed on retry."""
 
 
@@ -806,6 +1474,15 @@ class FederationTurnCancelledError(FederationRuntimeError):
 
 class FederationCapExceededError(FederationRuntimeError):
     """Raised when a federated row, byte, or timeout cap is exceeded. Carries ``limit_key`` (which cap fired, e.g. ``"row_cap"``) and optional ``source_id`` (empty string for coordinator-wide caps). Catch this specifically to prompt the caller to narrow or re-scope the question; retrying the same turn will not help. Prefer this over catching the parent and inspecting attributes to distinguish a cap breach from a per-member execution failure."""
+
+    def __init__(self, message: str, *, limit_key: str, source_id: str = "") -> None:
+        self.limit_key = str(limit_key or "")
+        self.source_id = str(source_id or "")
+        super().__init__(message)
+
+
+class ResultCapExceededError(AetherError, RuntimeError):
+    """Raised when a single-engine row or byte cap is exceeded during result fetch."""
 
     def __init__(self, message: str, *, limit_key: str, source_id: str = "") -> None:
         self.limit_key = str(limit_key or "")
@@ -853,106 +1530,7 @@ class FederationMemberUnprofilableError(FederationDeclarationError):
         super().__init__(message)
 
 
-def _federation_table_source_index(
-    schema: Any, mappings: FederationMappings, manifest: FederationManifest | None = None
-) -> dict[str, str]:
-    index: dict[str, str] = {}
-    logical_member_sources: dict[str, set[str]] = {}
-    for lt in mappings.logical_tables:
-        logical_member_sources[lt.logical] = {m.source for m in lt.members}
-    tables = getattr(schema, "tables", None) or {}
-    for name, table in tables.items():
-        member_source_ids = getattr(table, "member_source_ids", None) or ()
-        if member_source_ids:
-            if len(member_source_ids) == 1:
-                index[name] = member_source_ids[0]
-            continue
-        source_id = getattr(table, "source_id", "") or ""
-        if source_id:
-            index[name] = source_id
-        elif name in logical_member_sources:
-            sources = logical_member_sources[name]
-            if len(sources) == 1:
-                index[name] = next(iter(sources))
-    if manifest is not None:
-        for name, source_id in manifest.table_namespace.items():
-            if name in tables and name not in index:
-                index[name] = source_id
-    return index
-
-
-def resolve_federation_qualified_ref(
-    ref: str,
-    *,
-    manifest: FederationManifest,
-    schema: Any | None = None,
-    source_by_table: Mapping[str, str] | None = None,
-) -> ResolvedQualifiedRef:
-    """Resolve ``table.column`` or ``source.table.column``, erroring on ambiguity."""
-    text = str(ref or "").strip()
-    if not text:
-        raise ConfigError("empty federation qualified reference")
-    three = FEDERATION_QUALIFIED_THREE_PART_REF_RE.match(text)
-    if three:
-        source_id, table, column = three.group(1), three.group(2), three.group(3)
-        declared_sources = {s.source_id for s in manifest.sources}
-        if not declared_sources:
-            declared_sources = set(manifest.table_namespace.values())
-            if schema is not None:
-                declared_sources |= {
-                    str(getattr(table_meta, "source_id", "") or "").strip()
-                    for table_meta in getattr(schema, "tables", {}).values()
-                    if str(getattr(table_meta, "source_id", "") or "").strip()
-                }
-        if declared_sources and source_id not in declared_sources:
-            raise ConfigError(f"unknown federation source in reference: {text!r}")
-        ns_table = manifest.table_namespace.get(table, "")
-        if ns_table and ns_table != source_id:
-            raise ConfigError(
-                f"qualified reference {text!r} disagrees with table_namespace ({table!r} -> {ns_table!r})"
-            )
-        if schema is not None:
-            table_meta = tables.get(table) if (tables := getattr(schema, "tables", None)) else None
-            if table_meta is not None:
-                composite_source = getattr(table_meta, "source_id", "") or ""
-                if composite_source and composite_source != source_id:
-                    raise ConfigError(f"qualified reference {text!r} disagrees with composite source_id")
-        return ResolvedQualifiedRef(source_id=source_id, table=table, column=column, qualified=f"{table}.{column}")
-    two = FEDERATION_QUALIFIED_COLUMN_REF_RE.match(text)
-    if not two:
-        raise ConfigError(f"expected table.column or source.table.column: {text!r}")
-    table, column = two.group(1), two.group(2)
-    index = dict(source_by_table or {})
-    if not index and schema is not None:
-        index = _federation_table_source_index(
-            schema, FederationMappings(version=FEDERATION_MAPPINGS_VERSION), manifest
-        )
-    candidates: set[str] = set()
-    ns = manifest.table_namespace.get(table, "")
-    if ns:
-        candidates.add(ns)
-    mapped = index.get(table, "")
-    if mapped:
-        candidates.add(mapped)
-    if schema is not None:
-        composite_table = getattr(schema, "tables", {}).get(table)
-        if composite_table is not None:
-            composite_source = getattr(composite_table, "source_id", "") or ""
-            if composite_source:
-                candidates.add(composite_source)
-            candidates.update(getattr(composite_table, "member_source_ids", None) or ())
-    candidates.discard("")
-    if len(candidates) > 1:
-        raise ConfigError(f"ambiguous federation reference {text!r}: sources {sorted(candidates)}")
-    if not candidates:
-        if not manifest.sources and not manifest.table_namespace:
-            return ResolvedQualifiedRef(source_id="", table=table, column=column, qualified=f"{table}.{column}")
-        raise ConfigError(f"cannot attribute federation reference: {text!r}")
-    source_id = next(iter(candidates))
-    return ResolvedQualifiedRef(source_id=source_id, table=table, column=column, qualified=f"{table}.{column}")
-
-
-class MigrationTier(str, Enum):
+class MigrationTier(StrEnum):
     """Classified migration severity between a stored artifact fingerprint and the live graph."""
 
     NO_CHANGE = "no_change"
@@ -963,7 +1541,7 @@ class MigrationTier(str, Enum):
     DESTRUCTIVE = "destructive"
 
 
-class ColumnVisibilityBlockReason(str, Enum):
+class ColumnVisibilityBlockReason(StrEnum):
     """Machine-stable reason a column is blocked from LLM exposure or reference validation."""
 
     DENIED = "denied"
@@ -971,6 +1549,20 @@ class ColumnVisibilityBlockReason(str, Enum):
     SENSITIVE_HIDDEN = "sensitive_hidden"
     SENSITIVE_RESTRICTED = "sensitive_restricted"
     UNUSABLE = "unusable"
+
+
+@dataclass(frozen=True, slots=True)
+class RefreshReport:
+    """Outcome of :meth:`~aetherdialect.AetherEngine.refresh` or :meth:`~aetherdialect.AetherFederation.refresh`."""
+
+    migration_tier: MigrationTier
+    schema_changed: bool
+    objects_added: tuple[str, ...]
+    objects_removed: tuple[str, ...]
+    templates_invalidated: int
+    orphans_removed: int
+    bytes_reclaimed: int
+    diagnostics: tuple[Diagnostic, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -985,6 +1577,8 @@ class MigrationReport:
     remapped_templates: int = 0
     surgically_invalidated: int = 0
     dropped_tables: tuple[str, ...] = ()
+    added_tables: tuple[str, ...] = ()
+    added_columns: tuple[tuple[str, str], ...] = ()
     value_type_changed_columns: tuple[tuple[str, str, str], ...] = ()
 
 
@@ -1049,6 +1643,8 @@ class OverrideReport:
     coerced_columns: int = 0
     collapsed_inferences: int = 0
     descriptions_refined: int = 0
+    business_knowledge_refined: int = 0
+    business_knowledge_entries: tuple[BusinessKnowledgeEntry, ...] | None = None
     skipped: tuple[OverrideSkip, ...] = ()
 
 
@@ -1057,12 +1653,19 @@ class Diagnostic:
     """Structured status line emitted alongside ``notify`` / ``debug`` for programmatic consumers."""
 
     stage: str
-    level: str
+    level: DiagnosticSeverity | str
     code: str
     message: str
     details: tuple[tuple[str, str], ...] = ()
     duration_ms: int | None = None
     source_id: str | None = None
+    phase: str | None = None
+    remediation: str | None = None
+    subject: str | None = None
+    count: int = 1
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "level", DiagnosticSeverity.coerce(self.level))
 
 
 @dataclass(frozen=True, slots=True)
@@ -1106,7 +1709,8 @@ class DataQualityReport:
             severity = details_map.pop("severity", "")
             blocking_raw = details_map.pop("blocking", "no")
             details_map.pop("review", None)
-            level = severity or issue.level
+            issue_level = issue.level.value if isinstance(issue.level, DiagnosticSeverity) else issue.level
+            level = severity or issue_level
             issues_out.append(
                 {
                     "code": issue_code,
@@ -1155,6 +1759,7 @@ class ParameterBinding:
     handle: str
     current_value: ParamValue | None
     display_name: str
+    column_expr: str = ""
     upper_handle: str = ""
     unit_handle: str = ""
 
@@ -1180,12 +1785,12 @@ class SessionNotice:
 
 @dataclass(frozen=True, slots=True)
 class SessionStep:
-    """Single observable point in a programmatic interactive turn. Carries whether the turn has finished, a short instruction string, a stage discriminant, optional SQL, tabular data, a free-form body, and an error string when the engine fails. done: True when the pipeline finished successfully or ended in a terminal error; False when the caller must respond via ``PipelineSession.step``. prompt: The short line the interactive layer should show immediately before collecting input (for example yes or no, or a free-text rejection reason prompt). kind: Stable stage identifier matching the active suspend kind or a terminal sentinel; used to branch programmatic UIs without parsing ``prompt``. sql: The formatted SQL under discussion when the step pertains to execution or confirmation; otherwise None. data: Row-level query preview or full result as a ``pandas.DataFrame``; None for scalar outcomes, previews trimmed to five rows at suspend boundaries, and the full frame on the terminal acceptance step when rows exist. message: Multi-line contextual body: consolidated intent confirmation, migration DDL, rejection guidance, or a rendered scalar value; empty or None when nothing extra should print beyond ``prompt`` and ``data``. error: Terminal failure explanation when ``done`` is True and processing stopped; otherwise None. intent_summary: Structured intent headline when the step reflects a parsed intent or later pipeline stages; otherwise None. diagnostics: Structured diagnostics captured during this step (from ``notify`` / ``debug`` when a collector is active). status: On terminal error steps, a coarse failure category name (same string values as :class:`FailureCategory`); None on success or non-terminal steps. reply_shape: When ``done`` is False, whether the caller should collect a yes or no token or free text; None on terminal steps. semantic_warnings: Normalised warning strings for intent confirmation, often empty on non-intent suspend steps."""
+    """Single observable point in a programmatic interactive turn. Carries whether the turn has finished, a short instruction string, a stage discriminant, optional SQL, tabular data, a free-form body, and an error string when the engine fails. done: True when the pipeline finished successfully or ended in a terminal error; False when the caller must respond via ``PipelineSession.step``. prompt: The short line the interactive layer should show immediately before collecting input (for example yes or no, or a free-text rejection reason prompt). kind: Stable stage identifier matching the active suspend kind or a terminal sentinel; used to branch programmatic UIs without parsing ``prompt``. sql: The formatted SQL under discussion when the step pertains to execution or confirmation; otherwise None. data: Row-level query preview or full result as a ``pandas.DataFrame``; None for scalar outcomes, previews trimmed to five rows at suspend boundaries, and the full frame on the terminal acceptance step when rows exist. message: Multi-line contextual body: consolidated intent confirmation, migration DDL, rejection guidance, or a rendered scalar value; empty or None when nothing extra should print beyond ``prompt`` and ``data``. error: Terminal failure explanation when ``done`` is True and processing stopped; otherwise None. intent_summary: Structured intent headline when the step reflects a parsed intent or later pipeline stages; otherwise None. diagnostics: Structured diagnostics captured during this step (from ``notify`` / ``debug`` when a collector is active). status: On terminal steps, a coarse outcome name: failure categories use the same string values as :class:`FailureCategory`; cooperative cancellation uses ``cancelled``; None on success or non-terminal steps. reply_shape: When ``done`` is False, whether the caller should collect a yes or no token or free text; None on terminal steps. semantic_warnings: Normalised warning strings for intent confirmation, often empty on non-intent suspend steps."""
 
     done: bool
     prompt: str | None
     kind: str
-    sql: str | None = None
+    sql: str | dict[str, str] | None = None
     data: pandas.DataFrame | None = None
     message: str | None = None
     error: str | None = None
@@ -1204,6 +1809,11 @@ class SessionStep:
     retryable: bool = False
     notices: tuple[SessionNotice, ...] = ()
     data_truncated: bool = False
+    llm_usage: LlmTurnUsageSummary | None = None
+    refusal_code: str | None = None
+    refusal_diagnostic_code: str | None = None
+    template_id: str | None = None
+    meta_payload: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1230,7 +1840,8 @@ class PhaseProgressEvent:
     phase: str
     timestamp_iso: str
     source: str | None = None
-    stage: int | None = None
+    stage: int | str | None = None
+    turn_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1263,6 +1874,17 @@ class LlmUsageRecord:
     elapsed_ms: int
     phase: str = ""
     source_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class LlmTurnUsageSummary:
+    """Aggregated LLM token usage for one interactive ask turn."""
+
+    request_count: int
+    input_tokens: int
+    cached_input_tokens: int
+    output_tokens: int
+    cost_usd: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1311,13 +1933,7 @@ class StoredTemplateSummary:
     """Caller-visible summary row for one accepted template."""
 
     id: str
-    q_norm: str
-    sql_param: str
-    display_sql: str
-    space: str
-    use_count: int
-    created_at: str
-    last_used_at: str
+    approval_state: str = "approved"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1325,10 +1941,8 @@ class StoredTemplateDetail:
     """Full caller-visible detail for one accepted template."""
 
     summary: StoredTemplateSummary
-    sql_fp: str
-    tables_used: tuple[str, ...]
-    trust_level: int
     parameters: tuple[ParameterBinding, ...]
+    approval_state: str = "approved"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1354,11 +1968,12 @@ class EngineContext:
     """Frozen scope object that narrows what a question may touch on a single :class:`~aetherdialect.AetherEngine` (one database connection). Parallel to :class:`FederationContext` (multi-member federation) and :class:`SpaceContext` (named subset at question time). Unlike those types, this context has no ``name`` field and is the only one that carries an optional ``sql_file``. Allow/deny lists, include mode, and content hashes of ``notes_file`` / ``sql_file`` feed the engine scope fingerprint. Args: allow_objects: Relation names permitted in scope. Empty means unrestricted (catalog reflection still respects ``include``). include: Catalog kinds to reflect when ``allow_objects`` is empty: ``tables`` or ``views`` (default ``tables``). ``both`` is rejected; reflect tables and views in separate passes when both are needed. deny_objects: Relation names excluded from scope. Empty means none denied. Must not overlap ``allow_objects``. deny_columns: Qualified ``table.column`` or ``*.column`` specs to exclude. Empty means none denied. Three-part ``source.table.column`` forms are accepted and normalised to ``table.column``. Must not name the same table as an ``allow_objects`` or ``deny_objects`` entry. allow_columns: Qualified ``table.column`` or ``*.column`` specs that further restrict visible columns. Empty means all columns of tables in scope (subject to denies). Three-part forms normalise like ``deny_columns``. notes_ file: Optional path to domain notes whose content hash enters the scope fingerprint. ``None`` (default) means no notes file. sql_ file: Optional path to DDL whose content hash enters the scope fingerprint and dialect probe. ``None`` (default) means no DDL file. :class:`FederationContext` deliberately omits this field. Raises: ConfigError: ``include`` is not one of ``tables`` / ``views`` / ``both``; ``notes_file`` or ``sql_file`` is present but blank; a column spec is not ``table.column`` / ``*.column`` / ``source.table.column``; ``allow_objects`` overlaps ``deny_objects``; or a table-specific ``deny_columns`` entry conflicts with ``allow_objects`` or ``deny_objects``. ValueError: An allow/deny identifier is empty after strip/lower."""
 
     allow_objects: frozenset[str] = frozenset()
-    include: SchemaInclude = "tables"
+    include: SchemaInclude = SchemaInclude.TABLES
     deny_objects: frozenset[str] = frozenset()
     deny_columns: frozenset[str] = frozenset()
     allow_columns: frozenset[str] = frozenset()
     notes_file: str | None = None
+    notes: str | None = None
     sql_file: str | None = None
 
     def __post_init__(self) -> None:
@@ -1366,20 +1981,31 @@ class EngineContext:
             raise ConfigError(f"include must be 'tables' or 'views', not {self.include!r}")
         if self.notes_file is not None and not str(self.notes_file).strip():
             raise ConfigError("notes_file must be omitted or a non-empty path")
+        if self.notes is not None:
+            notes_stripped = str(self.notes).strip()
+            if not notes_stripped:
+                raise ConfigError("notes must be omitted or non-empty text")
+            object.__setattr__(self, "notes", notes_stripped)
+        if self.notes is not None and self.notes_file is not None:
+            raise ConfigError("set at most one of notes and notes_file")
         if self.sql_file is not None and not str(self.sql_file).strip():
             raise ConfigError("sql_file must be omitted or a non-empty path")
-        allow_norm = frozenset(norm_schema_identifier(t, what="allow_objects entry") for t in self.allow_objects)
-        deny_obj_norm = frozenset(norm_schema_identifier(t, what="deny_objects entry") for t in self.deny_objects)
+        allow_norm = frozenset(
+            SchemaNaming.norm_schema_identifier(t, what="allow_objects entry") for t in self.allow_objects
+        )
+        deny_obj_norm = frozenset(
+            SchemaNaming.norm_schema_identifier(t, what="deny_objects entry") for t in self.deny_objects
+        )
         overlap_obj = allow_norm & deny_obj_norm
         if overlap_obj:
             raise ConfigError(f"allow_objects and deny_objects overlap: {sorted(overlap_obj)!r}")
         normalized_specs: list[str] = []
         for spec in self.deny_columns:
-            normalized_specs.append(_normalize_scope_column_spec(spec, field="deny_columns"))
+            normalized_specs.append(SchemaNaming.normalize_scope_column_spec(spec, field="deny_columns"))
         col_set = frozenset(normalized_specs)
         allow_col_specs: list[str] = []
         for spec in self.allow_columns:
-            allow_col_specs.append(_normalize_scope_column_spec(spec, field="allow_columns"))
+            allow_col_specs.append(SchemaNaming.normalize_scope_column_spec(spec, field="allow_columns"))
         allow_col_set = frozenset(allow_col_specs)
         for t in allow_norm:
             for spec in col_set:
@@ -1447,29 +2073,41 @@ class FederationContext:
     """Frozen scope object that narrows what a question may touch on an :class:`~aetherdialect.AetherFederation` (several member engines). Parallel to :class:`EngineContext` (single connection) and :class:`SpaceContext` (named subset at question time). Unlike :class:`EngineContext`, this type has no ``sql_file`` field; unlike :class:`SpaceContext`, it is not a named subset. ``notes_file`` content hash feeds the composite scope identity. Mappings-aware validation (see :func:`~aetherdialect._federation.validate_federation_context_against_mappings`) requires that denies of collapsed members use the **logical** table name, and rejects partial denies of ``union`` / ``replica`` member sets. Args: allow_objects: Relation names permitted in composite scope. Empty means unrestricted. Prefer logical names for collapsed mapped tables. include: Catalog kinds considered when building member graphs under this scope: ``tables`` or ``views`` (default ``tables``). ``both`` is rejected. deny_objects: Relation names excluded from composite scope. Empty means none denied. Must not overlap ``allow_objects``. For collapsed mapped tables, name the logical table, not a physical member table. deny_columns: Qualified ``table.column`` or ``*.column`` specs to exclude. Empty means none denied. Three-part ``source.table.column`` forms are accepted and normalised to ``table.column``. Must not name the same table as an ``allow_objects`` or ``deny_objects`` entry. allow_columns: Qualified ``table.column`` or ``*.column`` specs that further restrict visible columns. Empty means all columns of tables in scope (subject to denies). Three-part forms normalise like ``deny_columns``. notes_file: Optional path to domain notes whose content hash enters the composite scope fingerprint. ``None`` (default) means no notes file. Raises: ConfigError: ``include`` is not one of ``tables`` / ``views`` / ``both``; ``notes_file`` is present but blank; a column spec is not ``table.column`` / ``*.column`` / ``source.table.column``; ``allow_objects`` overlaps ``deny_objects``; or a table-specific ``deny_columns`` entry conflicts with ``allow_objects`` or ``deny_objects``. Also raised by mappings-aware validation when a scope entry names a collapsed physical member table, or partially denies a ``union`` / ``replica`` logical table. ValueError: An allow/deny identifier is empty after strip/lower."""
 
     allow_objects: frozenset[str] = frozenset()
-    include: SchemaInclude = "tables"
+    include: SchemaInclude = SchemaInclude.TABLES
     deny_objects: frozenset[str] = frozenset()
     deny_columns: frozenset[str] = frozenset()
     allow_columns: frozenset[str] = frozenset()
     notes_file: str | None = None
+    notes: str | None = None
 
     def __post_init__(self) -> None:
         if self.include not in ("tables", "views"):
             raise ConfigError(f"include must be 'tables' or 'views', not {self.include!r}")
         if self.notes_file is not None and not str(self.notes_file).strip():
             raise ConfigError("notes_file must be omitted or a non-empty path")
-        allow_norm = frozenset(norm_schema_identifier(t, what="allow_objects entry") for t in self.allow_objects)
-        deny_obj_norm = frozenset(norm_schema_identifier(t, what="deny_objects entry") for t in self.deny_objects)
+        if self.notes is not None:
+            notes_stripped = str(self.notes).strip()
+            if not notes_stripped:
+                raise ConfigError("notes must be omitted or non-empty text")
+            object.__setattr__(self, "notes", notes_stripped)
+        if self.notes is not None and self.notes_file is not None:
+            raise ConfigError("set at most one of notes and notes_file")
+        allow_norm = frozenset(
+            SchemaNaming.norm_schema_identifier(t, what="allow_objects entry") for t in self.allow_objects
+        )
+        deny_obj_norm = frozenset(
+            SchemaNaming.norm_schema_identifier(t, what="deny_objects entry") for t in self.deny_objects
+        )
         overlap_obj = allow_norm & deny_obj_norm
         if overlap_obj:
             raise ConfigError(f"allow_objects and deny_objects overlap: {sorted(overlap_obj)!r}")
         normalized_specs: list[str] = []
         for spec in self.deny_columns:
-            normalized_specs.append(_normalize_scope_column_spec(spec, field="deny_columns"))
+            normalized_specs.append(SchemaNaming.normalize_scope_column_spec(spec, field="deny_columns"))
         col_set = frozenset(normalized_specs)
         allow_col_specs: list[str] = []
         for spec in self.allow_columns:
-            allow_col_specs.append(_normalize_scope_column_spec(spec, field="allow_columns"))
+            allow_col_specs.append(SchemaNaming.normalize_scope_column_spec(spec, field="allow_columns"))
         allow_col_set = frozenset(allow_col_specs)
         for t in allow_norm:
             for spec in col_set:
@@ -1532,28 +2170,6 @@ class FederationContext:
         return frozenset()
 
 
-def _normalize_scope_column_spec(spec: str, *, field: str) -> str:
-    """Normalize a ``table.column`` or ``source.table.column`` scope column spec."""
-    raw = str(spec).strip()
-    parts = raw.split(".")
-    if len(parts) == 2:
-        tbl_raw, col_raw = parts
-    elif len(parts) == 3:
-        _source_raw, tbl_raw, col_raw = parts
-    else:
-        raise ConfigError(CONFIG_ERROR_SCHEMA_CONTEXT_COLUMN_SPEC.format(spec=spec))
-    tbl = norm_schema_identifier(tbl_raw, what=f"{field} table")
-    col = norm_schema_identifier(col_raw, what=f"{field} column")
-    if tbl == "*":
-        return f"*.{col}"
-    return f"{tbl}.{col}"
-
-
-def normalize_scope_column_spec(spec: str, *, field: str) -> str:
-    """Normalize a ``table.column`` or ``source.table.column`` scope column spec."""
-    return _normalize_scope_column_spec(spec, field=field)
-
-
 @dataclass(frozen=True, slots=True)
 class BusinessKnowledgeEntry:
     """Single prompt-time business knowledge item not tied to schema column descriptions."""
@@ -1561,6 +2177,153 @@ class BusinessKnowledgeEntry:
     key: str
     text: str
     kind: str = "glossary"
+
+    @staticmethod
+    def normalize(entry: BusinessKnowledgeEntry) -> BusinessKnowledgeEntry:
+        """Strip whitespace, default blank kind to glossary, and refuse unknown kinds."""
+        key = str(entry.key).strip()
+        text = str(entry.text).strip()
+        kind_raw = str(entry.kind or BUSINESS_KNOWLEDGE_DEFAULT_KIND).strip() or BUSINESS_KNOWLEDGE_DEFAULT_KIND
+        allowed = {member.value for member in BusinessKnowledgeKind}
+        if kind_raw not in allowed:
+            raise ConfigError(f"unknown business knowledge kind: {kind_raw!r}")
+        kind = kind_raw
+        if not key:
+            raise ConfigError("business knowledge entry key must be non-empty")
+        if not text:
+            raise ConfigError(f"business knowledge entry {key!r} must have non-empty text")
+        if kind != entry.kind or key != entry.key or text != entry.text:
+            return BusinessKnowledgeEntry(key=key, text=text, kind=kind)
+        return entry
+
+    @staticmethod
+    def hidden_column_references(text: str, schema_graph: Any) -> list[str]:
+        """Return qualified hidden column names referenced in *text*."""
+        found: list[str] = []
+        seen: set[str] = set()
+        for match in BUSINESS_KNOWLEDGE_COLUMN_REF_RE.finditer(text):
+            table_name, column_name = match.group(1), match.group(2)
+            qualified = f"{table_name}.{column_name}"
+            if qualified in seen:
+                continue
+            seen.add(qualified)
+            table = schema_graph.tables.get(table_name)
+            if table is None:
+                continue
+            column = table.columns.get(column_name)
+            if column is None:
+                continue
+            if column.sensitivity == SensitivityClassification.HIDDEN:
+                found.append(qualified)
+        return found
+
+
+@dataclass
+class BusinessKnowledgeState:
+    """Versioned snapshot of active business knowledge entries and digest."""
+
+    version: int = 0
+    entries: tuple[BusinessKnowledgeEntry, ...] = ()
+    digest: str = ""
+
+    @staticmethod
+    def digest_for(entries: Sequence[BusinessKnowledgeEntry]) -> str:
+        """Stable SHA-256 digest over normalized business knowledge entries."""
+        payload = [{"key": entry.key, "kind": entry.kind, "text": entry.text} for entry in entries]
+        body = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def empty_digest() -> str:
+        """Return the digest for an empty knowledge set."""
+        return BusinessKnowledgeState.digest_for(())
+
+    @staticmethod
+    def validate_entries(
+        entries: Sequence[BusinessKnowledgeEntry],
+        schema_graph: Any,
+    ) -> tuple[BusinessKnowledgeEntry, ...]:
+        """Normalize entries and refuse hidden-column references."""
+        normalized: list[BusinessKnowledgeEntry] = []
+        seen_keys: set[str] = set()
+        for raw in entries:
+            if not isinstance(raw, BusinessKnowledgeEntry):
+                raise TypeError("business knowledge entries must be BusinessKnowledgeEntry instances")
+            entry = BusinessKnowledgeEntry.normalize(raw)
+            if entry.key in seen_keys:
+                raise ConfigError(f"duplicate business knowledge key: {entry.key!r}")
+            seen_keys.add(entry.key)
+            hidden_refs = BusinessKnowledgeEntry.hidden_column_references(entry.text, schema_graph)
+            if hidden_refs:
+                joined = ", ".join(sorted(hidden_refs))
+                raise ConfigError(f"business knowledge entry {entry.key!r} references hidden column(s): {joined}")
+            normalized.append(entry)
+        return tuple(normalized)
+
+
+class BusinessKnowledgeHolder:
+    """Mutable versioned store for engine- or federation-level business knowledge."""
+
+    def __init__(self) -> None:
+        self._state = BusinessKnowledgeState(digest=BusinessKnowledgeState.empty_digest())
+
+    def set(self, entries: Sequence[BusinessKnowledgeEntry], schema_graph: Any) -> int:
+        normalized = BusinessKnowledgeState.validate_entries(entries, schema_graph)
+        digest = BusinessKnowledgeState.digest_for(normalized)
+        self._state = BusinessKnowledgeState(
+            version=self._state.version + 1,
+            entries=normalized,
+            digest=digest,
+        )
+        return self._state.version
+
+    def entries(self) -> tuple[BusinessKnowledgeEntry, ...]:
+        return self._state.entries
+
+    def digest(self) -> str:
+        return self._state.digest
+
+    def version(self) -> int:
+        return self._state.version
+
+    def scope_kwargs(self) -> dict[str, Any]:
+        """Keyword args for business-knowledge scope binding."""
+        return {"entries": self._state.entries, "digest": self._state.digest}
+
+
+@dataclass(frozen=True, slots=True)
+class OpenResourceInventory:
+    """Test-only snapshot of library-owned resources still open."""
+
+    locks: int
+    temp_directories: int
+    live_connections: int
+
+
+@dataclass(frozen=True, slots=True)
+class RenameMigrationAssessment:
+    """Inferred rename migration with a confidence score in ``[0, 1]``."""
+
+    plan: tuple[tuple[tuple[str, str], ...], tuple[tuple[str, str, str], ...]]
+    confidence: float
+
+
+@dataclass(frozen=True)
+class MemberEffectiveGrants:
+    """Tables and columns a federation member role may read at composition time."""
+
+    tables: frozenset[str]
+    columns: frozenset[tuple[str, str]] | None = None
+
+
+class FederationMemberEngine(Protocol):
+    """Minimal member-engine surface used when deriving federation source bindings."""
+
+    dialect: str
+    _connection: object
+    _context_name: object
+    _schema_role: object
+    _runtime_config: object | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1603,22 +2366,32 @@ class SpaceContext:
     deny_objects: frozenset[str] = frozenset()
     deny_columns: frozenset[str] = frozenset()
     notes_file: str | None = None
+    notes: str | None = None
 
     def __post_init__(self) -> None:
         if self.notes_file is not None and not str(self.notes_file).strip():
             raise ConfigError("notes_file must be omitted or a non-empty path")
-        allow_norm = frozenset(norm_schema_identifier(t, what="tables entry") for t in self.tables)
-        deny_obj_norm = frozenset(norm_schema_identifier(t, what="deny_objects entry") for t in self.deny_objects)
+        if self.notes is not None:
+            notes_stripped = str(self.notes).strip()
+            if not notes_stripped:
+                raise ConfigError("notes must be omitted or non-empty text")
+            object.__setattr__(self, "notes", notes_stripped)
+        if self.notes is not None and self.notes_file is not None:
+            raise ConfigError("set at most one of notes and notes_file")
+        allow_norm = frozenset(SchemaNaming.norm_schema_identifier(t, what="tables entry") for t in self.tables)
+        deny_obj_norm = frozenset(
+            SchemaNaming.norm_schema_identifier(t, what="deny_objects entry") for t in self.deny_objects
+        )
         overlap_obj = allow_norm & deny_obj_norm
         if overlap_obj:
             raise ConfigError(f"SpaceContext tables and deny_objects overlap: {sorted(overlap_obj)!r}")
         normalized_cols: list[str] = []
         for spec in self.columns:
-            normalized_cols.append(_normalize_scope_column_spec(spec, field="columns"))
+            normalized_cols.append(SchemaNaming.normalize_scope_column_spec(spec, field="columns"))
         col_set = frozenset(normalized_cols)
         deny_col_specs: list[str] = []
         for spec in self.deny_columns:
-            deny_col_specs.append(_normalize_scope_column_spec(spec, field="deny_columns"))
+            deny_col_specs.append(SchemaNaming.normalize_scope_column_spec(spec, field="deny_columns"))
         deny_col_set = frozenset(deny_col_specs)
         if allow_norm:
             for qc in col_set:
@@ -1656,8 +2429,9 @@ class FederationSourceBinding:
     engine: str
     connection: str = ""
     context: str = "master"
-    role: SchemaRole = "consumer"
+    role: SchemaRole = SchemaRole.CONSUMER
     limits: FederationSourceLimits | None = None
+    session_timezone: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1740,7 +2514,7 @@ class LogicalTableMapping:
 class FederationMappings:
     """Cross-source mapping sidecar replayed on composite rebuild."""
 
-    version: int
+    version: str
     logical_columns: tuple[LogicalColumnMapping, ...] = ()
     logical_tables: tuple[LogicalTableMapping, ...] = ()
 
@@ -1756,7 +2530,7 @@ class FederationPlanTemplate:
     combine_hash: str
     question: str = ""
     accepted_questions: tuple[str, ...] = ()
-    format_version: int = 2
+    format_version: str = "0.2.1"
     member_template_ids: tuple[tuple[str, str], ...] = ()
     residual_hash: str = ""
     join_feedback: tuple[str, ...] = ()
@@ -1907,7 +2681,7 @@ class AetherEngineInitResult:
     rejected: dict[str, Any]
     schema_terms: set[str]
     schema_stats: dict[str, Any]
-    schema_role: SchemaRole = "owner"
+    schema_role: SchemaRole = SchemaRole.OWNER
     consumer_visible_objects: frozenset[str] | None = None
     context_name: str = "master"
     execution_context: EngineContext | FederationContext | None = None
@@ -1927,68 +2701,6 @@ class AetherFederationInitResult(AetherEngineInitResult):
     """Init bundle for :class:`~aetherdialect.AetherFederation`."""
 
     members: dict[str, Any] | None = None
-
-
-def is_numeric_type(data_type: str) -> bool:
-    """
-    Return whether a SQL data type string looks numeric.
-
-    Args:
-
-        data_type: Raw SQL type string.
-
-    Returns:
-
-        True if a numeric token appears in the lowercased string.
-    """
-    dt = data_type.lower()
-    return any(t in dt for t in NUMERIC_TYPE_TOKENS)
-
-
-def is_string_type(data_type: str) -> bool:
-    """
-    Return whether a SQL data type string looks string-like.
-
-    Args:
-
-        data_type: Raw SQL data type string.
-
-    Returns:
-
-        True if any string/text token is found in the lowercased type string.
-    """
-    dt = data_type.lower()
-    return any(t in dt for t in STRING_TYPE_TOKENS)
-
-
-def is_date_type(data_type: str) -> bool:
-    """
-    Return whether a SQL data type string looks date- or time-like.
-
-    Args:
-
-        data_type: Raw SQL data type string.
-
-    Returns:
-
-        True if any temporal token appears in the lowercased string.
-    """
-    dt = data_type.lower()
-    return any(t in dt for t in DATE_TYPE_TOKENS)
-
-
-def data_type_to_value_type(data_type: str) -> str:
-    normalized = normalize_column_type(data_type)
-    vt = COLUMN_TYPE_TO_VALUE_TYPE.get(normalized)
-    if vt:
-        return vt
-    if is_numeric_type(data_type):
-        return "number"
-    if is_date_type(data_type):
-        return "date"
-    if is_string_type(data_type):
-        return "string"
-    return "string"
 
 
 class ColumnRole(Enum):
@@ -2082,7 +2794,7 @@ WORKLOAD_FAMILY_SPECS: dict[WorkloadFamily, WorkloadFamilySpec] = {
 }
 
 
-class InferenceTag(str, Enum):
+class InferenceTag(StrEnum):
     """Provenance tag for an :class:`FKEdge`. A catalog-declared edge is represented by ``None`` rather than a member of this enum so that presence-of-tag and identity-of- inferred-layer are reflected by a single attribute. Inherits ``str`` so members compare equal to their wire value and round-trip through JSON without custom encoding."""
 
     SUFFIX = "suffix"
@@ -2094,38 +2806,39 @@ class InferenceTag(str, Enum):
     USER_SEMANTIC = "user_override_semantic"
     CROSS_SOURCE = "cross_source"
 
+    @classmethod
+    def coerce(cls, raw: object) -> InferenceTag | None:
+        """Normalise raw cache or override input into :class:`InferenceTag` (``None`` for catalog)."""
+        if raw is None or raw == "":
+            return None
+        if isinstance(raw, cls):
+            return raw
+        if isinstance(raw, str) and raw in INFERENCE_TAG_VALUES:
+            return cls(raw)
+        raise ValueError(f"unknown FK inference_tag: {raw!r}")
 
-def coerce_inference_tag(raw: object) -> InferenceTag | None:
-    """Normalise raw cache or override input into :class:`InferenceTag` (``None`` for catalog). Raises ``ValueError`` when *raw* is a non-empty string that does not match any enum value."""
-    if raw is None or raw == "":
-        return None
-    if isinstance(raw, InferenceTag):
-        return raw
-    if isinstance(raw, str) and raw in INFERENCE_TAG_VALUES:
-        return InferenceTag(raw)
-    raise ValueError(f"unknown FK inference_tag: {raw!r}")
 
-
-class PkInferenceTag(str, Enum):
+class PkInferenceTag(StrEnum):
     """Provenance tag for an inferred or user-supplied primary key. Engine-reflected catalog keys use ``None`` (locked). SQL-file- declared keys use ``DDL`` (overridable). Inferred and user-supplied keys use the remaining members."""
 
     DDL = "ddl"
+    IDENTITY = "identity"
     PROFILE = "profile"
     USER_OVERRIDE = "user_override"
 
+    @classmethod
+    def coerce(cls, raw: object) -> PkInferenceTag | None:
+        """Normalise raw cache or override input into :class:`PkInferenceTag` (``None`` for catalog)."""
+        if raw is None or raw == "":
+            return None
+        if isinstance(raw, cls):
+            return raw
+        if isinstance(raw, str) and raw in PK_INFERENCE_TAG_VALUES:
+            return cls(raw)
+        raise ValueError(f"unknown pk_inference_tag: {raw!r}")
 
-def coerce_pk_inference_tag(raw: object) -> PkInferenceTag | None:
-    """Normalise raw cache or override input into :class:`PkInferenceTag` (``None`` for catalog). Raises ``ValueError`` when *raw* is a non-empty string that does not match any enum value."""
-    if raw is None or raw == "":
-        return None
-    if isinstance(raw, PkInferenceTag):
-        return raw
-    if isinstance(raw, str) and raw in PK_INFERENCE_TAG_VALUES:
-        return PkInferenceTag(raw)
-    raise ValueError(f"unknown pk_inference_tag: {raw!r}")
 
-
-class RoleOwner(str, Enum):
+class RoleOwner(StrEnum):
     """Provenance for the writer that last set :attr:`ColumnMetadata.role`. The members are ordered by ascending precedence: a writer with strictly greater precedence may overwrite a role assigned by a lower-precedence owner, while equal-or-lower-precedence writers must skip the column. PK/FK coercion is treated as the highest authority because it is required for join correctness; user overrides win over LLM inference, which in turn wins over profile heuristics, which in turn wins over the default catalog fallback."""
 
     CATALOG = "catalog"
@@ -2134,6 +2847,24 @@ class RoleOwner(str, Enum):
     BOOLEAN_COERCION = "boolean_coercion"
     USER_OVERRIDE = "user_override"
     PK_FK_COERCION = "pk_fk_coercion"
+
+    @classmethod
+    def coerce(cls, raw: object) -> RoleOwner | None:
+        """Normalise raw cache or override input into :class:`RoleOwner` (``None`` when unset)."""
+        if raw is None or raw == "":
+            return None
+        if isinstance(raw, cls):
+            return raw
+        if isinstance(raw, str) and raw in ROLE_OWNER_VALUES:
+            return cls(raw)
+        raise ValueError(f"unknown role_owner: {raw!r}")
+
+    @classmethod
+    def can_overwrite(cls, current: RoleOwner | None, candidate: RoleOwner) -> bool:
+        """Return whether a writer with provenance *candidate* may overwrite a role currently owned by *current*."""
+        if current is None:
+            return True
+        return _ROLE_OWNER_PRECEDENCE[candidate] > _ROLE_OWNER_PRECEDENCE[current]
 
 
 _ROLE_OWNER_PRECEDENCE: dict[RoleOwner, int] = {
@@ -2146,32 +2877,78 @@ _ROLE_OWNER_PRECEDENCE: dict[RoleOwner, int] = {
 }
 
 
-def coerce_role_owner(raw: object) -> RoleOwner | None:
-    """Normalise raw cache or override input into :class:`RoleOwner` (``None`` when unset). Raises ``ValueError`` when *raw* is a non-empty string that does not match any enum value."""
-    if raw is None or raw == "":
-        return None
-    if isinstance(raw, RoleOwner):
-        return raw
-    if isinstance(raw, str) and raw in ROLE_OWNER_VALUES:
-        return RoleOwner(raw)
-    raise ValueError(f"unknown role_owner: {raw!r}")
-
-
-def can_overwrite_role(current: RoleOwner | None, candidate: RoleOwner) -> bool:
-    """Return whether a writer with provenance *candidate* may overwrite a role currently owned by *current*. A column whose role has never been claimed (``current is None``) accepts any writer. Otherwise the candidate must have strictly greater precedence than the incumbent owner; equal-precedence writes are rejected so the first writer of a given tier wins deterministically."""
-    if current is None:
-        return True
-    return _ROLE_OWNER_PRECEDENCE[candidate] > _ROLE_OWNER_PRECEDENCE[current]
-
-
-class DescriptionOwner(str, Enum):
-    """Provenance for the writer that last set a description on a table or column. Members are ordered by ascending precedence; the dedicated helper :func:`set_description` enforces a strict-greater-precedence rule so a later writer can only overwrite an existing description when its provenance outranks the incumbent owner."""
+class DescriptionOwner(StrEnum):
+    """Provenance for the writer that last set a description on a table or column. Members are ordered by ascending precedence; :meth:`set_on` enforces a strict-greater-precedence rule so a later writer can only overwrite an existing description when its provenance outranks the incumbent owner."""
 
     CATALOG = "catalog"
     PROFILE = "profile"
     NOTES = "notes"
     LLM_REFINEMENT = "llm_refinement"
+    SPACE_NOTES = "space_notes"
     USER_OVERRIDE = "user_override"
+
+    @classmethod
+    def coerce(cls, raw: object) -> DescriptionOwner | None:
+        """Normalise raw cache or override input into :class:`DescriptionOwner` (``None`` when unset)."""
+        if raw is None or raw == "":
+            return None
+        if isinstance(raw, cls):
+            return raw
+        if isinstance(raw, str) and raw in DESCRIPTION_OWNER_VALUES:
+            return cls(raw)
+        raise ValueError(f"unknown description_owner: {raw!r}")
+
+    @classmethod
+    def _rank(cls, owner: DescriptionOwner | None) -> int:
+        if owner is None:
+            return _DESCRIPTION_OWNER_PRECEDENCE[cls.CATALOG]
+        if not isinstance(owner, cls):
+            owner = cls(owner)
+        return _DESCRIPTION_OWNER_PRECEDENCE[owner]
+
+    @classmethod
+    def resolve(
+        cls,
+        *candidates: tuple[str | None, DescriptionOwner | None],
+    ) -> tuple[str, DescriptionOwner | None]:
+        """Resolve simultaneous description candidates using owner precedence."""
+        nonempty: list[tuple[str, DescriptionOwner | None]] = []
+        for text, owner in candidates:
+            cleaned = str(text or "").strip()
+            if not cleaned:
+                continue
+            coerced = owner
+            if coerced is not None and not isinstance(coerced, cls):
+                coerced = cls(coerced)
+            nonempty.append((cleaned, coerced))
+        if not nonempty:
+            return "", None
+        max_rank = max(cls._rank(owner) for _, owner in nonempty)
+        tier = [(text, owner) for text, owner in nonempty if cls._rank(owner) == max_rank]
+        distinct_texts = sorted({text for text, _ in tier})
+        if len(distinct_texts) == 1:
+            winner_owner = next(owner for text, owner in tier if text == distinct_texts[0])
+            return distinct_texts[0], winner_owner
+        return "", None
+
+    @classmethod
+    def set_on(cls, target: Any, text: str | None, owner: DescriptionOwner) -> bool:
+        """Single writer for ``description`` on tables and columns."""
+        if text is None:
+            return False
+        current_owner = getattr(target, "description_owner", None)
+        if current_owner is not None:
+            if not isinstance(current_owner, cls):
+                current_owner = cls(current_owner)
+            if _DESCRIPTION_OWNER_PRECEDENCE[owner] < _DESCRIPTION_OWNER_PRECEDENCE[current_owner]:
+                return False
+        cur_desc = (getattr(target, "description", None) or "").strip()
+        new_desc = str(text).strip()
+        if cur_desc == new_desc and current_owner == owner:
+            return False
+        target.description = new_desc
+        target.description_owner = owner
+        return True
 
 
 _DESCRIPTION_OWNER_PRECEDENCE: dict[DescriptionOwner, int] = {
@@ -2179,102 +2956,30 @@ _DESCRIPTION_OWNER_PRECEDENCE: dict[DescriptionOwner, int] = {
     DescriptionOwner.PROFILE: 1,
     DescriptionOwner.NOTES: 2,
     DescriptionOwner.LLM_REFINEMENT: 3,
-    DescriptionOwner.USER_OVERRIDE: 4,
+    DescriptionOwner.SPACE_NOTES: 4,
+    DescriptionOwner.USER_OVERRIDE: 5,
 }
 
 
-def _description_owner_rank(owner: DescriptionOwner | None) -> int:
-    if owner is None:
-        return _DESCRIPTION_OWNER_PRECEDENCE[DescriptionOwner.CATALOG]
-    if not isinstance(owner, DescriptionOwner):
-        owner = DescriptionOwner(owner)
-    return _DESCRIPTION_OWNER_PRECEDENCE[owner]
-
-
-def resolve_descriptions(
-    *candidates: tuple[str | None, DescriptionOwner | None],
-) -> tuple[str, DescriptionOwner | None]:
-    """Resolve simultaneous description candidates using owner precedence. Only non-empty texts participate. Among them, the highest-precedence owner tier wins; when that tier contains exactly one distinct text, return it with its owner, otherwise return an empty description."""
-    nonempty: list[tuple[str, DescriptionOwner | None]] = []
-    for text, owner in candidates:
-        cleaned = str(text or "").strip()
-        if not cleaned:
-            continue
-        coerced = owner
-        if coerced is not None and not isinstance(coerced, DescriptionOwner):
-            coerced = DescriptionOwner(coerced)
-        nonempty.append((cleaned, coerced))
-    if not nonempty:
-        return "", None
-    max_rank = max(_description_owner_rank(owner) for _, owner in nonempty)
-    tier = [(text, owner) for text, owner in nonempty if _description_owner_rank(owner) == max_rank]
-    distinct_texts = sorted({text for text, _ in tier})
-    if len(distinct_texts) == 1:
-        winner_owner = next(owner for text, owner in tier if text == distinct_texts[0])
-        return distinct_texts[0], winner_owner
-    return "", None
-
-
-def set_description(target: Any, text: str | None, owner: DescriptionOwner) -> bool:
-    """
-    Single writer for ``description`` on tables and columns.
-
-    Args:
-
-        target: Either a :class:`TableMetadata` or :class:`ColumnMetadata` instance.
-        text: New description text (``None`` rejects the write; empty string clears to ``""``).
-        owner: Provenance of the writer.
-
-    Returns:
-        ``True`` when the description was actually updated, ``False`` when the
-        write was rejected because *owner* has lower precedence than the current owner
-        (strictly higher precedence wins; equal precedence allows replacement).
-    """
-    if text is None:
-        return False
-    current_owner = getattr(target, "description_owner", None)
-    if current_owner is not None:
-        if not isinstance(current_owner, DescriptionOwner):
-            current_owner = DescriptionOwner(current_owner)
-        if _DESCRIPTION_OWNER_PRECEDENCE[owner] < _DESCRIPTION_OWNER_PRECEDENCE[current_owner]:
-            return False
-    cur_desc = (getattr(target, "description", None) or "").strip()
-    new_desc = str(text).strip()
-    if cur_desc == new_desc and current_owner == owner:
-        return False
-    target.description = new_desc
-    target.description_owner = owner
-    return True
-
-
-def set_sensitivity(col: Any, value: SensitivityClassification | str | None) -> None:
-    """Single writer for :attr:`ColumnMetadata.sensitivity`. Accepts :class:`SensitivityClassification` or ``None`` for :attr:`SensitivityClassification.NONE`. Clears concrete profile samples whenever the classification is not :attr:`SensitivityClassification.NONE`."""
-    if value is None or (isinstance(value, str) and not str(value).strip()):
-        resolved = SensitivityClassification.NONE
-    elif isinstance(value, SensitivityClassification):
-        resolved = value
-    else:
-        sv = str(value).strip().lower()
-        resolved = coerce_sensitivity_classification(sv) or SensitivityClassification.NONE
-    col.sensitivity = resolved
-    if resolved != SensitivityClassification.NONE:
-        col.frequent_values = []
-        col.value_overlap_sample = []
-        col.min_val = None
-        col.max_val = None
-
-
 class AccessError(SchemaAccessError, RuntimeError):
-    """Raised when the database refuses ``EXPLAIN`` or ``execute`` because of insufficient privileges."""
+    """Raised when execute/explain/preview is refused by library scope or the warehouse."""
 
-    def __init__(self, operation: Literal["explain", "execute"], message: str, *, relation: str | None = None) -> None:
-        """Attach *operation*, human *message*, and optional *relation* hint for UX."""
+    def __init__(
+        self,
+        operation: Literal["explain", "execute", "preview_table"],
+        message: str,
+        *,
+        relation: str | None = None,
+        reason: Literal["scope", "warehouse"] = "warehouse",
+    ) -> None:
+        """Attach *operation*, human *message*, optional *relation*, and access *reason*."""
         self.operation = operation
         self.relation = relation
+        self.reason = reason
         super().__init__(message)
 
 
-class PipelineSuspended(Exception):
+class PipelineSuspended(AetherError):
     """Raised when a programmatic interactive turn must wait for the next ``submit_*`` call."""
 
     def __init__(self, state_id: str, message_for_caller: str, payload: Any | None = None) -> None:
@@ -2284,7 +2989,7 @@ class PipelineSuspended(Exception):
         super().__init__(message_for_caller)
 
 
-class NoJoinPathError(Exception):
+class NoJoinPathError(AetherError):
     """Raised when multi-table scope has no foreign-key or semantic join path. This is a terminal, deterministic pipeline failure: no LLM call can invent a plausible join when neither the physical foreign-key graph nor the semantic edge set connects the requested tables."""
 
     def __init__(self, scope_label: str, tables: list[str]) -> None:
@@ -2298,17 +3003,11 @@ class NoJoinPathError(Exception):
     @property
     def user_message(self) -> str:
         """User-facing explanation naming the disconnected tables."""
-        if self.tables:
-            table_text = ", ".join(self.tables)
-        else:
-            table_text = "the requested tables"
-        return (
-            f"These tables could not be connected: {table_text}. "
-            "Declare a foreign-key or semantic relationship between them, or ask using fewer tables."
-        )
+        tables = ", ".join(self.tables) if self.tables else "the requested tables"
+        return REFUSAL_CATALOGUE[DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_UNAVAILABLE]["user_text"].format(tables=tables)
 
 
-class JoinPathTieCapExceededError(Exception):
+class JoinPathTieCapExceededError(AetherError):
     """Raised when shortest-path enumeration for one table pair exceeds the refusal ceiling."""
 
     def __init__(self, source_table: str, target_table: str, path_count: int, ceiling: int) -> None:
@@ -2321,8 +3020,18 @@ class JoinPathTieCapExceededError(Exception):
             f"{path_count} equal-length paths (limit {ceiling})"
         )
 
+    @property
+    def user_message(self) -> str:
+        """User-facing explanation when too many equally short join paths exist."""
+        return REFUSAL_CATALOGUE[DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_TIE_CAP]["user_text"].format(
+            source_table=self.source_table,
+            target_table=self.target_table,
+            path_count=str(self.path_count),
+            ceiling=str(self.ceiling),
+        )
 
-class AggregateJoinFanOutError(Exception):
+
+class AggregateJoinFanOutError(AetherError):
     """Raised when a resolved join path would duplicate rows aggregated at parent grain."""
 
     def __init__(self, scope_label: str, message: str) -> None:
@@ -2331,7 +3040,7 @@ class AggregateJoinFanOutError(Exception):
         super().__init__(message)
 
 
-class ClauseWidenedRowsetError(Exception):
+class ClauseWidenedRowsetError(AetherError):
     """Raised when LIMIT or DISTINCT ON would run on a join-widened row set."""
 
     def __init__(self, scope_label: str, message: str) -> None:
@@ -2339,8 +3048,40 @@ class ClauseWidenedRowsetError(Exception):
         self.message_for_caller = message
         super().__init__(message)
 
+    @property
+    def user_message(self) -> str:
+        """User-facing explanation when clause modifiers conflict with join shape."""
+        return REFUSAL_CATALOGUE[DIAGNOSTIC_CODE_REFUSAL_CLAUSE_WIDENED_ROWSET]["user_text"]
 
-class ProbeCtePlacementError(Exception):
+
+class NullInNegatedListError(AetherError):
+    """Raised when a NOT IN list literal contains null."""
+
+    def __init__(self, column: str, message: str) -> None:
+        self.column = column
+        self.message_for_caller = message
+        super().__init__(message)
+
+
+class SubdayDateWindowOnDateColumnError(AetherError):
+    """Raised when a sub-day date window is requested on a date-only column."""
+
+    def __init__(self, column: str, message: str) -> None:
+        self.column = column
+        self.message_for_caller = message
+        super().__init__(message)
+
+
+class AmbiguousDateLiteralError(AetherError):
+    """Raised when an absolute date bound is not valid ISO 8601."""
+
+    def __init__(self, literal: str, message: str) -> None:
+        self.literal = literal
+        self.message_for_caller = message
+        super().__init__(message)
+
+
+class ProbeCtePlacementError(AetherError):
     """Raised when a semi-join or anti-join probe CTE is used as a join anchor or left operand."""
 
     def __init__(self, scope_label: str, message: str) -> None:
@@ -2348,8 +3089,13 @@ class ProbeCtePlacementError(Exception):
         self.message_for_caller = message
         super().__init__(message)
 
+    @property
+    def user_message(self) -> str:
+        """User-facing explanation when a filter step is placed incorrectly in the join."""
+        return REFUSAL_CATALOGUE[DIAGNOSTIC_CODE_REFUSAL_PROBE_CTE_PLACEMENT]["user_text"]
 
-class ComparisonJoinScopeExceededError(Exception):
+
+class ComparisonJoinScopeExceededError(AetherError):
     """Raised when a cross-table comparison forces a join path beyond the allowed scope."""
 
     def __init__(self, scope_label: str, message: str) -> None:
@@ -2358,7 +3104,7 @@ class ComparisonJoinScopeExceededError(Exception):
         super().__init__(message)
 
 
-class JoinColumnCountMismatchError(Exception):
+class JoinColumnCountMismatchError(AetherError):
     """Raised when a join signature pairs unequal numbers of left and right columns."""
 
     def __init__(self, segment: str, left_count: int, right_count: int) -> None:
@@ -2370,14 +3116,18 @@ class JoinColumnCountMismatchError(Exception):
         )
 
 
-class JoinInjectionAlignmentError(Exception):
+class JoinInjectionAlignmentError(AetherError):
     """Raised when ``join_sigs_ordered`` does not align one-to-one with dialect join carriers on deterministic SQL."""
 
     def __init__(self, message: str) -> None:
         super().__init__(message)
 
 
-class JoinInjectionFailedError(Exception):
+class RegistryRenderError(AetherError, ValueError):
+    """Raised when rendering an expression references a missing window or case registry id."""
+
+
+class JoinInjectionFailedError(AetherError):
     """Raised when deterministic SQL cannot be rewritten with structured JOIN/WHERE edges via the dialect AST adapter."""
 
     def __init__(
@@ -2389,7 +3139,7 @@ class JoinInjectionFailedError(Exception):
         super().__init__(message)
 
 
-class LlmJsonExhausted(Exception):
+class LlmJsonExhausted(AetherError):
     """Raised by ``llm_json`` when every retry attempt fails to produce valid JSON. Callers decide whether exhaustion is recoverable (e.g., retry loops, deterministic fallbacks) or terminal."""
 
     def __init__(self, task: str, attempts: int) -> None:
@@ -2408,93 +3158,18 @@ class LlmBatchRequest:
     task: str = "default"
 
 
-_PARSE_EXPR_STRING_FN: Any | None = None
-_RENDER_EXPR_SQL_FN: Any | None = None
-
-
-def register_parse_expr_string(fn: Any) -> None:
-    global _PARSE_EXPR_STRING_FN
-    _PARSE_EXPR_STRING_FN = fn
-
-
-def register_render_expr_sql(fn: Any) -> None:
-    global _RENDER_EXPR_SQL_FN
-    _RENDER_EXPR_SQL_FN = fn
-
-
-def parse_expr_string_for_json(s: str) -> NormalizedExpr:
-    """Parse a JSON string field that contains a SQL expression into a. ``NormalizedExpr``. Args: s: Non-empty expression text from the model. Returns: Parsed structure when the registered parser is available; otherwise a column ref leaf."""
-    t = (s or "").strip()
-    if not t:
-        return NormalizedExpr()
-    fn = _PARSE_EXPR_STRING_FN
-    if fn is not None:
-        return cast(NormalizedExpr, fn(t))
-    return NormalizedExpr.from_column(t)
-
-
 ScalarArg = str | int | float
 ParamValue = str | int | float | bool | list[str | int | float]
 RawValue = str | int | float | bool | list[str | int | float] | dict[str, str | int] | None
 
-CteEmissionKind = Literal["join_table", "scalar_subquery", "semi_join", "anti_join"]
-OrderByNullPlacement = Literal["first", "last"]
-WindowFrameKind = Literal["rows", "range", "none"]
-
-PROBE_CTE_EMISSION_KINDS: frozenset[str] = frozenset({"semi_join", "anti_join"})
-
-
-def coerce_cte_emission(raw: Any) -> CteEmissionKind:
-    """
-    Normalize a stored emission string to a supported literal.
-
-    Args:
-
-        raw: Value from JSON or legacy payloads.
-
-    Returns:
-
-        ``join_table`` unless ``raw`` is a supported probe emission literal.
-        ``scalar_subquery`` is engine-owned and coerced to ``join_table``.
-    """
-    if raw in ("semi_join", "anti_join"):
-        return cast(CteEmissionKind, raw)
-    return "join_table"
-
-
-def coerce_order_by_nulls(raw: Any) -> OrderByNullPlacement | None:
-    """Normalize optional ORDER BY null-placement to ``first``, ``last``, or ``None``."""
-    if raw in ("first", "last"):
-        return cast(OrderByNullPlacement, raw)
-    return None
-
-
-def normalized_expr_from_stored_json(raw: Any) -> NormalizedExpr:
-    """
-    Coerce JSON or template `expr` payloads into a `NormalizedExpr`.
-
-    Args:
-
-        raw: String, dict, or existing `NormalizedExpr`.
-
-    Returns:
-
-        Normalised expression; empty expr if unsupported.
-    """
-    if isinstance(raw, str):
-        return NormalizedExpr.from_column(raw)
-    if isinstance(raw, dict):
-        return NormalizedExpr.from_dict(raw)
-    if isinstance(raw, NormalizedExpr):
-        return raw
-    return NormalizedExpr()
+PROBE_CTE_EMISSION_KINDS: frozenset[str] = frozenset({CteEmissionKind.SEMI_JOIN.value, CteEmissionKind.ANTI_JOIN.value})
 
 
 @dataclass
 class ExprValue:
     """Parameterized literal value for expression arithmetic with param_key for template reuse."""
 
-    value: float = 0.0
+    value: Decimal | int | float | str | bool | None = 0
     param_key: str = ""
 
     @staticmethod
@@ -2510,10 +3185,10 @@ class ExprValue:
 
             Populated ExprValue instance.
         """
-        if isinstance(d, int | float):
-            return ExprValue(value=float(d))
+        if isinstance(d, int | float | Decimal):
+            return ExprValue(value=d)
         if isinstance(d, dict):
-            return ExprValue(value=d.get("value", 0.0), param_key=d.get("param_key", ""))
+            return ExprValue(value=d.get("value", 0), param_key=d.get("param_key", ""))
         return ExprValue()
 
     def to_dict(self) -> dict[str, Any]:
@@ -2531,53 +3206,13 @@ class ExprValue:
         """Structural signature for template matching (ignores concrete. value). Returns: Always the string `val` (parameterisation uses `param_key` elsewhere)."""
         return "val"
 
-
-def _coerce_mul_term(raw: Any) -> NormalizedExpr:
-    """Coerce a multiply/divide list element to a `NormalizedExpr` leaf. Accepts a `NormalizedExpr` instance, a dict (round-trip), or a bare string. Bare strings that look like function calls or compound expressions are routed through the sqlglot-backed `parse_expr_string` parser to recover structural fields; simple identifiers become `column_ref` leaves."""
-    if isinstance(raw, NormalizedExpr):
-        return raw
-    if isinstance(raw, dict):
-        return NormalizedExpr.from_dict(raw)
-    if isinstance(raw, str):
-        s = raw.strip()
-        if s == "*":
-            return NormalizedExpr(star=True)
-        if s == "":
-            return NormalizedExpr()
-        if s.upper().startswith("DISTINCT "):
-            s = s[9:].strip()
-        while s.startswith("(") and s.endswith(")"):
-            inner = s[1:-1].strip()
-            if not inner:
-                break
-            s = inner
-        if "(" in s or " " in s:
-            fn = _PARSE_EXPR_STRING_FN
-            if fn is None:
-                return NormalizedExpr(raw_sql=s)
-            try:
-                parsed = cast(NormalizedExpr, fn(s))
-                if (
-                    parsed.add_groups
-                    and len(parsed.add_groups) == 1
-                    and not parsed.sub_groups
-                    and not parsed.add_values
-                    and not parsed.sub_values
-                ):
-                    g = parsed.add_groups[0]
-                    if (
-                        g.coefficient == 1.0
-                        and not g.divide
-                        and len(g.multiply) == 1
-                        and not g.agg_func
-                        and not g.scalar_func
-                    ):
-                        return g.multiply[0]
-                return parsed
-            except Exception:
-                return NormalizedExpr(raw_sql=s)
-        return NormalizedExpr(column_ref=s)
-    return NormalizedExpr()
+    @staticmethod
+    def sort_key(expr_value: ExprValue) -> tuple[int, str]:
+        """Return a stable comparable key for sorting ``ExprValue`` lists."""
+        value = expr_value.value
+        if value is None:
+            return (0, "")
+        return (1, str(value))
 
 
 @dataclass
@@ -2605,9 +3240,15 @@ class MulGroup:
     }
 
     def __post_init__(self) -> None:
-        """Coerce string entries to leaf NormalizedExpr, sort multiply/divide, and normalise function name casing/order."""
-        self.multiply = sorted((_coerce_mul_term(t) for t in self.multiply), key=lambda e: e.signature_key)
-        self.divide = sorted((_coerce_mul_term(t) for t in self.divide), key=lambda e: e.signature_key)
+        """Coerce string entries to leaf NormalizedExpr, sort multiply/divide for multiplicative chains, preserve order for CONCAT args, and normalise function name casing/order."""
+        multiply_terms = [NormalizedExpr.coerce_mul_term(t) for t in self.multiply]
+        divide_terms = [NormalizedExpr.coerce_mul_term(t) for t in self.divide]
+        if (self.scalar_func or "").lower() == "concat":
+            self.multiply = multiply_terms
+            self.divide = divide_terms
+        else:
+            self.multiply = sorted(multiply_terms, key=lambda e: e.signature_key)
+            self.divide = sorted(divide_terms, key=lambda e: e.signature_key)
         if self.agg_func:
             self.agg_func = self.agg_func.lower()
         if self.scalar_func:
@@ -2637,8 +3278,8 @@ class MulGroup:
         """Create MulGroup from dictionary; multiply/divide entries may be dicts (new nested form) or strings (legacy column ref) — both are accepted on read, always serialized as dicts on write."""
         return MulGroup(
             coefficient=d.get("coefficient", 1.0),
-            multiply=[_coerce_mul_term(t) for t in d.get("multiply", [])],
-            divide=[_coerce_mul_term(t) for t in d.get("divide", [])],
+            multiply=[NormalizedExpr.coerce_mul_term(t) for t in d.get("multiply", [])],
+            divide=[NormalizedExpr.coerce_mul_term(t) for t in d.get("divide", [])],
             agg_func=d.get("agg_func"),
             scalar_func=d.get("scalar_func"),
             inner_scalar_func=d.get("inner_scalar_func"),
@@ -2650,7 +3291,9 @@ class MulGroup:
             distinct=bool(d.get("distinct", False)),
             agg_sep_param_key=str(d.get("agg_sep_param_key", "") or ""),
             agg_order_by=[
-                OrderByCol.from_dict(o) if isinstance(o, dict) else OrderByCol(expr=parse_expr_string_for_json(o))
+                OrderByCol.from_dict(o)
+                if isinstance(o, dict)
+                else OrderByCol(expr=NormalizedExpr.parse_string_for_json(o))
                 for o in d.get("agg_order_by", [])
             ],
         )
@@ -2742,13 +3385,15 @@ class NormalizedExpr:
     keyword: str | None = None
     raw_sql: str | None = None
     string_literal: str = ""
+    _parse_expr_string_fn: ClassVar[Any] = None
+    _render_expr_sql_fn: ClassVar[Any] = None
 
     def __post_init__(self) -> None:
         """Sort child groups/values and normalise outer function name. casing/order. Returns: None."""
         self.add_groups = sorted(self.add_groups, key=lambda g: g.signature_key)
         self.sub_groups = sorted(self.sub_groups, key=lambda g: g.signature_key)
-        self.add_values = sorted(self.add_values, key=lambda v: v.value)
-        self.sub_values = sorted(self.sub_values, key=lambda v: v.value)
+        self.add_values = sorted(self.add_values, key=ExprValue.sort_key)
+        self.sub_values = sorted(self.sub_values, key=ExprValue.sort_key)
         if self.agg_func:
             self.agg_func = self.agg_func.lower()
         if self.scalar_func:
@@ -2801,6 +3446,27 @@ class NormalizedExpr:
             self.inner_scalar_func_args = []
             self.sarg_param_keys = []
             self.isarg_param_keys = []
+
+    @classmethod
+    def register_parse_expr_string(cls, fn: Any) -> None:
+        """Register the SQL expression string parser used for JSON round-trips."""
+        cls._parse_expr_string_fn = fn
+
+    @classmethod
+    def register_render_expr_sql(cls, fn: Any) -> None:
+        """Register the SQL expression renderer used for prompt shorthand."""
+        cls._render_expr_sql_fn = fn
+
+    @classmethod
+    def parse_string_for_json(cls, s: str) -> NormalizedExpr:
+        """Parse a JSON string field that contains a SQL expression into a ``NormalizedExpr``."""
+        t = (s or "").strip()
+        if not t:
+            return cls()
+        fn = cls._parse_expr_string_fn
+        if fn is not None:
+            return cast(NormalizedExpr, fn(t))
+        return cls.from_column(t)
 
     @staticmethod
     def from_dict(d: Any) -> NormalizedExpr:
@@ -3007,7 +3673,7 @@ class NormalizedExpr:
             return "*"
         if first.keyword:
             return first.keyword.upper()
-        fn = _RENDER_EXPR_SQL_FN
+        fn = NormalizedExpr._render_expr_sql_fn
         if fn is not None:
             try:
                 return cast(str, fn(first))
@@ -3021,92 +3687,104 @@ class NormalizedExpr:
 
     def to_prompt_dict(self) -> dict[str, Any]:
         """Shorthand ``expr`` string for LLM-facing JSON."""
-        return {"expr": expr_prompt_sql(self)}
+        return {"expr": self.prompt_sql()}
 
     @classmethod
     def prompt_example_dict(cls) -> dict[str, Any]:
         """Canonical ``expr`` field example for prompts."""
         return {"expr": "table.column"}
 
+    @classmethod
+    def from_stored_json(cls, raw: Any) -> NormalizedExpr:
+        """Coerce JSON or template `expr` payloads into a `NormalizedExpr`."""
+        if isinstance(raw, str):
+            return cls.from_column(raw)
+        if isinstance(raw, dict):
+            return cls.from_dict(raw)
+        if isinstance(raw, cls):
+            return raw
+        return cls()
 
-def expr_registry_ref(expr: NormalizedExpr) -> str | None:
-    """Return the canonical registry id when *expr* is a bare ``column_ref`` matching ``^[wc]\\d{2}$``. A registry reference is conventionally encoded as a single bare ``column_ref`` with no other expression complexity. The rest of the system treats this leaf shape as the canonical way to point at a window or case registry entry from select, group_by, order_by, filter, or having."""
-    if expr.string_literal:
-        return None
-    col = (expr.column_ref or "").strip()
-    if not col or not REGISTRY_REF_TOKEN_RE.match(col):
-        return None
-    if expr.add_groups or expr.sub_groups or expr.add_values or expr.sub_values:
-        return None
-    if expr.agg_func or expr.scalar_func or expr.inner_scalar_func:
-        return None
-    if expr.star or expr.cast_type or expr.interval is not None:
-        return None
-    if expr.keyword or expr.raw_sql:
-        return None
-    return col
+    @staticmethod
+    def coerce_mul_term(raw: Any) -> NormalizedExpr:
+        """Coerce a multiply/divide list element to a `NormalizedExpr` leaf."""
+        if isinstance(raw, NormalizedExpr):
+            return raw
+        if isinstance(raw, dict):
+            return NormalizedExpr.from_dict(raw)
+        if isinstance(raw, str):
+            s = raw.strip()
+            if s == "*":
+                return NormalizedExpr(star=True)
+            if s == "":
+                return NormalizedExpr()
+            if s.upper().startswith("DISTINCT "):
+                s = s[9:].strip()
+            while s.startswith("(") and s.endswith(")"):
+                inner = s[1:-1].strip()
+                if not inner:
+                    break
+                s = inner
+            if "(" in s or " " in s:
+                fn = NormalizedExpr._parse_expr_string_fn
+                if fn is None:
+                    return NormalizedExpr(raw_sql=s)
+                try:
+                    parsed = cast(NormalizedExpr, fn(s))
+                    if (
+                        parsed.add_groups
+                        and len(parsed.add_groups) == 1
+                        and not parsed.sub_groups
+                        and not parsed.add_values
+                        and not parsed.sub_values
+                    ):
+                        g = parsed.add_groups[0]
+                        if (
+                            g.coefficient == 1.0
+                            and not g.divide
+                            and len(g.multiply) == 1
+                            and not g.agg_func
+                            and not g.scalar_func
+                        ):
+                            return g.multiply[0]
+                    return parsed
+                except Exception as exc:
+                    raise ConfigError(f"expression parse failed: {exc}") from exc
+            return NormalizedExpr(column_ref=s)
+        return NormalizedExpr()
 
-
-def expr_prompt_sql(expr: NormalizedExpr) -> str:
-    """Render *expr* as the shorthand SQL string shown in LLM prompts. Registry references ``wNN`` / ``cNN`` emit as bare tokens; other expressions use the registered renderer when available."""
-    ref = expr_registry_ref(expr)
-    if ref:
-        return ref
-    if expr.string_literal:
-        return expr.string_literal
-    fn = _RENDER_EXPR_SQL_FN
-    if fn is not None:
-        try:
-            return cast(str, fn(expr))
-        except Exception:
-            pass
-    col = expr.primary_column
-    return col if col else ""
-
-
-def _canonicalize_predicate_sides(predicate: Any) -> None:
-    """Enforce column-bearing side on the left and flip the operator when a swap is required. When exactly one of ``left_expr`` / ``right_expr`` contains column / aggregate / scalar / registry references, that side is moved to ``left_expr`` and the operator is flipped. When both sides are column-bearing or both are literal-only, sides are left untouched."""
-    left = predicate.left_expr
-    right = predicate.right_expr
-    if right is None:
-        return
-    left_has_col = left.has_column_reference
-    right_has_col = right.has_column_reference
-    if left_has_col and not right_has_col:
-        return
-    if right_has_col and not left_has_col:
-        predicate.left_expr, predicate.right_expr = right, left
-        predicate.op = OP_FLIP.get(predicate.op, predicate.op)
-
-
-def _normalize_predicate_op(raw: Any) -> Literal["and", "or"]:
-    text = str(raw or "and").strip().lower()
-    return "or" if text == "or" else "and"
-
-
-_LEGACY_WHERE_GROUP_KEYS: tuple[str, ...] = ("where_group",)
-
-
-def _legacy_where_group_raw(raw: Mapping[str, Any]) -> Any:
-    for key in _LEGACY_WHERE_GROUP_KEYS:
-        if key in raw:
-            return raw[key]
-    return None
-
-
-def _where_group_int_from_stored(raw: Any) -> int | None:
-    if raw is None:
-        return None
-    if isinstance(raw, list | tuple):
-        if not raw:
+    def registry_ref(self) -> str | None:
+        """Return the canonical registry id when this is a bare ``column_ref`` matching ``^[wc]\\d{2}$``."""
+        if self.string_literal:
             return None
-        raw = raw[0]
-    if isinstance(raw, bool):
-        return None
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return None
+        col = (self.column_ref or "").strip()
+        if not col or not REGISTRY_REF_TOKEN_RE.match(col):
+            return None
+        if self.add_groups or self.sub_groups or self.add_values or self.sub_values:
+            return None
+        if self.agg_func or self.scalar_func or self.inner_scalar_func:
+            return None
+        if self.star or self.cast_type or self.interval is not None:
+            return None
+        if self.keyword or self.raw_sql:
+            return None
+        return col
+
+    def prompt_sql(self) -> str:
+        """Render as the shorthand SQL string shown in LLM prompts."""
+        ref = self.registry_ref()
+        if ref:
+            return ref
+        if self.string_literal:
+            return self.string_literal
+        fn = NormalizedExpr._render_expr_sql_fn
+        if fn is not None:
+            try:
+                return cast(str, fn(self))
+            except (AttributeError, TypeError, ValueError, RuntimeError):
+                pass
+        col = self.primary_column
+        return col if col else ""
 
 
 @dataclass(frozen=True)
@@ -3116,9 +3794,10 @@ class PredicateGroup:
     op: Literal["and", "or"] = "and"
     predicates: tuple[WhereParam | HavingParam, ...] = ()
     groups: tuple[PredicateGroup, ...] = ()
+    _LEGACY_WHERE_GROUP_KEYS: ClassVar[tuple[str, ...]] = ("where_group",)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "op", _normalize_predicate_op(self.op))
+        object.__setattr__(self, "op", PredicateGroup._normalize_op(self.op))
 
     def is_empty(self) -> bool:
         return not self.predicates and not self.groups
@@ -3139,6 +3818,140 @@ class PredicateGroup:
         return len(self.leaves())
 
     @staticmethod
+    def _canonicalize_sides(predicate: Any) -> None:
+        """Enforce column-bearing side on the left and flip the operator when a swap is required."""
+        left = predicate.left_expr
+        right = predicate.right_expr
+        if right is None:
+            return
+        left_has_col = left.has_column_reference
+        right_has_col = right.has_column_reference
+        if left_has_col and not right_has_col:
+            return
+        if right_has_col and not left_has_col:
+            predicate.left_expr, predicate.right_expr = right, left
+            predicate.op = OP_FLIP.get(predicate.op, predicate.op)
+
+    @staticmethod
+    def _normalize_op(raw: Any) -> Literal["and", "or"]:
+        text = str(raw or "and").strip().lower()
+        return "or" if text == "or" else "and"
+
+    @classmethod
+    def _legacy_where_group_raw(cls, raw: Mapping[str, Any]) -> Any:
+        for key in cls._LEGACY_WHERE_GROUP_KEYS:
+            if key in raw:
+                return raw[key]
+        return None
+
+    @staticmethod
+    def _where_group_int_from_stored(raw: Any) -> int | None:
+        if raw is None:
+            return None
+        if isinstance(raw, list | tuple):
+            if not raw:
+                return None
+            raw = raw[0]
+        if isinstance(raw, bool):
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _legacy_bool_op_from_stored(raw: Any) -> str:
+        text = str(raw or "AND").strip().upper()
+        return "OR" if text == "OR" else "AND"
+
+    @staticmethod
+    def _clamp_negative_where_group(value: int | None) -> int | None:
+        if value is not None and value < 0:
+            return None
+        return value
+
+    @classmethod
+    def _legacy_coerce_where_group_list(
+        cls,
+        items: Sequence[tuple[WhereParam | HavingParam, str, int | None]],
+    ) -> list[tuple[WhereParam | HavingParam, str, int | None]]:
+        if not items:
+            return []
+        normalized: list[tuple[WhereParam | HavingParam, str, int | None]] = []
+        for pred, bool_op, where_group in items:
+            normalized.append(
+                (pred, cls._legacy_bool_op_from_stored(bool_op), cls._clamp_negative_where_group(where_group))
+            )
+        any_grouped = any(fg is not None for _, _, fg in normalized)
+        if not any_grouped:
+            if len(normalized) <= 1:
+                return normalized
+            first_b = normalized[0][1]
+            rest_all_or = all(normalized[j][1] == "OR" for j in range(1, len(normalized)))
+            if first_b == "AND" and rest_all_or:
+                return [(pred, "AND", gid) for gid, (pred, _, _) in enumerate(normalized, start=1)]
+            return normalized
+        max_gid = max((fg for _, _, fg in normalized if fg is not None), default=-1)
+        next_gid = max_gid + 1
+        out: list[tuple[WhereParam | HavingParam, str, int | None]] = []
+        for pred, _, fg in normalized:
+            if fg is None:
+                out.append((pred, "AND", next_gid))
+                next_gid += 1
+            else:
+                out.append((pred, "AND", fg))
+        return out
+
+    @classmethod
+    def _combine(
+        cls,
+        left: PredicateGroup,
+        right_pred: WhereParam | HavingParam,
+        connector: Literal["and", "or"],
+        right_group: PredicateGroup,
+    ) -> PredicateGroup:
+        if connector == "and" and left.op == "and" and not left.groups:
+            if not right_group.groups and len(right_group.predicates) == 1:
+                return PredicateGroup(op="and", predicates=left.predicates + (right_pred,))
+        if connector == left.op and not left.groups and not right_group.groups:
+            if connector == "and":
+                return PredicateGroup(op="and", predicates=left.predicates + right_group.predicates)
+            return PredicateGroup(op="or", groups=(left, right_group))
+        return PredicateGroup(op=connector, groups=(left, right_group))
+
+    @classmethod
+    def _from_legacy_rows(
+        cls,
+        rows: Sequence[tuple[WhereParam | HavingParam, str, int | None]],
+    ) -> PredicateGroup | None:
+        rows = cls._legacy_coerce_where_group_list(rows)
+        if not rows:
+            return None
+        if any(fg is not None for _, _, fg in rows):
+            ordered_ids: list[int] = []
+            buckets: dict[int, list[WhereParam | HavingParam]] = {}
+            for pred, _, fg in rows:
+                gid = fg if fg is not None else 0
+                if gid not in buckets:
+                    ordered_ids.append(gid)
+                    buckets[gid] = []
+                buckets[gid].append(pred)
+            and_groups = tuple(
+                PredicateGroup(op="and", predicates=tuple(buckets[gid])) for gid in ordered_ids if buckets[gid]
+            )
+            if len(and_groups) == 1:
+                return and_groups[0]
+            return PredicateGroup(op="or", groups=and_groups)
+        if len(rows) == 1:
+            return PredicateGroup(op="and", predicates=(rows[0][0],))
+        acc = PredicateGroup(op="and", predicates=(rows[0][0],))
+        for idx in range(1, len(rows)):
+            connector = cls._normalize_op(rows[idx - 1][1])
+            right = PredicateGroup(op="and", predicates=(rows[idx][0],))
+            acc = cls._combine(acc, rows[idx][0], connector, right)
+        return acc
+
+    @staticmethod
     def from_dict(d: dict[str, Any] | None, *, having: bool = False) -> PredicateGroup | None:
         if not d or not isinstance(d, dict):
             return None
@@ -3147,7 +3960,7 @@ class PredicateGroup:
         groups = tuple(
             child for raw in d.get("groups", []) if (child := PredicateGroup.from_dict(raw, having=having)) is not None
         )
-        group = PredicateGroup(op=_normalize_predicate_op(d.get("op", "and")), predicates=preds, groups=groups)
+        group = PredicateGroup(op=PredicateGroup._normalize_op(d.get("op", "and")), predicates=preds, groups=groups)
         return None if group.is_empty() else group
 
     def to_dict(self) -> dict[str, Any]:
@@ -3174,303 +3987,319 @@ class PredicateGroup:
             "groups": [],
         }
 
+    @classmethod
+    def from_legacy_flat_where_list(cls, filters: list[WhereParam]) -> PredicateGroup | None:
+        rows = [(fp, "AND", None) for fp in filters]
+        return cls._from_legacy_rows(rows)
 
-def _legacy_bool_op_from_stored(raw: Any) -> str:
-    text = str(raw or "AND").strip().upper()
-    return "OR" if text == "OR" else "AND"
+    @classmethod
+    def from_legacy_having(cls, having: list[HavingParam]) -> PredicateGroup | None:
+        rows = [(hp, "AND", None) for hp in having]
+        return cls._from_legacy_rows(rows)
 
-
-def _clamp_negative_where_group(value: int | None) -> int | None:
-    if value is not None and value < 0:
-        return None
-    return value
-
-
-def _legacy_coerce_where_group_list(
-    items: Sequence[tuple[WhereParam | HavingParam, str, int | None]],
-) -> list[tuple[WhereParam | HavingParam, str, int | None]]:
-    if not items:
-        return []
-    normalized: list[tuple[WhereParam | HavingParam, str, int | None]] = []
-    for pred, bool_op, where_group in items:
-        normalized.append((pred, _legacy_bool_op_from_stored(bool_op), _clamp_negative_where_group(where_group)))
-    any_grouped = any(fg is not None for _, _, fg in normalized)
-    if not any_grouped:
-        if len(normalized) <= 1:
-            return normalized
-        first_b = normalized[0][1]
-        rest_all_or = all(normalized[j][1] == "OR" for j in range(1, len(normalized)))
-        if first_b == "AND" and rest_all_or:
-            return [(pred, "AND", gid) for gid, (pred, _, _) in enumerate(normalized, start=1)]
-        return normalized
-    max_gid = max((fg for _, _, fg in normalized if fg is not None), default=-1)
-    next_gid = max_gid + 1
-    out: list[tuple[WhereParam | HavingParam, str, int | None]] = []
-    for pred, _, fg in normalized:
-        if fg is None:
-            out.append((pred, "AND", next_gid))
-            next_gid += 1
-        else:
-            out.append((pred, "AND", fg))
-    return out
-
-
-def _predicate_group_from_legacy_rows(
-    rows: Sequence[tuple[WhereParam | HavingParam, str, int | None]],
-) -> PredicateGroup | None:
-    rows = _legacy_coerce_where_group_list(rows)
-    if not rows:
-        return None
-    if any(fg is not None for _, _, fg in rows):
-        ordered_ids: list[int] = []
-        buckets: dict[int, list[WhereParam | HavingParam]] = {}
-        for pred, _, fg in rows:
-            gid = fg if fg is not None else 0
-            if gid not in buckets:
-                ordered_ids.append(gid)
-                buckets[gid] = []
-            buckets[gid].append(pred)
-        and_groups = tuple(
-            PredicateGroup(op="and", predicates=tuple(buckets[gid])) for gid in ordered_ids if buckets[gid]
-        )
-        if len(and_groups) == 1:
-            return and_groups[0]
-        return PredicateGroup(op="or", groups=and_groups)
-    if len(rows) == 1:
-        return PredicateGroup(op="and", predicates=(rows[0][0],))
-    acc = PredicateGroup(op="and", predicates=(rows[0][0],))
-    for idx in range(1, len(rows)):
-        connector = _normalize_predicate_op(rows[idx - 1][1])
-        right = PredicateGroup(op="and", predicates=(rows[idx][0],))
-        acc = _combine_predicate_groups(acc, rows[idx][0], connector, right)
-    return acc
-
-
-def _combine_predicate_groups(
-    left: PredicateGroup,
-    right_pred: WhereParam | HavingParam,
-    connector: Literal["and", "or"],
-    right_group: PredicateGroup,
-) -> PredicateGroup:
-    if connector == "and" and left.op == "and" and not left.groups:
-        if not right_group.groups and len(right_group.predicates) == 1:
-            return PredicateGroup(op="and", predicates=left.predicates + (right_pred,))
-    if connector == left.op and not left.groups and not right_group.groups:
-        if connector == "and":
-            return PredicateGroup(op="and", predicates=left.predicates + right_group.predicates)
-        return PredicateGroup(op="or", groups=(left, right_group))
-    return PredicateGroup(op=connector, groups=(left, right_group))
-
-
-def predicate_group_from_legacy_flat_where_list(filters: list[WhereParam]) -> PredicateGroup | None:
-    rows = [(fp, "AND", None) for fp in filters]
-    return _predicate_group_from_legacy_rows(rows)
-
-
-def predicate_group_from_legacy_having(having: list[HavingParam]) -> PredicateGroup | None:
-    rows = [(hp, "AND", None) for hp in having]
-    return _predicate_group_from_legacy_rows(rows)
-
-
-def predicate_group_from_legacy_flat_where_dicts(fp_raw: list[Any]) -> PredicateGroup | None:
-    rows: list[tuple[WhereParam, str, int | None]] = []
-    for raw in fp_raw:
-        if not isinstance(raw, dict):
-            continue
-        fp = WhereParam.from_dict(raw)
-        rows.append(
-            (
-                fp,
-                _legacy_bool_op_from_stored(raw.get("bool_op", "AND")),
-                _where_group_int_from_stored(_legacy_where_group_raw(raw)),
+    @classmethod
+    def from_legacy_flat_where_dicts(cls, fp_raw: list[Any]) -> PredicateGroup | None:
+        rows: list[tuple[WhereParam, str, int | None]] = []
+        for raw in fp_raw:
+            if not isinstance(raw, dict):
+                continue
+            fp = WhereParam.from_dict(raw)
+            rows.append(
+                (
+                    fp,
+                    cls._legacy_bool_op_from_stored(raw.get("bool_op", "AND")),
+                    cls._where_group_int_from_stored(cls._legacy_where_group_raw(raw)),
+                )
             )
-        )
-    return _predicate_group_from_legacy_rows(rows)
+        return cls._from_legacy_rows(rows)
 
-
-def predicate_group_from_legacy_having_dicts(hp_raw: list[Any]) -> PredicateGroup | None:
-    rows: list[tuple[HavingParam, str, int | None]] = []
-    for raw in hp_raw:
-        if not isinstance(raw, dict):
-            continue
-        hp = HavingParam.from_dict(raw)
-        rows.append(
-            (
-                hp,
-                _legacy_bool_op_from_stored(raw.get("bool_op", "AND")),
-                _where_group_int_from_stored(_legacy_where_group_raw(raw)),
+    @classmethod
+    def from_legacy_having_dicts(cls, hp_raw: list[Any]) -> PredicateGroup | None:
+        rows: list[tuple[HavingParam, str, int | None]] = []
+        for raw in hp_raw:
+            if not isinstance(raw, dict):
+                continue
+            hp = HavingParam.from_dict(raw)
+            rows.append(
+                (
+                    hp,
+                    cls._legacy_bool_op_from_stored(raw.get("bool_op", "AND")),
+                    cls._where_group_int_from_stored(cls._legacy_where_group_raw(raw)),
+                )
             )
-        )
-    return _predicate_group_from_legacy_rows(rows)
+        return cls._from_legacy_rows(rows)
 
-
-def predicate_group_from_stored(raw: Any, *, legacy_key: str, having: bool = False) -> PredicateGroup | None:
-    if isinstance(raw, PredicateGroup):
-        return None if raw.is_empty() else raw
-    if isinstance(raw, dict):
-        group = PredicateGroup.from_dict(raw, having=having)
-        return group
-    if isinstance(raw, list):
-        if having:
-            return predicate_group_from_legacy_having_dicts(raw)
-        return predicate_group_from_legacy_flat_where_dicts(raw)
-    return None
-
-
-def coerce_predicate_group(group: PredicateGroup | None) -> PredicateGroup | None:
-    if group is None or group.is_empty():
+    @classmethod
+    def from_stored(cls, raw: Any, *, legacy_key: str, having: bool = False) -> PredicateGroup | None:
+        if isinstance(raw, PredicateGroup):
+            return None if raw.is_empty() else raw
+        if isinstance(raw, dict):
+            return cls.from_dict(raw, having=having)
+        if isinstance(raw, list):
+            if having:
+                return cls.from_legacy_having_dicts(raw)
+            return cls.from_legacy_flat_where_dicts(raw)
         return None
-    dnf = normalize_predicate_group_dnf(group)
-    cnf = normalize_predicate_group_cnf(group)
-    candidates: list[tuple[Literal["dnf", "cnf"], PredicateGroup]] = []
-    if dnf is not None and not dnf.is_empty():
-        candidates.append(("dnf", dnf))
-    if cnf is not None and not cnf.is_empty():
-        candidates.append(("cnf", cnf))
-    if not candidates:
-        return None
-    within_limit = [
-        (form, candidate) for form, candidate in candidates if candidate.depth() <= MAX_PREDICATE_NESTING_DEPTH
-    ]
-    if not within_limit:
-        raise ValueError(f"predicate nesting exceeds MAX_PREDICATE_NESTING_DEPTH={MAX_PREDICATE_NESTING_DEPTH}")
-    preference = _predicate_group_normalization_preference(group)
-    preferred = [candidate for form, candidate in within_limit if form == preference]
-    if preferred:
-        return min(preferred, key=lambda candidate: candidate.depth())
-    return min((candidate for _, candidate in within_limit), key=lambda candidate: candidate.depth())
 
+    @classmethod
+    def _cnf_or_clauses(cls, group: PredicateGroup) -> list[PredicateGroup]:
+        clauses: list[PredicateGroup] = []
+        for pred in group.predicates:
+            clauses.append(PredicateGroup(op="or", predicates=(pred,)))
+        for child in group.groups:
+            if child.op == "or":
+                clauses.append(child)
+            elif child.op == "and":
+                clauses.extend(cls._cnf_or_clauses(child))
+        return clauses
 
-def map_predicate_group(group: PredicateGroup | None, fn: Any) -> PredicateGroup | None:
-    if group is None or group.is_empty():
-        return None
-    preds = tuple(fn(pred) for pred in group.predicates)
-    subgroups = tuple(
-        mapped for mapped in (map_predicate_group(child, fn) for child in group.groups) if mapped is not None
-    )
-    mapped_group = PredicateGroup(op=group.op, predicates=preds, groups=subgroups)
-    return None if mapped_group.is_empty() else mapped_group
+    @classmethod
+    def _cnf_normalize_and_disjunct(cls, group: PredicateGroup) -> PredicateGroup:
+        and_preds: list[WhereParam | HavingParam] = list(group.predicates)
+        nested: list[PredicateGroup] = []
+        for child in group.groups:
+            normalized = cls.normalize_cnf(child)
+            if normalized is None or normalized.is_empty():
+                continue
+            if normalized.op == "or":
+                nested.append(normalized)
+            else:
+                and_preds.extend(normalized.predicates)
+                nested.extend(normalized.groups)
+        return PredicateGroup(op="and", predicates=tuple(and_preds), groups=tuple(nested))
 
+    @staticmethod
+    def _normalization_preference(group: PredicateGroup) -> Literal["dnf", "cnf", "auto"]:
+        if group.op == "and" and any(child.op == "or" for child in group.groups):
+            return "cnf"
+        if group.op == "or" and any(child.op == "and" for child in group.groups):
+            return "dnf"
+        return "auto"
 
-def reapply_predicate_leaves(
-    group: PredicateGroup | None, leaves: Sequence[WhereParam | HavingParam]
-) -> PredicateGroup | None:
-    """Replace predicate leaves in *group* with *leaves* in traversal order."""
-    if group is None or group.is_empty():
-        return None
-    leaf_iter = iter(leaves)
-    return map_predicate_group(group, lambda _pred: next(leaf_iter))
-
-
-def rebuild_predicate_group_from_leaves(
-    original: PredicateGroup | None, leaves: Sequence[WhereParam | HavingParam]
-) -> PredicateGroup | None:
-    """Preserve *original* tree shape when leaf counts match; otherwise flatten to AND."""
-    if not leaves:
-        return None
-    if original is not None and len(leaves) == len(original.leaves()):
-        return reapply_predicate_leaves(original, leaves)
-    return predicate_group_from_list(list(leaves))
-
-
-def partition_predicate_group(
-    group: PredicateGroup | None, keep_fn: Any
-) -> tuple[PredicateGroup | None, PredicateGroup | None]:
-    if group is None or group.is_empty():
-        return None, None
-
-    kept_preds: list[WhereParam | HavingParam] = []
-    dropped_preds: list[WhereParam | HavingParam] = []
-    for pred in group.predicates:
-        (kept_preds if keep_fn(pred) else dropped_preds).append(pred)
-
-    kept_groups: list[PredicateGroup] = []
-    dropped_groups: list[PredicateGroup] = []
-    for child in group.groups:
-        kept_child, dropped_child = partition_predicate_group(child, keep_fn)
-        if kept_child is not None:
-            kept_groups.append(kept_child)
-        if dropped_child is not None:
-            dropped_groups.append(dropped_child)
-
-    kept = PredicateGroup(op=group.op, predicates=tuple(kept_preds), groups=tuple(kept_groups))
-    dropped = PredicateGroup(op=group.op, predicates=tuple(dropped_preds), groups=tuple(dropped_groups))
-    return (None if kept.is_empty() else kept, None if dropped.is_empty() else dropped)
-
-
-def merge_predicate_groups(op: Literal["and", "or"], groups: Sequence[PredicateGroup | None]) -> PredicateGroup | None:
-    nonempty = [group for group in groups if group is not None and not group.is_empty()]
-    if not nonempty:
-        return None
-    if len(nonempty) == 1:
-        return nonempty[0]
-    preds: list[WhereParam | HavingParam] = []
-    nested: list[PredicateGroup] = []
-    for group in nonempty:
-        if not group.groups and group.op == op and group.predicates:
-            preds.extend(group.predicates)
-        else:
-            nested.append(group)
-    return PredicateGroup(op=op, predicates=tuple(preds), groups=tuple(nested))
-
-
-def parse_where_field(d: Mapping[str, Any]) -> PredicateGroup | None:
-    if "where" in d:
-        raw = d.get("where")
-        if raw is None:
+    @classmethod
+    def normalize_dnf(cls, group: PredicateGroup | None) -> PredicateGroup | None:
+        """Normalize a predicate tree toward OR-of-AND (DNF) form when possible."""
+        if group is None or group.is_empty():
             return None
-        return PredicateGroup.from_dict(raw) if isinstance(raw, dict) else None
-    if "where_param" in d:
-        return predicate_group_from_legacy_flat_where_dicts(d.get("where_param", []))
-    return None
+        if group.op == "or":
+            groups = tuple(cls.normalize_dnf(child) or child for child in group.groups)
+            preds = group.predicates
+            if preds and not groups:
+                return PredicateGroup(op="or", predicates=preds)
+            if not preds and groups:
+                flat_groups = [g for g in groups if g is not None and not g.is_empty()]
+                if len(flat_groups) == 1:
+                    return flat_groups[0]
+                return PredicateGroup(op="or", groups=tuple(flat_groups))
+            and_groups = list(groups)
+            if preds:
+                and_groups.insert(0, PredicateGroup(op="and", predicates=preds))
+            return PredicateGroup(op="or", groups=tuple(and_groups))
+        if group.op == "and":
+            and_preds: list[WhereParam | HavingParam] = list(group.predicates)
+            nested: list[PredicateGroup] = []
+            for child in group.groups:
+                normalized = cls.normalize_dnf(child)
+                if normalized is None or normalized.is_empty():
+                    continue
+                if normalized.op == "or":
+                    nested.append(normalized)
+                else:
+                    and_preds.extend(normalized.predicates)
+                    nested.extend(normalized.groups)
+            return PredicateGroup(op="and", predicates=tuple(and_preds), groups=tuple(nested))
+        raise ValueError(f"unsupported predicate op: {group.op!r}")
 
-
-def parse_having_field(d: Mapping[str, Any]) -> PredicateGroup | None:
-    if "having" in d:
-        raw = d.get("having")
-        if raw is None:
+    @classmethod
+    def normalize_cnf(cls, group: PredicateGroup | None) -> PredicateGroup | None:
+        """Normalize a predicate tree toward AND-of-OR (CNF) form when possible."""
+        if group is None or group.is_empty():
             return None
-        return PredicateGroup.from_dict(raw, having=True) if isinstance(raw, dict) else None
-    if "having_param" in d:
-        return predicate_group_from_legacy_having_dicts(d.get("having_param", []))
-    return None
+        if group.op == "and":
+            or_clauses: list[PredicateGroup] = []
+            for pred in group.predicates:
+                or_clauses.append(PredicateGroup(op="or", predicates=(pred,)))
+            for child in group.groups:
+                normalized = cls.normalize_cnf(child)
+                if normalized is None or normalized.is_empty():
+                    continue
+                if normalized.op == "or":
+                    or_clauses.append(normalized)
+                else:
+                    or_clauses.extend(cls._cnf_or_clauses(normalized))
+            if not or_clauses:
+                return None
+            if len(or_clauses) == 1:
+                return or_clauses[0]
+            return PredicateGroup(op="and", groups=tuple(or_clauses))
+        if group.op == "or":
+            or_preds: list[WhereParam | HavingParam] = list(group.predicates)
+            nested_or: list[PredicateGroup] = []
+            for child in group.groups:
+                if child.is_empty():
+                    continue
+                if child.op == "and":
+                    nested_or.append(cls._cnf_normalize_and_disjunct(child))
+                    continue
+                normalized = cls.normalize_cnf(child)
+                if normalized is None or normalized.is_empty():
+                    continue
+                or_preds.extend(normalized.predicates)
+                nested_or.extend(normalized.groups)
+            result = PredicateGroup(op="or", predicates=tuple(or_preds), groups=tuple(nested_or))
+            return None if result.is_empty() else result
+        raise ValueError(f"unsupported predicate op: {group.op!r}")
 
+    @classmethod
+    def coerce(cls, group: PredicateGroup | None) -> PredicateGroup | None:
+        if group is None or group.is_empty():
+            return None
+        dnf = cls.normalize_dnf(group)
+        cnf = cls.normalize_cnf(group)
+        candidates: list[tuple[Literal["dnf", "cnf"], PredicateGroup]] = []
+        if dnf is not None and not dnf.is_empty():
+            candidates.append(("dnf", dnf))
+        if cnf is not None and not cnf.is_empty():
+            candidates.append(("cnf", cnf))
+        if not candidates:
+            return None
+        within_limit = [
+            (form, candidate) for form, candidate in candidates if candidate.depth() <= MAX_PREDICATE_NESTING_DEPTH
+        ]
+        if not within_limit:
+            raise ValueError(f"predicate nesting exceeds MAX_PREDICATE_NESTING_DEPTH={MAX_PREDICATE_NESTING_DEPTH}")
+        preference = cls._normalization_preference(group)
+        preferred = [candidate for form, candidate in within_limit if form == preference]
+        if preferred:
+            return min(preferred, key=lambda candidate: candidate.depth())
+        return min((candidate for _, candidate in within_limit), key=lambda candidate: candidate.depth())
 
-def predicate_leaves(group: PredicateGroup | None) -> list[WhereParam | HavingParam]:
-    return group.leaves() if group else []
+    @classmethod
+    def map(cls, group: PredicateGroup | None, fn: Any) -> PredicateGroup | None:
+        if group is None or group.is_empty():
+            return None
+        preds = tuple(fn(pred) for pred in group.predicates)
+        subgroups = tuple(mapped for mapped in (cls.map(child, fn) for child in group.groups) if mapped is not None)
+        mapped_group = PredicateGroup(op=group.op, predicates=preds, groups=subgroups)
+        return None if mapped_group.is_empty() else mapped_group
 
+    @classmethod
+    def reapply_leaves(
+        cls, group: PredicateGroup | None, leaves: Sequence[WhereParam | HavingParam]
+    ) -> PredicateGroup | None:
+        """Replace predicate leaves in *group* with *leaves* in traversal order."""
+        if group is None or group.is_empty():
+            return None
+        leaf_iter = iter(leaves)
+        return cls.map(group, lambda _pred: next(leaf_iter))
 
-def where_leaves(group: PredicateGroup | None) -> list[WhereParam]:
-    """Return flat WHERE predicate leaves with a narrowed type."""
-    if group is None:
-        return []
-    return [leaf for leaf in group.leaves() if isinstance(leaf, WhereParam)]
+    @classmethod
+    def rebuild_from_leaves(
+        cls, original: PredicateGroup | None, leaves: Sequence[WhereParam | HavingParam]
+    ) -> PredicateGroup | None:
+        """Preserve *original* tree shape when leaf counts match; otherwise flatten to AND."""
+        if not leaves:
+            return None
+        if original is not None and len(leaves) == len(original.leaves()):
+            return cls.reapply_leaves(original, leaves)
+        return cls.from_list(list(leaves))
 
+    @classmethod
+    def partition(
+        cls, group: PredicateGroup | None, keep_fn: Any
+    ) -> tuple[PredicateGroup | None, PredicateGroup | None]:
+        if group is None or group.is_empty():
+            return None, None
+        kept_preds: list[WhereParam | HavingParam] = []
+        dropped_preds: list[WhereParam | HavingParam] = []
+        for pred in group.predicates:
+            (kept_preds if keep_fn(pred) else dropped_preds).append(pred)
+        kept_groups: list[PredicateGroup] = []
+        dropped_groups: list[PredicateGroup] = []
+        for child in group.groups:
+            kept_child, dropped_child = cls.partition(child, keep_fn)
+            if kept_child is not None:
+                kept_groups.append(kept_child)
+            if dropped_child is not None:
+                dropped_groups.append(dropped_child)
+        kept = PredicateGroup(op=group.op, predicates=tuple(kept_preds), groups=tuple(kept_groups))
+        dropped = PredicateGroup(op=group.op, predicates=tuple(dropped_preds), groups=tuple(dropped_groups))
+        return (None if kept.is_empty() else kept, None if dropped.is_empty() else dropped)
 
-def having_leaves(group: PredicateGroup | None) -> list[HavingParam]:
-    """Return flat HAVING predicate leaves with a narrowed type."""
-    if group is None:
-        return []
-    return [leaf for leaf in group.leaves() if isinstance(leaf, HavingParam)]
+    @staticmethod
+    def merge(op: Literal["and", "or"], groups: Sequence[PredicateGroup | None]) -> PredicateGroup | None:
+        nonempty = [group for group in groups if group is not None and not group.is_empty()]
+        if not nonempty:
+            return None
+        if len(nonempty) == 1:
+            return nonempty[0]
+        preds: list[WhereParam | HavingParam] = []
+        nested: list[PredicateGroup] = []
+        for group in nonempty:
+            if not group.groups and group.op == op and group.predicates:
+                preds.extend(group.predicates)
+            else:
+                nested.append(group)
+        return PredicateGroup(op=op, predicates=tuple(preds), groups=tuple(nested))
 
-
-def predicate_group_and(*preds: WhereParam | HavingParam) -> PredicateGroup | None:
-    items = tuple(pred for pred in preds if pred is not None)
-    if not items:
+    @classmethod
+    def parse_where_field(cls, d: Mapping[str, Any]) -> PredicateGroup | None:
+        if "where" in d:
+            raw = d.get("where")
+            if raw is None:
+                return None
+            return cls.from_dict(raw) if isinstance(raw, dict) else None
+        if "where_param" in d:
+            return cls.from_legacy_flat_where_dicts(d.get("where_param", []))
         return None
-    return PredicateGroup(op="and", predicates=items)
 
-
-def predicate_group_from_list(items: Sequence[WhereParam | HavingParam] | None) -> PredicateGroup | None:
-    if not items:
+    @classmethod
+    def parse_having_field(cls, d: Mapping[str, Any]) -> PredicateGroup | None:
+        if "having" in d:
+            raw = d.get("having")
+            if raw is None:
+                return None
+            return cls.from_dict(raw, having=True) if isinstance(raw, dict) else None
+        if "having_param" in d:
+            return cls.from_legacy_having_dicts(d.get("having_param", []))
         return None
-    return PredicateGroup(op="and", predicates=tuple(items))
 
+    @staticmethod
+    def predicate_leaves(group: PredicateGroup | None) -> list[WhereParam | HavingParam]:
+        return group.leaves() if group else []
 
-def coerce_having_group_list(having: list[HavingParam]) -> list[HavingParam]:
-    """Deprecated: convert a legacy flat HAVING list into a predicate group and back."""
-    group = predicate_group_from_legacy_having(having)
-    return having_leaves(group)
+    @staticmethod
+    def where_leaves(group: PredicateGroup | None) -> list[WhereParam]:
+        """Return flat WHERE predicate leaves with a narrowed type."""
+        if group is None:
+            return []
+        return [leaf for leaf in group.leaves() if isinstance(leaf, WhereParam)]
+
+    @staticmethod
+    def having_leaves(group: PredicateGroup | None) -> list[HavingParam]:
+        """Return flat HAVING predicate leaves with a narrowed type."""
+        if group is None:
+            return []
+        return [leaf for leaf in group.leaves() if isinstance(leaf, HavingParam)]
+
+    @staticmethod
+    def group_and(*preds: WhereParam | HavingParam) -> PredicateGroup | None:
+        items = tuple(pred for pred in preds if pred is not None)
+        if not items:
+            return None
+        return PredicateGroup(op="and", predicates=items)
+
+    @staticmethod
+    def from_list(items: Sequence[WhereParam | HavingParam] | None) -> PredicateGroup | None:
+        if not items:
+            return None
+        return PredicateGroup(op="and", predicates=tuple(items))
+
+    @classmethod
+    def coerce_having_group_list(cls, having: list[HavingParam]) -> list[HavingParam]:
+        """Deprecated: convert a legacy flat HAVING list into a predicate group and back."""
+        group = cls.from_legacy_having(having)
+        return cls.having_leaves(group)
 
 
 @dataclass
@@ -3506,7 +4335,7 @@ class OrderByCol:
         """
         expr_raw = d.get("expr", {})
         if isinstance(expr_raw, str):
-            expr = parse_expr_string_for_json(expr_raw)
+            expr = NormalizedExpr.parse_string_for_json(expr_raw)
         elif isinstance(expr_raw, dict):
             expr = NormalizedExpr.from_dict(expr_raw)
         elif isinstance(expr_raw, NormalizedExpr):
@@ -3516,7 +4345,7 @@ class OrderByCol:
         return OrderByCol(
             expr=expr,
             direction=d.get("direction", "ASC"),
-            nulls=coerce_order_by_nulls(d.get("nulls")),
+            nulls=OrderByNullPlacement.coerce(d.get("nulls")),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -3563,7 +4392,7 @@ class OrderByCol:
     def to_prompt_dict(self) -> dict[str, Any]:
         """ORDER BY entry shorthand."""
         out: dict[str, Any] = {
-            "expr": expr_prompt_sql(self.expr),
+            "expr": self.expr.prompt_sql(),
             "direction": self.direction.lower(),
         }
         if self.nulls is not None:
@@ -3600,7 +4429,7 @@ class WhereParam:
         self.op = self.op.strip().lower()
         self.value_type = self.value_type.strip().lower()
         if self.right_expr is not None:
-            _canonicalize_predicate_sides(self)
+            PredicateGroup._canonicalize_sides(self)
             for ev in self.left_expr.add_values:
                 self.right_expr.sub_values.append(ExprValue(value=ev.value, param_key=ev.param_key))
             for ev in self.left_expr.sub_values:
@@ -3612,8 +4441,8 @@ class WhereParam:
             and isinstance(self.raw_value, int | float)
             and not isinstance(self.raw_value, bool)
         ):
-            offset = sum(ev.value for ev in self.left_expr.add_values) - sum(
-                ev.value for ev in self.left_expr.sub_values
+            offset = sum(float(cast(Any, ev.value) or 0) for ev in self.left_expr.add_values) - sum(
+                float(cast(Any, ev.value) or 0) for ev in self.left_expr.sub_values
             )
             self.raw_value = self.raw_value - offset
             self.left_expr.add_values = []
@@ -3635,9 +4464,9 @@ class WhereParam:
         left_raw = d.get("left_expr", {})
         right_raw = d.get("right_expr")
         return WhereParam(
-            left_expr=normalized_expr_from_stored_json(left_raw),
+            left_expr=NormalizedExpr.from_stored_json(left_raw),
             op=d.get("op", "="),
-            right_expr=(normalized_expr_from_stored_json(right_raw) if right_raw else None),
+            right_expr=(NormalizedExpr.from_stored_json(right_raw) if right_raw else None),
             value_type=d.get("value_type", "string"),
             param_key=d.get("param_key", ""),
             param_key_hi=d.get("param_key_hi", ""),
@@ -3720,12 +4549,12 @@ class WhereParam:
     def to_prompt_dict(self) -> dict[str, Any]:
         """LLM shorthand dict with SQL strings for expression sides."""
         out: dict[str, Any] = {
-            "left_expr": expr_prompt_sql(self.left_expr),
+            "left_expr": self.left_expr.prompt_sql(),
             "op": self.op,
             "value_type": self.value_type,
         }
         if self.right_expr is not None:
-            out["right_expr"] = expr_prompt_sql(self.right_expr)
+            out["right_expr"] = self.right_expr.prompt_sql()
         elif self.raw_value is not None:
             out["value"] = self.raw_value
         return out
@@ -3764,7 +4593,7 @@ class HavingParam:
         self.op = self.op.strip().lower()
         self.value_type = self.value_type.strip().lower()
         if self.right_expr is not None:
-            _canonicalize_predicate_sides(self)
+            PredicateGroup._canonicalize_sides(self)
             for ev in self.left_expr.add_values:
                 self.right_expr.sub_values.append(ExprValue(value=ev.value, param_key=ev.param_key))
             for ev in self.left_expr.sub_values:
@@ -3776,8 +4605,8 @@ class HavingParam:
             and isinstance(self.raw_value, int | float)
             and not isinstance(self.raw_value, bool)
         ):
-            offset = sum(ev.value for ev in self.left_expr.add_values) - sum(
-                ev.value for ev in self.left_expr.sub_values
+            offset = sum(float(cast(Any, ev.value) or 0) for ev in self.left_expr.add_values) - sum(
+                float(cast(Any, ev.value) or 0) for ev in self.left_expr.sub_values
             )
             self.raw_value = self.raw_value - offset
             self.left_expr.add_values = []
@@ -3799,9 +4628,9 @@ class HavingParam:
         left_raw = d.get("left_expr", {})
         right_raw = d.get("right_expr")
         return HavingParam(
-            left_expr=normalized_expr_from_stored_json(left_raw),
+            left_expr=NormalizedExpr.from_stored_json(left_raw),
             op=d.get("op", "="),
-            right_expr=(normalized_expr_from_stored_json(right_raw) if right_raw else None),
+            right_expr=(NormalizedExpr.from_stored_json(right_raw) if right_raw else None),
             value_type=d.get("value_type", "number"),
             param_key=d.get("param_key", ""),
             param_key_unit=d.get("param_key_unit", ""),
@@ -3875,12 +4704,12 @@ class HavingParam:
     def to_prompt_dict(self) -> dict[str, Any]:
         """LLM shorthand dict with SQL strings for HAVING sides."""
         out: dict[str, Any] = {
-            "left_expr": expr_prompt_sql(self.left_expr),
+            "left_expr": self.left_expr.prompt_sql(),
             "op": self.op,
             "value_type": self.value_type,
         }
         if self.right_expr is not None:
-            out["right_expr"] = expr_prompt_sql(self.right_expr)
+            out["right_expr"] = self.right_expr.prompt_sql()
         elif self.raw_value is not None:
             out["value"] = self.raw_value
         return out
@@ -3899,109 +4728,82 @@ class HavingParam:
 PredicateLeaf = WhereParam | HavingParam
 
 
-def _cnf_or_clauses(group: PredicateGroup) -> list[PredicateGroup]:
-    clauses: list[PredicateGroup] = []
-    for pred in group.predicates:
-        clauses.append(PredicateGroup(op="or", predicates=(pred,)))
-    for child in group.groups:
-        if child.op == "or":
-            clauses.append(child)
-        elif child.op == "and":
-            clauses.extend(_cnf_or_clauses(child))
-    return clauses
+class JoinCandidateCapExceededError(AetherError):
+    """Raised when join path cross-product enumeration exceeds the refusal cap."""
+
+    def __init__(
+        self,
+        enumerated: int,
+        cap: int,
+        *,
+        tables: list[str] | None = None,
+        root: str | None = None,
+    ) -> None:
+        self.enumerated = enumerated
+        self.cap = cap
+        self.tables = list(tables) if tables is not None else None
+        self.root = root
+        tables_text = ",".join(self.tables) if self.tables else "?"
+        root_text = f" root={self.root!r}" if self.root else ""
+        super().__init__(
+            f"join candidate cross-product cap exceeded: {enumerated} paths (limit {cap}) tables={tables_text}{root_text}"
+        )
 
 
-def _cnf_normalize_and_disjunct(group: PredicateGroup) -> PredicateGroup:
-    """Normalize an AND disjunct nested under OR without CNF-expanding its predicates."""
-    and_preds: list[WhereParam | HavingParam] = list(group.predicates)
-    nested: list[PredicateGroup] = []
-    for child in group.groups:
-        normalized = normalize_predicate_group_cnf(child)
-        if normalized is None or normalized.is_empty():
-            continue
-        if normalized.op == "or":
-            nested.append(normalized)
-        else:
-            and_preds.extend(normalized.predicates)
-            nested.extend(normalized.groups)
-    return PredicateGroup(op="and", predicates=tuple(and_preds), groups=tuple(nested))
+class JoinProbeEdgeKindMismatchError(AetherError):
+    """Raised when join path signature and edge-kind lists are not aligned."""
+
+    def __init__(self, signature_len: int, kinds_len: int) -> None:
+        self.signature_len = signature_len
+        self.kinds_len = kinds_len
+        super().__init__(f"join path edge_kinds length mismatch: {kinds_len} kinds for {signature_len} segments")
 
 
-def _predicate_group_normalization_preference(group: PredicateGroup) -> Literal["dnf", "cnf", "auto"]:
-    if group.op == "and" and any(child.op == "or" for child in group.groups):
-        return "cnf"
-    if group.op == "or" and any(child.op == "and" for child in group.groups):
-        return "dnf"
-    return "auto"
+class JoinPathKeyTypeError(AetherError):
+    """Raised when a resolved join path pairs incompatible column types."""
+
+    def __init__(self, scope_label: str, message: str) -> None:
+        self.scope_label = scope_label
+        self.message_for_caller = message
+        super().__init__(message)
 
 
-def normalize_predicate_group_dnf(group: PredicateGroup | None) -> PredicateGroup | None:
-    """Normalize a predicate tree toward OR-of-AND (DNF) form when possible."""
-    if group is None or group.is_empty():
-        return None
-    if group.op == "or":
-        groups = tuple(normalize_predicate_group_dnf(child) or child for child in group.groups)
-        preds = group.predicates
-        if preds and not groups:
-            return PredicateGroup(op="or", predicates=preds)
-        if not preds and groups:
-            flat_groups = [g for g in groups if g is not None and not g.is_empty()]
-            if len(flat_groups) == 1:
-                return flat_groups[0]
-            return PredicateGroup(op="or", groups=tuple(flat_groups))
-        and_groups = list(groups)
-        if preds:
-            and_groups.insert(0, PredicateGroup(op="and", predicates=preds))
-        return PredicateGroup(op="or", groups=tuple(and_groups))
-    elif group.op == "and":
-        and_preds: list[WhereParam | HavingParam] = list(group.predicates)
-        nested: list[PredicateGroup] = []
-        for child in group.groups:
-            normalized = normalize_predicate_group_dnf(child)
-            if normalized is None or normalized.is_empty():
-                continue
-            if normalized.op == "or":
-                nested.append(normalized)
-            else:
-                and_preds.extend(normalized.predicates)
-                nested.extend(normalized.groups)
-        return PredicateGroup(op="and", predicates=tuple(and_preds), groups=tuple(nested))
+class ArtifactLockTimeoutError(RuntimeError, RetryableError):
+    """Raised when an artifact directory lock cannot be acquired before the timeout expires."""
+
+    def __init__(
+        self,
+        artifacts_dir: str,
+        holder_pid: int | None,
+        *,
+        timeout: float,
+        lock_path: str | None = None,
+    ) -> None:
+        self.artifacts_dir = artifacts_dir
+        self.holder_pid = holder_pid
+        self.timeout = timeout
+        self.lock_path = lock_path
+        pid_text = f" (held by pid {holder_pid})" if holder_pid is not None else ""
+        super().__init__(
+            f"Timed out waiting for artifact lock on {artifacts_dir!r} after {timeout:.1f}s{pid_text}",
+        )
 
 
-def normalize_predicate_group_cnf(group: PredicateGroup | None) -> PredicateGroup | None:
-    """Normalize a predicate tree toward AND-of-OR (CNF) form when possible."""
-    if group is None or group.is_empty():
-        return None
-    if group.op == "and":
-        or_clauses: list[PredicateGroup] = []
-        for pred in group.predicates:
-            or_clauses.append(PredicateGroup(op="or", predicates=(pred,)))
-        for child in group.groups:
-            normalized = normalize_predicate_group_cnf(child)
-            if normalized is None or normalized.is_empty():
-                continue
-            if normalized.op == "or":
-                or_clauses.append(normalized)
-            else:
-                or_clauses.extend(_cnf_or_clauses(normalized))
-        if not or_clauses:
-            return None
-        if len(or_clauses) == 1:
-            return or_clauses[0]
-        return PredicateGroup(op="and", groups=tuple(or_clauses))
-    if group.op == "or":
-        or_preds: list[WhereParam | HavingParam] = list(group.predicates)
-        nested_or: list[PredicateGroup] = []
-        for child in group.groups:
-            if child.is_empty():
-                continue
-            if child.op == "and":
-                nested_or.append(_cnf_normalize_and_disjunct(child))
-                continue
-            normalized = normalize_predicate_group_cnf(child)
-            if normalized is None or normalized.is_empty():
-                continue
-            or_preds.extend(normalized.predicates)
-            nested_or.extend(normalized.groups)
-        result = PredicateGroup(op="or", predicates=tuple(or_preds), groups=tuple(nested_or))
-        return None if result.is_empty() else result
+@dataclass(frozen=True, slots=True)
+class ArtifactManifest:
+    """Typed view of ``artifact_manifest.json`` fields used by migration checks."""
+
+    artifact_format_version: str = "0"
+    created_with_package_version: str = ""
+    min_compatible_package_version: str = ""
+    last_action: str = ""
+    last_action_at: str = ""
+    structural_hash: str = ""
+    profiling_hash: str = ""
+    scope_hash: str = ""
+    effective_structural_hash: str = ""
+    schema_graph_id: str = ""
+    notes_hash: str = ""
+    semantic_edges_hash: str = ""
+    last_migration_tier: str = ""
+    last_migration_at: str = ""

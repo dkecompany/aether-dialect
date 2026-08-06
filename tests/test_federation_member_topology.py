@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -66,7 +68,7 @@ def test_reconcile_authored_declaration_prunes_aliases_for_removed_member() -> N
             ],
         },
     )
-    mappings = FederationMappings(version=1)
+    mappings = FederationMappings(version="0.2.1")
     pruned_manifest, pruned_mappings = reconcile_authored_declaration_for_members(
         manifest,
         mappings,
@@ -92,7 +94,7 @@ def test_prune_federation_aliases_drops_removed_sources() -> None:
 
 @pytest.mark.fast
 def test_remove_engine_succeeds_when_declaration_names_removed_alias(tmp_path: Path) -> None:
-    declaration_path = write_federation_declaration_file(tmp_path, _three_member_manifest(), {"version": 1})
+    declaration_path = write_federation_declaration_file(tmp_path, _three_member_manifest(), {"version": "0.2.1"})
     members = {
         "a": _graph("t_a", source_id="a"),
         "b": _graph("t_b", source_id="b"),
@@ -130,6 +132,56 @@ def test_remove_engine_succeeds_when_declaration_names_removed_alias(tmp_path: P
     pruned_manifest = declaration[0]
     assert all(alias.source != "c" for alias in pruned_manifest.aliases)
     assert "c" not in fed._members
+
+
+@pytest.mark.fast
+def test_remove_engine_rewrites_declaration_file_on_disk(tmp_path: Path) -> None:
+    declaration_path = write_federation_declaration_file(tmp_path, _three_member_manifest(), {"version": "0.2.1"})
+    members = {
+        "a": _graph("t_a", source_id="a"),
+        "b": _graph("t_b", source_id="b"),
+        "c": _graph("t_c", source_id="c"),
+    }
+    manifest = parse_federation_manifest(_three_member_manifest())
+    composite = _graph("t_a", source_id="a")
+    bundle = _init_bundle(manifest, composite)
+
+    def _capture_init(*_args: object, **kwargs: object) -> object:
+        declaration = kwargs.get("declaration")
+        if isinstance(declaration, tuple):
+            pruned_manifest, _pruned_mappings = declaration
+            pruned_bundle = _init_bundle(pruned_manifest, composite)
+            if pruned_bundle.federation_manifest is not None:
+                pruned_bundle.federation_manifest = replace(
+                    pruned_bundle.federation_manifest,
+                    table_namespace={"t_a": "a", "t_b": "b"},
+                )
+            return pruned_bundle
+        return bundle
+
+    member_a = _minimal_member(connection="a")
+    member_a._schema_graph = members["a"]
+    member_b = _minimal_member(connection="b")
+    member_b._schema_graph = members["b"]
+    member_c = _minimal_member(connection="c")
+    member_c._schema_graph = members["c"]
+    with patch("aetherdialect.aetherdialect.initialize_aether_federation", side_effect=_capture_init):
+        fed = AetherFederation(
+            "fed_members",
+            members={"a": member_a, "b": member_b, "c": member_c},
+            declaration_file=str(declaration_path),
+            artifacts_dir=str(tmp_path),
+        )
+    fed._members = {"a": member_a, "b": member_b, "c": member_c}
+    with patch("aetherdialect.aetherdialect.initialize_aether_federation", side_effect=_capture_init):
+        fed.remove_engine("c")
+    stored = json.loads(Path(declaration_path).read_text(encoding="utf-8"))
+    aliases = stored.get("aliases") or []
+    if isinstance(aliases, dict):
+        alias_rows = list(aliases.values())
+    else:
+        alias_rows = aliases
+    assert all(row.get("source") != "c" for row in alias_rows)
 
 
 @pytest.mark.fast

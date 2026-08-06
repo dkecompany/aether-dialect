@@ -11,7 +11,6 @@ from aetherdialect._config import EngineConfig
 from aetherdialect._constants import DIAGNOSTIC_CODE_LLM_TURN_COST
 from aetherdialect._contracts_base import LlmUsageRecord
 from aetherdialect._core_utils import (
-    drain_llm_usage_records,
     llm_call_audit_details,
     llm_call_cost_usd,
     llm_turn_cost_diagnostic,
@@ -20,18 +19,19 @@ from aetherdialect._core_utils import (
     llm_usage_run_scope,
     llm_usage_session_scope,
     record_llm_usage,
+    reset_llm_usage_accumulator,
     set_llm_price_table_override,
     snapshot_llm_usage_records,
 )
-from aetherdialect._llm_provider import llm_chat
+from aetherdialect._llm_provider import LLMProvider
 
 
 @pytest.fixture(autouse=True)
 def _reset_price_override() -> None:
-    drain_llm_usage_records()
+    reset_llm_usage_accumulator()
     set_llm_price_table_override(None)
     yield
-    drain_llm_usage_records()
+    reset_llm_usage_accumulator()
     set_llm_price_table_override(None)
 
 
@@ -203,12 +203,12 @@ def test_llm_chat_records_usage_on_success() -> None:
     EngineConfig.LLM_PROVIDER = "openai"
     try:
         with llm_usage_session_scope():
-            with patch("aetherdialect._llm_provider._provider_order", return_value=["openai"]):
-                with patch("aetherdialect._llm_provider._provider_is_configured", return_value=True):
-                    with patch("aetherdialect._llm_provider._build_client", return_value=mock_client):
+            with patch("aetherdialect._llm_provider.LLMProvider._provider_order", return_value=["openai"]):
+                with patch("aetherdialect._llm_provider.LLMProvider._provider_is_configured", return_value=True):
+                    with patch("aetherdialect._llm_provider.LLMProvider._build_client", return_value=mock_client):
                         with patch("aetherdialect._core_utils.debug"):
                             with patch("aetherdialect._core_utils.pipeline_trace"):
-                                llm_chat("sys", "usr", max_retries=1, task="intent")
+                                LLMProvider.chat("sys", "usr", max_retries=1, task="intent")
     finally:
         EngineConfig.LLM_PROVIDER = prev
 

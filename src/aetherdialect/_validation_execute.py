@@ -14,6 +14,7 @@ from ._config import PolicyConfig
 from ._constants import (
     ARROW_RESULT_READER_KINDS,
     DIAG_TO_FAILURE_CATEGORY,
+    DIAGNOSTIC_CODE_SQL_PARSE_FAILED,
     MASTER_AETHERSPACE_NAME,
     PERMISSION_DENIED_USER_MESSAGE,
     SCALAR_FUNCTIONS_NUMERIC,
@@ -24,17 +25,21 @@ from ._constants import (
 )
 from ._contracts_base import (
     AccessError,
+    AggregateJoinFanOutError,
+    ClauseWidenedRowsetError,
     ColumnRole,
+    ConfigError,
+    CteEmissionKind,
     EngineContext,
     FailureCategory,
+    FederationContext,
     HavingParam,
     LogicalIntent,
     OrderByCol,
+    PredicateGroup,
     ProbeCtePlacementError,
     SqlDiagnostic,
     SqlDiagnosticCode,
-    having_leaves,
-    where_leaves,
 )
 from ._contracts_core import RuntimeCteStep, RuntimeIntent, SelectCol
 from ._contracts_schema import (
@@ -44,9 +49,15 @@ from ._contracts_schema import (
     IntentValidationResult,
     SchemaGraph,
     WindowRegistryStep,
-    make_intent_issue,
 )
-from ._core_utils import debug, pipeline_trace, reconcile_execute_bind_params, stable_json
+from ._core_utils import (
+    build_case_folded_index,
+    debug,
+    notify,
+    pipeline_trace,
+    reconcile_execute_bind_params,
+    stable_json,
+)
 from ._dialect import Dialect
 from ._intent_expr import extract_columns_from_expr
 from ._intent_repair import validate_table_scope_repairs
@@ -59,6 +70,7 @@ from ._intent_resolve import (
 from ._schema_graph import assert_consumer_sql_in_scope
 from ._sql_gen import classify_cte_emission, probe_cte_names
 from ._validation_schema import (
+    assert_execution_parameters_validated,
     collect_fan_out_sensitive_aggregates,
     cte_join_reachability_tables,
     extract_agg_col,
@@ -85,6 +97,7 @@ from ._validation_schema import (
     validate_join_path_reachability,
     validate_join_path_reachability_for_tables,
     validate_no_between_ops,
+    validate_not_in_negated_list_null,
     validate_null_filters,
     validate_order_by_cols_schema,
     validate_predicate_nesting_depth,
@@ -96,6 +109,7 @@ from ._validation_schema import (
     validate_select_cols_schema,
     validate_selectability,
     validate_table_reference_counts,
+    validate_unknown_column_operations,
     validate_where_ops_per_column,
     validate_where_value_type_alignment,
     validate_window_partition_group_by_alignment,
@@ -124,6 +138,7 @@ from ._validation_semantic import (
     validate_logical_intent_numeric_coverage,
     validate_mixed_aggregation_in_mulgroup,
     validate_no_nested_aggregation,
+    validate_no_opaque_raw_sql,
     validate_non_selectable_predicates,
     validate_order_by_aggregation_context,
     validate_order_by_expr_types,
@@ -230,7 +245,7 @@ def _column_resolution_issues(
     slug = re.sub(r"[^\w]+", "_", context).strip("_")
     for iss in raw:
         out.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"{iss.issue_id}_{slug}",
                 category=iss.category,
                 severity=iss.severity,
@@ -291,8 +306,8 @@ def _pg_parsed_has_forbidden_sql(parsed: Any, *, sql: str, sqlglot_dialect: str)
     """Return True when a pglast-backed SELECT contains PolicyConfig- forbidden constructs."""
     try:
         tree = sqlglot.parse_one(sql, dialect=sqlglot_dialect)
-    except Exception:
-        return True
+    except Exception as exc:
+        raise ConfigError(f"SQL parse failed: {exc}") from exc
     if isinstance(tree, exp.Select):
         return _sqlglot_select_has_forbidden_sql(tree)
     return True
@@ -318,9 +333,89 @@ def _enforce_select_only(sql: str, dialect: Dialect) -> tuple[bool, str]:
     parsed = dialect.parse_select(sql)
     if parsed is None:
         return False, "not_select"
-    if _parsed_ast_has_forbidden_sql(parsed, dialect, sql=sql):
-        return False, "forbidden_sql"
+    try:
+        if _parsed_ast_has_forbidden_sql(parsed, dialect, sql=sql):
+            return False, "forbidden_sql"
+    except ConfigError as exc:
+        return False, f"sql_parse_failed:{exc}"
     return True, "ok"
+
+
+def _raise_execute_join_semantics_errors(
+    intent: RuntimeIntent,
+    schema: SchemaGraph,
+    *,
+    scope_label: str,
+    join_signature: list[str],
+    from_anchor: str | None,
+) -> None:
+    """Raise when aggregate fan-out or clause-widened rowset rules forbid execution."""
+    fan_out_issues = validate_aggregate_join_fan_out(
+        intent,
+        schema,
+        scope_label,
+        join_signature=join_signature,
+        from_anchor=from_anchor,
+    )
+    fan_out_errors = [i for i in fan_out_issues if i.severity == "error"]
+    if fan_out_errors:
+        raise AggregateJoinFanOutError(scope_label, fan_out_errors[0].message)
+    clause_issues = validate_clause_widened_rowset(
+        intent,
+        schema,
+        scope_label,
+        join_signature=join_signature,
+        from_anchor=from_anchor,
+    )
+    clause_errors = [i for i in clause_issues if i.severity == "error"]
+    if clause_errors:
+        raise ClauseWidenedRowsetError(scope_label, clause_errors[0].message)
+
+
+def validate_execute_join_semantics(intent: RuntimeIntent, schema: SchemaGraph) -> None:
+    """Refuse execution when resolved join semantics inflate aggregates or widen clauses."""
+    tables = list(intent.tables or [])
+    if len(tables) >= 2:
+        sig = list(intent.chosen_join_path_signature or [])
+        if sig:
+            _raise_execute_join_semantics_errors(
+                intent,
+                schema,
+                scope_label="main query",
+                join_signature=sig,
+                from_anchor=tables[0],
+            )
+    for cte in intent.cte_steps or []:
+        cte_tbls = list(cte.tables or [])
+        if len(cte_tbls) < 2:
+            continue
+        sig = list(cte.chosen_join_path_signature or [])
+        if not sig:
+            continue
+        cte_scope = RuntimeIntent(
+            tables=cte_tbls,
+            grain=cte.grain or "row_level",
+            select_cols=list(cte.select_cols or []),
+            group_by_cols=list(cte.group_by_cols or []),
+            order_by_cols=list(cte.order_by_cols or []),
+            where=cte.where,
+            having=cte.having,
+            limit=cte.limit,
+            limit_param_key=cte.limit_param_key or "",
+            distinct_select_index=cte.distinct_select_index,
+            distinct_on=list(cte.distinct_on or []),
+            chosen_join_path_signature=sig,
+            resolved_join_tables=cte_join_reachability_tables(cte),
+            window_registry=list(cte.window_registry or []),
+        )
+        context = f"CTE '{cte.cte_name}'"
+        _raise_execute_join_semantics_errors(
+            cte_scope,
+            schema,
+            scope_label=context,
+            join_signature=sig,
+            from_anchor=cte_tbls[0],
+        )
 
 
 def validate_sql(
@@ -347,6 +442,26 @@ def validate_sql(
     if not ok:
         debug(f"[validation_execute.validate_sql] enforce_select_only FAILED: {reason}")
         pipeline_trace("validation_execute.validate_sql.FAILED_enforce_select_only", lambda: f"reason={reason}\n{sql}")
+        if reason.startswith("sql_parse_failed"):
+            parse_msg = reason.split(":", 1)[1].strip() if ":" in reason else "SQL parse failed"
+            notify(
+                parse_msg,
+                stage="validation",
+                code=DIAGNOSTIC_CODE_SQL_PARSE_FAILED,
+                level="error",
+            )
+            return (
+                False,
+                parse_msg,
+                FailureCategory.SCHEMA_VALIDATION,
+                [
+                    SqlDiagnostic(
+                        code=SqlDiagnosticCode.AST_PARSE_FAILED,
+                        message=parse_msg,
+                        details={"diagnostic_code": DIAGNOSTIC_CODE_SQL_PARSE_FAILED},
+                    )
+                ],
+            )
         cat = FailureCategory.SCHEMA if reason == "not_select" else FailureCategory.OTHER
         diag_code = SqlDiagnosticCode.NOT_SELECT if reason == "not_select" else SqlDiagnosticCode.MULTIPLE_STATEMENTS
         return False, reason, cat, [SqlDiagnostic(code=diag_code, message=reason or "")]
@@ -431,7 +546,7 @@ def execute_guarded_sql(
     schema: SchemaGraph | None = None,
     intent: RuntimeIntent | None = None,
     schema_role: str = "owner",
-    schema_context: EngineContext | None = None,
+    schema_context: EngineContext | FederationContext | None = None,
     visible_objects: frozenset[str] | None = None,
     context_name: str = MASTER_AETHERSPACE_NAME,
     timeout_ms: int | None = None,
@@ -442,7 +557,7 @@ def execute_guarded_sql(
     """Validate *sql* then execute via *dialect*, enforcing consumer scope when applicable."""
     if schema is not None:
         runtime_cfg_ctx = schema_context
-        ctx = runtime_cfg_ctx if runtime_cfg_ctx is not None else EngineContext()
+        ctx: EngineContext | FederationContext = runtime_cfg_ctx if runtime_cfg_ctx is not None else EngineContext()
         norm_name = str(context_name or MASTER_AETHERSPACE_NAME).strip().lower() or MASTER_AETHERSPACE_NAME
         gate_active = (
             schema_role == "consumer"
@@ -451,7 +566,13 @@ def execute_guarded_sql(
             or visible_objects is not None
         )
         if gate_active and not assert_consumer_sql_in_scope(sql, dialect, ctx, schema, visible_objects):
-            raise AccessError("execute", PERMISSION_DENIED_USER_MESSAGE)
+            raise AccessError("execute", PERMISSION_DENIED_USER_MESSAGE, reason="scope")
+    if schema is not None and intent is not None:
+        validate_execute_join_semantics(intent, schema)
+        try:
+            assert_execution_parameters_validated(intent, schema)
+        except Exception as exc:
+            raise ValueError(str(exc)) from exc
     with temporary_dialect_member_limits(
         dialect,
         max_query_cost_rows=max_query_cost_rows,
@@ -476,7 +597,7 @@ def execute_guarded_arrow_table(
     schema: SchemaGraph | None = None,
     intent: RuntimeIntent | None = None,
     schema_role: str = "owner",
-    schema_context: EngineContext | None = None,
+    schema_context: EngineContext | FederationContext | None = None,
     visible_objects: frozenset[str] | None = None,
     context_name: str = MASTER_AETHERSPACE_NAME,
     timeout_ms: int | None = None,
@@ -490,7 +611,7 @@ def execute_guarded_arrow_table(
         raise ValueError(f"dialect result reader {reader_kind!r} does not support Arrow coordinator streaming")
     if schema is not None:
         runtime_cfg_ctx = schema_context
-        ctx = runtime_cfg_ctx if runtime_cfg_ctx is not None else EngineContext()
+        ctx: EngineContext | FederationContext = runtime_cfg_ctx if runtime_cfg_ctx is not None else EngineContext()
         norm_name = str(context_name or MASTER_AETHERSPACE_NAME).strip().lower() or MASTER_AETHERSPACE_NAME
         gate_active = (
             schema_role == "consumer"
@@ -499,7 +620,13 @@ def execute_guarded_arrow_table(
             or visible_objects is not None
         )
         if gate_active and not assert_consumer_sql_in_scope(sql, dialect, ctx, schema, visible_objects):
-            raise AccessError("execute", PERMISSION_DENIED_USER_MESSAGE)
+            raise AccessError("execute", PERMISSION_DENIED_USER_MESSAGE, reason="scope")
+    if schema is not None and intent is not None:
+        validate_execute_join_semantics(intent, schema)
+        try:
+            assert_execution_parameters_validated(intent, schema)
+        except Exception as exc:
+            raise ValueError(str(exc)) from exc
     with temporary_dialect_member_limits(
         dialect,
         max_query_cost_rows=max_query_cost_rows,
@@ -581,6 +708,7 @@ def _validate_main_query_cte_usage(
         return list(cte_outputs.get(ck or "", []) or [])
 
     if cte_steps:
+        build_case_folded_index((c.cte_name for c in cte_steps if c.cte_name), kind="CTE name")
         steps_by_name = {c.cte_name.lower(): c for c in cte_steps}
         frontier = set(used)
         while frontier:
@@ -600,13 +728,14 @@ def _validate_main_query_cte_usage(
             frontier = nxt
     unreferenced_ctes = cte_names_lower - used
     if unreferenced_ctes and cte_steps:
+        build_case_folded_index((c.cte_name for c in cte_steps if c.cte_name), kind="CTE name")
         steps_by_name = {c.cte_name.lower(): c for c in cte_steps if c.cte_name}
         for u in sorted(unreferenced_ctes):
             st = steps_by_name.get(u)
             em = getattr(st, "emission", "join_table") if st is not None else "join_table"
             sev = "error" if em == "scalar_subquery" else "warning"
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"cte_unreferenced_{u}",
                     category=FailureCategory.CTE_USAGE,
                     severity=sev,
@@ -617,7 +746,7 @@ def _validate_main_query_cte_usage(
         debug(f"[validation_execute.validate_main_query_cte_usage] unreferenced CTEs: {unreferenced_ctes}")
     elif unreferenced_ctes:
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"cte_unreferenced_{','.join(sorted(unreferenced_ctes))}",
                 category=FailureCategory.CTE_USAGE,
                 severity="warning",
@@ -635,7 +764,7 @@ def _validate_main_query_cte_usage(
             cte_cols = _cte_col_list(table_ref)
             if col_name.lower() not in {c.lower() for c in cte_cols}:
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"main_col_not_in_cte_{table_ref}_{col_name}",
                         category=FailureCategory.CTE_COLUMN_REFERENCE,
                         severity="error",
@@ -654,7 +783,7 @@ def _validate_main_query_cte_usage(
             cte_cols = _cte_col_list(source)
             if col_name.lower() not in {c.lower() for c in cte_cols}:
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"main_colmap_not_in_cte_{source}_{col_name}",
                         category=FailureCategory.CTE_COLUMN_REFERENCE,
                         severity="error",
@@ -667,7 +796,7 @@ def _validate_main_query_cte_usage(
                     )
                 )
                 debug(f"[validation_execute.validate_main_query_cte_usage] column_map {col_name} not in CTE {source}")
-    for fp in where_leaves(intent.where) or []:
+    for fp in PredicateGroup.where_leaves(intent.where) or []:
         col_expr = fp.left_expr.primary_column
         if not col_expr or "." not in col_expr:
             continue
@@ -676,7 +805,7 @@ def _validate_main_query_cte_usage(
             cte_cols = _cte_col_list(table_ref)
             if col_name.lower() not in {c.lower() for c in cte_cols}:
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"main_where_not_in_cte_{table_ref}_{col_name}",
                         category=FailureCategory.CTE_COLUMN_REFERENCE,
                         severity="error",
@@ -755,7 +884,7 @@ def _validate_cte_output_types(cte_steps: list[RuntimeCteStep], schema: SchemaGr
                 col_type = cte_output_types[agg_table].get(col_name, "")
                 if col_type and col_type not in ("integer", "number"):
                     issues.append(
-                        make_intent_issue(
+                        IntentIssue.make(
                             issue_id=f"cte_agg_type_mismatch_{cte_name}_{agg_func}_{col_name}",
                             category=FailureCategory.CTE_TYPE_CONSISTENCY,
                             severity="warning",
@@ -792,7 +921,7 @@ def _validate_cte_cardinality(cte_steps: list[RuntimeCteStep]) -> list[IntentIss
         emission = getattr(cte, "emission", "join_table") or "join_table"
         if grain == "scalar" and expected != "one":
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"cte_scalar_cardinality_{cte_name}",
                     category=FailureCategory.CTE_CARDINALITY,
                     severity="error",
@@ -807,7 +936,7 @@ def _validate_cte_cardinality(cte_steps: list[RuntimeCteStep]) -> list[IntentIss
             debug(f"[validation_execute.validate_cte_cardinality] scalar CTE with expected_rows={expected}")
         if grain == "scalar" and cte.limit is not None and cte.limit != 1:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"cte_scalar_multi_row_limit_{cte_name}",
                     category=FailureCategory.CTE_CARDINALITY,
                     severity="error",
@@ -826,7 +955,7 @@ def _validate_cte_cardinality(cte_steps: list[RuntimeCteStep]) -> list[IntentIss
             debug(f"[validation_execute.validate_cte_cardinality] scalar CTE with multi-row limit={cte.limit}")
         if emission == "scalar_subquery" and cte.limit is not None and cte.limit != 1:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"cte_scalar_subquery_multi_row_limit_{cte_name}",
                     category=FailureCategory.CTE_CARDINALITY,
                     severity="error",
@@ -843,7 +972,7 @@ def _validate_cte_cardinality(cte_steps: list[RuntimeCteStep]) -> list[IntentIss
             )
         if cte.limit == 1 and expected != "one":
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"cte_limit1_cardinality_{cte_name}",
                     category=FailureCategory.CTE_CARDINALITY,
                     severity="error",
@@ -899,6 +1028,16 @@ def _validate_case_branches_for_scope(
             issues.extend(validate_having_operator_is_numeric(h_list, location))
             issues.extend(validate_having_requires_aggregation(h_list, location, group_by_cols=[]))
             issues.extend(validate_agg_vs_agg_having(h_list, schema, cte_outputs, location))
+            issues.extend(
+                validate_unknown_column_operations(
+                    [],
+                    h_list,
+                    select_cols,
+                    schema,
+                    location,
+                    cte_outputs,
+                )
+            )
             continue
         issues.extend(
             validate_filters_schema(f_list, schema, allowed_tables, cte_outputs, location, param_values=param_values)
@@ -907,6 +1046,17 @@ def _validate_case_branches_for_scope(
         issues.extend(validate_where_no_aggregation(f_list, location))
         issues.extend(validate_where_expr_types(f_list, schema, cte_outputs, location))
         issues.extend(validate_null_filters(f_list, cte_steps, location))
+        issues.extend(validate_not_in_negated_list_null(f_list, location, param_values=param_values))
+        issues.extend(
+            validate_unknown_column_operations(
+                f_list,
+                [],
+                select_cols,
+                schema,
+                location,
+                cte_outputs,
+            )
+        )
         issues.extend(
             validate_where_value_type_alignment(f_list, schema, location, cte_outputs, param_values=param_values)
         )
@@ -924,9 +1074,10 @@ def validate_cte_emission_reclassification(intent: RuntimeIntent, schema: Schema
     issues: list[IntentIssue] = []
     for cte in intent.cte_steps or []:
         declared = getattr(cte, "emission", "join_table") or "join_table"
+        declared_label = declared.value if isinstance(declared, CteEmissionKind) else str(declared)
         if declared == "scalar_subquery":
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"cte_emission_model_declared_scalar_subquery_{cte.cte_name}",
                     category=FailureCategory.CTE_STRUCTURE,
                     severity="error",
@@ -934,7 +1085,7 @@ def validate_cte_emission_reclassification(intent: RuntimeIntent, schema: Schema
                         f"CTE '{cte.cte_name}': scalar_subquery emission is engine-owned; "
                         "omit emission or declare semi_join/anti_join when appropriate"
                     ),
-                    context={"cte_name": cte.cte_name, "declared": declared},
+                    context={"cte_name": cte.cte_name, "declared": declared_label},
                 )
             )
             continue
@@ -943,13 +1094,16 @@ def validate_cte_emission_reclassification(intent: RuntimeIntent, schema: Schema
             continue
         if declared == "join_table" and derived == "scalar_subquery":
             continue
+        derived_label = derived.value if isinstance(derived, CteEmissionKind) else str(derived)
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"cte_emission_reclassified_{cte.cte_name}",
                 category=FailureCategory.CTE_STRUCTURE,
                 severity="error",
-                message=(f"CTE '{cte.cte_name}': declared emission '{declared}' reclassified to '{derived}'"),
-                context={"cte_name": cte.cte_name, "declared": declared, "derived": derived},
+                message=(
+                    f"CTE '{cte.cte_name}': declared emission '{declared_label}' reclassified to '{derived_label}'"
+                ),
+                context={"cte_name": cte.cte_name, "declared": declared_label, "derived": derived_label},
             )
         )
     return issues
@@ -983,7 +1137,7 @@ def validate_semantics(
     pipeline_trace("validation_execute.validate_semantics.input_intent", lambda: stable_json(intent.to_dict()))
     if not intent.tables:
         all_issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id="tables_empty",
                 category=FailureCategory.STRUCTURAL,
                 severity="error",
@@ -997,7 +1151,7 @@ def validate_semantics(
     for cte in cte_steps:
         if not cte.cte_name:
             all_issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id="cte_name_empty",
                     category=FailureCategory.CTE_STRUCTURE,
                     severity="error",
@@ -1007,7 +1161,7 @@ def validate_semantics(
             )
         if not cte.output_columns:
             all_issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"cte_output_columns_empty_{cte.cte_name}",
                     category=FailureCategory.CTE_STRUCTURE,
                     severity="error",
@@ -1023,7 +1177,7 @@ def validate_semantics(
         if len(cte_names) != len(set(cte_names)):
             duplicates = [n for n in cte_names if cte_names.count(n) > 1]
             all_issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"cte_duplicate_names_{','.join(sorted(set(duplicates)))}",
                     category=FailureCategory.CTE_STRUCTURE,
                     severity="error",
@@ -1035,7 +1189,7 @@ def validate_semantics(
             for table in cte.tables or []:
                 if table.lower() in {n.lower() for n in cte_names[i + 1 :]}:
                     all_issues.append(
-                        make_intent_issue(
+                        IntentIssue.make(
                             issue_id=f"cte_forward_ref_{cte.cte_name}_{table}",
                             category=FailureCategory.CTE_STRUCTURE,
                             severity="error",
@@ -1049,7 +1203,7 @@ def validate_semantics(
             for table in cte.tables or []:
                 if table.lower() not in {t.lower() for t in available}:
                     all_issues.append(
-                        make_intent_issue(
+                        IntentIssue.make(
                             issue_id=f"cte_unknown_table_{cte.cte_name}_{table}",
                             category=FailureCategory.CTE_TABLE_REFERENCE,
                             severity="error",
@@ -1070,8 +1224,8 @@ def validate_semantics(
             select_cols=intent.select_cols or [],
             group_by_cols=intent.group_by_cols or [],
             order_by_cols=intent.order_by_cols or [],
-            where_params=where_leaves(intent.where) or [],
-            having_param=having_leaves(intent.having) or [],
+            where_params=PredicateGroup.where_leaves(intent.where) or [],
+            having_param=PredicateGroup.having_leaves(intent.having) or [],
         )
     )
     all_issues.extend(
@@ -1090,6 +1244,7 @@ def validate_semantics(
     all_issues.extend(validate_sensitivity_group_by(intent, schema))
     all_issues.extend(validate_sensitivity_order_by(intent, schema))
     all_issues.extend(validate_non_selectable_predicates(intent, schema))
+    all_issues.extend(validate_no_opaque_raw_sql(intent, schema))
     all_issues.extend(validate_empty_window(intent, schema))
     all_issues.extend(
         validate_window_spec_schema(
@@ -1122,7 +1277,9 @@ def validate_semantics(
         )
     )
     all_issues.extend(
-        validate_contains_array_filters(where_leaves(intent.where) or [], schema, cte_outputs, "main query")
+        validate_contains_array_filters(
+            PredicateGroup.where_leaves(intent.where) or [], schema, cte_outputs, "main query"
+        )
     )
     all_issues.extend(
         validate_selectability(
@@ -1195,7 +1352,7 @@ def validate_semantics(
     )
     all_issues.extend(
         validate_filters_schema(
-            where_leaves(intent.where) or [],
+            PredicateGroup.where_leaves(intent.where) or [],
             schema,
             allowed_tables,
             cte_outputs,
@@ -1210,7 +1367,7 @@ def validate_semantics(
     )
     all_issues.extend(
         validate_having_schema(
-            having_leaves(intent.having) or [],
+            PredicateGroup.having_leaves(intent.having) or [],
             schema,
             allowed_tables,
             cte_outputs,
@@ -1219,13 +1376,19 @@ def validate_semantics(
         )
     )
     all_issues.extend(
-        validate_where_ops_per_column(where_leaves(intent.where) or [], schema, cte_outputs, "main query")
+        validate_where_ops_per_column(
+            PredicateGroup.where_leaves(intent.where) or [], schema, cte_outputs, "main query"
+        )
     )
     all_issues.extend(
-        validate_having_agg_per_role(having_leaves(intent.having) or [], schema, cte_outputs, "main query")
+        validate_having_agg_per_role(
+            PredicateGroup.having_leaves(intent.having) or [], schema, cte_outputs, "main query"
+        )
     )
     all_issues.extend(
-        validate_having_ops_per_column(having_leaves(intent.having) or [], schema, cte_outputs, "main query")
+        validate_having_ops_per_column(
+            PredicateGroup.having_leaves(intent.having) or [], schema, cte_outputs, "main query"
+        )
     )
     all_issues.extend(validate_select_agg_per_role(intent.select_cols or [], schema, cte_outputs, "main query"))
     all_issues.extend(validate_select_agg_semantics(intent.select_cols or [], schema, "main query"))
@@ -1234,35 +1397,68 @@ def validate_semantics(
     all_issues.extend(
         validate_scalar_func_type_semantics(intent.select_cols or [], intent.order_by_cols or [], schema, "main query")
     )
-    all_issues.extend(validate_null_filters(where_leaves(intent.where) or [], cte_steps, "main query"))
+    all_issues.extend(validate_null_filters(PredicateGroup.where_leaves(intent.where) or [], cte_steps, "main query"))
+    all_issues.extend(
+        validate_not_in_negated_list_null(
+            PredicateGroup.where_leaves(intent.where) or [],
+            "main query",
+            param_values=intent.param_values,
+        )
+    )
+    all_issues.extend(
+        validate_unknown_column_operations(
+            PredicateGroup.where_leaves(intent.where) or [],
+            PredicateGroup.having_leaves(intent.having) or [],
+            intent.select_cols or [],
+            schema,
+            "main query",
+            cte_outputs,
+        )
+    )
     all_issues.extend(
         validate_date_window_units(
-            where_leaves(intent.where) or [], cte_steps, "main query", scope_param_values=intent.param_values
+            PredicateGroup.where_leaves(intent.where) or [],
+            cte_steps,
+            "main query",
+            scope_param_values=intent.param_values,
         )
     )
     all_issues.extend(
         validate_date_diff_units(
-            where_leaves(intent.where) or [], cte_steps, "main query", scope_param_values=intent.param_values
+            PredicateGroup.where_leaves(intent.where) or [],
+            cte_steps,
+            "main query",
+            scope_param_values=intent.param_values,
         )
     )
     all_issues.extend(
-        validate_redundant_extract_year_column_literals(where_leaves(intent.where) or [], cte_steps, "main query")
+        validate_redundant_extract_year_column_literals(
+            PredicateGroup.where_leaves(intent.where) or [], cte_steps, "main query"
+        )
     )
     all_issues.extend(validate_column_types(intent.select_cols or [], schema, "main query"))
     all_issues.extend(
         validate_where_value_type_alignment(
-            where_leaves(intent.where) or [], schema, "main query", cte_outputs, param_values=intent.param_values
+            PredicateGroup.where_leaves(intent.where) or [],
+            schema,
+            "main query",
+            cte_outputs,
+            param_values=intent.param_values,
         )
     )
     all_issues.extend(
-        validate_no_between_ops(where_leaves(intent.where) or [], having_leaves(intent.having) or [], "main query")
+        validate_no_between_ops(
+            PredicateGroup.where_leaves(intent.where) or [],
+            PredicateGroup.having_leaves(intent.having) or [],
+            "main query",
+        )
     )
     all_issues.extend(
         validate_grain_consistency(
             intent.grain,
             intent.select_cols or [],
             intent.group_by_cols or [],
-            having_leaves(intent.having) or [],
+            PredicateGroup.having_leaves(intent.having) or [],
             "main query",
         )
     )
@@ -1272,7 +1468,7 @@ def validate_semantics(
             intent.select_cols or [],
             intent.group_by_cols or [],
             "main query",
-            having_param=having_leaves(intent.having) or [],
+            having_param=PredicateGroup.having_leaves(intent.having) or [],
         )
     )
     all_issues.extend(
@@ -1290,21 +1486,25 @@ def validate_semantics(
         validate_threshold_missing_having(
             intent.natural_language,
             intent.select_cols or [],
-            having_leaves(intent.having) or [],
+            PredicateGroup.having_leaves(intent.having) or [],
             intent.grain,
             "main query",
         )
     )
     all_issues.extend(
         validate_count_threshold_missing_having(
-            intent.natural_language, intent.tables or [], having_leaves(intent.having) or [], schema, "main query"
+            intent.natural_language,
+            intent.tables or [],
+            PredicateGroup.having_leaves(intent.having) or [],
+            schema,
+            "main query",
         )
     )
     all_issues.extend(
         validate_logical_intent_numeric_coverage(
             numeric_coverage_logical,
-            where_leaves(intent.where) or [],
-            having_leaves(intent.having) or [],
+            PredicateGroup.where_leaves(intent.where) or [],
+            PredicateGroup.having_leaves(intent.having) or [],
             intent.limit,
             "main query",
             param_values=intent.param_values,
@@ -1323,19 +1523,23 @@ def validate_semantics(
         validate_question_agg_keyword_coverage(
             intent.natural_language,
             intent.select_cols or [],
-            having_leaves(intent.having) or [],
+            PredicateGroup.having_leaves(intent.having) or [],
             "main query",
             intent.cte_steps or [],
         )
     )
     _has_agg = any(sc.is_aggregated for sc in (intent.select_cols or [])) or bool(
-        having_leaves(intent.having) if intent.having else []
+        PredicateGroup.having_leaves(intent.having) if intent.having else []
     )
     all_issues.extend(
         validate_for_each_grouping(intent.natural_language, intent.group_by_cols or [], schema, _has_agg, "main query")
     )
-    all_issues.extend(validate_expr_vs_expr_where(where_leaves(intent.where) or [], schema, cte_outputs, "main query"))
-    all_issues.extend(validate_agg_vs_agg_having(having_leaves(intent.having) or [], schema, cte_outputs, "main query"))
+    all_issues.extend(
+        validate_expr_vs_expr_where(PredicateGroup.where_leaves(intent.where) or [], schema, cte_outputs, "main query")
+    )
+    all_issues.extend(
+        validate_agg_vs_agg_having(PredicateGroup.having_leaves(intent.having) or [], schema, cte_outputs, "main query")
+    )
     all_issues.extend(
         _validate_case_branches_for_scope(
             select_cols=intent.select_cols or [],
@@ -1352,7 +1556,11 @@ def validate_semantics(
     all_issues.extend(validate_scalar_expression_semantics(intent.select_cols or [], schema, "main query"))
     all_issues.extend(
         validate_arith_expression_semantics(
-            where_leaves(intent.where) or [], having_leaves(intent.having) or [], schema, cte_outputs, "main query"
+            PredicateGroup.where_leaves(intent.where) or [],
+            PredicateGroup.having_leaves(intent.having) or [],
+            schema,
+            cte_outputs,
+            "main query",
         )
     )
     all_issues.extend(validate_concat_mulgroups_in_runtime(intent, "main query"))
@@ -1360,24 +1568,34 @@ def validate_semantics(
     all_issues.extend(validate_pk_fk_aggregation(intent.select_cols or [], schema, "main query"))
     all_issues.extend(validate_select_expr_types(intent.select_cols or [], schema, cte_outputs, "main query"))
     all_issues.extend(validate_order_by_expr_types(intent.order_by_cols or [], schema, cte_outputs, "main query"))
-    all_issues.extend(validate_where_expr_types(where_leaves(intent.where) or [], schema, cte_outputs, "main query"))
-    all_issues.extend(validate_having_expr_types(having_leaves(intent.having) or [], schema, cte_outputs, "main query"))
-    all_issues.extend(validate_where_no_aggregation(where_leaves(intent.where) or [], "main query"))
+    all_issues.extend(
+        validate_where_expr_types(PredicateGroup.where_leaves(intent.where) or [], schema, cte_outputs, "main query")
+    )
+    all_issues.extend(
+        validate_having_expr_types(PredicateGroup.having_leaves(intent.having) or [], schema, cte_outputs, "main query")
+    )
+    all_issues.extend(validate_where_no_aggregation(PredicateGroup.where_leaves(intent.where) or [], "main query"))
     all_issues.extend(
         validate_having_requires_aggregation(
-            having_leaves(intent.having) or [], "main query", group_by_cols=intent.group_by_cols or []
+            PredicateGroup.having_leaves(intent.having) or [], "main query", group_by_cols=intent.group_by_cols or []
         )
     )
-    all_issues.extend(validate_having_operator_is_numeric(having_leaves(intent.having) or [], "main query"))
     all_issues.extend(
-        validate_predicate_sidedness(where_leaves(intent.where) or [], having_leaves(intent.having) or [], "main query")
+        validate_having_operator_is_numeric(PredicateGroup.having_leaves(intent.having) or [], "main query")
+    )
+    all_issues.extend(
+        validate_predicate_sidedness(
+            PredicateGroup.where_leaves(intent.where) or [],
+            PredicateGroup.having_leaves(intent.having) or [],
+            "main query",
+        )
     )
     all_issues.extend(
         validate_no_nested_aggregation(
             intent.select_cols or [],
             intent.order_by_cols or [],
-            where_leaves(intent.where) or [],
-            having_leaves(intent.having) or [],
+            PredicateGroup.where_leaves(intent.where) or [],
+            PredicateGroup.having_leaves(intent.having) or [],
             "main query",
         )
     )
@@ -1385,8 +1603,8 @@ def validate_semantics(
         validate_mixed_aggregation_in_mulgroup(
             intent.select_cols or [],
             intent.order_by_cols or [],
-            where_leaves(intent.where) or [],
-            having_leaves(intent.having) or [],
+            PredicateGroup.where_leaves(intent.where) or [],
+            PredicateGroup.having_leaves(intent.having) or [],
             "main query",
         )
     )
@@ -1407,8 +1625,8 @@ def validate_semantics(
                 select_cols=cte.select_cols or [],
                 group_by_cols=cte.group_by_cols or [],
                 order_by_cols=cte.order_by_cols or [],
-                where_params=where_leaves(cte.where) or [],
-                having_param=having_leaves(cte.having) or [],
+                where_params=PredicateGroup.where_leaves(cte.where) or [],
+                having_param=PredicateGroup.having_leaves(cte.having) or [],
             )
         )
         all_issues.extend(
@@ -1453,7 +1671,9 @@ def validate_semantics(
             )
         )
         all_issues.extend(
-            validate_contains_array_filters(where_leaves(cte.where) or [], schema, cte_outputs, cte_context)
+            validate_contains_array_filters(
+                PredicateGroup.where_leaves(cte.where) or [], schema, cte_outputs, cte_context
+            )
         )
         all_issues.extend(
             validate_selectability(
@@ -1533,7 +1753,7 @@ def validate_semantics(
         )
         all_issues.extend(
             validate_filters_schema(
-                where_leaves(cte.where) or [],
+                PredicateGroup.where_leaves(cte.where) or [],
                 schema,
                 cte_allowed,
                 cte_outputs,
@@ -1546,7 +1766,7 @@ def validate_semantics(
         )
         all_issues.extend(
             validate_having_schema(
-                having_leaves(cte.having) or [],
+                PredicateGroup.having_leaves(cte.having) or [],
                 schema,
                 cte_allowed,
                 cte_outputs,
@@ -1555,23 +1775,29 @@ def validate_semantics(
             )
         )
         all_issues.extend(
-            validate_where_ops_per_column(where_leaves(cte.where) or [], schema, cte_outputs, cte_context)
+            validate_where_ops_per_column(
+                PredicateGroup.where_leaves(cte.where) or [], schema, cte_outputs, cte_context
+            )
         )
         all_issues.extend(
             validate_date_window_units(
-                where_leaves(cte.where) or [], [], cte_context, scope_param_values=cte.param_values
+                PredicateGroup.where_leaves(cte.where) or [], [], cte_context, scope_param_values=cte.param_values
             )
         )
         all_issues.extend(
             validate_date_diff_units(
-                where_leaves(cte.where) or [], [], cte_context, scope_param_values=cte.param_values
+                PredicateGroup.where_leaves(cte.where) or [], [], cte_context, scope_param_values=cte.param_values
             )
         )
         all_issues.extend(
-            validate_having_agg_per_role(having_leaves(cte.having) or [], schema, cte_outputs, cte_context)
+            validate_having_agg_per_role(
+                PredicateGroup.having_leaves(cte.having) or [], schema, cte_outputs, cte_context
+            )
         )
         all_issues.extend(
-            validate_having_ops_per_column(having_leaves(cte.having) or [], schema, cte_outputs, cte_context)
+            validate_having_ops_per_column(
+                PredicateGroup.having_leaves(cte.having) or [], schema, cte_outputs, cte_context
+            )
         )
         all_issues.extend(validate_select_agg_per_role(cte.select_cols or [], schema, cte_outputs, cte_context))
         all_issues.extend(validate_select_agg_semantics(cte.select_cols or [], schema, cte_context))
@@ -1583,11 +1809,36 @@ def validate_semantics(
         all_issues.extend(validate_column_types(cte.select_cols or [], schema, cte_context))
         all_issues.extend(
             validate_where_value_type_alignment(
-                where_leaves(cte.where) or [], schema, cte_context, cte_outputs, param_values=cte.param_values
+                PredicateGroup.where_leaves(cte.where) or [],
+                schema,
+                cte_context,
+                cte_outputs,
+                param_values=cte.param_values,
             )
         )
         all_issues.extend(
-            validate_no_between_ops(where_leaves(cte.where) or [], having_leaves(cte.having) or [], cte_context)
+            validate_no_between_ops(
+                PredicateGroup.where_leaves(cte.where) or [],
+                PredicateGroup.having_leaves(cte.having) or [],
+                cte_context,
+            )
+        )
+        all_issues.extend(
+            validate_not_in_negated_list_null(
+                PredicateGroup.where_leaves(cte.where) or [],
+                cte_context,
+                param_values=cte.param_values,
+            )
+        )
+        all_issues.extend(
+            validate_unknown_column_operations(
+                PredicateGroup.where_leaves(cte.where) or [],
+                PredicateGroup.having_leaves(cte.having) or [],
+                cte.select_cols or [],
+                schema,
+                cte_context,
+                cte_outputs,
+            )
         )
         all_issues.extend(validate_cte_grain_consistency(cte, cte_context))
         all_issues.extend(
@@ -1596,7 +1847,7 @@ def validate_semantics(
                 cte.select_cols or [],
                 cte.group_by_cols or [],
                 cte_context,
-                having_param=having_leaves(cte.having) or [],
+                having_param=PredicateGroup.having_leaves(cte.having) or [],
             )
         )
         all_issues.extend(
@@ -1610,8 +1861,12 @@ def validate_semantics(
             )
         )
         all_issues.extend(validate_predicate_group_hints(cte.description or "", cte.where, cte.having, cte_context))
-        all_issues.extend(validate_expr_vs_expr_where(where_leaves(cte.where) or [], schema, cte_outputs, cte_context))
-        all_issues.extend(validate_agg_vs_agg_having(having_leaves(cte.having) or [], schema, cte_outputs, cte_context))
+        all_issues.extend(
+            validate_expr_vs_expr_where(PredicateGroup.where_leaves(cte.where) or [], schema, cte_outputs, cte_context)
+        )
+        all_issues.extend(
+            validate_agg_vs_agg_having(PredicateGroup.having_leaves(cte.having) or [], schema, cte_outputs, cte_context)
+        )
         all_issues.extend(
             _validate_case_branches_for_scope(
                 select_cols=cte.select_cols or [],
@@ -1628,31 +1883,45 @@ def validate_semantics(
         all_issues.extend(validate_scalar_expression_semantics(cte.select_cols or [], schema, cte_context))
         all_issues.extend(
             validate_arith_expression_semantics(
-                where_leaves(cte.where) or [], having_leaves(cte.having) or [], schema, cte_outputs, cte_context
+                PredicateGroup.where_leaves(cte.where) or [],
+                PredicateGroup.having_leaves(cte.having) or [],
+                schema,
+                cte_outputs,
+                cte_context,
             )
         )
         all_issues.extend(validate_temporal_columns(cte.select_cols or [], schema, cte_context))
         all_issues.extend(validate_pk_fk_aggregation(cte.select_cols or [], schema, cte_context))
         all_issues.extend(validate_select_expr_types(cte.select_cols or [], schema, cte_outputs, cte_context))
         all_issues.extend(validate_order_by_expr_types(cte.order_by_cols or [], schema, cte_outputs, cte_context))
-        all_issues.extend(validate_where_expr_types(where_leaves(cte.where) or [], schema, cte_outputs, cte_context))
-        all_issues.extend(validate_having_expr_types(having_leaves(cte.having) or [], schema, cte_outputs, cte_context))
-        all_issues.extend(validate_where_no_aggregation(where_leaves(cte.where) or [], cte_context))
+        all_issues.extend(
+            validate_where_expr_types(PredicateGroup.where_leaves(cte.where) or [], schema, cte_outputs, cte_context)
+        )
+        all_issues.extend(
+            validate_having_expr_types(PredicateGroup.having_leaves(cte.having) or [], schema, cte_outputs, cte_context)
+        )
+        all_issues.extend(validate_where_no_aggregation(PredicateGroup.where_leaves(cte.where) or [], cte_context))
         all_issues.extend(
             validate_having_requires_aggregation(
-                having_leaves(cte.having) or [], cte_context, group_by_cols=cte.group_by_cols or []
+                PredicateGroup.having_leaves(cte.having) or [], cte_context, group_by_cols=cte.group_by_cols or []
             )
         )
-        all_issues.extend(validate_having_operator_is_numeric(having_leaves(cte.having) or [], cte_context))
         all_issues.extend(
-            validate_predicate_sidedness(where_leaves(cte.where) or [], having_leaves(cte.having) or [], cte_context)
+            validate_having_operator_is_numeric(PredicateGroup.having_leaves(cte.having) or [], cte_context)
+        )
+        all_issues.extend(
+            validate_predicate_sidedness(
+                PredicateGroup.where_leaves(cte.where) or [],
+                PredicateGroup.having_leaves(cte.having) or [],
+                cte_context,
+            )
         )
         all_issues.extend(
             validate_no_nested_aggregation(
                 cte.select_cols or [],
                 cte.order_by_cols or [],
-                where_leaves(cte.where) or [],
-                having_leaves(cte.having) or [],
+                PredicateGroup.where_leaves(cte.where) or [],
+                PredicateGroup.having_leaves(cte.having) or [],
                 cte_context,
             )
         )
@@ -1660,8 +1929,8 @@ def validate_semantics(
             validate_mixed_aggregation_in_mulgroup(
                 cte.select_cols or [],
                 cte.order_by_cols or [],
-                where_leaves(cte.where) or [],
-                having_leaves(cte.having) or [],
+                PredicateGroup.where_leaves(cte.where) or [],
+                PredicateGroup.having_leaves(cte.having) or [],
                 cte_context,
             )
         )
@@ -1743,7 +2012,7 @@ def validate_having_agg_per_role(
                 cte_meta = cte_cols[matched_key]
                 if cte_meta.valid_aggregations and func not in cte_meta.valid_aggregations:
                     issues.append(
-                        make_intent_issue(
+                        IntentIssue.make(
                             issue_id=f"having_agg_invalid_for_cte_{context}_{actual_target}_{func}",
                             category=FailureCategory.HAVING_VALIDITY,
                             severity="error",
@@ -1767,7 +2036,7 @@ def validate_having_agg_per_role(
         valid_aggs = col_meta.get_valid_aggregations()
         if func not in valid_aggs:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"having_agg_invalid_for_role_{context}_{actual_target}_{func}",
                     category=FailureCategory.HAVING_VALIDITY,
                     severity="error",
@@ -1818,7 +2087,7 @@ def validate_select_agg_per_role(
                     func_lower = agg_func.lower()
                     if func_lower not in cte_meta.valid_aggregations:
                         issues.append(
-                            make_intent_issue(
+                            IntentIssue.make(
                                 issue_id=f"select_agg_invalid_for_cte_{context}_{actual_col}_{agg_func}",
                                 category=FailureCategory.AGGREGATION_VALIDITY,
                                 severity="error",
@@ -1843,7 +2112,7 @@ def validate_select_agg_per_role(
         func_lower = agg_func.lower()
         if func_lower not in valid_aggs:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"select_agg_invalid_for_role_{context}_{actual_col}_{agg_func}",
                     category=FailureCategory.AGGREGATION_VALIDITY,
                     severity="error",
@@ -1895,7 +2164,7 @@ def validate_select_agg_semantics(
         temporal = vt == "date"
         if func_lower in numeric_aggs and not numeric:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"invalid_agg_semantics_{func_lower}_{table_name}_{col_name}",
                     category=FailureCategory.AGGREGATION_SEMANTICS,
                     severity="error",
@@ -1913,7 +2182,7 @@ def validate_select_agg_semantics(
             col_role = col_meta.role if col_meta.role else None
             if col_role == ColumnRole.FREE_TEXT.value:
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"questionable_agg_{func_lower}_{table_name}_{col_name}",
                         category=FailureCategory.AGGREGATION_SEMANTICS,
                         severity="warning",
@@ -1969,7 +2238,7 @@ def validate_order_by_agg_per_role(
                     func_lower = agg_func.lower()
                     if func_lower not in cte_meta.valid_aggregations:
                         issues.append(
-                            make_intent_issue(
+                            IntentIssue.make(
                                 issue_id=f"order_by_agg_invalid_for_cte_{context}_{actual_col}_{agg_func}",
                                 category=FailureCategory.AGGREGATION_VALIDITY,
                                 severity="error",
@@ -1994,7 +2263,7 @@ def validate_order_by_agg_per_role(
         func_lower = agg_func.lower()
         if func_lower not in valid_aggs:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"order_by_agg_invalid_for_role_{context}_{actual_col}_{agg_func}",
                     category=FailureCategory.AGGREGATION_VALIDITY,
                     severity="error",
@@ -2046,7 +2315,7 @@ def validate_order_by_agg_semantics(
         temporal = vt == "date"
         if func_lower in numeric_aggs and not numeric:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"invalid_order_by_agg_semantics_{func_lower}_{table_name}_{col_name}",
                     category=FailureCategory.AGGREGATION_SEMANTICS,
                     severity="error",
@@ -2064,7 +2333,7 @@ def validate_order_by_agg_semantics(
             col_role = col_meta.role if col_meta.role else None
             if col_role == ColumnRole.FREE_TEXT.value:
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"questionable_order_by_agg_{func_lower}_{table_name}_{col_name}",
                         category=FailureCategory.AGGREGATION_SEMANTICS,
                         severity="warning",
@@ -2114,7 +2383,7 @@ def validate_scalar_func_type_semantics(
         func_lower = scalar_func.lower()
         if agg_func and func_lower not in SCALAR_FUNCTIONS_NUMERIC:
             inner_issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"scalar_on_agg_invalid_{location}_{func_lower}",
                     category=FailureCategory.SCALAR_SEMANTICS,
                     severity="error",
@@ -2147,7 +2416,7 @@ def validate_scalar_func_type_semantics(
         temporal = vt == "date"
         if func_lower in SCALAR_FUNCTIONS_STRING and not string:
             inner_issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"scalar_type_mismatch_{location}_{func_lower}_{actual_col}",
                     category=FailureCategory.SCALAR_SEMANTICS,
                     severity="error",
@@ -2163,7 +2432,7 @@ def validate_scalar_func_type_semantics(
             )
         elif func_lower in SCALAR_FUNCTIONS_NUMERIC and not numeric:
             inner_issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"scalar_type_mismatch_{location}_{func_lower}_{actual_col}",
                     category=FailureCategory.SCALAR_SEMANTICS,
                     severity="error",
@@ -2179,7 +2448,7 @@ def validate_scalar_func_type_semantics(
             )
         elif func_lower in SCALAR_FUNCTIONS_TEMPORAL and not temporal:
             inner_issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"scalar_type_mismatch_{location}_{func_lower}_{actual_col}",
                     category=FailureCategory.SCALAR_SEMANTICS,
                     severity="error",
@@ -2277,7 +2546,7 @@ def validate_column_types(
             )
         if func_lower in numeric_aggs and text and not numeric:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"numeric_on_text_{table_name}_{col_name}",
                     category=FailureCategory.TYPE_MISMATCH,
                     severity="warning",
@@ -2294,7 +2563,7 @@ def validate_column_types(
             debug("[validation_schema.validate_column_types] type_mismatch: numeric_on_text")
         if func_lower in date_ops and not date:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"date_on_non_date_{table_name}_{col_name}",
                     category=FailureCategory.TYPE_MISMATCH,
                     severity="warning",
@@ -2311,7 +2580,7 @@ def validate_column_types(
             debug("[validation_schema.validate_column_types] type_mismatch: date_on_non_date")
         if func_lower in string_ops and numeric and "_id" not in col_name.lower():
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"string_on_numeric_{table_name}_{col_name}",
                     category=FailureCategory.TYPE_MISMATCH,
                     severity="warning",
@@ -2352,7 +2621,7 @@ def validate_scalar_expression_semantics(
             text = col_type == "string"
             if func_lower in numeric_scalars and not numeric and not sc.is_aggregated:
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"numeric_scalar_on_non_numeric_{sc.expr.primary_column}_{func_lower}",
                         category=FailureCategory.SCALAR_SEMANTIC,
                         severity="warning",
@@ -2367,7 +2636,7 @@ def validate_scalar_expression_semantics(
                 )
             if func_lower in string_scalars and not text:
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"string_scalar_on_non_string_{sc.expr.primary_column}_{func_lower}",
                         category=FailureCategory.SCALAR_SEMANTIC,
                         severity="warning",
@@ -2420,7 +2689,7 @@ def validate_temporal_columns(
             break
     if not has_date_column:
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"temporal_no_date_col_{','.join(sorted(agg_funcs & temporal_ops))}",
                 category=FailureCategory.MISSING_TEMPORAL_COLUMN,
                 severity="warning",
@@ -2460,7 +2729,7 @@ def validate_pk_fk_aggregation(
         col_meta = schema.tables[table_name].columns.get(col_name)
         if col_meta and (col_meta.is_primary_key or col_meta.is_foreign_key):
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"agg_on_pk_fk_{table_name}_{col_name}_{func_lower}",
                     category=FailureCategory.AGGREGATION_SEMANTICS,
                     severity="warning",
@@ -2489,8 +2758,6 @@ def validate_aggregate_join_fan_out(
     signature = list(join_signature or intent.chosen_join_path_signature or [])
     if not signature:
         return []
-    if intent.group_by_cols:
-        return []
     anchor = from_anchor or (intent.tables[0] if intent.tables else None)
     main_tables = {phys_table_key(t) for t in intent_join_reachability_tables(intent)}
     issues: list[IntentIssue] = []
@@ -2502,7 +2769,7 @@ def validate_aggregate_join_fan_out(
             continue
         edge = hits[0]["edge"]
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"aggregate_join_fan_out_{context.replace(' ', '_')}_{tbl}_{func}",
                 category=FailureCategory.AGGREGATION_SEMANTICS,
                 severity="error",
@@ -2566,7 +2833,7 @@ def validate_window_join_fan_out(
                 continue
             edge = hits[0]["edge"]
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"window_join_fan_out_{context}_{wr.registry_id}_{tbl}_{role}",
                     category=FailureCategory.AGGREGATION_SEMANTICS,
                     severity="error",

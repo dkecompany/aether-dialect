@@ -13,14 +13,14 @@ from aetherdialect._main_execution import (
     PipelineSession,
     PipelineSuspended,
 )
-from aetherdialect._templates import empty_template_store
+from aetherdialect._templates import TemplateOps
 
 
 def _session_owner() -> MagicMock:
     owner = MagicMock()
     owner._schema_graph = MagicMock()
     owner._schema_graph.effective_structural_hash = "test_hash"
-    owner._store = empty_template_store("test_hash")
+    owner._store = TemplateOps.empty_template_store("test_hash")
     owner._templates = {}
     owner._rejected = {}
     owner._schema_terms = set()
@@ -41,7 +41,7 @@ def test_terminal_step_includes_suspend_phase_diagnostics() -> None:
         notify("suspend-phase diagnostic", stage="intent", code=SUSPEND_DIAG_CODE)
         raise suspended
 
-    with patch("aetherdialect._main_execution.interactive_run_once", side_effect=ask_side_effect):
+    with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once", side_effect=ask_side_effect):
         suspend_step = session.ask("show rows")
 
     assert suspend_step.done is False
@@ -51,7 +51,9 @@ def test_terminal_step_includes_suspend_phase_diagnostics() -> None:
     def resume_side_effect(*_args: object, **_kwargs: object) -> None:
         notify("complete-phase diagnostic", stage="execution", code=COMPLETE_DIAG_CODE)
 
-    with patch("aetherdialect._main_execution.dispatch_pipeline_resume", side_effect=resume_side_effect):
+    with patch(
+        "aetherdialect._main_execution.MainExecutionOps.dispatch_pipeline_resume", side_effect=resume_side_effect
+    ):
         terminal_step = session.step("y")
 
     assert terminal_step.done is True
@@ -71,7 +73,7 @@ def test_suspend_step_carries_only_step_local_diagnostics() -> None:
         notify("suspend-only", stage="intent", code=SUSPEND_DIAG_CODE)
         raise suspended
 
-    with patch("aetherdialect._main_execution.interactive_run_once", side_effect=ask_side_effect):
+    with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once", side_effect=ask_side_effect):
         suspend_step = session.ask("show rows")
 
     suspend_codes = {d.code for d in suspend_step.diagnostics}
@@ -81,7 +83,9 @@ def test_suspend_step_carries_only_step_local_diagnostics() -> None:
     def resume_side_effect(*_args: object, **_kwargs: object) -> None:
         notify("complete-only", stage="execution", code=COMPLETE_DIAG_CODE)
 
-    with patch("aetherdialect._main_execution.dispatch_pipeline_resume", side_effect=resume_side_effect):
+    with patch(
+        "aetherdialect._main_execution.MainExecutionOps.dispatch_pipeline_resume", side_effect=resume_side_effect
+    ):
         terminal_step = session.step("y")
 
     terminal_codes = {d.code for d in terminal_step.diagnostics}

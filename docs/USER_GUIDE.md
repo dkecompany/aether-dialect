@@ -64,7 +64,7 @@ Progress prints as `Profiling [i/n] <table>` on stdout during construction. Prof
 - **include** - `"tables"` (default) or `"views"`. Only the master context (the `EngineContext` passed at owner construction) may set include mode. `"both"` is rejected - reflect tables and views in separate passes when both are needed.
 - **allow_objects** / **deny_objects** - optional table or view names to include or exclude from the graph.
 - **allow_columns** / **deny_columns** - qualified `table.column` or `*.column` entries. Denied columns are removed from the in-memory graph entirely (stronger than sensitivity tiers).
-- **notes_file** - path to domain notes on the master context only ([Notes file](#notes-file)). Saved scope presets cannot set `notes_file`.
+- **notes_file** / **notes** - path to domain notes or inline notes text on the master context only (set at most one; [Notes file](#notes-file)). Saved scope presets cannot set notes.
 - **sql_file** - optional DDL or annotated SQL on the master context only. Saved scope presets cannot set `sql_file`.
 
 The master context is implicit: pass an `EngineContext` at owner construction (or reload a cached master). Register saved scope presets with `engine.engine_context(name, context)` on a master-bound owner; consumers bind by that preset name string only. The master name cannot be created or overwritten as a named sidecar.
@@ -76,14 +76,14 @@ Each database connection gets its own engine storage directory keyed by a **conn
 **AetherFederation** composes several `AetherEngine` instances into one unified schema graph and session surface. Register members by connection name, declare cross-source joins in the **federation declaration** (`federation_declaration.json` passed as `declaration_file=` at construction), and optionally map logical tables (`union` stacks members; `replica` reads one authority member).
 
 - **Artifact trees** - Each member keeps `conn_<slug>/`; the composite persists under `fed_<federation_id>/` beside the member trees.
-- **Sessions** - Open `fed.session(...)` and ask normally. The turn uses the same suspend kinds and confirmations as a single engine. `SessionStep.federated_bundle` holds the executed plan; `step.sql` is display-only glue across member statements.
-- **Reuse** - Federated questions replay stored plan templates through `prepare_federated_sql_plan`; member templates are stamped `federation_plan_only` and are not reused as standalone SQL.
+- **Sessions** - Open `fed.session(...)` and ask normally. The turn uses the same suspend kinds and confirmations as a single engine (including terminal `kind="meta"`). `SessionStep.federated_bundle` holds the executed plan; **`step.sql`** is a member `source_id` → dialect SQL mapping for federated analytical turns.
+- **Reuse** - Federated questions replay stored plan templates through `prepare_federated_sql_plan`; member templates are stamped `federation_plan_only` and are not reused as standalone SQL. Prefer `fed.execute_template(step.template_id, params)` for agent re-runs after accept.
 - **Ineligible plans** - Cross-source joins are allowed only when declared. Unsupported shapes surface a diagnostic and rephrase hint instead of a wrong answer. When one member fails during execution, the turn ends with `federation_partial_failure` rather than a partial result.
 - **File engines** - A database may be federated with uploaded files, but a federation whose members are all file (`csv`) engines is refused at registration; load several uploads into one CSV engine instead.
 - **Clock consistency** - On a federated turn, when the parent intent uses relative date-window filters or clock keywords (`current_date`, `current_timestamp`, and similar), the coordinator resolves one UTC anchor at turn start (`AnchoredTemporalBind`) so every member statement uses the same clock instant instead of re-evaluating per-member clock functions.
 - **Re-entry** - Federation artifacts are library-owned ([Integrator guide - Artifacts are library-owned](INTEGRATOR_GUIDE.md#artifacts-are-library-owned)). Use `export_federation_declaration()` / `apply_federation_declaration()` for authored joins and mappings. Persisted sidecar shapes: [API reference - Federation and migration JSON](API_REFERENCE.md#federation-and-migration-json). Member catalog drift uses each source's `schema_migration_map.json`; cross-source identifier changes use `federation_migration_map.json`.
-- **Warmup** - `run_seed_warmup` routes seed questions through federation decompose/combine (per-member dialect SQL; learning in member stores plus a composite plan template). `run_seed_warmup_from_history` and `run_seed_warmup_from_query_log` raise `FederationConfigError` on `AetherFederation` - those are per-engine artifacts; run them on each member `AetherEngine`.
-
+- **Warmup** - `run_seed_warmup`, `run_seed_warmup_from_history`, and `run_seed_warmup_from_query_log` raise `ConfigError` (`warmup is not supported on AetherFederation`). Run those on each member `AetherEngine` instead.
+- **Exports** - `export_knowledge()` wraps engine/federation plus per-space business knowledge; `export_space_knowledge(space=...)` is per-space BK only; `export_metadata(space=...)` is deterministic table/column inventory (plus federation members when present).
 Operator embedding detail: [Integrator guide - Embedding a federation](INTEGRATOR_GUIDE.md#embedding-a-federation).
 
 ## FederationContext
@@ -93,7 +93,7 @@ Operator embedding detail: [Integrator guide - Embedding a federation](INTEGRATO
 - **include** - `"tables"` (default) or `"views"`. `"both"` is rejected.
 - **allow_objects** / **deny_objects** - table or view names in the composite namespace.
 - **allow_columns** / **deny_columns** - qualified `table.column` or `*.column` entries (three-part `source.table.column` inputs are accepted by the same normalizer). Deny-list semantics: [Security - Deny lists](SECURITY.md#7-deny-lists).
-- **notes_file** - optional domain notes for the composite ([Notes file](#notes-file)). Member engines may still carry their own `EngineContext.notes_file` for per-source vocabulary.
+- **notes_file** / **notes** - optional domain notes for the composite (set at most one; [Notes file](#notes-file)). Member engines may still carry their own `EngineContext` notes for per-source vocabulary.
 
 `FederationContext` does not replace database grants or member-level `EngineContext` scope. It narrows what the composite graph exposes and what federated execution may target on top of each member's credentials.
 
@@ -102,12 +102,12 @@ Operator embedding detail: [Integrator guide - Embedding a federation](INTEGRATO
 An **AetherSpace** is a named knowledge partition over the master graph on an engine or federation. It improves model focus and partitions template learning by space name. It is **not** a permission boundary - database grants and engine/federation context scope remain the execution boundary ([Security - Execution boundary](SECURITY.md#2-execution-boundary-and-credentials)).
 
 - **Master space** - implicit default (`space="master"`). Reflects the full master engine or federation context graph. Cannot be deleted or redefined.
-- **Named spaces** - defined on the owner with `engine.aetherspace(name, space_context=...)` (or the federation equivalent). The space **name** identifies the AetherSpace; put notes on `SpaceContext(notes_file=...)` ([SpaceContext](#spacecontext)). Snapshots persist under the engine tree or `fed_<federation_id>/aetherspaces/` on a federation.
-- **Per-space notes** - optional `SpaceContext.notes_file` at define time; content is baked into the aetherspace snapshot (not a catalog-rebuild fingerprint). The engine merges inherited master descriptions with space-specific refinements ([Sandbox guide - Named AetherSpaces](SANDBOX.md#named-aetherspaces)).
+- **Named spaces** - defined on the owner with `engine.aetherspace(name, space_context=...)` (or the federation equivalent). The space **name** identifies the AetherSpace; put notes on `SpaceContext(notes=...)` or `SpaceContext(notes_file=...)` ([SpaceContext](#spacecontext)). Snapshots persist under the engine tree or `fed_<federation_id>/aetherspaces/` on a federation.
+- **Per-space notes** - optional `SpaceContext.notes` or `SpaceContext.notes_file` at define time; content is baked into the aetherspace snapshot (not a catalog-rebuild fingerprint). The engine merges inherited master descriptions with space-specific refinements ([Sandbox guide - Named AetherSpaces](SANDBOX.md#named-aetherspaces)).
 
 ## SpaceContext
 
-**SpaceContext** supplies the allow/deny shape for a named AetherSpace: `tables`, `columns`, `deny_objects`, `deny_columns`, and optional `notes_file`. It uses the same token shapes as `EngineContext` column specs (`table.column` or `*.column`) but applies at **question time** for knowledge and template partitioning only - not at SQL execution. It has no `name` field - the name identifies the AetherSpace. Parallel to `EngineContext` / `FederationContext` for notes: space notes land in the snapshot, not a catalog fingerprint.
+**SpaceContext** supplies the allow/deny shape for a named AetherSpace: `tables`, `columns`, `deny_objects`, `deny_columns`, and optional `notes` or `notes_file` (set at most one). It uses the same token shapes as `EngineContext` column specs (`table.column` or `*.column`) but applies at **question time** for knowledge and template partitioning only - not at SQL execution. It has no `name` field - the name identifies the AetherSpace. Parallel to `EngineContext` / `FederationContext` for notes: space notes land in the snapshot, not a catalog fingerprint.
 
 Named spaces are always created against the master engine or federation context, never as an intersection with a non-master engine context. On a federation, space snapshots live under the federation artifact tree.
 
@@ -118,10 +118,11 @@ Every `session.ask(...)` or `session.step(...)` returns a **`SessionStep`** - on
 | State | `step.done` | What you see |
 | --- | --- | --- |
 | Suspended | `False` | `prompt`, `reply_shape` (`yes_no` or `free_text`); collect input and call `step(reply)`. |
-| Terminal success | `True` | `sql`, `data`, optional `message`. |
+| Terminal success | `True` | `sql`, `data`, optional `message`. For analytical success, `step.template_id` identifies the stored template when one was matched or accepted. |
+| Metadata answer | `True` | `kind="meta"`; `sql` is `None`; read `message` and optional `meta_payload` (schema inventory or business-knowledge prose). No confirm loop. |
 | Terminal failure | `True` | `error`, optional `status` and federation attribution fields. |
 
-On federated turns, executed SQL is on **`step.federated_bundle`**; **`step.sql`** is coordinator glue for display only. Turn-level tracing rows (reuse hits, repairs, `LLM_TURN_COST`, federation codes) are on **`step.diagnostics`**.
+On a single engine, **`step.sql`** is a dialect SQL string. On federated turns, **`step.sql`** is a `dict` mapping member `source_id` → that member's dialect SQL (also inspect **`step.federated_bundle`** for the executed plan). Turn-level tracing rows (reuse hits, repairs, `LLM_TURN_COST`, federation codes, `meta.*` route codes) are on **`step.diagnostics`**.
 
 Full field list and suspend `kind` values: [Integrator guide - The session contract](INTEGRATOR_GUIDE.md#the-session-contract-suspend-and-terminal-steps) | [API reference - SessionStep](API_REFERENCE.md#sessionstep).
 
@@ -133,18 +134,24 @@ Each column carries a sensitivity tier (`none`, `restricted`, or `hidden`). Full
 
 When the engine is not confident about a translation, it suspends the turn and asks for confirmation - intent readback, SQL preview, or execute confirmation depending on confidence and reuse path. Accept builds template learning; reject with a reason steers future turns away from the same mistake.
 
+Some questions never enter the SQL path: schema inventory/count questions and business-knowledge definitions return a terminal **`kind="meta"`** step instead of Intent/SQL confirmations.
+
 **Template reuse** is automatic - there is no separate "warm reuse" API:
 
 1. **Direct reuse** - when new wording is within a small normalized token edit distance (at most two, `FUZZY_MATCH_MAX_DISTANCE`) of a stored question, the engine replays the stored SQL path with no full parse LLM calls.
 2. **Intent-level match** - larger wording changes still require LLM calls even when structure is similar.
 
+For programmatic re-execution with new bind values on a known stored question, use `session.reuse_saved_question(question_old, question_new, new_values)` instead of a full ask loop. After an accepted analytical turn, agents may also re-run with `engine.execute_template(step.template_id, {b.handle: b.current_value for b in step.parameters})` (same surface on `AetherFederation`).
+
 Ask normally; change wording and observe which path runs via diagnostics or audit events ([Integrator guide - Observability](INTEGRATOR_GUIDE.md#observability)).
+
+Schema descriptions and business knowledge for agent context (without asking) come from `export_knowledge()`, `export_space_knowledge(space=...)`, and `export_metadata(space=...)` on the engine or federation.
 
 The offline sandbox supports the same accept/reject mechanism as production; bundled mock coverage is finite ([Sandbox guide](SANDBOX.md)). Federated date-window anchoring lives under [AetherFederation](#aetherfederation).
 
 ## Notes file
 
-Domain notes refine descriptions and guide role classification. Use one or two sentences per important table, business definitions, join hints, and explicit sensitivity statements. The master context reads `EngineContext.notes_file`; a federation may also supply `FederationContext.notes_file`. Each named AetherSpace may supply notes via `SpaceContext(notes_file=...)` at define time.
+Domain notes refine descriptions and guide role classification. Use one or two sentences per important table, business definitions, join hints, and explicit sensitivity statements. Supply notes as a path (`notes_file`) or inline text (`notes`) on the master context — set at most one. The master context reads `EngineContext` notes; a federation may also supply `FederationContext` notes. Each named AetherSpace may supply notes via `SpaceContext(notes=...)` or `SpaceContext(notes_file=...)` at define time.
 
 ## Schema overrides
 
@@ -173,7 +180,7 @@ Warmup paths populate templates so common questions hit the cache sooner:
 2. **SQL-history warmup** - reverse-engineers historical `SELECT` statements into intents.
 3. **Query-log warmup** - reads warehouse system logs for historical queries.
 
-Federation variation: `run_seed_warmup` on `AetherFederation` routes seed questions through decompose/combine into member stores and a composite plan template. `run_seed_warmup_from_history` and `run_seed_warmup_from_query_log` raise `FederationConfigError` on a federation - run them on each member engine. See [AetherFederation](#aetherfederation).
+Federation variation: `run_seed_warmup`, `run_seed_warmup_from_history`, and `run_seed_warmup_from_query_log` raise `ConfigError` on `AetherFederation` - run them on each member engine. See [AetherFederation](#aetherfederation).
 
 Warmup and QSim are unavailable inside the offline sandbox (`ConfigError`).
 

@@ -16,7 +16,7 @@ Conceptual end-to-end narrative for the `aetherdialect` engine: why it is built 
 | [5. AetherEngine, AetherFederation, and AetherSpace](#5-aetherengine-aetherfederation-and-aetherspace) | The three facades and their scope types |
 | [6. Question pipeline](#6-question-pipeline) | Intake through validated SQL - single-engine and federated |
 | [7. Learning model](#7-learning-model) | Templates, spaces, and feedback |
-| [8. Concurrent sessions and the write queue](#8-concurrent-sessions-and-the-write-queue) | Reader enqueue, writer drain |
+| [8. Concurrent sessions](#8-concurrent-sessions) | Reader vs writer session modes |
 
 ---
 
@@ -100,7 +100,7 @@ Three facades compose in order: engine (or federation) first, then optional name
 | **AetherFederation** | `FederationContext` | Named member engines, manifest-driven joins and mappings, one `fed_<federation_id>/` tree beside member `conn_*` trees. |
 | **AetherSpace** | `SpaceContext` | Named knowledge subset over the master graph on an engine or federation - partitions prompts and template learning by space name. |
 
-**Engine role and session mode:** pass **`role="owner"`** or **`role="consumer"`** on construction (engine role). Pass **`mode="writer"`** or **`mode="reader"`** on `session()` (session mode). `role="owner"` builds and mutates shared artifacts; `role="consumer"` pins to the owner's published snapshot. `session(mode="writer")` persists learning under the artifacts lock; `session(mode="reader")` enqueues to `write_queue.jsonl` for a writer on the same artifacts directory to drain.
+**Engine role and session mode:** pass **`role="owner"`** or **`role="consumer"`** on construction (engine role). Pass **`mode="writer"`** or **`mode="reader"`** on `session()` (session mode). `role="owner"` builds and mutates shared artifacts; `role="consumer"` pins to the owner's published snapshot. `session(mode="writer")` persists learning under the artifacts lock; `session(mode="reader")` does not persist shared learning (session-local only).
 
 `SpaceContext` narrows knowledge and template partitions at question time only - not SQL execution scope ([Security - Execution boundary](SECURITY.md#2-execution-boundary-and-credentials)).
 
@@ -140,9 +140,9 @@ Accepted turns fold into the partitioned template store under the active AetherS
 
 On federation accepts, per-source templates land in member stores and a versioned **plan template** on the federation tree records how to replay the turn. Member templates are stamped `federation_plan_only` so they replay only through the plan record, not as standalone single-engine SQL reuse.
 
-## 8. Concurrent sessions and the write queue
+## 8. Concurrent sessions
 
-Reader sessions defer durable learning by appending structured events to `write_queue.jsonl`. A writer session on the same artifacts directory drains the queue automatically at the **start** of each writer turn under the artifacts lock. Readers never mutate the partitioned template files directly. Federation `clear_all_learning()` drains member queues before clearing federation and member template stores.
+Reader sessions do not persist shared learning; writer sessions on the same artifacts directory persist templates and feedback under the artifacts lock. Readers never mutate the partitioned template files. Federation `clear_all_learning()` clears federation and member template stores.
 
 ---
 

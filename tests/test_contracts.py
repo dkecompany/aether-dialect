@@ -17,14 +17,9 @@ from aetherdialect._contracts_base import (
     MulGroup,
     NormalizedExpr,
     OrderByCol,
+    PredicateGroup,
     SensitivityClassification,
     WhereParam,
-    data_type_to_value_type,
-    is_date_type,
-    is_numeric_type,
-    is_string_type,
-    predicate_group_from_legacy_flat_where_dicts,
-    predicate_group_from_legacy_having_dicts,
 )
 from aetherdialect._contracts_core import (
     ConcreteCteStep,
@@ -41,13 +36,6 @@ from aetherdialect._contracts_core import (
     Template,
     TemplateMatch,
     ValueHistory,
-    _runtime_cte_to_concrete,
-    anchor_lattice_key_for_seed_intent,
-    anchor_lattice_signature,
-    classify_seed_warmup_intent_complexity,
-    concrete_cte_to_runtime,
-    concrete_intent_to_runtime_skeleton,
-    runtime_intent_to_concrete,
 )
 from aetherdialect._contracts_schema import (
     CaseRegistryStep,
@@ -75,6 +63,12 @@ from aetherdialect._contracts_schema import (
     ValueDomain,
     WindowRegistryStep,
     WindowSpec,
+)
+from aetherdialect._core_utils import (
+    data_type_to_value_type,
+    is_date_type,
+    is_numeric_type,
+    is_string_type,
 )
 
 
@@ -217,7 +211,7 @@ class TestNormalizedExpr:
 
     def test_primary_column_unbalanced_paren_stops_strip(self):
         """Malformed calls fall back to raw_sql; primary_column has no embedded column."""
-        expr = NormalizedExpr(add_groups=[MulGroup(multiply=["FOO(t.col"])])
+        expr = NormalizedExpr(add_groups=[MulGroup(multiply=[NormalizedExpr(raw_sql="FOO(t.col")])])
         assert expr.primary_column == ""
 
     def test_primary_term_returns_raw(self):
@@ -355,7 +349,7 @@ class TestWhereParam:
             {"left_expr": "t.a", "op": "=", "value": 1, "bool_op": "AND"},
             {"left_expr": "t.b", "op": "=", "value": 2, "bool_op": "OR"},
         ]
-        group = predicate_group_from_legacy_flat_where_dicts(legacy)
+        group = PredicateGroup.from_legacy_flat_where_dicts(legacy)
         assert group is not None
         assert group.op == "or"
         assert len(group.leaves()) == 2
@@ -369,7 +363,7 @@ class TestWhereParam:
             {"left_expr": "t.b", "op": "=", "value": 2, "where_group": 1},
             {"left_expr": "t.c", "op": "=", "value": 3, "where_group": 2},
         ]
-        group = predicate_group_from_legacy_flat_where_dicts(legacy)
+        group = PredicateGroup.from_legacy_flat_where_dicts(legacy)
         assert group is not None
         assert group.op == "or"
         assert len(group.groups) == 2
@@ -424,7 +418,7 @@ class TestHavingParam:
             {"left_expr": "COUNT(t.a)", "op": ">", "value": 1, "bool_op": "AND"},
             {"left_expr": "COUNT(t.b)", "op": ">", "value": 2, "bool_op": "OR"},
         ]
-        group = predicate_group_from_legacy_having_dicts(legacy)
+        group = PredicateGroup.from_legacy_having_dicts(legacy)
         assert group is not None
         assert group.op == "or"
         assert len(group.leaves()) == 2
@@ -438,7 +432,7 @@ class TestHavingParam:
             {"left_expr": "COUNT(t.b)", "op": ">", "value": 2, "where_group": 1},
             {"left_expr": "COUNT(t.c)", "op": ">", "value": 3, "where_group": 2},
         ]
-        group = predicate_group_from_legacy_having_dicts(legacy)
+        group = PredicateGroup.from_legacy_having_dicts(legacy)
         assert group is not None
         assert group.op == "or"
         assert len(group.groups) == 2
@@ -507,7 +501,7 @@ class TestCteRoundTrip:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.amount"))],
             grain="grouped",
         )
-        concrete = _runtime_cte_to_concrete(rt)
+        concrete = rt.to_concrete()
         assert isinstance(concrete, ConcreteCteStep)
         assert concrete.cte_name == "cte1"
         assert concrete.tables == ["orders"]
@@ -516,7 +510,7 @@ class TestCteRoundTrip:
     def test_concrete_cte_to_runtime_drops_runtime_fields(self):
         """concrete_cte_to_runtime creates RuntimeCteStep with empty runtime fields."""
         concrete = ConcreteCteStep(cte_name="cte1", tables=["t1"])
-        rt = concrete_cte_to_runtime(concrete)
+        rt = concrete.to_runtime()
         assert isinstance(rt, RuntimeCteStep)
         assert rt.description == ""
         assert rt.param_values == {}
@@ -530,8 +524,8 @@ class TestCteRoundTrip:
             grain="grouped",
             output_columns=["order_count"],
         )
-        concrete = _runtime_cte_to_concrete(original)
-        restored = concrete_cte_to_runtime(concrete)
+        concrete = original.to_concrete()
+        restored = concrete.to_runtime()
         assert restored.cte_name == original.cte_name
         assert restored.tables == original.tables
         assert restored.grain == original.grain
@@ -543,7 +537,7 @@ class TestRuntimeIntentToConcreteIntent:
 
     def test_basic_conversion(self, minimal_intent):
         """runtime_intent_to_concrete produces ConcreteIntent."""
-        concrete = runtime_intent_to_concrete(minimal_intent, "id_123")
+        concrete = minimal_intent.to_concrete("id_123")
         assert isinstance(concrete, ConcreteIntent)
         assert concrete.intent_id == "id_123"
         assert concrete.tables == ["orders"]
@@ -551,14 +545,14 @@ class TestRuntimeIntentToConcreteIntent:
 
     def test_drops_runtime_fields(self, grouped_intent):
         """ConcreteIntent omits natural_language; runtime param bag is stripped to empty."""
-        concrete = runtime_intent_to_concrete(grouped_intent, "id_456")
+        concrete = grouped_intent.to_concrete("id_456")
         d = concrete.to_dict()
         assert d.get("param_values") == {}
         assert "natural_language" not in d
 
     def test_round_trip_via_dict(self, grouped_intent):
         """ConcreteIntent to_dict/from_dict round trip."""
-        concrete = runtime_intent_to_concrete(grouped_intent, "id_789")
+        concrete = grouped_intent.to_concrete("id_789")
         rebuilt = ConcreteIntent.from_dict(concrete.to_dict())
         assert rebuilt.intent_id == "id_789"
         assert rebuilt.tables == concrete.tables
@@ -569,8 +563,8 @@ class TestConcreteIntentToRuntimeSkeleton:
 
     def test_clears_values(self, minimal_intent: RuntimeIntent) -> None:
         """Skeleton mirrors concrete shape with empty param_values."""
-        concrete = runtime_intent_to_concrete(minimal_intent, "id_sk")
-        skel = concrete_intent_to_runtime_skeleton(concrete)
+        concrete = minimal_intent.to_concrete("id_sk")
+        skel = concrete.to_runtime_skeleton()
         assert skel.param_values == {}
         assert skel.tables == concrete.tables
         assert skel.grain == concrete.grain
@@ -825,12 +819,12 @@ class TestColumnMetadaTypeFunctions:
         assert data_type_to_value_type("bool") == "boolean"
 
     def test_data_type_to_value_type_fallback(self):
-        """data_type_to_value_type falls back to string for unknown."""
-        assert data_type_to_value_type("xml") == "string"
+        """data_type_to_value_type falls back to unknown for unrecognized types."""
+        assert data_type_to_value_type("xml") == "unknown"
 
     def test_data_type_to_value_type_empty_string(self):
-        """data_type_to_value_type returns string for empty input."""
-        assert data_type_to_value_type("") == "string"
+        """data_type_to_value_type returns unknown for empty input."""
+        assert data_type_to_value_type("") == "unknown"
 
     def test_data_type_to_value_type_whitespace_stripped(self):
         """data_type_to_value_type strips whitespace before lookup."""
@@ -1383,7 +1377,7 @@ class TestClassifySeedWarmupComplexity:
             where=None,
             having=None,
         )
-        assert classify_seed_warmup_intent_complexity(si) == ComplexityTier.SIMPLE
+        assert si.complexity_tier() == ComplexityTier.SIMPLE
 
     def test_two_tables_at_least_moderate(self):
         """Two referenced tables lift tier to MODERATE or above."""
@@ -1397,7 +1391,7 @@ class TestClassifySeedWarmupComplexity:
             where=None,
             having=None,
         )
-        assert classify_seed_warmup_intent_complexity(si) == ComplexityTier.MODERATE
+        assert si.complexity_tier() == ComplexityTier.MODERATE
 
 
 class TestAnchorLatticeKeyForSeedIntent:
@@ -1431,11 +1425,11 @@ class TestAnchorLatticeKeyForSeedIntent:
             seed_index=3,
             expansion_metadata=em,
         )
-        ka = anchor_lattice_key_for_seed_intent(a)
-        kb = anchor_lattice_key_for_seed_intent(b)
+        ka = a.anchor_lattice_key()
+        kb = b.anchor_lattice_key()
         assert ka == kb
-        assert anchor_lattice_signature(ka, "fp1") == anchor_lattice_signature(kb, "fp1")
-        assert anchor_lattice_signature(ka, "fp1") != anchor_lattice_signature(kb, "fp2")
+        assert ka.signature("fp1") == kb.signature("fp1")
+        assert ka.signature("fp1") != kb.signature("fp2")
 
     def test_expansion_depth_splits_cells(self):
         em_low = ExpansionMetadata(operator="op", depth=0)
@@ -1466,7 +1460,7 @@ class TestAnchorLatticeKeyForSeedIntent:
             seed_index=3,
             expansion_metadata=em_high,
         )
-        assert anchor_lattice_key_for_seed_intent(low) != anchor_lattice_key_for_seed_intent(high)
+        assert low.anchor_lattice_key() != high.anchor_lattice_key()
 
 
 class TestSeedWarmupResult:
@@ -2506,8 +2500,6 @@ class TestWindowCaseRegistry:
 
     def test_runtime_intent_registry_round_trip_dict(self, minimal_intent: RuntimeIntent) -> None:
         """to_dict/from_dict preserves window_registry and the bare- registry-id select column."""
-        from aetherdialect._contracts_base import expr_registry_ref
-
         ob = OrderByCol(expr=NormalizedExpr.from_column("orders.amount"), direction="ASC")
         wspec = WindowSpec(function="row_number", order_by=[ob])
         intent = RuntimeIntent(
@@ -2530,7 +2522,7 @@ class TestWindowCaseRegistry:
         assert len(back.window_registry) == 1
         assert back.window_registry[0].registry_id == "w01"
         assert back.select_cols[0].expr.column_ref == "w01"
-        assert expr_registry_ref(back.select_cols[0].expr) == "w01"
+        assert back.select_cols[0].expr.registry_ref() == "w01"
 
     def test_duplicate_case_registry_id_emits_issue(self) -> None:
         """validate_scope_registries flags duplicate case ids."""
@@ -2725,7 +2717,7 @@ class TestPipelineFeatureTags:
 
     def test_feasible_features_respects_date_columns(self) -> None:
         from aetherdialect._contracts_base import DatabaseFeatureCapability
-        from aetherdialect._contracts_core import feasible_features_for_capability
+        from aetherdialect._contracts_core import PipelineFeatureSpec
 
         cap_no_dates = DatabaseFeatureCapability(
             table_count=2,
@@ -2743,12 +2735,12 @@ class TestPipelineFeatureTags:
             date_columns_by_table={},
             array_columns_by_table={},
         )
-        feasible = feasible_features_for_capability(cap_no_dates)
+        feasible = PipelineFeatureSpec.feasible_features_for_capability(cap_no_dates)
         assert "date_window_filter" not in feasible
         assert "in_list" in feasible
 
     def test_detect_intent_features_finds_having_and_distinct(self) -> None:
-        from aetherdialect._contracts_core import SeedWarmupIntent, detect_intent_features
+        from aetherdialect._contracts_core import SeedWarmupIntent
 
         intent = SeedWarmupIntent.from_dict(
             {
@@ -2768,6 +2760,6 @@ class TestPipelineFeatureTags:
                 "distinct_select_index": 0,
             }
         )
-        tags = detect_intent_features(intent)
+        tags = intent.to_runtime_intent().detect_features()
         assert "having_aggregate_compare" in tags
         assert "distinct_select" in tags

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -24,9 +25,12 @@ from aetherdialect._contracts_schema import (
     SchemaGraph,
     TableMetadata,
 )
-from aetherdialect._main_execution import PipelineSession, drain_write_queue
+from aetherdialect._main_execution import (
+    MainExecutionOps,
+    PipelineSession,
+)
 from aetherdialect._schema_graph import assert_consumer_intent_in_scope
-from aetherdialect._templates import empty_template_store
+from aetherdialect._templates import TemplateOps
 
 
 def _make_engine(*, role: str = "owner", graph_id: str = "sg_test000000000001__abcd1234") -> AetherEngine:
@@ -37,7 +41,7 @@ def _make_engine(*, role: str = "owner", graph_id: str = "sg_test000000000001__a
     obj._schema_graph.schema_graph_id = graph_id
     obj._schema_graph.effective_structural_hash = "eff"
     obj._artifacts_dir = Path("/tmp/artifacts")
-    obj._store = empty_template_store(graph_id)
+    obj._store = TemplateOps.empty_template_store(graph_id)
     obj._templates = {}
     obj._rejected = {}
     obj._dialect = None
@@ -75,12 +79,12 @@ class TestOwnerConsumerGate:
         with pytest.raises(OwnerOnlyOperationError):
             t.clear_template_store()
 
-    def test_export_schema_overrides_requires_owner(self) -> None:
+    def test_export_overrides_requires_owner(self) -> None:
         t = _make_engine(role="consumer")
         with pytest.raises(OwnerOnlyOperationError):
-            t.export_schema_overrides()
+            t.export_overrides()
 
-    def test_consumer_apply_schema_overrides_enqueues_proposal(self, tmp_path, monkeypatch) -> None:
+    def test_consumer_apply_overrides_enqueues_proposal(self, tmp_path, monkeypatch) -> None:
         monkeypatch.chdir(tmp_path)
         doc = {"tables": {}}
         (tmp_path / "schema_overrides.json").write_text(json.dumps(doc), encoding="utf-8")
@@ -92,13 +96,13 @@ class TestOwnerConsumerGate:
             emitted.append(ev)
 
         monkeypatch.setattr("aetherdialect.aetherdialect.emit_write_queue_event", _capture)
-        t.apply_schema_overrides()
+        t.apply_overrides()
         assert len(emitted) == 1
         assert emitted[0].kind == "override_proposal"
         assert emitted[0].schema_graph_id == "sg_test000000000001__abcd1234"
 
     def test_owner_drain_applies_override_proposal(self, tmp_path, monkeypatch) -> None:
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         from aetherdialect._core_utils import emit_write_queue_event
 
@@ -112,7 +116,7 @@ class TestOwnerConsumerGate:
             kind="override_proposal",
             schema_graph_id=graph_id,
             schema_hash="eff",
-            produced_at=datetime.now(timezone.utc).isoformat(),
+            produced_at=datetime.now(UTC).isoformat(),
             payload=(("document_json", json.dumps(doc)),),
         )
         emit_write_queue_event(str(tmp_path), ev)
@@ -120,7 +124,7 @@ class TestOwnerConsumerGate:
             "aetherdialect._main_execution.apply_overrides_and_persist",
             return_value=MagicMock(),
         ) as apply_mock:
-            n = drain_write_queue(owner, str(tmp_path))
+            n = MainExecutionOps.drain_write_queue(owner, str(tmp_path))
         assert n == 1
         apply_mock.assert_called_once()
 

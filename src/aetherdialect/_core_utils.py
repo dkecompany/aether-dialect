@@ -13,18 +13,20 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
+import uuid
 from collections import Counter, defaultdict
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import replace
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from importlib.metadata import PackageNotFoundError, version
 from itertools import permutations, product
 from pathlib import Path
 from typing import Any, Literal, cast
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 if sys.platform == "win32":
     import msvcrt
@@ -33,12 +35,19 @@ else:
 
 from packaging.version import InvalidVersion, Version
 
+import aetherdialect._constants
+
 from ._config import (
+    EngineLimits,
+    EngineRuntimeConfig,
+    FederationLimits,
     PolicyConfig,
 )
 from ._constants import (
     AETHERDIALECT_LOG_PERMISSION_DENIED_DETAIL_ENV,
     AETHERSPACES_SEGMENT,
+    ARTIFACT_DIR_MODE,
+    ARTIFACT_FILE_MODE,
     ARTIFACT_FORMAT_VERSION,
     ARTIFACT_LOCK_FILENAME,
     ARTIFACT_LOCK_POLL_INTERVAL_SECONDS,
@@ -46,10 +55,45 @@ from ._constants import (
     ARTIFACT_MANIFEST_FILENAME,
     AZURE_OPENAI_ENV_DEPLOYMENT_HEAVY,
     AZURE_OPENAI_ENV_DEPLOYMENT_LIGHT,
-    BUSINESS_KNOWLEDGE_COLUMN_REF_RE,
-    BUSINESS_KNOWLEDGE_DEFAULT_KIND,
+    DATABASE_ERROR_CLASSIFICATION_BY_EXCEPTION_NAME,
+    DATABASE_ERROR_CLASSIFICATION_BY_MESSAGE_PATTERN,
+    DATABASE_ERROR_CLASSIFICATION_TRANSIENT,
+    DATABASE_ERROR_CLASSIFICATION_TRANSIENT_ERRNOS,
+    DATABASE_ERROR_CLASSIFICATION_UNKNOWN,
+    DIAGNOSTIC_CODE_ARTIFACTS_DIR_NOT_LOCAL,
     DIAGNOSTIC_CODE_ENGINE_INFO,
+    DIAGNOSTIC_CODE_FEDERATION_POOL_UNDERSIZED,
     DIAGNOSTIC_CODE_LLM_TURN_COST,
+    DIAGNOSTIC_CODE_MEMBER_LIMIT_NARROWED,
+    DIAGNOSTIC_CODE_REFUSAL_AGGREGATE_FAN_OUT,
+    DIAGNOSTIC_CODE_REFUSAL_AMBIGUOUS_DATE_LITERAL,
+    DIAGNOSTIC_CODE_REFUSAL_CAPABILITY_GAP,
+    DIAGNOSTIC_CODE_REFUSAL_CLAUSE_WIDENED_ROWSET,
+    DIAGNOSTIC_CODE_REFUSAL_CTE_CAP,
+    DIAGNOSTIC_CODE_REFUSAL_DECLINED_SCHEMA,
+    DIAGNOSTIC_CODE_REFUSAL_HOP_CEILING,
+    DIAGNOSTIC_CODE_REFUSAL_INVALID_QUESTION,
+    DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_TIE_CAP,
+    DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_UNAVAILABLE,
+    DIAGNOSTIC_CODE_REFUSAL_NOT_AVAILABLE_IN_CONTEXT,
+    DIAGNOSTIC_CODE_REFUSAL_NULL_IN_NEGATED_LIST,
+    DIAGNOSTIC_CODE_REFUSAL_OPAQUE_EXPR,
+    DIAGNOSTIC_CODE_REFUSAL_PARSE_FAILURE,
+    DIAGNOSTIC_CODE_REFUSAL_PERMISSION_DENIED,
+    DIAGNOSTIC_CODE_REFUSAL_PROBE_CTE_PLACEMENT,
+    DIAGNOSTIC_CODE_REFUSAL_SCOPE_VIOLATION,
+    DIAGNOSTIC_CODE_REFUSAL_SUBDAY_DATE_WINDOW_ON_DATE_COLUMN,
+    DIAGNOSTIC_CODE_REFUSAL_UNION_COLUMN_MISSING,
+    DIAGNOSTIC_CODE_REFUSAL_UNSUPPORTED_COLUMN_TYPE,
+    DIAGNOSTIC_CODE_STALE_ARTIFACT_LOCK,
+    DIAGNOSTIC_CODE_WRITE_QUEUE_FULL,
+    ENGINE_DRIVER_REQUIREMENTS,
+    EXACT_NUMERIC_BASE_TYPES,
+    FAILURE_TRACE_ROTATE_BYTES,
+    FEDERATION_ARTIFACT_FORMAT_VERSION,
+    INEXACT_NUMERIC_BASE_TYPES,
+    ISO_DATE_ONLY_RE,
+    ISO_DATETIME_RE,
     JSON_COMPACT_SEPARATORS,
     LEGACY_ARTIFACT_FILENAMES,
     LEGACY_ARTIFACT_GLOBS,
@@ -57,17 +101,36 @@ from ._constants import (
     LLM_PRICE_TABLE_AS_OF,
     MIGRATION_DATA_OVERLAP_MIN,
     MIN_COMPATIBLE_PACKAGE_VERSION,
+    NUMERIC_TYPE_ARGUMENTS_RE,
+    OUTCOME_REFUSAL_CODES,
+    PERMISSION_DENIED_CATEGORY_ORACLE_KINDS,
+    PERMISSION_DENIED_FAILURE_KINDS,
     PRE_QUOTED_IN_LIST_INLINE_RE,
     QUERY_RESULTS_HEADER,
+    REFUSAL_CAPABILITY_GAP_REASON_CODES,
+    REFUSAL_CAPABILITY_GAP_REASON_PREFIXES,
+    REFUSAL_CATALOGUE,
+    REFUSAL_CTE_CAP_ISSUE_IDS,
+    REFUSAL_NOT_AVAILABLE_IN_CONTEXT_MESSAGE,
+    REFUSAL_NULL_IN_NEGATED_LIST_ISSUE_IDS,
+    REFUSAL_UNSUPPORTED_COLUMN_TYPE_ISSUE_IDS,
     REPHRASE_HINT_MESSAGES,
+    REPHRASE_HINT_REFUSAL_CODES,
     SIMULATION_CACHE_EXACT_FILENAMES,
     SIMULATION_CACHE_GLOB_PATTERNS,
     SQL_BIND_TOKEN_RE,
+    SQL_EXPONENT_LITERAL_RE,
+    SQL_FIXED_POINT_LITERAL_RE,
+    SQL_INTEGER_LITERAL_RE,
+    SQL_STRING_LITERAL_COMMENT_MARKERS,
+    SQL_STRING_LITERAL_STATEMENT_TERMINATOR,
     STRUCTURAL_IDENTITY_VALUES,
     STRUCTURAL_INLINE_SQL_LITERAL_LIST_RE,
     STRUCTURAL_SQL_PLACEHOLDER_PARAM_RE,
     TEMPLATE_STORE_SEGMENT,
     UNBOUND_PYFORMAT_PLACEHOLDER_RE,
+    UNKNOWN_VALUE_TYPE,
+    UNSAFE_PARAM_LITERAL,
     USER_ERROR_PREFIX,
     USER_INVALID_INPUT_LINE,
     USER_REJECTED_RESULT_BUCKET_TIPS,
@@ -77,35 +140,145 @@ from ._constants import (
     WRITE_QUEUE_FILENAME,
 )
 from ._contracts_base import (
+    AccessError,
+    AggregateJoinFanOutError,
+    AmbiguousDateLiteralError,
+    ArtifactLockTimeoutError,
+    ArtifactManifest,
     BusinessKnowledgeEntry,
+    BusinessKnowledgeState,
+    ClauseWidenedRowsetError,
+    ColumnTypeSemantics,
+    ComparisonJoinScopeExceededError,
     ConfigError,
+    DatabaseErrorClassification,
+    DatabaseExecutionError,
     Diagnostic,
+    DiagnosticCode,
+    DiagnosticSeverity,
     EngineContext,
     EngineIdentity,
+    FailureCategory,
     FederationContext,
     InteractiveChoicePort,
+    JoinPathTieCapExceededError,
     LlmExecutionConfig,
+    LlmTurnUsageSummary,
     LlmUsageRecord,
     MigrationTier,
+    NoJoinPathError,
+    NullInNegatedListError,
+    OpenResourceInventory,
+    OverlapComparison,
     PhaseProgressEvent,
+    ProbeCtePlacementError,
+    RefusalCatalogueEntry,
+    RenameMigrationAssessment,
     RephraseHint,
+    RetryableDatabaseExecutionError,
+    SchemaInvariantError,
+    SchemaNaming,
+    SubdayDateWindowOnDateColumnError,
     WriteQueueEvent,
 )
 from ._contracts_core import FederationExecutionContext, RuntimeCteStep, RuntimeIntent, StepResult
 from ._contracts_schema import (
     ColumnMetadata,
     FKEdge,
+    IntentIssue,
     SchemaGraph,
-    SensitivityClassification,
     TableMetadata,
 )
+
+
+def normalize_column_type(col_type: str) -> str:
+    """Lowercase a SQL type and remove `(n)` / `(n,m)` parameter lists."""
+    return ColumnTypeSemantics.normalize_column_type(col_type)
+
+
+def split_column_type(col_type: str) -> tuple[str, int | None, int | None]:
+    """Lowercase a SQL type, strip parameter lists for lookup, and return parsed precision and scale."""
+    return ColumnTypeSemantics.split_column_type(col_type)
+
+
+def structural_data_type_key(data_type: str) -> str:
+    """Return a canonical catalog-type token for structural diff and hashing."""
+    return ColumnTypeSemantics.structural_data_type_key(data_type)
+
+
+def column_is_unsigned_from_data_type(
+    data_type: str,
+    *,
+    reflected_unsigned: bool | None = None,
+) -> bool:
+    """Return whether a SQL column type carries unsigned integer semantics."""
+    return ColumnTypeSemantics.column_is_unsigned_from_data_type(
+        data_type,
+        reflected_unsigned=reflected_unsigned,
+    )
+
+
+def column_is_fixed_width_text_from_data_type(data_type: str) -> bool:
+    """Return whether a SQL column type is fixed-width character text (CHAR/NCHAR)."""
+    return ColumnTypeSemantics.column_is_fixed_width_text_from_data_type(data_type)
+
+
+def column_timezone_aware_from_data_type(
+    data_type: str,
+    *,
+    engine: str | None = None,
+) -> bool:
+    """Return whether a SQL temporal type preserves timezone offsets."""
+    return ColumnTypeSemantics.column_timezone_aware_from_data_type(data_type, engine=engine)
+
+
+def column_unsigned_near_type_max(meta: Any) -> bool:
+    """Return whether profiled maxima exceed float-safe range or approach an unsigned ceiling."""
+    return ColumnTypeSemantics.column_unsigned_near_type_max(meta)
+
+
+def is_numeric_type(data_type: str) -> bool:
+    """Return whether a SQL data type string looks numeric."""
+    return ColumnTypeSemantics.is_numeric_type(data_type)
+
+
+def is_string_type(data_type: str) -> bool:
+    """Return whether a SQL data type string looks string-like."""
+    return ColumnTypeSemantics.is_string_type(data_type)
+
+
+def is_date_type(data_type: str) -> bool:
+    """Return whether a SQL data type string looks date- or time- like."""
+    return ColumnTypeSemantics.is_date_type(data_type)
+
+
+def data_type_to_value_type(data_type: str) -> str:
+    """Map a SQL data type string to a prompt/value-type token."""
+    return ColumnTypeSemantics.data_type_to_value_type(data_type)
+
+
+def norm_schema_identifier(name: str, *, what: str) -> str:
+    """Lowercase and strip *name*; raise when empty after strip."""
+    return SchemaNaming.norm_schema_identifier(name, what=what)
+
+
+def normalize_scope_column_spec(spec: str, *, field: str) -> str:
+    """Normalize a ``table.column`` or ``source.table.column`` scope column spec."""
+    return SchemaNaming.normalize_scope_column_spec(spec, field=field)
+
 
 _DIAGNOSTIC_COLLECTOR: ContextVar[list[Diagnostic] | None] = ContextVar(
     "aetherdialect_diagnostic_collector",
     default=None,
 )
 
-_ORPHAN_DIAGNOSTICS: list[Diagnostic] = []
+_PENDING_INTENT_PARSE_REFUSAL: ContextVar[tuple[str, str] | None] = ContextVar(
+    "aetherdialect_pending_intent_parse_refusal",
+    default=None,
+)
+
+_ORPHAN_DIAGNOSTICS_LOCK = threading.Lock()
+_ORPHAN_DIAGNOSTICS: list[tuple[EngineIdentity, Diagnostic]] = []
 
 _DIAGNOSTIC_PRINT_LISTENER: ContextVar[Callable[[str], None] | None] = ContextVar(
     "aetherdialect_diagnostic_print_listener",
@@ -122,10 +295,110 @@ _ACTIVE_ENGINE_IDENTITY: ContextVar[EngineIdentity | None] = ContextVar(
     default=None,
 )
 
+_PENDING_CONSTRUCTION_ENGINE_IDENTITY: ContextVar[EngineIdentity | None] = ContextVar(
+    "aetherdialect_pending_construction_engine_identity",
+    default=None,
+)
+
 _FEDERATION_EXECUTION_CONTEXT: ContextVar[FederationExecutionContext | None] = ContextVar(
     "aetherdialect_federation_execution_context",
     default=None,
 )
+
+
+def parse_numeric_type_arguments(data_type: str) -> tuple[int | None, int | None]:
+    """Parse precision and optional scale from a SQL numeric type string."""
+    match = NUMERIC_TYPE_ARGUMENTS_RE.search(data_type)
+    if not match:
+        return None, None
+    precision = int(match.group(1))
+    scale = int(match.group(2)) if match.group(2) is not None else None
+    return precision, scale
+
+
+def collation_name_is_case_insensitive(name: str) -> bool:
+    """Return True when a reflected collation name compares strings case-insensitively."""
+    token = (name or "").strip().casefold()
+    if not token:
+        return False
+    if token in {"c", "posix"}:
+        return False
+    if token.endswith("_ci") or token.endswith("_ci_as") or token.endswith("_ci_ai"):
+        return True
+    if "_cs" in token:
+        return False
+    if "_ci" in token:
+        return True
+    return False
+
+
+def is_exact_numeric_data_type(data_type: str) -> bool:
+    """Return whether a SQL numeric type preserves exact values."""
+    base = normalize_column_type(data_type)
+    if base in INEXACT_NUMERIC_BASE_TYPES:
+        return False
+    if base in EXACT_NUMERIC_BASE_TYPES:
+        return True
+    lowered = data_type.lower()
+    if any(token in lowered for token in ("float", "double", "real")):
+        return False
+    return False
+
+
+def column_numeric_metadata_from_data_type(
+    data_type: str,
+    *,
+    reflected_precision: int | None = None,
+    reflected_scale: int | None = None,
+) -> tuple[int | None, int | None, bool]:
+    """Derive precision, scale and exactness for a column type string."""
+    precision = reflected_precision
+    scale = reflected_scale
+    if precision is None and scale is None:
+        precision, scale = parse_numeric_type_arguments(data_type)
+    return precision, scale, is_exact_numeric_data_type(data_type)
+
+
+def column_metadata_requires_exact_comparison(meta: ColumnMetadata) -> bool:
+    """Return whether comparisons must avoid binary-float widening for *meta*."""
+    if meta.is_exact_numeric:
+        return True
+    return column_unsigned_near_type_max(meta)
+
+
+def column_metadata_timezone_awareness_mismatch(left_meta: ColumnMetadata, right_meta: ColumnMetadata) -> bool:
+    """Return True when two temporal columns disagree on timezone awareness."""
+    if (left_meta.value_type or "").strip().lower() != "date":
+        return False
+    if (right_meta.value_type or "").strip().lower() != "date":
+        return False
+    return left_meta.is_timezone_aware != right_meta.is_timezone_aware
+
+
+def parse_sql_numeric_literal(text: str) -> Decimal | int | float:
+    """Parse a SQL numeric literal without widening exact values to binary floats."""
+    stripped = text.strip()
+    if SQL_INTEGER_LITERAL_RE.match(stripped):
+        return int(stripped)
+    if SQL_FIXED_POINT_LITERAL_RE.match(stripped):
+        return Decimal(stripped)
+    if SQL_EXPONENT_LITERAL_RE.match(stripped):
+        return float(stripped)
+    return Decimal(stripped)
+
+
+def render_sql_numeric_literal(text: str, parsed: Decimal | int | float) -> str:
+    """Render a parsed numeric literal back to SQL text."""
+    return text
+
+
+def render_sql_numeric_value(value: Decimal | int | float) -> str:
+    """Render a numeric value for SQL when the original literal text is unavailable."""
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    if isinstance(value, int):
+        return str(value)
+    return str(value)
 
 
 def active_engine_identity() -> EngineIdentity:
@@ -138,6 +411,46 @@ def active_engine_identity() -> EngineIdentity:
     )
 
 
+def active_engine_runtime_config() -> EngineRuntimeConfig:
+    """Return the active engine runtime config for this execution context."""
+    identity = active_engine_identity()
+    runtime = identity.runtime_config
+    if isinstance(runtime, type):
+        return EngineRuntimeConfig.process_default_for_class(runtime)
+    if not isinstance(runtime, EngineRuntimeConfig):
+        raise TypeError(
+            "active engine identity carries an unsupported runtime config value; "
+            f"expected EngineRuntimeConfig, got {type(runtime).__name__}"
+        )
+    return runtime
+
+
+def resolve_runtime_config(
+    config: EngineRuntimeConfig | type[EngineRuntimeConfig] | None = None,
+) -> EngineRuntimeConfig:
+    """Resolve a runtime config instance, preferring an explicit value then the active identity."""
+    if config is not None and not isinstance(config, type):
+        return config
+    if config is not None and isinstance(config, type):
+        return config()
+    try:
+        return active_engine_runtime_config()
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "no active engine identity; pass a runtime config instance instead of relying on implicit defaults"
+        ) from exc
+
+
+def bound_engine_runtime_config() -> EngineRuntimeConfig:
+    """Return the active engine runtime config; never guess a process default."""
+    try:
+        return active_engine_runtime_config()
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "no active engine identity; pass a runtime config instance instead of relying on implicit defaults"
+        ) from exc
+
+
 def push_engine_identity(identity: EngineIdentity) -> Token[EngineIdentity | None]:
     """Bind *identity* for nested pipeline and SQL generation calls."""
     return _ACTIVE_ENGINE_IDENTITY.set(identity)
@@ -146,6 +459,147 @@ def push_engine_identity(identity: EngineIdentity) -> Token[EngineIdentity | Non
 def pop_engine_identity(token: Token[EngineIdentity | None]) -> None:
     """Restore the prior engine identity after :func:`push_engine_identity`."""
     _ACTIVE_ENGINE_IDENTITY.reset(token)
+
+
+def bind_construction_orphan_identity(identity: EngineIdentity) -> Token[EngineIdentity | None]:
+    """Bind *identity* for construction-time diagnostics emitted without an active collector."""
+    return _PENDING_CONSTRUCTION_ENGINE_IDENTITY.set(identity)
+
+
+def release_construction_orphan_identity(token: Token[EngineIdentity | None]) -> None:
+    """Clear a construction-time orphan identity binding."""
+    _PENDING_CONSTRUCTION_ENGINE_IDENTITY.reset(token)
+
+
+def require_driver(engine_name: str) -> None:
+    """Import the driver for *engine_name* or raise :class:`ConfigError` with install guidance."""
+    spec = ENGINE_DRIVER_REQUIREMENTS.get(str(engine_name).strip().lower())
+    if spec is None:
+        return
+    import_names, _distribution, extra_name = spec
+    if isinstance(import_names, str):
+        import_names = (import_names,)
+    last_exc: ImportError | None = None
+    for import_name in import_names:
+        try:
+            __import__(import_name)
+            return
+        except ImportError as exc:
+            last_exc = exc
+    driver_label = " or ".join(import_names)
+    if len(import_names) > 1:
+        raise ConfigError(f"pip install aetherdialect[{extra_name}] (requires {driver_label})") from last_exc
+    raise ConfigError(f"pip install aetherdialect[{extra_name}]") from last_exc
+
+
+_ACTIVE_ENGINE_LIMITS: ContextVar[EngineLimits | None] = ContextVar("aetherdialect_active_engine_limits", default=None)
+_ACTIVE_FEDERATION_LIMITS: ContextVar[FederationLimits | None] = ContextVar(
+    "aetherdialect_active_federation_limits", default=None
+)
+
+
+def push_engine_limits(limits: EngineLimits) -> Token[EngineLimits | None]:
+    """Bind *limits* for nested execution calls."""
+    return _ACTIVE_ENGINE_LIMITS.set(limits)
+
+
+def pop_engine_limits(token: Token[EngineLimits | None]) -> None:
+    """Restore the prior engine limits binding."""
+    _ACTIVE_ENGINE_LIMITS.reset(token)
+
+
+def active_engine_limits() -> EngineLimits:
+    """Return the active engine limits for this execution context."""
+    limits = _ACTIVE_ENGINE_LIMITS.get()
+    if limits is None:
+        raise RuntimeError(
+            "no active engine limits; bind one with push_engine_limits before calling active_engine_limits"
+        )
+    return limits
+
+
+def push_federation_limits(limits: FederationLimits) -> Token[FederationLimits | None]:
+    """Bind federation limits for nested federation execution."""
+    return _ACTIVE_FEDERATION_LIMITS.set(limits)
+
+
+def pop_federation_limits(token: Token[FederationLimits | None]) -> None:
+    """Restore the prior federation limits binding."""
+    _ACTIVE_FEDERATION_LIMITS.reset(token)
+
+
+def active_federation_limits() -> FederationLimits:
+    """Return the active federation limits for this execution context."""
+    limits = _ACTIVE_FEDERATION_LIMITS.get()
+    if limits is None:
+        raise RuntimeError(
+            "no active federation limits; bind one with push_federation_limits before calling active_federation_limits"
+        )
+    return limits
+
+
+def sqlalchemy_pool_kwargs_from_limits(
+    limits: EngineLimits,
+    *,
+    single_connection_pool: bool = False,
+) -> dict[str, Any]:
+    """Return SQLAlchemy pool keyword arguments for *limits*."""
+    kwargs: dict[str, Any] = {
+        "pool_recycle": limits.pool_recycle_seconds,
+        "pool_pre_ping": limits.pool_pre_ping,
+    }
+    if not single_connection_pool:
+        kwargs["pool_size"] = limits.pool_size
+        kwargs["max_overflow"] = limits.pool_max_overflow
+        kwargs["pool_timeout"] = limits.pool_timeout_seconds
+    return kwargs
+
+
+def sqlalchemy_url_uses_single_connection_pool(url: str) -> bool:
+    """Return True when *url* targets an embedded engine with a one- connection pool."""
+    lowered = str(url or "").strip().lower()
+    return lowered.startswith("duckdb") or lowered.startswith("sqlite")
+
+
+def narrow_member_engine_limits(member_limits: EngineLimits, federation_limits: FederationLimits) -> EngineLimits:
+    """Keep caller-supplied member limits unless federation row cap is stricter."""
+    if federation_limits.member_row_cap is None:
+        return member_limits
+    member_cap = member_limits.max_result_rows
+    if member_cap is not None and member_cap <= federation_limits.member_row_cap:
+        return member_limits
+    narrowed = replace(member_limits, max_result_rows=federation_limits.member_row_cap)
+    notify(
+        "federation member row cap narrowed to match federation limit",
+        stage="federation",
+        code=DIAGNOSTIC_CODE_MEMBER_LIMIT_NARROWED,
+        level="warning",
+        details=(("field", "max_result_rows"), ("value", str(federation_limits.member_row_cap))),
+    )
+    return narrowed
+
+
+def validate_federation_pool_capacity(members: Mapping[str, Any], federation_limits: FederationLimits) -> None:
+    """Emit a diagnostic when aggregate pool capacity is below parallel member execution."""
+    aggregate = 0
+    for engine in members.values():
+        limits = getattr(engine, "limits", EngineLimits())
+        aggregate += int(limits.pool_size) + int(limits.pool_max_overflow)
+    needed = int(federation_limits.max_parallel_members)
+    if aggregate >= needed:
+        return
+    notify(
+        (f"federation aggregate pool capacity {aggregate} is below max_parallel_members {needed}"),
+        stage="federation",
+        code=DIAGNOSTIC_CODE_FEDERATION_POOL_UNDERSIZED,
+        level="warning",
+        source_id="",
+        details=(
+            ("phase", "composition"),
+            ("aggregate_pool_capacity", str(aggregate)),
+            ("max_parallel_members", str(needed)),
+        ),
+    )
 
 
 def push_federation_execution_context(
@@ -177,6 +631,10 @@ _SESSION_TURN_CANCEL: ContextVar[threading.Event | None] = ContextVar(
     "aetherdialect_session_turn_cancel",
     default=None,
 )
+_TURN_ID: ContextVar[str | None] = ContextVar(
+    "aetherdialect_turn_id",
+    default=None,
+)
 
 
 def push_session_turn_cancel(event: threading.Event) -> Token[threading.Event | None]:
@@ -193,6 +651,36 @@ def session_turn_cancelled() -> bool:
     """Return True when the active session turn has been cancelled."""
     event = _SESSION_TURN_CANCEL.get()
     return bool(event is not None and event.is_set())
+
+
+def mint_turn_id() -> str:
+    """Return a new opaque correlation id for one interactive ask turn."""
+    return str(uuid.uuid4())
+
+
+def push_turn_id(turn_id: str) -> Token[str | None]:
+    """Bind *turn_id* for audit, diagnostic, and phase correlation within the active turn."""
+    return _TURN_ID.set(turn_id)
+
+
+def pop_turn_id(token: Token[str | None]) -> None:
+    """Restore the prior turn correlation id."""
+    _TURN_ID.reset(token)
+
+
+def active_turn_id() -> str | None:
+    """Return the active ask-turn correlation id when one is bound."""
+    return _TURN_ID.get()
+
+
+def details_with_turn_id(details: tuple[tuple[str, str], ...] = ()) -> tuple[tuple[str, str], ...]:
+    """Prepend ``turn_id`` to *details* when a turn correlation id is active."""
+    turn_id = active_turn_id()
+    if turn_id is None:
+        return details
+    if any(key == "turn_id" for key, _ in details):
+        return details
+    return (("turn_id", turn_id),) + details
 
 
 _CONSTRUCTION_PHASE_CALLBACK: ContextVar[Callable[[PhaseProgressEvent], None] | None] = ContextVar(
@@ -242,7 +730,7 @@ def emit_construction_phase(
     callback(
         PhaseProgressEvent(
             phase=phase,
-            timestamp_iso=datetime.now(timezone.utc).isoformat(),
+            timestamp_iso=datetime.now(UTC).isoformat(),
             source=source,
             stage=stage,
         )
@@ -253,7 +741,7 @@ def emit_ask_phase(
     phase: str,
     *,
     source: str | None = None,
-    stage: int | None = None,
+    stage: int | str | None = None,
 ) -> None:
     """Invoke the active ask-phase callback, if any."""
     callback = _ASK_PHASE_CALLBACK.get()
@@ -262,11 +750,50 @@ def emit_ask_phase(
     callback(
         PhaseProgressEvent(
             phase=phase,
-            timestamp_iso=datetime.now(timezone.utc).isoformat(),
+            timestamp_iso=datetime.now(UTC).isoformat(),
             source=source,
             stage=stage,
+            turn_id=active_turn_id(),
         )
     )
+
+
+def coerce_format_version(value: Any) -> str:
+    """Normalize a stored format/package version to a canonical string. Accepts package-style strings (``"0.2.1"``), integers (``1`` → ``"1"``), and simple dotted numeric forms (``1.0`` / ``"1.0"`` → ``"1.0"``)."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        raise TypeError("boolean is not a format version")
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if value == int(value):
+            return str(int(value))
+        text = f"{value}"
+        return text.rstrip("0").rstrip(".") if "." in text else text
+    text = str(value).strip()
+    return text
+
+
+def format_versions_match(stored: Any, expected: str) -> bool:
+    """Return True when *stored* equals *expected* after :func:`coerce_format_version`. Also treats ``1`` / ``"1"`` / ``"1.0"`` as equivalent when both sides are numeric-only dotted segments (shorter side padded with zeros)."""
+    left = coerce_format_version(stored)
+    right = coerce_format_version(expected)
+    if left == right:
+        return True
+
+    def _parts(s: str) -> tuple[str, ...]:
+        return tuple(p for p in s.split(".") if p != "")
+
+    lp, rp = _parts(left), _parts(right)
+    if not lp or not rp:
+        return False
+    if all(p.isdigit() for p in lp + rp):
+        n = max(len(lp), len(rp))
+        lp2 = lp + ("0",) * (n - len(lp))
+        rp2 = rp + ("0",) * (n - len(rp))
+        return lp2 == rp2
+    return False
 
 
 def is_structural_param_key(key: str) -> bool:
@@ -286,7 +813,7 @@ def effective_explain_timeout_ms() -> int | None:
 
 
 def effective_llm_timeout_ms() -> int:
-    """Resolved HTTP timeout for OpenAI-compatible clients and :func:`aetherdialect._llm_provider.llm_chat`. Uses:data:`PolicyConfig.LLM_TIMEOUT_MS` when positive; otherwise ``60_000`` ms."""
+    """Resolved HTTP timeout for OpenAI-compatible clients and :func:`aetherdialect._llm_provider.LLMProvider.chat`. Uses:data:`PolicyConfig.LLM_TIMEOUT_MS` when positive; otherwise ``60_000`` ms."""
     tm = PolicyConfig.LLM_TIMEOUT_MS
     if cost_cap_active(tm) and tm is not None:
         return int(tm)
@@ -378,11 +905,24 @@ def reset_diagnostic_collector(token: Any) -> None:
     _DIAGNOSTIC_COLLECTOR.reset(token)
 
 
-def take_and_clear_orphan_diagnostics() -> tuple[Diagnostic, ...]:
-    """Drain diagnostics emitted before any collector was bound (for example during construction)."""
-    out = tuple(_ORPHAN_DIAGNOSTICS)
-    _ORPHAN_DIAGNOSTICS.clear()
-    return out
+def _orphan_identity_key(identity: EngineIdentity) -> tuple[str, int]:
+    """Stable per-engine key: type plus runtime config object identity."""
+    return (identity.engine_type, id(identity.runtime_config))
+
+
+def take_and_clear_orphan_diagnostics(identity: EngineIdentity) -> tuple[Diagnostic, ...]:
+    """Drain construction-time diagnostics keyed to *identity*."""
+    target_key = _orphan_identity_key(identity)
+    with _ORPHAN_DIAGNOSTICS_LOCK:
+        matched: list[Diagnostic] = []
+        remaining: list[tuple[EngineIdentity, Diagnostic]] = []
+        for entry_identity, diag in _ORPHAN_DIAGNOSTICS:
+            if _orphan_identity_key(entry_identity) == target_key:
+                matched.append(diag)
+            else:
+                remaining.append((entry_identity, diag))
+        _ORPHAN_DIAGNOSTICS[:] = remaining
+        return tuple(matched)
 
 
 @contextmanager
@@ -403,6 +943,21 @@ def drain_diagnostic_collector() -> tuple[Diagnostic, ...]:
     out = tuple(buf)
     buf.clear()
     return out
+
+
+def stash_intent_parse_refusal(code: str, message: str) -> None:
+    """Remember a crafted intent-parse refusal for the next generic parse-failed turn outcome."""
+    _PENDING_INTENT_PARSE_REFUSAL.set((code, message))
+    emit_session_refusal_diagnostic(code, message)
+
+
+def take_intent_parse_refusal() -> tuple[str, str] | None:
+    """Return and clear a stashed intent-parse refusal, if any."""
+    pending = _PENDING_INTENT_PARSE_REFUSAL.get()
+    if pending is None:
+        return None
+    _PENDING_INTENT_PARSE_REFUSAL.set(None)
+    return pending
 
 
 @contextmanager
@@ -482,7 +1037,7 @@ def _current_llm_usage_scope() -> Literal["build", "question", "run"]:
 
 @contextmanager
 def llm_usage_session_scope() -> Iterator[None]:
-    """Open a session-scoped LLM usage accumulator when one is not already active."""
+    """Open a session-scoped LLM usage accumulator when one is not already active. Hosts that nest this scope across multiple asks in one process must call :func:`drain_llm_usage_records` after each ask turn (the interactive session does this via :meth:`PipelineSession._emit_turn_llm_usage`) so records do not accumulate across turns."""
     existing = _LLM_USAGE_ACCUMULATOR.get()
     if existing is not None:
         yield
@@ -571,6 +1126,11 @@ def drain_llm_usage_records() -> tuple[LlmUsageRecord, ...]:
     out = tuple(buf)
     buf.clear()
     return out
+
+
+def scrub_schema_prose_for_prompt(text: str) -> str:
+    """Delegate Ground scrubbing to SchemaGraph (keeps a stable import path for callers)."""
+    return SchemaGraph.scrub_schema_prose_for_prompt(text)
 
 
 def reset_llm_usage_accumulator() -> None:
@@ -728,11 +1288,109 @@ def llm_turn_cost_diagnostic(
             details.append(("unpriced_models", ",".join(unpriced)))
     return Diagnostic(
         stage="llm",
-        level="info",
+        level=DiagnosticSeverity.INFO,
         code=DIAGNOSTIC_CODE_LLM_TURN_COST,
         message=message,
         details=tuple(details),
+        phase="llm",
     )
+
+
+def summarize_llm_turn_usage(
+    records: tuple[LlmUsageRecord, ...] | list[LlmUsageRecord],
+    *,
+    provider: Literal["openai", "azure", "mock"] = "openai",
+) -> LlmTurnUsageSummary | None:
+    """Aggregate per-call records into one turn-level usage summary."""
+    if not records:
+        return None
+    cost_usd: float | None = None
+    if provider == "openai":
+        costs = [c for r in records if (c := llm_call_cost_usd(r)) is not None]
+        if costs:
+            cost_usd = sum(costs)
+    return LlmTurnUsageSummary(
+        request_count=len(records),
+        input_tokens=sum(r.input_tokens for r in records),
+        cached_input_tokens=sum(r.cached_input_tokens for r in records),
+        output_tokens=sum(r.output_tokens for r in records),
+        cost_usd=cost_usd,
+    )
+
+
+_POISONED_CONNECTION_IDS: set[int] = set()
+_POISONED_CONNECTION_LOCK = threading.Lock()
+_FORK_PARENT_OWNED_CONNECTION_IDS: set[int] = set()
+_FORK_PARENT_OWNED_DIALECT_IDS: set[int] = set()
+_REGISTERED_DIALECT_IDS: set[int] = set()
+
+
+def mark_connection_poisoned(conn: Any) -> None:
+    """Mark *conn* as unsafe to reuse after a timed-out or aborted worker."""
+    with _POISONED_CONNECTION_LOCK:
+        _POISONED_CONNECTION_IDS.add(id(conn))
+
+
+def is_connection_poisoned(conn: Any) -> bool:
+    """Return whether *conn* was marked unsafe for pool reuse."""
+    with _POISONED_CONNECTION_LOCK:
+        return id(conn) in _POISONED_CONNECTION_IDS
+
+
+def clear_connection_poison(conn: Any) -> None:
+    """Clear any poison mark on *conn* before returning it to active use."""
+    with _POISONED_CONNECTION_LOCK:
+        _POISONED_CONNECTION_IDS.discard(id(conn))
+
+
+def is_fork_parent_owned_connection(conn: Any) -> bool:
+    """Return whether *conn* was inherited from the parent process after fork."""
+    with _RESOURCE_REGISTRY_LOCK:
+        return id(conn) in _FORK_PARENT_OWNED_CONNECTION_IDS
+
+
+def assert_connection_usable_after_fork(conn: Any) -> None:
+    """Raise when *conn* is a parent-owned handle in a forked child process."""
+    if is_fork_parent_owned_connection(conn):
+        raise RuntimeError(
+            "Database connection inherited from the parent process after fork. "
+            "Construct a new AetherEngine in the child process instead.",
+        )
+
+
+def assert_dialect_usable_after_fork(dialect: Any) -> None:
+    """Raise when *dialect* is a parent-owned handle in a forked child process."""
+    with _RESOURCE_REGISTRY_LOCK:
+        if id(dialect) in _FORK_PARENT_OWNED_DIALECT_IDS:
+            raise RuntimeError(
+                "Database connection inherited from the parent process after fork. "
+                "Construct a new AetherEngine in the child process instead.",
+            )
+
+
+def mark_fork_parent_owned_live_handles() -> None:
+    """Mark every tracked live connection and dialect as parent-owned in a fork child."""
+    with _RESOURCE_REGISTRY_LOCK:
+        _FORK_PARENT_OWNED_CONNECTION_IDS.update(_LIVE_CONNECTIONS)
+        _FORK_PARENT_OWNED_DIALECT_IDS.update(_REGISTERED_DIALECT_IDS)
+
+
+_AFTER_FORK_CALLBACKS: list[Callable[[], None]] = []
+
+
+def register_after_fork_callback(callback: Callable[[], None]) -> None:
+    """Register a child-process hook invoked after ``fork()``."""
+    _AFTER_FORK_CALLBACKS.append(callback)
+
+
+def _after_fork_in_child() -> None:
+    for callback in _AFTER_FORK_CALLBACKS:
+        callback()
+    mark_fork_parent_owned_live_handles()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_after_fork_in_child)
 
 
 def llm_turn_audit_details(
@@ -768,28 +1426,50 @@ def notify(
     message: str,
     *,
     stage: str | None = None,
-    code: str = DIAGNOSTIC_CODE_ENGINE_INFO,
-    level: str = "info",
+    code: DiagnosticCode | str = DiagnosticCode.DIAGNOSTIC_CODE_ENGINE_INFO,
+    level: DiagnosticSeverity | str = DiagnosticSeverity.INFO,
     duration_ms: int | None = None,
     details: tuple[tuple[str, str], ...] = (),
     source_id: str | None = None,
+    phase: str | None = None,
+    remediation: str | None = None,
+    subject: str | None = None,
 ) -> None:
     """Append a diagnostic to the active collector and optionally mirror the line to a print listener."""
     eff_stage = stage or "notify"
+    if isinstance(code, DiagnosticCode):
+        code_str = code.value
+    else:
+        raw_code = str(code)
+        try:
+            code_str = DiagnosticCode(raw_code).value
+        except ValueError:
+            code_str = raw_code
+    eff_phase = phase if phase is not None else eff_stage
     diag = Diagnostic(
         stage=eff_stage,
         level=level,
-        code=code,
+        code=code_str,
         message=message,
-        details=details,
+        details=details_with_turn_id(details),
         duration_ms=duration_ms,
         source_id=source_id,
+        phase=eff_phase,
+        remediation=remediation,
+        subject=subject,
     )
     buf = _DIAGNOSTIC_COLLECTOR.get()
     if buf is not None:
         buf.append(diag)
     else:
-        _ORPHAN_DIAGNOSTICS.append(diag)
+        orphan_identity: EngineIdentity | None
+        try:
+            orphan_identity = active_engine_identity()
+        except RuntimeError:
+            orphan_identity = _PENDING_CONSTRUCTION_ENGINE_IDENTITY.get()
+        if orphan_identity is not None:
+            with _ORPHAN_DIAGNOSTICS_LOCK:
+                _ORPHAN_DIAGNOSTICS.append((orphan_identity, diag))
     if prev_suppress:
         return
     fn = _DIAGNOSTIC_PRINT_LISTENER.get()
@@ -799,13 +1479,374 @@ def notify(
         rec: dict[str, Any] = {
             "kind": "notify",
             "stage": eff_stage,
-            "code": code,
-            "level": level,
+            "code": code_str,
+            "level": DiagnosticSeverity.coerce(diag.level).value,
             "message": message,
         }
         if duration_ms is not None:
             rec["duration_ms"] = duration_ms
         print(json.dumps(rec, ensure_ascii=False), file=sys.stderr, flush=True)
+
+
+def failure_kind_is_permission_denied(error_kind: str | None, error_text: str | None = None) -> bool:
+    """Return True when *error_kind* should terminate as a permission- denied access event."""
+    if error_kind and error_kind in PERMISSION_DENIED_FAILURE_KINDS:
+        return True
+    if not error_kind or error_kind not in PERMISSION_DENIED_CATEGORY_ORACLE_KINDS:
+        return False
+    return bool(error_text) and error_text == REFUSAL_NOT_AVAILABLE_IN_CONTEXT_MESSAGE
+
+
+def refusal_catalogue_entry(code: str) -> RefusalCatalogueEntry | None:
+    """Return the catalogue entry for *code* when present."""
+    raw = REFUSAL_CATALOGUE.get(code)
+    if raw is None:
+        return None
+    return RefusalCatalogueEntry(user_text=raw["user_text"], reformulation_hint=raw["reformulation_hint"])
+
+
+def refusal_user_text_for_code(code: str, **kwargs: str) -> str:
+    """Return catalogue user text for *code*, formatting placeholders from *kwargs*."""
+    entry = REFUSAL_CATALOGUE.get(code)
+    if entry is None:
+        return ""
+    text = entry["user_text"]
+    if kwargs:
+        return text.format(**kwargs)
+    return text
+
+
+def refusal_reformulation_hint_for_code(code: str) -> str:
+    """Return the reformulation hint for a catalogue refusal code."""
+    entry = REFUSAL_CATALOGUE.get(code)
+    if entry is None:
+        return ""
+    return entry["reformulation_hint"]
+
+
+def refusal_diagnostic_code_for_rephrase_hint_key(key: str) -> str | None:
+    """Map a rephrase-hint key to its refusal diagnostic code when catalogued."""
+    return REPHRASE_HINT_REFUSAL_CODES.get(key)
+
+
+def refusal_reformulation_hint_for_rephrase_hint_key(key: str) -> str:
+    """Return the reformulation hint for a rephrase-hint key via the refusal catalogue."""
+    code = refusal_diagnostic_code_for_rephrase_hint_key(key)
+    if code:
+        return refusal_reformulation_hint_for_code(code)
+    return REPHRASE_HINT_MESSAGES.get(key, "")
+
+
+def refusal_diagnostic_code_for_outcome(outcome: str) -> str | None:
+    """Map an interactive terminal outcome to its refusal diagnostic code."""
+    return OUTCOME_REFUSAL_CODES.get(outcome)
+
+
+def refusal_diagnostic_code_for_exception(exc: BaseException) -> str | None:
+    """Map a raised refusal exception to its stable diagnostic code."""
+    if isinstance(exc, NoJoinPathError):
+        return DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_UNAVAILABLE
+    if isinstance(exc, JoinPathTieCapExceededError):
+        return DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_TIE_CAP
+    if isinstance(exc, AggregateJoinFanOutError):
+        return DIAGNOSTIC_CODE_REFUSAL_AGGREGATE_FAN_OUT
+    if isinstance(exc, ComparisonJoinScopeExceededError):
+        return DIAGNOSTIC_CODE_REFUSAL_HOP_CEILING
+    if isinstance(exc, ClauseWidenedRowsetError):
+        return DIAGNOSTIC_CODE_REFUSAL_CLAUSE_WIDENED_ROWSET
+    if isinstance(exc, ProbeCtePlacementError):
+        return DIAGNOSTIC_CODE_REFUSAL_PROBE_CTE_PLACEMENT
+    if isinstance(exc, AccessError):
+        return DIAGNOSTIC_CODE_REFUSAL_PERMISSION_DENIED
+    if isinstance(exc, NullInNegatedListError):
+        return DIAGNOSTIC_CODE_REFUSAL_NULL_IN_NEGATED_LIST
+    if isinstance(exc, SubdayDateWindowOnDateColumnError):
+        return DIAGNOSTIC_CODE_REFUSAL_SUBDAY_DATE_WINDOW_ON_DATE_COLUMN
+    if isinstance(exc, AmbiguousDateLiteralError):
+        return DIAGNOSTIC_CODE_REFUSAL_AMBIGUOUS_DATE_LITERAL
+    return None
+
+
+def refusal_diagnostic_code_for_intent_issue(issue: IntentIssue) -> str | None:
+    """Map a terminal intent issue to its stable refusal diagnostic code."""
+    issue_id = str(issue.issue_id or "")
+    if issue_id in REFUSAL_CTE_CAP_ISSUE_IDS:
+        return DIAGNOSTIC_CODE_REFUSAL_CTE_CAP
+    if issue_id in REFUSAL_NULL_IN_NEGATED_LIST_ISSUE_IDS:
+        return DIAGNOSTIC_CODE_REFUSAL_NULL_IN_NEGATED_LIST
+    if issue_id in REFUSAL_UNSUPPORTED_COLUMN_TYPE_ISSUE_IDS:
+        return DIAGNOSTIC_CODE_REFUSAL_UNSUPPORTED_COLUMN_TYPE
+    if issue_id == "comparison_join_hop_ceiling":
+        return DIAGNOSTIC_CODE_REFUSAL_HOP_CEILING
+    if issue_id.startswith("clause_widened_rowset_"):
+        return DIAGNOSTIC_CODE_REFUSAL_CLAUSE_WIDENED_ROWSET
+    if issue_id.startswith("probe_cte_"):
+        return DIAGNOSTIC_CODE_REFUSAL_PROBE_CTE_PLACEMENT
+    if issue.category in (
+        FailureCategory.DENY_BARE_SELECT,
+        FailureCategory.DENIED_REFERENCE,
+        FailureCategory.SENSITIVE_GROUP_BY,
+    ):
+        return DIAGNOSTIC_CODE_REFUSAL_NOT_AVAILABLE_IN_CONTEXT
+    if issue_id.startswith("sensitive_order_by_") or issue_id.startswith("sensitive_group_by_"):
+        return DIAGNOSTIC_CODE_REFUSAL_NOT_AVAILABLE_IN_CONTEXT
+    if (
+        issue.category.value in PERMISSION_DENIED_CATEGORY_ORACLE_KINDS
+        and (issue.message or "") == REFUSAL_NOT_AVAILABLE_IN_CONTEXT_MESSAGE
+    ):
+        return DIAGNOSTIC_CODE_REFUSAL_NOT_AVAILABLE_IN_CONTEXT
+    return None
+
+
+def refusal_diagnostic_code_for_federation_reason(reason: str | None) -> str | None:
+    """Map a federation ineligible reason to a capability-gap refusal code when applicable."""
+    if not reason:
+        return None
+    lowered = reason.lower()
+    if lowered.startswith("union logical column"):
+        return DIAGNOSTIC_CODE_REFUSAL_UNION_COLUMN_MISSING
+    for prefix in REFUSAL_CAPABILITY_GAP_REASON_PREFIXES:
+        if lowered.startswith(prefix):
+            return DIAGNOSTIC_CODE_REFUSAL_CAPABILITY_GAP
+    if "is not supported by all federation members" in lowered:
+        return DIAGNOSTIC_CODE_REFUSAL_CAPABILITY_GAP
+    for code in REFUSAL_CAPABILITY_GAP_REASON_CODES:
+        if code in lowered:
+            return DIAGNOSTIC_CODE_REFUSAL_CAPABILITY_GAP
+    return None
+
+
+def emit_session_refusal_diagnostic(
+    code: str,
+    message: str,
+    *,
+    stage: str = "validation",
+    source_id: str | None = None,
+    details: tuple[tuple[str, str], ...] = (),
+    subject: str | None = None,
+) -> None:
+    """Emit a structured refusal diagnostic for attachment to the active session step."""
+    if code == DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_UNAVAILABLE:
+        notify(
+            message,
+            code=DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_UNAVAILABLE,
+            stage=stage,
+            level="error",
+            source_id=source_id,
+            details=details,
+            subject=subject,
+        )
+    elif code == DIAGNOSTIC_CODE_REFUSAL_AGGREGATE_FAN_OUT:
+        notify(
+            message,
+            code=DIAGNOSTIC_CODE_REFUSAL_AGGREGATE_FAN_OUT,
+            stage=stage,
+            level="error",
+            source_id=source_id,
+            details=details,
+        )
+    elif code == DIAGNOSTIC_CODE_REFUSAL_HOP_CEILING:
+        notify(
+            message,
+            code=DIAGNOSTIC_CODE_REFUSAL_HOP_CEILING,
+            stage=stage,
+            level="error",
+            source_id=source_id,
+            details=details,
+        )
+    elif code == DIAGNOSTIC_CODE_REFUSAL_CTE_CAP:
+        notify(
+            message,
+            code=DIAGNOSTIC_CODE_REFUSAL_CTE_CAP,
+            stage=stage,
+            level="error",
+            source_id=source_id,
+            details=details,
+        )
+    elif code == DIAGNOSTIC_CODE_REFUSAL_CAPABILITY_GAP:
+        notify(
+            message,
+            code=DIAGNOSTIC_CODE_REFUSAL_CAPABILITY_GAP,
+            stage=stage,
+            level="error",
+            source_id=source_id,
+            details=details,
+        )
+    elif code == DIAGNOSTIC_CODE_REFUSAL_NULL_IN_NEGATED_LIST:
+        notify(
+            message,
+            code=DIAGNOSTIC_CODE_REFUSAL_NULL_IN_NEGATED_LIST,
+            stage=stage,
+            level="error",
+            source_id=source_id,
+            details=details,
+        )
+    elif code == DIAGNOSTIC_CODE_REFUSAL_SUBDAY_DATE_WINDOW_ON_DATE_COLUMN:
+        notify(
+            message,
+            code=DIAGNOSTIC_CODE_REFUSAL_SUBDAY_DATE_WINDOW_ON_DATE_COLUMN,
+            stage=stage,
+            level="error",
+            source_id=source_id,
+            details=details,
+        )
+    elif code == DIAGNOSTIC_CODE_REFUSAL_AMBIGUOUS_DATE_LITERAL:
+        notify(
+            message,
+            code=DIAGNOSTIC_CODE_REFUSAL_AMBIGUOUS_DATE_LITERAL,
+            stage=stage,
+            level="error",
+            source_id=source_id,
+            details=details,
+        )
+    elif code == DIAGNOSTIC_CODE_REFUSAL_UNION_COLUMN_MISSING:
+        notify(
+            message,
+            code=DIAGNOSTIC_CODE_REFUSAL_UNION_COLUMN_MISSING,
+            stage=stage,
+            level="error",
+            source_id=source_id,
+            details=details,
+        )
+    elif code == DIAGNOSTIC_CODE_REFUSAL_UNSUPPORTED_COLUMN_TYPE:
+        notify(
+            message,
+            code=DIAGNOSTIC_CODE_REFUSAL_UNSUPPORTED_COLUMN_TYPE,
+            stage=stage,
+            level="error",
+            source_id=source_id,
+            details=details,
+            subject=subject,
+        )
+    elif code == DIAGNOSTIC_CODE_REFUSAL_NOT_AVAILABLE_IN_CONTEXT:
+        notify(
+            message,
+            code=DIAGNOSTIC_CODE_REFUSAL_NOT_AVAILABLE_IN_CONTEXT,
+            stage=stage,
+            level="error",
+            source_id=source_id,
+            details=details,
+            subject=subject,
+        )
+    elif code == DIAGNOSTIC_CODE_REFUSAL_PERMISSION_DENIED:
+        notify(
+            message,
+            code=DIAGNOSTIC_CODE_REFUSAL_PERMISSION_DENIED,
+            stage=stage,
+            level="error",
+            source_id=source_id,
+            details=details,
+            subject=subject,
+        )
+    elif code == DIAGNOSTIC_CODE_REFUSAL_SCOPE_VIOLATION:
+        notify(
+            message,
+            code=DIAGNOSTIC_CODE_REFUSAL_SCOPE_VIOLATION,
+            stage=stage,
+            level="error",
+            source_id=source_id,
+            details=details,
+            subject=subject,
+        )
+    elif code == DIAGNOSTIC_CODE_REFUSAL_INVALID_QUESTION:
+        notify(
+            message,
+            code=DIAGNOSTIC_CODE_REFUSAL_INVALID_QUESTION,
+            stage=stage,
+            level="error",
+            source_id=source_id,
+            details=details,
+            subject=subject,
+        )
+    elif code == DIAGNOSTIC_CODE_REFUSAL_PARSE_FAILURE:
+        notify(
+            message,
+            code=DIAGNOSTIC_CODE_REFUSAL_PARSE_FAILURE,
+            stage=stage,
+            level="error",
+            source_id=source_id,
+            details=details,
+            subject=subject,
+        )
+    elif code == DIAGNOSTIC_CODE_REFUSAL_DECLINED_SCHEMA:
+        notify(
+            message,
+            code=DIAGNOSTIC_CODE_REFUSAL_DECLINED_SCHEMA,
+            stage=stage,
+            level="error",
+            source_id=source_id,
+            details=details,
+            subject=subject,
+        )
+    elif code == DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_TIE_CAP:
+        notify(
+            message,
+            code=DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_TIE_CAP,
+            stage=stage,
+            level="error",
+            source_id=source_id,
+            details=details,
+            subject=subject,
+        )
+    elif code == DIAGNOSTIC_CODE_REFUSAL_CLAUSE_WIDENED_ROWSET:
+        notify(
+            message,
+            code=DIAGNOSTIC_CODE_REFUSAL_CLAUSE_WIDENED_ROWSET,
+            stage=stage,
+            level="error",
+            source_id=source_id,
+            details=details,
+            subject=subject,
+        )
+    elif code == DIAGNOSTIC_CODE_REFUSAL_PROBE_CTE_PLACEMENT:
+        notify(
+            message,
+            code=DIAGNOSTIC_CODE_REFUSAL_PROBE_CTE_PLACEMENT,
+            stage=stage,
+            level="error",
+            source_id=source_id,
+            details=details,
+            subject=subject,
+        )
+    elif code == DIAGNOSTIC_CODE_REFUSAL_OPAQUE_EXPR:
+        notify(
+            message,
+            code=DIAGNOSTIC_CODE_REFUSAL_OPAQUE_EXPR,
+            stage=stage,
+            level="error",
+            source_id=source_id,
+            details=details,
+            subject=subject,
+        )
+    elif code:
+        notify(
+            message,
+            code=code,
+            stage=stage,
+            level="error",
+            source_id=source_id,
+            details=details,
+            subject=subject,
+        )
+
+
+def refusal_message_for_exception(exc: BaseException) -> str:
+    """Return the user-facing refusal text for *exc* when available."""
+    code = refusal_diagnostic_code_for_exception(exc)
+    if code:
+        user_message = getattr(exc, "user_message", None)
+        if isinstance(user_message, str) and user_message:
+            return user_message
+        catalogue_text = refusal_user_text_for_code(code)
+        if catalogue_text:
+            return catalogue_text
+    user_message = getattr(exc, "user_message", None)
+    if isinstance(user_message, str) and user_message:
+        return user_message
+    caller_message = getattr(exc, "message_for_caller", None)
+    if isinstance(caller_message, str) and caller_message:
+        return caller_message
+    return str(exc)
 
 
 _progress_depth = 0
@@ -862,8 +1903,8 @@ def error(message: str) -> None:
     notify(
         f"{USER_ERROR_PREFIX}{message}",
         stage="user_error",
-        code=DIAGNOSTIC_CODE_ENGINE_INFO,
-        level="_error",
+        code=DiagnosticCode.DIAGNOSTIC_CODE_ENGINE_INFO,
+        level=DiagnosticSeverity.ERROR,
     )
 
 
@@ -888,15 +1929,15 @@ def invalid_input(detail: str | None = None) -> None:
         notify(
             detail.strip(),
             stage="user_invalid_input",
-            code=DIAGNOSTIC_CODE_ENGINE_INFO,
-            level="warn",
+            code=DiagnosticCode.DIAGNOSTIC_CODE_ENGINE_INFO,
+            level=DiagnosticSeverity.WARNING,
         )
     else:
         notify(
             USER_INVALID_INPUT_LINE,
             stage="user_invalid_input",
-            code=DIAGNOSTIC_CODE_ENGINE_INFO,
-            level="warn",
+            code=DiagnosticCode.DIAGNOSTIC_CODE_ENGINE_INFO,
+            level=DiagnosticSeverity.WARNING,
         )
 
 
@@ -905,7 +1946,7 @@ def note_interactive_turn(
     *,
     outcome: str,
     error: str | None = None,
-    sql: str | None = None,
+    sql: str | dict[str, str] | None = None,
     rows: list[tuple[Any, ...]] | None = None,
     columns: tuple[str, ...] | None = None,
     rejection_bucket: str | None = None,
@@ -923,6 +1964,17 @@ def note_interactive_turn(
     refusal_diagnostic_code: str | None = None,
 ) -> None:
     """Record turn outcome on *choice_port* when it implements ``note_turn_outcome``."""
+    if outcome == "parse_failed":
+        generic_errors = {
+            "Intent parse failed.",
+            REPHRASE_HINT_MESSAGES["intent_parse_failed"],
+            refusal_user_text_for_code(DIAGNOSTIC_CODE_REFUSAL_PARSE_FAILURE),
+        }
+        if error is None or error in generic_errors:
+            pending = take_intent_parse_refusal()
+            if pending:
+                refusal_diagnostic_code = pending[0]
+                error = pending[1]
     fn = getattr(choice_port, "note_turn_outcome", None)
     if callable(fn):
         fn(
@@ -997,7 +2049,7 @@ def _format_pipeline_trace_block(heading: str, body: str) -> str:
 
 
 def pipeline_trace(heading: str, body: str | Callable[[], str]) -> None:
-    """Emit a ``[PIPELINE_TRACE]`` block when ``PolicyConfig.DEBUG`` or diagnostic capture is active."""
+    """Emit a ``[PIPELINE_TRACE]`` block when debug or diagnostic capture is active. *heading* is a dotted trace vocabulary label for the pipeline stage being traced; it is **not** a diagnostic code and is excluded from the diagnostic catalogue."""
     sink_on = prev_sink is not None
     console_on = not prev_suppress and diagnostic_debug_enabled()
     if not sink_on and not console_on:
@@ -1016,6 +2068,14 @@ def pipeline_trace(heading: str, body: str | Callable[[], str]) -> None:
 def sha256(s: str) -> str:
     """SHA-256 hex digest of UTF-8 *s*."""
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def stable_bucket(key: str, n: int) -> int:
+    """Return a deterministic bucket index in ``[0, n)`` for *key*."""
+    if n <= 0:
+        raise ValueError("stable_bucket requires a positive bucket count")
+    digest = hashlib.sha256(key.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") % n
 
 
 def _strip_fences(s: str) -> str:
@@ -1100,56 +2160,23 @@ _ACTIVE_BUSINESS_KNOWLEDGE_DIGEST: ContextVar[str | None] = ContextVar(
 )
 
 
-@dataclass
-class BusinessKnowledgeState:
-    version: int = 0
-    entries: tuple[BusinessKnowledgeEntry, ...] = ()
-    digest: str = ""
-
-
 def empty_business_knowledge_digest() -> str:
     """Return the digest for an empty knowledge set."""
-    return business_knowledge_digest(())
+    return BusinessKnowledgeState.empty_digest()
 
 
 def business_knowledge_digest(entries: Sequence[BusinessKnowledgeEntry]) -> str:
     """Stable SHA-256 digest over normalized business knowledge entries."""
-    payload = [{"key": entry.key, "kind": entry.kind, "text": entry.text} for entry in entries]
-    return sha256(stable_json(payload))
+    return BusinessKnowledgeState.digest_for(entries)
 
 
 def _normalize_business_knowledge_entry(entry: BusinessKnowledgeEntry) -> BusinessKnowledgeEntry:
-    key = str(entry.key).strip()
-    text = str(entry.text).strip()
-    kind = str(entry.kind or BUSINESS_KNOWLEDGE_DEFAULT_KIND).strip() or BUSINESS_KNOWLEDGE_DEFAULT_KIND
-    if not key:
-        raise ConfigError("business knowledge entry key must be non-empty")
-    if not text:
-        raise ConfigError(f"business knowledge entry {key!r} must have non-empty text")
-    if kind != entry.kind or key != entry.key or text != entry.text:
-        return BusinessKnowledgeEntry(key=key, text=text, kind=kind)
-    return entry
+    return BusinessKnowledgeEntry.normalize(entry)
 
 
 def hidden_column_references_in_text(text: str, schema_graph: SchemaGraph) -> list[str]:
     """Return qualified hidden column names referenced in *text*."""
-    found: list[str] = []
-    seen: set[str] = set()
-    for match in BUSINESS_KNOWLEDGE_COLUMN_REF_RE.finditer(text):
-        table_name, column_name = match.group(1), match.group(2)
-        qualified = f"{table_name}.{column_name}"
-        if qualified in seen:
-            continue
-        seen.add(qualified)
-        table = schema_graph.tables.get(table_name)
-        if table is None:
-            continue
-        column = table.columns.get(column_name)
-        if column is None:
-            continue
-        if column.sensitivity == SensitivityClassification.HIDDEN:
-            found.append(qualified)
-    return found
+    return BusinessKnowledgeEntry.hidden_column_references(text, schema_graph)
 
 
 def validate_business_knowledge_entries(
@@ -1157,28 +2184,16 @@ def validate_business_knowledge_entries(
     schema_graph: SchemaGraph,
 ) -> tuple[BusinessKnowledgeEntry, ...]:
     """Normalize entries and refuse hidden-column references."""
-    normalized: list[BusinessKnowledgeEntry] = []
-    seen_keys: set[str] = set()
-    for raw in entries:
-        if not isinstance(raw, BusinessKnowledgeEntry):
-            raise TypeError("business knowledge entries must be BusinessKnowledgeEntry instances")
-        entry = _normalize_business_knowledge_entry(raw)
-        if entry.key in seen_keys:
-            raise ConfigError(f"duplicate business knowledge key: {entry.key!r}")
-        seen_keys.add(entry.key)
-        hidden_refs = hidden_column_references_in_text(entry.text, schema_graph)
-        if hidden_refs:
-            joined = ", ".join(sorted(hidden_refs))
-            raise ConfigError(f"business knowledge entry {entry.key!r} references hidden column(s): {joined}")
-        normalized.append(entry)
-    return tuple(normalized)
+    return BusinessKnowledgeState.validate_entries(entries, schema_graph)
 
 
 def business_context_payload(entries: Sequence[BusinessKnowledgeEntry]) -> list[dict[str, str]] | None:
     """Serialize active business knowledge for intent prompt injection."""
     if not entries:
         return None
-    return [{"key": entry.key, "kind": entry.kind, "text": entry.text} for entry in entries]
+    return [
+        {"key": entry.key, "kind": entry.kind, "text": scrub_schema_prose_for_prompt(entry.text)} for entry in entries
+    ]
 
 
 def active_business_knowledge() -> tuple[BusinessKnowledgeEntry, ...]:
@@ -1209,36 +2224,6 @@ def business_knowledge_scope(
     finally:
         _ACTIVE_BUSINESS_KNOWLEDGE.reset(tok_entries)
         _ACTIVE_BUSINESS_KNOWLEDGE_DIGEST.reset(tok_digest)
-
-
-class BusinessKnowledgeHolder:
-    """Mutable versioned store for engine- or federation-level business knowledge."""
-
-    def __init__(self) -> None:
-        self._state = BusinessKnowledgeState(digest=empty_business_knowledge_digest())
-
-    def set(self, entries: Sequence[BusinessKnowledgeEntry], schema_graph: SchemaGraph) -> int:
-        normalized = validate_business_knowledge_entries(entries, schema_graph)
-        digest = business_knowledge_digest(normalized)
-        self._state = BusinessKnowledgeState(
-            version=self._state.version + 1,
-            entries=normalized,
-            digest=digest,
-        )
-        return self._state.version
-
-    def entries(self) -> tuple[BusinessKnowledgeEntry, ...]:
-        return self._state.entries
-
-    def digest(self) -> str:
-        return self._state.digest
-
-    def version(self) -> int:
-        return self._state.version
-
-    def scope_kwargs(self) -> dict[str, Any]:
-        """Keyword args for :func:`business_knowledge_scope`."""
-        return {"entries": self._state.entries, "digest": self._state.digest}
 
 
 def _tables_descriptions_payload_for_cache(tables: Any) -> dict[str, Any]:
@@ -1285,6 +2270,23 @@ def schema_prompt_cache_id(schema_graph: Any) -> str | None:
         if meta_hash:
             segments.append(meta_hash[:16])
     return ":".join(segments) if graph_id else None
+
+
+def build_case_folded_index(names: Iterable[str], *, kind: str) -> dict[str, str]:
+    """Map case-folded identifiers to canonical spellings, refusing case-only duplicates."""
+    groups: dict[str, list[str]] = {}
+    for name in names:
+        folded = name.lower()
+        groups.setdefault(folded, []).append(name)
+    index: dict[str, str] = {}
+    for folded, members in groups.items():
+        distinct = sorted({member for member in members}, key=lambda value: (value.lower(), value))
+        if len(distinct) > 1:
+            raise SchemaInvariantError(
+                f"case-only {kind} collision: {distinct[0]!r} and {distinct[1]!r} cannot be distinguished by the engine"
+            )
+        index[folded] = distinct[0]
+    return index
 
 
 def colmap_signature(column_map: dict[str, str]) -> str:
@@ -1353,11 +2355,32 @@ def _schema_scope_file_content_sha256(path: str | None) -> str:
         return sha256(fh.read())
 
 
+def notes_content_from_context(schema_context: EngineContext | FederationContext | Any) -> str | None:
+    """Return notes text from inline ``notes`` or ``notes_file`` contents; ``None`` when neither yields text."""
+    notes_inline = getattr(schema_context, "notes", None)
+    if notes_inline is not None and str(notes_inline).strip():
+        return str(notes_inline)
+    notes_path = getattr(schema_context, "notes_file", None)
+    if notes_path is None or not str(notes_path).strip():
+        return None
+    expanded = os.path.expanduser(str(notes_path).strip())
+    if not os.path.isfile(expanded):
+        return None
+    with open(expanded, encoding="utf-8") as fh:
+        text = fh.read()
+    return text if text.strip() else None
+
+
 def scope_hash_fp(schema_context: EngineContext | FederationContext) -> str:
     """Fingerprint scope inputs: include mode, allow list, deny lists, and inlined DDL or notes file contents. ``FederationContext`` has no ``sql_file`` slot, so that field reads as an empty string for federation scopes while the payload key stays present, leaving existing ``EngineContext`` hashes unchanged."""
     deny_cols = sorted(schema_context.deny_columns)
     allow_cols = sorted(schema_context.allow_columns)
     sql_file = getattr(schema_context, "sql_file", "")
+    notes_inline = getattr(schema_context, "notes", None)
+    if notes_inline is not None and str(notes_inline).strip():
+        notes_digest = sha256(str(notes_inline))
+    else:
+        notes_digest = _schema_scope_file_content_sha256(schema_context.notes_file)
     payload = {
         "allow_objects": sorted(schema_context.allow_objects),
         "deny_objects": sorted(schema_context.deny_objects),
@@ -1365,7 +2388,7 @@ def scope_hash_fp(schema_context: EngineContext | FederationContext) -> str:
         "allow_columns": allow_cols,
         "include": schema_context.include,
         "sql_file_content_sha256": _schema_scope_file_content_sha256(sql_file),
-        "notes_file_content_sha256": _schema_scope_file_content_sha256(schema_context.notes_file),
+        "notes_file_content_sha256": notes_digest,
     }
     return sha256(stable_json(payload))
 
@@ -1380,9 +2403,24 @@ def schema_hash_fp(tables_dict: dict[str, Any]) -> str:
     return sha256(stable_json({"tables": tables_dict}))
 
 
+def _question_normalization_keep_char(ch: str) -> str:
+    """Return *ch* when allowed in normalised questions, otherwise a space."""
+    if ch.isalnum():
+        return ch
+    if ch.isspace() or ch in "_:/-.,?":
+        return ch
+    return " "
+
+
+def normalize_text_value(value: str) -> str:
+    """Return NFKC-normalised *value* for library-side text comparison only."""
+    return unicodedata.normalize("NFKC", value)
+
+
 def normalize_question(q: str) -> str:
-    """Lowercase and clean *q*; restore single-quoted spans to original. case."""
+    """Lowercase and clean *q*; restore single-quoted spans to original case."""
     q = q.strip()
+    q = unicodedata.normalize("NFKC", q)
     q = re.sub(r"[\u2018\u2019\u201c\u201d]", "'", q)
 
     quoted_values = []
@@ -1394,7 +2432,7 @@ def normalize_question(q: str) -> str:
     q = re.sub(r"'([^']*)'", preserve_quoted, q)
 
     q = q.lower()
-    q = re.sub(r"[^a-z0-9\s_:/\-\.,\?]", " ", q)
+    q = "".join(_question_normalization_keep_char(c) for c in q)
     q = re.sub(r"\s+", " ", q).strip()
 
     for i, val in enumerate(quoted_values):
@@ -1425,7 +2463,7 @@ def safe_json_loads(s: str) -> Any | None:
     s = s.strip()
     try:
         return json.loads(s)
-    except Exception:
+    except (json.JSONDecodeError, TypeError, ValueError):
         pass
     frag = _extract_first_json_object(s)
     if frag:
@@ -1447,42 +2485,49 @@ def _reconfigure_console_streams_to_utf8() -> None:
         if callable(reconfigure):
             try:
                 reconfigure(encoding="utf-8", errors="replace")
-            except Exception:
+            except (OSError, AttributeError, TypeError):
                 pass
 
 
-_reconfigure_console_streams_to_utf8()
+def paths_equal(a: Path | str, b: Path | str) -> bool:
+    return os.path.normcase(os.path.abspath(os.fspath(a))) == os.path.normcase(os.path.abspath(os.fspath(b)))
+
+
+def classify_database_error(exc: BaseException) -> str:
+    """Return ``transient``, ``permanent``, or ``unknown`` for a driver failure."""
+    exc_name = type(exc).__name__
+    by_name = DATABASE_ERROR_CLASSIFICATION_BY_EXCEPTION_NAME.get(exc_name)
+    if by_name is not None:
+        return by_name
+    msg = str(exc).lower()
+    for pattern, classification in DATABASE_ERROR_CLASSIFICATION_BY_MESSAGE_PATTERN:
+        if pattern in msg:
+            return classification
+    if isinstance(exc, OSError):
+        errn = getattr(exc, "errno", None)
+        if errn in DATABASE_ERROR_CLASSIFICATION_TRANSIENT_ERRNOS:
+            return DATABASE_ERROR_CLASSIFICATION_TRANSIENT
+    return DATABASE_ERROR_CLASSIFICATION_UNKNOWN
+
+
+def wrap_database_execution_error(exc: BaseException) -> DatabaseExecutionError:
+    """Wrap a driver exception in :class:`DatabaseExecutionError` with classification metadata."""
+    classification = classify_database_error(exc)
+    retryable = classification == DATABASE_ERROR_CLASSIFICATION_TRANSIENT
+    driver_class = f"{type(exc).__module__}.{type(exc).__qualname__}"
+    driver_detail = {"exception_type": type(exc).__name__, "message": str(exc)}
+    cls = RetryableDatabaseExecutionError if retryable else DatabaseExecutionError
+    return cls(
+        "Database execution failed.",
+        driver_class=driver_class,
+        classification=DatabaseErrorClassification(classification),
+        driver_detail=driver_detail,
+    )
 
 
 def engine_connect_likely_transient(exc: BaseException) -> bool:
     """Heuristic for cold-start or transport failures suitable for :class:`DatabasePingFailed`."""
-    s = str(exc).lower()
-    needles = (
-        "timeout",
-        "timed out",
-        "temporarily unavailable",
-        "503",
-        "502",
-        "429",
-        "connection refused",
-        "connection reset",
-        "eof",
-        "broken pipe",
-        "network",
-        "unreachable",
-        "name or service not known",
-        "could not translate host name",
-        "warehouse",
-        "cold-start",
-        "cold start",
-    )
-    if any(n in s for n in needles):
-        return True
-    if isinstance(exc, OSError):
-        errn = getattr(exc, "errno", None)
-        if errn in {10060, 10061, 11001, 11002, 111, 113, 115, 116}:
-            return True
-    return False
+    return classify_database_error(exc) == DATABASE_ERROR_CLASSIFICATION_TRANSIENT
 
 
 def _normalize_sql_operator_spaces(sql: str) -> str:
@@ -1532,6 +2577,29 @@ def normalize_sql(sql: str) -> str:
     return s
 
 
+def parse_iso_date_literal(text: str) -> date | datetime:
+    """Parse an ISO 8601 calendar date or date-time literal."""
+    raw = str(text or "").strip()
+    if not raw:
+        raise ValueError("empty date literal")
+    if ISO_DATE_ONLY_RE.match(raw):
+        return date.fromisoformat(raw)
+    if ISO_DATETIME_RE.match(raw):
+        normalized = raw.replace(" ", "T", 1)
+        if normalized.endswith("Z"):
+            normalized = normalized[:-1] + "+00:00"
+        return datetime.fromisoformat(normalized)
+    raise ValueError(f"ambiguous date literal: {raw!r}")
+
+
+def escape_like_wildcards(value: str, escape_char: str = "\\") -> str:
+    """Escape ``%``, ``_``, and the escape character for SQL LIKE/ILIKE literals."""
+    if not value:
+        return value
+    escaped_escape = escape_char + escape_char
+    return value.replace(escape_char, escaped_escape).replace("%", escape_char + "%").replace("_", escape_char + "_")
+
+
 def normalize_array_contains_param_value(value: Any) -> Any:
     """Strip whitespace and redundant surrounding quotes from array. ``contains`` operands. Keeps bind values free of decorative quotes; SQL generation also normalizes stored array elements per dialect so membership stays stable across data encodings."""
     if not isinstance(value, str):
@@ -1543,9 +2611,24 @@ def normalize_array_contains_param_value(value: Any) -> Any:
     return s
 
 
+def refuse_unsafe_sql_string_literal_content(value: str) -> None:
+    """Raise ``ValueError(UNSAFE_PARAM_LITERAL)`` when *value* cannot be inlined safely."""
+    if SQL_STRING_LITERAL_STATEMENT_TERMINATOR in value:
+        raise ValueError(UNSAFE_PARAM_LITERAL)
+    for marker in SQL_STRING_LITERAL_COMMENT_MARKERS:
+        if marker in value:
+            raise ValueError(UNSAFE_PARAM_LITERAL)
+
+
+def escape_sql_string_literal_body_base(value: str) -> str:
+    """Escape a UTF-8 string body for safe use inside single-quoted SQL literals."""
+    refuse_unsafe_sql_string_literal_content(value)
+    return value.replace("'", "''")
+
+
 def _escape_sql_single_quoted_literal(value: str) -> str:
     """Escape a UTF-8 string for safe use inside single-quoted SQL literals."""
-    return value.replace("'", "''")
+    return escape_sql_string_literal_body_base(value)
 
 
 def _resolve_string_literal_formatter(
@@ -1557,7 +2640,7 @@ def _resolve_string_literal_formatter(
     if dialect is not None:
         quote = getattr(dialect, "quote_string_literal", None)
         if callable(quote):
-            return quote
+            return cast(Callable[[str], str] | None, quote)
     return None
 
 
@@ -1641,12 +2724,13 @@ def substitute_params(
         elif isinstance(val, str):
             if not val.strip():
                 raise ValueError("unbound_placeholder")
-            formatted = inline_allowlisted_param_value(val)
-            if formatted is None:
-                if format_literal is not None:
-                    formatted = format_literal(val)
-                else:
-                    formatted = f"'{_escape_sql_single_quoted_literal(val)}'"
+            allowlisted = inline_allowlisted_param_value(val)
+            if allowlisted is not None:
+                formatted = allowlisted
+            elif format_literal is not None:
+                formatted = format_literal(val)
+            else:
+                formatted = f"'{_escape_sql_single_quoted_literal(val)}'"
         else:
             formatted = str(val)
         for prefix in (":", "$", "@"):
@@ -1864,7 +2948,7 @@ def print_rephrase_hint(
         )
         return
     notify(
-        f"\n{REPHRASE_HINT_MESSAGES[reason.value]}",
+        f"\n{refusal_reformulation_hint_for_rephrase_hint_key(reason.value)}",
         stage="rephrase_hint",
         code=DIAGNOSTIC_CODE_ENGINE_INFO,
         level="info",
@@ -1913,6 +2997,13 @@ def read_gzip_json(path: str) -> Any:
         return json.loads(fh.read().decode("utf-8"))
 
 
+def _chmod_artifact_file(path: str | os.PathLike[str]) -> None:
+    try:
+        os.chmod(path, ARTIFACT_FILE_MODE)
+    except OSError:
+        pass
+
+
 def write_gzip_json_atomic(path: str, obj: Any, *, sort_keys: bool) -> None:
     """Serialize ``obj`` to compact UTF-8 JSON, gzip it, and replace. ``path`` atomically."""
     raw = json.dumps(obj, ensure_ascii=False, separators=JSON_COMPACT_SEPARATORS, sort_keys=sort_keys).encode("utf-8")
@@ -1928,6 +3019,7 @@ def write_gzip_json_atomic(path: str, obj: Any, *, sort_keys: bool) -> None:
             for attempt in range(5):
                 try:
                     os.replace(tmp_path, abs_path)
+                    _chmod_artifact_file(abs_path)
                     break
                 except PermissionError:
                     if attempt == 4:
@@ -1941,7 +3033,387 @@ def write_gzip_json_atomic(path: str, obj: Any, *, sort_keys: bool) -> None:
             raise
 
 
+def write_text_atomic(path: str | os.PathLike[str], text: str, *, suffix: str = ".json.tmp") -> None:
+    """Replace *path* with *text* atomically via a temporary file in the same directory."""
+    abs_path = os.path.abspath(path)
+    directory = os.path.dirname(abs_path) or "."
+    os.makedirs(directory, mode=ARTIFACT_DIR_MODE, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", suffix=suffix, dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+            tmp.write(text)
+        for attempt in range(5):
+            try:
+                os.replace(tmp_path, abs_path)
+                _chmod_artifact_file(abs_path)
+                return
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+    finally:
+        if os.path.isfile(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def write_json_atomic(
+    path: str | os.PathLike[str],
+    obj: Any,
+    *,
+    sort_keys: bool = True,
+    indent: int | None = None,
+) -> None:
+    """Serialize ``obj`` to UTF-8 JSON and replace ``path`` atomically."""
+    if indent is not None:
+        text = json.dumps(obj, ensure_ascii=False, indent=indent, sort_keys=sort_keys)
+    else:
+        text = json.dumps(obj, ensure_ascii=False, separators=JSON_COMPACT_SEPARATORS, sort_keys=sort_keys)
+    write_text_atomic(path, text)
+
+
+_RESOURCE_REGISTRY_LOCK = threading.Lock()
+_OPEN_ARTIFACT_LOCKS: set[str] = set()
+_OWNED_TEMP_DIRECTORIES: set[str] = set()
+_LIVE_CONNECTIONS: set[int] = set()
+_OWNER_CLOSE_RESOURCES: dict[int, Any] = {}
+
+
+def _new_owner_close_resources() -> Any:
+    class _OwnerCloseResources:
+        __slots__ = ("temp_directories", "bundle_archives", "write_queue_handles", "live_connections")
+
+        def __init__(self) -> None:
+            self.temp_directories: list[str] = []
+            self.bundle_archives: list[Any] = []
+            self.write_queue_handles: list[Any] = []
+            self.live_connections: list[Any] = []
+
+    return _OwnerCloseResources()
+
+
+def _owner_resource_bundle_locked(owner: Any) -> Any:
+    bundle = _OWNER_CLOSE_RESOURCES.get(id(owner))
+    if bundle is None:
+        bundle = _new_owner_close_resources()
+        _OWNER_CLOSE_RESOURCES[id(owner)] = bundle
+    return bundle
+
+
+def _owner_resource_bundle(owner: Any) -> Any:
+    with _RESOURCE_REGISTRY_LOCK:
+        return _owner_resource_bundle_locked(owner)
+
+
+def open_resource_inventory() -> OpenResourceInventory:
+    """Return counts of open locks, temp directories, and live connections owned by the library."""
+    with _RESOURCE_REGISTRY_LOCK:
+        return OpenResourceInventory(
+            locks=len(_OPEN_ARTIFACT_LOCKS),
+            temp_directories=len(_OWNED_TEMP_DIRECTORIES),
+            live_connections=len(_LIVE_CONNECTIONS),
+        )
+
+
+def track_close_temp_directory(owner: Any, path: str) -> None:
+    """Record a library-owned temporary directory to remove during :meth:`release_close_resources`."""
+    abs_path = os.path.abspath(path)
+    with _RESOURCE_REGISTRY_LOCK:
+        bundle = _owner_resource_bundle_locked(owner)
+        if abs_path not in bundle.temp_directories:
+            bundle.temp_directories.append(abs_path)
+        _OWNED_TEMP_DIRECTORIES.add(abs_path)
+
+
+def register_live_connection(connection: Any, *, owner: Any | None = None) -> None:
+    """Record a live database handle attributable to the library."""
+    with _RESOURCE_REGISTRY_LOCK:
+        _LIVE_CONNECTIONS.add(id(connection))
+        if owner is not None:
+            bundle = _owner_resource_bundle_locked(owner)
+            if connection not in bundle.live_connections:
+                bundle.live_connections.append(connection)
+
+
+def unregister_live_connection(connection: Any) -> None:
+    """Drop a live database handle from the library inventory."""
+    with _RESOURCE_REGISTRY_LOCK:
+        _LIVE_CONNECTIONS.discard(id(connection))
+
+
+def track_close_bundle_archive(owner: Any, archive: Any) -> None:
+    """Record an open bundle archive to close during :meth:`release_close_resources`."""
+    with _RESOURCE_REGISTRY_LOCK:
+        bundle = _owner_resource_bundle_locked(owner)
+        if archive not in bundle.bundle_archives:
+            bundle.bundle_archives.append(archive)
+
+
+def track_close_write_queue_handle(owner: Any, handle: Any) -> None:
+    """Record an open write-queue file handle to close during :meth:`release_close_resources`."""
+    with _RESOURCE_REGISTRY_LOCK:
+        bundle = _owner_resource_bundle_locked(owner)
+        if handle not in bundle.write_queue_handles:
+            bundle.write_queue_handles.append(handle)
+
+
+def register_dialect_live_handles(dialect: Any, *, owner: Any | None = None) -> None:
+    """Register dialect connection handles for inventory and close release."""
+    with _RESOURCE_REGISTRY_LOCK:
+        _REGISTERED_DIALECT_IDS.add(id(dialect))
+    for attr in ("connection", "engine", "_native_connection", "_snowflake_connection"):
+        if not hasattr(dialect, attr):
+            continue
+        handle = getattr(dialect, attr, None)
+        if handle is None or isinstance(handle, MagicMock):
+            continue
+        register_live_connection(handle, owner=owner)
+
+
+def unregister_dialect_live_handles(
+    dialect: Any,
+    *,
+    borrowed_execution_engine: Any | None = None,
+    borrowed_native_connection: Any | None = None,
+) -> None:
+    """Drop dialect connection handles from the library inventory before disposal."""
+    with _RESOURCE_REGISTRY_LOCK:
+        _REGISTERED_DIALECT_IDS.discard(id(dialect))
+    for attr in ("connection", "engine", "_native_connection", "_snowflake_connection"):
+        handle = getattr(dialect, attr, None)
+        if handle is None:
+            continue
+        if attr == "engine" and handle is borrowed_execution_engine:
+            continue
+        if (
+            attr in ("connection", "_native_connection", "_snowflake_connection")
+            and handle is borrowed_native_connection
+        ):
+            continue
+        unregister_live_connection(handle)
+
+
+def _remove_owned_temp_directory(path: str) -> None:
+    abs_path = os.path.abspath(path)
+    with _RESOURCE_REGISTRY_LOCK:
+        _OWNED_TEMP_DIRECTORIES.discard(abs_path)
+    if os.path.isdir(abs_path):
+        shutil.rmtree(abs_path, ignore_errors=True)
+
+
+def _close_tracked_handle(handle: Any) -> None:
+    close = getattr(handle, "close", None)
+    if callable(close):
+        try:
+            close()
+        except (OSError, AttributeError, TypeError):
+            pass
+
+
 _LOCK_REENTRY = threading.local()
+_ARTIFACT_LOCK_TIMEOUT_DEFAULT = object()
+
+
+def _process_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        import ctypes
+
+        process_query_limited = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(process_query_limited, False, pid)
+        if handle:
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        return False
+    else:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        else:
+            return True
+
+
+def _lock_metadata_path(lock_path: str) -> str:
+    return f"{lock_path}.holder"
+
+
+def _parse_lock_metadata_bytes(raw: bytes) -> tuple[int | None, float | None]:
+    if not raw:
+        return None, None
+    if sys.platform == "win32" and len(raw) > 1:
+        payload_raw = raw[1:]
+        try:
+            payload = json.loads(payload_raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            payload = None
+        if isinstance(payload, dict):
+            raw = payload_raw
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, None
+    if not isinstance(payload, dict):
+        return None, None
+    pid_raw = payload.get("pid")
+    mono_raw = payload.get("monotonic")
+    pid = int(pid_raw) if isinstance(pid_raw, int) or (isinstance(pid_raw, str) and pid_raw.isdigit()) else None
+    mono: float | None
+    try:
+        mono = float(mono_raw) if mono_raw is not None else None
+    except (TypeError, ValueError):
+        mono = None
+    return pid, mono
+
+
+def _read_lock_metadata(lock_path: str) -> tuple[int | None, float | None]:
+    sidecar = _lock_metadata_path(lock_path)
+    try:
+        with open(sidecar, "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        raw = b""
+    if raw:
+        pid, mono = _parse_lock_metadata_bytes(raw)
+        if pid is not None:
+            return pid, mono
+    try:
+        with open(lock_path, "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return None, None
+    return _parse_lock_metadata_bytes(raw)
+
+
+def _remove_lock_metadata(lock_path: str) -> None:
+    try:
+        os.unlink(_lock_metadata_path(lock_path))
+    except OSError:
+        pass
+
+
+def _release_artifact_lock_files(artifacts_dir: str) -> None:
+    root = os.path.abspath(artifacts_dir)
+    lock_path = os.path.join(root, ARTIFACT_LOCK_FILENAME)
+    try:
+        os.unlink(lock_path)
+    except OSError:
+        pass
+    _remove_lock_metadata(lock_path)
+    with _RESOURCE_REGISTRY_LOCK:
+        _OPEN_ARTIFACT_LOCKS.discard(os.path.normcase(lock_path))
+
+
+def release_close_resources(owner: Any) -> None:
+    """Release locks, temp dirs, bundle archives, and write-queue handles owned by *owner*."""
+    owner_id = id(owner)
+    with _RESOURCE_REGISTRY_LOCK:
+        bundle = _OWNER_CLOSE_RESOURCES.pop(owner_id, None)
+    if bundle is None:
+        bundle = _new_owner_close_resources()
+
+    write_queue_handle = getattr(owner, "_write_queue_handle", None)
+    if write_queue_handle is not None:
+        bundle.write_queue_handles.append(write_queue_handle)
+    bundle_archive = getattr(owner, "_bundle_archive", None)
+    if bundle_archive is not None:
+        bundle.bundle_archives.append(bundle_archive)
+    for handle in list(bundle.write_queue_handles):
+        _close_tracked_handle(handle)
+
+    for archive in list(bundle.bundle_archives):
+        _close_tracked_handle(archive)
+
+    temp_dirs = list(bundle.temp_directories)
+    for path in list(getattr(owner, "_owned_temp_dirs", ()) or ()):
+        if path not in temp_dirs:
+            temp_dirs.append(str(path))
+    for path in temp_dirs:
+        _remove_owned_temp_directory(path)
+
+    artifacts_dir = getattr(owner, "_artifacts_dir", None)
+    if artifacts_dir is not None:
+        _release_artifact_lock_files(str(artifacts_dir))
+    federation_storage_dir = getattr(owner, "_federation_storage_dir", None)
+    if federation_storage_dir is not None:
+        _release_artifact_lock_files(str(federation_storage_dir))
+
+    for connection in list(bundle.live_connections):
+        unregister_live_connection(connection)
+
+
+def _write_lock_metadata(lock_path: str, fh: Any) -> None:
+    payload = json.dumps(
+        {"pid": os.getpid(), "monotonic": time.monotonic()}, separators=JSON_COMPACT_SEPARATORS
+    ).encode(
+        "utf-8",
+    )
+    sidecar = _lock_metadata_path(lock_path)
+    directory = os.path.dirname(os.path.abspath(sidecar)) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=".holder_", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as tmp:
+            tmp.write(payload)
+        os.replace(tmp_path, sidecar)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    if sys.platform == "win32":
+        return
+    else:
+        fh.seek(0)
+        fh.truncate(0)
+        fh.write(payload)
+        try:
+            fh.flush()
+        except OSError:
+            pass
+
+
+def _artifact_lock_timeout_seconds(explicit: float | object) -> float:
+    if explicit is not _ARTIFACT_LOCK_TIMEOUT_DEFAULT:
+        return float(cast(float, explicit))
+    limits = _ACTIVE_ENGINE_LIMITS.get()
+    if limits is not None:
+        return float(limits.artifact_lock_timeout_seconds)
+    return ARTIFACT_LOCK_TIMEOUT_SECONDS
+
+
+def _artifacts_dir_is_local_filesystem(path: str) -> bool:
+    """Return True when *path* resides on a local filesystem mount."""
+    abs_path = os.path.abspath(path)
+    if sys.platform == "win32":
+        if abs_path.startswith("\\\\"):
+            return False
+        drive, _ = os.path.splitdrive(abs_path)
+        if not drive:
+            return True
+        import ctypes
+
+        remote = 4
+        return cast(bool, ctypes.windll.kernel32.GetDriveTypeW(f"{drive}\\") != remote)
+    else:
+        return True
+
+
+def warn_if_artifacts_dir_not_local(artifacts_dir: str) -> None:
+    """Emit ``ARTIFACTS_DIR_NOT_LOCAL`` when *artifacts_dir* is not on a local filesystem."""
+    if _artifacts_dir_is_local_filesystem(artifacts_dir):
+        return
+    notify(
+        f"artifacts directory {artifacts_dir!r} is not on a local filesystem; advisory artifact locks may be unreliable",
+        stage="init",
+        code=DIAGNOSTIC_CODE_ARTIFACTS_DIR_NOT_LOCAL,
+        level="warning",
+    )
 
 
 def _get_reentry_map() -> dict[str, int]:
@@ -1953,62 +3425,105 @@ def _get_reentry_map() -> dict[str, int]:
 
 
 @contextmanager
-def _file_lock(lock_path: str, *, timeout: float) -> Iterator[None]:
-    """Acquire an exclusive OS-level lock on ``lock_path`` for the duration of the context. Blocks up to ``timeout`` seconds, raising ``TimeoutError`` if the lock cannot be acquired. Works on both POSIX (``fcntl.flock``) and Windows (``msvcrt.locking``) without external dependencies."""
-    os.makedirs(os.path.dirname(os.path.abspath(lock_path)) or ".", exist_ok=True)
-    fh = open(lock_path, "a+b")
+def _file_lock(lock_path: str, *, timeout: float, artifacts_dir: str | None = None) -> Iterator[None]:
+    """Acquire an exclusive OS-level lock on ``lock_path`` for the duration of the context."""
+    abs_lock_path = os.path.abspath(lock_path)
+    lock_directory = artifacts_dir or os.path.dirname(abs_lock_path) or "."
+    os.makedirs(os.path.dirname(abs_lock_path) or ".", mode=ARTIFACT_DIR_MODE, exist_ok=True)
+    deadline = time.monotonic() + max(timeout, 0.0)
+    stale_retried = False
+    fh: Any = None
+    acquired = False
     try:
-        deadline = time.monotonic() + max(timeout, 0.0)
-        if sys.platform == "win32":
+        while not acquired:
+            if fh is not None:
+                fh.close()
+                fh = None
+            fh = open(abs_lock_path, "a+b")
             while True:
-                try:
-                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                if sys.platform == "win32":
+                    fh.seek(0)
+                    try:
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                    except OSError:
+                        locked = False
+                    else:
+                        locked = True
+                else:
+                    try:
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        locked = False
+                    else:
+                        locked = True
+                if locked:
+                    acquired = True
+                    _write_lock_metadata(abs_lock_path, fh)
+                    with _RESOURCE_REGISTRY_LOCK:
+                        _OPEN_ARTIFACT_LOCKS.add(os.path.normcase(abs_lock_path))
                     break
-                except OSError:
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError(
-                            f"Could not acquire artifact lock {lock_path!r} within {timeout:.1f}s",
-                        ) from None
-                    time.sleep(ARTIFACT_LOCK_POLL_INTERVAL_SECONDS)
-            try:
-                yield
-            finally:
+                if time.monotonic() >= deadline:
+                    holder_pid, _ = _read_lock_metadata(abs_lock_path)
+                    raise ArtifactLockTimeoutError(
+                        lock_directory,
+                        holder_pid,
+                        timeout=timeout,
+                        lock_path=abs_lock_path,
+                    )
+                holder_pid, _ = _read_lock_metadata(abs_lock_path)
+                if not stale_retried and holder_pid is not None and not _process_exists(holder_pid):
+                    notify(
+                        f"removing stale artifact lock at {abs_lock_path!r} left by pid {holder_pid}",
+                        stage="pipeline",
+                        code=DIAGNOSTIC_CODE_STALE_ARTIFACT_LOCK,
+                        level="warning",
+                    )
+                    fh.close()
+                    fh = None
+                    try:
+                        os.unlink(abs_lock_path)
+                    except OSError:
+                        pass
+                    _remove_lock_metadata(abs_lock_path)
+                    stale_retried = True
+                    break
+                time.sleep(ARTIFACT_LOCK_POLL_INTERVAL_SECONDS)
+        yield
+    finally:
+        if acquired and fh is not None:
+            if sys.platform == "win32":
                 try:
                     fh.seek(0)
                     msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
                 except OSError:
                     pass
-        else:
-            while True:
-                try:
-                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except BlockingIOError:
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError(
-                            f"Could not acquire artifact lock {lock_path!r} within {timeout:.1f}s",
-                        ) from None
-                    time.sleep(ARTIFACT_LOCK_POLL_INTERVAL_SECONDS)
-            try:
-                yield
-            finally:
+            else:
                 try:
                     fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
                 except OSError:
                     pass
-    finally:
-        fh.close()
+            fh.close()
+            with _RESOURCE_REGISTRY_LOCK:
+                _OPEN_ARTIFACT_LOCKS.discard(os.path.normcase(abs_lock_path))
+            try:
+                os.unlink(abs_lock_path)
+            except OSError:
+                pass
+            _remove_lock_metadata(abs_lock_path)
+        elif fh is not None:
+            fh.close()
 
 
 @contextmanager
 def artifact_lock(
     artifacts_dir: str,
     *,
-    timeout: float = ARTIFACT_LOCK_TIMEOUT_SECONDS,
+    timeout: float | object = _ARTIFACT_LOCK_TIMEOUT_DEFAULT,
 ) -> Iterator[None]:
-    """Reentrant per-``artifacts_dir`` lock covering load, mutate, and save sequences for template learning. The lock file path joins *artifacts_dir* with :data:`ARTIFACT_LOCK_FILENAME` from ``aetherdialect._config``. Nested ``with artifact_lock`` blocks on the same directory bump a per-thread refcount without deadlocking. Cross-thread and cross- process callers serialize at the OS level."""
+    """Reentrant per-``artifacts_dir`` lock covering load, mutate, and save sequences for template learning. The lock is advisory: it serialises cooperating processes only and requires a local filesystem for reliable mutual exclusion. The lock file path joins *artifacts_dir* with :data:`ARTIFACT_LOCK_FILENAME` from ``aetherdialect._config``. Nested ``with artifact_lock`` blocks on the same directory bump a per-thread refcount without deadlocking. Cross-thread and cross-process callers serialize at the OS level when they cooperate on the same lock file."""
+    resolved_timeout = _artifact_lock_timeout_seconds(timeout)
     abs_dir = os.path.abspath(artifacts_dir)
-    os.makedirs(abs_dir, exist_ok=True)
+    os.makedirs(abs_dir, mode=ARTIFACT_DIR_MODE, exist_ok=True)
     lock_path = os.path.join(abs_dir, ARTIFACT_LOCK_FILENAME)
     key = os.path.normcase(lock_path)
     reentry = _get_reentry_map()
@@ -2024,7 +3539,7 @@ def artifact_lock(
         return
     reentry[key] = 1
     try:
-        with _file_lock(lock_path, timeout=timeout):
+        with _file_lock(lock_path, timeout=resolved_timeout, artifacts_dir=abs_dir):
             yield
     finally:
         reentry[key] -= 1
@@ -2032,7 +3547,7 @@ def artifact_lock(
             reentry.pop(key, None)
 
 
-def _artifact_package_version_string() -> str:
+def artifact_package_version_string() -> str:
     try:
         return version("aetherdialect")
     except PackageNotFoundError:
@@ -2042,26 +3557,6 @@ def _artifact_package_version_string() -> str:
 def _manifest_path(artifacts_dir: str) -> str:
     """Return the absolute path to ``artifact_manifest.json`` under ``artifacts_dir``."""
     return os.path.join(artifacts_dir, ARTIFACT_MANIFEST_FILENAME)
-
-
-@dataclass(frozen=True, slots=True)
-class ArtifactManifest:
-    """Typed view of ``artifact_manifest.json`` fields used by migration checks."""
-
-    artifact_format_version: int = 0
-    created_with_package_version: str = ""
-    min_compatible_package_version: str = ""
-    last_action: str = ""
-    last_action_at: str = ""
-    structural_hash: str = ""
-    profiling_hash: str = ""
-    scope_hash: str = ""
-    effective_structural_hash: str = ""
-    schema_graph_id: str = ""
-    notes_hash: str = ""
-    semantic_edges_hash: str = ""
-    last_migration_tier: str = ""
-    last_migration_at: str = ""
 
 
 def read_artifact_manifest(artifacts_dir: str) -> ArtifactManifest | None:
@@ -2078,9 +3573,9 @@ def read_artifact_manifest(artifacts_dir: str) -> ArtifactManifest | None:
         if not isinstance(data, dict):
             return None
         try:
-            ver = int(data.get("artifact_format_version", 0) or 0)
+            ver = coerce_format_version(data.get("artifact_format_version", "0") or "0")
         except (TypeError, ValueError):
-            ver = 0
+            ver = "0"
         return ArtifactManifest(
             artifact_format_version=ver,
             created_with_package_version=str(data.get("created_with_package_version", "") or ""),
@@ -2115,17 +3610,17 @@ def write_artifact_manifest(
     last_corruption_at: str = "",
 ) -> None:
     """Write manifest with format version, package version, optional. hashes, and last action. Persists atomically via a temporary file in *artifacts_dir* followed by ``os.replace``."""
-    os.makedirs(artifacts_dir, exist_ok=True)
+    os.makedirs(artifacts_dir, mode=ARTIFACT_DIR_MODE, exist_ok=True)
     path = _manifest_path(artifacts_dir)
     mig_at = last_migration_at if last_migration_at is not None else ""
     if last_migration_tier and not mig_at:
-        mig_at = datetime.now(timezone.utc).isoformat()
+        mig_at = datetime.now(UTC).isoformat()
     payload = {
         "artifact_format_version": ARTIFACT_FORMAT_VERSION,
-        "created_with_package_version": _artifact_package_version_string(),
+        "created_with_package_version": artifact_package_version_string(),
         "min_compatible_package_version": MIN_COMPATIBLE_PACKAGE_VERSION,
         "last_action": last_action,
-        "last_action_at": datetime.now(timezone.utc).isoformat(),
+        "last_action_at": datetime.now(UTC).isoformat(),
         "structural_hash": structural_hash,
         "profiling_hash": profiling_hash,
         "scope_hash": scope_hash,
@@ -2151,6 +3646,7 @@ def write_artifact_manifest(
             json.dump(payload, tf, ensure_ascii=False, indent=2)
         assert tmp_path is not None
         os.replace(tmp_path, path)
+        _chmod_artifact_file(path)
         tmp_path = None
     finally:
         if tmp_path and os.path.isfile(tmp_path):
@@ -2161,19 +3657,46 @@ def write_artifact_manifest(
     debug(f"[core_utils.write_artifact_manifest] path={path}")
 
 
-def emit_write_queue_event(artifacts_dir: str, event: WriteQueueEvent) -> None:
+def _write_queue_engine_limits() -> EngineLimits:
+    limits = _ACTIVE_ENGINE_LIMITS.get()
+    return limits if limits is not None else EngineLimits()
+
+
+def emit_write_queue_event(artifacts_dir: str, event: WriteQueueEvent, *, space_name: str | None = None) -> None:
     """Append one JSON line representing a deferred writer event to the artifact write queue."""
-    path = os.path.join(artifacts_dir, WRITE_QUEUE_FILENAME)
-    obj = {
+    obj: dict[str, Any] = {
         "kind": event.kind,
         "schema_graph_id": event.schema_graph_id,
         "schema_hash": event.schema_hash,
         "produced_at": event.produced_at,
         "payload": [list(pair) for pair in event.payload],
     }
+    if space_name is not None:
+        obj["space_name"] = str(space_name).strip().lower()
     line = json.dumps(obj, separators=(",", ":"), ensure_ascii=False) + "\n"
+    line_bytes = len(line.encode("utf-8"))
+    limits = _write_queue_engine_limits()
+    record_cap = limits.write_queue_max_record_bytes
+    if record_cap is not None and line_bytes > record_cap:
+        raise ConfigError(f"write queue record size {line_bytes} exceeds write_queue_max_record_bytes ({record_cap})")
+    path = os.path.join(artifacts_dir, WRITE_QUEUE_FILENAME)
     with artifact_lock(artifacts_dir):
-        os.makedirs(artifacts_dir, exist_ok=True)
+        os.makedirs(artifacts_dir, mode=ARTIFACT_DIR_MODE, exist_ok=True)
+        file_cap = limits.write_queue_max_file_bytes
+        if file_cap is not None:
+            current_bytes = os.path.getsize(path) if os.path.isfile(path) else 0
+            if current_bytes + line_bytes > file_cap:
+                notify(
+                    f"write queue file size would exceed write_queue_max_file_bytes ({file_cap}); drain required",
+                    stage="pipeline",
+                    code=DIAGNOSTIC_CODE_WRITE_QUEUE_FULL,
+                    details=(
+                        ("path", path),
+                        ("file_bytes", str(current_bytes)),
+                        ("record_bytes", str(line_bytes)),
+                    ),
+                )
+                return
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(line)
 
@@ -2220,6 +3743,15 @@ def decode_write_queue_event(obj: dict[str, Any]) -> WriteQueueEvent | None:
         produced_at=produced_at,
         payload=tuple(pairs),
     )
+
+
+def write_queue_event_space_name(obj: dict[str, Any]) -> str | None:
+    """Return the optional aetherspace name stamped on a write-queue JSON object."""
+    raw = obj.get("space_name")
+    if raw is None:
+        return None
+    cleaned = str(raw).strip().lower()
+    return cleaned or None
 
 
 def wipe_filenames(artifacts_dir: str, names: tuple[str, ...]) -> int:
@@ -2367,14 +3899,75 @@ def _prof_jaccard_sets(a: frozenset[str], b: frozenset[str]) -> float:
     return len(a & b) / u
 
 
+def column_overlap_comparison_mode(left: ColumnMetadata, right: ColumnMetadata) -> OverlapComparison:
+    """Return the overlap comparison rule when pairing two profiled columns."""
+    if left.is_case_insensitive_collation or right.is_case_insensitive_collation:
+        return OverlapComparison.CASE_FOLDED
+    return OverlapComparison.EXACT
+
+
+def _normalize_overlap_sample_value(value: object, *, case_fold: bool, rtrim_pad: bool = False) -> str | None:
+    if value is None:
+        return None
+    s = normalize_text_value(str(value))
+    if rtrim_pad:
+        s = s.rstrip()
+    else:
+        s = s.strip()
+    return s.casefold() if case_fold else s
+
+
+def normalized_value_overlap_sets(
+    left: ColumnMetadata,
+    right: ColumnMetadata,
+    *,
+    record_comparison: bool = True,
+) -> tuple[set[str], set[str], OverlapComparison]:
+    """Normalize overlap samples for a pair, optionally recording the comparison rule used."""
+    mode = column_overlap_comparison_mode(left, right)
+    fold = mode == "case_folded"
+    rtrim_pad = left.is_fixed_width_text or right.is_fixed_width_text
+    left_set = {
+        normalized
+        for v in left.value_overlap_sample or []
+        if (normalized := _normalize_overlap_sample_value(v, case_fold=fold, rtrim_pad=rtrim_pad)) is not None
+    }
+    right_set = {
+        normalized
+        for v in right.value_overlap_sample or []
+        if (normalized := _normalize_overlap_sample_value(v, case_fold=fold, rtrim_pad=rtrim_pad)) is not None
+    }
+    if record_comparison:
+        left.overlap_comparison = mode
+        right.overlap_comparison = mode
+    return left_set, right_set, mode
+
+
+def value_overlap_ratio_for_columns(left: ColumnMetadata, right: ColumnMetadata) -> float:
+    """Return overlap ratio for two columns using collation-aware sample comparison."""
+    left_set, right_set, _ = normalized_value_overlap_sets(left, right)
+    if not left_set or not right_set:
+        return 0.0
+    inter = len(left_set & right_set)
+    return inter / float(min(len(left_set), len(right_set)))
+
+
 def _col_value_overlap_frozen(col: ColumnMetadata) -> frozenset[str]:
     vals = col.value_overlap_sample or []
-    cleaned = {str(v).strip() for v in vals if v is not None and str(v).strip() != ""}
+    cleaned = {normalize_text_value(str(v).strip()) for v in vals if v is not None}
     cap = PolicyConfig.VALUE_OVERLAP_SAMPLE_LIMIT
     return frozenset(sorted(cleaned)[:cap])
 
 
-def _profiling_value_overlap(older: SchemaGraph, newer: SchemaGraph) -> float:
+def sanitize_tenant_slug(tenant_slug: str) -> str:
+    """Return a filesystem-safe tenant segment for artifact storage paths."""
+    safe = re.sub(r"[^a-z0-9_-]+", "-", str(tenant_slug).strip().lower()).strip("-")
+    if not safe:
+        raise ValueError("tenant_slug must contain at least one alphanumeric character after sanitization")
+    return safe
+
+
+def profiling_value_overlap(older: SchemaGraph, newer: SchemaGraph) -> float:
     """Aggregate Jaccard overlap of value-overlap samples on shared ``(table, column)`` keys."""
     inter = 0
     union = 0
@@ -2492,14 +4085,6 @@ def try_rename_migration_plan(
     return assessment.plan
 
 
-@dataclass(frozen=True, slots=True)
-class RenameMigrationAssessment:
-    """Inferred rename migration with a confidence score in ``[0, 1]``."""
-
-    plan: tuple[tuple[tuple[str, str], ...], tuple[tuple[str, str, str], ...]]
-    confidence: float
-
-
 def _rename_plan_confidence(
     old: SchemaGraph,
     new: SchemaGraph,
@@ -2594,14 +4179,18 @@ def artifact_manifest_incompatible_with_package(manifest: ArtifactManifest | Non
     """Return True when the manifest requires a newer package or unknown artifact format."""
     if manifest is None:
         return False
-    fmt = manifest.artifact_format_version
-    if fmt not in (0, ARTIFACT_FORMAT_VERSION):
+    fmt = coerce_format_version(manifest.artifact_format_version)
+    if not (
+        format_versions_match(fmt, ARTIFACT_FORMAT_VERSION)
+        or format_versions_match(fmt, FEDERATION_ARTIFACT_FORMAT_VERSION)
+        or fmt in {"0", ""}
+    ):
         return True
     min_cv = (manifest.min_compatible_package_version or "").strip()
     if not min_cv:
         return False
     try:
-        return Version(_artifact_package_version_string()) < Version(min_cv)
+        return Version(artifact_package_version_string()) < Version(min_cv)
     except (InvalidVersion, TypeError, ValueError):
         return True
 
@@ -2667,6 +4256,15 @@ def format_failure_trace(step: StepResult | list[StepResult] | object) -> str:
     return "\n".join(lines)
 
 
+def _rotate_failure_trace_if_needed(path: Path) -> None:
+    if not path.is_file() or path.stat().st_size < FAILURE_TRACE_ROTATE_BYTES:
+        return
+    rotated = Path(f"{path}.1")
+    if rotated.is_file():
+        rotated.unlink()
+    path.rename(rotated)
+
+
 def append_failure_trace(step: StepResult | list[StepResult] | object | None, path: str | os.PathLike[str]) -> None:
     """Append a formatted failure trace to the specified results file."""
     if step is None:
@@ -2675,6 +4273,7 @@ def append_failure_trace(step: StepResult | list[StepResult] | object | None, pa
     if not text:
         return
     p = Path(path)
+    _rotate_failure_trace_if_needed(p)
     needs_sep = p.is_file() and p.stat().st_size > 0
     with open(path, "a", encoding="utf-8") as fh:
         if needs_sep:
@@ -2934,12 +4533,9 @@ def cost_cap_active(v: float | int | None) -> bool:
         return False
 
 
-_DIAGNOSTIC_FORCE_DEPTH: int = 0
-
-
 def diagnostic_debug_enabled() -> bool:
     """True when ``PolicyConfig.DEBUG`` or diagnostic capture (``telemetry_capture`` depth) is active."""
-    return _DIAGNOSTIC_FORCE_DEPTH > 0 or PolicyConfig.DEBUG
+    return aetherdialect._constants.DIAGNOSTIC_FORCE_DEPTH > 0 or PolicyConfig.DEBUG
 
 
 def diagnostic_pipeline_trace_full_enabled() -> bool:
@@ -2949,15 +4545,13 @@ def diagnostic_pipeline_trace_full_enabled() -> bool:
 
 def diagnostic_force_enter() -> None:
     """Increment nested diagnostic capture depth (used by ``telemetry_capture``)."""
-    global _DIAGNOSTIC_FORCE_DEPTH
-    _DIAGNOSTIC_FORCE_DEPTH += 1
+    aetherdialect._constants.DIAGNOSTIC_FORCE_DEPTH += 1
 
 
 def diagnostic_force_exit() -> None:
     """Decrement nested diagnostic capture depth."""
-    global _DIAGNOSTIC_FORCE_DEPTH
-    if _DIAGNOSTIC_FORCE_DEPTH > 0:
-        _DIAGNOSTIC_FORCE_DEPTH -= 1
+    if aetherdialect._constants.DIAGNOSTIC_FORCE_DEPTH > 0:
+        aetherdialect._constants.DIAGNOSTIC_FORCE_DEPTH -= 1
 
 
 def permission_denied_detail_logging_enabled() -> bool:
@@ -2969,13 +4563,20 @@ def permission_denied_detail_logging_enabled() -> bool:
 def normalize_value_type(value_type: str) -> str:
     """Map a raw value-type string onto a canonical pipeline type."""
     if not value_type:
-        return "string"
+        return UNKNOWN_VALUE_TYPE
     vt_lower = value_type.lower().strip()
+    if not vt_lower:
+        return UNKNOWN_VALUE_TYPE
     if vt_lower in VALUE_TYPE_NORMALIZATION:
         return VALUE_TYPE_NORMALIZATION[vt_lower]
     if vt_lower in VALID_VALUE_TYPES:
         return vt_lower
-    return "string"
+    return UNKNOWN_VALUE_TYPE
+
+
+def column_has_unknown_value_type(col: ColumnMetadata) -> bool:
+    """Return True when profiling mapped the column onto the unknown value-type bucket."""
+    return (col.value_type or "").strip().lower() == UNKNOWN_VALUE_TYPE
 
 
 def load_runtime_config(

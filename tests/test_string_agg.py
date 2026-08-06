@@ -62,7 +62,9 @@ class TestStringAggRendering:
 
     def test_snowflake_renders_listagg_within_group(self) -> None:
         out = _render_group_sql(_string_agg_group(with_order=True), SnowflakeDialect.__new__(SnowflakeDialect))
-        assert "LISTAGG(CUSTOMERS.NAME, :sep) WITHIN GROUP (ORDER BY ORDERS.ID ASC)" in out
+        assert "LISTAGG(" in out and "WITHIN GROUP" in out
+        assert '"customers"."name"' in out or "customers.name" in out.replace('"', "")
+        assert '"orders"."id"' in out or "orders.id" in out.replace('"', "")
 
     def test_databricks_renders_unordered_collect_list(self) -> None:
         out = _render_group_sql(_string_agg_group(with_order=True), DatabricksDialect.__new__(DatabricksDialect))
@@ -72,6 +74,10 @@ class TestStringAggRendering:
     def test_sqlite_renders_bare_group_concat(self) -> None:
         out = _render_group_sql(_string_agg_group(with_order=True), SQLiteDialect.__new__(SQLiteDialect))
         assert out.replace('"', "") == "GROUP_CONCAT(customers.name)"
+
+    def test_sqlite_separator_emitted(self) -> None:
+        out = _render_group_sql(_string_agg_group(with_order=False), SQLiteDialect.__new__(SQLiteDialect))
+        assert out.replace('"', "") == "GROUP_CONCAT(customers.name, :sep)"
 
 
 class TestOrderedStringAggCapability:

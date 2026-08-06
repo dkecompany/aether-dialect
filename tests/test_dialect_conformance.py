@@ -22,8 +22,8 @@ from aetherdialect._contracts_base import (
     MulGroup,
     NormalizedExpr,
     OrderByCol,
+    PredicateGroup,
     WhereParam,
-    predicate_group_from_list,
 )
 from aetherdialect._contracts_core import (
     RuntimeCteStep,
@@ -41,7 +41,7 @@ from aetherdialect._contracts_schema import (
     WindowRegistryStep,
     WindowSpec,
 )
-from aetherdialect._dialect import Dialect, get_dialect_class, get_registered_engines
+from aetherdialect._dialect import Dialect, DialectRegistry
 from aetherdialect._sql_gen import build_deterministic_sql, inject_join_into_deterministic_sql
 from tests.join_test_helpers import catalog_edge_kinds_for_signatures
 
@@ -63,7 +63,7 @@ class ConformanceCase:
 
 
 def _uninit_dialect(engine: str) -> Dialect:
-    cls = get_dialect_class(engine)
+    cls = DialectRegistry.get_dialect_class(engine)
     dialect = cls.__new__(cls)
     if engine == "databricks":
         dialect.config = SimpleNamespace(CATALOG="conformance_catalog", SCHEMA="conformance_schema")
@@ -121,8 +121,8 @@ def _single_table_intent(
         select_cols=[SelectCol(expr=select_expr)],
         group_by_cols=group_by or [],
         order_by_cols=order_by or [],
-        where=predicate_group_from_list(filters) if filters else None,
-        having=predicate_group_from_list(having) if having else None,
+        where=PredicateGroup.from_list(filters) if filters else None,
+        having=PredicateGroup.from_list(having) if having else None,
         limit=limit,
         distinct_select_index=distinct_index if distinct_index is not None else -1,
         window_registry=window_registry or [],
@@ -202,9 +202,17 @@ def _verify_scalar(func: str, sql: str, engine: str) -> bool:
     if func == "length":
         return "LEN(" in upper if engine == "sqlserver" else "LENGTH" in upper
     if func == "date_trunc":
-        return "DATE_TRUNC" in upper or (engine in {"mysql", "mariadb"} and "STR_TO_DATE" in upper)
+        if "DATE_TRUNC" in upper:
+            return True
+        if engine in {"mysql", "mariadb"} and "DATE_FORMAT" in upper:
+            return True
+        if engine == "sqlite" and "DATE(" in upper and "START OF" in upper:
+            return True
+        if engine == "sqlserver" and "DATEADD" in upper:
+            return True
+        return engine in {"mysql", "mariadb"} and "STR_TO_DATE" in upper
     if func == "date_part":
-        return "DATE_PART" in upper or "EXTRACT" in upper
+        return "DATE_PART" in upper or "EXTRACT" in upper or "DATEPART" in upper
     if func == "extract":
         return "EXTRACT" in upper or "DATEPART" in upper or "DATE_PART" in upper
     if func == "concat":
@@ -228,11 +236,11 @@ def _verify_filter_op(op: str, sql: str, engine: str) -> bool:
     if op == "not like":
         return "NOT" in upper and " LIKE " in upper
     if op == "ilike":
-        if engine in {"mysql", "mariadb", "sqlite", "bigquery"}:
+        if engine in {"mysql", "mariadb", "sqlite", "bigquery", "sqlserver"}:
             return " LIKE " in upper and "LOWER" in upper
         return "ILIKE" in upper
     if op == "not ilike":
-        if engine in {"mysql", "mariadb", "sqlite", "bigquery"}:
+        if engine in {"mysql", "mariadb", "sqlite", "bigquery", "sqlserver"}:
             return "NOT" in upper and " LIKE " in upper and "LOWER" in upper
         if engine == "databricks":
             return "NOT" in upper and "ILIKE" in upper
@@ -569,10 +577,24 @@ def _build_filter_cases() -> list[ConformanceCase]:
 
 def _verify_date_window(sql: str, engine: str) -> bool:
     low = sql.lower()
+    clock_markers = (
+        "current_date",
+        "current_timestamp",
+        "getdate()",
+        "datetime('now')",
+        "date('now')",
+        "current_timestamp()",
+        "current_date()",
+    )
+    if not any(m in low for m in clock_markers):
+        return False
     markers = _date_window_markers(engine)
-    if engine in {"postgresql", "redshift", "mysql", "mariadb", "sqlserver", "sqlite"}:
-        return all(m.lower() in low for m in markers)
-    return any(m.lower() in low for m in markers)
+    non_clock = tuple(m for m in markers if m.upper() not in {"CURRENT_DATE", "CURRENT_TIMESTAMP"})
+    if not non_clock:
+        return True
+    if engine in {"postgresql", "redshift", "mysql", "mariadb", "sqlserver"}:
+        return all(m.lower() in low for m in non_clock)
+    return any(m.lower() in low for m in non_clock)
 
 
 def _date_window_markers(engine: str) -> tuple[str, ...]:
@@ -584,9 +606,9 @@ def _date_window_markers(engine: str) -> tuple[str, ...]:
         "mariadb": ("DATE_SUB",),
         "snowflake": ("DATEADD",),
         "sqlserver": ("DATEADD",),
-        "bigquery": ("DATE_SUB",),
-        "databricks": ("DATE_ADD", "ADD_MONTHS", "CURRENT_DATE", "INTERVAL"),
-        "sqlite": ("date(",),
+        "bigquery": ("DATE_SUB", "TIMESTAMP_SUB"),
+        "databricks": ("DATE_ADD", "ADD_MONTHS", "DATE_COLUMNDD", "CURRENT_DATE", "INTERVAL"),
+        "sqlite": ("date(", "datetime("),
     }
     return markers.get(engine, ("CURRENT_DATE",))
 
@@ -602,7 +624,7 @@ def _date_diff_markers(engine: str) -> tuple[str, ...]:
         "snowflake": ("DATEDIFF",),
         "sqlserver": ("DATEDIFF",),
         "bigquery": ("DATE_DIFF",),
-        "databricks": ("DATEDIFF", "datediff"),
+        "databricks": ("DATEDIFF", "datediff", "MONTHS_BETWEEN", "WEEKS_BETWEEN", "INTERVAL"),
         "sqlite": ("julianday",),
     }
     return markers.get(engine, ("DATEDIFF",))
@@ -944,7 +966,7 @@ def _expected_tags_from_config() -> frozenset[str]:
     return frozenset(tags)
 
 
-@pytest.mark.parametrize("engine", get_registered_engines())
+@pytest.mark.parametrize("engine", DialectRegistry.get_registered_engines())
 @pytest.mark.parametrize("case_id", sorted(_CASE_BY_ID))
 def test_dialect_conformance_matrix(engine: str, case_id: str) -> None:
     """Every conformance fixture renders non-empty SQL on every registered dialect."""

@@ -22,13 +22,7 @@ from aetherdialect._contracts_schema import (
 from aetherdialect._core_utils import write_artifact_manifest
 from aetherdialect._schema_graph import diff_schemas
 from aetherdialect._templates import (
-    _load_partitioned_view_unlocked,
-    _surgical_invalidation_targets,
-    apply_migration_policy,
-    empty_template_store,
-    save_template_store,
-    template_store_dir_for_space,
-    templates_to_store,
+    TemplateOps,
 )
 
 
@@ -87,14 +81,14 @@ def _make_template(tid: str, table: str, column: str) -> Template:
 
 def _seed_store(artifacts_dir: str, schema: SchemaGraph, templates: dict[str, Template]) -> None:
     os.makedirs(artifacts_dir, exist_ok=True)
-    store_dir = template_store_dir_for_space(artifacts_dir, "master")
+    store_dir = TemplateOps.template_store_dir_for_space(artifacts_dir, "master")
     os.makedirs(store_dir, exist_ok=True)
     prev = EngineConfig.TEMPLATE_STORE_DIR
     EngineConfig.TEMPLATE_STORE_DIR = store_dir
     try:
-        store = empty_template_store("eff_old")
-        templates_to_store(store, templates)
-        save_template_store(store)
+        store = TemplateOps.empty_template_store("eff_old")
+        TemplateOps.templates_to_store(store, templates)
+        TemplateOps.save_template_store(store)
     finally:
         EngineConfig.TEMPLATE_STORE_DIR = prev
     write_artifact_manifest(
@@ -109,14 +103,14 @@ def _seed_store(artifacts_dir: str, schema: SchemaGraph, templates: dict[str, Te
 
 
 def _reload_store(artifacts_dir: str):
-    store_dir = template_store_dir_for_space(artifacts_dir, "master")
-    return _load_partitioned_view_unlocked(store_dir)
+    store_dir = TemplateOps.template_store_dir_for_space(artifacts_dir, "master")
+    return TemplateOps._load_partitioned_view_unlocked(store_dir)
 
 
 @pytest.mark.fast
 def test_redeclared_column_is_surgical_target() -> None:
     diff = SchemaDiff(per_table={"orders": TableDiff(redeclared_columns=(("amount", "integer", "bigint"),))})
-    _tables, cols = _surgical_invalidation_targets(diff)
+    _tables, cols = TemplateOps._surgical_invalidation_targets(diff)
     assert ("orders", "amount") in cols
 
 
@@ -127,7 +121,7 @@ def test_redeclared_column_soft_refresh_invalidates_template(tmp_path) -> None:
     _seed_store(str(tmp_path), schema, {"T0001": t})
     diff = SchemaDiff(per_table={"orders": TableDiff(redeclared_columns=(("amount", "integer", "bigint"),))})
 
-    report = apply_migration_policy(str(tmp_path), schema, schema_diff=diff)
+    report = TemplateOps.apply_migration_policy(str(tmp_path), schema, schema_diff=diff)
 
     assert report.tier == MigrationTier.SOFT_REFRESH
     assert report.surgically_invalidated == 1
@@ -156,7 +150,7 @@ def test_pk_changed_soft_refresh_invalidates_template(tmp_path) -> None:
     diff = diff_schemas(old, new)
     assert diff.per_table["orders"].pk_changed is True
 
-    report = apply_migration_policy(str(tmp_path), new, schema_diff=diff)
+    report = TemplateOps.apply_migration_policy(str(tmp_path), new, schema_diff=diff)
 
     assert report.tier == MigrationTier.SOFT_REFRESH
     assert report.surgically_invalidated == 1
@@ -187,7 +181,7 @@ def test_fk_changed_soft_refresh_invalidates_template(tmp_path) -> None:
     t = _make_template("T0001", "orders", "order_id")
     _seed_store(str(tmp_path), new, {"T0001": t})
 
-    report = apply_migration_policy(str(tmp_path), new, schema_diff=diff)
+    report = TemplateOps.apply_migration_policy(str(tmp_path), new, schema_diff=diff)
 
     assert report.tier == MigrationTier.SOFT_REFRESH
     assert report.surgically_invalidated == 1

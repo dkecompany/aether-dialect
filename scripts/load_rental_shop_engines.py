@@ -1190,10 +1190,10 @@ def _load_postgresql(args: argparse.Namespace) -> None:
     if args.schema is None:
         args.schema = os.environ.get("POSTGRESQL_SCHEMA", "public")
 
-    import psycopg2
-    from psycopg2 import sql
+    import psycopg
+    from psycopg import sql
 
-    conn = psycopg2.connect(
+    conn = psycopg.connect(
         host=os.environ.get("PGHOST", "localhost"),
         port=int(os.environ.get("PGPORT", "5432")),
         user=os.environ.get("PGUSER", "postgres"),
@@ -1250,7 +1250,8 @@ def _load_postgresql(args: argparse.Namespace) -> None:
         buf = io.StringIO()
         frame.to_csv(buf, index=False, header=True, na_rep="")
         buf.seek(0)
-        cur.copy_expert(copy_sql, buf)
+        with cur.copy(copy_sql) as copy:
+            copy.write(buf.getvalue())
         _log_load_table("postgresql", name, len(frame))
 
     for name in _TABLE_ORDER:
@@ -1520,10 +1521,10 @@ def _cmd_extract_csv(args: argparse.Namespace) -> None:
     PostgresRuntimeConfig.apply_environment(os.environ)
     out_dir = args.out
     out_dir.mkdir(parents=True, exist_ok=True)
-    import psycopg2
+    import psycopg
 
-    url = PostgresRuntimeConfig.db_url().replace("postgresql+psycopg2://", "postgresql://")
-    conn = psycopg2.connect(url)
+    url = PostgresRuntimeConfig.db_url().replace("postgresql+psycopg://", "postgresql://")
+    conn = psycopg.connect(url)
     conn.autocommit = True
     cur = conn.cursor()
     cur.execute(
@@ -1537,11 +1538,10 @@ def _cmd_extract_csv(args: argparse.Namespace) -> None:
     )
     for (table,) in cur.fetchall():
         csv_path = out_dir / f"{table}.csv"
-        with csv_path.open("w", encoding="utf-8", newline="") as f:
-            cur.copy_expert(
-                f"COPY {args.schema}.{table} TO STDOUT WITH CSV HEADER",
-                f,
-            )
+        with csv_path.open("wb") as f:
+            with cur.copy(f"COPY {args.schema}.{table} TO STDOUT WITH CSV HEADER") as copy:
+                for data in copy:
+                    f.write(data)
     cur.close()
     conn.close()
     print(f"Extracted tables to {out_dir}")
@@ -1657,6 +1657,47 @@ def _apply_federation_column_projection(
     return frame.loc[:, keep]
 
 
+def _project_create_table_sql(create_sql: str, table: str, projections: dict[str, frozenset[str]]) -> str:
+    """Drop non-projected columns from a CREATE TABLE body when a projection exists."""
+    column_projection = projections.get(table)
+    if not column_projection:
+        return create_sql
+    start = create_sql.find("(")
+    end = create_sql.rfind(")")
+    if start < 0 or end <= start:
+        return create_sql
+    body = create_sql[start + 1 : end]
+    parts: list[str] = []
+    depth = 0
+    current: list[str] = []
+    for ch in body:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        if ch == "," and depth == 0:
+            parts.append("".join(current).strip())
+            current = []
+            continue
+        current.append(ch)
+    if current:
+        parts.append("".join(current).strip())
+    kept: list[str] = []
+    for part in parts:
+        token = part.strip()
+        if not token:
+            continue
+        upper_part = token.upper()
+        if upper_part.startswith(("PRIMARY KEY", "FOREIGN KEY", "UNIQUE", "CONSTRAINT", "CHECK", "KEY ", "INDEX ")):
+            continue
+        name = token.split()[0].strip('`"[]')
+        if name in column_projection:
+            kept.append(token)
+    if not kept:
+        return create_sql
+    return create_sql[: start + 1] + ", ".join(kept) + create_sql[end:]
+
+
 def _filter_payment_frame(frame: pd.DataFrame, *, source_id: str, csv_dir: Path) -> pd.DataFrame:
     from sandbox_corpus import PAYMENT_UNION_SPLIT_STORE_THRESHOLD, payment_store_id_by_rental_id
 
@@ -1692,14 +1733,14 @@ def _load_federation_postgresql_partition(args: argparse.Namespace, *, source_id
 
     partition = federation_partition_tables(source_id)
     load_env_file(args.env_file)
-    import psycopg2
-    from psycopg2 import sql as pg_sql
+    import psycopg
+    from psycopg import sql as pg_sql
 
     PostgresRuntimeConfig.apply_environment(os.environ)
     database = args.database or PostgresRuntimeConfig.DATABASE
     if not database:
         raise SystemExit("PostgreSQL database required (set PGDATABASE in env.env)")
-    conn = psycopg2.connect(
+    conn = psycopg.connect(
         host=PostgresRuntimeConfig.HOST,
         port=int(PostgresRuntimeConfig.PORT),
         user=PostgresRuntimeConfig.USER,
@@ -1731,16 +1772,17 @@ def _load_federation_postgresql_partition(args: argparse.Namespace, *, source_id
     if args.drop_first:
         for name, _, _ in reversed(parsed):
             cur.execute(f"DROP TABLE IF EXISTS {schema}.{name} CASCADE")
-    for _, create_sql, _ in parsed:
+    from sandbox_corpus import federation_member_column_projections
+
+    column_projections = federation_member_column_projections(source_id)
+    for name, create_sql, _ in parsed:
+        create_sql = _project_create_table_sql(create_sql, name, column_projections)
         cur.execute(create_sql)
     for name, _, _ in parsed:
         pk_cols = pk_map.get(name)
         if pk_cols:
             cols = ", ".join(pk_cols)
             cur.execute(f"ALTER TABLE {schema}.{name} ADD CONSTRAINT {name}_pkey PRIMARY KEY ({cols})")
-    from sandbox_corpus import federation_member_column_projections
-
-    column_projections = federation_member_column_projections(source_id)
     for name, _, _ in parsed:
         csv_path = args.csv_dir / f"{name}.csv"
         if not csv_path.is_file():
@@ -1755,7 +1797,8 @@ def _load_federation_postgresql_partition(args: argparse.Namespace, *, source_id
         buf = io.StringIO()
         frame.to_csv(buf, index=False, header=True, na_rep="")
         buf.seek(0)
-        cur.copy_expert(copy_sql, buf)
+        with cur.copy(copy_sql) as copy:
+            copy.write(buf.getvalue())
         _log_load_table("postgresql", name, len(frame))
     for name in _partition_table_order(partition):
         for i, fk in enumerate(fk_map.get(name, [])):
@@ -1799,6 +1842,9 @@ def _load_federation_mysql_partition(
     for table, pk_cols in iter_alter_primary_keys(ddl_text):
         if table in partition:
             pk_map[table] = pk_cols
+    from sandbox_corpus import federation_member_column_projections
+
+    column_projections = federation_member_column_projections(source_id)
     with sa_engine.begin() as conn:
         if args.drop_first:
             conn.execute(text("SET FOREIGN_KEY_CHECKS = 0"))
@@ -1810,6 +1856,7 @@ def _load_federation_mysql_partition(
             if block is None:
                 raise SystemExit(f"Missing CREATE TABLE block for {table}")
             create_sql = translate_create(engine_name, block, schema=schema)
+            create_sql = _project_create_table_sql(create_sql, table, column_projections)
             conn.execute(text(create_sql))
         for table in _partition_table_order(partition):
             pk_cols = pk_map.get(table)
@@ -1817,9 +1864,6 @@ def _load_federation_mysql_partition(
                 pk_stmt = translate_alter_pk(engine_name, table, schema, pk_cols)
                 if pk_stmt:
                     conn.execute(text(pk_stmt))
-        from sandbox_corpus import federation_member_column_projections
-
-        column_projections = federation_member_column_projections(source_id)
         for table in _partition_table_order(partition):
             csv_path = args.csv_dir / f"{table}.csv"
             if not csv_path.is_file():
@@ -1845,9 +1889,7 @@ def _validate_federation_partition_metrics(source_id: str, engine_label: str, co
     partition = federation_partition_tables(source_id)
     missing = [table for table in sorted(partition) if counts.get(table, 0) <= 0]
     if missing:
-        raise SystemExit(
-            f"{engine_label} federation verify failed: missing or empty tables: {', '.join(missing)}"
-        )
+        raise SystemExit(f"{engine_label} federation verify failed: missing or empty tables: {', '.join(missing)}")
 
 
 def _log_federation_verify_summary(source_id: str, counts: dict[str, int]) -> None:
@@ -2007,6 +2049,53 @@ def _cmd_federation_load(args: argparse.Namespace) -> None:
     _cmd_federation_verify(args)
 
 
+def _cli_engine_includes(args: argparse.Namespace) -> list[str]:
+    return [e for e in _ALL_ENGINES if getattr(args, f"engine_flag_{e}", False)]
+
+
+def _cli_engine_excludes(args: argparse.Namespace) -> list[str]:
+    return [e for e in _ALL_ENGINES if getattr(args, f"engine_exclude_{e}", False)]
+
+
+def _cli_exclusive_mode_flags(args: argparse.Namespace) -> list[str]:
+    """Return one representative flag per active exclusive CLI mode group."""
+    modes: list[str] = []
+    if args.ping:
+        modes.append("--ping")
+    if args.extract_csv is not None:
+        modes.append("--extract-csv")
+    if args.federation_load is not None:
+        modes.append("--federation-load")
+    if args.federation_verify is not None:
+        modes.append("--federation-verify")
+    includes = _cli_engine_includes(args)
+    excludes = _cli_engine_excludes(args)
+    if args.all:
+        modes.append("--all")
+    elif includes:
+        modes.append(f"--{includes[0].replace('_', '-')}")
+    elif excludes:
+        modes.append(f"--exclude-{excludes[0].replace('_', '-')}")
+    return modes
+
+
+def _validate_cli_modes(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    mode_flags = _cli_exclusive_mode_flags(args)
+    if len(mode_flags) > 1:
+        parser.error(f"Cannot combine {mode_flags[0]} with {mode_flags[1]}")
+
+    if args.federation_load is None and args.federation_verify is None:
+        return
+
+    fed_flag = "--federation-load" if args.federation_load is not None else "--federation-verify"
+    if args.schema is not None:
+        parser.error(f"Cannot combine {fed_flag} with --schema")
+    if args.recreate_schema:
+        parser.error(f"Cannot combine {fed_flag} with --recreate-schema")
+    if args.allow_public_schema_recreate:
+        parser.error(f"Cannot combine {fed_flag} with --allow-public-schema-recreate")
+
+
 def main() -> None:
     global _VERIFY_VERBOSE
     parser = argparse.ArgumentParser(
@@ -2093,6 +2182,7 @@ def main() -> None:
         help="Extract PostgreSQL rental_shop schema tables to OUT_DIR as CSV",
     )
     args = parser.parse_args()
+    _validate_cli_modes(args, parser)
 
     if args.ping:
         _cmd_ping(argparse.Namespace(engine=args.ping, env_file=args.env_file))
@@ -2120,8 +2210,8 @@ def main() -> None:
 
     _VERIFY_VERBOSE = bool(args.verbose)
 
-    includes = [e for e in _ALL_ENGINES if getattr(args, f"engine_flag_{e}", False)]
-    excludes = [e for e in _ALL_ENGINES if getattr(args, f"engine_exclude_{e}", False)]
+    includes = _cli_engine_includes(args)
+    excludes = _cli_engine_excludes(args)
     if includes and excludes and not args.all:
         parser.error(
             "Cannot combine engine include flags with exclude flags (use --all with excludes, or includes only)"

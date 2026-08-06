@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import pytest
 
-from aetherdialect._contracts_base import NormalizedExpr, WhereParam, predicate_group_from_list
+from aetherdialect._contracts_base import (
+    NormalizedExpr,
+    PredicateGroup,
+    WhereParam,
+)
 from aetherdialect._contracts_core import RuntimeCteStep, RuntimeIntent
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._federation import FederationMappings, parse_federation_manifest, plan_federated_intent
@@ -62,7 +66,7 @@ def test_spanning_cte_with_where_is_ineligible() -> None:
         select_cols=[],
         group_by_cols=[],
         order_by_cols=[],
-        where=predicate_group_from_list(
+        where=PredicateGroup.from_list(
             [
                 WhereParam(
                     left_expr=NormalizedExpr.from_column("ta.status"),
@@ -84,7 +88,7 @@ def test_spanning_cte_with_where_is_ineligible() -> None:
         cte_steps=[cte],
         param_values={"p1": "open"},
     )
-    plan = plan_federated_intent(intent, composite, manifest, FederationMappings(version=1))
+    plan = plan_federated_intent(intent, composite, manifest, FederationMappings(version="0.2.1"))
     assert plan.ineligible_reason is not None
     assert "span_cte" in plan.ineligible_reason
     assert "cross-source CTE" in plan.ineligible_reason

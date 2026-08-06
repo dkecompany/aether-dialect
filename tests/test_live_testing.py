@@ -7,13 +7,18 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aetherdialect._contracts_base import NormalizedExpr
+from aetherdialect._contracts_base import FeedbackMode, NormalizedExpr, QuestionRoute, QuestionValidationResult
 from aetherdialect._contracts_core import (
     ConcreteIntent,
+    Expected,
     GenerationPath,
     RuntimeCteStep,
     RuntimeIntent,
+    Scenario,
     SelectCol,
+    SequenceScenario,
+    SoftAssert,
+    SoftFailure,
     SqlGenerationOutcome,
     Template,
     ValueHistory,
@@ -21,11 +26,6 @@ from aetherdialect._contracts_core import (
 from aetherdialect._contracts_schema import SQLShape, TemplateStats
 from aetherdialect._core_utils import StepResult, _make_input_responder, _make_prompt_responders
 from aetherdialect._live_testing import (
-    Expected,
-    Scenario,
-    SequenceScenario,
-    SoftAssert,
-    SoftFailure,
     _assert_scenario,
     _assertion_table_names,
     _build_reuse_intent,
@@ -695,7 +695,6 @@ class TestRunSequenceAndAssert:
             [
                 [
                     _make_passing_result(),
-                    _make_passing_result(),
                 ],
             ]
         )
@@ -713,7 +712,6 @@ class TestRunSequenceAndAssert:
             [
                 [_make_failing_result()],
                 [
-                    _make_passing_result(),
                     _make_passing_result(),
                 ],
             ]
@@ -806,7 +804,7 @@ class TestAssertScenarioInternalLogsAndImplicitStatus:
         assert soft.passed is False
         assert any(f.field == "internal_failure_logs" for f in soft.failures)
 
-    def test_run_and_assert_surfaces_internal_log_failure(self):
+    def test_live_testing_ops_run_and_assert_surfaces_internal_log_failure(self):
         class _Runner:
             def clone(self):
                 return self
@@ -934,7 +932,7 @@ class TestRunPipelineCoreUnionPreview:
             ),
             patch(
                 "aetherdialect._live_testing.validate_question",
-                return_value=(True, "query", "q"),
+                return_value=QuestionValidationResult(accepted=True, route=QuestionRoute.ANALYTICAL, corrected="q"),
             ),
             patch(
                 "aetherdialect._live_testing.normalize_question_via_llm",
@@ -990,7 +988,7 @@ class TestRunPipelineCoreUnionPreview:
                 set(),
                 "y",
                 [],
-                feedback_mode="deferred_test",
+                feedback_mode=FeedbackMode.DEFERRED_TEST,
             )
 
         mock_mtf.assert_called_once()
@@ -1048,7 +1046,7 @@ class TestAssertionTableNames:
 def test_run_pipeline_core_refuses_federated_composite_schema() -> None:
     from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
     from aetherdialect._schema_graph import recompute_join_paths_multi
-    from aetherdialect._templates import empty_template_store
+    from aetherdialect._templates import TemplateOps
 
     composite = SchemaGraph(
         tables={
@@ -1070,7 +1068,7 @@ def test_run_pipeline_core_refuses_federated_composite_schema() -> None:
         join_paths_multi=recompute_join_paths_multi({}),
         schema_graph_id="sg_fed",
     )
-    store = empty_template_store("sg_fed")
+    store = TemplateOps.empty_template_store("sg_fed")
     result = _run_pipeline_core(
         question="join left and right",
         schema=composite,
@@ -1080,7 +1078,7 @@ def test_run_pipeline_core_refuses_federated_composite_schema() -> None:
         schema_terms=set(),
         feedback="y",
         captured_logs=[],
-        feedback_mode="deferred_test",
+        feedback_mode=FeedbackMode.DEFERRED_TEST,
     )
     assert result.status == "error"
     assert result.error is not None

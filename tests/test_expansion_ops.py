@@ -7,19 +7,24 @@ from unittest import mock
 import pytest
 
 from aetherdialect._config import EngineConfig
-from aetherdialect._constants import ExpansionOperatorId
+from aetherdialect._constants import (
+    AGG_CHANGE,
+    EXPANSION_OPERATOR_IDS,
+    GROUPBY_ADD,
+    INCLUDE_GOLD,
+    JOIN_DIMENSION_ADD,
+    WHERE_ADD,
+    WHERE_EXPR_ADD,
+)
 from aetherdialect._contracts_base import (
     ColumnRole,
     ExprValue,
     HavingParam,
     NormalizedExpr,
     OrderByCol,
+    PredicateGroup,
     TableRole,
     WhereParam,
-    expr_registry_ref,
-    having_leaves,
-    predicate_group_from_list,
-    where_leaves,
 )
 from aetherdialect._contracts_core import (
     RuntimeCteStep,
@@ -97,21 +102,17 @@ from aetherdialect._utils import intent_key
 
 
 def _all_operator_id_strings() -> set[str]:
-    """Return every public string constant on ``ExpansionOperatorId``."""
-    return {
-        getattr(ExpansionOperatorId, name)
-        for name in dir(ExpansionOperatorId)
-        if not name.startswith("_") and isinstance(getattr(ExpansionOperatorId, name), str)
-    }
+    """Return every expansion operator id string."""
+    return set(EXPANSION_OPERATOR_IDS)
 
 
 def _warmup_intent(**overrides) -> SeedWarmupIntent:
     """Build a minimal SeedWarmupIntent with optional overrides."""
     if "where" in overrides and isinstance(overrides["where"], list):
-        overrides["where"] = predicate_group_from_list(overrides["where"])
+        overrides["where"] = PredicateGroup.from_list(overrides["where"])
     if "where_param" in overrides:
         raw_fp = overrides.pop("where_param")
-        overrides["where"] = predicate_group_from_list(raw_fp)
+        overrides["where"] = PredicateGroup.from_list(raw_fp)
     defaults = dict(
         intent_id="test_001",
         tables=["orders"],
@@ -135,37 +136,37 @@ class TestAddExpansionMetadata:
     def test_first_expansion(self):
         """First expansion sets depth=1 and single-element path."""
         intent = _warmup_intent()
-        _add_expansion_metadata(intent, ExpansionOperatorId.WHERE_ADD)
+        _add_expansion_metadata(intent, WHERE_ADD)
         meta = intent.expansion_metadata
         assert meta is not None
-        assert meta.operator == ExpansionOperatorId.WHERE_ADD
+        assert meta.operator == WHERE_ADD
         assert meta.depth == 1
-        assert meta.expansion_path == [ExpansionOperatorId.WHERE_ADD]
+        assert meta.expansion_path == [WHERE_ADD]
 
     def test_second_expansion(self):
         """Second expansion increments depth and appends to path."""
         intent = _warmup_intent()
-        _add_expansion_metadata(intent, ExpansionOperatorId.WHERE_ADD)
-        _add_expansion_metadata(intent, ExpansionOperatorId.GROUPBY_ADD)
+        _add_expansion_metadata(intent, WHERE_ADD)
+        _add_expansion_metadata(intent, GROUPBY_ADD)
         meta = intent.expansion_metadata
         assert meta.depth == 2
-        assert meta.expansion_path == [ExpansionOperatorId.WHERE_ADD, ExpansionOperatorId.GROUPBY_ADD]
-        assert meta.operator == ExpansionOperatorId.GROUPBY_ADD
+        assert meta.expansion_path == [WHERE_ADD, GROUPBY_ADD]
+        assert meta.operator == GROUPBY_ADD
 
     def test_parent_intent_id_propagated(self):
         """Second expansion inherits intent_id as parent when first parent is empty."""
         intent = _warmup_intent()
-        _add_expansion_metadata(intent, ExpansionOperatorId.WHERE_ADD)
+        _add_expansion_metadata(intent, WHERE_ADD)
         assert intent.expansion_metadata.parent_intent_id == ""
-        _add_expansion_metadata(intent, ExpansionOperatorId.AGG_CHANGE)
+        _add_expansion_metadata(intent, AGG_CHANGE)
         assert intent.expansion_metadata.parent_intent_id == "test_001"
 
     def test_third_expansion(self):
         """Three-deep expansion has correct depth and path length."""
         intent = _warmup_intent()
-        _add_expansion_metadata(intent, ExpansionOperatorId.WHERE_ADD)
-        _add_expansion_metadata(intent, ExpansionOperatorId.WHERE_EXPR_ADD)
-        _add_expansion_metadata(intent, ExpansionOperatorId.JOIN_DIMENSION_ADD)
+        _add_expansion_metadata(intent, WHERE_ADD)
+        _add_expansion_metadata(intent, WHERE_EXPR_ADD)
+        _add_expansion_metadata(intent, JOIN_DIMENSION_ADD)
         meta = intent.expansion_metadata
         assert meta.depth == 3
         assert len(meta.expansion_path) == 3
@@ -175,12 +176,12 @@ class TestAddExpansionMetadata:
         intent = _warmup_intent(
             expansion_metadata=ExpansionMetadata(
                 parent_intent_id="original_parent",
-                operator=ExpansionOperatorId.WHERE_ADD,
+                operator=WHERE_ADD,
                 depth=1,
-                expansion_path=[ExpansionOperatorId.WHERE_ADD],
+                expansion_path=[WHERE_ADD],
             )
         )
-        _add_expansion_metadata(intent, ExpansionOperatorId.JOIN_DIMENSION_ADD)
+        _add_expansion_metadata(intent, JOIN_DIMENSION_ADD)
         assert intent.expansion_metadata.parent_intent_id == "original_parent"
         assert intent.expansion_metadata.depth == 2
 
@@ -496,7 +497,7 @@ class TestIncludeGold:
         intent = _warmup_intent(tables=["orders"])
         cm = _build_column_metadata(schema_graph)
         results = _include_gold(intent, schema_graph, cm)
-        assert results[0].expansion_metadata.operator == ExpansionOperatorId.INCLUDE_GOLD
+        assert results[0].expansion_metadata.operator == INCLUDE_GOLD
 
 
 class TestTempExtractGroupby:
@@ -777,7 +778,7 @@ class TestHavingRemove:
             grain="grouped",
             group_by_cols=[NormalizedExpr.from_column("orders.customer_id")],
             select_cols=[SelectCol(expr=NormalizedExpr.from_agg("sum", "orders.amount"))],
-            having=predicate_group_from_list(
+            having=PredicateGroup.from_list(
                 [
                     HavingParam(
                         left_expr=NormalizedExpr.from_agg("sum", "orders.amount"),
@@ -874,7 +875,7 @@ class TestNumericSelectAndFilterOps:
     def test_num_abs_on_range_filter(self, schema_graph):
         intent = _warmup_intent(
             tables=["orders"],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("orders.amount"),
@@ -888,7 +889,7 @@ class TestNumericSelectAndFilterOps:
         cm = _build_column_metadata(schema_graph)
         out = _num_abs_filter(intent, schema_graph, cm)
         assert len(out) == 1
-        assert where_leaves(out[0].where)[0].left_expr.scalar_func == "abs"
+        assert PredicateGroup.where_leaves(out[0].where)[0].left_expr.scalar_func == "abs"
 
 
 class TestSelectExprPairMultiply:
@@ -914,7 +915,7 @@ class TestSelectCaseLabelAdd:
         out = _select_case_label_add(intent, schema_graph, cm)
         assert len(out) > 0
         for r in out:
-            case_cols = [sc for sc in r.select_cols if (expr_registry_ref(sc.expr) or "").startswith("c")]
+            case_cols = [sc for sc in r.select_cols if (sc.expr.registry_ref() or "").startswith("c")]
             assert len(case_cols) >= 1
 
 
@@ -1003,8 +1004,8 @@ class TestFilterArrayContainsAdd:
         cm = _build_column_metadata(sg)
         out = _where_array_contains_add(intent, sg, cm)
         assert len(out) == 1
-        assert where_leaves(out[0].where)[-1].value_type == "array"
-        assert where_leaves(out[0].where)[-1].op == "contains"
+        assert PredicateGroup.where_leaves(out[0].where)[-1].value_type == "array"
+        assert PredicateGroup.where_leaves(out[0].where)[-1].op == "contains"
 
 
 class TestOrderbyLimitRemove:
@@ -1152,7 +1153,7 @@ class TestTableRemovePruning:
             group_by_cols=[NormalizedExpr.from_column("orders.customer_id")],
             order_by_cols=[],
             where=None,
-            having=predicate_group_from_list(
+            having=PredicateGroup.from_list(
                 [
                     HavingParam(
                         left_expr=NormalizedExpr.from_agg("count", "customers.customer_id"),
@@ -1168,7 +1169,9 @@ class TestTableRemovePruning:
         out = _table_remove(intent, schema_graph, fk, cm)
         assert out
         for v in out:
-            assert not any("customers" in h.left_expr.primary_column for h in (having_leaves(v.having) or []))
+            assert not any(
+                "customers" in h.left_expr.primary_column for h in (PredicateGroup.having_leaves(v.having) or [])
+            )
 
     def test_table_remove_prunes_filter_right_expr_referencing_dropped_table(self, schema_graph):
         intent = SeedWarmupIntent(
@@ -1178,7 +1181,7 @@ class TestTableRemovePruning:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("orders.order_id"),
@@ -1196,7 +1199,7 @@ class TestTableRemovePruning:
         out = _table_remove(intent, schema_graph, fk, cm)
         assert out
         for v in out:
-            for fp in where_leaves(v.where) or []:
+            for fp in PredicateGroup.where_leaves(v.where) or []:
                 if fp.right_expr:
                     assert _table_from_column_ref(fp.right_expr.primary_column) != "customers"
 
@@ -1227,7 +1230,7 @@ class TestTableRemovePruning:
         assert out
         for v in out:
             assert not (v.window_registry or [])
-            assert not any((expr_registry_ref(sc.expr) or "").startswith("w") for sc in (v.select_cols or []))
+            assert not any((sc.expr.registry_ref() or "").startswith("w") for sc in (v.select_cols or []))
 
     def test_table_remove_prunes_case_registry_branch_referencing_dropped_table(self, schema_graph):
         branch = CaseWhenBranch(
@@ -1263,7 +1266,7 @@ class TestTableRemovePruning:
         assert out
         for v in out:
             assert not (v.case_registry or [])
-            assert not any((expr_registry_ref(sc.expr) or "").startswith("c") for sc in (v.select_cols or []))
+            assert not any((sc.expr.registry_ref() or "").startswith("c") for sc in (v.select_cols or []))
 
 
 def _table_from_column_ref(col_ref: str) -> str:
@@ -1476,7 +1479,7 @@ class TestWindowStripOrderBy:
         out = _window_strip(ob_intent, schema_graph, cm)
         assert len(out) == 1
         for ob in out[0].order_by_cols or []:
-            assert (expr_registry_ref(ob.expr) or "") != w0
+            assert (ob.expr.registry_ref() or "") != w0
 
 
 class TestHavingStarTargets:
@@ -1491,7 +1494,7 @@ class TestHavingStarTargets:
         cm = _build_column_metadata(schema_graph)
         out = _having_value_add(intent, schema_graph, cm)
         for v in out:
-            for hp in having_leaves(v.having) or []:
+            for hp in PredicateGroup.having_leaves(v.having) or []:
                 term = hp.left_expr.primary_term.lower()
                 if "sum(" in term or "avg(" in term or "min(" in term or "max(" in term:
                     assert "*" not in term
@@ -1504,7 +1507,7 @@ class TestHavingStarTargets:
         )
         cm = _build_column_metadata(schema_graph)
         out = _having_expr_add(intent, schema_graph, cm)
-        pairs = [(h.left_expr.primary_term, h.op) for v in out for h in (having_leaves(v.having) or [])]
+        pairs = [(h.left_expr.primary_term, h.op) for v in out for h in (PredicateGroup.having_leaves(v.having) or [])]
         assert len(pairs) == len(set(pairs))
 
 
@@ -1515,7 +1518,7 @@ class TestFilterAddValueTypes:
         intent = _warmup_intent(tables=["orders"])
         cm = _build_column_metadata(schema_graph)
         out = _where_add(intent, schema_graph, cm)
-        by_col = {f.left_expr.primary_column: f for v in out for f in where_leaves(v.where) or []}
+        by_col = {f.left_expr.primary_column: f for v in out for f in PredicateGroup.where_leaves(v.where) or []}
         assert by_col["orders.customer_id"].value_type == "number"
         assert by_col["orders.status"].value_type == "string"
         assert by_col["orders.order_date"].value_type == "date"
@@ -1543,8 +1546,8 @@ class TestRemoveOperatorsDeepcopy:
         cm = _build_column_metadata(schema_graph)
         fr = _where_remove(intent, schema_graph, cm)
         assert fr
-        kept_idx = 1 if where_leaves(fr[0].where)[0].left_expr.primary_column == "orders.status" else 0
-        where_leaves(fr[0].where)[kept_idx].op = "FAKE"
+        kept_idx = 1 if PredicateGroup.where_leaves(fr[0].where)[0].left_expr.primary_column == "orders.status" else 0
+        PredicateGroup.where_leaves(fr[0].where)[kept_idx].op = "FAKE"
         assert (intent.where.leaves() if intent.where else [])[kept_idx].op != "FAKE"
 
         gb_intent = _warmup_intent(
@@ -1578,11 +1581,11 @@ class TestRemoveOperatorsDeepcopy:
                 param_key="h2",
             ),
         ]
-        hint = replace(gb_intent, having=predicate_group_from_list(hv))
+        hint = replace(gb_intent, having=PredicateGroup.from_list(hv))
         hr = _having_remove(hint, schema_graph, cm)
         assert hr
-        having_leaves(hr[0].having)[0].op = "FAKE"
-        assert having_leaves(hint.having)[0].op != "FAKE"
+        PredicateGroup.having_leaves(hr[0].having)[0].op = "FAKE"
+        assert PredicateGroup.having_leaves(hint.having)[0].op != "FAKE"
 
 
 class TestScalarGrainSkips:
@@ -1606,7 +1609,7 @@ class TestFilterExprAddPairing:
         cm = _build_column_metadata(schema_graph)
         out = _where_expr_add(intent, schema_graph, cm)
         for v in out:
-            for fp in where_leaves(v.where) or []:
+            for fp in PredicateGroup.where_leaves(v.where) or []:
                 if not fp.right_expr:
                     continue
                 lt = fp.left_expr.primary_column
@@ -1761,7 +1764,7 @@ class TestFilterExprAddPairing:
         pairs = {
             (f.left_expr.primary_column, f.right_expr.primary_column)
             for v in out
-            for f in where_leaves(v.where) or []
+            for f in PredicateGroup.where_leaves(v.where) or []
             if f.right_expr
         }
         assert ("factt.u1", "factt.u2") in pairs or ("factt.u2", "factt.u1") in pairs

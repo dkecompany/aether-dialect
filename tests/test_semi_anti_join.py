@@ -7,8 +7,10 @@ from unittest.mock import patch
 
 import pytest
 
-from aetherdialect._constants import anti_join_presence_column
-from aetherdialect._contracts_base import ProbeCtePlacementError, coerce_cte_emission
+from aetherdialect._contracts_base import (
+    CteEmissionKind,
+    ProbeCtePlacementError,
+)
 from aetherdialect._contracts_core import RuntimeCteStep, RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
 from aetherdialect._dialect_postgres import PostgresDialect
@@ -17,6 +19,7 @@ from aetherdialect._pipeline import _resolve_joins_fresh
 from aetherdialect._schema_graph import recompute_join_paths_multi
 from aetherdialect._sql_gen import (
     _join_kind_for_edge,
+    anti_join_presence_column,
     build_deterministic_sql,
     inject_join_into_deterministic_sql,
 )
@@ -96,14 +99,14 @@ def _assert_no_legacy_semi_anti_tokens(sql: str) -> None:
     ("raw", "expected"),
     [
         ("join_table", "join_table"),
-        ("scalar_subquery", "join_table"),
+        ("scalar_subquery", "scalar_subquery"),
         ("semi_join", "semi_join"),
         ("anti_join", "anti_join"),
         ("unknown", "join_table"),
     ],
 )
 def test_coerce_cte_emission(raw: str, expected: str) -> None:
-    assert coerce_cte_emission(raw) == expected
+    assert CteEmissionKind.coerce(raw).value == expected
 
 
 def test_join_kind_for_edge_forces_probe_kinds() -> None:
@@ -147,6 +150,44 @@ def test_semi_join_renders_distinct_without_exists() -> None:
     assert "inner join" in low
     _assert_no_legacy_semi_anti_tokens(det)
     _assert_no_legacy_semi_anti_tokens(joined)
+
+
+def test_anti_join_presence_predicates_attach_without_string_fragments() -> None:
+    """Anti-join IS NULL presence filters are grafted as AST, not parsed SQL fragments."""
+    schema = _parent_child_schema()
+    anti = RuntimeCteStep(
+        cte_name="has_child",
+        emission="anti_join",
+        tables=["child"],
+        select_cols=[SelectCol(expr=NormalizedExpr.from_column("child.parent_id"))],
+        output_columns=["parent_id"],
+        group_by_cols=[],
+        order_by_cols=[],
+        where=None,
+        having=None,
+    )
+    intent = RuntimeIntent(
+        tables=["parent", "has_child"],
+        grain="row_level",
+        select_cols=[SelectCol(expr=NormalizedExpr.from_column("parent.id"))],
+        group_by_cols=[],
+        order_by_cols=[],
+        where=None,
+        cte_steps=[anti],
+    )
+    det = build_deterministic_sql(intent, None, schema, _pg_render())
+    dialect = _pg_render()
+    with patch.object(dialect, "attach_where_sql_fragments", wraps=dialect.attach_where_sql_fragments) as mock_frag:
+        joined = inject_join_into_deterministic_sql(
+            det,
+            [[], ["parent.id->has_child.parent_id"]],
+            schema=schema,
+            edge_kinds_ordered=[[], ["catalog_fk"]],
+            dialect=dialect,
+            cte_emissions={"has_child": "anti_join"},
+        )
+    mock_frag.assert_not_called()
+    assert "is null" in joined.lower()
 
 
 def test_anti_join_renders_left_join_and_presence_null_without_except() -> None:

@@ -25,23 +25,25 @@ def test_schema_migration_map_read_from_artifacts_dir(tmp_path: Path, monkeypatc
     )
     assert not (tmp_path / MIGRATION_MAP_FILENAME).exists()
 
-    source = inspect.getsource(_main_execution.initialize_aether_engine)
+    source = inspect.getsource(_main_execution.MainExecutionOps.initialize_aether_engine)
     assert "cwd_root / MIGRATION_MAP_FILENAME" not in source
     assert "Path(adir)" in source
 
     observed: list[str] = []
-    real_load = _main_execution.load_schema_migration_map
+    from aetherdialect._templates import TemplateOps
+
+    real_load = TemplateOps.load_schema_migration_map
 
     def spy_load(path: Path):
         observed.append(str(Path(path).resolve()))
         return real_load(path)
 
-    monkeypatch.setattr(_main_execution, "load_schema_migration_map", spy_load)
+    monkeypatch.setattr(TemplateOps, "load_schema_migration_map", spy_load)
 
     artifacts_root = Path(str(adir))
     map_path = artifacts_root / MIGRATION_MAP_FILENAME
     if map_path.is_file():
-        _main_execution.load_schema_migration_map(artifacts_root)
+        TemplateOps.load_schema_migration_map(artifacts_root)
 
     assert observed == [str(adir.resolve())]
 
@@ -58,7 +60,7 @@ def test_print_questions_bundle_writes_under_artifacts_dir(tmp_path: Path, monke
         fh.write("1. How many rows?\n")
 
     with patch("aetherdialect._main_execution.notify"):
-        _main_execution.print_questions_bundle(2, artifacts_dir)
+        _main_execution.MainExecutionOps.print_questions_bundle(2, artifacts_dir)
 
     expected = os.path.join(artifacts_dir, "qsim_v2_questions.txt")
     assert os.path.isfile(expected)

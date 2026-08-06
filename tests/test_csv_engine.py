@@ -13,8 +13,8 @@ import pytest
 from aetherdialect import AetherEngine
 from aetherdialect._config import CsvRuntimeConfig, EngineConfig
 from aetherdialect._contracts_base import ConfigError, EngineContext
-from aetherdialect._dialect import get_dialect
-from aetherdialect._llm_provider import clear_llm_clients
+from aetherdialect._dialect import DialectRegistry
+from aetherdialect._llm_provider import LLMProvider
 
 _ORIG_ENGINE_TYPE = EngineConfig.TYPE
 _ORIG_ENGINE_RUNTIME = EngineConfig.RUNTIME
@@ -46,7 +46,7 @@ def _reset_csv_runtime_config() -> None:
         EngineConfig.RUNTIME = _ORIG_ENGINE_RUNTIME
         EngineConfig.API_TOKEN = orig_api_token
         EngineConfig.LLM_PROVIDER = orig_llm_provider
-        clear_llm_clients()
+        LLMProvider.clear_llm_clients()
 
 
 @pytest.fixture
@@ -71,7 +71,7 @@ def _configure_files(*paths: Path) -> None:
 
 def _make_dialect() -> object:
     pytest.importorskip("duckdb")
-    return get_dialect("csv", CsvRuntimeConfig)
+    return DialectRegistry.get("csv", CsvRuntimeConfig)
 
 
 def test_csv_query_join_and_aggregate(csv_fixture_dir: Path) -> None:
@@ -108,7 +108,7 @@ def test_csv_reflect_preserves_original_name_on_spaced_header(tmp_path: Path) ->
     path = tmp_path / "items.csv"
     path.write_text("Customer Name,qty\nAlice,1\n", encoding="utf-8")
     _configure_files(path)
-    with patch("aetherdialect._data_quality.llm_json", side_effect=RuntimeError("offline")):
+    with patch("aetherdialect._data_quality.LLMProvider.json", side_effect=RuntimeError("offline")):
         dialect = _make_dialect()
     graph = dialect.reflect_schema_graph(include="tables")
     table = graph.tables["items"]
@@ -123,7 +123,7 @@ def test_csv_source_selection_header_row(tmp_path: Path) -> None:
     path.write_text("Title\nid,name\n1,Alice\n", encoding="utf-8")
     CsvRuntimeConfig.set_source_selections({path.name: {"header_row": 2}})
     _configure_files(path)
-    with patch("aetherdialect._data_quality.llm_json", side_effect=RuntimeError("offline")):
+    with patch("aetherdialect._data_quality.LLMProvider.json", side_effect=RuntimeError("offline")):
         dialect = _make_dialect()
     graph = dialect.reflect_schema_graph(include="tables")
     assert "shifted" in graph.tables
@@ -267,7 +267,7 @@ api_key = "test-key"
 
 def _patch_csv_schema_llm() -> ExitStack:
     stack = ExitStack()
-    stack.enter_context(patch("aetherdialect._data_quality.llm_json", side_effect=_mock_upload_llm_json))
+    stack.enter_context(patch("aetherdialect._data_quality.LLMProvider.json", side_effect=_mock_upload_llm_json))
     stack.enter_context(patch("aetherdialect._schema_overrides._profile_subset"))
     stack.enter_context(patch("aetherdialect._schema_overrides.apply_column_roles_llm"))
     return stack

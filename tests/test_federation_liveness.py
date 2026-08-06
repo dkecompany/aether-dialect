@@ -9,7 +9,7 @@ import pytest
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._main_execution import SESSION_KIND_ERROR, PipelineSession
 from aetherdialect._schema_graph import recompute_join_paths_multi
-from aetherdialect._templates import empty_template_store
+from aetherdialect._templates import TemplateOps
 
 
 def _member_table(name: str, source_id: str) -> TableMetadata:
@@ -28,7 +28,7 @@ def _federation_owner(*, members: dict[str, MagicMock] | None = None) -> MagicMo
     owner = MagicMock()
     owner._is_aether_federation = True
     owner._schema_graph = schema
-    owner._store = empty_template_store(schema.schema_graph_id)
+    owner._store = TemplateOps.empty_template_store(schema.schema_graph_id)
     owner._templates = {}
     owner._rejected = {}
     owner._schema_terms = set()
@@ -59,7 +59,7 @@ def test_federation_turn_start_probes_member_connections() -> None:
     session = PipelineSession(owner)
 
     with patch("aetherdialect._main_execution.probe_federation_member_liveness") as probe_mock:
-        with patch("aetherdialect._main_execution.interactive_run_once"):
+        with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once"):
             session.ask("how many t")
 
     probe_mock.assert_called_once_with(members)
@@ -72,7 +72,7 @@ def test_stale_connection_surfaces_as_probe_error_not_partial_failure() -> None:
     owner = _federation_owner(members={"west": member})
     session = PipelineSession(owner)
 
-    with patch("aetherdialect._main_execution.interactive_run_once"):
+    with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once"):
         step = session.ask("how many t")
 
     assert step.done is True

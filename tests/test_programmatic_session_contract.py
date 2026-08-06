@@ -9,7 +9,7 @@ import pytest
 
 import aetherdialect
 from aetherdialect import AetherEngine, AsyncPipelineSession, SessionStep
-from aetherdialect._templates import empty_template_store
+from aetherdialect._templates import TemplateOps
 
 
 def test_public_all_excludes_legacy_types() -> None:
@@ -55,7 +55,7 @@ def _session_owner() -> MagicMock:
     owner = MagicMock()
     owner._schema_graph = MagicMock()
     owner._schema_graph.effective_structural_hash = "test_hash"
-    owner._store = empty_template_store("test_hash")
+    owner._store = TemplateOps.empty_template_store("test_hash")
     owner._templates = {}
     owner._rejected = {}
     owner._schema_terms = set()
@@ -83,7 +83,7 @@ def test_pipeline_session_ask_blocked_emits_audit() -> None:
     owner = _session_owner()
     sess = PipelineSession(owner)
     suspended = PipelineSuspended(PIPELINE_SUSPEND_ID_INTENT_CONFIRM, "p", None)
-    with patch("aetherdialect._main_execution.interactive_run_once", side_effect=suspended):
+    with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once", side_effect=suspended):
         sess.ask("first")
     with pytest.raises(SessionActiveError):
         sess.ask("second")
@@ -103,8 +103,8 @@ def test_ask_until_done_yes_resumes_to_completion() -> None:
     sess = PipelineSession(owner)
     suspended = PipelineSuspended(PIPELINE_SUSPEND_ID_INTENT_CONFIRM, "p", None)
     with (
-        patch("aetherdialect._main_execution.interactive_run_once", side_effect=suspended),
-        patch("aetherdialect._main_execution.dispatch_pipeline_resume") as disp,
+        patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once", side_effect=suspended),
+        patch("aetherdialect._main_execution.MainExecutionOps.dispatch_pipeline_resume") as disp,
     ):
         step = sess.ask_until_done("q", on_confirm="y")
     assert step.done is True
@@ -122,7 +122,7 @@ def test_ask_until_done_free_text_suspend_raises() -> None:
     owner = _session_owner()
     sess = PipelineSession(owner)
     suspended = PipelineSuspended(PIPELINE_SUSPEND_ID_INTENT_FEEDBACK, "why?", None)
-    with patch("aetherdialect._main_execution.interactive_run_once", side_effect=suspended):
+    with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once", side_effect=suspended):
         with pytest.raises(SessionActiveError, match="free-text"):
             sess.ask_until_done("q", on_confirm="y")
 
@@ -210,7 +210,7 @@ def test_async_pipeline_session_ask_smoke() -> None:
     inner = PipelineSession(owner)
 
     async def _run() -> None:
-        with patch("aetherdialect._main_execution.interactive_run_once", return_value=None):
+        with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once", return_value=None):
             ap = AsyncPipelineSession(inner)
             step = await ap.ask("q")
         assert step.done is True
@@ -319,7 +319,7 @@ def test_async_sqlite_in_memory_execute_on_worker_thread() -> None:
     import sqlite3
 
     from aetherdialect._config import EngineConfig, SQLiteRuntimeConfig
-    from aetherdialect._dialect import get_dialect
+    from aetherdialect._dialect import DialectRegistry
 
     connection = sqlite3.connect(":memory:", check_same_thread=False)
     connection.execute("CREATE TABLE worker_probe (value INTEGER)")
@@ -332,7 +332,7 @@ def test_async_sqlite_in_memory_execute_on_worker_thread() -> None:
         EngineConfig.SCHEMA_JSON_PATH = ""
         EngineConfig.TYPE = "sqlite"
         EngineConfig.RUNTIME = SQLiteRuntimeConfig
-        dialect = get_dialect("sqlite", SQLiteRuntimeConfig, native_connection=connection)
+        dialect = DialectRegistry.get("sqlite", SQLiteRuntimeConfig, native_connection=connection)
 
         async def _run() -> list[tuple]:
             return await asyncio.to_thread(dialect.execute, "SELECT value FROM worker_probe")

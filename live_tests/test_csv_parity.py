@@ -8,14 +8,11 @@ import pytest
 
 import aetherdialect._dialect_sqlglot_engines
 from aetherdialect._config import CsvRuntimeConfig, DuckDBRuntimeConfig, EngineConfig
-from aetherdialect._dialect import get_dialect
+from aetherdialect._dialect import DialectRegistry
 from aetherdialect._schema_overrides import apply_schema_overrides_to_graph, load_schema_overrides_file
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_CSV_DIRS = (
-    _REPO_ROOT / "scripts" / "data" / "rental_shop_csvs",
-    _REPO_ROOT / "scripts" / "data" / "rental_shop_csvs",
-)
+_CSV_DIRS = (_REPO_ROOT / "scripts" / "data" / "rental_shop_csvs",)
 _OVERRIDES = _REPO_ROOT / "scripts" / "data" / "rental_shop_overrides.json"
 
 _PARITY_TABLES = ("item", "customer", "store", "rental", "payment")
@@ -51,11 +48,11 @@ def csv_dialect():
     CsvRuntimeConfig.FILES = tuple(str(path) for path in csv_paths)
     CsvRuntimeConfig.clear_attached_connection()
     try:
-        connection = aetherdialect._dialect_sqlglot_engines._build_csv_memory_connection(CsvRuntimeConfig)
+        connection = aetherdialect._dialect_sqlglot_engines.CsvDialect._build_csv_memory_connection(CsvRuntimeConfig)
     except Exception as exc:
         pytest.skip(f"CSV bundle failed to load into DuckDB: {exc}")
     CsvRuntimeConfig.attach_connection(connection)
-    dialect = get_dialect("csv", CsvRuntimeConfig)
+    dialect = DialectRegistry.get("csv", CsvRuntimeConfig)
     graph = dialect.reflect_schema_graph(include="tables")
     if _OVERRIDES.is_file():
         apply_schema_overrides_to_graph(graph, load_schema_overrides_file(str(_OVERRIDES)))
@@ -84,7 +81,7 @@ def duckdb_dialect():
         if not csv_path.is_file():
             pytest.skip(f"missing parity CSV: {csv_path.name}")
         connection.execute(f"CREATE TABLE {table} AS SELECT * FROM read_csv_auto({csv_path.as_posix()!r})")
-    dialect = get_dialect("duckdb", DuckDBRuntimeConfig, native_connection=connection)
+    dialect = DialectRegistry.get("duckdb", DuckDBRuntimeConfig, native_connection=connection)
     graph = dialect.reflect_schema_graph(include="tables")
     if _OVERRIDES.is_file():
         apply_schema_overrides_to_graph(graph, load_schema_overrides_file(str(_OVERRIDES)))

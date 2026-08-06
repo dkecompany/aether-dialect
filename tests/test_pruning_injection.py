@@ -9,8 +9,8 @@ import pytest
 
 from aetherdialect._contracts_base import (
     NormalizedExpr,
+    PredicateGroup,
     WhereParam,
-    predicate_group_from_list,
 )
 from aetherdialect._contracts_core import RuntimeIntent
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
@@ -25,15 +25,14 @@ from aetherdialect._dialect_sqlglot_engines import (
     SnowflakeDialect,
     SQLServerDialect,
 )
-from aetherdialect._dialect_sqlglot_helper import (
-    append_required_partition_filter_guard,
-    table_requires_pruning_filter,
-)
+from aetherdialect._dialect_sqlglot_helper import PartitionSqlAdapter
 from aetherdialect._schema_build import (
     enrich_postgresql_partition_columns,
     merge_ddl_partition_columns_into_schema_graph,
     parse_mysql_partition_columns,
 )
+
+PartitionSqlSupport = PartitionSqlAdapter
 
 
 def _where_param(col: str, op: str, param_key: str | None = None, raw_value=None) -> WhereParam:
@@ -102,19 +101,19 @@ def _equality_intent(table: str, col: str, value: str) -> RuntimeIntent:
         select_cols=[],
         group_by_cols=[],
         order_by_cols=[],
-        where=predicate_group_from_list([_where_param(f"{table}.{col}", "=", "p1", None)]),
+        where=PredicateGroup.from_list([_where_param(f"{table}.{col}", "=", "p1", None)]),
         param_values={"p1": value},
     )
 
 
 PRUNING_DIALECTS: list[tuple[str, type, Callable[[], Any], str]] = [
-    ("databricks", DatabricksDialect, lambda: _dialect_shell(DatabricksDialect), "`events`.`dt` = '2024-01-15'"),
-    ("duckdb", DuckDBDialect, lambda: _dialect_shell(DuckDBDialect), '"events"."dt" = \'2024-01-15\''),
-    ("postgres", PostgresDialect, lambda: _dialect_shell(PostgresDialect), '"events"."dt" = \'2024-01-15\''),
-    ("mysql", MySQLDialect, lambda: _dialect_shell(MySQLDialect), "`events`.`dt` = '2024-01-15'"),
-    ("mariadb", MariaDBDialect, lambda: _dialect_shell(MariaDBDialect), "`events`.`dt` = '2024-01-15'"),
-    ("sqlserver", SQLServerDialect, lambda: _dialect_shell(SQLServerDialect), "[events].[dt] = '2024-01-15'"),
-    ("bigquery", BigQueryDialect, lambda: _dialect_shell(BigQueryDialect), "`events`.`dt` = '2024-01-15'"),
+    ("databricks", DatabricksDialect, lambda: _dialect_shell(DatabricksDialect), "`events`.`dt` = :p1"),
+    ("duckdb", DuckDBDialect, lambda: _dialect_shell(DuckDBDialect), '"events"."dt" = :p1'),
+    ("postgres", PostgresDialect, lambda: _dialect_shell(PostgresDialect), '"events"."dt" = :p1'),
+    ("mysql", MySQLDialect, lambda: _dialect_shell(MySQLDialect), "`events`.`dt` = :p1"),
+    ("mariadb", MariaDBDialect, lambda: _dialect_shell(MariaDBDialect), "`events`.`dt` = :p1"),
+    ("sqlserver", SQLServerDialect, lambda: _dialect_shell(SQLServerDialect), "[events].[dt] = :p1"),
+    ("bigquery", BigQueryDialect, lambda: _dialect_shell(BigQueryDialect), "`events`.`dt` = :p1"),
 ]
 
 
@@ -142,7 +141,8 @@ def test_redshift_inject_sortkey_predicate() -> None:
     sql = "SELECT * FROM sales"
     result = _dialect_shell(RedshiftDialect).inject_pruning_predicates(sql, schema=schema, intent=intent)
     assert '"sales"."dt"' in result or "sales.dt" in result.lower()
-    assert "2024-01-01" in result
+    assert ":p1" in result
+    assert "2024-01-01" not in result
 
 
 def test_snowflake_inject_cluster_predicate() -> None:
@@ -151,7 +151,8 @@ def test_snowflake_inject_cluster_predicate() -> None:
     intent = _equality_intent("events", "dt", "2024-06-01")
     sql = "SELECT * FROM events"
     result = _dialect_shell(SnowflakeDialect).inject_pruning_predicates(sql, schema=schema, intent=intent)
-    assert "2024-06-01" in result
+    assert ":p1" in result
+    assert "2024-06-01" not in result
     assert "WHERE" in result.upper()
 
 
@@ -266,7 +267,7 @@ class TestRequiredPartitionFilterGuard:
             primary_key=[],
             require_partition_filter=True,
         )
-        assert table_requires_pruning_filter(meta) is True
+        assert PartitionSqlSupport.table_requires_pruning_filter(meta) is True
 
     def test_appends_default_guard_predicate(self) -> None:
         meta = TableMetadata(
@@ -287,7 +288,7 @@ class TestRequiredPartitionFilterGuard:
             where=None,
         )
         sql = "SELECT * FROM events"
-        out = append_required_partition_filter_guard(
+        out = PartitionSqlSupport.append_required_partition_filter_guard(
             sql,
             schema=schema,
             intent=intent,

@@ -7,7 +7,7 @@ import json
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 import sqlglot
 from sqlglot import exp
@@ -31,13 +31,6 @@ from ._contracts_base import (
     PredicateGroup,
     SchemaInvariantError,
     WhereParam,
-    coerce_predicate_group,
-    expr_registry_ref,
-    having_leaves,
-    map_predicate_group,
-    predicate_group_from_list,
-    reapply_predicate_leaves,
-    where_leaves,
 )
 from ._contracts_core import (
     ConcreteIntent,
@@ -45,7 +38,6 @@ from ._contracts_core import (
     RuntimeIntent,
     SelectCol,
     UnionSelectColumnDelta,
-    effective_select_parts,
 )
 from ._contracts_schema import (
     CaseRegistryStep,
@@ -55,9 +47,16 @@ from ._contracts_schema import (
     IntentIssue,
     SchemaGraph,
     WindowRegistryStep,
-    make_intent_issue,
 )
-from ._core_utils import debug, normalize_op, normalize_value_type, pipeline_trace, stable_json
+from ._core_utils import (
+    build_case_folded_index,
+    debug,
+    normalize_op,
+    normalize_text_value,
+    normalize_value_type,
+    pipeline_trace,
+    stable_json,
+)
 from ._intent_expr import (
     classify_cte_expr,
     concat_logical_intent_prose,
@@ -129,17 +128,18 @@ def _match_enum_value(
         enum_vals = schema_graph.enum_values.get(dtype_lower)
     if not enum_vals:
         return None
-    raw_lower = raw_value.lower()
+    raw_norm = normalize_text_value(raw_value).lower()
     for ev in enum_vals:
-        if ev.lower() == raw_lower:
+        if normalize_text_value(ev).lower() == raw_norm:
             return ev
     return None
 
 
 def _match_frequent_value(raw_value: str, col_meta: ColumnMetadata) -> str | None:
     """Case-insensitive match against member-scoped frequent value samples."""
+    raw_norm = normalize_text_value(raw_value).lower()
     for sample in col_meta.frequent_values or ():
-        if isinstance(sample, str) and sample.lower() == raw_value.lower():
+        if isinstance(sample, str) and normalize_text_value(sample).lower() == raw_norm:
             return sample
     return None
 
@@ -414,8 +414,8 @@ def qualify_cte_output_columns(intent: RuntimeIntent) -> RuntimeIntent:
         )
         for obc in (intent.order_by_cols or [])
     ]
-    new_filters = _qualify_filters(where_leaves(intent.where) or [], main_tables)
-    new_having = _qualify_having(having_leaves(intent.having) or [], main_tables)
+    new_filters = _qualify_filters(PredicateGroup.where_leaves(intent.where) or [], main_tables)
+    new_having = _qualify_having(PredicateGroup.having_leaves(intent.having) or [], main_tables)
     new_wr = _qualify_wr(intent.window_registry, main_tables)
     new_cr = _qualify_cr(intent.case_registry, main_tables)
 
@@ -443,8 +443,8 @@ def qualify_cte_output_columns(intent: RuntimeIntent) -> RuntimeIntent:
             )
             for obc in (cte.order_by_cols or [])
         ]
-        c_fp = _qualify_filters(where_leaves(cte.where) or [], scope)
-        c_hp = _qualify_having(having_leaves(cte.having) or [], scope)
+        c_fp = _qualify_filters(PredicateGroup.where_leaves(cte.where) or [], scope)
+        c_hp = _qualify_having(PredicateGroup.having_leaves(cte.having) or [], scope)
         c_wr = _qualify_wr(cte.window_registry, scope)
         c_cr = _qualify_cr(cte.case_registry, scope)
         new_cte_steps.append(
@@ -453,8 +453,8 @@ def qualify_cte_output_columns(intent: RuntimeIntent) -> RuntimeIntent:
                 select_cols=c_sel,
                 group_by_cols=c_gb,
                 order_by_cols=c_ob,
-                where=predicate_group_from_list(c_fp),
-                having=predicate_group_from_list(c_hp),
+                where=PredicateGroup.from_list(c_fp),
+                having=PredicateGroup.from_list(c_hp),
                 window_registry=c_wr,
                 case_registry=c_cr,
             )
@@ -465,8 +465,8 @@ def qualify_cte_output_columns(intent: RuntimeIntent) -> RuntimeIntent:
         new_select_cols == intent.select_cols
         and new_group_by == intent.group_by_cols
         and new_order_by == intent.order_by_cols
-        and new_filters == (where_leaves(intent.where) or [])
-        and new_having == (having_leaves(intent.having) or [])
+        and new_filters == (PredicateGroup.where_leaves(intent.where) or [])
+        and new_having == (PredicateGroup.having_leaves(intent.having) or [])
         and new_wr == (intent.window_registry or [])
         and new_cr == (intent.case_registry or [])
         and new_cte_steps == cte_steps
@@ -479,8 +479,8 @@ def qualify_cte_output_columns(intent: RuntimeIntent) -> RuntimeIntent:
         select_cols=new_select_cols,
         group_by_cols=new_group_by,
         order_by_cols=new_order_by,
-        where=predicate_group_from_list(new_filters),
-        having=predicate_group_from_list(new_having),
+        where=PredicateGroup.from_list(new_filters),
+        having=PredicateGroup.from_list(new_having),
         window_registry=new_wr,
         case_registry=new_cr,
         cte_steps=new_cte_steps,
@@ -506,7 +506,7 @@ def normalize_count_star(intent: RuntimeIntent) -> RuntimeIntent:
                 and len(leaf.add_values) == 1
             ):
                 try:
-                    is_one = float(leaf.add_values[0].value) == 1.0
+                    is_one = float(str(leaf.add_values[0].value or 0)) == 1.0
                 except (TypeError, ValueError):
                     is_one = False
             if is_one:
@@ -540,14 +540,14 @@ def normalize_count_star(intent: RuntimeIntent) -> RuntimeIntent:
 
     new_select_cols = [replace(sc, expr=_normalize_expr(sc.expr)) for sc in (intent.select_cols or [])]
     new_order_by_cols = [replace(obc, expr=_normalize_expr(obc.expr)) for obc in (intent.order_by_cols or [])]
-    new_filters = map_predicate_group(intent.where, lambda fp: _fix_where_list([fp])[0])
-    new_having = map_predicate_group(intent.having, lambda hp: _fix_having_list([hp])[0])
+    new_filters = PredicateGroup.map(intent.where, lambda fp: _fix_where_list([fp])[0])
+    new_having = PredicateGroup.map(intent.having, lambda hp: _fix_having_list([hp])[0])
     new_cte_steps = []
     for cte in intent.cte_steps or []:
         cte_sc = [replace(sc, expr=_normalize_expr(sc.expr)) for sc in (cte.select_cols or [])]
         cte_obc = [replace(obc, expr=_normalize_expr(obc.expr)) for obc in (cte.order_by_cols or [])]
-        cte_where = map_predicate_group(cte.where, lambda fp: _fix_where_list([fp])[0])
-        cte_having = map_predicate_group(cte.having, lambda hp: _fix_having_list([hp])[0])
+        cte_where = PredicateGroup.map(cte.where, lambda fp: _fix_where_list([fp])[0])
+        cte_having = PredicateGroup.map(cte.having, lambda hp: _fix_having_list([hp])[0])
         new_cte_steps.append(
             replace(cte, select_cols=cte_sc, order_by_cols=cte_obc, where=cte_where, having=cte_having)
         )
@@ -575,7 +575,7 @@ def _is_row_count_count_mulgroup(group: MulGroup) -> bool:
             return True
         if leaf.add_values and not leaf.add_groups and not leaf.sub_groups and not leaf.sub_values:
             try:
-                if len(leaf.add_values) == 1 and float(leaf.add_values[0].value) == 1.0:
+                if len(leaf.add_values) == 1 and float(str(leaf.add_values[0].value or 0)) == 1.0:
                     return True
             except (TypeError, ValueError):
                 pass
@@ -728,7 +728,7 @@ def qualify_count_star_mulgroups(intent: RuntimeIntent, schema_graph: SchemaGrap
     main_cols, main_having, main_windows, main_cases, main_changed = _qualify_scope_count_star_mulgroups(
         tables=list(intent.tables or []),
         select_cols=list(intent.select_cols or []),
-        having_param=list(having_leaves(intent.having) or []),
+        having_param=list(PredicateGroup.having_leaves(intent.having) or []),
         window_registry=intent.window_registry,
         case_registry=intent.case_registry,
         schema_graph=schema_graph,
@@ -738,7 +738,7 @@ def qualify_count_star_mulgroups(intent: RuntimeIntent, schema_graph: SchemaGrap
         intent = replace(
             intent,
             select_cols=main_cols,
-            having=predicate_group_from_list(main_having),
+            having=PredicateGroup.from_list(main_having),
             window_registry=main_windows,
             case_registry=main_cases,
         )
@@ -747,7 +747,7 @@ def qualify_count_star_mulgroups(intent: RuntimeIntent, schema_graph: SchemaGrap
         cte_cols, cte_having, cte_windows, cte_cases, cte_changed = _qualify_scope_count_star_mulgroups(
             tables=list(cte.tables or []),
             select_cols=list(cte.select_cols or []),
-            having_param=list(having_leaves(cte.having) or []),
+            having_param=list(PredicateGroup.having_leaves(cte.having) or []),
             window_registry=cte.window_registry,
             case_registry=cte.case_registry,
             schema_graph=schema_graph,
@@ -758,7 +758,7 @@ def qualify_count_star_mulgroups(intent: RuntimeIntent, schema_graph: SchemaGrap
                 replace(
                     cte,
                     select_cols=cte_cols,
-                    having=predicate_group_from_list(cte_having),
+                    having=PredicateGroup.from_list(cte_having),
                     window_registry=cte_windows,
                     case_registry=cte_cases,
                 )
@@ -904,8 +904,8 @@ def canonicalize_registry_ids(intent: RuntimeIntent) -> RuntimeIntent:
         intent.select_cols or [],
         intent.group_by_cols or [],
         intent.order_by_cols or [],
-        where_leaves(intent.where) or [],
-        having_leaves(intent.having) or [],
+        PredicateGroup.where_leaves(intent.where) or [],
+        PredicateGroup.having_leaves(intent.having) or [],
         intent.window_registry or [],
         intent.case_registry or [],
     )
@@ -915,8 +915,8 @@ def canonicalize_registry_ids(intent: RuntimeIntent) -> RuntimeIntent:
             cte.select_cols or [],
             cte.group_by_cols or [],
             cte.order_by_cols or [],
-            where_leaves(cte.where) or [],
-            having_leaves(cte.having) or [],
+            PredicateGroup.where_leaves(cte.where) or [],
+            PredicateGroup.having_leaves(cte.having) or [],
             cte.window_registry or [],
             cte.case_registry or [],
         )
@@ -926,8 +926,8 @@ def canonicalize_registry_ids(intent: RuntimeIntent) -> RuntimeIntent:
                 select_cols=c_select,
                 group_by_cols=c_group,
                 order_by_cols=c_order,
-                where=reapply_predicate_leaves(cte.where, c_filters),
-                having=reapply_predicate_leaves(cte.having, c_having),
+                where=PredicateGroup.reapply_leaves(cte.where, c_filters),
+                having=PredicateGroup.reapply_leaves(cte.having, c_having),
                 window_registry=c_wr,
                 case_registry=c_cr,
             )
@@ -937,8 +937,8 @@ def canonicalize_registry_ids(intent: RuntimeIntent) -> RuntimeIntent:
         select_cols=new_select,
         group_by_cols=new_group,
         order_by_cols=new_order,
-        where=reapply_predicate_leaves(intent.where, new_filters),
-        having=reapply_predicate_leaves(intent.having, new_having),
+        where=PredicateGroup.reapply_leaves(intent.where, new_filters),
+        having=PredicateGroup.reapply_leaves(intent.having, new_having),
         window_registry=new_wr,
         case_registry=new_cr,
         cte_steps=new_cte_steps,
@@ -1002,13 +1002,11 @@ def coerce_predicate_group_mode(intent: RuntimeIntent) -> RuntimeIntent:
     """Normalise predicate trees before ``normalize_where_havings``."""
     new_ctes: list[RuntimeCteStep] = []
     for cte in intent.cte_steps or []:
-        new_ctes.append(
-            replace(cte, where=coerce_predicate_group(cte.where), having=coerce_predicate_group(cte.having))
-        )
+        new_ctes.append(replace(cte, where=PredicateGroup.coerce(cte.where), having=PredicateGroup.coerce(cte.having)))
     return replace(
         intent,
-        where=coerce_predicate_group(intent.where),
-        having=coerce_predicate_group(intent.having),
+        where=PredicateGroup.coerce(intent.where),
+        having=PredicateGroup.coerce(intent.having),
         cte_steps=new_ctes,
     )
 
@@ -1076,7 +1074,7 @@ def _normalize_predicate_group(
 ) -> PredicateGroup | None:
     if group is None or group.is_empty():
         return None
-    normalized = map_predicate_group(group, norm_fn)
+    normalized = PredicateGroup.map(group, norm_fn)
     sorted_group = _sort_predicate_group(normalized, key_fn)
     return _dedup_predicate_group(sorted_group)
 
@@ -1099,10 +1097,10 @@ def _select_carries_aggregation(
     sc: SelectCol, window_registry: list[WindowRegistryStep] | None, case_registry: list[CaseRegistryStep] | None
 ) -> bool:
     """Return True when *sc* carries SQL aggregation that participates in GROUP BY mixing rules."""
-    parts = effective_select_parts(sc, window_registry, case_registry)
+    parts = sc.effective_parts(window_registry, case_registry)
     if parts.window_spec is not None:
         return False
-    if expr_registry_ref(sc.expr) is not None:
+    if sc.expr.registry_ref() is not None:
         return False
     return parts.expr.has_aggregation
 
@@ -1192,7 +1190,7 @@ def enforce_grain_consistency(intent: RuntimeIntent, schema_graph: SchemaGraph) 
             return intent
         groupable: list[NormalizedExpr] = []
         for sc in non_agg:
-            if expr_registry_ref(sc.expr) is not None:
+            if sc.expr.registry_ref() is not None:
                 continue
             term = sc.expr.primary_term
             parts = term.split(".", 1) if "." in term else None
@@ -1219,7 +1217,7 @@ def enforce_grain_consistency(intent: RuntimeIntent, schema_graph: SchemaGraph) 
         for sc in select_cols:
             if _select_carries_aggregation(sc, intent.window_registry, intent.case_registry):
                 continue
-            if expr_registry_ref(sc.expr) is not None:
+            if sc.expr.registry_ref() is not None:
                 continue
             term = sc.expr.primary_term
             if term in gb_terms:
@@ -1352,11 +1350,11 @@ def collect_column_refs_for_post_processing(intent: RuntimeIntent) -> list[str]:
         all_cols.extend(extract_columns_from_expr(obc.expr))
     for g in intent.group_by_cols or []:
         all_cols.extend(extract_columns_from_expr(g))
-    for fp in where_leaves(intent.where) or []:
+    for fp in PredicateGroup.where_leaves(intent.where) or []:
         all_cols.extend(extract_columns_from_expr(fp.left_expr))
         if fp.right_expr:
             all_cols.extend(extract_columns_from_expr(fp.right_expr))
-    for hp in having_leaves(intent.having) or []:
+    for hp in PredicateGroup.having_leaves(intent.having) or []:
         all_cols.extend(extract_columns_from_expr(hp.left_expr))
         if hp.right_expr:
             all_cols.extend(extract_columns_from_expr(hp.right_expr))
@@ -1373,11 +1371,11 @@ def collect_column_refs_for_cte_step(cte: RuntimeCteStep) -> list[str]:
         all_cols.extend(extract_columns_from_expr(obc.expr))
     for g in cte.group_by_cols or []:
         all_cols.extend(extract_columns_from_expr(g))
-    for fp in where_leaves(cte.where) or []:
+    for fp in PredicateGroup.where_leaves(cte.where) or []:
         all_cols.extend(extract_columns_from_expr(fp.left_expr))
         if fp.right_expr:
             all_cols.extend(extract_columns_from_expr(fp.right_expr))
-    for hp in having_leaves(cte.having) or []:
+    for hp in PredicateGroup.having_leaves(cte.having) or []:
         all_cols.extend(extract_columns_from_expr(hp.left_expr))
         if hp.right_expr:
             all_cols.extend(extract_columns_from_expr(hp.right_expr))
@@ -1514,10 +1512,10 @@ def enforce_cte_grain_consistency(cte: RuntimeCteStep) -> RuntimeCteStep:
     """Derive ``grain`` and sorted ``group_by_cols`` from CTE structure."""
 
     def _cte_select_counts_as_classical_agg(sc: SelectCol) -> bool:
-        parts = effective_select_parts(sc, cte.window_registry, cte.case_registry)
+        parts = sc.effective_parts(cte.window_registry, cte.case_registry)
         if parts.window_spec is not None:
             return False
-        if expr_registry_ref(sc.expr) is not None:
+        if sc.expr.registry_ref() is not None:
             return False
         return parts.expr.has_aggregation
 
@@ -1561,7 +1559,7 @@ def resolve_column_map(
         elif len(candidates) > 1:
             cand_sorted = sorted(candidates)
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"column_ambiguous_{col_lower}",
                     category=FailureCategory.COLUMN_AMBIGUOUS,
                     severity="error",
@@ -1601,11 +1599,11 @@ def resolve_cte_column_maps(cte_steps: list[RuntimeCteStep]) -> list[RuntimeCteS
         cols_to_resolve.extend(cols_from_named_registries(cte.window_registry, cte.case_registry))
         for obc in cte.order_by_cols or []:
             cols_to_resolve.extend(extract_columns_from_expr(obc.expr))
-        for fp in where_leaves(cte.where) or []:
+        for fp in PredicateGroup.where_leaves(cte.where) or []:
             cols_to_resolve.extend(extract_columns_from_expr(fp.left_expr))
             if fp.right_expr:
                 cols_to_resolve.extend(extract_columns_from_expr(fp.right_expr))
-        for hp in having_leaves(cte.having) or []:
+        for hp in PredicateGroup.having_leaves(cte.having) or []:
             cols_to_resolve.extend(extract_columns_from_expr(hp.left_expr))
             if hp.right_expr:
                 cols_to_resolve.extend(extract_columns_from_expr(hp.right_expr))
@@ -1700,7 +1698,7 @@ def _compute_cte_structural_hash(
             (fp.value_type or "").lower(),
             (_expr_lineage_signature(fp.right_expr, cte_meta_map) if fp.right_expr else ""),
         )
-        for fp in (where_leaves(cte.where) or [])
+        for fp in (PredicateGroup.where_leaves(cte.where) or [])
     ]
     having_payload = [
         (
@@ -1709,7 +1707,7 @@ def _compute_cte_structural_hash(
             (hp.value_type or "").lower(),
             (_expr_lineage_signature(hp.right_expr, cte_meta_map) if hp.right_expr else ""),
         )
-        for hp in (having_leaves(cte.having) or [])
+        for hp in (PredicateGroup.having_leaves(cte.having) or [])
     ]
 
     payload = {
@@ -1740,6 +1738,8 @@ def _self_join_cte_step(physical_table: str, cte_name: str) -> RuntimeCteStep:
 def encode_inline_self_join_as_cte(intent: RuntimeIntent, schema_graph: SchemaGraph) -> RuntimeIntent:
     """Lift duplicate physical table references into ``sj_`` CTE steps for composer intents."""
     schema_tables = set(schema_graph.tables.keys())
+    known_cte_names = [c.cte_name for c in (intent.cte_steps or []) if c.cte_name]
+    build_case_folded_index(known_cte_names, kind="CTE name")
     known_cte = {c.cte_name.lower(): c for c in (intent.cte_steps or []) if c.cte_name}
     new_steps: list[RuntimeCteStep] = list(intent.cte_steps or [])
 
@@ -1894,6 +1894,7 @@ def normalize_cte_names(intent: RuntimeIntent) -> RuntimeIntent:
         if new_name in physical_tables:
             raise SchemaInvariantError(f"normalized CTE name {new_name!r} collides with physical table {new_name!r}")
 
+    build_case_folded_index(old_to_new.keys(), kind="CTE name")
     old_to_new_ci: dict[str, str] = {k.lower(): v for k, v in old_to_new.items()}
 
     def replace_cte_refs(s: str) -> str:
@@ -1927,7 +1928,7 @@ def normalize_cte_names(intent: RuntimeIntent) -> RuntimeIntent:
         new_order_by = [replace(obc, expr=_update_expr(obc.expr)) for obc in (cte.order_by_cols or [])]
         new_distinct_on = [_update_expr(expr) for expr in (cte.distinct_on or [])]
         new_filters = []
-        for fp in where_leaves(cte.where) or []:
+        for fp in PredicateGroup.where_leaves(cte.where) or []:
             new_fp = replace(
                 fp,
                 left_expr=_update_expr(fp.left_expr),
@@ -1935,7 +1936,7 @@ def normalize_cte_names(intent: RuntimeIntent) -> RuntimeIntent:
             )
             new_filters.append(new_fp)
         new_having = []
-        for hp in having_leaves(cte.having) or []:
+        for hp in PredicateGroup.having_leaves(cte.having) or []:
             new_hp = replace(
                 hp,
                 left_expr=_update_expr(hp.left_expr),
@@ -1965,8 +1966,8 @@ def normalize_cte_names(intent: RuntimeIntent) -> RuntimeIntent:
             group_by_cols=new_group_by,
             order_by_cols=new_order_by,
             distinct_on=new_distinct_on,
-            where=predicate_group_from_list(new_filters),
-            having=predicate_group_from_list(new_having),
+            where=PredicateGroup.from_list(new_filters),
+            having=PredicateGroup.from_list(new_having),
             column_map=new_column_map,
             output_columns=new_output_columns,
             output_column_metadata=new_ocm,
@@ -1980,13 +1981,13 @@ def normalize_cte_names(intent: RuntimeIntent) -> RuntimeIntent:
     new_main_order_by = [replace(obc, expr=_update_expr(obc.expr)) for obc in (intent.order_by_cols or [])]
     new_main_distinct_on = [_update_expr(expr) for expr in (intent.distinct_on or [])]
     new_main_filters = []
-    for fp in where_leaves(intent.where) or []:
+    for fp in PredicateGroup.where_leaves(intent.where) or []:
         new_fp = replace(
             fp, left_expr=_update_expr(fp.left_expr), right_expr=_update_expr(fp.right_expr) if fp.right_expr else None
         )
         new_main_filters.append(new_fp)
     new_main_having = []
-    for hp in having_leaves(intent.having) or []:
+    for hp in PredicateGroup.having_leaves(intent.having) or []:
         new_hp = replace(
             hp, left_expr=_update_expr(hp.left_expr), right_expr=_update_expr(hp.right_expr) if hp.right_expr else None
         )
@@ -2001,8 +2002,8 @@ def normalize_cte_names(intent: RuntimeIntent) -> RuntimeIntent:
         group_by_cols=new_main_group_by,
         order_by_cols=new_main_order_by,
         distinct_on=new_main_distinct_on,
-        where=predicate_group_from_list(new_main_filters),
-        having=predicate_group_from_list(new_main_having),
+        where=PredicateGroup.from_list(new_main_filters),
+        having=PredicateGroup.from_list(new_main_having),
         column_map=new_main_column_map,
         cte_steps=new_cte_steps,
         window_registry=_map_wr(intent.window_registry),
@@ -2014,6 +2015,7 @@ def rewrite_main_query_refs_to_final_cte_columns(intent: RuntimeIntent) -> Runti
     cte_steps = intent.cte_steps or []
     if not cte_steps:
         return intent
+    build_case_folded_index((c.cte_name for c in cte_steps), kind="CTE name")
     by_name: dict[str, RuntimeCteStep] = {c.cte_name.lower(): c for c in cte_steps}
 
     def _cte_bare_outputs(cte: RuntimeCteStep) -> set[str]:
@@ -2101,24 +2103,24 @@ def rewrite_main_query_refs_to_final_cte_columns(intent: RuntimeIntent) -> Runti
     new_gb = [_up(g) for g in (intent.group_by_cols or [])]
     new_ob = [replace(obc, expr=_up(obc.expr)) for obc in (intent.order_by_cols or [])]
     new_fp: list[WhereParam] = []
-    for fp in where_leaves(intent.where) or []:
+    for fp in PredicateGroup.where_leaves(intent.where) or []:
         new_fp.append(
             replace(fp, left_expr=_up(fp.left_expr), right_expr=_up(fp.right_expr) if fp.right_expr else None)
         )
     new_hp: list[HavingParam] = []
-    for hp in having_leaves(intent.having) or []:
+    for hp in PredicateGroup.having_leaves(intent.having) or []:
         new_hp.append(
             replace(hp, left_expr=_up(hp.left_expr), right_expr=_up(hp.right_expr) if hp.right_expr else None)
         )
 
     def _remap_cte_step(cte: RuntimeCteStep) -> RuntimeCteStep:
         cte_fp: list[WhereParam] = []
-        for fp in where_leaves(cte.where) or []:
+        for fp in PredicateGroup.where_leaves(cte.where) or []:
             cte_fp.append(
                 replace(fp, left_expr=_up(fp.left_expr), right_expr=_up(fp.right_expr) if fp.right_expr else None)
             )
         cte_hp: list[HavingParam] = []
-        for hp in having_leaves(cte.having) or []:
+        for hp in PredicateGroup.having_leaves(cte.having) or []:
             cte_hp.append(
                 replace(hp, left_expr=_up(hp.left_expr), right_expr=_up(hp.right_expr) if hp.right_expr else None)
             )
@@ -2127,8 +2129,8 @@ def rewrite_main_query_refs_to_final_cte_columns(intent: RuntimeIntent) -> Runti
             select_cols=[_map_sc(sc) for sc in (cte.select_cols or [])],
             group_by_cols=[_up(g) for g in (cte.group_by_cols or [])],
             order_by_cols=[replace(obc, expr=_up(obc.expr)) for obc in (cte.order_by_cols or [])],
-            where=predicate_group_from_list(cte_fp),
-            having=predicate_group_from_list(cte_hp),
+            where=PredicateGroup.from_list(cte_fp),
+            having=PredicateGroup.from_list(cte_hp),
             window_registry=_map_wr(cte.window_registry),
             case_registry=_map_cr(cte.case_registry),
         )
@@ -2139,8 +2141,8 @@ def rewrite_main_query_refs_to_final_cte_columns(intent: RuntimeIntent) -> Runti
         select_cols=new_select,
         group_by_cols=new_gb,
         order_by_cols=new_ob,
-        where=predicate_group_from_list(new_fp),
-        having=predicate_group_from_list(new_hp),
+        where=PredicateGroup.from_list(new_fp),
+        having=PredicateGroup.from_list(new_hp),
         window_registry=_map_wr(intent.window_registry),
         case_registry=_map_cr(intent.case_registry),
         cte_steps=new_cte_steps,
@@ -2219,21 +2221,21 @@ def resolve_window_registry_where_rhs(intent: RuntimeIntent) -> RuntimeIntent:
         new_cte_steps.append(
             replace(
                 cte,
-                where=predicate_group_from_list(
-                    [_fix_filter(fp, cte.window_registry) for fp in (where_leaves(cte.where) or [])]
+                where=PredicateGroup.from_list(
+                    [_fix_filter(fp, cte.window_registry) for fp in (PredicateGroup.where_leaves(cte.where) or [])]
                 ),
-                having=predicate_group_from_list(
-                    [_fix_having(hp, cte.window_registry) for hp in (having_leaves(cte.having) or [])]
+                having=PredicateGroup.from_list(
+                    [_fix_having(hp, cte.window_registry) for hp in (PredicateGroup.having_leaves(cte.having) or [])]
                 ),
             )
         )
     return replace(
         intent,
-        where=predicate_group_from_list(
-            [_fix_filter(fp, intent.window_registry) for fp in (where_leaves(intent.where) or [])]
+        where=PredicateGroup.from_list(
+            [_fix_filter(fp, intent.window_registry) for fp in (PredicateGroup.where_leaves(intent.where) or [])]
         ),
-        having=predicate_group_from_list(
-            [_fix_having(hp, intent.window_registry) for hp in (having_leaves(intent.having) or [])]
+        having=PredicateGroup.from_list(
+            [_fix_having(hp, intent.window_registry) for hp in (PredicateGroup.having_leaves(intent.having) or [])]
         ),
         cte_steps=new_cte_steps,
     )
@@ -2262,7 +2264,7 @@ def rewrite_cte_output_refs_to_aliases(intent: RuntimeIntent) -> RuntimeIntent:
                 left_expr=_update_expr(fp.left_expr),
                 right_expr=_update_expr(fp.right_expr) if fp.right_expr else None,
             )
-            for fp in (where_leaves(cte.where) or [])
+            for fp in (PredicateGroup.where_leaves(cte.where) or [])
         ]
         new_having = [
             replace(
@@ -2270,7 +2272,7 @@ def rewrite_cte_output_refs_to_aliases(intent: RuntimeIntent) -> RuntimeIntent:
                 left_expr=_update_expr(hp.left_expr),
                 right_expr=_update_expr(hp.right_expr) if hp.right_expr else None,
             )
-            for hp in (having_leaves(cte.having) or [])
+            for hp in (PredicateGroup.having_leaves(cte.having) or [])
         ]
         new_cte_steps.append(
             replace(
@@ -2278,8 +2280,8 @@ def rewrite_cte_output_refs_to_aliases(intent: RuntimeIntent) -> RuntimeIntent:
                 select_cols=new_select,
                 group_by_cols=new_group_by,
                 order_by_cols=new_order_by,
-                where=predicate_group_from_list(new_filters),
-                having=predicate_group_from_list(new_having),
+                where=PredicateGroup.from_list(new_filters),
+                having=PredicateGroup.from_list(new_having),
                 window_registry=rename_window_registry_steps(cte.window_registry, alias_map),
             )
         )
@@ -2291,21 +2293,21 @@ def rewrite_cte_output_refs_to_aliases(intent: RuntimeIntent) -> RuntimeIntent:
         replace(
             fp, left_expr=_update_expr(fp.left_expr), right_expr=_update_expr(fp.right_expr) if fp.right_expr else None
         )
-        for fp in (where_leaves(intent.where) or [])
+        for fp in (PredicateGroup.where_leaves(intent.where) or [])
     ]
     new_main_having = [
         replace(
             hp, left_expr=_update_expr(hp.left_expr), right_expr=_update_expr(hp.right_expr) if hp.right_expr else None
         )
-        for hp in (having_leaves(intent.having) or [])
+        for hp in (PredicateGroup.having_leaves(intent.having) or [])
     ]
     return replace(
         intent,
         select_cols=new_main_select,
         group_by_cols=new_main_group_by,
         order_by_cols=new_main_order_by,
-        where=predicate_group_from_list(new_main_filters),
-        having=predicate_group_from_list(new_main_having),
+        where=PredicateGroup.from_list(new_main_filters),
+        having=PredicateGroup.from_list(new_main_having),
         window_registry=rename_window_registry_steps(intent.window_registry, alias_map),
         case_registry=intent.case_registry,
         cte_steps=new_cte_steps,
@@ -2405,8 +2407,8 @@ def check_qualified_refs_exist(intent: RuntimeIntent, schema_graph: SchemaGraph)
 
     _check_expr_cols(intent.select_cols or [], "select")
     _check_expr_cols(intent.order_by_cols or [], "order_by")
-    _check_where_cols(where_leaves(intent.where) or [], "where")
-    _check_where_cols(having_leaves(intent.having) or [], "having")
+    _check_where_cols(PredicateGroup.where_leaves(intent.where) or [], "where")
+    _check_where_cols(PredicateGroup.having_leaves(intent.having) or [], "having")
     _check_bare_cols(intent.group_by_cols or [], "group_by")
     _check_window_registry(intent.window_registry or [], "main")
     for cte in intent.cte_steps or []:
@@ -2416,8 +2418,8 @@ def check_qualified_refs_exist(intent: RuntimeIntent, schema_graph: SchemaGraph)
                 errors.append(f"{ctx} unknown table: {tbl}")
         _check_expr_cols(cte.select_cols or [], f"{ctx} select")
         _check_expr_cols(cte.order_by_cols or [], f"{ctx} order_by")
-        _check_where_cols(where_leaves(cte.where) or [], f"{ctx} where")
-        _check_where_cols(having_leaves(cte.having) or [], f"{ctx} having")
+        _check_where_cols(PredicateGroup.where_leaves(cte.where) or [], f"{ctx} where")
+        _check_where_cols(PredicateGroup.having_leaves(cte.having) or [], f"{ctx} having")
         _check_bare_cols(cte.group_by_cols or [], f"{ctx} group_by")
         _check_window_registry(cte.window_registry or [], ctx)
     if errors:
@@ -2452,7 +2454,9 @@ def _simplify_expr(expr: NormalizedExpr, param_values: Mapping[str, Any] | None 
         if _is_zero_value(v):
             continue
         (parameterized_sub if v.param_key else sub_vals).append(v)
-    net_const = sum(v.value for v in add_vals) - sum(v.value for v in sub_vals)
+    net_const = sum(float(cast(Any, v.value) or 0) for v in add_vals) - sum(
+        float(cast(Any, v.value) or 0) for v in sub_vals
+    )
     for g in expr.add_groups:
         if g.coeff_param_key and g.coeff_param_key in pv and pv[g.coeff_param_key] in (1, 1.0):
             g = replace(g, coeff_param_key="")
@@ -2638,8 +2642,8 @@ def simplify_exprs(intent: RuntimeIntent) -> RuntimeIntent:
         else:
             new_select.append(replace(sc, expr=simplified))
     new_order = [replace(obc, expr=_simplify_expr(obc.expr, pv)) for obc in (intent.order_by_cols or [])]
-    new_filters = [_simplify_where_predicate(fp, pv) for fp in (where_leaves(intent.where) or [])]
-    new_having = [_simplify_having(hp, pv) for hp in (having_leaves(intent.having) or [])]
+    new_filters = [_simplify_where_predicate(fp, pv) for fp in (PredicateGroup.where_leaves(intent.where) or [])]
+    new_having = [_simplify_having(hp, pv) for hp in (PredicateGroup.having_leaves(intent.having) or [])]
     new_cte_steps: list[RuntimeCteStep] = []
     for cte in intent.cte_steps or []:
         cte_pv = cte.param_values or pv
@@ -2655,23 +2659,23 @@ def simplify_exprs(intent: RuntimeIntent) -> RuntimeIntent:
             else:
                 cte_select.append(replace(sc, expr=simplified_c))
         cte_order = [replace(obc, expr=_simplify_expr(obc.expr, cte_pv)) for obc in (cte.order_by_cols or [])]
-        cte_filters = [_simplify_where_predicate(fp, cte_pv) for fp in (where_leaves(cte.where) or [])]
-        cte_having = [_simplify_having(hp, cte_pv) for hp in (having_leaves(cte.having) or [])]
+        cte_filters = [_simplify_where_predicate(fp, cte_pv) for fp in (PredicateGroup.where_leaves(cte.where) or [])]
+        cte_having = [_simplify_having(hp, cte_pv) for hp in (PredicateGroup.having_leaves(cte.having) or [])]
         new_cte_steps.append(
             replace(
                 cte,
                 select_cols=cte_select,
                 order_by_cols=cte_order,
-                where=predicate_group_from_list(cte_filters),
-                having=predicate_group_from_list(cte_having),
+                where=PredicateGroup.from_list(cte_filters),
+                having=PredicateGroup.from_list(cte_having),
             )
         )
     return replace(
         intent,
         select_cols=new_select,
         order_by_cols=new_order,
-        where=predicate_group_from_list(new_filters),
-        having=predicate_group_from_list(new_having),
+        where=PredicateGroup.from_list(new_filters),
+        having=PredicateGroup.from_list(new_having),
         cte_steps=new_cte_steps,
     )
 
@@ -2727,8 +2731,8 @@ def apply_aggregatability_gate(intent: RuntimeIntent, schema_graph: SchemaGraph)
         replace(obc, expr=_gate_expr_aggregatability(obc.expr, schema_graph)) for obc in (intent.order_by_cols or [])
     ]
     new_group = [_gate_expr_aggregatability(e, schema_graph) for e in (intent.group_by_cols or [])]
-    new_filters = [_gate_filter(fp) for fp in (where_leaves(intent.where) or [])]
-    new_having = [_gate_having(hp) for hp in (having_leaves(intent.having) or [])]
+    new_filters = [_gate_filter(fp) for fp in (PredicateGroup.where_leaves(intent.where) or [])]
+    new_having = [_gate_having(hp) for hp in (PredicateGroup.having_leaves(intent.having) or [])]
     new_cte_steps: list[RuntimeCteStep] = []
     for cte in intent.cte_steps or []:
         cte_select = [
@@ -2738,16 +2742,16 @@ def apply_aggregatability_gate(intent: RuntimeIntent, schema_graph: SchemaGraph)
             replace(obc, expr=_gate_expr_aggregatability(obc.expr, schema_graph)) for obc in (cte.order_by_cols or [])
         ]
         cte_group = [_gate_expr_aggregatability(e, schema_graph) for e in (cte.group_by_cols or [])]
-        cte_filters = [_gate_filter(fp) for fp in (where_leaves(cte.where) or [])]
-        cte_having = [_gate_having(hp) for hp in (having_leaves(cte.having) or [])]
+        cte_filters = [_gate_filter(fp) for fp in (PredicateGroup.where_leaves(cte.where) or [])]
+        cte_having = [_gate_having(hp) for hp in (PredicateGroup.having_leaves(cte.having) or [])]
         new_cte_steps.append(
             replace(
                 cte,
                 select_cols=cte_select,
                 order_by_cols=cte_order,
                 group_by_cols=cte_group,
-                where=predicate_group_from_list(cte_filters),
-                having=predicate_group_from_list(cte_having),
+                where=PredicateGroup.from_list(cte_filters),
+                having=PredicateGroup.from_list(cte_having),
             )
         )
     return replace(
@@ -2755,8 +2759,8 @@ def apply_aggregatability_gate(intent: RuntimeIntent, schema_graph: SchemaGraph)
         select_cols=new_select,
         order_by_cols=new_order,
         group_by_cols=new_group,
-        where=predicate_group_from_list(new_filters),
-        having=predicate_group_from_list(new_having),
+        where=PredicateGroup.from_list(new_filters),
+        having=PredicateGroup.from_list(new_having),
         cte_steps=new_cte_steps,
     )
 
@@ -3003,9 +3007,13 @@ def _join_path_layer_payload(
     candidate_id: str = "",
     edge_kinds: list[str] | None = None,
     emission: str = "",
+    from_anchor: str | None = None,
 ) -> dict[str, Any]:
     return {
-        "segments": canonicalize_stored_join_path_signature([str(seg).strip() for seg in segments if str(seg).strip()]),
+        "segments": canonicalize_stored_join_path_signature(
+            [str(seg).strip() for seg in segments if str(seg).strip()],
+            from_anchor=from_anchor,
+        ),
         "candidate_id": candidate_id or "",
         "edge_kinds": list(edge_kinds or []),
         "emission": emission or "",
@@ -3017,27 +3025,41 @@ def _join_path_signature_hash(layers: list[dict[str, Any]]) -> str:
     return hashlib.sha256(stable_json(layers).encode("utf-8")).hexdigest()
 
 
-def _join_path_segments_only_layers(segments_layers: list[list[str]]) -> list[dict[str, Any]]:
+def _join_path_segments_only_layers(
+    segments_layers: list[list[str]],
+    *,
+    from_anchors: list[str | None] | None = None,
+) -> list[dict[str, Any]]:
+    anchors = from_anchors if from_anchors is not None else [None] * len(segments_layers)
     return [
-        {"segments": canonicalize_stored_join_path_signature([str(seg).strip() for seg in layer if str(seg).strip()])}
-        for layer in segments_layers
+        {
+            "segments": canonicalize_stored_join_path_signature(
+                [str(seg).strip() for seg in layer if str(seg).strip()],
+                from_anchor=anchor,
+            )
+        }
+        for layer, anchor in zip(segments_layers, anchors, strict=True)
     ]
 
 
 def join_path_segments_fingerprint_runtime(intent: RuntimeIntent) -> str:
     """Path-segment fingerprint for template merge/dedupe (excludes candidate id and edge kinds)."""
     layers = [list(intent.chosen_join_path_signature or [])]
+    anchors: list[str | None] = [intent.tables[0] if intent.tables else None]
     for step in intent.cte_steps or []:
         layers.append(list(step.chosen_join_path_signature or []))
-    return _join_path_signature_hash(_join_path_segments_only_layers(layers))
+        anchors.append(step.tables[0] if step.tables else None)
+    return _join_path_signature_hash(_join_path_segments_only_layers(layers, from_anchors=anchors))
 
 
 def join_path_segments_fingerprint_concrete(concrete: ConcreteIntent) -> str:
     """Path-segment fingerprint for template merge/dedupe (excludes candidate id and edge kinds)."""
     layers = [list(concrete.chosen_join_path_signature or [])]
+    anchors: list[str | None] = [concrete.tables[0] if concrete.tables else None]
     for step in concrete.cte_steps or []:
         layers.append(list(step.chosen_join_path_signature or []))
-    return _join_path_signature_hash(_join_path_segments_only_layers(layers))
+        anchors.append(step.tables[0] if step.tables else None)
+    return _join_path_signature_hash(_join_path_segments_only_layers(layers, from_anchors=anchors))
 
 
 def join_path_key_runtime(intent: RuntimeIntent) -> str:
@@ -3047,6 +3069,7 @@ def join_path_key_runtime(intent: RuntimeIntent) -> str:
             list(intent.chosen_join_path_signature or []),
             candidate_id=intent.chosen_join_candidate_id,
             edge_kinds=list(getattr(intent, "chosen_join_edge_kinds", None) or []),
+            from_anchor=intent.tables[0] if intent.tables else None,
         )
     ]
     for step in intent.cte_steps or []:
@@ -3056,6 +3079,7 @@ def join_path_key_runtime(intent: RuntimeIntent) -> str:
                 candidate_id=step.chosen_join_candidate_id,
                 edge_kinds=list(getattr(step, "chosen_join_edge_kinds", None) or []),
                 emission=str(getattr(step, "emission", "") or ""),
+                from_anchor=step.tables[0] if step.tables else None,
             )
         )
     return _join_path_signature_hash(layers)
@@ -3068,6 +3092,7 @@ def join_path_key_concrete(concrete: ConcreteIntent) -> str:
             list(concrete.chosen_join_path_signature or []),
             candidate_id=concrete.chosen_join_candidate_id,
             edge_kinds=list(getattr(concrete, "chosen_join_edge_kinds", None) or []),
+            from_anchor=concrete.tables[0] if concrete.tables else None,
         )
     ]
     for step in concrete.cte_steps or []:
@@ -3077,6 +3102,7 @@ def join_path_key_concrete(concrete: ConcreteIntent) -> str:
                 candidate_id=step.chosen_join_candidate_id,
                 edge_kinds=list(getattr(step, "chosen_join_edge_kinds", None) or []),
                 emission=str(getattr(step, "emission", "") or ""),
+                from_anchor=step.tables[0] if step.tables else None,
             )
         )
     return _join_path_signature_hash(layers)

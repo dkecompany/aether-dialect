@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import threading
 import time
 from collections import Counter
@@ -11,13 +12,14 @@ from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from contextvars import Context, copy_context
-from dataclasses import asdict, dataclass, replace
-from datetime import datetime, timezone
+from dataclasses import asdict, replace
+from datetime import UTC, datetime
 from typing import Any, Literal, TypeVar, cast
 
 import pandas
+import sqlglot
 
-from ._config import EngineConfig, PolicyConfig, llm_credentials_configured
+from ._config import EngineConfig, EngineLimits, PolicyConfig
 from ._constants import (
     ASK_PHASE_A,
     ASK_PHASE_B,
@@ -36,6 +38,7 @@ from ._constants import (
     DIAGNOSTIC_CODE_FEDERATION_MEMBER_GENERATED,
     DIAGNOSTIC_CODE_FEDERATION_PLAN_REPLAY,
     DIAGNOSTIC_CODE_FEDERATION_SEMIJOIN_SKIPPED,
+    DIAGNOSTIC_CODE_FEDERATION_TIME_ANCHOR,
     DIAGNOSTIC_CODE_FEDERATION_TURN_CANCELLED,
     DIAGNOSTIC_CODE_REUSE_HIT,
     DIAGNOSTIC_CODE_REUSE_MISS,
@@ -60,6 +63,7 @@ from ._constants import (
     TEMPLATE_INTENT_KEY_INDEX_KEY,
     TEMPLATE_QUESTION_TOKEN_INDEX_KEY,
     TEMPLATE_UNION_FAMILY_INDEX_KEY,
+    VALUE_TYPE_NORMALIZATION,
 )
 from ._contracts_base import (
     AccessError,
@@ -79,19 +83,19 @@ from ._contracts_base import (
     FederationTurnCancelledError,
     JoinInjectionAlignmentError,
     JoinInjectionFailedError,
+    JoinPathKeyTypeError,
     NoJoinPathError,
     PipelineSuspended,
     PlanPreviewResult,
+    PredicateGroup,
     ProbeCtePlacementError,
+    ResultCapExceededError,
     RetryableError,
     SpaceContext,
     SqlDiagnostic,
     StatementTimeoutError,
     TemplateExecutionResult,
     WriteQueueEvent,
-    expr_registry_ref,
-    having_leaves,
-    where_leaves,
 )
 from ._contracts_core import (
     ConcreteIntent,
@@ -120,19 +124,20 @@ from ._contracts_core import (
     TemplateMatch,
     UserFeedbackRejectSuspendContext,
     ValueHistory,
-    concrete_cte_to_runtime,
-    concrete_intent_to_runtime_skeleton,
-    runtime_intent_to_concrete,
 )
-from ._contracts_schema import SchemaGraph, resolve_intent_visible_objects
+from ._contracts_schema import SchemaGraph
 from ._core_utils import (
     InteractiveChoicePort,
     RephraseHint,
+    active_engine_limits,
+    active_engine_runtime_config,
     active_federation_execution_context,
     bind_params_for_sql,
+    bound_engine_runtime_config,
     business_knowledge_scope,
     debug,
     emit_ask_phase,
+    emit_session_refusal_diagnostic,
     emit_write_queue_event,
     federation_turn_cancelled,
     interactive_yes_no,
@@ -146,6 +151,7 @@ from ._core_utils import (
     phase_timer,
     pipeline_trace,
     pop_engine_identity,
+    pop_engine_limits,
     pop_federation_execution_context,
     print_info,
     print_query_result,
@@ -155,9 +161,13 @@ from ._core_utils import (
     prompt_cache_schema_scope,
     prompt_json,
     push_engine_identity,
+    push_engine_limits,
     push_federation_execution_context,
     reconcile_execute_bind_params,
     reduce_structural_sql_placeholders,
+    refusal_diagnostic_code_for_exception,
+    refusal_diagnostic_code_for_federation_reason,
+    refusal_message_for_exception,
     safe_json_loads,
     schema_prompt_cache_id,
     stable_json,
@@ -165,15 +175,9 @@ from ._core_utils import (
 )
 from ._dialect import (
     Dialect,
-    active_sqlglot_dialect,
-    compute_sql_fp,
-    extra_where_ops_for_engine,
-    finalize_executable_sql,
-    get_dialect,
-    get_runtime_config_class,
-    list_engines,
-    sql_outer_select_aliases,
+    DialectRegistry,
 )
+from ._dialect_sqlglot_helper import ResultBackend
 from ._federation import (
     CoordinatorMemberFrame,
     FederationCapExceededError,
@@ -189,6 +193,7 @@ from ._federation import (
     dialect_streams_arrow_to_coordinator,
     distinct_semijoin_keys,
     effective_union_specs,
+    emit_federation_member_timezone_mismatch_diagnostics,
     enforce_federation_plan_timeout,
     execute_federation_coordinator,
     federation_coordinator_spill_dir,
@@ -210,6 +215,7 @@ from ._federation import (
     federation_scaled_join_candidate_cap,
     federation_scaled_join_path_tie_cap,
     federation_stage_execution_waves,
+    federation_user_facing_ineligible_message,
     inject_filter_keys_where,
     inject_semijoin_where,
     intersect_member_where_ops,
@@ -220,11 +226,13 @@ from ._federation import (
     member_guard_limit_kwargs,
     member_schema_slice,
     member_stage_for_source,
+    mirror_federation_plan_join_feedback,
     order_federation_execution_steps,
     plan_federated_intent,
     record_federation_join_feedback,
     reducing_edge_allowed_for_target,
     render_federation_glue,
+    resolve_anchored_temporal_bind,
     resolve_federated_member_schema,
     resolve_source_column_table,
     revalidate_prepared_federation_plan,
@@ -267,12 +275,7 @@ from ._intent_repair import (
     expand_shared_pk_tables_for_refs,
 )
 from ._intent_resolve import join_path_key_concrete, prune_unused_cte_steps
-from ._llm_provider import llm_chat
-from ._refusal_diagnostics import (
-    emit_session_refusal_diagnostic,
-    refusal_diagnostic_code_for_exception,
-    refusal_message_for_exception,
-)
+from ._llm_provider import LLMProvider
 from ._schema_graph import assert_consumer_intent_in_scope, assert_consumer_sql_in_scope, assert_intent_in_scope
 from ._sql_gen import (
     ScopeClass,
@@ -299,37 +302,9 @@ from ._sql_gen import (
     tables_in_join_scope,
 )
 from ._templates import (
+    TemplateOps,
+    TemplateRefs,
     TemplateStoreView,
-    artifacts_dir_for_template_store,
-    delete_rejected_templates_matching_question,
-    handles_referenced_in_sql_param,
-    has_any_rejection_history_for_question,
-    insert_template,
-    join_fingerprint_from_concrete_intent,
-    join_fingerprint_from_runtime_intent,
-    lookup_join_feedback_for_question,
-    param_keys_from_intent_signature,
-    param_slot_prompt_payload,
-    path_bucket,
-    primary_template_q_norm,
-    promote_rejected_to_template,
-    promote_trust,
-    record_deterministic_join_failure_feedback,
-    record_per_question_feedback,
-    record_question_feedback,
-    record_template_feedback,
-    record_value_history_on_accept,
-    reject_out_per_question,
-    resolve_template_for_question,
-    resolve_template_ref,
-    save_template_store,
-    should_auto_accept_for_question,
-    sqlglot_dialect_for_template_fingerprint,
-    summarize_failure_for_memory,
-    template_is_live,
-    template_schema_refs,
-    template_visible_to_callers,
-    templates_to_store,
 )
 from ._utils import exact_question_match, flatten_param_values, intent_key, sql_shape
 from ._validation_execute import (
@@ -342,9 +317,11 @@ from ._validation_execute import (
     validate_sql,
 )
 from ._validation_schema import (
+    assert_execution_parameters_validated,
     validate_clause_widened_rowset,
     validate_comparison_join_scope_or_raise,
     validate_intent_join_reachability,
+    validate_join_path_key_types,
     validate_join_path_reachability_for_tables,
 )
 
@@ -368,6 +345,74 @@ def _execution_scope_gate_active(
     return execution_visible_objects is not None
 
 
+def _space_scope_gate_active(
+    space_tables: frozenset[str],
+    space_columns: frozenset[str],
+    space_deny_tables: frozenset[str] | None = None,
+    space_deny_columns: frozenset[str] | None = None,
+) -> bool:
+    """Return True when an aetherspace allow/deny gate should run."""
+    return bool(space_tables or space_columns or space_deny_tables or space_deny_columns)
+
+
+def _post_resolution_scope_outcome(
+    intent: RuntimeIntent,
+    schema: SchemaGraph,
+    *,
+    space_tables: frozenset[str],
+    space_columns: frozenset[str],
+    space_deny_tables: frozenset[str] | None = None,
+    space_deny_columns: frozenset[str] | None = None,
+    schema_context: EngineContext | None,
+    visible_objects: frozenset[str] | None,
+    schema_role: str,
+    context_name: str,
+    generation_path: GenerationPath,
+    matched_template: Template | None,
+    structural_tpl: tuple[Template, ...],
+) -> SqlGenerationOutcome | None:
+    """Re-run aetherspace and consumer scope gates after bridge tables are resolved."""
+    deny_tables = frozenset(space_deny_tables or ())
+    deny_columns = frozenset(space_deny_columns or ())
+    if _space_scope_gate_active(space_tables, space_columns, deny_tables, deny_columns):
+        if not assert_intent_in_scope(
+            intent, space_tables, space_columns, schema, deny_tables=deny_tables, deny_columns=deny_columns
+        ):
+            return SqlGenerationOutcome(
+                "",
+                False,
+                generation_path,
+                matched_template,
+                structural_tpl,
+                sql_validation_error="intent out of aetherspace scope",
+                error_kind=FailureCategory.DENIED_REFERENCE.value,
+            )
+    scope_ctx = schema_context if schema_context is not None else EngineContext()
+    if _execution_scope_gate_active(scope_ctx, visible_objects, schema_role, context_name=context_name):
+        if not assert_consumer_intent_in_scope(intent, scope_ctx, schema, visible_objects):
+            return SqlGenerationOutcome(
+                "",
+                False,
+                generation_path,
+                matched_template,
+                structural_tpl,
+                sql_validation_error="intent out of execution scope",
+                error_kind=FailureCategory.ACCESS_POLICY.value,
+            )
+    return None
+
+
+def _raise_if_join_path_key_types(
+    signature: list[str],
+    schema: SchemaGraph,
+    context: str,
+) -> None:
+    issues = validate_join_path_key_types(signature, schema, context)
+    errors = [i for i in issues if i.severity == "error"]
+    if errors:
+        raise JoinPathKeyTypeError(context, errors[0].message)
+
+
 def _row_structural_values_match_defaults(
     row_params: dict[str, Any], structural_defaults: dict[str, Any] | None, sql_param: str
 ) -> bool:
@@ -384,6 +429,79 @@ def _row_structural_values_match_defaults(
     return True
 
 
+def _python_bind_kind(value: Any) -> str:
+    """Classify a bound parameter value for fuzzy-reuse schema checks."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, (list, tuple)):
+        return "array"
+    return "unknown"
+
+
+def _bind_kinds_compatible(exemplar_kind: str, candidate_kind: str) -> bool:
+    if exemplar_kind == candidate_kind:
+        return True
+    if exemplar_kind in ("integer", "number") and candidate_kind in ("integer", "number"):
+        return True
+    return False
+
+
+def _value_matches_slot_domain(value: Any, value_type: str) -> bool:
+    vt = VALUE_TYPE_NORMALIZATION.get(
+        (value_type or "string").strip().lower(), (value_type or "string").strip().lower()
+    )
+    if vt in ("date_window", "date_diff", "unknown", "null"):
+        return True
+    kind = _python_bind_kind(value)
+    if vt == "boolean":
+        return kind == "boolean"
+    if vt == "integer":
+        return kind == "integer"
+    if vt == "number":
+        return kind in ("integer", "number")
+    if vt in ("string", "date", "binary"):
+        return kind == "string"
+    return True
+
+
+def _reuse_params_match_value_schema(
+    params: Mapping[str, Any],
+    schema_row: Mapping[str, Any],
+    intent_sig: ConcreteIntent,
+) -> bool:
+    """Return True when extracted bind values match exemplar ``param_values`` types and slot domains."""
+    if not schema_row:
+        return True
+    slot_meta = TemplateOps._collect_param_slot_meta(intent_sig)
+    for key, exemplar in schema_row.items():
+        if key not in params:
+            continue
+        candidate = params[key]
+        ex_kind = _python_bind_kind(exemplar)
+        cand_kind = _python_bind_kind(candidate)
+        if not _bind_kinds_compatible(ex_kind, cand_kind):
+            return False
+        if ex_kind == "array" and cand_kind == "array":
+            ex_items = list(exemplar) if isinstance(exemplar, (list, tuple)) else []
+            if ex_items:
+                item_kind = _python_bind_kind(ex_items[0])
+                cand_items = list(candidate) if isinstance(candidate, (list, tuple)) else []
+                if not all(_bind_kinds_compatible(item_kind, _python_bind_kind(item)) for item in cand_items):
+                    return False
+        meta = slot_meta.get(key)
+        if meta is not None and not _value_matches_slot_domain(candidate, meta.value_type):
+            return False
+    return True
+
+
 def extract_fuzzy_reuse_params(
     q_norm: str,
     template: Template,
@@ -393,7 +511,7 @@ def extract_fuzzy_reuse_params(
     schema: SchemaGraph | None = None,
 ) -> dict[str, Any]:
     """Extract p- and s-parameter values from a question for fuzzy template reuse via one LLM call."""
-    p_key_names, s_key_names = param_keys_from_intent_signature(
+    p_key_names, s_key_names = TemplateOps.param_keys_from_intent_signature(
         template.intent_signature, literal_structural_only=literal_structural_only
     )
     all_keys = p_key_names + ([] if literal_structural_only else s_key_names)
@@ -416,7 +534,7 @@ def extract_fuzzy_reuse_params(
     user = prompt_json(
         {
             "task": "The parameter slots below describe literal bind handles from the stored intent. Extract the correct value from the question for every param_key listed.",
-            "param_slots": param_slot_prompt_payload(template.intent_signature, all_keys),
+            "param_slots": TemplateOps.param_slot_prompt_payload(template.intent_signature, all_keys),
             "matched_question": matched_question,
             "matched_values": matched_values,
             "param_keys": all_keys,
@@ -440,7 +558,7 @@ def extract_fuzzy_reuse_params(
 
     def _reuse_llm_chat() -> str:
         with prompt_cache_schema_scope(schema_prompt_cache_id(schema)):
-            return llm_chat(system, user, task="default")
+            return LLMProvider.chat(system, user, task="default")
 
     raw = _reuse_llm_chat()
     parsed = safe_json_loads(raw)
@@ -499,13 +617,14 @@ def load_pipeline_resources(
     dialect: Dialect | None = None,
 ) -> tuple[Dialect, SchemaGraph, Any, dict[str, Any], dict[str, Any], set[str]]:
     """Validate inputs, build dialect, and return pipeline resource. bundle."""
-    if not llm_credentials_configured():
+    if not EngineConfig.llm_credentials_configured():
         raise RuntimeError("No OpenAI/Azure OpenAI API key configured")
 
     debug("loading schema")
     if dialect is None:
-        dialect = get_dialect(EngineConfig.TYPE, EngineConfig.RUNTIME)
-    if EngineConfig.TYPE not in list_engines():
+        runtime_cfg = bound_engine_runtime_config()
+        dialect = DialectRegistry.get_dialect(EngineConfig.TYPE, runtime_cfg)
+    if EngineConfig.TYPE not in DialectRegistry.list_engines():
         raise ValueError(f"Unsupported engine type: {EngineConfig.TYPE}")
 
     if schema is None:
@@ -536,7 +655,7 @@ def match_question_level_template_reuse(
 ) -> TemplateMatch:
     """Detect fuzzy question match against trusted template. ``value_history`` for direct SQL reuse."""
     debug(f"[{ASK_PHASE_A}] checking exact fuzzy match")
-    templates_list = list(templates.values()) if isinstance(templates, dict) else templates
+    templates_list = list(templates.values()) if isinstance(templates, Mapping) else templates
     idx: dict[str, list[str]] | None = None
     qtok_idx: dict[str, list[Any]] | None = None
     intent_idx: dict[str, list[str]] | None = None
@@ -567,7 +686,7 @@ def match_question_level_template_reuse(
     if hit is not None:
         ref_tmpl = hit.template
         if schema is not None:
-            live_ok, stale_reasons = template_is_live(template_schema_refs(ref_tmpl), schema)
+            live_ok, stale_reasons = TemplateRefs.template_is_live(TemplateRefs.template_schema_refs(ref_tmpl), schema)
             if not live_ok:
                 debug(f"[{ASK_PHASE_A}] question_reuse_template_not_live: {','.join(stale_reasons)}")
                 hit = None
@@ -665,12 +784,19 @@ def refinement_retry_available(ctx: RefinementContext | None) -> bool:
 
 def _artifact_dir_for_template_store(store: Any) -> str:
     if isinstance(store, TemplateStoreView):
-        return artifacts_dir_for_template_store(store._store_dir)
-    return artifacts_dir_for_template_store(EngineConfig.TEMPLATE_STORE_DIR)
+        return TemplateOps.artifacts_dir_for_template_store(store._store_dir)
+    if isinstance(store, dict):
+        store_dir = store.get("_store_dir") or store.get("store_dir")
+        if store_dir:
+            return TemplateOps.artifacts_dir_for_template_store(str(store_dir))
+        if store.get("templates") or store.get("question_feedback"):
+            return TemplateOps.artifacts_dir_for_template_store(EngineConfig.TEMPLATE_STORE_DIR)
+    raise ValueError("template store requires _store_dir or a TemplateStoreView for artifact path resolution")
 
 
 def _emit_reader_write_queue_event(store: Any, event: WriteQueueEvent) -> None:
-    emit_write_queue_event(_artifact_dir_for_template_store(store), event)
+    """Readers no longer append durable write-queue events (session- local learning only)."""
+    return
 
 
 def parse_intent_via_llm(
@@ -699,7 +825,7 @@ def parse_intent_via_llm(
     else:
         seed_lines = list(extra_user_feedback or [])
     intent_visible_objects = (
-        resolve_intent_visible_objects(
+        SchemaGraph.resolve_intent_visible_objects(
             visible_objects=getattr(choice_port, "visible_objects", None),
             execution_visible_objects=getattr(choice_port, "execution_visible_objects", None),
         )
@@ -727,7 +853,7 @@ def parse_intent_via_llm(
     if intent is None:
         print_rephrase_hint(RephraseHint.INTENT_PARSE_FAILED)
         if persist_template_learning and isinstance(store, TemplateStoreView):
-            save_template_store(store)
+            TemplateOps.save_template_store(store)
         return None, semantic_warnings, llm_calls, interpret_plan
 
     if semantic_warnings:
@@ -889,9 +1015,9 @@ def _join_matches_template_intent(matched: Template | None, intent: RuntimeInten
     """Compare stored template join fingerprint to the runtime intent join fingerprint."""
     if matched is None:
         return None
-    return join_fingerprint_from_concrete_intent(matched.intent_signature) == join_fingerprint_from_runtime_intent(
-        intent
-    )
+    return TemplateRefs.join_fingerprint_from_concrete_intent(
+        matched.intent_signature
+    ) == TemplateRefs.join_fingerprint_from_runtime_intent(intent)
 
 
 def _resolve_joins_for_intent_placeholder(
@@ -910,8 +1036,12 @@ def _resolve_joins_for_intent_placeholder(
     join_candidates, cmap, cte_join_hints = generate_join_candidates(intent, schema)
 
     prior_fb: list[str] | None = None
+    avoid_join_ids: frozenset[str] = frozenset()
     if store is not None:
-        prior_fb = lookup_join_feedback_for_question(store, q_norm)
+        prior_fb = TemplateOps.lookup_join_feedback_for_question(store, q_norm, schema_graph_id=schema.schema_graph_id)
+        avoid_join_ids = TemplateOps.lookup_join_avoid_candidate_ids_for_question(
+            store, q_norm, schema_graph_id=schema.schema_graph_id
+        )
 
     anchor_main, anchor_cte = _join_signatures_for_deterministic_from_anchor(cmap, cte_join_hints, intent)
     deterministic_sql = build_deterministic_sql(
@@ -933,6 +1063,7 @@ def _resolve_joins_for_intent_placeholder(
         structural_defaults=structural_defaults_src,
         dialect=dialect,
         prior_join_feedback=prior_fb,
+        avoided_candidate_ids=avoid_join_ids or None,
     )
 
 
@@ -990,7 +1121,7 @@ def prepare_union_match_join_phase(
 
 def _template_effective_sql_display_param(tmpl: Template, dialect: Dialect) -> str:
     """Return user-facing display SQL for a template row, recomputing when storage omits it. Paths touched: ``1``, ``2.1``, ``2.2`` direct reuse and any reader after storage trim."""
-    rt = concrete_intent_to_runtime_skeleton(tmpl.intent_signature)
+    rt = tmpl.intent_signature.to_runtime_skeleton()
     return build_display_sql(tmpl.sql_param, rt, tmpl.display_alias_map or None, dialect=dialect)
 
 
@@ -1023,7 +1154,7 @@ def enriched_display_alias_map(
         },
         DISPLAY_ALIAS_PROMPT_KEY_ORDER,
     )
-    raw = llm_chat(system, user, task="default")
+    raw = LLMProvider.chat(system, user, task="default")
     parsed = safe_json_loads(raw)
     if not isinstance(parsed, dict):
         return out
@@ -1081,6 +1212,7 @@ def _run_sql_validation_cascade(
             first = reach_errors[0]
             out_err = first.message
             debug(f"[{ASK_PHASE_K}] join reachability failed before validate_sql: {out_err}")
+            emit_ask_phase(ASK_PHASE_K)
             pipeline_trace(
                 "pipeline._run_sql_validation_cascade.reachability_failed",
                 lambda: stable_json({"err": out_err, "issue_id": first.issue_id}),
@@ -1102,6 +1234,7 @@ def _run_sql_validation_cascade(
         )
     out_err = "" if ok and err is None else (err or "")
     debug(f"[{ASK_PHASE_K}] validate_sql ok={ok}, err={out_err}, diagnostics={len(diags)}")
+    emit_ask_phase(ASK_PHASE_K)
     pipeline_trace(
         "pipeline._run_sql_validation_cascade.result",
         lambda: stable_json(
@@ -1145,7 +1278,7 @@ def _maybe_record_value_history_accept(
     nopt = form_storage.normalized_optional if form_storage is not None else None
     if nopt and nopt != pq and other_template_owns_question_string(templates, tmpl.id, nopt):
         return
-    record_value_history_on_accept(
+    TemplateOps.record_value_history_on_accept(
         tmpl.value_history,
         param_values=all_pv,
         natural_language=nl,
@@ -1176,14 +1309,23 @@ def clear_planner_schema_invalid_after_user_accept(intent: RuntimeIntent) -> Non
 
 
 def should_skip_intent_confirmation(
-    intent: RuntimeIntent, store: dict[str, Any] | None, q_norm: str | None, semantic_warnings: list[Any] | None
+    intent: RuntimeIntent,
+    store: dict[str, Any] | None,
+    q_norm: str | None,
+    semantic_warnings: list[Any] | None,
+    *,
+    schema_graph_id: str | None = None,
 ) -> bool:
     """Return True when intent confirmation may be skipped. Returns. False when the parsed intent is schema-invalid, when there are semantic warnings, or when the same canonicalised question has any prior rejection recorded in ``question_feedback``."""
     if getattr(intent, "schema_invalid", False):
         return False
     if semantic_warnings:
         return False
-    if store is not None and q_norm and has_any_rejection_history_for_question(store, q_norm):
+    if (
+        store is not None
+        and q_norm
+        and TemplateOps.has_any_rejection_history_for_question(store, q_norm, schema_graph_id)
+    ):
         return False
     return True
 
@@ -1192,26 +1334,23 @@ def _should_prompt_direct_reuse_user(
     ref_tmpl: Template, _rejected: dict[str, Any], intent: RuntimeIntent, q_norm: str, *, reuse_history_index: int
 ) -> bool:
     """Return True when direct SQL reuse must ask the user instead of auto-accepting."""
-    return not should_auto_accept_for_question(ref_tmpl, q_norm, reuse_history_index=reuse_history_index)
+    return not TemplateOps.should_auto_accept_for_question(ref_tmpl, q_norm, reuse_history_index=reuse_history_index)
 
 
-@dataclass(frozen=True)
-class PathSelectionState:
-    """Structured inputs for :func:`_choose_generation_path` after union SQL path resolution."""
-
-    has_matched_template: bool
-    resolved_union_path: GenerationPath | None
-    matched_template_id: str
-    structural_matches: int
-    cols_changed: bool
-    retry_depth: int
-
-
-def _choose_generation_path(state: PathSelectionState) -> GenerationPath:
+def _choose_generation_path(
+    *,
+    has_matched_template: bool,
+    resolved_union_path: GenerationPath | None,
+    matched_template_id: str = "",
+    structural_matches: int = 0,
+    cols_changed: bool = False,
+    retry_depth: int = 0,
+) -> GenerationPath:
     """Return the SQL generation branch: template-driven paths ``3``/``4`` when a template is in play, else ``5`` (fresh)."""
-    if not state.has_matched_template:
+    del matched_template_id, structural_matches, cols_changed, retry_depth
+    if not has_matched_template:
         return GenerationPath.FRESH
-    return state.resolved_union_path or GenerationPath.FRESH
+    return resolved_union_path or GenerationPath.FRESH
 
 
 def align_template_to_widened_intent(template: Template, intent: RuntimeIntent, dialect: Any) -> None:
@@ -1223,11 +1362,11 @@ def align_template_to_widened_intent(template: Template, intent: RuntimeIntent, 
         if template.intent_signature and template.intent_signature.intent_id
         else "union"
     )
-    template.intent_signature = runtime_intent_to_concrete(intent, sig_id)
+    template.intent_signature = intent.to_concrete(sig_id)
     template.intent_key = intent_key(intent)
     member_source_id = str(getattr(template, "member_source_id", "") or "") or None
-    sg_dialect = sqlglot_dialect_for_template_fingerprint(dialect, member_source_id)
-    template.sql_fp = compute_sql_fp(template.sql_param or "", sqlglot_dialect=sg_dialect)
+    sg_dialect = TemplateStoreView.sqlglot_dialect_for_template_fingerprint(dialect, member_source_id)
+    template.sql_fp = Dialect.compute_sql_fp(template.sql_param or "", sqlglot_dialect=sg_dialect)
     template.structural_defaults = {k: v for k, v in all_pv.items() if is_structural_param_key(k)}
     sig_aliases: dict[str, str] = {}
     for sc in intent.select_cols or []:
@@ -1263,6 +1402,38 @@ def _sql_validation_refusal_outcome(
     )
 
 
+def federation_ineligible_refusal_outcome(
+    reason: str,
+    *,
+    generation_path: GenerationPath,
+    matched_template: Template | None,
+    structural_match_templates: tuple[Template, ...] | list[Template] | None = (),
+) -> SqlGenerationOutcome:
+    """Return a failed reuse outcome for a federation ineligible reason."""
+    refusal_code = refusal_diagnostic_code_for_federation_reason(reason)
+    message = federation_user_facing_ineligible_message(reason)
+    if refusal_code:
+        emit_session_refusal_diagnostic(
+            refusal_code,
+            message,
+            stage="validation",
+            source_id="composite",
+            details=(("phase", "prepare"), ("reason", str(reason or ""))),
+        )
+    structural_tpl = tuple(structural_match_templates or ())
+    return SqlGenerationOutcome(
+        "",
+        False,
+        generation_path,
+        matched_template,
+        structural_tpl,
+        sql_validation_error=message,
+        join_matches_template=None,
+        error_kind=FailureCategory.DENIED_REFERENCE.value,
+        refusal_diagnostic_code=refusal_code,
+    )
+
+
 def _join_path_failure_outcome(
     exc: NoJoinPathError,
     *,
@@ -1277,10 +1448,10 @@ def _join_path_failure_outcome(
 ) -> SqlGenerationOutcome:
     """Record join feedback, print the join-path hint, and return a failed outcome."""
     debug(f"[{ASK_PHASE_K}] {exc}")
-    record_deterministic_join_failure_feedback(store, q_norm, exc, intent=intent, schema=schema)
+    TemplateOps.record_deterministic_join_failure_feedback(store, q_norm, exc, intent=intent, schema=schema)
     print_rephrase_hint(RephraseHint.JOIN_PATH_UNAVAILABLE)
     if persist_template_learning:
-        save_template_store(store)
+        TemplateOps.save_template_store(store)
     refusal_code = refusal_diagnostic_code_for_exception(exc)
     if refusal_code:
         emit_session_refusal_diagnostic(refusal_code, exc.user_message)
@@ -1319,6 +1490,8 @@ def generate_and_validate_sql(
     context_name: str = MASTER_AETHERSPACE_NAME,
     space_allowed_tables: frozenset[str] | None = None,
     space_allowed_columns: frozenset[str] | None = None,
+    space_deny_tables: frozenset[str] | None = None,
+    space_deny_columns: frozenset[str] | None = None,
     member_source_id: str | None = None,
     allowed_where_ops: frozenset[str] | None = None,
     join_preset_scope: dict[str, str] | None = None,
@@ -1333,7 +1506,7 @@ def generate_and_validate_sql(
     if getattr(intent, "schema_invalid", False):
         print_rephrase_hint(RephraseHint.SCHEMA_INVALID_DECLINED)
         if persist_template_learning:
-            save_template_store(store)
+            TemplateOps.save_template_store(store)
         return SqlGenerationOutcome(
             "",
             False,
@@ -1345,8 +1518,12 @@ def generate_and_validate_sql(
         )
     space_tables = frozenset(space_allowed_tables or ())
     space_columns = frozenset(space_allowed_columns or ())
-    if space_tables or space_columns:
-        if not assert_intent_in_scope(intent, space_tables, space_columns, schema):
+    deny_tables = frozenset(space_deny_tables or ())
+    deny_columns = frozenset(space_deny_columns or ())
+    if _space_scope_gate_active(space_tables, space_columns, deny_tables, deny_columns):
+        if not assert_intent_in_scope(
+            intent, space_tables, space_columns, schema, deny_tables=deny_tables, deny_columns=deny_columns
+        ):
             return SqlGenerationOutcome(
                 "",
                 False,
@@ -1369,7 +1546,7 @@ def generate_and_validate_sql(
                 error_kind=FailureCategory.ACCESS_POLICY.value,
             )
     if allowed_where_ops:
-        for fp in where_leaves(intent.where) or []:
+        for fp in PredicateGroup.where_leaves(intent.where) or []:
             if fp.op not in allowed_where_ops:
                 return SqlGenerationOutcome(
                     "",
@@ -1380,7 +1557,7 @@ def generate_and_validate_sql(
                     sql_validation_error=(f"filter operator {fp.op!r} is not supported by federation members"),
                     error_kind=FailureCategory.DENIED_REFERENCE.value,
                 )
-        for hp in having_leaves(intent.having) or []:
+        for hp in PredicateGroup.having_leaves(intent.having) or []:
             if hp.op not in allowed_where_ops:
                 return SqlGenerationOutcome(
                     "",
@@ -1393,24 +1570,23 @@ def generate_and_validate_sql(
                 )
     join_candidates, cmap, cte_join_hints = generate_join_candidates(intent, schema)
     debug("sql generation")
+    emit_ask_phase(ASK_PHASE_K, source=member_source_id)
     debug(f"[{ASK_PHASE_K}] tables={intent.tables or []}")
     debug(f"[{ASK_PHASE_K}] grain={intent.grain or 'unknown'}")
     debug(f"[{ASK_PHASE_K}] select_cols={[s.expr.primary_term for s in (intent.select_cols or [])]}")
-    debug(f"[{ASK_PHASE_K}] where={len(where_leaves(intent.where) or [])}")
-    debug(f"[{ASK_PHASE_K}] having={len(having_leaves(intent.having) or [])}")
+    debug(f"[{ASK_PHASE_K}] where={len(PredicateGroup.where_leaves(intent.where) or [])}")
+    debug(f"[{ASK_PHASE_K}] having={len(PredicateGroup.having_leaves(intent.having) or [])}")
     debug(f"[{ASK_PHASE_K}] cte_join_hints={list(cte_join_hints.keys()) if cte_join_hints else None}")
     resolved_union_path = resolve_sql_path(
         matched_template=matched_template, cols_changed=cols_changed, union_sql_path=union_sql_path
     )
     routing = _choose_generation_path(
-        PathSelectionState(
-            has_matched_template=matched_template is not None,
-            resolved_union_path=resolved_union_path,
-            matched_template_id=(matched_template.id if matched_template else ""),
-            structural_matches=len(structural_tpl),
-            cols_changed=cols_changed,
-            retry_depth=0,
-        )
+        has_matched_template=matched_template is not None,
+        resolved_union_path=resolved_union_path,
+        matched_template_id=(matched_template.id if matched_template else ""),
+        structural_matches=len(structural_tpl),
+        cols_changed=cols_changed,
+        retry_depth=0,
     )
     active_path = routing
     debug(f"[{ASK_PHASE_K}] generation path={active_path}")
@@ -1423,8 +1599,17 @@ def generate_and_validate_sql(
     params = dict(flatten_param_values(intent))
     debug(f"[{ASK_PHASE_K}] params={params}")
 
-    prior_join_fb = lookup_join_feedback_for_question(
-        cast(dict[str, Any], store), q_norm, member_source_id=member_source_id
+    prior_join_fb = TemplateOps.lookup_join_feedback_for_question(
+        cast(dict[str, Any], store),
+        q_norm,
+        schema_graph_id=schema.schema_graph_id,
+        member_source_id=member_source_id,
+    )
+    avoid_join_ids = TemplateOps.lookup_join_avoid_candidate_ids_for_question(
+        cast(dict[str, Any], store),
+        q_norm,
+        schema_graph_id=schema.schema_graph_id,
+        member_source_id=member_source_id,
     )
 
     generation_path_label = active_path
@@ -1437,7 +1622,9 @@ def generate_and_validate_sql(
         GenerationPath.UNION_TEMPLATE_WIDEN,
         GenerationPath.UNION_TEMPLATE_AND_RUNTIME_WIDEN,
     ):
-        live_ok, stale_reasons = template_is_live(template_schema_refs(matched_template), schema)
+        live_ok, stale_reasons = TemplateRefs.template_is_live(
+            TemplateRefs.template_schema_refs(matched_template), schema
+        )
         if not live_ok:
             debug(f"[{ASK_PHASE_K}] template_not_live: {','.join(stale_reasons)}")
             matched_template = None
@@ -1489,6 +1676,7 @@ def generate_and_validate_sql(
                 structural_defaults=structural_defaults_src,
                 dialect=dialect,
                 prior_join_feedback=prior_join_fb,
+                avoided_candidate_ids=avoid_join_ids or None,
                 join_preset_scope=effective_join_preset or None,
             )
         except NoJoinPathError as exc:
@@ -1509,18 +1697,34 @@ def generate_and_validate_sql(
             ComparisonJoinScopeExceededError,
             JoinInjectionAlignmentError,
             JoinInjectionFailedError,
+            JoinPathKeyTypeError,
             ProbeCtePlacementError,
         ) as exc:
             debug(f"[{ASK_PHASE_K}] {exc}")
             print_rephrase_hint(RephraseHint.SQL_VALIDATION_FAILED)
             if persist_template_learning:
-                save_template_store(store)
+                TemplateOps.save_template_store(store)
             return _sql_validation_refusal_outcome(
                 exc,
                 generation_path=generation_path_label,
                 matched_template=matched_for_outcome,
                 structural_match_templates=structural_tpl,
             )
+        scope_outcome = _post_resolution_scope_outcome(
+            intent,
+            schema,
+            space_tables=space_tables,
+            space_columns=space_columns,
+            schema_context=schema_context,
+            visible_objects=visible_objects,
+            schema_role=schema_role,
+            context_name=context_name,
+            generation_path=generation_path_label,
+            matched_template=matched_for_outcome,
+            structural_tpl=structural_tpl,
+        )
+        if scope_outcome is not None:
+            return scope_outcome
         intent.sql_param = sql_param
         subs_params = dict(flatten_param_values(intent))
         sql = finalize_substitute_sql(intent, structural_defaults_src=structural_defaults_src, params=subs_params)
@@ -1545,6 +1749,7 @@ def generate_and_validate_sql(
             profile_timeout_ms=profile_timeout_ms,
         )
         if ok_c:
+            soft_findings = tuple(d for d in diags_c if d.code.value in SOFT_DIAGNOSTIC_CODES)
             return SqlGenerationOutcome(
                 sql,
                 True,
@@ -1554,7 +1759,9 @@ def generate_and_validate_sql(
                 None,
                 jm3,
                 None,
-                sum(1 for d in diags_c if d.code.value in SOFT_DIAGNOSTIC_CODES),
+                None,
+                explain_soft_diagnostics=len(soft_findings),
+                explain_soft_findings=soft_findings,
             )
         debug(
             f"[{ASK_PHASE_K}] template path {resolved_union_path.code} "
@@ -1599,6 +1806,7 @@ def generate_and_validate_sql(
                 structural_defaults=structural_defaults_src,
                 dialect=dialect,
                 prior_join_feedback=prior_join_fb,
+                avoided_candidate_ids=avoid_join_ids or None,
                 join_preset_scope=join_preset_scope,
             )
         except NoJoinPathError as exc:
@@ -1619,18 +1827,34 @@ def generate_and_validate_sql(
             ComparisonJoinScopeExceededError,
             JoinInjectionAlignmentError,
             JoinInjectionFailedError,
+            JoinPathKeyTypeError,
             ProbeCtePlacementError,
         ) as exc:
             debug(f"[{ASK_PHASE_K}] {exc}")
             print_rephrase_hint(RephraseHint.SQL_VALIDATION_FAILED)
             if persist_template_learning:
-                save_template_store(store)
+                TemplateOps.save_template_store(store)
             return _sql_validation_refusal_outcome(
                 exc,
                 generation_path=generation_path_label,
                 matched_template=matched_for_outcome,
                 structural_match_templates=structural_tpl,
             )
+        scope_outcome = _post_resolution_scope_outcome(
+            gen_intent,
+            schema,
+            space_tables=space_tables,
+            space_columns=space_columns,
+            schema_context=schema_context,
+            visible_objects=visible_objects,
+            schema_role=schema_role,
+            context_name=context_name,
+            generation_path=generation_path_label,
+            matched_template=matched_for_outcome,
+            structural_tpl=structural_tpl,
+        )
+        if scope_outcome is not None:
+            return scope_outcome
         intent.chosen_join_candidate_id = gen_intent.chosen_join_candidate_id
         intent.chosen_join_path_signature = list(gen_intent.chosen_join_path_signature)
         intent.sql_param = sql_param
@@ -1680,6 +1904,7 @@ def generate_and_validate_sql(
                 structural_defaults=structural_defaults_src,
                 dialect=dialect,
                 prior_join_feedback=prior_join_fb,
+                avoided_candidate_ids=avoid_join_ids or None,
                 join_preset_scope=join_preset_scope,
             )
         except NoJoinPathError as exc:
@@ -1700,18 +1925,34 @@ def generate_and_validate_sql(
             ComparisonJoinScopeExceededError,
             JoinInjectionAlignmentError,
             JoinInjectionFailedError,
+            JoinPathKeyTypeError,
             ProbeCtePlacementError,
         ) as exc:
             debug(f"[{ASK_PHASE_K}] {exc}")
             print_rephrase_hint(RephraseHint.SQL_VALIDATION_FAILED)
             if persist_template_learning:
-                save_template_store(store)
+                TemplateOps.save_template_store(store)
             return _sql_validation_refusal_outcome(
                 exc,
                 generation_path=generation_path_label,
                 matched_template=matched_for_outcome,
                 structural_match_templates=structural_tpl,
             )
+        scope_outcome = _post_resolution_scope_outcome(
+            intent,
+            schema,
+            space_tables=space_tables,
+            space_columns=space_columns,
+            schema_context=schema_context,
+            visible_objects=visible_objects,
+            schema_role=schema_role,
+            context_name=context_name,
+            generation_path=generation_path_label,
+            matched_template=matched_for_outcome,
+            structural_tpl=structural_tpl,
+        )
+        if scope_outcome is not None:
+            return scope_outcome
         pipeline_trace(
             "pipeline.generate_and_validate_sql.after_resolve_joins_fresh",
             lambda: stable_json(
@@ -1770,6 +2011,7 @@ def generate_and_validate_sql(
                     structural_defaults=structural_defaults_src,
                     dialect=dialect,
                     prior_join_feedback=prior_join_fb,
+                    avoided_candidate_ids=avoid_join_ids or None,
                     join_preset_scope=join_preset_scope,
                 )
                 repaired_intent.sql_param = sql_param_r
@@ -1823,7 +2065,7 @@ def generate_and_validate_sql(
     if not ok:
         print_rephrase_hint(RephraseHint.SQL_VALIDATION_FAILED)
         if persist_template_learning:
-            save_template_store(store)
+            TemplateOps.save_template_store(store)
         ek = vcat.value if vcat is not None else PIPELINE_BUG_SQL_VALIDATION
         return SqlGenerationOutcome(
             sql,
@@ -1847,6 +2089,7 @@ def generate_and_validate_sql(
     elif matched_for_outcome is not None:
         join_matches_for_outcome = _join_matches_template_intent(matched_for_outcome, intent)
 
+    soft_findings = tuple(d for d in vdiags if d.code.value in SOFT_DIAGNOSTIC_CODES)
     return SqlGenerationOutcome(
         sql,
         True,
@@ -1856,7 +2099,9 @@ def generate_and_validate_sql(
         None,
         join_matches_for_outcome,
         None,
-        sum(1 for d in vdiags if d.code.value in SOFT_DIAGNOSTIC_CODES),
+        None,
+        explain_soft_diagnostics=len(soft_findings),
+        explain_soft_findings=soft_findings,
     )
 
 
@@ -1985,6 +2230,7 @@ def _resolve_joins_fresh(
     structural_defaults: dict[str, Any] | None = None,
     dialect: Any | None = None,
     prior_join_feedback: list[str] | None = None,
+    avoided_candidate_ids: frozenset[str] | None = None,
     join_preset_scope: dict[str, str] | None = None,
 ) -> tuple[str, dict[str, str]]:
     """Choose join candidate(s) and inject join SQL into deterministic. SQL."""
@@ -2088,6 +2334,7 @@ def _resolve_joins_fresh(
             require_final=False,
             schema=schema,
             prior_join_feedback=prior_join_feedback,
+            avoided_candidate_ids=avoided_candidate_ids,
         )
 
     pass1_keys = frozenset(str(s["scope"]) for s in pass1_llm if s.get("scope"))
@@ -2120,6 +2367,7 @@ def _resolve_joins_fresh(
             require_final=True,
             schema=schema,
             prior_join_feedback=prior_join_feedback,
+            avoided_candidate_ids=avoided_candidate_ids,
         )
 
     cmap = join_candidate_map(join_candidates)
@@ -2313,6 +2561,7 @@ def _resolve_joins_fresh(
         if multi_table:
             main_sig = _signature_for_candidate(join_candidates, candidate_id)
             main_anchor = intent.tables[0] if intent.tables else None
+            _raise_if_join_path_key_types(main_sig, schema, "main query")
             _raise_if_aggregate_join_fan_out(intent, main_sig, "main query", main_anchor)
             _raise_if_clause_widened_rowset(intent, main_sig, "main query", main_anchor)
         for cte_step in intent.cte_steps or []:
@@ -2322,6 +2571,7 @@ def _resolve_joins_fresh(
             hints_c = (cte_join_hints or {}).get(cte_step.cte_name) or {}
             cte_sig = _signature_for_candidate(hints_c, cte_join_ids[cte_step.cte_name])
             cte_anchor = cte_tbls[0] if cte_tbls else None
+            _raise_if_join_path_key_types(cte_sig, schema, f"CTE '{cte_step.cte_name}'")
             cte_scope_intent = RuntimeIntent(
                 tables=cte_tbls,
                 grain=cte_step.grain or "row_level",
@@ -2379,8 +2629,8 @@ def _resolve_joins_fresh(
                 signature=_signature_for_candidate(join_candidates, candidate_id),
                 edge_kinds=_edge_kinds_for_candidate(join_candidates, candidate_id),
                 from_anchor=intent.tables[0] if intent.tables else None,
-                where_params=where_leaves(intent.where),
-                having_params=having_leaves(intent.having),
+                where_params=PredicateGroup.where_leaves(intent.where),
+                having_params=PredicateGroup.having_leaves(intent.having),
             )
         for cte_step in intent.cte_steps or []:
             cte_tbls = list(cte_step.tables or [])
@@ -2395,8 +2645,8 @@ def _resolve_joins_fresh(
                 signature=_signature_for_candidate(hints_c, cid),
                 edge_kinds=_edge_kinds_for_candidate(hints_c, cid),
                 from_anchor=cte_tbls[0] if cte_tbls else None,
-                where_params=where_leaves(cte_step.where),
-                having_params=having_leaves(cte_step.having),
+                where_params=PredicateGroup.where_leaves(cte_step.where),
+                having_params=PredicateGroup.having_leaves(cte_step.having),
             )
 
     if not multi_table:
@@ -2493,7 +2743,9 @@ def finalize_substitute_sql(
     """Substitute bound parameters into ``intent.sql_param`` and return the executable SQL. ``intent.sql_param`` is already canonical because the compositional SQL builder emits column-left predicates from the intent layer; no post-SQL normalization is applied. Ensures ``intent.sql_param`` is non-empty when present."""
     sql_param = intent.sql_param or ""
     intent.sql_param = sql_param
-    return finalize_executable_sql(sql_param, params, structural_defaults_src, sqlglot_dialect=active_sqlglot_dialect())
+    return Dialect.finalize_executable_sql(
+        sql_param, params, structural_defaults_src, sqlglot_dialect=Dialect.active_sqlglot_dialect()
+    )
 
 
 def stamp_sql_shape(
@@ -2507,22 +2759,25 @@ def stamp_sql_shape(
     if generation_path is GenerationPath.FEDERATION_PLAN and federated_plan is not None:
         actual_shape = federation_plan_sql_shape(federated_plan)
     else:
-        actual_shape = sql_shape(sql, intent, sqlglot_dialect=active_sqlglot_dialect())
+        actual_shape = sql_shape(sql, intent, sqlglot_dialect=Dialect.active_sqlglot_dialect())
     intent.sql_shape = actual_shape
     debug(f"sql_shape={actual_shape}")
 
 
-def emit_explain_soft_diagnostics(count: int) -> None:
+def emit_explain_soft_diagnostics(findings: Sequence[Any]) -> None:
     """Surface EXPLAIN soft-diagnostic findings as structured diagnostics instead of a confidence penalty."""
-    n = max(0, int(count))
-    if n <= 0:
+    if not findings:
         return
-    notify(
-        f"EXPLAIN reported {n} soft diagnostic finding(s).",
-        stage="validation",
-        code=next(iter(SOFT_DIAGNOSTIC_CODES), DIAGNOSTIC_CODE_ENGINE_INFO),
-        details=(("explain_soft_diagnostics", str(n)),),
-    )
+    for finding in findings:
+        raw_code = finding.code if isinstance(finding.code, str) else finding.code.value
+        if raw_code not in SOFT_DIAGNOSTIC_CODES:
+            continue
+        message = getattr(finding, "message", None) or f"EXPLAIN soft diagnostic: {raw_code}"
+        notify(
+            message,
+            stage="validation",
+            code=raw_code,
+        )
 
 
 def credit_federation_accept(
@@ -2553,17 +2808,17 @@ def credit_federation_accept(
             member_templates = cast(dict[str, Any], member_store["templates"])
         else:
             member_templates = cast(dict[str, Any], member_store.get("templates", {}))
-        record_template_feedback(tmpl, accept=True)
+        TemplateOps.record_template_feedback(tmpl, accept=True)
         member_q = member_feedback_q_norm(step.source_id, q_norm)
-        record_per_question_feedback(tmpl, member_q, accept=True, path=path_bucket(path))
-        promote_trust(tmpl, member_q)
+        TemplateOps.record_per_question_feedback(tmpl, member_q, accept=True, path=TemplateOps.path_bucket(path))
+        TemplateOps.promote_trust(tmpl, member_q)
         stamp_federation_member_template(tmpl, plan_id=plan_id, source_id=step.source_id)
         member_schema = (schemas_by_source or {}).get(step.source_id)
         if member_schema is not None and not other_template_owns_question_string(member_templates, tmpl.id, member_q):
             _maybe_record_value_history_accept(
                 member_templates, tmpl, step.sub_intent, member_q, form_storage, member_schema
             )
-        save_template_store(member_store)
+        TemplateOps.save_template_store(member_store)
     if federation_dir and plan_id:
         member_ids = tuple(
             (step.source_id, str(step.matched_template.id))
@@ -2577,6 +2832,17 @@ def credit_federation_accept(
             member_template_ids=member_ids or None,
             pending_plan_template=pending_plan_template,
         )
+
+
+def _persist_federation_join_feedback(
+    federation_dir: str,
+    federation_plan_id: str,
+    summary: str,
+    *,
+    q_norm: str,
+) -> None:
+    record_federation_join_feedback(federation_dir, federation_plan_id, summary, q_norm=q_norm)
+    mirror_federation_plan_join_feedback(federation_dir, federation_plan_id, summary)
 
 
 def complete_user_feedback_reject(
@@ -2617,15 +2883,15 @@ def complete_user_feedback_reject(
 
     if persist_template_learning:
         if feedback_template is not None:
-            record_template_feedback(feedback_template, accept=False)
+            TemplateOps.record_template_feedback(feedback_template, accept=False)
             try:
                 resolved_path_for_reject = GenerationPath.parse(ctx.generation_path)
             except (KeyError, ValueError):
                 resolved_path_for_reject = None
-            path_bucket_value = path_bucket(resolved_path_for_reject)
-            record_per_question_feedback(feedback_template, q_norm, accept=False, path=path_bucket_value)
-            _, template_deleted = reject_out_per_question(templates, feedback_template, q_norm)
-            entry_fb = summarize_failure_for_memory(
+            path_bucket_value = TemplateOps.path_bucket(resolved_path_for_reject)
+            TemplateOps.record_per_question_feedback(feedback_template, q_norm, accept=False, path=path_bucket_value)
+            _, template_deleted = TemplateOps.reject_out_per_question(templates, feedback_template, q_norm)
+            entry_fb = TemplateOps.summarize_failure_for_memory(
                 question=q_norm,
                 intent=intent,
                 kind=FeedbackKind.INTENT_REJECTED,
@@ -2633,7 +2899,9 @@ def complete_user_feedback_reject(
                 user_reason=norm_reason,
             )
             if federation_plan_id and federation_dir:
-                record_federation_join_feedback(str(federation_dir), str(federation_plan_id), entry_fb.summary)
+                _persist_federation_join_feedback(
+                    str(federation_dir), str(federation_plan_id), entry_fb.summary, q_norm=q_norm
+                )
                 join_feedback_recorded = True
             elif (
                 cross_source_join_feedback
@@ -2641,16 +2909,18 @@ def complete_user_feedback_reject(
                 and federation_plan_id
                 and RejectionBucket.WRONG_TABLES_OR_JOINS in entry_fb.buckets
             ):
-                record_federation_join_feedback(str(federation_dir), str(federation_plan_id), entry_fb.summary)
+                _persist_federation_join_feedback(
+                    str(federation_dir), str(federation_plan_id), entry_fb.summary, q_norm=q_norm
+                )
                 join_feedback_recorded = True
             else:
-                record_question_feedback(store, q_norm, entry_fb)
+                TemplateOps.record_question_feedback(store, q_norm, entry_fb)
             last_bucket = entry_fb.buckets[0].value if entry_fb.buckets else RejectionBucket.OTHER.value
             if template_deleted:
-                templates_to_store(store, templates)
+                TemplateOps.templates_to_store(store, templates)
 
         else:
-            entry_fb = summarize_failure_for_memory(
+            entry_fb = TemplateOps.summarize_failure_for_memory(
                 question=q_norm,
                 intent=intent,
                 kind=FeedbackKind.INTENT_REJECTED,
@@ -2658,7 +2928,9 @@ def complete_user_feedback_reject(
                 user_reason=norm_reason,
             )
             if federation_plan_id and federation_dir:
-                record_federation_join_feedback(str(federation_dir), str(federation_plan_id), entry_fb.summary)
+                _persist_federation_join_feedback(
+                    str(federation_dir), str(federation_plan_id), entry_fb.summary, q_norm=q_norm
+                )
                 join_feedback_recorded = True
             elif (
                 cross_source_join_feedback
@@ -2666,14 +2938,16 @@ def complete_user_feedback_reject(
                 and federation_plan_id
                 and RejectionBucket.WRONG_TABLES_OR_JOINS in entry_fb.buckets
             ):
-                record_federation_join_feedback(str(federation_dir), str(federation_plan_id), entry_fb.summary)
+                _persist_federation_join_feedback(
+                    str(federation_dir), str(federation_plan_id), entry_fb.summary, q_norm=q_norm
+                )
                 join_feedback_recorded = True
             else:
-                record_question_feedback(store, q_norm, entry_fb)
+                TemplateOps.record_question_feedback(store, q_norm, entry_fb)
             last_bucket = entry_fb.buckets[0].value if entry_fb.buckets else RejectionBucket.OTHER.value
 
-        store = templates_to_store(store, templates)
-        save_template_store(store)
+        store = TemplateOps.templates_to_store(store, templates)
+        TemplateOps.save_template_store(store)
     else:
         gpath = ctx.generation_path
         gcode = gpath.code if isinstance(gpath, GenerationPath) else str(gpath)
@@ -2693,10 +2967,16 @@ def complete_user_feedback_reject(
             kind="template_reject",
             schema_graph_id=str(schema.schema_graph_id or ""),
             schema_hash=str(schema.effective_structural_hash or ""),
-            produced_at=datetime.now(timezone.utc).isoformat(),
+            produced_at=datetime.now(UTC).isoformat(),
             payload=(("ctx_json", stable_json(ctx_doc)),),
         )
-        _emit_reader_write_queue_event(store, ev)
+        try:
+            _emit_reader_write_queue_event(store, ev)
+        except ValueError:
+            if federation_dir:
+                emit_write_queue_event(federation_dir, ev)
+            else:
+                raise
         last_bucket = RejectionBucket.OTHER.value
     ctx_ref = _refinement_ctx_for_feedback(choice_port, refinement_ctx)
     reason_line = ((reject_reason or "").strip() if needs_reason else "") or norm_reason
@@ -2755,8 +3035,10 @@ def handle_user_feedback(
     if choice not in ("y", "n"):
         invalid_input("Invalid choice — please answer y or n.")
         if persist_template_learning:
-            save_template_store(store)
+            TemplateOps.save_template_store(store)
         return None
+
+    emit_ask_phase(ASK_PHASE_N, source=member_source_id)
 
     record_q = member_feedback_q_norm(member_source_id, q_norm) if member_source_id else q_norm
 
@@ -2764,7 +3046,7 @@ def handle_user_feedback(
     if resolved_path is GenerationPath.FEDERATION_PLAN and federated_plan is not None:
         stamp_sql_shape(sql, intent, generation_path=resolved_path, federated_plan=federated_plan)
     else:
-        intent.sql_shape = sql_shape(sql, intent, sqlglot_dialect=active_sqlglot_dialect())
+        intent.sql_shape = sql_shape(sql, intent, sqlglot_dialect=Dialect.active_sqlglot_dialect())
     feedback_template = matched_template
     if (
         resolved_path
@@ -2784,7 +3066,7 @@ def handle_user_feedback(
     if choice == "y":
         promoted = False
         if persist_template_learning:
-            delete_rejected_templates_matching_question(cast(dict[str, Any], store), record_q)
+            TemplateOps.delete_rejected_templates_matching_question(cast(dict[str, Any], store), record_q)
 
             if resolved_path == GenerationPath.FEDERATION_PLAN:
                 fed_steps = federated_steps or ()
@@ -2803,7 +3085,7 @@ def handle_user_feedback(
                 promoted = True
 
             if matched_rejected_template is not None:
-                new_tmpl = promote_rejected_to_template(
+                new_tmpl = TemplateOps.promote_rejected_to_template(
                     cast(dict[str, Any], store),
                     templates,
                     record_q,
@@ -2819,7 +3101,7 @@ def handle_user_feedback(
             if not promoted and resolved_path == GenerationPath.FRESH:
                 debug(f"[{ASK_PHASE_N}] insert_template path 5")
                 sm_list = list(structural_match_templates or [])
-                insert_template(
+                TemplateOps.insert_template(
                     store,
                     templates,
                     schema,
@@ -2834,9 +3116,11 @@ def handle_user_feedback(
                 )
             elif not promoted and matched_template is not None and resolved_path == GenerationPath.EXACT_QUESTION_REUSE:
                 tmpl = matched_template
-                record_template_feedback(tmpl, accept=True)
-                record_per_question_feedback(tmpl, record_q, accept=True, path=path_bucket(resolved_path))
-                promote_trust(tmpl, record_q)
+                TemplateOps.record_template_feedback(tmpl, accept=True)
+                TemplateOps.record_per_question_feedback(
+                    tmpl, record_q, accept=True, path=TemplateOps.path_bucket(resolved_path)
+                )
+                TemplateOps.promote_trust(tmpl, record_q)
                 if not other_template_owns_question_string(templates, tmpl.id, record_q):
                     _maybe_record_value_history_accept(templates, tmpl, intent, record_q, form_storage, schema)
             elif (
@@ -2846,15 +3130,17 @@ def handle_user_feedback(
                 in (GenerationPath.FUZZY_REUSE_LITERAL_STRUCTURAL, GenerationPath.FUZZY_REUSE_FULL_PARAMS)
             ):
                 tmpl = matched_template
-                record_template_feedback(tmpl, accept=True)
-                record_per_question_feedback(tmpl, record_q, accept=True, path=path_bucket(resolved_path))
-                promote_trust(tmpl, record_q)
+                TemplateOps.record_template_feedback(tmpl, accept=True)
+                TemplateOps.record_per_question_feedback(
+                    tmpl, record_q, accept=True, path=TemplateOps.path_bucket(resolved_path)
+                )
+                TemplateOps.promote_trust(tmpl, record_q)
                 if not other_template_owns_question_string(templates, tmpl.id, record_q):
                     _maybe_record_value_history_accept(templates, tmpl, intent, record_q, form_storage, schema)
             elif not promoted and matched_template is not None and resolved_path == GenerationPath.INTENT_DIRECT_MATCH:
                 if join_matches_template is False:
                     sm_list = list(structural_match_templates or [])
-                    insert_template(
+                    TemplateOps.insert_template(
                         store,
                         templates,
                         schema,
@@ -2869,9 +3155,11 @@ def handle_user_feedback(
                     )
                 else:
                     tmpl = matched_template
-                    record_template_feedback(tmpl, accept=True)
-                    record_per_question_feedback(tmpl, record_q, accept=True, path=path_bucket(resolved_path))
-                    promote_trust(tmpl, record_q)
+                    TemplateOps.record_template_feedback(tmpl, accept=True)
+                    TemplateOps.record_per_question_feedback(
+                        tmpl, record_q, accept=True, path=TemplateOps.path_bucket(resolved_path)
+                    )
+                    TemplateOps.promote_trust(tmpl, record_q)
                     if not other_template_owns_question_string(templates, tmpl.id, record_q):
                         _maybe_record_value_history_accept(templates, tmpl, intent, record_q, form_storage, schema)
             elif (
@@ -2881,7 +3169,7 @@ def handle_user_feedback(
             ):
                 if join_matches_template is False:
                     sm_list = list(structural_match_templates or [])
-                    insert_template(
+                    TemplateOps.insert_template(
                         store,
                         templates,
                         schema,
@@ -2896,15 +3184,17 @@ def handle_user_feedback(
                     )
                 else:
                     tmpl = matched_template
-                    record_template_feedback(tmpl, accept=True)
-                    record_per_question_feedback(tmpl, record_q, accept=True, path=path_bucket(resolved_path))
-                    promote_trust(tmpl, record_q)
+                    TemplateOps.record_template_feedback(tmpl, accept=True)
+                    TemplateOps.record_per_question_feedback(
+                        tmpl, record_q, accept=True, path=TemplateOps.path_bucket(resolved_path)
+                    )
+                    TemplateOps.promote_trust(tmpl, record_q)
                     if not other_template_owns_question_string(templates, tmpl.id, record_q):
                         _maybe_record_value_history_accept(templates, tmpl, intent, record_q, form_storage, schema)
             elif not promoted and matched_template is not None and resolved_path == GenerationPath.UNION_TEMPLATE_WIDEN:
                 if join_matches_template is False:
                     sm_list = list(structural_match_templates or [])
-                    insert_template(
+                    TemplateOps.insert_template(
                         store,
                         templates,
                         schema,
@@ -2919,12 +3209,14 @@ def handle_user_feedback(
                     )
                 else:
                     tmpl = matched_template
-                    record_template_feedback(tmpl, accept=True)
-                    record_per_question_feedback(tmpl, record_q, accept=True, path=path_bucket(resolved_path))
-                    promote_trust(tmpl, record_q)
+                    TemplateOps.record_template_feedback(tmpl, accept=True)
+                    TemplateOps.record_per_question_feedback(
+                        tmpl, record_q, accept=True, path=TemplateOps.path_bucket(resolved_path)
+                    )
+                    TemplateOps.promote_trust(tmpl, record_q)
                     if not other_template_owns_question_string(templates, tmpl.id, record_q):
                         _maybe_record_value_history_accept(templates, tmpl, intent, record_q, form_storage, schema)
-                    old_skeleton = concrete_intent_to_runtime_skeleton(tmpl.intent_signature)
+                    old_skeleton = tmpl.intent_signature.to_runtime_skeleton()
                     new_skeleton = cleared_param_runtime_intent(intent)
                     key_remap = _structural_key_remap_from_assignment_order(old_skeleton, new_skeleton)
                     _remap_value_history_structural_keys(tmpl.value_history, key_remap)
@@ -2939,7 +3231,7 @@ def handle_user_feedback(
             ):
                 if join_matches_template is False:
                     sm_list = list(structural_match_templates or [])
-                    insert_template(
+                    TemplateOps.insert_template(
                         store,
                         templates,
                         schema,
@@ -2954,12 +3246,14 @@ def handle_user_feedback(
                     )
                 else:
                     tmpl = matched_template
-                    record_template_feedback(tmpl, accept=True)
-                    record_per_question_feedback(tmpl, record_q, accept=True, path=path_bucket(resolved_path))
-                    promote_trust(tmpl, record_q)
+                    TemplateOps.record_template_feedback(tmpl, accept=True)
+                    TemplateOps.record_per_question_feedback(
+                        tmpl, record_q, accept=True, path=TemplateOps.path_bucket(resolved_path)
+                    )
+                    TemplateOps.promote_trust(tmpl, record_q)
                     if not other_template_owns_question_string(templates, tmpl.id, record_q):
                         _maybe_record_value_history_accept(templates, tmpl, intent, record_q, form_storage, schema)
-                    old_skeleton = concrete_intent_to_runtime_skeleton(tmpl.intent_signature)
+                    old_skeleton = tmpl.intent_signature.to_runtime_skeleton()
                     new_skeleton = cleared_param_runtime_intent(intent)
                     key_remap = _structural_key_remap_from_assignment_order(old_skeleton, new_skeleton)
                     _remap_value_history_structural_keys(tmpl.value_history, key_remap)
@@ -2968,8 +3262,8 @@ def handle_user_feedback(
                         templates, template_store_view=(store if isinstance(store, TemplateStoreView) else None)
                     )
 
-            store = templates_to_store(store, templates)
-            save_template_store(store)
+            store = TemplateOps.templates_to_store(store, templates)
+            TemplateOps.save_template_store(store)
         else:
             replay = {
                 "generation_path": resolved_path.code,
@@ -2987,7 +3281,7 @@ def handle_user_feedback(
                 kind="template_accept",
                 schema_graph_id=str(schema.schema_graph_id or ""),
                 schema_hash=str(schema.effective_structural_hash or ""),
-                produced_at=datetime.now(timezone.utc).isoformat(),
+                produced_at=datetime.now(UTC).isoformat(),
                 payload=(("replay_json", stable_json(replay)),),
             )
             _emit_reader_write_queue_event(store, ev)
@@ -3031,12 +3325,12 @@ def handle_user_feedback(
             except (EOFError, KeyboardInterrupt):
                 terminated()
                 if persist_template_learning:
-                    save_template_store(store)
+                    TemplateOps.save_template_store(store)
                 return None
             if not reject_reason:
                 invalid_input()
                 if persist_template_learning:
-                    save_template_store(store)
+                    TemplateOps.save_template_store(store)
                 return None
             return complete_user_feedback_reject(
                 ctx_rej,
@@ -3073,7 +3367,7 @@ def _most_frequent_natural_language(vh: ValueHistory) -> str:
 
 def extract_column_headers(sql: str) -> list[str]:
     """Parse the outermost ``SELECT`` projection list and return. display. column names / aliases via AST."""
-    return sql_outer_select_aliases(sql, sqlglot_dialect=active_sqlglot_dialect())
+    return Dialect.sql_outer_select_aliases(sql, sqlglot_dialect=Dialect.active_sqlglot_dialect())
 
 
 def _federated_result_column_headers(
@@ -3112,7 +3406,7 @@ def intent_result_column_headers(
     for sc in intent.select_cols:
         name = ""
         col_ref = (sc.expr.column_ref or sc.expr.primary_column or sc.expr.primary_term or "").strip()
-        registry_id = (expr_registry_ref(sc.expr) or "").strip()
+        registry_id = (sc.expr.registry_ref() or "").strip()
         if registry_id and registry_id in display_aliases:
             name = display_aliases[registry_id].strip()
         if not name and (sc.output_alias or "").strip():
@@ -3216,25 +3510,35 @@ def merge_structural_defaults_for_reuse(
     return added
 
 
-def _validate_replay_aggregate_join_fan_out(
+def _validate_replay_join_semantics(
     intent: RuntimeIntent,
     schema: SchemaGraph,
-) -> AggregateJoinFanOutError | None:
-    """Refuse replay when stored join paths would fan out aggregates in the reconstructed intent."""
+) -> AggregateJoinFanOutError | ClauseWidenedRowsetError | None:
+    """Refuse replay when stored join paths violate aggregate or clause- widened rules."""
     tables = list(intent.tables or [])
     if len(tables) >= 2:
         sig = list(intent.chosen_join_path_signature or [])
         if sig:
-            issues = validate_aggregate_join_fan_out(
+            fan_out_issues = validate_aggregate_join_fan_out(
                 intent,
                 schema,
                 "main query",
                 join_signature=sig,
                 from_anchor=tables[0],
             )
-            errors = [i for i in issues if i.severity == "error"]
-            if errors:
-                return AggregateJoinFanOutError("main query", errors[0].message)
+            fan_out_errors = [i for i in fan_out_issues if i.severity == "error"]
+            if fan_out_errors:
+                return AggregateJoinFanOutError("main query", fan_out_errors[0].message)
+            clause_issues = validate_clause_widened_rowset(
+                intent,
+                schema,
+                "main query",
+                join_signature=sig,
+                from_anchor=tables[0],
+            )
+            clause_errors = [i for i in clause_issues if i.severity == "error"]
+            if clause_errors:
+                return ClauseWidenedRowsetError("main query", clause_errors[0].message)
     for cte in intent.cte_steps or []:
         cte_tbls = list(cte.tables or [])
         if len(cte_tbls) < 2:
@@ -3257,16 +3561,37 @@ def _validate_replay_aggregate_join_fan_out(
             chosen_join_path_signature=sig,
         )
         context = f"CTE '{cte.cte_name}'"
-        issues = validate_aggregate_join_fan_out(
+        fan_out_issues = validate_aggregate_join_fan_out(
             cte_scope,
             schema,
             context,
             join_signature=sig,
             from_anchor=cte_tbls[0],
         )
-        errors = [i for i in issues if i.severity == "error"]
-        if errors:
-            return AggregateJoinFanOutError(context, errors[0].message)
+        fan_out_errors = [i for i in fan_out_issues if i.severity == "error"]
+        if fan_out_errors:
+            return AggregateJoinFanOutError(context, fan_out_errors[0].message)
+        clause_issues = validate_clause_widened_rowset(
+            cte_scope,
+            schema,
+            context,
+            join_signature=sig,
+            from_anchor=cte_tbls[0],
+        )
+        clause_errors = [i for i in clause_issues if i.severity == "error"]
+        if clause_errors:
+            return ClauseWidenedRowsetError(context, clause_errors[0].message)
+    return None
+
+
+def _validate_replay_aggregate_join_fan_out(
+    intent: RuntimeIntent,
+    schema: SchemaGraph,
+) -> AggregateJoinFanOutError | None:
+    """Refuse replay when stored join paths would fan out aggregates in the reconstructed intent."""
+    err = _validate_replay_join_semantics(intent, schema)
+    if isinstance(err, AggregateJoinFanOutError):
+        return err
     return None
 
 
@@ -3322,7 +3647,7 @@ def complete_direct_sql_reuse_user_choice(
                 **fed_contract,
             )
             if dfw is not None:
-                save_result_csv(dfw, output_path=results_csv_output_path(store))
+                save_result_csv_for_store(dfw, store)
         row_tuples = [tuple(r) for r in rows]
         cols = ctx.headers if ctx.headers else result_columns_for_session(sql, row_tuples, **fed_contract)
         note_interactive_turn(choice_port, outcome="success", sql=sql, rows=row_tuples, columns=cols, intent=intent)
@@ -3374,6 +3699,8 @@ def execute_reuse_with_params(
     context_name: str = MASTER_AETHERSPACE_NAME,
     space_allowed_tables: frozenset[str] | None = None,
     space_allowed_columns: frozenset[str] | None = None,
+    space_deny_tables: frozenset[str] | None = None,
+    space_deny_columns: frozenset[str] | None = None,
     prompt: bool = True,
     record_question: str | None = None,
     on_param_incomplete: Literal["return_none", "raise"] = "return_none",
@@ -3434,7 +3761,19 @@ def execute_reuse_with_params(
             raise ConfigError(msg)
         return None
 
-    live_ok, stale_reasons = template_is_live(template_schema_refs(ref_tmpl), schema)
+    schema_row = (
+        dict(ref_tmpl.value_history.param_values[reuse_row_idx])
+        if ref_tmpl.value_history.param_values and reuse_row_idx < len(ref_tmpl.value_history.param_values)
+        else {}
+    )
+    if schema_row and not _reuse_params_match_value_schema(new_params, schema_row, ref_tmpl.intent_signature):
+        msg = "parameter bind map has incompatible types for template reuse"
+        debug(f"[{ASK_PHASE_A}] param_extraction_type_mismatch: {msg}")
+        if on_param_incomplete == "raise":
+            raise ConfigError(msg)
+        return None
+
+    live_ok, stale_reasons = TemplateRefs.template_is_live(TemplateRefs.template_schema_refs(ref_tmpl), schema)
     if not live_ok:
         debug(f"[{ASK_PHASE_A}] template_not_live: {','.join(stale_reasons)}")
         if on_param_incomplete == "raise":
@@ -3444,14 +3783,14 @@ def execute_reuse_with_params(
     sd_reuse = getattr(ref_tmpl, "structural_defaults", None)
     reuse_nl = existing_nl if existing_nl else _most_frequent_natural_language(ref_tmpl.value_history)
     concrete_cte_steps = ref_tmpl.intent_signature.cte_steps or []
-    runtime_cte_steps = [concrete_cte_to_runtime(c) for c in concrete_cte_steps]
+    runtime_cte_steps = [c.to_runtime() for c in concrete_cte_steps]
 
     for cte in runtime_cte_steps:
         keys: set[str] = set()
-        for fp in where_leaves(cte.where) or []:
+        for fp in PredicateGroup.where_leaves(cte.where) or []:
             if fp.param_key:
                 keys.add(fp.param_key)
-        for hp in having_leaves(cte.having) or []:
+        for hp in PredicateGroup.having_leaves(cte.having) or []:
             if hp.param_key:
                 keys.add(hp.param_key)
         cte.param_values = {k: v for k, v in new_params.items() if k in keys}
@@ -3470,14 +3809,23 @@ def execute_reuse_with_params(
         natural_language=reuse_nl,
         chosen_join_candidate_id=ref_tmpl.chosen_join_candidate_id,
         chosen_join_path_signature=ref_tmpl.chosen_join_path_signature or [],
+        limit=ref_tmpl.intent_signature.limit,
+        limit_param_key=ref_tmpl.intent_signature.limit_param_key or "",
+        distinct_select_index=ref_tmpl.intent_signature.distinct_select_index,
+        distinct_on=list(ref_tmpl.intent_signature.distinct_on or []),
     )
 
-    fan_out_err = _validate_replay_aggregate_join_fan_out(intent, schema)
-    if fan_out_err is not None:
-        debug(f"[{ASK_PHASE_A}] aggregate_join_fan_out: {fan_out_err.message_for_caller}")
+    replay_err = _validate_replay_join_semantics(intent, schema)
+    if replay_err is not None:
+        debug(f"[{ASK_PHASE_A}] replay join semantics: {replay_err.message_for_caller}")
         if on_param_incomplete == "raise":
-            raise fan_out_err
-        return None
+            raise replay_err
+        return _sql_validation_refusal_outcome(
+            replay_err,
+            generation_path=reuse_path,
+            matched_template=ref_tmpl,
+            structural_match_templates=(),
+        )
 
     intent.sql_param = ref_tmpl.sql_param or ""
     exec_sql = dialect.finalize_render(
@@ -3493,8 +3841,12 @@ def execute_reuse_with_params(
 
     space_tables = frozenset(space_allowed_tables or ())
     space_columns = frozenset(space_allowed_columns or ())
-    if space_tables or space_columns:
-        if not assert_intent_in_scope(intent, space_tables, space_columns, schema):
+    deny_tables = frozenset(space_deny_tables or ())
+    deny_columns = frozenset(space_deny_columns or ())
+    if _space_scope_gate_active(space_tables, space_columns, deny_tables, deny_columns):
+        if not assert_intent_in_scope(
+            intent, space_tables, space_columns, schema, deny_tables=deny_tables, deny_columns=deny_columns
+        ):
             debug(f"[{ASK_PHASE_A}] intent out of aetherspace scope")
             return SqlGenerationOutcome(
                 "",
@@ -3518,6 +3870,13 @@ def execute_reuse_with_params(
                 sql_validation_error="intent out of execution scope",
                 error_kind=FailureCategory.ACCESS_POLICY.value,
             )
+    try:
+        assert_execution_parameters_validated(intent, schema)
+    except ConfigError as exc:
+        debug(f"[{ASK_PHASE_A}] parameter_validation_failed: {exc}")
+        if on_param_incomplete == "raise":
+            raise
+        return None
     ok, err, _vcat, _vdiags = _run_sql_validation_cascade(exec_sql, intent, dialect, schema=schema)
     if not ok:
         debug(f"[{ASK_PHASE_A}] validation_failed: {err}")
@@ -3538,7 +3897,7 @@ def execute_reuse_with_params(
 
     display_base = _template_effective_sql_display_param(ref_tmpl, dialect=dialect)
     display_sql = (
-        finalize_executable_sql(
+        Dialect.finalize_executable_sql(
             display_base, new_params, sd_reuse, sqlglot_dialect=dialect.sqlglot_dialect, for_display=True
         )
         if display_base and new_params
@@ -3606,7 +3965,7 @@ def execute_reuse_with_params(
             **fed_contract,
         )
         if dfw is not None:
-            save_result_csv(dfw, output_path=results_csv_output_path(store))
+            save_result_csv_for_store(dfw, store)
 
     handle_user_feedback(
         normalised_choice,
@@ -3655,13 +4014,13 @@ def _reuse_runtime_intent_from_template(
     """Build a runtime intent skeleton for question-level reuse with fresh bind values."""
     reuse_nl = existing_nl if existing_nl else _most_frequent_natural_language(ref_tmpl.value_history)
     concrete_cte_steps = ref_tmpl.intent_signature.cte_steps or []
-    runtime_cte_steps = [concrete_cte_to_runtime(c) for c in concrete_cte_steps]
+    runtime_cte_steps = [c.to_runtime() for c in concrete_cte_steps]
     for cte in runtime_cte_steps:
         keys: set[str] = set()
-        for fp in where_leaves(cte.where) or []:
+        for fp in PredicateGroup.where_leaves(cte.where) or []:
             if fp.param_key:
                 keys.add(fp.param_key)
-        for hp in having_leaves(cte.having) or []:
+        for hp in PredicateGroup.having_leaves(cte.having) or []:
             if hp.param_key:
                 keys.add(hp.param_key)
         cte.param_values = {k: v for k, v in new_params.items() if k in keys}
@@ -3845,7 +4204,11 @@ def _try_federation_plan_question_reuse(
     if plan.ineligible_reason:
         if on_param_incomplete == "raise":
             raise ConfigError(plan.ineligible_reason)
-        return None
+        return federation_ineligible_refusal_outcome(
+            plan.ineligible_reason,
+            generation_path=GenerationPath.FEDERATION_PLAN,
+            matched_template=ref_tmpl,
+        )
     step_fps = federation_plan_step_fingerprints(
         plan,
         intent_key_fn=intent_key,
@@ -3980,12 +4343,12 @@ def force_reuse_saved_question(
 
         ConfigError: When no template matches *question_old* or bind values are invalid.
     """
-    resolved = resolve_template_for_question(question_old, templates, template_store=store)
+    resolved = TemplateOps.resolve_template_for_question(question_old, templates, template_store=store)
     if resolved is None:
         raise ConfigError(f"No stored template matches question {question_old!r}")
     ref_tmpl, hist_idx = resolved
     q_new_norm = normalize_question(question_new)
-    expected_handles = set(handles_referenced_in_sql_param(ref_tmpl.sql_param or ""))
+    expected_handles = set(TemplateOps.handles_referenced_in_sql_param(ref_tmpl.sql_param or ""))
     for key in new_values:
         if key not in expected_handles:
             raise ConfigError(f"Unknown parameter handle {key!r} for template {ref_tmpl.id}")
@@ -4072,22 +4435,27 @@ def execute_stored_template_by_ref(
 
         ConfigError: When the ref is unknown, bind values are invalid, or execution fails.
     """
-    tmpl = resolve_template_ref(template_ref, templates)
-    if tmpl is None or not template_visible_to_callers(tmpl):
+    tmpl = TemplateOps.resolve_template_ref(template_ref, templates)
+    if tmpl is None or not TemplateOps.template_visible_to_callers(tmpl):
         raise ConfigError(f"unknown template ref {template_ref!r}")
-    expected_handles = set(handles_referenced_in_sql_param(tmpl.sql_param or ""))
+    approval = getattr(tmpl, "approval_state", None)
+    if approval is not None and str(getattr(approval, "value", approval)).lower() == "pending":
+        raise ConfigError(f"template {tmpl.id!r} is pending approval")
+    expected_handles = {
+        h for h in TemplateOps.handles_referenced_in_sql_param(tmpl.sql_param or "") if re.fullmatch(r"p\d+", h)
+    }
     for key in params:
         if key not in expected_handles:
             raise ConfigError(f"Unknown parameter handle {key!r} for template {tmpl.id}")
     vh = tmpl.value_history
     hist_idx = 0
     if vh.questions:
-        primary_q = primary_template_q_norm(tmpl)
+        primary_q = TemplateOps.primary_template_q_norm(tmpl)
         hist_idx = vh.questions.index(primary_q) if primary_q in vh.questions else 0
     base_row = dict(vh.param_values[hist_idx]) if vh.param_values and hist_idx < len(vh.param_values) else {}
     merged = dict(base_row)
     merged.update(params)
-    q_norm = normalize_question(question) if question else primary_template_q_norm(tmpl)
+    q_norm = normalize_question(question) if question else TemplateOps.primary_template_q_norm(tmpl)
     if not q_norm:
         raise ConfigError("template has no stored question row; pass question=")
     outcome = execute_reuse_with_params(
@@ -4117,7 +4485,9 @@ def execute_stored_template_by_ref(
     rows = dialect.execute(outcome.sql, exec_bind)
     display_base = _template_effective_sql_display_param(tmpl, dialect=dialect)
     display_sql = (
-        finalize_executable_sql(display_base, merged, sd_reuse, sqlglot_dialect=dialect.sqlglot_dialect)
+        Dialect.finalize_executable_sql(
+            display_base, merged, sd_reuse, sqlglot_dialect=dialect.sqlglot_dialect, for_display=True
+        )
         if display_base and merged
         else (display_base or outcome.sql)
     )
@@ -4293,7 +4663,7 @@ def _intent_decline_feedback_bucket(
             feedback = prompt("").strip()
     except (EOFError, KeyboardInterrupt):
         terminated()
-    entry = summarize_failure_for_memory(
+    entry = TemplateOps.summarize_failure_for_memory(
         question=q_norm,
         intent=intent,
         kind=FeedbackKind.INTENT_REJECTED,
@@ -4301,14 +4671,14 @@ def _intent_decline_feedback_bucket(
         user_reason=feedback or default_user_reason,
     )
     if persist_template_learning:
-        record_question_feedback(store, q_norm, entry)
-        save_template_store(store)
+        TemplateOps.record_question_feedback(store, q_norm, entry)
+        TemplateOps.save_template_store(store)
     else:
         ev = WriteQueueEvent(
             kind="feedback_record",
             schema_graph_id=str(schema.schema_graph_id or ""),
             schema_hash=str(schema.effective_structural_hash or ""),
-            produced_at=datetime.now(timezone.utc).isoformat(),
+            produced_at=datetime.now(UTC).isoformat(),
             payload=(("q_norm", q_norm), ("entry_json", stable_json(entry.to_dict()))),
         )
         _emit_reader_write_queue_event(store, ev)
@@ -4368,7 +4738,11 @@ def confirm_intent_with_user(
     if intent_already_confirmed:
         return True
     if not force_intent_confirm and should_skip_intent_confirmation(
-        intent, cast(dict[str, Any] | None, store), q_norm or "", semantic_warnings
+        intent,
+        cast(dict[str, Any] | None, store),
+        q_norm or "",
+        semantic_warnings,
+        schema_graph_id=(schema.schema_graph_id if schema is not None else None),
     ):
         debug(
             f"[{ASK_PHASE_H}] auto_proceed: similarity={similarity_score:.3f} "
@@ -4387,7 +4761,7 @@ def confirm_intent_with_user(
         debug(f"[{ASK_PHASE_H}] user_rejected_intent")
         if getattr(intent, "schema_invalid", False):
             if persist_template_learning:
-                save_template_store(store)
+                TemplateOps.save_template_store(store)
             print_rephrase_hint(RephraseHint.USER_REJECTED_INTENT, rejection_bucket=None)
             return False
         rejection_bucket = _intent_decline_feedback_bucket(
@@ -4402,7 +4776,7 @@ def confirm_intent_with_user(
             persist_template_learning=persist_template_learning,
         )
         if persist_template_learning:
-            save_template_store(store)
+            TemplateOps.save_template_store(store)
         print_rephrase_hint(RephraseHint.USER_REJECTED_INTENT, rejection_bucket=rejection_bucket)
         return False
     debug(f"[{ASK_PHASE_H}] user_confirmed_intent")
@@ -4425,7 +4799,8 @@ def _final_display_sql_for_results(
         display_param = intent.sql_param or ""
     else:
         try:
-            dialect = get_dialect(EngineConfig.TYPE, EngineConfig.RUNTIME)
+            runtime_cfg = active_engine_runtime_config()
+            dialect = DialectRegistry.get_dialect(EngineConfig.TYPE, runtime_cfg)
         except ValueError:
             dialect = None
         if dialect is None:
@@ -4434,11 +4809,11 @@ def _final_display_sql_for_results(
             d_aliases = enriched_display_alias_map(q_norm, intent.sql_param or "", intent, template_display_alias_map)
             display_param = build_display_sql(intent.sql_param or "", intent, d_aliases, dialect=dialect)
     if display_param and intent.param_values:
-        return finalize_executable_sql(
+        return Dialect.finalize_executable_sql(
             display_param,
             intent.param_values,
             structural_defaults,
-            sqlglot_dialect=active_sqlglot_dialect(),
+            sqlglot_dialect=Dialect.active_sqlglot_dialect(),
             for_display=True,
         )
     return display_param or sql
@@ -4567,7 +4942,29 @@ def results_csv_output_path(
         return os.path.join(artifacts_dir, "results.csv")
     if store is not None:
         return os.path.join(_artifact_dir_for_template_store(store), "results.csv")
-    return os.path.join(os.getcwd(), "results.csv")
+    raise ValueError(
+        "results.csv path requires artifacts_dir, csv_dir, or a template store with a persisted artifacts root"
+    )
+
+
+def save_result_csv_for_store(
+    df: pandas.DataFrame,
+    store: dict[str, Any] | TemplateStoreView,
+    *,
+    artifacts_dir: str | None = None,
+    csv_dir: str | None = None,
+) -> None:
+    """Write ``results.csv`` when an explicit destination can be resolved from *store*."""
+    try:
+        output_path = results_csv_output_path(
+            store,
+            artifacts_dir=artifacts_dir,
+            csv_dir=csv_dir,
+        )
+    except ValueError:
+        debug("save_result_csv skipped: no explicit artifacts destination")
+        return
+    save_result_csv(df, output_path=output_path)
 
 
 def save_result_csv(
@@ -4575,10 +4972,84 @@ def save_result_csv(
     *,
     output_path: str | os.PathLike[str] | None = None,
 ) -> None:
-    """Write *df* to ``results.csv`` at *output_path* or the process working directory."""
-    dest = os.fspath(output_path) if output_path is not None else os.path.join(os.getcwd(), "results.csv")
-    df.to_csv(dest, index=False)
+    """Write *df* to ``results.csv`` at *output_path*."""
+    if output_path is None:
+        raise ValueError(
+            "save_result_csv requires an explicit output_path or artifacts_dir via results_csv_output_path"
+        )
+    dest = os.fspath(output_path)
+    df.to_csv(dest, index=False, lineterminator="\n")
     debug(f"results saved to {dest}")
+
+
+def _estimate_result_row_bytes(row: tuple[Any, ...]) -> int:
+    """Estimate the in-memory byte size of one fetched result row."""
+    total = 0
+    for val in row:
+        if isinstance(val, (bytes, bytearray, memoryview)):
+            total += len(val)
+        elif isinstance(val, str):
+            total += len(val.encode("utf-8", errors="replace"))
+        elif val is not None:
+            total += sys.getsizeof(val)
+    return total
+
+
+def _push_result_row_limit_sql(sql: str, intent: RuntimeIntent, engine: str, max_rows: int) -> str:
+    """Push ``LIMIT max_rows + 1`` when the intent does not already carry a tighter limit."""
+    intent_limit = intent.limit
+    if intent_limit is not None and int(intent_limit) <= int(max_rows):
+        return sql
+    dialect_name = DialectRegistry.sqlglot_dialect_for_engine(engine) or engine or "duckdb"
+    try:
+        parsed = sqlglot.parse_one(sql, read=dialect_name)
+        if isinstance(parsed, sqlglot.exp.Select):
+            limited = parsed.limit(int(max_rows) + 1, copy=True)
+            return limited.sql(dialect=dialect_name)
+    except (sqlglot.errors.ParseError, AttributeError, TypeError, ValueError):
+        pass
+    stripped = sql.rstrip().rstrip(";")
+    return f"{stripped} LIMIT {int(max_rows) + 1}"
+
+
+def _fetch_capped_result_rows(
+    backend: ResultBackend,
+    sql: str,
+    params: dict[str, Any] | None,
+    *,
+    timeout_ms: int | None = None,
+) -> list[tuple[Any, ...]]:
+    """Fetch result rows with streaming row and byte caps from active engine limits."""
+    limits = active_engine_limits()
+    batch_rows = int(limits.result_fetch_batch_rows or 10_000)
+    max_rows = limits.max_result_rows
+    max_bytes = limits.max_result_bytes
+    rows: list[tuple[Any, ...]] = []
+    total_bytes = 0
+    for batch in backend.fetch_rows_batched(
+        sql,
+        params,
+        batch_rows=batch_rows,
+        max_rows=max_rows,
+        max_bytes=max_bytes,
+        timeout_ms=timeout_ms,
+    ):
+        for row in batch:
+            next_rows = len(rows) + 1
+            next_bytes = total_bytes + _estimate_result_row_bytes(row)
+            if max_rows is not None and next_rows > max_rows:
+                raise ResultCapExceededError(
+                    f"result row cap exceeded: {next_rows} rows > cap {max_rows}",
+                    limit_key="row_cap",
+                )
+            if max_bytes is not None and next_bytes > max_bytes:
+                raise ResultCapExceededError(
+                    f"result byte cap exceeded: {next_bytes} bytes > cap {max_bytes}",
+                    limit_key="byte_cap",
+                )
+            rows.append(row)
+            total_bytes = next_bytes
+    return rows
 
 
 def _execute_intent_sql_rows(
@@ -4594,6 +5065,7 @@ def _execute_intent_sql_rows(
     gate_kwargs: Mapping[str, Any] | None = None,
 ) -> list[tuple[Any, ...]] | tuple[list[tuple[Any, ...]], tuple[str, ...] | None]:
     """Finalize and execute one intent's SQL, returning row tuples."""
+    assert_execution_parameters_validated(intent, schema)
     exec_params = dict(bind_map) if bind_map is not None else dict(flatten_param_values(intent))
     base_sql = sql_override if sql_override is not None else (intent.sql_param or "")
     exec_sql = dialect.finalize_render(
@@ -4613,7 +5085,7 @@ def _execute_intent_sql_rows(
         ctx = schema_context if schema_context is not None else EngineContext()
         gate_active = _execution_scope_gate_active(ctx, visible_objects, schema_role, context_name=context_name)
         if gate_active and not assert_consumer_sql_in_scope(exec_sql, dialect, ctx, schema, visible_objects):
-            raise AccessError("execute", PERMISSION_DENIED_USER_MESSAGE)
+            raise AccessError("execute", PERMISSION_DENIED_USER_MESSAGE, reason="scope")
     backend = getattr(dialect, "result_backend", None)
     if return_column_names and backend is not None:
         fetch_with_cols = getattr(backend, "fetch_rows_with_columns", None)
@@ -4689,7 +5161,7 @@ def replay_federated_prepare_from_plan_template(
             manifest=manifest,
             member_graphs=member_graphs,
         )
-        live_ok, _stale_reasons = template_is_live(template_schema_refs(tmpl), sub_schema)
+        live_ok, _stale_reasons = TemplateRefs.template_is_live(TemplateRefs.template_schema_refs(tmpl), sub_schema)
         if not live_ok:
             raise FederationConfigError(
                 f"federation member template {tmpl_id!r} is stale for source {step.source_id!r}"
@@ -4740,21 +5212,23 @@ def replay_federated_prepare_from_plan_template(
                     phase="prepare",
                 )
         replay_intent = RuntimeIntent.from_dict(sub_intent.to_dict())
-        fan_out_err = _validate_replay_aggregate_join_fan_out(replay_intent, sub_schema)
-        if fan_out_err is not None:
-            raise AggregateJoinFanOutError(fan_out_err.scope_label, fan_out_err.message_for_caller)
+        replay_err = _validate_replay_join_semantics(replay_intent, sub_schema)
+        if replay_err is not None:
+            raise replay_err
         step_gates = dict(gate_map.get(step.source_id, {}))
         if manifest is not None and "allowed_where_ops" not in step_gates:
             engine_types = {binding.source_id: binding.engine for binding in manifest.sources}
             allowed_where_ops = intersect_member_where_ops(dialects_by_source, engine_types_by_source=engine_types)
             binding = next((item for item in manifest.sources if item.source_id == step.source_id), None)
             if binding is not None:
-                member_ops = extra_where_ops_for_engine(binding.engine)
+                member_ops = DialectRegistry.extra_where_ops_for_engine(binding.engine)
                 step_gates["allowed_where_ops"] = allowed_where_ops & (member_ops | set(FEDERATION_BASE_WHERE_OPS))
         runtime = dict(source_runtimes or {}).get(step.source_id)
         identity_token = None
+        limits_token = None
         if runtime is not None:
             identity_token = push_engine_identity(_engine_identity_for_source_runtime(runtime))
+            limits_token = push_engine_limits(_engine_limits_for_source_runtime(runtime))
         gen_out = None
         guard_limits = member_guard_limit_kwargs(manifest, step.source_id)
         try:
@@ -4769,10 +5243,12 @@ def replay_federated_prepare_from_plan_template(
                 matched_template=tmpl,
                 persist_template_learning=False,
                 member_source_id=None if degenerate else step.source_id,
-                **step_gates,
-                **guard_limits,
+                **cast(Any, step_gates),
+                **cast(Any, guard_limits),
             )
         finally:
+            if limits_token is not None:
+                pop_engine_limits(limits_token)
             if identity_token is not None:
                 pop_engine_identity(identity_token)
         if gen_out is None or not gen_out.success:
@@ -4828,9 +5304,16 @@ def _engine_identity_for_source_runtime(runtime: Any) -> EngineIdentity:
     """Bind federation SQL generation to the per-source runtime config (incl. DuckDB SCHEMA)."""
     engine_type = str(getattr(runtime, "engine", "") or "")
     runtime_config = getattr(getattr(runtime, "dialect", None), "config", None)
-    if runtime_config is None:
-        runtime_config = get_runtime_config_class(engine_type)
+    if runtime_config is None or isinstance(runtime_config, type):
+        raise RuntimeError(
+            f"federation source runtime for {engine_type!r} has no per-engine runtime configuration instance"
+        )
     return EngineIdentity(engine_type=engine_type, runtime_config=runtime_config)
+
+
+def _engine_limits_for_source_runtime(runtime: Any) -> EngineLimits:
+    limits = getattr(runtime, "limits", None)
+    return limits if isinstance(limits, EngineLimits) else EngineLimits()
 
 
 def _federated_step_sql_context(
@@ -4979,7 +5462,7 @@ def persist_federated_member_stores(
             continue
         seen.add(store_key)
         if isinstance(step_store, TemplateStoreView):
-            save_template_store(step_store)
+            TemplateOps.save_template_store(step_store)
 
 
 def prepare_federated_sql_plan(
@@ -5005,11 +5488,12 @@ def prepare_federated_sql_plan(
     emit_ask_phase(ASK_PHASE_M)
     debug(f"[{ASK_PHASE_M}] combine steps={len(plan.steps)} residual={plan.residual is not None}")
     if plan.ineligible_reason:
+        ineligible = str(plan.ineligible_reason)
         return FederatedPrepareOutcome(
             success=False,
             plan=plan,
             display_sql="",
-            sql_validation_error=plan.ineligible_reason,
+            sql_validation_error=federation_user_facing_ineligible_message(ineligible),
             error_kind=FailureCategory.DENIED_REFERENCE.value,
             phase="prepare",
         )
@@ -5017,6 +5501,34 @@ def prepare_federated_sql_plan(
         return FederatedPrepareOutcome(
             success=False, plan=plan, display_sql="", sql_validation_error="empty federated plan", phase="prepare"
         )
+    temporal_bind = resolve_anchored_temporal_bind(plan.steps[0].sub_intent)
+    fed_ctx = active_federation_execution_context()
+    fed_token = None
+    if fed_ctx is None:
+        fed_ctx = FederationExecutionContext(
+            plan_id=stable_json(
+                federation_plan_step_fingerprints(
+                    plan,
+                    intent_key_fn=intent_key,
+                    manifest=manifest,
+                    member_graphs=member_graphs,
+                    temporal_bind=temporal_bind,
+                )
+            ),
+            temporal_bind=temporal_bind,
+        )
+        fed_token = push_federation_execution_context(fed_ctx)
+    elif temporal_bind is not None and fed_ctx.temporal_bind is None:
+        fed_ctx.temporal_bind = temporal_bind
+    if temporal_bind is not None:
+        notify(
+            "Federated turn bound relative temporal predicates to a single anchor.",
+            stage="federation",
+            code=DIAGNOSTIC_CODE_FEDERATION_TIME_ANCHOR,
+            source_id="composite",
+            details=(("anchor_iso", temporal_bind.anchor_iso), ("phase", "prepare")),
+        )
+    emit_federation_member_timezone_mismatch_diagnostics(manifest, plan, schema=composite_schema)
     degenerate = federation_plan_is_degenerate(plan)
     if federation_turn_cancelled():
         _raise_federation_turn_cancelled(source_id="composite", phase="prepare")
@@ -5060,7 +5572,7 @@ def prepare_federated_sql_plan(
             allowed_where_ops = intersect_member_where_ops(dialects_by_source, engine_types_by_source=engine_types)
             binding = next((item for item in manifest.sources if item.source_id == step.source_id), None)
             if binding is not None:
-                member_ops = extra_where_ops_for_engine(binding.engine)
+                member_ops = DialectRegistry.extra_where_ops_for_engine(binding.engine)
                 step_gates["allowed_where_ops"] = allowed_where_ops & (member_ops | set(FEDERATION_BASE_WHERE_OPS))
         runtime = runtime_map.get(step.source_id)
         sub_intent = (
@@ -5103,9 +5615,11 @@ def prepare_federated_sql_plan(
                     phase="prepare",
                 )
         identity_token = None
+        limits_token = None
         if runtime is not None:
             identity = _engine_identity_for_source_runtime(runtime)
             identity_token = push_engine_identity(identity)
+            limits_token = push_engine_limits(_engine_limits_for_source_runtime(runtime))
         gen_out = None
         try:
             for attempt in range(2):
@@ -5133,6 +5647,8 @@ def prepare_federated_sql_plan(
                 if gen_out.success or attempt == 1:
                     break
         finally:
+            if limits_token is not None:
+                pop_engine_limits(limits_token)
             if identity_token is not None:
                 pop_engine_identity(identity_token)
         if gen_out is None or not gen_out.success:
@@ -5148,6 +5664,8 @@ def prepare_federated_sql_plan(
                     ("error_kind", str(gen_out.error_kind or "") if gen_out is not None else ""),
                 ),
             )
+            if fed_token is not None:
+                pop_federation_execution_context(fed_token)
             return FederatedPrepareOutcome(
                 success=False,
                 plan=plan,
@@ -5175,29 +5693,38 @@ def prepare_federated_sql_plan(
                 matched_template=gen_out.matched_template,
             )
         )
-    if degenerate:
-        display_sql = per_source[0][1] if per_source else ""
-        glue = ""
-    else:
-        glue = render_federation_glue(
-            plan, {sid: f"src_{sid}" for sid, _ in per_source}, schema=composite_schema, manifest=manifest
+    try:
+        if degenerate:
+            display_sql = per_source[0][1] if per_source else ""
+            glue = ""
+        else:
+            glue = render_federation_glue(
+                plan, {sid: f"src_{sid}" for sid, _ in per_source}, schema=composite_schema, manifest=manifest
+            )
+            display_sql = _format_federated_sql_display(per_source, glue)
+        outcome = FederatedPrepareOutcome(
+            success=True,
+            plan=plan,
+            display_sql=display_sql,
+            steps=tuple(prepared),
+            per_source_sql=tuple(per_source),
+            glue_sql=glue,
+            composite_schema_graph_id=str(composite_schema.schema_graph_id or ""),
+            combine_hash=federation_plan_combine_hash(plan),
+            step_fingerprints=federation_plan_step_fingerprints(
+                plan,
+                intent_key_fn=intent_key,
+                manifest=manifest,
+                member_graphs=member_graphs,
+                temporal_bind=temporal_bind,
+            ),
+            member_schema_graph_ids=federation_member_schema_graph_ids(plan, member_graphs),
+            member_resolved_limits=federation_member_resolved_limits(plan, manifest) if manifest is not None else (),
         )
-        display_sql = _format_federated_sql_display(per_source, glue)
-    return FederatedPrepareOutcome(
-        success=True,
-        plan=plan,
-        display_sql=display_sql,
-        steps=tuple(prepared),
-        per_source_sql=tuple(per_source),
-        glue_sql=glue,
-        composite_schema_graph_id=str(composite_schema.schema_graph_id or ""),
-        combine_hash=federation_plan_combine_hash(plan),
-        step_fingerprints=federation_plan_step_fingerprints(
-            plan, intent_key_fn=intent_key, manifest=manifest, member_graphs=member_graphs
-        ),
-        member_schema_graph_ids=federation_member_schema_graph_ids(plan, member_graphs),
-        member_resolved_limits=federation_member_resolved_limits(plan, manifest) if manifest is not None else (),
-    )
+    finally:
+        if fed_token is not None:
+            pop_federation_execution_context(fed_token)
+    return outcome
 
 
 def _member_statement_record(
@@ -5217,7 +5744,7 @@ def _member_statement_record(
         engine=engine_name,
         statement=statement,
         row_count=row_count,
-        read_instant=datetime.now(timezone.utc).isoformat(),
+        read_instant=datetime.now(UTC).isoformat(),
         row_cap=source_row_cap_for_source(manifest, source_id) if manifest is not None else None,
         timeout_ms=source_timeout_for_source(manifest, source_id) if manifest is not None else None,
         duration_ms=duration_ms,
@@ -5257,8 +5784,10 @@ def _execute_degenerate_federation_plan(
     runtime_map = dict(source_runtimes or {})
     member_runtime = runtime_map.get(step.source_id)
     identity_token = None
+    limits_token = None
     if member_runtime is not None:
         identity_token = push_engine_identity(_engine_identity_for_source_runtime(member_runtime))
+        limits_token = push_engine_limits(_engine_limits_for_source_runtime(member_runtime))
     t0 = time.perf_counter()
     try:
         exec_params = dict(flatten_param_values(prep_step.sub_intent))
@@ -5283,11 +5812,13 @@ def _execute_degenerate_federation_plan(
                 schema_context=step_gates.get("schema_context"),
                 visible_objects=step_gates.get("visible_objects"),
                 context_name=str(step_gates.get("context_name", MASTER_AETHERSPACE_NAME) or MASTER_AETHERSPACE_NAME),
-                **guard_limits,
+                **cast(Any, guard_limits),
             )
         except StatementTimeoutError as exc:
             raise federation_member_timeout_error(step.source_id, exc) from exc
     finally:
+        if limits_token is not None:
+            pop_engine_limits(limits_token)
         if identity_token is not None:
             pop_engine_identity(identity_token)
     duration_ms = int((time.perf_counter() - t0) * 1000)
@@ -5404,13 +5935,13 @@ def execute_federated_prepare(
         if effective_union_specs(prepared.plan) and len(execution_steps) > 1:
             for wave in stage_waves:
                 if wave.stage.kind != "member":
-                    emit_ask_phase(ASK_PHASE_L, stage=wave.stage)
+                    emit_ask_phase(ASK_PHASE_L, stage=cast(Any, wave.stage))
                     continue
                 member_wave = wave.member_steps
                 if not member_wave:
                     continue
                 for step in member_wave:
-                    emit_ask_phase(ASK_PHASE_L, source=step.source_id, stage=wave.stage)
+                    emit_ask_phase(ASK_PHASE_L, source=step.source_id, stage=cast(Any, wave.stage))
                 try:
                     _enforce_active_federation_plan_timeout()
                 except FederationCapExceededError as exc:
@@ -5454,13 +5985,13 @@ def execute_federated_prepare(
             succeeded: list[tuple[str, int, str]] = []
             for wave in stage_waves:
                 if wave.stage.kind != "member":
-                    emit_ask_phase(ASK_PHASE_L, stage=wave.stage)
+                    emit_ask_phase(ASK_PHASE_L, stage=cast(Any, wave.stage))
                     continue
                 member_wave = wave.member_steps
                 if not member_wave:
                     continue
                 for step in member_wave:
-                    emit_ask_phase(ASK_PHASE_L, source=step.source_id, stage=wave.stage)
+                    emit_ask_phase(ASK_PHASE_L, source=step.source_id, stage=cast(Any, wave.stage))
                 try:
                     _enforce_active_federation_plan_timeout()
                 except FederationCapExceededError as exc:
@@ -5502,7 +6033,7 @@ def execute_federated_prepare(
                                 manifest=manifest,
                             )
                         )
-                        succeeded.append((step.source_id, row_count, datetime.now(timezone.utc).isoformat()))
+                        succeeded.append((step.source_id, row_count, datetime.now(UTC).isoformat()))
                         if frame is not None:
                             frames[step.source_id] = frame
                     wave_frames.clear()
@@ -5545,7 +6076,7 @@ def execute_federated_prepare(
                     duration_ms = int((time.perf_counter() - t0) * 1000)
                     prep_step = prepared_by_source.get(step.source_id)
                     if prep_step is not None:
-                        read_instant = datetime.now(timezone.utc).isoformat()
+                        read_instant = datetime.now(UTC).isoformat()
                         row_count = coordinator_member_row_count(result_frame)
                         statements.append(
                             _member_statement_record(
@@ -5643,7 +6174,7 @@ def execute_federated_prepare(
                 engine=coord_engine,
                 statement=glue_sql,
                 row_count=len(result_df),
-                read_instant=datetime.now(timezone.utc).isoformat(),
+                read_instant=datetime.now(UTC).isoformat(),
                 row_cap=coordinator_row_cap,
                 phase="coordinator",
                 combine_kind=combine_kind,
@@ -5708,6 +6239,8 @@ def _member_execution_retryable(exc: BaseException) -> bool:
         return True
     cause = getattr(exc, "__cause__", None)
     if isinstance(cause, RetryableError):
+        return True
+    if isinstance(exc, FederationCapExceededError) and exc.limit_key == "timeout_ms":
         return True
     return False
 
@@ -5779,9 +6312,9 @@ def _raise_federation_turn_cancelled(
         for step in batch:
             member_dialect = dialect_map.get(step.source_id, dialect)
             if member_dialect is not None:
-                member_dialect.cancel_statement()
+                Dialect.cancel_in_flight_statement(member_dialect)
     elif dialect is not None:
-        dialect.cancel_statement()
+        Dialect.cancel_in_flight_statement(dialect)
     notify(
         "Federated turn cancelled.",
         stage="execution",
@@ -5826,7 +6359,7 @@ def _execute_federation_source_step_with_cancel(
     worker.start()
     while not done.wait(timeout=0.02):
         if federation_turn_cancelled():
-            member_dialect.cancel_statement()
+            Dialect.cancel_in_flight_statement(member_dialect)
             _raise_federation_turn_cancelled(
                 source_id=step.source_id,
                 phase="member",
@@ -5936,8 +6469,10 @@ def _execute_federation_source_step_body(
     runtime_map = dict(source_runtimes or {})
     member_runtime = runtime_map.get(step.source_id)
     identity_token = None
+    limits_token = None
     if member_runtime is not None:
         identity_token = push_engine_identity(_engine_identity_for_source_runtime(member_runtime))
+        limits_token = push_engine_limits(_engine_limits_for_source_runtime(member_runtime))
     try:
         return _execute_federation_source_step_body_impl(
             step,
@@ -5959,6 +6494,8 @@ def _execute_federation_source_step_body(
             executed_sql_by_source=executed_sql_by_source,
         )
     finally:
+        if limits_token is not None:
+            pop_engine_limits(limits_token)
         if identity_token is not None:
             pop_engine_identity(identity_token)
 
@@ -6232,8 +6769,17 @@ def _execute_federation_source_step_body_impl(
     narrowed_bind = narrow_bind_map_for_sub_intent(execution_intent, parent_params)
     space_tables = frozenset(gate_kwargs.get("space_allowed_tables") or ())
     space_columns = frozenset(gate_kwargs.get("space_allowed_columns") or ())
-    if space_tables or space_columns:
-        if not assert_intent_in_scope(execution_intent, space_tables, space_columns, sub_schema):
+    deny_tables = frozenset(gate_kwargs.get("space_deny_tables") or ())
+    deny_columns = frozenset(gate_kwargs.get("space_deny_columns") or ())
+    if _space_scope_gate_active(space_tables, space_columns, deny_tables, deny_columns):
+        if not assert_intent_in_scope(
+            execution_intent,
+            space_tables,
+            space_columns,
+            sub_schema,
+            deny_tables=deny_tables,
+            deny_columns=deny_columns,
+        ):
             raise FederationRuntimeError(
                 f"member {step.source_id!r} statement is outside the session aetherspace scope"
             )
@@ -6273,7 +6819,7 @@ def _execute_federation_source_step_body_impl(
                 schema_context=schema_context,
                 visible_objects=visible_objects,
                 context_name=context_name,
-                **guard_limits,
+                **cast(Any, guard_limits),
             )
         except StatementTimeoutError as exc:
             raise federation_member_timeout_error(step.source_id, exc) from exc
@@ -6290,7 +6836,7 @@ def _execute_federation_source_step_body_impl(
                 schema_context=schema_context,
                 visible_objects=visible_objects,
                 context_name=context_name,
-                **guard_limits,
+                **cast(Any, guard_limits),
             )
         except StatementTimeoutError as exc:
             raise federation_member_timeout_error(step.source_id, exc) from exc
@@ -6420,9 +6966,7 @@ def _execute_federation_steps_parallel(
                 if frame is not None:
                     frames[source_id] = frame
                     shared_executed[source_id] = frame
-                    succeeded.append(
-                        (source_id, coordinator_member_row_count(frame), datetime.now(timezone.utc).isoformat())
-                    )
+                    succeeded.append((source_id, coordinator_member_row_count(frame), datetime.now(UTC).isoformat()))
         finally:
             pool.shutdown(wait=True, cancel_futures=True)
     return frames
@@ -6474,7 +7018,7 @@ def persist_federated_warmup_learning(
                 corrected=first,
                 normalized_optional=normalize_question(first) if normalize_question(first) != first else None,
             )
-        tmpl = insert_template(
+        tmpl = TemplateOps.insert_template(
             member_store,
             member_templates,
             sub_schema,
@@ -6489,7 +7033,7 @@ def persist_federated_warmup_learning(
             record_accept=True,
         )
         stamp_federation_member_template(tmpl, plan_id=plan_id, source_id=step.source_id)
-        save_template_store(member_store)
+        TemplateOps.save_template_store(member_store)
         member_template_ids.append((step.source_id, str(tmpl.id)))
         created.append(tmpl)
     if federation_dir:
@@ -6705,7 +7249,7 @@ def build_plan_preview_from_intent(
 
 
 @contextmanager
-def _owner_business_knowledge_scope_for_preview(owner: Any):
+def _owner_business_knowledge_scope_for_preview(owner: Any) -> Any:
     holder = getattr(owner, "_business_knowledge", None)
     if holder is None:
         yield
@@ -6728,7 +7272,7 @@ def _parse_intent_for_preview(
     store: dict[str, Any] | None,
 ) -> RuntimeIntent | None:
     q_norm = normalize_question(question)
-    intent_visible = resolve_intent_visible_objects(
+    intent_visible = SchemaGraph.resolve_intent_visible_objects(
         visible_objects=visible_objects,
         execution_visible_objects=execution_visible_objects,
     )

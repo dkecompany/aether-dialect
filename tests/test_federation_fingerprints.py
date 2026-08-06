@@ -7,7 +7,7 @@ import pytest
 from aetherdialect._contracts_core import FederatedPlan, RuntimeIntent, SelectCol, SourceStep
 from aetherdialect._federation import federation_plan_step_fingerprints
 from aetherdialect._intent_process import NormalizedExpr
-from aetherdialect._templates import join_fingerprint_from_runtime_intent
+from aetherdialect._templates import TemplateRefs
 from aetherdialect._utils import intent_key
 
 
@@ -40,9 +40,9 @@ def test_step_fingerprints_differ_on_member_join_path() -> None:
     plan_bridge = _plan_with_member_join(bridge_sig, candidate_id="J02")
 
     assert intent_key(plan_direct.steps[0].sub_intent) == intent_key(plan_bridge.steps[0].sub_intent)
-    assert join_fingerprint_from_runtime_intent(
+    assert TemplateRefs.join_fingerprint_from_runtime_intent(
         plan_direct.steps[0].sub_intent
-    ) != join_fingerprint_from_runtime_intent(plan_bridge.steps[0].sub_intent)
+    ) != TemplateRefs.join_fingerprint_from_runtime_intent(plan_bridge.steps[0].sub_intent)
 
     fps_direct = federation_plan_step_fingerprints(plan_direct, intent_key_fn=intent_key)
     fps_bridge = federation_plan_step_fingerprints(plan_bridge, intent_key_fn=intent_key)
@@ -55,7 +55,7 @@ def test_step_fingerprints_differ_on_member_join_path() -> None:
 @pytest.mark.fast
 def test_step_fingerprint_includes_join_path_segment_hash() -> None:
     plan = _plan_with_member_join(["child.parent_id->parent.id"])
-    join_fp = join_fingerprint_from_runtime_intent(plan.steps[0].sub_intent)
+    join_fp = TemplateRefs.join_fingerprint_from_runtime_intent(plan.steps[0].sub_intent)
     fps = federation_plan_step_fingerprints(plan, intent_key_fn=intent_key)
     assert join_fp
     assert join_fp in fps[0][1]

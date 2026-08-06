@@ -27,7 +27,6 @@ from aetherdialect._contracts_schema import (
     ValueDomain,
 )
 from aetherdialect._qsim import (
-    _SKELETON_CACHE,
     _compute_intent_variance,
     _extract_date_part,
     _format_date,
@@ -44,6 +43,7 @@ from aetherdialect._qsim import (
     _sample_numeric_range,
     _sample_temporal,
     _sample_temporal_range,
+    _skeleton_cache,
     build_fk_adjacency,
     build_schema_context,
     compute_intent_id,
@@ -447,34 +447,34 @@ class TestGenerateAllSkeletons:
 
     def test_returns_non_empty(self, three_table_schema, column_roles):
         """Generates at least one skeleton for valid table set."""
-        _SKELETON_CACHE.clear()
+        _skeleton_cache.clear()
         result = generate_all_skeletons(["orders"], three_table_schema, column_roles)
         assert len(result) > 0
 
     def test_all_items_are_skeletons(self, three_table_schema, column_roles):
         """All returned items are QSimSkeleton instances."""
-        _SKELETON_CACHE.clear()
+        _skeleton_cache.clear()
         result = generate_all_skeletons(["orders"], three_table_schema, column_roles)
         for s in result:
             assert isinstance(s, QSimSkeleton)
 
     def test_tables_preserved(self, three_table_schema, column_roles):
         """All skeletons preserve the input table list."""
-        _SKELETON_CACHE.clear()
+        _skeleton_cache.clear()
         result = generate_all_skeletons(["orders", "products"], three_table_schema, column_roles)
         for s in result:
             assert s.tables == ["orders", "products"]
 
     def test_cache_hit(self, three_table_schema, column_roles):
         """Second call returns cached result."""
-        _SKELETON_CACHE.clear()
+        _skeleton_cache.clear()
         first = generate_all_skeletons(["orders"], three_table_schema, column_roles)
         second = generate_all_skeletons(["orders"], three_table_schema, column_roles)
         assert first is second
 
     def test_both_agg_variants(self, three_table_schema, column_roles):
         """Generates skeletons with and without aggregation."""
-        _SKELETON_CACHE.clear()
+        _skeleton_cache.clear()
         result = generate_all_skeletons(["orders"], three_table_schema, column_roles)
         has_agg_true = any(s.has_aggregation for s in result)
         has_agg_false = any(not s.has_aggregation for s in result)
@@ -483,7 +483,7 @@ class TestGenerateAllSkeletons:
 
     def test_non_agg_groupby_zero(self, three_table_schema, column_roles):
         """Non-aggregation skeletons always have num_groupby == 0."""
-        _SKELETON_CACHE.clear()
+        _skeleton_cache.clear()
         result = generate_all_skeletons(["orders"], three_table_schema, column_roles)
         for s in result:
             if not s.has_aggregation:
@@ -491,7 +491,7 @@ class TestGenerateAllSkeletons:
 
     def test_having_requires_agg_and_groupby(self, three_table_schema, column_roles):
         """``num_having > 0`` only when aggregated and grouped."""
-        _SKELETON_CACHE.clear()
+        _skeleton_cache.clear()
         result = generate_all_skeletons(["orders"], three_table_schema, column_roles)
         for s in result:
             if s.num_having > 0:
@@ -500,7 +500,7 @@ class TestGenerateAllSkeletons:
 
     def test_distinct_only_single_non_agg(self, three_table_schema, column_roles):
         """has_distinct only True for single-table non-aggregation skeletons."""
-        _SKELETON_CACHE.clear()
+        _skeleton_cache.clear()
         result = generate_all_skeletons(["orders"], three_table_schema, column_roles)
         for s in result:
             if s.has_distinct:
@@ -509,7 +509,7 @@ class TestGenerateAllSkeletons:
 
     def test_multi_table_no_distinct(self, three_table_schema, column_roles):
         """Multi-table skeletons never have has_distinct True."""
-        _SKELETON_CACHE.clear()
+        _skeleton_cache.clear()
         result = generate_all_skeletons(["orders", "products"], three_table_schema, column_roles)
         for s in result:
             assert not s.has_distinct
@@ -520,7 +520,7 @@ class TestLoadOrCreateSkeletons:
 
     def test_creates_cache_file(self, three_table_schema, column_roles, tmp_path, monkeypatch):
         """Creates cache gzip JSON file when none exists."""
-        _SKELETON_CACHE.clear()
+        _skeleton_cache.clear()
         cache_file = str(tmp_path / "skeletons.json.gz")
         monkeypatch.setattr("aetherdialect._qsim.QSimConfig.SKELETONS_JSON_PATH", cache_file)
         result = load_or_create_skeletons(three_table_schema, column_roles)
@@ -529,12 +529,12 @@ class TestLoadOrCreateSkeletons:
 
     def test_loads_from_existing_cache(self, three_table_schema, column_roles, tmp_path, monkeypatch):
         """Loads from existing cache file with matching schema hash."""
-        _SKELETON_CACHE.clear()
+        _skeleton_cache.clear()
         cache_file = str(tmp_path / "skeletons.json.gz")
         monkeypatch.setattr("aetherdialect._qsim.QSimConfig.SKELETONS_JSON_PATH", cache_file)
         load_or_create_skeletons(three_table_schema, column_roles)
-        first_count = len(_SKELETON_CACHE)
-        _SKELETON_CACHE.clear()
+        first_count = len(_skeleton_cache)
+        _skeleton_cache.clear()
         result = load_or_create_skeletons(three_table_schema, column_roles)
         assert len(result) == first_count
 
@@ -542,20 +542,20 @@ class TestLoadOrCreateSkeletons:
         """Schema hash mismatch triggers regeneration."""
         from aetherdialect._core_utils import read_gzip_json, write_gzip_json_atomic
 
-        _SKELETON_CACHE.clear()
+        _skeleton_cache.clear()
         cache_file = str(tmp_path / "skeletons.json.gz")
         monkeypatch.setattr("aetherdialect._qsim.QSimConfig.SKELETONS_JSON_PATH", cache_file)
         load_or_create_skeletons(three_table_schema, column_roles)
         data = read_gzip_json(cache_file)
         data["structural_hash"] = "wrong_hash"
         write_gzip_json_atomic(cache_file, data, sort_keys=True)
-        _SKELETON_CACHE.clear()
+        _skeleton_cache.clear()
         result = load_or_create_skeletons(three_table_schema, column_roles)
         assert len(result) > 0
 
     def test_corrupt_cache_file(self, three_table_schema, column_roles, tmp_path, monkeypatch):
         """Corrupt cache file triggers regeneration instead of crash."""
-        _SKELETON_CACHE.clear()
+        _skeleton_cache.clear()
         cache_file = str(tmp_path / "skeletons.json.gz")
         with open(cache_file, "wb") as f:
             f.write(b"NOT GZIP JSON")
@@ -567,7 +567,7 @@ class TestLoadOrCreateSkeletons:
         """Written cache file contains valid JSON with expected keys."""
         from aetherdialect._core_utils import read_gzip_json
 
-        _SKELETON_CACHE.clear()
+        _skeleton_cache.clear()
         cache_file = str(tmp_path / "skeletons.json.gz")
         monkeypatch.setattr("aetherdialect._qsim.QSimConfig.SKELETONS_JSON_PATH", cache_file)
         load_or_create_skeletons(three_table_schema, column_roles)

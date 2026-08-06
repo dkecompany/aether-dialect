@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from collections import deque
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, cast
 
 from ._config import PolicyConfig
 from ._constants import (
@@ -20,6 +20,8 @@ from ._constants import (
     MAX_PREDICATE_NESTING_DEPTH,
     NUMERIC_RESULT_AGGS,
     NUMERIC_RESULT_SCALARS,
+    REFUSAL_NULL_IN_NEGATED_LIST_MESSAGE,
+    REFUSAL_UNSUPPORTED_COLUMN_TYPE_MESSAGE,
     REGISTRY_CASE_ID_RE,
     REGISTRY_WINDOW_ID_RE,
     SCALAR_FUNCTIONS_TEMPORAL,
@@ -43,6 +45,7 @@ from ._constants import (
 from ._contracts_base import (
     PROBE_CTE_EMISSION_KINDS,
     ComparisonJoinScopeExceededError,
+    ConfigError,
     DatabaseFeatureCapability,
     FailureCategory,
     HavingParam,
@@ -50,13 +53,10 @@ from ._contracts_base import (
     NormalizedExpr,
     OrderByCol,
     PredicateGroup,
+    SensitivityClassification,
     WhereParam,
-    column_sensitivity_from_dict,
-    expr_registry_ref,
-    having_leaves,
-    where_leaves,
 )
-from ._contracts_core import RuntimeCteStep, RuntimeIntent, SelectCol, effective_select_parts
+from ._contracts_core import ResidualSpec, RuntimeCteStep, RuntimeIntent, SelectCol
 from ._contracts_schema import (
     CaseRegistryStep,
     CaseWhenExpr,
@@ -66,17 +66,22 @@ from ._contracts_schema import (
     SchemaGraph,
     WindowRegistryStep,
     WindowSpec,
-    make_intent_issue,
 )
 from ._core_utils import (
+    active_engine_identity,
+    column_has_unknown_value_type,
+    column_metadata_timezone_awareness_mismatch,
     cte_join_reachability_tables,
     debug,
+    emit_session_refusal_diagnostic,
     intent_join_reachability_tables,
     notify,
+    refusal_diagnostic_code_for_intent_issue,
 )
-from ._dialect_sqlglot_helper import array_storage_kind
+from ._dialect import DialectRegistry
+from ._dialect_sqlglot_helper import SqlglotParseMixin
 from ._intent_expr import expr_canonical_key, extract_columns_from_expr, strip_leading_distinct_from_column_ref
-from ._refusal_diagnostics import emit_session_refusal_diagnostic, refusal_diagnostic_code_for_intent_issue
+from ._schema_build import column_user_display_name, tables_referenced_in_view_definition
 from ._schema_graph import fk_infer_value_types_compatible
 
 
@@ -124,7 +129,7 @@ def _validate_scalar_func_valid(
     func_lower = scalar_func.lower()
     if func_lower not in VALID_SCALAR_FUNCTIONS:
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"invalid_scalar_func_{context}_{scalar_func}",
                 category=FailureCategory.SCALAR_VALIDITY,
                 severity="error",
@@ -142,7 +147,7 @@ def _validate_scalar_func_valid(
         col_value_type = (getattr(col_meta, "value_type", "") or "").strip().lower()
         if col_value_type and col_value_type != "date":
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"temporal_scalar_on_non_date_{context}_{scalar_func}",
                     category=FailureCategory.SCALAR_VALIDITY,
                     severity="error",
@@ -185,7 +190,7 @@ def validate_expr_no_extract_epoch(expr: NormalizedExpr, context: str, location:
     issues: list[IntentIssue] = []
     if _is_extract_epoch(expr.scalar_func, expr.scalar_func_args or []):
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"extract_epoch_{context}",
                 category=FailureCategory.EXTRACT_EPOCH,
                 severity="error",
@@ -198,7 +203,7 @@ def validate_expr_no_extract_epoch(expr: NormalizedExpr, context: str, location:
         )
     if _is_extract_epoch(expr.inner_scalar_func, expr.inner_scalar_func_args or []):
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"extract_epoch_inner_{context}",
                 category=FailureCategory.EXTRACT_EPOCH,
                 severity="error",
@@ -212,7 +217,7 @@ def validate_expr_no_extract_epoch(expr: NormalizedExpr, context: str, location:
     for group in expr.add_groups + expr.sub_groups:
         if _is_extract_epoch(group.scalar_func, group.scalar_func_args or []):
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"extract_epoch_group_{context}",
                     category=FailureCategory.EXTRACT_EPOCH,
                     severity="error",
@@ -225,7 +230,7 @@ def validate_expr_no_extract_epoch(expr: NormalizedExpr, context: str, location:
             )
         if _is_extract_epoch(group.inner_scalar_func, group.inner_scalar_func_args or []):
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"extract_epoch_inner_group_{context}",
                     category=FailureCategory.EXTRACT_EPOCH,
                     severity="error",
@@ -247,7 +252,7 @@ def _validate_agg_func_valid(agg_func: str | None, context: str, location: str) 
     func_lower = agg_func.lower()
     if func_lower not in VALID_AGGREGATION_FUNCTIONS:
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"invalid_agg_func_{context}_{agg_func}",
                 category=FailureCategory.AGGREGATION_VALIDITY,
                 severity="error",
@@ -276,7 +281,7 @@ def _validate_string_agg_groups(
             continue
         if not g.agg_sep_param_key:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"string_agg_missing_sep_{context}",
                     category=FailureCategory.AGGREGATION_VALIDITY,
                     severity="error",
@@ -286,7 +291,7 @@ def _validate_string_agg_groups(
             )
         if g.agg_order_by and cap is not None and not cap.supports_ordered_string_agg:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"ordered_string_agg_unsupported_{context}",
                     category=FailureCategory.AGGREGATION_VALIDITY,
                     severity="error",
@@ -310,7 +315,7 @@ def _validate_median_groups(
             continue
         if cap is not None and not cap.supports_median:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"median_unsupported_{context}",
                     category=FailureCategory.AGGREGATION_VALIDITY,
                     severity="error",
@@ -323,7 +328,7 @@ def _validate_median_groups(
 
 def _expr_has_registry_ref(expr: NormalizedExpr) -> bool:
     """Return True when *expr* is a bare registry-id reference."""
-    return expr_registry_ref(expr) is not None
+    return expr.registry_ref() is not None
 
 
 def _window_spec_has_registry_ref(ws: WindowSpec) -> bool:
@@ -385,7 +390,7 @@ def validate_scope_registries(
     case_ids = [s.registry_id for s in case_registry or []]
     for wid in {i for i in win_ids if win_ids.count(i) > 1}:
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"registry_duplicate_window_{context}_{wid}",
                 category=FailureCategory.REGISTRY,
                 severity="error",
@@ -395,7 +400,7 @@ def validate_scope_registries(
         )
     for cid in {i for i in case_ids if case_ids.count(i) > 1}:
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"registry_duplicate_case_{context}_{cid}",
                 category=FailureCategory.REGISTRY,
                 severity="error",
@@ -409,7 +414,7 @@ def validate_scope_registries(
         rid = win_step.registry_id
         if not REGISTRY_WINDOW_ID_RE.match(rid):
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"registry_invalid_window_id_{context}_{rid}",
                     category=FailureCategory.REGISTRY,
                     severity="error",
@@ -419,7 +424,7 @@ def validate_scope_registries(
             )
         if _window_spec_has_registry_ref(win_step.window_spec):
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"registry_recursion_window_{context}_{rid}",
                     category=FailureCategory.REGISTRY,
                     severity="error",
@@ -431,7 +436,7 @@ def validate_scope_registries(
         rid = case_step.registry_id
         if not REGISTRY_CASE_ID_RE.match(rid):
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"registry_invalid_case_id_{context}_{rid}",
                     category=FailureCategory.REGISTRY,
                     severity="error",
@@ -441,7 +446,7 @@ def validate_scope_registries(
             )
         if _case_when_has_registry_ref(case_step.case_when):
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"registry_recursion_case_{context}_{rid}",
                     category=FailureCategory.REGISTRY,
                     severity="error",
@@ -457,7 +462,7 @@ def validate_scope_registries(
         if REGISTRY_WINDOW_ID_RE.match(ref):
             if ref not in win_by:
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"registry_dangling_window_{context}_{ref}_{where}",
                         category=FailureCategory.REGISTRY,
                         severity="error",
@@ -469,7 +474,7 @@ def validate_scope_registries(
         if REGISTRY_CASE_ID_RE.match(ref):
             if ref not in case_by:
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"registry_dangling_case_{context}_{ref}_{where}",
                         category=FailureCategory.REGISTRY,
                         severity="error",
@@ -479,7 +484,7 @@ def validate_scope_registries(
                 )
             return
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"registry_invalid_ref_format_{context}_{ref}_{where}",
                 category=FailureCategory.REGISTRY,
                 severity="error",
@@ -489,31 +494,31 @@ def validate_scope_registries(
         )
 
     for si, sc in enumerate(select_cols or []):
-        ref = expr_registry_ref(sc.expr) or ""
+        ref = sc.expr.registry_ref() or ""
         if ref:
             _check_ref(ref, where=f"select_cols[{si}]")
     for gi, g in enumerate(group_by_cols or []):
-        ref = expr_registry_ref(g) or ""
+        ref = g.registry_ref() or ""
         if ref:
             _check_ref(ref, where=f"group_by_cols[{gi}]")
     for oi, obc in enumerate(order_by_cols or []):
-        ref = expr_registry_ref(obc.expr) or ""
+        ref = obc.expr.registry_ref() or ""
         if ref:
             _check_ref(ref, where=f"order_by_cols[{oi}]")
     for fi, fp in enumerate(filter_leaves):
-        ref = expr_registry_ref(fp.left_expr) or ""
+        ref = fp.left_expr.registry_ref() or ""
         if ref:
             _check_ref(ref, where=f"where_params[{fi}].left_expr")
         if fp.right_expr is not None:
-            ref_r = expr_registry_ref(fp.right_expr) or ""
+            ref_r = fp.right_expr.registry_ref() or ""
             if ref_r:
                 _check_ref(ref_r, where=f"where_params[{fi}].right_expr")
     for hi, hp in enumerate(having_leaves):
-        ref = expr_registry_ref(hp.left_expr) or ""
+        ref = hp.left_expr.registry_ref() or ""
         if ref:
             _check_ref(ref, where=f"having_param[{hi}].left_expr")
         if hp.right_expr is not None:
-            ref_r = expr_registry_ref(hp.right_expr) or ""
+            ref_r = hp.right_expr.registry_ref() or ""
             if ref_r:
                 _check_ref(ref_r, where=f"having_param[{hi}].right_expr")
     return issues
@@ -565,7 +570,7 @@ def validate_select_cols_schema(
     issues: list[IntentIssue] = []
     if not select_cols:
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"select_cols_empty_{context}",
                 category=FailureCategory.SELECT_VALIDITY,
                 severity="error",
@@ -593,8 +598,8 @@ def validate_select_cols_schema(
                 cap=cap,
             )
         )
-        if expr_registry_ref(sc.expr) is not None:
-            parts = effective_select_parts(sc, window_registry, case_registry)
+        if sc.expr.registry_ref() is not None:
+            parts = sc.effective_parts(window_registry, case_registry)
             ex = parts.expr
             issues.extend(_validate_agg_func_valid(ex.agg_func, f"select_{idx}", context))
             for g in ex.add_groups + ex.sub_groups:
@@ -607,7 +612,7 @@ def validate_select_cols_schema(
         col_expr = sc.expr.primary_column
         if not col_expr:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"select_col_empty_{context}_{idx}",
                     category=FailureCategory.SELECT_VALIDITY,
                     severity="error",
@@ -619,7 +624,7 @@ def validate_select_cols_schema(
         actual_col = extract_col_from_scalar_wrapper(col_expr)
         if "." not in actual_col:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"select_unqualified_{context}_{actual_col}",
                     category=FailureCategory.SELECT_VALIDITY,
                     severity="error",
@@ -632,7 +637,7 @@ def validate_select_cols_schema(
         if table_name in cte_outputs:
             if col_name.lower() not in [c.lower() for c in cte_outputs[table_name]]:
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"select_cte_col_not_found_{context}_{table_name}_{col_name}",
                         category=FailureCategory.SELECT_VALIDITY,
                         severity="error",
@@ -647,7 +652,7 @@ def validate_select_cols_schema(
             continue
         if table_name not in allowed_tables:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"select_table_not_allowed_{context}_{table_name}",
                     category=FailureCategory.SELECT_VALIDITY,
                     severity="error",
@@ -662,7 +667,7 @@ def validate_select_cols_schema(
             col_meta = table_meta.columns.get(col_name) or table_meta.columns.get(col_name.lower())
             if not col_meta:
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"select_col_not_found_{context}_{table_name}_{col_name}",
                         category=FailureCategory.SELECT_VALIDITY,
                         severity="error",
@@ -701,7 +706,7 @@ def validate_order_by_cols_schema(
         col_expr = obc.expr.primary_column
         if not col_expr:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"order_by_col_empty_{context}_{idx}",
                     category=FailureCategory.ORDER_BY_VALIDITY,
                     severity="error",
@@ -713,7 +718,7 @@ def validate_order_by_cols_schema(
         actual_col = extract_col_from_scalar_wrapper(col_expr)
         if "." not in actual_col:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"order_by_unqualified_{context}_{actual_col}",
                     category=FailureCategory.ORDER_BY_VALIDITY,
                     severity="error",
@@ -726,7 +731,7 @@ def validate_order_by_cols_schema(
         if table_name in cte_outputs:
             if col_name.lower() not in [c.lower() for c in cte_outputs[table_name]]:
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"order_by_cte_col_not_found_{context}_{table_name}_{col_name}",
                         category=FailureCategory.ORDER_BY_VALIDITY,
                         severity="error",
@@ -741,7 +746,7 @@ def validate_order_by_cols_schema(
             continue
         if table_name not in allowed_tables:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"order_by_table_not_allowed_{context}_{table_name}",
                     category=FailureCategory.ORDER_BY_VALIDITY,
                     severity="error",
@@ -756,7 +761,7 @@ def validate_order_by_cols_schema(
             col_meta = table_meta.columns.get(col_name) or table_meta.columns.get(col_name.lower())
             if not col_meta:
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"order_by_col_not_found_{context}_{table_name}_{col_name}",
                         category=FailureCategory.ORDER_BY_VALIDITY,
                         severity="error",
@@ -771,7 +776,7 @@ def validate_order_by_cols_schema(
         if obc.nulls is not None:
             if obc.nulls not in ("first", "last"):
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"order_by_invalid_nulls_{context}_{idx}",
                         category=FailureCategory.ORDER_BY_VALIDITY,
                         severity="error",
@@ -781,7 +786,7 @@ def validate_order_by_cols_schema(
                 )
             elif not (obc.direction or "").strip():
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"order_by_nulls_requires_direction_{context}_{idx}",
                         category=FailureCategory.ORDER_BY_VALIDITY,
                         severity="error",
@@ -791,7 +796,7 @@ def validate_order_by_cols_schema(
                 )
         if obc.direction not in ("ASC", "DESC"):
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"order_by_invalid_direction_{context}_{idx}",
                     category=FailureCategory.ORDER_BY_VALIDITY,
                     severity="error",
@@ -826,7 +831,7 @@ def validate_group_by_cols_schema(
         col = g.primary_column
         if "." not in col:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"group_by_unqualified_{context}_{col}",
                     category=FailureCategory.GROUP_BY_VALIDITY,
                     severity="error",
@@ -841,7 +846,7 @@ def validate_group_by_cols_schema(
             matched_key = next((c for c in cte_cols if c.lower() == col_name.lower()), None)
             if not matched_key:
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"group_by_cte_col_not_found_{context}_{table_name}_{col_name}",
                         category=FailureCategory.GROUP_BY_VALIDITY,
                         severity="error",
@@ -855,7 +860,7 @@ def validate_group_by_cols_schema(
                 )
             elif not cte_cols[matched_key].groupable:
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"group_by_cte_col_not_groupable_{context}_{table_name}_{col_name}",
                         category=FailureCategory.GROUP_BY_VALIDITY,
                         severity="warning",
@@ -871,7 +876,7 @@ def validate_group_by_cols_schema(
             continue
         if table_name not in allowed_tables:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"group_by_table_not_allowed_{context}_{table_name}",
                     category=FailureCategory.GROUP_BY_VALIDITY,
                     severity="error",
@@ -885,7 +890,7 @@ def validate_group_by_cols_schema(
             col_meta = table_meta.columns.get(col_name) or table_meta.columns.get(col_name.lower())
             if not col_meta:
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"group_by_col_not_found_{context}_{table_name}_{col_name}",
                         category=FailureCategory.GROUP_BY_VALIDITY,
                         severity="error",
@@ -899,7 +904,7 @@ def validate_group_by_cols_schema(
                 )
             elif not col_meta.is_groupable:
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"group_by_col_not_groupable_{context}_{table_name}_{col_name}",
                         category=FailureCategory.GROUP_BY_VALIDITY,
                         severity="warning",
@@ -931,7 +936,7 @@ def validate_distinct_on_schema(
         return issues
     if not order_by_cols:
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"distinct_on_missing_order_by_{context}",
                 category=FailureCategory.ORDER_BY_VALIDITY,
                 severity="error",
@@ -943,7 +948,7 @@ def validate_distinct_on_schema(
         for idx, do_expr in enumerate(distinct_on):
             if idx >= len(order_by_cols):
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"distinct_on_order_prefix_{context}_{idx}",
                         category=FailureCategory.ORDER_BY_VALIDITY,
                         severity="error",
@@ -957,7 +962,7 @@ def validate_distinct_on_schema(
                 break
             if expr_canonical_key(do_expr) != expr_canonical_key(order_by_cols[idx].expr):
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"distinct_on_order_prefix_{context}_{idx}",
                         category=FailureCategory.ORDER_BY_VALIDITY,
                         severity="error",
@@ -1001,7 +1006,7 @@ def _validate_where_col(
     actual_col = extract_col_from_scalar_wrapper(col_expr)
     if "." not in actual_col:
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"where_{side}_unqualified_{context}_{actual_col}",
                 category=FailureCategory.WHERE_VALIDITY,
                 severity="error",
@@ -1019,7 +1024,7 @@ def _validate_where_col(
     if table_name in cte_outputs:
         if col_name.lower() not in [c.lower() for c in cte_outputs[table_name]]:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"where_{side}_cte_col_not_found_{context}_{table_name}_{col_name}",
                     category=FailureCategory.WHERE_VALIDITY,
                     severity="error",
@@ -1036,7 +1041,7 @@ def _validate_where_col(
         return issues
     if table_name not in allowed_tables:
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"where_{side}_table_not_allowed_{context}_{table_name}",
                 category=FailureCategory.WHERE_VALIDITY,
                 severity="error",
@@ -1052,7 +1057,7 @@ def _validate_where_col(
         return issues
     if table_name not in schema.tables:
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"where_{side}_table_not_in_schema_{context}_{table_name}",
                 category=FailureCategory.WHERE_VALIDITY,
                 severity="error",
@@ -1070,7 +1075,7 @@ def _validate_where_col(
     col_meta = table_meta.columns.get(col_name) or table_meta.columns.get(col_name.lower())
     if not col_meta:
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"where_{side}_col_not_found_{context}_{table_name}_{col_name}",
                 category=FailureCategory.WHERE_VALIDITY,
                 severity="error",
@@ -1127,7 +1132,7 @@ def validate_filters_schema(
             )
         if fp.op not in VALID_WHERE_OPS:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"where_invalid_op_{context}_{fp.op}",
                     category=FailureCategory.WHERE_VALIDITY,
                     severity="error",
@@ -1142,7 +1147,7 @@ def validate_filters_schema(
         if not fp.right_expr and fp.op not in ("is null", "is not null"):
             if fp.value_type not in VALID_VALUE_TYPES:
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"where_invalid_value_type_{context}_{fp.value_type}",
                         category=FailureCategory.WHERE_VALIDITY,
                         severity="error",
@@ -1156,7 +1161,7 @@ def validate_filters_schema(
                 )
             elif fp.resolved_value(param_values) is None:
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"where_missing_value_{context}_{param_key}",
                         category=FailureCategory.WHERE_VALIDITY,
                         severity="error",
@@ -1177,7 +1182,7 @@ def validate_filters_schema(
                 meta = _resolve_col_meta_from_expr(fp.left_expr.primary_column, schema)
                 if meta and getattr(meta, "role", "") == "temporal":
                     issues.append(
-                        make_intent_issue(
+                        IntentIssue.make(
                             issue_id=f"where_temporal_year_literal_{context}_{param_key}",
                             category=FailureCategory.WHERE_VALIDITY,
                             severity="error",
@@ -1308,7 +1313,7 @@ def _validate_having_agg(
     func, actual_target, has_distinct = result
     if not func:
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"having_{side}_invalid_format_{context}_{agg_expr}",
                 category=FailureCategory.HAVING_VALIDITY,
                 severity="error",
@@ -1324,7 +1329,7 @@ def _validate_having_agg(
         return issues
     if func not in VALID_AGGREGATION_FUNCTIONS:
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"having_{side}_invalid_func_{context}_{func}",
                 category=FailureCategory.HAVING_VALIDITY,
                 severity="error",
@@ -1340,7 +1345,7 @@ def _validate_having_agg(
         return issues
     if has_distinct and func != "count":
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"having_{side}_distinct_not_count_{context}_{func}",
                 category=FailureCategory.HAVING_VALIDITY,
                 severity="error",
@@ -1358,7 +1363,7 @@ def _validate_having_agg(
     if actual_target == "*":
         if func != "count":
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"having_{side}_star_not_count_{context}_{func}",
                     category=FailureCategory.HAVING_VALIDITY,
                     severity="error",
@@ -1381,7 +1386,7 @@ def _validate_having_agg(
                     continue
                 if "." not in arg_target:
                     issues.append(
-                        make_intent_issue(
+                        IntentIssue.make(
                             issue_id=f"having_{side}_unqualified_{context}_{arg_target}",
                             category=FailureCategory.HAVING_VALIDITY,
                             severity="error",
@@ -1402,7 +1407,7 @@ def _validate_having_agg(
                 if table_name in cte_outputs:
                     if col_name.lower() not in [c.lower() for c in cte_outputs[table_name]]:
                         issues.append(
-                            make_intent_issue(
+                            IntentIssue.make(
                                 issue_id=f"having_{side}_cte_col_not_found_{context}_{table_name}_{col_name}",
                                 category=FailureCategory.HAVING_VALIDITY,
                                 severity="error",
@@ -1419,7 +1424,7 @@ def _validate_having_agg(
                     continue
                 if table_name not in allowed_tables:
                     issues.append(
-                        make_intent_issue(
+                        IntentIssue.make(
                             issue_id=f"having_{side}_table_not_allowed_{context}_{table_name}",
                             category=FailureCategory.HAVING_VALIDITY,
                             severity="error",
@@ -1438,7 +1443,7 @@ def _validate_having_agg(
                     table_col_meta = table_meta.columns.get(col_name) or table_meta.columns.get(col_name.lower())
                     if not table_col_meta:
                         issues.append(
-                            make_intent_issue(
+                            IntentIssue.make(
                                 issue_id=f"having_{side}_col_not_found_{context}_{table_name}_{col_name}",
                                 category=FailureCategory.HAVING_VALIDITY,
                                 severity="error",
@@ -1455,7 +1460,7 @@ def _validate_having_agg(
             return issues
     if not actual_target:
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"having_{side}_missing_target_{context}",
                 category=FailureCategory.HAVING_VALIDITY,
                 severity="error",
@@ -1471,7 +1476,7 @@ def _validate_having_agg(
         return issues
     if "." not in actual_target:
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"having_{side}_unqualified_{context}_{actual_target}",
                 category=FailureCategory.HAVING_VALIDITY,
                 severity="error",
@@ -1489,7 +1494,7 @@ def _validate_having_agg(
     if table_name in cte_outputs:
         if col_name.lower() not in [c.lower() for c in cte_outputs[table_name]]:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"having_{side}_cte_col_not_found_{context}_{table_name}_{col_name}",
                     category=FailureCategory.HAVING_VALIDITY,
                     severity="error",
@@ -1506,7 +1511,7 @@ def _validate_having_agg(
         return issues
     if table_name not in allowed_tables:
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"having_{side}_table_not_allowed_{context}_{table_name}",
                 category=FailureCategory.HAVING_VALIDITY,
                 severity="error",
@@ -1525,7 +1530,7 @@ def _validate_having_agg(
         table_col_meta = table_meta.columns.get(col_name) or table_meta.columns.get(col_name.lower())
         if not table_col_meta:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"having_{side}_col_not_found_{context}_{table_name}_{col_name}",
                     category=FailureCategory.HAVING_VALIDITY,
                     severity="error",
@@ -1544,7 +1549,7 @@ def _validate_having_agg(
             allowed_types = AGGREGATION_ALLOWED_COLUMN_TYPES.get(func, [])
             if value_type not in allowed_types:
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"having_{side}_type_mismatch_{context}_{func}_{col_name}",
                         category=FailureCategory.HAVING_VALIDITY,
                         severity="error",
@@ -1608,7 +1613,7 @@ def validate_having_schema(
             )
         if hp.op not in VALID_HAVING_OPS:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"having_invalid_op_{context}_{hp.op}",
                     category=FailureCategory.HAVING_VALIDITY,
                     severity="error",
@@ -1623,7 +1628,7 @@ def validate_having_schema(
         if not hp.right_expr:
             if hp.value_type not in VALID_VALUE_TYPES:
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"having_invalid_value_type_{context}_{hp.value_type}",
                         category=FailureCategory.HAVING_VALIDITY,
                         severity="error",
@@ -1637,7 +1642,7 @@ def validate_having_schema(
                 )
             if hp.op not in ("is null", "is not null") and hp.resolved_value(param_values) is None:
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"having_missing_value_{context}_{param_key}",
                         category=FailureCategory.HAVING_VALIDITY,
                         severity="error",
@@ -1669,6 +1674,137 @@ def validate_having_schema(
     return issues
 
 
+def validate_execution_parameters(intent: RuntimeIntent, schema: SchemaGraph) -> list[IntentIssue]:
+    """Validate filter and HAVING bind slots for the main query and every CTE body."""
+    issues: list[IntentIssue] = []
+    cte_outputs = _build_cte_outputs_map(intent)
+    allowed_tables = set(intent.tables or [])
+    issues.extend(
+        validate_filters_schema(
+            PredicateGroup.where_leaves(intent.where) or [],
+            schema,
+            allowed_tables,
+            cte_outputs,
+            "main query",
+            param_values=intent.param_values,
+        )
+    )
+    issues.extend(
+        validate_having_schema(
+            PredicateGroup.having_leaves(intent.having) or [],
+            schema,
+            allowed_tables,
+            cte_outputs,
+            "main query",
+            param_values=intent.param_values,
+        )
+    )
+    issues.extend(
+        validate_case_when_schema(
+            intent.select_cols or [],
+            schema,
+            allowed_tables,
+            cte_outputs,
+            "main query",
+            window_registry=list(intent.window_registry or []),
+            case_registry=list(intent.case_registry or []),
+            param_values=intent.param_values,
+        )
+    )
+    for cte in intent.cte_steps or []:
+        if not cte.cte_name:
+            continue
+        cte_tables = set(cte.tables or [])
+        cte_context = f"CTE '{cte.cte_name}'"
+        cte_param_values = dict(cte.param_values or {})
+        issues.extend(
+            validate_filters_schema(
+                PredicateGroup.where_leaves(cte.where) or [],
+                schema,
+                cte_tables,
+                cte_outputs,
+                cte_context,
+                param_values=cte_param_values,
+            )
+        )
+        issues.extend(
+            validate_having_schema(
+                PredicateGroup.having_leaves(cte.having) or [],
+                schema,
+                cte_tables,
+                cte_outputs,
+                cte_context,
+                param_values=cte_param_values,
+            )
+        )
+        issues.extend(
+            validate_case_when_schema(
+                list(cte.select_cols or []),
+                schema,
+                cte_tables,
+                cte_outputs,
+                cte_context,
+                window_registry=list(cte.window_registry or []),
+                case_registry=list(cte.case_registry or []),
+                param_values=cte_param_values,
+            )
+        )
+    return issues
+
+
+def validate_residual_execution_parameters(
+    residual: ResidualSpec,
+    param_values: Mapping[str, Any],
+    schema: SchemaGraph,
+    *,
+    context: str = "coordinator residual",
+) -> list[IntentIssue]:
+    """Validate coordinator residual filter and HAVING bind slots."""
+    allowed_tables = set(schema.tables.keys()) if schema is not None else set()
+    issues: list[IntentIssue] = []
+    issues.extend(
+        validate_filters_schema(
+            PredicateGroup.where_leaves(residual.where) or [],
+            schema,
+            allowed_tables,
+            {},
+            context,
+            param_values=param_values,
+        )
+    )
+    issues.extend(
+        validate_having_schema(
+            PredicateGroup.having_leaves(residual.having) or [],
+            schema,
+            allowed_tables,
+            {},
+            context,
+            param_values=param_values,
+        )
+    )
+    return issues
+
+
+def _raise_execution_parameter_validation_error(issues: list[IntentIssue]) -> None:
+    errors = [issue for issue in issues if (issue.severity or "").lower() == "error"]
+    if errors:
+        raise ConfigError(errors[0].message)
+
+
+def assert_execution_parameters_validated(intent: RuntimeIntent, schema: SchemaGraph) -> None:
+    """Validate bound filter/HAVING parameters and refuse execution when values are missing."""
+    _raise_execution_parameter_validation_error(validate_execution_parameters(intent, schema))
+
+
+def assert_residual_execution_parameters_validated(
+    residual: ResidualSpec,
+    param_values: Mapping[str, Any],
+    schema: SchemaGraph,
+) -> None:
+    """Validate coordinator residual bind slots before coordinator SQL execution."""
+    _raise_execution_parameter_validation_error(validate_residual_execution_parameters(residual, param_values, schema))
+
+
 def validate_where_ops_per_column(
     where_params: list[WhereParam],
     schema: SchemaGraph,
@@ -1698,7 +1834,7 @@ def validate_where_ops_per_column(
                 valid_ops = cte_meta.get_valid_where_ops()
                 if valid_ops and fp.op not in valid_ops:
                     issues.append(
-                        make_intent_issue(
+                        IntentIssue.make(
                             issue_id=f"where_op_invalid_for_cte_{context}_{actual_col}_{fp.op}",
                             category=FailureCategory.WHERE_VALIDITY,
                             severity="error",
@@ -1715,7 +1851,7 @@ def validate_where_ops_per_column(
                     )
                 if not cte_meta.filterable and fp.op not in ("is null", "is not null"):
                     issues.append(
-                        make_intent_issue(
+                        IntentIssue.make(
                             issue_id=f"where_cte_col_not_filterable_{context}_{actual_col}",
                             category=FailureCategory.WHERE_VALIDITY,
                             severity="warning",
@@ -1737,7 +1873,7 @@ def validate_where_ops_per_column(
         valid_ops = col_meta.get_valid_where_ops()
         if fp.op not in valid_ops:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"where_op_invalid_for_type_{context}_{actual_col}_{fp.op}",
                     category=FailureCategory.WHERE_VALIDITY,
                     severity="error",
@@ -1754,7 +1890,7 @@ def validate_where_ops_per_column(
             )
         if not col_meta.is_filterable and fp.op not in ("is null", "is not null"):
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"where_col_not_filterable_{context}_{actual_col}",
                     category=FailureCategory.WHERE_VALIDITY,
                     severity="warning",
@@ -1802,7 +1938,7 @@ def validate_having_ops_per_column(
                     if valid_ops and _hp.op not in valid_ops:
                         actual_col = f"{table_name}.{col_name}"
                         issues.append(
-                            make_intent_issue(
+                            IntentIssue.make(
                                 issue_id=f"having_op_invalid_for_cte_{context}_{actual_col}_{_hp.op}",
                                 category=FailureCategory.HAVING_VALIDITY,
                                 severity="error",
@@ -1825,7 +1961,7 @@ def validate_having_ops_per_column(
                     if valid_ops and _hp.op not in valid_ops:
                         actual_col = f"{table_name}.{col_name}"
                         issues.append(
-                            make_intent_issue(
+                            IntentIssue.make(
                                 issue_id=f"having_op_invalid_for_column_{context}_{actual_col}_{_hp.op}",
                                 category=FailureCategory.HAVING_VALIDITY,
                                 severity="error",
@@ -1885,7 +2021,7 @@ def validate_date_window_units(
         if unit not in VALID_RELATIVE_DATE_UNITS:
             col = fp.left_expr.primary_column
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"date_window_invalid_unit_{context}_{col}",
                     category=FailureCategory.WHERE_VALIDITY,
                     severity="error",
@@ -1905,7 +2041,7 @@ def validate_date_window_units(
     for fp in where_params:
         check(fp, f"{context} where", scope_param_values)
     for cte in cte_steps:
-        for fp in where_leaves(cte.where) or []:
+        for fp in PredicateGroup.where_leaves(cte.where) or []:
             check(fp, f"CTE '{cte.cte_name}' filter", cte.param_values)
 
     if issues:
@@ -1946,7 +2082,7 @@ def validate_date_diff_units(
         if unit is not None and unit not in VALID_RELATIVE_DATE_UNITS:
             col = fp.left_expr.primary_column or fp.left_expr.primary_term or fp.param_key or "expr"
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"date_diff_invalid_unit_{context}_{col}",
                     category=FailureCategory.DATE_DIFF,
                     severity="error",
@@ -1967,7 +2103,7 @@ def validate_date_diff_units(
             except (TypeError, ValueError):
                 col = fp.left_expr.primary_column or fp.left_expr.primary_term or fp.param_key or "expr"
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"date_diff_invalid_amount_{context}_{col}",
                         category=FailureCategory.DATE_DIFF,
                         severity="error",
@@ -1979,7 +2115,7 @@ def validate_date_diff_units(
     for fp in where_params:
         check(fp, f"{context} where", scope_param_values)
     for cte in cte_steps:
-        for fp in where_leaves(cte.where) or []:
+        for fp in PredicateGroup.where_leaves(cte.where) or []:
             check(fp, f"CTE '{cte.cte_name}' filter", cte.param_values)
 
     if issues:
@@ -2003,7 +2139,7 @@ def validate_date_diff_left_expr_is_subtraction(
             return
         col = expr.primary_column or expr.primary_term or fp.param_key or "expr"
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"date_diff_left_expr_not_subtraction_{context}_{col}",
                 category=FailureCategory.DATE_DIFF,
                 severity="error",
@@ -2019,7 +2155,7 @@ def validate_date_diff_left_expr_is_subtraction(
     for fp in where_params:
         check(fp, f"{context} where")
     for cte in cte_steps:
-        for fp in where_leaves(cte.where) or []:
+        for fp in PredicateGroup.where_leaves(cte.where) or []:
             check(fp, f"CTE '{cte.cte_name}' filter")
 
     if issues:
@@ -2050,7 +2186,7 @@ def validate_null_filters(
         if fp.op in ("is null", "is not null"):
             if fp.value_type and fp.value_type != "null":
                 col = fp.left_expr.primary_column
-                return make_intent_issue(
+                return IntentIssue.make(
                     issue_id=f"null_where_wrong_value_type_{col}",
                     category=FailureCategory.WHERE_STRUCTURE,
                     severity="error",
@@ -2070,7 +2206,7 @@ def validate_null_filters(
             issues.append(issue)
 
     for cte in cte_steps:
-        for fp in where_leaves(cte.where) or []:
+        for fp in PredicateGroup.where_leaves(cte.where) or []:
             issue = check_filter(fp, f"CTE '{cte.cte_name}' filter")
             if issue:
                 issues.append(issue)
@@ -2079,6 +2215,145 @@ def validate_null_filters(
         debug(f"[validation_schema.validate_null_filters] FAILED with {len(issues)} issues")
     else:
         debug("[validation_schema.validate_null_filters] PASSED")
+    return issues
+
+
+def validate_not_in_negated_list_null(
+    where_params: list[WhereParam],
+    context: str = "main query",
+    *,
+    param_values: Mapping[str, Any] | None = None,
+) -> list[IntentIssue]:
+    """Refuse NOT IN lists that contain null literals."""
+    issues: list[IntentIssue] = []
+    for fp in where_params:
+        if (fp.op or "").strip().lower() != "not in":
+            continue
+        resolved = fp.resolved_value(param_values)
+        if not isinstance(resolved, list) or not any(v is None for v in resolved):
+            continue
+        col = fp.left_expr.primary_column or "column"
+        issues.append(
+            IntentIssue.make(
+                issue_id="null_in_negated_list",
+                category=FailureCategory.WHERE_VALIDITY,
+                severity="error",
+                message=REFUSAL_NULL_IN_NEGATED_LIST_MESSAGE,
+                context={"column": col, "op": fp.op, "location": context},
+            )
+        )
+    if issues:
+        for issue in issues:
+            code = refusal_diagnostic_code_for_intent_issue(issue)
+            if code:
+                emit_session_refusal_diagnostic(code, issue.message)
+        debug(f"[validation_schema.validate_not_in_negated_list_null] FAILED with {len(issues)} issues in {context}")
+    return issues
+
+
+def _unsupported_unknown_column_message(col_meta: ColumnMetadata) -> str:
+    return REFUSAL_UNSUPPORTED_COLUMN_TYPE_MESSAGE.format(column=column_user_display_name(col_meta))
+
+
+def _unknown_column_issue(
+    *,
+    col_meta: ColumnMetadata,
+    col_ref: str,
+    context: str,
+    operation: str,
+) -> IntentIssue:
+    return IntentIssue.make(
+        issue_id="unsupported_column_type",
+        category=FailureCategory.WHERE_VALIDITY,
+        severity="error",
+        message=_unsupported_unknown_column_message(col_meta),
+        context={
+            "column": col_ref,
+            "operation": operation,
+            "value_type": col_meta.value_type,
+            "data_type": col_meta.data_type,
+            "location": context,
+        },
+    )
+
+
+def _unknown_column_refs_in_expr(
+    expr: NormalizedExpr,
+    schema: SchemaGraph,
+    cte_outputs: dict[str, dict[str, CteOutputColumnMeta]],
+) -> list[tuple[str, ColumnMetadata]]:
+    hits: list[tuple[str, ColumnMetadata]] = []
+    for col_ref in extract_columns_from_expr(expr):
+        col_meta = get_col_meta(col_ref, schema, cte_outputs)
+        if col_meta is not None and column_has_unknown_value_type(col_meta):
+            hits.append((col_ref, col_meta))
+    return hits
+
+
+def validate_unknown_column_operations(
+    where_params: list[WhereParam],
+    having_params: list[HavingParam],
+    select_cols: list[SelectCol],
+    schema: SchemaGraph,
+    context: str = "main",
+    cte_outputs: dict[str, dict[str, CteOutputColumnMeta]] | None = None,
+) -> list[IntentIssue]:
+    """Refuse filters and aggregates that target columns with unknown value types."""
+    issues: list[IntentIssue] = []
+    cte_outputs = cte_outputs or {}
+    seen: set[str] = set()
+    for fp in where_params:
+        col_meta = _resolve_col_meta_from_expr(fp.left_expr.primary_column, schema)
+        if col_meta is not None and column_has_unknown_value_type(col_meta):
+            col_ref = fp.left_expr.primary_column or col_meta.name
+            key = f"where:{col_ref}"
+            if key not in seen:
+                seen.add(key)
+                issues.append(
+                    _unknown_column_issue(
+                        col_meta=col_meta,
+                        col_ref=col_ref,
+                        context=context,
+                        operation="filter",
+                    )
+                )
+    for hp in having_params:
+        for col_ref, col_meta in _unknown_column_refs_in_expr(hp.left_expr, schema, cte_outputs):
+            key = f"having:{col_ref}"
+            if key in seen:
+                continue
+            seen.add(key)
+            issues.append(
+                _unknown_column_issue(
+                    col_meta=col_meta,
+                    col_ref=col_ref,
+                    context=context,
+                    operation="aggregate",
+                )
+            )
+    for idx, sc in enumerate(select_cols):
+        expr = sc.expr
+        if not (expr.agg_func or any(g.agg_func for g in expr.add_groups + expr.sub_groups)):
+            continue
+        for col_ref, col_meta in _unknown_column_refs_in_expr(expr, schema, cte_outputs):
+            key = f"select:{col_ref}:{idx}"
+            if key in seen:
+                continue
+            seen.add(key)
+            issues.append(
+                _unknown_column_issue(
+                    col_meta=col_meta,
+                    col_ref=col_ref,
+                    context=context,
+                    operation="aggregate",
+                )
+            )
+    if issues:
+        for issue in issues:
+            code = refusal_diagnostic_code_for_intent_issue(issue)
+            if code:
+                emit_session_refusal_diagnostic(code, issue.message)
+        debug(f"[validation_schema.validate_unknown_column_operations] FAILED with {len(issues)} issues in {context}")
     return issues
 
 
@@ -2108,7 +2383,7 @@ def validate_where_value_type_alignment(
         if col_meta:
             if col_meta.is_foreign_key and col_meta.value_type in {"integer", "number"}:
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"where_string_on_fk_int_{table_name}_{col_name}_{context}",
                         category=FailureCategory.TYPE_ALIGNMENT,
                         severity="warning",
@@ -2129,7 +2404,7 @@ def validate_where_value_type_alignment(
             cte_meta = cte_cols.get(col_name) or cte_cols.get(col_name.lower())
             if cte_meta and cte_meta.value_type in {"integer", "number"}:
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"where_string_on_cte_numeric_{table_name}_{col_name}_{context}",
                         category=FailureCategory.TYPE_ALIGNMENT,
                         severity="warning",
@@ -2155,7 +2430,7 @@ def validate_no_between_ops(
         if fp.op.lower() == "between":
             col = fp.left_expr.primary_column
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"where_between_not_decomposed_{col}_{context}",
                     category=FailureCategory.OPERATOR,
                     severity="error",
@@ -2170,7 +2445,7 @@ def validate_no_between_ops(
         if hp.op.lower() == "between":
             col = hp.left_expr.primary_column
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"having_between_not_decomposed_{col}_{context}",
                     category=FailureCategory.OPERATOR,
                     severity="error",
@@ -2209,7 +2484,7 @@ def _refs_from_select_col_extended(
     case_registry: list[CaseRegistryStep] | None = None,
 ) -> list[str]:
     """Collect column refs from a select column, window spec, and CASE."""
-    parts = effective_select_parts(sc, window_registry, case_registry)
+    parts = sc.effective_parts(window_registry, case_registry)
     refs = extract_columns_from_expr(parts.expr)
     if parts.window_spec:
         ws = parts.window_spec
@@ -2246,9 +2521,9 @@ def validate_contains_array_filters(
         meta = get_col_meta(cols[0], schema, cte_outputs)
         if meta is None:
             continue
-        if array_storage_kind(meta) == "unknown":
+        if SqlglotParseMixin.array_storage_kind(meta) == "unknown":
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"contains_non_array_{context}_{i}",
                     category=FailureCategory.WHERE_SEMANTIC,
                     severity="error",
@@ -2256,6 +2531,25 @@ def validate_contains_array_filters(
                     context={"column": cols[0], "location": context},
                 )
             )
+            continue
+        if SqlglotParseMixin.array_storage_kind(meta) == "json_text_array":
+            try:
+                engine_type = active_engine_identity().engine_type
+            except Exception:
+                engine_type = ""
+            if not DialectRegistry.engine_supports_json_containment(engine_type):
+                issues.append(
+                    IntentIssue.make(
+                        issue_id=f"contains_json_unsupported_{context}_{i}",
+                        category=FailureCategory.WHERE_SEMANTIC,
+                        severity="error",
+                        message=(
+                            f"{context}: operator 'contains' on JSON array column '{cols[0]}' "
+                            f"is not supported for engine {engine_type or 'unknown'!r}"
+                        ),
+                        context={"column": cols[0], "location": context, "engine": engine_type},
+                    )
+                )
     return issues
 
 
@@ -2272,13 +2566,13 @@ def validate_window_spec_schema(
     issues: list[IntentIssue] = []
     cte_outputs = cte_outputs or {}
     for idx, sc in enumerate(select_cols or []):
-        parts = effective_select_parts(sc, window_registry, case_registry)
+        parts = sc.effective_parts(window_registry, case_registry)
         ws = parts.window_spec
         if ws is None:
             continue
         if ws.function not in VALID_WINDOW_FUNCTIONS:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"window_invalid_fn_{context}_{idx}",
                     category=FailureCategory.SCHEMA,
                     severity="error",
@@ -2289,7 +2583,7 @@ def validate_window_spec_schema(
             continue
         if ws.function in WINDOW_RANKING_FUNCTIONS and not ws.order_by:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"window_ranking_no_order_{context}_{idx}",
                     category=FailureCategory.SCHEMA,
                     severity="error",
@@ -2300,7 +2594,7 @@ def validate_window_spec_schema(
         if ws.function in WINDOW_OFFSET_FUNCTIONS:
             if not ws.order_by:
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"window_offset_no_order_{context}_{idx}",
                         category=FailureCategory.SCHEMA,
                         severity="error",
@@ -2310,7 +2604,7 @@ def validate_window_spec_schema(
                 )
             if ws.argument is None:
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"window_offset_no_arg_{context}_{idx}",
                         category=FailureCategory.SCHEMA,
                         severity="error",
@@ -2321,7 +2615,7 @@ def validate_window_spec_schema(
         if ws.function in WINDOW_VALUE_FUNCTIONS:
             if not ws.order_by:
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"window_value_no_order_{context}_{idx}",
                         category=FailureCategory.SCHEMA,
                         severity="error",
@@ -2331,7 +2625,7 @@ def validate_window_spec_schema(
                 )
             if ws.argument is None:
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"window_value_no_arg_{context}_{idx}",
                         category=FailureCategory.SCHEMA,
                         severity="error",
@@ -2342,7 +2636,7 @@ def validate_window_spec_schema(
         if ws.function in WINDOW_NUMERIC_ARG_FUNCTIONS:
             if ws.numeric_argument is None or ws.numeric_argument <= 0:
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"window_numeric_arg_required_{context}_{idx}",
                         category=FailureCategory.SCHEMA,
                         severity="error",
@@ -2352,7 +2646,7 @@ def validate_window_spec_schema(
                 )
         elif ws.numeric_argument is not None:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"window_numeric_arg_forbidden_{context}_{idx}",
                     category=FailureCategory.SCHEMA,
                     severity="error",
@@ -2362,7 +2656,7 @@ def validate_window_spec_schema(
             )
         if ws.function in WINDOW_FUNCTIONS_WITHOUT_COLUMN_ARG and ws.argument is not None:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"window_column_arg_forbidden_{context}_{idx}",
                     category=FailureCategory.SCHEMA,
                     severity="error",
@@ -2373,7 +2667,7 @@ def validate_window_spec_schema(
         if ws.function in WINDOW_AGG_FUNCTIONS:
             if ws.argument is None:
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"window_agg_no_arg_{context}_{idx}",
                         category=FailureCategory.SCHEMA,
                         severity="error",
@@ -2386,7 +2680,7 @@ def validate_window_spec_schema(
                     num = is_col_numeric(cref, schema, cte_outputs)
                     if num is False:
                         issues.append(
-                            make_intent_issue(
+                            IntentIssue.make(
                                 issue_id=f"window_agg_non_numeric_{context}_{idx}_{cref}",
                                 category=FailureCategory.SCHEMA,
                                 severity="error",
@@ -2399,7 +2693,7 @@ def validate_window_spec_schema(
                 meta = get_col_meta(cref, schema, cte_outputs)
                 if meta is not None and not meta.is_groupable:
                     issues.append(
-                        make_intent_issue(
+                        IntentIssue.make(
                             issue_id=f"window_partition_not_groupable_{context}_{idx}_{cref}",
                             category=FailureCategory.SCHEMA,
                             severity="error",
@@ -2409,7 +2703,7 @@ def validate_window_spec_schema(
                     )
         if ws.frame_kind not in ("none", "rows", "range"):
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"window_bad_frame_kind_{context}_{idx}",
                     category=FailureCategory.SCHEMA,
                     severity="error",
@@ -2420,7 +2714,7 @@ def validate_window_spec_schema(
         elif ws.frame_kind != "none":
             if not ws.order_by:
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"window_frame_no_order_{context}_{idx}",
                         category=FailureCategory.SCHEMA,
                         severity="error",
@@ -2436,7 +2730,7 @@ def validate_window_spec_schema(
             ):
                 if bound not in WINDOW_FRAME_BOUNDS:
                     issues.append(
-                        make_intent_issue(
+                        IntentIssue.make(
                             issue_id=f"window_bad_{label}_{context}_{idx}",
                             category=FailureCategory.SCHEMA,
                             severity="error",
@@ -2446,7 +2740,7 @@ def validate_window_spec_schema(
                     )
                 elif bound in ("n_preceding", "n_following") and (off is None or off < 0):
                     issues.append(
-                        make_intent_issue(
+                        IntentIssue.make(
                             issue_id=f"window_frame_offset_{context}_{idx}_{label}",
                             category=FailureCategory.SCHEMA,
                             severity="error",
@@ -2487,7 +2781,7 @@ def validate_window_partition_group_by_alignment(
                 if cref_key in gb_keys or cref.lower() in gb_keys:
                     continue
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"window_partition_column_missing_{context}_{wr_idx}_{part_idx}_{cref}",
                         category=FailureCategory.GROUP_BY_MEMBERSHIP,
                         severity="error",
@@ -2533,7 +2827,7 @@ def validate_redundant_extract_year_column_literals(
             ref = fp.left_expr.primary_column
             if ref and ref.lower() in extract_cols:
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"redundant_extract_year_literal_{loc}_{ref}",
                         category=FailureCategory.WHERE_SEMANTIC,
                         severity="error",
@@ -2547,7 +2841,7 @@ def validate_redundant_extract_year_column_literals(
 
     check_scope(where_params, f"{context} where")
     for cte in cte_steps:
-        check_scope(where_leaves(cte.where) or [], f"CTE '{cte.cte_name}' filter")
+        check_scope(PredicateGroup.where_leaves(cte.where) or [], f"CTE '{cte.cte_name}' filter")
     return issues
 
 
@@ -2573,10 +2867,10 @@ def iterate_case_branch_conditions(
     out: list[tuple[WhereParam, str, str]] = []
     seen_registry_ids: set[str] = set()
     for _, sc in enumerate(select_cols or []):
-        ref = expr_registry_ref(sc.expr) or "" if sc.expr is not None else ""
+        ref = sc.expr.registry_ref() or "" if sc.expr is not None else ""
         if not ref.startswith("c"):
             continue
-        parts = effective_select_parts(sc, window_registry, case_registry)
+        parts = sc.effective_parts(window_registry, case_registry)
         cw = parts.case_when
         if cw is None:
             continue
@@ -2614,10 +2908,10 @@ def validate_case_when_schema(
     issues: list[IntentIssue] = []
     cte_outputs = cte_outputs or {}
     for sc in select_cols or []:
-        ref = expr_registry_ref(sc.expr) or ""
+        ref = sc.expr.registry_ref() or ""
         cw = None
         if ref.startswith("c"):
-            parts = effective_select_parts(sc, window_registry, case_registry)
+            parts = sc.effective_parts(window_registry, case_registry)
             cw = parts.case_when
         if cw is None:
             continue
@@ -2652,7 +2946,7 @@ def validate_case_when_schema(
                 t_name, _c = ac.rsplit(".", 1)
                 if t_name.lower() not in {x.lower() for x in allowed_tables} and t_name not in cte_outputs:
                     issues.append(
-                        make_intent_issue(
+                        IntentIssue.make(
                             issue_id=f"case_result_bad_table_{context}_{bi}_{cref}",
                             category=FailureCategory.SCHEMA,
                             severity="error",
@@ -2662,7 +2956,7 @@ def validate_case_when_schema(
                     )
                 elif get_col_meta(cref, schema, cte_outputs) is None and t_name not in cte_outputs:
                     issues.append(
-                        make_intent_issue(
+                        IntentIssue.make(
                             issue_id=f"case_result_unknown_col_{context}_{bi}_{cref}",
                             category=FailureCategory.SCHEMA,
                             severity="error",
@@ -2678,7 +2972,7 @@ def validate_case_when_schema(
                 t_name, _c = ac.rsplit(".", 1)
                 if t_name.lower() not in {x.lower() for x in allowed_tables} and t_name not in cte_outputs:
                     issues.append(
-                        make_intent_issue(
+                        IntentIssue.make(
                             issue_id=f"case_else_bad_table_{context}_{cref}",
                             category=FailureCategory.SCHEMA,
                             severity="error",
@@ -2688,7 +2982,7 @@ def validate_case_when_schema(
                     )
                 elif get_col_meta(cref, schema, cte_outputs) is None and t_name not in cte_outputs:
                     issues.append(
-                        make_intent_issue(
+                        IntentIssue.make(
                             issue_id=f"case_else_unknown_col_{context}_{cref}",
                             category=FailureCategory.SCHEMA,
                             severity="error",
@@ -2732,7 +3026,7 @@ def _mul_group_is_count_star(g: MulGroup) -> bool:
             return True
         if leaf.add_values and not leaf.add_groups and not leaf.sub_groups and not leaf.sub_values:
             try:
-                if len(leaf.add_values) == 1 and float(leaf.add_values[0].value) == 1.0:
+                if len(leaf.add_values) == 1 and float(cast(Any, leaf.add_values[0].value or 0)) == 1.0:
                     return True
             except (TypeError, ValueError):
                 pass
@@ -2773,7 +3067,7 @@ def _selectability_issues_for_normalized_expr(
         if meta is not None and not getattr(meta, "is_selectable", True):
             loc = f"{context} {detail}".strip()
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"not_selectable_{loc.replace(' ', '_').replace('[', '_').replace(']', '_')}_{qc.replace('.', '_')}",
                     category=FailureCategory.ACCESS_POLICY,
                     severity="error",
@@ -2900,7 +3194,7 @@ def validate_table_reference_counts(
         count = counts[tbl]
         if count > max_refs:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"table_reference_count_{context.replace(' ', '_')}_{tbl}",
                     category=FailureCategory.WRONG_JOIN,
                     severity="error",
@@ -2951,7 +3245,7 @@ def validate_cte_limits(intent: RuntimeIntent, context: str = "main query") -> l
     max_steps = int(PolicyConfig.MAX_CTE_STEPS)
     if count > max_steps:
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id="cte_step_count_exceeded",
                 category=FailureCategory.CTE_STRUCTURE,
                 severity="error",
@@ -2963,7 +3257,7 @@ def validate_cte_limits(intent: RuntimeIntent, context: str = "main query") -> l
     max_depth = int(PolicyConfig.MAX_CTE_REFERENCE_DEPTH)
     if depth > max_depth:
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id="cte_reference_depth_exceeded",
                 category=FailureCategory.CTE_STRUCTURE,
                 severity="error",
@@ -2987,7 +3281,7 @@ def validate_predicate_nesting_depth(
     issues: list[IntentIssue] = []
     if where is not None and where.depth() > MAX_PREDICATE_NESTING_DEPTH:
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id="where_predicate_nesting_depth",
                 category=FailureCategory.WHERE_SEMANTIC,
                 severity="error",
@@ -2997,7 +3291,7 @@ def validate_predicate_nesting_depth(
         )
     if having is not None and having.depth() > MAX_PREDICATE_NESTING_DEPTH:
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id="having_predicate_nesting_depth",
                 category=FailureCategory.HAVING_SEMANTIC,
                 severity="error",
@@ -3042,7 +3336,7 @@ def validate_cte_emission_shapes(intent: RuntimeIntent, schema: SchemaGraph) -> 
         for out_name in cte.output_columns or []:
             if _column_name_reserved_for_anti_join(out_name):
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"cte_reserved_presence_col_{cte.cte_name}_{out_name}",
                         category=FailureCategory.CTE_STRUCTURE,
                         severity="error",
@@ -3060,7 +3354,7 @@ def validate_cte_emission_shapes(intent: RuntimeIntent, schema: SchemaGraph) -> 
                 if sc.is_aggregated or (sc.expr.agg_func or ""):
                     has_aggregate = True
                     issues.append(
-                        make_intent_issue(
+                        IntentIssue.make(
                             issue_id=f"semi_join_payload_agg_{cte.cte_name}_{idx}",
                             category=FailureCategory.CTE_STRUCTURE,
                             severity="error",
@@ -3081,7 +3375,7 @@ def validate_cte_emission_shapes(intent: RuntimeIntent, schema: SchemaGraph) -> 
                     )
                 if not key_shape and not intersection_shape:
                     issues.append(
-                        make_intent_issue(
+                        IntentIssue.make(
                             issue_id=f"semi_join_projection_shape_{cte.cte_name}",
                             category=FailureCategory.CTE_STRUCTURE,
                             severity="error",
@@ -3094,7 +3388,7 @@ def validate_cte_emission_shapes(intent: RuntimeIntent, schema: SchemaGraph) -> 
                     )
                 elif intersection_unresolvable and not key_shape:
                     issues.append(
-                        make_intent_issue(
+                        IntentIssue.make(
                             issue_id=f"semi_join_projection_type_unresolved_{cte.cte_name}",
                             category=FailureCategory.CTE_STRUCTURE,
                             severity="warning",
@@ -3106,11 +3400,11 @@ def validate_cte_emission_shapes(intent: RuntimeIntent, schema: SchemaGraph) -> 
                         )
                     )
         if emission == "anti_join":
-            for fp in where_leaves(cte.where) if cte.where else []:
+            for fp in PredicateGroup.where_leaves(cte.where) if cte.where else []:
                 left = fp.left_expr.primary_column if fp.left_expr else ""
                 if left and _column_name_reserved_for_anti_join(left.rsplit(".", 1)[-1]):
                     issues.append(
-                        make_intent_issue(
+                        IntentIssue.make(
                             issue_id=f"anti_join_user_presence_where_{cte.cte_name}",
                             category=FailureCategory.CTE_STRUCTURE,
                             severity="error",
@@ -3118,7 +3412,7 @@ def validate_cte_emission_shapes(intent: RuntimeIntent, schema: SchemaGraph) -> 
                             context={"where": left},
                         )
                     )
-    for fp in where_leaves(intent.where) if intent.where else []:
+    for fp in PredicateGroup.where_leaves(intent.where) if intent.where else []:
         left = fp.left_expr.primary_column if fp.left_expr else ""
         if not left or "." not in left:
             continue
@@ -3131,7 +3425,7 @@ def validate_cte_emission_shapes(intent: RuntimeIntent, schema: SchemaGraph) -> 
             continue
         if (fp.op or "").strip().lower() in ("is null", "is not null"):
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"anti_join_user_null_where_{tbl}",
                     category=FailureCategory.WHERE_VALIDITY,
                     severity="error",
@@ -3150,7 +3444,7 @@ def validate_cte_emission_shapes(intent: RuntimeIntent, schema: SchemaGraph) -> 
             probe_out = list(probe_cte.output_columns or [])
             if len(probe_out) != len(outer_cols):
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"set_difference_arity_{probe}",
                         category=FailureCategory.CTE_STRUCTURE,
                         severity="error",
@@ -3181,7 +3475,7 @@ def validate_cte_emission_shapes(intent: RuntimeIntent, schema: SchemaGraph) -> 
                         else (probe_out[idx] if idx < len(probe_out) else f"position_{idx}")
                     )
                     issues.append(
-                        make_intent_issue(
+                        IntentIssue.make(
                             issue_id=f"set_difference_type_{probe}_{idx}",
                             category=FailureCategory.CTE_STRUCTURE,
                             severity="error",
@@ -3195,7 +3489,7 @@ def validate_cte_emission_shapes(intent: RuntimeIntent, schema: SchemaGraph) -> 
                     )
             if type_unresolvable:
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"set_difference_type_unresolved_{probe}",
                         category=FailureCategory.CTE_STRUCTURE,
                         severity="warning",
@@ -3228,7 +3522,7 @@ def validate_probe_cte_anchor_placement(
         left_tables = _join_sig_left_tables(signature)
         if probe.lower() not in left_tables:
             return None
-        return make_intent_issue(
+        return IntentIssue.make(
             issue_id=f"probe_cte_left_operand_{probe}",
             category=FailureCategory.CTE_STRUCTURE,
             severity="error",
@@ -3255,7 +3549,7 @@ def validate_probe_cte_anchor_placement(
         anchor = tables[0]
         if anchor in probe_names:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"probe_cte_anchor_{anchor}_{cte.cte_name}",
                     category=FailureCategory.CTE_STRUCTURE,
                     severity="error",
@@ -3266,7 +3560,7 @@ def validate_probe_cte_anchor_placement(
     main_tables = list(intent.tables or [])
     if len(main_tables) > 1 and main_tables[0] in probe_names:
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"probe_cte_main_anchor_{main_tables[0]}",
                 category=FailureCategory.CTE_STRUCTURE,
                 severity="error",
@@ -3345,7 +3639,7 @@ def validate_preserve_tables(
             continue
         if name.lower() not in allowed:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"preserve_tables_unknown_{context}_{name}",
                     category=FailureCategory.WRONG_JOIN,
                     severity="error",
@@ -3359,7 +3653,7 @@ def validate_preserve_tables(
             continue
         if name in probes:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"preserve_tables_probe_{context}_{name}",
                     category=FailureCategory.WRONG_JOIN,
                     severity="error",
@@ -3374,7 +3668,7 @@ def validate_preserve_tables(
         reachable = name.lower() == anchor_l or name.lower() in left_tables
         if sig and not reachable:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"preserve_tables_unreachable_{context}_{name}",
                     category=FailureCategory.WRONG_JOIN,
                     severity="error",
@@ -3388,7 +3682,7 @@ def validate_preserve_tables(
             continue
         if sig and _preservation_is_no_op_for_table(name, sig, schema):
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"preserve_tables_noop_{context}_{name}",
                     category=FailureCategory.WRONG_JOIN,
                     severity="error",
@@ -3412,7 +3706,7 @@ def validate_probe_cte_modifiers(intent: RuntimeIntent) -> list[IntentIssue]:
         ctx = f"CTE '{cte.cte_name}'"
         if cte.distinct_select_index >= 0:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"probe_cte_distinct_select_index_{cte.cte_name}",
                     category=FailureCategory.CTE_STRUCTURE,
                     severity="error",
@@ -3422,7 +3716,7 @@ def validate_probe_cte_modifiers(intent: RuntimeIntent) -> list[IntentIssue]:
             )
         if cte.distinct_on:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"probe_cte_distinct_on_{cte.cte_name}",
                     category=FailureCategory.CTE_STRUCTURE,
                     severity="error",
@@ -3432,7 +3726,7 @@ def validate_probe_cte_modifiers(intent: RuntimeIntent) -> list[IntentIssue]:
             )
         if cte.limit is not None:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"probe_cte_limit_{cte.cte_name}",
                     category=FailureCategory.CTE_STRUCTURE,
                     severity="error",
@@ -3448,6 +3742,13 @@ def validate_join_path_reachability_for_tables(
 ) -> list[IntentIssue]:
     """Emit issues when physical tables in *tables* do not form one connected join component."""
     combined: set[str] = set(tables or [])
+    for table_name in list(combined):
+        table_meta = schema.tables.get(table_name)
+        if table_meta is None or table_meta.kind not in ("view", "materialized_view"):
+            continue
+        for referenced in tables_referenced_in_view_definition(table_meta.view_definition):
+            if referenced in schema.tables:
+                combined.add(referenced)
     physical = {t for t in combined if t in schema.tables}
     if len(physical) <= 1:
         return []
@@ -3477,6 +3778,10 @@ def validate_join_path_reachability_for_tables(
         tbl_meta = schema.tables.get(tbl)
         if tbl_meta is None:
             continue
+        if tbl_meta.kind in ("view", "materialized_view"):
+            for referenced in tables_referenced_in_view_definition(tbl_meta.view_definition):
+                if referenced in physical:
+                    _connect(tbl, referenced)
         for _cn, col in tbl_meta.columns.items():
             for nt, _nc in col.semantic_join_neighbors:
                 _connect(tbl, nt)
@@ -3494,7 +3799,7 @@ def validate_join_path_reachability_for_tables(
     issues: list[IntentIssue] = []
     for target in sorted(physical - visited):
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"join_unreachable_{context.replace(' ', '_')}_{root}_{target}",
                 category=FailureCategory.WRONG_JOIN,
                 severity="error",
@@ -3541,9 +3846,13 @@ def validate_selectability(
     """Reject bare non-selectable columns in SELECT expressions, window. partitions, and CASE results."""
     issues: list[IntentIssue] = []
     cte_outputs = cte_outputs or {}
+    if window_registry is None:
+        window_registry = list(WindowRegistryStep.current_steps())
+    if case_registry is None:
+        case_registry = list(CaseRegistryStep.current_steps())
     for idx, sc in enumerate(select_cols or []):
         detail = f"select_cols[{idx}]"
-        parts = effective_select_parts(sc, window_registry, case_registry)
+        parts = sc.effective_parts(window_registry, case_registry)
         issues.extend(_selectability_issues_for_normalized_expr(parts.expr, schema, cte_outputs, context, detail))
         if parts.window_spec:
             ws = parts.window_spec
@@ -3618,7 +3927,7 @@ def get_col_meta(
             valid_where_ops=list(cte_meta.valid_where_ops or []),
             valid_aggregations=list(cte_meta.valid_aggregations or []),
             valid_having_ops=list(cte_meta.valid_having_ops or []),
-            sensitivity=column_sensitivity_from_dict({"sensitivity": cte_meta.sensitivity}),
+            sensitivity=SensitivityClassification.from_dict({"sensitivity": cte_meta.sensitivity}),
         )
     if table_name not in schema.tables:
         return None
@@ -3821,11 +4130,6 @@ def _join_columns_profiled_unique(schema: SchemaGraph, table: str, cols: list[st
         return True
     if len(clean) == 1:
         return _column_profiled_unique(schema, table, clean[0])
-    profiled: list[bool | None] = [_column_profiled_unique(schema, table, col) for col in clean]
-    if any(item is False for item in profiled):
-        return False
-    if all(item is True for item in profiled):
-        return True
     return None
 
 
@@ -4028,10 +4332,10 @@ def _collect_fan_out_from_case_registry(
 ) -> None:
     seen_registry_ids: set[str] = set()
     for sc in select_cols or []:
-        ref = expr_registry_ref(sc.expr) or "" if sc.expr is not None else ""
+        ref = sc.expr.registry_ref() or "" if sc.expr is not None else ""
         if not ref.startswith("c"):
             continue
-        parts = effective_select_parts(sc, window_registry, case_registry)
+        parts = sc.effective_parts(window_registry, case_registry)
         cw = parts.case_when
         if cw is None:
             continue
@@ -4041,8 +4345,6 @@ def _collect_fan_out_from_case_registry(
         if cw.else_result is not None:
             _extend_fan_out_aggregates_from_expr(cw.else_result, found)
     for step in case_registry or []:
-        if step is None or step.case_when is None:
-            continue
         rid = (step.registry_id or "").strip()
         if rid and rid in seen_registry_ids:
             continue
@@ -4066,12 +4368,12 @@ def _collect_fan_out_from_query_body(
     for sc in select_cols or []:
         _extend_fan_out_aggregates_from_expr(sc.expr, found)
     if having:
-        for hp in having_leaves(having) or []:
+        for hp in PredicateGroup.having_leaves(having) or []:
             _extend_fan_out_aggregates_from_expr(hp.left_expr, found)
             _extend_fan_out_aggregates_from_expr(hp.right_expr, found)
     for ob in order_by_cols or []:
         _extend_fan_out_aggregates_from_expr(ob.expr, found)
-    for fp in where_leaves(where) if where else []:
+    for fp in PredicateGroup.where_leaves(where) if where else []:
         _extend_fan_out_aggregates_from_expr(fp.left_expr, found)
         if fp.right_expr is not None:
             _extend_fan_out_aggregates_from_expr(fp.right_expr, found)
@@ -4138,6 +4440,66 @@ def _anchor_table_multiplied(
     return True, hits[0]["edge"]
 
 
+def validate_join_path_key_types(
+    signature: list[str],
+    schema: SchemaGraph,
+    context: str,
+) -> list[IntentIssue]:
+    """Emit errors when paired join-key columns have incompatible value types."""
+    issues: list[IntentIssue] = []
+    ctx_key = context.replace(" ", "_")
+    for seg_idx, (left_tbl, right_tbl, lcols, rcols) in enumerate(_parse_signature_segments(signature)):
+        if len(lcols) != len(rcols):
+            continue
+        for col_idx, (lcol, rcol) in enumerate(zip(lcols, rcols, strict=True)):
+            left_meta = schema.tables.get(left_tbl)
+            right_meta = schema.tables.get(right_tbl)
+            if left_meta is None or right_meta is None:
+                continue
+            l_cm = left_meta.columns.get(lcol)
+            r_cm = right_meta.columns.get(rcol)
+            if l_cm is None or r_cm is None:
+                continue
+            if column_metadata_timezone_awareness_mismatch(l_cm, r_cm):
+                issues.append(
+                    IntentIssue.make(
+                        issue_id=f"join_key_timezone_incompatible_{ctx_key}_{seg_idx}_{col_idx}",
+                        category=FailureCategory.WRONG_JOIN,
+                        severity="error",
+                        message=(
+                            f"{context}: join key timezone awareness incompatible for "
+                            f"{left_tbl}.{lcol} ({l_cm.data_type}) vs {right_tbl}.{rcol} ({r_cm.data_type}) "
+                            f"on the resolved join path."
+                        ),
+                        context={
+                            "left": f"{left_tbl}.{lcol}",
+                            "right": f"{right_tbl}.{rcol}",
+                            "location": context,
+                        },
+                    )
+                )
+                continue
+            if fk_infer_value_types_compatible(l_cm, r_cm):
+                continue
+            issues.append(
+                IntentIssue.make(
+                    issue_id=f"join_key_type_incompatible_{ctx_key}_{seg_idx}_{col_idx}",
+                    category=FailureCategory.WRONG_JOIN,
+                    severity="error",
+                    message=(
+                        f"{context}: join key {left_tbl}.{lcol} ({l_cm.data_type}) is not type-compatible "
+                        f"with {right_tbl}.{rcol} ({r_cm.data_type}) on the resolved join path."
+                    ),
+                    context={
+                        "left": f"{left_tbl}.{lcol}",
+                        "right": f"{right_tbl}.{rcol}",
+                        "location": context,
+                    },
+                )
+            )
+    return issues
+
+
 def validate_clause_widened_rowset(
     intent: RuntimeIntent,
     schema: SchemaGraph,
@@ -4150,7 +4512,7 @@ def validate_clause_widened_rowset(
     signature = list(join_signature or intent.chosen_join_path_signature or [])
     if not signature:
         return []
-    if (intent.grain or "row_level") != "row_level" or intent.group_by_cols:
+    if (intent.grain or "row_level") != "row_level":
         return []
     anchor = from_anchor or (intent.tables[0] if intent.tables else None)
     multiplied, edge = _anchor_table_multiplied(signature, anchor, schema)
@@ -4160,10 +4522,11 @@ def validate_clause_widened_rowset(
     ctx_key = context.replace(" ", "_")
     issues: list[IntentIssue] = []
     main_tables = {phys_table_key(t) for t in intent_join_reachability_tables(intent)}
+    grouped = bool(intent.group_by_cols)
 
-    if intent.limit is not None or (intent.limit_param_key or "").strip():
+    if not grouped and (intent.limit is not None or (intent.limit_param_key or "").strip()):
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"clause_widened_rowset_limit_{ctx_key}",
                 category=FailureCategory.WRONG_SORT_OR_LIMIT,
                 severity="error",
@@ -4178,7 +4541,7 @@ def validate_clause_widened_rowset(
 
     if intent.order_by_cols:
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"clause_widened_rowset_order_by_{ctx_key}",
                 category=FailureCategory.WRONG_SORT_OR_LIMIT,
                 severity="warning",
@@ -4190,9 +4553,9 @@ def validate_clause_widened_rowset(
             )
         )
 
-    if intent.distinct_select_index >= 0:
+    if not grouped and intent.distinct_select_index >= 0:
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"clause_widened_rowset_select_distinct_{ctx_key}",
                 category=FailureCategory.SELECT_VALIDITY,
                 severity="warning",
@@ -4216,7 +4579,7 @@ def validate_clause_widened_rowset(
                 multiplied_cols.append(col)
         if multiplied_cols:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"clause_widened_rowset_distinct_on_{ctx_key}_{idx}",
                     category=FailureCategory.ORDER_BY_VALIDITY,
                     severity="error",
@@ -4236,13 +4599,13 @@ def validate_clause_widened_rowset(
 
     count_star = any(_expr_has_unqualified_count_star(sc.expr) for sc in intent.select_cols or [])
     if not count_star and intent.having:
-        for hp in having_leaves(intent.having) or []:
+        for hp in PredicateGroup.having_leaves(intent.having) or []:
             if _expr_has_unqualified_count_star(hp.left_expr) or _expr_has_unqualified_count_star(hp.right_expr):
                 count_star = True
                 break
     if count_star:
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"clause_widened_rowset_count_star_{ctx_key}",
                 category=FailureCategory.AGGREGATION_SEMANTICS,
                 severity="warning",
@@ -4460,7 +4823,7 @@ def validate_comparison_join_scope(
                 "semantic override when the relationship is real."
             )
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id="comparison_join_semantic_path",
                     message=msg,
                     severity="error",
@@ -4476,7 +4839,7 @@ def validate_comparison_join_scope(
                 "Declare foreign_keys_add or a semantic override when the relationship is real."
             )
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id="comparison_join_hop_ceiling",
                     message=msg,
                     severity="error",

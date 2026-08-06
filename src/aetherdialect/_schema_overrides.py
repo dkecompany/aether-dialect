@@ -7,21 +7,25 @@ import gzip
 import hashlib
 import json
 import os
+import shutil
+import tempfile
 import time
-from collections.abc import Callable
-from datetime import datetime, timezone
+from collections.abc import Callable, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, cast
 
 from ._config import (
     ConfigError,
     EngineConfig,
     PolicyConfig,
-    llm_credentials_configured,
 )
 from ._constants import (
+    ARTIFACT_MANIFEST_FILENAME,
+    BUSINESS_KNOWLEDGE_REFINER_SYSTEM,
     DESCRIPTION_REFINER_SYSTEM,
     DIAGNOSTIC_CODE_ENGINE_INFO,
+    DIAGNOSTIC_CODE_OVERRIDE_NEEDS_RECONFIRMATION,
     DIAGNOSTIC_CODE_SCHEMA_OVERRIDE_SKIP,
     OVERRIDES_EDITABLE_ENUMS,
     ROLE_VALUE_TYPE_COMPAT,
@@ -51,6 +55,8 @@ from ._constants import (
     VALID_TOP_LEVEL_OVERRIDE_KEYS,
 )
 from ._contracts_base import (
+    BusinessKnowledgeEntry,
+    BusinessKnowledgeKind,
     ColumnRole,
     DescriptionOwner,
     EngineContext,
@@ -65,13 +71,8 @@ from ._contracts_base import (
     SchemaInclude,
     SensitivityClassification,
     SidecarReconcileReport,
+    TableKind,
     TableRole,
-    can_overwrite_role,
-    coerce_sensitivity_classification,
-    column_sensitivity_from_dict,
-    data_type_to_value_type,
-    set_description,
-    set_sensitivity,
 )
 from ._contracts_schema import (
     CatalogStructuralConstraintsIndex,
@@ -82,9 +83,13 @@ from ._contracts_schema import (
 )
 from ._core_utils import (
     artifact_lock,
+    bound_engine_runtime_config,
+    coerce_format_version,
+    data_type_to_value_type,
     debug,
     effective_structural_hash_fp,
     emit_construction_phase,
+    format_versions_match,
     notify,
     profiling_hash_fp,
     read_artifact_manifest,
@@ -96,9 +101,10 @@ from ._core_utils import (
     wipe_versioned_artifacts,
     write_artifact_manifest,
     write_gzip_json_atomic,
+    write_json_atomic,
 )
 from ._dialect import Dialect
-from ._llm_provider import llm_chat
+from ._llm_provider import LLMProvider
 from ._schema_build import (
     apply_full_build_deny_objects,
     debug_clip_stable_json,
@@ -120,11 +126,14 @@ from ._schema_catalog import (
     emit_description_enrichment_failed,
     emit_description_enrichment_noop,
     emit_schema_fk_catalog_absent_warning,
+    emit_schema_unknown_type_unusable_warnings,
     extract_tables_from_catalog,
     extract_tables_from_catalog_sql_connector,
+    filter_schema_anchored_business_knowledge,
     llm_classify_schema,
     parse_sql_file,
     replay_user_semantic_neighbors_to_columns,
+    schema_name_dump_for_business_knowledge,
 )
 from ._schema_graph import (
     SchemaDiff,
@@ -161,6 +170,7 @@ from ._schema_graph import (
     semantic_edges_fingerprint,
     strip_schema_context_denied_columns,
     table_from_dict,
+    table_structural_hash_fp,
     table_to_dict,
     tables_profiling_payload,
     tables_row_count_fingerprint,
@@ -197,6 +207,7 @@ def _add_profiling_data(
     debug(f"[{SCHEMA_BUILD_PHASE_E}] profiling columns (statistics)")
 
     dialect.profile_schema(sg)
+    emit_schema_unknown_type_unusable_warnings(sg)
 
     debug(f"[{SCHEMA_BUILD_PHASE_E}] inferring missing primary keys from profile")
     infer_missing_pks_from_profile(sg.tables, dialect=dialect, blocked=pk_blocked)
@@ -311,7 +322,7 @@ def _invalidate_corrupt_schema_cache(
     adir = os.path.dirname(os.path.abspath(schema_json_path))
     write_artifact_manifest(
         adir,
-        last_corruption_at=datetime.now(timezone.utc).isoformat(),
+        last_corruption_at=datetime.now(UTC).isoformat(),
         last_action="corrupt_schema_cache",
     )
     try:
@@ -351,8 +362,8 @@ def _refresh_join_paths_multi_if_enumeration_stale(
     *,
     sink: Callable[[str], None] | None = None,
 ) -> bool:
-    cached_ver = int(cache_data.get("join_path_enumeration_version", 0) or 0)
-    if cached_ver == SCHEMA_JOIN_PATH_ENUMERATION_VERSION:
+    cached_ver = coerce_format_version(cache_data.get("join_path_enumeration_version", "0") or "0")
+    if format_versions_match(cached_ver, SCHEMA_JOIN_PATH_ENUMERATION_VERSION):
         return False
     if sink is not None:
         sink("  Schema: join-path enumeration policy changed — recomputing join paths...")
@@ -428,6 +439,55 @@ def _debug_verify_profiling_round_trip(cache_data: dict[str, Any], schema_json_p
             return
 
 
+def _commit_schema_cache_and_manifest_pair(
+    adir: str,
+    schema_json_path: str,
+    cache_data: dict[str, Any],
+    *,
+    manifest_kwargs: dict[str, Any],
+) -> None:
+    """Stage schema cache and artifact manifest, then replace both live paths atomically."""
+    graph_path = os.path.abspath(schema_json_path)
+    manifest_path = os.path.join(adir, ARTIFACT_MANIFEST_FILENAME)
+    staging_dir = os.path.join(adir, ".schema_pair_staging")
+    graph_backup: str | None = None
+    try:
+        if os.path.isfile(graph_path):
+            fd, graph_backup = tempfile.mkstemp(prefix=".rollback_", suffix=".json.gz", dir=adir)
+            os.close(fd)
+            shutil.copy2(graph_path, graph_backup)
+
+        if os.path.isdir(staging_dir):
+            shutil.rmtree(staging_dir, ignore_errors=True)
+        os.makedirs(staging_dir, exist_ok=True)
+
+        graph_staging = os.path.join(staging_dir, os.path.basename(graph_path))
+        write_gzip_json_atomic(graph_staging, cache_data, sort_keys=True)
+        write_artifact_manifest(staging_dir, **manifest_kwargs)
+        manifest_staging = os.path.join(staging_dir, ARTIFACT_MANIFEST_FILENAME)
+
+        os.replace(graph_staging, graph_path)
+        try:
+            os.replace(manifest_staging, manifest_path)
+        except BaseException:
+            if graph_backup and os.path.isfile(graph_backup):
+                os.replace(graph_backup, graph_path)
+                graph_backup = None
+            elif os.path.isfile(graph_path):
+                try:
+                    os.remove(graph_path)
+                except OSError:
+                    pass
+            raise
+    finally:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        if graph_backup and os.path.isfile(graph_backup):
+            try:
+                os.unlink(graph_backup)
+            except OSError:
+                pass
+
+
 def save_schema_to_cache(sg: SchemaGraph, schema_json_path: str) -> None:
     """Save a SchemaGraph to a JSON cache file."""
     cache_data = {
@@ -459,25 +519,28 @@ def save_schema_to_cache(sg: SchemaGraph, schema_json_path: str) -> None:
     adir = os.path.dirname(os.path.abspath(schema_json_path))
     prev_manifest = read_artifact_manifest(adir)
     with artifact_lock(adir):
-        write_gzip_json_atomic(schema_json_path, cache_data, sort_keys=True)
-        write_artifact_manifest(
+        _commit_schema_cache_and_manifest_pair(
             adir,
-            structural_hash=sg.structural_hash,
-            profiling_hash=sg.profiling_hash,
-            scope_hash=sg.scope_hash,
-            effective_structural_hash=sg.effective_structural_hash,
-            schema_graph_id=sg.schema_graph_id,
-            notes_hash=sg.notes_hash,
-            semantic_edges_hash=sg.semantic_edges_hash,
-            last_migration_tier=prev_manifest.last_migration_tier if prev_manifest else "",
-            last_action="reconcile",
+            schema_json_path,
+            cache_data,
+            manifest_kwargs={
+                "structural_hash": sg.structural_hash,
+                "profiling_hash": sg.profiling_hash,
+                "scope_hash": sg.scope_hash,
+                "effective_structural_hash": sg.effective_structural_hash,
+                "schema_graph_id": sg.schema_graph_id,
+                "notes_hash": sg.notes_hash,
+                "semantic_edges_hash": sg.semantic_edges_hash,
+                "last_migration_tier": prev_manifest.last_migration_tier if prev_manifest else "",
+                "last_action": "reconcile",
+            },
         )
 
 
 def _scope_databricks_tables_meta(
     tables_meta: dict[str, dict[str, Any]],
     *,
-    object_kind: Literal["table", "view"],
+    object_kind: TableKind,
     table_types: dict[str, str],
 ) -> dict[str, dict[str, Any]]:
     """Keep only relations whose Unity ``table_type`` matches *object_kind*."""
@@ -506,7 +569,7 @@ def _scope_databricks_for_include(
     """Filter catalog metadata to tables or views."""
     return _scope_databricks_tables_meta(
         tables_meta,
-        object_kind="table" if include == "tables" else "view",
+        object_kind=TableKind.TABLE if include == "tables" else TableKind.VIEW,
         table_types=table_types,
     )
 
@@ -515,7 +578,7 @@ def load_or_create_schema_databricks(
     spark_session: Any | None = None,
     connection: Any | None = None,
     *,
-    include: SchemaInclude = "tables",
+    include: SchemaInclude = SchemaInclude.TABLES,
     allow_objects: frozenset[str] | None = None,
     deny_objects: frozenset[str] | None = None,
     table_kinds_map: dict[str, str],
@@ -523,8 +586,9 @@ def load_or_create_schema_databricks(
     sql_file: str | None = None,
 ) -> SchemaGraph:
     """Build a `SchemaGraph` for Databricks from catalog introspection. or SQL DDL fallback."""
-    catalog = str(getattr(EngineConfig.RUNTIME, "CATALOG", None) or "")
-    schema_name = str(getattr(EngineConfig.RUNTIME, "SCHEMA", None) or "")
+    runtime_cfg = bound_engine_runtime_config()
+    catalog = str(getattr(runtime_cfg, "CATALOG", None) or "")
+    schema_name = str(getattr(runtime_cfg, "SCHEMA", None) or "")
     tables_meta: dict[str, dict[str, Any]] = {}
     spark_used: Any = None
     try:
@@ -571,7 +635,7 @@ def load_or_create_schema_databricks(
         table_types=table_kinds_map,
     )
 
-    row_kind: Literal["table", "view"] = "table" if include != "views" else "view"
+    row_kind: TableKind = TableKind.TABLE if include != "views" else TableKind.VIEW
     sg = tables_meta_to_schema_graph(tables_meta, object_kind=row_kind)
     sql_file_path = expanded_scope_sql_file(sql_file)
     if include == "tables" and sql_file_path and os.path.exists(sql_file_path) and tables_meta:
@@ -587,6 +651,7 @@ def _description_owner_export_map() -> dict[DescriptionOwner, str]:
         DescriptionOwner.PROFILE: "profile",
         DescriptionOwner.NOTES: "notes",
         DescriptionOwner.LLM_REFINEMENT: SCHEMA_OVERRIDES_EXPORT_DEFAULT_OWNER,
+        DescriptionOwner.SPACE_NOTES: "space_notes",
         DescriptionOwner.USER_OVERRIDE: "user",
     }
 
@@ -792,6 +857,187 @@ def _table_has_exportable_override(table: TableMetadata) -> bool:
     return any(_column_has_exportable_override(col) for col in table.columns.values())
 
 
+def _column_structural_hash_fp(table: TableMetadata, column_name: str) -> str:
+    """Return the structural fingerprint for one column within *table*."""
+    col = table.columns[column_name]
+    payload = {
+        table.name: {
+            "columns": {
+                column_name: {
+                    "data_type": col.data_type,
+                    "is_nullable": col.is_nullable,
+                    "is_primary_key": col.is_primary_key,
+                    "is_foreign_key": col.is_foreign_key,
+                }
+            },
+            "foreign_keys": [],
+            "indexed_columns": [],
+            "kind": table.kind,
+            "primary_key": list(table.primary_key),
+            "view_definition": "",
+        }
+    }
+    return structural_hash_fp(payload)
+
+
+def _override_object_recreated(
+    object_name: str,
+    *,
+    previous_schema: SchemaGraph | None,
+    current_schema: SchemaGraph,
+    authored_hash: str,
+    current_hash: str,
+) -> bool:
+    """Return True when *object_name* was absent before and is present now with a new hash."""
+    if not authored_hash or authored_hash == current_hash:
+        return False
+    if previous_schema is None:
+        return False
+    if "." in object_name:
+        table_name, column_name = object_name.split(".", 1)
+        if table_name not in current_schema.tables:
+            return False
+        prev_tbl = previous_schema.tables.get(table_name)
+        if prev_tbl is None:
+            return True
+        return column_name not in prev_tbl.columns
+    return object_name not in previous_schema.tables
+
+
+def _notify_override_needs_reconfirmation(path: str, object_name: str) -> None:
+    notify(
+        f"Schema override for {object_name} requires re-confirmation after object recreation",
+        stage="schema",
+        code=DIAGNOSTIC_CODE_OVERRIDE_NEEDS_RECONFIRMATION,
+        details=(("path", path), ("object", object_name)),
+    )
+
+
+def _override_entry_blocked_by_recreation(
+    path: str,
+    object_name: str,
+    entry: dict[str, Any],
+    *,
+    current_hash: str,
+    previous_schema: SchemaGraph | None,
+    current_schema: SchemaGraph,
+    skipped: list[OverrideSkip],
+) -> bool:
+    """Skip replay when a recreated object still carries stale override provenance."""
+    authored_hash = str(entry.get("authored_against_structural_hash", "") or "")
+    if entry.get("needs_reconfirmation"):
+        skipped.append(OverrideSkip(path=path, reason="needs_reconfirmation", code="needs_reconfirmation"))
+        _notify_override_needs_reconfirmation(path, object_name)
+        return True
+    if not _override_object_recreated(
+        object_name,
+        previous_schema=previous_schema,
+        current_schema=current_schema,
+        authored_hash=authored_hash,
+        current_hash=current_hash,
+    ):
+        return False
+    entry["needs_reconfirmation"] = True
+    skipped.append(OverrideSkip(path=path, reason="needs_reconfirmation", code="needs_reconfirmation"))
+    _notify_override_needs_reconfirmation(path, object_name)
+    return True
+
+
+def _stamp_override_entry_provenance(entry: dict[str, Any], structural_hash: str) -> None:
+    """Record what structural state an override entry was authored against."""
+    entry["authored_against_structural_hash"] = structural_hash
+    entry["authored_at"] = datetime.now(UTC).isoformat()
+    entry.pop("needs_reconfirmation", None)
+
+
+def _stamp_sidecar_provenance(document: dict[str, Any], sg: SchemaGraph) -> None:
+    """Stamp provenance on every persisted override entry in *document*."""
+    tables = document.get("tables")
+    if isinstance(tables, dict):
+        for tname, tval in tables.items():
+            if not isinstance(tval, dict) or tname not in sg.tables:
+                continue
+            if tval.get("needs_reconfirmation"):
+                continue
+            _stamp_override_entry_provenance(tval, table_structural_hash_fp(sg.tables[tname]))
+            cols = tval.get("columns")
+            if isinstance(cols, dict):
+                for cname, cval in cols.items():
+                    if not isinstance(cval, dict) or cname not in sg.tables[tname].columns:
+                        continue
+                    if cval.get("needs_reconfirmation"):
+                        continue
+                    _stamp_override_entry_provenance(
+                        cval,
+                        _column_structural_hash_fp(sg.tables[tname], cname),
+                    )
+    for block_key in ("foreign_keys_add", "primary_keys_add"):
+        entries = document.get(block_key)
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict) or entry.get("needs_reconfirmation"):
+                continue
+            _stamp_override_entry_provenance(entry, sg.effective_structural_hash)
+
+
+def _resolve_sidecar_entry(document: dict[str, Any], object_path: str) -> dict[str, Any] | None:
+    """Return the override dict at *object_path* like ``tables.orders`` or ``tables.orders.columns.status``."""
+    parts = object_path.split(".")
+    if len(parts) < 2 or parts[0] != "tables":
+        return None
+    tables = document.get("tables")
+    if not isinstance(tables, dict):
+        return None
+    entry = tables.get(parts[1])
+    if not isinstance(entry, dict):
+        return None
+    if len(parts) == 2:
+        return entry
+    if len(parts) == 4 and parts[2] == "columns":
+        cols = entry.get("columns")
+        if not isinstance(cols, dict):
+            return None
+        col_entry = cols.get(parts[3])
+        return col_entry if isinstance(col_entry, dict) else None
+    return None
+
+
+def _structural_hash_for_override_path(sg: SchemaGraph, object_path: str) -> str | None:
+    """Return the current structural hash for an override object path on *sg*."""
+    parts = object_path.split(".")
+    if len(parts) == 2 and parts[0] == "tables":
+        tbl = sg.tables.get(parts[1])
+        return table_structural_hash_fp(tbl) if tbl is not None else None
+    if len(parts) == 4 and parts[0] == "tables" and parts[2] == "columns":
+        tbl = sg.tables.get(parts[1])
+        if tbl is None or parts[3] not in tbl.columns:
+            return None
+        return _column_structural_hash_fp(tbl, parts[3])
+    return None
+
+
+def reconfirm_override(schema_json_path: str | Path, object_path: str, sg: SchemaGraph) -> bool:
+    """Stamp the current structural hash onto a sidecar override entry so replay can apply it again."""
+    sidecar = load_overrides_sidecar(schema_json_path)
+    if sidecar is None:
+        return False
+    entry = _resolve_sidecar_entry(sidecar, object_path)
+    if entry is None:
+        return False
+    current_hash = _structural_hash_for_override_path(sg, object_path)
+    if not current_hash:
+        return False
+    _stamp_override_entry_provenance(entry, current_hash)
+    save_overrides_sidecar(
+        schema_json_path,
+        sidecar,
+        source_schema_hash=str(sidecar.get("source_schema_hash", "") or sg.effective_structural_hash),
+        metadata_hash=str(sidecar.get("metadata_hash", "") or compute_metadata_hash(sg)),
+    )
+    return True
+
+
 def _fk_block_to_remove_entries(block: list[Any]) -> list[dict[str, Any]]:
     """Convert persisted FK block-list entries into editable ``foreign_keys_remove`` records."""
     out: list[dict[str, Any]] = []
@@ -973,8 +1219,12 @@ def _columns_current_dump(sg: SchemaGraph) -> list[dict[str, Any]]:
     return records
 
 
-def dump_schema_overrides_dict(sg: SchemaGraph) -> dict[str, Any]:
-    """Build the editable overrides JSON document from a built schema graph. The document contains the editable input surface the user is allowed to mutate (``tables``, ``foreign_keys_add``, ``foreign_keys_remove``, ``primary_keys_remove``) and a ``_readonly`` envelope showing the *current* graph state for reference (FKs with ``removable``, PKs with provenance, table/column metadata). Editors should never modify ``_readonly`` — those entries are ignored on apply. Existing user-added FKs are surfaced under ``foreign_keys_add`` so editors can re-export and re-apply without losing them. Internal block lists (used by the system to suppress re-inference of FKs/PKs the user removed) live in the persisted sidecar under ``_internal`` and are never surfaced in the editable JSON."""
+def dump_schema_overrides_dict(
+    sg: SchemaGraph,
+    *,
+    business_knowledge: Sequence[BusinessKnowledgeEntry] | None = None,
+) -> dict[str, Any]:
+    """Build the editable overrides JSON document from a built schema graph. The document contains the editable input surface the user is allowed to mutate (``tables``, ``foreign_keys_add``, ``foreign_keys_remove``, ``primary_keys_remove``, ``business_knowledge``) and a ``_readonly`` envelope showing the *current* graph state for reference (FKs with ``removable``, PKs with provenance, table/column metadata). Editors should never modify ``_readonly`` — those entries are ignored on apply. Existing user- added FKs are surfaced under ``foreign_keys_add`` so editors can re- export and re-apply without losing them. Internal block lists (used by the system to suppress re-inference of FKs/PKs the user removed) live in the persisted sidecar under ``_internal`` and are never surfaced in the editable JSON."""
     sidecar = load_overrides_sidecar(EngineConfig.SCHEMA_JSON_PATH)
     internal = dict((sidecar or {}).get("_internal") or {})
     stashed = getattr(sg, "_override_internal_blocks", None)
@@ -985,6 +1235,7 @@ def dump_schema_overrides_dict(sg: SchemaGraph) -> dict[str, Any]:
     tables_out = {
         tname: tbl_doc for tname in sorted(sg.tables) if (tbl_doc := _table_override_value_dict(sg.tables[tname]))
     }
+    bk_entries = tuple(business_knowledge or ())
     return {
         "version": SCHEMA_OVERRIDES_VERSION,
         "tables": tables_out,
@@ -992,6 +1243,9 @@ def dump_schema_overrides_dict(sg: SchemaGraph) -> dict[str, Any]:
         "foreign_keys_remove": _fk_block_to_remove_entries(list(internal.get("fk_block_inferred") or [])),
         "primary_keys_add": user_added_pks_dump(sg),
         "primary_keys_remove": _pk_block_to_remove_entries(list(internal.get("pk_block_inferred") or [])),
+        "business_knowledge": {
+            "entries": [{"key": e.key, "kind": e.kind, "text": e.text} for e in bk_entries],
+        },
         "_readonly": {
             "foreign_keys_current": _foreign_keys_current_dump(sg),
             "primary_keys_current": _primary_keys_current_dump(sg),
@@ -1319,6 +1573,28 @@ def _dump_overrides_json_schema(path: str | Path) -> Path:
                     },
                 },
             },
+            "business_knowledge": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "entries": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["key", "text"],
+                            "properties": {
+                                "key": {"type": "string"},
+                                "kind": {
+                                    "type": "string",
+                                    "enum": ["glossary", "policy", "metric", "synonym", "caveat"],
+                                },
+                                "text": {"type": "string"},
+                            },
+                        },
+                    },
+                },
+            },
             "_readonly": {
                 "type": "object",
                 "description": "system-supplied snapshot; do not edit",
@@ -1329,22 +1605,21 @@ def _dump_overrides_json_schema(path: str | Path) -> Path:
             },
         },
     }
-    text = json.dumps(schema_doc, indent=2, sort_keys=True)
-    tmp = schema_path.with_suffix(schema_path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, schema_path)
+    write_json_atomic(schema_path, schema_doc, sort_keys=True, indent=2)
     return schema_path
 
 
-def dump_schema_overrides_to_path(sg: SchemaGraph, path: str | Path) -> Path:
+def dump_schema_overrides_to_path(
+    sg: SchemaGraph,
+    path: str | Path,
+    *,
+    business_knowledge: Sequence[BusinessKnowledgeEntry] | None = None,
+) -> Path:
     """Write the overrides editor document to *path*, replacing any existing file atomically."""
     target = Path(path).expanduser().resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
-    payload = dump_schema_overrides_dict(sg)
-    text = json.dumps(payload, indent=2, sort_keys=True)
-    tmp = target.with_suffix(target.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, target)
+    payload = dump_schema_overrides_dict(sg, business_knowledge=business_knowledge)
+    write_json_atomic(target, payload, sort_keys=True, indent=2)
     _dump_overrides_json_schema(target)
     return target
 
@@ -1369,7 +1644,7 @@ def _validate_overrides_structure(d: Any) -> dict[str, Any]:
         raise ValueError(f"unsupported top-level keys in overrides: {sorted(extra)!r}")
     if "version" not in d:
         raise ValueError("overrides JSON missing 'version' field")
-    if d["version"] != SCHEMA_OVERRIDES_VERSION:
+    if not format_versions_match(d["version"], SCHEMA_OVERRIDES_VERSION):
         raise ValueError(f"overrides 'version' is {d['version']!r}; this build expects {SCHEMA_OVERRIDES_VERSION}")
     tables = d.get("tables", {}) or {}
     if not isinstance(tables, dict):
@@ -1479,14 +1754,142 @@ def _validate_overrides_structure(d: Any) -> dict[str, Any]:
         raise ValueError("overrides '_readonly' must be an object (read-only envelope)")
     if "_internal" in d and not isinstance(d["_internal"], dict):
         raise ValueError("overrides '_internal' must be an object (system-managed envelope)")
+    if "business_knowledge" in d:
+        bk = d["business_knowledge"]
+        if not isinstance(bk, dict):
+            raise ValueError("overrides 'business_knowledge' must be an object")
+        bk_extra = set(bk.keys()) - {"entries"}
+        if bk_extra:
+            raise ValueError(f"overrides 'business_knowledge': unsupported keys {sorted(bk_extra)!r}")
+        entries = bk.get("entries", [])
+        if not isinstance(entries, list):
+            raise ValueError("overrides 'business_knowledge.entries' must be a list")
+        allowed_kinds = {member.value for member in BusinessKnowledgeKind}
+        for i, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                raise ValueError(f"business_knowledge.entries[{i}]: must be an object")
+            e_extra = set(entry.keys()) - {"key", "kind", "text"}
+            if e_extra:
+                raise ValueError(f"business_knowledge.entries[{i}]: unsupported keys {sorted(e_extra)!r}")
+            if "key" not in entry or "text" not in entry:
+                raise ValueError(f"business_knowledge.entries[{i}]: missing 'key' or 'text'")
+            if not isinstance(entry["key"], str) or not isinstance(entry["text"], str):
+                raise ValueError(f"business_knowledge.entries[{i}]: 'key' and 'text' must be strings")
+            kind = entry.get("kind", BusinessKnowledgeKind.GLOSSARY.value)
+            if kind is None:
+                kind = BusinessKnowledgeKind.GLOSSARY.value
+            if not isinstance(kind, str) or kind not in allowed_kinds:
+                raise ValueError(f"business_knowledge.entries[{i}].kind: {kind!r} not in {sorted(allowed_kinds)!r}")
     return d
+
+
+def _parse_document_business_knowledge(
+    document: dict[str, Any],
+) -> tuple[BusinessKnowledgeEntry, ...] | None:
+    """Return normalized BK entries when the overrides document carries ``business_knowledge``, else ``None``."""
+    if "business_knowledge" not in document:
+        return None
+    section = document.get("business_knowledge") or {}
+    raw_entries = list(section.get("entries") or []) if isinstance(section, dict) else []
+    out: list[BusinessKnowledgeEntry] = []
+    seen: set[str] = set()
+    for raw in raw_entries:
+        if not isinstance(raw, dict):
+            continue
+        key = str(raw.get("key") or "").strip()
+        text = str(raw.get("text") or "").strip()
+        kind = (
+            str(raw.get("kind") or BusinessKnowledgeKind.GLOSSARY.value).strip() or BusinessKnowledgeKind.GLOSSARY.value
+        )
+        if not key or not text or key in seen:
+            continue
+        try:
+            entry = BusinessKnowledgeEntry.normalize(BusinessKnowledgeEntry(key=key, text=text, kind=kind))
+        except ConfigError:
+            continue
+        seen.add(entry.key)
+        out.append(entry)
+    return tuple(out)
+
+
+def refine_business_knowledge_via_llm(
+    entries: Sequence[BusinessKnowledgeEntry],
+    sg: SchemaGraph,
+) -> tuple[BusinessKnowledgeEntry, ...]:
+    """Refine applied business-knowledge entries; never invent keys outside the applied set."""
+    applied = tuple(entries)
+    if not applied:
+        return ()
+    allowed_keys = {e.key for e in applied}
+    schema_names = list(schema_name_dump_for_business_knowledge(sg))
+    if not EngineConfig.llm_credentials_configured():
+        return filter_schema_anchored_business_knowledge(applied, sg)
+    user_payload = stable_json(
+        {
+            "entries": [{"key": e.key, "kind": e.kind, "text": e.text} for e in applied],
+            "schema_names": schema_names,
+        }
+    )
+    try:
+        raw = LLMProvider.chat(
+            system=BUSINESS_KNOWLEDGE_REFINER_SYSTEM,
+            user=user_payload,
+            task="schema",
+        )
+        parsed = json.loads(raw)
+        items = parsed.get("entries", []) if isinstance(parsed, dict) else []
+    except (ValueError, RuntimeError, OSError, TypeError, json.JSONDecodeError) as exc:
+        debug(f"[schema.refine_business_knowledge] llm refinement failed; using originals: {exc!r}")
+        return filter_schema_anchored_business_knowledge(applied, sg)
+    refined: list[BusinessKnowledgeEntry] = []
+    seen: set[str] = set()
+    allowed_kinds = {member.value for member in BusinessKnowledgeKind}
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "").strip()
+        text = str(item.get("text") or "").strip()
+        kind = (
+            str(item.get("kind") or BusinessKnowledgeKind.GLOSSARY.value).strip()
+            or BusinessKnowledgeKind.GLOSSARY.value
+        )
+        if not key or not text or key not in allowed_keys or key in seen:
+            continue
+        if kind not in allowed_kinds:
+            kind = BusinessKnowledgeKind.GLOSSARY.value
+        try:
+            entry = BusinessKnowledgeEntry.normalize(BusinessKnowledgeEntry(key=key, text=text, kind=kind))
+        except ConfigError:
+            continue
+        seen.add(entry.key)
+        refined.append(entry)
+    if not refined:
+        refined = list(applied)
+    else:
+        for e in applied:
+            if e.key not in seen:
+                refined.append(e)
+                seen.add(e.key)
+    return filter_schema_anchored_business_knowledge(tuple(refined), sg)
+
+
+def apply_document_business_knowledge(
+    document: dict[str, Any],
+    sg: SchemaGraph,
+) -> tuple[tuple[BusinessKnowledgeEntry, ...] | None, int]:
+    """Parse and refine ``business_knowledge`` from an overrides document when present. Returns ``(None, 0)`` when the key is absent. When present, returns refined entries (possibly empty) and the count of entries after refine."""
+    parsed = _parse_document_business_knowledge(document)
+    if parsed is None:
+        return None, 0
+    refined = refine_business_knowledge_via_llm(parsed, sg)
+    return refined, len(refined)
 
 
 def _refine_descriptions_via_llm(changes: list[dict[str, Any]]) -> dict[str, str]:
     """Send a batch of description edits to the LLM and return ``{path: refined_text}``. Each change item includes ``path``, ``kind``, ``text``, and optional ``previous_text`` (the description string on the graph before this apply pass). Falls back to the original text for any path missing from the LLM response or when LLM credentials are absent."""
     if not changes:
         return {}
-    if not llm_credentials_configured():
+    if not EngineConfig.llm_credentials_configured():
         debug("[schema.refine_descriptions] llm not configured; skipping refinement")
         return {str(c["path"]): str(c["text"]) for c in changes}
     user_payload = stable_json({"items": changes})
@@ -1497,7 +1900,7 @@ def _refine_descriptions_via_llm(changes: list[dict[str, Any]]) -> dict[str, str
         '{"items": [{"path": "...", "text": "<refined>"}]} with one entry per input item, in the same order.'
     )
     try:
-        raw = llm_chat(
+        raw = LLMProvider.chat(
             system=DESCRIPTION_REFINER_SYSTEM,
             user=instructions + "\n" + user_payload,
             task="default",
@@ -1631,7 +2034,7 @@ def coerce_pk_fk_columns_to_identifier(sg: SchemaGraph) -> list[tuple[str, str, 
                     f"[schema.coerce_pk_fk_columns_to_identifier] preserving user role for {tbl_name}.{col_name}",
                 )
                 continue
-            if not can_overwrite_role(col.role_owner, RoleOwner.PK_FK_COERCION):
+            if not RoleOwner.can_overwrite(col.role_owner, RoleOwner.PK_FK_COERCION):
                 continue
             prev = col.role or ""
             if prev == ident:
@@ -1719,6 +2122,7 @@ def apply_schema_overrides_to_graph(
     strict: bool = False,
     notes_content: str | None = None,
     manifest: FederationManifest | None = None,
+    previous_schema: SchemaGraph | None = None,
 ) -> OverrideReport:
     """Apply a validated overrides document to *sg* in place and return an ``OverrideReport``. Skips entries that reference unknown tables/columns or that would break PK/FK joins, recording each skip in the report. Description fields that differ from the current value are sent through a single batched LLM refinement pass when LLM credentials are configured (the call falls through cleanly with the raw text otherwise). The internal envelope ``overrides["_internal"]`` (system-managed; never round-tripped into the editable JSON) carries persistent block lists for inferred FKs and PKs that the user removed. ``foreign_keys_remove`` and ``primary_keys_remove`` always remove the requested edge/PK *and* (when the removed item was inferred, not catalog) auto-promote it into the matching internal block list so subsequent rebuilds suppress re-inference."""
     live = sg
@@ -1748,6 +2152,17 @@ def apply_schema_overrides_to_graph(
             )
             continue
         if not isinstance(tval, dict):
+            continue
+        table_path = f"tables.{tname}"
+        if _override_entry_blocked_by_recreation(
+            table_path,
+            tname,
+            tval,
+            current_hash=table_structural_hash_fp(tbl),
+            previous_schema=previous_schema,
+            current_schema=sg,
+            skipped=skipped,
+        ):
             continue
         touched_table = False
         if "description" in tval:
@@ -1780,7 +2195,7 @@ def apply_schema_overrides_to_graph(
                     description_targets[path] = (tname, None, want_owner)
                     touched_table = True
                 elif owner_changed and new_desc != "":
-                    if set_description(tbl, new_desc, want_owner):
+                    if DescriptionOwner.set_on(tbl, new_desc, want_owner):
                         direct_descriptions_refined += 1
                         touched_table = True
         if "role" in tval:
@@ -1812,7 +2227,7 @@ def apply_schema_overrides_to_graph(
                     tval.pop("role", None)
                 else:
                     if tbl.role != r_val:
-                        if can_overwrite_role(tbl.role_owner, r_own):
+                        if RoleOwner.can_overwrite(tbl.role_owner, r_own):
                             tbl.role = r_val
                             tbl.role_owner = r_own
                             touched_table = True
@@ -1824,7 +2239,7 @@ def apply_schema_overrides_to_graph(
                                 ),
                             )
                     elif r_own != (tbl.role_owner if tbl.role_owner is not None else RoleOwner.CATALOG):
-                        if can_overwrite_role(tbl.role_owner, r_own):
+                        if RoleOwner.can_overwrite(tbl.role_owner, r_own):
                             tbl.role_owner = r_own
                             touched_table = True
         if touched_table:
@@ -1846,13 +2261,24 @@ def apply_schema_overrides_to_graph(
                         skipped=skipped,
                     )
                     continue
+                column_path = f"tables.{tname}.columns.{cname}"
+                if _override_entry_blocked_by_recreation(
+                    column_path,
+                    f"{tname}.{cname}",
+                    cval,
+                    current_hash=_column_structural_hash_fp(tbl, cname),
+                    previous_schema=previous_schema,
+                    current_schema=sg,
+                    skipped=skipped,
+                ):
+                    continue
                 col_snapshot = _column_override_snapshot(col)
                 touched_col = False
                 if "sensitivity" in cval:
                     sens_raw = cval["sensitivity"]
                     if _override_json_null_sentinel(sens_raw):
                         cval.pop("sensitivity", None)
-                    elif coerce_sensitivity_classification(sens_raw) is None:
+                    elif SensitivityClassification.coerce(sens_raw) is None:
                         skipped.append(
                             OverrideSkip(
                                 path=f"tables.{tname}.columns.{cname}.sensitivity",
@@ -1860,10 +2286,10 @@ def apply_schema_overrides_to_graph(
                             )
                         )
                     else:
-                        merged = column_sensitivity_from_dict({"sensitivity": sens_raw})
+                        merged = SensitivityClassification.from_dict({"sensitivity": sens_raw})
                         prev_sens = col.sensitivity
                         if merged != prev_sens:
-                            set_sensitivity(col, merged)
+                            SensitivityClassification.apply_to(col, merged)
                             if prev_sens != SensitivityClassification.NONE and merged == SensitivityClassification.NONE:
                                 sensitivity_lowered_tables.add(tname)
                             touched_col = True
@@ -1887,7 +2313,7 @@ def apply_schema_overrides_to_graph(
                             path = f"tables.{tname}.columns.{cname}.description"
                             previous_text = col.description or ""
                             if col.sensitivity != SensitivityClassification.NONE:
-                                if set_description(col, new_desc, want_owner):
+                                if DescriptionOwner.set_on(col, new_desc, want_owner):
                                     direct_descriptions_refined += 1
                                     touched_col = True
                             else:
@@ -1902,7 +2328,7 @@ def apply_schema_overrides_to_graph(
                                 description_targets[path] = (tname, cname, want_owner)
                                 touched_col = True
                         elif owner_changed and new_desc != "":
-                            if set_description(col, new_desc, want_owner):
+                            if DescriptionOwner.set_on(col, new_desc, want_owner):
                                 direct_descriptions_refined += 1
                                 touched_col = True
                 if "role" in cval:
@@ -1935,7 +2361,7 @@ def apply_schema_overrides_to_graph(
                             cval.pop("role", None)
                         else:
                             if col.role != r_val:
-                                if can_overwrite_role(col.role_owner, r_own):
+                                if RoleOwner.can_overwrite(col.role_owner, r_own):
                                     col.role = r_val
                                     col.role_owner = r_own
                                     touched_col = True
@@ -2036,7 +2462,7 @@ def apply_schema_overrides_to_graph(
             desc_meta: TableMetadata | ColumnMetadata = sg.tables[tname]
         else:
             desc_meta = sg.tables[tname].columns[cname]
-        if set_description(desc_meta, cleaned, desc_owner):
+        if DescriptionOwner.set_on(desc_meta, cleaned, desc_owner):
             descriptions_refined += 1
     descriptions_refined += direct_descriptions_refined
 
@@ -2693,7 +3119,7 @@ def apply_schema_overrides_to_graph(
     internal["fk_block_inferred"] = fk_block_list
     internal["pk_block_inferred"] = pk_block_list
 
-    live._override_internal_blocks = {
+    cast(Any, live)._override_internal_blocks = {
         "fk_block_inferred": list(fk_block_list),
         "pk_block_inferred": list(pk_block_list),
         "catalog_fk_revoked": list(internal.get("catalog_fk_revoked") or []),
@@ -2766,7 +3192,7 @@ def load_overrides_sidecar(schema_json_path: str | Path) -> dict[str, Any] | Non
         debug(f"[schema.load_overrides_sidecar] ignoring non-object sidecar {path!s}")
         return None
     sidecar_version = d.get("version")
-    if sidecar_version != SCHEMA_OVERRIDES_VERSION:
+    if not format_versions_match(sidecar_version, SCHEMA_OVERRIDES_VERSION):
         raise ConfigError(
             f"overrides sidecar at {path!r} has version {sidecar_version!r}; "
             f"this build expects {SCHEMA_OVERRIDES_VERSION}. "
@@ -3180,7 +3606,7 @@ def _write_overrides_sidecar_payload(
         "version": SCHEMA_OVERRIDES_VERSION,
         "source_schema_hash": source_schema_hash,
         "metadata_hash": metadata_hash,
-        "applied_at": datetime.now(timezone.utc).isoformat(),
+        "applied_at": datetime.now(UTC).isoformat(),
         "tables": doc.get("tables", {}) or {},
         "foreign_keys_add": doc.get("foreign_keys_add", []) or [],
         "primary_keys_add": doc.get("primary_keys_add", []) or [],
@@ -3190,10 +3616,7 @@ def _write_overrides_sidecar_payload(
             "catalog_fk_revoked": list(internal.get("catalog_fk_revoked", []) or []),
         },
     }
-    text = json.dumps(payload, indent=2, sort_keys=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    write_json_atomic(path, payload, sort_keys=True, indent=2)
 
 
 def save_overrides_sidecar(
@@ -3240,6 +3663,7 @@ def finalize_with_overrides(
     schema_json_path: str | Path,
     *,
     dialect: Any | None = None,
+    previous_schema: SchemaGraph | None = None,
 ) -> bool:
     """Replay the persisted overrides sidecar onto *sg* if one exists. Called at the tail of every ``build_schema_graph_with_diff`` branch so user-applied metadata, user-added FKs, and inference block lists survive a cache hit, a notes-only refresh, a scope-subset filter, a partial rebuild, and a full rebuild alike. Replay is idempotent so it always runs when a sidecar exists; the sidecar's ``source_schema_hash`` and ``metadata_hash`` are then refreshed to the freshly stamped ``effective_structural_hash`` and :func:`compute_metadata_hash` output. Skipped override entries (unknown tables/columns, malformed FKs, etc.) are emitted via :func:`notify` and stashed on ``sg._last_overrides_skipped`` for programmatic inspection. Returns True iff a replay actually executed."""
     emit_construction_phase(SCHEMA_BUILD_PHASE_K)
@@ -3259,6 +3683,9 @@ def finalize_with_overrides(
         sg._last_overrides_skipped = ()
         return False
     debug(f"[schema.finalize_with_overrides] replaying sidecar (curr_hash={sg.effective_structural_hash[:16]!r})")
+    prev_schema = previous_schema
+    if prev_schema is None:
+        prev_schema = load_schema_graph_snapshot(str(schema_json_path))
     document: dict[str, Any] = {
         "version": SCHEMA_OVERRIDES_VERSION,
         "tables": sidecar.get("tables", {}) or {},
@@ -3275,7 +3702,13 @@ def finalize_with_overrides(
     if isinstance(tables_doc, dict):
         for stale_tname in [t for t in list(tables_doc) if t not in sg.tables]:
             tables_doc.pop(stale_tname, None)
-    report = apply_schema_overrides_to_graph(sg, document, dialect=dialect, strict=True)
+    report = apply_schema_overrides_to_graph(
+        sg,
+        document,
+        dialect=dialect,
+        strict=True,
+        previous_schema=prev_schema,
+    )
     sg._last_overrides_skipped = report.skipped
     if report.skipped:
         notify(
@@ -3303,6 +3736,7 @@ def finalize_with_overrides(
         assign_schema_graph_hashes(sg, schema_context_from_graph(sg), sg.notes_sha256)
     document["foreign_keys_add"] = user_added_fks_dump(sg)
     document["primary_keys_add"] = user_added_pks_dump(sg)
+    _stamp_sidecar_provenance(document, sg)
     adir = os.path.dirname(os.path.abspath(str(schema_json_path)))
     with artifact_lock(adir):
         save_overrides_sidecar(
@@ -3371,6 +3805,25 @@ def apply_overrides_and_persist(
     sg._last_overrides_skipped = report.skipped
     document["foreign_keys_add"] = user_added_fks_dump(sg)
     document["primary_keys_add"] = user_added_pks_dump(sg)
+    bk_entries, bk_refined = apply_document_business_knowledge(document, sg)
+    report = OverrideReport(
+        table_edits=report.table_edits,
+        column_edits=report.column_edits,
+        fks_added=report.fks_added,
+        fks_endorsed=report.fks_endorsed,
+        fks_removed=report.fks_removed,
+        pks_added=report.pks_added,
+        pks_endorsed=report.pks_endorsed,
+        pks_blocked=report.pks_blocked,
+        changed_pk_blocks=report.changed_pk_blocks,
+        changed_fk_blocks=report.changed_fk_blocks,
+        coerced_columns=report.coerced_columns,
+        collapsed_inferences=report.collapsed_inferences,
+        descriptions_refined=report.descriptions_refined,
+        business_knowledge_refined=bk_refined,
+        business_knowledge_entries=bk_entries,
+        skipped=report.skipped,
+    )
 
     adir = os.path.dirname(os.path.abspath(str(schema_json_path)))
     with artifact_lock(adir):
@@ -3485,18 +3938,18 @@ def _merge_llm_descriptions_and_roles_for_tables(
         if table is None or tname not in classifications:
             continue
         table_role, description, column_classifications = classifications[tname]
-        if can_overwrite_role(table.role_owner, RoleOwner.LLM):
+        if RoleOwner.can_overwrite(table.role_owner, RoleOwner.LLM):
             table.role = table_role
             table.role_owner = RoleOwner.LLM
-        set_description(table, description, DescriptionOwner.LLM_REFINEMENT)
+        DescriptionOwner.set_on(table, description, DescriptionOwner.LLM_REFINEMENT)
         for col in table.columns.values():
             if col.name not in column_classifications:
                 continue
             role, col_description, _sensitivity = column_classifications[col.name]
-            if can_overwrite_role(col.role_owner, RoleOwner.LLM):
+            if RoleOwner.can_overwrite(col.role_owner, RoleOwner.LLM):
                 col.role = role
                 col.role_owner = RoleOwner.LLM
-            set_description(col, col_description, DescriptionOwner.LLM_REFINEMENT)
+            DescriptionOwner.set_on(col, col_description, DescriptionOwner.LLM_REFINEMENT)
 
 
 def _descriptions_fingerprint(sg: SchemaGraph, table_names: set[str]) -> tuple[tuple[str, str], ...]:
@@ -3907,10 +4360,17 @@ def build_schema_graph_with_diff(
     refresh_existing_descriptions_on_addition: bool = False,
     force_live_schema_reflect: bool = False,
     trust_bundled_baseline: bool | None = None,
+    schema_json_path: str | None = None,
 ) -> tuple[SchemaGraph, SchemaDiff | None]:
     """Load or build the schema graph and report the structural diff if. a partial rebuild ran."""
     sink: Callable[[str], None] = log_sink if log_sink is not None else notify
-    schema_json_path = EngineConfig.SCHEMA_JSON_PATH
+    resolved_path = str(schema_json_path or EngineConfig.SCHEMA_JSON_PATH or "").strip()
+    if not resolved_path or os.path.isdir(resolved_path):
+        raise ConfigError(
+            "schema graph cache path is unset or points at a directory; "
+            "pass schema_json_path or construct the engine with artifacts_dir"
+        )
+    schema_json_path = resolved_path
 
     debug(f"[schema._build_schema_graph] engine_type={dialect.name}")
     emit_construction_phase(SCHEMA_BUILD_PHASE_A)

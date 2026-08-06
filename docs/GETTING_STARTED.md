@@ -60,8 +60,8 @@ There is no separate `excel` engine. CSV and Excel (`.xlsx`) uploads both use th
 
 | Engine | `pip install` | TOML `selected` | TOML section | Upload suffixes |
 | --- | --- | --- | --- | --- |
-| SQLite | `aetherdialect[sqlite]` | `sqlite` | `[sqlite]` | - |
-| DuckDB | `aetherdialect` | `duckdb` | `[duckdb]` | - |
+| SQLite | `pip install aetherdialect` (stdlib driver; no extra) | `sqlite` | `[sqlite]` | - |
+| DuckDB | `aetherdialect[duckdb]` | `duckdb` | `[duckdb]` | - |
 | CSV / Excel | `aetherdialect[csv]` | `csv` | `[csv]` | `.csv` and `.xlsx` |
 | MySQL | `aetherdialect[mysql]` | `mysql` | `[mysql]` | - |
 | MariaDB | `aetherdialect[mariadb]` | `mariadb` | `[mariadb]` | - |
@@ -73,6 +73,10 @@ There is no separate `excel` engine. CSV and Excel (`.xlsx`) uploads both use th
 | BigQuery | `aetherdialect[bigquery]` | `bigquery` | `[bigquery]` | - |
 
 You also need an OpenAI API key (or Azure OpenAI - see [API reference](API_REFERENCE.md#configuration)).
+
+For Azure OpenAI, set `AZURE_OPENAI_DEPLOYMENT_LIGHT` and `AZURE_OPENAI_DEPLOYMENT_HEAVY` (or the matching `[azure_openai.deployments]` TOML keys). Azure calls always use reasoning effort (never `temperature`); profile effort `minimal` is remapped to `none` on `gpt-5.4*` logical models. Provider `prompt_cache_key` values are capped at 64 characters.
+
+Optional logical-model overrides (same names as `EngineConfig` ClassVars): `OPENAI_MODEL`, `OPENAI_MODEL_INTENT`, `OPENAI_MODEL_JOIN`, `OPENAI_MODEL_SCHEMA_BASE`, `OPENAI_MODEL_DDL`, `OPENAI_MODEL_SCHEMA`, `OPENAI_MODEL_SYNTH`, `OPENAI_MODEL_SYNTH_VARIETY`, `OPENAI_MODEL_INTENT_FORMAT`, `OPENAI_MODEL_INTENT_SCHEMA_REPAIR`, `OPENAI_MODEL_UPLOAD_SUMMARY`, `OPENAI_MODEL_UPLOAD_INTERPRET`.
 
 ### Step 1 - Test the database connection
 
@@ -92,7 +96,7 @@ Examples:
 ```python
 create_engine("sqlite:////absolute/path/to/your.db")
 create_engine("duckdb:////absolute/path/to/your.duckdb")
-create_engine("postgresql+psycopg2://user:password@localhost:5432/your_database")
+create_engine("postgresql+psycopg://user:password@localhost:5432/your_database")
 ```
 
 If `SELECT 1` fails, fix credentials or networking before involving the text-to-SQL pipeline.
@@ -155,7 +159,7 @@ Environment variables can override mapped keys when the same name is set in the 
 
 ### Step 3 - Domain notes (optional, recommended)
 
-Plain text beside your script, passed as `EngineContext.notes_file`. Use one or two sentences per important table, join hints, and explicit sensitivity statements. The engine uses these to tag roles and tiers. See [User guide - Notes file](USER_GUIDE.md#notes-file) for the format.
+Plain text beside your script, passed as `EngineContext.notes_file` (or inline `EngineContext.notes` — set at most one). Use one or two sentences per important table, join hints, and explicit sensitivity statements. The engine uses these to tag roles and tiers. See [User guide - Notes file](USER_GUIDE.md#notes-file) for the format.
 
 ### Step 4 - Wire `EngineContext` and construct the engine
 
@@ -248,7 +252,7 @@ Accept/reject behavior and template reuse: [User guide - Asking a question](USER
 | --- | --- | --- |
 | `ConfigError: ... api_key ...` | Missing LLM key | Set `[openai] api_key` or env |
 | `ConfigError: ... engine ...` | Multiple engines configured | Set `[engine] selected` |
-| `ConnectionError` / `DatabasePingFailed` | Bad DB credentials or network | Re-run Step 1 |
+| `DatabaseConnectionError` / `DatabasePingFailed` | Bad DB credentials or network | Re-run Step 1 |
 | Silence after `Profiling [1/N]` | Profiling in progress | Wait; narrow `allow_objects` |
 | `MigrationPendingError` | Catalog drift | Edit `schema_migration_map.json` - [User guide](USER_GUIDE.md#migration) |
 

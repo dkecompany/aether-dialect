@@ -53,7 +53,7 @@ Loads CSVs + canonical DDL into supported engines from `scripts/data/rental_shop
 | Flag | Behaviour |
 | --- | --- |
 | `--all` | Start from all supported engines; subtract any `--exclude-*` flags. |
-| `--postgres`, `--mysql`, … | Include only listed engines (cannot mix with excludes unless `--all` is set). |
+| `--postgresql`, `--mysql`, … | Include only listed engines (cannot mix with excludes unless `--all` is set). |
 | `--exclude-*` | Skip engines when used with `--all`. |
 | `--drop-first` | Drop/recreate target schema or tables before load. |
 | `--csv-dir` | CSV directory (default `scripts/data/rental_shop_csvs/`). |
@@ -79,6 +79,16 @@ With **no arguments**, all ten engines load. Include and exclude flags cannot be
 | `--federation-load {storefront,catalog,logistics,crm,all}` | Apply the matching `federation_*_seed.sql` files, then run partition verify. |
 | `--federation-verify {storefront,catalog,logistics,crm,all}` | Row-count verify only — no reload. |
 | `--drop-first` | **Blast radius:** drop and recreate only the four federation partition namespaces above. Full `rental_shop` schemas/databases on those engines are **not** modified. |
+| `--verbose` | Print per-table row counts during federation verify. |
+
+**Invalid combinations** (script exits with an error before any mode runs):
+
+- `--federation-load` with `--federation-verify`, `--all`, any engine include/exclude, `--ping`, or `--extract-csv`
+- `--federation-verify` with `--all`, any engine include/exclude, `--ping`, or `--extract-csv`
+- `--federation-load` or `--federation-verify` with `--schema`, `--recreate-schema`, or `--allow-public-schema-recreate` (those flags apply to full-engine load only)
+- `--ping`, `--extract-csv`, `--all`, and engine include/exclude flags are mutually exclusive mode selectors (only one group per invocation)
+
+`--drop-first`, `--verbose`, `--env-file`, `--csv-dir`, and `--ddl` may be combined with federation modes.
 
 Credentials come from root `env.env` (`POSTGRES_*`, `MYSQL_*`, `MARIADB_*`).
 
@@ -165,6 +175,7 @@ Rebuild the shipped offline bundle after DDL, notes, overrides, or question-corp
 ```text
 .venv\Scripts\python.exe scripts\sandbox_corpus.py
 .venv\Scripts\python.exe scripts\sandbox_corpus.py --repair
+.venv\Scripts\python.exe scripts\sandbox_corpus.py --repair --force
 ```
 
 ### Two modes
@@ -173,8 +184,11 @@ Rebuild the shipped offline bundle after DDL, notes, overrides, or question-corp
 | --- | --- |
 | *(no flags)* | Full build: assemble staging, build baseline, record fixtures, validate, and pack. |
 | `--repair` | Re-record failing fixture slots when staging fingerprint matches last build. |
+| `--force` | With `--repair` only: re-record every recording slot (not only uncommitted ones). |
 | `--smoke` | End-to-end pipeline with one practice question plus validation/feedback/scenario slots; writes `sandbox_staging.zip` only. |
 | `--record-reuse-pairs` | Record paraphrase pairs in the same warm session to capture reuse traces. |
+
+Invalid combinations are rejected at startup: `--force` without `--repair`; `--repair` with `--smoke` or `--record-reuse-pairs`.
 
 ### What full rebuild does
 

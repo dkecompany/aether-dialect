@@ -6,10 +6,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from aetherdialect._contracts_base import NormalizedExpr, WhereParam, predicate_group_from_list
+from aetherdialect._contracts_base import (
+    NormalizedExpr,
+    PredicateGroup,
+    WhereParam,
+)
 from aetherdialect._contracts_core import RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._dialect import get_dialect_class
+from aetherdialect._dialect import DialectRegistry
 from aetherdialect._federation import parse_federation_manifest, plan_federated_intent
 from aetherdialect._schema_graph import recompute_join_paths_multi
 from aetherdialect._sql_gen import build_deterministic_sql
@@ -79,7 +83,7 @@ def test_single_member_federated_sql_matches_direct_render(engine: str) -> None:
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("left_t.id"))],
         group_by_cols=[],
         order_by_cols=[],
-        where=predicate_group_from_list(
+        where=PredicateGroup.from_list(
             [
                 WhereParam(
                     left_expr=NormalizedExpr.from_column("left_t.id"),
@@ -94,7 +98,7 @@ def test_single_member_federated_sql_matches_direct_render(engine: str) -> None:
     )
     plan = plan_federated_intent(intent, composite, manifest, member_graphs={"a": member_schema})
     assert len(plan.steps) == 1
-    dialect_cls = get_dialect_class(engine)
+    dialect_cls = DialectRegistry.get_class(engine)
     dialect = dialect_cls.__new__(dialect_cls)
     if engine == "databricks":
         dialect.config = SimpleNamespace(CATALOG="test_catalog", SCHEMA="test_schema")

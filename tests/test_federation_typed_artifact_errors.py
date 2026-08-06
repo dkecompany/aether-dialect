@@ -24,7 +24,7 @@ from tests.test_federation_artifacts import _MANIFEST, _member_graphs
 
 def _persisted_tree(tmp: str) -> tuple[object, FederationMappings, dict]:
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
-    mappings = FederationMappings(version=1)
+    mappings = FederationMappings(version="0.2.1")
     members = _member_graphs()
     composite = compose_composite_graph(members, manifest, mappings)
     persist_federation_tree(
@@ -40,7 +40,7 @@ def _persisted_tree(tmp: str) -> tuple[object, FederationMappings, dict]:
 @pytest.mark.fast
 def test_corrupt_artifact_manifest_raises_instead_of_replay_miss() -> None:
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
-    mappings = FederationMappings(version=1)
+    mappings = FederationMappings(version="0.2.1")
     members = _member_graphs()
     with tempfile.TemporaryDirectory() as tmp:
         _persisted_tree(tmp)

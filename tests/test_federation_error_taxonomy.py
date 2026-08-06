@@ -16,7 +16,6 @@ from aetherdialect._contracts_core import (
     TemplateStats,
     UserFeedbackRejectSuspendContext,
     ValueHistory,
-    runtime_intent_to_concrete,
 )
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, SQLShape, TableMetadata
 from aetherdialect._federation import (
@@ -65,7 +64,7 @@ def _template(*, plan_only: bool = False, plan_id: str = "") -> Template:
     )
     return Template(
         id="tmpl_fed",
-        intent_signature=runtime_intent_to_concrete(intent, ""),
+        intent_signature=intent.to_concrete(""),
         intent_key="ik",
         tables_used=["t"],
         sql_param="SELECT 1",
@@ -200,8 +199,8 @@ def test_federated_reject_routes_to_plan_not_member_store() -> None:
         structural_match_templates=[],
     )
     with patch("aetherdialect._pipeline.record_federation_join_feedback") as fed_fb:
-        with patch("aetherdialect._pipeline.record_question_feedback") as member_fb:
-            with patch("aetherdialect._pipeline.save_template_store"):
+        with patch("aetherdialect._templates.TemplateOps.record_question_feedback") as member_fb:
+            with patch("aetherdialect._templates.TemplateOps.save_template_store"):
                 complete_user_feedback_reject(
                     ctx,
                     needs_reason=False,
@@ -308,7 +307,7 @@ def test_sub_intent_post_compose_repair_uses_member_schema() -> None:
         "a",
         {"left_t"},
         {"left_t": "a", "right_t": "b"},
-        FederationMappings(version=2),
+        FederationMappings(version="0.2.1"),
         composite,
         manifest,
         multi_source=False,
@@ -461,7 +460,7 @@ def test_shared_key_expansion_after_decomposition_does_not_widen_sources() -> No
         "a",
         {"left_t", "parent_t"},
         {"left_t": "a", "parent_t": "a", "right_t": "b"},
-        FederationMappings(version=2),
+        FederationMappings(version="0.2.1"),
         composite,
         manifest,
         multi_source=False,
@@ -487,7 +486,7 @@ def test_shared_key_expansion_after_decomposition_does_not_widen_sources() -> No
 def test_partial_failure_interactive_turn_is_structured() -> None:
     """Partial federation failures surface source_id, phase, and succeeded — not error=str(exc)."""
     from aetherdialect._contracts_base import FederationPartialFailureError, FederationPlanTemplate
-    from aetherdialect._main_execution import _handle_federation_partial_failure_interactive
+    from aetherdialect._main_execution import MainExecutionOps
 
     owner = MagicMock()
     port = MagicMock()
@@ -505,7 +504,7 @@ def test_partial_failure_interactive_turn_is_structured() -> None:
         succeeded=(("a", 2, "2026-01-01T00:00:00+00:00"),),
     )
     with patch("aetherdialect._federation.save_federation_plan_template") as save_plan:
-        _handle_federation_partial_failure_interactive(port, owner, exc)
+        MainExecutionOps._handle_federation_partial_failure_interactive(port, owner, exc)
     save_plan.assert_not_called()
     assert port._pending_federation_plan_template is None
     port.note_turn_outcome.assert_called_once()
@@ -522,7 +521,7 @@ def test_persist_pending_plan_template_runs_after_successful_execute() -> None:
     """Deferred plan templates must survive execute without persisting until user accept."""
     from aetherdialect._contracts_base import FederationPlanTemplate
     from aetherdialect._contracts_core import FederatedPlan, FederatedPrepareOutcome, GenerationPath, SourceStep
-    from aetherdialect._main_execution import _run_sql_execution_for_gen_out
+    from aetherdialect._main_execution import MainExecutionOps
 
     sub_intent = RuntimeIntent(
         tables=["t"],
@@ -570,7 +569,7 @@ def test_persist_pending_plan_template_runs_after_successful_execute() -> None:
         patch("aetherdialect._federation.save_federation_plan_template") as save_plan,
     ):
         mock_exec.return_value = MagicMock(rows=[(1,)], bundle=MagicMock())
-        _run_sql_execution_for_gen_out(
+        MainExecutionOps._run_sql_execution_for_gen_out(
             intent=sub_intent,
             exec_schema=_graph("t", source_id="a"),
             exec_dialect=MagicMock(),
@@ -588,7 +587,7 @@ def test_persist_pending_plan_template_runs_after_successful_execute() -> None:
 def test_partial_failure_does_not_persist_member_learning() -> None:
     from aetherdialect._contracts_base import FederationPartialFailureError
     from aetherdialect._contracts_core import FederatedPlan, FederatedPrepareOutcome, GenerationPath, SourceStep
-    from aetherdialect._main_execution import _run_sql_execution_for_gen_out
+    from aetherdialect._main_execution import MainExecutionOps
 
     sub_intent = RuntimeIntent(
         tables=["t"],
@@ -634,11 +633,17 @@ def test_partial_failure_does_not_persist_member_learning() -> None:
             ),
         ),
         patch("aetherdialect._main_execution.persist_federated_member_stores") as persist_members,
-        patch("aetherdialect._main_execution._persist_template_learning_for_pipeline_session", return_value=True),
-        patch("aetherdialect._main_execution.federation_stores_by_source", return_value={"a": MagicMock()}),
+        patch(
+            "aetherdialect._main_execution.MainExecutionOps._persist_template_learning_for_pipeline_session",
+            return_value=True,
+        ),
+        patch(
+            "aetherdialect._main_execution.MainExecutionOps.federation_stores_by_source",
+            return_value={"a": MagicMock()},
+        ),
     ):
         with pytest.raises(FederationPartialFailureError):
-            _run_sql_execution_for_gen_out(
+            MainExecutionOps._run_sql_execution_for_gen_out(
                 intent=sub_intent,
                 exec_schema=_graph("t", source_id="a"),
                 exec_dialect=MagicMock(),
@@ -657,7 +662,7 @@ def test_non_federated_generate_does_not_reexpand_shared_pk() -> None:
     from aetherdialect._contracts_core import SelectCol
     from aetherdialect._intent_process import NormalizedExpr
     from aetherdialect._pipeline import generate_and_validate_sql
-    from aetherdialect._templates import empty_template_store
+    from aetherdialect._templates import TemplateOps
 
     schema = _graph("t", source_id="solo")
     intent = RuntimeIntent(
@@ -668,7 +673,7 @@ def test_non_federated_generate_does_not_reexpand_shared_pk() -> None:
         order_by_cols=[],
         where=None,
     )
-    store = empty_template_store(schema.schema_graph_id)
+    store = TemplateOps.empty_template_store(schema.schema_graph_id)
     with patch("aetherdialect._pipeline.expand_shared_pk_tables_for_refs") as expand_mock:
         expand_mock.side_effect = lambda value, _schema: value
         with patch("aetherdialect._pipeline.build_deterministic_sql", return_value="SELECT id FROM t"):

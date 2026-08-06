@@ -82,7 +82,7 @@ def test_absent_logical_sections_yield_empty_mappings() -> None:
 
 def test_higher_declaration_version_is_refused() -> None:
     bad = dict(_DECLARATION)
-    bad["version"] = FEDERATION_DECLARATION_VERSION + 1
+    bad["version"] = "9.9.9"
     with pytest.raises(FederationDeclarationError, match="unsupported federation declaration version"):
         parse_federation_declaration(bad)
 

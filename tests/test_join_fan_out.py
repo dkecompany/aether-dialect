@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import pytest
 
-from aetherdialect._contracts_base import AggregateJoinFanOutError, OrderByCol
+from aetherdialect._contracts_base import AggregateJoinFanOutError, ClauseWidenedRowsetError, OrderByCol
 from aetherdialect._contracts_core import NormalizedExpr, RuntimeCteStep, RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
-from aetherdialect._pipeline import _resolve_joins_fresh
+from aetherdialect._pipeline import _resolve_joins_fresh, _validate_replay_join_semantics
 from aetherdialect._schema_graph import recompute_join_paths_multi
 from aetherdialect._sql_gen import join_hints_multi
-from aetherdialect._validation_execute import validate_aggregate_join_fan_out, validate_semantics
+from aetherdialect._validation_execute import (
+    validate_aggregate_join_fan_out,
+    validate_execute_join_semantics,
+    validate_semantics,
+)
+from aetherdialect._validation_schema import multiplying_edges_for_table
 
 
 def _parent_child_schema() -> SchemaGraph:
@@ -444,6 +449,123 @@ class TestAggregateFanOut:
         issues = validate_aggregate_join_fan_out(intent, schema, "main query", from_anchor="parent")
         assert any(i.severity == "error" and "parent.amount" in i.message for i in issues)
 
+    def test_grouped_parent_sum_still_refuses_fan_out(self) -> None:
+        schema = _parent_child_schema()
+        intent = RuntimeIntent(
+            tables=["parent", "child"],
+            grain="grouped",
+            select_cols=[SelectCol(expr=NormalizedExpr.from_agg("sum", "parent.amount"))],
+            group_by_cols=[NormalizedExpr.from_column("parent.id")],
+            order_by_cols=[],
+            where=None,
+            chosen_join_path_signature=_join_signature(schema),
+        )
+        issues = validate_aggregate_join_fan_out(intent, schema, "main query", from_anchor="parent")
+        assert any(i.severity == "error" and "parent.amount" in i.message for i in issues)
+
+    def test_composite_fk_joint_key_not_multiplying_when_columns_profiled_non_unique(self) -> None:
+        tenant_cols = {
+            "tenant_id": ColumnMetadata(
+                name="tenant_id",
+                data_type="integer",
+                sensitivity="none",
+                is_unique=False,
+                row_count=100,
+                distinct_count=10,
+            ),
+            "id": ColumnMetadata(
+                name="id",
+                data_type="integer",
+                sensitivity="none",
+                is_primary_key=True,
+                is_unique=False,
+                row_count=100,
+                distinct_count=80,
+            ),
+            "amount": ColumnMetadata(name="amount", data_type="numeric", sensitivity="none"),
+        }
+        detail_cols = {
+            "tenant_id": ColumnMetadata(
+                name="tenant_id",
+                data_type="integer",
+                sensitivity="none",
+                is_foreign_key=True,
+                fk_target=("header", "tenant_id"),
+            ),
+            "header_id": ColumnMetadata(
+                name="header_id",
+                data_type="integer",
+                sensitivity="none",
+                is_foreign_key=True,
+                fk_target=("header", "id"),
+            ),
+            "qty": ColumnMetadata(name="qty", data_type="integer", sensitivity="none"),
+        }
+        fk = FKEdge(
+            src_table="detail",
+            src_cols=["tenant_id", "header_id"],
+            dst_table="header",
+            dst_cols=["tenant_id", "id"],
+        )
+        tables = {
+            "header": TableMetadata(
+                name="header",
+                columns=tenant_cols,
+                primary_key=["tenant_id", "id"],
+                foreign_keys=[],
+            ),
+            "detail": TableMetadata(
+                name="detail",
+                columns=detail_cols,
+                primary_key=["tenant_id", "header_id"],
+                foreign_keys=[fk],
+            ),
+        }
+        schema = SchemaGraph(
+            tables=tables,
+            join_paths_multi=recompute_join_paths_multi(tables),
+            effective_structural_hash="composite_fk_fan_out_test",
+        )
+        sig = ["detail.tenant_id,header_id->header.tenant_id,id"]
+        intent = RuntimeIntent(
+            tables=["detail", "header"],
+            grain="row_level",
+            select_cols=[SelectCol(expr=NormalizedExpr.from_agg("sum", "detail.qty"))],
+            group_by_cols=[],
+            order_by_cols=[],
+            where=None,
+            chosen_join_path_signature=sig,
+        )
+        issues = validate_aggregate_join_fan_out(intent, schema, "main query", from_anchor="detail")
+        assert not any(i.severity == "error" for i in issues)
+
+    def test_execute_guarded_sql_refuses_parent_sum_fan_out(self) -> None:
+        from unittest.mock import MagicMock
+
+        from aetherdialect._contracts_base import AggregateJoinFanOutError
+        from aetherdialect._validation_execute import execute_guarded_sql
+
+        schema = _parent_child_schema()
+        intent = RuntimeIntent(
+            tables=["parent", "child"],
+            grain="row_level",
+            select_cols=[SelectCol(expr=NormalizedExpr.from_agg("sum", "parent.amount"))],
+            group_by_cols=[],
+            order_by_cols=[],
+            where=None,
+            chosen_join_path_signature=_join_signature(schema),
+            resolved_join_tables=["parent", "child"],
+        )
+        dialect = MagicMock()
+        dialect.can_explain.return_value = False
+        with pytest.raises(AggregateJoinFanOutError):
+            execute_guarded_sql(
+                dialect,
+                "SELECT SUM(parent.amount) FROM parent JOIN child ON child.parent_id = parent.id",
+                schema=schema,
+                intent=intent,
+            )
+
     def test_resolve_joins_raises_on_parent_sum_fan_out(self) -> None:
         schema = _parent_child_schema()
         sig = _join_signature(schema)
@@ -475,3 +597,85 @@ class TestAggregateFanOut:
                 schema=schema,
                 join_preset_scope={"main": "J01"},
             )
+
+    def test_composite_join_keys_do_not_assume_per_column_uniqueness(self) -> None:
+        parent_cols = {
+            "a": ColumnMetadata(
+                name="a",
+                data_type="integer",
+                sensitivity="none",
+                is_primary_key=True,
+                is_unique=True,
+                row_count=100,
+                distinct_count=100,
+            ),
+            "b": ColumnMetadata(
+                name="b",
+                data_type="integer",
+                sensitivity="none",
+                is_primary_key=True,
+                is_unique=True,
+                row_count=100,
+                distinct_count=100,
+            ),
+        }
+        child_cols = {
+            "id": ColumnMetadata(name="id", data_type="integer", sensitivity="none", is_primary_key=True),
+            "pa": ColumnMetadata(name="pa", data_type="integer", sensitivity="none"),
+            "pb": ColumnMetadata(name="pb", data_type="integer", sensitivity="none"),
+        }
+        schema = SchemaGraph(
+            tables={
+                "parent": TableMetadata(name="parent", columns=parent_cols, primary_key=["a", "b"], foreign_keys=[]),
+                "child": TableMetadata(name="child", columns=child_cols, primary_key=["id"], foreign_keys=[]),
+            },
+            join_paths_multi={},
+            effective_structural_hash="composite_fan_out_test",
+        )
+        signature = ["child.pa->parent.a", "child.pb->parent.b"]
+        hits = multiplying_edges_for_table(signature, "parent", schema, from_anchor="parent")
+        assert hits
+
+    def test_execute_join_semantics_refuses_parent_sum_fan_out(self) -> None:
+        schema = _parent_child_schema()
+        intent = RuntimeIntent(
+            tables=["parent", "child"],
+            grain="row_level",
+            select_cols=[SelectCol(expr=NormalizedExpr.from_agg("sum", "parent.amount"))],
+            group_by_cols=[],
+            order_by_cols=[],
+            where=None,
+            chosen_join_path_signature=_join_signature(schema),
+        )
+        with pytest.raises(AggregateJoinFanOutError):
+            validate_execute_join_semantics(intent, schema)
+
+    def test_replay_join_semantics_refuses_parent_sum_fan_out(self) -> None:
+        schema = _parent_child_schema()
+        intent = RuntimeIntent(
+            tables=["parent", "child"],
+            grain="row_level",
+            select_cols=[SelectCol(expr=NormalizedExpr.from_agg("sum", "parent.amount"))],
+            group_by_cols=[],
+            order_by_cols=[],
+            where=None,
+            chosen_join_path_signature=_join_signature(schema),
+        )
+        err = _validate_replay_join_semantics(intent, schema)
+        assert isinstance(err, AggregateJoinFanOutError)
+        assert "parent.amount" in err.message_for_caller
+
+    def test_replay_join_semantics_refuses_clause_widened_limit(self) -> None:
+        schema = _parent_child_schema()
+        intent = RuntimeIntent(
+            tables=["parent", "child"],
+            grain="row_level",
+            select_cols=[SelectCol(expr=NormalizedExpr.from_column("parent.id"))],
+            group_by_cols=[],
+            order_by_cols=[],
+            where=None,
+            limit=5,
+            chosen_join_path_signature=_join_signature(schema),
+        )
+        err = _validate_replay_join_semantics(intent, schema)
+        assert isinstance(err, ClauseWidenedRowsetError)

@@ -14,11 +14,12 @@ from aetherdialect._constants import (
     SCHEMA_OVERRIDES_VERSION,
 )
 from aetherdialect._contracts_base import FederationConfigError, FederationDeclarationError, MigrationPendingError
-from aetherdialect._sandbox import data_zip_path
+
+data_zip_path = Sandbox.data_zip_path
 
 
 def _require_bundled_data() -> None:
-    if not data_zip_path().is_file():
+    if not Sandbox.data_zip_path().is_file():
         pytest.skip("needs_corpus: bundled sandbox data.zip absent")
 
 
@@ -197,16 +198,18 @@ def test_offline_sandbox_sql_file_override_beats_context_and_bundle(tmp_path: Pa
 def test_offline_sandbox_and_authoring_sandbox_share_bundle_loader(monkeypatch: pytest.MonkeyPatch) -> None:
     _require_bundled_data()
     from aetherdialect import AetherEngine
-    from aetherdialect._sandbox import _open_data_bundle
+    from aetherdialect._sandbox import Sandbox
 
     calls = 0
+    real_open = Sandbox._open_data_bundle
 
     def counting_open(*args: object, **kwargs: object) -> object:
         nonlocal calls
         calls += 1
-        return _open_data_bundle(*args, **kwargs)
+        return real_open(*args, **kwargs)
 
-    monkeypatch.setattr("aetherdialect._sandbox._open_data_bundle", counting_open)
+    monkeypatch.setattr("aetherdialect._sandbox.Sandbox._open_data_bundle", counting_open)
+    monkeypatch.setattr(Sandbox, "_open_data_bundle", staticmethod(counting_open))
     with AetherEngine.offline_sandbox() as handle:
         assert handle._sandbox is not None
         assert handle._sandbox._extract_path == handle._sandbox._extract_path
@@ -233,11 +236,11 @@ def test_narrow_engine_context_profiles_live_without_baseline_tables() -> None:
 def test_matching_engine_context_keeps_full_baseline_graph() -> None:
     _require_bundled_data()
     from aetherdialect import AetherEngine
-    from aetherdialect._sandbox import _owner_writer_schema_context
+    from aetherdialect._sandbox import Sandbox
 
     with AetherEngine.offline_sandbox() as default_handle:
         default_tables = set(default_handle.engine._schema_graph.tables)
-    bundled_scope = _owner_writer_schema_context(notes_file=None, sql_file=None)
+    bundled_scope = Sandbox._owner_writer_schema_context(notes_file=None, sql_file=None)
     with AetherEngine.offline_sandbox(engine_context=bundled_scope) as handle:
         assert set(handle.engine._schema_graph.tables) == default_tables
 
@@ -377,7 +380,7 @@ def test_custom_federation_declaration_rejects_cross_source_join_on_unowned_tabl
 
 
 @pytest.mark.fast
-def test_sandbox_apply_schema_overrides_rejects_unknown_column(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_sandbox_apply_overrides_rejects_unknown_column(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _require_bundled_data()
     from aetherdialect import AetherEngine
     from aetherdialect._contracts_base import ConfigError
@@ -394,14 +397,14 @@ def test_sandbox_apply_schema_overrides_rejects_unknown_column(tmp_path: Path, m
     (tmp_path / SCHEMA_OVERRIDES_DEFAULT_FILENAME).write_text(json.dumps(overrides), encoding="utf-8")
     with AetherEngine.offline_sandbox() as handle:
         with pytest.raises(ConfigError, match="unknown column"):
-            handle.engine.apply_schema_overrides()
+            handle.engine.apply_overrides()
 
 
 @pytest.mark.fast
 def test_sandbox_apply_migration_map_rejects_invalid_target(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _require_bundled_data()
     from aetherdialect import AetherEngine
-    from aetherdialect._sandbox import _owner_writer_schema_context
+    from aetherdialect._sandbox import Sandbox
 
     monkeypatch.chdir(tmp_path)
     bad_map = {
@@ -415,7 +418,7 @@ def test_sandbox_apply_migration_map_rejects_invalid_target(tmp_path: Path, monk
         with pytest.raises(MigrationPendingError, match="validation failed"):
             AetherEngine.apply_migration_map(
                 str(map_path),
-                engine_context=_owner_writer_schema_context(notes_file=None, sql_file=None),
+                engine_context=Sandbox._owner_writer_schema_context(notes_file=None, sql_file=None),
                 artifacts_dir=handle.artifacts_dir,
                 config_file=handle._sandbox.config_file,
                 execution_engine=handle.engine._execution_engine,
@@ -458,22 +461,25 @@ def test_unrecorded_question_in_recorded_corpus_mode_names_mode(tmp_path: Path) 
     from aetherdialect._llm_provider import (
         MockFixtureMissingError,
         MockProvider,
-        set_sandbox_recorded_corpus_question_count,
+        SandboxRuntimeState,
     )
 
     fixtures = tmp_path / "mock.json"
     fixtures.write_text(json.dumps({"fixtures": []}), encoding="utf-8")
-    set_sandbox_recorded_corpus_question_count(17)
+    runtime = SandboxRuntimeState()
+    token = SandboxRuntimeState.bind_sandbox_runtime(runtime)
+    SandboxRuntimeState.set_sandbox_recorded_corpus_question_count(17)
     try:
         provider = MockProvider(str(fixtures))
         with pytest.raises(MockFixtureMissingError, match="recorded-corpus mode") as exc_info:
             provider.chat_text("sys", "Who invented SQL?", task="default", max_retries=1, timeout=1.0)
         message = str(exc_info.value)
         assert "17" in message
-        assert "sandbox_questions()" in message
+        assert "Sandbox.sandbox_questions()" in message
         assert "malformed" not in message.lower()
     finally:
-        set_sandbox_recorded_corpus_question_count(None)
+        SandboxRuntimeState.set_sandbox_recorded_corpus_question_count(None)
+        SandboxRuntimeState.reset_sandbox_runtime(token)
 
 
 @pytest.mark.fast

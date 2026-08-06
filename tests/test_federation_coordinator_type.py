@@ -86,3 +86,87 @@ def test_unknown_coordinator_column_type_refuses_at_plan_time() -> None:
     )
     with pytest.raises(FederationDeclarationError, match=r"meta"):
         plan_federated_intent(intent, composite, manifest)
+
+
+@pytest.mark.fast
+def test_timestamptz_coordinator_type_maps_to_timestamptz() -> None:
+    manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
+    composite = compose_composite_graph(
+        {
+            "a": _graph(
+                "left_t",
+                source_id="a",
+                extra_columns={
+                    "created_at": ColumnMetadata(name="created_at", data_type="timestamptz", sensitivity="none"),
+                },
+            ),
+            "b": _graph("right_t", source_id="b"),
+        },
+        manifest,
+    )
+    intent = RuntimeIntent(
+        tables=["left_t", "right_t"],
+        grain="many",
+        select_cols=[SelectCol(expr=NormalizedExpr.from_column("left_t.created_at"))],
+        group_by_cols=[],
+        order_by_cols=[],
+        where=None,
+    )
+    plan = plan_federated_intent(intent, composite, manifest)
+    assert plan.ineligible_reason is None
+
+
+@pytest.mark.fast
+def test_tinyint_coordinator_type_refuses_at_plan_time() -> None:
+    manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
+    composite = compose_composite_graph(
+        {
+            "a": _graph(
+                "left_t",
+                source_id="a",
+                extra_columns={
+                    "flags": ColumnMetadata(name="flags", data_type="tinyint", sensitivity="none"),
+                },
+            ),
+            "b": _graph("right_t", source_id="b"),
+        },
+        manifest,
+    )
+    intent = RuntimeIntent(
+        tables=["left_t", "right_t"],
+        grain="many",
+        select_cols=[SelectCol(expr=NormalizedExpr.from_column("left_t.flags"))],
+        group_by_cols=[],
+        order_by_cols=[],
+        where=None,
+    )
+    with pytest.raises(FederationDeclarationError, match=r"flags"):
+        plan_federated_intent(intent, composite, manifest)
+
+
+@pytest.mark.fast
+def test_decimal_precision_loss_refuses_at_plan_time() -> None:
+    manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
+    composite = compose_composite_graph(
+        {
+            "a": _graph(
+                "left_t",
+                source_id="a",
+                extra_columns={
+                    "amount": ColumnMetadata(name="amount", data_type="decimal", sensitivity="none"),
+                },
+            ),
+            "b": _graph("right_t", source_id="b"),
+        },
+        manifest,
+    )
+    intent = RuntimeIntent(
+        tables=["left_t", "right_t"],
+        grain="many",
+        select_cols=[SelectCol(expr=NormalizedExpr.from_column("left_t.amount"))],
+        group_by_cols=[],
+        order_by_cols=[],
+        where=None,
+    )
+    with pytest.raises(FederationDeclarationError, match=r"amount"):
+        plan_federated_intent(intent, composite, manifest)

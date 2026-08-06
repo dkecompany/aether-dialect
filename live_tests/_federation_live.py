@@ -17,7 +17,7 @@ from aetherdialect import AetherEngine, AetherFederation
 from aetherdialect._config import MariaDBRuntimeConfig, MySQLRuntimeConfig, PostgresRuntimeConfig
 from aetherdialect._contracts_base import EngineContext
 from aetherdialect._core_utils import llm_usage_build_scope
-from aetherdialect._dialect import get_dialect
+from aetherdialect._dialect import DialectRegistry
 from aetherdialect._federation import FederationConfigError, parse_federation_declaration, parse_federation_manifest
 from aetherdialect._schema_graph import SchemaGraph, recompute_join_paths_multi
 
@@ -122,7 +122,7 @@ def _reflect_member_graph(engine_type: str, sa_engine: Any, source_id: str) -> S
     else:
         MySQLRuntimeConfig.apply_environment(os.environ)
         runtime_cls = MySQLRuntimeConfig
-    dialect = get_dialect(engine_type, runtime_cls, sqlalchemy_engine=sa_engine)
+    dialect = DialectRegistry.get(engine_type, runtime_cls, sqlalchemy_engine=sa_engine)
     ctx = EngineContext(include="tables", allow_objects=frozenset(tables))
     graph = dialect.reflect_schema_graph(ctx)
     return _stamp_source_id(graph, source_id)

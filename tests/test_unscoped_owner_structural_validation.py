@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from aetherdialect._contracts_base import EngineContext, NormalizedExpr, WhereParam, predicate_group_from_list
+from aetherdialect._contracts_base import (
+    EngineContext,
+    NormalizedExpr,
+    PredicateGroup,
+    WhereParam,
+)
 from aetherdialect._contracts_core import RuntimeCteStep, RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._pipeline import _execution_scope_gate_active, _run_sql_validation_cascade
@@ -156,7 +161,7 @@ class TestUnscopedOwnerNonTerminalCteDenyValidation:
             cte_name="inner_x",
             tables=["t"],
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.id"))],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("t.secret"),

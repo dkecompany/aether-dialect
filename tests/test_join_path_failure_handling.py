@@ -13,7 +13,7 @@ from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMe
 from aetherdialect._core_utils import RephraseHint
 from aetherdialect._intent_process import NormalizedExpr
 from aetherdialect._pipeline import _join_path_failure_outcome, _resolve_joins_fresh, generate_and_validate_sql
-from aetherdialect._templates import lookup_join_feedback_for_question, record_deterministic_join_failure_feedback
+from aetherdialect._templates import TemplateOps
 
 
 def _disconnected_schema() -> SchemaGraph:
@@ -52,7 +52,7 @@ def test_join_path_failure_hint_is_distinct_from_sql_validation_hint() -> None:
 
 
 @patch("aetherdialect._pipeline.print_rephrase_hint")
-@patch("aetherdialect._pipeline.save_template_store")
+@patch("aetherdialect._templates.TemplateOps.save_template_store")
 def test_join_path_failure_outcome_records_feedback_and_user_message(
     _mock_save,
     mock_hint,
@@ -82,7 +82,7 @@ def test_join_path_failure_outcome_records_feedback_and_user_message(
     assert outcome.success is False
     assert outcome.sql_validation_error == exc.user_message
     mock_hint.assert_called_once_with(RephraseHint.JOIN_PATH_UNAVAILABLE)
-    feedback = lookup_join_feedback_for_question(store, "show alpha beta")
+    feedback = TemplateOps.lookup_join_feedback_for_question(store, "show alpha beta")
     assert feedback and exc.user_message in feedback[0]
 
 
@@ -98,7 +98,7 @@ def test_deterministic_join_failure_feedback_is_wrong_tables_bucket() -> None:
     )
     store: dict = {"question_feedback": {}}
     exc = NoJoinPathError("main query", ["alpha", "beta"])
-    record_deterministic_join_failure_feedback(store, "q", exc, intent=intent, schema=schema)
+    TemplateOps.record_deterministic_join_failure_feedback(store, "q", exc, intent=intent, schema=schema)
     rows = store["question_feedback"]["q"]
     assert len(rows) == 1
     assert rows[0]["kind"] == FeedbackKind.INTENT_REJECTED.value
@@ -115,7 +115,7 @@ def test_join_edges_from_signature_raises_when_path_is_disconnected() -> None:
 
 
 @patch("aetherdialect._pipeline.print_rephrase_hint")
-@patch("aetherdialect._pipeline.save_template_store")
+@patch("aetherdialect._templates.TemplateOps.save_template_store")
 @patch("aetherdialect._pipeline.finalize_substitute_sql", return_value="SELECT alpha.id FROM alpha")
 @patch("aetherdialect._pipeline._run_sql_validation_cascade")
 @patch("aetherdialect._pipeline.apply_diagnostic_repairs")

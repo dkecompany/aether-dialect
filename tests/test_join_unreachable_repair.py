@@ -6,13 +6,13 @@ import pytest
 
 from aetherdialect._contracts_base import FailureCategory
 from aetherdialect._contracts_core import NormalizedExpr, RuntimeIntent, SelectCol
-from aetherdialect._contracts_schema import IntentIssue, make_intent_issue
+from aetherdialect._contracts_schema import IntentIssue
 from aetherdialect._intent_process import resolve_repair_instruction
 from aetherdialect._intent_repair import refusal_for_join_unreachable_table_removal
 
 
 def _join_unreachable_issue(*, root: str = "orders", target: str = "products") -> IntentIssue:
-    return make_intent_issue(
+    return IntentIssue.make(
         issue_id=f"join_unreachable_main_query_{root}_{target}",
         category=FailureCategory.WRONG_JOIN,
         severity="error",

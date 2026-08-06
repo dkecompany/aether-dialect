@@ -3,11 +3,28 @@
 from __future__ import annotations
 
 import os
+from unittest.mock import MagicMock
 
 import pandas
+import pytest
 
 import aetherdialect._pipeline
 from aetherdialect._core_utils import pipeline_capture
+from aetherdialect._seed_warmup import SeedWarmupCacheSession
+
+run_seed_warmup_execution = SeedWarmupCacheSession.run_seed_warmup_execution
+
+
+def test_save_result_csv_rejects_missing_output_path(tmp_path, monkeypatch):
+    """save_result_csv must not fall back to process cwd."""
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(ValueError, match="output_path"):
+        aetherdialect._pipeline.save_result_csv(pandas.DataFrame({"col": [1]}))
+
+
+def test_results_csv_output_path_rejects_cwd_fallback():
+    with pytest.raises(ValueError, match="artifacts_dir"):
+        aetherdialect._pipeline.results_csv_output_path()
 
 
 def test_save_result_csv_writes_to_explicit_path_not_cwd(tmp_path, monkeypatch):
@@ -49,3 +66,8 @@ def test_pipeline_capture_does_not_chdir(tmp_path, monkeypatch):
     assert chdir_calls == []
     assert (csv_dir / "results.csv").exists()
     assert not (wrong_dir / "results.csv").exists()
+
+
+def test_warmup_failure_log_requires_lattice_root():
+    with pytest.raises(ValueError, match="warmup_lattice_root"):
+        SeedWarmupCacheSession.run_seed_warmup_execution([], MagicMock(), MagicMock(), 1)

@@ -32,7 +32,6 @@ from aetherdialect._config import (
     DuckDBRuntimeConfig,
     EngineConfig,
     PolicyConfig,
-    llm_credentials_configured,
 )
 from aetherdialect._constants import (
     FEDERATION_DECLARATION_FILENAME,
@@ -51,21 +50,9 @@ from aetherdialect._core_utils import (
     pipeline_capture,
     stable_json,
 )
-from aetherdialect._llm_provider import (
-    mock_fixture_user_key,
-    reset_mock_provider,
-)
-from aetherdialect._main_execution import (
-    _configure_llm_from_environment,
-    compute_engine_storage_dir,
-)
-from aetherdialect._sandbox import (
-    _sandbox_doctor_verbose,
-    assert_sandbox_complete,
-    check_sandbox_faithfulness,
-    question_ok,
-    validate_sandbox_corpus,
-)
+from aetherdialect._llm_provider import MockProvider
+from aetherdialect._main_execution import MainExecutionOps
+from aetherdialect._sandbox import Sandbox
 from aetherdialect._utils import generate_paraphrases_of_seed_question, normalize_question
 from aetherdialect.aetherdialect import AetherEngine
 
@@ -384,7 +371,7 @@ def _check_slot_recording(
     sid = slot_id_for(slot)
     check_profile = profile if profile is not None else slot.preset
     check_tier = tier if tier is not None else slot.tier
-    if question_ok(
+    if Sandbox.question_ok(
         step,
         slot.label,
         slot_id=sid,
@@ -392,7 +379,7 @@ def _check_slot_recording(
         tier=check_tier,
     ):
         return True, ""
-    detail = check_sandbox_faithfulness(
+    detail = Sandbox.check_sandbox_faithfulness(
         step,
         slot.label,
         slot_id=sid,
@@ -545,7 +532,7 @@ def _sandbox_memory_engine_dir(artifacts_dir: str) -> Path:
     saved_schema = DuckDBRuntimeConfig.SCHEMA
     try:
         _reset_sandbox_duckdb_runtime()
-        return Path(compute_engine_storage_dir(artifacts_dir, "duckdb"))
+        return Path(MainExecutionOps.compute_engine_storage_dir(artifacts_dir, "duckdb"))
     finally:
         DuckDBRuntimeConfig.DATABASE_PATH = saved_path
         DuckDBRuntimeConfig.SCHEMA = saved_schema
@@ -644,12 +631,12 @@ def prepare_recording_environment() -> RecordingEnvironment:
     merged_env = dict(os.environ)
     merged_env["AETHERDIALECT_LLM_PROVIDER"] = "openai"
     try:
-        _configure_llm_from_environment(merged_env)
+        MainExecutionOps._configure_llm_from_environment(merged_env)
     except ConfigError as exc:
         raise RuntimeError(
             f"LLM credentials are not configured (check {env_path}). {exc}",
         ) from exc
-    if not llm_credentials_configured():
+    if not EngineConfig.llm_credentials_configured():
         raise RuntimeError(
             f"LLM credentials are not configured after loading {env_path}. "
             "Set OPENAI_API_KEY or the full Azure OpenAI variable set.",
@@ -674,18 +661,20 @@ def prepare_recording_environment() -> RecordingEnvironment:
     orig_template_match = aetherdialect._pipeline.match_question_level_template_reuse
     aetherdialect._sandbox._write_sandbox_toml = openai_toml
     prev_provider = EngineConfig.LLM_PROVIDER
-    reset_mock_provider()
+    MockProvider.reset_mock_provider()
     EngineConfig.LLM_PROVIDER = "openai"
     aetherdialect._pipeline.match_question_level_template_reuse = skip_template_reuse
     aetherdialect._main_execution.match_question_level_template_reuse = skip_template_reuse
     aetherdialect._live_testing.match_question_level_template_reuse = skip_template_reuse
-    orig_persist = aetherdialect._main_execution._persist_template_learning_for_pipeline_session
+    orig_persist = aetherdialect._main_execution.MainExecutionOps._persist_template_learning_for_pipeline_session
 
     def skip_template_learning(_port: object | None) -> bool:
         del _port
         return False
 
-    aetherdialect._main_execution._persist_template_learning_for_pipeline_session = skip_template_learning
+    aetherdialect._main_execution.MainExecutionOps._persist_template_learning_for_pipeline_session = (
+        skip_template_learning
+    )
 
     return RecordingEnvironment(
         orig_write_toml=orig_write_toml,
@@ -707,7 +696,9 @@ def teardown_recording_environment(env: RecordingEnvironment) -> None:
     aetherdialect._pipeline.match_question_level_template_reuse = env.orig_template_match
     aetherdialect._main_execution.match_question_level_template_reuse = env.orig_template_match
     aetherdialect._live_testing.match_question_level_template_reuse = env.orig_template_match
-    aetherdialect._main_execution._persist_template_learning_for_pipeline_session = env.orig_persist_template_learning
+    aetherdialect._main_execution.MainExecutionOps._persist_template_learning_for_pipeline_session = (
+        env.orig_persist_template_learning
+    )
     EngineConfig.LLM_PROVIDER = env.prev_provider
 
 
@@ -763,6 +754,7 @@ SUBSCRIPTION_RETAIL_RESKIN_REPLACEMENTS: tuple[tuple[str, str], ...] = (
 )
 
 CRM_CUSTOMER_DESYNC_IDS: frozenset[int] = frozenset({1, 5, 12, 23, 37})
+CRM_CUSTOMER_ADDRESS_DESYNC_OFFSET: int = 1000
 
 CRM_CUSTOMER_LOYALTY_TIERS: tuple[str, ...] = ("bronze", "silver", "gold", "platinum")
 
@@ -874,6 +866,66 @@ def _crm_customer_desync_first_name(customer_id: int, first_name: str) -> str:
     if customer_id not in CRM_CUSTOMER_DESYNC_IDS:
         return first_name
     return f"{first_name} (crm)"
+
+
+def _crm_customer_desync_address_id(customer_id: int, address_id: int) -> int:
+    if customer_id not in CRM_CUSTOMER_DESYNC_IDS:
+        return address_id
+    return int(address_id) + CRM_CUSTOMER_ADDRESS_DESYNC_OFFSET
+
+
+_SEED_INSERT_RE = re.compile(
+    r"INSERT\s+INTO\s+\"?(\w+)\"?\s*\(([^)]+)\)\s*VALUES\s*\((.+?)\);",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _split_sql_values(values_clause: str) -> list[str]:
+    parts: list[str] = []
+    current: list[str] = []
+    in_string = False
+    index = 0
+    text = values_clause.strip()
+    while index < len(text):
+        char = text[index]
+        if in_string:
+            current.append(char)
+            if char == "'" and (index + 1 >= len(text) or text[index + 1] != "'"):
+                in_string = False
+            elif char == "'" and index + 1 < len(text) and text[index + 1] == "'":
+                current.append(text[index + 1])
+                index += 1
+        elif char == "'":
+            in_string = True
+            current.append(char)
+        elif char == ",":
+            parts.append("".join(current).strip())
+            current = []
+        else:
+            current.append(char)
+        index += 1
+    if current:
+        parts.append("".join(current).strip())
+    return parts
+
+
+def parse_seed_insert_column_values(seed_sql: str, table_name: str, column_name: str) -> tuple[str, ...]:
+    """Return literal values for *column_name* from INSERT rows targeting *table_name*."""
+    table_key = table_name.strip().lower()
+    column_key = column_name.strip().lower()
+    values: list[str] = []
+    for match in _SEED_INSERT_RE.finditer(seed_sql):
+        table = match.group(1).strip().lower()
+        if table != table_key:
+            continue
+        columns = [part.strip().strip('"').lower() for part in match.group(2).split(",")]
+        if column_key not in columns:
+            continue
+        column_index = columns.index(column_key)
+        row_values = _split_sql_values(match.group(3))
+        if column_index < len(row_values):
+            values.append(row_values[column_index].strip().strip("'"))
+    return tuple(values)
 
 
 def _build_logistics_receipt_lines(
@@ -994,6 +1046,7 @@ def _export_crm_customer_lines(
         if last_update is not None and str(last_update).strip():
             last_sql = _format_timestamp_second_precision(last_update)
         loyalty = _loyalty_tier_for_customer(customer_id)
+        address_id = _crm_customer_desync_address_id(customer_id, int(row_map["address_id"]))
         first_sql = first_name.replace("'", "''")
         last_name_sql = str(row_map["last_name"]).replace("'", "''")
         lines.append(
@@ -1001,7 +1054,7 @@ def _export_crm_customer_lines(
             f"address_id, loyalty_tier, create_date, last_update) VALUES "
             f"({customer_id}, {int(row_map['store_id'])}, '{first_sql}', "
             f"'{last_name_sql}', {email_sql}, "
-            f"{int(row_map['address_id'])}, '{loyalty}', {create_sql}, {last_sql});"
+            f"{address_id}, '{loyalty}', {create_sql}, {last_sql});"
         )
     return lines
 
@@ -2333,10 +2386,10 @@ def build_artifacts_baseline() -> None:
         del line
 
     aetherdialect._sandbox._write_sandbox_toml = openai_toml
-    reset_mock_provider()
+    MockProvider.reset_mock_provider()
     merged_env = dict(os.environ)
     merged_env["AETHERDIALECT_LLM_PROVIDER"] = "openai"
-    _configure_llm_from_environment(merged_env)
+    MainExecutionOps._configure_llm_from_environment(merged_env)
     PolicyConfig.REGENERATE_SCHEMA_GRAPH = True
     original_log_sink = aetherdialect.aetherdialect._init_log_sink
     aetherdialect.aetherdialect._init_log_sink = build_log_sink
@@ -2412,7 +2465,7 @@ def build_artifacts_baseline() -> None:
         aetherdialect.aetherdialect._init_log_sink = original_log_sink
         PolicyConfig.REGENERATE_SCHEMA_GRAPH = prev_regen
         aetherdialect._sandbox._write_sandbox_toml = orig_write_toml
-        reset_mock_provider()
+        MockProvider.reset_mock_provider()
         EngineConfig.LLM_PROVIDER = prev_provider
     aetherdialect._sandbox._pin_bundled_schema_literals(STAGING)
     verbose_message(f"Wrote artifacts baseline under {baseline_root}")
@@ -2464,7 +2517,7 @@ def build_federation_artifacts_baseline(staging_dir: Path = STAGING) -> None:
     aetherdialect._sandbox._write_sandbox_toml = openai_toml
     merged_env = dict(os.environ)
     merged_env["AETHERDIALECT_LLM_PROVIDER"] = "openai"
-    _configure_llm_from_environment(merged_env)
+    MainExecutionOps._configure_llm_from_environment(merged_env)
     parsed_manifest, _ = parse_federation_declaration(json.loads(declaration_src.read_text(encoding="utf-8")))
     try:
         with AetherEngine.offline_sandbox(
@@ -2594,7 +2647,7 @@ def sync_gatekeeper_normalization_fixture_questions(corpus: FixtureCorpus) -> in
         if not corrected or corrected == question:
             continue
         body["question"] = corrected
-        new_user = mock_fixture_user_key(stable_json(body))
+        new_user = MockProvider.mock_fixture_user_key(stable_json(body))
         if new_user == user:
             continue
         replacements[fixture_key(row)] = {
@@ -2617,7 +2670,7 @@ def sync_gatekeeper_normalization_fixture_questions(corpus: FixtureCorpus) -> in
 
 def repair_federation_intent_schema_literals(corpus: FixtureCorpus, staging_dir: Path = STAGING) -> int:
     """Backfill federation intent fixture schema_literal_json from the bundled composite graph."""
-    from aetherdialect._llm_provider import stable_schema_literal
+    from aetherdialect._llm_provider import MockProvider
     from aetherdialect._sandbox import create_offline_sandbox
 
     fixtures_path = staging_dir / "fixtures" / "rental_shop_mock.json"
@@ -2640,7 +2693,7 @@ def repair_federation_intent_schema_literals(corpus: FixtureCorpus, staging_dir:
         bundle_dir=str(staging_dir),
         cleanup_artifacts=True,
     ) as handle:
-        schema_literal = stable_schema_literal(handle.engine._schema_graph.schema_literal_json)
+        schema_literal = MockProvider.stable_schema_literal(handle.engine._schema_graph.schema_literal_json)
 
     def _is_federation_intent_fixture(user: str) -> bool:
         lowered = user.lower()
@@ -2661,13 +2714,13 @@ def repair_federation_intent_schema_literals(corpus: FixtureCorpus, staging_dir:
             continue
         embedded = body.get("schema_literal_json")
         if isinstance(embedded, dict):
-            embedded_text = stable_schema_literal(json.dumps(embedded, ensure_ascii=False))
+            embedded_text = MockProvider.stable_schema_literal(json.dumps(embedded, ensure_ascii=False))
         else:
-            embedded_text = stable_schema_literal(str(embedded or "{}"))
+            embedded_text = MockProvider.stable_schema_literal(str(embedded or "{}"))
         if embedded_text == schema_literal:
             continue
         body["schema_literal_json"] = schema_literal
-        new_user = mock_fixture_user_key(stable_json(body))
+        new_user = MockProvider.mock_fixture_user_key(stable_json(body))
         if new_user == user:
             continue
         replacements[fixture_key(row)] = {
@@ -2695,7 +2748,7 @@ def recanonicalize_mock_fixture_user_keys(corpus: FixtureCorpus) -> int:
         user = str(row.get("user", "")).strip()
         if not user:
             continue
-        new_user = mock_fixture_user_key(user)
+        new_user = MockProvider.mock_fixture_user_key(user)
         if new_user == user:
             continue
         key = fixture_key(row)
@@ -2740,7 +2793,7 @@ def normalize_fixture_corpus_schema_domains(corpus: FixtureCorpus) -> int:
         if not isinstance(body, dict) or "schema_domain" not in body:
             continue
         body["schema_domain"] = domain
-        new_user = mock_fixture_user_key(stable_json(body))
+        new_user = MockProvider.mock_fixture_user_key(stable_json(body))
         if new_user == user:
             continue
         key = fixture_key(row)
@@ -2918,10 +2971,9 @@ class WarmRecordingPool:
         apply_overrides: bool = False,
     ) -> tuple[object | None, str]:
         """Run one mock-provider question, flattening handcrafted slot fixtures when needed."""
-        from aetherdialect._llm_provider import reset_mock_provider
 
         self._pin_schema_literals()
-        reset_mock_provider()
+        MockProvider.reset_mock_provider()
 
         effective_fixtures = fixtures_file
         cleanup_fixtures = False
@@ -2963,7 +3015,7 @@ class WarmRecordingPool:
             return None, _short_retry_reason(str(exc), mock=True)
         finally:
             handle.close()
-            reset_mock_provider()
+            MockProvider.reset_mock_provider()
             EngineConfig.LLM_PROVIDER = prev_provider
             EngineConfig.MOCK_FIXTURES_FILE = prev_fixtures
 
@@ -3308,7 +3360,7 @@ def _build_reverse_param_extraction_rows(
             {
                 "task": str(row.get("task", "")),
                 "system": str(row.get("system", "")),
-                "user": llm_mod.mock_fixture_user_key(swapped_user),
+                "user": llm_mod.MockProvider.mock_fixture_user_key(swapped_user),
                 "output_text": swapped_output,
             }
         )
@@ -3369,23 +3421,23 @@ class RecordingSession:
         self.paraphrase_catalog_rows: list[dict[str, object]] = []
         self.paraphrase_seeds_collected: list[tuple[RecordingSlot, object]] = []
         self._llm_mod = aetherdialect._llm_provider
-        self._orig_chat = aetherdialect._llm_provider.llm_chat
-        self._orig_json = aetherdialect._llm_provider.llm_json
+        self._orig_chat = aetherdialect._llm_provider.LLMProvider.chat
+        self._orig_json = aetherdialect._llm_provider.LLMProvider.json
         self._set_llm_chat(self._recording_chat)
         self._set_llm_json(self._recording_json)
 
     def _set_llm_chat(self, hook: Callable[..., str]) -> None:
-        self._llm_mod.llm_chat = hook
+        self._llm_mod.LLMProvider.chat = hook
         for mod_name in self.env.llm_patch_modules:
-            mod = __import__(mod_name, fromlist=["llm_chat"])
-            mod.llm_chat = hook
+            mod = __import__(mod_name, fromlist=["LLMProvider"])
+            mod.LLMProvider.chat = hook
 
     def _set_llm_json(self, hook: Callable[..., dict[str, Any]]) -> None:
-        self._llm_mod.llm_json = hook
+        self._llm_mod.LLMProvider.json = hook
         for mod_name in self.env.llm_patch_modules:
-            mod = __import__(mod_name, fromlist=["llm_json"])
-            if hasattr(mod, "llm_json"):
-                mod.llm_json = hook
+            mod = __import__(mod_name, fromlist=["LLMProvider"])
+            if hasattr(mod, "LLMProvider"):
+                mod.LLMProvider.json = hook
 
     @contextmanager
     def _patched_handcrafted_entries(self, question: str) -> Any:
@@ -3418,7 +3470,7 @@ class RecordingSession:
                 call_counts[key] = next_attempt
                 result = json.dumps(row.get("response", {}), ensure_ascii=False)
                 user_for_llm = self._llm_mod._llm_user_text_without_sensitivity_classification(user)
-                user_key = self._llm_mod.mock_fixture_user_key(user_for_llm)
+                user_key = self._llm_mod.MockProvider.mock_fixture_user_key(user_for_llm)
                 self.corpus.record(task=task, system=system, user_key=user_key, output_text=result)
                 return result
             return self._recording_chat(
@@ -3449,7 +3501,7 @@ class RecordingSession:
             timeout = self._llm_mod._DEFAULT_LLM_CHAT_TIMEOUT
         result = self._orig_chat(system, user, max_retries=max_retries, timeout=timeout, task=task)
         user_for_llm = self._llm_mod._llm_user_text_without_sensitivity_classification(user)
-        user_key = self._llm_mod.mock_fixture_user_key(user_for_llm)
+        user_key = self._llm_mod.MockProvider.mock_fixture_user_key(user_for_llm)
         self.corpus.record(task=task, system=system, user_key=user_key, output_text=result)
         return result
 
@@ -3465,7 +3517,7 @@ class RecordingSession:
         del kwargs
         result = self._orig_json(system, user, retries=retries, task=task)
         user_for_llm = self._llm_mod._llm_user_text_without_sensitivity_classification(user)
-        user_key = self._llm_mod.mock_fixture_user_key(user_for_llm)
+        user_key = self._llm_mod.MockProvider.mock_fixture_user_key(user_for_llm)
         output_text = json.dumps(result, ensure_ascii=False)
         self.corpus.record(task=task, system=system, user_key=user_key, output_text=output_text)
         return result
@@ -3562,7 +3614,7 @@ class RecordingSession:
         saved_pipeline_match = aetherdialect._pipeline.match_question_level_template_reuse
         saved_main_match = aetherdialect._main_execution.match_question_level_template_reuse
         saved_live_match = aetherdialect._live_testing.match_question_level_template_reuse
-        saved_persist = aetherdialect._main_execution._persist_template_learning_for_pipeline_session
+        saved_persist = aetherdialect._main_execution.MainExecutionOps._persist_template_learning_for_pipeline_session
         self._set_llm_chat(self._orig_chat)
         self._set_llm_json(self._orig_json)
         aetherdialect._sandbox._write_sandbox_toml = self.env.orig_write_toml
@@ -3571,18 +3623,22 @@ class RecordingSession:
         aetherdialect._pipeline.match_question_level_template_reuse = self.env.skip_template_reuse
         aetherdialect._main_execution.match_question_level_template_reuse = self.env.skip_template_reuse
         aetherdialect._live_testing.match_question_level_template_reuse = self.env.skip_template_reuse
-        aetherdialect._main_execution._persist_template_learning_for_pipeline_session = self.env.skip_template_learning
-        reset_mock_provider()
+        aetherdialect._main_execution.MainExecutionOps._persist_template_learning_for_pipeline_session = (
+            self.env.skip_template_learning
+        )
+        MockProvider.reset_mock_provider()
         try:
             yield
         finally:
-            reset_mock_provider()
+            MockProvider.reset_mock_provider()
             EngineConfig.LLM_PROVIDER = prev_provider
             EngineConfig.MOCK_FIXTURES_FILE = prev_fixtures
             aetherdialect._pipeline.match_question_level_template_reuse = saved_pipeline_match
             aetherdialect._main_execution.match_question_level_template_reuse = saved_main_match
             aetherdialect._live_testing.match_question_level_template_reuse = saved_live_match
-            aetherdialect._main_execution._persist_template_learning_for_pipeline_session = saved_persist
+            aetherdialect._main_execution.MainExecutionOps._persist_template_learning_for_pipeline_session = (
+                saved_persist
+            )
             aetherdialect._sandbox._write_sandbox_toml = saved_toml
             self._set_llm_chat(self._recording_chat)
             self._set_llm_json(self._recording_json)
@@ -3635,7 +3691,7 @@ class RecordingSession:
             return False, _short_retry_reason(str(exc), mock=True)
         finally:
             handle.close()
-            reset_mock_provider()
+            MockProvider.reset_mock_provider()
             EngineConfig.LLM_PROVIDER = prev_provider
             EngineConfig.MOCK_FIXTURES_FILE = prev_fixtures
             aetherdialect._sandbox._unlink_artifact_lock_files(artifacts_dir)
@@ -3931,7 +3987,7 @@ class RecordingSession:
 
     def record_migration_demo_fixtures(self) -> tuple[bool, str]:
         from aetherdialect._contracts_base import MigrationPendingError
-        from aetherdialect._dialect_sqlglot_engines import create_duckdb_sqlalchemy_engine
+        from aetherdialect._dialect_sqlglot_engines import DuckDBDialect
         from aetherdialect._sandbox import (
             _load_memory_connection,
             _owner_writer_schema_context,
@@ -3953,7 +4009,7 @@ class RecordingSession:
             artifacts_dir = str(work / "artifacts")
             shutil.copytree(artifacts_src, artifacts_dir)
             connection = _load_memory_connection(str(post_sql))
-            execution_engine = create_duckdb_sqlalchemy_engine(connection)
+            execution_engine = DuckDBDialect.create_duckdb_sqlalchemy_engine(connection)
             notes_file = STAGING / "rental_shop_notes.txt"
             notes_arg = str(notes_file) if notes_file.is_file() else None
             sql_file = STAGING / "rental_shop.sql"
@@ -4073,8 +4129,8 @@ class RecordingSession:
         return not self.failed_slots and not reuse_pair_failures
 
     def close(self) -> None:
-        self._llm_mod.llm_chat = self._orig_chat
-        self._llm_mod.llm_json = self._orig_json
+        self._llm_mod.LLMProvider.chat = self._orig_chat
+        self._llm_mod.LLMProvider.json = self._orig_json
 
 
 def pack_bundled_aetherspace_snapshots(pool: WarmRecordingPool) -> None:
@@ -4506,7 +4562,7 @@ def validate_staging_dir(*, staging_dir: Path | None = None, smoke: bool = False
     prev = os.environ.get("AETHERDIALECT_SANDBOX_DATA_ZIP")
     os.environ["AETHERDIALECT_SANDBOX_DATA_ZIP"] = str(target)
     try:
-        return validate_sandbox_corpus(AetherEngine, smoke=smoke)
+        return Sandbox.validate_sandbox_corpus(AetherEngine, smoke=smoke)
     finally:
         if prev is None:
             os.environ.pop("AETHERDIALECT_SANDBOX_DATA_ZIP", None)
@@ -4523,7 +4579,7 @@ def validate_staging_zip(*, data_zip: Path | None = None) -> list[dict[str, str]
     prev = os.environ.get("AETHERDIALECT_SANDBOX_DATA_ZIP")
     os.environ["AETHERDIALECT_SANDBOX_DATA_ZIP"] = str(target)
     try:
-        return validate_sandbox_corpus(AetherEngine)
+        return Sandbox.validate_sandbox_corpus(AetherEngine)
     finally:
         if prev is None:
             os.environ.pop("AETHERDIALECT_SANDBOX_DATA_ZIP", None)
@@ -4672,7 +4728,7 @@ def pack_and_promote(*, smoke: bool = False) -> None:
     if smoke:
         issues: list[str] = []
     else:
-        issues = _sandbox_doctor_verbose()
+        issues = Sandbox._sandbox_doctor_verbose()
     if issues:
         raise SystemExit(f"sandbox doctor failed after promote: {issues}")
     if smoke:
@@ -4687,7 +4743,7 @@ def pack_and_promote(*, smoke: bool = False) -> None:
     prev_bundle = os.environ.get("AETHERDIALECT_SANDBOX_DATA_ZIP")
     os.environ["AETHERDIALECT_SANDBOX_DATA_ZIP"] = str(OUT_ZIP)
     try:
-        assert_sandbox_complete(AetherEngine)
+        Sandbox.assert_sandbox_complete(AetherEngine)
     finally:
         if prev_bundle is None:
             os.environ.pop("AETHERDIALECT_SANDBOX_DATA_ZIP", None)
@@ -4760,6 +4816,10 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    if args.force and not args.repair:
+        parser.error("--force only applies with --repair")
+    if args.repair and (args.smoke or args.record_reuse_pairs):
+        parser.error("--repair cannot be combined with --smoke or --record-reuse-pairs")
     if args.repair:
         if args.force:
             corpus_message("[repair] force re-recording all committed slots...")

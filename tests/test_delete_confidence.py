@@ -34,7 +34,7 @@ from aetherdialect._federation import (
     save_federation_plan_template,
 )
 from aetherdialect._pipeline import credit_federation_accept, emit_explain_soft_diagnostics
-from aetherdialect._templates import lookup_join_feedback_for_question
+from aetherdialect._templates import TemplateOps
 
 
 def test_lookup_join_feedback_filters_by_member() -> None:
@@ -68,17 +68,25 @@ def test_lookup_join_feedback_filters_by_member() -> None:
             ],
         }
     }
-    owner_fb = lookup_join_feedback_for_question(store, "q", member_source_id="owner")
+    owner_fb = TemplateOps.lookup_join_feedback_for_question(store, "q", member_source_id="owner")
     assert owner_fb == ["wrong join on owner"]
-    consumer_fb = lookup_join_feedback_for_question(store, "q", member_source_id="consumer")
+    consumer_fb = TemplateOps.lookup_join_feedback_for_question(store, "q", member_source_id="consumer")
     assert consumer_fb == ["wrong join on consumer"]
 
 
 def test_emit_explain_soft_diagnostics_notifies() -> None:
+    from aetherdialect._contracts_base import SqlDiagnostic, SqlDiagnosticCode
+
     diags: list = []
     set_diagnostic_collector(diags)
-    emit_explain_soft_diagnostics(2)
-    assert any("soft diagnostic" in d.message for d in diags)
+    emit_explain_soft_diagnostics(
+        (
+            SqlDiagnostic(code=SqlDiagnosticCode.EXPLAIN_SEQ_SCAN_INDEXED, message="seq soft"),
+            SqlDiagnostic(code=SqlDiagnosticCode.EXPLAIN_ZERO_ESTIMATE, message="zero soft"),
+        )
+    )
+    assert len(diags) == 2
+    assert any("seq soft" in d.message for d in diags)
 
 
 def test_phase_timer_sets_duration() -> None:
@@ -157,7 +165,7 @@ def test_emit_llm_usage_summary_diagnostics() -> None:
     assert any("LLM question/interpret" in d.message for d in diags)
 
 
-@patch("aetherdialect._pipeline.save_template_store")
+@patch("aetherdialect._templates.TemplateOps.save_template_store")
 @patch("aetherdialect._pipeline.credit_federation_plan_accept")
 def test_credit_federation_accept_credits_member_and_plan(
     mock_plan_credit: pytest.Mock,

@@ -8,8 +8,8 @@ from unittest.mock import MagicMock, patch
 from aetherdialect._constants import PERMISSION_DENIED_USER_MESSAGE
 from aetherdialect._contracts_base import AccessError
 from aetherdialect._main_execution import (
+    MainExecutionOps,
     PipelineSession,
-    _run_sql_phase_after_intent_confirm,
 )
 
 
@@ -40,7 +40,7 @@ class TestPermissionDeniedResponse:
         assert step.intent_summary is None
         assert step.status == "permission_denied"
 
-    def test_execute_access_error_notes_permission_denied_without_sql(self) -> None:
+    def test_execute_access_error_notes_validation_failed_without_sql(self) -> None:
         port = MagicMock()
         dialect = MagicMock()
         dialect.finalize_render.return_value = "SELECT 1"
@@ -60,7 +60,7 @@ class TestPermissionDeniedResponse:
             return_value=gen_out,
         ):
             with patch("aetherdialect._main_execution.note_interactive_turn") as note:
-                out = _run_sql_phase_after_intent_confirm(
+                out = MainExecutionOps._run_sql_phase_after_intent_confirm(
                     q_norm="q",
                     intent=intent,
                     schema=MagicMock(),
@@ -82,7 +82,7 @@ class TestPermissionDeniedResponse:
                 )
         assert out is None
         note.assert_called_once()
-        assert note.call_args.kwargs["outcome"] == "permission_denied"
+        assert note.call_args.kwargs["outcome"] == "validation_failed"
         assert note.call_args.kwargs["sql"] is None
         assert note.call_args.kwargs["intent"] is None
 

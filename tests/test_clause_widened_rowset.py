@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from aetherdialect._contracts_base import NormalizedExpr, OrderByCol
+from aetherdialect._contracts_base import ClauseWidenedRowsetError, NormalizedExpr, OrderByCol
 from aetherdialect._contracts_core import RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import SchemaGraph, WindowRegistryStep, WindowSpec
 from aetherdialect._validation_execute import validate_window_join_fan_out
@@ -130,6 +130,39 @@ def test_grouped_parent_query_exempt_from_clause_widened_checks() -> None:
     )
     issues = validate_clause_widened_rowset(intent, schema, "main query", from_anchor="parent")
     assert not any(i.issue_id.startswith("clause_widened_rowset_") for i in issues)
+
+
+def test_grouped_count_star_still_warns_on_multiplied_join() -> None:
+    schema = _parent_child_schema()
+    intent = _parent_child_intent(
+        group_by_cols=[NormalizedExpr.from_column("parent.id")],
+        select_cols=[
+            SelectCol(expr=NormalizedExpr.from_column("parent.id")),
+            SelectCol(expr=NormalizedExpr.from_agg("count", "*")),
+        ],
+    )
+    issues = validate_clause_widened_rowset(intent, schema, "main query", from_anchor="parent")
+    assert any(i.severity == "warning" and i.issue_id.startswith("clause_widened_rowset_count_star_") for i in issues)
+
+
+def test_grouped_parent_sum_still_refuses_clause_widened_limit() -> None:
+    schema = _parent_child_schema()
+    intent = _parent_child_intent(
+        limit=10,
+        group_by_cols=[NormalizedExpr.from_column("parent.id")],
+        select_cols=[SelectCol(expr=NormalizedExpr.from_agg("sum", "parent.amount"))],
+    )
+    issues = validate_clause_widened_rowset(intent, schema, "main query", from_anchor="parent")
+    assert not any(i.issue_id.startswith("clause_widened_rowset_limit_") for i in issues)
+
+
+def test_replay_refuses_clause_widened_limit() -> None:
+    from aetherdialect._pipeline import _validate_replay_join_semantics
+
+    schema = _parent_child_schema()
+    intent = _parent_child_intent(limit=10)
+    err = _validate_replay_join_semantics(intent, schema)
+    assert isinstance(err, ClauseWidenedRowsetError)
 
 
 def test_many_to_one_path_has_no_clause_widened_issues() -> None:

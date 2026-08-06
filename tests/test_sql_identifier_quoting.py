@@ -4,15 +4,19 @@ from __future__ import annotations
 
 import pytest
 
-from aetherdialect._constants import SELF_JOIN_CTE_NAME_PREFIX, anti_join_presence_column
+from aetherdialect._constants import SELF_JOIN_CTE_NAME_PREFIX
 from aetherdialect._contracts_base import JoinInjectionFailedError, SchemaInvariantError
 from aetherdialect._contracts_core import RuntimeCteStep, RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._dialect import get_dialect
-from aetherdialect._federation import _apply_coordinator_probe_joins, _quote_ident
+from aetherdialect._dialect import DialectRegistry
+from aetherdialect._federation import Dialect, _apply_coordinator_probe_joins
 from aetherdialect._intent_process import NormalizedExpr
 from aetherdialect._intent_resolve import encode_inline_self_join_as_cte, normalize_cte_names
-from aetherdialect._sql_gen import _join_edges_from_signature, inject_join_into_deterministic_sql
+from aetherdialect._sql_gen import (
+    _join_edges_from_signature,
+    anti_join_presence_column,
+    inject_join_into_deterministic_sql,
+)
 from tests.test_join_kind_preservation import catalog_edge_kinds_for_signatures
 
 
@@ -49,7 +53,7 @@ def _reserved_order_schema() -> SchemaGraph:
 def test_reserved_word_table_in_anti_join_predicate_is_quoted() -> None:
     det = "SELECT line.id\nFROM line"
     sig = [["line.order_id->order.id"]]
-    dialect = get_dialect("duckdb")
+    dialect = DialectRegistry.get("duckdb")
     out = inject_join_into_deterministic_sql(
         det,
         sig,
@@ -65,9 +69,9 @@ def test_reserved_word_table_in_anti_join_predicate_is_quoted() -> None:
 
 
 def test_federation_quote_ident_quotes_sql_reserved_words() -> None:
-    assert _quote_ident("order") == '"order"'
-    assert _quote_ident("group") == '"group"'
-    assert _quote_ident("plain_table") == '"plain_table"'
+    assert Dialect.sqlglot_quote_identifier("order") == '"order"'
+    assert Dialect.sqlglot_quote_identifier("group") == '"group"'
+    assert Dialect.sqlglot_quote_identifier("plain_table") == '"plain_table"'
 
 
 def test_coordinator_probe_join_quotes_reserved_join_keys() -> None:

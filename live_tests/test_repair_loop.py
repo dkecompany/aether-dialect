@@ -7,18 +7,14 @@ from unittest.mock import patch
 
 from aetherdialect._contracts_base import (
     NormalizedExpr,
+    PredicateGroup,
     WhereParam,
-    predicate_group_from_list,
-    where_leaves,
 )
 from aetherdialect._contracts_core import (
     RuntimeIntent,
     SelectCol,
 )
-from aetherdialect._live_testing import (
-    deterministic_generate_validate_execute,
-    run_seeded_schema_semantic_repair,
-)
+from aetherdialect._live_testing import deterministic_generate_validate_execute, run_seeded_schema_semantic_repair
 from aetherdialect._templates import TemplateStoreView
 
 
@@ -98,7 +94,7 @@ def test_seeded_repair_realigns_filter_on_unrelated_table(schema) -> None:
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("customer.first_name"))],
         group_by_cols=[],
         order_by_cols=[],
-        where=predicate_group_from_list([bad_filter]),
+        where=PredicateGroup.from_list([bad_filter]),
         having=None,
         natural_language="first names of customers at a store last updated on 2023-02-15",
     )
@@ -110,7 +106,7 @@ def test_seeded_repair_realigns_filter_on_unrelated_table(schema) -> None:
     assert repaired is not None
     filter_tables = {
         fp.left_expr.primary_column.split(".", 1)[0]
-        for fp in (where_leaves(repaired.where) or [])
+        for fp in (PredicateGroup.where_leaves(repaired.where) or [])
         if fp.left_expr and "." in fp.left_expr.primary_column
     }
     if filter_tables:

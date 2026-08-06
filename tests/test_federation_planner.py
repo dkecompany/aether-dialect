@@ -9,10 +9,10 @@ from aetherdialect._contracts_base import (
     FederationContext,
     FederationMappings,
     NormalizedExpr,
+    PredicateGroup,
     SensitivityClassification,
     SpaceContext,
     WhereParam,
-    predicate_group_from_list,
 )
 from aetherdialect._contracts_core import FederatedPlan, RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
@@ -28,6 +28,7 @@ from aetherdialect._federation import (
     resolve_federated_combine,
 )
 from aetherdialect._schema_graph import recompute_join_paths_multi
+from tests.federation_helpers import union_member_graph_pair
 
 
 def _graph(table: str, source_id: str) -> SchemaGraph:
@@ -214,7 +215,7 @@ def test_horror_style_scalar_projects_join_keys_and_aggregate_columns() -> None:
         ],
         group_by_cols=[],
         order_by_cols=[],
-        where=predicate_group_from_list([horror_filter]),
+        where=PredicateGroup.from_list([horror_filter]),
     )
     plan = plan_federated_intent(intent, composite, manifest)
     assert len(plan.steps) == 2
@@ -334,7 +335,7 @@ def test_sub_intent_filters_isolated_from_parent() -> None:
         select_cols=[],
         group_by_cols=[],
         order_by_cols=[],
-        where=predicate_group_from_list([parent_filter]),
+        where=PredicateGroup.from_list([parent_filter]),
     )
     plan = plan_federated_intent(intent, composite, manifest)
     assert len(plan.steps) == 2
@@ -369,7 +370,7 @@ def test_union_plan_keeps_join_combine_when_both_present() -> None:
     )
     mappings = parse_federation_mappings(
         {
-            "version": 2,
+            "version": "0.2.1",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -456,7 +457,7 @@ def test_union_only_glue_renders_union_all() -> None:
     )
     mappings = parse_federation_mappings(
         {
-            "version": 1,
+            "version": "0.2.1",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -509,7 +510,7 @@ def test_residual_spec_carries_ir_objects() -> None:
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("t_a.id"))],
         group_by_cols=[],
         order_by_cols=[],
-        where=predicate_group_from_list([cross_filter]),
+        where=PredicateGroup.from_list([cross_filter]),
         limit=5,
     )
     plan = plan_federated_intent(intent, composite, manifest)
@@ -787,7 +788,7 @@ _UNION_MANIFEST = {
 def _union_mappings() -> FederationMappings:
     return parse_federation_mappings(
         {
-            "version": 2,
+            "version": "0.2.1",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -806,11 +807,7 @@ def _union_mappings() -> FederationMappings:
 def _union_composite() -> SchemaGraph:
     manifest = parse_federation_manifest(_UNION_MANIFEST, include_derived_roster=True)
     mappings = _union_mappings()
-    return compose_composite_graph(
-        {"a": _graph("payment_a", "a"), "b": _graph("payment_b", "b")},
-        manifest,
-        mappings,
-    )
+    return compose_composite_graph(union_member_graph_pair("payment_a", "payment_b"), manifest, mappings)
 
 
 def test_scalar_aggregate_over_union_plans_member_steps_and_residual() -> None:
@@ -865,7 +862,7 @@ def test_chosen_join_path_signature_crossing_sources_plans_combine() -> None:
 def test_federation_context_deny_on_collapsed_member_table_raises() -> None:
     manifest = parse_federation_manifest(_UNION_MANIFEST, include_derived_roster=True)
     mappings = _union_mappings()
-    members = {"a": _graph("payment_a", "a"), "b": _graph("payment_b", "b")}
+    members = union_member_graph_pair("payment_a", "payment_b")
     ctx = FederationContext(deny_objects=frozenset({"payment_a"}))
     with pytest.raises(ConfigError, match="collapsed member table 'payment_a'"):
         compose_composite_graph(members, manifest, mappings, master_context=ctx)
@@ -889,7 +886,7 @@ def test_cross_source_filter_routes_to_residual_not_gate() -> None:
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("t_a.id"))],
         group_by_cols=[],
         order_by_cols=[],
-        where=predicate_group_from_list([cross_filter]),
+        where=PredicateGroup.from_list([cross_filter]),
     )
     plan = plan_federated_intent(intent, composite, manifest)
     assert plan.ineligible_reason is None
@@ -922,7 +919,7 @@ def test_union_and_join_glue_renders_both() -> None:
     )
     mappings = parse_federation_mappings(
         {
-            "version": 2,
+            "version": "0.2.1",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -1099,7 +1096,7 @@ def test_space_excluded_table_produces_no_sub_intent_step_or_bridge() -> None:
         where=None,
     )
     space = SpaceContext(tables=frozenset({"t_a"}))
-    mappings = FederationMappings(version=2)
+    mappings = FederationMappings(version="0.2.1")
     tables_all = {"t_a", "t_b"}
     source_by_table = {"t_a": "a", "t_b": "b"}
 
@@ -1187,7 +1184,7 @@ _REPLICA_MANIFEST = {
 def _replica_mappings() -> FederationMappings:
     return parse_federation_mappings(
         {
-            "version": 2,
+            "version": "0.2.1",
             "logical_tables": [
                 {
                     "logical": "entity",
@@ -1283,7 +1280,7 @@ def test_space_partial_deny_of_union_backed_logical_table_raises() -> None:
 
     mappings = parse_federation_mappings(
         {
-            "version": 2,
+            "version": "0.2.1",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -1306,7 +1303,7 @@ def test_space_partial_deny_of_union_backed_logical_table_raises() -> None:
 def test_federation_space_for_choice_port_carries_deny_lists() -> None:
     from types import SimpleNamespace
 
-    from aetherdialect._main_execution import _federation_space_for_choice_port
+    from aetherdialect._main_execution import MainExecutionOps
 
     port = SimpleNamespace(
         space_tables=frozenset({"t_a"}),
@@ -1314,7 +1311,7 @@ def test_federation_space_for_choice_port_carries_deny_lists() -> None:
         space_deny_objects=frozenset({"t_b"}),
         space_deny_columns=frozenset({"t_a.id"}),
     )
-    space = _federation_space_for_choice_port(port)
+    space = MainExecutionOps._federation_space_for_choice_port(port)
     assert space is not None
     assert space.tables == frozenset({"t_a"})
     assert space.deny_objects == frozenset({"t_b"})
@@ -1325,14 +1322,14 @@ def test_federation_space_for_choice_port_carries_deny_lists() -> None:
         space_deny_objects=frozenset({"t_b"}),
         space_deny_columns=frozenset(),
     )
-    deny_space = _federation_space_for_choice_port(deny_only)
+    deny_space = MainExecutionOps._federation_space_for_choice_port(deny_only)
     assert deny_space is not None
     assert deny_space.deny_objects == frozenset({"t_b"})
 
 
 @pytest.mark.fast
 def test_validate_space_source_qualified_column_uses_shared_resolver() -> None:
-    from aetherdialect._main_execution import validate_space_context_against_graph
+    from aetherdialect._main_execution import MainExecutionOps
 
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
     composite = compose_composite_graph(
@@ -1341,7 +1338,7 @@ def test_validate_space_source_qualified_column_uses_shared_resolver() -> None:
     )
     ctx = SpaceContext(tables=frozenset({"t_a"}), columns=frozenset({"t_a.id"}))
     object.__setattr__(ctx, "columns", frozenset({"a.t_a.id"}))
-    validated = validate_space_context_against_graph(
+    validated = MainExecutionOps.validate_space_context_against_graph(
         ctx,
         composite,
         federation_manifest=manifest,
@@ -1350,7 +1347,7 @@ def test_validate_space_source_qualified_column_uses_shared_resolver() -> None:
     bad = SpaceContext(tables=frozenset({"t_a"}), columns=frozenset({"t_a.id"}))
     object.__setattr__(bad, "columns", frozenset({"ghost.t_a.id"}))
     with pytest.raises(ConfigError, match="unknown federation source"):
-        validate_space_context_against_graph(
+        MainExecutionOps.validate_space_context_against_graph(
             bad,
             composite,
             federation_manifest=manifest,

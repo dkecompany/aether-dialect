@@ -10,7 +10,7 @@ from aetherdialect._contracts_core import (
     SelectCol,
 )
 from aetherdialect._live_testing import deterministic_generate_validate_execute
-from aetherdialect._templates import empty_template_store
+from aetherdialect._templates import TemplateOps
 
 
 def _llm_forbidden(*_args, **_kwargs) -> None:
@@ -27,7 +27,7 @@ def test_deterministic_single_table_film_title(schema, t2s) -> None:
         where=None,
         having=None,
     )
-    store = empty_template_store(schema.effective_structural_hash)
+    store = TemplateOps.empty_template_store(schema.effective_structural_hash)
     with patch("aetherdialect._pipeline.get_join_choice_from_llm", side_effect=_llm_forbidden):
         gen_out, rows = deterministic_generate_validate_execute(
             q_norm="deterministic film titles",
@@ -55,7 +55,7 @@ def test_deterministic_film_language_join(schema, t2s) -> None:
         where=None,
         having=None,
     )
-    store = empty_template_store(schema.effective_structural_hash)
+    store = TemplateOps.empty_template_store(schema.effective_structural_hash)
     with patch("aetherdialect._pipeline.get_join_choice_from_llm", side_effect=_llm_forbidden):
         gen_out, rows = deterministic_generate_validate_execute(
             q_norm="deterministic film and language",

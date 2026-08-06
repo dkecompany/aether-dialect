@@ -7,7 +7,7 @@ import importlib.util
 import pytest
 
 from aetherdialect._contracts_base import ConfigError
-from aetherdialect._dialect_sqlglot_helper import require_duckdb_sqlalchemy_dialect
+from aetherdialect._dialect_sqlglot_helper import SqlalchemyExecutionMixin
 
 
 def test_duckdb_sqlalchemy_dialect_missing_raises_config_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -20,4 +20,4 @@ def test_duckdb_sqlalchemy_dialect_missing_raises_config_error(monkeypatch: pyte
 
     monkeypatch.setattr(importlib.util, "find_spec", _hide_duckdb_engine)
     with pytest.raises(ConfigError, match="duckdb-engine"):
-        require_duckdb_sqlalchemy_dialect()
+        SqlalchemyExecutionMixin.require_duckdb_sqlalchemy_dialect()

@@ -7,10 +7,13 @@ from unittest.mock import MagicMock
 import pytest
 
 from aetherdialect._config import PolicyConfig
-from aetherdialect._contracts_base import WhereParam, predicate_group_from_list
+from aetherdialect._contracts_base import (
+    PredicateGroup,
+    WhereParam,
+)
 from aetherdialect._contracts_core import RuntimeIntent
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._dialect import explain_cost_gate_violation
+from aetherdialect._dialect import Dialect
 from aetherdialect._federation import (
     compose_composite_graph,
     federation_plan_step_fingerprints,
@@ -57,7 +60,7 @@ def _ilike_intent(*, table: str) -> RuntimeIntent:
         select_cols=[],
         group_by_cols=[],
         order_by_cols=[],
-        where=predicate_group_from_list(
+        where=PredicateGroup.from_list(
             [
                 WhereParam(
                     left_expr=NormalizedExpr.from_column(f"{table}.name"),
@@ -104,7 +107,7 @@ def test_explain_cost_gate_prefers_dialect_member_limit_over_global_policy(monke
     monkeypatch.setattr(PolicyConfig, "MAX_QUERY_COST_ROWS", 50_000_000)
     dialect = MagicMock()
     dialect.max_query_cost_rows = 100.0
-    failed, msg = explain_cost_gate_violation(500.0, None, dialect=dialect)
+    failed, msg = Dialect.explain_cost_gate_violation(500.0, None, dialect=dialect)
     assert failed
     assert "100" in msg
 
@@ -125,7 +128,7 @@ def test_federation_validation_cascade_applies_fingerprinted_member_cost_cap(mon
         schema: object | None = None,
         intent: object | None = None,
     ) -> tuple[bool, list[object], str]:
-        failed, why = explain_cost_gate_violation(500.0, None, dialect=dialect)
+        failed, why = Dialect.explain_cost_gate_violation(500.0, None, dialect=dialect)
         if failed:
             return False, [], why
         return True, [], ""

@@ -23,7 +23,7 @@ def test_inspect_persisted_federation_returns_declaration_and_roster() -> None:
     bundle = build_two_member_federation(federation_id="fed_reopen")
     manifest = bundle.manifest
     members = bundle.member_graphs
-    mappings = FederationMappings(version=1)
+    mappings = FederationMappings(version="0.2.1")
     composite = bundle.composite
     with tempfile.TemporaryDirectory() as tmp:
         fed_dir = compute_federation_storage_dir(tmp, "fed_reopen")
@@ -40,7 +40,7 @@ def test_inspect_persisted_federation_returns_declaration_and_roster() -> None:
         assert inspection.federation_dir == fed_dir
         assert inspection.manifest.federation_id == "fed_reopen"
         assert len(inspection.manifest.cross_source_joins) == 1
-        assert inspection.mappings.version == 1
+        assert inspection.mappings.version == "0.2.1"
         assert len(inspection.roster) == 2
         assert all(len(row) == 4 for row in inspection.roster)
 
@@ -55,7 +55,7 @@ def test_inspect_persisted_hydrates_sources_and_table_namespace() -> None:
         persist_federation_tree(
             fed_dir,
             manifest=bundle.manifest,
-            mappings=FederationMappings(version=1),
+            mappings=FederationMappings(version="0.2.1"),
             composite=bundle.composite,
             member_graphs=bundle.member_graphs,
         )
@@ -78,7 +78,7 @@ def test_inspect_persisted_does_not_initialize_member_engines() -> None:
         persist_federation_tree(
             fed_dir,
             manifest=bundle.manifest,
-            mappings=FederationMappings(version=1),
+            mappings=FederationMappings(version="0.2.1"),
             composite=bundle.composite,
             member_graphs=bundle.member_graphs,
         )
@@ -108,7 +108,7 @@ def test_inspect_persisted_missing_roster_raises() -> None:
         persist_federation_tree(
             fed_dir,
             manifest=bundle.manifest,
-            mappings=FederationMappings(version=1),
+            mappings=FederationMappings(version="0.2.1"),
             composite=bundle.composite,
             member_graphs=bundle.member_graphs,
         )

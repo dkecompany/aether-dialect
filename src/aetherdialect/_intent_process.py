@@ -7,7 +7,7 @@ import re
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
-from typing import Any, Literal, NamedTuple
+from typing import Any, Literal, NamedTuple, cast
 
 from ._config import PolicyConfig
 from ._constants import (
@@ -20,11 +20,13 @@ from ._constants import (
     ASK_PHASE_H,
     COMPOSE_PROMPT_KEY_ORDER,
     COMPOSE_SUPPORTED_CAPABILITIES,
+    DETERMINISTIC_REPAIR_TRACE_HEADINGS,
     DIAGNOSTIC_CODE_COMPOSE_REPAIR,
     DIAGNOSTIC_CODE_DESCRIPTION_PROMPT_TRUNCATED,
     DIAGNOSTIC_CODE_ENUM_PROMPT_TRUNCATED,
     DIAGNOSTIC_CODE_FALLBACK_FRESH_RESTART,
     DIAGNOSTIC_CODE_INTERPRET_GROUND_RETRY,
+    DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_UNAVAILABLE,
     ENCODER_IR_ASSEMBLY_RULES,
     ENCODER_NL_PHRASE_MAPPINGS,
     ENCODER_NL_TO_IR_GUIDANCE,
@@ -72,18 +74,14 @@ from ._constants import (
     VALID_HAVING_OPS,
 )
 from ._contracts_base import (
+    ConfigError,
     FailureCategory,
     HavingParam,
     LogicalIntent,
     MulGroup,
     NormalizedExpr,
+    PredicateGroup,
     WhereParam,
-    expr_registry_ref,
-    having_leaves,
-    map_predicate_group,
-    predicate_group_from_list,
-    rebuild_predicate_group_from_leaves,
-    where_leaves,
 )
 from ._contracts_core import (
     ConcreteCteStep,
@@ -98,24 +96,24 @@ from ._contracts_core import (
     StructuralCompareResult,
     Template,
     TrustedTemplateHit,
-    concrete_intent_to_runtime_skeleton,
-    intent_prompt_structural_index,
 )
-from ._contracts_schema import CaseRegistryStep, IntentIssue, SchemaGraph, WindowRegistryStep, make_intent_issue
+from ._contracts_schema import CaseRegistryStep, IntentIssue, SchemaGraph, WindowRegistryStep
 from ._core_utils import (
     active_business_knowledge,
     business_context_payload,
     debug,
     diagnostic_debug_enabled,
     diagnostic_pipeline_trace_full_enabled,
+    emit_ask_phase,
     notify,
     pipeline_trace,
     prompt_cache_schema_scope,
     prompt_json,
     schema_prompt_cache_id,
     stable_json,
+    stash_intent_parse_refusal,
 )
-from ._dialect import extra_where_ops_for_engine
+from ._dialect import DialectRegistry
 from ._federation import intersect_member_where_ops, schema_spans_multiple_sources
 from ._intent_expr import (
     assign_param_keys,
@@ -220,9 +218,9 @@ from ._intent_resolve import (
     sort_select_cols,
     strip_redundant_identifier_group_by,
 )
-from ._llm_provider import llm_chat
+from ._llm_provider import LLMProvider
 from ._sql_gen import classify_cte_emission
-from ._templates import template_is_live, template_schema_refs
+from ._templates import LazyTemplateMapping, TemplateOps, TemplateRefs, TemplateStoreView
 from ._utils import (
     body_similarity_key,
     body_similarity_key_for_concrete,
@@ -231,6 +229,17 @@ from ._utils import (
     template_instance_key_for_concrete,
 )
 from ._validation_execute import validate_cte_emission_reclassification, validate_semantics
+
+
+def _structured_prompt_json(raw: str | dict[str, Any] | list[Any]) -> Any:
+    """Parse a JSON string into an object, or return an already- structured value."""
+    if isinstance(raw, (dict, list)):
+        return raw
+    text = str(raw)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return text
 
 
 def build_intent_interpret_prompt(
@@ -243,7 +252,7 @@ def build_intent_interpret_prompt(
     body: dict[str, Any] = {
         "task": "Read the question against the domain schema and produce a thinking pathway (interpret_plan).",
         "question": question,
-        "schema_domain": json.loads(domain_payload),
+        "schema_domain": _structured_prompt_json(domain_payload),
         "supported_capabilities": list(INTERPRET_SUPPORTED_CAPABILITIES),
         "interpret_plan_schema": INTERPRET_PLAN_SCHEMA,
     }
@@ -271,7 +280,7 @@ def build_intent_ground_prompt(
         "task": "Convert interpret_plan into logical intent JSON with natural-language clause fields bound to schema identifiers.",
         "question": question,
         "interpret_plan": interpret_plan_for_ground(interpret_plan),
-        "schema_literal_json": json.loads(ground_payload),
+        "schema_literal_json": _structured_prompt_json(ground_payload),
         "logical_intent_json_schema": LOGICAL_INTENT_SCHEMA,
         "nl_conventions": json.loads(stable_json(dict(PLANNER_NL_CONVENTIONS))),
         "logical_schema_rules": [
@@ -376,7 +385,7 @@ def _where_ops_for_schema(schema_graph: SchemaGraph | None = None) -> list[str]:
             if op not in parse_where_ops:
                 parse_where_ops.append(op)
     else:
-        parse_where_ops.extend(sorted(extra_where_ops_for_engine()))
+        parse_where_ops.extend(sorted(DialectRegistry.extra_where_ops_for_engine()))
     parse_where_ops.extend(
         [
             "in",
@@ -395,8 +404,13 @@ def _emit_schema_enum_truncation_diagnostic(schema_graph: SchemaGraph) -> None:
     truncated = getattr(schema_graph, "_last_enum_truncations", ())
     if not truncated:
         return
-    pipeline_trace(
-        DIAGNOSTIC_CODE_ENUM_PROMPT_TRUNCATED, lambda: f"cap={FEDERATION_ENUM_PROMPT_CAP} types={','.join(truncated)}"
+    detail = f"cap={FEDERATION_ENUM_PROMPT_CAP} types={','.join(truncated)}"
+    pipeline_trace(DIAGNOSTIC_CODE_ENUM_PROMPT_TRUNCATED, lambda: detail)
+    notify(
+        "Enum prompt truncated to fit token budget.",
+        stage="intent",
+        code=DIAGNOSTIC_CODE_ENUM_PROMPT_TRUNCATED,
+        details=(("cap", str(FEDERATION_ENUM_PROMPT_CAP)), ("types", ",".join(truncated))),
     )
 
 
@@ -405,11 +419,19 @@ def _emit_schema_description_truncation_diagnostic(schema_graph: SchemaGraph) ->
     truncated = getattr(schema_graph, "_last_description_truncations", ())
     if not truncated:
         return
-    pipeline_trace(
-        DIAGNOSTIC_CODE_DESCRIPTION_PROMPT_TRUNCATED,
-        lambda: (
-            f"cap_chars={SCHEMA_DESCRIPTION_PROMPT_MAX_CHARS} "
-            f"cap_count={SCHEMA_DESCRIPTION_PROMPT_COUNT_CAP} keys={','.join(truncated)}"
+    detail = (
+        f"cap_chars={SCHEMA_DESCRIPTION_PROMPT_MAX_CHARS} "
+        f"cap_count={SCHEMA_DESCRIPTION_PROMPT_COUNT_CAP} keys={','.join(truncated)}"
+    )
+    pipeline_trace(DIAGNOSTIC_CODE_DESCRIPTION_PROMPT_TRUNCATED, lambda: detail)
+    notify(
+        "Description prompt truncated to fit token budget.",
+        stage="intent",
+        code=DIAGNOSTIC_CODE_DESCRIPTION_PROMPT_TRUNCATED,
+        details=(
+            ("cap_chars", str(SCHEMA_DESCRIPTION_PROMPT_MAX_CHARS)),
+            ("cap_count", str(SCHEMA_DESCRIPTION_PROMPT_COUNT_CAP)),
+            ("keys", ",".join(truncated)),
         ),
     )
 
@@ -447,7 +469,7 @@ def _build_intent_compose_prompt(
             "Logical tables may list base schema tables and prior logical cte_steps names."
         ),
         "structural_schema_for_chosen_tables": structural_obj,
-        "structural_json_keys": intent_prompt_structural_index(),
+        "structural_json_keys": RuntimeIntent.prompt_structural_index(),
         "critical_rules": list(INTENT_CRITICAL_RULES),
         "parse_rules_append": list(INTENT_PARSE_RULES_APPEND),
         "field_specifications": dict(RuntimeIntent.PROMPT_FIELD_SPEC.items()),
@@ -515,6 +537,7 @@ def _refuse_if_join_unreachable_repair_removed_tables(
     refusal = refusal_for_join_unreachable_table_removal(before, after, open_errors)
     if refusal:
         debug(f"[{phase}] join_unreachable repair removed table — refusing: {refusal}")
+        stash_intent_parse_refusal(DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_UNAVAILABLE, refusal)
         return True
     return False
 
@@ -571,12 +594,15 @@ def build_intent_semantic_repair_prompt(
         "errors_to_fix": errors_to_fix,
         "suggestions": suggestions,
         "field_specifications": dict(RuntimeIntent.PROMPT_FIELD_SPEC.items()),
-        "structural_json_keys": intent_prompt_structural_index(),
-        "current_intent": current_intent_json,
+        "structural_json_keys": RuntimeIntent.prompt_structural_index(),
+        "current_intent": _structured_prompt_json(current_intent_json),
         "question": question,
-        "schema_info": schema_literal_json,
+        "schema_info": _structured_prompt_json(schema_literal_json),
         "output_format": RuntimeIntent.prompt_example_dict(),
     }
+    business_context = business_context_payload(active_business_knowledge())
+    if business_context:
+        body["business_context"] = business_context
     if prior_question_feedback:
         body["prior_question_feedback"] = {
             "instruction": (
@@ -608,7 +634,7 @@ def build_intent_format_repair_prompt(question: str, raw_response: str, parse_er
             "invalid_response": raw_response,
             "parse_error": parse_error,
             "field_specifications": dict(RuntimeIntent.PROMPT_FIELD_SPEC.items()),
-            "structural_json_keys": intent_prompt_structural_index(),
+            "structural_json_keys": RuntimeIntent.prompt_structural_index(),
             "instructions": list(INTENT_FORMAT_REPAIR_JSON_RULES) + list(INTENT_CRITICAL_RULES),
             "output_format": RuntimeIntent.prompt_example_dict(),
         },
@@ -646,7 +672,7 @@ def build_intent_parse_prompt(
             "filters, HAVING, limits, and parameters."
         ),
         "question": question,
-        "schema_summary": schema_literal_json,
+        "schema_summary": _structured_prompt_json(schema_literal_json),
         "allowed_tables": table_list,
         "naming_conventions": {
             "qualified_column_reference": INSTRUCTIONAL_QUALIFIED_COLUMN_PLACEHOLDER,
@@ -658,7 +684,7 @@ def build_intent_parse_prompt(
             ),
         },
         "field_specifications": dict(RuntimeIntent.PROMPT_FIELD_SPEC.items()),
-        "structural_json_keys": intent_prompt_structural_index(),
+        "structural_json_keys": RuntimeIntent.prompt_structural_index(),
         "expression_format": {
             "description": (
                 "expr strings mirror SQL using qualified columns, arithmetic, aggregation, and scalar functions. "
@@ -696,6 +722,9 @@ def build_intent_parse_prompt(
             ),
             "items": list(prior_question_feedback),
         }
+    business_context = business_context_payload(active_business_knowledge())
+    if business_context:
+        user_payload["business_context"] = business_context
 
     user = prompt_json(user_payload, PARSE_PROMPT_KEY_ORDER)
     return system, user
@@ -742,7 +771,7 @@ def _format_repair_loop(
             parse_error = INTENT_PLACEHOLDER_FORMAT_REPAIR_PARSE_ERROR
         parse_detail.clear()
         repair_prompt = build_intent_format_repair_prompt(question, raw, parse_error)
-        raw = llm_chat(system, repair_prompt, task="intent_format")
+        raw = LLMProvider.chat(system, repair_prompt, task="intent_format")
         llm_calls += 1
         intent = parse_intent_response(raw, question, parse_detail_out=parse_detail)
         if _acceptable(intent):
@@ -753,6 +782,8 @@ def _format_repair_loop(
                     "intent_after_parse_intent_response.format_repair", stable_json(accepted_intent.to_dict())
                 )
             return intent, llm_calls
+    if not _acceptable(intent):
+        return None, llm_calls
     return intent, llm_calls
 
 
@@ -841,7 +872,7 @@ def _derive_cte_output_columns_resolved(cte: RuntimeCteStep, *, cte_ordinal: int
         explicit = explicit_raw.lower() if explicit_raw else None
         if explicit and re.fullmatch(REGISTRY_TOKEN_PATTERN, explicit):
             explicit = None
-        rid = expr_registry_ref(sc.expr) or ""
+        rid = sc.expr.registry_ref() or ""
         if rid.startswith("w"):
             step = wr_by.get(rid)
             if step is not None:
@@ -920,7 +951,7 @@ def _normalize_cte_output_aliases(intent: RuntimeIntent, schema_graph: SchemaGra
             order_by_cols=[replace(obc, expr=_remap_expr(obc.expr)) for obc in (cte.order_by_cols or [])],
             group_by_cols=[_remap_expr(g) for g in (cte.group_by_cols or [])],
             window_registry=rename_window_registry_steps(cte.window_registry, alias_map),
-            where=map_predicate_group(
+            where=PredicateGroup.map(
                 cte.where,
                 lambda fp: replace(
                     fp,
@@ -928,7 +959,7 @@ def _normalize_cte_output_aliases(intent: RuntimeIntent, schema_graph: SchemaGra
                     right_expr=(_remap_expr(fp.right_expr) if fp.right_expr else None),
                 ),
             ),
-            having=map_predicate_group(
+            having=PredicateGroup.map(
                 cte.having,
                 lambda hp: replace(
                     hp,
@@ -947,7 +978,7 @@ def _normalize_cte_output_aliases(intent: RuntimeIntent, schema_graph: SchemaGra
         order_by_cols=[replace(obc, expr=_remap_expr(obc.expr)) for obc in (intent.order_by_cols or [])],
         group_by_cols=[_remap_expr(g) for g in (intent.group_by_cols or [])],
         window_registry=rename_window_registry_steps(intent.window_registry, alias_map),
-        where=map_predicate_group(
+        where=PredicateGroup.map(
             intent.where,
             lambda fp: replace(
                 fp,
@@ -955,7 +986,7 @@ def _normalize_cte_output_aliases(intent: RuntimeIntent, schema_graph: SchemaGra
                 right_expr=(_remap_expr(fp.right_expr) if fp.right_expr else None),
             ),
         ),
-        having=map_predicate_group(
+        having=PredicateGroup.map(
             intent.having,
             lambda hp: replace(
                 hp,
@@ -984,7 +1015,11 @@ def _trace_intent_after_deterministic_step(
         for field_name in changed_fields
     }
     if diagnostic_debug_enabled() and diagnostic_pipeline_trace_full_enabled():
-        pipeline_trace(f"intent_after_deterministic_repair.{step_name}", lambda: stable_json(diff_payload))
+        try:
+            heading = DETERMINISTIC_REPAIR_TRACE_HEADINGS[step_name]
+        except KeyError:
+            raise ConfigError(f"unknown deterministic repair step: {step_name}") from None
+        pipeline_trace(heading, lambda: stable_json(diff_payload))
 
 
 def _intent_changed_fields(before: RuntimeIntent, after: RuntimeIntent) -> list[str]:
@@ -1046,23 +1081,29 @@ def apply_deterministic_repairs(
 
     def auto_repair_where_having_all_scopes(i: RuntimeIntent) -> RuntimeIntent:
         repaired_fp, repaired_hp = process(
-            where_leaves(i.where) or [], having_leaves(i.having) or [], i.group_by_cols or []
+            PredicateGroup.where_leaves(i.where) or [],
+            PredicateGroup.having_leaves(i.having) or [],
+            i.group_by_cols or [],
         )
         out = replace(
             i,
-            where=rebuild_predicate_group_from_leaves(i.where, repaired_fp),
-            having=rebuild_predicate_group_from_leaves(i.having, repaired_hp),
+            where=PredicateGroup.rebuild_from_leaves(i.where, repaired_fp),
+            having=PredicateGroup.rebuild_from_leaves(i.having, repaired_hp),
         )
         if not out.cte_steps:
             return out
         new_cte_steps = []
         for cte in out.cte_steps:
-            fp, hp = process(where_leaves(cte.where) or [], having_leaves(cte.having) or [], cte.group_by_cols or [])
+            fp, hp = process(
+                PredicateGroup.where_leaves(cte.where) or [],
+                PredicateGroup.having_leaves(cte.having) or [],
+                cte.group_by_cols or [],
+            )
             new_cte_steps.append(
                 replace(
                     cte,
-                    where=rebuild_predicate_group_from_leaves(cte.where, fp),
-                    having=rebuild_predicate_group_from_leaves(cte.having, hp),
+                    where=PredicateGroup.rebuild_from_leaves(cte.where, fp),
+                    having=PredicateGroup.rebuild_from_leaves(cte.having, hp),
                 )
             )
         return replace(out, cte_steps=new_cte_steps)
@@ -1249,15 +1290,15 @@ def _apply_post_processing(
             intent = replace(intent, cte_steps=emission_ctes)
 
     where_params, having_param, cte_steps, case_registry, _ = assign_param_keys(
-        where_leaves(intent.where) or [],
-        having_leaves(intent.having) or [],
+        PredicateGroup.where_leaves(intent.where) or [],
+        PredicateGroup.having_leaves(intent.having) or [],
         intent.cte_steps,
         intent.case_registry or [],
     )
     intent = replace(
         intent,
-        where=predicate_group_from_list(where_params),
-        having=predicate_group_from_list(having_param),
+        where=PredicateGroup.from_list(where_params),
+        having=PredicateGroup.from_list(having_param),
         cte_steps=cte_steps,
         case_registry=case_registry,
     )
@@ -1291,17 +1332,17 @@ def _apply_post_processing(
 
     expected_keys: list[str] = []
     for cte in intent.cte_steps or []:
-        for fp in where_leaves(cte.where) or []:
+        for fp in PredicateGroup.where_leaves(cte.where) or []:
             if fp.param_key and fp.op not in ("is null", "is not null") and not fp.right_expr:
                 expected_keys.append(fp.param_key)
-        for hp in having_leaves(cte.having) or []:
+        for hp in PredicateGroup.having_leaves(cte.having) or []:
             if hp.param_key and not hp.right_expr:
                 expected_keys.append(hp.param_key)
         expected_keys.extend(_expected_keys_from_case_registry(cte.case_registry))
-    for fp in where_leaves(intent.where) or []:
+    for fp in PredicateGroup.where_leaves(intent.where) or []:
         if fp.param_key and fp.op not in ("is null", "is not null") and not fp.right_expr:
             expected_keys.append(fp.param_key)
-    for hp in having_leaves(intent.having) or []:
+    for hp in PredicateGroup.having_leaves(intent.having) or []:
         if hp.param_key and not hp.right_expr:
             expected_keys.append(hp.param_key)
     expected_keys.extend(_expected_keys_from_case_registry(intent.case_registry))
@@ -1316,10 +1357,10 @@ def _apply_post_processing(
         new_cte_steps = []
         for cte in intent.cte_steps:
             cte_pks: set[str] = set()
-            for fp in where_leaves(cte.where) or []:
+            for fp in PredicateGroup.where_leaves(cte.where) or []:
                 if fp.param_key:
                     cte_pks.add(fp.param_key)
-            for hp in having_leaves(cte.having) or []:
+            for hp in PredicateGroup.having_leaves(cte.having) or []:
                 if hp.param_key:
                     cte_pks.add(hp.param_key)
             for step in cte.case_registry or []:
@@ -1481,7 +1522,7 @@ def _collect_post_compose_validation_issues(
     _, schema_errors = check_qualified_refs_exist(intent, schema_graph)
     for idx, err in enumerate(schema_errors):
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"schema_ref_post_compose_{idx}",
                 category=classify_schema_error(err),
                 severity="error",
@@ -1522,7 +1563,7 @@ def apply_runtime_post_processing(
     _, schema_errors = check_qualified_refs_exist(result, schema_graph)
     for idx, err in enumerate(schema_errors):
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"schema_ref_post_compose_{idx}",
                 category=classify_schema_error(err),
                 severity="error",
@@ -1781,7 +1822,9 @@ def _full_intent_parse_body(
                 seed_rows.append({"summary": t, "source": "user_refinement"})
     persisted: list[dict[str, str]] = []
     if store is not None and tpl is not None:
-        persisted = tpl.collect_question_feedback_for_prompt(store, question, schema_graph.schema_graph_id)
+        persisted = TemplateOps.collect_question_feedback_for_prompt(
+            store, question, schema_graph.effective_structural_hash
+        )
     merged_feedback = dedupe_prior_question_feedback_rows(seed_rows + persisted)
     prior_fb_text = serialized_prior_feedback_rows(merged_feedback)
     answer_style_text = stable_json(list(LOGICAL_DECOMPOSITION_GUIDANCE))
@@ -1797,7 +1840,7 @@ def _full_intent_parse_body(
             prior_fb_text,
             prior_user_corrections,
         )
-        raw_interpret = llm_chat(INTENT_INTERPRET_SYSTEM, user_interpret, task="intent")
+        raw_interpret = LLMProvider.chat(INTENT_INTERPRET_SYSTEM, user_interpret, task="intent")
         llm_calls += 1
         debug(f"[{ASK_PHASE_B}] raw_llm_response (attempt {attempt_a + 1}): {raw_interpret}")
         interpret_candidate, interpret_issues = parse_interpret_plan_response(raw_interpret)
@@ -1851,7 +1894,7 @@ def _full_intent_parse_body(
             prior_user_corrections,
             prior_grounding_failures,
         )
-        raw_ground = llm_chat(INTENT_GROUND_SYSTEM, user_ground, task="intent")
+        raw_ground = LLMProvider.chat(INTENT_GROUND_SYSTEM, user_ground, task="intent")
         llm_calls += 1
         debug(f"[{ASK_PHASE_C}] raw_llm_response (attempt {attempt_a + 1}): {raw_ground}")
         logical_candidate, logical_issues = parse_logical_intent_response(raw_ground, schema_graph)
@@ -1890,9 +1933,10 @@ def _full_intent_parse_body(
             continue
 
         logical = logical_candidate
+        emit_ask_phase(ASK_PHASE_C)
         structural_json = schema_graph.schema_payload_compose(_structural_tables_for_logical(logical))
         user_compose = _build_intent_compose_prompt(logical, structural_json, schema_graph=schema_graph)
-        raw_compose = llm_chat(system_compose, user_compose, task="intent")
+        raw_compose = LLMProvider.chat(system_compose, user_compose, task="intent")
         llm_calls += 1
         debug(f"[{ASK_PHASE_D}] raw_llm_response: {raw_compose}")
         intent, fmt_calls = _format_repair_loop(system_compose, raw_compose, question, max_retries)
@@ -1920,6 +1964,7 @@ def _full_intent_parse_body(
             return intent, warns, calls, plan
 
         debug(f"[{ASK_PHASE_D}] normalized intent:\n{stable_json(intent.to_dict())}")
+        emit_ask_phase(ASK_PHASE_D)
 
         intent = _align_runtime_tables_to_planner(intent, logical)
         intent = _propagate_interpret_schema_invalid_flag(intent, interpret_plan)
@@ -2005,6 +2050,7 @@ def _full_intent_parse_body(
             warnings = [iss for iss in merged_issues if iss.severity == "warning"]
             intent_json = stable_json(result.to_prompt_dict())
             debug(f"[{ASK_PHASE_E}] post-compose repair errors: {[(e.category, e.message) for e in errors]}")
+            emit_ask_phase(ASK_PHASE_E)
             compose_repair_json = schema_graph.schema_payload_compose(result.tables or table_list)
             repair_prompt = build_intent_semantic_repair_prompt(
                 question, intent_json, errors, warnings, compose_repair_json, prior_question_feedback=avoid_rows or None
@@ -2016,7 +2062,7 @@ def _full_intent_parse_body(
                 details=(("phase", ASK_PHASE_E), ("repair_round", str(b_repairs_used + 1))),
             )
             rollback_intent = result
-            repaired_raw = llm_chat(system_compose, repair_prompt, task="intent")
+            repaired_raw = LLMProvider.chat(system_compose, repair_prompt, task="intent")
             llm_calls += 1
             repaired, fmt_rep_calls = _format_repair_loop(system_compose, repaired_raw, question, max_retries)
             llm_calls += fmt_rep_calls
@@ -2197,14 +2243,18 @@ def _run_schema_semantic_repair_loop(
 
     for sem_round in range(sem_iterations):
         debug(f"[{ASK_PHASE_G}] semantic round {sem_round + 1}/{sem_iterations}")
+        emit_ask_phase(ASK_PHASE_G)
         tpl = get_templates_module()
 
         persisted_rows: list[dict[str, str]] = []
         if store is not None and tpl is not None:
-            persisted_rows = tpl.collect_question_feedback_for_prompt(store, question, schema_graph.schema_graph_id)
+            persisted_rows = TemplateOps.collect_question_feedback_for_prompt(
+                store, question, schema_graph.effective_structural_hash
+            )
         avoid_rows = dedupe_prior_question_feedback_rows(list(in_turn) + persisted_rows)
         intent = apply_deterministic_repairs(intent, schema_graph, question)
         debug(f"[{ASK_PHASE_E}] repairs:\n{stable_json(intent.to_dict())}")
+        emit_ask_phase(ASK_PHASE_E)
 
         schema_error_history: list[frozenset[str]] = []
         schema_resolved = False
@@ -2212,9 +2262,11 @@ def _run_schema_semantic_repair_loop(
             intent, schema_errors = check_qualified_refs_exist(intent, schema_graph)
             if not schema_errors:
                 debug(f"[{ASK_PHASE_F}] validation passed on sub-round {schema_sub + 1}/{schema_iterations}")
+                emit_ask_phase(ASK_PHASE_F)
                 schema_resolved = True
                 break
             debug(f"[{ASK_PHASE_F}] sub-round {schema_sub + 1}/{schema_iterations}: {len(schema_errors)} errors")
+            emit_ask_phase(ASK_PHASE_F)
             schema_sig = _compute_error_signature_strings(schema_errors)
             schema_error_history.append(schema_sig)
             if _detect_oscillation_strings(schema_error_history):
@@ -2223,7 +2275,7 @@ def _run_schema_semantic_repair_loop(
             if schema_sub >= schema_iterations - 1:
                 break
             schema_issues = [
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"schema_error_{idx}",
                     category=classify_schema_error(err),
                     severity="error",
@@ -2256,7 +2308,7 @@ def _run_schema_semantic_repair_loop(
                     ("schema_sub_round", str(schema_sub + 1)),
                 ),
             )
-            repaired_raw = llm_chat(system, repair_prompt, task="intent_schema_repair")
+            repaired_raw = LLMProvider.chat(system, repair_prompt, task="intent_schema_repair")
             llm_calls += 1
             repaired, fmt_calls = _format_repair_loop(system, repaired_raw, question, max_retries)
             llm_calls += fmt_calls
@@ -2383,7 +2435,7 @@ def _run_schema_semantic_repair_loop(
             code=DIAGNOSTIC_CODE_COMPOSE_REPAIR,
             details=(("phase", "semantic"), ("semantic_round", str(sem_round + 1))),
         )
-        repaired_raw = llm_chat(system, repair_prompt, task="intent")
+        repaired_raw = LLMProvider.chat(system, repair_prompt, task="intent")
         llm_calls += 1
         repaired, fmt_calls = _format_repair_loop(system, repaired_raw, question, max_retries)
         llm_calls += fmt_calls
@@ -2419,6 +2471,7 @@ def _run_schema_semantic_repair_loop(
             intent = intent_before_semantic_llm
         debug(f"[{ASK_PHASE_G}] normalized intent after semantic repair:\n{stable_json(intent.to_dict())}")
         pipeline_trace(ASK_PHASE_G, stable_json(intent.to_dict()))
+        emit_ask_phase(ASK_PHASE_G)
 
     result, post_issues = _apply_post_processing(intent, schema_graph, question)
     if result is None:
@@ -2440,11 +2493,12 @@ def _run_schema_semantic_repair_loop(
 
     debug(
         f"[{ASK_PHASE_H}] parsed intent with {len(result.tables or [])} tables, "
-        f"{len(where_leaves(result.where) or [])} filters, {llm_calls} LLM calls"
+        f"{len(PredicateGroup.where_leaves(result.where) or [])} filters, {llm_calls} LLM calls"
     )
     assert result is not None
     final_result = result
     pipeline_trace(ASK_PHASE_H, lambda: stable_json(final_result.to_dict()))
+    emit_ask_phase(ASK_PHASE_H)
 
     if interpret_plan is not None:
         result = finalize_planner_schema_invalid_flag(result, interpret_plan, schema_graph)
@@ -2544,10 +2598,10 @@ def cte_structural_signature(steps: Sequence[RuntimeCteStep | ConcreteCteStep]) 
         parts: list[str] = [
             cte.grain or "row_level",
             ",".join(sorted(cte.tables or [])),
-            ",".join(sorted(f.signature_key for f in (where_leaves(cte.where) or []))),
+            ",".join(sorted(f.signature_key for f in (PredicateGroup.where_leaves(cte.where) or []))),
             ",".join(sorted(g.signature_key for g in (cte.group_by_cols or []))),
             ",".join(sorted(o.signature_key for o in (cte.order_by_cols or []))),
-            ",".join(sorted(h.signature_key for h in (having_leaves(cte.having) or []))),
+            ",".join(sorted(h.signature_key for h in (PredicateGroup.having_leaves(cte.having) or []))),
             ",".join(sorted(s.signature_key for s in (cte.window_registry or []))),
             ",".join(sorted(s.signature_key for s in (cte.case_registry or []))),
         ]
@@ -2564,8 +2618,8 @@ def _structural_body_matches(intent: RuntimeIntent, concrete: ConcreteIntent) ->
     if intent.limit != concrete.limit:
         return False
 
-    i_filters = sorted(f.signature_key for f in (where_leaves(intent.where) or []))
-    c_filters = sorted(f.signature_key for f in (where_leaves(concrete.where) or []))
+    i_filters = sorted(f.signature_key for f in (PredicateGroup.where_leaves(intent.where) or []))
+    c_filters = sorted(f.signature_key for f in (PredicateGroup.where_leaves(concrete.where) or []))
     if i_filters != c_filters:
         return False
 
@@ -2579,8 +2633,8 @@ def _structural_body_matches(intent: RuntimeIntent, concrete: ConcreteIntent) ->
     if i_ob != c_ob:
         return False
 
-    i_hav = sorted(h.signature_key for h in (having_leaves(intent.having) or []))
-    c_hav = sorted(h.signature_key for h in (having_leaves(concrete.having) or []))
+    i_hav = sorted(h.signature_key for h in (PredicateGroup.having_leaves(intent.having) or []))
+    c_hav = sorted(h.signature_key for h in (PredicateGroup.having_leaves(concrete.having) or []))
     if i_hav != c_hav:
         return False
 
@@ -2636,7 +2690,7 @@ def _diff_cols_span_disjoint_tables(
 
 def _select_col_is_plain_column(sc: SelectCol) -> bool:
     """Return True when *sc* is a bare ``table.column`` reference with no transforms. Path 4 widening only inlines select columns that need no expression rebuild — neither aggregates, scalar/inner-scalar functions, coefficients, expression composition, registry window/case references, nor CASE expressions are tolerated."""
-    rid = expr_registry_ref(sc.expr) or ""
+    rid = sc.expr.registry_ref() or ""
     if rid.startswith("w") or rid.startswith("c"):
         return False
     if sc.is_aggregated:
@@ -2728,7 +2782,9 @@ def reconcile_template_store_until_stable(
         n = len(r1) + len(r2)
         total += n
         if is_template_store_view(template_store_view):
-            refresh_template_store_indexes_for_view(template_store_view, template_objs=list(templates.values()))
+            view = cast(TemplateStoreView, template_store_view)
+            template_objs = [t for batch in view.iter_templates_by_partition() for t in batch]
+            refresh_template_store_indexes_for_view(view, template_objs=template_objs)
         if n == 0:
             break
     return total
@@ -2759,7 +2815,7 @@ def _expr_strict_union_safe(expr: NormalizedExpr) -> bool:
 
 def _select_col_strict_union_safe(sc: SelectCol) -> bool:
     """Return False when window, CASE, or expression tree blocks union merge."""
-    rid = expr_registry_ref(sc.expr) or ""
+    rid = sc.expr.registry_ref() or ""
     if rid.startswith("w") or rid.startswith("c"):
         return False
     return _expr_strict_union_safe(sc.expr)
@@ -2789,7 +2845,7 @@ def _union_sql_eligibility_strict_shape(intent: RuntimeIntent, concrete: Concret
     """Return True when both sides pass scalar- and coefficient-gates for union comparison."""
     if not _runtime_intent_union_select_structures_safe(intent):
         return False
-    rt = concrete_intent_to_runtime_skeleton(concrete)
+    rt = concrete.to_runtime_skeleton()
     return _runtime_intent_union_select_structures_safe(rt)
 
 
@@ -2894,18 +2950,44 @@ def union_template_compatibility(
     """Return union columns, column-change flag, merge case, and non-agg diff when *tmpl* is eligible."""
     if tmpl.trust_level < 1:
         return None
+    approval = getattr(tmpl, "approval_state", None)
+    if approval is not None and str(getattr(approval, "value", approval)).lower() == "pending":
+        return None
     return union_runtime_concrete_compatibility(intent, tmpl.intent_signature)
 
 
 def collect_structural_match_templates(
-    intent: RuntimeIntent, templates: dict[str, Template], *, schema: SchemaGraph | None = None
+    intent: RuntimeIntent,
+    templates: dict[str, Template],
+    *,
+    schema: SchemaGraph | None = None,
+    union_family_index: dict[str, list[str]] | None = None,
 ) -> list[Template]:
     """Trusted templates with same body similarity key as *intent* and union-compatible without column change."""
     ibk = body_similarity_key(intent)
     out: list[Template] = []
-    for tmpl in templates.values():
+    if isinstance(templates, LazyTemplateMapping):
+        ufi = templates._view._indexes.get(TEMPLATE_UNION_FAMILY_INDEX_KEY, {})
+        cand_ids: list[str] = []
+        if isinstance(ufi, dict):
+            raw = ufi.get(ibk)
+            if isinstance(raw, list):
+                cand_ids = [str(x) for x in raw]
+        tmpl_iter = ((tid, templates[tid]) for tid in cand_ids if tid in templates)
+    else:
+        ufi = union_family_index
+        cand_ids = []
+        if isinstance(ufi, dict):
+            raw = ufi.get(ibk)
+            if isinstance(raw, list):
+                cand_ids = [str(x) for x in raw]
+        if cand_ids:
+            tmpl_iter = ((tid, templates[tid]) for tid in cand_ids if tid in templates)
+        else:
+            tmpl_iter = ((tmpl.id, tmpl) for tmpl in templates.values())
+    for _tid, tmpl in tmpl_iter:
         if schema is not None:
-            live_ok, _ = template_is_live(template_schema_refs(tmpl), schema)
+            live_ok, _ = TemplateRefs.template_is_live(TemplateRefs.template_schema_refs(tmpl), schema)
             if not live_ok:
                 continue
         cr = structural_compare(intent, tmpl, mode="warmup_gold_store_check")
@@ -2995,26 +3077,25 @@ def reconcile_union_family_after_mutation(
     return removed
 
 
-class _UnionMatchCandidate(NamedTuple):
-    """One accepted template row eligible for union-style reuse with resolved column metadata."""
-
-    template: Template
-    union_cols: list[SelectCol]
-    cols_changed: bool
-    union_sql_path: GenerationPath
-    non_agg_symmetric_diff: int
-
-
 def list_union_match_candidates(
     intent: RuntimeIntent, templates: dict[str, Template], *, schema: SchemaGraph | None = None
-) -> list[_UnionMatchCandidate]:
+) -> list[Any]:
     """List every trusted template that passes structural union gates for *intent*. Used for paths ``3`` and ``4.x`` so the join phase can pick among templates that differ only in stored join fingerprints."""
 
-    def _collect() -> list[_UnionMatchCandidate]:
-        rows: list[_UnionMatchCandidate] = []
+    class _UnionMatchCandidate(NamedTuple):
+        """One accepted template row eligible for union-style reuse with resolved column metadata."""
+
+        template: Template
+        union_cols: list[SelectCol]
+        cols_changed: bool
+        union_sql_path: GenerationPath
+        non_agg_symmetric_diff: int
+
+    def _collect() -> list[Any]:
+        rows: list[Any] = []
         for tmpl in templates.values():
             if schema is not None:
-                live_ok, _ = template_is_live(template_schema_refs(tmpl), schema)
+                live_ok, _ = TemplateRefs.template_is_live(TemplateRefs.template_schema_refs(tmpl), schema)
                 if not live_ok:
                     continue
             cr = structural_compare(intent, tmpl, mode="full")
@@ -3036,9 +3117,7 @@ def list_union_match_candidates(
     return rows
 
 
-def pick_union_match_for_runtime_join(
-    intent: RuntimeIntent, candidates: Sequence[_UnionMatchCandidate]
-) -> _UnionMatchCandidate | None:
+def pick_union_match_for_runtime_join(intent: RuntimeIntent, candidates: Sequence[Any]) -> Any | None:
     """Choose the union candidate whose stored join fingerprint matches the runtime intent. When the runtime intent has no join fingerprint yet and every candidate shares one join key, returns the lexicographically smallest stable pick. When candidates disagree on join keys and the runtime intent is not pinned yet, returns ``None`` so the join LLM can run first."""
     if not candidates:
         return None
@@ -3083,7 +3162,7 @@ def reconcile_union_family_body_join_after_mutation(
         keeper = templates.get(keeper_id)
         if keeper is None:
             return
-        keeper_rt = concrete_intent_to_runtime_skeleton(keeper.intent_signature)
+        keeper_rt = keeper.intent_signature.to_runtime_skeleton()
         for dup_id in tids_sorted[1:]:
             if dup_id not in templates:
                 continue

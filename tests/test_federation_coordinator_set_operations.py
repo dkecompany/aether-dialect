@@ -5,7 +5,6 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from aetherdialect._constants import anti_join_presence_column
 from aetherdialect._contracts_base import FederationCapExceededError
 from aetherdialect._contracts_core import FederatedPlan, JoinSpec, RuntimeCteStep, RuntimeIntent, SelectCol, SourceStep
 from aetherdialect._federation import (
@@ -14,6 +13,7 @@ from aetherdialect._federation import (
     render_federation_glue,
 )
 from aetherdialect._intent_process import NormalizedExpr
+from aetherdialect._sql_gen import anti_join_presence_column
 
 
 def _cross_source_probe_plan(fed, *, emission: str, probe_name: str) -> FederatedPlan:

@@ -1,4 +1,4 @@
-"""T4: classify_migration_tier and apply_migration_policy must agree on tier."""
+"""classify_migration_tier and apply_migration_policy must agree on tier."""
 
 from __future__ import annotations
 
@@ -7,11 +7,11 @@ from dataclasses import replace
 import pytest
 
 from aetherdialect._constants import ARTIFACT_FORMAT_VERSION
-from aetherdialect._contracts_base import ColumnRole, MigrationTier
+from aetherdialect._contracts_base import ArtifactManifest, ColumnRole, MigrationTier
 from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import ArtifactManifest, write_artifact_manifest
+from aetherdialect._core_utils import write_artifact_manifest
 from aetherdialect._schema_graph import classify_migration_tier, diff_schemas
-from aetherdialect._templates import apply_migration_policy
+from aetherdialect._templates import TemplateOps
 
 
 def _col(
@@ -86,7 +86,7 @@ def _assert_tier_agreement(
         last_migration_tier=MigrationTier.SOFT_REFRESH.value,
         last_action="seed",
     )
-    report = apply_migration_policy(str(tmp_path), new, previous_schema=old, schema_diff=diff)
+    report = TemplateOps.apply_migration_policy(str(tmp_path), new, previous_schema=old, schema_diff=diff)
     assert report.tier == tier
 
 

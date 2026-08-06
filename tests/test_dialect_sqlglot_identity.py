@@ -10,7 +10,7 @@ import sqlglot
 
 from aetherdialect._config import EngineConfig
 from aetherdialect._constants import SQLGLOT_DIALECT_BY_ENGINE
-from aetherdialect._dialect import get_dialect_class, get_registered_engines
+from aetherdialect._dialect import DialectRegistry
 from aetherdialect._schema_catalog import (
     _parse_sql_file_fallback,
     _parse_sql_file_sqlglot,
@@ -21,7 +21,7 @@ _REPO = Path(__file__).resolve().parents[1]
 
 
 def _uninit(engine: str):
-    cls = get_dialect_class(engine)
+    cls = DialectRegistry.get_class(engine)
     return cls.__new__(cls)
 
 
@@ -33,7 +33,7 @@ def _identifier_quote_char(dialect) -> str | None:
 
 
 @pytest.mark.fast
-@pytest.mark.parametrize("engine", get_registered_engines())
+@pytest.mark.parametrize("engine", DialectRegistry.get_registered_engines())
 def test_shipped_dialect_sqlglot_identity_agrees(engine: str) -> None:
     """Read, write, name, capability lookup key, and quote style agree per engine."""
     dialect = _uninit(engine)

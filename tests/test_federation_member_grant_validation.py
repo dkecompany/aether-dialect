@@ -7,17 +7,17 @@ from unittest.mock import MagicMock
 import pytest
 
 from aetherdialect._constants import FEDERATION_MAPPINGS_VERSION
-from aetherdialect._contracts_base import LogicalColumnMapping
+from aetherdialect._contracts_base import LogicalColumnMapping, MemberEffectiveGrants
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._federation import (
     FederationDeclarationError,
     FederationMappings,
-    MemberEffectiveGrants,
     compose_composite_graph,
     introspect_member_effective_grants,
     member_effective_grants_from_graph,
     member_graphs_from_engines,
     parse_federation_manifest,
+    resolve_member_effective_grants,
 )
 from aetherdialect._schema_graph import recompute_join_paths_multi
 
@@ -172,3 +172,41 @@ def test_member_effective_grants_from_graph_respects_scope_descriptor() -> None:
     assert "customers" in grants.tables
     assert ("customers", "id") in grants.columns
     assert ("customers", "email") not in grants.columns
+
+
+@pytest.mark.fast
+def test_resolve_member_effective_grants_fail_closed_without_live_hook() -> None:
+    graph = _graph("customers", source_id="a")
+    engine = MagicMock(spec=[])
+    with pytest.raises(FederationDeclarationError, match=r"live effective grants are unavailable"):
+        resolve_member_effective_grants("a", graph, engine=engine, allow_profiled_graph_fallback=False)
+
+
+@pytest.mark.fast
+def test_resolve_member_effective_grants_fail_closed_accepts_explicit() -> None:
+    graph = _graph("customers", source_id="a")
+    grants = MemberEffectiveGrants(
+        tables=frozenset({"customers"}),
+        columns=frozenset({("customers", "id"), ("customers", "email")}),
+    )
+    resolved = resolve_member_effective_grants("a", graph, explicit=grants, allow_profiled_graph_fallback=False)
+    assert resolved is grants
+
+
+@pytest.mark.fast
+def test_resolve_member_effective_grants_uses_dialect_hook() -> None:
+    dialect = MagicMock()
+    dialect.introspect_effective_grants.return_value = MemberEffectiveGrants(tables=frozenset({"customers"}))
+    engine = MagicMock()
+    engine._dialect = dialect
+    grants = resolve_member_effective_grants("a", _graph("customers", source_id="a"), engine=engine)
+    assert grants.tables == frozenset({"customers"})
+
+
+@pytest.mark.fast
+def test_resolve_member_effective_grants_refuses_profiled_graph_fallback() -> None:
+    graph = _graph("customers", source_id="a")
+    engine = MagicMock(spec=[])
+    with pytest.raises(FederationDeclarationError, match=r"profiled schema graphs cannot substitute"):
+        resolve_member_effective_grants("a", graph, engine=engine, allow_profiled_graph_fallback=False)
+    assert member_effective_grants_from_graph(graph).tables == frozenset({"customers"})

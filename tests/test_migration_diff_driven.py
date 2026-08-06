@@ -32,14 +32,8 @@ from aetherdialect._core_utils import (
     write_gzip_json_atomic,
 )
 from aetherdialect._templates import (
+    TemplateOps,
     TemplateStoreView,
-    _load_partitioned_view_unlocked,
-    apply_migration_policy,
-    empty_template_store,
-    save_template_store,
-    surgical_invalidate_templates_by_diff,
-    template_store_dir_for_space,
-    templates_to_store,
 )
 
 
@@ -147,14 +141,14 @@ def _seed_store(
 ) -> str:
     """Write a partitioned template store + a *stale* manifest so apply_migration_policy proceeds."""
     os.makedirs(artifacts_dir, exist_ok=True)
-    store_dir = template_store_dir_for_space(artifacts_dir, "master")
+    store_dir = TemplateOps.template_store_dir_for_space(artifacts_dir, "master")
     os.makedirs(store_dir, exist_ok=True)
     prev = EngineConfig.TEMPLATE_STORE_DIR
     EngineConfig.TEMPLATE_STORE_DIR = store_dir
     try:
-        store = empty_template_store(stale_eff)
-        templates_to_store(store, templates)
-        save_template_store(store)
+        store = TemplateOps.empty_template_store(stale_eff)
+        TemplateOps.templates_to_store(store, templates)
+        TemplateOps.save_template_store(store)
     finally:
         EngineConfig.TEMPLATE_STORE_DIR = prev
     write_artifact_manifest(
@@ -171,11 +165,11 @@ def _seed_store(
 
 def _reload_store(artifacts_dir: str):
     """Load the on-disk partitioned store for assertions (ignores hash reconciliation)."""
-    store_dir = template_store_dir_for_space(artifacts_dir, "master")
+    store_dir = TemplateOps.template_store_dir_for_space(artifacts_dir, "master")
     prev = EngineConfig.TEMPLATE_STORE_DIR
     EngineConfig.TEMPLATE_STORE_DIR = store_dir
     try:
-        raw = _load_partitioned_view_unlocked(store_dir)
+        raw = TemplateOps._load_partitioned_view_unlocked(store_dir)
         if raw is None:
             return TemplateStoreView.empty(store_dir, "eff_placeholder")
         return raw
@@ -193,7 +187,7 @@ class TestSurgicalInvalidateDirect:
         _seed_store(str(tmp_path), schema, {"T0001": t_keep, "T0002": t_drop})
         diff = SchemaDiff(per_table={"orders": TableDiff(dropped_columns=("amount",))})
 
-        deleted = surgical_invalidate_templates_by_diff(str(tmp_path), schema, diff)
+        deleted = TemplateOps.surgical_invalidate_templates_by_diff(str(tmp_path), schema, diff)
 
         assert deleted == 1
         store = _reload_store(str(tmp_path))
@@ -213,7 +207,7 @@ class TestSurgicalInvalidateDirect:
         write_gzip_json_atomic(hdr, poisoned, sort_keys=True)
 
         diff = SchemaDiff(per_table={"orders": TableDiff(dropped_columns=("amount",))})
-        deleted = surgical_invalidate_templates_by_diff(str(tmp_path), schema, diff)
+        deleted = TemplateOps.surgical_invalidate_templates_by_diff(str(tmp_path), schema, diff)
 
         assert deleted == 1
         store = _reload_store(str(tmp_path))
@@ -226,7 +220,7 @@ class TestSurgicalInvalidateDirect:
         _seed_store(str(tmp_path), schema, {"T0001": t1, "T0002": t2})
         diff = SchemaDiff(dropped_tables=("orders",))
 
-        deleted = surgical_invalidate_templates_by_diff(str(tmp_path), schema, diff)
+        deleted = TemplateOps.surgical_invalidate_templates_by_diff(str(tmp_path), schema, diff)
 
         assert deleted == 1
         store = _reload_store(str(tmp_path))
@@ -245,7 +239,7 @@ class TestSurgicalInvalidateDirect:
             },
         )
 
-        deleted = surgical_invalidate_templates_by_diff(str(tmp_path), schema, diff)
+        deleted = TemplateOps.surgical_invalidate_templates_by_diff(str(tmp_path), schema, diff)
 
         assert deleted == 1
         store = _reload_store(str(tmp_path))
@@ -256,7 +250,7 @@ class TestSurgicalInvalidateDirect:
         t = _make_template("T0001", "orders", "amount")
         _seed_store(str(tmp_path), schema, {"T0001": t})
 
-        deleted = surgical_invalidate_templates_by_diff(str(tmp_path), schema, SchemaDiff())
+        deleted = TemplateOps.surgical_invalidate_templates_by_diff(str(tmp_path), schema, SchemaDiff())
 
         assert deleted == 0
         store = _reload_store(str(tmp_path))
@@ -266,7 +260,7 @@ class TestSurgicalInvalidateDirect:
         schema = _two_table_schema()
         diff = SchemaDiff(dropped_tables=("orders",))
 
-        deleted = surgical_invalidate_templates_by_diff(str(tmp_path), schema, diff)
+        deleted = TemplateOps.surgical_invalidate_templates_by_diff(str(tmp_path), schema, diff)
         assert deleted == 0
 
 
@@ -280,7 +274,7 @@ class TestApplyMigrationPolicyDiffDriven:
         _seed_store(str(tmp_path), schema, {"T0001": t_keep, "T0002": t_drop})
         diff = SchemaDiff(per_table={"orders": TableDiff(dropped_columns=("amount",))})
 
-        report = apply_migration_policy(str(tmp_path), schema, schema_diff=diff)
+        report = TemplateOps.apply_migration_policy(str(tmp_path), schema, schema_diff=diff)
 
         assert report.tier == MigrationTier.SOFT_REFRESH
         assert report.surgically_invalidated == 1
@@ -294,7 +288,7 @@ class TestApplyMigrationPolicyDiffDriven:
         _seed_store(str(tmp_path), schema, {"T0001": t})
         diff = SchemaDiff(dropped_tables=("orders",))
 
-        report = apply_migration_policy(str(tmp_path), schema, schema_diff=diff)
+        report = TemplateOps.apply_migration_policy(str(tmp_path), schema, schema_diff=diff)
 
         assert report.tier == MigrationTier.SOFT_REFRESH
         assert report.dropped_tables == ("orders",)
@@ -312,7 +306,7 @@ class TestApplyMigrationPolicyDiffDriven:
             },
         )
 
-        report = apply_migration_policy(str(tmp_path), schema, schema_diff=diff)
+        report = TemplateOps.apply_migration_policy(str(tmp_path), schema, schema_diff=diff)
 
         assert report.tier == MigrationTier.SOFT_REFRESH
         assert ("amount", "integer", "string") in report.value_type_changed_columns
@@ -343,7 +337,7 @@ class TestApplyMigrationPolicyDiffDriven:
             per_table={"sales_orders": TableDiff(added_columns=("tax",))},
         )
 
-        report = apply_migration_policy(str(tmp_path), new_schema, schema_diff=diff)
+        report = TemplateOps.apply_migration_policy(str(tmp_path), new_schema, schema_diff=diff)
 
         assert report.tier == MigrationTier.REMAP
         assert report.renamed_tables == (("orders", "sales_orders"),)
@@ -373,7 +367,7 @@ class TestApplyMigrationPolicyDiffDriven:
             per_table={"customers": TableDiff(dropped_columns=("name",))},
         )
 
-        report = apply_migration_policy(str(tmp_path), new_schema, schema_diff=diff)
+        report = TemplateOps.apply_migration_policy(str(tmp_path), new_schema, schema_diff=diff)
 
         assert report.tier == MigrationTier.REMAP
         assert report.remapped_templates >= 1
@@ -401,7 +395,7 @@ class TestApplyMigrationPolicyDiffDriven:
             per_table={"orders": TableDiff(renamed_columns=(("amount", "total"),))},
         )
 
-        report = apply_migration_policy(str(tmp_path), new_schema, schema_diff=diff)
+        report = TemplateOps.apply_migration_policy(str(tmp_path), new_schema, schema_diff=diff)
 
         assert report.tier == MigrationTier.REMAP
         assert report.renamed_columns == (("orders", "amount", "total"),)
@@ -416,7 +410,7 @@ class TestBackwardsCompatNoDiff:
         t = _make_template("T0001", "orders", "order_id")
         _seed_store(str(tmp_path), schema, {"T0001": t})
 
-        report = apply_migration_policy(str(tmp_path), schema)
+        report = TemplateOps.apply_migration_policy(str(tmp_path), schema)
 
         assert report.surgically_invalidated == 0
         assert report.dropped_tables == ()

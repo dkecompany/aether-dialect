@@ -2,56 +2,29 @@
 
 from __future__ import annotations
 
-import os
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from types import MappingProxyType
 from typing import Any, Literal
 
-from platformdirs import user_data_dir
 from sqlglot import exp
 
+ENGINE_STORAGE_PLACEHOLDER_DIR: str = ".aetherdialect/__placeholder__"
 
-def env_first_nonempty(env: Mapping[str, str], *keys: str) -> str:
-    """Return the first non-blank value among *keys*, else an empty string."""
-    for key in keys:
-        value = str(env.get(key, "") or "").strip()
-        if value:
-            return value
-    return ""
-
-
-def env_any_nonempty(env: Mapping[str, str], keys: tuple[str, ...]) -> bool:
-    """Return True when at least one key maps to a non-blank string."""
-    return any(str(env.get(key, "") or "").strip() for key in keys)
-
-
-def env_role_hint(label: str, keys: tuple[str, ...]) -> str:
-    """Return a human-readable hint listing acceptable environment variable names."""
-    return f"{label}: {' or '.join(keys)}"
-
-
-def package_importable(name: str) -> bool:
-    """Return True when *name* can be imported as a top-level module."""
-    import importlib.util
-
-    return importlib.util.find_spec(name) is not None
-
-
-ResultReaderKind = Literal[
-    "sqlalchemy",
-    "spark",
-    "connector",
-    "bq_client",
-    "bq_storage",
-    "snowflake_arrow",
-]
-
-_ARTIFACT_USER_PARENT: str = user_data_dir(appname="aetherdialect", appauthor=False)
-ENGINE_STORAGE_PLACEHOLDER_DIR: str = os.path.join(
-    _ARTIFACT_USER_PARENT,
-    "aetherdialect",
-    "__placeholder__",
+ENGINE_MODULE_PATHS: Mapping[str, str] = MappingProxyType(
+    {
+        "sqlite": "aetherdialect._dialect_sqlglot_engines",
+        "duckdb": "aetherdialect._dialect_sqlglot_engines",
+        "csv": "aetherdialect._dialect_sqlglot_engines",
+        "mysql": "aetherdialect._dialect_sqlglot_engines",
+        "mariadb": "aetherdialect._dialect_sqlglot_engines",
+        "sqlserver": "aetherdialect._dialect_sqlglot_engines",
+        "postgresql": "aetherdialect._dialect_postgres",
+        "redshift": "aetherdialect._dialect_sqlglot_engines",
+        "databricks": "aetherdialect._dialect_sqlglot_engines",
+        "snowflake": "aetherdialect._dialect_sqlglot_engines",
+        "bigquery": "aetherdialect._dialect_sqlglot_engines",
+    }
 )
 
 SESSION_PROMPT_YESNO: str = "Is this correct? (y/n): "
@@ -68,6 +41,7 @@ SESSION_INTENT_FEEDBACK_BODY: str = (
 )
 
 MIGRATION_HEADER_BY_TIER: dict[str, str] = {
+    "additive": "Schema expanded with new tables or columns. Existing learning is kept.",
     "soft_refresh": "Refreshing cached metadata. Existing learning is kept.",
     "remap": "Schema renames detected. Mapping existing learning to the new names.",
     "destructive": "Learning reset: cache rebuilt from scratch (schema changed in ways that cannot be remapped).",
@@ -77,9 +51,12 @@ SAVED_LINE: str = "Saved."
 
 FEEDBACK_NOTED_LINE: str = "Feedback noted. Try rephrasing your question for a better match."
 
-SESSION_PERSISTENCE_FORMAT_VERSION: int = 1
+SESSION_PERSISTENCE_FORMAT_VERSION: str = "0.2.1"
+SUSPEND_STATE_FORMAT_VERSION: str = "0.2.1"
 
 QUERY_RESULTS_HEADER: str = "Query Results"
+
+FAILURE_TRACE_ROTATE_BYTES: int = 8388608
 
 USER_ERROR_PREFIX: str = "Error: "
 USER_WARN_PREFIX: str = "! "
@@ -113,9 +90,8 @@ REPHRASE_HINT_MESSAGES: dict[str, str] = {
         "Tips: be more specific about columns, filters, grouping, or time range.\n"
     ),
     "restricted_question": (
-        "This question references columns or tables outside the visible schema. Try rephrasing using only "
-        "the table and column names you see in the schema notes, or update `deny_columns` / `allow_columns` "
-        "if you want them in scope."
+        "This question cannot be answered with the information currently available.\n\n"
+        "Try rephrasing to ask about tables and columns you can see in the schema."
     ),
     "vague_question": (
         "I could not pin this question to specific tables or columns.\n\n"
@@ -149,6 +125,11 @@ REPHRASE_HINT_MESSAGES: dict[str, str] = {
         "Tips: retry the question if you still need an answer.\n"
     ),
 }
+
+REMEDIATION_RESTRICTED_QUESTION: str = (
+    "Review allow_columns and deny_columns scope for this aetherspace so the referenced "
+    "tables or columns are visible to the end user."
+)
 
 USER_REJECTED_RESULT_BUCKET_TIPS: dict[str, str] = {
     "MISSING_FILTER": "Tips: name the filter or dimension you care about (time range, status, category).",
@@ -231,15 +212,55 @@ AETHERDIALECT_LOG_PERMISSION_DENIED_DETAIL_ENV: str = "AETHERDIALECT_LOG_PERMISS
 
 SUPPORTED_ENGINES: frozenset[str] = frozenset()
 
+CLASS_DELEGATED_METHODS = frozenset(
+    {
+        "db_url",
+        "connect_args",
+        "connection_slug_fields",
+        "sqlalchemy_url",
+        "validate",
+        "has_native_connection",
+        "has_iam_credentials",
+        "has_password_auth",
+        "has_keypair_auth",
+        "has_oauth_auth",
+        "has_sql_auth",
+        "has_windows_auth",
+        "has_aad_password_auth",
+        "has_aad_service_principal_auth",
+        "has_service_account",
+        "resolve_source_files",
+        "set_source_selections",
+        "apply_connection_credentials",
+    }
+)
 
-def set_supported_engines(engines: frozenset[str]) -> None:
-    """Update the runtime registry of dialect names after ``register_dialect`` calls."""
-    global SUPPORTED_ENGINES
-    SUPPORTED_ENGINES = engines
+
+EngineDriverRequirement = tuple[str | tuple[str, ...], str | tuple[str, ...], str]
+
+ENGINE_DRIVER_REQUIREMENTS: dict[str, EngineDriverRequirement] = {
+    "postgresql": ("psycopg", "psycopg", "postgresql"),
+    "mysql": ("mysql.connector", "mysql-connector-python", "mysql"),
+    "mariadb": ("mysql.connector", "mysql-connector-python", "mysql"),
+    "duckdb": ("duckdb", "duckdb", "duckdb"),
+    "csv": ("openpyxl", "openpyxl", "csv"),
+    "sqlite": ("sqlite3", "sqlite", "sqlite"),
+    "sqlserver": ("pyodbc", "pyodbc", "sqlserver"),
+    "snowflake": ("snowflake.connector", "snowflake-connector-python", "snowflake"),
+    "bigquery": ("google.cloud.bigquery", "google-cloud-bigquery", "bigquery"),
+    "databricks": ("databricks", "databricks-sql-connector", "databricks"),
+    "redshift": ("redshift_connector", "redshift-connector", "redshift"),
+}
 
 
+ARTIFACT_DIR_MODE: int = 0o700
+ARTIFACT_FILE_MODE: int = 0o600
 ARTIFACT_LOCK_TIMEOUT_SECONDS: float = 30.0
 ARTIFACT_LOCK_POLL_INTERVAL_SECONDS: float = 0.05
+SCHEMA_CLASSIFY_ERROR_DETAIL_CAP: int = 50
+DIAGNOSTIC_CODE_STALE_ARTIFACT_LOCK: str = "STALE_ARTIFACT_LOCK"
+DIAGNOSTIC_CODE_ARTIFACTS_DIR_NOT_LOCAL: str = "ARTIFACTS_DIR_NOT_LOCAL"
+DIAGNOSTIC_FORCE_DEPTH: int = 0
 
 NORMALIZATION_JACCARD_FLOOR: float = 0.4
 
@@ -251,6 +272,8 @@ WARMUP_ROUND_TRIP_CARDINALITY_TOLERANCE: float = 0.25
 
 WRITE_QUEUE_DRAIN_TIMEOUT_SECONDS: float = 30.0
 WRITE_QUEUE_MAX_BYTES_PER_DRAIN: int = 4194304
+DIAGNOSTIC_CODE_WRITE_QUEUE_CORRUPT: str = "WRITE_QUEUE_CORRUPT"
+DIAGNOSTIC_CODE_WRITE_QUEUE_FULL: str = "WRITE_QUEUE_FULL"
 
 SCHEMA_OVERRIDES_MAX_DESCRIPTION_CHARS: int = 2000
 
@@ -276,6 +299,12 @@ PERMISSION_DENIED_USER_MESSAGE: str = (
     "You do not have access to one or more tables required by this answer. Please contact your administrator."
 )
 
+REFUSAL_NOT_AVAILABLE_IN_CONTEXT: str = "refusal_not_available_in_context"
+
+REFUSAL_NOT_AVAILABLE_IN_CONTEXT_MESSAGE: str = (
+    "This question refers to information that is not available in this context."
+)
+
 TABLE_PREVIEW_DEFAULT_LIMIT: int = 20
 TABLE_PREVIEW_MAX_LIMIT: int = 200
 
@@ -287,13 +316,39 @@ SCHEMA_FIELD_TYPE: str = "type"
 SCHEMA_FIELD_TRUTH_VALUE: str = "truth_value"
 SCHEMA_FIELD_KEYS: str = "keys"
 SCHEMA_FIELD_ENUM: str = "enum"
+SCHEMA_FIELD_SAMPLES: str = "samples"
+SCHEMA_FIELD_DERIVED: str = "derived"
+SCHEMA_FIELD_RAW_TYPE: str = "raw_type"
+
+UNKNOWN_VALUE_TYPE: str = "unknown"
+
+JSON_COLUMN_TYPE_TOKENS: frozenset[str] = frozenset({"json", "jsonb"})
+
+PROMPT_SCALAR_VALUE_TYPES: frozenset[str] = frozenset({"boolean", "date", "integer", "number", "string"})
+
+JSON_CONTAINMENT_ENGINES: frozenset[str] = frozenset({"postgresql", "mysql", "mariadb", "duckdb", "databricks"})
 
 INTERPRET_FIELDS: frozenset[str] = frozenset({SCHEMA_FIELD_DESCRIPTION, SCHEMA_FIELD_ENUM})
 GROUND_FIELDS: frozenset[str] = frozenset(
-    {SCHEMA_FIELD_DESCRIPTION, SCHEMA_FIELD_ROLE, SCHEMA_FIELD_TYPE, SCHEMA_FIELD_TRUTH_VALUE, SCHEMA_FIELD_ENUM}
+    {
+        SCHEMA_FIELD_DESCRIPTION,
+        SCHEMA_FIELD_ROLE,
+        SCHEMA_FIELD_TYPE,
+        SCHEMA_FIELD_TRUTH_VALUE,
+        SCHEMA_FIELD_ENUM,
+        SCHEMA_FIELD_SAMPLES,
+        SCHEMA_FIELD_DERIVED,
+    }
 )
 COMPOSE_FIELDS: frozenset[str] = frozenset(
-    {SCHEMA_FIELD_ROLE, SCHEMA_FIELD_TYPE, SCHEMA_FIELD_TRUTH_VALUE, SCHEMA_FIELD_KEYS, SCHEMA_FIELD_ENUM}
+    {
+        SCHEMA_FIELD_ROLE,
+        SCHEMA_FIELD_TYPE,
+        SCHEMA_FIELD_TRUTH_VALUE,
+        SCHEMA_FIELD_KEYS,
+        SCHEMA_FIELD_ENUM,
+        SCHEMA_FIELD_DERIVED,
+    }
 )
 FULL_FIELDS: frozenset[str] = frozenset(
     {
@@ -303,6 +358,7 @@ FULL_FIELDS: frozenset[str] = frozenset(
         SCHEMA_FIELD_TRUTH_VALUE,
         SCHEMA_FIELD_KEYS,
         SCHEMA_FIELD_ENUM,
+        SCHEMA_FIELD_DERIVED,
     }
 )
 
@@ -324,6 +380,105 @@ INTERPRET_PLAN_SCHEMA: dict[str, Any] = {
         },
         "schema_invalid": {"type": "boolean"},
         "missing": {"type": "string"},
+    },
+}
+
+META_SCHEMA_ANSWER_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["response_kind", "headline", "counts", "tables", "relationships", "notes"],
+    "additionalProperties": False,
+    "properties": {
+        "response_kind": {"type": "string", "const": "schema_catalog"},
+        "headline": {"type": "string", "minLength": 1},
+        "counts": {
+            "type": "object",
+            "required": ["tables", "columns", "members", "columns_in_table", "tables_in_member"],
+            "additionalProperties": False,
+            "properties": {
+                "tables": {"type": ["integer", "null"]},
+                "columns": {"type": ["integer", "null"]},
+                "members": {"type": ["integer", "null"]},
+                "columns_in_table": {
+                    "oneOf": [
+                        {"type": "null"},
+                        {
+                            "type": "object",
+                            "required": ["table", "columns"],
+                            "additionalProperties": False,
+                            "properties": {
+                                "table": {"type": "string", "minLength": 1},
+                                "columns": {"type": "integer"},
+                            },
+                        },
+                    ]
+                },
+                "tables_in_member": {
+                    "oneOf": [
+                        {"type": "null"},
+                        {
+                            "type": "object",
+                            "required": ["source_id", "tables"],
+                            "additionalProperties": False,
+                            "properties": {
+                                "source_id": {"type": "string", "minLength": 1},
+                                "tables": {"type": "integer"},
+                            },
+                        },
+                    ]
+                },
+            },
+        },
+        "tables": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["name", "source_id", "description", "columns"],
+                "additionalProperties": False,
+                "properties": {
+                    "name": {"type": "string", "minLength": 1},
+                    "source_id": {"type": "string", "minLength": 1},
+                    "description": {"type": "string"},
+                    "columns": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["name", "data_type", "role", "description"],
+                            "additionalProperties": False,
+                            "properties": {
+                                "name": {"type": "string", "minLength": 1},
+                                "data_type": {"type": "string"},
+                                "role": {"type": "string"},
+                                "description": {"type": "string"},
+                            },
+                        },
+                    },
+                },
+            },
+        },
+        "relationships": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["left", "right", "kind"],
+                "additionalProperties": False,
+                "properties": {
+                    "left": {"type": "string", "minLength": 1},
+                    "right": {"type": "string", "minLength": 1},
+                    "kind": {"type": "string", "enum": ["fk", "semantic"]},
+                },
+            },
+        },
+        "notes": {"type": "array", "items": {"type": "string"}},
+    },
+}
+
+META_KNOWLEDGE_ANSWER_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["response_kind", "message"],
+    "additionalProperties": False,
+    "properties": {
+        "response_kind": {"type": "string", "const": "business_knowledge"},
+        "message": {"type": "string", "minLength": 1},
     },
 }
 
@@ -409,6 +564,57 @@ SCHEMA_BUILD_PHASE_I: str = "I:viability_hash"
 SCHEMA_BUILD_PHASE_J: str = "J:persist"
 SCHEMA_BUILD_PHASE_K: str = "K:overrides_health"
 
+SCHEMA_CLASSIFY_SYSTEM: str = (
+    "Classify every table's role and every column listed in the input for each table.\n\n"
+    "INPUT SCOPE:\n"
+    "Each table object lists only the columns you must classify under columns. "
+    "Return JSON with exactly those table keys. For each table, include exactly those column keys under columns — "
+    "no additional columns and no omissions.\n\n"
+    "TABLE ROLES:\n"
+    "- dimension: reference/lookup table referenced by others, descriptive attributes\n"
+    "- fact: transactional/event table with FKs to dimensions, contains measures\n"
+    "- bridge: junction table for many-to-many, mostly FKs, few own columns\n"
+    "- unknown: cannot confidently classify\n"
+    "Use FK topology: tables referenced by many others are dimension; tables with many outbound FKs are fact; tables with only 2+ FKs and minimal columns are bridge.\n\n"
+    "COLUMN ROLE DECISION PRIORITY (evaluate in order, first match wins):\n"
+    "1. is_primary_key or is_foreign_key → identifier\n"
+    "2. value_type is date → temporal (unless name clearly marks audit-only system timestamp like last_update → audit)\n"
+    "3. name suggests binary state (is_*, has_*, active) and distinct_count = 2 → boolean\n"
+    "4. value_type is integer or number and name suggests quantity/amount/price/count/size/distance → numeric_measure\n"
+    "4b. value_type is integer and name suggests duration/period/lead_time/lag/tenure/offset in time units → temporal\n"
+    "5. value_type is integer or number and name suggests code/rating/level/rank/status/tier/year → numeric_categorical\n"
+    "6. value_type is integer or number with no clear name signal → numeric_measure (default for numeric value types)\n"
+    "7. value_type is string and very high distinct_ratio → free_text\n"
+    "8. value_type is string → categorical (default for string value types)\n\n"
+    "AMBIGUOUS TWO-VALUE COLUMNS:\n"
+    "When a column has exactly two sampled categorical values (e.g. positive/negative-style pairs), do not assume boolean unless name, value_type, FK topology, and profile_hints clearly support a flag.\n\n"
+    "PROFILE HINTS (supporting evidence only — never override name/value_type signals):\n"
+    "Each column may include a profile_hints object with distinct_count, distinct_ratio, and null_ratio. Use these to confirm or disambiguate when name and value_type are ambiguous.\n"
+    "Do NOT use profile_hints as the primary reason to choose a role.\n\n"
+    "CROSS-TABLE CONSISTENCY:\n"
+    "- Columns with the same name and value_type across tables MUST receive the same role.\n"
+    "- Deduce roles from names, value_type, FK topology, and profile_hints using the priority above.\n\n"
+    "COLUMN DESCRIPTIONS:\n"
+    "For each column, provide a short semantic description (max 8 words) describing what the column represents in business terms. Every column object MUST include a non-empty description.\n"
+    "Role-based guidance for column descriptions:\n"
+    "- identifier columns: describe what entity the ID refers to.\n"
+    "- numeric_measure columns: state the unit or what is measured.\n"
+    "- categorical columns: mention common category values or groupings.\n"
+    "- temporal columns with value_type date: state what event the date/time marks.\n"
+    "- temporal columns with value_type integer: state that the column holds a day-count or period length (not a calendar date).\n"
+    "- audit columns: state that the column records when a row was last changed by the system.\n"
+    "- boolean columns: describe the yes/no condition.\n"
+    "- FK columns: MUST state what business data the target table provides when joined. Name the key descriptive columns on the target table (e.g. 'links to target_table for name, title, description').\n\n"
+    "TABLE DESCRIPTIONS:\n"
+    "For each table provide a one-line business purpose that includes: (a) what entity or event the table represents, (b) which related tables it connects to via foreign keys, and (c) the notable descriptive or measure columns it provides that users commonly ask about. Every table MUST include a non-empty description.\n\n"
+    "SENSITIVITY (per column, optional):\n"
+    'Include "sensitivity" in each column object: always null in this pass.\n'
+    'A later second-pass refine step may set "restricted" or "hidden" only when domain notes explicitly require it.\n\n'
+    "Reason internally, output only JSON:\n"
+    '{"table1": {"table_role": "...", "description": "...", '
+    '"columns": {"col1": {"role": "...", "description": "...", "sensitivity": null}, ...}}, ...}'
+)
+
 SCHEMA_NOTES_REFINE_SYSTEM: str = (
     "You refine base_classification using domain_notes.\n\n"
     "The base_classification was produced from profiling statistics and FK topology alone.\n"
@@ -425,12 +631,22 @@ SCHEMA_NOTES_REFINE_SYSTEM: str = (
     '"columns": {"col1": {"role": "...", "description": "...", "sensitivity": null}, ...}}, ...}'
 )
 
+BUSINESS_KNOWLEDGE_NOTES_EXTRACT_SYSTEM: str = (
+    "You extract business-knowledge entries from operator notes.\n"
+    "Return a JSON array of objects with keys key, kind, and text only.\n"
+    "kind must be one of: glossary, policy, metric, synonym, caveat.\n"
+    "Include only definitions, policies, metrics, synonyms, and caveats that are not descriptions of a specific "
+    "table or column already listed in the user payload schema_names.\n"
+    "Do not invent facts absent from the notes. Do not include empty keys or empty text.\n"
+    "Reason internally, output only the JSON array."
+)
+
 SCHEMA_CONSISTENCY_REFINE_SYSTEM: str = (
     "You receive base_classification JSON describing every table and column. The user message contains only "
     "base_classification under that key.\n\n"
     "Preserve the base output unless you detect a genuine cross-table inconsistency — for example the same "
-    "column name and SQL data type assigned different roles in different tables. When you fix such an "
-    "inconsistency, align the conflicting entries to the role that best matches the shared name, type, and "
+    "column name and value_type assigned different roles in different tables. When you fix such an "
+    "inconsistency, align the conflicting entries to the role that best matches the shared name, value_type, and "
     "FK topology.\n\n"
     "Do not invent new descriptions: keep each table description and column description from the base unless a "
     "detected inconsistency forces a minimal coordinated rewrite.\n"
@@ -450,6 +666,18 @@ DESCRIPTION_REFINER_SYSTEM: str = (
     "(column names, table names, units, values, conditions, references). Tighten phrasing, remove fluff, make role "
     "and business meaning explicit, and keep wording in plain prose. Do not invent facts the human did not state. "
     "Output ONLY valid JSON."
+)
+
+BUSINESS_KNOWLEDGE_REFINER_SYSTEM: str = (
+    "You refine business-knowledge entries for a text-to-SQL system. "
+    "Input is JSON with 'entries' (objects with key, kind, text) and 'schema_names' (qualified table and "
+    "table.column names). Return ONLY JSON of the form "
+    '{"entries": [{"key": "...", "kind": "...", "text": "..."}]} '
+    "with the same keys as the input (or fewer when merging duplicate keys). "
+    "Do not invent keys that were not in the input. Keep kind in "
+    "{glossary, policy, metric, synonym, caveat}. "
+    "Tighten prose; preserve human keywords; do not invent facts. "
+    "Do not write definitions that merely rename a schema table or column—those belong in schema descriptions."
 )
 
 QSIM_PHASE_A: str = "A:bootstrap"
@@ -501,9 +729,11 @@ DIAGNOSTIC_CODE_INTERPRET_GROUND_RETRY: str = "INTERPRET_GROUND_RETRY"
 DIAGNOSTIC_CODE_COMPOSE_REPAIR: str = "COMPOSE_REPAIR"
 DIAGNOSTIC_CODE_FALLBACK_FRESH_RESTART: str = "FALLBACK_FRESH_RESTART"
 DIAGNOSTIC_CODE_CONFIG_FILE_VALUE_APPLIED: str = "CONFIG_FILE_VALUE_APPLIED"
+DIAGNOSTIC_CODE_CONFIGURATION_KEY_IGNORED: str = "CONFIGURATION_KEY_IGNORED"
 DIAGNOSTIC_CODE_ENGINE_INFO: str = "ENGINE_INFO"
 DIAGNOSTIC_CODE_LLM_TURN_COST: str = "LLM_TURN_COST"
 DIAGNOSTIC_CODE_SCHEMA_OVERRIDE_SKIP: str = "SCHEMA_OVERRIDE_SKIP"
+DIAGNOSTIC_CODE_OVERRIDE_NEEDS_RECONFIRMATION: str = "OVERRIDE_NEEDS_RECONFIRMATION"
 DIAGNOSTIC_CODE_PK_INFERENCE_PROMPT: str = "PK_INFERENCE_PROMPT"
 DIAGNOSTIC_CODE_ZERO_ROW_WHERE_SUGGESTION: str = "ZERO_ROW_WHERE_SUGGESTION"
 DIAGNOSTIC_CODE_ZERO_ROW_WHERE_AUTO_FIXED: str = "ZERO_ROW_WHERE_AUTO_FIXED"
@@ -511,8 +741,13 @@ DIAGNOSTIC_CODE_DATA_QUALITY_BLOCKING: str = "DATA_QUALITY_BLOCKING"
 DIAGNOSTIC_CODE_DATA_QUALITY_ADVISORY: str = "DATA_QUALITY_ADVISORY"
 DIAGNOSTIC_CODE_DATA_QUALITY_AUTO_READ: str = "DATA_QUALITY_AUTO_READ"
 DIAGNOSTIC_CODE_DATA_QUALITY_AUTO_CORRECTED: str = "DATA_QUALITY_AUTO_CORRECTED"
+DIAGNOSTIC_CODE_UPLOAD_UNIT_AFFIX_STRIPPED: str = "UPLOAD_UNIT_AFFIX_STRIPPED"
+DIAGNOSTIC_CODE_UPLOAD_TRANSFORM_REJECTED: str = "UPLOAD_TRANSFORM_REJECTED"
+DIAGNOSTIC_CODE_UPLOAD_TRANSFORM_APPLIED: str = "UPLOAD_TRANSFORM_APPLIED"
 DIAGNOSTIC_CODE_COMPOSITE_DESCRIPTIVE_PROFILE_FAILED: str = "COMPOSITE_DESCRIPTIVE_PROFILE_FAILED"
 DIAGNOSTIC_CODE_COLUMN_PROFILE_FAILED: str = "COLUMN_PROFILE_FAILED"
+DIAGNOSTIC_CODE_COLUMN_CHARSET_MISMATCH: str = "COLUMN_CHARSET_MISMATCH"
+DIAGNOSTIC_CODE_MATERIALIZED_VIEW_ANSWER: str = "MATERIALIZED_VIEW_ANSWER"
 DIAGNOSTIC_CODE_PROFILE_TABLE_CLONE_FAILED: str = "PROFILE_TABLE_CLONE_FAILED"
 
 DATA_QUALITY_ISSUE_EMPTY_FILE: str = "empty_file"
@@ -712,6 +947,100 @@ CSV_IDENTIFIER_NAMING_SCHEMA: dict[str, Any] = {
     "properties": {"identifier": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"}},
 }
 
+
+UPLOAD_COLUMN_TRANSFORM_IDS: tuple[str, ...] = (
+    "parse_temporal",
+    "strip_numeric_affix",
+    "band_bounds",
+    "band_value_map",
+    "keep_canonical_columns",
+    "derive_by_pattern",
+    "drop_empty_columns",
+    "null_tokens",
+    "unpivot_columns",
+)
+UPLOAD_SAMPLE_MAX_ROWS: int = 5
+UPLOAD_INTERPRET_MAX_ROWS: int = 25
+UPLOAD_BAND_VALUE_MAP_MAX_DISTINCT: int = 25
+REVIEW_GATED_UPLOAD_COLUMN_TRANSFORMS: frozenset[str] = frozenset(
+    {
+        "keep_canonical_columns",
+        "drop_empty_columns",
+        "unpivot_columns",
+    }
+)
+
+UPLOAD_COLUMN_TRANSFORMS_SYSTEM: str = (
+    "You propose column transforms for one tabular upload relation. Output ONLY valid JSON matching "
+    "column_transforms_schema in the user payload. Use transform_id values from upload_transform_ids "
+    f"in the user payload ({', '.join(UPLOAD_COLUMN_TRANSFORM_IDS)}). Each proposal must name the "
+    "target column label when required and supply params fields defined in the schema. Mark "
+    "requires_review true for shape-changing transforms. Proposals are verified deterministically on "
+    "the full column before apply; invalid proposals are rejected without changing data."
+)
+
+UPLOAD_COLUMN_TRANSFORMS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["column_transforms"],
+    "additionalProperties": False,
+    "properties": {
+        "column_transforms": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["transform_id"],
+                "additionalProperties": False,
+                "properties": {
+                    "transform_id": {"type": "string", "enum": list(UPLOAD_COLUMN_TRANSFORM_IDS)},
+                    "column": {"type": "string"},
+                    "requires_review": {"type": "boolean"},
+                    "params": {"type": "object"},
+                },
+            },
+        },
+    },
+}
+
+UPLOAD_SUMMARY_SYSTEM: str = (
+    "You summarize structured upload inspection findings for an operator. Output ONLY valid JSON with "
+    "one summary field. Use issue codes, locations, severities, and suggested_selections from the "
+    "user payload. Do not invent row values or business meaning beyond the supplied findings."
+)
+
+UPLOAD_SUMMARY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["summary"],
+    "additionalProperties": False,
+    "properties": {"summary": {"type": "string"}},
+}
+
+UPLOAD_INTERPRET_SYSTEM: str = (
+    "You propose layout interpretation for one ambiguous tabular upload. Output ONLY valid JSON "
+    "matching upload_interpret_schema in the user payload. Suggest header_row, table_range, "
+    "append_regions, or merge_regions when structural scoring is inconclusive. Use only fields "
+    "present in the schema. Proposals are verified against the grid before use."
+)
+
+UPLOAD_INTERPRET_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "header_row": {"type": "integer"},
+        "table_range": {"type": "string"},
+        "append_regions": {"type": "array", "items": {"type": "string"}},
+        "merge_regions": {"type": "array", "items": {"type": "string"}},
+    },
+}
+
+UPLOAD_PROMPT_NEUTRALITY_AUDIT_CONSTANTS: frozenset[str] = frozenset(
+    {
+        "CSV_IDENTIFIER_NAMING_SYSTEM",
+        "UPLOAD_COLUMN_TRANSFORMS_SYSTEM",
+        "UPLOAD_INTERPRET_SYSTEM",
+        "UPLOAD_SUMMARY_SYSTEM",
+    }
+)
+
 CSV_SCHEMA_LITERAL_ORIGINAL_NAME_NOTE: str = (
     "For file-sourced tables, name is the normalized SQL identifier and original_name is the label "
     "from the uploaded file."
@@ -722,6 +1051,8 @@ AUDIT_EVENT_WRITE_QUEUE_TEMPLATE_REJECT: str = "write_queue_template_reject"
 AUDIT_EVENT_WRITE_QUEUE_TEMPLATE_ACCEPT: str = "write_queue_template_accept"
 AUDIT_EVENT_WRITE_QUEUE_OVERRIDE_PROPOSAL: str = "write_queue_override_proposal"
 AUDIT_EVENT_FEDERATION_SEMIJOIN_KEY_TRANSFER: str = "federation_semijoin_key_transfer"
+AUDIT_EVENT_ASK_SUSPEND: str = "ask_suspend"
+AUDIT_EVENT_ASK_CANCELLED: str = "ask_cancelled"
 
 CONFIG_ERROR_SCHEMA_CONTEXT_COLUMN_SPEC: str = "deny_columns and allow_columns entries must be qualified as 'table.column' or '*.column'; bare column names are not permitted; got {spec!r}"
 
@@ -735,16 +1066,35 @@ INTENT_NON_SELECTABLE_PREDICATE_MESSAGE_DEFAULT: str = (
     "{location}: column {table}.{column} cannot appear in {surface} (sensitivity policy)."
 )
 
-ARTIFACT_FORMAT_VERSION: int = 6
-NAMED_SCHEMA_CONTEXT_ARTIFACT_VERSION: int = 2
+ARTIFACT_FORMAT_VERSION: str = "0.2.1"
+KNOWLEDGE_EXPORT_FORMAT_VERSION: str = "0.2.1"
+META_ANSWER_FORMAT_VERSION: str = "0.2.1"
+META_ANSWERS_FILENAME: str = "meta_answers.json"
+META_DEFAULT_SOURCE_ID: str = "default"
+META_EMPTY_BUSINESS_KNOWLEDGE_MESSAGE: str = "No business knowledge entries are configured for this engine or space."
+NAMED_SCHEMA_CONTEXT_ARTIFACT_VERSION: str = "0.2.1"
 NAMED_SCHEMA_CONTEXT_PREFIX: str = "schema_context."
-MIN_COMPATIBLE_PACKAGE_VERSION: str = "0.2.0"
+MIN_COMPATIBLE_PACKAGE_VERSION: str = "0.2.1"
 ARTIFACT_MANIFEST_FILENAME: str = "artifact_manifest.json"
+RENAME_HISTORY_FILENAME: str = "rename_history.json.gz"
 ARTIFACT_LOCK_FILENAME: str = ".aetherdialect_engine.lock"
 
 SCHEMA_OVERRIDES_DEFAULT_FILENAME: str = "schema_overrides.json"
 MIGRATION_MAP_FILENAME: str = "schema_migration_map.json"
+MIGRATION_CHECKPOINT_SCHEMA_BASENAME: str = "schema_graph.json.gz"
 WRITE_QUEUE_FILENAME: str = "write_queue.jsonl"
+
+SCHEMA_INSTRUCTION_LIKE_LINE_PATTERNS: tuple[str, ...] = (
+    r"(?i)^\s*ignore\s+(all\s+)?(prior|previous)\b",
+    r"(?i)^\s*disregard\s+(all\s+)?(prior|previous)\b",
+    r"(?i)^\s*system\s*:",
+    r"(?i)^\s*assistant\s*:",
+    r"(?i)^\s*you\s+are\b",
+    r"(?i)^\s*always\s+filter\b",
+    r"(?i)^\s*never\s+reveal\b",
+    r"(?i)^\s*do\s+not\s+follow\b",
+)
+SCHEMA_INSTRUCTION_SCRUB_REPLACEMENT: str = "[scrubbed]"
 
 MIGRATION_MAP_ACTION_REMAP: str = "remap"
 MIGRATION_MAP_ACTION_DESTRUCTIVE: str = "destructive"
@@ -756,7 +1106,7 @@ ARTIFACT_LAST_ACTION_DESTRUCTIVE_USER_MAP: str = "destructive_user_map"
 SCHEMA_OVERRIDES_APPLIED_SUFFIX: str = ".applied.json"
 SCHEMA_OVERRIDES_APPLIED_TIMESTAMP_FORMAT: str = "%Y%m%dT%H%M%SZ"
 SCHEMA_OVERRIDES_SIDECAR_FILENAME: str = "applied_overrides.json"
-SCHEMA_OVERRIDES_VERSION: int = 3
+SCHEMA_OVERRIDES_VERSION: str = "0.2.1"
 SCHEMA_OVERRIDES_EXPORT_DEFAULT_OWNER: str = "ai"
 
 INTERACTIVE_STAGE_DIRECT_REUSE: str = "direct_reuse_confirm"
@@ -774,22 +1124,25 @@ PIPELINE_BUG_SQL_VALIDATION: str = "pipeline_bug_sql_validation"
 SESSION_KIND_IDLE: str = "idle"
 SESSION_KIND_AWAITING_INTENT_CONFIRM: str = "awaiting_intent_confirm"
 SESSION_KIND_AWAITING_INTENT_FEEDBACK: str = "awaiting_intent_feedback"
+SESSION_KIND_AWAITING_REUSE_CONFIRM: str = "awaiting_reuse_confirm"
 SESSION_KIND_AWAITING_SQL_CONFIRM: str = "awaiting_sql_confirm"
 SESSION_KIND_AWAITING_SQL_FEEDBACK: str = "awaiting_sql_feedback"
 SESSION_KIND_EXECUTE: str = "execute"
 SESSION_KIND_RESULT: str = "result"
+SESSION_KIND_META: str = "meta"
 SESSION_KIND_ERROR: str = "error"
 
 YES_NO_SESSION_KINDS: frozenset[str] = frozenset(
     {
         SESSION_KIND_AWAITING_INTENT_CONFIRM,
+        SESSION_KIND_AWAITING_REUSE_CONFIRM,
         SESSION_KIND_AWAITING_SQL_CONFIRM,
         SESSION_KIND_EXECUTE,
     }
 )
 
 SUSPEND_ID_TO_SESSION_KIND: dict[str, str] = {
-    PIPELINE_SUSPEND_ID_DIRECT_REUSE: SESSION_KIND_AWAITING_SQL_CONFIRM,
+    PIPELINE_SUSPEND_ID_DIRECT_REUSE: SESSION_KIND_AWAITING_REUSE_CONFIRM,
     PIPELINE_SUSPEND_ID_INTENT_CONFIRM: SESSION_KIND_AWAITING_INTENT_CONFIRM,
     PIPELINE_SUSPEND_ID_INTENT_FEEDBACK: SESSION_KIND_AWAITING_INTENT_FEEDBACK,
     PIPELINE_SUSPEND_ID_EXECUTE: SESSION_KIND_EXECUTE,
@@ -806,10 +1159,10 @@ JOIN_CHOICE_SCOPE_MAIN: str = "main"
 SCHEMA_CONTEXT_CACHE_NAME: str = "schema_context.json"
 SCHEMA_CONTEXT_CACHED_DDL: str = "_cached_schema_context.sql"
 SCHEMA_CONTEXT_CACHED_NOTES: str = "_cached_schema_context_notes.txt"
-SCHEMA_CONTEXT_CACHE_VERSION: int = 4
-SCHEMA_JOIN_PATH_ENUMERATION_VERSION: int = 1
+SCHEMA_CONTEXT_CACHE_VERSION: str = "0.2.1"
+SCHEMA_JOIN_PATH_ENUMERATION_VERSION: str = "0.2.1"
 
-AETHERSPACE_ARTIFACT_VERSION: int = 2
+AETHERSPACE_ARTIFACT_VERSION: str = "0.2.1"
 AETHERSPACES_SEGMENT: str = "aetherspaces"
 MASTER_AETHERSPACE_NAME: str = "master"
 CANONICAL_FEEDBACK_DIALECT: str = "duckdb"
@@ -819,12 +1172,21 @@ TEMPLATE_STORE_SPACES_SEGMENT: str = "spaces"
 SCHEMA_CONTEXT_NAMED_SPEC_GLOB: str = "schema_context.*.json"
 TEMPLATE_STORE_HEADER_FILENAME: str = "header.json.gz"
 TEMPLATE_STORE_PARTITION_PREFIX: str = "partition_"
+TEMPLATE_STORE_FEEDBACK_SEGMENT: str = "feedback"
+TEMPLATE_STORE_FEEDBACK_PARTITION_PREFIX: str = "partition_"
+FEEDBACK_SHARD_INDEX_KEY: str = "feedback_shard_index"
 TEMPLATE_STORE_PARTITION_COUNT: int = 256
 TEMPLATE_STORE_PARTITION_LRU_MAX: int = 32
-TEMPLATE_STORE_MAX_TEMPLATE_COUNT: int = 10_000
-TEMPLATE_STORE_MAX_DISK_BYTES: int = 512 * 1024 * 1024
 TEMPLATE_VALUE_HISTORY_MAX_ROWS: int = 64
 TEMPLATE_STORE_LEGACY_SINGLE_FILE: str = "intent_templates.json.gz"
+TEMPLATE_STORE_ORPHANED_SEGMENT: str = "orphaned"
+MIGRATION_CHECKPOINT_PREFIX: str = ".migration_checkpoint_"
+ORPHAN_RETENTION_SECONDS: int = 7 * 24 * 3600
+DIAGNOSTIC_CODE_TEMPLATE_STORE_ORPHANED: str = "TEMPLATE_STORE_ORPHANED"
+DIAGNOSTIC_CODE_TEMPLATE_REMAP_DIVERGED: str = "TEMPLATE_REMAP_DIVERGED"
+DIAGNOSTIC_CODE_MIGRATION_CHECKPOINT_ORPHANED: str = "MIGRATION_CHECKPOINT_ORPHANED"
+DIAGNOSTIC_CODE_ARTIFACT_GROWTH: str = "ARTIFACT_GROWTH"
+DIAGNOSTIC_CODE_ARTIFACT_LIMIT_NEAR: str = "ARTIFACT_LIMIT_NEAR"
 
 SEED_WARMUP_CACHE_ZIP: str = "seed_warmup_cache.zip"
 WARMUP_ANCHOR_LATTICE_SUBDIR: str = "anchor_lattice"
@@ -855,6 +1217,8 @@ SIMULATION_CACHE_GLOB_PATTERNS: tuple[str, ...] = (
     "qsim_*.json.gz",
     "qsim_summary_*.json.gz",
     "qsim_skeletons_*.json.gz",
+    "qsim/summary_*.json",
+    "qsim/index.jsonl",
     f"{WARMUP_ANCHOR_LATTICE_SUBDIR}/*",
 )
 
@@ -864,6 +1228,68 @@ SOFT_DIAGNOSTIC_CODES: frozenset[str] = frozenset(
         "explain_zero_estimate",
     }
 )
+
+DETERMINISTIC_REPAIR_TRACE_HEADINGS: dict[str, str] = {
+    "dedup_extract_year_vs_column_literal": "intent_after_deterministic_repair.dedup_extract_year_vs_column_literal",
+    "repair_intent_placeholder_tokens": "intent_after_deterministic_repair.repair_intent_placeholder_tokens",
+    "normalize_count_star": "intent_after_deterministic_repair.normalize_count_star",
+    "promote_temporal_keyword_rhs": "intent_after_deterministic_repair.promote_temporal_keyword_rhs",
+    "dedup_value_vs_right_expr": "intent_after_deterministic_repair.dedup_value_vs_right_expr",
+    "qualify_count_star_mulgroups": "intent_after_deterministic_repair.qualify_count_star_mulgroups",
+    "lift_distinct_select_from_raw_sql": "intent_after_deterministic_repair.lift_distinct_select_from_raw_sql",
+    "canonicalize_registry_ids": "intent_after_deterministic_repair.canonicalize_registry_ids",
+    "encode_inline_self_join_as_cte": "intent_after_deterministic_repair.encode_inline_self_join_as_cte",
+    "reorder_cte_steps_by_dag": "intent_after_deterministic_repair.reorder_cte_steps_by_dag",
+    "normalize_cte_names": "intent_after_deterministic_repair.normalize_cte_names",
+    "normalize_cte_output_aliases": "intent_after_deterministic_repair.normalize_cte_output_aliases",
+    "rewrite_main_query_refs_to_final_cte_columns": (
+        "intent_after_deterministic_repair.rewrite_main_query_refs_to_final_cte_columns"
+    ),
+    "ensure_cte_output_columns_exposure": "intent_after_deterministic_repair.ensure_cte_output_columns_exposure",
+    "qualify_cte_output_columns": "intent_after_deterministic_repair.qualify_cte_output_columns",
+    "derive_tables_from_intent": "intent_after_deterministic_repair.derive_tables_from_intent",
+    "expand_shared_pk_tables_for_refs": "intent_after_deterministic_repair.expand_shared_pk_tables_for_refs",
+    "sanitize_table_names": "intent_after_deterministic_repair.sanitize_table_names",
+    "replace_unknown_scalar_funcs": "intent_after_deterministic_repair.replace_unknown_scalar_funcs",
+    "enforce_grain_consistency": "intent_after_deterministic_repair.enforce_grain_consistency",
+    "repair_window_partition_group_by_alignment": (
+        "intent_after_deterministic_repair.repair_window_partition_group_by_alignment"
+    ),
+    "strip_redundant_identifier_group_by": "intent_after_deterministic_repair.strip_redundant_identifier_group_by",
+    "strip_spurious_group_by": "intent_after_deterministic_repair.strip_spurious_group_by",
+    "decompose_between_params": "intent_after_deterministic_repair.decompose_between_params",
+    "auto_repair_where_having": "intent_after_deterministic_repair.auto_repair_where_having",
+    "coerce_predicate_group_mode": "intent_after_deterministic_repair.coerce_predicate_group_mode",
+    "normalize_where_havings": "intent_after_deterministic_repair.normalize_where_havings",
+    "repair_null_equality_where": "intent_after_deterministic_repair.repair_null_equality_where",
+    "strip_join_conditions": "intent_after_deterministic_repair.strip_join_conditions",
+    "cte_grain_consistency": "intent_after_deterministic_repair.cte_grain_consistency",
+    "sort_select_and_order_by": "intent_after_deterministic_repair.sort_select_and_order_by",
+    "lift_distinct_modifier_in_multiply": "intent_after_deterministic_repair.lift_distinct_modifier_in_multiply",
+    "simplify_exprs": "intent_after_deterministic_repair.simplify_exprs",
+    "normalize_in_raw_values": "intent_after_deterministic_repair.normalize_in_raw_values",
+    "promote_date_subtraction_to_date_diff": "intent_after_deterministic_repair.promote_date_subtraction_to_date_diff",
+    "repair_misclassified_date_diff": "intent_after_deterministic_repair.repair_misclassified_date_diff",
+    "normalize_date_diff_raw_values": "intent_after_deterministic_repair.normalize_date_diff_raw_values",
+    "canonicalize_temporal_unit_args": "intent_after_deterministic_repair.canonicalize_temporal_unit_args",
+    "strip_impossible_having": "intent_after_deterministic_repair.strip_impossible_having",
+    "repair_fk_where_type_mismatch": "intent_after_deterministic_repair.repair_fk_where_type_mismatch",
+    "resolve_where_value_case": "intent_after_deterministic_repair.resolve_where_value_case",
+    "normalize_in_where_types": "intent_after_deterministic_repair.normalize_in_where_types",
+    "normalize_boolean_where_values": "intent_after_deterministic_repair.normalize_boolean_where_values",
+    "normalize_null_where_values": "intent_after_deterministic_repair.normalize_null_where_values",
+    "expand_fk_select_to_descriptive": "intent_after_deterministic_repair.expand_fk_select_to_descriptive",
+    "dedup_contradictory_where": "intent_after_deterministic_repair.dedup_contradictory_where",
+    "repair_cumulative_phrasing_window_intent": (
+        "intent_after_deterministic_repair.repair_cumulative_phrasing_window_intent"
+    ),
+    "repair_case_when_intent": "intent_after_deterministic_repair.repair_case_when_intent",
+    "drop_invalid_case_registry_entries": "intent_after_deterministic_repair.drop_invalid_case_registry_entries",
+    "repair_array_where_intent": "intent_after_deterministic_repair.repair_array_where_intent",
+    "enforce_sensitivity_policy_intent": "intent_after_deterministic_repair.enforce_sensitivity_policy_intent",
+    "tail_enforce_grain_consistency": "intent_after_deterministic_repair.tail_enforce_grain_consistency",
+    "tail_normalize_where_havings": "intent_after_deterministic_repair.tail_normalize_where_havings",
+}
 
 ROLE_VALUE_TYPE_COMPAT: dict[str, frozenset[str]] = {
     "boolean": frozenset({"boolean", "integer", "string"}),
@@ -915,7 +1341,7 @@ CANONICAL_ENGINE_ORDER: tuple[str, ...] = (
     "bigquery",
 )
 
-RESULT_READER_KINDS: tuple[ResultReaderKind, ...] = (
+RESULT_READER_KINDS: tuple[str, ...] = (
     "sqlalchemy",
     "spark",
     "connector",
@@ -924,7 +1350,7 @@ RESULT_READER_KINDS: tuple[ResultReaderKind, ...] = (
     "snowflake_arrow",
 )
 
-ARROW_RESULT_READER_KINDS: frozenset[ResultReaderKind] = frozenset({"snowflake_arrow", "bq_storage"})
+ARROW_RESULT_READER_KINDS: frozenset[str] = frozenset({"snowflake_arrow", "bq_storage"})
 
 _INTENT_DATE_UNIT_AMOUNT_VALUE: dict[str, Any] = {
     "type": "object",
@@ -998,6 +1424,7 @@ INTENT_SCHEMA = {
                     },
                 },
                 {"type": "array"},
+                {"type": "null"},
             ]
         },
         "having": {
@@ -1011,6 +1438,7 @@ INTENT_SCHEMA = {
                     },
                 },
                 {"type": "array"},
+                {"type": "null"},
             ]
         },
         "cte_steps": {
@@ -1044,8 +1472,8 @@ INTENT_SCHEMA = {
                     },
                     "group_by_cols": {"type": "array"},
                     "order_by_cols": {"type": "array"},
-                    "where": {"oneOf": [{"type": "object"}, {"type": "array"}]},
-                    "having": {"oneOf": [{"type": "object"}, {"type": "array"}]},
+                    "where": {"oneOf": [{"type": "object"}, {"type": "array"}, {"type": "null"}]},
+                    "having": {"oneOf": [{"type": "object"}, {"type": "array"}, {"type": "null"}]},
                     "output_columns": {
                         "type": "array",
                         "items": {"type": "string", "pattern": "^[a-z_][a-z0-9_]*$"},
@@ -1056,7 +1484,7 @@ INTENT_SCHEMA = {
                     "preserve_tables": {"type": "array", "items": {"type": "string"}},
                     "emission": {
                         "type": "string",
-                        "enum": ["join_table", "scalar_subquery", "semi_join", "anti_join"],
+                        "enum": ["semi_join", "anti_join"],
                     },
                 },
             },
@@ -1067,51 +1495,50 @@ INTENT_SCHEMA = {
         "natural_language": {"type": "string"},
         "distinct_on": {"type": "array", "items": {"type": "string"}},
         "preserve_tables": {"type": "array", "items": {"type": "string"}},
+        "grain": {
+            "type": "string",
+            "enum": ["row_level", "grouped", "scalar"],
+        },
     },
 }
 
 
-def _build_logical_intent_schema() -> dict[str, Any]:
-    """Return JSON Schema for planner :class:`LogicalIntent` LLM output."""
-    prose: dict[str, Any] = {"type": "string"}
-    limit_null: dict[str, Any] = {"oneOf": [{"type": "string"}, {"type": "null"}]}
-    cte_item: dict[str, Any] = {
-        "type": "object",
-        "required": ["name", "tables", "select"],
-        "additionalProperties": False,
-        "properties": {
-            "name": {"type": "string", "minLength": 1},
-            "tables": {"type": "array", "items": {"type": "string"}, "minItems": 1},
-            "select": {"type": "string", "minLength": 1},
-            "where": prose,
-            "group_by": prose,
-            "having": prose,
-            "order_by": prose,
-            "limit": limit_null,
-            "window": prose,
-            "case": prose,
+LOGICAL_INTENT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["tables", "select"],
+    "additionalProperties": False,
+    "properties": {
+        "tables": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        "select": {"type": "string", "minLength": 1},
+        "where": {"type": "string"},
+        "group_by": {"type": "string"},
+        "having": {"type": "string"},
+        "order_by": {"type": "string"},
+        "limit": {"oneOf": [{"type": "string"}, {"type": "null"}]},
+        "window": {"type": "string"},
+        "case": {"type": "string"},
+        "cte_steps": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["name", "tables", "select"],
+                "additionalProperties": False,
+                "properties": {
+                    "name": {"type": "string", "minLength": 1},
+                    "tables": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                    "select": {"type": "string", "minLength": 1},
+                    "where": {"type": "string"},
+                    "group_by": {"type": "string"},
+                    "having": {"type": "string"},
+                    "order_by": {"type": "string"},
+                    "limit": {"oneOf": [{"type": "string"}, {"type": "null"}]},
+                    "window": {"type": "string"},
+                    "case": {"type": "string"},
+                },
+            },
         },
-    }
-    return {
-        "type": "object",
-        "required": ["tables", "select"],
-        "additionalProperties": False,
-        "properties": {
-            "tables": {"type": "array", "items": {"type": "string"}, "minItems": 1},
-            "select": {"type": "string", "minLength": 1},
-            "where": prose,
-            "group_by": prose,
-            "having": prose,
-            "order_by": prose,
-            "limit": limit_null,
-            "window": prose,
-            "case": prose,
-            "cte_steps": {"type": "array", "items": cte_item},
-        },
-    }
-
-
-LOGICAL_INTENT_SCHEMA: dict[str, Any] = _build_logical_intent_schema()
+    },
+}
 
 PLANNER_PROSE_FIELDS: tuple[str, ...] = (
     "select",
@@ -1237,12 +1664,6 @@ QUALIFY_SKIP_IDENTIFIERS: frozenset[str] = frozenset(
 
 FILE_ENGINE_NAMES: frozenset[str] = frozenset({"csv"})
 
-
-def is_file_engine(engine: str | None) -> bool:
-    """Return whether *engine* is the CSV file-upload backend."""
-    return (engine or "").strip().lower() in FILE_ENGINE_NAMES
-
-
 NATIVE_BACKEND_ENGINES: frozenset[str] = frozenset(
     {
         "databricks",
@@ -1261,12 +1682,38 @@ NATIVE_BACKEND_ENGINES: frozenset[str] = frozenset(
 EMBEDDED_ENGINE_NAMES: frozenset[str] = frozenset({"duckdb", "sqlite", "csv"})
 
 UPLOAD_INGEST_ENGINE_NAMES: frozenset[str] = frozenset({"duckdb", "csv"})
+UPLOAD_SCALAR_AFFIX_TOKENS: tuple[str, ...] = (
+    "US$",
+    "USD",
+    "AUD",
+    "EUR",
+    "GBP",
+    "CAD",
+    "NZD",
+    "CHF",
+    "JPY",
+    "CNY",
+    "€",
+    "£",
+    "$",
+    "%",
+)
 
+UPLOAD_SCALAR_AFFIX_TOKENS_SORTED: tuple[str, ...] = tuple(sorted(UPLOAD_SCALAR_AFFIX_TOKENS, key=len, reverse=True))
+UPLOAD_SCALAR_BAND_PATTERN_STRINGS: tuple[str, ...] = (
+    r"(?i)\bto\b",
+    r"(?i)\bor\s+more\b",
+    r"(?i)\bless\s+than\b",
+    r"(?i)\d+\s*[-–—]\s*\d+\s*%",
+)
+UPLOAD_SCALAR_BAND_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(pattern) for pattern in UPLOAD_SCALAR_BAND_PATTERN_STRINGS
+)
+ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+ISO_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?$")
+BARE_SCALAR_NUMBER_RE = re.compile(r"^[+-]?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d+)?$")
 
-def is_upload_ingest_engine(engine: str | None) -> bool:
-    """Return whether *engine* can receive validated tabular upload materialisation."""
-    return (engine or "").strip().lower() in UPLOAD_INGEST_ENGINE_NAMES
-
+UPLOAD_CURRENCY_AFFIX_TOKENS: frozenset[str] = frozenset(token for token in UPLOAD_SCALAR_AFFIX_TOKENS if token != "%")
 
 SQLGLOT_DIALECT_HOOK_ENGINES: frozenset[str] = frozenset(
     name for name in CANONICAL_ENGINE_ORDER if name != "postgresql"
@@ -1306,13 +1753,31 @@ VALID_VALUE_TYPES = {
     "number",
     "null",
     "boolean",
+    "binary",
+    "unknown",
     "date_window",
     "date_diff",
 }
 
+WEEK_START_DAY: str = "monday"
+WEEK_NUMBERING: str = "iso"
+
 VALID_RELATIVE_DATE_UNITS = frozenset(
     {"day", "week", "month", "quarter", "half_year", "year", "hour", "minute", "second"}
 )
+
+SUBDAY_RELATIVE_DATE_UNITS: frozenset[str] = frozenset({"hour", "minute", "second"})
+
+MYSQL_DATE_WINDOW_TRUNC_FORMAT: dict[str, str] = {
+    "month": "%Y-%m-01",
+    "year": "%Y-01-01",
+}
+
+MYSQL_DATE_WINDOW_SUBDAY_TRUNC_FORMAT: dict[str, str] = {
+    "hour": "%Y-%m-%d %H:00:00",
+    "minute": "%Y-%m-%d %H:%i:00",
+    "second": "%Y-%m-%d %H:%i:%s",
+}
 
 YEAR_LITERAL_COMPARISON_OPS: frozenset[str] = frozenset({"=", ">", "<", ">=", "<="})
 YEAR_LITERAL_RE = re.compile(r"^(19|20)\d{2}$")
@@ -1441,9 +1906,11 @@ VALUE_TYPE_NORMALIZATION = {
     "date": "date",
     "number": "number",
     "boolean": "boolean",
+    "binary": "binary",
     "null": "null",
     "date_window": "date_window",
     "date_diff": "date_diff",
+    "unknown": "unknown",
 }
 
 _BOOLEAN_WHERE_OPS = {"=", "!=", "in", "not in", "is null", "is not null"}
@@ -1560,8 +2027,12 @@ COLUMN_TYPE_TO_VALUE_TYPE = {
     "float64": "number",
     "float32": "number",
     "bignumeric": "number",
-    "bytes": "string",
-    "blob": "string",
+    "bytes": "binary",
+    "blob": "binary",
+    "bytea": "binary",
+    "binary": "binary",
+    "varbinary": "binary",
+    "image": "binary",
     "timestamp_ntz": "date",
     "timestamp_ltz": "date",
     "timestamp_tz": "date",
@@ -1772,6 +2243,46 @@ NUMERIC_TYPE_TOKENS = frozenset(
     }
 )
 
+NUMERIC_TYPE_ARGUMENTS_RE = re.compile(r"\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)", re.IGNORECASE)
+
+SQL_INTEGER_LITERAL_RE = re.compile(r"^[+-]?\d+$")
+SQL_FIXED_POINT_LITERAL_RE = re.compile(r"^[+-]?\d+\.\d+$")
+SQL_EXPONENT_LITERAL_RE = re.compile(r"^[+-]?(?:\d+\.?\d*|\.\d+)[eE][+-]?\d+$")
+
+EXACT_NUMERIC_BASE_TYPES = frozenset(
+    {
+        "decimal",
+        "numeric",
+        "money",
+        "int",
+        "integer",
+        "bigint",
+        "smallint",
+        "tinyint",
+        "int2",
+        "int4",
+        "int8",
+        "long",
+        "short",
+        "serial",
+        "bigserial",
+        "smallserial",
+        "byteint",
+        "int64",
+    }
+)
+
+INEXACT_NUMERIC_BASE_TYPES = frozenset(
+    {
+        "float",
+        "real",
+        "double",
+        "double precision",
+        "float4",
+        "float8",
+    }
+)
+
 STRING_TYPE_TOKENS = frozenset(
     {
         "char",
@@ -1883,9 +2394,7 @@ COMPATIBLE_TYPE_PAIRS = {
     ("date", "timestamptz"),
     ("timestamp", "timestamp"),
     ("timestamp", "date"),
-    ("timestamp", "timestamptz"),
     ("timestamptz", "timestamptz"),
-    ("timestamptz", "timestamp"),
     ("timestamptz", "date"),
     ("boolean", "boolean"),
     ("boolean", "bool"),
@@ -2152,70 +2661,133 @@ IRREGULAR_PLURALS_MAP: dict[str, str] = {
 }
 
 
-class ExpansionOperatorId:
-    """Stable expansion operator ids; registry keys and expansion metadata stamps."""
+WHERE_ADD = "WHERE_ADD"
+WHERE_EXPR_ADD = "WHERE_EXPR_ADD"
+AGG_CHANGE = "AGG_CHANGE"
+GROUPBY_ADD = "GROUPBY_ADD"
+ORDERBY_ADD = "ORDERBY_ADD"
+HAVING_VALUE_ADD = "HAVING_VALUE_ADD"
+HAVING_EXPR_ADD = "HAVING_EXPR_ADD"
+WHERE_REMOVE = "WHERE_REMOVE"
+GROUPBY_REMOVE = "GROUPBY_REMOVE"
+HAVING_REMOVE = "HAVING_REMOVE"
+JOIN_DIMENSION_ADD = "JOIN_DIMENSION_ADD"
+JOIN_FACT_ADD = "JOIN_FACT_ADD"
+DIMENSION_SWAP = "DIMENSION_SWAP"
+TABLE_REMOVE = "TABLE_REMOVE"
+BRIDGE_INTERMEDIATE_ADD = "BRIDGE_INTERMEDIATE_ADD"
+INCLUDE_GOLD = "INCLUDE_GOLD"
+TEMP_EXTRACT_GROUPBY = "TEMP_EXTRACT_GROUPBY"
+TEMP_DATE_TRUNC_GROUPBY = "TEMP_DATE_TRUNC_GROUPBY"
+TEMP_DATE_WINDOW_WHERE = "TEMP_DATE_WINDOW_WHERE"
+TEMP_DATE_DIFF_WHERE = "TEMP_DATE_DIFF_WHERE"
+NUM_ROUND_SELECT = "NUM_ROUND_SELECT"
+NUM_ABS_WHERE = "NUM_ABS_WHERE"
+DISTINCT_ADD = "DISTINCT_ADD"
+LIMIT_ADD = "LIMIT_ADD"
+WHERE_OR_GROUP = "WHERE_OR_GROUP"
+SELECT_EXPR_PAIR_MULTIPLY = "SELECT_EXPR_PAIR_MULTIPLY"
+WINDOW_RANK_ADD = "WINDOW_RANK_ADD"
+WINDOW_SUM_PARTITION_ADD = "WINDOW_SUM_PARTITION_ADD"
+SELECT_CASE_LABEL_ADD = "SELECT_CASE_LABEL_ADD"
+WINDOW_LAG_ADD = "WINDOW_LAG_ADD"
+WINDOW_LEAD_ADD = "WINDOW_LEAD_ADD"
+WHERE_ILIKE_ADD = "WHERE_ILIKE_ADD"
+WHERE_ARRAY_CONTAINS_ADD = "WHERE_ARRAY_CONTAINS_ADD"
+ORDERBY_REMOVE = "ORDERBY_REMOVE"
+LIMIT_REMOVE = "LIMIT_REMOVE"
+SELECT_COL_TRIM = "SELECT_COL_TRIM"
+WINDOW_STRIP = "WINDOW_STRIP"
+DISTINCT_REMOVE = "DISTINCT_REMOVE"
+SPLICE_SUBTREE = "SPLICE_SUBTREE"
+EMI_MUTATE = "EMI_MUTATE"
+CTE_WRAP_GROUPED = "CTE_WRAP_GROUPED"
+CTE_SCALAR_THRESHOLD = "CTE_SCALAR_THRESHOLD"
+CASE_CATEGORICAL_ADD = "CASE_CATEGORICAL_ADD"
+WHERE_IN_LIST_ADD = "WHERE_IN_LIST_ADD"
+WHERE_NULL_ADD = "WHERE_NULL_ADD"
+WHERE_NOT_NULL_ADD = "WHERE_NOT_NULL_ADD"
+HAVING_MATCH_SELECT_AGG = "HAVING_MATCH_SELECT_AGG"
+COUNT_DISTINCT_ADD = "COUNT_DISTINCT_ADD"
+WINDOW_DENSE_RANK_ADD = "WINDOW_DENSE_RANK_ADD"
+WINDOW_RANK_FUNC_ADD = "WINDOW_RANK_FUNC_ADD"
+WINDOW_AVG_PARTITION_ADD = "WINDOW_AVG_PARTITION_ADD"
+ORDERBY_WINDOW_COL_ADD = "ORDERBY_WINDOW_COL_ADD"
+WHERE_LIKE_ADD = "WHERE_LIKE_ADD"
+SELECT_COALESCE_ADD = "SELECT_COALESCE_ADD"
+SELECT_STRING_SCALAR_ADD = "SELECT_STRING_SCALAR_ADD"
+TEMP_EXTRACT_WHERE = "TEMP_EXTRACT_WHERE"
+CTE_UNNEST_ADD = "CTE_UNNEST_ADD"
+SELF_JOIN_CTE_ADD = "SELF_JOIN_CTE_ADD"
+MULTI_CTE_CHAIN_ADD = "MULTI_CTE_CHAIN_ADD"
+SPLICE_HAVING_SUBTREE = "SPLICE_HAVING_SUBTREE"
+SPLICE_WINDOW_SUBTREE = "SPLICE_WINDOW_SUBTREE"
 
-    WHERE_ADD = "WHERE_ADD"
-    WHERE_EXPR_ADD = "WHERE_EXPR_ADD"
-    AGG_CHANGE = "AGG_CHANGE"
-    GROUPBY_ADD = "GROUPBY_ADD"
-    ORDERBY_ADD = "ORDERBY_ADD"
-    HAVING_VALUE_ADD = "HAVING_VALUE_ADD"
-    HAVING_EXPR_ADD = "HAVING_EXPR_ADD"
-    WHERE_REMOVE = "WHERE_REMOVE"
-    GROUPBY_REMOVE = "GROUPBY_REMOVE"
-    HAVING_REMOVE = "HAVING_REMOVE"
-    JOIN_DIMENSION_ADD = "JOIN_DIMENSION_ADD"
-    JOIN_FACT_ADD = "JOIN_FACT_ADD"
-    DIMENSION_SWAP = "DIMENSION_SWAP"
-    TABLE_REMOVE = "TABLE_REMOVE"
-    BRIDGE_INTERMEDIATE_ADD = "BRIDGE_INTERMEDIATE_ADD"
-    INCLUDE_GOLD = "INCLUDE_GOLD"
-    TEMP_EXTRACT_GROUPBY = "TEMP_EXTRACT_GROUPBY"
-    TEMP_DATE_TRUNC_GROUPBY = "TEMP_DATE_TRUNC_GROUPBY"
-    TEMP_DATE_WINDOW_WHERE = "TEMP_DATE_WINDOW_WHERE"
-    TEMP_DATE_DIFF_WHERE = "TEMP_DATE_DIFF_WHERE"
-    NUM_ROUND_SELECT = "NUM_ROUND_SELECT"
-    NUM_ABS_WHERE = "NUM_ABS_WHERE"
-    DISTINCT_ADD = "DISTINCT_ADD"
-    LIMIT_ADD = "LIMIT_ADD"
-    WHERE_OR_GROUP = "WHERE_OR_GROUP"
-    SELECT_EXPR_PAIR_MULTIPLY = "SELECT_EXPR_PAIR_MULTIPLY"
-    WINDOW_RANK_ADD = "WINDOW_RANK_ADD"
-    WINDOW_SUM_PARTITION_ADD = "WINDOW_SUM_PARTITION_ADD"
-    SELECT_CASE_LABEL_ADD = "SELECT_CASE_LABEL_ADD"
-    WINDOW_LAG_ADD = "WINDOW_LAG_ADD"
-    WINDOW_LEAD_ADD = "WINDOW_LEAD_ADD"
-    WHERE_ILIKE_ADD = "WHERE_ILIKE_ADD"
-    WHERE_ARRAY_CONTAINS_ADD = "WHERE_ARRAY_CONTAINS_ADD"
-    ORDERBY_REMOVE = "ORDERBY_REMOVE"
-    LIMIT_REMOVE = "LIMIT_REMOVE"
-    SELECT_COL_TRIM = "SELECT_COL_TRIM"
-    WINDOW_STRIP = "WINDOW_STRIP"
-    DISTINCT_REMOVE = "DISTINCT_REMOVE"
-    SPLICE_SUBTREE = "SPLICE_SUBTREE"
-    EMI_MUTATE = "EMI_MUTATE"
-    CTE_WRAP_GROUPED = "CTE_WRAP_GROUPED"
-    CTE_SCALAR_THRESHOLD = "CTE_SCALAR_THRESHOLD"
-    CASE_CATEGORICAL_ADD = "CASE_CATEGORICAL_ADD"
-    WHERE_IN_LIST_ADD = "WHERE_IN_LIST_ADD"
-    WHERE_NULL_ADD = "WHERE_NULL_ADD"
-    WHERE_NOT_NULL_ADD = "WHERE_NOT_NULL_ADD"
-    HAVING_MATCH_SELECT_AGG = "HAVING_MATCH_SELECT_AGG"
-    COUNT_DISTINCT_ADD = "COUNT_DISTINCT_ADD"
-    WINDOW_DENSE_RANK_ADD = "WINDOW_DENSE_RANK_ADD"
-    WINDOW_RANK_FUNC_ADD = "WINDOW_RANK_FUNC_ADD"
-    WINDOW_AVG_PARTITION_ADD = "WINDOW_AVG_PARTITION_ADD"
-    ORDERBY_WINDOW_COL_ADD = "ORDERBY_WINDOW_COL_ADD"
-    WHERE_LIKE_ADD = "WHERE_LIKE_ADD"
-    SELECT_COALESCE_ADD = "SELECT_COALESCE_ADD"
-    SELECT_STRING_SCALAR_ADD = "SELECT_STRING_SCALAR_ADD"
-    TEMP_EXTRACT_WHERE = "TEMP_EXTRACT_WHERE"
-    CTE_UNNEST_ADD = "CTE_UNNEST_ADD"
-    SELF_JOIN_CTE_ADD = "SELF_JOIN_CTE_ADD"
-    MULTI_CTE_CHAIN_ADD = "MULTI_CTE_CHAIN_ADD"
-    SPLICE_HAVING_SUBTREE = "SPLICE_HAVING_SUBTREE"
-    SPLICE_WINDOW_SUBTREE = "SPLICE_WINDOW_SUBTREE"
+EXPANSION_OPERATOR_IDS: frozenset[str] = frozenset(
+    {
+        WHERE_ADD,
+        WHERE_EXPR_ADD,
+        AGG_CHANGE,
+        GROUPBY_ADD,
+        ORDERBY_ADD,
+        HAVING_VALUE_ADD,
+        HAVING_EXPR_ADD,
+        WHERE_REMOVE,
+        GROUPBY_REMOVE,
+        HAVING_REMOVE,
+        JOIN_DIMENSION_ADD,
+        JOIN_FACT_ADD,
+        DIMENSION_SWAP,
+        TABLE_REMOVE,
+        BRIDGE_INTERMEDIATE_ADD,
+        INCLUDE_GOLD,
+        TEMP_EXTRACT_GROUPBY,
+        TEMP_DATE_TRUNC_GROUPBY,
+        TEMP_DATE_WINDOW_WHERE,
+        TEMP_DATE_DIFF_WHERE,
+        NUM_ROUND_SELECT,
+        NUM_ABS_WHERE,
+        DISTINCT_ADD,
+        LIMIT_ADD,
+        WHERE_OR_GROUP,
+        SELECT_EXPR_PAIR_MULTIPLY,
+        WINDOW_RANK_ADD,
+        WINDOW_SUM_PARTITION_ADD,
+        SELECT_CASE_LABEL_ADD,
+        WINDOW_LAG_ADD,
+        WINDOW_LEAD_ADD,
+        WHERE_ILIKE_ADD,
+        WHERE_ARRAY_CONTAINS_ADD,
+        ORDERBY_REMOVE,
+        LIMIT_REMOVE,
+        SELECT_COL_TRIM,
+        WINDOW_STRIP,
+        DISTINCT_REMOVE,
+        SPLICE_SUBTREE,
+        EMI_MUTATE,
+        CTE_WRAP_GROUPED,
+        CTE_SCALAR_THRESHOLD,
+        CASE_CATEGORICAL_ADD,
+        WHERE_IN_LIST_ADD,
+        WHERE_NULL_ADD,
+        WHERE_NOT_NULL_ADD,
+        HAVING_MATCH_SELECT_AGG,
+        COUNT_DISTINCT_ADD,
+        WINDOW_DENSE_RANK_ADD,
+        WINDOW_RANK_FUNC_ADD,
+        WINDOW_AVG_PARTITION_ADD,
+        ORDERBY_WINDOW_COL_ADD,
+        WHERE_LIKE_ADD,
+        SELECT_COALESCE_ADD,
+        SELECT_STRING_SCALAR_ADD,
+        TEMP_EXTRACT_WHERE,
+        CTE_UNNEST_ADD,
+        SELF_JOIN_CTE_ADD,
+        MULTI_CTE_CHAIN_ADD,
+        SPLICE_HAVING_SUBTREE,
+        SPLICE_WINDOW_SUBTREE,
+    }
+)
 
 
 POSTGRES_ENV_HOST: tuple[str, ...] = (
@@ -2456,10 +3028,14 @@ QUESTION_NORMALIZE_VOCABULARY_GUIDANCE: str = (
 )
 
 QUESTION_VALIDATION_SYSTEM: str = (
-    "You decide if user input is a database query request or not.\n\n"
-    "Treat the input as a VALID database query request whenever a reasonable relational database could store rows that answer it.\n"
-    "That includes list, show, get, find, count, sum, average, min, max, filter, sort, group, compare, rank, top-N, trend, or per-entity questions, including bounded counts such as listing two named entities.\n"
-    "When the utterance is ambiguous but still plausibly data-seeking, choose VALID.\n\n"
+    "You decide if user input is a database query request or not, and which answer path it needs.\n\n"
+    "Treat the input as a VALID database query request whenever a reasonable relational database could store rows "
+    "that answer it, OR when it asks about this database's schema structure (tables, columns, types, keys, "
+    "relationships, inventory or counts of tables/columns/members, federation membership), OR when it asks for "
+    "definitions, policies, metrics, synonyms, or caveats answerable from business knowledge.\n"
+    "That includes list, show, get, find, count, sum, average, min, max, filter, sort, group, compare, rank, "
+    "top-N, trend, or per-entity questions, including bounded counts such as listing two named entities.\n"
+    "When the utterance is ambiguous but still plausibly data-seeking, choose VALID with query_type analytical.\n\n"
     "Mark as INVALID only when it is clearly one of the following:\n"
     '- Chitchat or meta conversation (e.g. "hello", "thanks", "who are you")\n'
     '- A request for SQL tutoring, query help, or how-to without asking for actual rows (e.g. "how do I write a join")\n'
@@ -2468,12 +3044,43 @@ QUESTION_VALIDATION_SYSTEM: str = (
     "DML covers any data mutation (delete, update, insert, merge, truncate, copy). "
     "DDL covers schema mutation (create, drop, alter, rename). "
     "Administrative covers privilege management, indexing, vacuuming, configuration, and any other non-analytical operation. "
-    "Analytical questions never receive restricted, including questions that describe their solution using analytical primitives such as CTEs, subqueries, joins, aggregations, window functions, distinct, recursion, or set operations. "
-    "Use of the literal words CTE, subquery, with, join, group, order, window, partition, recursive, or similar terms in the question never alone implies restricted.\n\n"
+    "Analytical questions never receive restricted, including questions that describe their solution using analytical "
+    "primitives such as CTEs, subqueries, joins, aggregations, window functions, distinct, recursion, or set operations. "
+    "Use of the literal words CTE, subquery, with, join, group, order, window, partition, recursive, or similar terms "
+    "in the question never alone implies restricted.\n\n"
+    "When valid_database_question is yes, set query_type to exactly one of:\n"
+    "- analytical: the user wants data rows or aggregates from tables\n"
+    "- schema_catalog: the user asks about this schema's structure, inventory, counts of tables/columns/members, "
+    "or federation membership inventory\n"
+    "- business_knowledge: the user asks for glossary, policy, metric, synonym, or caveat definitions from "
+    "business knowledge\n"
+    "When valid_database_question is no and the request is not restricted, set query_type to unspecified.\n\n"
     "Respond with JSON containing exactly three fields:\n"
     '- "valid_database_question": "yes" or "no"\n'
-    '- "query_type": "allowed" if read/SELECT operation, "restricted" if write or schema-modifying, "unspecified" if unclear.\n'
+    '- "query_type": "analytical", "schema_catalog", "business_knowledge", "restricted", or "unspecified"\n'
     '- "corrected": the input with spelling typos fixed only. Do NOT remove, reorder, or rephrase any words.\n\n'
+    f"{LLM_JSON_ONLY_FOOTER}"
+)
+
+META_SCHEMA_CATALOG_SYSTEM: str = (
+    "You answer questions about the active database schema using only the JSON `schema` object in the user message.\n"
+    "Never invent table names, column names, source ids, or relationships that are absent from `schema`.\n"
+    "Copy inventory counts only from `schema.inventory` and `schema.members` into the `counts` fields; "
+    "do not recount by scanning table lists or prose.\n"
+    "Leave a `counts` field null when the question does not ask for that metric.\n"
+    "Leave `tables` and `relationships` as empty arrays for pure count or inventory questions that need no detail list.\n"
+    "Return JSON matching META_SCHEMA_ANSWER_SCHEMA exactly "
+    "(response_kind, headline, counts, tables, relationships, notes).\n"
+    f"{LLM_JSON_ONLY_FOOTER}"
+)
+
+META_BUSINESS_KNOWLEDGE_SYSTEM: str = (
+    "You answer questions using only the JSON `business_knowledge` list in the user message.\n"
+    "Each entry has key, kind, and text. Answer only from that list; never invent terms.\n"
+    "If the list is empty, set `message` to exactly the configured empty-knowledge reply "
+    f"({META_EMPTY_BUSINESS_KNOWLEDGE_MESSAGE!r}).\n"
+    "Return JSON matching META_KNOWLEDGE_ANSWER_SCHEMA exactly "
+    "(response_kind business_knowledge, message as natural-language prose).\n"
     f"{LLM_JSON_ONLY_FOOTER}"
 )
 
@@ -2532,15 +3139,6 @@ SEED_QUESTION_CLARIFY_SYSTEM: str = (
     "per input index, indices matching the batch, no extra keys, no markdown."
 )
 
-UNIT_TO_DAYS: dict[str, int] = {
-    "day": 1,
-    "week": 7,
-    "month": 30,
-    "quarter": 91,
-    "half_year": 182,
-    "year": 365,
-}
-
 NULL_CHECK_OPS: frozenset[str] = frozenset({"is null", "is not null"})
 
 NULL_OP_NEGATED_ALIASES: frozenset[str] = frozenset(
@@ -2574,6 +3172,22 @@ DATE_RESULT_SCALARS: frozenset[str] = frozenset(
 )
 
 DATE_COLUMN_VALUE_TYPES: frozenset[str] = frozenset({"date", "datetime", "timestamp", "date_time", "time"})
+
+TIMESTAMP_COLUMN_DATA_TYPES: frozenset[str] = frozenset(
+    {
+        "datetime",
+        "datetime2",
+        "datetimeoffset",
+        "smalldatetime",
+        "timestamp",
+        "timestamptz",
+        "timestamp_ntz",
+        "timestamp_ltz",
+        "timestamp_tz",
+        "timestamp without time zone",
+        "timestamp with time zone",
+    }
+)
 
 STRING_COLUMN_VALUE_TYPES: frozenset[str] = frozenset({"string", "text", "varchar", "char"})
 
@@ -2640,11 +3254,15 @@ INFERRED_COLLAPSE_TAGS: frozenset[str] = frozenset(
     }
 )
 
-VALID_FK_ADD_KEYS: frozenset[str] = frozenset({"from", "to", "kind"})
+VALID_FK_ADD_KEYS: frozenset[str] = frozenset(
+    {"from", "to", "kind", "authored_against_structural_hash", "authored_at", "needs_reconfirmation"}
+)
 
 VALID_FK_REMOVE_KEYS: frozenset[str] = frozenset({"from", "to"})
 
-VALID_PK_ADD_KEYS: frozenset[str] = frozenset({"table", "column"})
+VALID_PK_ADD_KEYS: frozenset[str] = frozenset(
+    {"table", "column", "authored_against_structural_hash", "authored_at", "needs_reconfirmation"}
+)
 
 VALID_PK_REMOVE_KEYS: frozenset[str] = frozenset({"table", "column"})
 
@@ -2710,8 +3328,8 @@ DIAG_TO_FAILURE_CATEGORY: dict[str, str] = {
     "explain_cartesian_join": "wrong_join",
     "explain_zero_estimate": "semantic_contradiction",
     "explain_seq_scan_indexed": "other",
-    "explain_type_mismatch": "type_mismatch",
-    "explain_permission_denied": "access_policy",
+    "explain_sort_spill": "wrong_sort_or_limit",
+    "explain_temporary_table": "execution_explain_failed",
     "explain_other": "execution_explain_failed",
     "explain_cost_exceeded": "execution_cost_exceeded",
 }
@@ -2830,7 +3448,7 @@ SANDBOX_UNEXERCISED_PRODUCTION_STAGES: tuple[str, ...] = (
     "live_reflection_and_profiling",
     "probe_mismatch_partial_rebuild",
     "cold_build_descriptions_and_classification",
-    "composite_composition_replay_skip",
+    "member_cold_reflect_profile_and_member_drift_migration_pending",
     "warmup_and_question_simulation",
     "model_turns_outside_recorded_fixtures",
 )
@@ -2858,17 +3476,6 @@ SANDBOX_BUNDLED_DATASET_NAMES: frozenset[str] = frozenset(
     {SANDBOX_DEFAULT_DATASET_NAME, *(name for name, _ in SANDBOX_BUNDLED_MEMBER_SEEDS)}
 )
 SANDBOX_CONNECTION_HOST_ATTR = "_aether_sandbox_host"
-
-
-def sandbox_bundled_dataset_seed(name: str) -> str:
-    """Return the bundled seed filename for a sandbox dataset *name*."""
-    if name == SANDBOX_DEFAULT_DATASET_NAME:
-        return "rental_shop_seed.sql"
-    for member_name, seed_name in SANDBOX_BUNDLED_MEMBER_SEEDS:
-        if member_name == name:
-            return seed_name
-    raise KeyError(name)
-
 
 MOCK_FIXTURE_STUB_SCHEMA_LITERALS: dict[str, str] = {"owner": "{}", "consumer": "{}"}
 
@@ -2911,7 +3518,7 @@ CONSUMER_ALLOW_OBJECTS: frozenset[str] = frozenset(
     }
 )
 
-CONSUMER_RESTRICTED_ALLOW_OBJECTS: frozenset[str] = frozenset(
+CONSUMER_EXAMPLE_NARROW_ALLOW_OBJECTS: frozenset[str] = frozenset(
     {
         "customer",
         "payment",
@@ -2922,62 +3529,56 @@ CONSUMER_RESTRICTED_ALLOW_OBJECTS: frozenset[str] = frozenset(
     }
 )
 
+SANDBOX_CATALOG_SPACE_TABLES: frozenset[str] = frozenset(
+    {
+        "item",
+        "film",
+        "category",
+        "item_category",
+    }
+)
+
 WINDOW_ADD_OPS = frozenset(
     {
-        ExpansionOperatorId.WINDOW_RANK_ADD,
-        ExpansionOperatorId.WINDOW_DENSE_RANK_ADD,
-        ExpansionOperatorId.WINDOW_RANK_FUNC_ADD,
-        ExpansionOperatorId.WINDOW_SUM_PARTITION_ADD,
-        ExpansionOperatorId.WINDOW_AVG_PARTITION_ADD,
-        ExpansionOperatorId.WINDOW_LAG_ADD,
-        ExpansionOperatorId.WINDOW_LEAD_ADD,
-        ExpansionOperatorId.ORDERBY_WINDOW_COL_ADD,
+        WINDOW_RANK_ADD,
+        WINDOW_DENSE_RANK_ADD,
+        WINDOW_RANK_FUNC_ADD,
+        WINDOW_SUM_PARTITION_ADD,
+        WINDOW_AVG_PARTITION_ADD,
+        WINDOW_LAG_ADD,
+        WINDOW_LEAD_ADD,
+        ORDERBY_WINDOW_COL_ADD,
     }
 )
 
 CASE_ADD_OPS = frozenset(
     {
-        ExpansionOperatorId.SELECT_CASE_LABEL_ADD,
-        ExpansionOperatorId.CASE_CATEGORICAL_ADD,
+        SELECT_CASE_LABEL_ADD,
+        CASE_CATEGORICAL_ADD,
     }
 )
 
 CTE_ADD_OPS = frozenset(
     {
-        ExpansionOperatorId.CTE_WRAP_GROUPED,
-        ExpansionOperatorId.CTE_SCALAR_THRESHOLD,
-        ExpansionOperatorId.CTE_UNNEST_ADD,
-        ExpansionOperatorId.SELF_JOIN_CTE_ADD,
-        ExpansionOperatorId.MULTI_CTE_CHAIN_ADD,
+        CTE_WRAP_GROUPED,
+        CTE_SCALAR_THRESHOLD,
+        CTE_UNNEST_ADD,
+        SELF_JOIN_CTE_ADD,
+        MULTI_CTE_CHAIN_ADD,
     }
 )
 
 HAVING_ADD_OPS = frozenset(
     {
-        ExpansionOperatorId.HAVING_VALUE_ADD,
-        ExpansionOperatorId.HAVING_EXPR_ADD,
-        ExpansionOperatorId.HAVING_MATCH_SELECT_AGG,
+        HAVING_VALUE_ADD,
+        HAVING_EXPR_ADD,
+        HAVING_MATCH_SELECT_AGG,
     }
 )
 
 SIMPLE_AGG_NAMES: frozenset[str] = frozenset(
     {"count", "sum", "avg", "min", "max", "string_agg", "stddev", "variance", "median"}
 )
-
-AGG_NODE_TO_NAME: dict[type[exp.Expression], str] = {
-    exp.Sum: "sum",
-    exp.Count: "count",
-    exp.Avg: "avg",
-    exp.Min: "min",
-    exp.Max: "max",
-    exp.GroupConcat: "string_agg",
-    exp.Stddev: "stddev",
-    exp.StddevSamp: "stddev",
-    exp.StddevPop: "stddev",
-    exp.Variance: "variance",
-    exp.VariancePop: "variance",
-    exp.Median: "median",
-}
 
 ALLOWED_JOIN_KINDS: frozenset[str | None] = frozenset({None, "INNER", "LEFT", "RIGHT", "FULL"})
 
@@ -3063,7 +3664,7 @@ INFERENCE_TAG_VALUES: frozenset[str] = frozenset(
     }
 )
 
-PK_INFERENCE_TAG_VALUES: frozenset[str] = frozenset({"ddl", "profile", "user_override"})
+PK_INFERENCE_TAG_VALUES: frozenset[str] = frozenset({"ddl", "identity", "profile", "user_override"})
 
 ROLE_OWNER_VALUES: frozenset[str] = frozenset(
     {
@@ -3127,7 +3728,9 @@ CASE_WHEN_QUALIFIED_COLUMN_REF_RE = re.compile(
     r"^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$",
 )
 
-DESCRIPTION_OWNER_VALUES: frozenset[str] = frozenset({"catalog", "profile", "notes", "llm_refinement", "user_override"})
+DESCRIPTION_OWNER_VALUES: frozenset[str] = frozenset(
+    {"catalog", "profile", "notes", "llm_refinement", "space_notes", "user_override"}
+)
 
 AST_AGG_NODE_TO_NAME: dict[type[exp.Expression], str] = {
     exp.Sum: "sum",
@@ -3216,7 +3819,9 @@ REPAIR_INSTRUCTIONS: dict[str, str] = {
         "Use singular unit names. The amount is interpreted as an ISO half-open window: "
         "the start is N units before today, the end is exclusive. Prefer unit 'day' whenever "
         "the question phrases the window in days, weeks, or fortnights (convert weeks to days) "
-        "so the start/end boundary matches the schema's daily granularity."
+        "so the start/end boundary matches the schema's daily granularity. "
+        'For absolute calendar bounds use {"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"} '
+        "in ISO 8601 form only."
     ),
     "date_diff": (
         "For date-difference filters comparing two date columns "
@@ -3366,14 +3971,21 @@ INTENT_CRITICAL_RULES: tuple[str, ...] = (
         "from foreign keys."
     ),
     "SUM and AVG apply only to numeric measure columns; use COUNT for non-measure columns.",
+    "Columns whose schema type is unknown may appear in select_cols only; do not filter or aggregate them.",
     "Nested aggregation is forbidden; compute inner aggregates in a CTE step, then aggregate in the main query.",
     "Do not use EXTRACT(EPOCH FROM ...) for time differences; subtract date columns directly or use supported date functions.",
     f"CTE output_columns are snake_case alias tokens matching ^[a-z_][a-z0-9_]*$; never qualified {INSTRUCTIONAL_QUALIFIED_COLUMN_PLACEHOLDER}, never function call text, never AS clauses; align positionally with select_cols. Reference CTE outputs only via cteN.<output_columns_token> in window_registry, where, having, order_by_cols, and select_cols.",
     'Relative date-window filters use value_type date_window with value {"unit", "amount"}; '
-    'column-to-column date spans use value_type date_diff with value {"unit", "amount"}. Use singular unit names.',
+    'column-to-column date spans use value_type date_diff with value {"unit", "amount"}. Use singular unit names. '
+    'Absolute calendar bounds in date_window use ISO 8601 start/end strings such as "2020-01-15".',
     "Integer columns with schema role temporal represent day-count durations; compare them to elapsed day expressions "
     "(date subtraction or keyword minus date), not as calendar dates.",
     "BETWEEN uses op between with value [lower, upper]. NULL checks use op is null or is not null without a value field.",
+    (
+        "Negated comparisons (!=, not in, not like, not between) include rows where the filtered column value "
+        "is unknown when that column is nullable; use is null or is not null when the question is only about "
+        "missing values."
+    ),
     (
         "Encode WHERE and HAVING boolean logic as PredicateGroup trees: op and/or with predicate leaves "
         "and nested groups (nesting depth capped at 3). For (predicate_A OR predicate_B) emit op or with two "
@@ -3606,6 +4218,12 @@ STRUCTURAL_SQL_PLACEHOLDER_PARAM_RE = re.compile(r":(s\d+)\b")
 STRUCTURAL_INLINE_SQL_LITERAL_LIST_RE = re.compile(r"^-?\d+(?:\.\d+)?(?:,\s*-?\d+(?:\.\d+)?)*$")
 PRE_QUOTED_IN_LIST_INLINE_RE: re.Pattern[str] = re.compile(r"^'(?:[^']|'')*'(?:,'(?:[^']|'')*')+$")
 
+UNSAFE_PARAM_LITERAL: str = "unsafe_param_literal"
+SQL_STRING_LITERAL_STATEMENT_TERMINATOR: str = ";"
+SQL_STRING_LITERAL_COMMENT_MARKERS: tuple[str, ...] = ("--", "/*")
+SQL_STRING_LITERAL_CONTROL_CHAR_RE: re.Pattern[str] = re.compile(r"[\x00-\x1f\x7f]")
+MYSQL_NO_BACKSLASH_ESCAPES_SQL_MODE_TOKEN: str = "NO_BACKSLASH_ESCAPES"
+
 IN_OPS = frozenset({"in", "not in"})
 
 IN_STRING_SEPARATORS = re.compile(r"['\"]?\s*,\s*['\"]?")
@@ -3667,6 +4285,10 @@ SHAPE_FORM_DATE_REGEX = re.compile(
 SHAPE_FORM_STR_REGEX = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"")
 
 SHAPE_QUESTION_INDEX_KEY: str = "shape_question_index"
+
+QUESTION_NORMALIZATION_VERSION: str = "0.2.1"
+
+QUESTION_NORMALIZATION_VERSION_KEY: str = "question_normalization_version"
 
 TEMPLATE_INTENT_KEY_INDEX_KEY: str = "intent_key_index"
 
@@ -4076,6 +4698,8 @@ SQLSERVER_QUERY_LOG_FETCH_SQL: str = (
     "ORDER BY qs.last_execution_time DESC"
 )
 
+SQLSERVER_SHOWPLAN_ROW_CACHE_MAX: int = 256
+
 SQLSERVER_QUERY_STORE_AVAILABILITY_SQL: str = "SELECT 1 FROM sys.database_query_store_options WHERE desired_state = 2"
 
 SQLSERVER_QUERY_STORE_FETCH_SQL: str = (
@@ -4124,6 +4748,8 @@ MYSQL_INDEX_STATISTICS_SQL: str = (
     "WHERE TABLE_SCHEMA = :s ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX"
 )
 
+MYSQL_CONNECTION_CHARSET: str = "utf8mb4"
+
 SNOWFLAKE_QUERY_LOG_AVAILABILITY_SQL: str = (
     "SELECT 1 FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY(RESULT_LIMIT => 1)) LIMIT 1"
 )
@@ -4154,9 +4780,7 @@ EXPLAIN_PERMISSION_DENIED_PATTERNS: tuple[str, ...] = (
     "does not have permission",
     "does not have access",
     "operation not permitted",
-    "undefinedtable",
     "42501",
-    "42p01",
 )
 
 SQLGLOT_DIALECT_BY_ENGINE: dict[str, str] = {}
@@ -4195,11 +4819,15 @@ PG_AGG_FUNCNAMES: frozenset[str] = frozenset(
     }
 )
 
-VALID_COLUMN_OVERRIDE_KEYS: frozenset[str] = frozenset(
-    {"description", "sensitivity", "role", "boolean_truth_value", "usable"},
+OVERRIDE_PROVENANCE_KEYS: frozenset[str] = frozenset(
+    {"authored_against_structural_hash", "authored_at", "needs_reconfirmation"}
 )
 
-VALID_TABLE_OVERRIDE_KEYS: frozenset[str] = frozenset({"description", "role", "columns"})
+VALID_COLUMN_OVERRIDE_KEYS: frozenset[str] = frozenset(
+    {"description", "sensitivity", "role", "boolean_truth_value", "usable", *OVERRIDE_PROVENANCE_KEYS},
+)
+
+VALID_TABLE_OVERRIDE_KEYS: frozenset[str] = frozenset({"description", "role", "columns", *OVERRIDE_PROVENANCE_KEYS})
 
 VALID_TOP_LEVEL_OVERRIDE_KEYS: frozenset[str] = frozenset(
     {
@@ -4209,6 +4837,7 @@ VALID_TOP_LEVEL_OVERRIDE_KEYS: frozenset[str] = frozenset(
         "foreign_keys_remove",
         "primary_keys_add",
         "primary_keys_remove",
+        "business_knowledge",
         "_readonly",
     }
 )
@@ -4224,14 +4853,9 @@ DISTINCT_ON_RANK_COLUMN: str = "__don_rn"
 
 ANTI_JOIN_PRESENCE_COLUMN_SUFFIX: str = "__present"
 
-
-def anti_join_presence_column(cte_name: str) -> str:
-    """Return the renderer-owned presence marker column for an anti-join CTE."""
-    return f"{cte_name}{ANTI_JOIN_PRESENCE_COLUMN_SUFFIX}"
-
-
 JOIN_ORPHAN_RATE_DIAGNOSTIC_FLOOR: float = 0.05
 DIAGNOSTIC_CODE_JOIN_ORPHAN_RATE_HIGH: str = "JOIN_ORPHAN_RATE_HIGH"
+DIAGNOSTIC_CODE_JOIN_NULLABLE_KEY: str = "JOIN_NULLABLE_KEY"
 JOIN_PATH_TIE_REFUSAL_CEILING: int = 64
 JOIN_PATH_TIE_OVERFLOW_MARKER: str = "__join_path_tie_overflow_count__"
 DIAGNOSTIC_CODE_JOIN_PATH_TIE_CEILING_EXCEEDED: str = "JOIN_PATH_TIE_CEILING_EXCEEDED"
@@ -4243,7 +4867,6 @@ DIAGNOSTIC_CODE_REDUNDANT_KEY_JOIN_CAP_REACHED: str = "REDUNDANT_KEY_JOIN_CAP_RE
 
 ELIMINATE_REDUNDANT_KEY_JOINS_MAX_ITERATIONS: int = 8
 
-NULL_SENSITIVE_ELIMINATION_OPS: frozenset[str] = frozenset({"is null", "is not null", "not in"})
 DIAGNOSTIC_CODE_COMPARISON_JOIN_DETOUR: str = "COMPARISON_JOIN_DETOUR"
 
 FAN_OUT_SENSITIVE_AGG_FUNCS: frozenset[str] = frozenset({"sum", "avg", "count"})
@@ -4277,7 +4900,7 @@ DATE_COLUMN_NAME_TOKENS: frozenset[str] = frozenset(
     }
 )
 
-TEMPLATE_STORE_FORMAT_VERSION: int = 3
+TEMPLATE_STORE_FORMAT_VERSION: str = "0.2.1"
 
 TOML_SECTION_TO_ENGINE: dict[str, str] = {
     "postgresql": "postgresql",
@@ -4446,6 +5069,7 @@ SEMANTIC_REPAIR_PROMPT_KEY_ORDER: tuple[str, ...] = (
     "errors_to_fix",
     "suggestions",
     "schema_info",
+    "business_context",
     "current_intent",
     "question",
     "prior_question_feedback",
@@ -4475,6 +5099,7 @@ PARSE_PROMPT_KEY_ORDER: tuple[str, ...] = (
     "value_type_reference",
     "naming_conventions",
     "schema_summary",
+    "business_context",
     "allowed_tables",
     "question",
     "prior_question_feedback",
@@ -4520,6 +5145,8 @@ FEDERATION_MAPPINGS_APPLIED_FILENAME: str = "applied_federation_mappings.json"
 FEDERATION_COMPOSITE_SCHEMA_FILENAME: str = "composite_schema_graph.json.gz"
 FEDERATION_MIGRATION_MAP_FILENAME: str = "federation_migration_map.json"
 FEDERATION_PLAN_TEMPLATE_FILENAME: str = "federation_plan_templates.json"
+FEDERATION_JOIN_FEEDBACK_SEGMENT: str = "feedback"
+FEDERATION_JOIN_FEEDBACK_PREFIX: str = "join_"
 FEDERATION_MAPPING_SUGGESTIONS_CACHE_FILENAME: str = "federation_mapping_suggestions_cache.json"
 FEDERATION_STORAGE_PREFIX: str = "fed_"
 FEDERATION_SOURCE_STORAGE_PREFIX: str = "fedsrc_"
@@ -4527,12 +5154,13 @@ APPLIED_MAP_ARCHIVE_RETENTION_COUNT: int = 3
 APPLIED_MAP_ARCHIVE_TIMESTAMP_RE = re.compile(r"\.applied\.\d{8}T\d{6}Z\.json$")
 FEDERATION_TEMPLATES_SEGMENT: str = "federation_templates"
 
-FEDERATION_ARTIFACT_FORMAT_VERSION: int = 9
-FederationMethodScope = Literal["composite", "member", "both", "unsupported"]
-FEDERATION_METHOD_SEMANTICS: dict[str, FederationMethodScope] = {
+FEDERATION_ARTIFACT_FORMAT_VERSION: str = "0.2.1"
+FEDERATION_MEMBER_MANIFEST_FILENAME: str = "federation_member_manifest.json"
+FEDERATION_METHOD_SEMANTICS: dict[str, str] = {
     "add_engine": "composite",
     "apply_federation_declaration": "composite",
     "apply_migration_map": "composite",
+    "apply_overrides": "both",
     "apply_schema_overrides": "both",
     "asession": "composite",
     "clear_all_learning": "both",
@@ -4544,11 +5172,13 @@ FEDERATION_METHOD_SEMANTICS: dict[str, FederationMethodScope] = {
     "apply_aetherspace": "composite",
     "delete_aetherspace": "composite",
     "export_aetherspace": "composite",
+    "export_context": "composite",
+    "list_contexts": "composite",
     "export_federation_declaration": "composite",
+    "export_overrides": "both",
     "export_schema_overrides": "both",
     "get_qsim_summary": "composite",
     "get_questions_only": "composite",
-    "get_schema_stats": "composite",
     "get_seed_warmup_summary": "composite",
     "list_aetherspaces": "composite",
     "prepared_federated_outcome": "composite",
@@ -4558,16 +5188,21 @@ FEDERATION_METHOD_SEMANTICS: dict[str, FederationMethodScope] = {
     "remove_engine": "composite",
     "run_interactive": "composite",
     "run_qsim": "composite",
-    "run_seed_warmup": "composite",
+    "run_seed_warmup": "unsupported",
     "run_seed_warmup_from_history": "unsupported",
     "run_seed_warmup_from_query_log": "unsupported",
     "session": "composite",
     "show_config": "composite",
-    "execute_sql": "unsupported",
+    "list_templates": "composite",
+    "fetch_template": "composite",
+    "execute_template": "composite",
+    "export_knowledge": "composite",
+    "export_space_knowledge": "composite",
+    "export_metadata": "composite",
 }
-FEDERATION_MAPPINGS_VERSION: int = 2
-FEDERATION_MAPPINGS_MIN_VERSION: int = 1
-FEDERATION_PLAN_TEMPLATE_FORMAT_VERSION: int = 2
+FEDERATION_MAPPINGS_VERSION: str = "0.2.1"
+FEDERATION_MAPPINGS_MIN_VERSION: str = "0.2.1"
+FEDERATION_PLAN_TEMPLATE_FORMAT_VERSION: str = "0.2.1"
 FEDERATION_PLAN_TEMPLATE_FILE_CAP: int = 256
 FEDERATION_PLAN_ACCEPTED_QUESTIONS_CAP: int = 64
 FEDERATION_MAX_JOIN_PATH_TIE_CAP: int = 256
@@ -4575,6 +5210,12 @@ FEDERATION_MAX_JOIN_CANDIDATE_CAP: int = 1024
 FEDERATION_ENUM_PROMPT_CAP: int = 10
 SCHEMA_DESCRIPTION_PROMPT_MAX_CHARS: int = 256
 SCHEMA_DESCRIPTION_PROMPT_COUNT_CAP: int = 128
+FEDERATION_AVERAGE_SCALE_HEADROOM: int = 6
+FEDERATION_COORDINATOR_DECIMAL_MAX_PRECISION: int = 38
+FEDERATION_COORDINATOR_DECIMAL_FALLBACK_SCALE: int = 9
+FEDERATION_COORDINATOR_DECIMAL_FALLBACK: str = (
+    f"DECIMAL({FEDERATION_COORDINATOR_DECIMAL_MAX_PRECISION}, {FEDERATION_COORDINATOR_DECIMAL_FALLBACK_SCALE})"
+)
 SCHEMA_ENRICHED_LINES_MAX_CHARS: int = 16384
 
 FEDERATION_MAPPING_NAME_SUBSTRING_SCORE: float = 0.85
@@ -4654,7 +5295,7 @@ FEDERATION_MANIFEST_TOP_LEVEL_KEYS: frozenset[str] = frozenset(
 )
 FEDERATION_MANIFEST_ALIAS_KEYS: frozenset[str] = frozenset({"source", "table"})
 FEDERATION_MANIFEST_SOURCE_KEYS: frozenset[str] = frozenset(
-    {"source_id", "engine", "connection", "context", "role", "limits"},
+    {"source_id", "engine", "connection", "context", "role", "limits", "session_timezone"},
 )
 FEDERATION_MANIFEST_LIMITS_KEYS: frozenset[str] = frozenset(
     {
@@ -4683,8 +5324,9 @@ FEDERATION_MANIFEST_COORDINATOR_KEYS: frozenset[str] = frozenset(
 )
 
 FEDERATION_MAPPINGS_TOP_LEVEL_KEYS: frozenset[str] = frozenset({"version", "logical_columns", "logical_tables"})
-FEDERATION_DECLARATION_VERSION: int = 1
+FEDERATION_DECLARATION_VERSION: str = "0.2.1"
 FEDERATION_DECLARATION_FILENAME: str = "federation_declaration.json"
+FEDERATION_WARMUP_UNSUPPORTED_MESSAGE: str = "warmup is not supported on AetherFederation"
 FEDERATION_DECLARATION_TOP_LEVEL_KEYS: frozenset[str] = (
     (FEDERATION_MANIFEST_TOP_LEVEL_KEYS | FEDERATION_MAPPINGS_TOP_LEVEL_KEYS) - {"version"}
 ) | {"version"}
@@ -4696,7 +5338,7 @@ FEDERATION_MAPPINGS_LOGICAL_TABLE_KEYS: frozenset[str] = frozenset(
 )
 FEDERATION_MAPPINGS_TABLE_MEMBER_KEYS: frozenset[str] = frozenset({"source", "table", "columns"})
 
-FEDERATION_COORDINATOR_DUCKDB_TYPE_MAP: Mapping[str, str] = MappingProxyType(
+FEDERATION_COORDINATOR_DUCKDB_TYPE_MAP: Mapping[str, str | Callable[[int, int], str]] = MappingProxyType(
     {
         "bigint": "BIGINT",
         "int8": "BIGINT",
@@ -4711,10 +5353,10 @@ FEDERATION_COORDINATOR_DUCKDB_TYPE_MAP: Mapping[str, str] = MappingProxyType(
         "integer": "INTEGER",
         "int4": "INTEGER",
         "serial": "INTEGER",
-        "decimal": "DECIMAL(38, 9)",
-        "numeric": "DECIMAL(38, 9)",
-        "number": "DECIMAL(38, 9)",
-        "money": "DECIMAL(38, 9)",
+        "decimal": lambda precision, scale: f"DECIMAL({precision}, {scale})",
+        "numeric": lambda precision, scale: f"DECIMAL({precision}, {scale})",
+        "number": lambda precision, scale: f"DECIMAL({precision}, {scale})",
+        "money": lambda precision, scale: f"DECIMAL({precision}, {scale})",
         "double": "DOUBLE",
         "float8": "DOUBLE",
         "double precision": "DOUBLE",
@@ -4724,10 +5366,13 @@ FEDERATION_COORDINATOR_DUCKDB_TYPE_MAP: Mapping[str, str] = MappingProxyType(
         "bool": "BOOLEAN",
         "boolean": "BOOLEAN",
         "timestamp": "TIMESTAMP",
-        "timestamptz": "TIMESTAMP",
+        "timestamptz": "TIMESTAMP WITH TIME ZONE",
         "datetime": "TIMESTAMP",
         "timestamp without time zone": "TIMESTAMP",
-        "timestamp with time zone": "TIMESTAMP",
+        "timestamp with time zone": "TIMESTAMP WITH TIME ZONE",
+        "datetimeoffset": "TIMESTAMP WITH TIME ZONE",
+        "timestamp_tz": "TIMESTAMP WITH TIME ZONE",
+        "timestamp_ltz": "TIMESTAMP WITH TIME ZONE",
         "date": "DATE",
         "time": "TIME",
         "timetz": "TIME",
@@ -4755,6 +5400,8 @@ DIAGNOSTIC_CODE_DESCRIPTION_PROMPT_TRUNCATED: str = "DESCRIPTION_PROMPT_TRUNCATE
 DIAGNOSTIC_CODE_DESCRIPTION_ENRICHMENT_FAILED: str = "DESCRIPTION_ENRICHMENT_FAILED"
 DIAGNOSTIC_CODE_DESCRIPTION_ENRICHMENT_NOOP: str = "DESCRIPTION_ENRICHMENT_NOOP"
 DIAGNOSTIC_CODE_SCHEMA_FK_CATALOG_ABSENT: str = "SCHEMA_FK_CATALOG_ABSENT"
+DIAGNOSTIC_CODE_SCHEMA_ROLE_TYPE_COERCED: str = "SCHEMA_ROLE_TYPE_COERCED"
+DIAGNOSTIC_CODE_SCHEMA_UNKNOWN_TYPE_UNUSABLE: str = "SCHEMA_UNKNOWN_TYPE_UNUSABLE"
 
 LLM_PRICE_TABLE_AS_OF: str = "2026-07-26"
 LLM_PRICE_PER_MILLION: dict[str, dict[str, float]] = {
@@ -4769,32 +5416,332 @@ LLM_PRICE_PER_MILLION: dict[str, dict[str, float]] = {
 DIAGNOSTIC_CODE_FEDERATION_INELIGIBLE: str = "FEDERATION_INELIGIBLE"
 DIAGNOSTIC_CODE_FEDERATION_PARTIAL_FAILURE: str = "FEDERATION_PARTIAL_FAILURE"
 DIAGNOSTIC_CODE_FEDERATION_MEMBER_FAILED: str = "FEDERATION_MEMBER_FAILED"
+DIAGNOSTIC_CODE_FEDERATION_MEMBER_PROBE_FAILED: str = "FEDERATION_MEMBER_PROBE_FAILED"
 DIAGNOSTIC_CODE_FEDERATION_MEMBER_GENERATED: str = "FEDERATION_MEMBER_GENERATED"
 DIAGNOSTIC_CODE_FEDERATION_MEMBER_EXECUTED: str = "FEDERATION_MEMBER_EXECUTED"
 DIAGNOSTIC_CODE_FEDERATION_COORDINATOR_EXECUTED: str = "FEDERATION_COORDINATOR_EXECUTED"
 DIAGNOSTIC_CODE_FEDERATION_SOURCES_QUERIED: str = "FEDERATION_SOURCES_QUERIED"
 DIAGNOSTIC_CODE_FEDERATION_MAPPING_DRIFT: str = "FEDERATION_MAPPING_DRIFT"
 DIAGNOSTIC_CODE_FEDERATION_SEMIJOIN_SKIPPED: str = "FEDERATION_SEMIJOIN_SKIPPED"
+DIAGNOSTIC_CODE_FEDERATION_REDUCTION_NULL_KEYS: str = "FEDERATION_REDUCTION_NULL_KEYS"
 DIAGNOSTIC_CODE_FEDERATION_JOIN_CANDIDATE_CAP: str = "FEDERATION_JOIN_CANDIDATE_CAP"
 DIAGNOSTIC_CODE_FEDERATION_PLAN_REPLAY: str = "FEDERATION_PLAN_REPLAY"
 DIAGNOSTIC_CODE_FEDERATION_CAP_EXCEEDED: str = "FEDERATION_CAP_EXCEEDED"
 DIAGNOSTIC_CODE_FEDERATION_TURN_CANCELLED: str = "FEDERATION_TURN_CANCELLED"
+DIAGNOSTIC_CODE_CANCEL_NOT_SUPPORTED: str = "CANCEL_NOT_SUPPORTED"
+DIAGNOSTIC_CODE_SQL_PARSE_FAILED: str = "SQL_PARSE_FAILED"
 DIAGNOSTIC_CODE_FEDERATION_MALFORMED_MEMBER_ANSWER: str = "FEDERATION_MALFORMED_MEMBER_ANSWER"
 DIAGNOSTIC_CODE_FEDERATION_JOIN_FAN_OUT: str = "FEDERATION_JOIN_FAN_OUT"
+DIAGNOSTIC_CODE_FEDERATION_COORDINATOR_DECIMAL_FALLBACK: str = "FEDERATION_COORDINATOR_DECIMAL_FALLBACK"
+DIAGNOSTIC_CODE_FEDERATION_COORDINATOR_ARROW_SPILL_FALLBACK: str = "FEDERATION_COORDINATOR_ARROW_SPILL_FALLBACK"
+DIAGNOSTIC_CODE_FEDERATION_TIME_ANCHOR: str = "FEDERATION_TIME_ANCHOR"
+DIAGNOSTIC_CODE_FEDERATION_TIMESTAMP_NORMALISED: str = "FEDERATION_TIMESTAMP_NORMALISED"
+DIAGNOSTIC_CODE_FEDERATION_MEMBER_TIMEZONE_MISMATCH: str = "FEDERATION_MEMBER_TIMEZONE_MISMATCH"
+DIAGNOSTIC_CODE_FEDERATION_MEMBER_REMOVED: str = "FEDERATION_MEMBER_REMOVED"
+DIAGNOSTIC_CODE_FEDERATION_POOL_UNDERSIZED: str = "FEDERATION_POOL_UNDERSIZED"
+DIAGNOSTIC_CODE_MEMBER_LIMIT_NARROWED: str = "MEMBER_LIMIT_NARROWED"
+DIAGNOSTIC_CODE_COORDINATOR_LIMITS: str = "COORDINATOR_LIMITS"
+DIAGNOSTIC_CODE_ROUNDING_MODE_MIXED: str = "ROUNDING_MODE_MIXED"
+
+FEDERATION_TIMEZONE_AWARE_DATA_TYPES: frozenset[str] = frozenset(
+    {
+        "timestamptz",
+        "timetz",
+        "datetimeoffset",
+        "timestamp_tz",
+        "timestamp_ltz",
+    }
+)
+
+MYSQL_TIMESTAMP_ENGINES: frozenset[str] = frozenset({"mysql", "mariadb"})
+
+FIXED_WIDTH_TEXT_BASE_TYPES: frozenset[str] = frozenset({"char", "nchar", "bpchar", "character"})
+
+UNSIGNED_INTEGER_TYPE_MAX: dict[str, int] = {
+    "tinyint": 255,
+    "smallint": 65535,
+    "mediumint": 16777215,
+    "int": 4294967295,
+    "integer": 4294967295,
+    "bigint": 18446744073709551615,
+}
+
+MAX_FLOAT_SAFE_INTEGER: int = 9007199254740992
+
+ISO_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+ISO_DATETIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?$")
 
 DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_UNAVAILABLE: str = "REFUSAL_JOIN_PATH_UNAVAILABLE"
 DIAGNOSTIC_CODE_REFUSAL_AGGREGATE_FAN_OUT: str = "REFUSAL_AGGREGATE_FAN_OUT"
 DIAGNOSTIC_CODE_REFUSAL_HOP_CEILING: str = "REFUSAL_HOP_CEILING"
 DIAGNOSTIC_CODE_REFUSAL_CTE_CAP: str = "REFUSAL_CTE_CAP"
 DIAGNOSTIC_CODE_REFUSAL_CAPABILITY_GAP: str = "REFUSAL_CAPABILITY_GAP"
+DIAGNOSTIC_CODE_REFUSAL_NULL_IN_NEGATED_LIST: str = "REFUSAL_NULL_IN_NEGATED_LIST"
+DIAGNOSTIC_CODE_REFUSAL_OPAQUE_EXPR: str = "REFUSAL_OPAQUE_EXPR"
+DIAGNOSTIC_CODE_REFUSAL_SUBDAY_DATE_WINDOW_ON_DATE_COLUMN: str = "REFUSAL_SUBDAY_DATE_WINDOW_ON_DATE_COLUMN"
+DIAGNOSTIC_CODE_REFUSAL_AMBIGUOUS_DATE_LITERAL: str = "REFUSAL_AMBIGUOUS_DATE_LITERAL"
+DIAGNOSTIC_CODE_REFUSAL_UNION_COLUMN_MISSING: str = "REFUSAL_UNION_COLUMN_MISSING"
+DIAGNOSTIC_CODE_REFUSAL_UNSUPPORTED_COLUMN_TYPE: str = "REFUSAL_UNSUPPORTED_COLUMN_TYPE"
+DIAGNOSTIC_CODE_REFUSAL_NOT_AVAILABLE_IN_CONTEXT: str = "REFUSAL_NOT_AVAILABLE_IN_CONTEXT"
+DIAGNOSTIC_CODE_REFUSAL_PERMISSION_DENIED: str = "REFUSAL_PERMISSION_DENIED"
+DIAGNOSTIC_CODE_REFUSAL_SCOPE_VIOLATION: str = "REFUSAL_SCOPE_VIOLATION"
+DIAGNOSTIC_CODE_REFUSAL_INVALID_QUESTION: str = "REFUSAL_INVALID_QUESTION"
+DIAGNOSTIC_CODE_REFUSAL_PARSE_FAILURE: str = "REFUSAL_PARSE_FAILURE"
+DIAGNOSTIC_CODE_REFUSAL_DECLINED_SCHEMA: str = "REFUSAL_DECLINED_SCHEMA"
+DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_TIE_CAP: str = "REFUSAL_JOIN_PATH_TIE_CAP"
+DIAGNOSTIC_CODE_REFUSAL_CLAUSE_WIDENED_ROWSET: str = "REFUSAL_CLAUSE_WIDENED_ROWSET"
+DIAGNOSTIC_CODE_REFUSAL_PROBE_CTE_PLACEMENT: str = "REFUSAL_PROBE_CTE_PLACEMENT"
 
-REFUSAL_DIAGNOSTIC_CODES: frozenset[str] = frozenset(
+REFUSAL_CATALOGUE: dict[str, dict[str, str]] = {
+    DIAGNOSTIC_CODE_REFUSAL_PERMISSION_DENIED: {
+        "user_text": PERMISSION_DENIED_USER_MESSAGE,
+        "reformulation_hint": (
+            "Ask your administrator for access to the required tables, or rephrase using only data you can query."
+        ),
+    },
+    DIAGNOSTIC_CODE_REFUSAL_SCOPE_VIOLATION: {
+        "user_text": (
+            "This question cannot be answered with the information currently available.\n\n"
+            "Try rephrasing to ask about tables and columns you can see in the schema."
+        ),
+        "reformulation_hint": ("Try rephrasing to ask about tables and columns you can see in the schema."),
+    },
+    DIAGNOSTIC_CODE_REFUSAL_INVALID_QUESTION: {
+        "user_text": (
+            "I could not pin this question to specific tables or columns.\n\n"
+            "Try naming the entity you care about, the metric you want, and any filter such as a date range, "
+            "status, or region."
+        ),
+        "reformulation_hint": (
+            "Try naming the entity you care about, the metric you want, and any filter such as a date range, "
+            "status, or region."
+        ),
+    },
+    DIAGNOSTIC_CODE_REFUSAL_PARSE_FAILURE: {
+        "user_text": (
+            "I could not understand the structure of this question.\n\n"
+            "Try naming specific tables or columns, keeping filters simple and references clear."
+        ),
+        "reformulation_hint": (
+            "Please rephrase your question.\n\n"
+            "Tips: mention specific tables or columns, keep filters simple, and avoid ambiguous references.\n"
+        ),
+    },
+    DIAGNOSTIC_CODE_REFUSAL_DECLINED_SCHEMA: {
+        "user_text": (
+            "The proposed table and column mapping was declined.\n\n"
+            "Try rephrasing using tables and columns that exist in this database, or ask about a related concept."
+        ),
+        "reformulation_hint": (
+            "Please rephrase your question.\n"
+            "Tips: use tables and columns that exist in this database, or ask about a related concept."
+        ),
+    },
+    DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_UNAVAILABLE: {
+        "user_text": (
+            "These tables could not be connected: {tables}. "
+            "Declare a foreign-key or semantic relationship between them, or ask using fewer tables."
+        ),
+        "reformulation_hint": (
+            "These tables cannot be joined with the relationships currently in this schema.\n\n"
+            "Tips: declare a foreign-key or semantic link between the tables named in the error, "
+            "or narrow the question to tables that already connect.\n"
+        ),
+    },
+    DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_TIE_CAP: {
+        "user_text": (
+            "Too many equally short join paths between {source_table} and {target_table} "
+            "({path_count} paths; limit {ceiling}). Narrow the tables in your question or declare "
+            "which relationship to use."
+        ),
+        "reformulation_hint": (
+            "Too many equally short join paths were found between the named tables.\n\n"
+            "Tips: narrow the question to fewer tables or declare which relationship should connect them.\n"
+        ),
+    },
+    DIAGNOSTIC_CODE_REFUSAL_AGGREGATE_FAN_OUT: {
+        "user_text": (
+            "This aggregate would duplicate parent rows because of how the tables connect.\n\n"
+            "Try grouping at the parent grain first, or use a join path that does not multiply rows."
+        ),
+        "reformulation_hint": (
+            "Tips: group at the parent grain first, or choose a join path that does not multiply rows.\n"
+        ),
+    },
+    DIAGNOSTIC_CODE_REFUSAL_HOP_CEILING: {
+        "user_text": (
+            "This comparison would require joining across too many tables.\n\n"
+            "Try comparing values on tables that are closer together in the schema."
+        ),
+        "reformulation_hint": (
+            "Tips: compare values on tables that are closer together, or simplify the comparison.\n"
+        ),
+    },
+    DIAGNOSTIC_CODE_REFUSAL_CTE_CAP: {
+        "user_text": (
+            "This question needs too many intermediate query steps.\n\n"
+            "Try splitting the question into smaller parts or simplifying the logic."
+        ),
+        "reformulation_hint": ("Tips: split the question into smaller parts or simplify the intermediate logic.\n"),
+    },
+    DIAGNOSTIC_CODE_REFUSAL_CAPABILITY_GAP: {
+        "user_text": (
+            "This question shape cannot be answered with the databases currently available.\n\n"
+            "Try a simpler question or ask on each source individually."
+        ),
+        "reformulation_hint": (
+            "Please rephrase your question.\n\nTips: try a simpler question or ask on each source individually.\n"
+        ),
+    },
+    DIAGNOSTIC_CODE_REFUSAL_CLAUSE_WIDENED_ROWSET: {
+        "user_text": (
+            "A limit, sort, or distinct cannot be applied cleanly when a join multiplies rows.\n\n"
+            "Group first or simplify joins before limiting or deduplicating results."
+        ),
+        "reformulation_hint": (
+            "Please rephrase or retry.\n\n"
+            "Tips: group first or simplify joins before limiting, sorting, or deduplicating results.\n"
+        ),
+    },
+    DIAGNOSTIC_CODE_REFUSAL_PROBE_CTE_PLACEMENT: {
+        "user_text": (
+            "A filter step cannot be used in this join position.\n\n"
+            "Restructure the question so filtering happens on the correct side of the join."
+        ),
+        "reformulation_hint": (
+            "Please rephrase or retry.\n\n"
+            "Tips: restructure the question so filtering happens on the correct side of the join.\n"
+        ),
+    },
+    DIAGNOSTIC_CODE_REFUSAL_NULL_IN_NEGATED_LIST: {
+        "user_text": (
+            "This filter cannot be expressed: a NOT IN list cannot include null. "
+            "Ask whether the column is null or not, or name only the non-null values to exclude."
+        ),
+        "reformulation_hint": ("Ask whether the column is null or not, or name only the non-null values to exclude.\n"),
+    },
+    DIAGNOSTIC_CODE_REFUSAL_OPAQUE_EXPR: {
+        "user_text": (
+            "This question uses an expression structure that cannot be compiled safely.\n\n"
+            "Rephrase using explicit columns, filters, and aggregates supported by the schema."
+        ),
+        "reformulation_hint": (
+            "Please rephrase your question.\n\n"
+            "Tips: use explicit table.column references and supported filters or aggregates.\n"
+        ),
+    },
+    DIAGNOSTIC_CODE_REFUSAL_SUBDAY_DATE_WINDOW_ON_DATE_COLUMN: {
+        "user_text": (
+            "This filter cannot be expressed: the column stores dates without time-of-day, "
+            "so hour, minute, or second windows cannot be answered. Ask for a day-level window instead."
+        ),
+        "reformulation_hint": "Ask for a day-level date window instead of hours, minutes, or seconds.\n",
+    },
+    DIAGNOSTIC_CODE_REFUSAL_AMBIGUOUS_DATE_LITERAL: {
+        "user_text": (
+            "This filter cannot be expressed: the date bound is ambiguous. "
+            "Use ISO 8601 form such as 2020-01-15 or 2020-01-15T14:30:00."
+        ),
+        "reformulation_hint": ("Use an unambiguous ISO 8601 date such as 2020-01-15 or 2020-01-15T14:30:00.\n"),
+    },
+    DIAGNOSTIC_CODE_REFUSAL_UNION_COLUMN_MISSING: {
+        "user_text": (
+            "A column needed for this answer is missing from one or more databases in the group.\n\n"
+            "Try asking over the sources that have the column, or declare a shared column mapping."
+        ),
+        "reformulation_hint": (
+            "Try asking over the sources that have the column, or declare a shared column mapping.\n"
+        ),
+    },
+    DIAGNOSTIC_CODE_REFUSAL_UNSUPPORTED_COLUMN_TYPE: {
+        "user_text": (
+            "This question cannot be answered: the {column} column has an unsupported data type "
+            "and cannot be filtered or aggregated."
+        ),
+        "reformulation_hint": ("Try asking about a different column or a supported data type.\n"),
+    },
+    DIAGNOSTIC_CODE_REFUSAL_NOT_AVAILABLE_IN_CONTEXT: {
+        "user_text": REFUSAL_NOT_AVAILABLE_IN_CONTEXT_MESSAGE,
+        "reformulation_hint": ("Try rephrasing to ask about information that is available in this context.\n"),
+    },
+}
+
+REFUSAL_NULL_IN_NEGATED_LIST_MESSAGE: str = REFUSAL_CATALOGUE[DIAGNOSTIC_CODE_REFUSAL_NULL_IN_NEGATED_LIST]["user_text"]
+
+REFUSAL_SUBDAY_DATE_WINDOW_ON_DATE_COLUMN_MESSAGE: str = REFUSAL_CATALOGUE[
+    DIAGNOSTIC_CODE_REFUSAL_SUBDAY_DATE_WINDOW_ON_DATE_COLUMN
+]["user_text"]
+
+REFUSAL_AMBIGUOUS_DATE_LITERAL_MESSAGE: str = REFUSAL_CATALOGUE[DIAGNOSTIC_CODE_REFUSAL_AMBIGUOUS_DATE_LITERAL][
+    "user_text"
+]
+
+REFUSAL_UNSUPPORTED_COLUMN_TYPE_MESSAGE: str = REFUSAL_CATALOGUE[DIAGNOSTIC_CODE_REFUSAL_UNSUPPORTED_COLUMN_TYPE][
+    "user_text"
+]
+
+REFUSAL_DIAGNOSTIC_CODES: frozenset[str] = frozenset(REFUSAL_CATALOGUE.keys())
+
+REFUSAL_CONDITION_CODES: dict[str, str] = {
+    "permission_denial": DIAGNOSTIC_CODE_REFUSAL_PERMISSION_DENIED,
+    "scope_violation": DIAGNOSTIC_CODE_REFUSAL_SCOPE_VIOLATION,
+    "invalid_question": DIAGNOSTIC_CODE_REFUSAL_INVALID_QUESTION,
+    "parse_failure": DIAGNOSTIC_CODE_REFUSAL_PARSE_FAILURE,
+    "declined_schema": DIAGNOSTIC_CODE_REFUSAL_DECLINED_SCHEMA,
+    "tie_cap_exhaustion": DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_TIE_CAP,
+    "widened_clause_refusal": DIAGNOSTIC_CODE_REFUSAL_CLAUSE_WIDENED_ROWSET,
+    "probe_placement": DIAGNOSTIC_CODE_REFUSAL_PROBE_CTE_PLACEMENT,
+    "unsupported_column_type": DIAGNOSTIC_CODE_REFUSAL_UNSUPPORTED_COLUMN_TYPE,
+    "null_in_negated_list": DIAGNOSTIC_CODE_REFUSAL_NULL_IN_NEGATED_LIST,
+    "opaque_expr": DIAGNOSTIC_CODE_REFUSAL_OPAQUE_EXPR,
+    "ambiguous_date_literal": DIAGNOSTIC_CODE_REFUSAL_AMBIGUOUS_DATE_LITERAL,
+    "union_column_missing": DIAGNOSTIC_CODE_REFUSAL_UNION_COLUMN_MISSING,
+    "join_path_unavailable": DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_UNAVAILABLE,
+    "aggregate_fan_out": DIAGNOSTIC_CODE_REFUSAL_AGGREGATE_FAN_OUT,
+    "hop_ceiling": DIAGNOSTIC_CODE_REFUSAL_HOP_CEILING,
+    "cte_cap": DIAGNOSTIC_CODE_REFUSAL_CTE_CAP,
+    "capability_gap": DIAGNOSTIC_CODE_REFUSAL_CAPABILITY_GAP,
+    "not_available_in_context": DIAGNOSTIC_CODE_REFUSAL_NOT_AVAILABLE_IN_CONTEXT,
+    "subday_date_window": DIAGNOSTIC_CODE_REFUSAL_SUBDAY_DATE_WINDOW_ON_DATE_COLUMN,
+}
+
+OUTCOME_REFUSAL_CODES: dict[str, str] = {
+    "permission_denied": DIAGNOSTIC_CODE_REFUSAL_PERMISSION_DENIED,
+    "restricted": DIAGNOSTIC_CODE_REFUSAL_SCOPE_VIOLATION,
+    "invalid_question": DIAGNOSTIC_CODE_REFUSAL_INVALID_QUESTION,
+    "parse_failed": DIAGNOSTIC_CODE_REFUSAL_PARSE_FAILURE,
+    "schema_invalid_declined": DIAGNOSTIC_CODE_REFUSAL_DECLINED_SCHEMA,
+}
+
+REPHRASE_HINT_REFUSAL_CODES: dict[str, str] = {
+    "intent_parse_failed": DIAGNOSTIC_CODE_REFUSAL_PARSE_FAILURE,
+    "schema_invalid_declined": DIAGNOSTIC_CODE_REFUSAL_DECLINED_SCHEMA,
+    "join_path_unavailable": DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_UNAVAILABLE,
+    "restricted_question": DIAGNOSTIC_CODE_REFUSAL_SCOPE_VIOLATION,
+    "vague_question": DIAGNOSTIC_CODE_REFUSAL_INVALID_QUESTION,
+    "federation_ineligible": DIAGNOSTIC_CODE_REFUSAL_CAPABILITY_GAP,
+}
+
+PERMISSION_DENIED_FAILURE_KINDS: frozenset[str] = frozenset(
     {
-        DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_UNAVAILABLE,
-        DIAGNOSTIC_CODE_REFUSAL_AGGREGATE_FAN_OUT,
-        DIAGNOSTIC_CODE_REFUSAL_HOP_CEILING,
-        DIAGNOSTIC_CODE_REFUSAL_CTE_CAP,
-        DIAGNOSTIC_CODE_REFUSAL_CAPABILITY_GAP,
+        "access_policy",
+        "denied_reference",
+        "deny_bare_select",
+        "sensitive_group_by",
+    }
+)
+
+PERMISSION_DENIED_CATEGORY_ORACLE_KINDS: frozenset[str] = frozenset(
+    {
+        "order_by_validity",
+        "where_validity",
+        "having_semantic",
+    }
+)
+
+REFUSAL_UNSUPPORTED_COLUMN_TYPE_ISSUE_IDS: frozenset[str] = frozenset(
+    {
+        "unsupported_column_type",
     }
 )
 
@@ -4825,6 +5772,12 @@ REFUSAL_CTE_CAP_ISSUE_IDS: frozenset[str] = frozenset(
     }
 )
 
+REFUSAL_NULL_IN_NEGATED_LIST_ISSUE_IDS: frozenset[str] = frozenset(
+    {
+        "null_in_negated_list",
+    }
+)
+
 FEDERATION_REJECTION_BUCKETS: frozenset[str] = frozenset(
     {
         "MALFORMED_MEMBER_ANSWER",
@@ -4832,13 +5785,14 @@ FEDERATION_REJECTION_BUCKETS: frozenset[str] = frozenset(
     }
 )
 
-FederationTopologyChange = Literal["none", "add", "remove", "mixed"]
-
-_INELIGIBLE_ANSWERABLE_HINTS_BY_CODE: dict[str, str] = {
+INELIGIBLE_ANSWERABLE_HINTS_BY_CODE: dict[str, str] = {
     "no_tables": "Try naming the entities and metrics you need from the schema.",
     "space_scope": "Try asking within the active space tables, or widen the space definition.",
     "projection_not_single_member": (
         "Try asking for columns that live on one member, or declare a logical column mapping."
+    ),
+    "union_column_missing": (
+        "Try asking over the members that do have the column, or declare a logical column mapping spanning all members."
     ),
     "undeclared_join_path": ("Try naming entities that share a declared relationship in the federation manifest."),
     "cross_source_aggregate": "Try asking for the metric per entity or per category separately.",
@@ -4869,10 +5823,73 @@ STATISTICAL_AGG_EXCLUDED_ENGINES = frozenset({"sqlite", "csv"})
 WINDOW_FRAMES_EXCLUDED_ENGINES = frozenset({"csv"})
 ARRAY_CONTAINS_EXCLUDED_ENGINES = frozenset({"csv"})
 COLLATION_ENGINES = frozenset({"postgresql", "redshift", "mysql", "mariadb", "sqlserver", "snowflake", "oracle"})
+CASE_INSENSITIVE_COLLATION_ENGINES = frozenset({"mysql", "mariadb", "sqlserver"})
 UNSIGNED_SEMANTICS_ENGINES = frozenset({"mysql", "mariadb"})
 TIMESTAMPTZ_SEMANTICS_ENGINES = frozenset({"postgresql", "redshift", "snowflake", "duckdb", "bigquery"})
+ROUNDING_MODE_HALF_EVEN_ENGINES = frozenset({"sqlite"})
 
+DEFAULT_NULL_ORDERING_ASC: Literal["last"] = "last"
+DEFAULT_NULL_ORDERING_DESC: Literal["first"] = "first"
 
-def ineligible_answerable_hint_for_code(code: str) -> str | None:
-    """Return the nearest answerable rephrase hint for a federation ineligibility code."""
-    return _INELIGIBLE_ANSWERABLE_HINTS_BY_CODE.get(code)
+REMOVED_BEHAVIOUR_ENVIRONMENT_KEYS: dict[str, str] = {
+    "AETHERDIALECT_MAX_QUERY_COST_ROWS": "PolicyConfig.MAX_QUERY_COST_ROWS",
+    "AETHERDIALECT_MAX_QUERY_COST_BYTES": "PolicyConfig.MAX_QUERY_COST_BYTES",
+    "AETHERDIALECT_STATEMENT_TIMEOUT_MS": "EngineLimits.statement_timeout_ms",
+    "AETHERDIALECT_LLM_TIMEOUT_MS": "PolicyConfig.LLM_TIMEOUT_MS",
+    "AETHERDIALECT_PROFILE_TIMEOUT_MS": "EngineLimits.profile_timeout_ms",
+    "AETHERDIALECT_EXPLAIN_TIMEOUT_MS": "PolicyConfig.EXPLAIN_TIMEOUT_MS",
+    "AETHERDIALECT_LLM_BATCH_ENABLED": "PolicyConfig.LLM_BATCH_ENABLED",
+    "AETHERDIALECT_TABULAR_LLM_ASSIST": "PolicyConfig.TABULAR_LLM_ASSIST",
+}
+
+UNUSABLE_NULL_RATIO_THRESHOLD: float = 0.99
+SENTINEL_MODE_FREQUENCY_THRESHOLD: float = 0.99
+
+DATABASE_ERROR_CLASSIFICATION_TRANSIENT: str = "transient"
+DATABASE_ERROR_CLASSIFICATION_PERMANENT: str = "permanent"
+DATABASE_ERROR_CLASSIFICATION_UNKNOWN: str = "unknown"
+
+DATABASE_ERROR_CLASSIFICATION_BY_EXCEPTION_NAME: dict[str, str] = {
+    "InterfaceError": DATABASE_ERROR_CLASSIFICATION_TRANSIENT,
+}
+
+DATABASE_ERROR_CLASSIFICATION_BY_MESSAGE_PATTERN: tuple[tuple[str, str], ...] = (
+    ("connection reset", DATABASE_ERROR_CLASSIFICATION_TRANSIENT),
+    ("connection refused", DATABASE_ERROR_CLASSIFICATION_TRANSIENT),
+    ("server closed the connection", DATABASE_ERROR_CLASSIFICATION_TRANSIENT),
+    ("server closed", DATABASE_ERROR_CLASSIFICATION_TRANSIENT),
+    ("could not connect", DATABASE_ERROR_CLASSIFICATION_TRANSIENT),
+    ("deadlock detected", DATABASE_ERROR_CLASSIFICATION_TRANSIENT),
+    ("deadlock", DATABASE_ERROR_CLASSIFICATION_TRANSIENT),
+    ("lock wait timeout", DATABASE_ERROR_CLASSIFICATION_TRANSIENT),
+    ("statement timeout", DATABASE_ERROR_CLASSIFICATION_TRANSIENT),
+    ("statement_timeout", DATABASE_ERROR_CLASSIFICATION_TRANSIENT),
+    ("query cancelled", DATABASE_ERROR_CLASSIFICATION_TRANSIENT),
+    ("query canceled", DATABASE_ERROR_CLASSIFICATION_TRANSIENT),
+    ("too many connections", DATABASE_ERROR_CLASSIFICATION_TRANSIENT),
+    ("rate limit", DATABASE_ERROR_CLASSIFICATION_TRANSIENT),
+    ("name or service not known", DATABASE_ERROR_CLASSIFICATION_TRANSIENT),
+    ("could not translate host name", DATABASE_ERROR_CLASSIFICATION_TRANSIENT),
+    ("temporary failure in name resolution", DATABASE_ERROR_CLASSIFICATION_TRANSIENT),
+    ("temporarily unavailable", DATABASE_ERROR_CLASSIFICATION_TRANSIENT),
+    ("broken pipe", DATABASE_ERROR_CLASSIFICATION_TRANSIENT),
+    ("timed out", DATABASE_ERROR_CLASSIFICATION_TRANSIENT),
+    ("timeout", DATABASE_ERROR_CLASSIFICATION_TRANSIENT),
+    ("eof", DATABASE_ERROR_CLASSIFICATION_TRANSIENT),
+    ("network", DATABASE_ERROR_CLASSIFICATION_TRANSIENT),
+    ("unreachable", DATABASE_ERROR_CLASSIFICATION_TRANSIENT),
+    ("warehouse", DATABASE_ERROR_CLASSIFICATION_TRANSIENT),
+    ("cold-start", DATABASE_ERROR_CLASSIFICATION_TRANSIENT),
+    ("cold start", DATABASE_ERROR_CLASSIFICATION_TRANSIENT),
+    ("503", DATABASE_ERROR_CLASSIFICATION_TRANSIENT),
+    ("502", DATABASE_ERROR_CLASSIFICATION_TRANSIENT),
+    ("429", DATABASE_ERROR_CLASSIFICATION_TRANSIENT),
+)
+
+DATABASE_ERROR_CLASSIFICATION_TRANSIENT_ERRNOS: frozenset[int] = frozenset(
+    {10060, 10061, 11001, 11002, 111, 113, 115, 116}
+)
+
+REPHRASE_HINT_MESSAGES.update(
+    {key: REFUSAL_CATALOGUE[code]["reformulation_hint"] for key, code in REPHRASE_HINT_REFUSAL_CODES.items()}
+)

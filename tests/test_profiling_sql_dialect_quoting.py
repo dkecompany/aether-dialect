@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from aetherdialect._constants import QUALIFIED_TABLE_REF_ENGINES
-from aetherdialect._dialect import get_dialect_class, get_registered_engines
+from aetherdialect._dialect import DialectRegistry
 from aetherdialect._dialect_postgres import PostgresDialect
 from aetherdialect._dialect_sqlglot_engines import (
     BigQueryDialect,
@@ -79,7 +79,7 @@ def test_postgres_overlap_sql_uses_double_quotes() -> None:
 @pytest.mark.parametrize("engine", sorted(QUALIFIED_TABLE_REF_ENGINES))
 def test_qualified_table_ref_includes_table_name(engine: str) -> None:
     """Engines with catalog qualification emit the bare table name in qualified refs."""
-    cls = get_dialect_class(engine)
+    cls = DialectRegistry.get_class(engine)
     dialect = _uninit(cls)
     ref = dialect.qualified_table_ref("orders")
     assert "orders" in ref.lower()
@@ -109,8 +109,8 @@ def test_embedded_engine_profile_stats_use_dialect_quotes(
 def test_noop_query_log_engines_return_source() -> None:
     """DuckDB and SQLite expose documented no-op query-log sources."""
     for engine in ("duckdb", "sqlite"):
-        assert engine in get_registered_engines()
-        dialect = _uninit(get_dialect_class(engine))
+        assert engine in DialectRegistry.get_registered_engines()
+        dialect = _uninit(DialectRegistry.get_class(engine))
         src = dialect.query_log_source()
         assert src is not None
         assert src.is_available(None) is False

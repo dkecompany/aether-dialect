@@ -60,7 +60,7 @@ def _plan_template(plan_id: str, *, accepted: tuple[str, ...] = ()) -> Federatio
 def test_execute_success_does_not_persist_plan_template() -> None:
     """Successful federation execute must defer plan template persistence until accept."""
     from aetherdialect._contracts_core import SqlGenerationOutcome
-    from aetherdialect._main_execution import _run_sql_execution_for_gen_out
+    from aetherdialect._main_execution import MainExecutionOps
 
     sub_intent = RuntimeIntent(
         tables=["t"],
@@ -90,7 +90,7 @@ def test_execute_success_does_not_persist_plan_template() -> None:
         patch("aetherdialect._federation.save_federation_plan_template") as save_plan,
     ):
         mock_exec.return_value = MagicMock(rows=[(1,)], bundle=MagicMock())
-        _run_sql_execution_for_gen_out(
+        MainExecutionOps._run_sql_execution_for_gen_out(
             intent=sub_intent,
             exec_schema=_graph("t", source_id="a"),
             exec_dialect=MagicMock(),

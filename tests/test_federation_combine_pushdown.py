@@ -8,7 +8,12 @@ from unittest.mock import MagicMock
 import pandas as pd
 import pytest
 
-from aetherdialect._contracts_base import NormalizedExpr, OrderByCol, WhereParam, predicate_group_from_list
+from aetherdialect._contracts_base import (
+    NormalizedExpr,
+    OrderByCol,
+    PredicateGroup,
+    WhereParam,
+)
 from aetherdialect._contracts_core import RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._federation import (
@@ -82,7 +87,7 @@ def test_left_combine_does_not_reduce_preserved_member() -> None:
     )
     reducing = _collect_member_reducing_edges(
         manifest,
-        FederationMappings(version=2),
+        FederationMappings(version="0.2.1"),
         sources,
         intent,
         source_by_table,
@@ -208,7 +213,7 @@ def test_nullable_side_predicate_appears_in_residual_not_member_sql() -> None:
         select_cols=[],
         group_by_cols=[],
         order_by_cols=[],
-        where=predicate_group_from_list([nullable_filter]),
+        where=PredicateGroup.from_list([nullable_filter]),
     )
     plan = plan_federated_intent(intent, schema, manifest)
     assert plan.ineligible_reason is None

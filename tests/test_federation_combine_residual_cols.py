@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import pytest
 
-from aetherdialect._contracts_base import NormalizedExpr, WhereParam, predicate_group_from_list
+from aetherdialect._contracts_base import (
+    NormalizedExpr,
+    PredicateGroup,
+    WhereParam,
+)
 from aetherdialect._contracts_core import FederatedPlan, ResidualSpec, RuntimeIntent, SourceStep
 from aetherdialect._federation import _combine_select_column_names
 
@@ -25,7 +29,7 @@ def test_combine_select_harvests_residual_where_column() -> None:
             SourceStep(source_id="b", sub_intent=sub_intent),
         ),
         residual=ResidualSpec(
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("filter_col"),

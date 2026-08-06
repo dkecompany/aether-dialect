@@ -25,12 +25,7 @@ from aetherdialect._contracts_schema import (
 )
 from aetherdialect._core_utils import write_artifact_manifest
 from aetherdialect._templates import (
-    apply_schema_migration_map,
-    empty_template_store,
-    export_schema_migration_map_skeleton,
-    save_template_store,
-    template_store_dir_for_space,
-    templates_to_store,
+    TemplateOps,
 )
 
 
@@ -89,14 +84,14 @@ def _make_template(tid: str, table: str, column: str) -> Template:
 
 def _seed_store(artifacts_dir: str, schema: SchemaGraph, templates: dict[str, Template]) -> None:
     os.makedirs(artifacts_dir, exist_ok=True)
-    store_dir = template_store_dir_for_space(artifacts_dir, "master")
+    store_dir = TemplateOps.template_store_dir_for_space(artifacts_dir, "master")
     os.makedirs(store_dir, exist_ok=True)
     prev = EngineConfig.TEMPLATE_STORE_DIR
     EngineConfig.TEMPLATE_STORE_DIR = store_dir
     try:
-        store = empty_template_store("eff_old")
-        templates_to_store(store, templates)
-        save_template_store(store)
+        store = TemplateOps.empty_template_store("eff_old")
+        TemplateOps.templates_to_store(store, templates)
+        TemplateOps.save_template_store(store)
     finally:
         EngineConfig.TEMPLATE_STORE_DIR = prev
     write_artifact_manifest(
@@ -112,7 +107,7 @@ def _seed_store(artifacts_dir: str, schema: SchemaGraph, templates: dict[str, Te
 
 @pytest.mark.fast
 def test_skeleton_export_uses_tmp_and_replace_not_plain_open(tmp_path) -> None:
-    source = inspect.getsource(export_schema_migration_map_skeleton)
+    source = inspect.getsource(TemplateOps.export_schema_migration_map_skeleton)
     assert "os.replace" in source
     assert '.open(path, "w")' not in source
     assert 'open(path, "w")' not in source
@@ -126,7 +121,7 @@ def test_skeleton_export_uses_tmp_and_replace_not_plain_open(tmp_path) -> None:
 
     diff = SchemaDiff(per_table={"orders": TableDiff(dropped_columns=("amount",))})
     with patch("aetherdialect._templates.os.replace", side_effect=_capture_replace):
-        path = export_schema_migration_map_skeleton(
+        path = TemplateOps.export_schema_migration_map_skeleton(
             tmp_path,
             tier=MigrationTier.DESTRUCTIVE,
             schema_diff=diff,
@@ -182,12 +177,12 @@ def test_apply_schema_migration_map_holds_lock_for_remap_surgery_stamp(tmp_path)
 
     with (
         patch("aetherdialect._templates.artifact_lock", side_effect=_tracking_lock),
-        patch("aetherdialect._templates._apply_schema_rename_migration_to_store", side_effect=_remap_track),
-        patch("aetherdialect._templates.surgical_invalidate_templates_by_diff", side_effect=_surgery_track),
-        patch("aetherdialect._templates._stamp_manifest", side_effect=_stamp_track),
-        patch("aetherdialect._templates.apply_structural_migration_from_map"),
+        patch("aetherdialect._templates.TemplateOps._apply_schema_rename_migration_to_store", side_effect=_remap_track),
+        patch("aetherdialect._templates.TemplateOps.surgical_invalidate_templates_by_diff", side_effect=_surgery_track),
+        patch("aetherdialect._templates.TemplateOps._stamp_manifest", side_effect=_stamp_track),
+        patch("aetherdialect._templates.TemplateOps.apply_structural_migration_from_map"),
         patch("aetherdialect._templates.migrate_sidecar_for_diff"),
     ):
-        apply_schema_migration_map(map_obj, str(tmp_path), schema, tmp_path / "schema.json.gz")
+        TemplateOps.apply_schema_migration_map(map_obj, str(tmp_path), schema, tmp_path / "schema.json.gz")
 
     assert phases == ["remap_depth_1", "surgery_depth_1", "stamp_depth_1"]

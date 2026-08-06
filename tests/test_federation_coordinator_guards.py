@@ -14,6 +14,7 @@ from aetherdialect._contracts_core import (
 )
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._federation import (
+    FederationConfigError,
     compose_composite_graph,
     parse_federation_manifest,
     parse_federation_mappings,
@@ -87,7 +88,7 @@ def _two_member_join_manifest(*, kind: str = "inner") -> tuple[object, object]:
         },
         include_derived_roster=True,
     )
-    mappings = parse_federation_mappings({"version": 1, "logical_columns": []})
+    mappings = parse_federation_mappings({"version": "0.2.1", "logical_columns": []})
     return manifest, mappings
 
 
@@ -360,7 +361,7 @@ def test_join_key_clique_non_unique_endpoint_refuses_at_declaration() -> None:
     )
     mappings = parse_federation_mappings(
         {
-            "version": 1,
+            "version": "0.2.1",
             "logical_columns": [
                 {
                     "logical": "join_id",
@@ -481,7 +482,7 @@ def _union_members_and_mappings(
     )
     mappings = parse_federation_mappings(
         {
-            "version": 2,
+            "version": "0.2.1",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -580,7 +581,7 @@ def test_disagreeing_primary_keys_raise_at_collapse() -> None:
     )
     mappings = parse_federation_mappings(
         {
-            "version": 2,
+            "version": "0.2.1",
             "logical_tables": [
                 {
                     "logical": "entity",
@@ -598,3 +599,124 @@ def test_disagreeing_primary_keys_raise_at_collapse() -> None:
     with pytest.raises(FederationDeclarationError) as exc_info:
         compose_composite_graph(members, manifest, mappings)
     assert "primary" in str(exc_info.value).lower()
+
+
+@pytest.mark.fast
+def test_union_unprofiled_members_refuse_disjointness_check() -> None:
+    members = {
+        "a": _graph("payment_a", source_id="a", row_count=0, overlap_sample=(), id_distinct=0),
+        "b": _graph("payment_b", source_id="b", row_count=0, overlap_sample=(), id_distinct=0),
+    }
+    _, manifest, mappings = _union_members_and_mappings()
+    with pytest.raises(FederationDeclarationError) as exc_info:
+        compose_composite_graph(members, manifest, mappings)
+    message = str(exc_info.value)
+    assert "payment" in message
+    assert "disjoint" in message.lower() or "establish" in message.lower()
+
+
+@pytest.mark.fast
+def test_disagreeing_member_grains_raise_at_collapse() -> None:
+    members = {
+        "a": _graph(
+            "entity_a",
+            source_id="a",
+            row_count=10,
+            id_unique=True,
+            id_distinct=10,
+        ),
+        "b": _graph(
+            "entity_b",
+            source_id="b",
+            row_count=10,
+            id_unique=False,
+            id_distinct=5,
+        ),
+    }
+    manifest = parse_federation_manifest(
+        {
+            "federation_id": "fed_grain",
+            "sources": [
+                {"source_id": "a", "engine": "duckdb", "role": "owner"},
+                {"source_id": "b", "engine": "duckdb", "role": "owner"},
+            ],
+            "table_namespace": {"entity_a": "a", "entity_b": "b"},
+            "cross_source_joins": [],
+        },
+        include_derived_roster=True,
+    )
+    mappings = parse_federation_mappings(
+        {
+            "version": "0.2.1",
+            "logical_tables": [
+                {
+                    "logical": "entity",
+                    "semantics": "replica",
+                    "authoritative_source": "a",
+                    "members": [
+                        {"source": "a", "table": "entity_a", "columns": {"id": "id"}},
+                        {"source": "b", "table": "entity_b", "columns": {"id": "id"}},
+                    ],
+                },
+            ],
+            "logical_columns": [],
+        }
+    )
+    with pytest.raises(FederationDeclarationError) as exc_info:
+        compose_composite_graph(members, manifest, mappings)
+    message = str(exc_info.value)
+    assert "grain" in message.lower()
+    assert "a" in message
+    assert "b" in message
+
+
+@pytest.mark.fast
+def test_replica_merge_raises_on_conflicting_value_type() -> None:
+    members = {
+        "a": _entity_graph("entity_a", source_id="a", primary_key=["id"]),
+        "b": _entity_graph("entity_b", source_id="b", primary_key=["id"]),
+    }
+    members["a"].tables["entity_a"].columns["id"].value_type = "integer"
+    members["b"].tables["entity_b"].columns["id"].value_type = "string"
+    manifest = parse_federation_manifest(
+        {
+            "federation_id": "fed_value_type",
+            "sources": [
+                {"source_id": "a", "engine": "duckdb", "role": "owner"},
+                {"source_id": "b", "engine": "duckdb", "role": "owner"},
+            ],
+            "table_namespace": {"entity_a": "a", "entity_b": "b"},
+            "cross_source_joins": [],
+        },
+        include_derived_roster=True,
+    )
+    mappings = parse_federation_mappings(
+        {
+            "version": "0.2.1",
+            "logical_tables": [
+                {
+                    "logical": "entity",
+                    "semantics": "replica",
+                    "authoritative_source": "a",
+                    "members": [
+                        {"source": "a", "table": "entity_a", "columns": {"id": "id"}},
+                        {"source": "b", "table": "entity_b", "columns": {"id": "id"}},
+                    ],
+                },
+            ],
+            "logical_columns": [],
+        }
+    )
+    with pytest.raises(FederationConfigError) as exc_info:
+        compose_composite_graph(members, manifest, mappings)
+    assert "value_type" in str(exc_info.value)
+
+
+@pytest.mark.fast
+def test_union_merge_raises_on_conflicting_value_type() -> None:
+    members, manifest, mappings = _union_members_and_mappings()
+    members["a"].tables["payment_a"].columns["id"].value_type = "integer"
+    members["b"].tables["payment_b"].columns["id"].value_type = "string"
+    with pytest.raises(FederationConfigError) as exc_info:
+        compose_composite_graph(members, manifest, mappings)
+    assert "value_type" in str(exc_info.value)

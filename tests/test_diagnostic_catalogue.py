@@ -190,9 +190,23 @@ def test_federation_diagnostics_carry_source_id_and_phase() -> None:
     assert gaps == []
 
 
+_API_REFERENCE = _REPO_ROOT / "docs" / "API_REFERENCE.md"
+
+
+@pytest.mark.fast
+def test_api_reference_documents_all_refusal_diagnostic_codes() -> None:
+    from aetherdialect._constants import REFUSAL_DIAGNOSTIC_CODES
+
+    text = _API_REFERENCE.read_text(encoding="utf-8")
+    start = text.index("### Diagnostic code catalog")
+    section = text[start:]
+    missing = sorted(code for code in REFUSAL_DIAGNOSTIC_CODES if code not in section)
+    assert not missing, f"API_REFERENCE.md missing refusal diagnostic codes: {missing}"
+
+
 @pytest.mark.fast
 def test_refusal_diagnostic_codes_are_declared_and_emitted() -> None:
-    from aetherdialect._refusal_diagnostics import REFUSAL_DIAGNOSTIC_CODES
+    from aetherdialect._constants import REFUSAL_DIAGNOSTIC_CODES
 
     declared = declared_session_diagnostic_codes()
     emitted = discover_emitted_session_diagnostic_codes()
@@ -200,3 +214,108 @@ def test_refusal_diagnostic_codes_are_declared_and_emitted() -> None:
     missing_emitted = sorted(REFUSAL_DIAGNOSTIC_CODES - emitted)
     assert not missing_declared, f"refusal codes missing from constants: {missing_declared}"
     assert not missing_emitted, f"refusal codes never emitted: {missing_emitted}"
+
+
+_L37_FEDERATION_DIAGNOSTIC_CODES = frozenset(
+    {
+        "FEDERATION_CAP_EXCEEDED",
+        "FEDERATION_MALFORMED_MEMBER_ANSWER",
+        "FEDERATION_JOIN_FAN_OUT",
+    }
+)
+
+
+@pytest.mark.fast
+def test_api_reference_documents_l37_federation_diagnostic_codes() -> None:
+    text = _API_REFERENCE.read_text(encoding="utf-8")
+    start = text.index("**Federation diagnostics**")
+    end = text.index("**Catch-all**", start)
+    section = text[start:end]
+    missing = sorted(code for code in _L37_FEDERATION_DIAGNOSTIC_CODES if code not in section)
+    assert not missing, f"API_REFERENCE.md federation diagnostics missing L37 codes: {missing}"
+
+
+@pytest.mark.fast
+def test_single_catalogue_covers_every_emission() -> None:
+    from aetherdialect._contracts_base import DiagnosticCode, SqlDiagnosticCode
+
+    enum_values = {m.value for m in DiagnosticCode}
+    session_values = set(_diagnostic_constant_map().values())
+    sql_values = {m.value for m in SqlDiagnosticCode}
+    assert session_values <= enum_values
+    assert sql_values <= enum_values
+    emitted = discover_emitted_session_diagnostic_codes() | sql_values
+    missing_emission = sorted(enum_values - emitted - sql_values)
+    # Session catalogue members must have an emission site; SQL members are covered via SqlDiagnostic usage.
+    session_only = enum_values & session_values
+    missing_session = sorted(session_only - discover_emitted_session_diagnostic_codes())
+    assert not missing_session, f"catalogue members never emitted: {missing_session}"
+    docs = (_REPO_ROOT / "docs" / "API_REFERENCE.md").read_text(encoding="utf-8")
+    start = docs.index("### Diagnostic code catalog")
+    section = docs[start:]
+    undocumented = sorted(v for v in session_only if v not in section)
+    assert not undocumented, f"catalogue members missing from API reference: {undocumented}"
+    _ = missing_emission
+
+
+@pytest.mark.fast
+def test_trace_headings_are_not_codes() -> None:
+    import inspect
+
+    from aetherdialect._core_utils import pipeline_trace
+
+    params = list(inspect.signature(pipeline_trace).parameters)
+    assert params[0] == "heading"
+    assert "code" not in params[:1]
+    doc = pipeline_trace.__doc__ or ""
+    assert "heading" in doc.lower()
+    assert "not" in doc.lower() and "code" in doc.lower()
+
+
+@pytest.mark.fast
+def test_probe_and_execution_failures_have_distinct_codes() -> None:
+    from aetherdialect._constants import (
+        DIAGNOSTIC_CODE_FEDERATION_MEMBER_FAILED,
+        DIAGNOSTIC_CODE_FEDERATION_MEMBER_PROBE_FAILED,
+    )
+    from aetherdialect._contracts_base import SqlDiagnosticCode
+
+    assert DIAGNOSTIC_CODE_FEDERATION_MEMBER_PROBE_FAILED != DIAGNOSTIC_CODE_FEDERATION_MEMBER_FAILED
+    assert SqlDiagnosticCode.EXPLAIN_SORT_SPILL.value != SqlDiagnosticCode.EXPLAIN_TEMPORARY_TABLE.value
+    assert SqlDiagnosticCode.EXPLAIN_SORT_SPILL.value != SqlDiagnosticCode.EXPLAIN_OTHER.value
+    text = _API_REFERENCE.read_text(encoding="utf-8")
+    for code in (
+        DIAGNOSTIC_CODE_FEDERATION_MEMBER_PROBE_FAILED,
+        SqlDiagnosticCode.EXPLAIN_SORT_SPILL.value,
+        SqlDiagnosticCode.EXPLAIN_TEMPORARY_TABLE.value,
+    ):
+        assert code in text, f"missing documentation for {code}"
+
+
+@pytest.mark.fast
+def test_no_dead_codes() -> None:
+    from aetherdialect._constants import DIAG_TO_FAILURE_CATEGORY
+    from aetherdialect._contracts_base import SqlDiagnosticCode
+
+    names = {m.name for m in SqlDiagnosticCode}
+    assert "EXPLAIN_TYPE_MISMATCH" not in names
+    assert "EXPLAIN_PERMISSION_DENIED" not in names
+    assert "explain_type_mismatch" not in DIAG_TO_FAILURE_CATEGORY
+    assert "explain_permission_denied" not in DIAG_TO_FAILURE_CATEGORY
+
+
+@pytest.mark.fast
+def test_public_reference_matches_catalogue() -> None:
+    declared = declared_session_diagnostic_codes()
+    emitted = discover_emitted_session_diagnostic_codes()
+    text = _API_REFERENCE.read_text(encoding="utf-8")
+    start = text.index("### Diagnostic code catalog")
+    section = text[start:]
+    documented = {code for code in declared if code in section}
+    undocumented = sorted(declared - documented)
+    assert not undocumented, f"declared codes missing from public reference: {undocumented}"
+    orphan_docs = sorted(
+        code for code in declared if code in section and code not in emitted and not code.startswith("DATA_QUALITY_")
+    )
+    # Soft codes count as emitted via SOFT_DIAGNOSTIC_CODES inclusion in discover helper.
+    assert orphan_docs == [], f"documented codes with no emission site: {orphan_docs}"

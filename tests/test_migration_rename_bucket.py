@@ -1,12 +1,12 @@
-"""T3: rename migration must not abort on anonymous-signature bucket size alone."""
+"""Rename migration must not abort on anonymous-signature bucket size alone."""
 
 from __future__ import annotations
 
 import pytest
 
-from aetherdialect._contracts_base import ColumnRole, MigrationTier
+from aetherdialect._contracts_base import ArtifactManifest, ColumnRole, MigrationTier
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import ArtifactManifest, assess_rename_migration_plan, try_rename_migration_plan
+from aetherdialect._core_utils import assess_rename_migration_plan, try_rename_migration_plan
 from aetherdialect._schema_graph import classify_migration_tier
 
 

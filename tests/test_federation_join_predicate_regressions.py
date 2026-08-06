@@ -9,15 +9,13 @@ from unittest.mock import MagicMock
 import pytest
 
 from aetherdialect._config import PolicyConfig
-from aetherdialect._constants import MAX_PREDICATE_NESTING_DEPTH, anti_join_presence_column
+from aetherdialect._constants import MAX_PREDICATE_NESTING_DEPTH
 from aetherdialect._contracts_base import (
     FederationMappings,
     MulGroup,
     PredicateGroup,
     SpaceContext,
     WhereParam,
-    coerce_predicate_group,
-    predicate_group_from_list,
 )
 from aetherdialect._contracts_core import (
     FederatedPlan,
@@ -27,7 +25,7 @@ from aetherdialect._contracts_core import (
     SourceStep,
 )
 from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
-from aetherdialect._dialect import get_dialect
+from aetherdialect._dialect import DialectRegistry
 from aetherdialect._federation import (
     FederationConfigError,
     FederationInvariantError,
@@ -45,15 +43,16 @@ from aetherdialect._federation import (
     render_federation_glue,
 )
 from aetherdialect._intent_process import NormalizedExpr
-from aetherdialect._main_execution import _verify_federation_execute_resume
+from aetherdialect._main_execution import MainExecutionOps
 from aetherdialect._pipeline import prepare_federated_sql_plan
 from aetherdialect._schema_graph import recompute_join_paths_multi
 from aetherdialect._sql_gen import (
     _build_deterministic_select_block,
+    anti_join_presence_column,
     build_deterministic_sql,
     inject_join_into_deterministic_sql,
 )
-from aetherdialect._templates import empty_template_store
+from aetherdialect._templates import TemplateOps
 from aetherdialect._validation_schema import (
     validate_cte_emission_shapes,
     validate_distinct_on_schema,
@@ -184,7 +183,7 @@ def _semi_join_intent(*, probe_name: str = "active_parents") -> RuntimeIntent:
 
 
 def _render_joined_sql(intent: RuntimeIntent, schema: SchemaGraph) -> str:
-    dialect = get_dialect("sqlite")
+    dialect = DialectRegistry.get("sqlite")
     det = build_deterministic_sql(intent, schema=schema, dialect=dialect)
     join_edges = list(intent.chosen_join_path_signature or [])
     sig = [[], join_edges] if join_edges else [[]]
@@ -401,7 +400,7 @@ def test_predicate_nesting_depths_one_to_three_render(depth: int) -> None:
         None,
         None,
         "row_level",
-        get_dialect("sqlite"),
+        DialectRegistry.get("sqlite"),
     )
     assert "WHERE" in sql.upper()
     assert '"t"."a"' in sql or "t.a" in sql.lower()
@@ -414,7 +413,7 @@ def test_predicate_nesting_depth_four_raises() -> None:
     issues = validate_predicate_nesting_depth(nested, None, "main query")
     assert any(issue.issue_id == "where_predicate_nesting_depth" for issue in issues)
     assert any(issue.severity == "error" for issue in issues)
-    coerced = coerce_predicate_group(nested)
+    coerced = PredicateGroup.coerce(nested)
     assert coerced is not None
     assert coerced.depth() <= MAX_PREDICATE_NESTING_DEPTH
 
@@ -521,7 +520,7 @@ def test_preserve_tables_zero_fill_and_left_propagation() -> None:
         preserve_tables=["parent"],
         chosen_join_path_signature=["parent.id->child.parent_id"],
     )
-    sql = build_deterministic_sql(intent, schema=simple_schema, dialect=get_dialect("sqlite"))
+    sql = build_deterministic_sql(intent, schema=simple_schema, dialect=DialectRegistry.get("sqlite"))
     _assert_no_forbidden_sql_tokens(sql)
     assert "COALESCE(COUNT" in sql and ", 0)" in sql
 
@@ -553,7 +552,7 @@ def test_single_source_federated_plan_renders_byte_identical_sql() -> None:
     from unittest.mock import patch
 
     from aetherdialect._federation import federation_plan_is_degenerate, plan_federated_intent
-    from aetherdialect._main_execution import _build_federation_source_runtimes, _federation_single_source_sql_context
+    from aetherdialect._main_execution import MainExecutionOps
     from aetherdialect._pipeline import generate_and_validate_sql
     from tests.conftest import duckdb_engine_identity
 
@@ -570,11 +569,11 @@ def test_single_source_federated_plan_renders_byte_identical_sql() -> None:
     )
     plan = plan_federated_intent(intent, composite, manifest)
     assert federation_plan_is_degenerate(plan)
-    default = get_dialect("duckdb")
-    runtimes = _build_federation_source_runtimes(
+    default = DialectRegistry.get("duckdb")
+    runtimes = MainExecutionOps._build_federation_source_runtimes(
         _runtime_manifest(), None, default, default_identity=duckdb_engine_identity()
     )
-    store = empty_template_store(composite.schema_graph_id)
+    store = TemplateOps.empty_template_store(composite.schema_graph_id)
     with patch(
         "aetherdialect._pipeline._run_sql_validation_cascade",
         return_value=(True, "", None, []),
@@ -585,7 +584,7 @@ def test_single_source_federated_plan_renders_byte_identical_sql() -> None:
             _federation_dialects = {sid: runtime.dialect for sid, runtime in runtimes.items()}
 
         owner = _Owner()
-        single_source = _federation_single_source_sql_context(
+        single_source = MainExecutionOps._federation_single_source_sql_context(
             owner,
             intent,
             composite,
@@ -739,7 +738,7 @@ def test_capability_refusal_names_unsupported_operator() -> None:
         select_cols=[],
         group_by_cols=[],
         order_by_cols=[],
-        where=predicate_group_from_list(
+        where=PredicateGroup.from_list(
             [
                 WhereParam(
                     left_expr=NormalizedExpr.from_column("left_t.name"),
@@ -761,7 +760,7 @@ def test_compose_twice_is_byte_identical_on_identity_fields() -> None:
     assert fed.composite.schema_graph_id == second.schema_graph_id
     assert fed.composite.structural_hash == second.structural_hash
     assert fed.composite.effective_structural_hash == second.effective_structural_hash
-    assert_composite_invariants(second, fed.member_graphs, fed.manifest, FederationMappings(version=2))
+    assert_composite_invariants(second, fed.member_graphs, fed.manifest, FederationMappings(version="0.2.1"))
 
 
 @pytest.mark.fast
@@ -901,7 +900,7 @@ def test_resume_rejects_substitute_federation_plan_id() -> None:
         federation_plan_id="substitute",
     )
     with pytest.raises(FederationInvariantError, match="plan id mismatch"):
-        _verify_federation_execute_resume(ctx)
+        MainExecutionOps._verify_federation_execute_resume(ctx)
 
 
 @pytest.mark.fast
@@ -944,7 +943,7 @@ def test_federation_artifact_version_mismatch_reports_expected_version() -> None
     from aetherdialect._constants import FEDERATION_ARTIFACT_FORMAT_VERSION
 
     fed = build_two_member_federation()
-    mappings = FederationMappings(version=2)
+    mappings = FederationMappings(version="0.2.1")
     with tempfile.TemporaryDirectory() as tmp:
         persist_federation_tree(
             tmp,
@@ -956,7 +955,7 @@ def test_federation_artifact_version_mismatch_reports_expected_version() -> None
         manifest_path = federation_artifact_paths(tmp)["artifact_manifest"]
         with open(manifest_path, encoding="utf-8") as handle:
             stored = json.load(handle)
-        stored["artifact_format_version"] = FEDERATION_ARTIFACT_FORMAT_VERSION - 1
+        stored["artifact_format_version"] = "0.0.0"
         with open(manifest_path, "w", encoding="utf-8") as handle:
             json.dump(stored, handle)
         with pytest.raises(FederationConfigError, match=r"artifact_format_version") as exc_info:

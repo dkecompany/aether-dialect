@@ -9,10 +9,9 @@ from unittest.mock import MagicMock
 import pytest
 
 from aetherdialect import AetherEngine, BusinessKnowledgeEntry
-from aetherdialect._contracts_base import ConfigError, EngineContext, LLMConfig, RuntimeConfig
+from aetherdialect._contracts_base import BusinessKnowledgeHolder, ConfigError, EngineContext, LLMConfig, RuntimeConfig
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, SensitivityClassification, TableMetadata
 from aetherdialect._core_utils import (
-    BusinessKnowledgeHolder,
     business_knowledge_digest,
     business_knowledge_scope,
     empty_business_knowledge_digest,
@@ -20,8 +19,8 @@ from aetherdialect._core_utils import (
     prompt_cache_schema_scope,
 )
 from aetherdialect._intent_process import build_intent_interpret_prompt
-from aetherdialect._llm_provider import resolve_prompt_cache_key
-from aetherdialect._templates import empty_template_store
+from aetherdialect._llm_provider import LLMProvider
+from aetherdialect._templates import TemplateOps
 
 
 def _minimal_engine(**overrides: object) -> AetherEngine:
@@ -37,7 +36,7 @@ def _minimal_engine(**overrides: object) -> AetherEngine:
         _schema_graph=_schema_with_hidden_email(),
         _dialect=MagicMock(),
         _artifacts_dir="/tmp/aether_bk",
-        _store=empty_template_store("graph-bk-1"),
+        _store=TemplateOps.empty_template_store("graph-bk-1"),
         _templates={},
         _rejected={},
         _schema_terms=set(),
@@ -89,11 +88,16 @@ def test_set_and_read_back_business_knowledge() -> None:
     engine = _minimal_engine()
     entries = (
         BusinessKnowledgeEntry(key="revenue", text="Monthly recurring revenue from paid subscriptions."),
-        BusinessKnowledgeEntry(key="fiscal_year", text="Fiscal year starts in July.", kind="convention"),
+        BusinessKnowledgeEntry(key="fiscal_year", text="Fiscal year starts in July.", kind="policy"),
     )
     version = engine.set_business_knowledge(entries)
     assert version == 1
-    assert engine.business_knowledge() == entries
+    assert engine.business_knowledge() == (
+        BusinessKnowledgeEntry(
+            key="revenue", text="Monthly recurring revenue from paid subscriptions.", kind="glossary"
+        ),
+        BusinessKnowledgeEntry(key="fiscal_year", text="Fiscal year starts in July.", kind="policy"),
+    )
     assert engine.business_knowledge_version() == 1
     assert engine.business_knowledge_digest() == business_knowledge_digest(entries)
 
@@ -162,9 +166,9 @@ def test_prompt_cache_key_includes_business_digest() -> None:
     entries = (BusinessKnowledgeEntry(key="term", text="Definition."),)
     digest = business_knowledge_digest(entries)
     with prompt_cache_schema_scope("schema-hash-1"):
-        without_business = resolve_prompt_cache_key("intent")
+        without_business = LLMProvider.resolve_prompt_cache_key("intent")
     with prompt_cache_schema_scope("schema-hash-1"):
         with business_knowledge_scope(entries, digest):
-            with_business = resolve_prompt_cache_key("intent")
+            with_business = LLMProvider.resolve_prompt_cache_key("intent")
     assert without_business == "intent:schema-hash-1"
     assert with_business == f"intent:schema-hash-1:{digest[:16]}"

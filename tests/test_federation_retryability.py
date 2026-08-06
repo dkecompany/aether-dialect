@@ -14,7 +14,11 @@ from aetherdialect._contracts_base import (
     SessionStep,
     StatementTimeoutError,
 )
-from aetherdialect._main_execution import PipelineSession, _handle_federation_partial_failure_interactive
+from aetherdialect._federation import federation_member_timeout_error
+from aetherdialect._main_execution import (
+    MainExecutionOps,
+    PipelineSession,
+)
 from aetherdialect._pipeline import _raise_partial_member_failure
 
 
@@ -92,7 +96,7 @@ def test_partial_failure_interactive_turn_surfaces_retryable_on_step() -> None:
         retryable=True,
     )
     with patch("aetherdialect._federation.save_federation_plan_template"):
-        _handle_federation_partial_failure_interactive(port, owner, exc)
+        MainExecutionOps._handle_federation_partial_failure_interactive(port, owner, exc)
     kwargs = port.note_turn_outcome.call_args.kwargs
     assert kwargs["retryable"] is True
 
@@ -150,3 +154,18 @@ def test_retryable_cause_via_member_execution_wraps_retryable() -> None:
             succeeded=(),
         )
     assert isinstance(exc_info.value, RetryableError)
+
+
+@pytest.mark.fast
+def test_member_timeout_cap_exceeded_remains_retryable_in_partial_failure() -> None:
+    timeout_exc = federation_member_timeout_error("b", StatementTimeoutError("statement timeout"))
+    with pytest.raises(FederationPartialFailureError) as exc_info:
+        _raise_partial_member_failure(
+            timeout_exc,
+            source_id="b",
+            phase="member",
+            succeeded=(),
+        )
+    exc = exc_info.value
+    assert isinstance(exc, RetryableError)
+    assert exc.retryable is True

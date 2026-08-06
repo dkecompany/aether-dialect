@@ -6,8 +6,8 @@ from live_tests._rental_partition_metadata import apply_synthetic_rental_partiti
 
 from aetherdialect._contracts_base import (
     NormalizedExpr,
+    PredicateGroup,
     WhereParam,
-    predicate_group_from_list,
 )
 from aetherdialect._contracts_core import RuntimeIntent
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
@@ -71,13 +71,14 @@ class TestDuckDBInjectPruningPredicates:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([_where_param("rental.rental_date", "=", "p1", None)]),
+            where=PredicateGroup.from_list([_where_param("rental.rental_date", "=", "p1", None)]),
             param_values={"p1": "2023-07-15"},
         )
         sql = "SELECT * FROM rental"
         result = _duckdb_shell().inject_pruning_predicates(sql, schema=sg, intent=intent)
         assert "WHERE" in result.upper()
-        assert "2023-07-15" in result
+        assert ":p1" in result
+        assert "2023-07-15" not in result
         assert '"rental"."rental_date"' in result or "rental.rental_date" in result.lower()
 
     def test_unchanged_without_partition_columns(self) -> None:
@@ -88,7 +89,7 @@ class TestDuckDBInjectPruningPredicates:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([_where_param("rental.rental_date", "=", "p1", None)]),
+            where=PredicateGroup.from_list([_where_param("rental.rental_date", "=", "p1", None)]),
             param_values={"p1": "2023-07-15"},
         )
         sql = "SELECT * FROM rental WHERE rental_date = '2023-07-15'"

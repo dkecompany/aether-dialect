@@ -13,14 +13,14 @@ from typing import Any
 from aetherdialect import AetherEngine
 from aetherdialect._config import EngineConfig, QSimConfig
 from aetherdialect._contracts_base import EngineContext, SchemaInclude
+from aetherdialect._contracts_core import LiveTestRunner
 from aetherdialect._contracts_schema import (
     ColumnMetadata,
     SchemaGraph,
     TableMetadata,
 )
 from aetherdialect._core_utils import llm_usage_build_scope, write_gzip_json_atomic
-from aetherdialect._live_testing import LiveTestRunner
-from aetherdialect._templates import load_template_store, store_to_templates
+from aetherdialect._templates import TemplateOps
 
 from ._rental_partition_metadata import apply_synthetic_rental_partition_metadata
 from .conftest import (
@@ -50,12 +50,9 @@ ENGINE_MODULE_FRAGMENTS = (
     "test_sqlite_dialect",
 )
 
-
 _SESSION_ENGINE_CACHE: dict[tuple[str, str], AetherEngine] = {}
 
-
 _RENTAL_SHOP_VIEWS_SQL = Path(__file__).resolve().parent.parent / "scripts" / "data" / "rental_shop_views.sql"
-
 
 _RENTAL_SHOP_VIEW_NAMES = ("active_customer_v", "store_revenue_v", "film_catalog_v")
 
@@ -233,9 +230,11 @@ def build_engine_t2s(engine_name: str, schema: str) -> AetherEngine:
 
             _redirect_to_livetest_dir(instance)
 
-            fresh_store = load_template_store(instance._schema_graph.effective_structural_hash, instance._schema_graph)
+            fresh_store = TemplateOps.load_template_store(
+                instance._schema_graph.effective_structural_hash, instance._schema_graph
+            )
             instance._store = fresh_store
-            instance._templates = store_to_templates(fresh_store)
+            instance._templates = TemplateOps.store_to_templates(fresh_store)
             instance._rejected = {}
 
             _relax_rental_shop_selectability(instance._schema_graph, schema)

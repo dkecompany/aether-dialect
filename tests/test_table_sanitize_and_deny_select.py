@@ -3,8 +3,8 @@
 from aetherdialect._contracts_base import (
     FailureCategory,
     NormalizedExpr,
+    PredicateGroup,
     WhereParam,
-    predicate_group_from_list,
 )
 from aetherdialect._contracts_core import (
     RuntimeCteStep,
@@ -102,7 +102,7 @@ def test_validate_denied_references_flags_non_terminal_cte_denied_col() -> None:
         cte_name="inner_x",
         tables=["t"],
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.id"))],
-        where=predicate_group_from_list(
+        where=PredicateGroup.from_list(
             [
                 WhereParam(
                     left_expr=NormalizedExpr.from_column("t.secret"),
@@ -169,7 +169,6 @@ def test_tier2_numeric_coverage_short_circuits_on_empty_nl() -> None:
     assert (
         validate_logical_intent_numeric_coverage(
             None,
-            [],
             [],
             None,
             "CTE 'c1'",

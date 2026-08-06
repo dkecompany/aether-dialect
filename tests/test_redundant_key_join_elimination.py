@@ -7,10 +7,14 @@ from dataclasses import replace
 import pytest
 
 from aetherdialect._config import PolicyConfig
-from aetherdialect._contracts_base import InferenceTag, NormalizedExpr, WhereParam
+from aetherdialect._contracts_base import (
+    InferenceTag,
+    NormalizedExpr,
+    PredicateGroup,
+    WhereParam,
+)
 from aetherdialect._contracts_core import RuntimeCteStep, RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
-from aetherdialect._intent_process import predicate_group_from_list
 from aetherdialect._intent_repair import eliminate_redundant_key_joins, reconcile_tables
 
 
@@ -94,7 +98,7 @@ def _orders_customers_intent(
         select_cols.append(SelectCol(expr=NormalizedExpr.from_column("customers.id")))
     where = None
     if nullable_fk_null_predicate:
-        where = predicate_group_from_list(
+        where = PredicateGroup.from_list(
             [
                 WhereParam(
                     left_expr=NormalizedExpr.from_column("orders.customer_id"),

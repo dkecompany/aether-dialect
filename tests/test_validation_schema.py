@@ -9,8 +9,8 @@ from aetherdialect._contracts_base import (
     MulGroup,
     NormalizedExpr,
     OrderByCol,
+    PredicateGroup,
     WhereParam,
-    predicate_group_from_list,
 )
 from aetherdialect._contracts_core import (
     RuntimeCteStep,
@@ -27,7 +27,6 @@ from aetherdialect._contracts_schema import (
     TableMetadata,
     WindowRegistryStep,
     WindowSpec,
-    registry_render_scope,
 )
 from aetherdialect._validation_schema import (
     _validate_agg_func_valid,
@@ -696,7 +695,7 @@ class TestValidateNullFilters:
     def test_cte_filter_included(self):
         cte = RuntimeCteStep(
             cte_name="s1",
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("t.a"),
@@ -1689,7 +1688,7 @@ class TestSelectabilityValidator:
             )
         ]
         sc = SelectCol(expr=NormalizedExpr(column_ref="w01"))
-        with registry_render_scope(wr, None):
+        with WindowRegistryStep.render_scope(wr, None):
             issues = validate_selectability([sc], typed_schema, {}, "main")
         assert len(issues) >= 1
         assert "partition" in issues[0].message.lower()
@@ -1708,7 +1707,7 @@ class TestSelectabilityValidator:
             )
         ]
         sc = SelectCol(expr=NormalizedExpr(column_ref="w01"))
-        with registry_render_scope(wr, None):
+        with WindowRegistryStep.render_scope(wr, None):
             issues = validate_selectability([sc], typed_schema, {}, "main")
         assert issues == []
 
@@ -1792,7 +1791,7 @@ class TestValidateDateWindowUnits:
             value_type="date_window",
             raw_value={"unit": "bad", "amount": 1},
         )
-        cte = RuntimeCteStep(cte_name="c1", where=predicate_group_from_list([fp]))
+        cte = RuntimeCteStep(cte_name="c1", where=PredicateGroup.from_list([fp]))
         issues = validate_date_window_units([], cte_steps=[cte])
         assert len(issues) == 1
 
@@ -1826,7 +1825,7 @@ class TestValidateDateDiffUnitsMore:
             value_type="date_diff",
             raw_value={"unit": "fortnight", "amount": 1},
         )
-        cte = RuntimeCteStep(cte_name="inner", where=predicate_group_from_list([fp]))
+        cte = RuntimeCteStep(cte_name="inner", where=PredicateGroup.from_list([fp]))
         issues = validate_date_diff_units([], cte_steps=[cte])
         assert len(issues) == 1
 
@@ -2333,7 +2332,7 @@ def _deep_or_predicate_tree(depth: int):
 @pytest.mark.fast
 def test_where_predicate_depth_four_reports_max_nesting() -> None:
     from aetherdialect._constants import MAX_PREDICATE_NESTING_DEPTH
-    from aetherdialect._contracts_base import coerce_predicate_group
+    from aetherdialect._contracts_base import PredicateGroup
     from aetherdialect._validation_schema import validate_predicate_nesting_depth
 
     nested = _deep_or_predicate_tree(MAX_PREDICATE_NESTING_DEPTH + 1)
@@ -2342,7 +2341,7 @@ def test_where_predicate_depth_four_reports_max_nesting() -> None:
     assert any(i.issue_id == "where_predicate_nesting_depth" for i in issues)
     assert any(i.severity == "error" for i in issues if i.issue_id == "where_predicate_nesting_depth")
     assert any(f"MAX_PREDICATE_NESTING_DEPTH={MAX_PREDICATE_NESTING_DEPTH}" in i.message for i in issues)
-    coerced = coerce_predicate_group(nested)
+    coerced = PredicateGroup.coerce(nested)
     assert coerced is not None
     assert coerced.depth() <= MAX_PREDICATE_NESTING_DEPTH
 
@@ -2350,7 +2349,7 @@ def test_where_predicate_depth_four_reports_max_nesting() -> None:
 @pytest.mark.fast
 def test_having_predicate_depth_four_reports_max_nesting() -> None:
     from aetherdialect._constants import MAX_PREDICATE_NESTING_DEPTH
-    from aetherdialect._contracts_base import HavingParam, PredicateGroup, coerce_predicate_group
+    from aetherdialect._contracts_base import HavingParam, PredicateGroup
     from aetherdialect._validation_schema import validate_predicate_nesting_depth
 
     def _having_leaf() -> HavingParam:
@@ -2369,6 +2368,6 @@ def test_having_predicate_depth_four_reports_max_nesting() -> None:
     assert any(i.issue_id == "having_predicate_nesting_depth" for i in issues)
     assert any(i.severity == "error" for i in issues if i.issue_id == "having_predicate_nesting_depth")
     assert any(f"MAX_PREDICATE_NESTING_DEPTH={MAX_PREDICATE_NESTING_DEPTH}" in i.message for i in issues)
-    coerced = coerce_predicate_group(nested)
+    coerced = PredicateGroup.coerce(nested)
     assert coerced is not None
     assert coerced.depth() <= MAX_PREDICATE_NESTING_DEPTH

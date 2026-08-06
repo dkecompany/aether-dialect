@@ -18,7 +18,6 @@ from aetherdialect._contracts_base import (
     OrderByCol,
     PredicateGroup,
     WhereParam,
-    predicate_group_from_list,
 )
 from aetherdialect._contracts_core import (
     FeedbackKind,
@@ -39,13 +38,12 @@ from aetherdialect._contracts_schema import (
     VirtualTableSpec,
     WindowRegistryStep,
     WindowSpec,
-    registry_render_scope,
 )
 from aetherdialect._core_utils import (
     _format_scalar_for_structural_sql_inline,
     reduce_structural_sql_placeholders,
 )
-from aetherdialect._dialect import finalize_executable_sql
+from aetherdialect._dialect import Dialect
 from aetherdialect._dialect_postgres import PostgresDialect
 from aetherdialect._dialect_sqlglot_engines import DatabricksDialect
 from aetherdialect._sql_gen import (
@@ -64,7 +62,6 @@ from aetherdialect._sql_gen import (
     _render_case_branch_sql,
     _render_case_when_sql,
     _render_group_sql,
-    _render_order_by_sql,
     _render_window_over_sql,
     _serialize_join_candidate_row,
     _try_ast_inject_joins,
@@ -83,12 +80,13 @@ from aetherdialect._sql_gen import (
     merge_join_hints_for_na_scopes,
     physical_tables_for_join_hints,
     render_expr_sql,
+    render_order_by_sql,
     render_select_col_sql,
     select_col_prefers_llm_display_alias,
     sql_gen_type_scope,
     tables_in_join_scope,
 )
-from aetherdialect._templates import lookup_join_feedback_for_question, record_question_feedback
+from aetherdialect._templates import TemplateOps
 from tests.join_test_helpers import catalog_edge_kinds_for_signatures
 
 
@@ -340,9 +338,9 @@ class TestCountDistinctConcatShapeA:
 
     @pytest.mark.parametrize("engine", ["postgresql", "duckdb", "databricks", "mysql"])
     def test_render_per_dialect(self, engine: str) -> None:
-        from aetherdialect._dialect import get_dialect_class
+        from aetherdialect._dialect import DialectRegistry
 
-        dialect_cls = get_dialect_class(engine)
+        dialect_cls = DialectRegistry.get_class(engine)
         dialect = dialect_cls.__new__(dialect_cls)
         if engine == "databricks":
             dialect.config = SimpleNamespace(CATALOG="test_catalog", SCHEMA="test_schema")
@@ -603,7 +601,7 @@ class TestCteToIntentForRanking:
             group_by_cols=[NormalizedExpr.from_column("t1.name")],
             output_columns=["id"],
             order_by_cols=[OrderByCol(expr=NormalizedExpr.from_column("t1.name"))],
-            where=predicate_group_from_list([WhereParam(left_expr=NormalizedExpr.from_column("t1.status"), op="=")]),
+            where=PredicateGroup.from_list([WhereParam(left_expr=NormalizedExpr.from_column("t1.status"), op="=")]),
         )
         intent = cte_to_intent_for_ranking(cte)
         assert intent.tables == ["t1", "t2"]
@@ -1011,7 +1009,7 @@ class TestBuildDeterministicSql:
             group_by_cols=[NormalizedExpr(add_groups=[MulGroup(multiply=["t1.x"])], sub_groups=[])],
             order_by_cols=[],
             where=None,
-            having=predicate_group_from_list(
+            having=PredicateGroup.from_list(
                 [
                     HavingParam(
                         left_expr=NormalizedExpr(
@@ -1039,7 +1037,7 @@ class TestBuildDeterministicSql:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr(add_groups=[MulGroup(multiply=["t1.d"])], sub_groups=[]),
@@ -1069,7 +1067,7 @@ class TestBuildDeterministicSql:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr(
@@ -1197,7 +1195,7 @@ class TestBuildDeterministicSql:
             )
         ]
         sc = SelectCol(expr=NormalizedExpr(column_ref="w01"))
-        with registry_render_scope(wr, None):
+        with WindowRegistryStep.render_scope(wr, None):
             lag_sql = render_select_col_sql(sc)
         compact = lag_sql.replace(" ", "").replace('"', "")
         assert "LAG(payment.amount)" in compact
@@ -1239,7 +1237,7 @@ class TestBuildJoinAstFromSignature:
     """Dialect adapter ``attach_joins`` reproduces the string join clause."""
 
     def test_attach_joins_postgres_emits_equivalent_join(self):
-        from aetherdialect._dialect import JoinEdge
+        from aetherdialect._contracts_base import JoinEdge
         from aetherdialect._sql_gen import _join_edges_from_signature
 
         sig = ["orders.cid->customers.id"]
@@ -1262,7 +1260,7 @@ class TestBuildJoinAstFromSignature:
         assert "customers.id" in emitted
 
     def test_attach_joins_databricks_emits_equivalent_join(self):
-        from aetherdialect._dialect import JoinEdge
+        from aetherdialect._contracts_base import JoinEdge
         from aetherdialect._sql_gen import _join_edges_from_signature
 
         sig = ["orders.cid->customers.id"]
@@ -1565,7 +1563,7 @@ class TestReduceStructuralSqlPlaceholders:
         assert ":p1" in sql
 
     def test_finalize_executable_sql_end_to_end(self):
-        out = finalize_executable_sql(
+        out = Dialect.finalize_executable_sql(
             "SELECT :s1 * x WHERE id = :p1",
             {"s1": 1, "p1": 42},
             None,
@@ -1813,7 +1811,7 @@ class TestWherePredicateGroupRendering:
 class TestGetJoinChoiceFromLlm:
     """Tests for get_join_choice_from_llm validation and silent retry."""
 
-    @patch("aetherdialect._sql_gen.llm_json")
+    @patch("aetherdialect._sql_gen.LLMProvider.json")
     def test_second_call_used_when_first_id_invalid(self, mock_llm_json: MagicMock) -> None:
         cands = [
             {
@@ -1843,7 +1841,7 @@ class TestGetJoinChoiceFromLlm:
         assert got[JOIN_CHOICE_SCOPE_MAIN] == "J02"
         assert mock_llm_json.call_count == 2
 
-    @patch("aetherdialect._sql_gen.llm_json")
+    @patch("aetherdialect._sql_gen.LLMProvider.json")
     def test_invalid_llm_choice_does_not_override_valid_preset(self, mock_llm_json: MagicMock) -> None:
         cands = [
             {
@@ -1870,7 +1868,7 @@ class TestGetJoinChoiceFromLlm:
         assert got[JOIN_CHOICE_SCOPE_MAIN] == "J02"
         mock_llm_json.assert_called_once()
 
-    @patch("aetherdialect._sql_gen.llm_json")
+    @patch("aetherdialect._sql_gen.LLMProvider.json")
     def test_j00_when_both_attempts_invalid(self, mock_llm_json: MagicMock) -> None:
         cands = [{"candidate_id": "J01", "join_path_signature": [], "candidate_tier": "base"}]
         scopes = [{"scope": JOIN_CHOICE_SCOPE_MAIN, "tables": [], "candidates": cands}]
@@ -1889,7 +1887,7 @@ class TestGetJoinChoiceFromLlm:
         assert got[JOIN_CHOICE_SCOPE_MAIN] == "J01"
         assert mock_llm_json.call_count == 2
 
-    @patch("aetherdialect._sql_gen.llm_json")
+    @patch("aetherdialect._sql_gen.LLMProvider.json")
     def test_j00_when_llm_scopes_empty(self, mock_llm_json: MagicMock) -> None:
         got = get_join_choice_from_llm(
             "q",
@@ -1902,7 +1900,7 @@ class TestGetJoinChoiceFromLlm:
         assert got[JOIN_CHOICE_SCOPE_MAIN] == "J01"
         mock_llm_json.assert_not_called()
 
-    @patch("aetherdialect._sql_gen.llm_json")
+    @patch("aetherdialect._sql_gen.LLMProvider.json")
     def test_j00_when_llm_json_exhausted_on_all_attempts(self, mock_llm_json: MagicMock) -> None:
         cands = [
             {
@@ -1927,7 +1925,7 @@ class TestGetJoinChoiceFromLlm:
         assert got[JOIN_CHOICE_SCOPE_MAIN] == "J01"
         assert mock_llm_json.call_count == 2
 
-    @patch("aetherdialect._sql_gen.llm_json")
+    @patch("aetherdialect._sql_gen.LLMProvider.json")
     def test_na_accepted_on_first_pass_when_enabled(self, mock_llm_json: MagicMock) -> None:
         main_c = [
             {
@@ -2315,7 +2313,7 @@ class TestRenderSelectColCaseAndWindow:
         )
         step = CaseRegistryStep(registry_id="c01", case_when=cw)
         sc = SelectCol(expr=NormalizedExpr.from_column("c01"))
-        with registry_render_scope(None, [step]):
+        with WindowRegistryStep.render_scope(None, [step]):
             assert render_select_col_sql(sc).startswith("CASE")
 
     def test_window_sum_with_partition_and_order(self) -> None:
@@ -2370,7 +2368,7 @@ class TestBuildDeterministicSqlEdgeCases:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t1.name"))],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("t1.name"),
@@ -2393,7 +2391,7 @@ class TestBuildDeterministicSqlEdgeCases:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t1.name"))],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("t1.name"),
@@ -2416,7 +2414,7 @@ class TestBuildDeterministicSqlEdgeCases:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t1.tags"))],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("t1.tags"),
@@ -2561,8 +2559,8 @@ class TestJoinChoicePromptAndValidation:
             updated_at="t",
             rejected_join_path_signature=(verified_sig,),
         )
-        record_question_feedback(store, "q?", entry)
-        feedback_lines = lookup_join_feedback_for_question(store, "q?")
+        TemplateOps.record_question_feedback(store, "q?", entry)
+        feedback_lines = TemplateOps.lookup_join_feedback_for_question(store, "q?")
         assert feedback_lines
         assert verified_sig in feedback_lines[0]
 
@@ -3351,26 +3349,26 @@ class TestVisibilityFilterInJoinPaths:
 class TestOrderByNullPlacement:
     @staticmethod
     def _stub_dialect(engine: str):
-        from aetherdialect._dialect import get_dialect_class
+        from aetherdialect._dialect import DialectRegistry
 
-        dialect_cls = get_dialect_class(engine)
+        dialect_cls = DialectRegistry.get_class(engine)
         return dialect_cls.__new__(dialect_cls)
 
     def test_postgresql_renders_native_nulls_last(self) -> None:
         cols = [OrderByCol(expr=NormalizedExpr.from_column("t.n"), direction="ASC", nulls="last")]
-        sql = _render_order_by_sql(cols, self._stub_dialect("postgresql"))
+        sql = render_order_by_sql(cols, self._stub_dialect("postgresql"))
         assert "NULLS LAST" in sql
 
     def test_mysql_renders_is_null_rewrite_for_nulls_first(self) -> None:
         cols = [OrderByCol(expr=NormalizedExpr.from_column("t.n"), direction="ASC", nulls="first")]
-        sql = _render_order_by_sql(cols, self._stub_dialect("mysql"))
+        sql = render_order_by_sql(cols, self._stub_dialect("mysql"))
         assert "IS NULL" in sql
         assert "NULLS FIRST" not in sql
 
     def test_window_and_outer_order_by_agree_on_null_placement(self) -> None:
         dialect = self._stub_dialect("postgresql")
         cols = [OrderByCol(expr=NormalizedExpr.from_column("t.n"), direction="DESC", nulls="first")]
-        outer = _render_order_by_sql(cols, dialect)
+        outer = render_order_by_sql(cols, dialect)
         ws = WindowSpec(function="row_number", partition_by=[], order_by=cols, frame_kind="none")
         window = _render_window_over_sql(ws, dialect)
         assert "NULLS FIRST" in outer

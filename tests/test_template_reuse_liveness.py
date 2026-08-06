@@ -126,13 +126,13 @@ def _fed_member_schema(*, with_fk: bool = True) -> SchemaGraph:
     )
 
 
-@patch("aetherdialect._pipeline.llm_chat", return_value='{"aliases":{}}')
-@patch("aetherdialect._pipeline.save_template_store")
-@patch("aetherdialect._pipeline.templates_to_store", side_effect=lambda s, t: s)
-@patch("aetherdialect._pipeline.delete_rejected_templates_matching_question")
-@patch("aetherdialect._pipeline.save_result_csv")
+@patch("aetherdialect._pipeline.LLMProvider.chat", return_value='{"aliases":{}}')
+@patch("aetherdialect._templates.TemplateOps.save_template_store")
+@patch("aetherdialect._templates.TemplateOps.templates_to_store", side_effect=lambda s, t: s)
+@patch("aetherdialect._templates.TemplateOps.delete_rejected_templates_matching_question")
+@patch("aetherdialect._pipeline.save_result_csv_for_store")
 @patch("aetherdialect._pipeline.print_query_result")
-@patch("aetherdialect._pipeline.promote_trust")
+@patch("aetherdialect._templates.TemplateOps.promote_trust")
 @patch("aetherdialect._pipeline.validate_sql", return_value=(True, None, None, []))
 def test_stale_join_path_skips_direct_reuse(
     _mock_val,
@@ -183,13 +183,13 @@ def test_stale_join_path_skips_direct_reuse(
     dialect.execute.assert_not_called()
 
 
-@patch("aetherdialect._pipeline.llm_chat", return_value='{"aliases":{}}')
-@patch("aetherdialect._pipeline.save_template_store")
-@patch("aetherdialect._pipeline.templates_to_store", side_effect=lambda s, t: s)
-@patch("aetherdialect._pipeline.delete_rejected_templates_matching_question")
-@patch("aetherdialect._pipeline.save_result_csv")
+@patch("aetherdialect._pipeline.LLMProvider.chat", return_value='{"aliases":{}}')
+@patch("aetherdialect._templates.TemplateOps.save_template_store")
+@patch("aetherdialect._templates.TemplateOps.templates_to_store", side_effect=lambda s, t: s)
+@patch("aetherdialect._templates.TemplateOps.delete_rejected_templates_matching_question")
+@patch("aetherdialect._pipeline.save_result_csv_for_store")
 @patch("aetherdialect._pipeline.print_query_result")
-@patch("aetherdialect._pipeline.promote_trust")
+@patch("aetherdialect._templates.TemplateOps.promote_trust")
 @patch("aetherdialect._pipeline.validate_sql", return_value=(True, None, None, []))
 def test_restored_join_path_allows_direct_reuse_again(
     _mock_val,

@@ -16,6 +16,7 @@ from aetherdialect._core_utils import (
 )
 from aetherdialect._federation import (
     FederationConfigError,
+    FederationMemberProbeError,
     _resolve_composite_table_names,
     compose_composite_graph,
     derive_table_namespace,
@@ -108,7 +109,7 @@ def test_probe_fails_on_missing_declared_column() -> None:
     )
     mappings = parse_federation_mappings(
         {
-            "version": 2,
+            "version": "0.2.1",
             "logical_tables": [
                 {
                     "logical": "orders",
@@ -126,6 +127,102 @@ def test_probe_fails_on_missing_declared_column() -> None:
         },
     )
     with pytest.raises(FederationConfigError, match="ghost_col"):
+        probe_federation_member_connections({"a": engine}, manifest=manifest, mappings=mappings)
+
+
+@pytest.mark.fast
+def test_probe_fails_when_live_object_missing_despite_stale_graph() -> None:
+    graph = _graph(
+        "orders",
+        source_id="a",
+        columns={
+            "id": ColumnMetadata(name="id", data_type="integer", sensitivity="none"),
+            "ghost_col": ColumnMetadata(name="ghost_col", data_type="text", sensitivity="none"),
+        },
+    )
+    engine = MagicMock()
+    engine.dialect = "postgresql"
+    sa_engine = MagicMock()
+    conn = MagicMock()
+
+    def _execute(stmt: object) -> MagicMock:
+        sql = str(stmt)
+        if "ghost_col" in sql.lower():
+            raise RuntimeError('column "ghost_col" does not exist')
+        return MagicMock()
+
+    conn.execute.side_effect = _execute
+    sa_engine.connect.return_value.__enter__ = MagicMock(return_value=conn)
+    sa_engine.connect.return_value.__exit__ = MagicMock(return_value=False)
+    engine._execution_engine = sa_engine
+    engine._schema_graph = graph
+    manifest = parse_federation_manifest(
+        {
+            "federation_id": "fed_probe_live",
+            "sources": [{"source_id": "a", "engine": "postgresql", "role": "owner"}],
+            "table_namespace": {"orders": "a"},
+            "cross_source_joins": [],
+        },
+        include_derived_roster=True,
+    )
+    mappings = parse_federation_mappings(
+        {
+            "version": "0.2.1",
+            "logical_tables": [
+                {
+                    "logical": "orders",
+                    "semantics": "replica",
+                    "authoritative_source": "a",
+                    "members": [
+                        {
+                            "source": "a",
+                            "table": "orders",
+                            "columns": {"id": "id", "ghost_col": "ghost_col"},
+                        },
+                    ],
+                },
+            ],
+        },
+    )
+    with pytest.raises(FederationMemberProbeError):
+        probe_federation_member_connections({"a": engine}, manifest=manifest, mappings=mappings)
+
+
+@pytest.mark.fast
+def test_probe_fails_when_live_table_missing_despite_stale_graph() -> None:
+    graph = _graph("orders", source_id="a")
+    engine = MagicMock()
+    engine.dialect = "postgresql"
+    sa_engine = MagicMock()
+    conn = MagicMock()
+    sa_engine.connect.return_value.__enter__ = MagicMock(return_value=conn)
+    sa_engine.connect.return_value.__exit__ = MagicMock(return_value=False)
+    engine._execution_engine = sa_engine
+    engine._schema_graph = graph
+    conn.execute.side_effect = RuntimeError('relation "orders" does not exist')
+    manifest = parse_federation_manifest(
+        {
+            "federation_id": "fed_probe_live_table",
+            "sources": [{"source_id": "a", "engine": "postgresql", "role": "owner"}],
+            "table_namespace": {"orders": "a"},
+            "cross_source_joins": [],
+        },
+        include_derived_roster=True,
+    )
+    mappings = parse_federation_mappings(
+        {
+            "version": "0.2.1",
+            "logical_tables": [
+                {
+                    "logical": "orders",
+                    "semantics": "replica",
+                    "authoritative_source": "a",
+                    "members": [{"source": "a", "table": "orders", "columns": {"id": "id"}}],
+                },
+            ],
+        },
+    )
+    with pytest.raises(FederationMemberProbeError):
         probe_federation_member_connections({"a": engine}, manifest=manifest, mappings=mappings)
 
 
@@ -161,7 +258,7 @@ def test_compose_refuses_on_hard_mapping_drift() -> None:
     }
     mappings = parse_federation_mappings(
         {
-            "version": 2,
+            "version": "0.2.1",
             "logical_columns": [
                 {
                     "logical": "entity_id",
@@ -208,7 +305,7 @@ def test_parse_rejects_join_key_without_unify_in_graph() -> None:
     with pytest.raises(FederationDeclarationError, match="unify_in_graph"):
         parse_federation_mappings(
             {
-                "version": 2,
+                "version": "0.2.1",
                 "logical_columns": [
                     {
                         "logical": "shared_id",
@@ -226,7 +323,7 @@ def test_parse_rejects_unknown_logical_column_role() -> None:
     with pytest.raises(FederationDeclarationError, match="role"):
         parse_federation_mappings(
             {
-                "version": 2,
+                "version": "0.2.1",
                 "logical_columns": [
                     {
                         "logical": "attr",
@@ -258,7 +355,7 @@ def test_replica_merge_raises_on_data_type_mismatch() -> None:
     }
     mappings = parse_federation_mappings(
         {
-            "version": 2,
+            "version": "0.2.1",
             "logical_tables": [
                 {
                     "logical": "orders",
@@ -311,4 +408,20 @@ def test_resolve_composite_table_names_raises_on_excess_aliases() -> None:
     )
     members = {"a": _graph("phys_only", source_id="a")}
     with pytest.raises(FederationConfigError, match="alias"):
+        _resolve_composite_table_names(members, manifest)
+
+
+@pytest.mark.fast
+def test_resolve_composite_table_names_raises_on_excess_unaliased() -> None:
+    manifest = parse_federation_manifest(
+        {
+            "federation_id": "fed_unaliased",
+            "sources": [{"source_id": "a", "engine": "duckdb", "role": "owner"}],
+            "table_namespace": {"alias_one": "a"},
+            "cross_source_joins": [],
+        },
+        include_derived_roster=True,
+    )
+    members = {"a": _multi_table_graph("a", ["phys_a", "phys_b"])}
+    with pytest.raises(FederationConfigError, match="unaliased"):
         _resolve_composite_table_names(members, manifest)

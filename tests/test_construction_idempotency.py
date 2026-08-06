@@ -13,6 +13,7 @@ from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMe
 from aetherdialect._schema_catalog import (
     _load_schema_classification_cache,
     _save_schema_classification_cache,
+    llm_classification_column_scope,
     llm_classify_schema,
     schema_classification_content_hash,
 )
@@ -72,9 +73,15 @@ def test_llm_classify_schema_reuses_disk_cache_for_unchanged_inputs(
         calls["count"] += 1
         return payload
 
-    with patch("aetherdialect._schema_catalog.llm_chat", side_effect=_llm_chat):
-        first = llm_classify_schema(graph, notes)
-        second = llm_classify_schema(graph, notes)
+    with patch("aetherdialect._schema_catalog.LLMProvider.chat", side_effect=_llm_chat):
+        scope = llm_classification_column_scope(graph)
+        cache_holder: list[dict] = []
+        first = llm_classify_schema(graph, notes, column_scope=scope, cache_payload_out=cache_holder)
+        _save_schema_classification_cache(
+            schema_classification_content_hash(graph, notes, scope),
+            cache_holder[0],
+        )
+        second = llm_classify_schema(graph, notes, column_scope=scope)
 
     assert calls["count"] == 2
     assert first == second

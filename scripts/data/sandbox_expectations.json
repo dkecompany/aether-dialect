@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": "0.2.1",
   "slots": [
     {
       "slot_id": "owner:writer:How many items are in the catalog by item type?",

@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import pytest
 
-from aetherdialect._contracts_base import WhereParam, predicate_group_from_list
+from aetherdialect._contracts_base import (
+    OrderByCol,
+    PredicateGroup,
+    WhereParam,
+)
 from aetherdialect._contracts_core import RuntimeIntent, SelectCol, WindowRegistryStep
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata, WindowSpec
 from aetherdialect._federation import (
@@ -161,7 +165,7 @@ def test_contains_where_op_refused_when_member_lacks_array_contains() -> None:
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("ta.id"))],
         group_by_cols=[],
         order_by_cols=[],
-        where=predicate_group_from_list(
+        where=PredicateGroup.from_list(
             [
                 WhereParam(
                     left_expr=NormalizedExpr.from_column("ta.tags"),
@@ -174,3 +178,35 @@ def test_contains_where_op_refused_when_member_lacks_array_contains() -> None:
     )
     plan = plan_federated_intent(intent, composite, manifest)
     assert plan.ineligible_reason == "array contains is not supported by all federation members"
+
+
+@pytest.mark.fast
+def test_collation_order_by_refused_when_member_lacks_support() -> None:
+    manifest = parse_federation_manifest(
+        {
+            "federation_id": "fed_cap_collation",
+            "sources": [
+                {"source_id": "a", "engine": "postgresql", "role": "owner"},
+                {"source_id": "b", "engine": "csv", "role": "owner"},
+            ],
+            "table_namespace": {"ta": "a", "tb": "b"},
+            "cross_source_joins": [{"left": "ta.id", "right": "tb.id", "kind": "inner", "logical_key": "id"}],
+        },
+        include_derived_roster=True,
+    )
+    composite = compose_composite_graph(
+        {"a": _graph("ta", "a"), "b": _graph("tb", "b")},
+        manifest,
+    )
+    intent = RuntimeIntent(
+        tables=["ta"],
+        grain="many",
+        select_cols=[SelectCol(expr=NormalizedExpr.from_column("ta.id"))],
+        group_by_cols=[],
+        order_by_cols=[
+            OrderByCol(expr=NormalizedExpr(raw_sql='ta.name COLLATE "C"'), direction="ASC"),
+        ],
+        where=None,
+    )
+    plan = plan_federated_intent(intent, composite, manifest)
+    assert plan.ineligible_reason == "collation is not supported by all federation members"

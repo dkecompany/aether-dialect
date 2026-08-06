@@ -33,7 +33,11 @@ from aetherdialect._federation import (
     resolve_federation_qualified_ref,
 )
 from aetherdialect._schema_graph import recompute_join_paths_multi
-from tests.federation_helpers import enriched_manifest, write_federation_declaration_file
+from tests.federation_helpers import (
+    enriched_manifest,
+    union_member_graph_pair,
+    write_federation_declaration_file,
+)
 
 
 def _simple_graph(name: str, source_id: str = "") -> SchemaGraph:
@@ -192,7 +196,7 @@ def test_sensitive_cross_source_key_rejected() -> None:
 
 
 def test_mappings_hash_stable() -> None:
-    mappings = parse_federation_mappings({"version": 1, "logical_columns": []})
+    mappings = parse_federation_mappings({"version": "0.2.1", "logical_columns": []})
     assert mappings_hash(mappings) == mappings_hash(mappings)
 
 
@@ -299,7 +303,11 @@ def _write_member_schema_artifact(
     graph: SchemaGraph,
 ) -> None:
     binding = next(binding for binding in manifest.sources if binding.source_id == source_id)
-    member_dir = federation_source_artifacts_dir(str(artifacts_dir), binding)
+    member_dir = federation_source_artifacts_dir(
+        str(artifacts_dir),
+        binding,
+        federation_id=str(getattr(manifest, "federation_id", "") or "") or None,
+    )
     os.makedirs(member_dir, exist_ok=True)
     write_gzip_json_atomic(
         os.path.join(member_dir, "schema_graph.json.gz"),
@@ -378,7 +386,6 @@ _ONE_MEMBER_MANIFEST = {
     "cross_source_joins": [],
 }
 
-
 _UNION_MANIFEST = {
     "federation_id": "fed_union_manifest",
     "cross_source_joins": [],
@@ -388,7 +395,7 @@ _UNION_MANIFEST = {
 def _union_mappings() -> object:
     return parse_federation_mappings(
         {
-            "version": 2,
+            "version": "0.2.1",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -426,10 +433,7 @@ def test_binding_raises_when_member_key_disagrees_with_connection() -> None:
 
 
 def test_ambiguous_federation_reference_raises_for_collapsed_logical_table() -> None:
-    members = {
-        "a": _simple_graph("payment_a", source_id="a"),
-        "b": _simple_graph("payment_b", source_id="b"),
-    }
+    members = union_member_graph_pair("payment_a", "payment_b")
     engines = {"a": _engine_member("a"), "b": _engine_member("b")}
     manifest = enriched_manifest(engines, _UNION_MANIFEST, member_graphs=members)
     mappings = _union_mappings()

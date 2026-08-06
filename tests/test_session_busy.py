@@ -10,14 +10,14 @@ import pytest
 from aetherdialect._contracts_base import FederationPlanTemplate, SessionActiveError
 from aetherdialect._federation import clear_federated_turn_state
 from aetherdialect._main_execution import PipelineSession
-from aetherdialect._templates import empty_template_store
+from aetherdialect._templates import TemplateOps
 
 
 def _session_owner() -> MagicMock:
     owner = MagicMock()
     owner._schema_graph = MagicMock()
     owner._schema_graph.effective_structural_hash = "test_hash"
-    owner._store = empty_template_store("test_hash")
+    owner._store = TemplateOps.empty_template_store("test_hash")
     owner._templates = {}
     owner._rejected = {}
     owner._schema_terms = set()
@@ -45,7 +45,7 @@ def test_concurrent_ask_only_one_turn_starts() -> None:
         release_drive.wait(timeout=5)
 
     def run_ask() -> None:
-        with patch("aetherdialect._main_execution.interactive_run_once", side_effect=block_run):
+        with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once", side_effect=block_run):
             session.ask("question")
 
     def run_second_ask() -> None:

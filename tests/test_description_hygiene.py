@@ -20,7 +20,7 @@ from aetherdialect._core_utils import (
     reset_diagnostic_collector,
     set_diagnostic_collector,
 )
-from aetherdialect._main_execution import enrich_space_snapshot_with_notes
+from aetherdialect._main_execution import MainExecutionOps
 from aetherdialect._schema_overrides import _refresh_existing_descriptions_after_addition
 from aetherdialect._utils import schema_context_enriched_lines_for_tables
 
@@ -58,32 +58,26 @@ def _space_snapshot(*tables: str) -> dict:
 
 
 @pytest.mark.fast
-def test_enrich_space_notes_failure_emits_diagnostic(tmp_path: Path) -> None:
+def test_enrich_space_notes_failure_propagates(tmp_path: Path) -> None:
     notes = tmp_path / "notes.txt"
     notes.write_text("domain notes\n", encoding="utf-8")
     graph = _graph("orders")
     snapshot = _space_snapshot("orders")
     space = SpaceContext(tables=frozenset({"orders"}), notes_file=str(notes))
 
-    token = set_diagnostic_collector([])
-    try:
-        with (
-            patch("aetherdialect._main_execution.llm_credentials_configured", return_value=True),
-            patch(
-                "aetherdialect._main_execution.llm_classify_schema",
-                side_effect=RuntimeError("model unavailable"),
-            ),
-        ):
-            out = enrich_space_snapshot_with_notes(snapshot, graph, space, str(notes))
-        diags = drain_diagnostic_collector()
-    finally:
-        reset_diagnostic_collector(token)
-
-    assert out["notes_hash"]
-    assert out.get("table_descriptions") == {}
-    assert len(diags) == 1
-    assert diags[0].code == DIAGNOSTIC_CODE_DESCRIPTION_ENRICHMENT_FAILED
-    assert diags[0].details == (("scope", "aetherspace_notes"),)
+    with (
+        patch("aetherdialect._config.EngineConfig.llm_credentials_configured", return_value=True),
+        patch(
+            "aetherdialect._main_execution.extract_business_knowledge_from_notes",
+            return_value=(),
+        ),
+        patch(
+            "aetherdialect._main_execution.llm_classify_schema",
+            side_effect=RuntimeError("model unavailable"),
+        ),
+        pytest.raises(RuntimeError, match="model unavailable"),
+    ):
+        MainExecutionOps.enrich_space_snapshot_with_notes(snapshot, graph, space, str(notes))
 
 
 @pytest.mark.fast
@@ -98,13 +92,17 @@ def test_enrich_space_notes_noop_emits_diagnostic(tmp_path: Path) -> None:
     token = set_diagnostic_collector([])
     try:
         with (
-            patch("aetherdialect._main_execution.llm_credentials_configured", return_value=True),
+            patch("aetherdialect._config.EngineConfig.llm_credentials_configured", return_value=True),
+            patch(
+                "aetherdialect._main_execution.extract_business_knowledge_from_notes",
+                return_value=(),
+            ),
             patch(
                 "aetherdialect._main_execution.llm_classify_schema",
                 return_value=empty_classify,
             ),
         ):
-            out = enrich_space_snapshot_with_notes(snapshot, graph, space, str(notes))
+            out = MainExecutionOps.enrich_space_snapshot_with_notes(snapshot, graph, space, str(notes))
         diags = drain_diagnostic_collector()
     finally:
         reset_diagnostic_collector(token)

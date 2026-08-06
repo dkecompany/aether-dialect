@@ -11,16 +11,15 @@ from aetherdialect._contracts_base import (
     ColumnRole,
     EngineIdentity,
     NormalizedExpr,
+    PredicateGroup,
     TableRole,
     WhereParam,
-    predicate_group_from_list,
 )
 from aetherdialect._contracts_core import (
     RuntimeIntent,
     SelectCol,
     Template,
     ValueHistory,
-    runtime_intent_to_concrete,
 )
 from aetherdialect._contracts_schema import (
     ColumnMetadata,
@@ -39,17 +38,24 @@ def duckdb_engine_identity() -> EngineIdentity:
 
 
 @pytest.fixture(autouse=True)
-def _default_engine_identity(request: pytest.FixtureRequest) -> Any:
+def _default_engine_identity() -> Any:
     """Bind a default engine identity for tests that call pipeline helpers directly."""
-    if request.node.get_closest_marker("no_default_engine_identity"):
-        yield
-        return
     from aetherdialect._config import EngineConfig
     from aetherdialect._core_utils import pop_engine_identity, push_engine_identity
 
     token = push_engine_identity(EngineIdentity(EngineConfig.TYPE, EngineConfig.RUNTIME))
     yield
     pop_engine_identity(token)
+
+
+@pytest.fixture
+def unbound_engine_identity() -> Any:
+    """Clear the autouse engine identity so unbound-path assertions can run."""
+    from aetherdialect._core_utils import _ACTIVE_ENGINE_IDENTITY
+
+    token = _ACTIVE_ENGINE_IDENTITY.set(None)
+    yield
+    _ACTIVE_ENGINE_IDENTITY.reset(token)
 
 
 def _term_str(term: Any) -> str:
@@ -196,13 +202,13 @@ def _requires_corpus_bundle(item: pytest.Item) -> bool:
 
 
 def _sandbox_bundle_ready() -> bool:
-    """Return True when bundled ``sandbox/data.zip`` is present and passes ``sandbox_doctor()``."""
-    from aetherdialect._sandbox import data_zip_path, sandbox_doctor
+    """Return True when bundled ``sandbox/data.zip`` is present and passes ``Sandbox.sandbox_doctor()``."""
+    from aetherdialect._sandbox import Sandbox
 
-    if not data_zip_path().is_file():
+    if not Sandbox.data_zip_path().is_file():
         return False
     try:
-        return sandbox_doctor() == []
+        return Sandbox.sandbox_doctor() == []
     except Exception:
         return False
 
@@ -281,7 +287,7 @@ def _reset_engine_config_after_test() -> None:
         QSimConfig,
     )
     from aetherdialect._constants import ENGINE_STORAGE_PLACEHOLDER_DIR, TEMPLATE_STORE_SEGMENT
-    from aetherdialect._llm_provider import reset_mock_provider
+    from aetherdialect._llm_provider import MockProvider
 
     EngineConfig.TYPE = "postgresql"
     EngineConfig.RUNTIME = PostgresRuntimeConfig
@@ -289,7 +295,14 @@ def _reset_engine_config_after_test() -> None:
     EngineConfig.TEMPLATE_STORE_DIR = os.path.join(ENGINE_STORAGE_PLACEHOLDER_DIR, TEMPLATE_STORE_SEGMENT)
     EngineConfig.LLM_PROVIDER = "openai"
     EngineConfig.MOCK_FIXTURES_FILE = ""
-    reset_mock_provider()
+    # Credential ClassVars are mutated by tests/init; restore from the live process env
+    # after monkeypatch teardown so a prior test's sk-test token cannot force live LLM calls.
+    EngineConfig.API_TOKEN = os.environ.get("OPENAI_API_KEY")
+    EngineConfig.AZURE_API_TOKEN = os.environ.get("AZURE_OPENAI_API_KEY")
+    EngineConfig.AZURE_OPENAI_BASE_URL = os.environ.get("AZURE_OPENAI_BASE_URL")
+    EngineConfig.AZURE_OPENAI_ENDPOINT = os.environ.get("AZURE_OPENAI_ENDPOINT")
+    EngineConfig.AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION")
+    MockProvider.reset_mock_provider()
     QSimConfig.SKELETONS_JSON_PATH = os.path.join(ENGINE_STORAGE_PLACEHOLDER_DIR, "qsim_skeletons.json.gz")
 
 
@@ -532,7 +545,7 @@ def grouped_intent() -> RuntimeIntent:
         ],
         group_by_cols=[NormalizedExpr.from_column("customers.name")],
         order_by_cols=[],
-        where=predicate_group_from_list(
+        where=PredicateGroup.from_list(
             [
                 WhereParam(
                     left_expr=NormalizedExpr.from_column("orders.status"),
@@ -555,7 +568,7 @@ def sample_template(grouped_intent) -> Template:
     return Template(
         id="T0001",
         effective_structural_hash="test_hash_abc123",
-        intent_signature=runtime_intent_to_concrete(grouped_intent, "test_id"),
+        intent_signature=grouped_intent.to_concrete("test_id"),
         intent_key="test_intent_key_hash",
         tables_used=["customers", "orders"],
         sql_param="SELECT customers.name, SUM(orders.amount) FROM orders JOIN customers ON orders.customer_id = customers.customer_id WHERE orders.status = :p1 GROUP BY customers.name",

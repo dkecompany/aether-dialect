@@ -32,22 +32,9 @@ from aetherdialect._contracts_core import (
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, SQLShape, TableMetadata, TemplateStats
 from aetherdialect._core_utils import read_gzip_json, write_gzip_json_atomic
 from aetherdialect._templates import (
+    TemplateOps,
+    TemplateRefs,
     TemplateStoreView,
-    collect_question_feedback_for_prompt,
-    compute_question_feedback_penalty,
-    empty_template_store,
-    join_fingerprint_from_concrete_intent,
-    join_fingerprint_from_runtime_intent,
-    load_template_store,
-    merge_seed_warmup_templates_into_store,
-    record_question_feedback,
-    save_template_store,
-    summarize_failure_for_memory,
-    template_is_live,
-    template_partition_number,
-    template_schema_refs,
-    template_store_dir_for_space,
-    templates_to_store,
 )
 from aetherdialect._utils import intent_key, question_token_fingerprint_from_raw
 
@@ -116,7 +103,7 @@ class TestRecordQuestionFeedback:
                 created_at=f"t{i}",
                 updated_at=f"t{i}",
             )
-            record_question_feedback(store, q, ent)
+            TemplateOps.record_question_feedback(store, q, ent)
         assert len(store["question_feedback"][q]) == PolicyConfig.MAX_QUESTION_FEEDBACK_ENTRIES_PER_QUESTION
 
     def test_skips_duplicate_validation_failure_hash(self):
@@ -131,8 +118,7 @@ class TestRecordQuestionFeedback:
             created_at="t",
             updated_at="t",
         )
-        record_question_feedback(store, "q", ent)
-        record_question_feedback(store, "q", ent)
+        TemplateOps.record_question_feedback(store, "q", ent)
         assert len(store["question_feedback"]["q"]) == 1
 
     def test_intent_rejected_merges_second_bucket_same_hash(self):
@@ -157,8 +143,8 @@ class TestRecordQuestionFeedback:
             created_at="t2",
             updated_at="t2",
         )
-        record_question_feedback(store, "q", ent_a)
-        record_question_feedback(store, "q", ent_b)
+        TemplateOps.record_question_feedback(store, "q", ent_a)
+        TemplateOps.record_question_feedback(store, "q", ent_b)
         rows = store["question_feedback"]["q"]
         assert len(rows) == 1
         rebuilt = QuestionFeedbackEntry.from_dict(rows[0])
@@ -204,18 +190,18 @@ class TestCollectQuestionFeedbackForPrompt:
                 ],
             },
         }
-        rows = collect_question_feedback_for_prompt(store, "q1", "keep")
+        rows = TemplateOps.collect_question_feedback_for_prompt(store, "q1", "keep")
         assert [r["summary"] for r in rows] == ["first", "second"]
 
 
 class TestSummarizeFailureForMemory:
     def test_llm_chat_runtime_error_propagates(self):
         with (
-            patch("aetherdialect._templates.llm_credentials_configured", return_value=True),
-            patch("aetherdialect._templates.llm_chat", side_effect=RuntimeError("down")),
+            patch("aetherdialect._config.EngineConfig.llm_credentials_configured", return_value=True),
+            patch("aetherdialect._templates.LLMProvider.chat", side_effect=RuntimeError("down")),
         ):
             with pytest.raises(RuntimeError, match="down"):
-                summarize_failure_for_memory(
+                TemplateOps.summarize_failure_for_memory(
                     question="q",
                     intent=_minimal_intent(),
                     kind=FeedbackKind.VALIDATION_FAILURE,
@@ -225,10 +211,10 @@ class TestSummarizeFailureForMemory:
 
     def test_bad_json_coerces_to_other(self):
         with (
-            patch("aetherdialect._templates.llm_credentials_configured", return_value=True),
-            patch("aetherdialect._templates.llm_chat", return_value="not json"),
+            patch("aetherdialect._config.EngineConfig.llm_credentials_configured", return_value=True),
+            patch("aetherdialect._templates.LLMProvider.chat", return_value="not json"),
         ):
-            ent = summarize_failure_for_memory(
+            ent = TemplateOps.summarize_failure_for_memory(
                 question="q",
                 intent=_minimal_intent(),
                 kind=FeedbackKind.VALIDATION_FAILURE,
@@ -239,8 +225,8 @@ class TestSummarizeFailureForMemory:
             assert "err" in ent.summary
 
     def test_no_credentials_uses_user_reason(self):
-        with patch("aetherdialect._templates.llm_credentials_configured", return_value=False):
-            ent = summarize_failure_for_memory(
+        with patch("aetherdialect._config.EngineConfig.llm_credentials_configured", return_value=False):
+            ent = TemplateOps.summarize_failure_for_memory(
                 question="q",
                 intent=None,
                 kind=FeedbackKind.INTENT_REJECTED,
@@ -280,15 +266,15 @@ class TestComputeQuestionFeedbackPenalty:
                 ],
             },
         }
-        pen = compute_question_feedback_penalty(store, "mine", "h")
+        pen = TemplateOps.compute_question_feedback_penalty(store, "mine", "h")
         assert pen == pytest.approx(2 * PolicyConfig.PEN_BY_THREE_SOURCE_UNIT)
 
 
 class TestJoinFingerprints:
     def test_runtime_deterministic(self):
         ri = _minimal_intent()
-        a = join_fingerprint_from_runtime_intent(ri)
-        b = join_fingerprint_from_runtime_intent(ri)
+        a = TemplateRefs.join_fingerprint_from_runtime_intent(ri)
+        b = TemplateRefs.join_fingerprint_from_runtime_intent(ri)
         assert a == b
         assert len(a) == 64
 
@@ -302,22 +288,24 @@ class TestJoinFingerprints:
             order_by_cols=[],
             where=None,
         )
-        assert join_fingerprint_from_concrete_intent(ci) == join_fingerprint_from_runtime_intent(_minimal_intent())
+        assert TemplateRefs.join_fingerprint_from_concrete_intent(
+            ci
+        ) == TemplateRefs.join_fingerprint_from_runtime_intent(_minimal_intent())
 
 
 class TestSchemaMigrationMapParse:
     """``schema_migration_map.json`` optional fields."""
 
     def test_refresh_descriptions_defaults_false(self):
-        from aetherdialect._templates import _parse_schema_migration_map_payload
+        from aetherdialect._templates import TemplateOps
 
-        m = _parse_schema_migration_map_payload({"version": 1, "action": "remap"})
+        m = TemplateOps._parse_schema_migration_map_payload({"version": 1, "action": "remap"})
         assert m.refresh_existing_descriptions_on_addition is False
 
     def test_refresh_descriptions_true(self):
-        from aetherdialect._templates import _parse_schema_migration_map_payload
+        from aetherdialect._templates import TemplateOps
 
-        m = _parse_schema_migration_map_payload(
+        m = TemplateOps._parse_schema_migration_map_payload(
             {
                 "version": 1,
                 "action": "remap",
@@ -328,10 +316,10 @@ class TestSchemaMigrationMapParse:
 
     def test_refresh_descriptions_rejects_non_bool(self):
         from aetherdialect._contracts_base import MigrationPendingError
-        from aetherdialect._templates import _parse_schema_migration_map_payload
+        from aetherdialect._templates import TemplateOps
 
         with pytest.raises(MigrationPendingError, match="refresh_existing_descriptions_on_addition"):
-            _parse_schema_migration_map_payload(
+            TemplateOps._parse_schema_migration_map_payload(
                 {
                     "version": 1,
                     "action": "remap",
@@ -343,8 +331,8 @@ class TestSchemaMigrationMapParse:
 class TestTemplateIsLiveHelpers:
     def test_template_is_live_empty_refs(self):
         sg = _tiny_schema()
-        refs = template_schema_refs(_minimal_template())
-        ok, dead = template_is_live(refs, sg)
+        refs = TemplateRefs.template_schema_refs(_minimal_template())
+        ok, dead = TemplateRefs.template_is_live(refs, sg)
         assert ok is True
         assert dead == ()
 
@@ -358,13 +346,13 @@ class TestLoadTemplateStoreIndexes:
         monkeypatch.setattr(EngineConfig, "TEMPLATE_STORE_DIR", store_dir)
         tmpl = _minimal_template()
         eff = tmpl.schema_graph_id
-        store = empty_template_store(eff)
-        templates_to_store(store, {tmpl.id: tmpl})
-        save_template_store(store)
+        store = TemplateOps.empty_template_store(eff)
+        TemplateOps.templates_to_store(store, {tmpl.id: tmpl})
+        TemplateOps.save_template_store(store)
         from aetherdialect._constants import TEMPLATE_STORE_HEADER_FILENAME
 
         hdr_path = os.path.join(
-            template_store_dir_for_space(str(tmp_path), "master"),
+            TemplateOps.template_store_dir_for_space(str(tmp_path), "master"),
             TEMPLATE_STORE_HEADER_FILENAME,
         )
         header = read_gzip_json(hdr_path)
@@ -377,7 +365,7 @@ class TestLoadTemplateStoreIndexes:
         ):
             header.pop(k, None)
         write_gzip_json_atomic(hdr_path, header, sort_keys=True)
-        out = load_template_store(eff, schema=None)
+        out = TemplateOps.load_template_store(eff, schema=None)
         for k in (
             SHAPE_QUESTION_INDEX_KEY,
             TEMPLATE_INTENT_KEY_INDEX_KEY,
@@ -393,7 +381,7 @@ class TestLoadTemplateStoreIndexes:
 class TestPartitionedTemplateStore:
     def test_partition_number_matches_sha256_prefix(self) -> None:
         tid = "T0042"
-        assert template_partition_number(tid) == int(
+        assert TemplateStoreView.template_partition_number(tid) == int(
             hashlib.sha256(tid.encode("utf-8")).hexdigest()[:2],
             16,
         )
@@ -405,10 +393,10 @@ class TestPartitionedTemplateStore:
         monkeypatch.setattr(EngineConfig, "TEMPLATE_STORE_DIR", sd)
         tmpl = _minimal_template()
         eff = tmpl.schema_graph_id
-        v = empty_template_store(eff)
-        templates_to_store(v, {tmpl.id: tmpl})
-        save_template_store(v)
-        loaded = load_template_store(eff, schema=None)
+        v = TemplateOps.empty_template_store(eff)
+        TemplateOps.templates_to_store(v, {tmpl.id: tmpl})
+        TemplateOps.save_template_store(v)
+        loaded = TemplateOps.load_template_store(eff, schema=None)
         assert isinstance(loaded, TemplateStoreView)
         assert loaded.partition_map
         assert isinstance(loaded[TEMPLATE_INTENT_KEY_INDEX_KEY], dict)
@@ -420,11 +408,11 @@ class TestPartitionedTemplateStore:
         monkeypatch.setattr(EngineConfig, "TEMPLATE_STORE_DIR", sd)
         tmpl = _minimal_template()
         eff = tmpl.schema_graph_id
-        v = empty_template_store(eff)
-        templates_to_store(v, {tmpl.id: tmpl})
-        save_template_store(v)
+        v = TemplateOps.empty_template_store(eff)
+        TemplateOps.templates_to_store(v, {tmpl.id: tmpl})
+        TemplateOps.save_template_store(v)
         assert not v.dirty_partitions()
-        save_template_store(v)
+        TemplateOps.save_template_store(v)
         assert not v.dirty_partitions()
 
 
@@ -438,9 +426,9 @@ def test_load_template_store_invalidates_on_schema_graph_id_mismatch(tmp_path, m
     os.makedirs(store_dir, exist_ok=True)
     monkeypatch.setattr(EngineConfig, "TEMPLATE_STORE_DIR", store_dir)
     tmpl = _minimal_template()
-    store = empty_template_store(tmpl.schema_graph_id)
-    templates_to_store(store, {tmpl.id: tmpl})
-    save_template_store(store)
+    store = TemplateOps.empty_template_store(tmpl.schema_graph_id)
+    TemplateOps.templates_to_store(store, {tmpl.id: tmpl})
+    TemplateOps.save_template_store(store)
     tables = {
         "t": TableMetadata(
             name="t",
@@ -455,7 +443,7 @@ def test_load_template_store_invalidates_on_schema_graph_id_mismatch(tmp_path, m
         schema_graph_id="different-graph-id",
         effective_structural_hash="different-graph-id",
     )
-    loaded = load_template_store(schema.schema_graph_id, schema)
+    loaded = TemplateOps.load_template_store(schema.schema_graph_id, schema)
     assert tmpl.id in loaded.partition_map
     assert loaded.schema_graph_id == schema.schema_graph_id
 
@@ -503,11 +491,11 @@ def test_warmup_template_dedupe_merges_same_join_fingerprint_different_candidate
     templates = {"T0001": _join_template(tid="T0001", candidate_id="J01", question="q1")}
     new_templates = [_join_template(tid="T0002", candidate_id="J02", question="q2")]
 
-    merge_seed_warmup_templates_into_store(templates, new_templates)
+    TemplateRefs.merge_seed_warmup_templates_into_store(templates, new_templates)
 
     assert len(templates) == 1
     only = next(iter(templates.values()))
     assert set(only.value_history.questions) == {"q1", "q2"}
-    assert join_fingerprint_from_concrete_intent(only.intent_signature) == join_fingerprint_from_concrete_intent(
-        new_templates[0].intent_signature
-    )
+    assert TemplateRefs.join_fingerprint_from_concrete_intent(
+        only.intent_signature
+    ) == TemplateRefs.join_fingerprint_from_concrete_intent(new_templates[0].intent_signature)

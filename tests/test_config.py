@@ -53,13 +53,17 @@ from aetherdialect._constants import (
     WINDOW_RANKING_FUNCTIONS,
     WINDOW_VALUE_FUNCTIONS,
 )
-from aetherdialect._contracts_base import HavingParam, WhereParam, normalize_column_type
+from aetherdialect._contracts_base import (
+    HavingParam,
+    WhereParam,
+)
 from aetherdialect._core_utils import (
     diagnostic_debug_enabled,
     diagnostic_force_enter,
     diagnostic_force_exit,
     effective_explain_timeout_ms,
     effective_llm_timeout_ms,
+    normalize_column_type,
     normalize_value_type,
     seed_warmup_failure_code_from_validate_sql_error,
 )
@@ -148,23 +152,23 @@ class TestNormalizeValueType:
         assert normalize_value_type("string") == "string"
         assert normalize_value_type("date") == "date"
 
-    def test_empty_to_string(self):
-        """normalize_value_type maps empty to string."""
-        assert normalize_value_type("") == "string"
+    def test_empty_to_unknown(self):
+        """normalize_value_type maps empty to unknown."""
+        assert normalize_value_type("") == "unknown"
 
-    def test_unknown_to_string(self):
-        """normalize_value_type maps unknown to string."""
-        assert normalize_value_type("xml_blob") == "string"
+    def test_unrecognized_to_unknown(self):
+        """normalize_value_type maps unrecognized types to unknown."""
+        assert normalize_value_type("xml_blob") == "unknown"
 
     def test_case_insensitive(self):
         """normalize_value_type is case-insensitive."""
         assert normalize_value_type("TIMESTAMP") == "date"
         assert normalize_value_type("Integer") == "integer"
 
-    def test_whitespace_only_returns_string(self):
-        """normalize_value_type returns string when input is only whitespace."""
-        assert normalize_value_type("   ") == "string"
-        assert normalize_value_type("\t\n") == "string"
+    def test_whitespace_only_returns_unknown(self):
+        """normalize_value_type returns unknown when input is only whitespace."""
+        assert normalize_value_type("   ") == "unknown"
+        assert normalize_value_type("\t\n") == "unknown"
 
     def test_stripped_whitespace_around_valid_type(self):
         """normalize_value_type strips leading and trailing whitespace."""
@@ -589,16 +593,25 @@ class TestPostgresRuntimeConfig:
         """db_url returns proper connection string when configured."""
         orig_pw = PostgresRuntimeConfig.PASSWORD
         orig_db = PostgresRuntimeConfig.DATABASE
+        orig_user = PostgresRuntimeConfig.USER
+        orig_host = PostgresRuntimeConfig.HOST
+        orig_port = PostgresRuntimeConfig.PORT
         try:
-            PostgresRuntimeConfig.PASSWORD = "secret"
+            PostgresRuntimeConfig.PASSWORD = "unit-test-only-pw"
             PostgresRuntimeConfig.DATABASE = "mydb"
+            PostgresRuntimeConfig.USER = "postgres"
+            PostgresRuntimeConfig.HOST = "localhost"
+            PostgresRuntimeConfig.PORT = 5432
             url = PostgresRuntimeConfig.db_url()
-            assert "postgresql+psycopg2://" in url
-            assert "secret" in url
-            assert "mydb" in url
+            assert url.startswith("postgresql+psycopg://")
+            assert "unit-test-only-pw" in url
+            assert url.endswith("@localhost:5432/mydb")
         finally:
             PostgresRuntimeConfig.PASSWORD = orig_pw
             PostgresRuntimeConfig.DATABASE = orig_db
+            PostgresRuntimeConfig.USER = orig_user
+            PostgresRuntimeConfig.HOST = orig_host
+            PostgresRuntimeConfig.PORT = orig_port
 
 
 class TestDatabricksRuntimeConfig:
@@ -655,25 +668,43 @@ class TestEngineConfig:
         assert EngineConfig.RUNTIME is PostgresRuntimeConfig
 
     def test_schema_json_path(self):
-        """SCHEMA_JSON_PATH is an absolute path under ENGINE_STORAGE_PLACEHOLDER_DIR."""
+        """SCHEMA_JSON_PATH is a relative placeholder segment with the expected basename."""
         assert isinstance(EngineConfig.SCHEMA_JSON_PATH, str)
-        assert os.path.isabs(EngineConfig.SCHEMA_JSON_PATH)
-        assert os.path.dirname(EngineConfig.SCHEMA_JSON_PATH) == ENGINE_STORAGE_PLACEHOLDER_DIR
+        assert not os.path.isabs(EngineConfig.SCHEMA_JSON_PATH)
+        norm = EngineConfig.SCHEMA_JSON_PATH.replace("\\", "/")
+        assert norm.endswith("schema_graph.json.gz")
+        placeholder = ENGINE_STORAGE_PLACEHOLDER_DIR.replace("\\", "/")
+        assert norm.startswith(f"{placeholder}/")
         assert os.path.basename(EngineConfig.SCHEMA_JSON_PATH) == "schema_graph.json.gz"
+        root = EngineConfig.default_artifacts_root()
+        assert root.is_absolute()
+        assert (root / EngineConfig.SCHEMA_JSON_PATH).resolve().is_absolute()
 
     def test_template_store_dir(self):
-        """TEMPLATE_STORE_DIR is an absolute path under ENGINE_STORAGE_PLACEHOLDER_DIR."""
+        """TEMPLATE_STORE_DIR is a relative placeholder segment with the expected basename."""
         assert isinstance(EngineConfig.TEMPLATE_STORE_DIR, str)
-        assert os.path.isabs(EngineConfig.TEMPLATE_STORE_DIR)
-        assert os.path.dirname(EngineConfig.TEMPLATE_STORE_DIR) == ENGINE_STORAGE_PLACEHOLDER_DIR
+        assert not os.path.isabs(EngineConfig.TEMPLATE_STORE_DIR)
+        norm = EngineConfig.TEMPLATE_STORE_DIR.replace("\\", "/")
+        assert norm.endswith("intent_templates")
+        placeholder = ENGINE_STORAGE_PLACEHOLDER_DIR.replace("\\", "/")
+        assert norm.startswith(f"{placeholder}/")
         assert os.path.basename(EngineConfig.TEMPLATE_STORE_DIR) == "intent_templates"
+        root = EngineConfig.default_artifacts_root()
+        assert root.is_absolute()
+        assert (root / EngineConfig.TEMPLATE_STORE_DIR).resolve().is_absolute()
 
     def test_skeletons_json_path(self):
-        """QSimConfig.SKELETONS_JSON_PATH is an absolute path under ENGINE_STORAGE_PLACEHOLDER_DIR."""
+        """QSimConfig.SKELETONS_JSON_PATH is a relative placeholder segment with the expected basename."""
         assert isinstance(QSimConfig.SKELETONS_JSON_PATH, str)
-        assert os.path.isabs(QSimConfig.SKELETONS_JSON_PATH)
-        assert os.path.dirname(QSimConfig.SKELETONS_JSON_PATH) == ENGINE_STORAGE_PLACEHOLDER_DIR
+        assert not os.path.isabs(QSimConfig.SKELETONS_JSON_PATH)
+        norm = QSimConfig.SKELETONS_JSON_PATH.replace("\\", "/")
+        assert norm.endswith("qsim_skeletons.json.gz")
+        placeholder = ENGINE_STORAGE_PLACEHOLDER_DIR.replace("\\", "/")
+        assert norm.startswith(f"{placeholder}/")
         assert os.path.basename(QSimConfig.SKELETONS_JSON_PATH) == "qsim_skeletons.json.gz"
+        root = EngineConfig.default_artifacts_root()
+        assert root.is_absolute()
+        assert (root / QSimConfig.SKELETONS_JSON_PATH).resolve().is_absolute()
 
     def test_engine_config_not_importable_from_package_root(self) -> None:
         """EngineConfig is internal and must not be importable from the public ``aetherdialect`` namespace."""
@@ -829,10 +860,15 @@ class TestIntentSchema:
                 }
             ],
         }
-        for emission in ("join_table", "scalar_subquery", "semi_join", "anti_join"):
+        for emission in ("semi_join", "anti_join"):
             step = dict(payload["cte_steps"][0])
             step["emission"] = emission
             jsonschema.validate(instance={**payload, "cte_steps": [step]}, schema=INTENT_SCHEMA)
+        for emission in ("join_table", "scalar_subquery"):
+            step = dict(payload["cte_steps"][0])
+            step["emission"] = emission
+            with pytest.raises(jsonschema.ValidationError):
+                jsonschema.validate(instance={**payload, "cte_steps": [step]}, schema=INTENT_SCHEMA)
 
     def test_rejects_invalid_emission_value(self) -> None:
         import jsonschema
@@ -1056,7 +1092,7 @@ class TestConfigFileFullCoverage:
     """TOML ``config_file`` flattening covers every documented key."""
 
     def test_config_file_full_coverage(self, tmp_path) -> None:
-        from aetherdialect._main_execution import _load_config_file
+        from aetherdialect._main_execution import MainExecutionOps
 
         path = tmp_path / "full.toml"
         path.write_text(
@@ -1096,19 +1132,11 @@ class TestConfigFileFullCoverage:
                     "",
                     "[llm]",
                     'provider = "openai"',
-                    "",
-                    "[execution]",
-                    "max_query_cost_rows = 100",
-                    "max_query_cost_bytes = 200",
-                    "statement_timeout_ms = 300",
-                    "llm_timeout_ms = 400",
-                    "profile_timeout_ms = 500",
-                    "explain_timeout_ms = 600",
                 ),
             ),
             encoding="utf-8",
         )
-        got, _claimed, _named = _load_config_file(str(path))
+        got, _claimed, _named = MainExecutionOps._load_config_file(str(path))
         expected = {
             "OPENAI_API_KEY": "oak",
             "OPENAI_BASE_URL": "https://example-openai/v1",
@@ -1131,11 +1159,5 @@ class TestConfigFileFullCoverage:
             "DATABRICKS_SCHEMA": "ds",
             "AETHERDIALECT_ENGINE": "postgresql",
             "AETHERDIALECT_LLM_PROVIDER": "openai",
-            "AETHERDIALECT_MAX_QUERY_COST_ROWS": "100",
-            "AETHERDIALECT_MAX_QUERY_COST_BYTES": "200",
-            "AETHERDIALECT_STATEMENT_TIMEOUT_MS": "300",
-            "AETHERDIALECT_LLM_TIMEOUT_MS": "400",
-            "AETHERDIALECT_PROFILE_TIMEOUT_MS": "500",
-            "AETHERDIALECT_EXPLAIN_TIMEOUT_MS": "600",
         }
         assert got == expected

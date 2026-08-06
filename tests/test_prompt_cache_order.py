@@ -18,11 +18,7 @@ from aetherdialect._intent_process import (
     build_intent_ground_prompt,
     build_intent_interpret_prompt,
 )
-from aetherdialect._llm_provider import (
-    llm_chat,
-    mock_fixture_user_key,
-    resolve_prompt_cache_key,
-)
+from aetherdialect._llm_provider import LLMProvider, MockProvider
 from aetherdialect._sql_gen import build_join_choice_prompt
 
 
@@ -134,16 +130,16 @@ class TestMockFixtureLookupUnchanged:
             ("task", "schema_summary", "question"),
         )
         assert a != b
-        assert mock_fixture_user_key(a) == mock_fixture_user_key(b)
+        assert MockProvider.mock_fixture_user_key(a) == MockProvider.mock_fixture_user_key(b)
 
 
 class TestPromptCacheKey:
     def test_resolve_without_schema_hash(self) -> None:
-        assert resolve_prompt_cache_key("intent") is None
+        assert LLMProvider.resolve_prompt_cache_key("intent") is None
 
     def test_resolve_with_schema_hash(self) -> None:
         with prompt_cache_schema_scope("schema-graph-abc"):
-            assert resolve_prompt_cache_key("intent") == "intent:schema-graph-abc"
+            assert LLMProvider.resolve_prompt_cache_key("intent") == "intent:schema-graph-abc"
 
     @pytest.mark.usefixtures("_non_mock_llm_provider")
     def test_llm_chat_attaches_prompt_cache_key(self) -> None:
@@ -153,12 +149,12 @@ class TestPromptCacheKey:
         client.responses.create.return_value = mock_resp
 
         with prompt_cache_schema_scope("graph-123"):
-            with patch("aetherdialect._llm_provider._provider_order", return_value=["openai"]):
-                with patch("aetherdialect._llm_provider._provider_is_configured", return_value=True):
-                    with patch("aetherdialect._llm_provider._build_client", return_value=client):
+            with patch("aetherdialect._llm_provider.LLMProvider._provider_order", return_value=["openai"]):
+                with patch("aetherdialect._llm_provider.LLMProvider._provider_is_configured", return_value=True):
+                    with patch("aetherdialect._llm_provider.LLMProvider._build_client", return_value=client):
                         with patch("aetherdialect._core_utils.debug"):
                             with patch("aetherdialect._core_utils.pipeline_trace"):
-                                llm_chat("sys", "usr", max_retries=1, task="intent")
+                                LLMProvider.chat("sys", "usr", max_retries=1, task="intent")
 
         kwargs = client.responses.create.call_args.kwargs
         assert kwargs.get("prompt_cache_key") == "intent:graph-123"
@@ -170,12 +166,12 @@ class TestPromptCacheKey:
         client = MagicMock()
         client.responses.create.return_value = mock_resp
 
-        with patch("aetherdialect._llm_provider._provider_order", return_value=["openai"]):
-            with patch("aetherdialect._llm_provider._provider_is_configured", return_value=True):
-                with patch("aetherdialect._llm_provider._build_client", return_value=client):
+        with patch("aetherdialect._llm_provider.LLMProvider._provider_order", return_value=["openai"]):
+            with patch("aetherdialect._llm_provider.LLMProvider._provider_is_configured", return_value=True):
+                with patch("aetherdialect._llm_provider.LLMProvider._build_client", return_value=client):
                     with patch("aetherdialect._core_utils.debug"):
                         with patch("aetherdialect._core_utils.pipeline_trace"):
-                            llm_chat("sys", "usr", max_retries=1, task="join")
+                            LLMProvider.chat("sys", "usr", max_retries=1, task="join")
 
         kwargs = client.responses.create.call_args.kwargs
         assert "prompt_cache_key" not in kwargs
@@ -184,7 +180,7 @@ class TestPromptCacheKey:
     def test_fuzzy_reuse_extraction_attaches_prompt_cache_key(self) -> None:
         from types import SimpleNamespace
 
-        from aetherdialect._contracts_base import predicate_group_from_list
+        from aetherdialect._contracts_base import PredicateGroup
         from aetherdialect._contracts_core import ConcreteIntent, Template, ValueHistory, WhereParam
         from aetherdialect._contracts_schema import SQLShape, TemplateStats
         from aetherdialect._intent_process import NormalizedExpr
@@ -197,7 +193,7 @@ class TestPromptCacheKey:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("customers.name"),
@@ -232,9 +228,9 @@ class TestPromptCacheKey:
         client = MagicMock()
         client.responses.create.return_value = mock_resp
 
-        with patch("aetherdialect._llm_provider._provider_order", return_value=["openai"]):
-            with patch("aetherdialect._llm_provider._provider_is_configured", return_value=True):
-                with patch("aetherdialect._llm_provider._build_client", return_value=client):
+        with patch("aetherdialect._llm_provider.LLMProvider._provider_order", return_value=["openai"]):
+            with patch("aetherdialect._llm_provider.LLMProvider._provider_is_configured", return_value=True):
+                with patch("aetherdialect._llm_provider.LLMProvider._build_client", return_value=client):
                     with patch("aetherdialect._core_utils.debug"):
                         with patch("aetherdialect._core_utils.pipeline_trace"):
                             extract_fuzzy_reuse_params(

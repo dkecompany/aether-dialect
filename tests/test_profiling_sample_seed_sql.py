@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from aetherdialect._constants import DEFAULT_RANDOM_SEED
-from aetherdialect._dialect import Dialect, get_dialect_class, get_registered_engines
+from aetherdialect._dialect import Dialect, DialectRegistry
 from aetherdialect._schema_catalog import _build_profile_stats_sql
 
 _SEEDED_RAND_ENGINES = frozenset({"mysql", "mariadb"})
@@ -19,7 +19,7 @@ def _uninit(cls: type) -> object:
 
 
 def _suffix(engine: str, *, seed: int = DEFAULT_RANDOM_SEED) -> str:
-    dialect = get_dialect_class(engine).__new__(get_dialect_class(engine))
+    dialect = DialectRegistry.get_class(engine).__new__(DialectRegistry.get_class(engine))
     return dialect.profiling_stats_sample_suffix(
         use_sample=True,
         row_count=250_000,
@@ -102,9 +102,9 @@ def test_profiling_sample_suffix_varies_with_seed(engine: str) -> None:
 
 
 @pytest.mark.fast
-@pytest.mark.parametrize("engine", get_registered_engines())
+@pytest.mark.parametrize("engine", DialectRegistry.get_registered_engines())
 def test_profiling_stats_sql_is_deterministic_for_large_tables(engine: str) -> None:
-    dialect = get_dialect_class(engine).__new__(get_dialect_class(engine))
+    dialect = DialectRegistry.get_class(engine).__new__(DialectRegistry.get_class(engine))
     suffix = dialect.profiling_stats_sample_suffix(
         use_sample=True,
         row_count=250_000,

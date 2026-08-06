@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from aetherdialect._contracts_base import NormalizedExpr, WhereParam, predicate_group_from_list
+from aetherdialect._contracts_base import (
+    NormalizedExpr,
+    PredicateGroup,
+    WhereParam,
+)
 from aetherdialect._contracts_core import RuntimeIntent
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._utils import (
@@ -61,7 +65,7 @@ def test_patch_filter_literal_updates_param_values() -> None:
         select_cols=[],
         group_by_cols=[],
         order_by_cols=[],
-        where=predicate_group_from_list([where_param]),
+        where=PredicateGroup.from_list([where_param]),
         param_values={"p0": "trailer"},
     )
     patched = patch_where_literal_on_intent(intent, where_param, "trailers")
@@ -82,7 +86,7 @@ def test_zero_row_where_suggestions_uses_levenshtein_distance() -> None:
         select_cols=[],
         group_by_cols=[],
         order_by_cols=[],
-        where=predicate_group_from_list([where_param]),
+        where=PredicateGroup.from_list([where_param]),
         param_values={"p0": "traler"},
     )
     suggestions = zero_row_where_suggestions(intent, _schema_with_feature_values("trailers"))
@@ -102,7 +106,7 @@ def test_zero_row_where_suggestions_skips_distant_values() -> None:
         select_cols=[],
         group_by_cols=[],
         order_by_cols=[],
-        where=predicate_group_from_list([where_param]),
+        where=PredicateGroup.from_list([where_param]),
         param_values={"p0": "completely unrelated"},
     )
     suggestions = zero_row_where_suggestions(intent, _schema_with_feature_values("trailers"))

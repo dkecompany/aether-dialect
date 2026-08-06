@@ -13,12 +13,13 @@ How an engineer embeds `aetherdialect` in a service, job runner, notebook, or au
 | [The session contract: suspend and terminal steps](#the-session-contract-suspend-and-terminal-steps) | `SessionStep`, `done`, `kind`, `reply_shape` |
 | [Minimal embedding (sync)](#minimal-embedding-sync) | Smallest correct `ask` / `step` loop |
 | [Async embedding](#async-embedding) | Same loop with `AsyncPipelineSession` |
-| [Reader and writer split](#reader-and-writer-split) | Multi-process learning queue |
+| [Reader and writer split](#reader-and-writer-split) | Multi-process reader vs writer sessions |
 | [Multi-user deployment](#multi-user-deployment) | Owner/consumer on shared artifacts |
 | [Embedding a federation](#embedding-a-federation) | Composite `AetherFederation` embedding |
 | [Embedding file uploads (CSV/Excel)](#embedding-file-uploads-csvexcel) | File-engine construction and validation |
 | [LLM provider wiring](#llm-provider-wiring) | Azure two-slot mapping and OpenAI note |
 | [Observability](#observability) | Audit, diagnostics, config snapshot |
+| [Guarantees](#guarantees) | Determinism, replay limits, federation numerics, cost caps, configuration boundary |
 
 ---
 
@@ -40,22 +41,22 @@ Composite facade over named member `AetherEngine` instances. Each member keeps i
 
 ### FederationContext
 
-Optional composite scope on `AetherFederation(..., context=...)`. Same allow/deny shape as `EngineContext`, plus optional `notes_file` on the master federation context. Qualified `source.table.column` tokens resolve member ownership; bare names that match more than one member raise. Operator detail: [User guide - FederationContext](USER_GUIDE.md#federationcontext).
+Optional composite scope on `AetherFederation(..., context=...)`. Same allow/deny shape as `EngineContext`, plus optional `notes` or `notes_file` on the master federation context (set at most one). Qualified `source.table.column` tokens resolve member ownership; bare names that match more than one member raise. Operator detail: [User guide - FederationContext](USER_GUIDE.md#federationcontext).
 
 ### AetherSpace
 
-Named knowledge partition over the master graph on an engine or federation. Define with `engine.aetherspace(name, space_context=...)` or the federation equivalent - put notes on `SpaceContext(notes_file=...)`, not a loose `notes_file=` kwarg. Select at session open: `engine.session(space="catalog")` or `fed.session(space="catalog")`. Template learning is partitioned by space name. Operator overview: [User guide - AetherSpace](USER_GUIDE.md#aetherspace).
+Named knowledge partition over the master graph on an engine or federation. Define with `engine.aetherspace(name, space_context=...)` or the federation equivalent - put notes on `SpaceContext(notes=...)` or `SpaceContext(notes_file=...)`, not a loose unpaired kwarg unless you intentionally override. Select at session open: `engine.session(space="catalog")` or `fed.session(space="catalog")`. Template learning is partitioned by space name. Operator overview: [User guide - AetherSpace](USER_GUIDE.md#aetherspace).
 
 ### SpaceContext
 
-Frozen allow/deny lists for a named space: `tables`, `columns`, `deny_objects`, `deny_columns`, and optional `notes_file`. Applied at question time for knowledge and template partitioning only - not at SQL execution. All `SpaceContext` instances are created on the master engine or federation context. Operator detail: [User guide - SpaceContext](USER_GUIDE.md#spacecontext).
+Frozen allow/deny lists for a named space: `tables`, `columns`, `deny_objects`, `deny_columns`, and optional `notes` or `notes_file` (set at most one). Applied at question time for knowledge and template partitioning only - not at SQL execution. All `SpaceContext` instances are created on the master engine or federation context. Operator detail: [User guide - SpaceContext](USER_GUIDE.md#spacecontext).
 
 ### Engine role and session mode
 
 | Knob | Values | Effect |
 | --- | --- | --- |
 | `AetherEngine(..., role=...)` / `AetherFederation(..., role=...)` | `owner` (default), `consumer` | **Engine role:** owner builds/mutates artifacts; consumer pins the owner snapshot. |
-| `engine.session(mode=...)` / `fed.session(mode=...)` | `writer` (default), `reader` | **Session mode:** writer persists learning; reader enqueues to `write_queue.jsonl`. |
+| `engine.session(mode=...)` / `fed.session(mode=...)` | `writer` (default), `reader` | **Session mode:** writer persists learning; reader does not persist shared learning (session-local only). |
 
 ---
 
@@ -70,18 +71,20 @@ The objects above persist under a shared root so owner, consumer, reader, and wr
 
 Each database connection gets its own directory and its own master context snapshot. Named engine contexts and AetherSpaces persist as JSON sidecars under the same tree. Federation composites use `fed_<federation_id>/` beside member `conn_<slug>/` trees as parallel siblings under the same artifacts root. Layout detail: [How it works - Engine storage](HOW_IT_WORKS.md#3-engine-storage-and-fingerprints).
 
+The artifacts parent directory must reside on a **local filesystem** so advisory artifact locks can serialize cooperating processes reliably; network-mounted paths may emit an `ARTIFACTS_DIR_NOT_LOCAL` diagnostic at construction.
+
 ### Artifacts are library-owned
 
 The artifacts directory is **library-owned**: never edit, move, or partially restore files under `<artifacts_parent>/aetherdialect/` by hand. User-facing changes go through export, edit in the working directory, then apply:
 
 | Change | Export | Apply |
 | --- | --- | --- |
-| Schema overrides | `export_schema_overrides()` | `apply_schema_overrides()` |
+| Schema overrides | `export_overrides()` | `apply_overrides()` |
 | Federation declaration | `export_federation_declaration()` | `apply_federation_declaration()` |
 | Aetherspace snapshot | `export_aetherspace(name)` | `apply_aetherspace(name)` |
 | Migration decisions | `preview_migration_map()` | `apply_migration_map()` |
 
-On a federation, member schema overrides use `export_schema_overrides(connection_name)` / `apply_schema_overrides(connection_name)`. Cross-source identifier drift uses `apply_migration_map(path="federation_migration_map.json")` after editing the map the engine wrote to the working directory.
+On a federation, member schema overrides use `export_overrides(connection_name)` / `apply_overrides(connection_name)`. Cross-source identifier drift uses `apply_migration_map(path="federation_migration_map.json")` after editing the map the engine wrote to the working directory.
 
 ---
 
@@ -106,31 +109,75 @@ Inside the pipeline, suspend points carry an internal `state_id`. Before returni
 | --- | --- | --- | --- |
 | `awaiting_intent_confirm` | intent confirmation | `yes_no` | Confirm interpreted plan. |
 | `awaiting_intent_feedback` | intent rejection | `free_text` | Supply reason intent is wrong. |
-| `awaiting_sql_confirm` | SQL preview / direct reuse | `yes_no` | Confirm generated or reused SQL. |
+| `awaiting_reuse_confirm` | direct template reuse | `yes_no` | Confirm a matched template reuse hit. |
+| `awaiting_sql_confirm` | post-execution SQL preview | `yes_no` | Confirm generated SQL after execution. |
 | `execute` | execute gate | `yes_no` | Confirm running stored SQL. |
 | `awaiting_sql_feedback` | SQL rejection | `free_text` | Supply reason SQL is wrong. |
 | `result` | - | - | Terminal success (`step.done == True`). |
+| `meta` | - | - | Terminal metadata answer (`step.done == True`); inspect `step.meta_payload`. No confirm loop. |
 | `error` | - | - | Terminal failure (`step.done == True`, `step.error` set). |
 | `idle` | - | - | Session reset / no active turn. |
 
-Direct template reuse suspends with `kind="awaiting_sql_confirm"` (same as a normal SQL preview) - there is no separate public reuse API or kind.
+Direct template reuse suspends with `kind="awaiting_reuse_confirm"`; post-execution SQL preview uses `kind="awaiting_sql_confirm"`.
+
+### Template replay vs fresh generation
+
+Generation paths **1** (exact question reuse) and **2.x** (fuzzy question reuse with parameter extraction) pin the stored template SQL and its recorded join signature (`chosen_join_candidate_id` / `chosen_join_path_signature`). They rebind literal and structural parameters against the template's stored `param_values` schema; missing or wrongly typed extractions abort reuse and fall through to fresh generation.
+
+**Equality with a cold generation path is not promised.** A replayed turn may differ in SQL text, bind map, or join choice from what the full interpret/ground/compose pipeline would produce today for the same question. Integrators should treat replay as "execute this trusted template with new binds," not as a deterministic duplicate of path 3+ generation.
+
+After a successful analytical turn, store `step.template_id` and re-run later with `engine.execute_template(step.template_id, {b.handle: b.current_value for b in step.parameters})` — no second `ask()`. Template ids stay stable across additive schema changes when the template footprint still survives (see template footprint migration). `AetherFederation` exposes the same `list_templates` / `fetch_template` / `execute_template` trio against the federation artifact store.
 
 ### SessionStep fields (embedding checklist)
 
 | Field | Use |
 | --- | --- |
-| `done` | Loop until `True`. |
+| `done` | Loop until `True`. Meta turns finish in one step (`done=True`) with no confirm loop. |
 | `kind` | Branch UI logic ([table above](#public-kind-values)). |
 | `prompt` | Short line to show before collecting input. |
 | `reply_shape` | `"yes_no"` vs `"free_text"` while suspended. |
 | `message` | Optional narrative (also printed by `run_interactive`). |
-| `sql` / `data` | Preview or final result. |
-| `federated_bundle` | Structured per-member statements on federated turns (display `sql` is glue only). |
+| `sql` | Dialect parameterized SQL: `str` on single-engine / one-member federation; `dict[str, str]` (`source_id` → SQL) on multi-member federation; `None` when absent. Branch with `isinstance(step.sql, dict)`. |
+| `data` | Preview or final result frame. |
+| `parameters` | P-params only (`p1`, `p2`, …) with `handle`, `current_value`, `display_name`, `column_expr`, `upper_handle`, `unit_handle`. Present whenever `sql` is set and a template supplies slots. |
+| `template_id` | Stable template id for agent cache → `execute_template`. |
+| `meta_payload` | Structured meta answer when `kind="meta"`. Schema catalog includes `counts` (and may omit detail `tables`); business knowledge is `{response_kind: "business_knowledge"}` with prose in `message`. |
+| `federated_bundle` | Optional timings/row counts; prefer `step.sql` for member SQL text. |
 | `federation_source_id` / `federation_phase` / `federation_limit_key` / `federation_succeeded` | Federation error attribution on terminal failure steps. |
 | `error` | Terminal error text. |
-| `diagnostics` | Turn-level tracing rows. |
+| `status` | On terminal steps: coarse outcome (`permission_denied`, `restricted`, `validation_failed`, ...). Default owner warehouse failures do not surface contact-admin text; RBAC scope denials do. Learning/reuse is role-agnostic; scope gates run at execute. |
+| `refusal_code` | Back-compat alias for the primary refusal code; inspect `diagnostics` for the full refusal catalogue. |
+| `retryable` | On terminal failure steps: whether the same question may be retried. |
+| `notices` | Structured bookkeeping notices (`turn_saved`, `feedback_noted`, ...). |
+| `data_truncated` | `True` when `data` was trimmed to the configured row cap. |
+| `diagnostics` | Turn-level tracing rows, including structured refusal codes. |
 
 Full field list: [API reference - SessionStep](API_REFERENCE.md#sessionstep).
+
+### Ask routes (caller still only calls `ask`)
+
+Validation classifies the question internally. Integrators never pass a route flag — branch on the returned step:
+
+| Outcome | How it shows up |
+| --- | --- |
+| Analytical | Existing SQL suspend/confirm loop; terminal `kind="result"` with `sql` / `data` / `template_id`. |
+| Schema catalog / business knowledge | One terminal `kind="meta"` step (`done=True`); no confirm loop. Read `message` and `meta_payload`. |
+| Restricted / invalid | Terminal refuse (`kind="error"` / validation status); no SQL pipeline. |
+
+### Knowledge export (agent context without asking)
+
+Use `export_knowledge()` for the engine/federation plus per-space business-knowledge wrapper. Use `export_space_knowledge(space=...)` for one space’s BK only. Use `export_metadata(space=...)` for deterministic table/column inventory (and federation `members` when present). Prefer `ask()` meta turns when the user asked in natural language; prefer export when the agent only needs structured inventory.
+
+### Permission denial
+
+When the database or execution scope blocks a turn, detect denial without importing message constants:
+
+| Signal | How to detect | Action |
+| --- | --- | --- |
+| Synchronous API | `except AccessError as exc` during `preview_table`, validation, or direct execute helpers | Map to your product's access-denied UX; read `exc.operation`. |
+| Session turn | `step.done` and `step.status == "permission_denied"` | Show `step.message` to the user; branch on `step.refusal_code == "refusal_not_available_in_context"` for structured analytics. |
+
+Do not compare against exported string constants for denial text. `SchemaAccessError` remains the init-time access surface; runtime execute/EXPLAIN denial is `AccessError`.
 
 ---
 
@@ -186,7 +233,7 @@ Method table: [API reference - AsyncPipelineSession methods](API_REFERENCE.md#as
 
 ### Cancelling a federated turn
 
-Call `session.cancel_active_federation_turn()` on the **same** `PipelineSession` (or `await session.cancel_active_federation_turn()` on `AsyncPipelineSession`) that owns the in-flight turn. It returns `True` only when that session has an active federated turn. Cancellation is cooperative: the coordinator observes it **between member stages or batches**. It does **not** interrupt an already-running database statement on a member.
+Call `session.cancel()` on the **same** `PipelineSession` (or `await session.cancel()` on `AsyncPipelineSession`) that owns the in-flight turn. It returns `True` only when that session has an active turn. Cancellation is cooperative: the coordinator observes it **between member stages or batches** and also cancels any in-flight database statement on a member. `cancel_active_federation_turn()` remains as a deprecated alias.
 
 ---
 
@@ -195,11 +242,9 @@ Call `session.cancel_active_federation_turn()` on the **same** `PipelineSession`
 More than one process can share one artifacts directory when you split write responsibility:
 
 - **Writer** (`mode="writer"`, default): persists learning directly. One active writer per artifacts directory is recommended.
-- **Reader** (`mode="reader"`): enqueues learning to `write_queue.jsonl`. Many readers can overlap on the same artifacts path.
+- **Reader** (`mode="reader"`): does not persist shared learning (session-local only). Many readers can overlap on the same artifacts path.
 
-A writer turn drains the queue at start under the engine's writer lock. Queue path: `engine.write_queue_path`.
-
-Offline demo: [Sandbox guide - Reader/writer queue](SANDBOX.md#readerwriter-queue).
+Offline demo: [Sandbox guide - Reader/writer sessions](SANDBOX.md#readerwriter-sessions).
 
 ---
 
@@ -209,12 +254,12 @@ Owner/consumer builds directly on the reader/writer split and the shared artifac
 
 Pattern for **any supported database engine** (not PostgreSQL-specific):
 
-1. **Owner writer** - one process with `role="owner"`, `mode="writer"`, full `EngineContext`, and durable `artifacts_dir` on shared storage. Builds the master graph and drains the write queue.
+1. **Owner writer** - one process with `role="owner"`, `mode="writer"`, full `EngineContext`, and durable `artifacts_dir` on shared storage. Builds the master graph and persists learning.
 2. **Consumer readers** - processes with `role="consumer"`, a saved scope-preset **name string**, restricted database credentials matching their allow lists, and `mode="reader"` (or `"writer"` only on the owner).
 3. **Align scope** - `EngineContext.allow_objects` / `allow_columns` must match each consumer's database grants.
 4. **Optional AetherSpaces** - further narrow model focus per team or product surface without changing warehouse roles.
 
-Readers share the owner's artifacts directory but never mutate it directly; they append queue events the owner drains.
+Readers share the owner's artifacts directory but never mutate it directly.
 
 ```python
 # Owner (any engine - fill config_file for yours)
@@ -236,7 +281,23 @@ with consumer.session(mode="reader", space="master") as session:
     session.accept_until_done("How many orders last month?")
 ```
 
-Practice the same pattern offline: [Sandbox guide - Owner vs consumer presets](SANDBOX.md#owner-vs-consumer-presets).
+Practice the same pattern offline: [Sandbox guide - Owner vs consumer roles](SANDBOX.md#owner-vs-consumer-roles).
+
+### Restricted environments
+
+When `artifacts_dir` is omitted, the library uses the platform user-data directory as the artifacts parent. If that default directory is not writable, construction raises `ConfigError` naming the attempted path and stating that an explicit `artifacts_dir` is required:
+
+```text
+default artifacts directory '<path>' is not writable; set an explicit artifacts_dir
+```
+
+Federation coordinator spill and DuckDB temp files are created under the federation artifact tree when one exists, or under the system temporary directory otherwise. If that coordinator temporary directory is not writable, construction raises `ConfigError` naming the directory:
+
+```text
+coordinator temporary directory '<path>' is not writable; set FederationLimits.coordinator_temp_dir or ensure the system temporary directory is writable
+```
+
+Set `artifacts_dir` and, when needed, `FederationLimits.coordinator_temp_dir` to writable local paths before embedding in locked-down service accounts, containers, or CI sandboxes.
 
 ---
 
@@ -246,7 +307,7 @@ Once a single-engine embedding loop works, the composite case is the same sessio
 
 Register members with `AetherFederation` (preferred). Each member keeps its own artifact tree under `conn_<connection>/`; the federation tree lives at `fed_<federation_id>/`. On re-entry, member graphs reload from disk when hashes match before composition runs.
 
-`clear_all_learning()` drains member write queues before clearing federation and member template stores.
+`clear_all_learning()` clears federation and member template stores (and related learning artifacts).
 
 ```python
 from aetherdialect import AetherEngine, AetherFederation
@@ -265,7 +326,7 @@ with fed.session() as session:
         step = session.step(reply_for(step))
 ```
 
-Cross-source joins and logical mappings are declared in `federation_declaration.json` passed to `declaration_file=` at construction. The planner decomposes multi-source intents into per-source sub-intents (each reuses that source's template store) and combines frames in a DuckDB coordinator. Execution attaches a structured bundle on `SessionStep.federated_bundle`; display SQL on `SessionStep.sql` is glue only.
+Cross-source joins and logical mappings are declared in `federation_declaration.json` passed to `declaration_file=` at construction. The planner decomposes multi-source intents into per-source sub-intents (each reuses that source's template store) and combines frames in a DuckDB coordinator. Multi-member turns set `SessionStep.sql` to a `dict` of member SQL; prefer that over reading `federated_bundle` for text.
 
 ### End-to-end walkthrough
 
@@ -273,7 +334,7 @@ Cross-source joins and logical mappings are declared in `federation_declaration.
 2. **Member engines** - construct one `AetherEngine` per connection with a shared `artifacts_dir`. Each member gets `conn_<slug>/` under that root. Wait for first construction (profiling) on every member before composing.
 3. **Author declaration** - write `federation_declaration.json` (`federation_id`, `cross_source_joins`, `coordinator` caps, optional `logical_tables` / `logical_columns`). Resolve table-name collisions with `aliases` or logical mappings before construction - colliding bare names raise at compose time.
 4. **Compose** - `AetherFederation(name, members={...}, declaration_file=..., artifacts_dir=...)`. The federation `name` must equal `federation_id` in the declaration. Export the authored shape with `export_federation_declaration()` when you need to review or edit it.
-5. **First question** - `with fed.session() as session:` then the same `ask` / `step` loop as a single engine. Confirm intent, then execute. Inspect `step.federated_bundle` for per-member SQL; `step.sql` is display-only.
+5. **First question** - `with fed.session() as session:` then the same `ask` / `step` loop as a single engine. Confirm intent, then execute. On multi-member turns `isinstance(step.sql, dict)` is true (`source_id` → member parameterized SQL); one-member degenerate turns keep `step.sql` as `str`. `step.federated_bundle` remains available for timings/row counts.
 6. **Re-entry** - use the export/apply pairs above; never edit persisted sidecars directly. For federation logical tables and joins, `export_federation_declaration()` into the working directory, edit `federation_declaration.json`, then `apply_federation_declaration()`. Member catalog drift uses `preview_migration_map()` / `apply_migration_map()` on each member engine; cross-source identifier drift uses `apply_migration_map(path="federation_migration_map.json")` on the federation after editing the map in the working directory.
 7. **Add or remove a member** - register a new `AetherEngine`, update the declaration JSON, delete the federation tree if `artifact_format_version` mismatches, and reconstruct. Plan templates prune when topology changes.
 
@@ -351,6 +412,28 @@ Model-assisted upload interpretation (sampled cell content) is gated by `PolicyC
 
 ---
 
+## Configuration boundary
+
+The TOML config file and environment variables carry **connection identity** only: engine selection, hosts, ports, databases, schemas, warehouses, catalogs, roles, users, passwords, tokens, key paths, LLM provider and API keys, named connection blocks, artifacts roots, and file-engine source paths.
+
+**Behaviour** — pool sizing, timeouts, caps, retention counts, and non-security policy flags — is set only through `EngineLimits` and `FederationLimits` constructor arguments, or explicitly via `EngineLimits.from_config_file(path)` and `FederationLimits.from_config_file(path)` reading `[limits]` and `[federation_limits]` from the same TOML document. A limit value you pass to the constructor is never overlaid by the file or the environment.
+
+Legacy behaviour environment variables (`AETHERDIALECT_STATEMENT_TIMEOUT_MS`, `AETHERDIALECT_MAX_QUERY_COST_ROWS`, and the other keys listed in [API reference - Configuration](API_REFERENCE.md#configuration)) are ignored; when still set they emit diagnostic `CONFIGURATION_KEY_IGNORED` naming the replacement field.
+
+| Side | Examples |
+| --- | --- |
+| Connection identity (env / TOML) | `[postgresql].host`, `PGHOST`, `[engine].selected`, `OPENAI_API_KEY`, `[llm].provider`, `CSV_DIRECTORY` |
+| Behaviour (`EngineLimits` / `FederationLimits`) | `pool_size`, `statement_timeout_ms`, `max_result_rows`, `max_members`, `member_row_cap` |
+
+```python
+from aetherdialect import AetherEngine, EngineContext, EngineLimits
+
+limits = EngineLimits.from_config_file("./aetherdialect.toml")
+engine = AetherEngine(EngineContext(), artifacts_dir="./run", config_file="./aetherdialect.toml", limits=limits)
+```
+
+---
+
 ## LLM provider wiring
 
 When `AETHERDIALECT_LLM_PROVIDER` is `azure`, provision exactly two deployments and map them through TOML or environment variables:
@@ -372,11 +455,48 @@ Full key tables: [API reference - Configuration](API_REFERENCE.md#configuration)
 
 | Channel | Access | Granularity |
 | --- | --- | --- |
-| **`audit_sink`** | Constructor callback on `AetherEngine` / `AetherFederation` | Coarse lifecycle (`init`, `ask_begin`, `ask_done`, queue drain events). |
-| **`SessionStep.diagnostics`** | Every `ask` / `step` return | Turn-level codes (`REUSE_HIT`, `COMPOSE_REPAIR`, `SENSITIVITY_GATE_HIT`, ...). |
+| **`audit_sink`** | Constructor callback on `AetherEngine` / `AetherFederation` | Coarse lifecycle (`init`, `ask_begin`, `ask_done`, `close`, and related admin events). |
+| **`construction_phase_callback` / `ask_phase_callback`** | Constructor callbacks on `AetherEngine` / `AetherFederation` | Coarse `PhaseProgressEvent` transitions during construction and ask turns. |
+| **`SessionStep.diagnostics`** | Every `ask` / `step` return | Turn-level codes (`REUSE_HIT`, `COMPOSE_REPAIR`, `SENSITIVITY_GATE_HIT`, structured refusals, ...). |
 | **`engine.show_config()`** / **`fed.show_config()`** | Method call | Redacted config snapshot. |
 
 Diagnostic catalog: [API reference - Observability](API_REFERENCE.md#observability).
+
+---
+
+## Guarantees
+
+What the library promises integrators, and what it deliberately does not. For refused question shapes and per-engine capability limits, see the [Support matrix](SUPPORT_MATRIX.md).
+
+### Deterministic ask rebuild
+
+When the artifacts tree is unchanged and the resolved intent is the same, the **ask rebuild** path produces byte-identical SQL. This applies to fresh generation after intent confirmation — not to template replay (below).
+
+### Template replay boundaries
+
+**template reuse** on paths **1** and **2.x** pins the stored template SQL and its recorded **join signature**. Parameters rebind against the template's stored schema; replay is **not** promised to match a cold regenerate after schema enrichment or graph changes. Treat replay as executing a trusted template, not as a duplicate of today's full pipeline output.
+
+### Federation numeric exactness
+
+Exact numeric types remain exact through **federation egress** (coordinator glue and member fetch). Approximate numeric types may be widened to float at federation boundaries.
+
+### EXPLAIN cost caps
+
+Query cost caps are enforced only where the [Support matrix](SUPPORT_MATRIX.md) shows an active EXPLAIN cost gate for your engine. When the warehouse returns no row estimate, the gate is **fail-open**: the turn proceeds and a named diagnostic records the missing estimate.
+
+### Host configuration vs library-owned artifacts
+
+| You configure | Library-owned (do not hand-edit) |
+| --- | --- |
+| `EngineLimits` / `FederationLimits` | Files under `<artifacts_parent>/aetherdialect/` |
+| Engine and federation contexts, AetherSpaces | Template stores, fingerprint sidecars |
+| `audit_sink`, phase callbacks | Internal graph snapshots and learning partitions |
+
+Export/apply pairs ([Artifacts are library-owned](#artifacts-are-library-owned)) are the supported edit surface.
+
+### Unsupported constructs
+
+Question shapes the engine refuses, and how to reformulate them, are listed in [SUPPORT_MATRIX](SUPPORT_MATRIX.md). Route user-facing capability questions there rather than inferring support from successful turns on other shapes.
 
 ---
 

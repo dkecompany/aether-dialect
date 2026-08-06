@@ -106,10 +106,10 @@ def test_federation_migration_map_renames_join_keys() -> None:
     )
 
     manifest = _full_manifest(["a", "b"])
-    mappings = parse_federation_mappings({"version": 1, "logical_columns": [], "logical_tables": []})
+    mappings = parse_federation_mappings({"version": "0.2.1", "logical_columns": [], "logical_tables": []})
     migration = parse_federation_migration_map(
         {
-            "version": 1,
+            "version": "1",
             "action": "remap",
             "qualified_column_renames": [
                 {"from": "t_a.id", "to": "t_a.identifier"},
@@ -130,10 +130,10 @@ def test_federation_migration_map_drops_reversed_inner_join() -> None:
     )
 
     manifest = _full_manifest(["a", "b"])
-    mappings = parse_federation_mappings({"version": 1, "logical_columns": [], "logical_tables": []})
+    mappings = parse_federation_mappings({"version": "0.2.1", "logical_columns": [], "logical_tables": []})
     migration = parse_federation_migration_map(
         {
-            "version": 1,
+            "version": "1",
             "action": "remap",
             "dropped_cross_source_joins": [{"left": "t_b.id", "right": "t_a.id"}],
         },
@@ -146,7 +146,7 @@ def test_per_source_column_rename_propagates() -> None:
     from aetherdialect._federation import apply_per_source_column_renames
 
     manifest = _full_manifest(["a", "b"])
-    mappings = parse_federation_mappings({"version": 1, "logical_columns": [], "logical_tables": []})
+    mappings = parse_federation_mappings({"version": "0.2.1", "logical_columns": [], "logical_tables": []})
     updated_manifest, _ = apply_per_source_column_renames(
         manifest,
         mappings,
@@ -174,7 +174,7 @@ def test_member_allow_tables_includes_union_partition_members() -> None:
     )
     mappings = parse_federation_mappings(
         {
-            "version": 2,
+            "version": "0.2.1",
             "logical_columns": [],
             "logical_tables": [
                 {
@@ -212,7 +212,7 @@ def test_federation_migration_map_archive_uses_storage_dir(tmp_path: Path) -> No
 
     archive_dir = tmp_path / "fed_storage"
     map_path = tmp_path / "federation_migration_map.json"
-    map_path.write_text('{"version": 1}', encoding="utf-8")
+    map_path.write_text('{"version": "0.2.1"}', encoding="utf-8")
     archive_federation_migration_map_file(map_path, archive_dir=archive_dir)
     assert not map_path.is_file()
     assert (archive_dir / "federation_migration_map.applied.json").is_file()

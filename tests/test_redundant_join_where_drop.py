@@ -5,7 +5,11 @@ from __future__ import annotations
 import pytest
 
 from aetherdialect._constants import DIAGNOSTIC_CODE_REDUNDANT_JOIN_WHERE_DROPPED
-from aetherdialect._contracts_base import NormalizedExpr, WhereParam
+from aetherdialect._contracts_base import (
+    NormalizedExpr,
+    PredicateGroup,
+    WhereParam,
+)
 from aetherdialect._contracts_core import RuntimeIntent
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._core_utils import (
@@ -13,7 +17,6 @@ from aetherdialect._core_utils import (
     reset_diagnostic_collector,
     set_diagnostic_collector,
 )
-from aetherdialect._intent_process import predicate_group_from_list, where_leaves
 from aetherdialect._intent_repair import drop_redundant_resolved_join_where_predicates
 from tests.join_test_helpers import catalog_edge_kinds_for_signatures
 from tests.test_join_kind_preservation import _nullable_child_schema, _parent_child_schema
@@ -35,7 +38,7 @@ def _fk_join_intent(
         select_cols=[],
         group_by_cols=[],
         order_by_cols=[],
-        where=predicate_group_from_list([fp]),
+        where=PredicateGroup.from_list([fp]),
         preserve_tables=list(preserve_tables or []),
     )
 
@@ -73,7 +76,7 @@ def test_inner_join_duplicate_filter_is_dropped() -> None:
     finally:
         reset_diagnostic_collector(token)
     assert changed is True
-    assert where_leaves(updated.where) == []
+    assert PredicateGroup.where_leaves(updated.where) == []
     assert len(diags) == 1
     assert diags[0].code == DIAGNOSTIC_CODE_REDUNDANT_JOIN_WHERE_DROPPED
 
@@ -85,7 +88,7 @@ def test_nullable_foreign_key_left_edge_keeps_duplicate_filter() -> None:
     edge_kinds = catalog_edge_kinds_for_signatures([signature])[0]
     intent = _fk_join_intent()
     updated = _drop_main(intent, schema, signature, edge_kinds)
-    assert len(where_leaves(updated.where) or []) == 1
+    assert len(PredicateGroup.where_leaves(updated.where) or []) == 1
 
 
 @pytest.mark.fast
@@ -95,7 +98,7 @@ def test_preserve_tables_keeps_duplicate_filter() -> None:
     edge_kinds = catalog_edge_kinds_for_signatures([signature])[0]
     intent = _fk_join_intent(preserve_tables=["parent"])
     updated = _drop_main(intent, schema, signature, edge_kinds)
-    assert len(where_leaves(updated.where) or []) == 1
+    assert len(PredicateGroup.where_leaves(updated.where) or []) == 1
 
 
 @pytest.mark.fast
@@ -147,7 +150,7 @@ def test_semantic_profile_edge_keeps_duplicate_filter() -> None:
         select_cols=[],
         group_by_cols=[],
         order_by_cols=[],
-        where=predicate_group_from_list([fp]),
+        where=PredicateGroup.from_list([fp]),
     )
     updated = _drop_main(intent, schema, signature, edge_kinds)
-    assert len(where_leaves(updated.where) or []) == 1
+    assert len(PredicateGroup.where_leaves(updated.where) or []) == 1

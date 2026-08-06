@@ -33,9 +33,9 @@ CREATE TABLE customer (
     create_date DATE NOT NULL,
     last_update TIMESTAMP
 );;
-INSERT INTO customer (customer_id, store_id, first_name, last_name, email_addr, address_id, loyalty_tier, create_date, last_update) VALUES (1, 1, 'Mary (crm)', 'Smith', 'mary.smith@example.com', 1, 'gold', '2020-01-15', '2024-01-01 00:00:00');
+INSERT INTO customer (customer_id, store_id, first_name, last_name, email_addr, address_id, loyalty_tier, create_date, last_update) VALUES (1, 1, 'Mary (crm)', 'Smith', 'mary.smith@example.com', 1001, 'gold', '2020-01-15', '2024-01-01 00:00:00');
 INSERT INTO customer (customer_id, store_id, first_name, last_name, email_addr, address_id, loyalty_tier, create_date, last_update) VALUES (2, 1, 'Patricia', 'Johnson', 'patricia.j@example.com', 2, 'silver', '2020-02-20', '2024-01-01 00:00:00');
-INSERT INTO customer (customer_id, store_id, first_name, last_name, email_addr, address_id, loyalty_tier, create_date, last_update) VALUES (5, 2, 'Linda (crm)', 'Brown', NULL, 5, 'bronze', '2020-05-10', '2024-01-01 00:00:00');
+INSERT INTO customer (customer_id, store_id, first_name, last_name, email_addr, address_id, loyalty_tier, create_date, last_update) VALUES (5, 2, 'Linda (crm)', 'Brown', NULL, 1005, 'bronze', '2020-05-10', '2024-01-01 00:00:00');
 
 CREATE TABLE staff (
     staff_id INTEGER NOT NULL,

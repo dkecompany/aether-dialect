@@ -1,4 +1,4 @@
-"""T9: consumer init must not run structural migration when tier is masked or destructive."""
+"""Consumer init must not run structural migration when tier is masked or destructive."""
 
 from __future__ import annotations
 
@@ -23,15 +23,10 @@ from aetherdialect._contracts_schema import (
     TemplateStats,
 )
 from aetherdialect._core_utils import write_artifact_manifest
-from aetherdialect._main_execution import migration_report_for_init
+from aetherdialect._main_execution import MainExecutionOps
 from aetherdialect._schema_graph import consumer_graph_is_permission_subset, diff_schemas
 from aetherdialect._templates import (
-    _load_partitioned_view_unlocked,
-    apply_migration_policy,
-    empty_template_store,
-    save_template_store,
-    template_store_dir_for_space,
-    templates_to_store,
+    TemplateOps,
 )
 
 
@@ -106,14 +101,14 @@ def _make_template(tid: str, table: str) -> Template:
 
 def _seed_store(artifacts_dir: str, schema: SchemaGraph, templates: dict[str, Template]) -> None:
     os.makedirs(artifacts_dir, exist_ok=True)
-    store_dir = template_store_dir_for_space(artifacts_dir, "master")
+    store_dir = TemplateOps.template_store_dir_for_space(artifacts_dir, "master")
     os.makedirs(store_dir, exist_ok=True)
     prev = EngineConfig.TEMPLATE_STORE_DIR
     EngineConfig.TEMPLATE_STORE_DIR = store_dir
     try:
-        store = empty_template_store("eff_old")
-        templates_to_store(store, templates)
-        save_template_store(store)
+        store = TemplateOps.empty_template_store("eff_old")
+        TemplateOps.templates_to_store(store, templates)
+        TemplateOps.save_template_store(store)
     finally:
         EngineConfig.TEMPLATE_STORE_DIR = prev
     write_artifact_manifest(
@@ -129,11 +124,11 @@ def _seed_store(artifacts_dir: str, schema: SchemaGraph, templates: dict[str, Te
 
 
 def _reload_template_ids(artifacts_dir: str) -> set[str]:
-    store_dir = template_store_dir_for_space(artifacts_dir, "master")
+    store_dir = TemplateOps.template_store_dir_for_space(artifacts_dir, "master")
     prev = EngineConfig.TEMPLATE_STORE_DIR
     EngineConfig.TEMPLATE_STORE_DIR = store_dir
     try:
-        raw = _load_partitioned_view_unlocked(store_dir)
+        raw = TemplateOps._load_partitioned_view_unlocked(store_dir)
         if raw is None:
             return set()
         return set(raw.partition_map.keys())
@@ -155,7 +150,7 @@ def test_consumer_init_migration_report_is_no_change_when_permission_filtered(tm
     schema_diff = diff_schemas(owner, consumer)
     assert schema_diff.dropped_tables == ("b",)
 
-    report = migration_report_for_init(
+    report = MainExecutionOps.migration_report_for_init(
         artifacts_dir,
         owner,
         schema_role="consumer",
@@ -176,7 +171,7 @@ def test_allow_destructive_false_skips_diff_driven_mutation(tmp_path) -> None:
     _seed_store(artifacts_dir, owner, {"T_a": _make_template("T_a", "a"), "T_b": _make_template("T_b", "b")})
     schema_diff = diff_schemas(owner, consumer)
 
-    report = apply_migration_policy(
+    report = TemplateOps.apply_migration_policy(
         artifacts_dir,
         owner,
         allow_destructive=False,

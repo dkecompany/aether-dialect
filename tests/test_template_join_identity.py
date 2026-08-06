@@ -6,11 +6,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from aetherdialect._config import EngineConfig
 from aetherdialect._contracts_core import GenerationPath, RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
 from aetherdialect._intent_process import NormalizedExpr
 from aetherdialect._pipeline import execute_reuse_with_params
-from aetherdialect._templates import insert_template, join_fingerprint_from_runtime_intent
+from aetherdialect._templates import TemplateOps, TemplateRefs
 
 
 def _film_star_schema() -> SchemaGraph:
@@ -112,7 +113,7 @@ def test_differing_join_paths_create_separate_templates() -> None:
     direct_sig = ["child.parent_id->parent.id"]
     bridge_sig = ["child.bridge_id->bridge.id", "bridge.parent_id->parent.id"]
 
-    first = insert_template(
+    first = TemplateOps.insert_template(
         store,
         templates,
         schema,
@@ -120,7 +121,7 @@ def test_differing_join_paths_create_separate_templates() -> None:
         _join_intent(signature=direct_sig),
         "SELECT child.id FROM child JOIN parent ON child.parent_id = parent.id",
     )
-    second = insert_template(
+    second = TemplateOps.insert_template(
         store,
         templates,
         schema,
@@ -134,9 +135,9 @@ def test_differing_join_paths_create_separate_templates() -> None:
 
     assert first.id != second.id
     assert len(templates) == 2
-    assert join_fingerprint_from_runtime_intent(
+    assert TemplateRefs.join_fingerprint_from_runtime_intent(
         _join_intent(signature=direct_sig)
-    ) != join_fingerprint_from_runtime_intent(_join_intent(signature=bridge_sig))
+    ) != TemplateRefs.join_fingerprint_from_runtime_intent(_join_intent(signature=bridge_sig))
     assert first.chosen_join_path_signature == direct_sig
     assert second.chosen_join_path_signature == bridge_sig
     assert first.sql_fp != second.sql_fp
@@ -156,39 +157,44 @@ def test_matching_join_paths_merge_into_one_template() -> None:
     )
     tables = ["category", "film", "language"]
 
-    first = insert_template(
-        store,
-        templates,
-        schema,
-        "q1",
-        _join_intent(signature=sig_a, tables=tables, select_col="film.film_id"),
-        sql,
-    )
-    second = insert_template(
-        store,
-        templates,
-        schema,
-        "q2",
-        _join_intent(signature=sig_b, tables=tables, select_col="film.film_id"),
-        sql,
-    )
+    TemplateOps.clear_sandbox_paraphrase_source()
+    with patch.object(EngineConfig, "llm_credentials_configured", return_value=False):
+        first = TemplateOps.insert_template(
+            store,
+            templates,
+            schema,
+            "q1",
+            _join_intent(signature=sig_a, tables=tables, select_col="film.film_id"),
+            sql,
+        )
+        second = TemplateOps.insert_template(
+            store,
+            templates,
+            schema,
+            "q2",
+            _join_intent(signature=sig_b, tables=tables, select_col="film.film_id"),
+            sql,
+        )
 
-    assert join_fingerprint_from_runtime_intent(
-        _join_intent(signature=sig_a, tables=tables, select_col="film.film_id")
-    ) == join_fingerprint_from_runtime_intent(_join_intent(signature=sig_b, tables=tables, select_col="film.film_id"))
-    assert first.id == second.id
-    assert len(templates) == 1
-    assert second.stats.accept == 2
-    assert set(second.value_history.questions) == {"q1", "q2"}
+        assert TemplateRefs.join_fingerprint_from_runtime_intent(
+            _join_intent(signature=sig_a, tables=tables, select_col="film.film_id")
+        ) == TemplateRefs.join_fingerprint_from_runtime_intent(
+            _join_intent(signature=sig_b, tables=tables, select_col="film.film_id")
+        )
+        assert first.id == second.id
+        assert len(templates) == 1
+        assert second.stats.accept == 2
+        assert set(second.value_history.questions) == {"q1", "q2"}
+    TemplateOps.clear_sandbox_paraphrase_source()
 
 
-@patch("aetherdialect._pipeline.llm_chat", return_value='{"aliases":{}}')
-@patch("aetherdialect._pipeline.save_template_store")
-@patch("aetherdialect._pipeline.templates_to_store", side_effect=lambda s, t: s)
-@patch("aetherdialect._pipeline.delete_rejected_templates_matching_question")
-@patch("aetherdialect._pipeline.save_result_csv")
+@patch("aetherdialect._pipeline.LLMProvider.chat", return_value='{"aliases":{}}')
+@patch("aetherdialect._templates.TemplateOps.save_template_store")
+@patch("aetherdialect._templates.TemplateOps.templates_to_store", side_effect=lambda s, t: s)
+@patch("aetherdialect._templates.TemplateOps.delete_rejected_templates_matching_question")
+@patch("aetherdialect._pipeline.save_result_csv_for_store")
 @patch("aetherdialect._pipeline.print_query_result")
-@patch("aetherdialect._pipeline.promote_trust")
+@patch("aetherdialect._templates.TemplateOps.promote_trust")
 @patch("aetherdialect._pipeline.validate_sql", return_value=(True, None, None, []))
 @patch("aetherdialect._pipeline._resolve_joins_fresh")
 @patch("aetherdialect._pipeline.generate_join_candidates")

@@ -11,9 +11,8 @@ import pytest
 
 from aetherdialect._config import EngineConfig
 from aetherdialect._constants import SCHEMA_OVERRIDES_VERSION
-from aetherdialect._contracts_base import DescriptionOwner, EngineContext, MigrationTier, RoleOwner
+from aetherdialect._contracts_base import ArtifactManifest, DescriptionOwner, EngineContext, MigrationTier, RoleOwner
 from aetherdialect._contracts_schema import FKEdge, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import ArtifactManifest
 from aetherdialect._dialect import Dialect
 from aetherdialect._schema_graph import (
     SchemaDiff,
@@ -251,7 +250,7 @@ def test_migration_map_reconcile_prunes_dropped_sidecar_entries(
 @pytest.mark.fast
 def test_export_only_includes_overridden_tables(schema_graph: SchemaGraph, monkeypatch: pytest.MonkeyPatch) -> None:
     """Export must include only tables/columns with user overrides, not the full graph."""
-    monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+    monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
     apply_schema_overrides_to_graph(
         schema_graph,
         _ov_doc(tables={"orders": {"description": {"value": "User order text.", "owner": "user"}}}),
@@ -267,7 +266,7 @@ def test_export_edit_apply_export_preserves_user_provenance(
     schema_graph: SchemaGraph, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Export → edit → apply → export must preserve user authorship."""
-    monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+    monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
     apply_schema_overrides_to_graph(
         schema_graph,
         _ov_doc(
@@ -294,7 +293,7 @@ def test_export_edit_apply_export_preserves_user_provenance(
 @pytest.mark.fast
 def test_export_persists_fk_pk_removal_lists(schema_graph: SchemaGraph, monkeypatch: pytest.MonkeyPatch) -> None:
     """Export must surface active FK/PK suppressions in removal lists."""
-    monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+    monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
     inferred = [e for e in schema_graph.tables["orders"].foreign_keys if e.inference_tag is not None]
     if not inferred:
         schema_graph.tables["orders"].foreign_keys.append(
@@ -327,7 +326,7 @@ def test_export_persists_fk_pk_removal_lists(schema_graph: SchemaGraph, monkeypa
 @pytest.mark.fast
 def test_apply_ignores_readonly_envelope_edits(schema_graph: SchemaGraph, monkeypatch: pytest.MonkeyPatch) -> None:
     """Mutations under _readonly must not be applied."""
-    monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+    monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
     exported = dump_schema_overrides_dict(schema_graph)
     original_desc = schema_graph.tables["orders"].description or ""
     readonly = exported.setdefault("_readonly", {})
@@ -345,7 +344,7 @@ def test_foreign_keys_add_refuses_resurrected_catalog_edge(
     schema_graph: SchemaGraph, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Persisted foreign_keys_add must not resurrect a catalog FK removed upstream."""
-    monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+    monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
     catalog_edge = next(e for e in schema_graph.tables["orders"].foreign_keys if e.inference_tag is None)
     from_str = f"{catalog_edge.src_table}.{catalog_edge.src_cols[0]}"
     to_str = f"{catalog_edge.dst_table}.{catalog_edge.dst_cols[0]}"
@@ -373,7 +372,7 @@ def test_user_fk_addition_does_not_change_effective_structural_hash(
     schema_graph: SchemaGraph, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """User-added structural FK must not change effective_structural_hash."""
-    monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+    monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
     ctx = EngineContext()
     assign_schema_graph_hashes(schema_graph, ctx, "")
     before = schema_graph.effective_structural_hash
@@ -398,7 +397,7 @@ def test_user_pk_addition_does_not_change_effective_structural_hash(
     schema_graph: SchemaGraph, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """User-promoted PK must not change effective_structural_hash."""
-    monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+    monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
     ctx = EngineContext()
     schema_graph.tables["orders"].primary_key = ["order_id"]
     assign_schema_graph_hashes(schema_graph, ctx, "")

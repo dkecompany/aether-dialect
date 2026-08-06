@@ -82,10 +82,8 @@ def test_sqlglot_spark_cte_native_extractor(schema_graph: SchemaGraph) -> None:
 
 def test_databricks_plan_rows_from_explain_text_finds_row_count() -> None:
     """Spark-style statistics lines yield a numeric estimate."""
-    from aetherdialect._sql_to_intent import databricks_plan_rows_from_explain_text
-
     sample = "Statistics(sizeInBytes=100.0 MiB, rowCount=12345)"
-    assert databricks_plan_rows_from_explain_text(sample) == 12345.0
+    assert _databricks().plan_rows_from_explain_text(sample) == 12345.0
 
 
 def test_compute_sql_history_content_hash_stable_order() -> None:

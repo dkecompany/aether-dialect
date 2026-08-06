@@ -9,6 +9,7 @@ from aetherdialect._constants import (
     FULL_FIELDS,
     GROUND_FIELDS,
     INTERPRET_FIELDS,
+    SCHEMA_FIELD_DERIVED,
     SCHEMA_FIELD_DESCRIPTION,
     SCHEMA_FIELD_ENUM,
     SCHEMA_FIELD_KEYS,
@@ -16,13 +17,13 @@ from aetherdialect._constants import (
     SCHEMA_FIELD_TRUTH_VALUE,
     SCHEMA_FIELD_TYPE,
 )
-from aetherdialect._contracts_base import SensitivityClassification, TableRole, set_sensitivity
+from aetherdialect._contracts_base import SensitivityClassification, TableRole
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 
 
 def _make_graph_with_hidden_column() -> SchemaGraph:
     hidden_col = ColumnMetadata(name="secret_col", data_type="varchar", description="hidden metric")
-    set_sensitivity(hidden_col, SensitivityClassification.HIDDEN)
+    SensitivityClassification.apply_to(hidden_col, SensitivityClassification.HIDDEN)
     visible_col = ColumnMetadata(name="id", data_type="integer", is_primary_key=True)
     table = TableMetadata(
         name="tbl_a",
@@ -77,6 +78,7 @@ def test_field_set_constants() -> None:
     assert FULL_FIELDS == frozenset(
         {
             SCHEMA_FIELD_DESCRIPTION,
+            SCHEMA_FIELD_DERIVED,
             SCHEMA_FIELD_ROLE,
             SCHEMA_FIELD_TYPE,
             SCHEMA_FIELD_TRUTH_VALUE,

@@ -11,7 +11,6 @@ import pandas as pd
 import pytest
 
 from aetherdialect import AetherFederation
-from aetherdialect._constants import anti_join_presence_column
 from aetherdialect._contracts_base import (
     ConfigError,
     FederationMappings,
@@ -19,7 +18,6 @@ from aetherdialect._contracts_base import (
     OwnerOnlyOperationError,
     PredicateGroup,
     SpaceContext,
-    predicate_group_from_list,
 )
 from aetherdialect._contracts_core import (
     FederatedPlan,
@@ -66,14 +64,12 @@ from aetherdialect._federation import (
     revalidate_prepared_federation_plan,
 )
 from aetherdialect._intent_process import NormalizedExpr
-from aetherdialect._main_execution import (
-    _sql_execute_suspend_context,
-    _verify_federation_execute_resume,
-    snapshot_turn_policy,
-)
+from aetherdialect._main_execution import MainExecutionOps
 from aetherdialect._pipeline import execute_federated_prepare
 from aetherdialect._schema_graph import recompute_join_paths_multi
+from aetherdialect._sql_gen import anti_join_presence_column
 from aetherdialect._utils import intent_key
+from tests.federation_helpers import union_member_graph_pair
 
 
 def _table(name: str, *, source_id: str, id_type: str = "integer") -> TableMetadata:
@@ -129,7 +125,7 @@ _UNION_MANIFEST = {
 def _union_mappings() -> FederationMappings:
     return parse_federation_mappings(
         {
-            "version": 2,
+            "version": "0.2.1",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -202,7 +198,7 @@ def test_compose_sets_ddl_probe_hash_from_member_probes() -> None:
     )
     expected = hashlib.sha256(probe_blob.encode()).hexdigest()[:32]
     assert composite.ddl_probe_hash == expected
-    assert_composite_invariants(composite, members, manifest, FederationMappings(version=2))
+    assert_composite_invariants(composite, members, manifest, FederationMappings(version="0.2.1"))
     assert composite.structural_hash
     assert composite.scope_hash
     assert composite.effective_structural_hash
@@ -229,15 +225,15 @@ def test_render_join_coerces_typed_join_keys() -> None:
     assert "BIGINT" in glue.upper()
 
 
+def _union_payment_graphs() -> dict[str, SchemaGraph]:
+    return union_member_graph_pair("payment_a", "payment_b")
+
+
 @pytest.mark.fast
 def test_union_scalar_glue_aggregates_member_counts() -> None:
     manifest = parse_federation_manifest(_UNION_MANIFEST, include_derived_roster=True)
     mappings = _union_mappings()
-    composite = compose_composite_graph(
-        {"a": _graph("payment_a", source_id="a"), "b": _graph("payment_b", source_id="b")},
-        manifest,
-        mappings,
-    )
+    composite = compose_composite_graph(_union_payment_graphs(), manifest, mappings)
     intent = RuntimeIntent(
         tables=["payment"],
         grain="scalar",
@@ -308,8 +304,8 @@ def test_sql_execute_suspend_context_freezes_turn_policy_and_exec_context() -> N
     snap = MagicMock()
     gen_out = SqlGenerationOutcome("sql", True, GenerationPath.FEDERATION_PLAN, None)
     fed_prep = FederatedPrepareOutcome(success=True, plan=FederatedPlan(steps=()), display_sql="sql")
-    policy = snapshot_turn_policy()
-    ctx = _sql_execute_suspend_context(
+    policy = MainExecutionOps.snapshot_turn_policy()
+    ctx = MainExecutionOps._sql_execute_suspend_context(
         snap,
         "sql",
         None,
@@ -362,7 +358,7 @@ def test_verify_federation_execute_resume_accepts_matching_plan_id() -> None:
         tmpl_sd=None,
         federation_plan_id="plan_match",
     )
-    _verify_federation_execute_resume(ctx)
+    MainExecutionOps._verify_federation_execute_resume(ctx)
 
 
 @pytest.mark.fast
@@ -575,11 +571,7 @@ def test_federation_table_set_widens_join_path_endpoints() -> None:
 def test_union_logical_table_plans_member_steps_and_union_specs() -> None:
     manifest = parse_federation_manifest(_UNION_MANIFEST, include_derived_roster=True)
     mappings = _union_mappings()
-    composite = compose_composite_graph(
-        {"a": _graph("payment_a", source_id="a"), "b": _graph("payment_b", source_id="b")},
-        manifest,
-        mappings,
-    )
+    composite = compose_composite_graph(_union_payment_graphs(), manifest, mappings)
     intent = RuntimeIntent(
         tables=["payment"],
         grain="many",
@@ -608,7 +600,7 @@ def test_mappings_replay_fingerprint_detects_member_drift() -> None:
     )
 
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
-    mappings = FederationMappings(version=2)
+    mappings = FederationMappings(version="0.2.1")
     members = {"a": _graph("left_t", source_id="a"), "b": _graph("right_t", source_id="b")}
     composite = compose_composite_graph(members, manifest, mappings)
     with tempfile.TemporaryDirectory() as tmp:
@@ -638,7 +630,7 @@ def test_mappings_replay_fingerprint_detects_member_drift() -> None:
 def test_federation_result_contract_kwargs_prefers_bundle_then_residual() -> None:
     from aetherdialect._contracts_core import FederatedSqlBundle, ResidualSpec
     from aetherdialect._intent_process import NormalizedExpr
-    from aetherdialect._main_execution import _federation_result_contract_kwargs
+    from aetherdialect._main_execution import MainExecutionOps
 
     plan = FederatedPlan(
         steps=(),
@@ -653,7 +645,6 @@ def test_federation_result_contract_kwargs_prefers_bundle_then_residual() -> Non
         None,
         (),
         None,
-        None,
         0,
         (),
     )
@@ -663,14 +654,14 @@ def test_federation_result_contract_kwargs_prefers_bundle_then_residual() -> Non
         display_sql="-- display",
     )
     bundle = FederatedSqlBundle(statements=(), display_sql="-- display", column_names=("driver_id",))
-    kwargs = _federation_result_contract_kwargs(
+    kwargs = MainExecutionOps._federation_result_contract_kwargs(
         gen_out,
         federated_prepare=prep,
         federated_bundle=bundle,
     )
     assert kwargs["column_names"] == ("driver_id",)
     empty_bundle = FederatedSqlBundle(statements=(), display_sql="-- display", column_names=())
-    kwargs_residual = _federation_result_contract_kwargs(
+    kwargs_residual = MainExecutionOps._federation_result_contract_kwargs(
         gen_out,
         federated_prepare=prep,
         federated_bundle=empty_bundle,
@@ -770,7 +761,7 @@ def test_same_source_filter_group_disjunction_remains_eligible() -> None:
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("left_t.id"))],
         group_by_cols=[],
         order_by_cols=[],
-        where=predicate_group_from_list(
+        where=PredicateGroup.from_list(
             [
                 WhereParam(
                     left_expr=NormalizedExpr.from_column("left_t.id"),
@@ -796,11 +787,7 @@ def test_same_source_filter_group_disjunction_remains_eligible() -> None:
 def test_logical_table_union_decomposes_without_ir_set_op() -> None:
     manifest = parse_federation_manifest(_UNION_MANIFEST, include_derived_roster=True)
     mappings = _union_mappings()
-    composite = compose_composite_graph(
-        {"a": _graph("payment_a", source_id="a"), "b": _graph("payment_b", source_id="b")},
-        manifest,
-        mappings,
-    )
+    composite = compose_composite_graph(_union_payment_graphs(), manifest, mappings)
     intent = RuntimeIntent(
         tables=["payment"],
         grain="many",
@@ -963,7 +950,7 @@ def test_reconcile_classification_failure_surfaces() -> None:
         join_paths_multi=recompute_join_paths_multi({"payment": composite_table}),
     )
     mappings = FederationMappings(
-        version=2,
+        version="0.2.1",
         logical_tables=(
             LogicalTableMapping(
                 logical="payment",
@@ -996,7 +983,7 @@ def test_unresolvable_qualified_ref_does_not_yield_empty_source_id() -> None:
         _qualified_ref_source_id("missing_table.id", manifest)
     mappings = parse_federation_mappings(
         {
-            "version": 2,
+            "version": "0.2.1",
             "logical_columns": [
                 {
                     "logical": "shared_id",
@@ -1016,7 +1003,7 @@ def test_corrupt_member_hash_row_does_not_false_match() -> None:
         _normalize_stored_member_hash_row(["only_one_field"])
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
     members = {"a": _graph("left_t", source_id="a"), "b": _graph("right_t", source_id="b")}
-    mappings = FederationMappings(version=1)
+    mappings = FederationMappings(version="0.2.1")
     composite = compose_composite_graph(members, manifest)
     with tempfile.TemporaryDirectory() as tmp:
         from aetherdialect._federation import federation_artifact_paths, persist_federation_tree

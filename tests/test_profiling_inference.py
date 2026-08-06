@@ -141,8 +141,8 @@ def test_profile_column_zero_row_count_stays_zero_for_ratios() -> None:
     col = ColumnMetadata(name="status", data_type="varchar", value_type="string")
     dialect = DuckDBDialect.__new__(DuckDBDialect)
     _profile_column(dialect, engine, col, "empty_table", row_count=0)
-    assert col.distinct_ratio == 0.0
-    assert col.null_ratio == 0.0
+    assert col.distinct_ratio is None
+    assert col.null_ratio is None
     assert col.mode_frequency_ratio == 0.0
 
 

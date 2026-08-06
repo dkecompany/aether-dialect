@@ -5,10 +5,8 @@ from __future__ import annotations
 import re
 import time
 import traceback
-from collections.abc import Callable
-from copy import deepcopy
-from dataclasses import dataclass, replace
-from typing import Any, Literal
+from dataclasses import replace
+from typing import Any
 from unittest.mock import patch
 
 import aetherdialect._core_utils
@@ -34,12 +32,24 @@ import aetherdialect._validation_schema
 import aetherdialect._validation_semantic
 
 from ._config import PolicyConfig
-from ._contracts_core import GenerationPath, QuestionFormStorage, RuntimeIntent, SqlGenerationOutcome
+from ._contracts_base import FeedbackMode, QuestionRoute
+from ._contracts_core import (
+    Expected,
+    GenerationPath,
+    LiveTestRunner,
+    PendingFeedback,
+    QuestionFormStorage,
+    RuntimeIntent,
+    Scenario,
+    SequenceScenario,
+    SoftAssert,
+    SqlGenerationOutcome,
+)
 from ._core_utils import StepResult, debug, pipeline_capture, substitute_params
-from ._dialect import Dialect, active_sqlglot_dialect, resolve_dialect, sql_outer_has_join_or_comma_from
+from ._dialect import Dialect, DialectRegistry
 from ._federation import schema_spans_multiple_sources
 from ._intent_process import collect_structural_match_templates, match_template_for_union
-from ._main_execution import try_zero_row_where_remediation
+from ._main_execution import MainExecutionOps
 from ._pipeline import (
     best_accepted_template_similarity,
     build_result_dataframe,
@@ -59,10 +69,92 @@ from ._pipeline import (
     save_result_csv,
     stamp_sql_shape,
 )
-from ._templates import TemplateStoreView, has_any_rejection_history_for_question, should_prompt_sql_feedback
+from ._templates import TemplateOps, TemplateStoreView
 from ._utils import flatten_param_values, normalize_question_via_llm, validate_question
 
-FeedbackMode = Literal["live", "deferred_test"]
+"""Live pipeline test runners and assertion helpers."""
+
+
+def run_live_test(runner: LiveTestRunner, scenario: Scenario, retries: int = 0) -> StepResult | None:
+    """Execute a single scenario against the live pipeline."""
+    auto = scenario.auto_responses if scenario.auto_responses is not None else ["y", "y", "y"]
+    last_result: StepResult | None = None
+
+    for _ in range(1 + retries):
+        t0 = time.monotonic()
+        try:
+            with pipeline_capture(list(auto), scenario.reject_reason, csv_dir=runner.csv_dir) as cap:
+                step = _run_pipeline_core(
+                    question=scenario.question,
+                    schema=runner.schema,
+                    store=runner.store,
+                    templates=runner.templates,
+                    rejected=runner.rejected,
+                    schema_terms=runner.schema_terms,
+                    feedback=scenario.feedback,
+                    captured_logs=cap["logs"],
+                    reject_reason=scenario.reject_reason,
+                    feedback_mode=FeedbackMode.LIVE,
+                    force_intent_confirm=_scenario_requires_intent_prompt(scenario),
+                    dialect=runner.dialect,
+                    csv_dir=runner.csv_dir,
+                )
+        except Exception:
+            step = StepResult(
+                scenario_id=scenario.id,
+                question=scenario.question,
+                status="error",
+                error=traceback.format_exc(),
+                captured_logs=cap.get("logs", []) if "cap" in dir() else [],
+            )
+
+        step.scenario_id = scenario.id
+        step.duration_seconds = time.monotonic() - t0
+        last_result = step
+
+        if step.status == "ok":
+            break
+
+    return last_result
+
+
+def run_live_test_deferred(runner: LiveTestRunner, scenario: Scenario, retries: int = 0) -> StepResult | None:
+    """Execute one scenario while deferring feedback persistence."""
+    auto = scenario.auto_responses if scenario.auto_responses is not None else ["y", "y", "y"]
+    last_result: StepResult | None = None
+    for _ in range(1 + retries):
+        t0 = time.monotonic()
+        try:
+            with pipeline_capture(list(auto), scenario.reject_reason, csv_dir=runner.csv_dir) as cap:
+                step = _run_pipeline_core(
+                    question=scenario.question,
+                    schema=runner.schema,
+                    store=runner.store,
+                    templates=runner.templates,
+                    rejected=runner.rejected,
+                    schema_terms=runner.schema_terms,
+                    feedback=scenario.feedback,
+                    captured_logs=cap["logs"],
+                    reject_reason=scenario.reject_reason,
+                    feedback_mode=FeedbackMode.DEFERRED_TEST,
+                    force_intent_confirm=_scenario_requires_intent_prompt(scenario),
+                    dialect=runner.dialect,
+                    csv_dir=runner.csv_dir,
+                )
+        except Exception:
+            step = StepResult(
+                scenario_id=scenario.id,
+                question=scenario.question,
+                status="error",
+                error=traceback.format_exc(),
+                captured_logs=cap.get("logs", []) if "cap" in dir() else [],
+            )
+        step.scenario_id = scenario.id
+        step.duration_seconds = time.monotonic() - t0
+        last_result = step
+        if step.status == "ok":
+            break
+    return last_result
 
 
 def deterministic_generate_validate_execute(
@@ -76,7 +168,7 @@ def deterministic_generate_validate_execute(
     """Build SQL from a fixed ``RuntimeIntent`` (join candidates + ``generate_and_validate_sql``), then execute. Skips NL intent parsing entirely. A join-choice LLM may still run when the graph yields ambiguous join candidates; callers that require zero LLM traffic should patch ``get_join_choice_from_llm`` in tests."""
     if store is None:
         store = {"next_id": 1, "templates": {}, "question_feedback": {}}
-    dialect_obj = resolve_dialect(dialect)
+    dialect_obj = DialectRegistry.resolve_dialect(dialect)
     join_candidates, cmap, cte_hints = generate_join_candidates(intent, schema)
     gen_out = generate_and_validate_sql(
         q_norm,
@@ -105,121 +197,11 @@ def deterministic_generate_validate_execute(
     rows = dialect_obj.execute(exec_sql, params)
     row_list = [tuple(row) for row in rows] if rows else []
     if len(row_list) == 0:
-        fixed_intent, fixed_rows = try_zero_row_where_remediation(intent, schema, dialect_obj, tmpl_sd)
+        fixed_intent, fixed_rows = MainExecutionOps.try_zero_row_where_remediation(intent, schema, dialect_obj, tmpl_sd)
         if fixed_rows is not None:
             intent = fixed_intent
             row_list = [tuple(row) for row in fixed_rows]
     return gen_out, row_list
-
-
-@dataclass
-class PendingFeedback:
-    """Deferred feedback payload for post-assertion commit."""
-
-    choice: str
-    intent: RuntimeIntent
-    sql: str
-    schema: Any
-    store: dict[str, Any]
-    templates: dict[str, Any]
-    rejected: dict[str, Any]
-    q_norm: str
-    generation_path: GenerationPath
-    matched_template: Any
-    matched_rejected_template: Any | None
-    dialect: Any
-    canned_reject_reason: str = ""
-    structural_match_templates: tuple[Any, ...] = ()
-    join_matches_template: bool | None = None
-
-
-@dataclass
-class Expected:
-    """Optional checks for one run; `None` or defaults skip the corresponding assertion. When ``reuse_type`` is checked, values align with pipeline routing: ``direct_reuse`` (question match, ``GenerationPath`` 1–2), ``intent_direct_reuse`` (union, same columns, path 3), ``intent_reuse`` (union, columns changed, path 4)."""
-
-    tables: list[str] | None = None
-    tables_one_of: list[list[str]] | None = None
-    grain_in: tuple[str, ...] | None = None
-    min_rows: int | None = None
-    max_rows: int | None = None
-    reuse_type: str | tuple[str, ...] | None = None
-    contains_join: bool | None = None
-    contains_group_by: bool | None = None
-    contains_cte: bool | None = None
-    sql_contains: list[str] | None = None
-    sql_contains_one_of: list[list[str]] | None = None
-    sql_excludes: list[str] | None = None
-    grain: str | tuple[str, ...] | None = None
-    should_fail_validation: bool = False
-    column_names_one_of: list[list[str]] | None = None
-    row_value_check: Callable[[list[tuple[Any, ...]]], bool] | None = None
-    min_semantic_warnings: int | None = None
-    status: str | None = None
-    status_in: tuple[str, ...] | None = None
-    generation_path: str | None = None
-    generation_path_in: tuple[str, ...] | None = None
-    max_llm_calls: int | None = None
-
-
-@dataclass
-class Scenario:
-    """One NL question, expectations, canned prompts, and metadata for a live run."""
-
-    id: str
-    question: str
-    expected: Expected
-    category: str = ""
-    auto_responses: list[str] | None = None
-    feedback: str = "y"
-    reject_reason: str = "incorrect results"
-    sequence_id: str | None = None
-
-
-@dataclass
-class SequenceScenario:
-    """Ordered scenarios sharing template state for stateful live tests."""
-
-    id: str
-    steps: list[Scenario]
-    category: str = ""
-
-
-@dataclass
-class SoftFailure:
-    """One recorded mismatch from a soft assertion."""
-
-    field: str
-    expected: Any
-    actual: Any
-    message: str
-
-
-class SoftAssert:
-    """Collect soft assertion failures; call `report()` to raise one combined error."""
-
-    def __init__(self) -> None:
-        """Initialize an empty failure list."""
-        self.failures: list[SoftFailure] = []
-
-    def check(self, condition: bool, field_name: str, expected: Any, actual: Any, message: str = "") -> None:
-        """Append a `SoftFailure` when `condition` is false."""
-        if not condition:
-            msg = message or f"{field_name}: expected {expected!r}, got {actual!r}"
-            self.failures.append(SoftFailure(field=field_name, expected=expected, actual=actual, message=msg))
-
-    @property
-    def passed(self) -> bool:
-        """True if no failures were recorded."""
-        return len(self.failures) == 0
-
-    def report(self, header: str = "") -> None:
-        """Raise `AssertionError` with all failures, or return if. `passed`."""
-        if self.passed:
-            return
-        lines = [header] if header else []
-        for f in self.failures:
-            lines.append(f"  [{f.field}] {f.message}")
-        raise AssertionError("\n".join(lines))
 
 
 def _extract_reuse_sql(tmpl: Any, q_norm: str) -> str:
@@ -275,7 +257,7 @@ def _run_pipeline_core(
     feedback: str,
     captured_logs: list[str],
     reject_reason: str = "",
-    feedback_mode: FeedbackMode = "live",
+    feedback_mode: FeedbackMode = FeedbackMode.LIVE,
     force_intent_confirm: bool = False,
     dialect: Any | None = None,
     csv_dir: str = "",
@@ -327,12 +309,12 @@ def _run_pipeline_core(
                 result.intent = _build_reuse_intent(best_template)
                 return result
 
-    valid, query_type, corrected = validate_question(raw_question)
-    if not valid:
-        result.status = "restricted" if query_type == "restricted" else "invalid_question"
+    validation = validate_question(raw_question)
+    if not validation.accepted:
+        result.status = "restricted" if validation.route == QuestionRoute.RESTRICTED else "invalid_question"
         return result
 
-    corrected_text = corrected
+    corrected_text = validation.corrected
 
     tmpl_typo = match_question_level_template_reuse(corrected_text, templates, template_store=store)
     result.reuse_type = tmpl_typo.reuse_type
@@ -368,7 +350,9 @@ def _run_pipeline_core(
 
     neg_drop = False
     normalized_canonical = normalize_question_via_llm(corrected_text, raw_original=raw_question)
-    if normalized_canonical != corrected_text and has_any_rejection_history_for_question(store, corrected_text):
+    if normalized_canonical != corrected_text and TemplateOps.has_any_rejection_history_for_question(
+        store, corrected_text
+    ):
         neg_drop = True
         normalized_canonical = corrected_text
 
@@ -521,7 +505,7 @@ def _run_pipeline_core(
     rows = dialect.execute(exec_sql, aetherdialect._core_utils.reconcile_execute_bind_params(exec_sql, exec_params))
     row_list = [tuple(row) for row in rows] if rows else []
     if len(row_list) == 0:
-        fixed_intent, fixed_rows = try_zero_row_where_remediation(intent, schema, dialect, tmpl_sd)
+        fixed_intent, fixed_rows = MainExecutionOps.try_zero_row_where_remediation(intent, schema, dialect, tmpl_sd)
         if fixed_rows is not None:
             intent = fixed_intent
             result.intent = intent
@@ -535,7 +519,7 @@ def _run_pipeline_core(
         )
 
     stamp_sql_shape(sql, intent)
-    emit_explain_soft_diagnostics(getattr(gen_out, "explain_soft_diagnostics", 0))
+    emit_explain_soft_diagnostics(getattr(gen_out, "explain_soft_findings", ()))
 
     display_final_results_to_stdout(
         q_norm,
@@ -548,7 +532,7 @@ def _run_pipeline_core(
         ),
     )
 
-    need_sql_feedback = should_prompt_sql_feedback(store, corrected_text, gen_out.matched_template)
+    need_sql_feedback = TemplateOps.should_prompt_sql_feedback(store, corrected_text, gen_out.matched_template)
     if need_sql_feedback:
         effective_feedback = feedback
     else:
@@ -570,7 +554,7 @@ def _run_pipeline_core(
         if df_out is not None:
             save_result_csv(df_out, output_path=results_csv_output_path(store, csv_dir=csv_dir or None))
 
-    if feedback_mode == "live":
+    if feedback_mode == FeedbackMode.LIVE:
         reject_info = handle_user_feedback(
             effective_feedback,
             intent,
@@ -612,135 +596,13 @@ def _run_pipeline_core(
         )
 
     if effective_feedback == "n":
-        if feedback_mode == "deferred_test":
+        if feedback_mode == FeedbackMode.DEFERRED_TEST:
             result.status = "ok"
         else:
             result.status = "intent_rejected"
     else:
         result.status = "ok"
     return result
-
-
-class LiveTestRunner:
-    """Orchestrate single-scenario and sequence-scenario execution against the live pipeline. Holds pre-loaded resources; `run` / `run_deferred` wrap the pipeline in a capture context and return `StepResult` values for assertions (multi-step flows use `run_sequence_and_assert`)."""
-
-    def __init__(
-        self,
-        schema: Any,
-        store: dict[str, Any],
-        templates: dict[str, Any],
-        rejected: dict[str, Any],
-        schema_terms: set[str],
-        csv_dir: str = "",
-        dialect: Any | None = None,
-    ) -> None:
-        """Initialize runner state from loaded pipeline resources."""
-        self.schema = schema
-        self.store = store
-        self.templates = templates
-        self.rejected = rejected
-        self.schema_terms = schema_terms
-        self.csv_dir = csv_dir
-        self.dialect = dialect
-
-    def run(self, scenario: Scenario, retries: int = 0) -> StepResult | None:
-        """Execute a single scenario against the live pipeline."""
-        auto = scenario.auto_responses if scenario.auto_responses is not None else ["y", "y", "y"]
-        last_result: StepResult | None = None
-
-        for _ in range(1 + retries):
-            t0 = time.monotonic()
-            try:
-                with pipeline_capture(list(auto), scenario.reject_reason, csv_dir=self.csv_dir) as cap:
-                    step = _run_pipeline_core(
-                        question=scenario.question,
-                        schema=self.schema,
-                        store=self.store,
-                        templates=self.templates,
-                        rejected=self.rejected,
-                        schema_terms=self.schema_terms,
-                        feedback=scenario.feedback,
-                        captured_logs=cap["logs"],
-                        reject_reason=scenario.reject_reason,
-                        feedback_mode="live",
-                        force_intent_confirm=_scenario_requires_intent_prompt(scenario),
-                        dialect=self.dialect,
-                        csv_dir=self.csv_dir,
-                    )
-            except Exception:
-                step = StepResult(
-                    scenario_id=scenario.id,
-                    question=scenario.question,
-                    status="error",
-                    error=traceback.format_exc(),
-                    captured_logs=cap.get("logs", []) if "cap" in dir() else [],
-                )
-
-            step.scenario_id = scenario.id
-            step.duration_seconds = time.monotonic() - t0
-            last_result = step
-
-            if step.status == "ok":
-                break
-
-        return last_result
-
-    def run_deferred(self, scenario: Scenario, retries: int = 0) -> StepResult | None:
-        """Execute one scenario while deferring feedback persistence."""
-        auto = scenario.auto_responses if scenario.auto_responses is not None else ["y", "y", "y"]
-        last_result: StepResult | None = None
-        for _ in range(1 + retries):
-            t0 = time.monotonic()
-            try:
-                with pipeline_capture(list(auto), scenario.reject_reason, csv_dir=self.csv_dir) as cap:
-                    step = _run_pipeline_core(
-                        question=scenario.question,
-                        schema=self.schema,
-                        store=self.store,
-                        templates=self.templates,
-                        rejected=self.rejected,
-                        schema_terms=self.schema_terms,
-                        feedback=scenario.feedback,
-                        captured_logs=cap["logs"],
-                        reject_reason=scenario.reject_reason,
-                        feedback_mode="deferred_test",
-                        force_intent_confirm=_scenario_requires_intent_prompt(scenario),
-                        dialect=self.dialect,
-                        csv_dir=self.csv_dir,
-                    )
-            except Exception:
-                step = StepResult(
-                    scenario_id=scenario.id,
-                    question=scenario.question,
-                    status="error",
-                    error=traceback.format_exc(),
-                    captured_logs=cap.get("logs", []) if "cap" in dir() else [],
-                )
-            step.scenario_id = scenario.id
-            step.duration_seconds = time.monotonic() - t0
-            last_result = step
-            if step.status == "ok":
-                break
-        return last_result
-
-    def clone(self) -> LiveTestRunner:
-        """Return an isolated runner with deep-copied mutable state."""
-        return LiveTestRunner(
-            schema=self.schema,
-            store=deepcopy(self.store),
-            templates=deepcopy(self.templates),
-            rejected=deepcopy(self.rejected),
-            schema_terms=set(self.schema_terms),
-            csv_dir=self.csv_dir,
-            dialect=self.dialect,
-        )
-
-    def adopt_state_from(self, other: LiveTestRunner) -> None:
-        """Replace mutable state with another runner's state."""
-        self.store = other.store
-        self.templates = other.templates
-        self.rejected = other.rejected
-        self.schema_terms = other.schema_terms
 
 
 def commit_pending_feedback(result: StepResult) -> None:
@@ -785,8 +647,8 @@ def commit_pending_feedback(result: StepResult) -> None:
 
 
 def _live_sql_has_join_clause(sql: str) -> bool:
-    """Return whether *sql* uses an explicit JOIN or a comma-separated multi-relation FROM in the outer SELECT. Implemented via the dialect-agnostic AST helper :func:`aetherdialect._dialect.sql_outer_has_join_or_comma_from`."""
-    return sql_outer_has_join_or_comma_from(sql, sqlglot_dialect=active_sqlglot_dialect())
+    """Return whether *sql* uses an explicit JOIN or a comma- separated multi-relation FROM in the outer SELECT. Implemented via the dialect-agnostic AST helper :func:`aetherdialect._dialect.sql_outer_has_join_or_comma_from`."""
+    return Dialect.sql_outer_has_join_or_comma_from(sql, sqlglot_dialect=Dialect.active_sqlglot_dialect())
 
 
 def _step_result_indicates_join(result: StepResult) -> bool:
@@ -842,9 +704,7 @@ def _assertion_table_names(intent: RuntimeIntent, sql: str | None) -> list[str]:
     main_base = {t for t in (intent.tables or []) if t and t not in cte_aliases}
     names: set[str] = set(base_from_ctes) | set(main_base)
     if sql:
-        sql_tables = aetherdialect._dialect.sql_tables_referenced(
-            sql, sqlglot_dialect=aetherdialect._dialect.active_sqlglot_dialect()
-        )
+        sql_tables = Dialect.sql_tables_referenced(sql, sqlglot_dialect=Dialect.active_sqlglot_dialect())
         names.update(t for t in sql_tables if t and t not in cte_aliases)
     return sorted(names)
 
@@ -980,7 +840,10 @@ def _assert_scenario(result: StepResult, expected: Expected, soft: SoftAssert | 
 
     if expected.max_llm_calls is not None:
         soft.check(
-            result.llm_calls <= expected.max_llm_calls, "max_llm_calls", f"<={expected.max_llm_calls}", result.llm_calls
+            result.llm_calls <= expected.max_llm_calls,
+            "max_llm_calls",
+            f"<={expected.max_llm_calls}",
+            result.llm_calls,
         )
 
     if result.status == "ok":
@@ -1001,14 +864,17 @@ def _assert_scenario(result: StepResult, expected: Expected, soft: SoftAssert | 
 def run_and_assert(
     runner: LiveTestRunner, scenario: Scenario, header: str, max_attempts: int = 2, retries: int = 1
 ) -> None:
-    """Run a scenario and assert expectations, retrying from scratch on. failure. On the first attempt the pipeline runs and assertions are checked. When any assertion fails and `max_attempts` > 1, the pipeline is re- run from scratch and assertions are re-evaluated."""
+    """Run a scenario and assert expectations, retrying from scratch on. failure. On the first attempt the pipeline runs and assertions are checked. When any assertion fails and `max_attempts` > 1, the pipeline is re- run from scratch and assertions are re- evaluated."""
     last_soft: SoftAssert | None = None
     for _ in range(max_attempts):
         attempt_runner = runner.clone()
         result = attempt_runner.run_deferred(scenario, retries=retries)
         if result is None:
             result = StepResult(
-                scenario_id=scenario.id, question=scenario.question, status="error", error="runner returned no result"
+                scenario_id=scenario.id,
+                question=scenario.question,
+                status="error",
+                error="runner returned no result",
             )
         last_soft = _assert_scenario(result, scenario.expected)
         if last_soft.passed:
@@ -1066,3 +932,7 @@ def run_seeded_schema_semantic_repair(
         max_retries=mr,
         llm_calls=0,
     )[:3]
+
+
+LiveTestRunner._run_impl = run_live_test
+LiveTestRunner._run_deferred_impl = run_live_test_deferred

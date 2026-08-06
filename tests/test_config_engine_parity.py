@@ -277,7 +277,7 @@ class TestSevenEngineTomlParsing:
     """All five sqlglot-engine TOML blocks flatten to env keys."""
 
     def test_load_config_file_parses_five_sqlglot_engines(self, tmp_path) -> None:
-        from aetherdialect._main_execution import _load_config_file
+        from aetherdialect._main_execution import MainExecutionOps
 
         path = tmp_path / "engines.toml"
         path.write_text(
@@ -325,7 +325,7 @@ class TestSevenEngineTomlParsing:
             ),
             encoding="utf-8",
         )
-        got, claimed, _named = _load_config_file(str(path))
+        got, claimed, _named = MainExecutionOps._load_config_file(str(path))
         expected = {
             "MYSQL_HOST": "mh",
             "MYSQL_PORT": "3307",

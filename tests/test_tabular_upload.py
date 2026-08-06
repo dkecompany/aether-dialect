@@ -1,7 +1,8 @@
-"""Data-quality severity contract and inspect_tabular_upload tests."""
+"""Tabular upload inspection API and severity contract tests."""
 
 from __future__ import annotations
 
+import io
 from pathlib import Path
 from unittest.mock import patch
 
@@ -51,7 +52,7 @@ def _mock_llm_json(system: str, user: str, retries: int = 1, task: str = "defaul
 
 @pytest.fixture(autouse=True)
 def _patch_upload_llm() -> None:
-    with patch("aetherdialect._data_quality.llm_json", side_effect=_mock_llm_json):
+    with patch("aetherdialect._data_quality.LLMProvider.json", side_effect=_mock_llm_json):
         yield
 
 
@@ -131,6 +132,32 @@ def test_inspect_tabular_upload_returns_report_without_engine(tmp_path: Path) ->
 
 
 @pytest.mark.fast
+def test_inspect_tabular_upload_accepts_csv_bytes() -> None:
+    payload = b"id,name\n1,Alice\n"
+    report = inspect_tabular_upload(payload, filename="items.csv")
+    assert isinstance(report, DataQualityReport)
+    assert report.ok is True
+
+
+@pytest.mark.fast
+def test_inspect_tabular_upload_accepts_bytesio_file_object() -> None:
+    payload = io.BytesIO(b"id,name\n1,Bob\n")
+    report = inspect_tabular_upload(payload, filename="uploaded.csv")
+    assert isinstance(report, DataQualityReport)
+    assert report.ok is True
+
+
+@pytest.mark.fast
+def test_inspect_tabular_upload_accepts_binary_file_object(tmp_path: Path) -> None:
+    path = tmp_path / "items.csv"
+    path.write_text("id,name\n1,Carol\n", encoding="utf-8")
+    with path.open("rb") as handle:
+        report = inspect_tabular_upload(handle)
+    assert isinstance(report, DataQualityReport)
+    assert report.ok is True
+
+
+@pytest.mark.fast
 def test_inspect_blocking_empty_file_returns_report_not_raise(tmp_path: Path) -> None:
     path = tmp_path / "empty.csv"
     path.write_text("", encoding="utf-8")
@@ -156,7 +183,7 @@ def test_inspect_does_not_call_duckdb_or_engine_construction(tmp_path: Path) -> 
     with (
         patch("duckdb.connect", side_effect=AssertionError("duckdb.connect must not run during inspect")),
         patch(
-            "aetherdialect._main_execution.initialize_aether_engine",
+            "aetherdialect._main_execution.MainExecutionOps.initialize_aether_engine",
             side_effect=AssertionError("engine construction must not run during inspect"),
         ),
         patch(

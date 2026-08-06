@@ -8,7 +8,7 @@ import pytest
 
 from aetherdialect._contracts_core import RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._dialect import get_dialect
+from aetherdialect._dialect import DialectRegistry
 from aetherdialect._federation import (
     build_federation_manifest_from_members,
     compose_composite_graph,
@@ -19,10 +19,10 @@ from aetherdialect._federation import (
     source_ids_for_intent,
 )
 from aetherdialect._intent_process import NormalizedExpr
-from aetherdialect._main_execution import _build_federation_source_runtimes, _federation_single_source_sql_context
+from aetherdialect._main_execution import MainExecutionOps
 from aetherdialect._pipeline import generate_and_validate_sql, prepare_federated_sql_plan
 from aetherdialect._schema_graph import recompute_join_paths_multi
-from aetherdialect._templates import empty_template_store
+from aetherdialect._templates import TemplateOps
 from tests.conftest import duckdb_engine_identity
 from tests.federation_helpers import enriched_manifest
 
@@ -92,8 +92,10 @@ def _runtime_manifest() -> object:
 
 def test_build_federation_source_runtimes_bind_catalog_schema() -> None:
     manifest = _runtime_manifest()
-    default = get_dialect("duckdb")
-    runtimes = _build_federation_source_runtimes(manifest, None, default, default_identity=duckdb_engine_identity())
+    default = DialectRegistry.get("duckdb")
+    runtimes = MainExecutionOps._build_federation_source_runtimes(
+        manifest, None, default, default_identity=duckdb_engine_identity()
+    )
     assert runtimes["storefront"].dialect.schema_name() == "main"
     assert runtimes["catalog"].dialect.schema_name() == "catalog"
 
@@ -101,11 +103,11 @@ def test_build_federation_source_runtimes_bind_catalog_schema() -> None:
 def test_catalog_dialect_qualifies_film_to_catalog_schema() -> None:
     duckdb = pytest.importorskip("duckdb")
     manifest = _runtime_manifest()
-    default = get_dialect("duckdb")
+    default = DialectRegistry.get("duckdb")
     connection = duckdb.connect(":memory:")
     connection.execute("ATTACH ':memory:' AS catalog")
     connection.execute("CREATE TABLE catalog.film (film_id INTEGER)")
-    runtimes = _build_federation_source_runtimes(
+    runtimes = MainExecutionOps._build_federation_source_runtimes(
         manifest,
         None,
         default,
@@ -158,11 +160,11 @@ def test_degenerate_federated_prepare_matches_direct_member_sql() -> None:
     )
     plan = plan_federated_intent(intent, composite, manifest)
     assert federation_plan_is_degenerate(plan)
-    default = get_dialect("duckdb")
-    runtimes = _build_federation_source_runtimes(
+    default = DialectRegistry.get("duckdb")
+    runtimes = MainExecutionOps._build_federation_source_runtimes(
         _runtime_manifest(), None, default, default_identity=duckdb_engine_identity()
     )
-    store = empty_template_store(composite.schema_graph_id)
+    store = TemplateOps.empty_template_store(composite.schema_graph_id)
     with patch(
         "aetherdialect._pipeline._run_sql_validation_cascade",
         return_value=(True, "", None, []),
@@ -173,7 +175,7 @@ def test_degenerate_federated_prepare_matches_direct_member_sql() -> None:
             _federation_dialects = {sid: runtime.dialect for sid, runtime in runtimes.items()}
 
         owner = _Owner()
-        single_source = _federation_single_source_sql_context(
+        single_source = MainExecutionOps._federation_single_source_sql_context(
             owner,
             intent,
             composite,
@@ -229,8 +231,8 @@ def test_federated_step_sql_context_prefers_runtime_dialect() -> None:
     )
     plan = plan_federated_intent(intent, composite, manifest)
     assert len(plan.steps) == 2
-    default = get_dialect("duckdb")
-    runtimes = _build_federation_source_runtimes(
+    default = DialectRegistry.get("duckdb")
+    runtimes = MainExecutionOps._build_federation_source_runtimes(
         _runtime_manifest(), None, default, default_identity=duckdb_engine_identity()
     )
     catalog_step = next(step for step in plan.steps if step.source_id == "catalog")
@@ -246,8 +248,8 @@ def test_federated_step_sql_context_prefers_runtime_dialect() -> None:
 
 
 def test_catalog_dialect_rewrites_stale_main_schema_qualifiers() -> None:
-    default = get_dialect("duckdb")
-    runtimes = _build_federation_source_runtimes(
+    default = DialectRegistry.get("duckdb")
+    runtimes = MainExecutionOps._build_federation_source_runtimes(
         _runtime_manifest(), None, default, default_identity=duckdb_engine_identity()
     )
     catalog_dialect = runtimes["catalog"].dialect

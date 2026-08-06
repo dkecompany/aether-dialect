@@ -236,7 +236,7 @@ class TestSandboxScenarios:
                 writer = writer_sandbox.engine(role="owner")
                 # The writer should have drained the queue upon initialization or session start
                 # We can check the internal write queue path is empty or was processed
-                queue_path = writer.write_queue_path
+                queue_path = writer._write_queue_path
                 if queue_path.exists():
                     with queue_path.open(encoding="utf-8") as f:
                         lines = f.readlines()
@@ -255,20 +255,20 @@ class TestSandboxScenarios:
         from pathlib import Path
 
         from aetherdialect._config import PolicyConfig
-        from aetherdialect._dialect_sqlglot_engines import create_duckdb_sqlalchemy_engine
-        from aetherdialect._llm_provider import reset_mock_provider
-        from aetherdialect._sandbox import (
-            _copy_baseline_cache_files,
-            _fixtures_path,
-            _load_memory_connection,
-            _open_data_bundle,
-            _owner_writer_schema_context,
-            _post_migration_seed_sql,
-            _sandbox_memory_engine_dir,
-            _write_sandbox_toml,
-        )
+        from aetherdialect._dialect_sqlglot_engines import DuckDBDialect
+        from aetherdialect._llm_provider import MockProvider
+        from aetherdialect._sandbox import Sandbox
 
-        bundle_access = _open_data_bundle()
+        _copy_baseline_cache_files = Sandbox._copy_baseline_cache_files
+        _fixtures_path = Sandbox._fixtures_path
+        _load_memory_connection = Sandbox._load_memory_connection
+        _open_data_bundle = Sandbox._open_data_bundle
+        _owner_writer_schema_context = Sandbox._owner_writer_schema_context
+        _post_migration_seed_sql = Sandbox._post_migration_seed_sql
+        _sandbox_memory_engine_dir = Sandbox._sandbox_memory_engine_dir
+        _write_sandbox_toml = Sandbox._write_sandbox_toml
+
+        bundle_access = Sandbox._open_data_bundle()
         extract = bundle_access.path
         work = Path(tempfile.mkdtemp(prefix="test_sandbox_migration_"))
         prev_cwd = os.getcwd()
@@ -282,23 +282,23 @@ class TestSandboxScenarios:
 
             # 1. Prepare post-migration state
             post_sql = work / "rental_shop_post_migration.sql"
-            post_sql.write_text(_post_migration_seed_sql(seed_path, map_path), encoding="utf-8")
+            post_sql.write_text(Sandbox._post_migration_seed_sql(seed_path, map_path), encoding="utf-8")
 
             artifacts_dir = str(work / "artifacts")
             shutil.copytree(artifacts_src, artifacts_dir)
-            engine_dir = _sandbox_memory_engine_dir(artifacts_dir)
-            _copy_baseline_cache_files(artifacts_src, engine_dir)
+            engine_dir = Sandbox._sandbox_memory_engine_dir(artifacts_dir)
+            Sandbox._copy_baseline_cache_files(artifacts_src, engine_dir)
 
-            connection = _load_memory_connection(str(post_sql))
-            execution_engine = create_duckdb_sqlalchemy_engine(connection)
+            connection = Sandbox._load_memory_connection(str(post_sql))
+            execution_engine = DuckDBDialect.create_duckdb_sqlalchemy_engine(connection)
 
             notes_file = extract / "rental_shop_notes.txt"
             sql_file = extract / "rental_shop.sql"
-            schema_context = _owner_writer_schema_context(
+            schema_context = Sandbox._owner_writer_schema_context(
                 notes_file=str(notes_file) if notes_file.is_file() else None,
                 sql_file=str(sql_file) if sql_file.is_file() else None,
             )
-            config_file = _write_sandbox_toml(fixtures_file=_fixtures_path(extract))
+            config_file = Sandbox._write_sandbox_toml(fixtures_file=Sandbox._fixtures_path(extract))
 
             # 2. Apply migration map against pre-migration cache + post-migration DB.
             PolicyConfig.SANDBOX_TRUST_SCHEMA_BASELINE = False
@@ -314,7 +314,7 @@ class TestSandboxScenarios:
             t2s._sandbox_mode = True
 
             # 3. Verify post-migration question works
-            reset_mock_provider()
+            MockProvider.reset_mock_provider()
             with t2s.session() as session:
                 step = session.accept_until_done("How many books do we have?")
                 assert step.done
@@ -356,7 +356,9 @@ class TestSandboxScenarios:
         import shutil
         import tempfile
 
-        from aetherdialect._sandbox import _sandbox_memory_engine_dir
+        from aetherdialect._sandbox import Sandbox
+
+        _sandbox_memory_engine_dir = Sandbox._sandbox_memory_engine_dir
 
         shared_dir = tempfile.mkdtemp(prefix="sandbox_shared_reset_")
         try:
@@ -366,7 +368,7 @@ class TestSandboxScenarios:
                     session.accept_until_done("How many films are there?")
 
                 # Verify artifacts exist under the engine storage dir
-                assert (_sandbox_memory_engine_dir(shared_dir) / "schema_graph.json.gz").exists()
+                assert (Sandbox._sandbox_memory_engine_dir(shared_dir) / "schema_graph.json.gz").exists()
 
             # 2. Re-open with same artifacts_dir.
             # create_offline_sandbox should wipe the dir and re-seed from baseline.

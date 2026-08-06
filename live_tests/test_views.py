@@ -95,14 +95,15 @@ def test_both_reflection_coexist(engine_bundle) -> None:
     assert any(k == "view" for k in kinds.values())
 
 
-def test_execute_select_on_store_revenue_view(engine_bundle) -> None:
-    """Approved SELECT against store_revenue_v returns aggregated rows."""
+def test_preview_store_revenue_view(engine_bundle) -> None:
+    """Approved preview against store_revenue_v returns aggregated rows."""
     _engine, t2s = engine_bundle
     if "store_revenue_v" not in t2s._schema_graph.tables:
         pytest.skip("store_revenue_v not loaded")
-    rows = t2s.execute_sql("SELECT store_id, total_revenue FROM store_revenue_v ORDER BY store_id LIMIT 5")
-    assert rows
-    assert len(rows[0]) == 2
+    preview = t2s.preview_table("store_revenue_v", limit=5)
+    assert preview.rows
+    assert len(preview.columns) >= 2
+    assert len(preview.rows[0]) == len(preview.columns)
 
 
 def test_pipeline_question_on_store_revenue_view(engine_bundle) -> None:

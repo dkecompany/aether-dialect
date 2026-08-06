@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import copy
 import glob
 import gzip
@@ -19,6 +20,7 @@ from sqlalchemy import text
 
 from ._config import PolicyConfig
 from ._constants import (
+    ARTIFACT_FORMAT_VERSION,
     COMPATIBLE_TYPE_PAIRS,
     DIAGNOSTIC_CODE_PK_INFERENCE_PROMPT,
     DIAGNOSTIC_CODE_PROFILE_TABLE_CLONE_FAILED,
@@ -41,6 +43,7 @@ from ._constants import (
     WRITE_QUEUE_FILENAME,
 )
 from ._contracts_base import (
+    ArtifactManifest,
     ColumnRole,
     ConfigError,
     DatabaseFeatureCapability,
@@ -50,17 +53,13 @@ from ._contracts_base import (
     MigrationTier,
     OverrideSkip,
     PkInferenceTag,
+    PredicateGroup,
     SchemaAccessError,
     SchemaInclude,
     SchemaInvariantError,
     SchemaRole,
     SensitivityClassification,
-    data_type_to_value_type,
-    having_leaves,
-    is_date_type,
-    is_numeric_type,
-    structural_data_type_key,
-    where_leaves,
+    TableKind,
 )
 from ._contracts_core import RuntimeIntent
 from ._contracts_schema import (
@@ -71,42 +70,39 @@ from ._contracts_schema import (
     SchemaLimits,
     TableDiff,
     TableMetadata,
-    set_schema_helpers,
 )
 from ._core_utils import (
-    ArtifactManifest,
     artifact_manifest_incompatible_with_package,
+    build_case_folded_index,
+    column_has_unknown_value_type,
+    column_metadata_timezone_awareness_mismatch,
     cte_join_reachability_tables,
+    data_type_to_value_type,
     debug,
     descriptions_hash_fp,
     effective_structural_hash_fp,
     intent_join_reachability_tables,
+    is_date_type,
+    is_numeric_type,
     manifest_matches_schema,
+    normalized_value_overlap_sets,
     notify,
     profiling_hash_fp,
+    profiling_value_overlap,
     read_artifact_manifest,
     read_gzip_json,
     scope_hash_fp,
     stable_json,
+    structural_data_type_key,
     structural_hash_fp,
     try_rename_migration_plan,
     write_artifact_manifest,
     write_gzip_json_atomic,
+    write_text_atomic,
 )
 from ._dialect import (
     Dialect,
-    engine_supports_anti_join,
-    engine_supports_array_contains,
-    engine_supports_collation,
-    engine_supports_median,
-    engine_supports_ordered_string_agg,
-    engine_supports_predicate_nesting,
-    engine_supports_semi_join,
-    engine_supports_stddev,
-    engine_supports_timestamptz_semantics,
-    engine_supports_unsigned_semantics,
-    engine_supports_variance,
-    engine_supports_window_frames,
+    DialectRegistry,
 )
 from ._intent_expr import extract_columns_from_expr
 from ._qsim import get_aggregatable_columns, get_groupable_columns
@@ -116,6 +112,10 @@ from ._schema_catalog import (
     assign_column_ops,
     collect_profiling_frequent_values,
     compute_semantic_profile_join_neighbors,
+)
+
+_schema_build_dialect_ctx: contextvars.ContextVar[Dialect | None] = contextvars.ContextVar(
+    "_schema_build_dialect_ctx", default=None
 )
 
 
@@ -150,6 +150,7 @@ def expanded_scope_sql_file(sql_file: str | None) -> str | None:
 
 def compute_dialect_probe(dialect: Dialect, schema_context: EngineContext) -> str:
     """Return the combined DDL probe: dialect ``information_schema`` digest XOR'd with the ``sql_file`` content digest. The combination is a SHA-256 over the two hex digests joined by ``|``. Returns ``""`` when the dialect probe itself is empty (so the caller falls back to fingerprint validation); otherwise always returns a non-empty digest, even when ``sql_file`` is absent. Note on collision risk: the joined-digest construction inherits SHA-256 collision resistance, but a hypothetical adversary who can simultaneously alter both the catalog DDL and the local ``sql_file`` in offsetting ways could in theory produce the same final digest. This is negligible in practice (no adversarial input is involved during cache validation), and the only consequence would be a false cache-hit that the downstream structural fingerprint check is expected to surface; documented here for future auditors."""
+    _schema_build_dialect_ctx.set(dialect)
     dialect_part = ""
     try:
         dialect_part = dialect.compute_ddl_probe(schema_context) or ""
@@ -326,13 +327,20 @@ def table_from_dict(d: dict[str, Any]) -> TableMetadata:
     """Deserialize a TableMetadata instance from a plain dictionary."""
     columns = {k: ColumnMetadata.from_dict(v) for k, v in d["columns"].items()}
     kind_raw = d.get("kind", "table")
-    kind: Literal["table", "view"] = "table" if kind_raw == "table" else "view"
+    if kind_raw == "materialized_view":
+        kind: TableKind = TableKind.MATERIALIZED_VIEW
+    elif kind_raw == "view":
+        kind = TableKind.VIEW
+    else:
+        kind = TableKind.TABLE
     return TableMetadata(
         name=d["name"],
         columns=columns,
         primary_key=d["primary_key"],
         foreign_keys=[FKEdge(**fk) for fk in d["foreign_keys"]],
         kind=kind,
+        view_definition=str(d.get("view_definition", "") or ""),
+        last_refreshed_at=(str(d.get("last_refreshed_at")).strip() if d.get("last_refreshed_at") else None),
         source_id=str(d.get("source_id", "") or ""),
         partition_columns=d.get("partition_columns", []),
         role=d.get("role"),
@@ -366,12 +374,12 @@ def load_pg_enum_values(engine: Any) -> dict[str, list[str]]:
 
 def _graph_tables_lower_index(tables: dict[str, TableMetadata]) -> dict[str, str]:
     """Map lowercased relation name to the graph's canonical table key."""
-    return {name.lower(): name for name in tables}
+    return build_case_folded_index(tables, kind="table")
 
 
 def _column_names_lower_index(columns: dict[str, ColumnMetadata]) -> dict[str, str]:
     """Map lowercased column name to the canonical column key."""
-    return {col.lower(): col for col in columns}
+    return build_case_folded_index(columns, kind="column")
 
 
 def _semantic_neighbor_edge_count(sg: SchemaGraph) -> int:
@@ -972,6 +980,8 @@ def classify_migration_tier(
     """Compare stored manifest fingerprints to the live schema graph."""
     if manifest is None:
         return MigrationTier.NO_CHANGE
+    if artifact_manifest_incompatible_with_package(manifest):
+        return MigrationTier.DESTRUCTIVE
     man_id = str(manifest.schema_graph_id or "")
     live_id = str(schema.schema_graph_id or "")
     if man_id and live_id and man_id == live_id and manifest_matches_schema(manifest, schema):
@@ -980,8 +990,6 @@ def classify_migration_tier(
         return MigrationTier.NO_CHANGE
     if manifest_matches_schema(manifest, schema):
         return MigrationTier.NO_CHANGE
-    if artifact_manifest_incompatible_with_package(manifest):
-        return MigrationTier.DESTRUCTIVE
     same_effective = manifest.effective_structural_hash == schema.effective_structural_hash
     if same_effective:
         if (manifest.notes_hash or "") != (schema.notes_hash or ""):
@@ -989,6 +997,10 @@ def classify_migration_tier(
         if (manifest.semantic_edges_hash or "") != (schema.semantic_edges_hash or ""):
             return MigrationTier.SOFT_REFRESH
         if manifest.profiling_hash != schema.profiling_hash:
+            if previous_schema is not None:
+                overlap = profiling_value_overlap(previous_schema, schema)
+                if overlap < MIGRATION_DATA_OVERLAP_MIN:
+                    return MigrationTier.DESTRUCTIVE
             return MigrationTier.SOFT_REFRESH
         return MigrationTier.SOFT_REFRESH
     resolved_diff: SchemaDiff | None = None
@@ -1343,10 +1355,10 @@ def raise_if_schema_unusable(
         if not tbl.columns:
             reasons.append(f"table {name} reflected with zero columns; likely a catalog misconfiguration")
             offending.append(name)
-        if schema_context.include == "tables" and tbl.kind != "table":
+        if schema_context.include == SchemaInclude.TABLES and tbl.kind != TableKind.TABLE:
             reasons.append(f"internal invariant: non-table relation in tables-only scope: {name}")
             offending.append(name)
-        if schema_context.include == "views" and tbl.kind != "view":
+        if schema_context.include == SchemaInclude.VIEWS and tbl.kind != TableKind.VIEW:
             reasons.append(f"internal invariant: non-view relation in views-only scope: {name}")
             offending.append(name)
     seen_lower: dict[str, str] = {}
@@ -1360,7 +1372,7 @@ def raise_if_schema_unusable(
     fk_ct = sum(len(x.foreign_keys) for x in sg.tables.values())
     sem_ct = _semantic_neighbor_edge_count(sg)
     if len(sg.tables) > 1 and not federation_composite:
-        if schema_context.include == "tables":
+        if schema_context.include == SchemaInclude.TABLES:
             if fk_ct + sem_ct == 0:
                 reasons.append(
                     "graph has multiple relations but no FK edges and no semantic join neighbors; "
@@ -1492,6 +1504,9 @@ def _column_profiling_dict(col: ColumnMetadata) -> dict[str, Any]:
         "role": col.role,
         "row_count": col.row_count,
         "value_overlap_sample": col.value_overlap_sample,
+        "collation": col.collation,
+        "is_case_insensitive_collation": col.is_case_insensitive_collation,
+        "overlap_comparison": col.overlap_comparison,
         "semantic_join_neighbors": [list(p) for p in col.semantic_join_neighbors],
         "sensitivity": col.sensitivity,
         "frequent_values": collect_profiling_frequent_values(col.frequent_values),
@@ -1569,10 +1584,27 @@ def tables_descriptions_payload(tables: dict[str, TableMetadata]) -> dict[str, A
     return out
 
 
-def _derive_deterministic_schema_graph_seed(effective_structural_hash: str) -> str:
-    """Return a deterministic 16-hex seed derived from a legacy effective structural hash."""
-    payload = (SCHEMA_GRAPH_ID_DETERMINISTIC_SEED_V1 + effective_structural_hash).encode()
-    return hashlib.sha256(payload).hexdigest()[:16]
+def table_structural_hash_fp(table: TableMetadata) -> str:
+    """Return the structural fingerprint for a single table object."""
+    return structural_hash_fp(tables_structural_payload({table.name: table}))
+
+
+def _derive_deterministic_schema_graph_seed(
+    effective_structural_hash: str,
+    scope_descriptor: dict[str, Any],
+    *,
+    artifact_format_version: int | str,
+) -> str:
+    """Return a deterministic 16-hex seed from structural, scope, and format inputs."""
+    payload = stable_json(
+        {
+            "seed": SCHEMA_GRAPH_ID_DETERMINISTIC_SEED_V1,
+            "effective_structural_hash": effective_structural_hash,
+            "scope_descriptor": scope_descriptor,
+            "artifact_format_version": artifact_format_version,
+        }
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
 def mint_schema_graph_id(*, seed_hex: str, structural_hash: str) -> str:
@@ -1580,9 +1612,22 @@ def mint_schema_graph_id(*, seed_hex: str, structural_hash: str) -> str:
     return f"{SCHEMA_GRAPH_ID_PREFIX}{seed_hex}__{structural_hash[:8]}"
 
 
-def derive_deterministic_schema_graph_id(effective_structural_hash: str, structural_hash: str) -> str:
-    """Build a stable schema-graph identity for upgrading legacy artifact directories."""
-    seed = _derive_deterministic_schema_graph_seed(effective_structural_hash)
+def derive_deterministic_schema_graph_id(
+    effective_structural_hash: str,
+    structural_hash: str,
+    *,
+    scope_descriptor: dict[str, Any] | None = None,
+    artifact_format_version: int | str | None = None,
+) -> str:
+    """Build a stable schema-graph identity from structural, scope, and format inputs."""
+    scope = scope_descriptor if scope_descriptor is not None else scope_descriptor_for(EngineContext())
+    seed = _derive_deterministic_schema_graph_seed(
+        effective_structural_hash,
+        scope,
+        artifact_format_version=artifact_format_version
+        if artifact_format_version is not None
+        else ARTIFACT_FORMAT_VERSION,
+    )
     return mint_schema_graph_id(seed_hex=seed, structural_hash=structural_hash)
 
 
@@ -1601,9 +1646,10 @@ def assign_schema_graph_hashes(
     schema_context: EngineContext | FederationContext,
     notes_sha256: str,
     *,
-    schema_role: SchemaRole = "owner",
+    schema_role: SchemaRole = SchemaRole.OWNER,
     pinned_schema_graph_id: str | None = None,
     federation_scope_hash: str | None = None,
+    dialect: Dialect | None = None,
 ) -> None:
     """Compute structural, profiling, scope, effective, notes, semantic- edge hashes and schema-graph identity on *sg* in place."""
     prior_structural = sg.structural_hash
@@ -1621,17 +1667,38 @@ def assign_schema_graph_hashes(
     sg.notes_hash = notes_sha256
     sg.semantic_edges_hash = semantic_edges_fingerprint(sg.tables)
     sg.scope_descriptor = scope_descriptor_for(schema_context)
+    scope_desc = sg.scope_descriptor if isinstance(sg.scope_descriptor, dict) else {}
     if schema_role == "consumer":
         pin = pinned_schema_graph_id or sg.schema_graph_id
         if not pin:
             raise ConfigError("Consumer role requires a pinned schema_graph_id from the owner snapshot artifacts.")
         sg.schema_graph_id = pin
         return
+    if federation_scope_hash is None:
+        active_dialect = dialect if dialect is not None else _schema_build_dialect_ctx.get()
+        if active_dialect is not None:
+            stamp_single_engine_capability_from_dialect(sg, active_dialect)
     if not sg.schema_graph_id:
-        sg.schema_graph_id = derive_deterministic_schema_graph_id(ef, st)
+        sg.schema_graph_id = derive_deterministic_schema_graph_id(ef, st, scope_descriptor=scope_desc)
         return
     if prior_structural and prior_structural != st:
-        sg.schema_graph_id = derive_deterministic_schema_graph_id(ef, st)
+        sg.schema_graph_id = derive_deterministic_schema_graph_id(ef, st, scope_descriptor=scope_desc)
+
+
+def stamp_single_engine_capability_from_dialect(sg: SchemaGraph, dialect: Dialect) -> None:
+    """Record the live dialect engine on a single-engine graph for capability gating."""
+    if sg._schema_literal_spans_multiple_sources():
+        return
+    membership = sg.federation_membership if isinstance(sg.federation_membership, dict) else {}
+    if membership.get("federation_id"):
+        return
+    engine = str(getattr(dialect, "name", "") or "").strip().lower()
+    if not engine:
+        return
+    payload = dict(membership)
+    payload["engine"] = engine
+    sg.federation_membership = payload
+    object.__setattr__(sg, "_database_feature_capability_cache", None)
 
 
 def consumer_graph_is_permission_subset(owner: SchemaGraph, consumer: SchemaGraph) -> bool:
@@ -1773,8 +1840,8 @@ def assert_intent_in_scope(
     if not _check_scope_block(
         intent_join_reachability_tables(intent),
         intent.select_cols,
-        where_leaves(intent.where),
-        having_leaves(intent.having),
+        PredicateGroup.where_leaves(intent.where),
+        PredicateGroup.having_leaves(intent.having),
         intent.order_by_cols,
         intent.group_by_cols,
         intent.window_registry,
@@ -1784,8 +1851,8 @@ def assert_intent_in_scope(
         if not _check_scope_block(
             cte_join_reachability_tables(cte),
             cte.select_cols,
-            where_leaves(cte.where),
-            having_leaves(cte.having),
+            PredicateGroup.where_leaves(cte.where),
+            PredicateGroup.having_leaves(cte.having),
             cte.order_by_cols,
             cte.group_by_cols,
             cte.window_registry,
@@ -1939,8 +2006,8 @@ def assert_consumer_intent_in_scope(
     if not _check_scope_block(
         intent_join_reachability_tables(intent),
         intent.select_cols,
-        where_leaves(intent.where),
-        having_leaves(intent.having),
+        PredicateGroup.where_leaves(intent.where),
+        PredicateGroup.having_leaves(intent.having),
         intent.order_by_cols,
         intent.group_by_cols,
         intent.window_registry,
@@ -1950,8 +2017,8 @@ def assert_consumer_intent_in_scope(
         if not _check_scope_block(
             cte_join_reachability_tables(cte),
             cte.select_cols,
-            where_leaves(cte.where),
-            having_leaves(cte.having),
+            PredicateGroup.where_leaves(cte.where),
+            PredicateGroup.having_leaves(cte.having),
             cte.order_by_cols,
             cte.group_by_cols,
             cte.window_registry,
@@ -1963,7 +2030,7 @@ def assert_consumer_intent_in_scope(
 def assert_consumer_sql_in_scope(
     sql: str,
     dialect: Any,
-    schema_context: EngineContext,
+    schema_context: EngineContext | FederationContext,
     schema_graph: SchemaGraph,
     visible_objects: frozenset[str] | None,
 ) -> bool:
@@ -2057,7 +2124,11 @@ def upgrade_artifacts_schema_graph_id(artifacts_dir: str) -> dict[str, int]:
         structural = eff
     if not eff:
         return counts
-    graph_id = derive_deterministic_schema_graph_id(eff, structural or eff)
+    graph_id = derive_deterministic_schema_graph_id(
+        eff,
+        structural or eff,
+        scope_descriptor=scope_descriptor_for(EngineContext()),
+    )
     if os.path.isfile(header_path):
         try:
             header = read_gzip_json(header_path)
@@ -2119,8 +2190,7 @@ def upgrade_artifacts_schema_graph_id(artifacts_dir: str) -> dict[str, int]:
                 new_lines.append(json.dumps(doc, separators=(",", ":"), ensure_ascii=False))
                 counts["queue_lines"] += 1
         if new_lines:
-            with open(queue_path, "w", encoding="utf-8") as fh:
-                fh.write("\n".join(new_lines) + "\n")
+            write_text_atomic(queue_path, "\n".join(new_lines) + "\n", suffix=".jsonl.tmp")
     safe_id = graph_id.replace("__", "_")
     for old_path in glob.glob(os.path.join(artifacts_dir, "**", f"lattice_{eff}_*.json"), recursive=True):
         base = os.path.basename(old_path)
@@ -2274,35 +2344,39 @@ def compute_join_paths_multi_from_adj(
             if t not in dist:
                 row[t] = []
                 continue
-            paths_edges: list[list[FKEdge]] = []
+            seen_keys: set[str] = set()
+            out_paths: list[list[dict[str, Any]]] = []
+            overflow_count: list[int | None] = [None]
 
             def collect_paths(
                 node: str,
                 stack: list[FKEdge],
-                _paths_edges: list[list[FKEdge]] = paths_edges,
                 _preds: dict[str, list[tuple[str, FKEdge]]] = preds,
                 _target: str = s,
+                _overflow_count: list[int | None] = overflow_count,
+                _seen_keys: set[str] = seen_keys,
+                _out_paths: list[list[dict[str, Any]]] = out_paths,
             ) -> None:
                 """Depth-first FK-path enumeration for one source/target pair."""
+                if _overflow_count[0] is not None:
+                    return
                 if node == _target:
-                    _paths_edges.append(list(reversed(stack)))
+                    sp = [asdict(ed) for ed in reversed(stack)]
+                    norm = _normalize_fk_path(sp)
+                    key = stable_json(norm)
+                    if key in _seen_keys:
+                        return
+                    _seen_keys.add(key)
+                    _out_paths.append(norm)
+                    if len(_out_paths) > refusal_ceiling:
+                        _overflow_count[0] = len(_out_paths)
                     return
                 for pr, ed in _preds.get(node, ()):
                     collect_paths(pr, stack + [ed])
 
             collect_paths(t, [])
-            seen_keys: set[str] = set()
-            out_paths: list[list[dict[str, Any]]] = []
-            for pedges in paths_edges:
-                sp = [asdict(ed) for ed in pedges]
-                norm = _normalize_fk_path(sp)
-                key = stable_json(norm)
-                if key in seen_keys:
-                    continue
-                seen_keys.add(key)
-                out_paths.append(norm)
-            if len(out_paths) > refusal_ceiling:
-                row[t] = _tie_overflow_marker(len(out_paths))
+            if overflow_count[0] is not None:
+                row[t] = _tie_overflow_marker(overflow_count[0])
             else:
                 row[t] = out_paths
         join_paths_multi[s] = row
@@ -2415,8 +2489,14 @@ def fk_name_shape_matches_table(col_lower: str, dst_table_lower: str) -> bool:
 
 def fk_infer_value_types_compatible(src: ColumnMetadata, dst_col: ColumnMetadata | None) -> bool:
     """Return True when profiling types are absent or compatible for inferred FK endpoints."""
+    if column_has_unknown_value_type(src):
+        return False
+    if dst_col is not None and column_has_unknown_value_type(dst_col):
+        return False
     if dst_col is None:
         return True
+    if column_metadata_timezone_awareness_mismatch(src, dst_col):
+        return False
     st = (src.value_type or "").strip()
     dt = (dst_col.value_type or "").strip()
     if not st or not dt:
@@ -2446,20 +2526,19 @@ def _fk_string_int_compatible(a: ColumnMetadata, b: ColumnMetadata) -> bool:
     return all(str(v).strip().lstrip("-").isdigit() for v in samples if v is not None and str(v).strip() != "")
 
 
-def _fk_overlap_sample_norm_set(col: ColumnMetadata) -> set[str]:
+def _fk_overlap_sample_norm_set(col: ColumnMetadata, *, case_fold: bool = False) -> set[str]:
     out: set[str] = set()
     for v in col.value_overlap_sample or []:
         s = str(v).strip()
         if s == "":
             continue
-        out.add(s)
+        out.add(s.casefold() if case_fold else s)
     return out
 
 
 def fk_overlap_validates(src: ColumnMetadata, dst: ColumnMetadata) -> bool:
-    """Return True when sampled values overlap enough to support an inferred FK. Compares ``value_overlap_sample`` from both sides after normalizing via ``str()`` and stripping. When either side has fewer than ``PolicyConfig.FK_INFER_OVERLAP_MIN_SAMPLE`` non-empty samples the helper returns False (insufficient evidence to accept). Otherwise the overlap ratio is computed against the smaller sample set, and the candidate is accepted when the ratio is at least ``PolicyConfig.FK_INFER_OVERLAP_MIN_RATIO``. The helper is symmetric and treats integer / digit-string pairs as equal after string normalization so it cooperates with ``_fk_string_int_compatible``."""
-    a_set = _fk_overlap_sample_norm_set(src)
-    b_set = _fk_overlap_sample_norm_set(dst)
+    """Return True when sampled values overlap enough to support an inferred FK. Compares ``value_overlap_sample`` from both sides after normalizing via ``str()`` and stripping. When either side has fewer than ``PolicyConfig.FK_INFER_OVERLAP_MIN_SAMPLE`` non-empty samples the helper returns False (insufficient evidence to accept). Otherwise the overlap ratio is computed against the smaller sample set, and the candidate is accepted when the ratio is at least ``PolicyConfig.FK_INFER_OVERLAP_MIN_RATIO``. The helper is symmetric and treats integer / digit-string pairs as equal after string normalization so it cooperates with ``_fk_string_int_compatible``. When either column uses a case-insensitive collation, samples are compared case-folded and ``overlap_comparison`` is recorded as ``case_folded``."""
+    a_set, b_set, _ = normalized_value_overlap_sets(src, dst)
     min_sample = int(PolicyConfig.FK_INFER_OVERLAP_MIN_SAMPLE)
     if len(a_set) < min_sample or len(b_set) < min_sample:
         return False
@@ -2471,8 +2550,7 @@ def fk_overlap_validates(src: ColumnMetadata, dst: ColumnMetadata) -> bool:
 
 def _fk_containment_validates(child: ColumnMetadata, parent: ColumnMetadata) -> bool:
     """Return True when the child sample is sufficiently contained in the parent sample. Directional FK semantics require child values to appear in the parent key domain. ASC-ordered LIMIT-N samples are not guaranteed to be subsets, so acceptance uses ``|child ∩ parent| / |child|`` against ``PolicyConfig.FK_INFER_CONTAINMENT_MIN_RATIO``. When either side has fewer than ``PolicyConfig.FK_INFER_OVERLAP_MIN_SAMPLE`` non-empty samples the helper returns False (insufficient evidence to accept)."""
-    child_set = _fk_overlap_sample_norm_set(child)
-    parent_set = _fk_overlap_sample_norm_set(parent)
+    child_set, parent_set, _ = normalized_value_overlap_sets(child, parent)
     min_sample = int(PolicyConfig.FK_INFER_OVERLAP_MIN_SAMPLE)
     if len(child_set) < min_sample or len(parent_set) < min_sample:
         return False
@@ -2551,7 +2629,7 @@ def refuse_incompatible_catalog_foreign_keys(sg: SchemaGraph) -> None:
 
 def _pk_null_gate_passes(col: ColumnMetadata) -> bool:
     """Return True when a column satisfies the not-null gate for PK inference."""
-    if col.null_ratio > 0.0:
+    if col.null_ratio is not None and col.null_ratio > 0.0:
         return False
     if col.is_nullable:
         return False
@@ -2580,13 +2658,39 @@ def _statistical_pk_unique(
     return col.distinct_count is not None and rc > 0 and col.distinct_count == rc and rc >= min_rows
 
 
-def _apply_inferred_pk_columns(table: TableMetadata, col_names: list[str]) -> None:
-    """Stamp profile-inferred PK membership on *table* for *col_names*."""
+def _apply_inferred_pk_columns(
+    table: TableMetadata, col_names: list[str], *, tag: PkInferenceTag = PkInferenceTag.PROFILE
+) -> None:
+    """Stamp inferred PK membership on *table* for *col_names* with provenance *tag*."""
     for col_name in col_names:
         col_meta = table.columns[col_name]
-        col_meta.pk_inference_tag = PkInferenceTag.PROFILE
+        col_meta.pk_inference_tag = tag
         if col_name not in table.primary_key:
             table.primary_key.append(col_name)
+
+
+def _try_infer_pk_from_profile_pools(
+    table_name: str,
+    table: TableMetadata,
+    tier1: list[str],
+    tier2: list[str],
+    not_null_cols: list[str],
+    *,
+    dialect: Any | None,
+    min_rows: int,
+) -> list[str] | None:
+    """Pick single- or composite-column PK candidates from pre- partitioned profiling pools."""
+    if tier1:
+        chosen = _select_inferred_pk_candidate(table_name, tier1)
+        if chosen is not None:
+            return [chosen]
+    if tier2:
+        chosen = _select_inferred_pk_candidate(table_name, tier2)
+        if chosen is not None:
+            return [chosen]
+    if not_null_cols:
+        return _infer_composite_pk_from_profile(table_name, table, not_null_cols, dialect=dialect, min_rows=min_rows)
+    return None
 
 
 def _infer_composite_pk_from_profile(
@@ -2629,6 +2733,9 @@ def infer_missing_pks_from_profile(
         tier1: list[str] = []
         tier2: list[str] = []
         not_null_cols: list[str] = []
+        identity_tier1: list[str] = []
+        identity_tier2: list[str] = []
+        identity_not_null_cols: list[str] = []
         for col_name, col in table.columns.items():
             if (table_name, col_name) in blocked:
                 continue
@@ -2637,34 +2744,51 @@ def infer_missing_pks_from_profile(
             vt = (col.value_type or "").strip().lower()
             if vt and vt not in INFERRED_PK_VALUE_TYPES:
                 continue
-            not_null_cols.append(col_name)
+            is_identity = bool(col.is_identity)
+            if is_identity:
+                identity_not_null_cols.append(col_name)
+            else:
+                not_null_cols.append(col_name)
             if col.is_unique:
-                tier1.append(col_name)
+                if is_identity:
+                    identity_tier1.append(col_name)
+                else:
+                    tier1.append(col_name)
                 continue
             if _statistical_pk_unique(table_name, table, col_name, col, dialect=dialect, min_rows=min_rows):
-                tier2.append(col_name)
-        chosen_cols: list[str] | None = None
-        if tier1:
-            chosen = _select_inferred_pk_candidate(table_name, tier1)
-            if chosen is not None:
-                chosen_cols = [chosen]
-        elif tier2:
-            chosen = _select_inferred_pk_candidate(table_name, tier2)
-            if chosen is not None:
-                chosen_cols = [chosen]
-        elif not_null_cols:
-            composite = _infer_composite_pk_from_profile(
-                table_name, table, not_null_cols, dialect=dialect, min_rows=min_rows
+                if is_identity:
+                    identity_tier2.append(col_name)
+                else:
+                    tier2.append(col_name)
+        chosen_cols = _try_infer_pk_from_profile_pools(
+            table_name,
+            table,
+            tier1,
+            tier2,
+            not_null_cols,
+            dialect=dialect,
+            min_rows=min_rows,
+        )
+        pk_tag = PkInferenceTag.PROFILE
+        if chosen_cols is None:
+            chosen_cols = _try_infer_pk_from_profile_pools(
+                table_name,
+                table,
+                identity_tier1,
+                identity_tier2,
+                identity_not_null_cols,
+                dialect=dialect,
+                min_rows=min_rows,
             )
-            if composite:
-                chosen_cols = composite
+            if chosen_cols is not None:
+                pk_tag = PkInferenceTag.IDENTITY
         if chosen_cols:
-            _apply_inferred_pk_columns(table, chosen_cols)
+            _apply_inferred_pk_columns(table, chosen_cols, tag=pk_tag)
             for col_name in chosen_cols:
                 debug(f"[schema.infer_missing_pks] inferred PK {table_name}.{col_name}")
                 inferred.append((table_name, col_name))
         else:
-            if not_null_cols:
+            if not_null_cols or identity_not_null_cols:
                 notify(
                     f"No primary key could be inferred for table {table_name!r}; declare one via schema overrides.",
                     stage="schema",
@@ -2703,9 +2827,51 @@ def _select_inferred_pk_candidate(table_name: str, candidates: list[str]) -> str
     return sorted_candidates[0]
 
 
-def catalog_fk_union_find(sg: SchemaGraph) -> _FkUnionFind:
+def _new_fk_union_find() -> Any:
+    """Return a disjoint-set union for table names (FK graph connectivity)."""
+
+    class _FkUnionFind:
+        __slots__ = ("_parent", "_rank")
+
+        def __init__(self) -> None:
+            self._parent: dict[str, str] = {}
+            self._rank: dict[str, int] = {}
+
+        def make_set(self, x: str) -> None:
+            if x not in self._parent:
+                self._parent[x] = x
+                self._rank[x] = 0
+
+        def find(self, x: str) -> str:
+            if x not in self._parent:
+                self.make_set(x)
+            root = x
+            while self._parent[root] != root:
+                root = self._parent[root]
+            while x != root:
+                px = self._parent[x]
+                self._parent[x] = root
+                x = px
+            return root
+
+        def union(self, a: str, b: str) -> None:
+            ra, rb = self.find(a), self.find(b)
+            if ra == rb:
+                return
+            if self._rank[ra] < self._rank[rb]:
+                self._parent[ra] = rb
+            elif self._rank[ra] > self._rank[rb]:
+                self._parent[rb] = ra
+            else:
+                self._parent[rb] = ra
+                self._rank[ra] += 1
+
+    return _FkUnionFind()
+
+
+def catalog_fk_union_find(sg: SchemaGraph) -> Any:
     """Connect tables using only catalog-declared FK edges."""
-    uf = _FkUnionFind()
+    uf = _new_fk_union_find()
     for t in sg.tables:
         uf.make_set(t)
     for tbl_name, tbl in sg.tables.items():
@@ -2761,6 +2927,8 @@ def bridge_disjoint_graph_by_value_overlap(
         tbl = sg.tables[tname]
         for cname in sorted(tbl.columns):
             cmeta = tbl.columns[cname]
+            if column_has_unknown_value_type(cmeta):
+                continue
             if cmeta.value_overlap_sample:
                 cols.append((tname, cname, cmeta))
     for i, (t1, c1, m1) in enumerate(cols):
@@ -2784,6 +2952,10 @@ def bridge_disjoint_graph_by_value_overlap(
             elif left_is_pk and right_is_pk:
                 src_tbl, src_col, dst_tbl, dst_col = t1, c1, t2, c2
             else:
+                left_vt = (m1.value_type or "").strip().lower()
+                right_vt = (m2.value_type or "").strip().lower()
+                if left_vt != "string" or right_vt != "string":
+                    continue
                 m1.semantic_join_neighbors = sorted(
                     set(m1.semantic_join_neighbors) | {(t2, c2)}, key=lambda p: (p[0], p[1])
                 )
@@ -2859,48 +3031,9 @@ def _apply_inferred_fks_to_graph(sg: SchemaGraph, edges: list[FKEdge]) -> int:
     return added
 
 
-class _FkUnionFind:
-    """Disjoint-set union for table names (FK graph connectivity)."""
-
-    __slots__ = ("_parent", "_rank")
-
-    def __init__(self) -> None:
-        self._parent: dict[str, str] = {}
-        self._rank: dict[str, int] = {}
-
-    def make_set(self, x: str) -> None:
-        if x not in self._parent:
-            self._parent[x] = x
-            self._rank[x] = 0
-
-    def find(self, x: str) -> str:
-        if x not in self._parent:
-            self.make_set(x)
-        root = x
-        while self._parent[root] != root:
-            root = self._parent[root]
-        while x != root:
-            px = self._parent[x]
-            self._parent[x] = root
-            x = px
-        return root
-
-    def union(self, a: str, b: str) -> None:
-        ra, rb = self.find(a), self.find(b)
-        if ra == rb:
-            return
-        if self._rank[ra] < self._rank[rb]:
-            self._parent[ra] = rb
-        elif self._rank[ra] > self._rank[rb]:
-            self._parent[rb] = ra
-        else:
-            self._parent[rb] = ra
-            self._rank[ra] += 1
-
-
-def _union_find_with_tag_filter(sg: SchemaGraph, exclude_tags: frozenset[InferenceTag]) -> _FkUnionFind:
+def _union_find_with_tag_filter(sg: SchemaGraph, exclude_tags: frozenset[InferenceTag]) -> Any:
     """Connect tables using FK edges whose inference_tag is not in *exclude_tags* (catalog edges always union)."""
-    uf = _FkUnionFind()
+    uf = _new_fk_union_find()
     for t in sg.tables:
         uf.make_set(t)
     for tbl_name, tbl in sg.tables.items():
@@ -2914,9 +3047,9 @@ def _union_find_with_tag_filter(sg: SchemaGraph, exclude_tags: frozenset[Inferen
     return uf
 
 
-def _union_find_truth_fk_edges(sg: SchemaGraph) -> _FkUnionFind:
+def _union_find_truth_fk_edges(sg: SchemaGraph) -> Any:
     """Tables connected by catalog FKs plus user-declared structural/semantic override FK edges."""
-    uf = _FkUnionFind()
+    uf = _new_fk_union_find()
     for t in sg.tables:
         uf.make_set(t)
     for tbl_name, tbl in sg.tables.items():
@@ -3175,7 +3308,7 @@ def _infer_missing_fks_suffix(
     inferred: list[FKEdge] = []
     for table_name, table in sorted(tables.items(), key=lambda item: item[0].lower()):
         for col_name, col in sorted(table.columns.items(), key=lambda item: item[0].lower()):
-            if col.is_foreign_key or col.is_primary_key:
+            if col.is_foreign_key or col.is_primary_key or col.is_generated or column_has_unknown_value_type(col):
                 continue
             col_lower = col_name.lower()
             matched_suffix = fk_match_suffix_stem(col_lower)
@@ -3338,84 +3471,84 @@ def _graph_engine_from_membership(sg: SchemaGraph) -> str:
 def _graph_supports_median(sg: SchemaGraph) -> bool:
     engine = _graph_engine_from_membership(sg)
     if engine:
-        return engine_supports_median(engine)
+        return DialectRegistry.engine_supports_median(engine)
     return True
 
 
 def _graph_supports_ordered_string_agg(sg: SchemaGraph) -> bool:
     engine = _graph_engine_from_membership(sg)
     if engine:
-        return engine_supports_ordered_string_agg(engine)
+        return DialectRegistry.engine_supports_ordered_string_agg(engine)
     return True
 
 
 def _graph_supports_semi_join(sg: SchemaGraph) -> bool:
     engine = _graph_engine_from_membership(sg)
     if engine:
-        return engine_supports_semi_join(engine)
+        return DialectRegistry.engine_supports_semi_join(engine)
     return True
 
 
 def _graph_supports_anti_join(sg: SchemaGraph) -> bool:
     engine = _graph_engine_from_membership(sg)
     if engine:
-        return engine_supports_anti_join(engine)
+        return DialectRegistry.engine_supports_anti_join(engine)
     return True
 
 
 def _graph_supports_predicate_nesting(sg: SchemaGraph) -> bool:
     engine = _graph_engine_from_membership(sg)
     if engine:
-        return engine_supports_predicate_nesting(engine)
+        return DialectRegistry.engine_supports_predicate_nesting(engine)
     return True
 
 
 def _graph_supports_stddev(sg: SchemaGraph) -> bool:
     engine = _graph_engine_from_membership(sg)
     if engine:
-        return engine_supports_stddev(engine)
+        return DialectRegistry.engine_supports_stddev(engine)
     return True
 
 
 def _graph_supports_variance(sg: SchemaGraph) -> bool:
     engine = _graph_engine_from_membership(sg)
     if engine:
-        return engine_supports_variance(engine)
+        return DialectRegistry.engine_supports_variance(engine)
     return True
 
 
 def _graph_supports_window_frames(sg: SchemaGraph) -> bool:
     engine = _graph_engine_from_membership(sg)
     if engine:
-        return engine_supports_window_frames(engine)
+        return DialectRegistry.engine_supports_window_frames(engine)
     return True
 
 
 def _graph_supports_array_contains(sg: SchemaGraph) -> bool:
     engine = _graph_engine_from_membership(sg)
     if engine:
-        return engine_supports_array_contains(engine)
+        return DialectRegistry.engine_supports_array_contains(engine)
     return True
 
 
 def _graph_supports_collation(sg: SchemaGraph) -> bool:
     engine = _graph_engine_from_membership(sg)
     if engine:
-        return engine_supports_collation(engine)
+        return DialectRegistry.engine_supports_collation(engine)
     return True
 
 
 def _graph_supports_unsigned_semantics(sg: SchemaGraph) -> bool:
     engine = _graph_engine_from_membership(sg)
     if engine:
-        return engine_supports_unsigned_semantics(engine)
+        return DialectRegistry.engine_supports_unsigned_semantics(engine)
     return True
 
 
 def _graph_supports_timestamptz_semantics(sg: SchemaGraph) -> bool:
     engine = _graph_engine_from_membership(sg)
     if engine:
-        return engine_supports_timestamptz_semantics(engine)
+        return DialectRegistry.engine_supports_timestamptz_semantics(engine)
     return True
 
 
@@ -3506,7 +3639,7 @@ def _infer_missing_fks_same_name(
     by_lower: dict[str, list[tuple[str, str, ColumnMetadata]]] = {}
     for tname, tbl in sorted(tables.items(), key=lambda item: item[0].lower()):
         for cname, col in sorted(tbl.columns.items(), key=lambda item: item[0].lower()):
-            if col.is_foreign_key or col.is_primary_key:
+            if col.is_foreign_key or col.is_primary_key or col.is_generated or column_has_unknown_value_type(col):
                 continue
             by_lower.setdefault(cname.lower(), []).append((tname, cname, col))
     for entries in sorted(by_lower.values(), key=lambda items: (items[0][0].lower(), items[0][1].lower())):
@@ -3570,7 +3703,7 @@ def _infer_missing_fks_composite(
             pk = dst_tbl.primary_key
             if len(pk) < 2:
                 continue
-            src_cols_lower = {c.lower(): c for c in src_tbl.columns.keys()}
+            src_cols_lower = build_case_folded_index(src_tbl.columns, kind="column")
             mapped: list[tuple[str, str]] = []
             ok = True
             for pk_col in pk:
@@ -3580,7 +3713,11 @@ def _infer_missing_fks_composite(
                     break
                 src_real = src_cols_lower[pkl]
                 src_col_meta = src_tbl.columns[src_real]
-                if src_col_meta.is_foreign_key:
+                if (
+                    src_col_meta.is_foreign_key
+                    or src_col_meta.is_generated
+                    or column_has_unknown_value_type(src_col_meta)
+                ):
                     ok = False
                     break
                 if (src_name, src_real.lower()) in existing_src_cols:
@@ -3590,7 +3727,7 @@ def _infer_missing_fks_composite(
                 if not fk_infer_value_types_compatible(src_col_meta, dst_col_meta):
                     ok = False
                     break
-                if not fk_overlap_validates(src_col_meta, dst_col_meta):
+                if dst_col_meta is None or not fk_overlap_validates(src_col_meta, dst_col_meta):
                     ok = False
                     break
                 mapped.append((src_real, pk_col))
@@ -3677,4 +3814,4 @@ def infer_missing_fks(
     return [e for e in candidates if (e.src_table, tuple(e.src_cols), e.dst_table, tuple(e.dst_cols)) not in blocked]
 
 
-set_schema_helpers(compute_schema_stats, compute_database_feature_capability)
+SchemaGraph.configure_default_helpers(compute_schema_stats, compute_database_feature_capability)

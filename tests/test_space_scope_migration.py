@@ -10,16 +10,9 @@ from aetherdialect._constants import AETHERSPACE_ARTIFACT_VERSION
 from aetherdialect._contracts_base import EngineContext, SpaceContext
 from aetherdialect._contracts_core import NormalizedExpr, RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaDiff, SchemaGraph, TableDiff, TableMetadata
-from aetherdialect._main_execution import (
-    apply_structural_migration_to_aetherspace_snapshots,
-    load_aetherspace_snapshot,
-    save_aetherspace_snapshot,
-    space_allowed_sets_from_snapshot,
-    space_deny_sets_from_snapshot,
-    subset_graph_for_space,
-)
+from aetherdialect._main_execution import MainExecutionOps
 from aetherdialect._schema_graph import assert_consumer_sql_in_scope, assert_intent_in_scope
-from aetherdialect._templates import apply_structural_migration_from_schema_diff
+from aetherdialect._templates import TemplateOps
 
 
 def _column(name: str, *, data_type: str = "integer") -> ColumnMetadata:
@@ -43,7 +36,7 @@ def _two_table_schema() -> SchemaGraph:
 
 
 def _deny_only_snapshot(schema: SchemaGraph) -> dict[str, object]:
-    return subset_graph_for_space(schema, SpaceContext(deny_objects=frozenset({"secret"})))
+    return MainExecutionOps.subset_graph_for_space(schema, SpaceContext(deny_objects=frozenset({"secret"})))
 
 
 def _secret_table_intent() -> RuntimeIntent:
@@ -69,8 +62,8 @@ def test_deny_only_space_snapshot_leaves_tables_empty() -> None:
 def test_deny_only_space_intent_gate_rejects_denied_table() -> None:
     schema = _two_table_schema()
     snap = _deny_only_snapshot(schema)
-    tables, columns = space_allowed_sets_from_snapshot(snap)
-    deny_objects, _ = space_deny_sets_from_snapshot(snap)
+    tables, columns = MainExecutionOps.space_allowed_sets_from_snapshot(snap)
+    deny_objects, _ = MainExecutionOps.space_deny_sets_from_snapshot(snap)
     intent = _secret_table_intent()
     gate_ran = bool(tables or columns or deny_objects)
     assert gate_ran
@@ -82,8 +75,8 @@ def test_deny_only_space_intent_gate_rejects_denied_table() -> None:
 def test_deny_only_space_sql_scope_rejects_denied_table() -> None:
     schema = _two_table_schema()
     snap = _deny_only_snapshot(schema)
-    tables, _ = space_allowed_sets_from_snapshot(snap)
-    deny_objects, _ = space_deny_sets_from_snapshot(snap)
+    tables, _ = MainExecutionOps.space_allowed_sets_from_snapshot(snap)
+    deny_objects, _ = MainExecutionOps.space_deny_sets_from_snapshot(snap)
     sql = "SELECT id FROM secret"
     ctx = EngineContext(deny_objects=deny_objects)
     dialect = MagicMock()
@@ -117,16 +110,16 @@ def _base_snapshot(**overrides: object) -> dict[str, object]:
 @pytest.mark.fast
 def test_space_migration_remaps_deny_objects_on_table_rename(tmp_path) -> None:
     engine_dir = str(tmp_path)
-    save_aetherspace_snapshot(
+    MainExecutionOps.save_aetherspace_snapshot(
         engine_dir,
         "deny_rename",
         _base_snapshot(deny_objects=["secret"]),
     )
-    apply_structural_migration_to_aetherspace_snapshots(
+    MainExecutionOps.apply_structural_migration_to_aetherspace_snapshots(
         engine_dir,
         table_renames=(("secret", "classified"),),
     )
-    loaded = load_aetherspace_snapshot(engine_dir, "deny_rename")
+    loaded = MainExecutionOps.load_aetherspace_snapshot(engine_dir, "deny_rename")
     assert loaded is not None
     assert loaded["deny_objects"] == ["classified"]
     assert "secret" not in loaded["deny_objects"]
@@ -135,7 +128,7 @@ def test_space_migration_remaps_deny_objects_on_table_rename(tmp_path) -> None:
 @pytest.mark.fast
 def test_space_migration_remaps_deny_columns_on_column_rename(tmp_path) -> None:
     engine_dir = str(tmp_path)
-    save_aetherspace_snapshot(
+    MainExecutionOps.save_aetherspace_snapshot(
         engine_dir,
         "deny_col_rename",
         _base_snapshot(
@@ -144,11 +137,11 @@ def test_space_migration_remaps_deny_columns_on_column_rename(tmp_path) -> None:
             deny_columns=["secret.id"],
         ),
     )
-    apply_structural_migration_to_aetherspace_snapshots(
+    MainExecutionOps.apply_structural_migration_to_aetherspace_snapshots(
         engine_dir,
         column_renames=(("secret", "id", "identifier"),),
     )
-    loaded = load_aetherspace_snapshot(engine_dir, "deny_col_rename")
+    loaded = MainExecutionOps.load_aetherspace_snapshot(engine_dir, "deny_col_rename")
     assert loaded is not None
     assert loaded["deny_columns"] == ["secret.identifier"]
     assert "secret.id" not in loaded["deny_columns"]
@@ -157,7 +150,7 @@ def test_space_migration_remaps_deny_columns_on_column_rename(tmp_path) -> None:
 @pytest.mark.fast
 def test_retype_schema_diff_updates_space_column_meta(tmp_path) -> None:
     engine_dir = str(tmp_path)
-    save_aetherspace_snapshot(
+    MainExecutionOps.save_aetherspace_snapshot(
         engine_dir,
         "retype_space",
         _base_snapshot(
@@ -174,8 +167,8 @@ def test_retype_schema_diff_updates_space_column_meta(tmp_path) -> None:
             )
         }
     )
-    apply_structural_migration_from_schema_diff(engine_dir, schema_diff)
-    loaded = load_aetherspace_snapshot(engine_dir, "retype_space")
+    TemplateOps.apply_structural_migration_from_schema_diff(engine_dir, schema_diff)
+    loaded = MainExecutionOps.load_aetherspace_snapshot(engine_dir, "retype_space")
     assert loaded is not None
     meta = loaded["column_meta"]["orders.amount"]
     assert meta.get("value_type") == "varchar"

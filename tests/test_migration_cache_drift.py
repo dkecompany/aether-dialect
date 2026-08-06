@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -10,21 +9,27 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from aetherdialect import AetherFederation, _main_execution
-from aetherdialect._constants import FEDERATION_MIGRATION_MAP_FILENAME
+from aetherdialect._constants import FEDERATION_MIGRATION_MAP_FILENAME, MIGRATION_MAP_ACTION_REMAP
 from aetherdialect._contracts_base import (
+    EngineContext,
     FederationContext,
     LLMConfig,
     MigrationPendingError,
     RuntimeConfig,
+    SchemaMigrationMap,
+    SchemaMigrationMapEntry,
 )
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import load_runtime_config
+from aetherdialect._core_utils import load_runtime_config, write_artifact_manifest
 from aetherdialect._federation import (
     compute_federation_storage_dir,
     federation_artifact_paths,
     load_federation_composite_graph,
 )
+from aetherdialect._main_execution import MainExecutionOps
 from aetherdialect._schema_graph import recompute_join_paths_multi
+from aetherdialect._schema_overrides import save_schema_to_cache
+from aetherdialect._templates import TemplateOps
 from tests.federation_helpers import write_federation_declaration_file
 
 
@@ -124,17 +129,116 @@ def _bootstrap_federation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tu
 
 
 @pytest.mark.fast
-def test_post_map_rebuild_passes_force_live_schema_reflect() -> None:
-    source = inspect.getsource(_main_execution.initialize_aether_engine)
-    apply_idx = source.index("apply_schema_migration_map(")
-    rebuild_idx = source.index("build_schema_graph_with_diff(", apply_idx)
-    rebuild_block = source[rebuild_idx : rebuild_idx + 500]
-    assert "force_live_schema_reflect=True" in rebuild_block
+def test_post_map_rebuild_bypasses_schema_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def _col(name: str, *, pk: bool = False) -> ColumnMetadata:
+        return ColumnMetadata(name=name, data_type="integer", is_primary_key=pk)
+
+    def _table(name: str) -> TableMetadata:
+        return TableMetadata(
+            name=name,
+            columns={"id": _col("id", pk=True), "name": _col("name")},
+            primary_key=["id"],
+            foreign_keys=[],
+        )
+
+    owner_tables = {"items": _table("items")}
+    owner = SchemaGraph(
+        tables=owner_tables,
+        join_paths_multi=recompute_join_paths_multi(owner_tables),
+        schema_graph_id="sg_post_map_cache",
+        structural_hash="owner_struct",
+        profiling_hash="profile_1",
+        scope_hash="scope_1",
+        effective_structural_hash="owner_eff",
+    )
+    live_tables = {"products": _table("products")}
+    live = SchemaGraph(
+        tables=live_tables,
+        join_paths_multi=recompute_join_paths_multi(live_tables),
+        schema_graph_id="sg_post_map_cache",
+        structural_hash="live_struct",
+        profiling_hash="profile_1",
+        scope_hash="scope_1",
+        effective_structural_hash="live_eff",
+    )
+    artifacts_dir = str(tmp_path)
+    schema_path = tmp_path / "schema_graph.json.gz"
+    save_schema_to_cache(owner, str(schema_path))
+    write_artifact_manifest(
+        artifacts_dir,
+        structural_hash=owner.structural_hash,
+        profiling_hash=owner.profiling_hash,
+        scope_hash=owner.scope_hash,
+        effective_structural_hash=owner.effective_structural_hash,
+        schema_graph_id=owner.schema_graph_id,
+    )
+    MainExecutionOps.write_schema_context_cache(artifacts_dir, EngineContext())
+    map_obj = SchemaMigrationMap(
+        version=1,
+        action=MIGRATION_MAP_ACTION_REMAP,
+        table_renames=(SchemaMigrationMapEntry(entry_type="table", from_name="items", to_name="products"),),
+        column_renames=(),
+        dropped_tables=(),
+        dropped_columns=(),
+        added_tables=(),
+        added_columns=(),
+    )
+    (tmp_path / "schema_migration_map.json").write_text(
+        json.dumps(
+            {
+                "version": map_obj.version,
+                "action": map_obj.action,
+                "table_renames": [{"entry_type": "table", "from_name": "items", "to_name": "products"}],
+                "column_renames": [],
+                "dropped_tables": [],
+                "dropped_columns": [],
+                "added_tables": [],
+                "added_columns": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    rebuild_calls: list[bool] = []
+
+    def _build_graph(*_args, **kwargs):
+        rebuild_calls.append(bool(kwargs.get("force_live_schema_reflect")))
+        from aetherdialect._schema_graph import diff_schemas
+
+        return live, diff_schemas(owner, live)
+
+    monkeypatch.setenv("AETHERDIALECT_ENGINE", "duckdb")
+    monkeypatch.setenv("DUCKDB_DATABASE", ":memory:")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+
+    with (
+        patch("aetherdialect._main_execution.MainExecutionOps.compute_engine_storage_dir", return_value=artifacts_dir),
+        patch("aetherdialect._main_execution.DialectRegistry.get", return_value=MagicMock()),
+        patch("aetherdialect._main_execution.build_schema_graph_with_diff", side_effect=_build_graph),
+        patch("aetherdialect._templates.TemplateOps.load_template_store", return_value=MagicMock()),
+        patch("aetherdialect._templates.TemplateOps.store_to_templates", return_value={}),
+        patch(
+            "aetherdialect._templates.TemplateOps.apply_schema_migration_map",
+            wraps=TemplateOps.apply_schema_migration_map,
+        ),
+    ):
+        with pytest.raises(MigrationPendingError):
+            _main_execution.MainExecutionOps.initialize_aether_engine(
+                artifacts_dir=artifacts_dir,
+                schema_role="owner",
+                execution_engine=MagicMock(),
+                log_sink=lambda _msg: None,
+            )
+
+    assert len(rebuild_calls) >= 2
+    assert rebuild_calls[0] is True
+    assert rebuild_calls[-1] is True
 
 
 @pytest.mark.fast
 def test_federation_composite_drift_gate_precedes_persist_in_source() -> None:
-    source = inspect.getsource(_main_execution.initialize_aether_federation)
+    import inspect
+
+    source = inspect.getsource(_main_execution.MainExecutionOps.initialize_aether_federation)
     tier_idx = source.index("federation_composite_migration_tier(")
     persist_idx = source.index("persist_federation_tree(")
     gate_idx = source.index("Federation composite drift", tier_idx)

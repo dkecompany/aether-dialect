@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from aetherdialect._contracts_base import HavingParam, NormalizedExpr, WhereParam, predicate_group_from_list
+from aetherdialect._contracts_base import (
+    HavingParam,
+    NormalizedExpr,
+    PredicateGroup,
+    WhereParam,
+)
 from aetherdialect._contracts_core import RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._federation import compose_composite_graph, parse_federation_manifest, plan_federated_intent
@@ -134,7 +139,7 @@ def test_join_covered_literal_filter_pushes_to_nullable_member() -> None:
         select_cols=[],
         group_by_cols=[],
         order_by_cols=[],
-        where=predicate_group_from_list([join_key_filter]),
+        where=PredicateGroup.from_list([join_key_filter]),
     )
     plan = plan_federated_intent(intent, schema, manifest)
     assert plan.ineligible_reason is None
@@ -160,7 +165,7 @@ def test_cross_source_aggregate_single_source_having_stays_on_member() -> None:
         group_by_cols=[NormalizedExpr.from_column("t_b.id")],
         order_by_cols=[],
         where=None,
-        having=predicate_group_from_list(
+        having=PredicateGroup.from_list(
             [
                 HavingParam(
                     left_expr=NormalizedExpr.from_column("t_a.id"),

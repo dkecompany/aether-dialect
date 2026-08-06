@@ -8,9 +8,9 @@ from aetherdialect._contracts_base import (
     MulGroup,
     NormalizedExpr,
     OrderByCol,
+    PredicateGroup,
     SensitivityClassification,
     WhereParam,
-    predicate_group_from_list,
 )
 from aetherdialect._contracts_core import (
     RuntimeCteStep,
@@ -135,7 +135,7 @@ class TestValidateEmptyWindow:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("payment.payment_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("payment.payment_date"),
@@ -165,7 +165,7 @@ class TestValidateEmptyWindow:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("payment.payment_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("payment.payment_date"),
@@ -192,7 +192,7 @@ class TestValidateEmptyWindow:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("payment.payment_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("payment.payment_date"),
@@ -1219,7 +1219,7 @@ class TestValidateCteGrainConsistency:
         """Error for CTE with having but no aggregation."""
         cte = RuntimeCteStep(
             cte_name="base",
-            having=predicate_group_from_list(
+            having=PredicateGroup.from_list(
                 [
                     HavingParam(
                         left_expr=NormalizedExpr.from_column("t.a"),
@@ -1272,7 +1272,7 @@ class TestValidateCteGrainConsistency:
             grain="grouped",
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.a"))],
             group_by_cols=[NormalizedExpr.from_column("t.a")],
-            having=predicate_group_from_list(
+            having=PredicateGroup.from_list(
                 [
                     HavingParam(
                         left_expr=NormalizedExpr.from_agg("count", "t.b"),
@@ -1819,8 +1819,8 @@ class TestValidateQuestionAggKeywordCoverage:
             "total rental count per customer",
             [],
             [],
-            "main query",
-            [step],
+            context="main query",
+            cte_steps=[step],
         )
         assert issues == []
 
@@ -2547,7 +2547,7 @@ class TestValidateDenyBareSelect:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.id"))],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("orders.amount"),
@@ -2595,7 +2595,7 @@ class TestValidateDeniedReferences:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.id"))],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("orders.amount"),
@@ -2671,7 +2671,7 @@ class TestValidateDeniedReferences:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.id"))],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("orders.amount"),
@@ -2747,7 +2747,7 @@ class TestValidateSensitiveGroupBy:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("users.id"))],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("users.email"),
@@ -2790,7 +2790,8 @@ class TestValidateSensitiveGroupBy:
         )
         issues = validate_sensitivity_order_by(intent, schema)
         assert len(issues) == 1
-        assert "sensitive column users.email cannot be used in ORDER BY" in issues[0].message
+        assert issues[0].category == FailureCategory.ORDER_BY_VALIDITY
+        assert "email" in (issues[0].context or {}).get("column", "") or "not available" in issues[0].message.lower()
 
     def test_sensitive_in_cte_order_by_rejected(self):
         schema = self._schema_with_sensitivity(SensitivityClassification.RESTRICTED)

@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from aetherdialect._contracts_base import FederationMappings, MulGroup, NormalizedExpr, WhereParam
+from aetherdialect._contracts_base import (
+    FederationMappings,
+    MulGroup,
+    NormalizedExpr,
+    WhereParam,
+)
 from aetherdialect._contracts_core import (
     FederatedPlan,
     FederatedStage,
@@ -183,7 +188,7 @@ def test_sub_intent_keeps_referenced_case_registry_only() -> None:
         ],
     )
     table_set = federation_table_set(intent, composite, manifest)
-    mappings = FederationMappings(version=2)
+    mappings = FederationMappings(version="0.2.1")
     members = {"a": _graph("t_a", "a"), "b": _graph("t_b", "b")}
     step_a = _build_source_sub_intent(
         intent,
@@ -312,7 +317,7 @@ def test_plan_federated_stages_scalar_coordinator_stage_id() -> None:
 
 def test_member_prepare_skips_expand_shared_pk_tables_for_refs() -> None:
     from aetherdialect._pipeline import generate_and_validate_sql
-    from aetherdialect._templates import empty_template_store
+    from aetherdialect._templates import TemplateOps
 
     schema = _graph("t_a", "a")
     intent = RuntimeIntent(
@@ -323,7 +328,7 @@ def test_member_prepare_skips_expand_shared_pk_tables_for_refs() -> None:
         order_by_cols=[],
         where=None,
     )
-    store = empty_template_store(schema.schema_graph_id)
+    store = TemplateOps.empty_template_store(schema.schema_graph_id)
     with patch("aetherdialect._pipeline.expand_shared_pk_tables_for_refs") as expand_mock:
         expand_mock.side_effect = lambda value, _schema: value
         with patch("aetherdialect._pipeline.build_deterministic_sql", return_value="SELECT id FROM t_a"):

@@ -14,7 +14,7 @@ The **sandbox** is an offline practice environment that needs **no configuration
 | [Ask questions](#ask-questions) | Session patterns |
 | [Question sets](#question-sets) | Practice questions and catalog helpers |
 | [Owner vs consumer roles](#owner-vs-consumer-roles) | Engine role and session mode in offline mode |
-| [Reader/writer queue](#readerwriter-queue) | Shared artifacts demo |
+| [Reader/writer sessions](#readerwriter-sessions) | Shared artifacts demo |
 | [Rejections and feedback](#rejections-and-feedback) | Bundled feedback samples |
 | [Template reuse](#template-reuse) | Direct vs full parse |
 | [Schema overrides demo](#schema-overrides-demo) | Bundled override file |
@@ -244,7 +244,7 @@ Offline practice uses the same **owner/consumer** split as production. Choose th
 | Role | Typical session mode | What loads | Learning |
 | --- | --- | --- | --- |
 | owner (default) | `writer` | Full **rental_shop** seed (~34 tables) and owner schema baseline from `data.zip` | Templates, overrides, and feedback persist locally for that handle |
-| consumer | `reader` | Same seed, narrowed by your `EngineContext.allow_objects` (must be a subset of the owner scope) | Learning events enqueue to `write_queue.jsonl`; `apply_schema_overrides` enqueues proposals instead of applying |
+| consumer | `reader` | Same seed, narrowed by your `EngineContext.allow_objects` (must be a subset of the owner scope) | Shared learning is not persisted; consumer `apply_overrides` does not mutate owner artifacts |
 
 ```python
 # Owner - full catalog, writer learning
@@ -284,8 +284,8 @@ from aetherdialect import Sandbox
 
 with Sandbox() as sandbox:
     engine = sandbox.engine(role="consumer")
-    stats = engine.get_schema_stats()
-    print(stats)  # table/column counts for the narrowed graph
+    inventory = engine.export_metadata()
+    print(inventory["table_count"], len(inventory["tables"]))
 ```
 
 Consumer questions that reference tables outside the allow list (for example `staff`) should fail with permission or schema errors - see `sandbox_validation_failure_demo()`.
@@ -296,7 +296,7 @@ Author a single `federation_declaration.json` per federation. Pass its path to `
 
 | Field | Meaning |
 | --- | --- |
-| `version` | Declaration format version (currently `1`) |
+| `version` | Declaration format version (package-style string; currently `"0.2.1"`) |
 | `federation_id` | Stable federation name; must match the `AetherFederation` constructor `name` |
 | `cross_source_joins[]` | Cross-member joins: `left` / `right` (`table.column`), `kind`, `logical_key` |
 | `aliases` | Optional map of alias -> `{source, table}` |
@@ -308,7 +308,7 @@ Annotated sandbox example (bundled as `federation_declaration.json`):
 
 ```json
 {
-  "version": 1,
+  "version": "0.2.1",
   "federation_id": "sandbox_rental_shop",
   "aliases": {},
   "coordinator": {
@@ -347,7 +347,7 @@ Annotated sandbox example (bundled as `federation_declaration.json`):
 }
 ```
 
-`export_federation_declaration()` writes this authored shape to the working directory. `export_federation_manifest()` and `export_federation_mappings()` write **persisted** sidecars (including derived roster fields) for review under the federation tree. Field reference: [API reference - Federation and migration JSON](API_REFERENCE.md#federation-and-migration-json).
+`export_federation_declaration()` writes this authored shape to the working directory; edit `federation_declaration.json`, then call `apply_federation_declaration()` for a full round trip. Field reference: [API reference - Federation and migration JSON](API_REFERENCE.md#federation-and-migration-json).
 
 ```python
 from aetherdialect import Sandbox
@@ -359,11 +359,11 @@ with Sandbox() as sandbox:
     print(step.federated_bundle.display_sql)
 ```
 
-## Reader/writer queue
+## Reader/writer sessions
 
 Advanced: production reader/writer sharing uses a durable `artifacts_dir` on disk. The sandbox **does not require this** for normal practice. The pattern below is documented for integrators mirroring production; it is not the default offline path.
 
-Readers append events to `write_queue.jsonl`; an owner writer on the same shared artifacts root drains the queue. Resolve the path with `engine.write_queue_path`.
+Reader sessions do not persist shared learning. An owner writer on the same shared artifacts root persists templates and feedback under the artifacts lock. There is no public `write_queue_path`.
 
 ```python
 import tempfile
@@ -405,7 +405,7 @@ with AetherEngine.offline_sandbox() as sb:
     sb.apply_bundled_schema_overrides()
 ```
 
-Copies bundled `sandbox_overrides_demo.json` to the working directory and applies overrides (owners) or enqueues proposals (consumers).
+Copies bundled `sandbox_overrides_demo.json` to the working directory and applies overrides for owners. Consumers cannot mutate owner override state through this path.
 
 **What the demo changes** (read the file after apply, or inspect the bundled JSON in the corpus):
 
@@ -417,18 +417,29 @@ Copies bundled `sandbox_overrides_demo.json` to the working directory and applie
 **How to see allowed vs denied behavior without a discovery API:**
 
 1. `AetherEngine.sandbox_validation_failure_demo()` - questions that should fail after overrides (for example targeting `staff.ssn`).
-2. `export_schema_overrides()` on a production owner engine writes the current override editor JSON; in the sandbox, read `./schema_overrides.json` after `apply_bundled_schema_overrides()`.
+2. `export_overrides()` on a production owner engine writes the current override editor JSON; in the sandbox, read `./schema_overrides.json` after `apply_bundled_schema_overrides()`.
 3. Compare owner vs consumer roles - consumer cannot call owner-only override APIs.
 
 Overrides are manual - there is no runtime "list overrides" method beyond export/read of the JSON file. Full schema: [API reference - Schema overrides JSON](API_REFERENCE.md#schema-overrides-json-schema_overridesjson). Sensitivity tiers: [Security - Sensitivity tags](SECURITY.md#6-sensitivity-tags).
 
 ## Migration demo
 
-The shipped corpus includes a toy `item.title` -> `item_title` rename under `migration_demo/` (pre-migration artifacts plus a remap map). The internal sandbox tour loads those assets, constructs an engine against the post-rename seed, expects `MigrationPendingError`, then applies the map with `AetherEngine.apply_migration_map(...)`. Production workflow: [User guide - Migration](USER_GUIDE.md#migration).
+The shipped corpus includes a toy `item.title` -> `item_title` rename under `migration_demo/` (pre-migration artifacts plus a remap map). Walk the production preview-and-apply path from a sandbox handle:
+
+```python
+with AetherEngine.offline_sandbox() as sb:
+    preview = sb.preview_migration_corpus_variant()
+    print(preview.tier, preview.affected_columns)
+    sb.apply_migration_corpus_variant()
+    with sb.session() as session:
+        session.accept_until_done("How many books do we have?")
+```
+
+`preview_migration_corpus_variant()` stages the post-rename seed against stale pre-migration artifacts and returns a `MigrationPreview`. `apply_migration_corpus_variant()` applies the bundled `schema_migration_map.json` and replaces the handle engine with the migrated owner instance. Production workflow: [User guide - Migration](USER_GUIDE.md#migration).
 
 ## Sensitivity
 
-Canonical tier definitions: [Security - Sensitivity tags](SECURITY.md#6-sensitivity-tags). After `apply_bundled_schema_overrides()`, try questions from `AetherEngine.sandbox_validation_failure_demo()` to see terminal errors when targeting hidden columns such as `staff.ssn`.
+Canonical tier definitions: [Security - Sensitivity tags](SECURITY.md#6-sensitivity-tags). After `apply_bundled_schema_overrides()`, try questions from `AetherEngine.sandbox_validation_failure_demo()` to see terminal refusals when targeting hidden columns such as `staff.ssn`.
 
 ## Column security
 
@@ -451,7 +462,23 @@ Production equivalent: set `deny_columns` on `EngineContext` at construction ([U
 
 ## Named AetherSpaces
 
-Offline sessions default to `space="master"`. Define named spaces on the owner engine the same way as production:
+Offline sessions default to `space="master"`. Define named spaces on the owner engine the same way as production. A `SpaceContext` table subset is required; **notes are optional** — omit `notes` / `notes_file` when you only need graph narrowing.
+
+```python
+from aetherdialect import AetherEngine, SpaceContext
+
+with AetherEngine.offline_sandbox() as sb:
+    sb.engine.aetherspace(
+        "catalog",
+        space_context=SpaceContext(
+            tables=frozenset({"item", "film", "category", "item_category"}),
+        ),
+    )
+    with sb.session(space="catalog") as session:
+        session.accept_until_done("How many films are in the Horror category?")
+```
+
+Attach bundled notes when you want knowledge-narrowing demos:
 
 ```python
 from aetherdialect import AetherEngine, SpaceContext
@@ -562,11 +589,11 @@ The sandbox replays bundled baselines instead of running several production cons
 | `live_reflection_and_profiling` | Live catalog reflection and column profiling against your warehouse | Replays a frozen `schema_graph.json.gz` baseline |
 | `probe_mismatch_partial_rebuild` | DDL probe mismatch triggers structural diff and partial rebuild | Baseline fingerprints match the bundle; no probe mismatch path |
 | `cold_build_descriptions_and_classification` | LLM description generation and column classification on first build | Descriptions and roles come from the recorded baseline |
-| `composite_composition_replay_skip` | Full federation composite composition when member baselines differ | Composite graph is replayed when seeded baselines satisfy replay |
+| `member_cold_reflect_profile_and_member_drift_migration_pending` | Federation composite composition always runs; production may cold-reflect and profile member catalogs before composition, and raises `MigrationPendingError` when live member graphs drift from the persisted federation snapshot | Sandbox seeds frozen profiled member baselines and aligned bundles, so member cold reflect/profile and member-drift `MigrationPendingError` paths are not exercised; `compose_composite_graph` still runs |
 | `warmup_and_question_simulation` | Seed warmup and QSim enumeration against live schema | Blocked via production-API guard |
 | `model_turns_outside_recorded_fixtures` | Arbitrary LLM turns for unseen questions | Mock provider replays recorded fixtures only |
 
-Bundled malformed mock fixtures exercise compose repair paths for questions listed in `SANDBOX_MALFORMED_MOCK_FIXTURE_QUESTIONS`.
+Bundled malformed mock fixtures exercise compose repair paths for questions listed in `SANDBOX_MALFORMED_MOCK_FIXTURE_QUESTIONS`. On the first compose replay for those questions the mock provider returns deliberately invalid JSON; a subsequent compose or format-repair turn replays the bundled repair response so validation and repair logic run offline.
 
 When you move to production, follow [Getting started - Connect your warehouse](GETTING_STARTED.md#connect-your-warehouse) for TOML, LLM credentials, and durable artifacts.
 

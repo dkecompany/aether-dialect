@@ -13,12 +13,8 @@ from aetherdialect._contracts_base import (
     NormalizedExpr,
     OrderByCol,
     PredicateGroup,
+    QuestionRoute,
     WhereParam,
-    having_leaves,
-    predicate_group_from_legacy_flat_where_dicts,
-    predicate_group_from_legacy_having_dicts,
-    predicate_group_from_list,
-    where_leaves,
 )
 from aetherdialect._contracts_core import (
     ConcreteIntent,
@@ -27,7 +23,6 @@ from aetherdialect._contracts_core import (
     SelectCol,
     Template,
     ValueHistory,
-    concrete_intent_to_runtime_skeleton,
 )
 from aetherdialect._contracts_schema import (
     ColumnMetadata,
@@ -174,7 +169,7 @@ class TestSqlShape:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
         )
         shape = sql_shape("SELECT * FROM t WHERE t.col = 'x'", intent, sqlglot_dialect="postgres")
         assert shape.num_where == 1
@@ -268,11 +263,11 @@ class TestIntentKey:
         ]
         i_and = RuntimeIntent(
             **skeleton,
-            where=predicate_group_from_legacy_flat_where_dicts(legacy_and),
+            where=PredicateGroup.from_legacy_flat_where_dicts(legacy_and),
         )
         i_or = RuntimeIntent(
             **skeleton,
-            where=predicate_group_from_legacy_flat_where_dicts(legacy_or),
+            where=PredicateGroup.from_legacy_flat_where_dicts(legacy_or),
         )
         assert intent_key(i_and) == intent_key(i_or)
 
@@ -295,11 +290,11 @@ class TestIntentKey:
         ]
         i_grouped = RuntimeIntent(
             **skeleton,
-            where=predicate_group_from_legacy_flat_where_dicts(legacy_grouped),
+            where=PredicateGroup.from_legacy_flat_where_dicts(legacy_grouped),
         )
         i_split = RuntimeIntent(
             **skeleton,
-            where=predicate_group_from_legacy_flat_where_dicts(legacy_split),
+            where=PredicateGroup.from_legacy_flat_where_dicts(legacy_split),
         )
         assert intent_key(i_grouped) == intent_key(i_split)
 
@@ -344,11 +339,11 @@ class TestIntentKey:
         ]
         i_and = RuntimeIntent(
             **skeleton,
-            having=predicate_group_from_legacy_having_dicts(legacy_and),
+            having=PredicateGroup.from_legacy_having_dicts(legacy_and),
         )
         i_or = RuntimeIntent(
             **skeleton,
-            having=predicate_group_from_legacy_having_dicts(legacy_or),
+            having=PredicateGroup.from_legacy_having_dicts(legacy_or),
         )
         assert intent_key(i_and) == intent_key(i_or)
 
@@ -372,11 +367,11 @@ class TestIntentKey:
         ]
         i_grouped = RuntimeIntent(
             **skeleton,
-            having=predicate_group_from_legacy_having_dicts(legacy_grouped),
+            having=PredicateGroup.from_legacy_having_dicts(legacy_grouped),
         )
         i_split = RuntimeIntent(
             **skeleton,
-            having=predicate_group_from_legacy_having_dicts(legacy_split),
+            having=PredicateGroup.from_legacy_having_dicts(legacy_split),
         )
         assert intent_key(i_grouped) == intent_key(i_split)
 
@@ -415,7 +410,7 @@ class TestNormalizeFilters:
             {"left_expr": "t.col", "op": "=", "value_type": "string", "bool_op": "AND"},
             {"left_expr": "t.other", "op": "=", "value_type": "string", "bool_op": "OR"},
         ]
-        group = predicate_group_from_legacy_flat_where_dicts(legacy)
+        group = PredicateGroup.from_legacy_flat_where_dicts(legacy)
         assert group is not None
         assert group.op == "or"
         result = _normalize_where_predicates(group.leaves())
@@ -428,7 +423,7 @@ class TestNormalizeFilters:
             {"left_expr": "a.col", "op": "=", "where_group": 2},
             {"left_expr": "z.col", "op": "=", "where_group": 1},
         ]
-        group = predicate_group_from_legacy_flat_where_dicts(legacy)
+        group = PredicateGroup.from_legacy_flat_where_dicts(legacy)
         assert group is not None
         assert group.op == "or"
         assert len(group.groups) == 2
@@ -470,7 +465,7 @@ class TestNormalizeHavingConditions:
             {"left_expr": "COUNT(t.id)", "op": ">", "value_type": "integer", "bool_op": "AND"},
             {"left_expr": "SUM(t.amount)", "op": ">", "value_type": "integer", "bool_op": "OR"},
         ]
-        group = predicate_group_from_legacy_having_dicts(legacy)
+        group = PredicateGroup.from_legacy_having_dicts(legacy)
         assert group is not None
         assert group.op == "or"
         result = _normalize_having_conditions(group.leaves())
@@ -483,7 +478,7 @@ class TestNormalizeHavingConditions:
             {"left_expr": "SUM(t.amount)", "op": ">", "where_group": 2},
             {"left_expr": "COUNT(t.id)", "op": ">", "where_group": 1},
         ]
-        group = predicate_group_from_legacy_having_dicts(legacy)
+        group = PredicateGroup.from_legacy_having_dicts(legacy)
         assert group is not None
         assert group.op == "or"
         assert len(group.groups) == 2
@@ -726,7 +721,7 @@ class TestNormalizeCteStepsForKey:
             select_cols=[],
             group_by_cols=[],
             output_columns=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
         )
         result = _normalize_cte_steps_for_key([cte])
         assert result[0]["where"] == [fp.signature_key]
@@ -734,7 +729,7 @@ class TestNormalizeCteStepsForKey:
     def test_legacy_where_group_not_in_key(self):
         """normalize_cte_steps_for_key omits legacy where_group from filter key entries."""
         legacy = [{"left_expr": "t1.status", "op": "=", "value_type": "string", "where_group": 1}]
-        group = predicate_group_from_legacy_flat_where_dicts(legacy)
+        group = PredicateGroup.from_legacy_flat_where_dicts(legacy)
         assert group is not None
         fp = group.leaves()[0]
         cte = RuntimeCteStep(
@@ -920,7 +915,7 @@ class TestFlattenParamValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             param_values={"p1": '"Trailers"', "p2": "'keep'"},
         )
         out = flatten_param_values(intent)
@@ -1007,7 +1002,7 @@ class TestSqlShapeEdgeCases:
             select_cols=[],
             group_by_cols=[],
             output_columns=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
         )
         intent = RuntimeIntent(
             tables=["t"],
@@ -1035,7 +1030,7 @@ class TestSqlShapeEdgeCases:
             select_cols=[],
             group_by_cols=[],
             output_columns=[],
-            having=predicate_group_from_list([hp]),
+            having=PredicateGroup.from_list([hp]),
         )
         intent = RuntimeIntent(
             tables=["t"],
@@ -1062,7 +1057,7 @@ class TestSqlShapeEdgeCases:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
         )
         shape = sql_shape("SELECT * FROM t WHERE a = b", intent, sqlglot_dialect="postgres")
         assert shape.num_where == 1
@@ -1082,7 +1077,7 @@ class TestSqlShapeEdgeCases:
             select_cols=[],
             group_by_cols=[],
             output_columns=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
         )
         intent = RuntimeIntent(
             tables=["t"],
@@ -1165,7 +1160,7 @@ class TestNormalizeFiltersEdgeCases:
         assert len(result) == 1
         assert not hasattr(result[0], "bool_op")
         legacy = [{"left_expr": "t.col", "op": "=", "value_type": "string", "bool_op": "OR"}]
-        group = predicate_group_from_legacy_flat_where_dicts(legacy)
+        group = PredicateGroup.from_legacy_flat_where_dicts(legacy)
         assert group is not None
         assert len(group.leaves()) == 1
 
@@ -1311,7 +1306,7 @@ class TestNormalizeCteStepsEdgeCases:
         ]
         result = _normalize_cte_steps(steps)
         assert len(result) == 1
-        assert len(where_leaves(result[0].where) or []) == 1
+        assert len(PredicateGroup.where_leaves(result[0].where) or []) == 1
 
     def test_dict_with_having(self):
         """normalize_cte_steps converts dict with having params."""
@@ -1334,7 +1329,7 @@ class TestNormalizeCteStepsEdgeCases:
         ]
         result = _normalize_cte_steps(steps)
         assert len(result) == 1
-        assert len(having_leaves(result[0].having) or []) == 1
+        assert len(PredicateGroup.having_leaves(result[0].having) or []) == 1
 
     def test_available_ctes_mutated(self):
         """normalize_cte_steps populates available_ctes dict."""
@@ -1405,8 +1400,8 @@ class TestNormalizeCteStepsForKeyEdgeCases:
             select_cols=[],
             group_by_cols=[],
             output_columns=[],
-            where=predicate_group_from_list([fp]),
-            having=predicate_group_from_list([hp]),
+            where=PredicateGroup.from_list([fp]),
+            having=PredicateGroup.from_list([hp]),
         )
         result = _normalize_cte_steps_for_key([cte])
         assert len(result) == 1
@@ -1523,7 +1518,7 @@ class TestIntentKeyEdgeCases:
             group_by_cols=[],
             order_by_cols=[],
             where=None,
-            having=predicate_group_from_list([hp]),
+            having=PredicateGroup.from_list([hp]),
         )
         i2 = RuntimeIntent(
             tables=["t"],
@@ -1579,45 +1574,45 @@ class TestIntentKeyEdgeCases:
 class TestValidateQuestion:
     """Tests for validate_question."""
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_valid_allowed_returns_true_and_corrected(self, mock_llm_json):
-        """validate_question returns (True, 'allowed', corrected) when LLM says valid."""
+        """validate_question maps legacy allowed to analytical and returns corrected text."""
         mock_llm_json.return_value = {
             "valid_database_question": "yes",
             "query_type": "allowed",
             "corrected": "What is the total revenue?",
         }
-        is_valid, query_type, corrected = validate_question("What is the total reveneu?")
-        assert is_valid is True
-        assert query_type == "allowed"
-        assert corrected == "What is the total revenue?"
+        result = validate_question("What is the total reveneu?")
+        assert result.accepted is True
+        assert result.route is QuestionRoute.ANALYTICAL
+        assert result.corrected == "What is the total revenue?"
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_invalid_returns_false_invalid_type(self, mock_llm_json):
-        """validate_question returns (False, 'invalid', ...) when not valid."""
+        """validate_question returns invalid route when not valid."""
         mock_llm_json.return_value = {
             "valid_database_question": "no",
             "query_type": "unspecified",
             "corrected": "fixed typo",
         }
-        is_valid, query_type, corrected = validate_question("random text")
-        assert is_valid is False
-        assert query_type == "invalid"
-        assert corrected == "fixed typo"
+        result = validate_question("random text")
+        assert result.accepted is False
+        assert result.route is QuestionRoute.INVALID
+        assert result.corrected == "fixed typo"
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_restricted_returns_false_restricted_type(self, mock_llm_json):
-        """validate_question returns (False, 'restricted', ...) for restricted query."""
+        """validate_question returns restricted route for restricted query."""
         mock_llm_json.return_value = {
             "valid_database_question": "yes",
             "query_type": "restricted",
             "corrected": "List all users",
         }
-        is_valid, query_type, corrected = validate_question("List all users")
-        assert is_valid is False
-        assert query_type == "restricted"
+        result = validate_question("List all users")
+        assert result.accepted is False
+        assert result.route is QuestionRoute.RESTRICTED
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_restricted_wins_when_valid_flag_no(self, mock_llm_json):
         """Restricted is reported even when valid_database_question is no (Group A precedence)."""
         mock_llm_json.return_value = {
@@ -1625,33 +1620,33 @@ class TestValidateQuestion:
             "query_type": "restricted",
             "corrected": "drop table t",
         }
-        is_valid, query_type, corrected = validate_question("drop table t")
-        assert is_valid is False
-        assert query_type == "restricted"
-        assert corrected == "drop table t"
+        result = validate_question("drop table t")
+        assert result.accepted is False
+        assert result.route is QuestionRoute.RESTRICTED
+        assert result.corrected == "drop table t"
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_cte_analytical_may_be_allowed_not_restricted(self, mock_llm_json):
-        """Analytical questions that mention CTEs are classified allowed when the model agrees (CJ regression)."""
+        """Analytical questions that mention CTEs are classified analytical when the model agrees (CJ regression)."""
         mock_llm_json.return_value = {
             "valid_database_question": "yes",
             "query_type": "allowed",
             "corrected": "Using a CTE show monthly revenue trends",
         }
-        ok, qt, _ = validate_question("Using a CTE show monthly revenue trends")
-        assert ok is True
-        assert qt == "allowed"
+        result = validate_question("Using a CTE show monthly revenue trends")
+        assert result.accepted is True
+        assert result.route is QuestionRoute.ANALYTICAL
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_llm_json_exhausted_returns_invalid(self, mock_llm_json):
-        """validate_question returns (False, 'invalid', original) when llm_json exhausts."""
+        """validate_question returns invalid route when llm_json exhausts."""
         mock_llm_json.side_effect = LlmJsonExhausted(task="default", attempts=2)
-        is_valid, query_type, corrected = validate_question("anything")
-        assert is_valid is False
-        assert query_type == "invalid"
-        assert corrected == "anything"
+        result = validate_question("anything")
+        assert result.accepted is False
+        assert result.route is QuestionRoute.INVALID
+        assert result.corrected == "anything"
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_missing_corrected_uses_original_question(self, mock_llm_json):
         """validate_question uses original question when corrected is missing."""
         mock_llm_json.return_value = {
@@ -1659,9 +1654,9 @@ class TestValidateQuestion:
             "query_type": "allowed",
             "corrected": "",
         }
-        is_valid, _, corrected = validate_question("Original question")
-        assert is_valid is True
-        assert corrected == "Original question"
+        result = validate_question("Original question")
+        assert result.accepted is True
+        assert result.corrected == "Original question"
 
 
 class TestNormalizationGuard:
@@ -1695,7 +1690,7 @@ class TestGenerateQuestion:
         return SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"orders": t})
 
     @patch("aetherdialect._utils.pick_question_style", return_value="How many")
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_returns_question_when_llm_returns_valid_json(self, mock_llm_json, _mock_style, minimal_schema):
         """generate_question returns question string when LLM returns valid JSON."""
         mock_llm_json.return_value = {"question": "How many orders are there?"}
@@ -1709,7 +1704,7 @@ class TestGenerateQuestion:
         )
         assert result == "How many orders are there?"
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_returns_none_when_llm_returns_empty(self, mock_llm_json, minimal_schema):
         """generate_question returns None when response lacks a usable question."""
         mock_llm_json.return_value = {}
@@ -1723,7 +1718,7 @@ class TestGenerateQuestion:
         )
         assert result is None
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_returns_none_when_question_key_missing(self, mock_llm_json, minimal_schema):
         """generate_question returns None when response has no 'question' key."""
         mock_llm_json.return_value = {"other_key": "value"}
@@ -1737,7 +1732,7 @@ class TestGenerateQuestion:
         )
         assert result is None
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_invokes_llm_with_system_and_user_prompt(self, mock_llm_json, minimal_schema):
         """generate_question calls llm_json with system and user prompt."""
         mock_llm_json.return_value = {"question": "Generated question."}
@@ -1812,7 +1807,7 @@ class TestBodySimilarityAndTemplateKeys:
             order_by_cols=[],
             where=None,
         )
-        sk = concrete_intent_to_runtime_skeleton(concrete)
+        sk = concrete.to_runtime_skeleton()
         assert body_similarity_key_for_concrete(concrete) == body_similarity_key(sk)
 
     def test_template_instance_key_from_parts_deterministic(self):
@@ -1837,7 +1832,7 @@ class TestGenerateQuestionFromSql:
         """Schema with no tables (prompt still builds)."""
         return SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={})
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_unrealistic_returns_empty_questions(self, mock_llm, empty_schema):
         """Unrealistic response omits generated questions."""
         mock_llm.return_value = {
@@ -1854,7 +1849,7 @@ class TestGenerateQuestionFromSql:
             "drop_reason_category": "other",
         }
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_unrealistic_default_drop_reason(self, mock_llm, empty_schema):
         """Missing drop_reason uses fallback string."""
         mock_llm.return_value = {"is_realistic": False, "drop_reason": None}
@@ -1862,7 +1857,7 @@ class TestGenerateQuestionFromSql:
         assert out["drop_reason"] == "unrealistic"
         assert out["drop_reason_category"] == "other"
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_is_realistic_string_coercion(self, mock_llm, empty_schema):
         """String truthiness coerces to bool before branching."""
         mock_llm.return_value = {
@@ -1875,7 +1870,7 @@ class TestGenerateQuestionFromSql:
         assert out["question"] == "First phrase?"
 
     @patch("aetherdialect._utils.generate_warmup_paraphrases_by_style", return_value=None)
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_realistic_keeps_all_parsed_questions(self, mock_llm, _mock_styles, empty_schema):
         """Parsed questions are kept when style generation is unavailable."""
         many = [f"Question number {i}?" for i in range(8)]
@@ -1884,7 +1879,7 @@ class TestGenerateQuestionFromSql:
         assert out is not None
         assert len(out["questions"]) == 8
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_realistic_dedupes_normalized_phrases(self, mock_llm, empty_schema):
         """Phrases that normalize identically are dropped."""
         mock_llm.return_value = {
@@ -1895,7 +1890,7 @@ class TestGenerateQuestionFromSql:
         assert out is not None
         assert len(out["questions"]) == 1
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_realistic_falls_back_to_legacy_question_field(self, mock_llm, empty_schema):
         """Empty questions array uses legacy question string."""
         mock_llm.return_value = {
@@ -1907,7 +1902,7 @@ class TestGenerateQuestionFromSql:
         assert out is not None
         assert out["questions"] == ["Legacy only?"]
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_realistic_empty_after_parse_returns_none(self, mock_llm, empty_schema):
         """No usable phrases after filtering yields None."""
         mock_llm.return_value = {
@@ -1917,13 +1912,13 @@ class TestGenerateQuestionFromSql:
         }
         assert generate_question_from_sql("SELECT 1", empty_schema, []) is None
 
-    @patch("aetherdialect._utils.llm_json", side_effect=RuntimeError("boom"))
+    @patch("aetherdialect._utils.LLMProvider.json", side_effect=RuntimeError("boom"))
     def test_runtime_error_propagates(self, _mock_llm, empty_schema):
         """LLM transport failures propagate to the caller."""
         with pytest.raises(RuntimeError, match="boom"):
             generate_question_from_sql("SELECT 1", empty_schema, [])
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_schema_table_descriptions_in_prompt(self, mock_llm, schema_graph):
         """Known tables contribute column lines to the user prompt."""
         mock_llm.return_value = {"is_realistic": True, "questions": ["ok?"]}
@@ -2038,7 +2033,7 @@ class TestExactQuestionMatchBudget:
 class TestValidateQuestionEdgeCases:
     """Extra branches for validate_question."""
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_corrected_none_uses_original(self, mock_llm_json):
         """Explicit null corrected falls back to original question."""
         mock_llm_json.return_value = {
@@ -2046,21 +2041,21 @@ class TestValidateQuestionEdgeCases:
             "query_type": "allowed",
             "corrected": None,
         }
-        ok, kind, corrected = validate_question("Keep me")
-        assert ok is True
-        assert corrected == "Keep me"
+        result = validate_question("Keep me")
+        assert result.accepted is True
+        assert result.corrected == "Keep me"
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_query_type_case_insensitive(self, mock_llm_json):
-        """query_type is normalised with lower()."""
+        """query_type is normalised with lower() and allowed maps to analytical."""
         mock_llm_json.return_value = {
             "valid_database_question": "yes",
             "query_type": "ALLOWED",
             "corrected": "x",
         }
-        ok, kind, _ = validate_question("x")
-        assert ok is True
-        assert kind == "allowed"
+        result = validate_question("x")
+        assert result.accepted is True
+        assert result.route is QuestionRoute.ANALYTICAL
 
 
 class TestGenerateQuestionPhrasing:
@@ -2079,7 +2074,7 @@ class TestGenerateQuestionPhrasing:
         return SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"orders": t})
 
     @patch("aetherdialect._utils.pick_question_style", return_value="How many")
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_phrasing_violation_returns_none(self, mock_llm_json, _mock_style, minimal_schema):
         """Question must start with template prefix from required style."""
         mock_llm_json.return_value = {"question": "What is the count of orders?"}
@@ -2096,7 +2091,7 @@ class TestGenerateQuestionPhrasing:
         )
 
     @patch("aetherdialect._utils.pick_question_style", return_value="Prefix{ignored}")
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_required_start_splits_on_brace(self, mock_llm_json, _mock_style, minimal_schema):
         """Brace suffix in style is stripped for startswith check."""
         mock_llm_json.return_value = {"question": "Prefix rest of question"}
@@ -2110,7 +2105,7 @@ class TestGenerateQuestionPhrasing:
         )
         assert out == "Prefix rest of question"
 
-    @patch("aetherdialect._utils.llm_json", side_effect=ValueError("bad json"))
+    @patch("aetherdialect._utils.LLMProvider.json", side_effect=ValueError("bad json"))
     @patch("aetherdialect._utils.pick_question_style", return_value="What are")
     def test_llm_exception_propagates(self, _mock_style, _mock_llm, minimal_schema):
         """Exceptions from llm_json propagate to the caller."""
@@ -2139,7 +2134,7 @@ class TestFlattenParamValuesContainsEdges:
             select_cols=[],
             group_by_cols=[],
             output_columns=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             param_values={"tags": '"x"'},
         )
         intent = RuntimeIntent(
@@ -2168,7 +2163,7 @@ class TestFlattenParamValuesContainsEdges:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             param_values={"p1": '"keep"'},
         )
         assert flatten_param_values(intent)["p1"] == '"keep"'
@@ -2218,7 +2213,7 @@ class TestNormalizeCteStepsFilterClamp:
             }
         ]
         out = _normalize_cte_steps(steps)
-        assert (where_leaves(out[0].where) or [])[0].op == "="
+        assert (PredicateGroup.where_leaves(out[0].where) or [])[0].op == "="
 
     def test_invalid_having_op_clamped_to_equals(self):
         steps = [
@@ -2239,7 +2234,7 @@ class TestNormalizeCteStepsFilterClamp:
             }
         ]
         out = _normalize_cte_steps(steps)
-        assert (having_leaves(out[0].having) or [])[0].op == "="
+        assert (PredicateGroup.having_leaves(out[0].having) or [])[0].op == "="
 
     def test_skips_unknown_step_type(self):
         """Non-dict, non-RuntimeCteStep steps are skipped."""

@@ -30,6 +30,7 @@ from aetherdialect._federation import (
     save_federation_plan_template,
 )
 from aetherdialect._schema_graph import recompute_join_paths_multi
+from tests.federation_helpers import stamp_union_disjointness_profiling
 
 
 def _table(
@@ -116,9 +117,11 @@ def test_collapse_unions_column_statistics_from_all_members() -> None:
             },
         ),
     }
+    stamp_union_disjointness_profiling(members["a"].tables["payment"], overlap_sample=("1", "2"))
+    stamp_union_disjointness_profiling(members["b"].tables["payment"], overlap_sample=("3", "4"))
     mappings = parse_federation_mappings(
         {
-            "version": 2,
+            "version": "0.2.1",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -139,7 +142,7 @@ def test_collapse_unions_column_statistics_from_all_members() -> None:
 
 def test_load_composite_graph_rejects_stale_fingerprint() -> None:
     manifest = parse_federation_manifest(_PAYMENT_MANIFEST, include_derived_roster=True)
-    mappings = FederationMappings(version=2)
+    mappings = FederationMappings(version="0.2.1")
     members = {
         "a": _table("payment", source_id="a", profiling_hash="p_a", notes_sha256="n_a"),
         "b": _table("payment", source_id="b", profiling_hash="p_b", notes_sha256="n_b"),

@@ -14,14 +14,7 @@ from aetherdialect._constants import AETHERSPACE_ARTIFACT_VERSION
 from aetherdialect._contracts_base import ConfigError, SpaceContext
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._main_execution import (
-    _aetherspace_export_path,
-    _aetherspace_path,
-    apply_aetherspace_json,
-    delete_aetherspace_snapshot,
-    export_aetherspace_json,
-    load_aetherspace_snapshot,
-    save_aetherspace_snapshot,
-    subset_graph_for_space,
+    MainExecutionOps,
 )
 
 
@@ -57,16 +50,16 @@ def test_engine_exposes_apply_and_delete_aetherspace() -> None:
 def test_export_apply_round_trip_persists_named_space(tmp_path: Path) -> None:
     engine_dir = str(tmp_path)
     schema = _sample_schema()
-    snap = subset_graph_for_space(schema, SpaceContext(tables=frozenset({"film"})))
-    save_aetherspace_snapshot(engine_dir, "films_only", snap)
-    export_path = export_aetherspace_json(engine_dir, "films_only", schema)
-    delete_aetherspace_snapshot(engine_dir, "films_only")
-    assert load_aetherspace_snapshot(engine_dir, "films_only") is None
+    snap = MainExecutionOps.subset_graph_for_space(schema, SpaceContext(tables=frozenset({"film"})))
+    MainExecutionOps.save_aetherspace_snapshot(engine_dir, "films_only", snap)
+    export_path = MainExecutionOps.export_aetherspace_json(engine_dir, "films_only", schema)
+    MainExecutionOps.delete_aetherspace_snapshot(engine_dir, "films_only")
+    assert MainExecutionOps.load_aetherspace_snapshot(engine_dir, "films_only") is None
 
-    desc = apply_aetherspace_json(engine_dir, "films_only", schema)
+    desc = MainExecutionOps.apply_aetherspace_json(engine_dir, "films_only", schema)
     assert desc.name == "films_only"
     assert export_path.is_file()
-    loaded = load_aetherspace_snapshot(engine_dir, "films_only")
+    loaded = MainExecutionOps.load_aetherspace_snapshot(engine_dir, "films_only")
     assert loaded is not None
     assert "film" in loaded["tables"]
 
@@ -75,14 +68,14 @@ def test_export_apply_round_trip_persists_named_space(tmp_path: Path) -> None:
 def test_apply_from_explicit_source_path(tmp_path: Path) -> None:
     engine_dir = str(tmp_path)
     schema = _sample_schema()
-    snap = subset_graph_for_space(schema, SpaceContext(tables=frozenset({"film"})))
-    save_aetherspace_snapshot(engine_dir, "films_only", snap)
-    export_path = export_aetherspace_json(engine_dir, "films_only", schema)
-    delete_aetherspace_snapshot(engine_dir, "films_only")
+    snap = MainExecutionOps.subset_graph_for_space(schema, SpaceContext(tables=frozenset({"film"})))
+    MainExecutionOps.save_aetherspace_snapshot(engine_dir, "films_only", snap)
+    export_path = MainExecutionOps.export_aetherspace_json(engine_dir, "films_only", schema)
+    MainExecutionOps.delete_aetherspace_snapshot(engine_dir, "films_only")
 
-    desc = apply_aetherspace_json(engine_dir, "imported", schema, source=export_path)
+    desc = MainExecutionOps.apply_aetherspace_json(engine_dir, "imported", schema, source=export_path)
     assert desc.name == "imported"
-    loaded = load_aetherspace_snapshot(engine_dir, "imported")
+    loaded = MainExecutionOps.load_aetherspace_snapshot(engine_dir, "imported")
     assert loaded is not None
     assert "film" in loaded["tables"]
 
@@ -91,57 +84,57 @@ def test_apply_from_explicit_source_path(tmp_path: Path) -> None:
 def test_apply_rejects_export_version_mismatch(tmp_path: Path) -> None:
     engine_dir = str(tmp_path)
     schema = _sample_schema()
-    snap = subset_graph_for_space(schema, SpaceContext(tables=frozenset({"film"})))
-    export_path = Path(_aetherspace_export_path(engine_dir, "stale"))
+    snap = MainExecutionOps.subset_graph_for_space(schema, SpaceContext(tables=frozenset({"film"})))
+    export_path = Path(MainExecutionOps._aetherspace_export_path(engine_dir, "stale"))
     export_path.parent.mkdir(parents=True, exist_ok=True)
     stale = dict(snap)
     stale["name"] = "stale"
-    stale["version"] = AETHERSPACE_ARTIFACT_VERSION - 1
+    stale["version"] = "0.0.0"
     export_path.write_text(json.dumps(stale), encoding="utf-8")
 
     with pytest.raises(ConfigError, match=r"version .*" + str(AETHERSPACE_ARTIFACT_VERSION)) as exc_info:
-        apply_aetherspace_json(engine_dir, "stale", schema)
+        MainExecutionOps.apply_aetherspace_json(engine_dir, "stale", schema)
     msg = str(exc_info.value)
-    assert str(AETHERSPACE_ARTIFACT_VERSION - 1) in msg
+    assert "0.0.0" in msg
     assert "Delete" in msg
 
 
 @pytest.mark.fast
 def test_delete_unknown_aetherspace_raises(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="unknown aetherspace"):
-        delete_aetherspace_snapshot(str(tmp_path), "missing")
+        MainExecutionOps.delete_aetherspace_snapshot(str(tmp_path), "missing")
 
 
 @pytest.mark.fast
 def test_delete_master_aetherspace_raises(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="cannot be deleted"):
-        delete_aetherspace_snapshot(str(tmp_path), "master")
+        MainExecutionOps.delete_aetherspace_snapshot(str(tmp_path), "master")
 
 
 @pytest.mark.fast
 def test_apply_master_aetherspace_raises(tmp_path: Path) -> None:
     engine_dir = str(tmp_path)
     schema = _sample_schema()
-    export_path = export_aetherspace_json(engine_dir, "master", schema)
+    export_path = MainExecutionOps.export_aetherspace_json(engine_dir, "master", schema)
     with pytest.raises(ConfigError, match="cannot be created or overwritten"):
-        apply_aetherspace_json(engine_dir, "master", schema, source=export_path)
+        MainExecutionOps.apply_aetherspace_json(engine_dir, "master", schema, source=export_path)
 
 
 @pytest.mark.fast
 def test_apply_missing_export_raises(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="export file not found"):
-        apply_aetherspace_json(str(tmp_path), "films_only", _sample_schema())
+        MainExecutionOps.apply_aetherspace_json(str(tmp_path), "films_only", _sample_schema())
 
 
 @pytest.mark.fast
 def test_delete_removes_snapshot_file(tmp_path: Path) -> None:
     engine_dir = str(tmp_path)
     schema = _sample_schema()
-    snap = subset_graph_for_space(schema, SpaceContext(tables=frozenset({"film"})))
-    save_aetherspace_snapshot(engine_dir, "films_only", snap)
-    path = _aetherspace_path(engine_dir, "films_only")
+    snap = MainExecutionOps.subset_graph_for_space(schema, SpaceContext(tables=frozenset({"film"})))
+    MainExecutionOps.save_aetherspace_snapshot(engine_dir, "films_only", snap)
+    path = MainExecutionOps._aetherspace_path(engine_dir, "films_only")
     assert Path(path).is_file()
-    assert delete_aetherspace_snapshot(engine_dir, "films_only") is True
+    assert MainExecutionOps.delete_aetherspace_snapshot(engine_dir, "films_only") is True
     assert not Path(path).is_file()
 
 

@@ -7,9 +7,9 @@ from unittest.mock import patch
 import pytest
 
 from aetherdialect._contracts_core import FeedbackKind, GenerationPath, UserFeedbackRejectSuspendContext
-from aetherdialect._dialect import get_dialect
+from aetherdialect._dialect import DialectRegistry
 from aetherdialect._pipeline import complete_user_feedback_reject
-from aetherdialect._templates import _compute_intent_structural_signature
+from aetherdialect._templates import TemplateOps
 from aetherdialect._utils import intent_key
 
 from ._seed_helpers import (
@@ -33,7 +33,7 @@ _REJECTION_CASES = [
     _REJECTION_CASES,
     ids=[case[0] for case in _REJECTION_CASES],
 )
-@patch("aetherdialect._templates.llm_credentials_configured", return_value=False)
+@patch("aetherdialect._config.EngineConfig.llm_credentials_configured", return_value=False)
 def test_seeded_rejection_feedback(
     _mock_no_llm,
     schema,
@@ -46,7 +46,7 @@ def test_seeded_rejection_feedback(
     """Pre-seed an accepted template, then drive ``complete_user_feedback_reject`` directly. Asserts the rejection bookkeeping writes ``question_feedback`` for this question with the canonicalised reason recorded."""
     intent = intent_customer_first_names()
     sql = "SELECT customer.customer_id, customer.first_name FROM customer"
-    ish, _ = _compute_intent_structural_signature(intent)
+    ish, _ = TemplateOps._compute_intent_structural_signature(intent)
     with isolated_runner(schema, schema_terms, t2s, label=f"rej_{scenario_id.lower()}") as runner:
         tmpl = seed_template(
             runner,
@@ -67,7 +67,7 @@ def test_seeded_rejection_feedback(
             generation_path=GenerationPath.UNION_TEMPLATE_WIDEN,
             matched_template=tmpl,
             matched_rejected_template=None,
-            dialect=get_dialect(),
+            dialect=DialectRegistry.get(),
         )
         result = complete_user_feedback_reject(ctx, needs_reason=True, reject_reason=reject_reason)
 

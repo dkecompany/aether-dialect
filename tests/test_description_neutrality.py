@@ -1,4 +1,4 @@
-"""I12: model-facing descriptions must not leak federation or physical vocabulary."""
+"""Model-facing descriptions must not leak federation or physical vocabulary."""
 
 from __future__ import annotations
 
@@ -147,7 +147,7 @@ def test_fk_enrich_description_sanitized_with_forbidden_tokens() -> None:
     tokens = collect_federation_description_forbidden_tokens(
         members,
         manifest,
-        parse_federation_mappings({"version": 2}),
+        parse_federation_mappings({"version": "0.2.1"}),
         composite_names,
     )
     sanitize_schema_graph_descriptions(member_graph, tokens)
@@ -220,7 +220,7 @@ def test_collect_federation_description_forbidden_tokens_includes_aliases() -> N
     tokens = collect_federation_description_forbidden_tokens(
         members,
         manifest,
-        parse_federation_mappings({"version": 2}),
+        parse_federation_mappings({"version": "0.2.1"}),
         composite_names,
     )
     assert "legacy_payment" in tokens

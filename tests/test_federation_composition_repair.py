@@ -21,6 +21,7 @@ from aetherdialect._federation import (
 )
 from aetherdialect._intent_process import NormalizedExpr
 from aetherdialect._schema_graph import assign_schema_graph_hashes, recompute_join_paths_multi
+from tests.federation_helpers import stamp_union_disjointness_profiling
 
 
 def _table(
@@ -86,7 +87,6 @@ _MANIFEST = {
     ],
 }
 
-
 _PAYMENT_ONLY_MANIFEST = {
     "federation_id": "fed_payment_only",
     "sources": [
@@ -106,9 +106,13 @@ def _payment_members(
     a_table: TableMetadata | None = None,
     b_table: TableMetadata | None = None,
 ) -> dict[str, SchemaGraph]:
+    a_tbl = a_table or _table("payment", source_id="a")
+    b_tbl = b_table or _table("payment", source_id="b")
+    stamp_union_disjointness_profiling(a_tbl, overlap_sample=("a1", "a2"))
+    stamp_union_disjointness_profiling(b_tbl, overlap_sample=("b1", "b2"))
     return {
-        "a": _graph("payment", source_id="a", tables={"payment": a_table or _table("payment", source_id="a")}),
-        "b": _graph("payment", source_id="b", tables={"payment": b_table or _table("payment", source_id="b")}),
+        "a": _graph("payment", source_id="a", tables={"payment": a_tbl}),
+        "b": _graph("payment", source_id="b", tables={"payment": b_tbl}),
     }
 
 
@@ -162,9 +166,11 @@ def test_collapse_remaps_foreign_keys() -> None:
             },
         ),
     }
+    stamp_union_disjointness_profiling(members["a"].tables["payment"], overlap_sample=("a1", "a2"))
+    stamp_union_disjointness_profiling(members["b"].tables["payment"], overlap_sample=("b1", "b2"))
     mappings = parse_federation_mappings(
         {
-            "version": 2,
+            "version": "0.2.1",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -194,7 +200,7 @@ def test_collapse_sums_row_count_for_union() -> None:
     )
     mappings = parse_federation_mappings(
         {
-            "version": 2,
+            "version": "0.2.1",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -219,7 +225,7 @@ def test_collapse_rejects_partition_mismatch() -> None:
     )
     mappings = parse_federation_mappings(
         {
-            "version": 2,
+            "version": "0.2.1",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -268,7 +274,7 @@ def test_collapse_uses_strictest_sensitivity() -> None:
     )
     mappings = parse_federation_mappings(
         {
-            "version": 2,
+            "version": "0.2.1",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -301,7 +307,7 @@ def test_reconcile_composite_classifications_agrees_deterministically() -> None:
     )
     mappings = parse_federation_mappings(
         {
-            "version": 2,
+            "version": "0.2.1",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -328,7 +334,7 @@ def test_classification_conflict_reconciles_without_notes(monkeypatch: pytest.Mo
     )
     mappings = parse_federation_mappings(
         {
-            "version": 2,
+            "version": "0.2.1",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -357,7 +363,7 @@ def test_replica_requires_authoritative_source() -> None:
     with pytest.raises(FederationConfigError, match="authoritative_source"):
         parse_federation_mappings(
             {
-                "version": 2,
+                "version": "0.2.1",
                 "logical_tables": [
                     {
                         "logical": "payment",
@@ -377,7 +383,7 @@ def test_replica_plan_uses_authoritative_member_only() -> None:
 
     mappings = parse_federation_mappings(
         {
-            "version": 2,
+            "version": "0.2.1",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -404,7 +410,7 @@ def test_unresolved_mapping_member_raises() -> None:
     }
     mappings = parse_federation_mappings(
         {
-            "version": 2,
+            "version": "0.2.1",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -436,7 +442,7 @@ def test_composition_created_at_is_deterministic() -> None:
 def test_mappings_hash_is_order_independent() -> None:
     mapping_a = parse_federation_mappings(
         {
-            "version": 2,
+            "version": "0.2.1",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -451,7 +457,7 @@ def test_mappings_hash_is_order_independent() -> None:
     )
     mapping_b = parse_federation_mappings(
         {
-            "version": 2,
+            "version": "0.2.1",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -525,7 +531,7 @@ def test_column_coverage_marks_ineligible_plan() -> None:
     )
     mappings = parse_federation_mappings(
         {
-            "version": 2,
+            "version": "0.2.1",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -559,4 +565,4 @@ def test_column_coverage_marks_ineligible_plan() -> None:
         ],
     )
     plan = plan_federated_intent(intent, composite, manifest, mappings)
-    assert plan.ineligible_reason == "projection columns are not held by any single member"
+    assert plan.ineligible_reason == ("union logical column 'only_a' on 'payment' is not present on members: b")

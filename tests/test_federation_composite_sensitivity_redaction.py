@@ -6,6 +6,7 @@ from aetherdialect._contracts_base import SensitivityClassification
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._federation import compose_composite_graph, parse_federation_manifest, parse_federation_mappings
 from aetherdialect._schema_graph import recompute_join_paths_multi
+from tests.federation_helpers import stamp_union_disjointness_profiling
 
 
 def _payment_graph(
@@ -60,10 +61,14 @@ def test_hidden_member_sensitivity_strips_profile_samples_on_composite() -> None
             email_samples=[],
         ),
     }
+    stamp_union_disjointness_profiling(members["a"].tables["payment_a"], key_col="id", overlap_sample=("a1", "a2"))
+    stamp_union_disjointness_profiling(members["b"].tables["payment_b"], key_col="id", overlap_sample=("b1", "b2"))
+    stamp_union_disjointness_profiling(members["a"].tables["payment_a"], key_col="email", overlap_sample=("ea1",))
+    stamp_union_disjointness_profiling(members["b"].tables["payment_b"], key_col="email", overlap_sample=("eb1",))
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
     mappings = parse_federation_mappings(
         {
-            "version": 1,
+            "version": "0.2.1",
             "logical_columns": [],
             "logical_tables": [
                 {

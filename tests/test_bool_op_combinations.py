@@ -13,9 +13,6 @@ from aetherdialect._contracts_base import (
     NormalizedExpr,
     PredicateGroup,
     WhereParam,
-    predicate_group_from_legacy_flat_where_dicts,
-    predicate_group_from_legacy_having_dicts,
-    predicate_group_from_list,
 )
 from aetherdialect._contracts_core import (
     RuntimeCteStep,
@@ -71,8 +68,8 @@ def _coerce_where(
     if not filters:
         return None
     if isinstance(filters[0], dict):
-        return predicate_group_from_legacy_flat_where_dicts(cast(list[Any], filters))
-    return predicate_group_from_list(cast(list[WhereParam], filters))
+        return PredicateGroup.from_legacy_flat_where_dicts(cast(list[Any], filters))
+    return PredicateGroup.from_list(cast(list[WhereParam], filters))
 
 
 def _coerce_having(
@@ -83,8 +80,8 @@ def _coerce_having(
     if not having:
         return None
     if isinstance(having[0], dict):
-        return predicate_group_from_legacy_having_dicts(cast(list[Any], having))
-    return predicate_group_from_list(cast(list[HavingParam], having))
+        return PredicateGroup.from_legacy_having_dicts(cast(list[Any], having))
+    return PredicateGroup.from_list(cast(list[HavingParam], having))
 
 
 def _wf(col: str, pk: str, **extra: object) -> dict[str, object]:
@@ -129,7 +126,7 @@ def _where_after_pipeline(filters: PredicateGroup | list[WhereParam] | list[dict
         group_by_cols=[],
         order_by_cols=[],
         where=(
-            predicate_group_from_list([WhereParam.from_dict(raw) for raw in legacy_dicts])
+            PredicateGroup.from_list([WhereParam.from_dict(raw) for raw in legacy_dicts])
             if legacy_dicts
             else _coerce_where(filters)
         ),
@@ -140,7 +137,7 @@ def _where_after_pipeline(filters: PredicateGroup | list[WhereParam] | list[dict
     if legacy_dicts:
         intent = replace(
             intent,
-            where=predicate_group_from_legacy_flat_where_dicts(
+            where=PredicateGroup.from_legacy_flat_where_dicts(
                 _legacy_dicts_after_decompose(legacy_dicts, intent.where)
             ),
         )
@@ -181,7 +178,7 @@ def _having_after_pipeline(having: PredicateGroup | list[HavingParam] | list[dic
         order_by_cols=[],
         where=None,
         having=(
-            predicate_group_from_list([HavingParam.from_dict(raw) for raw in legacy_dicts])
+            PredicateGroup.from_list([HavingParam.from_dict(raw) for raw in legacy_dicts])
             if legacy_dicts
             else _coerce_having(having)
         ),
@@ -191,7 +188,7 @@ def _having_after_pipeline(having: PredicateGroup | list[HavingParam] | list[dic
     if legacy_dicts:
         intent = replace(
             intent,
-            having=predicate_group_from_legacy_having_dicts(legacy_dicts),
+            having=PredicateGroup.from_legacy_having_dicts(legacy_dicts),
         )
     intent = coerce_predicate_group_mode(intent)
     intent = normalize_where_havings(intent)
@@ -510,7 +507,7 @@ class TestCteCaseDedupQsimWarnings:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.id"))],
             group_by_cols=[],
             output_columns=["id"],
-            where=predicate_group_from_legacy_flat_where_dicts(
+            where=PredicateGroup.from_legacy_flat_where_dicts(
                 [
                     _wf("t.a", "p1", where_group=1, bool_op="OR"),
                     _wf("t.b", "p2", where_group=2),
@@ -577,8 +574,8 @@ class TestCteCaseDedupQsimWarnings:
             _wf("t.a", "p9", where_group=1),
             _wf("t.b", "p8", where_group=2),
         ]
-        g1 = predicate_group_from_legacy_flat_where_dicts(f1)
-        g2 = predicate_group_from_legacy_flat_where_dicts(f2)
+        g1 = PredicateGroup.from_legacy_flat_where_dicts(f1)
+        g2 = PredicateGroup.from_legacy_flat_where_dicts(f2)
         assert g1 is not None and g2 is not None
         assert _compute_where_similarity(g1.leaves(), g2.leaves()) == pytest.approx(1.0)
 
@@ -591,15 +588,15 @@ class TestCteCaseDedupQsimWarnings:
             _wf("t.a", "p1", where_group=1),
             _wf("t.b", "p2", where_group=2),
         ]
-        t_group = predicate_group_from_legacy_flat_where_dicts(template)
-        i_group = predicate_group_from_legacy_flat_where_dicts(intent)
+        t_group = PredicateGroup.from_legacy_flat_where_dicts(template)
+        i_group = PredicateGroup.from_legacy_flat_where_dicts(intent)
         assert t_group is not None and i_group is not None
         assert _compute_where_similarity(t_group.leaves(), i_group.leaves()) == pytest.approx(1.0)
 
     def test_warning_or_with_no_signal(self) -> None:
         issues = validate_predicate_group_hints(
             "Show rows where name is Alice or Bob",
-            predicate_group_from_list(
+            PredicateGroup.from_list(
                 [
                     WhereParam(
                         NormalizedExpr.from_column("t.name"),
@@ -622,7 +619,7 @@ class TestCteCaseDedupQsimWarnings:
     def test_warning_both_signals(self) -> None:
         issues = validate_predicate_group_hints(
             "",
-            predicate_group_from_legacy_flat_where_dicts([_wf("t.a", "p1", where_group=1, bool_op="OR")]),
+            PredicateGroup.from_legacy_flat_where_dicts([_wf("t.a", "p1", where_group=1, bool_op="OR")]),
             None,
         )
         assert issues == []
@@ -635,7 +632,7 @@ def test_validate_semantics_includes_bool_hints() -> None:
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.a"))],
         group_by_cols=[],
         order_by_cols=[],
-        where=predicate_group_from_legacy_flat_where_dicts([_wf("t.a", "p1", where_group=1, bool_op="OR")]),
+        where=PredicateGroup.from_legacy_flat_where_dicts([_wf("t.a", "p1", where_group=1, bool_op="OR")]),
         having=None,
         natural_language="",
     )

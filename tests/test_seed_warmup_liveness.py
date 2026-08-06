@@ -13,11 +13,10 @@ from aetherdialect._config import SeedWarmupConfig
 from aetherdialect._contracts_base import NormalizedExpr
 from aetherdialect._contracts_core import SeedWarmupIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._seed_warmup import (
-    SeedWarmupCacheSession,
-    open_seed_warmup_cache_session,
-    warmup_intent_fingerprint,
-)
+from aetherdialect._seed_warmup import SeedWarmupCacheSession
+
+open_seed_warmup_cache_session = SeedWarmupCacheSession.open_seed_warmup_cache_session
+warmup_intent_fingerprint = SeedWarmupCacheSession.warmup_intent_fingerprint
 
 
 def _orders_intent() -> SeedWarmupIntent:
@@ -91,7 +90,7 @@ def _seed_cache_zip(
 
 @pytest.mark.fast
 def test_profiling_hash_drift_prunes_stale_work_units() -> None:
-    fp = warmup_intent_fingerprint(_orders_intent())
+    fp = SeedWarmupCacheSession.warmup_intent_fingerprint(_orders_intent())
     with tempfile.TemporaryDirectory() as td:
         _seed_cache_zip(td, work_units={"stale-wid": _work_unit_record(fingerprint=fp, work_unit_id="stale-wid")})
         schema = SchemaGraph(
@@ -102,36 +101,36 @@ def test_profiling_hash_drift_prunes_stale_work_units() -> None:
             schema_graph_id="same",
             profiling_hash="p1",
         )
-        sess = open_seed_warmup_cache_session(td, schema, "same")
+        sess = SeedWarmupCacheSession.open_seed_warmup_cache_session(td, schema, "same")
         assert sess.work_units == {}
         assert sess.fp_to_wid == {}
 
 
 @pytest.mark.fast
 def test_profiling_hash_drift_retains_live_work_units() -> None:
-    fp = warmup_intent_fingerprint(_orders_intent())
+    fp = SeedWarmupCacheSession.warmup_intent_fingerprint(_orders_intent())
     with tempfile.TemporaryDirectory() as td:
         _seed_cache_zip(td, work_units={"live-wid": _work_unit_record(fingerprint=fp, work_unit_id="live-wid")})
         schema = _orders_schema(profiling_hash="p1")
-        sess = open_seed_warmup_cache_session(td, schema, "same")
+        sess = SeedWarmupCacheSession.open_seed_warmup_cache_session(td, schema, "same")
         assert "live-wid" in sess.work_units
         assert sess.fp_to_wid[fp] == "live-wid"
 
 
 @pytest.mark.fast
 def test_ensure_work_unit_id_is_content_addressed_from_fingerprint() -> None:
-    fp = warmup_intent_fingerprint(_orders_intent())
+    fp = SeedWarmupCacheSession.warmup_intent_fingerprint(_orders_intent())
     sess = SeedWarmupCacheSession(manifest={}, work_units={})
     first = sess.ensure_work_unit_id(fp)
     second = sess.ensure_work_unit_id(fp)
     assert first == fp
     assert second == fp
-    assert sess.ensure_work_unit_id(warmup_intent_fingerprint(_orders_intent())) == fp
+    assert sess.ensure_work_unit_id(SeedWarmupCacheSession.warmup_intent_fingerprint(_orders_intent())) == fp
 
 
 @pytest.mark.fast
 def test_reingest_same_fingerprint_reuses_content_addressed_work_unit_id() -> None:
-    fp = warmup_intent_fingerprint(_orders_intent())
+    fp = SeedWarmupCacheSession.warmup_intent_fingerprint(_orders_intent())
     first = SeedWarmupCacheSession(manifest={}, work_units={})
     wid_a = first.ensure_work_unit_id(fp)
     second = SeedWarmupCacheSession(manifest={}, work_units={})

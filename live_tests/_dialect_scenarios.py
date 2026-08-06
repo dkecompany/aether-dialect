@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from aetherdialect._live_testing import Expected, Scenario
+from aetherdialect._contracts_core import Expected, Scenario
 from live_tests.mydb_scenarios import FILM_SCOPED
 
 

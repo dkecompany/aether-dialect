@@ -8,9 +8,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from aetherdialect._contracts_base import (
+    ConfigError,
     FederationCoordinatorConfig,
     FederationManifest,
-    FederationMappings,
     FederationPlanTemplate,
     FederationSourceBinding,
 )
@@ -88,50 +88,21 @@ def test_query_log_warmup_allowed_with_mock_owner() -> None:
 @pytest.mark.fast
 def test_aether_federation_seed_warmup_routes_not_refused() -> None:
     fed = _federation_stub()
-    fed._federation_mappings = FederationMappings(version=2)
-    fed._federation_member_graphs = {
-        "a": SchemaGraph(tables={}, join_paths_multi={}),
-        "b": SchemaGraph(tables={}, join_paths_multi={}),
-    }
-    fed._federation_dialects = {"a": object(), "b": object()}
-    fed._federation_source_runtimes = {}
-    fed._federation_storage_dir = "fed_dir"
-    fed._schema_graph = SchemaGraph(tables={}, join_paths_multi={})
-    fed._dialect = object()
-    fed._store = {"next_id": 1}
-    fed._templates = {}
-    with (
-        patch.object(AetherFederation, "_require_open"),
-        patch.object(AetherFederation, "_ensure_llm"),
-        patch("aetherdialect.aetherdialect.federation_stores_by_source", return_value={"a": {}, "b": {}}),
-        patch("aetherdialect.aetherdialect.seed_warmup_run_once") as run_once,
-        patch("aetherdialect.aetherdialect.diagnostic_print_listener", return_value=MagicMock()),
-    ):
+    with pytest.raises(ConfigError, match="warmup is not supported on AetherFederation"):
         fed.run_seed_warmup("seed.txt")
-    run_once.assert_called_once()
-    kwargs = run_once.call_args.kwargs
-    assert kwargs["federation_manifest"] is fed._federation_manifest
-    assert kwargs["stores_by_source"] == {"a": {}, "b": {}}
-    assert kwargs["federation_dir"] == "fed_dir"
 
 
 @pytest.mark.fast
 def test_aether_federation_history_warmup_refused_with_member_guidance() -> None:
     fed = _federation_stub()
-    with pytest.raises(
-        FederationConfigError,
-        match="run SQL-history warmup on each source engine individually",
-    ):
+    with pytest.raises(ConfigError, match="warmup is not supported on AetherFederation"):
         fed.run_seed_warmup_from_history("history.sql")
 
 
 @pytest.mark.fast
 def test_aether_federation_query_log_warmup_refused_with_member_guidance() -> None:
     fed = _federation_stub()
-    with pytest.raises(
-        FederationConfigError,
-        match="run query-log warmup on each source engine individually",
-    ):
+    with pytest.raises(ConfigError, match="warmup is not supported on AetherFederation"):
         fed.run_seed_warmup_from_query_log()
 
 
@@ -251,8 +222,8 @@ def test_federated_warmup_learning_lands_in_member_stores_and_plan() -> None:
         return tmpl_a if store is store_a else tmpl_b
 
     with (
-        patch("aetherdialect._pipeline.insert_template", side_effect=_insert),
-        patch("aetherdialect._pipeline.save_template_store") as save_store,
+        patch("aetherdialect._templates.TemplateOps.insert_template", side_effect=_insert),
+        patch("aetherdialect._templates.TemplateOps.save_template_store") as save_store,
         patch("aetherdialect._pipeline.stamp_federation_member_template"),
         patch("aetherdialect._pipeline.member_schema_slice", return_value=SchemaGraph(tables={}, join_paths_multi={})),
         patch(

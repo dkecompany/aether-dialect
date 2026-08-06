@@ -13,7 +13,7 @@ from aetherdialect import AetherEngine
 from aetherdialect._constants import MIGRATION_MAP_FILENAME, SCHEMA_OVERRIDES_DEFAULT_FILENAME
 from aetherdialect._contracts_base import EngineContext, LLMConfig, RuntimeConfig
 from aetherdialect._core_utils import load_runtime_config
-from aetherdialect._templates import empty_template_store
+from aetherdialect._templates import TemplateOps
 
 
 def _make_aether_stub(*, artifacts_dir: Path, **overrides: object) -> AetherEngine:
@@ -28,7 +28,7 @@ def _make_aether_stub(*, artifacts_dir: Path, **overrides: object) -> AetherEngi
         _schema_graph=MagicMock(),
         _dialect=MagicMock(),
         _artifacts_dir=artifacts_dir,
-        _store=empty_template_store("unit_test_eff"),
+        _store=TemplateOps.empty_template_store("unit_test_eff"),
         _templates={},
         _rejected={},
         _schema_terms=set(),
@@ -47,7 +47,7 @@ def _make_aether_stub(*, artifacts_dir: Path, **overrides: object) -> AetherEngi
     return obj
 
 
-def test_export_schema_overrides_under_artifacts_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_export_overrides_under_artifacts_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     artifacts_dir = tmp_path / "artifacts"
     artifacts_dir.mkdir()
     cwd_dir = tmp_path / "cwd"
@@ -56,12 +56,12 @@ def test_export_schema_overrides_under_artifacts_dir(tmp_path: Path, monkeypatch
 
     engine = _make_aether_stub(artifacts_dir=artifacts_dir)
 
-    def _write_stub(_schema_graph: object, target: Path) -> Path:
+    def _write_stub(_schema_graph: object, target: Path, **_kwargs: object) -> Path:
         target.write_text("{}", encoding="utf-8")
         return target
 
     with patch("aetherdialect.aetherdialect.dump_schema_overrides_to_path", side_effect=_write_stub):
-        out = engine.export_schema_overrides()
+        out = engine.export_overrides()
 
     expected = artifacts_dir / SCHEMA_OVERRIDES_DEFAULT_FILENAME
     assert out == expected

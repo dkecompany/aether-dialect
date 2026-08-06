@@ -116,9 +116,9 @@ def test_execute_guarded_sql_enforces_member_cost_cap_not_global() -> None:
         schema: object | None = None,
         intent: object | None = None,
     ) -> tuple[bool, list[SqlDiagnostic], str]:
-        from aetherdialect._dialect import explain_cost_gate_violation
+        from aetherdialect._dialect import Dialect
 
-        failed, why = explain_cost_gate_violation(500.0, None, dialect=dialect)
+        failed, why = Dialect.explain_cost_gate_violation(500.0, None, dialect=dialect)
         if failed:
             return (
                 False,
@@ -135,3 +135,56 @@ def test_execute_guarded_sql_enforces_member_cost_cap_not_global() -> None:
     assert PolicyConfig.MAX_QUERY_COST_ROWS is None or 500.0 < float(PolicyConfig.MAX_QUERY_COST_ROWS)
     result = execute_guarded_sql(dialect, "SELECT 1", max_query_cost_rows=1000.0)
     assert result == [(1,)]
+
+
+@pytest.mark.fast
+def test_execute_guarded_sql_enforces_member_cost_bytes_cap() -> None:
+    dialect = MagicMock()
+    dialect.parse_select.return_value = "SELECT"
+    dialect.ast_validate_full.return_value = []
+    dialect.can_explain.return_value = True
+    dialect.execute.return_value = [(1,)]
+
+    def _explain_with_bytes_gate(
+        _sql: str,
+        _params: dict[str, object] | None = None,
+        *,
+        schema: object | None = None,
+        intent: object | None = None,
+    ) -> tuple[bool, list[SqlDiagnostic], str]:
+        from aetherdialect._dialect import Dialect
+
+        failed, why = Dialect.explain_cost_gate_violation(1.0, 500.0, dialect=dialect)
+        if failed:
+            return (
+                False,
+                [SqlDiagnostic(code=SqlDiagnosticCode.EXPLAIN_COST_EXCEEDED, message=why)],
+                why,
+            )
+        return True, [], ""
+
+    dialect.explain_diagnose.side_effect = _explain_with_bytes_gate
+
+    with pytest.raises(ValueError, match="cost gate"):
+        execute_guarded_sql(dialect, "SELECT 1", max_query_cost_bytes=100.0)
+
+    result = execute_guarded_sql(dialect, "SELECT 1", max_query_cost_bytes=1000.0)
+    assert result == [(1,)]
+
+
+@pytest.mark.fast
+def test_explain_diagnose_honors_profile_timeout_ms_override() -> None:
+    dialect = MagicMock()
+    dialect.parse_select.return_value = "SELECT"
+    dialect.ast_validate_full.return_value = []
+    dialect.can_explain.return_value = True
+    dialect.execute.return_value = [(1,)]
+    seen: list[int | None] = []
+
+    def _capture_validate(d: object, *_args: object, **_kwargs: object) -> tuple[bool, None, None, list[SqlDiagnostic]]:
+        seen.append(getattr(d, "profile_timeout_ms", None))
+        return True, None, None, []
+
+    with patch("aetherdialect._validation_execute.validate_sql", side_effect=_capture_validate):
+        execute_guarded_sql(dialect, "SELECT 1", profile_timeout_ms=42)
+    assert seen == [42]

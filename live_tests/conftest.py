@@ -23,6 +23,7 @@ from aetherdialect._config import (
     QSimConfig,
 )
 from aetherdialect._contracts_base import EngineContext, SensitivityClassification
+from aetherdialect._contracts_core import LiveTestRunner
 from aetherdialect._core_utils import (
     StepResult,
     append_failure_trace,
@@ -30,15 +31,13 @@ from aetherdialect._core_utils import (
     llm_usage_question_scope,
     llm_usage_session_scope,
 )
-from aetherdialect._live_testing import LiveTestRunner
-from aetherdialect._main_execution import load_schema_context_cache, write_schema_context_cache
+from aetherdialect._main_execution import MainExecutionOps
 from aetherdialect._schema_overrides import (
     apply_schema_overrides_to_graph,
     load_schema_overrides_file,
 )
 from aetherdialect._templates import (
-    load_template_store,
-    store_to_templates,
+    TemplateOps,
 )
 
 from ._invoice import clear_invoice_file, write_invoice_file
@@ -590,8 +589,8 @@ def _build_rbac_owner_engine(
             PolicyConfig.REGENERATE_SCHEMA_GRAPH = prev_regen_graph
         _redirect_to_livetest_dir(instance)
         master_ctx = instance._runtime_config.engine_context
-        if load_schema_context_cache(str(instance._artifacts_dir)) is None:
-            write_schema_context_cache(str(instance._artifacts_dir), master_ctx)
+        if MainExecutionOps.load_schema_context_cache(str(instance._artifacts_dir)) is None:
+            MainExecutionOps.write_schema_context_cache(str(instance._artifacts_dir), master_ctx)
         if relax_sensitivity:
             _relax_rental_shop_selectability(
                 instance._schema_graph,
@@ -637,6 +636,23 @@ def _build_rbac_consumer_engine(
     finally:
         if owns_config:
             Path(config_file).unlink(missing_ok=True)
+
+
+def restore_default_engine_config_classvars() -> None:
+    """Restore class-level engine storage paths and connection config after live sessions."""
+    from aetherdialect._constants import ENGINE_STORAGE_PLACEHOLDER_DIR, TEMPLATE_STORE_SEGMENT
+
+    EngineConfig.TYPE = "postgresql"
+    EngineConfig.RUNTIME = PostgresRuntimeConfig
+    EngineConfig.SCHEMA_JSON_PATH = os.path.join(ENGINE_STORAGE_PLACEHOLDER_DIR, "schema_graph.json.gz")
+    EngineConfig.TEMPLATE_STORE_DIR = os.path.join(ENGINE_STORAGE_PLACEHOLDER_DIR, TEMPLATE_STORE_SEGMENT)
+    QSimConfig.SKELETONS_JSON_PATH = os.path.join(ENGINE_STORAGE_PLACEHOLDER_DIR, "qsim_skeletons.json.gz")
+    PostgresRuntimeConfig.HOST = "localhost"
+    PostgresRuntimeConfig.PORT = 5432
+    PostgresRuntimeConfig.USER = "postgres"
+    PostgresRuntimeConfig.PASSWORD = None
+    PostgresRuntimeConfig.DATABASE = None
+    PostgresRuntimeConfig.SCHEMA = "public"
 
 
 def _redirect_to_livetest_dir(t2s: AetherEngine) -> str:
@@ -711,12 +727,12 @@ def _build_live_aether_engine(*, relax_sensitivity: bool) -> AetherEngine:
                 PolicyConfig.REGENERATE_SCHEMA_GRAPH = prev_regen_graph
                 PolicyConfig.REGENERATE_SKELETON_CACHE = prev_regen_skeleton
 
-            fresh_store = load_template_store(
+            fresh_store = TemplateOps.load_template_store(
                 instance._schema_graph.effective_structural_hash,
                 instance._schema_graph,
             )
             instance._store = fresh_store
-            instance._templates = store_to_templates(fresh_store)
+            instance._templates = TemplateOps.store_to_templates(fresh_store)
             instance._rejected = {}
 
             if relax_sensitivity:
@@ -750,8 +766,8 @@ def _derive_enforce_sensitivity_engine(t2s: AetherEngine) -> AetherEngine:
     for slot in AetherEngine.__slots__:
         setattr(derived, slot, getattr(t2s, slot))
     derived._schema_graph = enforced_graph
-    derived._store = load_template_store(enforced_graph.effective_structural_hash, enforced_graph)
-    derived._templates = store_to_templates(derived._store)
+    derived._store = TemplateOps.load_template_store(enforced_graph.effective_structural_hash, enforced_graph)
+    derived._templates = TemplateOps.store_to_templates(derived._store)
     derived._rejected = {}
     return derived
 
@@ -779,6 +795,13 @@ def _enforce_postgresql_dialect(request: pytest.FixtureRequest) -> None:
     }
     if pg_env:
         PostgresRuntimeConfig.apply_environment(pg_env)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _restore_engine_config_after_live_session() -> Any:
+    """Restore EngineConfig ClassVars mutated by live session fixtures."""
+    yield
+    restore_default_engine_config_classvars()
 
 
 @pytest.fixture(scope="session")

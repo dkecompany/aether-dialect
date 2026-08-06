@@ -16,6 +16,7 @@ from aetherdialect._federation import (
     plan_federated_intent,
 )
 from aetherdialect._schema_graph import recompute_join_paths_multi
+from tests.federation_helpers import stamp_union_disjointness_profiling
 
 
 def _member_table(table: str, source_id: str) -> TableMetadata:
@@ -67,7 +68,7 @@ _FOUR_MEMBER_MANIFEST = {
 }
 
 _FOUR_MEMBER_MAPPINGS = {
-    "version": 2,
+    "version": "0.2.1",
     "logical_tables": [
         {
             "logical": "events",
@@ -116,6 +117,11 @@ def test_one_member_and_four_member_plans_share_envelope_fields(monkeypatch: pyt
         "m3": _member_graph("e3", "m3"),
         "m4": _member_graph("e4", "m4"),
     }
+    for source_id, graph in four_members.items():
+        stamp_union_disjointness_profiling(
+            graph.tables[next(iter(graph.tables))],
+            overlap_sample=(f"{source_id}_1", f"{source_id}_2"),
+        )
     four_composite = compose_composite_graph(four_members, four_manifest, four_mappings)
     four_intent = RuntimeIntent(
         tables=["events"],

@@ -6,7 +6,7 @@ import pytest
 
 from aetherdialect._contracts_base import ColumnRole
 from aetherdialect._contracts_schema import ColumnMetadata, QSimSkeleton, SchemaGraph, TableMetadata
-from aetherdialect._qsim import _SKELETON_CACHE, generate_all_skeletons
+from aetherdialect._qsim import _skeleton_cache, generate_all_skeletons
 
 
 def _column_roles(schema: SchemaGraph) -> dict[str, str]:
@@ -60,7 +60,7 @@ def test_skeleton_cache_isolated_by_schema_graph_identity() -> None:
     roles_a = _column_roles(tenant_a)
     roles_b = _column_roles(tenant_b)
 
-    _SKELETON_CACHE.clear()
+    _skeleton_cache.clear()
     result_a = generate_all_skeletons(["orders"], tenant_a, roles_a)
     result_b = generate_all_skeletons(["orders"], tenant_b, roles_b)
 

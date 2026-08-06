@@ -10,7 +10,6 @@ from aetherdialect._constants import INTERPRET_FIELDS
 from aetherdialect._contracts_base import (
     DescriptionOwner,
     FederationMemberUnprofilableError,
-    resolve_descriptions,
 )
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._federation import (
@@ -75,7 +74,7 @@ def test_merge_union_statistics_preserves_single_member_distinct_count() -> None
 
 @pytest.mark.fast
 def test_resolve_descriptions_higher_owner_wins() -> None:
-    text, owner = resolve_descriptions(
+    text, owner = DescriptionOwner.resolve(
         ("catalog text", DescriptionOwner.CATALOG),
         ("user text", DescriptionOwner.USER_OVERRIDE),
     )
@@ -85,7 +84,7 @@ def test_resolve_descriptions_higher_owner_wins() -> None:
 
 @pytest.mark.fast
 def test_resolve_descriptions_same_owner_conflict_clears() -> None:
-    text, owner = resolve_descriptions(
+    text, owner = DescriptionOwner.resolve(
         ("alpha", DescriptionOwner.PROFILE),
         ("beta", DescriptionOwner.PROFILE),
     )
@@ -95,8 +94,7 @@ def test_resolve_descriptions_same_owner_conflict_clears() -> None:
 
 @pytest.mark.fast
 def test_resolve_descriptions_same_owner_unanimous_keeps_text() -> None:
-    text, owner = resolve_descriptions(
-        ("shared", DescriptionOwner.PROFILE),
+    text, owner = DescriptionOwner.resolve(
         ("shared", DescriptionOwner.PROFILE),
     )
     assert text == "shared"

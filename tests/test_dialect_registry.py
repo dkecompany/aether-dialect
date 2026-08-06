@@ -17,7 +17,7 @@ from aetherdialect._constants import (
 )
 from aetherdialect._contracts_core import SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._dialect import derive_dialect_registry_surfaces, get_registered_engines, get_runtime_config_class
+from aetherdialect._dialect import DialectRegistry
 from aetherdialect._dialect_sqlglot_engines import SnowflakeDialect
 from aetherdialect._intent_process import NormalizedExpr
 from aetherdialect._sql_gen import _maybe_render_array_unnest_select
@@ -64,7 +64,7 @@ def test_snowflake_skips_select_list_unnest_expansion_for_cte_arrays() -> None:
 
 @pytest.mark.fast
 def test_derived_registry_surfaces_match_runtime_constants() -> None:
-    derived = derive_dialect_registry_surfaces()
+    derived = DialectRegistry.derive_surfaces()
     assert derived["canonical_engine_order"] == CANONICAL_ENGINE_ORDER
     assert derived["native_backend_engines"] == NATIVE_BACKEND_ENGINES
     assert derived["embedded_engine_names"] == EMBEDDED_ENGINE_NAMES
@@ -73,15 +73,28 @@ def test_derived_registry_surfaces_match_runtime_constants() -> None:
     assert derived["statistical_agg_excluded_engines"] == STATISTICAL_AGG_EXCLUDED_ENGINES
     assert derived["window_frames_excluded_engines"] == WINDOW_FRAMES_EXCLUDED_ENGINES
     assert derived["array_contains_excluded_engines"] == ARRAY_CONTAINS_EXCLUDED_ENGINES
+    expected_toml_sections = frozenset(
+        (DialectRegistry.get_class(engine).registry_toml_section or engine)
+        for engine in DialectRegistry.get_registered_engines()
+        if (DialectRegistry.get_class(engine).registry_toml_section or engine) in TOML_ENGINE_FIELD_MAPS
+    )
+    assert derived["toml_field_map_engines"] == expected_toml_sections
+    assert derived["toml_field_map_engines"] <= frozenset(TOML_ENGINE_FIELD_MAPS)
 
 
 @pytest.mark.fast
 def test_every_registered_dialect_has_runtime_config_and_toml_fields() -> None:
-    derived = derive_dialect_registry_surfaces()
-    for engine in get_registered_engines():
-        get_runtime_config_class(engine)
-        toml_section = next(
-            (section for section in derived["toml_field_map_engines"] if TOML_ENGINE_FIELD_MAPS.get(section)),
-            None,
+    for engine in DialectRegistry.get_registered_engines():
+        DialectRegistry.get_runtime_config_class(engine)
+        cls = DialectRegistry.get_class(engine)
+        toml_section = cls.registry_toml_section or engine
+        assert toml_section in TOML_ENGINE_FIELD_MAPS, (
+            f"registered engine {engine!r} TOML section {toml_section!r} missing from TOML_ENGINE_FIELD_MAPS"
         )
-        assert toml_section is not None, f"registered engine {engine!r} missing TOML field map"
+        field_specs = TOML_ENGINE_FIELD_MAPS[toml_section]
+        assert field_specs, f"registered engine {engine!r} missing TOML field map for section {toml_section!r}"
+        for field_name, env_var in field_specs:
+            assert field_name, f"registered engine {engine!r} TOML section {toml_section!r} has empty field name"
+            assert env_var, (
+                f"registered engine {engine!r} TOML section {toml_section!r} field {field_name!r} has empty env var"
+            )

@@ -8,7 +8,11 @@ from unittest.mock import MagicMock
 import pandas as pd
 import pytest
 
-from aetherdialect._contracts_base import NormalizedExpr, WhereParam, predicate_group_from_list
+from aetherdialect._contracts_base import (
+    NormalizedExpr,
+    PredicateGroup,
+    WhereParam,
+)
 from aetherdialect._contracts_core import (
     FederatedStage,
     FederationReducingEdge,
@@ -97,11 +101,11 @@ def test_filter_keys_edges_respect_semijoin_disabled_switch() -> None:
         select_cols=[],
         group_by_cols=[],
         order_by_cols=[],
-        where=predicate_group_from_list([_cross_source_join_where()]),
+        where=PredicateGroup.from_list([_cross_source_join_where()]),
     )
     reducing = _collect_member_reducing_edges(
         manifest,
-        FederationMappings(version=2),
+        FederationMappings(version="0.2.1"),
         sources,
         intent,
         source_by_table,

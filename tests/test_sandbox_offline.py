@@ -16,24 +16,22 @@ import pytest
 from aetherdialect import AetherEngine, EngineContext, Sandbox
 from aetherdialect._config import DuckDBRuntimeConfig
 from aetherdialect._constants import (
-    CONSUMER_RESTRICTED_ALLOW_OBJECTS,
+    CONSUMER_EXAMPLE_NARROW_ALLOW_OBJECTS,
     SANDBOX_TOUR_EXPECT_NO_SQL,
     SANDBOX_VALIDATION_FAILURE_EXPECT_NO_SQL,
     SANDBOX_VALIDATION_FAILURE_QUESTIONS,
     SESSION_KIND_AWAITING_SQL_CONFIRM,
 )
-from aetherdialect._contracts_base import OwnerOnlyOperationError, SessionActiveError
-from aetherdialect._llm_provider import reset_mock_provider
-from aetherdialect._sandbox import (
-    SandboxBuildSection,
-    _sandbox_build_section,
-    assert_sandbox_complete,
-    data_zip_path,
-    fixtures_corpus_text,
-    sandbox_doctor,
-    sandbox_feedback_demo,
-)
+from aetherdialect._contracts_base import OwnerOnlyOperationError, SandboxBuildSection, SessionActiveError
+from aetherdialect._llm_provider import MockProvider
 from aetherdialect._sql_gen import join_hints_multi
+
+_sandbox_build_section = Sandbox._sandbox_build_section
+assert_sandbox_complete = Sandbox.assert_sandbox_complete
+data_zip_path = Sandbox.data_zip_path
+fixtures_corpus_text = Sandbox.fixtures_corpus_text
+sandbox_doctor = Sandbox.sandbox_doctor
+sandbox_feedback_demo = Sandbox.sandbox_feedback_demo
 
 _TOUR_EXPECT_NO_SQL = SANDBOX_TOUR_EXPECT_NO_SQL
 _VALIDATION_FAILURE_QUESTIONS = SANDBOX_VALIDATION_FAILURE_QUESTIONS
@@ -60,14 +58,14 @@ _ZIP_REQUIRED_MEMBERS = (
 
 @pytest.fixture(autouse=True)
 def _reset_mock() -> None:
-    reset_mock_provider()
+    MockProvider.reset_mock_provider()
     yield
-    reset_mock_provider()
+    MockProvider.reset_mock_provider()
 
 
 @pytest.fixture(scope="module")
 def _fixture_corpus() -> str:
-    raw = fixtures_corpus_text()
+    raw = Sandbox.fixtures_corpus_text()
     assert '"fixtures": []' not in raw and '"fixtures":[]' not in raw, "fixture corpus is empty"
     return raw
 
@@ -84,7 +82,7 @@ duckdb = pytest.importorskip("duckdb")
 
 
 def _zip_member_set() -> set[str]:
-    with zipfile.ZipFile(data_zip_path()) as zf:
+    with zipfile.ZipFile(Sandbox.data_zip_path()) as zf:
         return set(zf.namelist())
 
 
@@ -93,15 +91,15 @@ def _zip_members_without_locks() -> set[str]:
 
 
 def _sandbox_practice_questions() -> list[str]:
-    if not data_zip_path().is_file():
+    if not Sandbox.data_zip_path().is_file():
         return []
     return AetherEngine.sandbox_questions()
 
 
 def _sandbox_build_questions(section: str) -> list[str]:
-    if not data_zip_path().is_file():
+    if not Sandbox.data_zip_path().is_file():
         return []
-    return _sandbox_build_section(cast(SandboxBuildSection, section))
+    return Sandbox._sandbox_build_section(cast(SandboxBuildSection, section))
 
 
 _QUESTION_SOURCE_BY_TEST: dict[str, str] = {
@@ -112,10 +110,10 @@ _QUESTION_SOURCE_BY_TEST: dict[str, str] = {
 
 def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
     if "feedback" in metafunc.fixturenames:
-        if not data_zip_path().is_file():
+        if not Sandbox.data_zip_path().is_file():
             metafunc.parametrize("feedback", [])
             return
-        demo = sandbox_feedback_demo()
+        demo = Sandbox.sandbox_feedback_demo()
         rejection = str(demo.get("allowed_rejection_text", "")).strip()
         metafunc.parametrize("feedback", [rejection] if rejection else [])
         return
@@ -129,7 +127,7 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
 
 class TestSandboxBundle:
     def test_sandbox_doctor_passes(self) -> None:
-        assert sandbox_doctor() == []
+        assert Sandbox.sandbox_doctor() == []
 
     def test_data_zip_required_members(self) -> None:
         names = _zip_member_set()
@@ -139,7 +137,7 @@ class TestSandboxBundle:
 
     def test_data_zip_is_canonical_source(self) -> None:
         """Bundle invariants: zip is the only shipped source (no sandbox/data/ on disk)."""
-        data_dir = data_zip_path().parent / "data"
+        data_dir = Sandbox.data_zip_path().parent / "data"
         assert not data_dir.is_dir(), "sandbox/data/ must not exist; use data.zip only"
         names = _zip_members_without_locks()
         assert len(names) >= len(_ZIP_REQUIRED_MEMBERS)
@@ -152,7 +150,7 @@ class TestSandboxBundle:
         assert len(data.get("fixtures", [])) >= 100
 
     def test_baseline_schema_graph_in_zip_has_category_pk(self) -> None:
-        with zipfile.ZipFile(data_zip_path()) as zf:
+        with zipfile.ZipFile(Sandbox.data_zip_path()) as zf:
             graph_name = next(n for n in zf.namelist() if n.endswith("artifacts_baseline/owner/schema_graph.json.gz"))
             payload = json.loads(gzip.decompress(zf.read(graph_name)))
         category = payload.get("tables", {}).get("category", {})
@@ -195,16 +193,16 @@ class TestSandboxHandle:
         with AetherEngine.offline_sandbox() as sb:
             assert sb.engine.dialect == "duckdb"
             assert sb.engine._sandbox_mode is True
-            stats = sb.engine.get_schema_stats()
-            assert int(stats.stats.get("table_count", 0)) == 34
+            meta = sb.engine.export_metadata()
+            assert int(meta.get("table_count", 0)) == 34
 
     def test_sandbox_schema_init_uses_baseline_cache(self) -> None:
         with AetherEngine.offline_sandbox() as sb:
             col = sb.engine._schema_graph.get_column("item_feature", "feature_name")
             assert col is not None
             assert (col.data_type or "").lower().startswith("varchar") or (col.data_type or "").lower() == "text"
-            stats = sb.engine.get_schema_stats()
-            assert int(stats.stats.get("table_count", 0)) >= 34
+            meta = sb.engine.export_metadata()
+            assert int(meta.get("table_count", 0)) >= 34
 
     def test_handle_close_removes_owned_artifacts(self) -> None:
         sb = AetherEngine.offline_sandbox()
@@ -275,15 +273,15 @@ class TestSandboxHandle:
         assert step.sql
 
     def test_custom_seed_sql(self) -> None:
-        with zipfile.ZipFile(data_zip_path()) as zf:
+        with zipfile.ZipFile(Sandbox.data_zip_path()) as zf:
             seed_name = next(n for n in zf.namelist() if n.endswith("rental_shop_seed.sql"))
             custom = tempfile.NamedTemporaryFile(mode="wb", suffix=".sql", delete=False)
             try:
                 custom.write(zf.read(seed_name))
                 custom.close()
                 with AetherEngine.offline_sandbox(seed_sql=custom.name, maintainer_access=True) as sb:
-                    stats = sb.engine.get_schema_stats()
-                    assert int(stats.stats.get("table_count", 0)) == 34
+                    meta = sb.engine.export_metadata()
+                    assert int(meta.get("table_count", 0)) == 34
             finally:
                 Path(custom.name).unlink(missing_ok=True)
 
@@ -296,7 +294,7 @@ class TestSandboxQuestions:
         assert "How many rentals happened in 2025?" in practice
 
     def test_assert_sandbox_complete_with_corpus(self, _fixture_corpus: str) -> None:
-        assert_sandbox_complete(AetherEngine)
+        Sandbox.assert_sandbox_complete(AetherEngine)
 
     def test_fixture_corpus_covers_consumer_reader_practice(self, _fixture_corpus: str) -> None:
         practice = AetherEngine.sandbox_questions()
@@ -313,7 +311,7 @@ class TestSandboxQuestions:
                     session.reset()
 
     def test_feedback_samples_rejection_flow(self, feedback: str) -> None:
-        demo = sandbox_feedback_demo()
+        demo = Sandbox.sandbox_feedback_demo()
         anchor = str(demo.get("anchor_question", "")).strip()
         assert anchor
         with AetherEngine.offline_sandbox() as sb:
@@ -373,7 +371,7 @@ class TestSandboxQuestions:
         elif question == "Show me all staff salaries.":
             with Sandbox() as sandbox:
                 engine = sandbox.engine(
-                    EngineContext(allow_objects=CONSUMER_RESTRICTED_ALLOW_OBJECTS),
+                    EngineContext(allow_objects=CONSUMER_EXAMPLE_NARROW_ALLOW_OBJECTS),
                     role="consumer",
                 )
                 with engine.session(mode="reader") as session:
@@ -412,7 +410,7 @@ class TestSandboxSessionWorkflows:
         assert step.sql
 
     def test_recipe_rejections_completes(self) -> None:
-        demo = sandbox_feedback_demo()
+        demo = Sandbox.sandbox_feedback_demo()
         anchor = str(demo.get("anchor_question", "")).strip()
         rejection = str(demo.get("allowed_rejection_text", "")).strip()
         assert anchor and rejection
@@ -445,7 +443,7 @@ class TestSandboxSessionWorkflows:
         with Sandbox(artifacts_dir=shared, cleanup=False) as reader_sandbox:
             reader = reader_sandbox.engine(role="consumer")
             reader_sandbox.apply_bundled_schema_overrides(reader)
-            queue = reader.write_queue_path
+            queue = reader._write_queue_path
             assert queue.is_file()
             with queue.open(encoding="utf-8") as fh:
                 before = sum(1 for _ in fh)
@@ -468,20 +466,20 @@ class TestSandboxSessionWorkflows:
         assert (tmp_path / "schema_overrides.applied.json").is_file()
 
     def test_migration_demo_bundle(self) -> None:
-        with zipfile.ZipFile(data_zip_path()) as zf:
+        with zipfile.ZipFile(Sandbox.data_zip_path()) as zf:
             names = zf.namelist()
             assert any("migration_demo/artifacts_v1" in n for n in names)
             assert any(n.endswith("schema_migration_map.json") for n in names)
 
     def test_recipe_validation_failures(self) -> None:
-        fails = _sandbox_build_section("validation_failures")
+        fails = Sandbox._sandbox_build_section("validation_failures")
         with AetherEngine.offline_sandbox() as owner:
             with owner.engine.session() as session:
                 step = session.accept_until_done(fails[0])
             assert step.done
         with Sandbox() as sandbox:
             consumer = sandbox.engine(
-                EngineContext(allow_objects=CONSUMER_RESTRICTED_ALLOW_OBJECTS),
+                EngineContext(allow_objects=CONSUMER_EXAMPLE_NARROW_ALLOW_OBJECTS),
                 role="consumer",
             )
             with consumer.session(mode="reader") as session:
@@ -495,8 +493,8 @@ class TestSandboxSessionWorkflows:
         with AetherEngine.offline_sandbox() as sb:
             snap = sb.engine.show_config()
             assert snap.text
-            stats = sb.engine.get_schema_stats()
-            assert int(stats.stats.get("table_count", 0)) == 34
+            meta = sb.engine.export_metadata()
+            assert int(meta.get("table_count", 0)) == 34
 
     def test_recipe_full_session_completes(self) -> None:
         with AetherEngine.offline_sandbox() as sb:
@@ -557,7 +555,7 @@ class TestSandboxSecurity:
     def test_restricted_consumer_permission_denied(self) -> None:
         with Sandbox() as sandbox:
             engine = sandbox.engine(
-                EngineContext(allow_objects=CONSUMER_RESTRICTED_ALLOW_OBJECTS),
+                EngineContext(allow_objects=CONSUMER_EXAMPLE_NARROW_ALLOW_OBJECTS),
                 role="consumer",
             )
             with engine.session(mode="reader") as session:
@@ -643,4 +641,4 @@ class TestSandboxPublicApi:
         with Sandbox() as sandbox:
             engine = sandbox.engine(role="consumer")
             sandbox.apply_bundled_schema_overrides(engine)
-            assert engine.write_queue_path.is_file()
+            assert engine._write_queue_path.is_file()

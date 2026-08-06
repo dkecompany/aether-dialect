@@ -14,8 +14,8 @@ from aetherdialect._contracts_base import (
     MulGroup,
     NormalizedExpr,
     OrderByCol,
+    PredicateGroup,
     WhereParam,
-    predicate_group_from_list,
 )
 from aetherdialect._contracts_core import (
     RuntimeCteStep,
@@ -29,7 +29,7 @@ from aetherdialect._contracts_schema import (
     ColumnMetadata,
     SchemaGraph,
     TableMetadata,
-    registry_render_scope,
+    WindowRegistryStep,
 )
 from aetherdialect._core_utils import substitute_params
 from aetherdialect._intent_expr import (
@@ -202,7 +202,7 @@ class TestAssignParamKeys:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([cte_fp]),
+            where=PredicateGroup.from_list([cte_fp]),
             having=None,
             param_values={},
             output_columns=[],
@@ -247,7 +247,7 @@ class TestDecomposeBetweenFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             having=None,
             param_values={},
             cte_steps=[],
@@ -269,7 +269,7 @@ class TestDecomposeBetweenFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             having=None,
             param_values={},
             cte_steps=[],
@@ -415,7 +415,7 @@ class TestNormalizeDateDiffRawValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             having=None,
             param_values={},
             cte_steps=[],
@@ -438,7 +438,7 @@ class TestNormalizeDateDiffRawValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             having=None,
             param_values={},
             cte_steps=[],
@@ -461,7 +461,7 @@ class TestNormalizeDateDiffRawValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             having=None,
             param_values={},
             cte_steps=[],
@@ -484,7 +484,7 @@ class TestNormalizeDateDiffRawValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             having=None,
             param_values={},
             cte_steps=[],
@@ -608,7 +608,7 @@ class TestCanonicalizeTemporalUnitArgs:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([cte_filter]),
+            where=PredicateGroup.from_list([cte_filter]),
             having=None,
         )
         intent = RuntimeIntent(
@@ -640,7 +640,7 @@ class TestCanonicalizeTemporalUnitArgs:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             having=None,
             param_values={},
             cte_steps=[],
@@ -882,7 +882,7 @@ class TestTagExprNumeric:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr(add_groups=[MulGroup(coefficient=5.0, multiply=["t.name"])]),
@@ -942,7 +942,7 @@ class TestTagExprNumeric:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr(add_groups=[MulGroup(coefficient=2.0, multiply=["t.amount"])]),
@@ -964,7 +964,7 @@ class TestTagExprNumeric:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr(add_groups=[MulGroup(coefficient=1.0, multiply=["t.amount"])]),
@@ -989,7 +989,7 @@ class TestTagExprNumeric:
             group_by_cols=[],
             order_by_cols=[],
             where=None,
-            having=predicate_group_from_list(
+            having=PredicateGroup.from_list(
                 [
                     HavingParam(
                         left_expr=NormalizedExpr(
@@ -1013,7 +1013,7 @@ class TestTagExprNumeric:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr(add_groups=[MulGroup(coefficient=2.0, multiply=["t.amount"])]),
@@ -1463,7 +1463,7 @@ class TestExtractStructuralParams:
         )
         out = extract_structural_params(intent)
         sc0 = out.select_cols[0]
-        with registry_render_scope(None, out.case_registry):
+        with WindowRegistryStep.render_scope(None, out.case_registry):
             sql_frag = render_select_col_sql(sc0)
         final = substitute_params(sql_frag, dict(out.param_values))
         assert "> THEN" not in final
@@ -1495,7 +1495,7 @@ class TestExtractStructuralParams:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     WhereParam(
                         left_expr=NormalizedExpr.from_column("t.created_at"),
@@ -1576,7 +1576,7 @@ class TestDecomposeBetweenFiltersEdgeCases:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             having=None,
             param_values={},
             cte_steps=[],
@@ -1673,7 +1673,7 @@ class TestAssignParamKeysEdgeCases:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             having=None,
             param_values={},
             output_columns=[],
@@ -2169,7 +2169,7 @@ class TestDecomposeBetweenHaving:
             group_by_cols=[],
             order_by_cols=[],
             where=None,
-            having=predicate_group_from_list([hp]),
+            having=PredicateGroup.from_list([hp]),
             param_values={},
             cte_steps=[],
             natural_language="test",
@@ -2196,7 +2196,7 @@ class TestDecomposeBetweenHaving:
             group_by_cols=[],
             order_by_cols=[],
             where=None,
-            having=predicate_group_from_list([hp]),
+            having=PredicateGroup.from_list([hp]),
             param_values={},
             cte_steps=[],
             natural_language="test",
@@ -2220,7 +2220,7 @@ class TestDecomposeBetweenHaving:
             group_by_cols=[],
             order_by_cols=[],
             where=None,
-            having=predicate_group_from_list([cte_hp]),
+            having=PredicateGroup.from_list([cte_hp]),
             param_values={},
             output_columns=[],
         )
@@ -2294,7 +2294,7 @@ class TestNormalizeInFilterRawValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             having=None,
             param_values={},
             cte_steps=[],
@@ -2317,7 +2317,7 @@ class TestNormalizeInFilterRawValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             having=None,
             param_values={},
             cte_steps=[],
@@ -2340,7 +2340,7 @@ class TestNormalizeInFilterRawValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             having=None,
             param_values={},
             cte_steps=[],
@@ -2363,7 +2363,7 @@ class TestNormalizeInFilterRawValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             having=None,
             param_values={},
             cte_steps=[],
@@ -2386,7 +2386,7 @@ class TestNormalizeInFilterRawValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             having=None,
             param_values={},
             cte_steps=[],
@@ -2409,7 +2409,7 @@ class TestNormalizeInFilterRawValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             having=None,
             param_values={},
             cte_steps=[],
@@ -2432,7 +2432,7 @@ class TestNormalizeInFilterRawValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([cte_fp]),
+            where=PredicateGroup.from_list([cte_fp]),
             having=None,
             param_values={},
             output_columns=[],
@@ -2508,7 +2508,7 @@ class TestExtractColumnsFromExpr:
 
     def test_unbalanced_open_paren_does_not_raise(self):
         """Malformed LLM terms without a closing parenthesis do not crash extraction."""
-        expr = NormalizedExpr(add_groups=[MulGroup(multiply=["SUM(film.rental_rate"])])
+        expr = NormalizedExpr(add_groups=[MulGroup(multiply=[NormalizedExpr(raw_sql="SUM(film.rental_rate")])])
         cols = extract_columns_from_expr(expr)
         assert isinstance(cols, list)
 
@@ -2536,7 +2536,7 @@ class TestRepairMisclassifiedDateDiff:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             natural_language="test",
         )
         result = repair_misclassified_date_diff(intent)
@@ -2561,7 +2561,7 @@ class TestRepairMisclassifiedDateDiff:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             natural_language="test",
         )
         result = repair_misclassified_date_diff(intent)
@@ -2581,7 +2581,7 @@ class TestRepairMisclassifiedDateDiff:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             natural_language="test",
         )
         result = repair_misclassified_date_diff(intent)
@@ -2601,7 +2601,7 @@ class TestRepairMisclassifiedDateDiff:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             having=None,
             param_values={},
             output_columns=[],
@@ -2635,7 +2635,7 @@ class TestRepairMisclassifiedDateDiff:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             natural_language="test",
         )
         result = repair_misclassified_date_diff(intent)
@@ -2656,7 +2656,7 @@ class TestRepairMisclassifiedDateDiff:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             natural_language="test",
         )
         result = repair_misclassified_date_diff(intent)
@@ -2679,7 +2679,7 @@ class TestRepairMisclassifiedDateDiff:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             natural_language="test",
         )
         result = repair_misclassified_date_diff(intent)
@@ -2700,7 +2700,7 @@ class TestRepairMisclassifiedDateDiff:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             natural_language="test",
         )
         result = repair_misclassified_date_diff(intent)
@@ -3332,7 +3332,7 @@ class TestCollectRawParamValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
         )
         out = collect_raw_param_values(intent)
         assert out == {"p1": "hello"}
@@ -3352,7 +3352,7 @@ class TestCollectRawParamValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
         )
         assert collect_raw_param_values(intent) == {}
 
@@ -3371,14 +3371,14 @@ class TestCollectRawParamValues:
             param_key="pm",
             raw_value=2,
         )
-        cte = RuntimeCteStep(cte_name="c", where=predicate_group_from_list([fp_cte]))
+        cte = RuntimeCteStep(cte_name="c", where=PredicateGroup.from_list([fp_cte]))
         intent = RuntimeIntent(
             tables=["t"],
             grain="row_level",
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp_main]),
+            where=PredicateGroup.from_list([fp_main]),
             cte_steps=[cte],
         )
         out = collect_raw_param_values(intent)
@@ -3408,7 +3408,7 @@ class TestNormalizeDateDiffSingularUnitPassthrough:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             having=None,
             param_values={},
             cte_steps=[],
@@ -3821,7 +3821,7 @@ class TestEnsureScalarFuncDefaultsLikely:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
         )
         ensure_scalar_func_defaults(intent)
         assert (intent.where.leaves() if intent.where else [])[0].left_expr.add_groups[0].scalar_func_args == [2]
@@ -3839,7 +3839,7 @@ class TestEnsureScalarFuncDefaultsLikely:
             group_by_cols=[],
             order_by_cols=[],
             where=None,
-            having=predicate_group_from_list([hp]),
+            having=PredicateGroup.from_list([hp]),
         )
         ensure_scalar_func_defaults(intent)
         assert (intent.having.leaves() if intent.having else [])[0].left_expr.add_groups[0].scalar_func_args == [
@@ -3925,7 +3925,7 @@ class TestDecomposeBetweenLikely:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             having=None,
             param_values={},
             cte_steps=[],
@@ -3954,7 +3954,7 @@ class TestNormalizeDateDiffLikely:
             value_type="date_diff",
             raw_value={"unit": "years", "amount": 1},
         )
-        cte = RuntimeCteStep(cte_name="c", where=predicate_group_from_list([cte_fp]))
+        cte = RuntimeCteStep(cte_name="c", where=PredicateGroup.from_list([cte_fp]))
         intent = RuntimeIntent(
             tables=["t"],
             grain="row_level",
@@ -3962,7 +3962,7 @@ class TestNormalizeDateDiffLikely:
             group_by_cols=[],
             order_by_cols=[],
             where=None,
-            having=predicate_group_from_list([hp]),
+            having=PredicateGroup.from_list([hp]),
             param_values={},
             cte_steps=[cte],
             natural_language="q",
@@ -3989,7 +3989,7 @@ class TestNormalizeInLikely:
             group_by_cols=[],
             order_by_cols=[],
             where=None,
-            having=predicate_group_from_list([hp]),
+            having=PredicateGroup.from_list([hp]),
             param_values={},
             cte_steps=[],
             natural_language="regions",
@@ -4155,7 +4155,7 @@ class TestClassifyCteEmission:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column(f"{cte.cte_name}.avg_amount"))],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
             cte_steps=[cte],
         )
         assert classify_cte_emission(cte, intent, None) == "scalar_subquery"
@@ -4210,7 +4210,7 @@ class TestDateDiffNormalizationGuards:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("rental.rental_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([fp]),
+            where=PredicateGroup.from_list([fp]),
         )
         out = normalize_where_havings(intent)
         kept = out.where.leaves()[0]

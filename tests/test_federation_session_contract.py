@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -28,10 +29,10 @@ from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph,
 from aetherdialect._federation import parse_federation_manifest
 from aetherdialect._intent_process import NormalizedExpr
 from aetherdialect._intent_repair import expand_shared_pk_tables_for_refs
-from aetherdialect._main_execution import _complete_interactive_execute, _sql_execute_suspend_context
+from aetherdialect._main_execution import MainExecutionOps
 from aetherdialect._pipeline import handle_direct_sql_reuse
 from aetherdialect._schema_graph import recompute_join_paths_multi
-from aetherdialect._templates import empty_template_store
+from aetherdialect._templates import TemplateOps
 
 
 def _member_table(name: str, source_id: str) -> TableMetadata:
@@ -138,7 +139,7 @@ def test_handle_direct_sql_reuse_blocked_when_federation_manifest_active() -> No
         ),
         stats=TemplateStats(accept=1, reject=0),
     )
-    store = empty_template_store(schema.schema_graph_id)
+    store = TemplateOps.empty_template_store(schema.schema_graph_id)
     templates = {tmpl.id: tmpl}
     with patch("aetherdialect._pipeline._try_federation_plan_question_reuse", return_value=None):
         with patch("aetherdialect._pipeline.execute_reuse_with_params") as exec_mock:
@@ -175,7 +176,7 @@ def test_sql_execute_suspend_context_carries_federated_prepare() -> None:
         federation_plan_id="plan1",
     )
     snap = MagicMock()
-    ctx = _sql_execute_suspend_context(
+    ctx = MainExecutionOps._sql_execute_suspend_context(
         snap,
         "display",
         None,
@@ -204,7 +205,7 @@ def test_prepare_member_failure_emits_federation_diagnostic() -> None:
     plan = FederatedPlan(steps=(SourceStep(source_id="west", sub_intent=sub_intent),))
     tables = {"t": _member_table("t", "west")}
     schema = SchemaGraph(tables=tables, join_paths_multi=recompute_join_paths_multi(tables))
-    store = empty_template_store(schema.schema_graph_id)
+    store = TemplateOps.empty_template_store(schema.schema_graph_id)
     member_graphs = {"west": schema}
     with patch("aetherdialect._pipeline.generate_and_validate_sql") as gen_mock:
         gen_mock.return_value = SqlGenerationOutcome(
@@ -286,7 +287,7 @@ def test_concurrent_federation_sessions_keep_distinct_prepared_plans() -> None:
         owner._federation_source_runtimes = {}
         owner._federation_storage_dir = None
         session._owner = owner
-        ctx = _sql_execute_suspend_context(
+        ctx = MainExecutionOps._sql_execute_suspend_context(
             snap,
             f"display-{source_id}",
             None,
@@ -306,11 +307,11 @@ def test_concurrent_federation_sessions_keep_distinct_prepared_plans() -> None:
 
     def _resume(session: MagicMock, ctx: object, label: str) -> None:
         with patch(
-            "aetherdialect._main_execution._run_sql_execution_for_gen_out",
+            "aetherdialect._main_execution.MainExecutionOps._run_sql_execution_for_gen_out",
             side_effect=lambda **kwargs: captured.__setitem__(label, kwargs["federated_prepare"]) or ([(1,)], None),
         ):
-            with patch("aetherdialect._main_execution._offer_sql_feedback_after_execute"):
-                _complete_interactive_execute(ctx, "y", choice_port=session)
+            with patch("aetherdialect._main_execution.MainExecutionOps._offer_sql_feedback_after_execute"):
+                MainExecutionOps._complete_interactive_execute(ctx, "y", choice_port=session)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         futures = [
@@ -382,14 +383,14 @@ def test_credit_federation_accept_raises_when_member_store_missing() -> None:
 
 @pytest.mark.fast
 def test_drain_write_queue_applies_member_tree_events(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from aetherdialect._config import EngineConfig
     from aetherdialect._contracts_base import WriteQueueEvent
     from aetherdialect._contracts_core import FeedbackKind, QuestionFeedbackEntry, RejectionBucket
     from aetherdialect._core_utils import emit_write_queue_event
-    from aetherdialect._main_execution import drain_write_queue
-    from aetherdialect._templates import empty_template_store
+    from aetherdialect._main_execution import MainExecutionOps
+    from aetherdialect._templates import TemplateOps
 
     composite_dir = tmp_path / "fed"
     member_dir = tmp_path / "member_west"
@@ -403,21 +404,21 @@ def test_drain_write_queue_applies_member_tree_events(monkeypatch: pytest.Monkey
         schema_graph_id="member_west",
         effective_structural_hash="member_west",
     )
-    member_store = empty_template_store("member_west")
+    member_store = TemplateOps.empty_template_store("member_west")
     monkeypatch.setattr(
-        "aetherdialect._main_execution.load_template_store",
+        "aetherdialect._templates.TemplateOps.load_template_store",
         lambda *_a, **_k: member_store,
     )
     saves: list[int] = []
     monkeypatch.setattr(
-        "aetherdialect._main_execution.save_template_store",
+        "aetherdialect._templates.TemplateOps.save_template_store",
         lambda _s: saves.append(1),
     )
 
     owner = MagicMock()
     owner._is_aether_federation = True
     owner._schema_graph = MagicMock(schema_graph_id="composite")
-    owner._store = empty_template_store("composite")
+    owner._store = TemplateOps.empty_template_store("composite")
     owner._templates = {}
     owner._rejected = {}
     owner._dialect = None
@@ -426,7 +427,7 @@ def test_drain_write_queue_applies_member_tree_events(monkeypatch: pytest.Monkey
     owner._federation_source_runtimes = {"west": MagicMock(artifacts_dir=str(member_dir), dialect=None)}
     owner._federation_member_graphs = {"west": member_graph}
 
-    ts = datetime.now(timezone.utc).isoformat()
+    ts = datetime.now(UTC).isoformat()
     entry = QuestionFeedbackEntry(
         summary="s",
         buckets=(RejectionBucket.OTHER,),
@@ -446,7 +447,7 @@ def test_drain_write_queue_applies_member_tree_events(monkeypatch: pytest.Monkey
     )
     emit_write_queue_event(str(member_dir), ev)
 
-    applied = drain_write_queue(owner, str(composite_dir))
+    applied = MainExecutionOps.drain_write_queue(owner, str(composite_dir))
     assert applied == 1
     assert "west::how many t" in member_store.question_feedback
     assert saves == [1]

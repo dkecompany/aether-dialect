@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from aetherdialect._config import PolicyConfig
 from aetherdialect._constants import DIAGNOSTIC_CODE_JOIN_CANDIDATE_CAP, JOIN_PATH_TIE_REFUSAL_CEILING
 from aetherdialect._contracts_core import NormalizedExpr, RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
@@ -12,12 +13,14 @@ from aetherdialect._core_utils import (
     reset_diagnostic_collector,
     set_diagnostic_collector,
 )
+from aetherdialect._federation import federation_scaled_join_candidate_cap
 from aetherdialect._schema_graph import recompute_join_paths_multi
 from aetherdialect._sql_gen import (
     JOIN_CHOICE_SCOPE_MAIN,
     JoinCandidateCapExceededError,
     JoinProbeEdgeKindMismatchError,
     ScopeClass,
+    _candidate_join_paths_for_tables,
     _order_join_candidates_stable,
     classify_scope_candidates,
     collapse_probe_edge_candidate_variation,
@@ -55,6 +58,28 @@ def _parallel_mid_tables(mid_count: int) -> SchemaGraph:
         )
     join_paths_multi = recompute_join_paths_multi(tables)
     return SchemaGraph(tables=tables, join_paths_multi=join_paths_multi, effective_structural_hash="anchor_order")
+
+
+def test_nested_merge_uses_federation_scaled_cross_product_cap() -> None:
+    """Inner cartesian merges must honor the passed cap, not the static policy default."""
+    schema = _cross_product_ambiguity_schema(3)
+    default_cap = PolicyConfig.JOIN_CANDIDATE_CROSS_PRODUCT_CAP
+    scaled_cap = federation_scaled_join_candidate_cap(2)
+    assert scaled_cap > default_cap
+    with pytest.raises(JoinCandidateCapExceededError):
+        _candidate_join_paths_for_tables(
+            schema,
+            ["root", "t2", "t3"],
+            cross_product_cap=default_cap,
+            tie_cap=JOIN_PATH_TIE_REFUSAL_CEILING,
+        )
+    paths = _candidate_join_paths_for_tables(
+        schema,
+        ["root", "t2", "t3"],
+        cross_product_cap=scaled_cap,
+        tie_cap=JOIN_PATH_TIE_REFUSAL_CEILING,
+    )
+    assert paths
 
 
 def test_cross_product_cap_exceeded_refuses_with_session_diagnostic() -> None:

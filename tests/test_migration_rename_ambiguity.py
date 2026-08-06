@@ -1,4 +1,4 @@
-"""T2: rename inference must refuse on ties, not pick first."""
+"""Rename inference must refuse on ties, not pick first."""
 
 from __future__ import annotations
 

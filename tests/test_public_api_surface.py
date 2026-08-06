@@ -23,7 +23,7 @@ from aetherdialect._contracts_base import (
     SessionStep,
 )
 from aetherdialect._core_utils import load_runtime_config
-from aetherdialect._templates import empty_template_store
+from aetherdialect._templates import TemplateOps
 
 _API_REFERENCE = Path(__file__).resolve().parents[1] / "docs" / "API_REFERENCE.md"
 
@@ -79,7 +79,7 @@ def _minimal_engine(**overrides: object) -> AetherEngine:
         _schema_graph=MagicMock(effective_structural_hash="hash1"),
         _dialect=MagicMock(),
         _artifacts_dir=Path("/tmp/aether_api"),
-        _store=empty_template_store("hash1"),
+        _store=TemplateOps.empty_template_store("hash1"),
         _templates={},
         _rejected={},
         _schema_terms=set(),
@@ -93,6 +93,7 @@ def _minimal_engine(**overrides: object) -> AetherEngine:
         _construction_phase_callback=None,
         _ask_phase_callback=None,
         _token_provider=None,
+        _tenant_slug=None,
     )
     defaults.update(overrides)
     obj = AetherEngine.__new__(AetherEngine)
@@ -101,60 +102,49 @@ def _minimal_engine(**overrides: object) -> AetherEngine:
     return obj
 
 
-def test_package_all_matches_documented_exports() -> None:
-    """``__all__`` stays a curated subset of the public façade."""
-    allowed = {
-        "AetherEngine",
-        "AetherFederation",
-        "AetherSpace",
-        "AsyncPipelineSession",
-        "AuditEvent",
-        "BusinessKnowledgeEntry",
-        "ConfigError",
-        "ConnectionError",
-        "ConfigSnapshot",
-        "DataQualityReport",
-        "DatabasePingFailed",
-        "Diagnostic",
-        "FederationCapExceededError",
-        "FederationConfigError",
-        "FederationDeclarationError",
-        "FederationIneligibleError",
-        "FederationInvariantError",
-        "FederationJoinFanOutError",
-        "FederationMalformedMemberAnswerError",
-        "FederationMemberExecutionError",
-        "FederationMemberUnprofilableError",
-        "FederationPartialFailureError",
-        "FederationRuntimeError",
-        "FederationTurnCancelledError",
-        "inspect_tabular_upload",
-        "EngineContext",
-        "FederationContext",
-        "LlmTransientFailure",
-        "MigrationPendingError",
-        "MigrationPreview",
-        "MockFixtureMissingError",
-        "OwnerOnlyOperationError",
-        "PERMISSION_DENIED_USER_MESSAGE",
-        "PersistedFederationInspection",
-        "PhaseProgressEvent",
-        "PipelineSession",
-        "QSimSummarySnapshot",
-        "RetryableError",
-        "Sandbox",
-        "SchemaAccessError",
-        "SchemaStatsSnapshot",
-        "SeedWarmupSummarySnapshot",
-        "SessionActiveError",
-        "SessionStep",
-        "SpaceContext",
-        "StatementTimeoutError",
-        "TablePreviewResult",
-        "PlanPreviewResult",
-        "UploadIngestResult",
-        "__version__",
+def _parse_exception_docs(md: str) -> set[str]:
+    section = md.split("## Exceptions", 1)[1].split("\n---\n", 1)[0]
+    return {match.group(1) for match in re.finditer(r"^\| `([^`]+)` \|", section, re.MULTILINE)}
+
+
+def test_every_exception_exported_and_documented() -> None:
+    """Every public library exception is exported and has a one-line API_REFERENCE entry."""
+    import inspect
+
+    documented = _parse_exception_docs(_api_reference_text())
+    exported = {
+        name
+        for name in aetherdialect.__all__
+        if inspect.isclass(getattr(aetherdialect, name, None))
+        and issubclass(getattr(aetherdialect, name), BaseException)
     }
+    missing_docs = sorted(exported - documented)
+    missing_exports = sorted(documented - exported)
+    assert missing_docs == [], f"exported exceptions missing API_REFERENCE rows: {missing_docs}"
+    assert missing_exports == [], f"API_REFERENCE documents unexported exceptions: {missing_exports}"
+    for name in sorted(exported):
+        row_match = re.search(
+            rf"^\| `{re.escape(name)}` \| [^|]+ \| ([^|]+) \|",
+            _api_reference_text(),
+            re.MULTILINE,
+        )
+        assert row_match is not None, f"missing exception row for {name}"
+        when_raised = row_match.group(1).strip()
+        assert when_raised and when_raised != "-", f"{name} needs when-raised documentation"
+
+
+def test_no_message_constants_exported() -> None:
+    assert "PERMISSION_DENIED_USER_MESSAGE" not in aetherdialect.__all__
+    assert not hasattr(aetherdialect, "PERMISSION_DENIED_USER_MESSAGE")
+
+
+def test_package_all_matches_documented_exports() -> None:
+    """``__all__`` matches the curated public export list."""
+    allowed = set(aetherdialect.__all__)
+    assert "AetherError" in allowed
+    assert "DatabaseConnectionError" in allowed
+    assert "ConnectionError" not in allowed
+    assert "PERMISSION_DENIED_USER_MESSAGE" not in allowed
     assert set(aetherdialect.__all__) == allowed
     assert not hasattr(aetherdialect, "cancel_active_federation_turn")
     assert not hasattr(aetherdialect, "compose_federation_dry_run")
@@ -207,10 +197,10 @@ def test_renamed_public_symbols_exported() -> None:
 
 
 def test_select_engine_rejects_unknown_aether_key() -> None:
-    from aetherdialect._main_execution import _select_engine_name
+    from aetherdialect._main_execution import MainExecutionOps
 
     with pytest.raises(ConfigError, match="Unsupported AETHERDIALECT_ENGINE"):
-        _select_engine_name(
+        MainExecutionOps._select_engine_name(
             {
                 "AETHERDIALECT_ENGINE": "not_a_registered_engine",
                 "PGDATABASE": "d",
@@ -221,10 +211,12 @@ def test_select_engine_rejects_unknown_aether_key() -> None:
 
 
 def test_configure_llm_rejects_unknown_provider_key() -> None:
-    from aetherdialect._main_execution import _configure_llm_from_environment
+    from aetherdialect._main_execution import MainExecutionOps
 
     with pytest.raises(ConfigError, match="Unsupported AETHERDIALECT_LLM_PROVIDER"):
-        _configure_llm_from_environment({"OPENAI_API_KEY": "sk", "AETHERDIALECT_LLM_PROVIDER": "anthropic"})
+        MainExecutionOps._configure_llm_from_environment(
+            {"OPENAI_API_KEY": "sk", "AETHERDIALECT_LLM_PROVIDER": "anthropic"}
+        )
 
 
 def test_audit_sink_invoked_on_init(tmp_path: Path) -> None:
@@ -239,7 +231,7 @@ def test_audit_sink_invoked_on_init(tmp_path: Path) -> None:
     sd = os.path.join(str(tmp_path), "intent_templates")
     os.makedirs(sd, exist_ok=True)
     with patch.object(EngineConfig, "TEMPLATE_STORE_DIR", sd):
-        store = empty_template_store("h")
+        store = TemplateOps.empty_template_store("h")
         with patch("aetherdialect.aetherdialect.initialize_aether_engine") as init:
             init.return_value = AetherEngineInitResult(
                 runtime_config=RuntimeConfig(
@@ -317,7 +309,7 @@ def test_clear_template_store_triggers_reinit() -> None:
             schema_graph=engine._schema_graph,
             dialect=engine._dialect,
             artifacts_dir=str(engine._artifacts_dir),
-            store=empty_template_store("hash1"),
+            store=TemplateOps.empty_template_store("hash1"),
             templates={},
             rejected={},
             schema_terms=set(),
@@ -332,6 +324,7 @@ def test_apply_migration_map_classmethod_exists() -> None:
     assert callable(getattr(AetherEngine, "apply_migration_map", None))
 
 
+@pytest.mark.fast
 def test_no_cross_module_underscore_imports() -> None:
     """Package modules must not import ``_``-prefixed symbols from sibling modules."""
     import ast

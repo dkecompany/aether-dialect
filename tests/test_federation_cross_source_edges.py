@@ -63,7 +63,7 @@ def _n_member_fixture(n: int) -> tuple[object, object, dict[str, SchemaGraph]]:
     )
     mappings = parse_federation_mappings(
         {
-            "version": 1,
+            "version": "0.2.1",
             "logical_columns": [
                 {
                     "logical": "shared_id",
@@ -311,7 +311,7 @@ def _two_member_join_manifest() -> tuple[object, object]:
         },
         include_derived_roster=True,
     )
-    mappings = parse_federation_mappings({"version": 1, "logical_columns": []})
+    mappings = parse_federation_mappings({"version": "0.2.1", "logical_columns": []})
     return manifest, mappings
 
 

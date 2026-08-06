@@ -22,11 +22,7 @@ from aetherdialect._contracts_core import (
     SelectCol,
 )
 from aetherdialect._main_execution import (
-    apply_structural_migration_to_aetherspace_snapshots,
-    load_aetherspace_snapshot,
-    save_aetherspace_snapshot,
-    subset_graph_for_space,
-    validate_space_subset_of_execution_context,
+    MainExecutionOps,
 )
 from aetherdialect._pipeline import generate_and_validate_sql
 from aetherdialect._schema_graph import assert_intent_in_scope
@@ -115,21 +111,21 @@ class TestAetherspacePersistence:
             assert payload["name"] == "films_only"
             assert "film" in payload["tables"]
 
-    def test_export_engine_context_round_trip(self, tmp_path) -> None:
+    def test_export_context_round_trip(self, tmp_path) -> None:
         with AetherEngine.offline_sandbox(artifacts_dir=str(tmp_path), cleanup_artifacts=False) as sb:
-            path = sb.engine.export_engine_context("master")
+            path = sb.engine.export_context("master")
             payload = json.loads(path.read_text(encoding="utf-8"))
             assert payload["name"] == "master"
 
     def test_empty_space_after_migration_raises(self, tmp_path) -> None:
         with AetherEngine.offline_sandbox(artifacts_dir=str(tmp_path), cleanup_artifacts=False) as sb:
             engine_dir = str(sb.engine._artifacts_dir)
-            snap = subset_graph_for_space(
+            snap = MainExecutionOps.subset_graph_for_space(
                 sb.engine._schema_graph,
                 SpaceContext(tables=frozenset({"film"})),
             )
-            save_aetherspace_snapshot(engine_dir, "orphan", snap)
-            apply_structural_migration_to_aetherspace_snapshots(
+            MainExecutionOps.save_aetherspace_snapshot(engine_dir, "orphan", snap)
+            MainExecutionOps.apply_structural_migration_to_aetherspace_snapshots(
                 engine_dir,
                 dropped_tables=("film",),
             )
@@ -155,7 +151,7 @@ class TestRunInteractiveSpaceValidation:
             _, space_tables, space_columns, _, _ = sb.engine._resolve_aetherspace("wide")
             exec_ctx = EngineContext(allow_objects=frozenset({"film"}))
             with pytest.raises(ConfigError, match="exceed the active engine context"):
-                validate_space_subset_of_execution_context(
+                MainExecutionOps.validate_space_subset_of_execution_context(
                     space_tables,
                     space_columns,
                     exec_ctx,
@@ -170,52 +166,60 @@ class TestRunInteractiveSpaceValidation:
 
 
 class TestSpaceContextNotesFileSandbox:
+    @staticmethod
+    def _catalog_notes_path() -> Path:
+        return Path(__file__).resolve().parents[1] / "scripts" / "data" / "sandbox_space_catalog_notes.txt"
+
     @pytest.mark.fast
     def test_notes_file_round_trips_into_aetherspace_notes(self, tmp_path: Path) -> None:
-        notes = tmp_path / "space_notes.txt"
-        notes.write_text("film.rating is MPAA classification.\n", encoding="utf-8")
+        notes = self._catalog_notes_path()
+        from aetherdialect._constants import SANDBOX_CATALOG_SPACE_TABLES
+
         with AetherEngine.offline_sandbox(artifacts_dir=str(tmp_path / "arts"), cleanup_artifacts=False) as sb:
             desc = sb.engine.aetherspace(
-                "films_notes",
-                SpaceContext(tables=frozenset({"film"}), notes_file=str(notes)),
+                "catalog_notes",
+                SpaceContext(tables=SANDBOX_CATALOG_SPACE_TABLES, notes_file=str(notes)),
             )
             assert desc.notes is not None
-            assert "MPAA" in desc.notes
-            resolved = sb.engine.aetherspace("films_notes")
+            assert "catalog inventory" in desc.notes.lower()
+            resolved = sb.engine.aetherspace("catalog_notes")
             assert resolved.notes == desc.notes
 
     @pytest.mark.fast
     def test_notes_hash_in_snapshot_detects_notes_change(self, tmp_path: Path) -> None:
-        notes = tmp_path / "space_notes.txt"
-        notes.write_text("first notes body\n", encoding="utf-8")
-        expected_first = hashlib.sha256(b"first notes body\n").hexdigest()
+        notes = tmp_path / "catalog_notes_copy.txt"
+        source = self._catalog_notes_path().read_text(encoding="utf-8")
+        notes.write_text(source, encoding="utf-8")
+        expected_first = hashlib.sha256(source.encode("utf-8")).hexdigest()
+        from aetherdialect._constants import SANDBOX_CATALOG_SPACE_TABLES
+
         arts = tmp_path / "arts"
         with AetherEngine.offline_sandbox(artifacts_dir=str(arts), cleanup_artifacts=False) as sb:
             sb.engine.aetherspace(
-                "films_notes",
-                SpaceContext(tables=frozenset({"film"}), notes_file=str(notes)),
+                "catalog_notes",
+                SpaceContext(tables=SANDBOX_CATALOG_SPACE_TABLES, notes_file=str(notes)),
             )
-            snap = load_aetherspace_snapshot(str(sb.engine._artifacts_dir), "films_notes")
+            snap = MainExecutionOps.load_aetherspace_snapshot(str(sb.engine._artifacts_dir), "catalog_notes")
             assert snap is not None
             assert snap["version"] == AETHERSPACE_ARTIFACT_VERSION
             assert snap["notes_hash"] == expected_first
             assert snap["notes"] is not None
-            notes.write_text("changed notes body\n", encoding="utf-8")
-            expected_second = hashlib.sha256(b"changed notes body\n").hexdigest()
+            changed = source + "\nextra line for hash change\n"
+            notes.write_text(changed, encoding="utf-8")
+            expected_second = hashlib.sha256(changed.encode("utf-8")).hexdigest()
             assert expected_second != expected_first
             assert snap["notes_hash"] != expected_second
-            sb.engine.aetherspace(
-                "films_notes",
-                SpaceContext(tables=frozenset({"film"}), notes_file=str(notes)),
-            )
-            snap2 = load_aetherspace_snapshot(str(sb.engine._artifacts_dir), "films_notes")
-            assert snap2 is not None
-            assert snap2["notes_hash"] == expected_second
+            with pytest.raises(ConfigError, match="custom notes"):
+                sb.engine.aetherspace(
+                    "catalog_notes",
+                    SpaceContext(tables=SANDBOX_CATALOG_SPACE_TABLES, notes_file=str(notes)),
+                )
 
     @pytest.mark.fast
     def test_defining_space_with_notes_does_not_rebuild_schema(self, tmp_path: Path) -> None:
-        notes = tmp_path / "space_notes.txt"
-        notes.write_text("space-only notes; must not rebuild catalog.\n", encoding="utf-8")
+        notes = self._catalog_notes_path()
+        from aetherdialect._constants import SANDBOX_CATALOG_SPACE_TABLES
+
         arts = tmp_path / "arts"
         with AetherEngine.offline_sandbox(artifacts_dir=str(arts), cleanup_artifacts=False) as sb:
             engine_dir = Path(str(sb.engine._artifacts_dir))
@@ -231,8 +235,8 @@ class TestSpaceContextNotesFileSandbox:
             )
             before_graph_id = id(sb.engine._schema_graph)
             sb.engine.aetherspace(
-                "films_notes",
-                SpaceContext(tables=frozenset({"film"}), notes_file=str(notes)),
+                "catalog_notes",
+                SpaceContext(tables=SANDBOX_CATALOG_SPACE_TABLES, notes_file=str(notes)),
             )
             assert id(sb.engine._schema_graph) == before_graph_id
             assert str(sb.engine._schema_graph.effective_structural_hash or "") == before_structural

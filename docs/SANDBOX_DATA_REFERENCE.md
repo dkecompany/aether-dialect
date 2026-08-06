@@ -2,7 +2,7 @@
 
 Closed-world inventory of every table, column, view, federation member, and practice question shipped in the **rental_shop** sandbox bundle. Use this document when authoring `EngineContext(allow_objects=...)`, federation declarations, or AetherSpace scopes. For session recipes and API patterns, see [Sandbox guide](SANDBOX.md).
 
-**Reading order:** [README](../README.md) → [Sandbox guide](SANDBOX.md) → this document.
+**Reading order:** [Sandbox guide](SANDBOX.md) -> this document.
 
 ## Sections
 
@@ -11,11 +11,10 @@ Closed-world inventory of every table, column, view, federation member, and prac
 | [Overview](#overview) | Table and view counts, date range, closed-world rule |
 | [Single-engine schema](#single-engine-schema) | All 34 tables with columns, keys, and foreign keys |
 | [Views](#views) | Bundled analytical views and `include="views"` |
-| [Bundled notes](#bundled-notes) | Owner and catalog notes emphasis |
+| [Bundled notes and named spaces](#bundled-notes-and-named-spaces) | Optional notes fixtures and `SpaceContext` subsets |
 | [Overrides and sensitivity fixtures](#overrides-and-sensitivity-fixtures) | Hidden vs denied columns |
-| [Consumer scopes](#consumer-scopes) | Owner, standard consumer, and restricted allow lists |
+| [Consumer scopes](#consumer-scopes) | Owner role and narrowed consumer `allow_objects` |
 | [Federation topology](#federation-topology) | Members, replicas, joins, and logical tables |
-| [Offline versus live](#offline-versus-live) | In-memory vs warehouse namespaces |
 | [Question corpus](#question-corpus) | Practice question tiers |
 
 ---
@@ -431,30 +430,47 @@ Three analytical views ship in `rental_shop_views.sql`. They are **not** in `ren
 
 ---
 
-## Bundled notes
+## Bundled notes and named spaces
 
-Two owner note files ship with the corpus.
+Hosts may define named AetherSpaces with any `SpaceContext` table subset validated against the schema graph. **Notes are optional** — `SpaceContext(tables={...})` without `notes_file` is valid. Attach bundled notes when you want knowledge-narrowing demos.
+
+```python
+from aetherdialect import AetherEngine, SpaceContext
+
+with AetherEngine.offline_sandbox() as sb:
+    sb.engine.aetherspace(
+        "catalog",
+        space_context=SpaceContext(
+            tables=frozenset({"item", "film", "category", "item_category"}),
+        ),
+    )
+    with sb.session(space="catalog") as session:
+        session.accept_until_done("How many films are in the Horror category?")
+```
+
+Two owner note files ship with the corpus. Full bundled text:
 
 ### `rental_shop_notes.txt` (default master space)
 
-| Topic | Tables / columns emphasised |
-| --- | --- |
-| Unified catalog | `item`, `film`, `book`, `game`, `item_feature` |
-| Rental lifecycle | `rental.rental_date`, `rental.return_date`, `item.rental_duration` |
-| Inventory status | `inventory`, `inventory_status_history` |
-| Payments | `payment` linked to `rental` |
-| Staff privacy | `staff.password`, `staff.ssn` — must never appear in analysis |
-| Logistics | `delivery`, `courier`, `damage_report` |
-| Procurement | `purchase_order`, `purchase_line`, `stock_transfer`, `warehouse` |
-| Promotions | `promotion`, `promotion_redemption` |
+```text
+The Rental Shop inventory system tracks films, books, and games through a unified catalog. Every media entry is represented by a central item record that contains common attributes like title, description, release year, and language. Specific details for each media type are stored in dedicated tables for films, books, and games. For films, we track physical length and ratings, while additional features like trailers or deleted scenes are managed as separate line items rather than being embedded in the main record.
+
+Rental tracking is based on strict date semantics. The rental date marks when an item was checked out, while the return date indicates when it was received back. If no return date is recorded, the item is still with the customer. Items have a defined rental duration in days; a rental is considered overdue if it hasn't been returned and the allowed duration has passed since the checkout date.
+
+Inventory is managed at the store level, where each record represents a specific physical copy of an item at a particular location. Status history allows us to track whether a copy is available, currently rented, undergoing repair, or lost. Payments are directly associated with these rental transactions.
+
+Our customer database includes contact information and employment status for staff members. We maintain strict privacy controls: sensitive staff credentials like passwords and social security numbers are completely hidden from the system and must never be included in any analysis or output.
+
+The system also handles advance reservations, damage reporting for returned items, and optional delivery services through various courier partners. Procurement and stock transfers between stores and warehouses ensure that inventory levels remain balanced. Promotions and loyalty rewards are applied to rentals using specific redemption codes and types like clearance or member specials.
+```
 
 ### `sandbox_space_catalog_notes.txt` (second-space demo)
 
-| Topic | Tables / columns emphasised |
-| --- | --- |
-| Media catalog | `item`, `film`, `category`, `item_category` |
-| Classification | category names and media titles over numeric IDs |
-| Scope boundary | media attributes only — not transactions, revenue, or logistics |
+```text
+The catalog inventory focuses on our core sellable media assets and their organization. We track individual items and their specific attributes across different formats, primarily films.
+
+Classification is handled through a category system that allows us to group items for better discovery. Each item can belong to one or more categories. When analyzing this part of the business, we prioritize descriptive category names and media titles over internal numeric identifiers. This domain is concerned with the attributes and grouping of the media itself, rather than transaction history, revenue, or store-specific logistics.
+```
 
 Use with `SpaceContext(tables={...}, notes_file="sandbox_space_catalog_notes.txt")` as shown in [Sandbox guide - Named AetherSpaces](SANDBOX.md#named-aetherspaces).
 
@@ -482,6 +498,34 @@ Applied via `apply_bundled_schema_overrides()`:
 | `staff.ssn`, `staff.password` | `sensitivity: hidden` |
 | `film` | analyst description override |
 
+Full bundled JSON:
+
+```json
+{
+  "version": "0.2.1",
+  "tables": {
+    "staff": {
+      "columns": {
+        "ssn": {
+          "sensitivity": "hidden"
+        },
+        "password": {
+          "sensitivity": "hidden"
+        }
+      }
+    },
+    "film": {
+      "description": "Sandbox demo override: Rental Shop film catalog.",
+      "role": null
+    }
+  },
+  "foreign_keys_add": [],
+  "foreign_keys_remove": [],
+  "primary_keys_add": [],
+  "primary_keys_remove": []
+}
+```
+
 ### Hidden versus denied
 
 | Mechanism | Where set | Effect |
@@ -493,25 +537,33 @@ Applied via `apply_bundled_schema_overrides()`:
 
 ## Consumer scopes
 
-Exact table allow lists used by the sandbox consumer role.
+`role="consumer"` uses the **same practice question surface** as the owner role (`AetherEngine.sandbox_questions()` and the other catalog helpers). Narrow visibility with `EngineContext(allow_objects=...)` — any subset of the owner seed tables is valid. Questions that reference tables outside the allow list fail at ask or execution with permission or schema refusal.
 
 ### Owner (default)
 
-No `allow_objects` restriction — all **34** base tables from section 2 are visible.
+No `allow_objects` restriction — all **34** base tables from [Single-engine schema](#single-engine-schema) are visible.
 
-### Standard consumer (default when `role="consumer"`)
+### Consumer (`role="consumer"`)
 
-When you call `sandbox.engine(role="consumer")` without narrowing `EngineContext.allow_objects`, execution scope is set to this list:
+When you call `sandbox.engine(role="consumer")` or pass a consumer `EngineContext` to `AetherEngine.offline_sandbox()`, the engine runs in reader session mode and enqueues learning events instead of applying them locally. Table visibility follows your `allow_objects` set. If you omit `allow_objects`, the consumer sees the full **34**-table owner seed (same table list as owner).
 
-`actor`, `address`, `author`, `book`, `category`, `city`, `country`, `courier`, `customer`, `damage_report`, `delivery`, `film`, `film_actor`, `game`, `game_supported_language`, `inventory`, `inventory_status_history`, `item`, `item_category`, `item_feature`, `language`, `payment`, `promotion`, `promotion_redemption`, `publisher`, `purchase_line`, `purchase_order`, `rental`, `reservation`, `staff`, `stock_transfer`, `store`, `supplier`, `warehouse`
+Pass an explicit `EngineContext(allow_objects=...)` to exercise narrowed scopes.
 
-**This list is identical to the full owner seed (34 tables).** The consumer preset today changes role, session mode (`reader`), and learning behaviour (write-queue enqueue) but **not** table visibility. Pass an explicit `EngineContext(allow_objects=...)` to narrow scope.
+### Example: permission-denied exercise
 
-### Restricted consumer (permission-denied exercise)
-
-When `role="consumer"` **and** `allow_objects` is exactly this six-table set, the sandbox activates the restricted consumer path:
+One common narrow allow list for practising permission errors:
 
 `customer`, `payment`, `rental`, `address`, `city`, `country`
+
+```python
+from aetherdialect import EngineContext, Sandbox
+
+narrow = EngineContext(
+    allow_objects=frozenset({"customer", "payment", "rental", "address", "city", "country"}),
+)
+with Sandbox() as sandbox:
+    engine = sandbox.engine(narrow, role="consumer")
+```
 
 Questions referencing tables outside this set (for example `staff`) should fail with permission or schema errors. See [Sandbox guide - Owner vs consumer roles](SANDBOX.md#owner-vs-consumer-roles).
 
@@ -526,8 +578,8 @@ Federation ID: **`sandbox_rental_shop`** (offline). Declaration: `federation_dec
 | Member | Offline engine | Tables |
 | --- | --- | --- |
 | `storefront` | DuckDB in-memory | `address`, `city`, `country`, `customer`, `payment`, `rental`, `reservation`, `staff`, `store` |
-| `catalog` | DuckDB in-memory | `actor`, `author`, `book`, `category`, `film`, `film_actor`, `game`, `game_supported_language`, `inventory`, `item`, `item_category`, `item_feature`, `language`, `payment`, `publisher` |
-| `logistics` | DuckDB in-memory | `courier`, `damage_report`, `delivery`, `inventory_status_history`, `purchase_line`, `purchase_order`, `stock_transfer`, `supplier`, `warehouse` |
+| `catalog` | DuckDB in-memory | `actor`, `author`, `book`, `category`, `city`, `country`, `film`, `film_actor`, `game`, `game_supported_language`, `inventory`, `item`, `item_category`, `item_feature`, `language`, `payment`, `publisher` |
+| `logistics` | DuckDB in-memory | `courier`, `damage_report`, `delivery`, `inventory_status_history`, `purchase_line`, `purchase_order`, `receipts`, `stock_transfer`, `supplier`, `warehouse` |
 | `crm` | DuckDB in-memory | `customer`, `promotion`, `promotion_redemption`, `staff` |
 
 Offline construction: `Sandbox().federation("sandbox_rental_shop")` loads four separate in-memory DuckDB connections with per-member artifact trees.
@@ -580,29 +632,6 @@ Member roster fields (`sources`, `table_namespace`) are derived at compose time 
 
 ---
 
-## Offline versus live
-
-The same four-member topology runs offline (bundled DuckDB seeds) and in live integration tests (real database engines). Logical table and join declarations are shared; only the backing engines and namespace names differ.
-
-| Member | Offline (`sandbox_rental_shop`) | Live (`live_rental_shop`) |
-| --- | --- | --- |
-| `storefront` | DuckDB `:memory:` | PostgreSQL schema `rental_shop_fed_storefront` |
-| `catalog` | DuckDB `:memory:` | MySQL database `rental_shop_fed_catalog` |
-| `logistics` | DuckDB `:memory:` | PostgreSQL schema `rental_shop_fed_logistics` |
-| `crm` | DuckDB `:memory:` | MariaDB database `rental_shop_fed_crm` |
-
-| Property | Offline | Live |
-| --- | --- | --- |
-| Federation ID | `sandbox_rental_shop` | `live_rental_shop` |
-| Declaration file | `federation_declaration.json` | `live_tests/fixtures/federation_live_declaration.json` |
-| Member source names | `storefront`, `catalog`, `logistics`, `crm` | same |
-| Logical tables / joins | identical shape | identical shape |
-| Partition table lists | `federation_partition.json` | same map, loaded into real engines |
-
-Offline partition seed files (`federation_*_seed.sql`) may ship as payment-only placeholders until a full corpus rebuild; `federation_partition.json` always lists the authoritative table roster per member.
-
----
-
 ## Question corpus
 
 Practice strings live in `sandbox_questions.txt` inside the bundled `data.zip`. Tiers and counts:
@@ -616,19 +645,73 @@ Practice strings live in `sandbox_questions.txt` inside the bundled `data.zip`. 
 
 ### `questions` tier (50)
 
-How many items are in the catalog by item type? · How many books do we have? · How many games are in the catalog? · Which films include trailers? · Which games support English? · How many open reservations are there? · Show active staff at each store. · How many rentals happened in 2025? · Who are our top 5 customers by total payment? · Rank films by rental count within each category. · What is the total delivery fee by courier? · What is the count of pending reservations by store? · What's the weather today? · What is the best pizza topping? · List all store locations by city. · What is the average rental duration? · Which films have the highest replacement cost? · How many actors are in the database? · What are the film ratings available? · Which staff members work at store 1? · List customers who have never rented an item. · What is the total revenue by store? · How many films are in the Horror category? · Which languages are available? · Which city has the most customers? · How many customers are in each country? · Which actors appear in the most films? · Which actors have the most film credits? · Which films are in the Horror category? · What is the average payment amount? · How many rentals are currently overdue? · List films released in 2006. · Which author has the most books? · How many inventory items does each store have? · List publishers with more than five books. · Show purchase orders still open by supplier. · How many damage reports are open? · List inventory status changes in the last 90 days. · Which warehouse holds the most stock? · List promotion redemptions by promotion name. · Show delivery status counts by courier. · List stock transfers between warehouses this year. · Which suppliers have the most purchase lines? · What is the average page count by publisher? · How many rentals are linked to film titles? · What is the total payment amount? · How many distinct customers rented horror films? · Show payroll deductions grouped by staff member. · What is the average payment amount grouped by film category? · List all films in the catalog.
+- How many items are in the catalog by item type?
+- How many books do we have?
+- How many games are in the catalog?
+- Which films include trailers?
+- Which games support English?
+- How many open reservations are there?
+- Show active staff at each store.
+- How many rentals happened in 2025?
+- Who are our top 5 customers by total payment?
+- Rank films by rental count within each category.
+- What is the total delivery fee by courier?
+- What is the count of pending reservations by store?
+- What's the weather today?
+- What is the best pizza topping?
+- List all store locations by city.
+- What is the average rental duration?
+- Which films have the highest replacement cost?
+- How many actors are in the database?
+- What are the film ratings available?
+- Which staff members work at store 1?
+- List customers who have never rented an item.
+- What is the total revenue by store?
+- How many films are in the Horror category?
+- Which languages are available?
+- Which city has the most customers?
+- How many customers are in each country?
+- Which actors appear in the most films?
+- Which actors have the most film credits?
+- Which films are in the Horror category?
+- What is the average payment amount?
+- How many rentals are currently overdue?
+- List films released in 2006.
+- Which author has the most books?
+- How many inventory items does each store have?
+- List publishers with more than five books.
+- Show purchase orders still open by supplier.
+- How many damage reports are open?
+- List inventory status changes in the last 90 days.
+- Which warehouse holds the most stock?
+- List promotion redemptions by promotion name.
+- Show delivery status counts by courier.
+- List stock transfers between warehouses this year.
+- Which suppliers have the most purchase lines?
+- What is the average page count by publisher?
+- How many rentals are linked to film titles?
+- What is the total payment amount?
+- How many distinct customers rented horror films?
+- Show payroll deductions grouped by staff member.
+- What is the average payment amount grouped by film category?
+- List all films in the catalog.
 
 ### `validation_failures` tier (4)
 
-Show payroll deductions by employee SSN. · Show me all staff salaries. · How many rentals happened on 2025-01-01? · How many rentals were made in total?
+- Show payroll deductions by employee SSN.
+- Show me all staff salaries.
+- How many rentals happened on 2025-01-01?
+- How many rentals were made in total?
 
 ### `feedback_samples` tier (1)
 
-The intent is wrong, count distinct films only.
+- The intent is wrong, count distinct films only.
 
 ### `views_questions` tier (3)
 
-How many active customers do we have? · What is the total revenue by store? · Which films are in the catalog view?
+- How many active customers do we have?
+- What is the total revenue by store?
+- Which films are in the catalog view?
 
 ---
 
@@ -646,5 +729,3 @@ The sandbox is closed-world. When authoring scopes or declarations, names must c
 | View names | [Views](#views) (`active_customer_v`, `store_revenue_v`, `film_catalog_v`) |
 
 ---
-
-**See also:** [Sandbox guide](SANDBOX.md) | [API reference](API_REFERENCE.md) | [Security](SECURITY.md) | [README](../README.md)

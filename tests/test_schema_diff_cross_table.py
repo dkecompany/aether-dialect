@@ -1,4 +1,4 @@
-"""T11: cross-table column moves are detected or surfaced with explicit operator guidance."""
+"""Cross-table column moves are detected or surfaced with explicit operator guidance."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import pytest
 from aetherdialect._contracts_base import ColumnRole, MigrationTier
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._schema_graph import diff_schemas, schema_diff_cross_table_limitation_note
-from aetherdialect._templates import export_schema_migration_map_skeleton
+from aetherdialect._templates import TemplateOps
 
 
 def _col(name: str, data_type: str = "integer") -> ColumnMetadata:
@@ -91,7 +91,7 @@ def test_migration_skeleton_includes_cross_table_limitation_when_needed(tmp_path
         }
     )
     diff = diff_schemas(old, new)
-    path = export_schema_migration_map_skeleton(
+    path = TemplateOps.export_schema_migration_map_skeleton(
         tmp_path,
         tier=MigrationTier.DESTRUCTIVE,
         schema_diff=diff,

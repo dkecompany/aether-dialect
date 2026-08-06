@@ -10,10 +10,10 @@ from aetherdialect._constants import BOOLEAN_TRUTH_PATTERN_MAP
 from aetherdialect._contracts_base import (
     ColumnRole,
     NormalizedExpr,
+    PredicateGroup,
     RoleOwner,
     TableRole,
     WhereParam,
-    predicate_group_from_list,
 )
 from aetherdialect._contracts_core import RuntimeIntent
 from aetherdialect._contracts_schema import (
@@ -24,9 +24,7 @@ from aetherdialect._contracts_schema import (
 )
 from aetherdialect._core_utils import stable_json
 from aetherdialect._dialect_sqlglot_engines import DatabricksDialect
-from aetherdialect._dialect_sqlglot_helper import (
-    structural_constraints_index_from_information_schema_rows,
-)
+from aetherdialect._dialect_sqlglot_helper import SqlglotEngineDialect
 from aetherdialect._schema_catalog import (
     SCHEMA_CONSISTENCY_REFINE_SYSTEM,
     SCHEMA_NOTES_REFINE_SYSTEM,
@@ -60,6 +58,8 @@ from aetherdialect._schema_catalog import (
     llm_classify_schema,
     parse_sql_file,
 )
+
+InformationSchemaSupport = SqlglotEngineDialect
 
 
 class TestBooleanTruthPatternMap:
@@ -284,7 +284,7 @@ class TestParseColumnsAndConstraints:
     def test_simple_columns(self):
         """Parse simple column definitions."""
         block = "id INTEGER PRIMARY KEY, name VARCHAR, age INTEGER"
-        columns, types, pks, fks, _unique, nulls = _parse_columns_and_constraints(block)
+        columns, types, pks, fks, _unique, nulls, _comments = _parse_columns_and_constraints(block)
         assert columns == ["id", "name", "age"]
         assert types == ["INTEGER", "VARCHAR", "INTEGER"]
         assert "id" in pks
@@ -293,7 +293,7 @@ class TestParseColumnsAndConstraints:
     def test_separate_pk_constraint(self):
         """Parse PRIMARY KEY as separate constraint."""
         block = "id INTEGER, name VARCHAR, PRIMARY KEY (id)"
-        columns, types, pks, fks, _unique, nulls = _parse_columns_and_constraints(block)
+        columns, types, pks, fks, _unique, nulls, _comments = _parse_columns_and_constraints(block)
         assert columns == ["id", "name"]
         assert "id" in pks
         assert nulls == [False, True]
@@ -301,7 +301,7 @@ class TestParseColumnsAndConstraints:
     def test_foreign_key_constraint(self):
         """Parse FOREIGN KEY constraint."""
         block = "id INTEGER, customer_id INTEGER, FOREIGN KEY (customer_id) REFERENCES customers(id)"
-        columns, types, pks, fks, _unique, nulls = _parse_columns_and_constraints(block)
+        columns, types, pks, fks, _unique, nulls, _comments = _parse_columns_and_constraints(block)
         assert columns == ["id", "customer_id"]
         assert len(fks) == 1
         assert fks[0]["src_cols"] == ["customer_id"]
@@ -311,7 +311,7 @@ class TestParseColumnsAndConstraints:
 
     def test_empty_block(self):
         """Parse empty column block."""
-        columns, types, pks, fks, _unique, nulls = _parse_columns_and_constraints("")
+        columns, types, pks, fks, _unique, nulls, _comments = _parse_columns_and_constraints("")
         assert columns == []
         assert fks == []
         assert nulls == []
@@ -319,7 +319,7 @@ class TestParseColumnsAndConstraints:
     def test_quoted_column_names(self):
         """Parse quoted column names."""
         block = '"order_id" INTEGER PRIMARY KEY, "total" NUMERIC'
-        columns, types, pks, fks, _unique, nulls = _parse_columns_and_constraints(block)
+        columns, types, pks, fks, _unique, nulls, _comments = _parse_columns_and_constraints(block)
         assert "order_id" in columns
         assert "order_id" in pks
         assert nulls == [False, True]
@@ -327,7 +327,7 @@ class TestParseColumnsAndConstraints:
     def test_numeric_precision_scale_across_tokens(self):
         """NUMERIC(4, 2) with a split after the comma still forms one type."""
         block = "rental_rate NUMERIC(4, 2) NOT NULL"
-        columns, types, pks, fks, _, nulls = _parse_columns_and_constraints(block)
+        columns, types, pks, fks, _, nulls, _comments = _parse_columns_and_constraints(block)
         assert columns == ["rental_rate"]
         assert "4" in types[0] and "2" in types[0]
         assert nulls == [False]
@@ -384,17 +384,16 @@ class TestValidateColumnClassification:
     """Tests for _validate_column_classification."""
 
     def test_numeric_measure_on_string(self):
-        """Hard error for NUMERIC_MEASURE on non-numeric column."""
+        """Role/value_type mismatches are coerced, not hard validation errors."""
         col = ColumnMetadata(name="name", data_type="varchar", value_type="string")
         hard, soft = _validate_column_classification(col, ColumnRole.NUMERIC_MEASURE.value)
-        assert len(hard) > 0
-        assert "NUMERIC_MEASURE" in hard[0]
+        assert len(hard) == 0
 
-    def test_temporal_on_integer_without_duration_name_fails(self):
-        """Hard error for TEMPORAL on generic integer column."""
+    def test_temporal_on_integer_without_duration_name_ok(self):
+        """TEMPORAL on generic integer column is allowed when value_type matches."""
         col = ColumnMetadata(name="count", data_type="integer", value_type="integer")
         hard, soft = _validate_column_classification(col, ColumnRole.TEMPORAL.value)
-        assert len(hard) > 0
+        assert len(hard) == 0
 
     def test_temporal_on_integer_duration_name_ok(self):
         """TEMPORAL on integer duration-style column passes validation."""
@@ -453,25 +452,25 @@ class TestValidateColumnClassification:
         hard, soft = _validate_column_classification(col, ColumnRole.NUMERIC_MEASURE.value)
         assert len(hard) == 0
 
-    def test_numeric_categorical_on_string_hard_error(self):
-        """Hard error for NUMERIC_CATEGORICAL on non-numeric column."""
+    def test_numeric_categorical_on_string_not_hard_error(self):
+        """Role/value_type mismatches are coerced, not hard validation errors."""
         col = ColumnMetadata(name="code", data_type="varchar", value_type="string")
         hard, soft = _validate_column_classification(col, ColumnRole.NUMERIC_CATEGORICAL.value)
-        assert len(hard) > 0
-        assert "NUMERIC_CATEGORICAL" in hard[0]
+        assert len(hard) == 0
 
 
 class TestBuildColumnProfileForLlm:
     """Tests for _build_column_profile_for_llm."""
 
     def test_basic_fields(self):
-        """Profile contains name, data_type, is_primary_key, is_foreign_key."""
-        col = ColumnMetadata(name="id", data_type="integer", is_primary_key=True)
+        """Profile contains name, value_type, is_primary_key, is_foreign_key."""
+        col = ColumnMetadata(name="id", data_type="integer", value_type="integer", is_primary_key=True)
         result = _build_column_profile_for_llm(col)
         assert result["name"] == "id"
-        assert result["data_type"] == "integer"
+        assert result["value_type"] == "integer"
         assert result["is_primary_key"] is True
         assert result["is_foreign_key"] is False
+        assert "data_type" not in result
 
     def test_hints_with_stats(self):
         """Profile includes profile_hints when stats present."""
@@ -490,10 +489,11 @@ class TestBuildColumnProfileForLlm:
 
     def test_default_stats_included(self):
         """Profile includes default stats in hints."""
-        col = ColumnMetadata(name="x", data_type="int")
+        col = ColumnMetadata(name="x", data_type="int", value_type="integer")
         result = _build_column_profile_for_llm(col)
         assert result["name"] == "x"
-        assert result["data_type"] == "int"
+        assert result["value_type"] == "integer"
+        assert "data_type" not in result
 
     def test_hints_include_distinct_count(self):
         """Profile hints include distinct_count when set."""
@@ -699,7 +699,7 @@ class TestLlmClassifySchemaRefinePasses:
             return raw
 
         monkeypatch.setattr(EngineConfig, "SCHEMA_JSON_PATH", str(tmp_path / "schema_graph.json.gz"))
-        monkeypatch.setattr("aetherdialect._schema_catalog.llm_chat", fake_llm)
+        monkeypatch.setattr("aetherdialect._schema_catalog.LLMProvider.chat", fake_llm)
         out = llm_classify_schema(sg, None)
         assert len(calls) == 2
         assert calls[0][1] == "schema_base"
@@ -733,7 +733,7 @@ class TestLlmClassifySchemaRefinePasses:
             return raw
 
         monkeypatch.setattr(EngineConfig, "SCHEMA_JSON_PATH", str(tmp_path / "schema_graph.json.gz"))
-        monkeypatch.setattr("aetherdialect._schema_catalog.llm_chat", fake_llm)
+        monkeypatch.setattr("aetherdialect._schema_catalog.LLMProvider.chat", fake_llm)
         llm_classify_schema(sg, "domain notes here")
         assert len(calls) == 2
         assert calls[1] == SCHEMA_NOTES_REFINE_SYSTEM
@@ -778,6 +778,7 @@ class TestApplyColumnRolesLlmDescriptionInvariant:
             notes_content: str | None = None,
             *,
             column_scope: dict[str, frozenset[str]] | None = None,
+            **kwargs: Any,
         ):
             return {
                 "t": (
@@ -803,6 +804,7 @@ class TestApplyColumnRolesLlmDescriptionInvariant:
             notes_content: str | None = None,
             *,
             column_scope: dict[str, frozenset[str]] | None = None,
+            **kwargs: Any,
         ):
             return {
                 "t": (
@@ -830,6 +832,7 @@ class TestApplyColumnRolesLlmDescriptionInvariant:
             notes_content: str | None = None,
             *,
             column_scope: dict[str, frozenset[str]] | None = None,
+            **kwargs: Any,
         ):
             calls["n"] += 1
             return {
@@ -856,6 +859,7 @@ class TestApplyColumnRolesLlmDescriptionInvariant:
             notes_content: str | None = None,
             *,
             column_scope: dict[str, frozenset[str]] | None = None,
+            **kwargs: Any,
         ):
             calls["n"] += 1
             if calls["n"] < 2:
@@ -900,6 +904,7 @@ class TestApplyColumnRolesLlmPostOverrides:
             notes_content: str | None = None,
             *,
             column_scope: dict[str, frozenset[str]] | None = None,
+            **kwargs: Any,
         ):
             return {
                 "events": (
@@ -929,6 +934,7 @@ class TestApplyColumnRolesLlmPostOverrides:
             notes_content: str | None = None,
             *,
             column_scope: dict[str, frozenset[str]] | None = None,
+            **kwargs: Any,
         ):
             return {
                 "events": (
@@ -958,6 +964,7 @@ class TestApplyColumnRolesLlmPostOverrides:
             notes_content: str | None = None,
             *,
             column_scope: dict[str, frozenset[str]] | None = None,
+            **kwargs: Any,
         ):
             return {
                 "t": (
@@ -1125,7 +1132,7 @@ class TestParseSqlFileConditionalLlm:
             calls.append(args)
             return '{"tables": {}}'
 
-        monkeypatch.setattr("aetherdialect._schema_catalog.llm_chat", _capture_llm)
+        monkeypatch.setattr("aetherdialect._schema_catalog.LLMProvider.chat", _capture_llm)
 
         out = parse_sql_file(path, reflected_schema=sg)
         assert out == {}
@@ -1152,7 +1159,7 @@ class TestParseSqlFileConditionalLlm:
             calls.append(1)
             return '{"tables": {}}'
 
-        monkeypatch.setattr("aetherdialect._schema_catalog.llm_chat", _capture_llm)
+        monkeypatch.setattr("aetherdialect._schema_catalog.LLMProvider.chat", _capture_llm)
 
         out = parse_sql_file(path, reflected_schema=sg)
         assert out == {}
@@ -1178,7 +1185,7 @@ class TestParseSqlFileViaLlmNullability:
             }
         }
         monkeypatch.setattr(
-            "aetherdialect._schema_catalog.llm_chat",
+            "aetherdialect._schema_catalog.LLMProvider.chat",
             lambda *a, **k: stable_json(payload),
         )
         out = _parse_sql_file_via_llm(ddl)
@@ -1203,7 +1210,7 @@ class TestParseSqlFileViaLlmNullability:
             }
         }
         monkeypatch.setattr(
-            "aetherdialect._schema_catalog.llm_chat",
+            "aetherdialect._schema_catalog.LLMProvider.chat",
             lambda *a, **k: stable_json(payload),
         )
         out = _parse_sql_file_via_llm(ddl)
@@ -1562,7 +1569,9 @@ class TestUnityStructuralConstraintsIndexFromRows:
                 "unique_constraint_name": "pk_users",
             },
         ]
-        idx = structural_constraints_index_from_information_schema_rows(tc_rows, kcu_rows, rc_rows)
+        idx = InformationSchemaSupport.structural_constraints_index_from_information_schema_rows(
+            tc_rows, kcu_rows, rc_rows
+        )
         ub = idx.tables["users"]
         assert ub.primary_keys == ["id"]
         assert "email" in ub.unique_columns
@@ -1612,6 +1621,7 @@ class TestApplyColumnRolesLlmBooleanStringValueType:
             notes_content: str | None = None,
             *,
             column_scope: dict[str, frozenset[str]] | None = None,
+            **kwargs: Any,
         ):
             return {
                 "clinical_data": (
@@ -2008,8 +2018,8 @@ class TestValidateColumnClassificationEdgeCases:
         assert len(hard) > 0 or len(soft) > 0
 
     def test_temporal_on_domain_dtype_soft_warning_only(self):
-        """TEMPORAL on a DOMAIN-typed column yields a soft warning, not a hard error."""
-        col = ColumnMetadata(name="code", data_type="INTEGER DOMAIN year_t", value_type="integer")
+        """TEMPORAL on a year-like integer column yields a soft warning, not a hard error."""
+        col = ColumnMetadata(name="release_year", data_type="INTEGER DOMAIN year_t", value_type="integer")
         hard, soft = _validate_column_classification(col, ColumnRole.TEMPORAL.value)
         assert len(hard) == 0
         assert len(soft) > 0
@@ -2099,12 +2109,12 @@ class TestInjectPartitionFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([_where_param("events.dt", "=", "p1", None)]),
+            where=PredicateGroup.from_list([_where_param("events.dt", "=", "p1", None)]),
             param_values={"p1": "2024-01-15"},
         )
         sql = "SELECT * FROM events"
         result = _databricks_partition_dialect().inject_pruning_predicates(sql, schema=schema, intent=intent)
-        assert "`events`.`dt` = '2024-01-15'" in result
+        assert "`events`.`dt` = :p1" in result
         assert "WHERE" in result
 
     def test_inject_in_partition_predicate(self):
@@ -2116,7 +2126,7 @@ class TestInjectPartitionFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     _where_param("logs.region", "=", "p1", None),
                     _where_param("logs.region", "=", "p2", None),
@@ -2126,7 +2136,7 @@ class TestInjectPartitionFilters:
         )
         sql = "SELECT * FROM logs"
         result = _databricks_partition_dialect().inject_pruning_predicates(sql, schema=schema, intent=intent)
-        assert "`logs`.`region` IN ('us', 'eu')" in result
+        assert "`logs`.`region` IN (:p1, :p2)" in result
 
     def test_inject_between_partition_predicate(self):
         """Inject BETWEEN as >= and <= partition predicates."""
@@ -2137,7 +2147,7 @@ class TestInjectPartitionFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list(
+            where=PredicateGroup.from_list(
                 [
                     _where_param("sales.dt", ">=", "p1", None),
                     _where_param("sales.dt", "<=", "p2", None),
@@ -2149,8 +2159,10 @@ class TestInjectPartitionFilters:
         result = _databricks_partition_dialect().inject_pruning_predicates(sql, schema=schema, intent=intent)
         assert ">=" in result
         assert "<=" in result
-        assert "2024-01-01" in result
-        assert "2024-01-31" in result
+        assert ":p1" in result
+        assert ":p2" in result
+        assert "2024-01-01" not in result
+        assert "2024-01-31" not in result
 
     def test_no_partition_columns_unchanged(self):
         """SQL unchanged when table has no partition columns."""
@@ -2168,7 +2180,7 @@ class TestInjectPartitionFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([_where_param("plain.id", "=", "p1", None)]),
+            where=PredicateGroup.from_list([_where_param("plain.id", "=", "p1", None)]),
             param_values={"p1": 1},
         )
         sql = "SELECT * FROM plain WHERE id = 1"
@@ -2184,10 +2196,10 @@ class TestInjectPartitionFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([_where_param("events.dt", "=", "p1", None)]),
+            where=PredicateGroup.from_list([_where_param("events.dt", "=", "p1", None)]),
             param_values={"p1": "2024-01-15"},
         )
-        sql = "SELECT * FROM events WHERE `events`.`dt` = '2024-01-15'"
+        sql = "SELECT * FROM events WHERE `events`.`dt` = :p1"
         result = _databricks_partition_dialect().inject_pruning_predicates(sql, schema=schema, intent=intent)
         assert result == sql
 
@@ -2200,13 +2212,13 @@ class TestInjectPartitionFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            where=predicate_group_from_list([_where_param("events.dt", "=", "p1", None)]),
+            where=PredicateGroup.from_list([_where_param("events.dt", "=", "p1", None)]),
             param_values={"p1": "2024-01-15"},
         )
         sql = "SELECT * FROM events WHERE status = 'active'"
         result = _databricks_partition_dialect().inject_pruning_predicates(sql, schema=schema, intent=intent)
         assert "status = 'active'" in result
-        assert "`events`.`dt` = '2024-01-15'" in result
+        assert "`events`.`dt` = :p1" in result
         assert " AND " in result
 
 

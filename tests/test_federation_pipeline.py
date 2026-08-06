@@ -36,7 +36,7 @@ from aetherdialect._federation import (
     parse_federation_manifest,
     validate_coordinator_join_fan_out,
 )
-from aetherdialect._main_execution import _federation_gate_kwargs_by_source
+from aetherdialect._main_execution import MainExecutionOps
 from aetherdialect._pipeline import (
     _execute_federation_steps_parallel,
     execute_federated_prepare,
@@ -443,7 +443,7 @@ def test_federation_gate_kwargs_master_member_uses_member_context() -> None:
         },
         include_derived_roster=True,
     )
-    gates = _federation_gate_kwargs_by_source(owner, port, manifest)
+    gates = MainExecutionOps._federation_gate_kwargs_by_source(owner, port, manifest)
     member_gate = gates["alpha"]
     assert member_gate["context_name"] == MASTER_AETHERSPACE_NAME
     assert member_gate["schema_context"] == EngineContext()
@@ -452,7 +452,7 @@ def test_federation_gate_kwargs_master_member_uses_member_context() -> None:
 
 @pytest.mark.fast
 def test_consumer_sql_gate_kwargs_does_not_supply_composite_to_master_members() -> None:
-    from aetherdialect._main_execution import _consumer_sql_gate_kwargs
+    from aetherdialect._main_execution import MainExecutionOps
 
     composite_ctx = EngineContext(deny_objects=frozenset({"orders"}))
     owner = MagicMock()
@@ -465,7 +465,7 @@ def test_consumer_sql_gate_kwargs_does_not_supply_composite_to_master_members() 
         space_tables=None,
         space_columns=None,
     )
-    kwargs = _consumer_sql_gate_kwargs(port)
+    kwargs = MainExecutionOps._consumer_sql_gate_kwargs(port)
     assert kwargs["schema_context"] is composite_ctx
     manifest = parse_federation_manifest(
         {
@@ -476,6 +476,6 @@ def test_consumer_sql_gate_kwargs_does_not_supply_composite_to_master_members() 
         },
         include_derived_roster=True,
     )
-    gates = _federation_gate_kwargs_by_source(owner, port, manifest)
+    gates = MainExecutionOps._federation_gate_kwargs_by_source(owner, port, manifest)
     assert gates["alpha"]["schema_context"] == EngineContext()
     assert gates["alpha"]["schema_context"] is not composite_ctx

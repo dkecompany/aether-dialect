@@ -93,7 +93,7 @@ def _replica_members_and_mappings(
     )
     mappings = parse_federation_mappings(
         {
-            "version": 2,
+            "version": "0.2.1",
             "logical_tables": [
                 {
                     "logical": "entity",
@@ -148,7 +148,7 @@ def _union_members_and_mappings(
     )
     mappings = parse_federation_mappings(
         {
-            "version": 2,
+            "version": "0.2.1",
             "logical_tables": [
                 {
                     "logical": "payment",
