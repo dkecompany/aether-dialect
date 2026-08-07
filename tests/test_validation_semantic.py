@@ -3,13 +3,14 @@
 from aetherdialect._constants import COMPATIBLE_TYPE_PAIRS
 from aetherdialect._contracts_base import (
     FailureCategory,
-    FilterParam,
     HavingParam,
     LogicalIntent,
     MulGroup,
     NormalizedExpr,
     OrderByCol,
+    PredicateGroup,
     SensitivityClassification,
+    WhereParam,
 )
 from aetherdialect._contracts_core import (
     RuntimeCteStep,
@@ -50,9 +51,7 @@ from aetherdialect._validation_semantic import (
     validate_denied_references,
     validate_deny_bare_select,
     validate_empty_window,
-    validate_expr_vs_expr_filters,
-    validate_filter_expr_types,
-    validate_filter_no_aggregation,
+    validate_expr_vs_expr_where,
     validate_for_each_grouping,
     validate_grain_consistency,
     validate_grouped_requires_aggregation,
@@ -72,6 +71,8 @@ from aetherdialect._validation_semantic import (
     validate_sensitivity_group_by,
     validate_sensitivity_order_by,
     validate_threshold_missing_having,
+    validate_where_expr_types,
+    validate_where_no_aggregation,
 )
 
 
@@ -134,20 +135,22 @@ class TestValidateEmptyWindow:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("payment.payment_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("payment.payment_date"),
-                    op=">=",
-                    value_type="date",
-                    raw_value="2020-01-01",
-                ),
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("payment.payment_date"),
-                    op="<=",
-                    value_type="date",
-                    raw_value="2020-01-01",
-                ),
-            ],
+            where=PredicateGroup.from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("payment.payment_date"),
+                        op=">=",
+                        value_type="date",
+                        raw_value="2020-01-01",
+                    ),
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("payment.payment_date"),
+                        op="<=",
+                        value_type="date",
+                        raw_value="2020-01-01",
+                    ),
+                ]
+            ),
         )
         issues = validate_empty_window(intent, schema)
         assert len(issues) == 1
@@ -162,20 +165,22 @@ class TestValidateEmptyWindow:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("payment.payment_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("payment.payment_date"),
-                    op=">=",
-                    value_type="date",
-                    raw_value="2020-01-01",
-                ),
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("payment.payment_date"),
-                    op="<=",
-                    value_type="date",
-                    raw_value="2020-12-31",
-                ),
-            ],
+            where=PredicateGroup.from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("payment.payment_date"),
+                        op=">=",
+                        value_type="date",
+                        raw_value="2020-01-01",
+                    ),
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("payment.payment_date"),
+                        op="<=",
+                        value_type="date",
+                        raw_value="2020-12-31",
+                    ),
+                ]
+            ),
         )
         assert validate_empty_window(intent, schema) == []
 
@@ -187,14 +192,16 @@ class TestValidateEmptyWindow:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("payment.payment_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("payment.payment_date"),
-                    op=">=",
-                    value_type="date_window",
-                    raw_value={"start": "2021-06-01", "end": "2021-06-01"},
-                ),
-            ],
+            where=PredicateGroup.from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("payment.payment_date"),
+                        op=">=",
+                        value_type="date_window",
+                        raw_value={"start": "2021-06-01", "end": "2021-06-01"},
+                    ),
+                ]
+            ),
         )
         issues = validate_empty_window(intent, schema)
         assert len(issues) == 1
@@ -230,36 +237,36 @@ class TestValidateSemanticContradictions:
 
 
 class TestValidateExprVsExprFilters:
-    """Tests for validate_expr_vs_expr_filters."""
+    """Tests for validate_expr_vs_expr_where."""
 
     def test_self_comparison(self, typed_schema):
         """Error for self-comparison in filter."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("customers.balance"),
             op=">",
             right_expr=NormalizedExpr.from_column("customers.balance"),
         )
-        issues = validate_expr_vs_expr_filters([fp], typed_schema)
+        issues = validate_expr_vs_expr_where([fp], typed_schema)
         assert any("Self-comparison" in i.message for i in issues)
 
     def test_type_mismatch(self, typed_schema):
         """Error for type mismatch in expr-vs-expr comparison."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("customers.balance"),
             op=">",
             right_expr=NormalizedExpr.from_column("customers.name"),
         )
-        issues = validate_expr_vs_expr_filters([fp], typed_schema)
+        issues = validate_expr_vs_expr_where([fp], typed_schema)
         assert any("mismatch" in i.message.lower() for i in issues)
 
     def test_compatible_types_no_issue(self, typed_schema):
         """No issues for compatible type comparison."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("customers.balance"),
             op=">",
             right_expr=NormalizedExpr.from_column("orders.amount"),
         )
-        issues = validate_expr_vs_expr_filters([fp], typed_schema)
+        issues = validate_expr_vs_expr_where([fp], typed_schema)
         type_issues = [i for i in issues if "mismatch" in i.message.lower()]
         assert len(type_issues) == 0
 
@@ -312,33 +319,33 @@ class TestValidateExprVsExprFilters:
         )
         from aetherdialect._intent_expr import parse_expr_string
 
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=parse_expr_string("rental.return_date - rental.rental_date"),
             op=">",
             right_expr=parse_expr_string("item.rental_duration"),
         )
-        issues = validate_expr_vs_expr_filters([fp], schema)
+        issues = validate_expr_vs_expr_where([fp], schema)
         type_issues = [i for i in issues if "mismatch" in i.message.lower() and i.severity == "error"]
         assert len(type_issues) == 0
 
 
 class TestValidateFilterNoAggregation:
-    """Tests for validate_filter_no_aggregation."""
+    """Tests for validate_where_no_aggregation."""
 
     def test_bare_column_filter(self):
         """No issues for non-aggregated filter."""
-        fp = FilterParam(left_expr=NormalizedExpr.from_column("t.a"), op="=", value_type="string")
-        issues = validate_filter_no_aggregation([fp])
+        fp = WhereParam(left_expr=NormalizedExpr.from_column("t.a"), op="=", value_type="string")
+        issues = validate_where_no_aggregation([fp])
         assert len(issues) == 0
 
     def test_aggregated_filter(self):
         """Error for aggregated filter expression."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_agg("count", "t.a"),
             op=">",
             value_type="integer",
         )
-        issues = validate_filter_no_aggregation([fp])
+        issues = validate_where_no_aggregation([fp])
         assert len(issues) > 0
 
 
@@ -382,7 +389,7 @@ class TestValidatePredicateSidedness:
         """No issues when left is column-bearing and right is literal- only."""
         from aetherdialect._contracts_base import ExprValue
 
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("orders.amount"),
             op=">",
             right_expr=NormalizedExpr(add_values=[ExprValue(value=5.0)]),
@@ -394,7 +401,7 @@ class TestValidatePredicateSidedness:
         """Error when a filter's sides are mutated so literal-only ends up on the left."""
         from aetherdialect._contracts_base import ExprValue
 
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("orders.amount"),
             op=">",
             right_expr=NormalizedExpr(add_values=[ExprValue(value=5.0)]),
@@ -423,7 +430,7 @@ class TestValidatePredicateSidedness:
 
     def test_ignores_right_expr_none(self):
         """Filters with no right_expr are untouched by the sidedness check."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("orders.amount"),
             op="=",
             param_key="p1",
@@ -439,13 +446,13 @@ class TestValidateLogicalIntentNumericCoverage:
 
     def test_year_in_date_literal_covered(self):
         """Year substring in date literal (e.g. 2005 in 2005-08-01) is covered."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op=">=",
             value_type="date",
             raw_value="2005-08-01",
         )
-        li = LogicalIntent(tables=("t",), select="*", filter="Show rentals from 2005")
+        li = LogicalIntent(tables=("t",), select="*", where="Show rentals from 2005")
         issues = validate_logical_intent_numeric_coverage(
             li,
             [fp],
@@ -457,13 +464,13 @@ class TestValidateLogicalIntentNumericCoverage:
 
     def test_missing_numeric_without_date_covered(self):
         """Number in planner prose without matching filter produces issue."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op="=",
             value_type="string",
             raw_value="x",
         )
-        li = LogicalIntent(tables=("t",), select="*", filter="Show rows where value is 42")
+        li = LogicalIntent(tables=("t",), select="*", where="Show rows where value is 42")
         issues = validate_logical_intent_numeric_coverage(
             li,
             [fp],
@@ -808,7 +815,7 @@ class TestValidateArithExpressionSemantics:
 
     def test_no_arithmetic_no_issues(self, typed_schema):
         """Simple column filters with no arithmetic produce no issues."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("orders.amount"),
             op=">",
             value_type="number",
@@ -823,7 +830,7 @@ class TestValidateArithExpressionSemantics:
                 MulGroup(multiply=["customers.balance", "customers.description"]),
             ]
         )
-        fp = FilterParam(left_expr=arith_expr, op=">", value_type="number", param_key="p1")
+        fp = WhereParam(left_expr=arith_expr, op=">", value_type="number", param_key="p1")
         issues = validate_arith_expression_semantics([fp], [], typed_schema)
         assert len(issues) >= 1
 
@@ -833,7 +840,7 @@ class TestValidateArithExpressionSemantics:
 
     def test_non_arithmetic_filter_no_issues(self, typed_schema):
         """No issues for non-arithmetic filter."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("customers.name"),
             op="=",
             value_type="string",
@@ -844,7 +851,7 @@ class TestValidateArithExpressionSemantics:
     def test_arithmetic_filter_with_non_numeric(self, typed_schema):
         """Error for non-numeric column in arithmetic filter."""
         g = MulGroup(multiply=["customers.name"], coefficient=2.0)
-        fp = FilterParam(left_expr=NormalizedExpr(add_groups=[g]), op=">", value_type="number")
+        fp = WhereParam(left_expr=NormalizedExpr(add_groups=[g]), op=">", value_type="number")
         issues = validate_arith_expression_semantics([fp], [], typed_schema)
         errors = [i for i in issues if i.severity == "error"]
         assert len(errors) >= 1
@@ -943,70 +950,70 @@ class TestValidateOrderByExprTypes:
 
 
 class TestValidateFilterExprTypes:
-    """Tests for validate_filter_expr_types."""
+    """Tests for validate_where_expr_types."""
 
     def test_empty_filters_no_issues(self, typed_schema):
         """No issues for empty filter list."""
-        issues = validate_filter_expr_types([], typed_schema)
+        issues = validate_where_expr_types([], typed_schema)
         assert len(issues) == 0
 
     def test_non_arithmetic_filter_no_issues(self, typed_schema):
         """No issues for non-arithmetic filter."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("customers.name"),
             op="=",
             value_type="string",
         )
-        issues = validate_filter_expr_types([fp], typed_schema)
+        issues = validate_where_expr_types([fp], typed_schema)
         assert len(issues) == 0
 
     def test_cross_type_mismatch(self, typed_schema):
         """Error for numeric vs non-numeric expr-vs-expr comparison."""
         left = NormalizedExpr(add_groups=[MulGroup(multiply=["customers.balance"], coefficient=2.0)])
         right = NormalizedExpr.from_column("customers.name")
-        fp = FilterParam(left_expr=left, op=">", right_expr=right, value_type="number")
-        issues = validate_filter_expr_types([fp], typed_schema)
+        fp = WhereParam(left_expr=left, op=">", right_expr=right, value_type="number")
+        issues = validate_where_expr_types([fp], typed_schema)
         errors = [i for i in issues if i.severity == "error"]
         assert len(errors) >= 1
 
     def test_arithmetic_op_mismatch(self, typed_schema):
         """Error for LIKE on arithmetic expression."""
         g = MulGroup(multiply=["customers.balance"], coefficient=2.0)
-        fp = FilterParam(left_expr=NormalizedExpr(add_groups=[g]), op="like", value_type="string")
-        issues = validate_filter_expr_types([fp], typed_schema)
+        fp = WhereParam(left_expr=NormalizedExpr(add_groups=[g]), op="like", value_type="string")
+        issues = validate_where_expr_types([fp], typed_schema)
         errors = [i for i in issues if "invalid" in i.message.lower() or "op" in i.message.lower()]
         assert len(errors) >= 1
 
     def test_simple_filter_no_issue(self, typed_schema):
         """Simple column filter produces no issue."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("orders.amount"),
             op=">",
             value_type="number",
             param_key="p1",
         )
-        issues = validate_filter_expr_types([fp], typed_schema)
+        issues = validate_where_expr_types([fp], typed_schema)
         assert len(issues) == 0
 
     def test_cross_type_mismatch_direct_columns(self, typed_schema):
         """Numeric vs non-numeric cross comparison produces issue."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("orders.amount"),
             op=">",
             right_expr=NormalizedExpr.from_column("customers.name"),
             value_type="number",
             param_key="p1",
         )
-        issues = validate_filter_expr_types([fp], typed_schema)
+        issues = validate_where_expr_types([fp], typed_schema)
         assert any("cross_type_mismatch" in i.issue_id or "mismatch" in i.message.lower() for i in issues)
 
     def test_empty_filters(self, typed_schema):
         """Empty filter list produces no issues."""
-        assert validate_filter_expr_types([], typed_schema) == []
+        assert validate_where_expr_types([], typed_schema) == []
 
     def test_none_filters(self, typed_schema):
         """None filter list produces no issues."""
-        assert validate_filter_expr_types(None, typed_schema) == []
+        assert validate_where_expr_types(None, typed_schema) == []
 
 
 class TestValidateHavingExprTypes:
@@ -1212,13 +1219,15 @@ class TestValidateCteGrainConsistency:
         """Error for CTE with having but no aggregation."""
         cte = RuntimeCteStep(
             cte_name="base",
-            having_param=[
-                HavingParam(
-                    left_expr=NormalizedExpr.from_column("t.a"),
-                    op=">",
-                    value_type="integer",
-                )
-            ],
+            having=PredicateGroup.from_list(
+                [
+                    HavingParam(
+                        left_expr=NormalizedExpr.from_column("t.a"),
+                        op=">",
+                        value_type="integer",
+                    )
+                ]
+            ),
         )
         issues = validate_cte_grain_consistency(cte, "CTE 'base'")
         assert any("HAVING" in i.message for i in issues)
@@ -1263,13 +1272,15 @@ class TestValidateCteGrainConsistency:
             grain="grouped",
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.a"))],
             group_by_cols=[NormalizedExpr.from_column("t.a")],
-            having_param=[
-                HavingParam(
-                    left_expr=NormalizedExpr.from_agg("count", "t.b"),
-                    op=">",
-                    value_type="integer",
-                )
-            ],
+            having=PredicateGroup.from_list(
+                [
+                    HavingParam(
+                        left_expr=NormalizedExpr.from_agg("count", "t.b"),
+                        op=">",
+                        value_type="integer",
+                    )
+                ]
+            ),
         )
         issues = validate_cte_grain_consistency(cte, "cte1")
         assert any("HAVING" in i.message and "no aggregation" in i.message for i in issues)
@@ -1382,27 +1393,27 @@ class TestValidateCteDependencyGrains:
 
 
 class TestValidateFilterNoAggregationEdgeCases:
-    """Edge-case tests for validate_filter_no_aggregation."""
+    """Edge-case tests for validate_where_no_aggregation."""
 
     def test_right_expr_aggregated(self):
         """Error for aggregated right expression."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op=">",
             right_expr=NormalizedExpr.from_agg("count", "t.b"),
             value_type="integer",
         )
-        issues = validate_filter_no_aggregation([fp])
+        issues = validate_where_no_aggregation([fp])
         assert len(issues) >= 1
 
     def test_empty_filters(self):
         """No issues for empty filter list."""
-        issues = validate_filter_no_aggregation([])
+        issues = validate_where_no_aggregation([])
         assert len(issues) == 0
 
     def test_none_filters(self):
         """No issues for None filter list."""
-        issues = validate_filter_no_aggregation(None)
+        issues = validate_where_no_aggregation(None)
         assert len(issues) == 0
 
 
@@ -1522,7 +1533,7 @@ class TestValidateCaseBranchAggregationConsistency:
     @staticmethod
     def _having_case() -> CaseWhenExpr:
         agg = NormalizedExpr.from_agg("sum", "orders.amount")
-        cond = FilterParam(left_expr=agg, op=">", value_type="number", param_key="p1")
+        cond = WhereParam(left_expr=agg, op=">", value_type="number", param_key="p1")
         br = CaseWhenBranch(condition=cond, result=NormalizedExpr.from_column("'high'"))
         return CaseWhenExpr(
             branches=[br],
@@ -1545,7 +1556,7 @@ class TestValidateCaseBranchAggregationConsistency:
         assert issues == []
 
     def test_filter_scope_case_ignored(self):
-        cond = FilterParam(
+        cond = WhereParam(
             left_expr=NormalizedExpr.from_column("orders.status"),
             op="=",
             value_type="string",
@@ -1553,7 +1564,7 @@ class TestValidateCaseBranchAggregationConsistency:
         )
         cw = CaseWhenExpr(
             branches=[CaseWhenBranch(condition=cond, result=NormalizedExpr.from_column("'x'"))],
-            condition_scope="filter",
+            condition_scope="where",
         )
         step = CaseRegistryStep(registry_id="c01", case_when=cw)
         issues = validate_case_branch_aggregation_consistency([step], [], context="main")
@@ -1671,11 +1682,10 @@ class TestValidateThresholdMissingHaving:
 
 
 class TestValidateForEachGrouping:
-    """Tests for validate_for_each_grouping."""
+    """validate_for_each_grouping is a reserved no-op; NL does not drive validation."""
 
     @staticmethod
     def _make_schema():
-        """Build a minimal schema with customer and store tables."""
         return SchemaGraph(
             tables={
                 "customer": TableMetadata(
@@ -1687,35 +1697,16 @@ class TestValidateForEachGrouping:
                             value_type="integer",
                             is_primary_key=True,
                         ),
-                        "first_name": ColumnMetadata(
-                            name="first_name",
-                            data_type="varchar",
-                            value_type="string",
-                        ),
                     },
                     foreign_keys=[],
                     primary_key="customer_id",
-                ),
-                "store": TableMetadata(
-                    name="store",
-                    columns={
-                        "store_id": ColumnMetadata(
-                            name="store_id",
-                            data_type="integer",
-                            value_type="integer",
-                            is_primary_key=True,
-                        ),
-                    },
-                    foreign_keys=[],
-                    primary_key="store_id",
                 ),
             },
             join_paths_multi={},
             effective_structural_hash="",
         )
 
-    def test_fires_when_per_entity_missing_from_group_by(self):
-        """Issue raised when 'per customer' without aggregation keyword prefix and customer not in group_by."""
+    def test_returns_empty_for_per_entity_phrase(self):
         schema = self._make_schema()
         issues = validate_for_each_grouping(
             "show rentals per customer",
@@ -1724,16 +1715,13 @@ class TestValidateForEachGrouping:
             True,
             "main",
         )
-        assert len(issues) == 1
-        assert issues[0].severity == "error"
-        assert issues[0].category == "for_each_grouping"
+        assert issues == []
 
-    def test_silent_when_entity_in_group_by(self):
-        """No issue when 'per store' and store column in group_by."""
+    def test_returns_empty_when_entity_in_group_by(self):
         schema = self._make_schema()
-        gb = [NormalizedExpr.from_column("store.store_id")]
+        gb = [NormalizedExpr.from_column("customer.customer_id")]
         issues = validate_for_each_grouping(
-            "show sales per store",
+            "show sales per customer",
             gb,
             schema,
             True,
@@ -1741,8 +1729,7 @@ class TestValidateForEachGrouping:
         )
         assert issues == []
 
-    def test_silent_when_no_for_each_phrase(self):
-        """No issue when question has no 'for each' / 'per' phrase."""
+    def test_returns_empty_without_for_each_phrase(self):
         schema = self._make_schema()
         issues = validate_for_each_grouping(
             "show all customers",
@@ -1753,192 +1740,31 @@ class TestValidateForEachGrouping:
         )
         assert issues == []
 
-    def test_silent_when_noun_not_in_schema(self):
-        """No issue when the noun after 'per' does not match any table or column."""
-        schema = self._make_schema()
-        issues = validate_for_each_grouping(
-            "revenue per region",
-            [],
-            schema,
-            True,
-            "main",
-        )
-        assert issues == []
-
-    def test_silent_when_no_aggregation(self):
-        """No issue when question says 'for each' but intent has no aggregation context."""
-        schema = self._make_schema()
-        issues = validate_for_each_grouping(
-            "show district for each customer",
-            [],
-            schema,
-            False,
-            "main",
-        )
-        assert issues == []
-
-    def test_silent_on_by_phrase(self):
-        """No issue when question uses 'by total payment' — removed 'by' from pattern to avoid false positives."""
-        schema = self._make_schema()
-        issues = validate_for_each_grouping(
-            "top 5 customers by total payment",
-            [],
-            schema,
-            True,
-            "main",
-        )
-        assert issues == []
-
-
-class TestForEachGroupingAggKeywordSkip:
-    """Tests for validate_for_each_grouping skipping 'per X' after agg keywords."""
-
-    @staticmethod
-    def _make_schema():
-        return SchemaGraph(
-            tables={
-                "customer": TableMetadata(
-                    name="customer",
-                    columns={
-                        "customer_id": ColumnMetadata(
-                            name="customer_id",
-                            data_type="integer",
-                            value_type="integer",
-                            is_primary_key=True,
-                        ),
-                    },
-                    foreign_keys=[],
-                    primary_key="customer_id",
-                ),
-                "rental": TableMetadata(
-                    name="rental",
-                    columns={
-                        "rental_id": ColumnMetadata(
-                            name="rental_id",
-                            data_type="integer",
-                            value_type="integer",
-                            is_primary_key=True,
-                        ),
-                    },
-                    foreign_keys=[],
-                    primary_key="rental_id",
-                ),
-            },
-            join_paths_multi={},
-            effective_structural_hash="",
-        )
-
-    def test_per_customer_after_average_keyword_skipped(self):
-        """'average payment per customer' should NOT fire because 'per' is preceded by 'average'."""
-        schema = self._make_schema()
-        issues = validate_for_each_grouping(
-            "average payment per customer",
-            [],
-            schema,
-            True,
-            "main",
-        )
-        assert issues == []
-
-    def test_per_rental_after_total_keyword_skipped(self):
-        """'total amount per rental' should NOT fire because 'per' is preceded by 'total'."""
-        schema = self._make_schema()
-        issues = validate_for_each_grouping(
-            "total amount per rental",
-            [],
-            schema,
-            True,
-            "main",
-        )
-        assert issues == []
-
-    def test_per_customer_after_count_keyword_skipped(self):
-        """'count of films per customer' should NOT fire because 'per' is preceded by 'count'."""
-        schema = self._make_schema()
-        issues = validate_for_each_grouping(
-            "count of films per customer",
-            [],
-            schema,
-            True,
-            "main",
-        )
-        assert issues == []
-
-    def test_per_customer_without_agg_prefix_still_fires(self):
-        """'show data per customer' fires because no agg keyword precedes 'per'."""
-        schema = self._make_schema()
-        issues = validate_for_each_grouping(
-            "show data per customer",
-            [],
-            schema,
-            True,
-            "main",
-        )
-        assert len(issues) == 1
-        assert issues[0].category == "for_each_grouping"
-
-    def test_for_each_customer_still_fires(self):
-        """'for each customer' always fires regardless of agg prefix (skip only applies to 'per')."""
-        schema = self._make_schema()
-        issues = validate_for_each_grouping(
-            "average payment for each customer",
-            [],
-            schema,
-            True,
-            "main",
-        )
-        assert len(issues) == 1
-
 
 class TestValidateQuestionAggKeywordCoverage:
-    """Tests for validate_question_agg_keyword_coverage."""
+    """validate_question_agg_keyword_coverage is a reserved no-op; NL does not drive validation."""
 
     @staticmethod
     def _agg_select_col() -> SelectCol:
-        """Return a SelectCol with an aggregated expression."""
         return SelectCol(expr=NormalizedExpr.from_agg("sum", "payment.amount"))
 
-    def test_fires_when_total_keyword_and_no_agg(self):
-        """'total' in question with no aggregation fires a warning."""
+    def test_returns_empty_for_agg_keyword_without_agg(self):
         issues = validate_question_agg_keyword_coverage(
             "total revenue per country",
             [],
             [],
         )
-        assert len(issues) == 1
-        assert issues[0].category == "agg_keyword_missing"
-        assert issues[0].severity == "warning"
+        assert issues == []
 
-    def test_fires_when_count_keyword_and_no_agg(self):
-        """'count' in question with no aggregation fires a warning."""
+    def test_returns_empty_for_count_keyword_without_agg(self):
         issues = validate_question_agg_keyword_coverage(
             "count active customers",
             [],
             [],
         )
-        assert len(issues) == 1
-        assert issues[0].severity == "warning"
+        assert issues == []
 
-    def test_fires_when_average_keyword_and_no_agg(self):
-        """'average' in question with no aggregation fires a warning."""
-        issues = validate_question_agg_keyword_coverage(
-            "average rental duration per rating",
-            [],
-            [],
-        )
-        assert len(issues) == 1
-
-    def test_fires_when_how_many_keyword_and_no_agg(self):
-        """'how many' in question with no aggregation fires a warning."""
-        issues = validate_question_agg_keyword_coverage(
-            "how many films is each actor in",
-            [],
-            [],
-        )
-        assert len(issues) == 1
-
-    def test_silent_when_agg_present_in_select(self):
-        """No issue when the intent already has an aggregated column."""
+    def test_returns_empty_when_agg_present_in_select(self):
         col = self._agg_select_col()
         issues = validate_question_agg_keyword_coverage(
             "total revenue per country",
@@ -1947,8 +1773,7 @@ class TestValidateQuestionAggKeywordCoverage:
         )
         assert issues == []
 
-    def test_silent_when_having_present(self):
-        """No issue when HAVING is present (aggregation implied)."""
+    def test_returns_empty_when_having_present(self):
         hp = HavingParam(
             left_expr=NormalizedExpr.from_agg("count", "rental.rental_id"),
             op=">",
@@ -1962,8 +1787,7 @@ class TestValidateQuestionAggKeywordCoverage:
         )
         assert issues == []
 
-    def test_silent_when_no_agg_keyword(self):
-        """No issue when the question has no aggregation keyword."""
+    def test_returns_empty_when_no_agg_keyword(self):
         issues = validate_question_agg_keyword_coverage(
             "list all active customers",
             [],
@@ -1971,22 +1795,20 @@ class TestValidateQuestionAggKeywordCoverage:
         )
         assert issues == []
 
-    def test_silent_when_question_empty(self):
-        """No issue when question is empty string."""
+    def test_returns_empty_when_question_empty(self):
         issues = validate_question_agg_keyword_coverage("", [], [])
         assert issues == []
 
-    def test_issue_id_contains_context(self):
-        """Issue id encodes the context label."""
+    def test_returns_empty_with_context_label(self):
         issues = validate_question_agg_keyword_coverage(
             "total revenue per country",
             [],
             [],
             context="cte_step_1",
         )
-        assert "cte_step_1" in issues[0].issue_id
+        assert issues == []
 
-    def test_silent_when_aggregate_only_in_cte_steps(self):
+    def test_returns_empty_when_aggregate_only_in_cte_steps(self):
         step = RuntimeCteStep(
             cte_name="rental_counts",
             grain="grouped",
@@ -1997,8 +1819,8 @@ class TestValidateQuestionAggKeywordCoverage:
             "total rental count per customer",
             [],
             [],
-            "main query",
-            [step],
+            context="main query",
+            cte_steps=[step],
         )
         assert issues == []
 
@@ -2234,7 +2056,7 @@ class TestValidateLogicalIntentNumericCoverageExtended:
 
     def test_top_n_number_excluded_from_missing_numeric(self):
         """Numbers only referenced in 'top N' phrases do not produce missing-numeric issues."""
-        li = LogicalIntent(tables=("t",), select="*", filter="Show top 5 customers")
+        li = LogicalIntent(tables=("t",), select="*", where="Show top 5 customers")
         issues = validate_logical_intent_numeric_coverage(
             li,
             [],
@@ -2245,7 +2067,7 @@ class TestValidateLogicalIntentNumericCoverageExtended:
         assert issues == []
 
     def test_number_covered_by_limit(self):
-        li = LogicalIntent(tables=("t",), select="*", filter="Return 25 rows", limit="25")
+        li = LogicalIntent(tables=("t",), select="*", where="Return 25 rows", limit="25")
         issues = validate_logical_intent_numeric_coverage(
             li,
             [],
@@ -2291,15 +2113,15 @@ class TestValidateLogicalIntentNumericCoverageExtended:
         )
         assert not any("100" in i.issue_id for i in issues)
 
-    def test_number_covered_by_filter_param_values(self):
-        fp = FilterParam(
+    def test_number_covered_by_where_param_values(self):
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("customers.balance"),
             op=">",
             value_type="number",
             raw_value=None,
             param_key="n1",
         )
-        li = LogicalIntent(tables=("t",), select="*", filter="Customers with balance over 60")
+        li = LogicalIntent(tables=("t",), select="*", where="Customers with balance over 60")
         issues = validate_logical_intent_numeric_coverage(
             li,
             [fp],
@@ -2315,40 +2137,40 @@ class TestValidateLogicalIntentNumericCoverageExtended:
 
     def test_non_floatable_literal_skipped(self):
         """Invalid float in raw_value does not break scanning."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op="=",
             value_type="string",
             raw_value="not-a-number",
         )
-        li = LogicalIntent(tables=("t",), select="*", filter="value 99")
+        li = LogicalIntent(tables=("t",), select="*", where="value 99")
         issues = validate_logical_intent_numeric_coverage(li, [fp], [], None, "main")
         assert any("99" in i.message for i in issues)
 
 
 class TestValidateExprVsExprFiltersExtended:
-    """Branches for validate_expr_vs_expr_filters."""
+    """Branches for validate_expr_vs_expr_where."""
 
     def test_empty_list(self, typed_schema):
-        assert validate_expr_vs_expr_filters([], typed_schema) == []
+        assert validate_expr_vs_expr_where([], typed_schema) == []
 
     def test_pk_comparison_warning(self, typed_schema):
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("customers.id"),
             op="=",
             right_expr=NormalizedExpr.from_column("orders.id"),
             value_type="integer",
         )
-        issues = validate_expr_vs_expr_filters([fp], typed_schema)
+        issues = validate_expr_vs_expr_where([fp], typed_schema)
         assert any(i.severity == "warning" and "primary key" in i.message.lower() for i in issues)
 
     def test_none_cte_outputs_defaults(self, typed_schema):
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("customers.balance"),
             op=">",
             right_expr=NormalizedExpr.from_column("orders.amount"),
         )
-        issues = validate_expr_vs_expr_filters([fp], typed_schema, cte_outputs=None)
+        issues = validate_expr_vs_expr_where([fp], typed_schema, cte_outputs=None)
         assert isinstance(issues, list)
 
 
@@ -2357,13 +2179,13 @@ class TestValidateFilterExprTypesIsNull:
 
     def test_is_null_on_arithmetic_allowed(self, typed_schema):
         g = MulGroup(multiply=["customers.balance"], coefficient=2.0)
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr(add_groups=[g]),
             op="is null",
             value_type="string",
             param_key="pnull",
         )
-        issues = validate_filter_expr_types([fp], typed_schema)
+        issues = validate_where_expr_types([fp], typed_schema)
         op_issues = [i for i in issues if "invalid" in i.message.lower() and "operator" in i.message.lower()]
         assert len(op_issues) == 0
 
@@ -2432,7 +2254,7 @@ class TestValidateSelectExprTypesNone:
 
 class TestValidateNoNestedAggregationExtended:
     def test_nested_agg_in_filter_left(self):
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr(
                 agg_func="sum",
                 add_groups=[MulGroup(coefficient=1.0, multiply=["t.a"], agg_func="count")],
@@ -2446,7 +2268,7 @@ class TestValidateNoNestedAggregationExtended:
 
 class TestValidateMixedAggregationInMulgroupExtended:
     def test_mixed_in_filter_expression(self):
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr(add_groups=[MulGroup(coefficient=1.0, multiply=["COUNT(t.a)", "t.b"])]),
             op=">",
             value_type="number",
@@ -2609,7 +2431,7 @@ class TestValidateCountThresholdMissingHavingExtended:
 
 
 class TestValidateForEachGroupingExtended:
-    def test_multi_word_noun_resolves_last_token_to_table(self):
+    def test_multi_word_noun_returns_empty(self):
         schema = SchemaGraph(
             tables={
                 "customer": TableMetadata(
@@ -2636,8 +2458,7 @@ class TestValidateForEachGroupingExtended:
             True,
             "main",
         )
-        assert len(issues) == 1
-        assert issues[0].context.get("table") == "customer"
+        assert issues == []
 
 
 class TestTermHasAggregationExtended:
@@ -2685,8 +2506,8 @@ class TestValidateDenyBareSelect:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.amount"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
         )
         assert validate_deny_bare_select(intent, schema) == []
 
@@ -2698,8 +2519,8 @@ class TestValidateDenyBareSelect:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.amount"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
         )
         issues = validate_deny_bare_select(intent, schema)
         assert len(issues) == 1
@@ -2713,8 +2534,8 @@ class TestValidateDenyBareSelect:
             select_cols=[SelectCol(expr=NormalizedExpr.from_agg("sum", "orders.amount"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
         )
         assert validate_deny_bare_select(intent, schema) == []
 
@@ -2726,15 +2547,17 @@ class TestValidateDenyBareSelect:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("orders.amount"),
-                    op=">",
-                    value_type="numeric",
-                    raw_value=0,
-                ),
-            ],
-            having_param=[],
+            where=PredicateGroup.from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("orders.amount"),
+                        op=">",
+                        value_type="numeric",
+                        raw_value=0,
+                    ),
+                ]
+            ),
+            having=None,
         )
         assert validate_deny_bare_select(intent, schema) == []
 
@@ -2772,15 +2595,17 @@ class TestValidateDeniedReferences:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("orders.amount"),
-                    op=">",
-                    value_type="numeric",
-                    raw_value=0,
-                ),
-            ],
-            having_param=[],
+            where=PredicateGroup.from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("orders.amount"),
+                        op=">",
+                        value_type="numeric",
+                        raw_value=0,
+                    ),
+                ]
+            ),
+            having=None,
         )
         issues = validate_denied_references(intent, schema)
         assert len(issues) == 1
@@ -2794,8 +2619,8 @@ class TestValidateDeniedReferences:
             select_cols=[SelectCol(expr=NormalizedExpr.from_agg("sum", "orders.amount"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
         )
         issues = validate_denied_references(intent, schema)
         assert len(issues) == 1
@@ -2809,8 +2634,8 @@ class TestValidateDeniedReferences:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.amount"))],
             group_by_cols=[NormalizedExpr.from_column("orders.amount")],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
         )
         issues = validate_denied_references(intent, schema)
         assert any(i.category == FailureCategory.DENIED_REFERENCE for i in issues)
@@ -2830,8 +2655,8 @@ class TestValidateDeniedReferences:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("base.id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             cte_steps=[cte],
         )
         issues = validate_denied_references(intent, schema)
@@ -2846,15 +2671,17 @@ class TestValidateDeniedReferences:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("orders.amount"),
-                    op=">",
-                    value_type="numeric",
-                    raw_value=0,
-                ),
-            ],
-            having_param=[],
+            where=PredicateGroup.from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("orders.amount"),
+                        op=">",
+                        value_type="numeric",
+                        raw_value=0,
+                    ),
+                ]
+            ),
+            having=None,
         )
         assert validate_denied_references(intent, schema) == []
 
@@ -2892,8 +2719,8 @@ class TestValidateSensitiveGroupBy:
             select_cols=[SelectCol(expr=NormalizedExpr.from_agg("count", "*"))],
             group_by_cols=[NormalizedExpr.from_column("users.email")],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
         )
         issues = validate_sensitivity_group_by(intent, schema)
         assert len(issues) == 1
@@ -2907,8 +2734,8 @@ class TestValidateSensitiveGroupBy:
             select_cols=[SelectCol(expr=NormalizedExpr.from_agg("count", "*"))],
             group_by_cols=[NormalizedExpr.from_column("users.email")],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
         )
         assert validate_sensitivity_group_by(intent, schema) == []
 
@@ -2920,15 +2747,17 @@ class TestValidateSensitiveGroupBy:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("users.id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("users.email"),
-                    op="=",
-                    value_type="string",
-                    raw_value="x@y.com",
-                ),
-            ],
-            having_param=[],
+            where=PredicateGroup.from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("users.email"),
+                        op="=",
+                        value_type="string",
+                        raw_value="x@y.com",
+                    ),
+                ]
+            ),
+            having=None,
         )
         assert validate_sensitivity_group_by(intent, schema) == []
 
@@ -2940,8 +2769,8 @@ class TestValidateSensitiveGroupBy:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("users.id"))],
             group_by_cols=[],
             order_by_cols=[OrderByCol(expr=NormalizedExpr.from_column("users.email"), direction="asc")],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
         )
         issues = validate_sensitivity_order_by(intent, schema)
         assert len(issues) == 1
@@ -2956,12 +2785,13 @@ class TestValidateSensitiveGroupBy:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("users.id"))],
             group_by_cols=[],
             order_by_cols=[OrderByCol(expr=NormalizedExpr.from_column("users.email"), direction="desc")],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
         )
         issues = validate_sensitivity_order_by(intent, schema)
         assert len(issues) == 1
-        assert "sensitive column users.email cannot be used in ORDER BY" in issues[0].message
+        assert issues[0].category == FailureCategory.ORDER_BY_VALIDITY
+        assert "email" in (issues[0].context or {}).get("column", "") or "not available" in issues[0].message.lower()
 
     def test_sensitive_in_cte_order_by_rejected(self):
         schema = self._schema_with_sensitivity(SensitivityClassification.RESTRICTED)
@@ -2978,8 +2808,8 @@ class TestValidateSensitiveGroupBy:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("base.id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             cte_steps=[cte],
         )
         issues = validate_sensitivity_order_by(intent, schema)
@@ -2997,7 +2827,7 @@ class TestCuratedWarmupSemanticParity:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         msgs = curated_warmup_semantic_issues(intent, schema_graph)
         assert any("no tables" in m.lower() for m in msgs)
@@ -3010,7 +2840,7 @@ class TestCuratedWarmupSemanticParity:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("w99"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             window_registry=[WindowRegistryStep(registry_id="w01", window_spec=ws)],
         )
         msgs = curated_warmup_post_binding_issues(intent, schema_graph, "SELECT 1")
@@ -3072,8 +2902,8 @@ class TestValidateConcatMulgroup:
             select_cols=[SelectCol(expr=expr)],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             natural_language="q",
         )
         assert validate_concat_mulgroups_in_runtime(intent, "main query") == []

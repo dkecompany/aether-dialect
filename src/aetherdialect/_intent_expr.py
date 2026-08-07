@@ -3,26 +3,24 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
-from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from dataclasses import replace
+from datetime import UTC, datetime
 from typing import Any, TypeVar, cast
 
 import jsonschema
 import sqlglot
 from sqlglot import exp
 
-from ._config import (
-    ConfigError,
-    PolicyConfig,
-)
+from ._config import PolicyConfig
 from ._constants import (
+    AGGREGATE_FUNCTION_NAMES,
     AST_AGG_NODE_TO_NAME,
     CTE_DEFAULT_AGGS,
     CTE_FULL_AGGS,
     CTE_HAVING_COMPARE_OPS,
-    CTE_NUMERIC_FILTER_OPS,
+    CTE_NUMERIC_WHERE_OPS,
     CTE_OUTPUT_ALIAS_RE,
     DATE_INTERVAL_EXPR_SUBSTRINGS,
     DATE_UNIT_ALIAS_TO_CANONICAL,
@@ -40,22 +38,23 @@ from ._constants import (
     SCALAR_FUNC_DEFAULTS,
     SCALAR_FUNCTIONS_LEADING_ARG,
     SQL_AGG_FUNC_CALL_RE,
+    SQLGLOT_AGG_FUNC_KEY_ALIASES,
 )
 from ._contracts_base import (
+    ConfigError,
+    CteEmissionKind,
     CteIntent,
     ExprValue,
     FailureCategory,
-    FilterParam,
     HavingParam,
     LogicalIntent,
     MulGroup,
     NormalizedExpr,
     OrderByCol,
+    OrderByNullPlacement,
+    PredicateGroup,
     RawValue,
-    coerce_filter_group_list,
-    coerce_having_group_list,
-    expr_registry_ref,
-    register_parse_expr_string,
+    WhereParam,
 )
 from ._contracts_core import (
     ConcreteIntent,
@@ -78,9 +77,6 @@ from ._contracts_schema import (
     VirtualTableSpec,
     WindowRegistryStep,
     WindowSpec,
-    make_intent_issue,
-    validate_cte_tables_and_dag,
-    validate_tables_exist,
 )
 from ._core_utils import debug, is_structural_param_key, normalize_op, safe_json_loads, stable_json
 
@@ -126,9 +122,12 @@ def _bound_value_to_right_expr(value: Any) -> NormalizedExpr | None:
     s = value.strip()
     if not s:
         return None
-    if _is_date_or_interval_expr(s):
-        return parse_expr_string(s)
-    expr = parse_expr_string(s)
+    try:
+        if _is_date_or_interval_expr(s):
+            return parse_expr_string(s)
+        expr = parse_expr_string(s)
+    except ConfigError:
+        return None
     if _expr_is_sql_bound_not_literal(expr):
         return expr
     return None
@@ -176,7 +175,7 @@ def extract_columns_from_expr(expr: NormalizedExpr) -> list[str]:
                         name = col.name
                         ref = f"{tbl}.{name}" if tbl else name
                         _add(ref)
-            except Exception:
+            except (sqlglot.errors.ParseError, AttributeError, TypeError, ValueError):
                 pass
         for arg in node.scalar_func_args:
             if isinstance(arg, NormalizedExpr):
@@ -335,10 +334,7 @@ def _ast_node_to_normalized(node: exp.Expression) -> NormalizedExpr:
         inner = _ast_node_to_normalized(node.this)
         to_node = node.args.get("to")
         type_name = to_node.sql(dialect=None).upper() if to_node is not None else ""
-        wrapper = NormalizedExpr(
-            cast_type=type_name,
-            add_groups=[MulGroup(multiply=[inner])],
-        )
+        wrapper = NormalizedExpr(cast_type=type_name, add_groups=[MulGroup(multiply=[inner])])
         return wrapper
 
     if isinstance(node, exp.Interval):
@@ -373,15 +369,7 @@ def _ast_node_to_normalized(node: exp.Expression) -> NormalizedExpr:
             child = NormalizedExpr(star=True)
         else:
             child = _ast_node_to_normalized(inner)
-        return NormalizedExpr(
-            add_groups=[
-                MulGroup(
-                    multiply=[child],
-                    agg_func=agg_name,
-                    distinct=distinct_flag,
-                )
-            ]
-        )
+        return NormalizedExpr(add_groups=[MulGroup(multiply=[child], agg_func=agg_name, distinct=distinct_flag)])
 
     if isinstance(node, exp.DPipe):
         parts: list[exp.Expression] = []
@@ -396,9 +384,7 @@ def _ast_node_to_normalized(node: exp.Expression) -> NormalizedExpr:
 
         _collect_dpipe(node)
         children = [_ast_node_to_normalized(p) for p in parts]
-        return NormalizedExpr(
-            add_groups=[MulGroup(multiply=children, scalar_func="concat", scalar_func_args=[])],
-        )
+        return NormalizedExpr(add_groups=[MulGroup(multiply=children, scalar_func="concat", scalar_func_args=[])])
 
     if isinstance(node, exp.Anonymous) or (
         isinstance(node, exp.Func) and not isinstance(node, (exp.Mul, exp.Add, exp.Sub, exp.Div, exp.Paren, exp.Neg))
@@ -421,11 +407,24 @@ def _ast_node_to_normalized(node: exp.Expression) -> NormalizedExpr:
                             seen_ids.add(id(e))
             args = collected
 
+        canonical_agg = SQLGLOT_AGG_FUNC_KEY_ALIASES.get(func_name, func_name)
+        if canonical_agg in AGGREGATE_FUNCTION_NAMES:
+            distinct_flag = False
+            if len(args) == 1 and isinstance(args[0], exp.Distinct):
+                distinct_flag = True
+                exprs = args[0].expressions or [args[0].this]
+                args = [exprs[0]] if exprs else ([args[0].this] if args[0].this is not None else [])
+            if not args:
+                child = NormalizedExpr(star=True)
+            else:
+                child = _ast_node_to_normalized(args[0])
+            return NormalizedExpr(
+                add_groups=[MulGroup(multiply=[child], agg_func=canonical_agg, distinct=distinct_flag)]
+            )
+
         if func_name == "concat":
             children = [_ast_node_to_normalized(a) for a in args]
-            return NormalizedExpr(
-                add_groups=[MulGroup(multiply=children, scalar_func="concat", scalar_func_args=[])],
-            )
+            return NormalizedExpr(add_groups=[MulGroup(multiply=children, scalar_func="concat", scalar_func_args=[])])
 
         if isinstance(node, exp.Extract):
             unit_node = node.this
@@ -433,13 +432,7 @@ def _ast_node_to_normalized(node: exp.Expression) -> NormalizedExpr:
             unit = getattr(unit_node, "name", None) or _ast_literal_value(unit_node) or ""
             source = _ast_node_to_normalized(source_node) if source_node is not None else NormalizedExpr(star=True)
             return NormalizedExpr(
-                add_groups=[
-                    MulGroup(
-                        multiply=[source],
-                        scalar_func="extract",
-                        scalar_func_args=[str(unit).lower()],
-                    )
-                ]
+                add_groups=[MulGroup(multiply=[source], scalar_func="extract", scalar_func_args=[str(unit).lower()])]
             )
 
         if not args:
@@ -461,13 +454,7 @@ def _ast_node_to_normalized(node: exp.Expression) -> NormalizedExpr:
 
         children = [_ast_node_to_normalized(a) for a in expr_args]
         return NormalizedExpr(
-            add_groups=[
-                MulGroup(
-                    multiply=children,
-                    scalar_func=func_name,
-                    scalar_func_args=list(trailing_scalars),
-                )
-            ]
+            add_groups=[MulGroup(multiply=children, scalar_func=func_name, scalar_func_args=list(trailing_scalars))]
         )
 
     if isinstance(node, exp.Column):
@@ -479,7 +466,7 @@ def _ast_node_to_normalized(node: exp.Expression) -> NormalizedExpr:
             v = float(node.this)
             return NormalizedExpr(add_values=[ExprValue(value=v)])
         except (TypeError, ValueError):
-            return NormalizedExpr(raw_sql=node.sql(dialect=None))
+            return NormalizedExpr(string_literal=str(node.this))
 
     if isinstance(node, (exp.Add, exp.Sub, exp.Neg)):
         additive = _ast_collect_additive(node)
@@ -545,9 +532,7 @@ def _ast_mul_chain_to_group(node: exp.Expression) -> MulGroup:
     return MulGroup(multiply=multiply, divide=divide, coefficient=coefficient)
 
 
-def _additive_to_normalized(
-    additive: list[tuple[str, exp.Expression]],
-) -> NormalizedExpr:
+def _additive_to_normalized(additive: list[tuple[str, exp.Expression]]) -> NormalizedExpr:
     """Build a NormalizedExpr from a signed list of additive terms."""
     additive = [
         (s, t)
@@ -590,16 +575,11 @@ def _additive_to_normalized(
             (add_groups if sign == "+" else sub_groups).append(grp)
         else:
             (add_groups if sign == "+" else sub_groups).append(MulGroup(multiply=[sub]))
-    return NormalizedExpr(
-        add_groups=add_groups,
-        sub_groups=sub_groups,
-        add_values=add_values,
-        sub_values=sub_values,
-    )
+    return NormalizedExpr(add_groups=add_groups, sub_groups=sub_groups, add_values=add_values, sub_values=sub_values)
 
 
 def parse_expr_string(expr_str: Any) -> NormalizedExpr:
-    """Parse LLM SQL text (or ``{"expr": ...}``) into a structural :class:`NormalizedExpr` tree. Uses sqlglot as the sole parser – no string-based fallback."""
+    """Parse LLM SQL text (or ``{"expr": ...}``) into a structural :class:`NormalizedExpr` tree. Uses sqlglot as the sole parser – no string-based fallback. Opaque command/select-shaped or unparseable text raises :class:`ConfigError` instead of becoming a ``raw_sql`` leaf."""
     if isinstance(expr_str, dict):
         raw_str = str(expr_str.get("expr", "") or "")
     else:
@@ -609,20 +589,43 @@ def parse_expr_string(expr_str: Any) -> NormalizedExpr:
         return NormalizedExpr()
     try:
         tree = sqlglot.parse_one(raw_str, dialect=None)
-    except Exception:
-        return NormalizedExpr(raw_sql=raw_str)
+    except Exception as exc:
+        raise ConfigError(
+            "Expression text could not be parsed into a supported structural form (opaque expression refused)."
+        ) from exc
     if isinstance(tree, (exp.Command, exp.Select)):
-        return NormalizedExpr(raw_sql=raw_str)
+        raise ConfigError(
+            "Expression text is a statement or command rather than a scalar expression (opaque expression refused)."
+        )
     additive = _ast_collect_additive(tree)
     if len(additive) == 1 and additive[0][0] == "+":
-        return _ast_node_to_normalized(additive[0][1])
-    return _additive_to_normalized(additive)
+        result = _ast_node_to_normalized(additive[0][1])
+    else:
+        result = _additive_to_normalized(additive)
+    if (
+        result.raw_sql
+        and not result.column_ref
+        and not result.star
+        and not result.keyword
+        and not result.string_literal
+        and not result.cast_type
+        and result.interval is None
+        and not result.add_groups
+        and not result.sub_groups
+        and not result.add_values
+        and not result.sub_values
+        and not result.agg_func
+        and not result.scalar_func
+        and not result.inner_scalar_func
+    ):
+        raise ConfigError(
+            "Expression text could not be parsed into a supported structural form (opaque expression refused)."
+        )
+    return result
 
 
 def _is_expr_numeric(
-    expr: NormalizedExpr,
-    schema: SchemaGraph,
-    cte_steps: Sequence[RuntimeCteStep] | None = None,
+    expr: NormalizedExpr, schema: SchemaGraph, cte_steps: Sequence[RuntimeCteStep] | None = None
 ) -> bool:
     """
     Heuristic: agg/scalar/column typing implies a numeric result.
@@ -665,9 +668,7 @@ def _is_expr_numeric(
 
 
 def _cte_output_value_type_for_numeric(
-    qualifier: str,
-    output_alias: str,
-    cte_steps: Sequence[RuntimeCteStep] | None,
+    qualifier: str, output_alias: str, cte_steps: Sequence[RuntimeCteStep] | None
 ) -> str | None:
     """Return the value_type for ``cte_name.output_alias`` from CTE output metadata, or None."""
     if not cte_steps or not qualifier:
@@ -730,11 +731,7 @@ def _tag_single_expr(
         if skip_value_injection:
             return replace(expr, is_numeric=True)
         need_offset = bool(expr.add_groups) and not expr.add_values and not bare_leaf
-        return replace(
-            expr,
-            is_numeric=True,
-            add_values=[ExprValue(value=0.0)] if need_offset else expr.add_values,
-        )
+        return replace(expr, is_numeric=True, add_values=[ExprValue(value=0.0)] if need_offset else expr.add_values)
     sanitized_groups = [
         (replace(g, coefficient=1.0, coeff_param_key="") if g.coefficient != 1.0 or g.coeff_param_key else g)
         for g in expr.add_groups
@@ -774,13 +771,13 @@ def tag_expr_numeric(intent: RuntimeIntent, schema: SchemaGraph) -> RuntimeInten
         replace(obc, expr=_tag_single_expr(obc.expr, schema, cte_steps=cte_seq)) for obc in (intent.order_by_cols or [])
     ]
     group_by_cols = [_tag_single_expr(g, schema, cte_steps=cte_seq) for g in (intent.group_by_cols or [])]
-    filters_param = []
-    for fp in intent.filters_param or []:
+    where_params = []
+    for fp in PredicateGroup.where_leaves(intent.where) or []:
         left = _tag_single_expr(fp.left_expr, schema, skip_value_injection=True, cte_steps=cte_seq)
         right = _tag_single_expr(fp.right_expr, schema, cte_steps=cte_seq) if fp.right_expr else None
-        filters_param.append(replace(fp, left_expr=left, right_expr=right))
+        where_params.append(replace(fp, left_expr=left, right_expr=right))
     having_param = []
-    for hp in intent.having_param or []:
+    for hp in PredicateGroup.having_leaves(intent.having) or []:
         left = _tag_single_expr(hp.left_expr, schema, skip_value_injection=True, cte_steps=cte_seq)
         right = _tag_single_expr(hp.right_expr, schema, cte_steps=cte_seq) if hp.right_expr else None
         having_param.append(replace(hp, left_expr=left, right_expr=right))
@@ -795,12 +792,12 @@ def tag_expr_numeric(intent: RuntimeIntent, schema: SchemaGraph) -> RuntimeInten
         ]
         cte_gb = [_tag_single_expr(g, schema, cte_steps=cte_seq) for g in (cte.group_by_cols or [])]
         cte_fp = []
-        for fp in cte.filters_param or []:
+        for fp in PredicateGroup.where_leaves(cte.where) or []:
             left = _tag_single_expr(fp.left_expr, schema, skip_value_injection=True, cte_steps=cte_seq)
             right = _tag_single_expr(fp.right_expr, schema, cte_steps=cte_seq) if fp.right_expr else None
             cte_fp.append(replace(fp, left_expr=left, right_expr=right))
         cte_hp = []
-        for hp in cte.having_param or []:
+        for hp in PredicateGroup.having_leaves(cte.having) or []:
             left = _tag_single_expr(hp.left_expr, schema, skip_value_injection=True, cte_steps=cte_seq)
             right = _tag_single_expr(hp.right_expr, schema, cte_steps=cte_seq) if hp.right_expr else None
             cte_hp.append(replace(hp, left_expr=left, right_expr=right))
@@ -810,8 +807,8 @@ def tag_expr_numeric(intent: RuntimeIntent, schema: SchemaGraph) -> RuntimeInten
                 select_cols=cte_sc,
                 order_by_cols=cte_obc,
                 group_by_cols=cte_gb,
-                filters_param=cte_fp,
-                having_param=cte_hp,
+                where=PredicateGroup.from_list(cte_fp),
+                having=PredicateGroup.from_list(cte_hp),
             )
         )
     return replace(
@@ -819,8 +816,8 @@ def tag_expr_numeric(intent: RuntimeIntent, schema: SchemaGraph) -> RuntimeInten
         select_cols=select_cols,
         order_by_cols=order_by_cols,
         group_by_cols=group_by_cols,
-        filters_param=filters_param,
-        having_param=having_param,
+        where=PredicateGroup.from_list(where_params),
+        having=PredicateGroup.from_list(having_param),
         cte_steps=cte_steps,
     )
 
@@ -911,9 +908,11 @@ def _data_and_value_type_for_window_spec(ws: WindowSpec, schema: SchemaGraph) ->
     fn = (ws.function or "").strip().lower()
     if fn in {"row_number", "rank", "dense_rank", "ntile"}:
         return "integer", "integer"
+    if fn in {"percent_rank", "cume_dist"}:
+        return "numeric", "number"
     if fn in {"sum", "avg"}:
         return "numeric", "number"
-    if fn in {"lag", "lead", "first_value", "last_value"}:
+    if fn in {"lag", "lead", "first_value", "last_value", "nth_value"}:
         arg = ws.argument
         if arg is None:
             return "unknown", "string"
@@ -928,17 +927,7 @@ def _data_and_value_type_for_window_spec(ws: WindowSpec, schema: SchemaGraph) ->
                 dt = cm.data_type.lower().split("(")[0].strip()
                 if dt in ("date", "timestamp", "timestamptz", "datetime"):
                     return dt, "date"
-                if dt in (
-                    "int",
-                    "integer",
-                    "bigint",
-                    "smallint",
-                    "float",
-                    "double",
-                    "numeric",
-                    "decimal",
-                    "real",
-                ):
+                if dt in ("int", "integer", "bigint", "smallint", "float", "double", "numeric", "decimal", "real"):
                     return "numeric", "number"
         return "numeric", "number"
     return "numeric", "number"
@@ -970,7 +959,7 @@ def build_cte_output_metadata(
         out_col = output_columns[i]
         expr = sc.expr
         wr_by = {s.registry_id: s for s in (window_registry or [])}
-        rid = expr_registry_ref(expr) or ""
+        rid = expr.registry_ref() or ""
         if rid.startswith("w"):
             step = wr_by.get(rid)
             if step is not None:
@@ -984,7 +973,7 @@ def build_cte_output_metadata(
                     data_type=data_type,
                     value_type=value_type,
                     groupable=False,
-                    valid_filter_ops=list(CTE_NUMERIC_FILTER_OPS),
+                    valid_where_ops=list(CTE_NUMERIC_WHERE_OPS),
                     valid_aggregations=list(CTE_FULL_AGGS),
                     valid_having_ops=list(CTE_HAVING_COMPARE_OPS),
                     sensitivity=None,
@@ -1008,7 +997,7 @@ def build_cte_output_metadata(
             filterable = src_meta.is_filterable if src_meta else True
             aggregatable = src_meta.is_aggregatable if src_meta else False
             groupable = src_meta.is_groupable if src_meta else True
-            vf_ops = list(src_meta.get_valid_filter_ops()) if src_meta else list(CTE_NUMERIC_FILTER_OPS)
+            vf_ops = list(src_meta.get_valid_where_ops()) if src_meta else list(CTE_NUMERIC_WHERE_OPS)
             v_aggs = sorted(src_meta.get_valid_aggregations()) if src_meta else list(CTE_DEFAULT_AGGS)
             vh_ops = list(src_meta.get_valid_having_ops()) if src_meta else list(CTE_HAVING_COMPARE_OPS)
             out_sensitivity = src_meta.sensitivity.value if src_meta else None
@@ -1025,7 +1014,7 @@ def build_cte_output_metadata(
             filterable = True
             aggregatable = True
             groupable = False
-            vf_ops = list(CTE_NUMERIC_FILTER_OPS)
+            vf_ops = list(CTE_NUMERIC_WHERE_OPS)
             v_aggs = list(CTE_FULL_AGGS)
             vh_ops = list(CTE_HAVING_COMPARE_OPS)
             out_sensitivity = None
@@ -1035,7 +1024,7 @@ def build_cte_output_metadata(
                 data_type = "integer" if scalar in INTEGER_SCALARS else "numeric"
                 aggregatable = True
                 groupable = False
-                vf_ops = list(CTE_NUMERIC_FILTER_OPS)
+                vf_ops = list(CTE_NUMERIC_WHERE_OPS)
                 v_aggs = list(CTE_FULL_AGGS)
                 vh_ops = list(CTE_HAVING_COMPARE_OPS)
                 out_sensitivity = None
@@ -1044,7 +1033,7 @@ def build_cte_output_metadata(
                 data_type = base_type
                 aggregatable = src_meta.is_aggregatable if src_meta else False
                 groupable = src_meta.is_groupable if src_meta else True
-                vf_ops = list(src_meta.get_valid_filter_ops()) if src_meta else list(CTE_NUMERIC_FILTER_OPS)
+                vf_ops = list(src_meta.get_valid_where_ops()) if src_meta else list(CTE_NUMERIC_WHERE_OPS)
                 v_aggs = sorted(src_meta.get_valid_aggregations()) if src_meta else list(CTE_DEFAULT_AGGS)
                 vh_ops = list(src_meta.get_valid_having_ops()) if src_meta else list(CTE_HAVING_COMPARE_OPS)
                 out_sensitivity = src_meta.sensitivity.value if src_meta else None
@@ -1055,7 +1044,7 @@ def build_cte_output_metadata(
             filterable = True
             aggregatable = True
             groupable = False
-            vf_ops = list(CTE_NUMERIC_FILTER_OPS)
+            vf_ops = list(CTE_NUMERIC_WHERE_OPS)
             v_aggs = list(CTE_FULL_AGGS)
             vh_ops = list(CTE_HAVING_COMPARE_OPS)
             out_sensitivity = None
@@ -1086,7 +1075,7 @@ def build_cte_output_metadata(
             aggregatable=aggregatable,
             data_type=data_type,
             groupable=groupable,
-            valid_filter_ops=vf_ops,
+            valid_where_ops=vf_ops,
             valid_aggregations=v_aggs,
             valid_having_ops=vh_ops,
             sensitivity=out_sensitivity,
@@ -1101,10 +1090,7 @@ def build_cte_output_metadata(
     return result
 
 
-def build_virtual_table_specs(
-    intent: RuntimeIntent,
-    schema: SchemaGraph | None,
-) -> dict[str, VirtualTableSpec]:
+def build_virtual_table_specs(intent: RuntimeIntent, schema: SchemaGraph | None) -> dict[str, VirtualTableSpec]:
     """Build join-graph virtual nodes for each CTE that exposes output. column metadata. Args: intent: Runtime intent including ``cte_steps`` with ``output_column_metadata``. schema: Physical schema (unused today; reserved for cross-checks). Returns: Map ``cte_name -> VirtualTableSpec`` for CTEs with at least one output column."""
     if schema is None:
         return {}
@@ -1130,9 +1116,7 @@ def build_virtual_table_specs(
             )
         if cols:
             out[step.cte_name] = VirtualTableSpec(
-                cte_name=step.cte_name,
-                columns=cols,
-                emission=getattr(step, "emission", "join_table") or "join_table",
+                cte_name=step.cte_name, columns=cols, emission=getattr(step, "emission", "join_table") or "join_table"
             )
     return out
 
@@ -1206,14 +1190,19 @@ def _order_by_col_from_obc(obc: dict[str, Any]) -> OrderByCol:
         return OrderByCol(
             expr=parse_expr_string(expr_clean),
             direction=_normalize_order_direction(merged),
+            nulls=OrderByNullPlacement.coerce(obc.get("nulls")),
         )
     payload = dict(obc)
     payload["direction"] = _normalize_order_direction(obc.get("direction", "asc"))
     col = OrderByCol.from_dict(payload)
-    return OrderByCol(expr=col.expr, direction=_normalize_order_direction(col.direction))
+    return OrderByCol(
+        expr=col.expr,
+        direction=_normalize_order_direction(col.direction),
+        nulls=col.nulls,
+    )
 
 
-def _coerce_filter_group_token(x: Any) -> int | None:
+def _coerce_where_group_token(x: Any) -> int | None:
     if x is None:
         return None
     if isinstance(x, bool):
@@ -1229,13 +1218,13 @@ def _coerce_filter_group_token(x: Any) -> int | None:
     return None
 
 
-def _filter_group_for_param(raw: Any) -> int | None:
-    return _coerce_filter_group_token(raw)
+def _where_group_for_param(raw: Any) -> int | None:
+    return _coerce_where_group_token(raw)
 
 
-def _parse_filter_param_from_llm(fp: dict[str, Any]) -> list[FilterParam]:
+def _parse_where_param_from_llm(fp: dict[str, Any]) -> list[WhereParam]:
     """
-    Parse one LLM filter object into at most one ``FilterParam`` row.
+    Parse one LLM filter object into at most one ``WhereParam`` row.
 
     Args:
 
@@ -1251,7 +1240,6 @@ def _parse_filter_param_from_llm(fp: dict[str, Any]) -> list[FilterParam]:
     right_str = fp.get("right_expr") or fp.get("right_col") or ""
     if right_str and "." not in right_str and not _is_date_or_interval_expr(right_str):
         right_str = ""
-    fg = _filter_group_for_param(fp.get("filter_group"))
     left_ex = parse_expr_string(left_str)
     op = normalize_op(fp.get("op", "="))
     right_ex = parse_expr_string(right_str) if right_str else None
@@ -1262,19 +1250,7 @@ def _parse_filter_param_from_llm(fp: dict[str, Any]) -> list[FilterParam]:
         if promoted is not None:
             right_ex = promoted
             raw_v = None
-    bop = fp.get("bool_op", "AND")
-    return [
-        FilterParam(
-            left_expr=left_ex,
-            op=op,
-            right_expr=right_ex,
-            value_type=vt,
-            param_key="",
-            raw_value=raw_v,
-            bool_op=bop,
-            filter_group=fg,
-        )
-    ]
+    return [WhereParam(left_expr=left_ex, op=op, right_expr=right_ex, value_type=vt, param_key="", raw_value=raw_v)]
 
 
 def _parse_having_param_from_llm(hp: dict[str, Any]) -> list[HavingParam]:
@@ -1295,7 +1271,6 @@ def _parse_having_param_from_llm(hp: dict[str, Any]) -> list[HavingParam]:
     right_str = hp.get("right_expr") or hp.get("right_agg") or ""
     if right_str and "." not in right_str and not _is_date_or_interval_expr(right_str):
         right_str = ""
-    fg = _filter_group_for_param(hp.get("filter_group"))
     left_ex = parse_expr_string(left_str)
     op = normalize_op(hp.get("op", ">"))
     right_ex = parse_expr_string(right_str) if right_str else None
@@ -1306,19 +1281,7 @@ def _parse_having_param_from_llm(hp: dict[str, Any]) -> list[HavingParam]:
         if promoted is not None:
             right_ex = promoted
             raw_v = None
-    bop = hp.get("bool_op", "AND")
-    return [
-        HavingParam(
-            left_expr=left_ex,
-            op=op,
-            right_expr=right_ex,
-            value_type=vt,
-            param_key="",
-            raw_value=raw_v,
-            bool_op=bop,
-            filter_group=fg,
-        )
-    ]
+    return [HavingParam(left_expr=left_ex, op=op, right_expr=right_ex, value_type=vt, param_key="", raw_value=raw_v)]
 
 
 def _parse_select_col_from_llm(sc: dict[str, Any]) -> SelectCol:
@@ -1359,12 +1322,7 @@ def _sanitize_cte_alias_token(s: str) -> str:
     return t
 
 
-def _canonicalise_one_output_column_item(
-    raw: str,
-    select_cols: list[SelectCol],
-    derived: list[str],
-    index: int,
-) -> str:
+def _canonicalise_one_output_column_item(raw: str, select_cols: list[SelectCol], derived: list[str], index: int) -> str:
     """Map one raw ``output_columns`` string to a snake_case alias. matching ``INTENT_SCHEMA``. Args: raw: One cell from the LLM. select_cols: Parsed CTE ``select_cols`` (same order as output columns). derived: Result of :func:`derive_cte_output_columns` when *select_cols* is non-empty. index: Position of this cell. Returns: Canonical alias string."""
     s = raw.strip()
     if re.search(r"\s+AS\s+", s, flags=re.I):
@@ -1412,12 +1370,25 @@ def _canonicalise_cte_output_columns(intent_dict: dict[str, Any]) -> None:
         cte["output_columns"] = new_oc
 
 
-def _sanitize_filter_having_param_item(item: dict[str, Any]) -> None:
-    """Coerce compose JSON filter/having rows so they pass ``INTENT_SCHEMA`` validation."""
+def _legacy_where_group_raw(item: Mapping[str, Any]) -> Any:
+    if "where_group" in item:
+        return item["where_group"]
+    return None
+
+
+def _sanitize_where_having_param_item(item: dict[str, Any]) -> None:
+    """Coerce compose JSON where/having rows so they pass ``INTENT_SCHEMA`` validation."""
     if item.get("bool_op") is None:
         item.pop("bool_op", None)
-    if item.get("filter_group") is None:
-        item.pop("filter_group", None)
+    wg_raw = _legacy_where_group_raw(item)
+    if isinstance(wg_raw, list | tuple):
+        wg_coerced = _where_group_for_param(wg_raw[0] if wg_raw else None)
+        if wg_coerced is not None:
+            item["where_group"] = wg_coerced
+        else:
+            item.pop("where_group", None)
+    elif wg_raw is None:
+        item.pop("where_group", None)
     for key in ("left_expr", "right_expr", "left_agg", "right_agg"):
         val = item.get(key)
         if isinstance(val, dict):
@@ -1434,17 +1405,17 @@ def _sanitize_filter_having_param_item(item: dict[str, Any]) -> None:
 
 def _sanitize_compose_intent_json(parsed: dict[str, Any]) -> None:
     """Normalize compose intent JSON in place before ``INTENT_SCHEMA`` validation."""
-    for key in ("filters_param", "having_param"):
+    for key in ("where_param", "having_param"):
         for item in parsed.get(key, []) or []:
             if isinstance(item, dict):
-                _sanitize_filter_having_param_item(item)
+                _sanitize_where_having_param_item(item)
     for cte in parsed.get("cte_steps", []) or []:
         if not isinstance(cte, dict):
             continue
-        for key in ("filters_param", "having_param"):
+        for key in ("where_param", "having_param"):
             for item in cte.get(key, []) or []:
                 if isinstance(item, dict):
-                    _sanitize_filter_having_param_item(item)
+                    _sanitize_where_having_param_item(item)
 
 
 def _intent_schema_validation_error(parsed: dict[str, Any]) -> str | None:
@@ -1464,19 +1435,16 @@ def _flatten_dpipe_chain_operands(node: exp.Expression) -> list[exp.Expression]:
     return [node]
 
 
-CaseBranchTransform = Callable[[list[FilterParam]], list[FilterParam]]
+CaseBranchTransform = Callable[[list[WhereParam]], list[WhereParam]]
 
 
 def walk_case_when_branches(
-    case_when: CaseWhenExpr,
-    transform: CaseBranchTransform,
-    scopes: frozenset[str],
-    location: str,
+    case_when: CaseWhenExpr, transform: CaseBranchTransform, scopes: frozenset[str], location: str
 ) -> tuple[CaseWhenExpr, bool]:
     """Apply *transform* to each branch condition whose scope is in *scopes*; return updated CASE and changed flag."""
     if not case_when or not case_when.branches:
         return case_when, False
-    branch_scope = (case_when.condition_scope or "filter").strip().lower()
+    branch_scope = (case_when.condition_scope or "where").strip().lower()
     if branch_scope not in scopes:
         return case_when, False
     new_branches: list[CaseWhenBranch] = []
@@ -1486,13 +1454,13 @@ def walk_case_when_branches(
         produced = transform([cond])
         if not produced:
             debug(
-                f"[intent_expr.walk_case_when_branches] {location}.branches[{bi}]: transform returned empty; keeping original",
+                f"[intent_expr.walk_case_when_branches] {location}.branches[{bi}]: transform returned empty; keeping original"
             )
             new_branches.append(branch)
             continue
         if len(produced) > 1:
             debug(
-                f"[intent_expr.walk_case_when_branches] {location}.branches[{bi}]: transform expanded to {len(produced)} predicates; CASE branch only accepts one — keeping first",
+                f"[intent_expr.walk_case_when_branches] {location}.branches[{bi}]: transform expanded to {len(produced)} predicates; CASE branch only accepts one — keeping first"
             )
         new_cond = produced[0]
         if new_cond is cond:
@@ -1506,10 +1474,7 @@ def walk_case_when_branches(
 
 
 def walk_case_registry(
-    registry: Sequence[CaseRegistryStep] | None,
-    transform: CaseBranchTransform,
-    scopes: frozenset[str],
-    location: str,
+    registry: Sequence[CaseRegistryStep] | None, transform: CaseBranchTransform, scopes: frozenset[str], location: str
 ) -> tuple[list[CaseRegistryStep] | None, bool]:
     """Apply transform to every registered CASE; return new registry list and changed flag."""
     if not registry:
@@ -1518,10 +1483,7 @@ def walk_case_registry(
     changed = False
     for step in registry:
         new_cw, c = walk_case_when_branches(
-            step.case_when,
-            transform,
-            scopes,
-            f"{location}.case_registry[{step.registry_id}]",
+            step.case_when, transform, scopes, f"{location}.case_registry[{step.registry_id}]"
         )
         if c:
             new_steps.append(replace(step, case_when=new_cw))
@@ -1532,28 +1494,15 @@ def walk_case_registry(
 
 
 def map_case_branch_conditions(
-    intent: RuntimeIntent,
-    transform: CaseBranchTransform,
-    *,
-    scopes: frozenset[str] = frozenset({"filter", "having"}),
+    intent: RuntimeIntent, transform: CaseBranchTransform, *, scopes: frozenset[str] = frozenset({"where", "having"})
 ) -> RuntimeIntent:
     """Apply *transform* to every CASE WHEN branch condition in the intent."""
-    new_main_registry, mr_changed = walk_case_registry(
-        intent.case_registry,
-        transform,
-        scopes,
-        "main",
-    )
+    new_main_registry, mr_changed = walk_case_registry(intent.case_registry, transform, scopes, "main")
 
     new_cte_steps: list[RuntimeCteStep] = []
     cte_any_changed = False
     for ci, cte in enumerate(intent.cte_steps or []):
-        new_cte_registry, cr_changed = walk_case_registry(
-            cte.case_registry,
-            transform,
-            scopes,
-            f"cte_steps[{ci}]",
-        )
+        new_cte_registry, cr_changed = walk_case_registry(cte.case_registry, transform, scopes, f"cte_steps[{ci}]")
         if cr_changed:
             cte_any_changed = True
             new_cte_steps.append(replace(cte, case_registry=new_cte_registry or []))
@@ -1562,18 +1511,11 @@ def map_case_branch_conditions(
 
     if not mr_changed and not cte_any_changed:
         return intent
-    return replace(
-        intent,
-        case_registry=new_main_registry or [],
-        cte_steps=new_cte_steps,
-    )
+    return replace(intent, case_registry=new_main_registry or [], cte_steps=new_cte_steps)
 
 
 def parse_intent_response(
-    raw: str,
-    question: str,
-    *,
-    parse_detail_out: list[str] | None = None,
+    raw: str, question: str, *, parse_detail_out: list[str] | None = None
 ) -> RuntimeIntent | None:
     """
     Parse LLM JSON through ``INTENT_SCHEMA`` into ``RuntimeIntent``.
@@ -1633,17 +1575,12 @@ def parse_intent_response(
         elif isinstance(obc, dict):
             order_by_cols.append(_order_by_col_from_obc(obc))
 
-    filters_param_raw = parsed.get("filters_param", [])
-    filters_param = []
-    for fp in filters_param_raw:
-        if isinstance(fp, dict):
-            filters_param.extend(_parse_filter_param_from_llm(fp))
-
-    having_param_raw = parsed.get("having_param", [])
-    having_param = []
-    for hp in having_param_raw:
-        if isinstance(hp, dict):
-            having_param.extend(_parse_having_param_from_llm(hp))
+    where = PredicateGroup.from_stored(parsed.get("where"), legacy_key="where")
+    if where is None:
+        where = PredicateGroup.from_legacy_flat_where_dicts(parsed.get("where_param", []))
+    having = PredicateGroup.from_stored(parsed.get("having"), legacy_key="having", having=True)
+    if having is None:
+        having = PredicateGroup.from_legacy_having_dicts(parsed.get("having_param", []))
 
     cte_steps_raw = parsed.get("cte_steps", [])
     cte_steps = []
@@ -1667,15 +1604,12 @@ def parse_intent_response(
                 elif isinstance(obc, dict):
                     cte_order_by.append(_order_by_col_from_obc(obc))
 
-            cte_filters = []
-            for fp in cte.get("filters_param", []):
-                if isinstance(fp, dict):
-                    cte_filters.extend(_parse_filter_param_from_llm(fp))
-
-            cte_having = []
-            for hp in cte.get("having_param", []):
-                if isinstance(hp, dict):
-                    cte_having.extend(_parse_having_param_from_llm(hp))
+            cte_where = PredicateGroup.from_stored(cte.get("where"), legacy_key="where")
+            if cte_where is None:
+                cte_where = PredicateGroup.from_legacy_flat_where_dicts(cte.get("where_param", []))
+            cte_having_group = PredicateGroup.from_stored(cte.get("having"), legacy_key="having", having=True)
+            if cte_having_group is None:
+                cte_having_group = PredicateGroup.from_legacy_having_dicts(cte.get("having_param", []))
 
             cte_output_columns_raw = cte.get("output_columns", [])
             if isinstance(cte_output_columns_raw, str):
@@ -1720,14 +1654,17 @@ def parse_intent_response(
                     select_cols=cte_select_cols,
                     group_by_cols=cte_group_by,
                     order_by_cols=cte_order_by,
-                    filters_param=cte_filters,
-                    having_param=cte_having,
+                    where=cte_where,
+                    having=cte_having_group,
                     param_values={},
                     output_columns=cte_output_columns,
                     grain=cte.get("grain") or "row_level",
                     limit=cte.get("limit"),
                     window_registry=cte_window_registry,
                     case_registry=cte_case_registry,
+                    emission=CteEmissionKind.coerce(cte.get("emission")),
+                    preserve_tables=[str(t) for t in (cte.get("preserve_tables") or [])],
+                    distinct_on=[parse_expr_string(x) for x in (cte.get("distinct_on") or [])],
                 )
             )
 
@@ -1763,8 +1700,8 @@ def parse_intent_response(
         select_cols=select_cols,
         group_by_cols=group_by_cols,
         order_by_cols=order_by_cols,
-        filters_param=filters_param,
-        having_param=having_param,
+        where=where,
+        having=having,
         param_values={},
         cte_steps=cte_steps,
         natural_language=natural_language,
@@ -1772,7 +1709,12 @@ def parse_intent_response(
         schema_invalid=False,
         window_registry=main_window_registry,
         case_registry=main_case_registry,
+        preserve_tables=[str(t) for t in (parsed.get("preserve_tables") or [])],
+        distinct_on=[parse_expr_string(x) for x in (parsed.get("distinct_on") or [])],
     )
+
+
+_PredParamT = TypeVar("_PredParamT", WhereParam, HavingParam)
 
 
 def _is_nontrivial_group(g: MulGroup) -> bool:
@@ -1790,117 +1732,178 @@ def _is_nontrivial_group(g: MulGroup) -> bool:
     return bool(g.agg_func or g.scalar_func or g.inner_scalar_func or g.divide or g.coefficient != 1.0)
 
 
-def _assign_structural_group(g: MulGroup, idx: int, pv: dict[str, Any], is_numeric: bool = True) -> int:
-    """Assign structural param keys to a single MulGroup and collect. values. Args: g: The MulGroup to assign param keys to. idx: The current structural param index counter. pv: The param_values dict to populate with key and value pairs. is_numeric: If False, skip coefficient parameterization entirely. Returns: The updated index after all assignments."""
+def _assign_structural_group(
+    g: MulGroup, idx: int, pv: dict[str, Any], is_numeric: bool = True
+) -> tuple[MulGroup, int]:
+    """Return a MulGroup copy with structural param keys and collect values. Never mutates *g*. Args: g: The MulGroup to assign param keys for. idx: The current structural param index counter. pv: The param_values dict to populate with key and value pairs. is_numeric: If False, skip coefficient parameterization entirely. Returns: ``(tagged_group, updated_idx)``."""
+    coeff_key = g.coeff_param_key
     if is_numeric and _is_nontrivial_group(g) and g.coefficient not in (1, 1.0):
-        key = f"s{idx}"
-        g.coeff_param_key = key
-        pv[key] = g.coefficient
+        coeff_key = f"s{idx}"
+        pv[coeff_key] = g.coefficient
         idx += 1
     if not is_numeric:
-        return idx
+        if coeff_key != g.coeff_param_key:
+            return replace(g, coeff_param_key=coeff_key), idx
+        return g, idx
+    sarg_keys = list(g.sarg_param_keys)
     for i, v in enumerate(g.scalar_func_args or []):
         key = f"s{idx}"
-        if len(g.sarg_param_keys) <= i:
-            g.sarg_param_keys.append(key)
+        if len(sarg_keys) <= i:
+            sarg_keys.append(key)
         else:
-            g.sarg_param_keys[i] = key
+            sarg_keys[i] = key
         pv[key] = v
         idx += 1
+    isarg_keys = list(g.isarg_param_keys)
     for i, v in enumerate(g.inner_scalar_func_args or []):
         key = f"s{idx}"
-        if len(g.isarg_param_keys) <= i:
-            g.isarg_param_keys.append(key)
+        if len(isarg_keys) <= i:
+            isarg_keys.append(key)
         else:
-            g.isarg_param_keys[i] = key
+            isarg_keys[i] = key
         pv[key] = v
         idx += 1
-    return idx
+    if (
+        coeff_key == g.coeff_param_key
+        and sarg_keys == list(g.sarg_param_keys)
+        and isarg_keys == list(g.isarg_param_keys)
+    ):
+        return g, idx
+    return replace(g, coeff_param_key=coeff_key, sarg_param_keys=sarg_keys, isarg_param_keys=isarg_keys), idx
 
 
-def _assign_structural_filter_param(fp: FilterParam, idx: int, pv: dict[str, Any]) -> int:
-    """Assign structural keys to both sides of a filter predicate."""
-    idx = _assign_structural_date_predicate_payload(fp, idx, pv)
-    idx = _assign_structural_expr(fp.left_expr, idx, pv)
-    if fp.right_expr is not None:
-        idx = _assign_structural_expr(fp.right_expr, idx, pv)
-    return idx
+def _assign_structural_where_param(fp: WhereParam, idx: int, pv: dict[str, Any]) -> tuple[WhereParam, int]:
+    """Return a filter predicate copy with structural keys on both sides."""
+    fp, idx = _assign_structural_date_predicate_payload(fp, idx, pv)
+    left, idx = _assign_structural_expr(fp.left_expr, idx, pv)
+    right = fp.right_expr
+    if right is not None:
+        right, idx = _assign_structural_expr(right, idx, pv)
+    if left is not fp.left_expr or right is not fp.right_expr:
+        fp = replace(fp, left_expr=left, right_expr=right)
+    return fp, idx
 
 
-def _assign_structural_having_param(hp: HavingParam, idx: int, pv: dict[str, Any]) -> int:
-    """Assign structural keys to a HAVING predicate."""
-    idx = _assign_structural_date_predicate_payload(hp, idx, pv)
-    idx = _assign_structural_expr(hp.left_expr, idx, pv)
-    if hp.right_expr is not None:
-        idx = _assign_structural_expr(hp.right_expr, idx, pv)
-    return idx
+def _assign_structural_having_param(hp: HavingParam, idx: int, pv: dict[str, Any]) -> tuple[HavingParam, int]:
+    """Return a HAVING predicate copy with structural keys assigned."""
+    hp, idx = _assign_structural_date_predicate_payload(hp, idx, pv)
+    left, idx = _assign_structural_expr(hp.left_expr, idx, pv)
+    right = hp.right_expr
+    if right is not None:
+        right, idx = _assign_structural_expr(right, idx, pv)
+    if left is not hp.left_expr or right is not hp.right_expr:
+        hp = replace(hp, left_expr=left, right_expr=right)
+    return hp, idx
 
 
-def _assign_structural_case_when_expr(cw: CaseWhenExpr, idx: int, pv: dict[str, Any]) -> int:
-    """Assign structural keys across CASE branches and else clause."""
+def _assign_structural_case_when_expr(cw: CaseWhenExpr, idx: int, pv: dict[str, Any]) -> tuple[CaseWhenExpr, int]:
+    """Return a CASE expression copy with structural keys across branches and else."""
+    new_branches: list[CaseWhenBranch] = []
+    branches_changed = False
     for br in cw.branches or []:
-        idx = _assign_structural_filter_param(br.condition, idx, pv)
-        idx = _assign_structural_expr(br.result, idx, pv)
-    if cw.else_result is not None:
-        idx = _assign_structural_expr(cw.else_result, idx, pv)
-    return idx
+        cond, idx = _assign_structural_where_param(br.condition, idx, pv)
+        result, idx = _assign_structural_expr(br.result, idx, pv)
+        if cond is not br.condition or result is not br.result:
+            new_branches.append(replace(br, condition=cond, result=result))
+            branches_changed = True
+        else:
+            new_branches.append(br)
+    else_result = cw.else_result
+    if else_result is not None:
+        else_result, idx = _assign_structural_expr(else_result, idx, pv)
+    if not branches_changed and else_result is cw.else_result:
+        return cw, idx
+    return replace(cw, branches=new_branches if branches_changed else cw.branches, else_result=else_result), idx
 
 
-def _assign_structural_select_col(sc: SelectCol, idx: int, pv: dict[str, Any]) -> int:
-    """Assign structural keys for one SELECT column expression."""
-    return _assign_structural_expr(sc.expr, idx, pv)
+def _assign_structural_select_col(sc: SelectCol, idx: int, pv: dict[str, Any]) -> tuple[SelectCol, int]:
+    """Return a SELECT column copy with structural keys on its expression."""
+    expr, idx = _assign_structural_expr(sc.expr, idx, pv)
+    if expr is not sc.expr:
+        return replace(sc, expr=expr), idx
+    return sc, idx
 
 
 def _assign_structural_case_registry(
-    registry: list[CaseRegistryStep] | None,
-    idx: int,
-    pv: dict[str, Any],
-) -> int:
-    """Assign structural keys across ``case_registry[*].case_when`` bodies."""
+    registry: list[CaseRegistryStep] | None, idx: int, pv: dict[str, Any]
+) -> tuple[list[CaseRegistryStep], int]:
+    """Return a case-registry copy with structural keys on ``case_when`` bodies."""
+    out: list[CaseRegistryStep] = []
     for step in registry or []:
-        idx = _assign_structural_case_when_expr(step.case_when, idx, pv)
-    return idx
+        cw, idx = _assign_structural_case_when_expr(step.case_when, idx, pv)
+        if cw is not step.case_when:
+            out.append(replace(step, case_when=cw))
+        else:
+            out.append(step)
+    return out, idx
 
 
-def _assign_structural_expr(expr: NormalizedExpr, idx: int, pv: dict[str, Any]) -> int:
-    """Assign structural param keys to a single NormalizedExpr. including. ExprValue offsets and collect values. Args: expr: The NormalizedExpr to assign param keys to. idx: The current structural param index counter. pv: The param_values dict to populate with key and value pairs. Returns: The updated index after all assignments."""
+def _assign_structural_expr(expr: NormalizedExpr, idx: int, pv: dict[str, Any]) -> tuple[NormalizedExpr, int]:
+    """Return a NormalizedExpr copy with structural param keys and collect values. Never mutates *expr* or nested groups/values. Args: expr: The NormalizedExpr to assign param keys for. idx: The current structural param index counter. pv: The param_values dict to populate with key and value pairs. Returns: ``(tagged_expr, updated_idx)``."""
+    new_add: list[MulGroup] = []
+    add_changed = False
     for g in expr.add_groups:
-        idx = _assign_structural_group(g, idx, pv, is_numeric=expr.is_numeric)
+        g2, idx = _assign_structural_group(g, idx, pv, is_numeric=expr.is_numeric)
+        add_changed = add_changed or g2 is not g
+        new_add.append(g2)
+    new_sub: list[MulGroup] = []
+    sub_changed = False
     for g in expr.sub_groups:
-        idx = _assign_structural_group(g, idx, pv, is_numeric=expr.is_numeric)
+        g2, idx = _assign_structural_group(g, idx, pv, is_numeric=expr.is_numeric)
+        sub_changed = sub_changed or g2 is not g
+        new_sub.append(g2)
+    sarg_keys = list(expr.sarg_param_keys)
+    isarg_keys = list(expr.isarg_param_keys)
     if expr.is_numeric:
         for i, v in enumerate(expr.scalar_func_args or []):
             key = f"s{idx}"
-            if len(expr.sarg_param_keys) <= i:
-                expr.sarg_param_keys.append(key)
+            if len(sarg_keys) <= i:
+                sarg_keys.append(key)
             else:
-                expr.sarg_param_keys[i] = key
+                sarg_keys[i] = key
             pv[key] = v
             idx += 1
         for i, v in enumerate(expr.inner_scalar_func_args or []):
             key = f"s{idx}"
-            if len(expr.isarg_param_keys) <= i:
-                expr.isarg_param_keys.append(key)
+            if len(isarg_keys) <= i:
+                isarg_keys.append(key)
             else:
-                expr.isarg_param_keys[i] = key
+                isarg_keys[i] = key
             pv[key] = v
             idx += 1
+    new_add_values = list(expr.add_values)
+    new_sub_values = list(expr.sub_values)
+    values_changed = False
     if expr.is_numeric:
-        for ev in expr.add_values:
+        for i, ev in enumerate(expr.add_values):
             if ev.value in (0, 0.0):
                 continue
             key = f"s{idx}"
-            ev.param_key = key
+            new_add_values[i] = replace(ev, param_key=key)
+            values_changed = True
             pv[key] = ev.value
             idx += 1
-        for ev in expr.sub_values:
+        for i, ev in enumerate(expr.sub_values):
             if ev.value in (0, 0.0):
                 continue
             key = f"s{idx}"
-            ev.param_key = key
+            new_sub_values[i] = replace(ev, param_key=key)
+            values_changed = True
             pv[key] = ev.value
             idx += 1
-    return idx
+    sarg_changed = sarg_keys != list(expr.sarg_param_keys)
+    isarg_changed = isarg_keys != list(expr.isarg_param_keys)
+    if not (add_changed or sub_changed or sarg_changed or isarg_changed or values_changed):
+        return expr, idx
+    return replace(
+        expr,
+        add_groups=new_add if add_changed else expr.add_groups,
+        sub_groups=new_sub if sub_changed else expr.sub_groups,
+        sarg_param_keys=sarg_keys if sarg_changed else expr.sarg_param_keys,
+        isarg_param_keys=isarg_keys if isarg_changed else expr.isarg_param_keys,
+        add_values=new_add_values if values_changed else expr.add_values,
+        sub_values=new_sub_values if values_changed else expr.sub_values,
+    ), idx
 
 
 def _infer_date_unit(column: str) -> str:
@@ -1999,11 +2002,11 @@ def ensure_scalar_func_defaults(intent: RuntimeIntent) -> RuntimeIntent:
             _fill_expr_defaults(g)
         for obc in cte.order_by_cols or []:
             _fill_expr_defaults(obc.expr)
-        for fp in cte.filters_param or []:
+        for fp in PredicateGroup.where_leaves(cte.where) or []:
             _fill_expr_defaults(fp.left_expr)
             if fp.right_expr:
                 _fill_expr_defaults(fp.right_expr)
-        for hp in cte.having_param or []:
+        for hp in PredicateGroup.having_leaves(cte.having) or []:
             _fill_expr_defaults(hp.left_expr)
             if hp.right_expr:
                 _fill_expr_defaults(hp.right_expr)
@@ -2013,11 +2016,11 @@ def ensure_scalar_func_defaults(intent: RuntimeIntent) -> RuntimeIntent:
         _fill_expr_defaults(g)
     for obc in intent.order_by_cols or []:
         _fill_expr_defaults(obc.expr)
-    for fp in intent.filters_param or []:
+    for fp in PredicateGroup.where_leaves(intent.where) or []:
         _fill_expr_defaults(fp.left_expr)
         if fp.right_expr:
             _fill_expr_defaults(fp.right_expr)
-    for hp in intent.having_param or []:
+    for hp in PredicateGroup.having_leaves(intent.having) or []:
         _fill_expr_defaults(hp.left_expr)
         if hp.right_expr:
             _fill_expr_defaults(hp.right_expr)
@@ -2025,30 +2028,55 @@ def ensure_scalar_func_defaults(intent: RuntimeIntent) -> RuntimeIntent:
 
 
 def _assign_structural_window_registry(
-    registry: list[WindowRegistryStep] | None,
-    idx: int,
-    pv: dict[str, Any],
-) -> int:
-    """Assign structural keys for window registry expressions nested in ``window_spec``."""
+    registry: list[WindowRegistryStep] | None, idx: int, pv: dict[str, Any]
+) -> tuple[list[WindowRegistryStep], int]:
+    """Return a window-registry copy with structural keys nested in ``window_spec``."""
+    out: list[WindowRegistryStep] = []
     for step in registry or []:
         ws = step.window_spec
+        new_parts: list[NormalizedExpr] = []
+        parts_changed = False
         for part in ws.partition_by or []:
-            idx = _assign_structural_expr(part, idx, pv)
+            part2, idx = _assign_structural_expr(part, idx, pv)
+            parts_changed = parts_changed or part2 is not part
+            new_parts.append(part2)
+        new_obs: list[OrderByCol] = []
+        obs_changed = False
         for ob in ws.order_by or []:
-            idx = _assign_structural_expr(ob.expr, idx, pv)
+            ex, idx = _assign_structural_expr(ob.expr, idx, pv)
+            if ex is not ob.expr:
+                new_obs.append(replace(ob, expr=ex))
+                obs_changed = True
+            else:
+                new_obs.append(ob)
+        new_arg = ws.argument
+        arg_changed = False
         if ws.argument is not None:
-            idx = _assign_structural_expr(ws.argument, idx, pv)
-    return idx
+            new_arg, idx = _assign_structural_expr(ws.argument, idx, pv)
+            arg_changed = new_arg is not ws.argument
+        if parts_changed or obs_changed or arg_changed:
+            new_ws = replace(
+                ws,
+                partition_by=new_parts if parts_changed else ws.partition_by,
+                order_by=new_obs if obs_changed else ws.order_by,
+                argument=new_arg,
+            )
+            out.append(replace(step, window_spec=new_ws))
+        else:
+            out.append(step)
+    return out, idx
 
 
-def _assign_structural_date_predicate_payload(pred: FilterParam | HavingParam, idx: int, pv: dict[str, Any]) -> int:
-    """Bind ``s*`` for calendar unit in ``date_diff`` / ``date_window`` dict payloads; clear ``raw_value``."""
+def _assign_structural_date_predicate_payload(
+    pred: _PredParamT, idx: int, pv: dict[str, Any]
+) -> tuple[_PredParamT, int]:
+    """Bind ``s*`` for calendar unit in ``date_diff`` / ``date_window`` dict payloads. Returns a predicate copy with ``param_key_unit`` set and ``raw_value`` cleared; never mutates *pred*."""
     vt = (pred.value_type or "").lower()
     if vt not in ("date_diff", "date_window"):
-        return idx
+        return pred, idx
     rv = pred.raw_value
     if not isinstance(rv, dict) or "unit" not in rv:
-        return idx
+        return pred, idx
     key = f"s{idx}"
     ur = rv.get("unit", "day")
     if isinstance(ur, str):
@@ -2057,53 +2085,98 @@ def _assign_structural_date_predicate_payload(pred: FilterParam | HavingParam, i
     else:
         stored = str(ur) if ur is not None else "day"
     pv[key] = stored
-    pred.param_key_unit = key
-    pred.raw_value = None
-    return idx + 1
+    return replace(pred, param_key_unit=key, raw_value=None), idx + 1
 
 
 def extract_structural_params(intent: RuntimeIntent) -> RuntimeIntent:
-    """Assign ``s*`` keys to limits, coeffs, and func args; fill. ``param_values``. Args: intent: Tagged intent (``is_numeric``, etc.). Returns: ``replace`` copy with ``param_values`` and ``limit_param_key``."""
+    """Assign ``s*`` keys to limits, coeffs, and func args; fill ``param_values``. Returns a fresh intent tree via ``dataclasses.replace``. Never mutates *intent* or any nested node reachable from it. Args: intent: Tagged intent (``is_numeric``, etc.). Returns: Copy with structural keys, ``param_values``, and ``limit_param_key``."""
     pv: dict[str, Any] = dict(intent.param_values or {})
     idx = 1
+    new_cte_steps: list[RuntimeCteStep] = []
     for cte in intent.cte_steps or []:
+        cte_limit_key = cte.limit_param_key
         if cte.limit is not None:
             key = f"s{idx}"
             pv[key] = cte.limit
-            cte.limit_param_key = key
+            cte_limit_key = key
             idx += 1
+        new_select: list[SelectCol] = []
         for sc in cte.select_cols or []:
-            idx = _assign_structural_select_col(sc, idx, pv)
-        idx = _assign_structural_window_registry(cte.window_registry, idx, pv)
-        idx = _assign_structural_case_registry(cte.case_registry, idx, pv)
+            sc2, idx = _assign_structural_select_col(sc, idx, pv)
+            new_select.append(sc2)
+        new_win, idx = _assign_structural_window_registry(cte.window_registry, idx, pv)
+        new_case, idx = _assign_structural_case_registry(cte.case_registry, idx, pv)
+        new_gb: list[NormalizedExpr] = []
         for g in cte.group_by_cols or []:
-            idx = _assign_structural_expr(g, idx, pv)
+            g2, idx = _assign_structural_expr(g, idx, pv)
+            new_gb.append(g2)
+        new_ob: list[OrderByCol] = []
         for obc in cte.order_by_cols or []:
-            idx = _assign_structural_expr(obc.expr, idx, pv)
-        for fp in cte.filters_param or []:
-            idx = _assign_structural_filter_param(fp, idx, pv)
-        for hp in cte.having_param or []:
-            idx = _assign_structural_having_param(hp, idx, pv)
+            ex, idx = _assign_structural_expr(obc.expr, idx, pv)
+            new_ob.append(replace(obc, expr=ex) if ex is not obc.expr else obc)
+        new_fp: list[WhereParam] = []
+        for fp in PredicateGroup.where_leaves(cte.where) or []:
+            fp2, idx = _assign_structural_where_param(fp, idx, pv)
+            new_fp.append(fp2)
+        new_hp: list[HavingParam] = []
+        for hp in PredicateGroup.having_leaves(cte.having) or []:
+            hp2, idx = _assign_structural_having_param(hp, idx, pv)
+            new_hp.append(hp2)
+        new_cte_steps.append(
+            replace(
+                cte,
+                limit_param_key=cte_limit_key,
+                select_cols=new_select,
+                window_registry=new_win,
+                case_registry=new_case,
+                group_by_cols=new_gb,
+                order_by_cols=new_ob,
+                where=PredicateGroup.from_list(new_fp),
+                having=PredicateGroup.from_list(new_hp),
+            )
+        )
     limit_param_key = ""
     if intent.limit is not None:
         key = f"s{idx}"
         pv[key] = intent.limit
         limit_param_key = key
         idx += 1
+    new_select_cols: list[SelectCol] = []
     for sc in intent.select_cols or []:
-        idx = _assign_structural_select_col(sc, idx, pv)
-    idx = _assign_structural_window_registry(intent.window_registry, idx, pv)
-    idx = _assign_structural_case_registry(intent.case_registry, idx, pv)
+        sc2, idx = _assign_structural_select_col(sc, idx, pv)
+        new_select_cols.append(sc2)
+    new_window_registry, idx = _assign_structural_window_registry(intent.window_registry, idx, pv)
+    new_case_registry, idx = _assign_structural_case_registry(intent.case_registry, idx, pv)
+    new_group_by: list[NormalizedExpr] = []
     for g in intent.group_by_cols or []:
-        idx = _assign_structural_expr(g, idx, pv)
+        g2, idx = _assign_structural_expr(g, idx, pv)
+        new_group_by.append(g2)
+    new_order_by: list[OrderByCol] = []
     for obc in intent.order_by_cols or []:
-        idx = _assign_structural_expr(obc.expr, idx, pv)
-    for fp in intent.filters_param or []:
-        idx = _assign_structural_filter_param(fp, idx, pv)
-    for hp in intent.having_param or []:
-        idx = _assign_structural_having_param(hp, idx, pv)
+        ex, idx = _assign_structural_expr(obc.expr, idx, pv)
+        new_order_by.append(replace(obc, expr=ex) if ex is not obc.expr else obc)
+    new_filters: list[WhereParam] = []
+    for fp in PredicateGroup.where_leaves(intent.where) or []:
+        fp2, idx = _assign_structural_where_param(fp, idx, pv)
+        new_filters.append(fp2)
+    new_having: list[HavingParam] = []
+    for hp in PredicateGroup.having_leaves(intent.having) or []:
+        hp2, idx = _assign_structural_having_param(hp, idx, pv)
+        new_having.append(hp2)
     debug(f"[intent_process.extract_structural_params] assigned {idx - 1} structural params")
-    return replace(intent, param_values=pv, limit_param_key=limit_param_key)
+    return replace(
+        intent,
+        param_values=pv,
+        limit_param_key=limit_param_key,
+        cte_steps=new_cte_steps,
+        select_cols=new_select_cols,
+        window_registry=new_window_registry,
+        case_registry=new_case_registry,
+        group_by_cols=new_group_by,
+        order_by_cols=new_order_by,
+        where=PredicateGroup.from_list(new_filters),
+        having=PredicateGroup.from_list(new_having),
+    )
 
 
 def apply_default_structural_values(intent: RuntimeIntent) -> RuntimeIntent:
@@ -2133,25 +2206,117 @@ def structural_s_key_assignment_order(intent: RuntimeIntent) -> list[str]:
     return [k for k in tagged.param_values if is_structural_param_key(k)]
 
 
+def _register_param_key(keys: set[str], key: str | None) -> None:
+    pk = (key or "").strip()
+    if pk:
+        keys.add(pk)
+
+
+def _collect_param_keys_from_group(g: MulGroup, keys: set[str]) -> None:
+    _register_param_key(keys, g.coeff_param_key)
+    for pk in g.sarg_param_keys or []:
+        _register_param_key(keys, pk)
+    for pk in g.isarg_param_keys or []:
+        _register_param_key(keys, pk)
+
+
+def _collect_param_keys_from_expr(expr: NormalizedExpr | None, keys: set[str]) -> None:
+    if expr is None:
+        return
+    for g in expr.add_groups or []:
+        _collect_param_keys_from_group(g, keys)
+    for g in expr.sub_groups or []:
+        _collect_param_keys_from_group(g, keys)
+    for pk in expr.sarg_param_keys or []:
+        _register_param_key(keys, pk)
+    for pk in expr.isarg_param_keys or []:
+        _register_param_key(keys, pk)
+    for ev in expr.add_values or []:
+        _register_param_key(keys, ev.param_key)
+    for ev in expr.sub_values or []:
+        _register_param_key(keys, ev.param_key)
+
+
+def _collect_param_keys_from_where(fp: WhereParam, keys: set[str]) -> None:
+    _register_param_key(keys, fp.param_key)
+    _register_param_key(keys, fp.param_key_hi)
+    _register_param_key(keys, fp.param_key_unit)
+    _collect_param_keys_from_expr(fp.left_expr, keys)
+    if fp.right_expr is not None:
+        _collect_param_keys_from_expr(fp.right_expr, keys)
+
+
+def _collect_param_keys_from_having(hp: HavingParam, keys: set[str]) -> None:
+    _register_param_key(keys, hp.param_key)
+    _register_param_key(keys, hp.param_key_unit)
+    _collect_param_keys_from_expr(hp.left_expr, keys)
+    if hp.right_expr is not None:
+        _collect_param_keys_from_expr(hp.right_expr, keys)
+
+
+def _collect_param_keys_from_case_registry(registry: list[CaseRegistryStep] | None, keys: set[str]) -> None:
+    for step in registry or []:
+        cw = step.case_when
+        for branch in cw.branches or []:
+            _collect_param_keys_from_where(branch.condition, keys)
+            _collect_param_keys_from_expr(branch.result, keys)
+        if cw.else_result is not None:
+            _collect_param_keys_from_expr(cw.else_result, keys)
+
+
+def _collect_param_keys_from_window_registry(registry: list[WindowRegistryStep] | None, keys: set[str]) -> None:
+    for step in registry or []:
+        spec = step.window_spec
+        for expr in spec.partition_by or []:
+            _collect_param_keys_from_expr(expr, keys)
+        for obc in spec.order_by or []:
+            _collect_param_keys_from_expr(obc.expr, keys)
+
+
+def collect_intent_referenced_param_keys(intent: Any) -> frozenset[str]:
+    """Return every ``p*`` / ``s*`` handle referenced on *intent* IR nodes."""
+    keys: set[str] = set()
+    for cte in getattr(intent, "cte_steps", None) or []:
+        _register_param_key(keys, getattr(cte, "limit_param_key", ""))
+        for fp in PredicateGroup.where_leaves(cte.where) or []:
+            _collect_param_keys_from_where(fp, keys)
+        for hp in PredicateGroup.having_leaves(cte.having) or []:
+            _collect_param_keys_from_having(hp, keys)
+        for sc in cte.select_cols or []:
+            _collect_param_keys_from_expr(sc.expr, keys)
+        _collect_param_keys_from_window_registry(cte.window_registry, keys)
+        _collect_param_keys_from_case_registry(cte.case_registry, keys)
+        for g in cte.group_by_cols or []:
+            _collect_param_keys_from_expr(g, keys)
+        for obc in cte.order_by_cols or []:
+            _collect_param_keys_from_expr(obc.expr, keys)
+    _register_param_key(keys, getattr(intent, "limit_param_key", ""))
+    for sc in intent.select_cols or []:
+        _collect_param_keys_from_expr(sc.expr, keys)
+    _collect_param_keys_from_window_registry(getattr(intent, "window_registry", None), keys)
+    _collect_param_keys_from_case_registry(getattr(intent, "case_registry", None), keys)
+    for g in intent.group_by_cols or []:
+        _collect_param_keys_from_expr(g, keys)
+    for obc in intent.order_by_cols or []:
+        _collect_param_keys_from_expr(obc.expr, keys)
+    for fp in PredicateGroup.where_leaves(intent.where) or []:
+        _collect_param_keys_from_where(fp, keys)
+    for hp in PredicateGroup.having_leaves(intent.having) or []:
+        _collect_param_keys_from_having(hp, keys)
+    return frozenset(keys)
+
+
+def narrow_bind_map_for_sub_intent(sub_intent: RuntimeIntent, parent_params: Mapping[str, Any]) -> dict[str, Any]:
+    """Return *parent_params* narrowed to handles referenced by *sub_intent*."""
+    referenced = collect_intent_referenced_param_keys(sub_intent)
+    return {k: v for k, v in parent_params.items() if k in referenced}
+
+
 def collect_raw_param_values(intent: RuntimeIntent) -> dict[str, Any]:
-    """
-    Harvest ``raw_value`` into a dict and clear ``raw_value`` on.
-
-    each. param (CTEs first). Walks ``filters_param``, ``having_param``,
-
-    and ``case_registry[*].case_when`` branch conditions in both the
-
-    main intent and every CTE so CASE literals are bound alongside WHERE
-
-    / HAVING parameters. Args: intent: Intent to scan and mutate.
-
-    Returns:
-
-        ``param_key -> raw_value`` map.
-    """
+    """Harvest ``raw_value`` into a dict and clear ``raw_value`` on. each. param (CTEs first). Walks ``where``, ``having``, and ``case_registry[*].case_when`` branch conditions in both the main intent and every CTE so CASE literals are bound alongside WHERE / HAVING parameters. Args: intent: Intent to scan and mutate. Returns: ``param_key -> raw_value`` map."""
     pv: dict[str, Any] = {}
 
-    def _harvest_filter(fp: FilterParam) -> None:
+    def _harvest_filter(fp: WhereParam) -> None:
         vt = (fp.value_type or "").lower()
         if vt in ("date_window", "date_diff") and isinstance(fp.raw_value, dict):
             rv = dict(fp.raw_value)
@@ -2208,22 +2373,21 @@ def collect_raw_param_values(intent: RuntimeIntent) -> dict[str, Any]:
                 _harvest_filter(branch.condition)
 
     for cte in intent.cte_steps or []:
-        for fp in cte.filters_param or []:
+        for fp in PredicateGroup.where_leaves(cte.where) or []:
             _harvest_filter(fp)
-        for hp in cte.having_param or []:
+        for hp in PredicateGroup.having_leaves(cte.having) or []:
             _harvest_having(hp)
         _harvest_case_registry(cte.case_registry)
-    for fp in intent.filters_param or []:
+    for fp in PredicateGroup.where_leaves(intent.where) or []:
         _harvest_filter(fp)
-    for hp in intent.having_param or []:
+    for hp in PredicateGroup.having_leaves(intent.having) or []:
         _harvest_having(hp)
     _harvest_case_registry(intent.case_registry)
     return pv
 
 
 def _assign_case_registry_param_keys(
-    case_registry: list[CaseRegistryStep] | None,
-    start_idx: int,
+    case_registry: list[CaseRegistryStep] | None, start_idx: int
 ) -> tuple[list[CaseRegistryStep], int]:
     """Allocate ``p*`` keys to CASE branch conditions inside ``case_registry`` entries."""
     if not case_registry:
@@ -2266,23 +2430,23 @@ def _assign_case_registry_param_keys(
 
 
 def assign_param_keys(
-    filters_param: list[FilterParam],
+    where_params: list[WhereParam],
     having_param: list[HavingParam],
     cte_steps: list[RuntimeCteStep] | None = None,
     case_registry: list[CaseRegistryStep] | None = None,
 ) -> tuple[
-    list[FilterParam],
+    list[WhereParam],
     list[HavingParam],
     list[RuntimeCteStep],
     list[CaseRegistryStep],
     int,
 ]:
-    """Assign ``p*`` keys to filter/having value params and CASE-branch. conditions (CTEs first). Skips null operators, date_window/date_diff value types, and predicates whose RHS is a column expression. Each CTE ``case_registry`` is keyed before main filters/having; main ``case_registry`` follows. Args: filters_param: Main filters. having_param: Main having list. cte_steps: Optional CTE chain to key before main. case_registry: Main-query CASE registry rows (``c01``, …). Returns: ``(filters, having, cte_steps, case_registry, next_index)``."""
+    """Assign ``p*`` keys to where/having value params and CASE-branch. conditions (CTEs first). Skips null operators, date_window/date_diff value types, and predicates whose RHS is a column expression. Each CTE ``case_registry`` is keyed before main where/having; main ``case_registry`` follows. Args: where_params: Main where predicates. having_param: Main having list. cte_steps: Optional CTE chain to key before main. case_registry: Main-query CASE registry rows (``c01``, …). Returns: ``(where_params, having, cte_steps, case_registry, next_index)``."""
     idx = 1
     updated_cte_steps: list[RuntimeCteStep] = []
     for cte in cte_steps or []:
         cte_fp = []
-        for fp in cte.filters_param or []:
+        for fp in PredicateGroup.where_leaves(cte.where) or []:
             vt = (fp.value_type or "").lower()
             if fp.op in ("is null", "is not null") or fp.right_expr is not None:
                 cte_fp.append(fp)
@@ -2295,7 +2459,7 @@ def assign_param_keys(
                 cte_fp.append(replace(fp, param_key=f"p{idx}"))
                 idx += 1
         cte_hp = []
-        for hp in cte.having_param or []:
+        for hp in PredicateGroup.having_leaves(cte.having) or []:
             if hp.right_expr is not None:
                 cte_hp.append(hp)
             else:
@@ -2305,23 +2469,23 @@ def assign_param_keys(
         updated_cte_steps.append(
             replace(
                 cte,
-                filters_param=cte_fp,
-                having_param=cte_hp,
+                where=PredicateGroup.from_list(cte_fp),
+                having=PredicateGroup.from_list(cte_hp),
                 case_registry=new_cte_case_registry,
             )
         )
-    new_filters_param = []
-    for fp in filters_param:
+    new_where_params = []
+    for fp in where_params:
         vt = (fp.value_type or "").lower()
         if fp.op in ("is null", "is not null") or fp.right_expr is not None:
-            new_filters_param.append(fp)
+            new_where_params.append(fp)
         elif vt in ("date_window", "date_diff") and isinstance(fp.raw_value, dict):
-            new_filters_param.append(replace(fp, param_key=f"p{idx}"))
+            new_where_params.append(replace(fp, param_key=f"p{idx}"))
             idx += 1
         elif vt in ("date_window", "date_diff"):
-            new_filters_param.append(fp)
+            new_where_params.append(fp)
         else:
-            new_filters_param.append(replace(fp, param_key=f"p{idx}"))
+            new_where_params.append(replace(fp, param_key=f"p{idx}"))
             idx += 1
     new_having_param = []
     for hp in having_param:
@@ -2331,13 +2495,7 @@ def assign_param_keys(
             new_having_param.append(replace(hp, param_key=f"p{idx}"))
             idx += 1
     new_case_registry, idx = _assign_case_registry_param_keys(case_registry, idx)
-    return (
-        new_filters_param,
-        new_having_param,
-        updated_cte_steps,
-        new_case_registry,
-        idx,
-    )
+    return (new_where_params, new_having_param, updated_cte_steps, new_case_registry, idx)
 
 
 def _parse_between_raw_value(raw_value: Any) -> tuple[Any, Any] | None:
@@ -2365,12 +2523,7 @@ def _parse_between_raw_value(raw_value: Any) -> tuple[Any, Any] | None:
     return None
 
 
-_PredParamT = TypeVar("_PredParamT", FilterParam, HavingParam)
-
-
-def _decompose_between_param_list(
-    params: list[_PredParamT],
-) -> list[_PredParamT]:
+def _decompose_between_param_list(params: list[_PredParamT]) -> list[_PredParamT]:
     """
     Replace each ``between`` with ``>=`` and ``<=`` pair.
 
@@ -2391,7 +2544,7 @@ def _decompose_between_param_list(
         if bounds is not None:
             lo_expr = _bound_value_to_right_expr(bounds[0])
             hi_expr = _bound_value_to_right_expr(bounds[1])
-            ge_fields: dict[str, Any] = {"op": ">=", "bool_op": "AND"}
+            ge_fields: dict[str, Any] = {"op": ">="}
             le_fields: dict[str, Any] = {"op": "<="}
             if lo_expr is not None:
                 ge_fields["right_expr"] = lo_expr
@@ -2406,14 +2559,12 @@ def _decompose_between_param_list(
             result.append(replace(p, **ge_fields))
             result.append(replace(p, **le_fields))
         else:
-            result.append(replace(p, op=">=", bool_op="AND"))
+            result.append(replace(p, op=">="))
             result.append(replace(p, op="<="))
     return result
 
 
-def _normalize_case_registry_between(
-    case_registry: list[CaseRegistryStep] | None,
-) -> list[CaseRegistryStep] | None:
+def _normalize_case_registry_between(case_registry: list[CaseRegistryStep] | None) -> list[CaseRegistryStep] | None:
     """Canonicalise BETWEEN raw_values inside CASE branches stored in. the case_registry. Branch predicates live under ``case_registry[*].case_when.branches[*].condition``. Args: case_registry: Registry list to scan; ``None`` is returned unchanged. Returns: New registry list with BETWEEN bounds expanded to ``[lo, hi]`` tuples, or the original value when no rewrites apply."""
     if not case_registry:
         return case_registry
@@ -2450,9 +2601,9 @@ def decompose_between_params(intent: RuntimeIntent) -> RuntimeIntent:
     """
     Decompose BETWEEN filter and having operators into paired >= and.
 
-    <= conditions. Applies to filters_param, having_param, and their
+    <= conditions. Applies to where, having, and their counterparts in
 
-    counterparts in CTE steps. CASE branch conditions under
+    CTE steps. CASE branch conditions under
 
     ``case_registry[*].case_when`` cannot be split into two flat
 
@@ -2462,31 +2613,31 @@ def decompose_between_params(intent: RuntimeIntent) -> RuntimeIntent:
 
     ``_render_case_branch_sql`` after two param keys are allocated.
 
-    Args: intent: RuntimeIntent containing filters_param, having_param,
-        and cte_steps to process. Returns: New RuntimeIntent with all
-        BETWEEN operators split into >= and <= pairs in flat lists and
-        canonicalised raw_values inside CASE branches.
+    Args: intent: RuntimeIntent containing where, having, and cte_steps
+        to process. Returns: New RuntimeIntent with all BETWEEN operators
+        split into >= and <= pairs in flat lists and canonicalised
+        raw_values inside CASE branches.
     """
-    new_fp = _decompose_between_param_list(intent.filters_param or [])
-    new_hp = _decompose_between_param_list(intent.having_param or [])
+    new_fp = _decompose_between_param_list(PredicateGroup.where_leaves(intent.where) or [])
+    new_hp = _decompose_between_param_list(PredicateGroup.having_leaves(intent.having) or [])
     new_case_registry = _normalize_case_registry_between(intent.case_registry)
     new_cte_steps = []
     for cte in intent.cte_steps or []:
-        cte_fp = _decompose_between_param_list(cte.filters_param or [])
-        cte_hp = _decompose_between_param_list(cte.having_param or [])
+        cte_fp = _decompose_between_param_list(PredicateGroup.where_leaves(cte.where) or [])
+        cte_hp = _decompose_between_param_list(PredicateGroup.having_leaves(cte.having) or [])
         cte_cr = _normalize_case_registry_between(cte.case_registry)
         new_cte_steps.append(
             replace(
                 cte,
-                filters_param=cte_fp,
-                having_param=cte_hp,
+                where=PredicateGroup.rebuild_from_leaves(cte.where, cte_fp),
+                having=PredicateGroup.rebuild_from_leaves(cte.having, cte_hp),
                 case_registry=cte_cr or [],
             )
         )
     return replace(
         intent,
-        filters_param=new_fp,
-        having_param=new_hp,
+        where=PredicateGroup.rebuild_from_leaves(intent.where, new_fp),
+        having=PredicateGroup.rebuild_from_leaves(intent.having, new_hp),
         case_registry=new_case_registry or [],
         cte_steps=new_cte_steps,
     )
@@ -2498,9 +2649,7 @@ def _parse_in_string_to_list(raw_value: str) -> list[str]:
     return [p.strip().strip("'\"") for p in parts if p.strip().strip("'\"")]
 
 
-def _normalize_in_param_list(
-    params: list[_PredParamT],
-) -> list[_PredParamT]:
+def _normalize_in_param_list(params: list[_PredParamT]) -> list[_PredParamT]:
     """
     Convert string raw_values to lists for IN / NOT IN operators.
 
@@ -2537,21 +2686,26 @@ def normalize_in_raw_values(intent: RuntimeIntent) -> RuntimeIntent:
 
         Intent with list ``raw_value`` where applicable.
     """
-    new_fp = _normalize_in_param_list(intent.filters_param or [])
-    new_hp = _normalize_in_param_list(intent.having_param or [])
+    new_fp = _normalize_in_param_list(PredicateGroup.where_leaves(intent.where) or [])
+    new_hp = _normalize_in_param_list(PredicateGroup.having_leaves(intent.having) or [])
     new_cr = _normalize_in_case_registry_raw_values(intent.case_registry)
     new_cte_steps = []
     for cte in intent.cte_steps or []:
-        cte_fp = _normalize_in_param_list(cte.filters_param or [])
-        cte_hp = _normalize_in_param_list(cte.having_param or [])
+        cte_fp = _normalize_in_param_list(PredicateGroup.where_leaves(cte.where) or [])
+        cte_hp = _normalize_in_param_list(PredicateGroup.having_leaves(cte.having) or [])
         cte_cr = _normalize_in_case_registry_raw_values(cte.case_registry)
         new_cte_steps.append(
-            replace(cte, filters_param=cte_fp, having_param=cte_hp, case_registry=cte_cr or []),
+            replace(
+                cte,
+                where=PredicateGroup.from_list(cte_fp),
+                having=PredicateGroup.from_list(cte_hp),
+                case_registry=cte_cr or [],
+            )
         )
     return replace(
         intent,
-        filters_param=new_fp,
-        having_param=new_hp,
+        where=PredicateGroup.from_list(new_fp),
+        having=PredicateGroup.from_list(new_hp),
         case_registry=new_cr or [],
         cte_steps=new_cte_steps,
     )
@@ -2602,7 +2756,7 @@ def _tag_case_registry_condition_scope(case_registry: list[Any] | None) -> list[
         if cw is None or not cw.branches:
             out.append(step)
             continue
-        new_scope = "having" if cw.has_aggregated_condition else "filter"
+        new_scope = "having" if cw.has_aggregated_condition else "where"
         if cw.condition_scope == new_scope:
             out.append(step)
             continue
@@ -2611,17 +2765,13 @@ def _tag_case_registry_condition_scope(case_registry: list[Any] | None) -> list[
 
 
 def tag_case_when_condition_scope(intent: RuntimeIntent) -> RuntimeIntent:
-    """Tag every ``CaseWhenExpr`` with ``condition_scope`` (``"filter"`` vs ``"having"``). A branch condition that references SQL aggregates (e.g. ``SUM(amount) > 100``) implies the parent scope must use GROUP BY semantics — surfaced as ``"having"`` so downstream validators can gate aggregation consistency."""
+    """Tag every ``CaseWhenExpr`` with ``condition_scope`` (``"where"`` vs ``"having"``). A branch condition that references SQL aggregates (e.g. ``SUM(amount) > 100``) implies the parent scope must use GROUP BY semantics — surfaced as ``"having"`` so downstream validators can gate aggregation consistency."""
     new_registry = _tag_case_registry_condition_scope(intent.case_registry)
     new_cte_steps = []
     for cte in intent.cte_steps or []:
         cte_cr = _tag_case_registry_condition_scope(getattr(cte, "case_registry", None))
         new_cte_steps.append(replace(cte, case_registry=cte_cr))
-    return replace(
-        intent,
-        case_registry=new_registry,
-        cte_steps=new_cte_steps,
-    )
+    return replace(intent, case_registry=new_registry, cte_steps=new_cte_steps)
 
 
 def _canonicalize_temporal_unit(unit: Any) -> Any:
@@ -2687,14 +2837,21 @@ def normalize_date_diff_raw_values(intent: RuntimeIntent) -> RuntimeIntent:
                 out.append(p)
         return out
 
-    new_fp = _process(intent.filters_param or [])
-    new_hp = _process(intent.having_param or [])
+    new_fp = _process(PredicateGroup.where_leaves(intent.where) or [])
+    new_hp = _process(PredicateGroup.having_leaves(intent.having) or [])
     new_cte_steps = []
     for cte in intent.cte_steps or []:
-        cte_fp = _process(cte.filters_param or [])
-        cte_hp = _process(cte.having_param or [])
-        new_cte_steps.append(replace(cte, filters_param=cte_fp, having_param=cte_hp))
-    return replace(intent, filters_param=new_fp, having_param=new_hp, cte_steps=new_cte_steps)
+        cte_fp = _process(PredicateGroup.where_leaves(cte.where) or [])
+        cte_hp = _process(PredicateGroup.having_leaves(cte.having) or [])
+        new_cte_steps.append(
+            replace(cte, where=PredicateGroup.from_list(cte_fp), having=PredicateGroup.from_list(cte_hp))
+        )
+    return replace(
+        intent,
+        where=PredicateGroup.from_list(new_fp),
+        having=PredicateGroup.from_list(new_hp),
+        cte_steps=new_cte_steps,
+    )
 
 
 def _canonicalize_group_temporal_args(g: MulGroup) -> None:
@@ -2746,11 +2903,11 @@ def canonicalize_temporal_unit_args(intent: RuntimeIntent) -> RuntimeIntent:
             _canonicalize_expr_temporal_args(g)
         for obc in cte.order_by_cols or []:
             _canonicalize_expr_temporal_args(obc.expr)
-        for fp in cte.filters_param or []:
+        for fp in PredicateGroup.where_leaves(cte.where) or []:
             _canonicalize_expr_temporal_args(fp.left_expr)
             if fp.right_expr:
                 _canonicalize_expr_temporal_args(fp.right_expr)
-        for hp in cte.having_param or []:
+        for hp in PredicateGroup.having_leaves(cte.having) or []:
             _canonicalize_expr_temporal_args(hp.left_expr)
             if hp.right_expr:
                 _canonicalize_expr_temporal_args(hp.right_expr)
@@ -2760,18 +2917,18 @@ def canonicalize_temporal_unit_args(intent: RuntimeIntent) -> RuntimeIntent:
         _canonicalize_expr_temporal_args(g)
     for obc in intent.order_by_cols or []:
         _canonicalize_expr_temporal_args(obc.expr)
-    for fp in intent.filters_param or []:
+    for fp in PredicateGroup.where_leaves(intent.where) or []:
         _canonicalize_expr_temporal_args(fp.left_expr)
         if fp.right_expr:
             _canonicalize_expr_temporal_args(fp.right_expr)
-    for hp in intent.having_param or []:
+    for hp in PredicateGroup.having_leaves(intent.having) or []:
         _canonicalize_expr_temporal_args(hp.left_expr)
         if hp.right_expr:
             _canonicalize_expr_temporal_args(hp.right_expr)
     return intent
 
 
-def _is_plain_column_expr(expr: NormalizedExpr) -> bool:
+def is_plain_column_expr(expr: NormalizedExpr) -> bool:
     """
     True for a single ``table.col`` term with no arithmetic.
 
@@ -2802,9 +2959,7 @@ def _is_plain_column_expr(expr: NormalizedExpr) -> bool:
     return bool(leaf.column_ref) and not leaf.add_groups and not leaf.sub_groups
 
 
-def _reclassify_date_diff_param(
-    fp: FilterParam,
-) -> FilterParam:
+def _reclassify_date_diff_param(fp: WhereParam) -> WhereParam:
     """
     If ``date_diff`` targets a plain column, retype to.
 
@@ -2820,7 +2975,7 @@ def _reclassify_date_diff_param(
         return fp
     if not isinstance(fp.raw_value, dict):
         return fp
-    if not _is_plain_column_expr(fp.left_expr):
+    if not is_plain_column_expr(fp.left_expr):
         return fp
     rv = fp.raw_value
     amount = rv.get("amount")
@@ -2830,9 +2985,7 @@ def _reclassify_date_diff_param(
     return replace(fp, value_type="date_window", raw_value=new_rv)
 
 
-def promote_date_subtraction_to_date_diff(
-    intent: RuntimeIntent,
-) -> RuntimeIntent:
+def promote_date_subtraction_to_date_diff(intent: RuntimeIntent) -> RuntimeIntent:
     """
     Retype date-column subtraction filters compared to a scalar bound as ``date_diff``.
 
@@ -2848,8 +3001,8 @@ def promote_date_subtraction_to_date_diff(
     def _is_date_subtraction(expr: NormalizedExpr) -> bool:
         return bool(expr.sub_groups and expr.add_groups)
 
-    def _process(params: list[FilterParam]) -> list[FilterParam]:
-        out: list[FilterParam] = []
+    def _process(params: list[WhereParam]) -> list[WhereParam]:
+        out: list[WhereParam] = []
         for fp in params:
             if fp.value_type == "date_diff":
                 out.append(fp)
@@ -2873,26 +3026,18 @@ def promote_date_subtraction_to_date_diff(
             else:
                 out.append(fp)
                 continue
-            out.append(
-                replace(
-                    fp,
-                    value_type="date_diff",
-                    raw_value={"unit": "day", "amount": amount},
-                )
-            )
+            out.append(replace(fp, value_type="date_diff", raw_value={"unit": "day", "amount": amount}))
         return out
 
-    new_fp = _process(intent.filters_param or [])
+    new_fp = _process(PredicateGroup.where_leaves(intent.where) or [])
     new_cte_steps = []
     for cte in intent.cte_steps or []:
-        cte_fp = _process(cte.filters_param or [])
-        new_cte_steps.append(replace(cte, filters_param=cte_fp))
-    return replace(intent, filters_param=new_fp, cte_steps=new_cte_steps)
+        cte_fp = _process(PredicateGroup.where_leaves(cte.where) or [])
+        new_cte_steps.append(replace(cte, where=PredicateGroup.from_list(cte_fp)))
+    return replace(intent, where=PredicateGroup.from_list(new_fp), cte_steps=new_cte_steps)
 
 
-def repair_misclassified_date_diff(
-    intent: RuntimeIntent,
-) -> RuntimeIntent:
+def repair_misclassified_date_diff(intent: RuntimeIntent) -> RuntimeIntent:
     """
     Apply ``_reclassify_date_diff_param`` to main and CTE filters.
 
@@ -2905,15 +3050,15 @@ def repair_misclassified_date_diff(
         Updated intent.
     """
 
-    def _process(params: list[FilterParam]) -> list[FilterParam]:
+    def _process(params: list[WhereParam]) -> list[WhereParam]:
         return [_reclassify_date_diff_param(fp) for fp in params]
 
-    new_fp = _process(intent.filters_param or [])
+    new_fp = _process(PredicateGroup.where_leaves(intent.where) or [])
     new_cte_steps = []
     for cte in intent.cte_steps or []:
-        cte_fp = _process(cte.filters_param or [])
-        new_cte_steps.append(replace(cte, filters_param=cte_fp))
-    return replace(intent, filters_param=new_fp, cte_steps=new_cte_steps)
+        cte_fp = _process(PredicateGroup.where_leaves(cte.where) or [])
+        new_cte_steps.append(replace(cte, where=PredicateGroup.from_list(cte_fp)))
+    return replace(intent, where=PredicateGroup.from_list(new_fp), cte_steps=new_cte_steps)
 
 
 def concat_logical_intent_prose(logical: LogicalIntent) -> str:
@@ -2927,7 +3072,7 @@ def concat_logical_intent_prose(logical: LogicalIntent) -> str:
     return " ".join(c for c in chunks if c.strip())
 
 
-register_parse_expr_string(parse_expr_string)
+NormalizedExpr.register_parse_expr_string(parse_expr_string)
 
 _TEMPLATES_MODULE: Any = None
 
@@ -2948,15 +3093,13 @@ def dedupe_prior_question_feedback_rows(rows: list[dict[str, str]]) -> list[dict
 
 
 def in_turn_row_from_semantic_errors(
-    errors: list[IntentIssue],
-    schema_hash: str,
-    intent: RuntimeIntent,
+    errors: list[IntentIssue], schema_hash: str, intent: RuntimeIntent
 ) -> dict[str, str]:
     """Build one ``to_prompt_row``-shaped dict from semantic validation errors."""
     max_b = PolicyConfig.MAX_SUMMARY_BULLETS
     lines = [f"[{e.category.value}] {e.message}" for e in errors[:max_b]]
     summary = "\n".join(lines)
-    ts = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    ts = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     tplm = _TEMPLATES_MODULE
     if tplm is None:
         ish, ipay = "", ""
@@ -2991,11 +3134,7 @@ def is_template_store_view(store: Any) -> bool:
     return mod is not None and isinstance(store, mod.TemplateStoreView)
 
 
-def refresh_template_store_indexes_for_view(
-    store: Any,
-    *,
-    template_objs: list[Template] | None = None,
-) -> None:
+def refresh_template_store_indexes_for_view(store: Any, *, template_objs: list[Template] | None = None) -> None:
     """Refresh matcher indexes on *store* when it is a registered :class:`TemplateStoreView`."""
     mod = _TEMPLATES_MODULE
     if mod is None:
@@ -3027,18 +3166,6 @@ def runtime_intent_has_refusal_natural_language(intent: RuntimeIntent) -> bool:
 
 if PolicyConfig.MAX_FRESH_RESTARTS < 0:
     raise ConfigError("PolicyConfig.MAX_FRESH_RESTARTS must be >= 0")
-
-
-@dataclass
-class RestartBudget:
-    """Mutable counter bounding the number of fresh full-parse restarts per top-level invocation."""
-
-    fresh_restarts_left: int
-
-    @classmethod
-    def default(cls) -> RestartBudget:
-        """Construct a budget initialised from :data:`PolicyConfig.MAX_FRESH_RESTARTS`."""
-        return cls(fresh_restarts_left=PolicyConfig.MAX_FRESH_RESTARTS)
 
 
 def _logical_coerce_str_list(v: Any) -> list[str]:
@@ -3083,7 +3210,7 @@ def _cte_intent_from_obj(obj: dict[str, Any]) -> CteIntent:
         name=str(obj.get("name", "") or "").strip(),
         tables=tuple(_logical_coerce_str_list(obj.get("tables"))),
         select=str(obj.get("select", "") or "").strip(),
-        filter=_logical_coerce_optional_str(obj.get("filter")),
+        where=_logical_coerce_optional_str(obj.get("where") or obj.get("filter")),
         group_by=_logical_coerce_optional_str(obj.get("group_by")),
         having=_logical_coerce_optional_str(obj.get("having")),
         order_by=_logical_coerce_optional_str(obj.get("order_by")),
@@ -3102,7 +3229,7 @@ def logical_intent_from_parsed(d: dict[str, Any]) -> LogicalIntent:
     return LogicalIntent(
         tables=tuple(_logical_coerce_str_list(d.get("tables"))),
         select=str(d.get("select", "") or "").strip(),
-        filter=_logical_coerce_optional_str(d.get("filter")),
+        where=_logical_coerce_optional_str(d.get("where") or d.get("filter")),
         group_by=_logical_coerce_optional_str(d.get("group_by")),
         having=_logical_coerce_optional_str(d.get("having")),
         order_by=_logical_coerce_optional_str(d.get("order_by")),
@@ -3149,7 +3276,7 @@ def parse_interpret_plan_response(raw: str) -> tuple[InterpretPlan | None, list[
     parsed = safe_json_loads(raw)
     if parsed is None or not isinstance(parsed, dict):
         return None, [
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id="json_schema_violation_interpret_root",
                 category=FailureCategory.INTENT_SCHEMA_INVALID_ABORT,
                 severity="error",
@@ -3161,7 +3288,7 @@ def parse_interpret_plan_response(raw: str) -> tuple[InterpretPlan | None, list[
         jsonschema.validate(instance=parsed, schema=INTERPRET_PLAN_SCHEMA)
     except jsonschema.ValidationError as exc:
         return None, [
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id="json_schema_violation_interpret_detail",
                 category=FailureCategory.INTENT_SCHEMA_INVALID_ABORT,
                 severity="error",
@@ -3173,7 +3300,7 @@ def parse_interpret_plan_response(raw: str) -> tuple[InterpretPlan | None, list[
     plan = _interpret_plan_from_dict(parsed)
     if not plan.approach:
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id="interpret_empty_approach",
                 category=FailureCategory.INTENT_SCHEMA_INVALID_ABORT,
                 severity="error",
@@ -3183,7 +3310,7 @@ def parse_interpret_plan_response(raw: str) -> tuple[InterpretPlan | None, list[
         )
     if not plan.tables:
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id="interpret_empty_tables",
                 category=FailureCategory.INTENT_SCHEMA_INVALID_ABORT,
                 severity="error",
@@ -3200,7 +3327,7 @@ def _logical_intent_schema_issues(parsed: dict[str, Any] | None) -> list[IntentI
     """Return Ground-stage JSON-schema violations as logical-stage issues."""
     if parsed is None or not isinstance(parsed, dict):
         return [
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id="json_schema_violation_logical_root",
                 category=FailureCategory.INTENT_SCHEMA_INVALID_ABORT,
                 severity="error",
@@ -3212,7 +3339,7 @@ def _logical_intent_schema_issues(parsed: dict[str, Any] | None) -> list[IntentI
         jsonschema.validate(instance=parsed, schema=LOGICAL_INTENT_SCHEMA)
     except jsonschema.ValidationError as exc:
         return [
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id="json_schema_violation_logical_detail",
                 category=FailureCategory.INTENT_SCHEMA_INVALID_ABORT,
                 severity="error",
@@ -3225,8 +3352,7 @@ def _logical_intent_schema_issues(parsed: dict[str, Any] | None) -> list[IntentI
 
 
 def parse_logical_intent_response(
-    raw: str,
-    schema_graph: SchemaGraph,
+    raw: str, schema_graph: SchemaGraph
 ) -> tuple[LogicalIntent | None, list[IntentIssue]]:
     """Parse and validate a planner model payload against schema and graph rules."""
     obj = safe_json_loads(raw.strip())
@@ -3237,7 +3363,7 @@ def parse_logical_intent_response(
     li = logical_intent_from_parsed(obj)
     if not li.tables or not li.select.strip():
         return None, [
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id="logical_intent_empty_core",
                 category=FailureCategory.INTENT_SCHEMA_INVALID_ABORT,
                 severity="error",
@@ -3245,8 +3371,8 @@ def parse_logical_intent_response(
                 responsible_stage="ground",
             )
         ]
-    issues = list(validate_tables_exist(li.tables, schema_graph))
-    issues.extend(validate_cte_tables_and_dag(li, schema_graph))
+    issues = list(schema_graph.validate_tables_exist(li.tables))
+    issues.extend(schema_graph.validate_cte_tables_and_dag(li))
     if issues:
         return None, issues
     return li, []
@@ -3259,38 +3385,35 @@ def serialized_prior_feedback_rows(rows: list[dict[str, str]] | None) -> str:
     return stable_json({"items": rows})
 
 
-def _compute_filters_similarity(filters1: list[FilterParam], filters2: list[FilterParam]) -> float:
-    """Jaccard similarity on ``signature_key``, with a small penalty. when coerced ``(signature_key, filter_group)`` wiring differs. Coercion matches the main pipeline so flat ``bool_op=OR`` rows align with ``filter_group`` disjuncts for template reuse. Args: filters1: First filter list. filters2: Second filter list. Returns: Score in ``[0, 1]``; ``1.0`` when both empty."""
+def _predicate_group_structure_key(group: PredicateGroup | None) -> tuple[Any, ...]:
+    if group is None or group.is_empty():
+        return ()
+    return (
+        group.op,
+        tuple(p.signature_key for p in group.predicates),
+        tuple(_predicate_group_structure_key(child) for child in group.groups),
+    )
+
+
+def _compute_where_similarity(filters1: list[WhereParam], filters2: list[WhereParam]) -> float:
+    """Jaccard similarity on predicate ``signature_key`` values with a small penalty when boolean structure differs."""
     if not filters1 and not filters2:
         return 1.0
     if not filters1 or not filters2:
         return 0.0
-
-    c1 = coerce_filter_group_list(list(filters1))
-    c2 = coerce_filter_group_list(list(filters2))
-    keys1 = {fp.signature_key for fp in c1}
-    keys2 = {fp.signature_key for fp in c2}
+    g1 = PredicateGroup.from_list(filters1)
+    g2 = PredicateGroup.from_list(filters2)
+    keys1 = {fp.signature_key for fp in filters1}
+    keys2 = {fp.signature_key for fp in filters2}
     score = _jaccard(keys1, keys2)
-    if score > 0:
-        g1 = any(fp.filter_group is not None for fp in c1)
-        g2 = any(fp.filter_group is not None for fp in c2)
-        if (
-            len(c1) >= 2
-            and len(c1) == len(c2)
-            and sorted(fp.signature_key for fp in c1) == sorted(fp.signature_key for fp in c2)
-        ):
-            if g1 != g2:
-                return score
-        sig_fg1 = sorted((fp.signature_key, fp.filter_group) for fp in c1)
-        sig_fg2 = sorted((fp.signature_key, fp.filter_group) for fp in c2)
-        if sig_fg1 != sig_fg2:
-            score *= 0.9
+    if score > 0 and _predicate_group_structure_key(g1) != _predicate_group_structure_key(g2):
+        score *= 0.9
     return score
 
 
 def _compute_having_similarity(having1: list[HavingParam], having2: list[HavingParam]) -> float:
     """
-    Same as ``_compute_filters_similarity`` for having clauses.
+    Same as ``_compute_where_similarity`` for having clauses.
 
     Args:
 
@@ -3305,26 +3428,13 @@ def _compute_having_similarity(having1: list[HavingParam], having2: list[HavingP
         return 1.0
     if not having1 or not having2:
         return 0.0
-
-    c1 = coerce_having_group_list(list(having1))
-    c2 = coerce_having_group_list(list(having2))
-    keys1 = {hp.signature_key for hp in c1}
-    keys2 = {hp.signature_key for hp in c2}
+    g1 = PredicateGroup.from_list(having1)
+    g2 = PredicateGroup.from_list(having2)
+    keys1 = {hp.signature_key for hp in having1}
+    keys2 = {hp.signature_key for hp in having2}
     score = _jaccard(keys1, keys2)
-    if score > 0:
-        g1 = any(hp.filter_group is not None for hp in c1)
-        g2 = any(hp.filter_group is not None for hp in c2)
-        if (
-            len(c1) >= 2
-            and len(c1) == len(c2)
-            and sorted(hp.signature_key for hp in c1) == sorted(hp.signature_key for hp in c2)
-        ):
-            if g1 != g2:
-                return score
-        sig_fg1 = sorted((hp.signature_key, hp.filter_group) for hp in c1)
-        sig_fg2 = sorted((hp.signature_key, hp.filter_group) for hp in c2)
-        if sig_fg1 != sig_fg2:
-            score *= 0.9
+    if score > 0 and _predicate_group_structure_key(g1) != _predicate_group_structure_key(g2):
+        score *= 0.9
     return score
 
 
@@ -3381,8 +3491,8 @@ def _base_similarity(
     group2: list[NormalizedExpr],
     order1: list[OrderByCol],
     order2: list[OrderByCol],
-    filters1: list[FilterParam],
-    filters2: list[FilterParam],
+    filters1: list[WhereParam],
+    filters2: list[WhereParam],
     having1: list[HavingParam],
     having2: list[HavingParam],
 ) -> float:
@@ -3401,7 +3511,7 @@ def _base_similarity(
     select_sim = _compute_select_cols_similarity(select1, select2)
     group_sim = _jaccard({g.signature_key for g in group1}, {g.signature_key for g in group2})
     order_sim = _compute_order_by_cols_similarity(order1, order2)
-    filter_sim = _compute_filters_similarity(filters1, filters2)
+    filter_sim = _compute_where_similarity(filters1, filters2)
     having_sim = _compute_having_similarity(having1, having2)
     return (
         0.30 * tables_sim
@@ -3435,10 +3545,10 @@ def _cte_step_similarity(cte1: RuntimeCteStep, cte2: RuntimeCteStep) -> float:
         cte2.group_by_cols or [],
         cte1.order_by_cols or [],
         cte2.order_by_cols or [],
-        cte1.filters_param or [],
-        cte2.filters_param or [],
-        cte1.having_param or [],
-        cte2.having_param or [],
+        PredicateGroup.where_leaves(cte1.where) or [],
+        PredicateGroup.where_leaves(cte2.where) or [],
+        PredicateGroup.having_leaves(cte1.having) or [],
+        PredicateGroup.having_leaves(cte2.having) or [],
     )
 
 
@@ -3471,10 +3581,10 @@ def intent_similarity(intent1: RuntimeIntent | ConcreteIntent, intent2: RuntimeI
         intent2.group_by_cols or [],
         intent1.order_by_cols or [],
         intent2.order_by_cols or [],
-        intent1.filters_param or [],
-        intent2.filters_param or [],
-        intent1.having_param or [],
-        intent2.having_param or [],
+        PredicateGroup.where_leaves(intent1.where) or [],
+        PredicateGroup.where_leaves(intent2.where) or [],
+        PredicateGroup.having_leaves(intent1.having) or [],
+        PredicateGroup.having_leaves(intent2.having) or [],
     )
     ctes1 = intent1.cte_steps or []
     ctes2 = intent2.cte_steps or []

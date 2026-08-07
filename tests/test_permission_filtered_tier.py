@@ -11,7 +11,7 @@ from aetherdialect._contracts_schema import (
     TableMetadata,
 )
 from aetherdialect._schema_graph import consumer_graph_is_permission_subset
-from aetherdialect._templates import apply_migration_policy
+from aetherdialect._templates import TemplateOps
 
 
 def _table(name: str) -> TableMetadata:
@@ -59,6 +59,6 @@ class TestPermissionFilteredTier:
             "aetherdialect._templates.classify_migration_tier",
             return_value=MigrationTier.PERMISSION_FILTERED,
         ):
-            report = apply_migration_policy(str(tmp_path), consumer)
+            report = TemplateOps.apply_migration_policy(str(tmp_path), consumer)
         assert report.tier == MigrationTier.PERMISSION_FILTERED
         assert report.destroyed_templates == 0

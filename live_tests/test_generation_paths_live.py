@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from aetherdialect._constants import GenerationPath
 from aetherdialect._contracts_base import NormalizedExpr
 from aetherdialect._contracts_core import (
+    Expected,
+    GenerationPath,
     RuntimeIntent,
+    Scenario,
     SelectCol,
 )
-from aetherdialect._live_testing import Expected, Scenario, run_and_assert
+from aetherdialect._live_testing import run_and_assert
 from live_tests.mydb_scenarios import FILM_SCOPED
 
 from ._seed_helpers import (
@@ -30,8 +32,8 @@ def _customer_names_intent_with_limit(limit_value: int) -> RuntimeIntent:
         ],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
-        having_param=[],
+        where=None,
+        having=None,
         natural_language="list customer first and last names",
         limit=limit_value,
         limit_param_key="s1",

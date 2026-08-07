@@ -13,11 +13,7 @@ from aetherdialect._contracts_core import (
     SeedWarmupIntent,
     SelectCol,
 )
-from aetherdialect._main_execution import (
-    _run_seed_warmup_sql_history_pipeline,
-    run_seed_warmup_from_history_execution,
-    run_seed_warmup_from_query_log_execution,
-)
+from aetherdialect._main_execution import MainExecutionOps
 
 
 def _intent(**overrides: object) -> SeedWarmupIntent:
@@ -28,8 +24,8 @@ def _intent(**overrides: object) -> SeedWarmupIntent:
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("t1.id"))],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
-        having_param=[],
+        where=None,
+        having=None,
         param_values={},
         source="sql_history",
     )
@@ -50,9 +46,9 @@ def _minimal_engine_shell() -> AetherEngine:
 @pytest.mark.parametrize(
     ("entry_fn", "extra_kwargs"),
     [
-        (run_seed_warmup_from_history_execution, {"sql_history_filepath": "/tmp/hist.sql"}),
+        (MainExecutionOps.run_seed_warmup_from_history_execution, {"sql_history_filepath": "/tmp/hist.sql"}),
         (
-            run_seed_warmup_from_query_log_execution,
+            MainExecutionOps.run_seed_warmup_from_query_log_execution,
             {"lookback_days": 30, "max_queries": 10},
         ),
     ],
@@ -84,19 +80,19 @@ def test_sql_warmup_entrypoints_thread_expand_and_max_kept_intents(
             return_value=["SELECT 1"],
         ),
         patch(
-            "aetherdialect._main_execution._raw_db_connection_for_query_log",
+            "aetherdialect._main_execution.MainExecutionOps._raw_db_connection_for_query_log",
             return_value=MagicMock(),
         ),
         patch(
-            "aetherdialect._main_execution._dialect_name_for_query_log",
+            "aetherdialect._main_execution.MainExecutionOps._dialect_name_for_query_log",
             return_value="postgresql",
         ),
         patch(
-            "aetherdialect._main_execution._run_seed_warmup_sql_history_pipeline",
+            "aetherdialect._main_execution.MainExecutionOps._run_seed_warmup_sql_history_pipeline",
             side_effect=_capture,
         ),
     ):
-        if entry_fn is run_seed_warmup_from_history_execution:
+        if entry_fn is MainExecutionOps.run_seed_warmup_from_history_execution:
             entry_fn(engine, str(tmp_path / "hist.sql"), expand=True, max_kept_intents=None)
         else:
             entry_fn(engine, expand=True, max_kept_intents=None, **extra_kwargs)
@@ -127,7 +123,7 @@ def test_sql_history_pipeline_expand_builds_larger_queue(monkeypatch, tmp_path) 
     )
     monkeypatch.setattr(
         "aetherdialect._main_execution.compute_schema_limits",
-        lambda _s: MagicMock(max_filters=3, max_groupby=2, max_tables=4),
+        lambda _s: MagicMock(max_where_predicates=3, max_groupby=2, max_tables=4),
     )
     expand_called: list[bool] = []
 
@@ -140,11 +136,11 @@ def test_sql_history_pipeline_expand_builds_larger_queue(monkeypatch, tmp_path) 
         _fake_expand,
     )
     monkeypatch.setattr(
-        "aetherdialect._main_execution.resolve_joins_for_table_set",
+        "aetherdialect._seed_warmup.SeedWarmupCacheSession.resolve_joins_for_table_set",
         lambda *_a, **_k: None,
     )
     monkeypatch.setattr(
-        "aetherdialect._main_execution.open_seed_warmup_cache_session",
+        "aetherdialect._seed_warmup.SeedWarmupCacheSession.open_seed_warmup_cache_session",
         lambda *_a, **_k: MagicMock(
             manifest={},
             work_units=[],
@@ -152,11 +148,11 @@ def test_sql_history_pipeline_expand_builds_larger_queue(monkeypatch, tmp_path) 
         ),
     )
     monkeypatch.setattr(
-        "aetherdialect._main_execution.save_seed_warmup_cache_zip",
+        "aetherdialect._seed_warmup.SeedWarmupCacheSession.save_seed_warmup_cache_zip",
         lambda *_a, **_k: None,
     )
     monkeypatch.setattr(
-        "aetherdialect._main_execution.save_seed_warmup_report",
+        "aetherdialect._seed_warmup.SeedWarmupCacheSession.save_seed_warmup_report",
         lambda *_a, **_k: None,
     )
 
@@ -167,11 +163,11 @@ def test_sql_history_pipeline_expand_builds_larger_queue(monkeypatch, tmp_path) 
         return [], [], 1, {"execute_ok_count": 0}
 
     monkeypatch.setattr(
-        "aetherdialect._main_execution.run_seed_warmup_execution",
+        "aetherdialect._seed_warmup.SeedWarmupCacheSession.run_seed_warmup_execution",
         _fake_exec,
     )
 
-    _run_seed_warmup_sql_history_pipeline(
+    MainExecutionOps._run_seed_warmup_sql_history_pipeline(
         schema=schema,
         dialect=dialect,
         output_dir=str(tmp_path),
@@ -210,14 +206,14 @@ def test_sql_history_pipeline_passes_max_kept_intents_to_execution(monkeypatch, 
     )
     monkeypatch.setattr(
         "aetherdialect._main_execution.compute_schema_limits",
-        lambda _s: MagicMock(max_filters=3, max_groupby=2, max_tables=4),
+        lambda _s: MagicMock(max_where_predicates=3, max_groupby=2, max_tables=4),
     )
     monkeypatch.setattr(
-        "aetherdialect._main_execution.resolve_joins_for_table_set",
+        "aetherdialect._seed_warmup.SeedWarmupCacheSession.resolve_joins_for_table_set",
         lambda *_a, **_k: None,
     )
     monkeypatch.setattr(
-        "aetherdialect._main_execution.open_seed_warmup_cache_session",
+        "aetherdialect._seed_warmup.SeedWarmupCacheSession.open_seed_warmup_cache_session",
         lambda *_a, **_k: MagicMock(
             manifest={},
             work_units=[],
@@ -225,11 +221,11 @@ def test_sql_history_pipeline_passes_max_kept_intents_to_execution(monkeypatch, 
         ),
     )
     monkeypatch.setattr(
-        "aetherdialect._main_execution.save_seed_warmup_cache_zip",
+        "aetherdialect._seed_warmup.SeedWarmupCacheSession.save_seed_warmup_cache_zip",
         lambda *_a, **_k: None,
     )
     monkeypatch.setattr(
-        "aetherdialect._main_execution.save_seed_warmup_report",
+        "aetherdialect._seed_warmup.SeedWarmupCacheSession.save_seed_warmup_report",
         lambda *_a, **_k: None,
     )
 
@@ -240,11 +236,11 @@ def test_sql_history_pipeline_passes_max_kept_intents_to_execution(monkeypatch, 
         return [], [], 1, {"execute_ok_count": 0}
 
     monkeypatch.setattr(
-        "aetherdialect._main_execution.run_seed_warmup_execution",
+        "aetherdialect._seed_warmup.SeedWarmupCacheSession.run_seed_warmup_execution",
         _fake_exec,
     )
 
-    _run_seed_warmup_sql_history_pipeline(
+    MainExecutionOps._run_seed_warmup_sql_history_pipeline(
         schema=schema,
         dialect=dialect,
         output_dir=str(tmp_path),

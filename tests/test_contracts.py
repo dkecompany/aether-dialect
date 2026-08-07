@@ -5,24 +5,21 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from aetherdialect._config import ConfigError
 from aetherdialect._constants import ROLE_ALLOWED_AGGREGATIONS, VALID_AGGREGATION_FUNCTIONS
 from aetherdialect._contracts_base import (
     ColumnRole,
     ComplexityTier,
+    ConfigError,
     EngineContext,
     ExprValue,
     FailureCategory,
-    FilterParam,
     HavingParam,
     MulGroup,
     NormalizedExpr,
     OrderByCol,
+    PredicateGroup,
     SensitivityClassification,
-    data_type_to_value_type,
-    is_date_type,
-    is_numeric_type,
-    is_string_type,
+    WhereParam,
 )
 from aetherdialect._contracts_core import (
     ConcreteCteStep,
@@ -39,13 +36,6 @@ from aetherdialect._contracts_core import (
     Template,
     TemplateMatch,
     ValueHistory,
-    _runtime_cte_to_concrete,
-    anchor_lattice_key_for_seed_intent,
-    anchor_lattice_signature,
-    classify_seed_warmup_intent_complexity,
-    concrete_cte_to_runtime,
-    concrete_intent_to_runtime_skeleton,
-    runtime_intent_to_concrete,
 )
 from aetherdialect._contracts_schema import (
     CaseRegistryStep,
@@ -57,11 +47,11 @@ from aetherdialect._contracts_schema import (
     FKEdge,
     IntentIssue,
     IntentValidationResult,
-    QSimFilter,
     QSimHaving,
     QSimIntent,
     QSimSkeleton,
     QSimSummary,
+    QSimWhereParam,
     RetryFailureContext,
     SchemaGraph,
     SchemaLimits,
@@ -73,6 +63,12 @@ from aetherdialect._contracts_schema import (
     ValueDomain,
     WindowRegistryStep,
     WindowSpec,
+)
+from aetherdialect._core_utils import (
+    data_type_to_value_type,
+    is_date_type,
+    is_numeric_type,
+    is_string_type,
 )
 
 
@@ -215,7 +211,7 @@ class TestNormalizedExpr:
 
     def test_primary_column_unbalanced_paren_stops_strip(self):
         """Malformed calls fall back to raw_sql; primary_column has no embedded column."""
-        expr = NormalizedExpr(add_groups=[MulGroup(multiply=["FOO(t.col"])])
+        expr = NormalizedExpr(add_groups=[MulGroup(multiply=[NormalizedExpr(raw_sql="FOO(t.col")])])
         assert expr.primary_column == ""
 
     def test_primary_term_returns_raw(self):
@@ -281,142 +277,98 @@ class TestNormalizedExpr:
         assert expr.is_literal_only is True
 
 
-class TestFilterParam:
-    """Tests for FilterParam dataclass."""
+class TestWhereParam:
+    """Tests for WhereParam dataclass."""
 
     def test_round_trip(self):
-        """FilterParam to_dict/from_dict round trip."""
-        fp = FilterParam(
+        """WhereParam to_dict/from_dict round trip."""
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("orders.status"),
             op="=",
             value_type="string",
             param_key="p1",
         )
-        rebuilt = FilterParam.from_dict(fp.to_dict())
+        rebuilt = WhereParam.from_dict(fp.to_dict())
         assert rebuilt.op == "="
         assert rebuilt.value_type == "string"
         assert rebuilt.param_key == "p1"
 
     def test_post_init_normalizes_op(self):
-        """FilterParam.__post_init__ lowercases and strips op."""
-        fp = FilterParam(left_expr=NormalizedExpr.from_column("t.c"), op="  LIKE  ")
+        """WhereParam.__post_init__ lowercases and strips op."""
+        fp = WhereParam(left_expr=NormalizedExpr.from_column("t.c"), op="  LIKE  ")
         assert fp.op == "like"
 
     def test_post_init_both_columns_preserves_order(self):
-        """FilterParam.__post_init__ leaves ordering untouched when both sides are column-bearing."""
+        """WhereParam.__post_init__ leaves ordering untouched when both sides are column-bearing."""
         left = NormalizedExpr.from_column("z.col")
         right = NormalizedExpr.from_column("a.col")
-        fp = FilterParam(left_expr=left, op=">", right_expr=right)
+        fp = WhereParam(left_expr=left, op=">", right_expr=right)
         assert fp.left_expr.primary_term == "z.col"
         assert fp.right_expr.primary_term == "a.col"
         assert fp.op == ">"
 
     def test_post_init_swaps_literal_left_column_right(self):
-        """FilterParam.__post_init__ swaps literal-only left with column-bearing right and flips op."""
+        """WhereParam.__post_init__ swaps literal-only left with column- bearing right and flips op."""
         left = NormalizedExpr(add_values=[ExprValue(value=5.0)])
         right = NormalizedExpr.from_column("orders.amount")
-        fp = FilterParam(left_expr=left, op=">", right_expr=right)
+        fp = WhereParam(left_expr=left, op=">", right_expr=right)
         assert fp.left_expr.primary_term == "orders.amount"
         assert fp.op == "<"
 
     def test_post_init_both_literals_preserves_order(self):
-        """FilterParam.__post_init__ leaves ordering untouched when both sides are literal-only."""
+        """WhereParam.__post_init__ leaves ordering untouched when both sides are literal-only."""
         left = NormalizedExpr(add_values=[ExprValue(value=1.0)])
         right = NormalizedExpr(add_values=[ExprValue(value=2.0)])
-        fp = FilterParam(left_expr=left, op=">", right_expr=right)
+        fp = WhereParam(left_expr=left, op=">", right_expr=right)
         assert fp.op == ">"
 
-    def test_bool_op_defaults_to_and(self):
-        """FilterParam.bool_op defaults to 'AND'."""
-        fp = FilterParam(left_expr=NormalizedExpr.from_column("t.c"), op="=")
-        assert fp.bool_op == "AND"
+    def test_from_dict_ignores_bool_op(self):
+        """WhereParam.from_dict does not store legacy bool_op on the leaf."""
+        d = {"left_expr": "t.c", "op": "=", "bool_op": "OR"}
+        fp = WhereParam.from_dict(d)
+        assert not hasattr(fp, "bool_op")
+        assert "bool_op" not in fp.to_dict()
 
-    def test_bool_op_normalizes_to_uppercase(self):
-        """FilterParam.__post_init__ normalizes bool_op to uppercase."""
-        fp = FilterParam(left_expr=NormalizedExpr.from_column("t.c"), op="=", bool_op="or")
-        assert fp.bool_op == "OR"
+    def test_from_dict_ignores_where_group(self):
+        """WhereParam.from_dict does not store legacy where_group on the leaf."""
+        d = {"left_expr": "t.c", "op": "=", "where_group": 3}
+        fp = WhereParam.from_dict(d)
+        assert not hasattr(fp, "where_group")
+        assert "where_group" not in fp.to_dict()
 
-    def test_bool_op_strips_whitespace(self):
-        """FilterParam.__post_init__ strips whitespace from bool_op."""
-        fp = FilterParam(left_expr=NormalizedExpr.from_column("t.c"), op="=", bool_op="  and  ")
-        assert fp.bool_op == "AND"
-
-    def test_bool_op_invalid_falls_back_to_and(self):
-        """FilterParam.__post_init__ falls back to 'AND' for invalid bool_op."""
-        fp = FilterParam(left_expr=NormalizedExpr.from_column("t.c"), op="=", bool_op="XOR")
-        assert fp.bool_op == "AND"
-
-    def test_filter_group_defaults_to_none(self):
-        """FilterParam.filter_group defaults to None."""
-        fp = FilterParam(left_expr=NormalizedExpr.from_column("t.c"), op="=")
-        assert fp.filter_group is None
-
-    def test_filter_group_set(self):
-        """FilterParam.filter_group can be set to an integer."""
-        fp = FilterParam(left_expr=NormalizedExpr.from_column("t.c"), op="=", filter_group=1)
-        assert fp.filter_group == 1
-
-    def test_to_dict_omits_bool_op_when_and(self):
-        """FilterParam.to_dict omits bool_op when it is the default 'AND'."""
-        fp = FilterParam(left_expr=NormalizedExpr.from_column("t.c"), op="=")
+    def test_to_dict_never_includes_legacy_bool_fields(self):
+        """WhereParam.to_dict never emits bool_op or where_group."""
+        fp = WhereParam(left_expr=NormalizedExpr.from_column("t.c"), op="=")
         d = fp.to_dict()
         assert "bool_op" not in d
+        assert "where_group" not in d
 
-    def test_to_dict_includes_bool_op_when_or(self):
-        """FilterParam.to_dict includes bool_op when it is 'OR'."""
-        fp = FilterParam(left_expr=NormalizedExpr.from_column("t.c"), op="=", bool_op="OR")
-        d = fp.to_dict()
-        assert d["bool_op"] == "OR"
+    def test_legacy_bool_op_migrates_via_predicate_group(self):
+        """Legacy bool_op in filter dicts is consumed by predicate_group_from_legacy_flat_where_dicts."""
+        legacy = [
+            {"left_expr": "t.a", "op": "=", "value": 1, "bool_op": "AND"},
+            {"left_expr": "t.b", "op": "=", "value": 2, "bool_op": "OR"},
+        ]
+        group = PredicateGroup.from_legacy_flat_where_dicts(legacy)
+        assert group is not None
+        assert group.op == "or"
+        assert len(group.leaves()) == 2
+        for leaf in group.leaves():
+            assert not hasattr(leaf, "bool_op")
 
-    def test_to_dict_omits_filter_group_when_none(self):
-        """FilterParam.to_dict omits filter_group when None."""
-        fp = FilterParam(left_expr=NormalizedExpr.from_column("t.c"), op="=")
-        d = fp.to_dict()
-        assert "filter_group" not in d
-
-    def test_to_dict_includes_filter_group_when_set(self):
-        """FilterParam.to_dict includes filter_group when set."""
-        fp = FilterParam(left_expr=NormalizedExpr.from_column("t.c"), op="=", filter_group=2)
-        d = fp.to_dict()
-        assert d["filter_group"] == 2
-
-    def test_from_dict_parses_bool_op(self):
-        """FilterParam.from_dict parses bool_op."""
-        d = {"left_expr": "t.c", "op": "=", "bool_op": "OR"}
-        fp = FilterParam.from_dict(d)
-        assert fp.bool_op == "OR"
-
-    def test_from_dict_defaults_bool_op(self):
-        """FilterParam.from_dict defaults bool_op to 'AND' when missing."""
-        d = {"left_expr": "t.c", "op": "="}
-        fp = FilterParam.from_dict(d)
-        assert fp.bool_op == "AND"
-
-    def test_from_dict_parses_filter_group(self):
-        """FilterParam.from_dict parses filter_group."""
-        d = {"left_expr": "t.c", "op": "=", "filter_group": 3}
-        fp = FilterParam.from_dict(d)
-        assert fp.filter_group == 3
-
-    def test_from_dict_filter_group_none_when_missing(self):
-        """FilterParam.from_dict sets filter_group to None when missing."""
-        d = {"left_expr": "t.c", "op": "="}
-        fp = FilterParam.from_dict(d)
-        assert fp.filter_group is None
-
-    def test_round_trip_with_bool_op_and_filter_group(self):
-        """FilterParam round trip preserves bool_op and filter_group."""
-        fp = FilterParam(
-            left_expr=NormalizedExpr.from_column("t.c"),
-            op="=",
-            value_type="string",
-            param_key="p1",
-            bool_op="OR",
-            filter_group=1,
-        )
-        rebuilt = FilterParam.from_dict(fp.to_dict())
-        assert rebuilt.bool_op == "OR"
-        assert rebuilt.filter_group == 1
+    def test_legacy_where_group_migrates_via_predicate_group(self):
+        """Legacy where_group in filter dicts is consumed by predicate_group_from_legacy_flat_where_dicts."""
+        legacy = [
+            {"left_expr": "t.a", "op": "=", "value": 1, "where_group": 1},
+            {"left_expr": "t.b", "op": "=", "value": 2, "where_group": 1},
+            {"left_expr": "t.c", "op": "=", "value": 3, "where_group": 2},
+        ]
+        group = PredicateGroup.from_legacy_flat_where_dicts(legacy)
+        assert group is not None
+        assert group.op == "or"
+        assert len(group.groups) == 2
+        for leaf in group.leaves():
+            assert not hasattr(leaf, "where_group")
 
 
 class TestHavingParam:
@@ -439,95 +391,53 @@ class TestHavingParam:
         hp = HavingParam(left_expr=NormalizedExpr.from_agg("sum", "t.x"), op=">=")
         assert hp.value_type == "number"
 
-    def test_bool_op_defaults_to_and(self):
-        """HavingParam.bool_op defaults to 'AND'."""
-        hp = HavingParam(left_expr=NormalizedExpr.from_agg("count", "t.id"), op=">")
-        assert hp.bool_op == "AND"
+    def test_from_dict_ignores_bool_op(self):
+        """HavingParam.from_dict does not store legacy bool_op on the leaf."""
+        d = {"left_expr": "COUNT(t.id)", "op": ">", "bool_op": "OR"}
+        hp = HavingParam.from_dict(d)
+        assert not hasattr(hp, "bool_op")
+        assert "bool_op" not in hp.to_dict()
 
-    def test_bool_op_normalizes_to_uppercase(self):
-        """HavingParam.__post_init__ normalizes bool_op to uppercase."""
-        hp = HavingParam(left_expr=NormalizedExpr.from_agg("count", "t.id"), op=">", bool_op="or")
-        assert hp.bool_op == "OR"
+    def test_from_dict_ignores_where_group(self):
+        """HavingParam.from_dict does not store legacy where_group on the leaf."""
+        d = {"left_expr": "COUNT(t.id)", "op": ">", "where_group": 2}
+        hp = HavingParam.from_dict(d)
+        assert not hasattr(hp, "where_group")
+        assert "where_group" not in hp.to_dict()
 
-    def test_bool_op_strips_whitespace(self):
-        """HavingParam.__post_init__ strips whitespace from bool_op."""
-        hp = HavingParam(
-            left_expr=NormalizedExpr.from_agg("count", "t.id"),
-            op=">",
-            bool_op="  and  ",
-        )
-        assert hp.bool_op == "AND"
-
-    def test_bool_op_invalid_falls_back_to_and(self):
-        """HavingParam.__post_init__ falls back to 'AND' for invalid bool_op."""
-        hp = HavingParam(left_expr=NormalizedExpr.from_agg("count", "t.id"), op=">", bool_op="NAND")
-        assert hp.bool_op == "AND"
-
-    def test_filter_group_defaults_to_none(self):
-        """HavingParam.filter_group defaults to None."""
-        hp = HavingParam(left_expr=NormalizedExpr.from_agg("count", "t.id"), op=">")
-        assert hp.filter_group is None
-
-    def test_filter_group_set(self):
-        """HavingParam.filter_group can be set to an integer."""
-        hp = HavingParam(left_expr=NormalizedExpr.from_agg("count", "t.id"), op=">", filter_group=2)
-        assert hp.filter_group == 2
-
-    def test_to_dict_omits_bool_op_when_and(self):
-        """HavingParam.to_dict omits bool_op when it is the default 'AND'."""
+    def test_to_dict_never_includes_legacy_bool_fields(self):
+        """HavingParam.to_dict never emits bool_op or where_group."""
         hp = HavingParam(left_expr=NormalizedExpr.from_agg("count", "t.id"), op=">")
         d = hp.to_dict()
         assert "bool_op" not in d
+        assert "where_group" not in d
 
-    def test_to_dict_includes_bool_op_when_or(self):
-        """HavingParam.to_dict includes bool_op when it is 'OR'."""
-        hp = HavingParam(left_expr=NormalizedExpr.from_agg("count", "t.id"), op=">", bool_op="OR")
-        d = hp.to_dict()
-        assert d["bool_op"] == "OR"
+    def test_legacy_bool_op_migrates_via_predicate_group(self):
+        """Legacy bool_op in having dicts is consumed by predicate_group_from_legacy_having_dicts."""
+        legacy = [
+            {"left_expr": "COUNT(t.a)", "op": ">", "value": 1, "bool_op": "AND"},
+            {"left_expr": "COUNT(t.b)", "op": ">", "value": 2, "bool_op": "OR"},
+        ]
+        group = PredicateGroup.from_legacy_having_dicts(legacy)
+        assert group is not None
+        assert group.op == "or"
+        assert len(group.leaves()) == 2
+        for leaf in group.leaves():
+            assert not hasattr(leaf, "bool_op")
 
-    def test_to_dict_omits_filter_group_when_none(self):
-        """HavingParam.to_dict omits filter_group when None."""
-        hp = HavingParam(left_expr=NormalizedExpr.from_agg("count", "t.id"), op=">")
-        d = hp.to_dict()
-        assert "filter_group" not in d
-
-    def test_to_dict_includes_filter_group_when_set(self):
-        """HavingParam.to_dict includes filter_group when set."""
-        hp = HavingParam(left_expr=NormalizedExpr.from_agg("count", "t.id"), op=">", filter_group=1)
-        d = hp.to_dict()
-        assert d["filter_group"] == 1
-
-    def test_from_dict_parses_bool_op(self):
-        """HavingParam.from_dict parses bool_op."""
-        d = {"left_expr": "COUNT(t.id)", "op": ">", "bool_op": "OR"}
-        hp = HavingParam.from_dict(d)
-        assert hp.bool_op == "OR"
-
-    def test_from_dict_defaults_bool_op(self):
-        """HavingParam.from_dict defaults bool_op to 'AND' when missing."""
-        d = {"left_expr": "COUNT(t.id)", "op": ">"}
-        hp = HavingParam.from_dict(d)
-        assert hp.bool_op == "AND"
-
-    def test_from_dict_parses_filter_group(self):
-        """HavingParam.from_dict parses filter_group."""
-        d = {"left_expr": "COUNT(t.id)", "op": ">", "filter_group": 2}
-        hp = HavingParam.from_dict(d)
-        assert hp.filter_group == 2
-
-    def test_round_trip_with_bool_op_and_filter_group(self):
-        """HavingParam round trip preserves bool_op and filter_group."""
-        hp = HavingParam(
-            left_expr=NormalizedExpr.from_agg("count", "t.id"),
-            op=">",
-            value_type="integer",
-            param_key="p1",
-            bool_op="OR",
-            filter_group=1,
-        )
-        rebuilt = HavingParam.from_dict(hp.to_dict())
-        assert rebuilt.bool_op == "OR"
-        assert rebuilt.filter_group == 1
+    def test_legacy_where_group_migrates_via_predicate_group(self):
+        """Legacy where_group in having dicts is consumed by predicate_group_from_legacy_having_dicts."""
+        legacy = [
+            {"left_expr": "COUNT(t.a)", "op": ">", "value": 1, "where_group": 1},
+            {"left_expr": "COUNT(t.b)", "op": ">", "value": 2, "where_group": 1},
+            {"left_expr": "COUNT(t.c)", "op": ">", "value": 3, "where_group": 2},
+        ]
+        group = PredicateGroup.from_legacy_having_dicts(legacy)
+        assert group is not None
+        assert group.op == "or"
+        assert len(group.groups) == 2
+        for leaf in group.leaves():
+            assert not hasattr(leaf, "where_group")
 
     def test_post_init_swaps_literal_left_agg_right(self):
         """HavingParam.__post_init__ swaps literal-only left with aggregate right and flips op."""
@@ -591,7 +501,7 @@ class TestCteRoundTrip:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.amount"))],
             grain="grouped",
         )
-        concrete = _runtime_cte_to_concrete(rt)
+        concrete = rt.to_concrete()
         assert isinstance(concrete, ConcreteCteStep)
         assert concrete.cte_name == "cte1"
         assert concrete.tables == ["orders"]
@@ -600,7 +510,7 @@ class TestCteRoundTrip:
     def test_concrete_cte_to_runtime_drops_runtime_fields(self):
         """concrete_cte_to_runtime creates RuntimeCteStep with empty runtime fields."""
         concrete = ConcreteCteStep(cte_name="cte1", tables=["t1"])
-        rt = concrete_cte_to_runtime(concrete)
+        rt = concrete.to_runtime()
         assert isinstance(rt, RuntimeCteStep)
         assert rt.description == ""
         assert rt.param_values == {}
@@ -614,8 +524,8 @@ class TestCteRoundTrip:
             grain="grouped",
             output_columns=["order_count"],
         )
-        concrete = _runtime_cte_to_concrete(original)
-        restored = concrete_cte_to_runtime(concrete)
+        concrete = original.to_concrete()
+        restored = concrete.to_runtime()
         assert restored.cte_name == original.cte_name
         assert restored.tables == original.tables
         assert restored.grain == original.grain
@@ -627,7 +537,7 @@ class TestRuntimeIntentToConcreteIntent:
 
     def test_basic_conversion(self, minimal_intent):
         """runtime_intent_to_concrete produces ConcreteIntent."""
-        concrete = runtime_intent_to_concrete(minimal_intent, "id_123")
+        concrete = minimal_intent.to_concrete("id_123")
         assert isinstance(concrete, ConcreteIntent)
         assert concrete.intent_id == "id_123"
         assert concrete.tables == ["orders"]
@@ -635,14 +545,14 @@ class TestRuntimeIntentToConcreteIntent:
 
     def test_drops_runtime_fields(self, grouped_intent):
         """ConcreteIntent omits natural_language; runtime param bag is stripped to empty."""
-        concrete = runtime_intent_to_concrete(grouped_intent, "id_456")
+        concrete = grouped_intent.to_concrete("id_456")
         d = concrete.to_dict()
         assert d.get("param_values") == {}
         assert "natural_language" not in d
 
     def test_round_trip_via_dict(self, grouped_intent):
         """ConcreteIntent to_dict/from_dict round trip."""
-        concrete = runtime_intent_to_concrete(grouped_intent, "id_789")
+        concrete = grouped_intent.to_concrete("id_789")
         rebuilt = ConcreteIntent.from_dict(concrete.to_dict())
         assert rebuilt.intent_id == "id_789"
         assert rebuilt.tables == concrete.tables
@@ -653,8 +563,8 @@ class TestConcreteIntentToRuntimeSkeleton:
 
     def test_clears_values(self, minimal_intent: RuntimeIntent) -> None:
         """Skeleton mirrors concrete shape with empty param_values."""
-        concrete = runtime_intent_to_concrete(minimal_intent, "id_sk")
-        skel = concrete_intent_to_runtime_skeleton(concrete)
+        concrete = minimal_intent.to_concrete("id_sk")
+        skel = concrete.to_runtime_skeleton()
         assert skel.param_values == {}
         assert skel.tables == concrete.tables
         assert skel.grain == concrete.grain
@@ -671,7 +581,7 @@ class TestRuntimeIntent:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         assert intent.expected_rows == "one"
 
@@ -683,7 +593,7 @@ class TestRuntimeIntent:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             limit=10,
         )
         assert intent.expected_rows == "few"
@@ -696,7 +606,7 @@ class TestRuntimeIntent:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         assert intent.expected_rows == "many"
 
@@ -708,7 +618,7 @@ class TestRuntimeIntent:
             select_cols=[SelectCol(expr=NormalizedExpr.from_agg("count", "t.id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         assert intent.has_aggregation is True
 
@@ -827,7 +737,7 @@ class TestQSimIntent:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=[],
             having_param=[],
             distinct=True,
         )
@@ -842,7 +752,7 @@ class TestQSimIntent:
             select_cols=["t.x"],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=[],
             having_param=[],
             distinct=True,
         )
@@ -909,12 +819,12 @@ class TestColumnMetadaTypeFunctions:
         assert data_type_to_value_type("bool") == "boolean"
 
     def test_data_type_to_value_type_fallback(self):
-        """data_type_to_value_type falls back to string for unknown."""
-        assert data_type_to_value_type("xml") == "string"
+        """data_type_to_value_type falls back to unknown for unrecognized types."""
+        assert data_type_to_value_type("xml") == "unknown"
 
     def test_data_type_to_value_type_empty_string(self):
-        """data_type_to_value_type returns string for empty input."""
-        assert data_type_to_value_type("") == "string"
+        """data_type_to_value_type returns unknown for empty input."""
+        assert data_type_to_value_type("") == "unknown"
 
     def test_data_type_to_value_type_whitespace_stripped(self):
         """data_type_to_value_type strips whitespace before lookup."""
@@ -985,7 +895,7 @@ class TestColumnMetadataRoles:
         assert "count" in aggs
         assert "sum" not in aggs
 
-    def test_get_valid_filter_ops_pk(self):
+    def test_get_valid_where_ops_pk(self):
         """Primary key column gets comparison ops."""
         cm = ColumnMetadata(
             name="id",
@@ -994,7 +904,7 @@ class TestColumnMetadataRoles:
             role=ColumnRole.IDENTIFIER.value,
             distinct_count=100,
             row_count=100,
-            valid_filter_ops=[
+            valid_where_ops=[
                 "=",
                 "!=",
                 "<",
@@ -1008,12 +918,12 @@ class TestColumnMetadataRoles:
                 "is not null",
             ],
         )
-        ops = cm.get_valid_filter_ops()
+        ops = cm.get_valid_where_ops()
         assert "=" in ops
         assert "between" in ops
         assert "is null" in ops
 
-    def test_get_valid_filter_ops_categorical(self):
+    def test_get_valid_where_ops_categorical(self):
         """Categorical string column gets LIKE ops."""
         cm = ColumnMetadata(
             name="name",
@@ -1021,7 +931,7 @@ class TestColumnMetadataRoles:
             role=ColumnRole.CATEGORICAL.value,
             distinct_count=50,
             row_count=100,
-            valid_filter_ops=[
+            valid_where_ops=[
                 "=",
                 "!=",
                 "in",
@@ -1034,7 +944,7 @@ class TestColumnMetadataRoles:
                 "is not null",
             ],
         )
-        ops = cm.get_valid_filter_ops()
+        ops = cm.get_valid_where_ops()
         assert "like" in ops
         assert "ilike" in ops
 
@@ -1101,7 +1011,7 @@ class TestSQLShape:
             has_group_by=True,
             has_agg=True,
             num_cte=1,
-            num_filters=3,
+            num_where=3,
             has_distinct=True,
         )
         rebuilt = SQLShape.from_dict(original.to_dict())
@@ -1135,7 +1045,7 @@ class TestNoCountDistinctRegression:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         assert not hasattr(intent, "distinct")
 
@@ -1148,42 +1058,44 @@ class TestNoCountDistinctRegression:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=[],
             having_param=[],
         )
         assert hasattr(qi, "distinct")
 
 
-class TestFilterParamSignatureKey:
-    """Tests for FilterParam.signature_key."""
+class TestWhereParamSignatureKey:
+    """Tests for WhereParam.signature_key."""
 
     def test_signature_key_deterministic(self):
-        """FilterParam.signature_key is deterministic."""
-        fp = FilterParam(left_expr=NormalizedExpr.from_column("t.c"), op="=", value_type="string")
+        """WhereParam.signature_key is deterministic."""
+        fp = WhereParam(left_expr=NormalizedExpr.from_column("t.c"), op="=", value_type="string")
         assert fp.signature_key == fp.signature_key
 
     def test_signature_key_includes_op(self):
-        """FilterParam.signature_key includes the op."""
-        fp = FilterParam(left_expr=NormalizedExpr.from_column("t.c"), op=">=", value_type="number")
+        """WhereParam.signature_key includes the op."""
+        fp = WhereParam(left_expr=NormalizedExpr.from_column("t.c"), op=">=", value_type="number")
         assert ">=" in fp.signature_key
 
     def test_different_ops_different_keys(self):
-        """FilterParam with different ops have different signature_keys."""
-        fp1 = FilterParam(left_expr=NormalizedExpr.from_column("t.c"), op="=")
-        fp2 = FilterParam(left_expr=NormalizedExpr.from_column("t.c"), op="!=")
+        """WhereParam with different ops have different signature_keys."""
+        fp1 = WhereParam(left_expr=NormalizedExpr.from_column("t.c"), op="=")
+        fp2 = WhereParam(left_expr=NormalizedExpr.from_column("t.c"), op="!=")
         assert fp1.signature_key != fp2.signature_key
 
     def test_signature_key_ignores_bool_op(self):
-        """FilterParam.signature_key does not include bool_op."""
-        fp1 = FilterParam(left_expr=NormalizedExpr.from_column("t.c"), op="=")
-        fp2 = FilterParam(left_expr=NormalizedExpr.from_column("t.c"), op="=", bool_op="OR")
-        assert fp1.signature_key == fp2.signature_key
+        """WhereParam.signature_key does not include legacy bool_op."""
+        fp_plain = WhereParam(left_expr=NormalizedExpr.from_column("t.c"), op="=")
+        fp_legacy = WhereParam.from_dict({"left_expr": "t.c", "op": "=", "bool_op": "OR"})
+        assert fp_plain.signature_key == fp_legacy.signature_key
+        assert "bool_op" not in fp_plain.signature_key
 
-    def test_signature_key_ignores_filter_group(self):
-        """FilterParam.signature_key does not include filter_group."""
-        fp1 = FilterParam(left_expr=NormalizedExpr.from_column("t.c"), op="=")
-        fp2 = FilterParam(left_expr=NormalizedExpr.from_column("t.c"), op="=", filter_group=1)
-        assert fp1.signature_key == fp2.signature_key
+    def test_signature_key_ignores_where_group(self):
+        """WhereParam.signature_key does not include legacy where_group."""
+        fp_plain = WhereParam(left_expr=NormalizedExpr.from_column("t.c"), op="=")
+        fp_legacy = WhereParam.from_dict({"left_expr": "t.c", "op": "=", "where_group": 5})
+        assert fp_plain.signature_key == fp_legacy.signature_key
+        assert "where_group" not in fp_plain.signature_key
 
 
 class TestHavingParamSignatureKey:
@@ -1248,35 +1160,35 @@ class TestRuntimeCteStepExpectedRows:
         assert rt.expected_rows == "many"
 
 
-class TestQSimFilter:
-    """Tests for QSimFilter."""
+class TestQSimWhereParam:
+    """Tests for QSimWhereParam."""
 
     def test_round_trip(self):
-        """QSimFilter to_dict/from_dict round trip."""
-        qf = QSimFilter(column="orders.status", op="=", value_type="categorical")
-        rebuilt = QSimFilter.from_dict(qf.to_dict())
+        """QSimWhereParam to_dict/from_dict round trip."""
+        qf = QSimWhereParam(column="orders.status", op="=", value_type="categorical")
+        rebuilt = QSimWhereParam.from_dict(qf.to_dict())
         assert rebuilt.column == "orders.status"
         assert rebuilt.op == "="
 
     def test_is_expr_comparison_false(self):
-        """QSimFilter.is_expr_comparison False when no right_column."""
-        qf = QSimFilter(column="t.c", op="=", value_type="categorical")
+        """QSimWhereParam.is_expr_comparison False when no right_column."""
+        qf = QSimWhereParam(column="t.c", op="=", value_type="categorical")
         assert qf.is_expr_comparison is False
 
     def test_is_expr_comparison_true(self):
-        """QSimFilter.is_expr_comparison True when right_column set."""
-        qf = QSimFilter(column="t.c1", op=">", value_type="numeric", right_column="t.c2")
+        """QSimWhereParam.is_expr_comparison True when right_column set."""
+        qf = QSimWhereParam(column="t.c1", op=">", value_type="numeric", right_column="t.c2")
         assert qf.is_expr_comparison is True
 
     def test_to_dict_excludes_empty_right_column(self):
-        """QSimFilter.to_dict omits right_column when empty."""
-        qf = QSimFilter(column="t.c", op="=", value_type="categorical")
+        """QSimWhereParam.to_dict omits right_column when empty."""
+        qf = QSimWhereParam(column="t.c", op="=", value_type="categorical")
         d = qf.to_dict()
         assert "right_column" not in d
 
     def test_to_dict_includes_right_column(self):
-        """QSimFilter.to_dict includes right_column when set."""
-        qf = QSimFilter(column="t.c1", op=">", value_type="numeric", right_column="t.c2")
+        """QSimWhereParam.to_dict includes right_column when set."""
+        qf = QSimWhereParam(column="t.c1", op=">", value_type="numeric", right_column="t.c2")
         d = qf.to_dict()
         assert d["right_column"] == "t.c2"
 
@@ -1324,8 +1236,8 @@ class TestSeedWarmupIntent:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
         )
         rebuilt = SeedWarmupIntent.from_dict(si.to_dict())
         assert rebuilt.intent_id == "warm_1"
@@ -1340,8 +1252,8 @@ class TestSeedWarmupIntent:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             distinct_select_index=0,
         )
         rebuilt = SeedWarmupIntent.from_dict(si.to_dict())
@@ -1354,8 +1266,8 @@ class TestSeedWarmupIntent:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
         )
         ri = si.to_runtime_intent()
         assert isinstance(ri, RuntimeIntent)
@@ -1371,8 +1283,8 @@ class TestSeedWarmupIntent:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             expansion_metadata=em,
         )
         rebuilt = SeedWarmupIntent.from_dict(si.to_dict())
@@ -1392,7 +1304,7 @@ class TestConcreteIntentStandalone:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         rebuilt = ConcreteIntent.from_dict(ci.to_dict())
         assert rebuilt.intent_id == "ci_1"
@@ -1407,7 +1319,7 @@ class TestConcreteIntentStandalone:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             chosen_join_candidate_id="jc_1",
             chosen_join_path_signature=["orders.customer_id=customers.customer_id"],
         )
@@ -1462,10 +1374,10 @@ class TestClassifySeedWarmupComplexity:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t1.id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
         )
-        assert classify_seed_warmup_intent_complexity(si) == ComplexityTier.SIMPLE
+        assert si.complexity_tier() == ComplexityTier.SIMPLE
 
     def test_two_tables_at_least_moderate(self):
         """Two referenced tables lift tier to MODERATE or above."""
@@ -1476,10 +1388,10 @@ class TestClassifySeedWarmupComplexity:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("a.id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
         )
-        assert classify_seed_warmup_intent_complexity(si) == ComplexityTier.MODERATE
+        assert si.complexity_tier() == ComplexityTier.MODERATE
 
 
 class TestAnchorLatticeKeyForSeedIntent:
@@ -1494,8 +1406,8 @@ class TestAnchorLatticeKeyForSeedIntent:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t1.id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             source="synthetic",
             seed_index=3,
             expansion_metadata=em,
@@ -1507,17 +1419,17 @@ class TestAnchorLatticeKeyForSeedIntent:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t1.id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             source="synthetic",
             seed_index=3,
             expansion_metadata=em,
         )
-        ka = anchor_lattice_key_for_seed_intent(a)
-        kb = anchor_lattice_key_for_seed_intent(b)
+        ka = a.anchor_lattice_key()
+        kb = b.anchor_lattice_key()
         assert ka == kb
-        assert anchor_lattice_signature(ka, "fp1") == anchor_lattice_signature(kb, "fp1")
-        assert anchor_lattice_signature(ka, "fp1") != anchor_lattice_signature(kb, "fp2")
+        assert ka.signature("fp1") == kb.signature("fp1")
+        assert ka.signature("fp1") != kb.signature("fp2")
 
     def test_expansion_depth_splits_cells(self):
         em_low = ExpansionMetadata(operator="op", depth=0)
@@ -1529,8 +1441,8 @@ class TestAnchorLatticeKeyForSeedIntent:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t1.id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             source="synthetic",
             seed_index=3,
             expansion_metadata=em_low,
@@ -1542,13 +1454,13 @@ class TestAnchorLatticeKeyForSeedIntent:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t1.id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             source="synthetic",
             seed_index=3,
             expansion_metadata=em_high,
         )
-        assert anchor_lattice_key_for_seed_intent(low) != anchor_lattice_key_for_seed_intent(high)
+        assert low.anchor_lattice_key() != high.anchor_lattice_key()
 
 
 class TestSeedWarmupResult:
@@ -1562,14 +1474,14 @@ class TestSeedWarmupResult:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
-        sr = SeedWarmupResult(intent=ri, question="test question", success=True, confidence=0.9)
+        sr = SeedWarmupResult(intent=ri, question="test question", success=True)
         d = sr.to_dict()
         assert d["question"] == "test question"
         assert d["questions"] == []
         assert d["success"] is True
-        assert d["confidence"] == 0.9
+        assert "confidence" not in d
 
     def test_defaults(self):
         """SeedWarmupResult defaults."""
@@ -1579,7 +1491,7 @@ class TestSeedWarmupResult:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         sr = SeedWarmupResult(intent=ri, question="q")
         assert sr.sql is None
@@ -2136,27 +2048,27 @@ class TestColumnMetadataRoundTrip:
         )
         assert cm.is_filterable is False
 
-    def test_get_valid_filter_ops_uses_stored_when_set(self):
-        """ColumnMetadata.get_valid_filter_ops returns stored ops plus null when set."""
+    def test_get_valid_where_ops_uses_stored_when_set(self):
+        """ColumnMetadata.get_valid_where_ops returns stored ops plus null when set."""
         cm = ColumnMetadata(
             name="c",
             data_type="varchar",
-            valid_filter_ops=["=", "!=", "in"],
+            valid_where_ops=["=", "!=", "in"],
         )
-        ops = cm.get_valid_filter_ops()
+        ops = cm.get_valid_where_ops()
         assert "=" in ops
         assert "is null" in ops
         assert "is not null" in ops
 
-    def test_get_valid_filter_ops_foreign_key_includes_range(self):
-        """ColumnMetadata.get_valid_filter_ops for FK includes range operators."""
+    def test_get_valid_where_ops_foreign_key_includes_range(self):
+        """ColumnMetadata.get_valid_where_ops for FK includes range operators."""
         cm = ColumnMetadata(
             name="ref_id",
             data_type="int",
             is_foreign_key=True,
             role=ColumnRole.IDENTIFIER.value,
             distinct_count=10,
-            valid_filter_ops=[
+            valid_where_ops=[
                 "=",
                 "!=",
                 "<",
@@ -2170,31 +2082,31 @@ class TestColumnMetadataRoundTrip:
                 "is not null",
             ],
         )
-        ops = cm.get_valid_filter_ops()
+        ops = cm.get_valid_where_ops()
         assert "between" in ops
         assert ">=" in ops
 
-    def test_get_valid_filter_ops_boolean_excludes_like(self):
-        """ColumnMetadata.get_valid_filter_ops for boolean excludes like."""
+    def test_get_valid_where_ops_boolean_excludes_like(self):
+        """ColumnMetadata.get_valid_where_ops for boolean excludes like."""
         cm = ColumnMetadata(
             name="active",
             data_type="bool",
             role=ColumnRole.BOOLEAN.value,
             distinct_count=2,
-            valid_filter_ops=["=", "!=", "in", "not in", "is null", "is not null"],
+            valid_where_ops=["=", "!=", "in", "not in", "is null", "is not null"],
         )
-        ops = cm.get_valid_filter_ops()
+        ops = cm.get_valid_where_ops()
         assert "like" not in ops
         assert "=" in ops
 
-    def test_get_valid_filter_ops_numeric_categorical_includes_between(self):
-        """ColumnMetadata.get_valid_filter_ops for numeric_categorical includes between."""
+    def test_get_valid_where_ops_numeric_categorical_includes_between(self):
+        """ColumnMetadata.get_valid_where_ops for numeric_categorical includes between."""
         cm = ColumnMetadata(
             name="code",
             data_type="int",
             role=ColumnRole.NUMERIC_CATEGORICAL.value,
             distinct_count=20,
-            valid_filter_ops=[
+            valid_where_ops=[
                 "=",
                 "!=",
                 "in",
@@ -2208,7 +2120,7 @@ class TestColumnMetadataRoundTrip:
                 "is not null",
             ],
         )
-        ops = cm.get_valid_filter_ops()
+        ops = cm.get_valid_where_ops()
         assert "between" in ops
 
     def test_get_valid_aggregations_uses_stored_when_set(self):
@@ -2471,21 +2383,21 @@ class TestQSimSkeleton:
         sk = QSimSkeleton(
             tables=["orders"],
             has_aggregation=True,
-            num_filters=2,
+            num_where=2,
             num_groupby=1,
             has_orderby=True,
             num_having=0,
         )
         assert sk.tables == ["orders"]
         assert sk.has_aggregation is True
-        assert sk.num_filters == 2
+        assert sk.num_where == 2
 
     def test_defaults(self):
         """QSimSkeleton has defaults for optional fields."""
         sk = QSimSkeleton(
             tables=["t"],
             has_aggregation=False,
-            num_filters=0,
+            num_where=0,
             num_groupby=0,
             has_orderby=False,
             num_having=0,
@@ -2523,8 +2435,8 @@ class TestSchemaLimits:
 
     def test_fields(self):
         """SchemaLimits stores computed limits."""
-        sl = SchemaLimits(max_filters=4, max_groupby=2, max_tables=3)
-        assert sl.max_filters == 4
+        sl = SchemaLimits(max_where_predicates=4, max_groupby=2, max_tables=3)
+        assert sl.max_where_predicates == 4
         assert sl.max_tables == 3
 
 
@@ -2550,7 +2462,7 @@ class TestSkeletonPool:
         skel = QSimSkeleton(
             tables=["orders"],
             has_aggregation=False,
-            num_filters=0,
+            num_where=0,
             num_groupby=0,
             has_orderby=False,
             num_having=0,
@@ -2588,8 +2500,6 @@ class TestWindowCaseRegistry:
 
     def test_runtime_intent_registry_round_trip_dict(self, minimal_intent: RuntimeIntent) -> None:
         """to_dict/from_dict preserves window_registry and the bare- registry-id select column."""
-        from aetherdialect._contracts_base import expr_registry_ref
-
         ob = OrderByCol(expr=NormalizedExpr.from_column("orders.amount"), direction="ASC")
         wspec = WindowSpec(function="row_number", order_by=[ob])
         intent = RuntimeIntent(
@@ -2598,7 +2508,7 @@ class TestWindowCaseRegistry:
             select_cols=[SelectCol(expr=NormalizedExpr(column_ref="w01"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             window_registry=[
                 WindowRegistryStep(
                     registry_id="w01",
@@ -2612,7 +2522,7 @@ class TestWindowCaseRegistry:
         assert len(back.window_registry) == 1
         assert back.window_registry[0].registry_id == "w01"
         assert back.select_cols[0].expr.column_ref == "w01"
-        assert expr_registry_ref(back.select_cols[0].expr) == "w01"
+        assert back.select_cols[0].expr.registry_ref() == "w01"
 
     def test_duplicate_case_registry_id_emits_issue(self) -> None:
         """validate_scope_registries flags duplicate case ids."""
@@ -2631,8 +2541,8 @@ class TestWindowCaseRegistry:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
         )
         assert any("duplicate case registry_id" in i.message for i in issues)
 
@@ -2673,12 +2583,12 @@ class TestCaseWhenExprConditionScope:
         back = CaseWhenExpr.from_dict(d)
         assert back.condition_scope == "having"
 
-    def test_unknown_scope_falls_back_to_filter(self) -> None:
+    def test_unknown_scope_falls_back_to_where(self) -> None:
         back = CaseWhenExpr.from_dict({"branches": [], "condition_scope": "bogus"})
-        assert back.condition_scope == "filter"
+        assert back.condition_scope == "where"
 
     def test_signature_key_includes_scope(self) -> None:
-        a = CaseWhenExpr(branches=[], condition_scope="filter")
+        a = CaseWhenExpr(branches=[], condition_scope="where")
         b = CaseWhenExpr(branches=[], condition_scope="having")
         assert a.signature_key != b.signature_key
 
@@ -2689,7 +2599,7 @@ class TestCaseWhenStringResultExpr:
     def test_branch_bare_label_is_string_literal(self) -> None:
         br = CaseWhenBranch.from_dict(
             {
-                "condition": FilterParam.prompt_example_dict(),
+                "condition": WhereParam.prompt_example_dict(),
                 "result": "premium",
             }
         )
@@ -2699,7 +2609,7 @@ class TestCaseWhenStringResultExpr:
     def test_branch_qualified_ref_is_column(self) -> None:
         br = CaseWhenBranch.from_dict(
             {
-                "condition": FilterParam.prompt_example_dict(),
+                "condition": WhereParam.prompt_example_dict(),
                 "result": "table.column",
             }
         )
@@ -2709,7 +2619,7 @@ class TestCaseWhenStringResultExpr:
     def test_branch_dict_result_unchanged(self) -> None:
         br = CaseWhenBranch.from_dict(
             {
-                "condition": FilterParam.prompt_example_dict(),
+                "condition": WhereParam.prompt_example_dict(),
                 "result": {"column_ref": "table.other_column"},
             }
         )
@@ -2718,7 +2628,7 @@ class TestCaseWhenStringResultExpr:
     def test_branch_literal_string_wins_over_result(self) -> None:
         br = CaseWhenBranch.from_dict(
             {
-                "condition": FilterParam.prompt_example_dict(),
+                "condition": WhereParam.prompt_example_dict(),
                 "literal_string": "from_literal",
                 "result": "ignored",
             }
@@ -2755,6 +2665,11 @@ class TestSchemaContextDenyParsing:
         assert ctx.qualified_denies() == frozenset({("contacts", "email")})
         assert ctx.glob_column_denies() == frozenset()
 
+    def test_source_qualified_entry_normalized(self):
+        ctx = EngineContext(deny_columns=frozenset({"alpha.contacts.email"}))
+        assert ctx.deny_columns == frozenset({"contacts.email"})
+        assert ctx.qualified_denies() == frozenset({("contacts", "email")})
+
     def test_glob_entry_normalized(self):
         ctx = EngineContext(deny_columns=frozenset({"*.Email"}))
         assert ctx.deny_columns == frozenset({"*.email"})
@@ -2772,7 +2687,7 @@ class TestSchemaContextDenyParsing:
 
     def test_too_many_dots_rejected(self):
         with pytest.raises(ConfigError):
-            EngineContext(deny_columns=frozenset({"public.contacts.email"}))
+            EngineContext(deny_columns=frozenset({"a.b.c.d"}))
 
     def test_empty_entry_rejected(self):
         try:
@@ -2802,7 +2717,7 @@ class TestPipelineFeatureTags:
 
     def test_feasible_features_respects_date_columns(self) -> None:
         from aetherdialect._contracts_base import DatabaseFeatureCapability
-        from aetherdialect._contracts_core import feasible_features_for_capability
+        from aetherdialect._contracts_core import PipelineFeatureSpec
 
         cap_no_dates = DatabaseFeatureCapability(
             table_count=2,
@@ -2820,12 +2735,12 @@ class TestPipelineFeatureTags:
             date_columns_by_table={},
             array_columns_by_table={},
         )
-        feasible = feasible_features_for_capability(cap_no_dates)
+        feasible = PipelineFeatureSpec.feasible_features_for_capability(cap_no_dates)
         assert "date_window_filter" not in feasible
         assert "in_list" in feasible
 
     def test_detect_intent_features_finds_having_and_distinct(self) -> None:
-        from aetherdialect._contracts_core import SeedWarmupIntent, detect_intent_features
+        from aetherdialect._contracts_core import SeedWarmupIntent
 
         intent = SeedWarmupIntent.from_dict(
             {
@@ -2845,6 +2760,6 @@ class TestPipelineFeatureTags:
                 "distinct_select_index": 0,
             }
         )
-        tags = detect_intent_features(intent)
+        tags = intent.to_runtime_intent().detect_features()
         assert "having_aggregate_compare" in tags
         assert "distinct_select" in tags

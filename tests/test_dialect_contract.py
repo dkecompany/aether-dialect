@@ -13,7 +13,7 @@ from aetherdialect._constants import (
     SQLGLOT_DIALECT_HOOK_ENGINES,
     STRUCTURAL_INDEX_ENGINES,
 )
-from aetherdialect._dialect import Dialect, get_registered_engines, register_dialect
+from aetherdialect._dialect import Dialect, DialectRegistry
 
 _REQUIRED_METHODS: tuple[str, ...] = (
     "ast_validate_full",
@@ -28,7 +28,6 @@ _REQUIRED_METHODS: tuple[str, ...] = (
     "execute",
     "reflect_schema_graph",
     "profile_schema",
-    "quote_table_column",
 )
 
 _SQLGLOT_HOOK_METHODS: tuple[str, ...] = (
@@ -45,7 +44,7 @@ _QUOTE_FIXTURES: dict[str, str] = {
     "mysql": "`fixture`.`column`",
     "redshift": '"fixture"."column"',
     "sqlserver": "[fixture].[column]",
-    "snowflake": "FIXTURE.COLUMN",
+    "snowflake": '"fixture"."column"',
     "bigquery": "`fixture`.`column`",
     "postgresql": '"fixture"."column"',
     "databricks": "`fixture`.`column`",
@@ -83,6 +82,8 @@ _SAMPLE_SUFFIX_ENGINES: frozenset[str] = frozenset(
 
 _SAMPLE_SUFFIX_WHERE_ENGINES: frozenset[str] = frozenset({"mysql", "redshift"})
 
+_SAMPLE_SUFFIX_ORDERED_LIMIT_ENGINES: frozenset[str] = frozenset({"sqlserver", "bigquery"})
+
 
 def _uninit_dialect(cls: type[Dialect]) -> Dialect:
     return cls.__new__(cls)
@@ -101,7 +102,7 @@ def _assert_dialect_contract(dialect: Dialect, engine: str) -> None:
     assert isinstance(dialect.sqlglot_dialect, str)
     assert dialect.sqlglot_dialect or engine == "postgresql"
     assert isinstance(dialect.dialect_label, str) and dialect.dialect_label
-    assert isinstance(dialect.extra_filter_ops(), frozenset)
+    assert isinstance(dialect.extra_where_ops(), frozenset)
     assert dialect.result_reader_kind in RESULT_READER_KINDS
     assert isinstance(dialect.inject_pruning_predicates("SELECT 1", schema=None, intent=None), str)
     assert isinstance(dialect.date_window_upper_bound_sql("day"), str) and dialect.date_window_upper_bound_sql("day")
@@ -134,6 +135,8 @@ def _assert_dialect_contract(dialect: Dialect, engine: str) -> None:
         assert suffix
         if engine in _SAMPLE_SUFFIX_WHERE_ENGINES:
             assert suffix.startswith("WHERE ")
+        elif engine in _SAMPLE_SUFFIX_ORDERED_LIMIT_ENGINES:
+            assert suffix.upper().startswith("ORDER BY")
         elif engine == "databricks":
             assert "TABLESAMPLE" in suffix
         else:
@@ -158,12 +161,12 @@ def _assert_dialect_contract(dialect: Dialect, engine: str) -> None:
         assert dialect.result_reader_kind in RESULT_READER_KINDS
 
 
-@pytest.mark.parametrize("engine", get_registered_engines())
+@pytest.mark.parametrize("engine", DialectRegistry.get_registered_engines())
 def test_registered_dialect_satisfies_contract(engine: str) -> None:
     """Every registered dialect must implement the full override contract."""
-    from aetherdialect._dialect import get_dialect_class
+    from aetherdialect._dialect import DialectRegistry
 
-    cls = get_dialect_class(engine)
+    cls = DialectRegistry.get_class(engine)
     dialect = _uninit_dialect(cls)
     _assert_dialect_contract(dialect, engine)
 
@@ -177,12 +180,10 @@ class _StubDialect(Dialect):
 
 @pytest.fixture
 def stub_dialect_registration():
-    register_dialect("_stub", _StubDialect)
+    DialectRegistry.register("_stub", _StubDialect)
     yield
-    from aetherdialect._dialect import _DIALECT_REGISTRY, _RUNTIME_REGISTRY
-
-    _DIALECT_REGISTRY.pop("_stub", None)
-    _RUNTIME_REGISTRY.pop("_stub", None)
+    DialectRegistry._DIALECT_REGISTRY.pop("_stub", None)
+    DialectRegistry._RUNTIME_REGISTRY.pop("_stub", None)
 
 
 def test_stub_dialect_fails_contract(stub_dialect_registration: Any) -> None:
@@ -196,6 +197,17 @@ def test_stub_dialect_fails_contract(stub_dialect_registration: Any) -> None:
 
 def test_sqlglot_hook_engine_sets_cover_config() -> None:
     """Registered sqlglot engines match the SQLGLOT_DIALECT_HOOK_ENGINES contract set."""
-    registered = set(get_registered_engines())
+    registered = set(DialectRegistry.get_registered_engines())
     assert SQLGLOT_DIALECT_HOOK_ENGINES <= registered
     assert "postgresql" not in SQLGLOT_DIALECT_HOOK_ENGINES
+
+
+@pytest.mark.parametrize("engine", DialectRegistry.get_registered_engines())
+def test_ilike_extra_where_ops_matches_supports_ilike(engine: str) -> None:
+    from aetherdialect._dialect import DialectRegistry
+
+    dialect = _uninit_dialect(DialectRegistry.get_class(engine))
+    ops = dialect.extra_where_ops()
+    has_ilike = "ilike" in ops
+    assert has_ilike == dialect.supports_ilike
+    assert ("not ilike" in ops) == dialect.supports_ilike

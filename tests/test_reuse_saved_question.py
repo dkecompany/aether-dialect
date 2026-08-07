@@ -5,13 +5,16 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 from aetherdialect import SessionStep
-from aetherdialect._contracts_base import FilterParam, NormalizedExpr, ParameterBinding
+from aetherdialect._contracts_base import (
+    NormalizedExpr,
+    ParameterBinding,
+    PredicateGroup,
+    WhereParam,
+)
 from aetherdialect._contracts_core import ConcreteIntent, Template, ValueHistory
 from aetherdialect._contracts_schema import SQLShape, TemplateStats
 from aetherdialect._templates import (
-    build_parameter_bindings,
-    handles_referenced_in_sql_param,
-    resolve_template_for_question,
+    TemplateOps,
 )
 
 
@@ -23,14 +26,16 @@ def _minimal_template(*, question: str = "count of item in category x") -> Templ
         select_cols=[],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[
-            FilterParam(
-                left_expr=NormalizedExpr.from_column("t1.category"),
-                op="=",
-                value_type="string",
-                param_key="p1",
-            )
-        ],
+        where=PredicateGroup.from_list(
+            [
+                WhereParam(
+                    left_expr=NormalizedExpr.from_column("t1.category"),
+                    op="=",
+                    value_type="string",
+                    param_key="p1",
+                )
+            ]
+        ),
     )
     return Template(
         id="T0001",
@@ -39,7 +44,7 @@ def _minimal_template(*, question: str = "count of item in category x") -> Templ
         tables_used=["t1"],
         sql_param="SELECT 1 FROM t1 WHERE category = :p1",
         sql_fp="fp",
-        shape=SQLShape(num_joins=0, has_group_by=False, has_agg=False, num_filters=1),
+        shape=SQLShape(num_joins=0, has_group_by=False, has_agg=False, num_where=1),
         colmap_sig="cm",
         value_history=ValueHistory(
             param_values=[{"p1": "x"}],
@@ -53,12 +58,12 @@ def _minimal_template(*, question: str = "count of item in category x") -> Templ
 
 
 def test_handles_referenced_in_sql_param_orders_p_before_s() -> None:
-    assert handles_referenced_in_sql_param("WHERE a = :p2 AND limit :s1 AND b = :p1") == ("p1", "p2", "s1")
+    assert TemplateOps.handles_referenced_in_sql_param("WHERE a = :p2 AND limit :s1 AND b = :p1") == ("p1", "p2", "s1")
 
 
 def test_resolve_template_for_question_exact_match() -> None:
     tmpl = _minimal_template()
-    resolved = resolve_template_for_question("count of item in category x", {"T0001": tmpl})
+    resolved = TemplateOps.resolve_template_for_question("count of item in category x", {"T0001": tmpl})
     assert resolved is not None
     found, idx = resolved
     assert found.id == "T0001"
@@ -69,7 +74,7 @@ def test_build_parameter_bindings_uses_cached_display_names() -> None:
     tmpl = _minimal_template()
     schema = MagicMock()
     schema.tables = {}
-    bindings = build_parameter_bindings(
+    bindings = TemplateOps.build_parameter_bindings(
         tmpl,
         history_index=0,
         schema=schema,
@@ -80,6 +85,7 @@ def test_build_parameter_bindings_uses_cached_display_names() -> None:
         handle="p1",
         current_value="x",
         display_name="category",
+        column_expr="t1.category",
     )
 
 

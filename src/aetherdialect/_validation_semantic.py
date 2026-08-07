@@ -2,28 +2,26 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 from ._constants import (
-    AGG_KEYWORDS_RE,
     AGG_QUANTITY_RE,
     COMPATIBLE_TYPE_PAIRS,
     COUNT_THRESHOLD_TABLE_RE,
     DATE_FRIENDLY_VALUE_TYPES,
-    INTENT_NON_SELECTABLE_PREDICATE_MESSAGE_BY_SENSITIVITY_VALUE,
-    INTENT_NON_SELECTABLE_PREDICATE_MESSAGE_DEFAULT,
+    DIAGNOSTIC_CODE_REFUSAL_NOT_AVAILABLE_IN_CONTEXT,
+    DIAGNOSTIC_CODE_REFUSAL_OPAQUE_EXPR,
     NUMERIC_ONLY_AGGREGATIONS,
     NUMERIC_RESULT_AGGS,
     NUMERIC_RESULT_OPS,
     NUMERIC_RESULT_SCALARS,
-    QUESTION_AGGREGATION_RATE_PREFIX_RE,
     QUESTION_DISTINCT_KEYWORD_RE,
-    QUESTION_FOR_EACH_OR_PER_RE,
     QUESTION_NUMERIC_LITERAL_RE,
     QUESTION_TOP_N_PHRASE_RE,
     QUESTION_YEAR_IN_STRING_RE,
+    REFUSAL_CATALOGUE,
+    REFUSAL_NOT_AVAILABLE_IN_CONTEXT_MESSAGE,
     SCALAR_FUNCTIONS_NUMERIC,
     SCALAR_FUNCTIONS_STRING,
     VALID_AGGREGATION_FUNCTIONS,
@@ -31,28 +29,29 @@ from ._constants import (
 )
 from ._contracts_base import (
     FailureCategory,
-    FilterParam,
     HavingParam,
     LogicalIntent,
     MulGroup,
     NormalizedExpr,
     OrderByCol,
+    PredicateGroup,
     SensitivityClassification,
-    expr_registry_ref,
+    WhereParam,
 )
-from ._contracts_core import (
-    RuntimeCteStep,
-    RuntimeIntent,
-    SelectCol,
-)
+from ._contracts_core import RuntimeCteStep, RuntimeIntent, SelectCol
 from ._contracts_schema import (
     CteOutputColumnMeta,
     IntentIssue,
     SchemaGraph,
-    make_intent_issue,
-    registry_render_scope,
+    WindowRegistryStep,
 )
-from ._core_utils import debug, stable_json
+from ._core_utils import (
+    build_case_folded_index,
+    column_metadata_timezone_awareness_mismatch,
+    debug,
+    emit_session_refusal_diagnostic,
+    stable_json,
+)
 from ._intent_expr import concat_logical_intent_prose, extract_columns_from_expr
 from ._validation_schema import (
     expr_has_arithmetic,
@@ -78,8 +77,18 @@ def _column_meta_or_none(schema: SchemaGraph, ref: str) -> Any:
     return schema.get_column(parts[0], parts[1])
 
 
+def _emit_denied_column_refusal(table: str, column: str, location: str) -> None:
+    """Record a denied-column refusal with audit metadata hidden from the user message."""
+    emit_session_refusal_diagnostic(
+        DIAGNOSTIC_CODE_REFUSAL_NOT_AVAILABLE_IN_CONTEXT,
+        REFUSAL_NOT_AVAILABLE_IN_CONTEXT_MESSAGE,
+        details=(("table", table), ("column", column), ("location", location)),
+        subject=f"{table}.{column}",
+    )
+
+
 def validate_deny_bare_select(intent: RuntimeIntent, schema: SchemaGraph) -> list[IntentIssue]:
-    """Reject bare (non-aggregated) ``select_cols`` entries that reference denied columns. Reads each column's ``is_denied`` flag (canonical source set during reflection from ``EngineContext.deny_columns``). Filters, ``group_by_cols``, and aggregated selects are not checked here — see ``validate_denied_references`` and ``validate_sensitivity_group_by`` for those gates. For CTEs, only steps whose ``cte_name`` appears in ``intent.tables`` are checked (terminal CTEs)."""
+    """Reject bare (non-aggregated) ``select_cols`` entries that reference denied columns. Reads each column's ``is_denied`` flag (canonical source set during reflection from ``EngineContext.deny_columns``). Filters, ``group_by_cols``, and aggregated selects are not checked here — see ``validate_denied_references`` and ``validate_sensitivity_group_by`` for those gates. Every CTE body is scanned, including probe and intermediate CTEs not listed in ``intent.tables``."""
     issues: list[IntentIssue] = []
 
     def _scan_select_cols(select_cols: list[SelectCol], context: str) -> None:
@@ -92,22 +101,18 @@ def validate_deny_bare_select(intent: RuntimeIntent, schema: SchemaGraph) -> lis
                     continue
                 t, c = ref.split(".", 1)
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"deny_bare_select_{context}_{idx}",
                         category=FailureCategory.DENY_BARE_SELECT,
                         severity="error",
-                        message=(
-                            f"{context}: denied column {t}.{c} cannot appear as a bare (non-aggregated) select column"
-                        ),
+                        message=REFUSAL_NOT_AVAILABLE_IN_CONTEXT_MESSAGE,
                         context={"table": t, "column": c, "location": context},
                     )
                 )
+                _emit_denied_column_refusal(t, c, context)
 
     _scan_select_cols(intent.select_cols or [], "main query")
-    main_names = {t.lower() for t in intent.tables or []}
     for cte in intent.cte_steps or []:
-        if cte.cte_name.lower() not in main_names:
-            continue
         _scan_select_cols(cte.select_cols or [], f"CTE {cte.cte_name}")
     return issues
 
@@ -120,24 +125,25 @@ def _scan_norm_expr_refs(expr: NormalizedExpr | None) -> list[str]:
 
 
 def validate_denied_references(intent: RuntimeIntent, schema: SchemaGraph) -> list[IntentIssue]:
-    """Reject any reference to a denied column in filters, group-by, having, order-by, or aggregated selects (including each terminal CTE body's ORDER BY list). Bare select projection is gated separately by ``validate_deny_bare_select``. This validator covers every other surface so a denied column never reaches generated SQL even when wrapped in COUNT, used as a WHERE predicate, or appears in GROUP BY / ORDER BY / HAVING."""
+    """Reject any reference to a denied column in filters, group-by, having, order-by, or aggregated selects (including each CTE body's ORDER BY list). Bare select projection is gated separately by ``validate_deny_bare_select``. This validator covers every other surface so a denied column never reaches generated SQL even when wrapped in COUNT, used as a WHERE predicate, or appears in GROUP BY / ORDER BY / HAVING. Every CTE body is scanned, including probe and intermediate CTEs not listed in ``intent.tables``."""
     issues: list[IntentIssue] = []
 
     def _emit(ref: str, location: str, idx: int) -> None:
         t, c = ref.split(".", 1)
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"denied_reference_{location}_{idx}_{t}_{c}",
                 category=FailureCategory.DENIED_REFERENCE,
                 severity="error",
-                message=f"{location}: denied column {t}.{c} cannot be referenced",
+                message=REFUSAL_NOT_AVAILABLE_IN_CONTEXT_MESSAGE,
                 context={"table": t, "column": c, "location": location},
             )
         )
+        _emit_denied_column_refusal(t, c, location)
 
     def _scan_intent(
         select_cols: list[SelectCol],
-        filters: list[FilterParam],
+        filters: list[WhereParam],
         group_by: list[NormalizedExpr],
         having: list[HavingParam],
         order_by: list[OrderByCol],
@@ -182,21 +188,18 @@ def validate_denied_references(intent: RuntimeIntent, schema: SchemaGraph) -> li
 
     _scan_intent(
         intent.select_cols or [],
-        intent.filters_param or [],
+        PredicateGroup.where_leaves(intent.where) or [],
         intent.group_by_cols or [],
-        intent.having_param or [],
+        PredicateGroup.having_leaves(intent.having) or [],
         intent.order_by_cols or [],
         "main query",
     )
-    main_names = {t.lower() for t in intent.tables or []}
     for cte in intent.cte_steps or []:
-        if cte.cte_name.lower() not in main_names:
-            continue
         _scan_intent(
             cte.select_cols or [],
-            cte.filters_param or [],
+            PredicateGroup.where_leaves(cte.where) or [],
             cte.group_by_cols or [],
-            cte.having_param or [],
+            PredicateGroup.having_leaves(cte.having) or [],
             cte.order_by_cols or [],
             f"CTE {cte.cte_name}",
         )
@@ -213,21 +216,19 @@ def validate_sensitivity_group_by(intent: RuntimeIntent, schema: SchemaGraph) ->
                 meta = _column_meta_or_none(schema, ref)
                 if meta is None:
                     continue
-                if meta.sensitivity not in (
-                    SensitivityClassification.RESTRICTED,
-                    SensitivityClassification.HIDDEN,
-                ):
+                if meta.sensitivity not in (SensitivityClassification.RESTRICTED, SensitivityClassification.HIDDEN):
                     continue
                 t, c = ref.split(".", 1)
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"sensitive_group_by_{location}_{idx}_{t}_{c}",
                         category=FailureCategory.SENSITIVE_GROUP_BY,
                         severity="error",
-                        message=f"{location}: sensitive column {t}.{c} cannot be used in GROUP BY",
+                        message=REFUSAL_NOT_AVAILABLE_IN_CONTEXT_MESSAGE,
                         context={"table": t, "column": c, "location": location},
                     )
                 )
+                _emit_denied_column_refusal(t, c, location)
 
     _scan(intent.group_by_cols or [], "main query")
     main_names = {t.lower() for t in intent.tables or []}
@@ -249,21 +250,19 @@ def validate_sensitivity_order_by(intent: RuntimeIntent, schema: SchemaGraph) ->
                 meta = _column_meta_or_none(schema, ref)
                 if meta is None:
                     continue
-                if meta.sensitivity not in (
-                    SensitivityClassification.RESTRICTED,
-                    SensitivityClassification.HIDDEN,
-                ):
+                if meta.sensitivity not in (SensitivityClassification.RESTRICTED, SensitivityClassification.HIDDEN):
                     continue
                 t, c = ref.split(".", 1)
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"sensitive_order_by_{location}_{idx}_{t}_{c}",
                         category=FailureCategory.ORDER_BY_VALIDITY,
                         severity="error",
-                        message=f"{location}: sensitive column {t}.{c} cannot be used in ORDER BY",
+                        message=REFUSAL_NOT_AVAILABLE_IN_CONTEXT_MESSAGE,
                         context={"table": t, "column": c, "location": location},
                     )
                 )
+                _emit_denied_column_refusal(t, c, location)
 
     _scan(intent.order_by_cols or [], "main query")
     main_names = {t.lower() for t in intent.tables or []}
@@ -295,16 +294,11 @@ def _issues_for_non_selectable_expr(
         if meta is None or meta.is_selectable:
             continue
         t, c = ref.split(".", 1)
-        sk = str(meta.sensitivity.value)
-        tpl = INTENT_NON_SELECTABLE_PREDICATE_MESSAGE_BY_SENSITIVITY_VALUE.get(
-            sk,
-            INTENT_NON_SELECTABLE_PREDICATE_MESSAGE_DEFAULT,
-        )
-        msg = tpl.format(location=location, table=t, column=c, surface=surface)
-        category = FailureCategory.FILTER_VALIDITY if surface == "WHERE" else FailureCategory.HAVING_SEMANTIC
+        msg = REFUSAL_NOT_AVAILABLE_IN_CONTEXT_MESSAGE
+        category = FailureCategory.WHERE_VALIDITY if surface == "WHERE" else FailureCategory.HAVING_SEMANTIC
         suf = f"_{id_suffix}" if id_suffix else ""
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"{issue_tag}{suf}_{location}_{t}_{c}",
                 category=category,
                 severity="error",
@@ -317,6 +311,7 @@ def _issues_for_non_selectable_expr(
                 },
             )
         )
+        _emit_denied_column_refusal(t, c, location)
     return issues
 
 
@@ -324,7 +319,7 @@ def validate_non_selectable_predicates(intent: RuntimeIntent, schema: SchemaGrap
     """Emit terminal issues when ``WHERE`` or ``HAVING`` references columns that are not selectable."""
     issues: list[IntentIssue] = []
 
-    def _scan_filters(filters: list[FilterParam], location: str) -> None:
+    def _scan_filters(filters: list[WhereParam], location: str) -> None:
         for fi, fp in enumerate(filters or []):
             op_cmp = (fp.op or "").strip().lower()
             if op_cmp not in ("is null", "is not null"):
@@ -334,7 +329,7 @@ def validate_non_selectable_predicates(intent: RuntimeIntent, schema: SchemaGrap
                         fp.left_expr,
                         location=location,
                         surface="WHERE",
-                        issue_tag="non_selectable_filter",
+                        issue_tag="non_selectable_where",
                         id_suffix=f"{fi}_L",
                     )
                 )
@@ -345,7 +340,7 @@ def validate_non_selectable_predicates(intent: RuntimeIntent, schema: SchemaGrap
                         fp.right_expr,
                         location=location,
                         surface="WHERE",
-                        issue_tag="non_selectable_filter",
+                        issue_tag="non_selectable_where",
                         id_suffix=f"{fi}_R",
                     )
                 )
@@ -373,45 +368,45 @@ def validate_non_selectable_predicates(intent: RuntimeIntent, schema: SchemaGrap
                 )
             )
 
-    _scan_filters(intent.filters_param or [], "main query")
-    _scan_having(intent.having_param or [], "main query")
+    _scan_filters(PredicateGroup.where_leaves(intent.where) or [], "main query")
+    _scan_having(PredicateGroup.having_leaves(intent.having) or [], "main query")
     main_names = {t.lower() for t in intent.tables or []}
     for cte in intent.cte_steps or []:
         if cte.cte_name.lower() not in main_names:
             continue
         loc = f"CTE {cte.cte_name}"
-        _scan_filters(cte.filters_param or [], loc)
-        _scan_having(cte.having_param or [], loc)
+        _scan_filters(PredicateGroup.where_leaves(cte.where) or [], loc)
+        _scan_having(PredicateGroup.having_leaves(cte.having) or [], loc)
     return issues
 
 
-def _filter_conjunct_groups(filters: list[FilterParam]) -> list[list[FilterParam]]:
-    """Partition ``filters_param`` into AND-conjuncts (OR splits in flat mode; ``filter_group`` buckets otherwise)."""
+def _where_conjunct_groups(where: PredicateGroup | list[WhereParam] | None) -> list[list[WhereParam]]:
+    """Partition WHERE predicates into AND-conjuncts from a predicate tree or flat list."""
+    if where is None:
+        return []
+    if isinstance(where, PredicateGroup):
+        if where.op == "or":
+            groups: list[list[WhereParam]] = []
+            for pred in where.predicates:
+                if isinstance(pred, WhereParam):
+                    groups.append([pred])
+            for child in where.groups:
+                groups.extend(_where_conjunct_groups(child))
+            return groups
+        filters = [p for p in where.leaves() if isinstance(p, WhereParam)]
+        if where.groups:
+            groups = [filters] if filters else []
+            for child in where.groups:
+                groups.extend(_where_conjunct_groups(child))
+            return groups
+        return [filters] if filters else []
+    filters = list(where)
     if not filters:
         return []
-    if any(fp.filter_group is not None for fp in filters):
-        ordered: list[int] = []
-        buckets: dict[int, list[FilterParam]] = {}
-        for fp in filters:
-            gid = fp.filter_group if fp.filter_group is not None else -1
-            if gid not in buckets:
-                ordered.append(gid)
-                buckets[gid] = []
-            buckets[gid].append(fp)
-        return [buckets[g] for g in ordered]
-    groups: list[list[FilterParam]] = []
-    cur: list[FilterParam] = [filters[0]]
-    for i in range(1, len(filters)):
-        if filters[i - 1].bool_op == "OR":
-            groups.append(cur)
-            cur = [filters[i]]
-        else:
-            cur.append(filters[i])
-    groups.append(cur)
-    return groups
+    return [filters]
 
 
-def _primary_filter_column_key(fp: FilterParam) -> str | None:
+def _primary_where_column_key(fp: WhereParam) -> str | None:
     """Return a single qualified ``table.column`` key for simple column filters, else ``None``."""
     refs = [r for r in extract_columns_from_expr(fp.left_expr) if "." in r]
     if len(refs) != 1:
@@ -432,7 +427,7 @@ def _scalar_norm_for_window_bounds(val: Any) -> str:
     return stable_json(val) if isinstance(val, dict | list | tuple) else str(val).strip().lower()
 
 
-def _filter_bound_norm(fp: FilterParam, pv: Mapping[str, Any] | None) -> str | None:
+def _where_bound_norm(fp: WhereParam, pv: Mapping[str, Any] | None) -> str | None:
     """Comparable bound payload for inequality / ``between`` window checks."""
     if fp.op == "between" and fp.param_key and fp.param_key_hi:
         store = pv or {}
@@ -472,15 +467,15 @@ def validate_empty_window(intent: RuntimeIntent, schema: SchemaGraph) -> list[In
     _ = schema
     issues: list[IntentIssue] = []
 
-    def _scan_filters(filters: list[FilterParam], pv: Mapping[str, Any] | None, loc: str) -> None:
+    def _scan_filters(filters: list[WhereParam], pv: Mapping[str, Any] | None, loc: str) -> None:
         for fp in filters or []:
             if fp.value_type == "date_window":
                 rv = fp.resolved_value(pv)
                 if isinstance(rv, dict) and "start" in rv and "end" in rv:
                     if _scalar_norm_for_window_bounds(rv.get("start")) == _scalar_norm_for_window_bounds(rv.get("end")):
-                        col = _primary_filter_column_key(fp) or "unknown column"
+                        col = _primary_where_column_key(fp) or "unknown column"
                         issues.append(
-                            make_intent_issue(
+                            IntentIssue.make(
                                 issue_id=f"intent_empty_window_{loc}_date_window_range",
                                 category=FailureCategory.INTENT_EMPTY_WINDOW,
                                 severity="error",
@@ -489,13 +484,13 @@ def validate_empty_window(intent: RuntimeIntent, schema: SchemaGraph) -> list[In
                             )
                         )
             if fp.op == "between":
-                bn = _filter_bound_norm(fp, pv)
+                bn = _where_bound_norm(fp, pv)
                 if bn and bn.startswith("between:"):
                     parts = bn.split(":", 2)
                     if len(parts) == 3 and parts[1] == parts[2] and parts[1] != "":
-                        col = _primary_filter_column_key(fp) or "unknown column"
+                        col = _primary_where_column_key(fp) or "unknown column"
                         issues.append(
-                            make_intent_issue(
+                            IntentIssue.make(
                                 issue_id=f"intent_empty_window_{loc}_between",
                                 category=FailureCategory.INTENT_EMPTY_WINDOW,
                                 severity="error",
@@ -503,16 +498,16 @@ def validate_empty_window(intent: RuntimeIntent, schema: SchemaGraph) -> list[In
                                 context={"location": loc, "column": col},
                             )
                         )
-        for conj in _filter_conjunct_groups(list(filters or [])):
+        for conj in _where_conjunct_groups(list(filters or [])):
             by_col: dict[str, dict[str, set[str]]] = {}
             for fp in conj:
-                col_key = _primary_filter_column_key(fp)
+                col_key = _primary_where_column_key(fp)
                 if col_key is None:
                     continue
                 op = (fp.op or "").strip().lower()
                 if op not in (">=", ">", "<=", "<"):
                     continue
-                bn = _filter_bound_norm(fp, pv)
+                bn = _where_bound_norm(fp, pv)
                 if bn is None:
                     continue
                 bucket = by_col.setdefault(col_key, {"lower": set(), "upper": set()})
@@ -525,7 +520,7 @@ def validate_empty_window(intent: RuntimeIntent, schema: SchemaGraph) -> list[In
                 ups = sides["upper"]
                 if any(low == up for low in lows for up in ups):
                     issues.append(
-                        make_intent_issue(
+                        IntentIssue.make(
                             issue_id=f"intent_empty_window_{loc}_{col.replace('.', '_')}",
                             category=FailureCategory.INTENT_EMPTY_WINDOW,
                             severity="error",
@@ -535,13 +530,13 @@ def validate_empty_window(intent: RuntimeIntent, schema: SchemaGraph) -> list[In
                     )
 
     pv_main = intent.param_values or {}
-    _scan_filters(intent.filters_param or [], pv_main, "main query")
+    _scan_filters(PredicateGroup.where_leaves(intent.where) or [], pv_main, "main query")
     main_names = {t.lower() for t in intent.tables or []}
     for cte in intent.cte_steps or []:
         if cte.cte_name.lower() not in main_names:
             continue
         pv_cte = cte.param_values or pv_main
-        _scan_filters(cte.filters_param or [], pv_cte, f"CTE {cte.cte_name}")
+        _scan_filters(PredicateGroup.where_leaves(cte.where) or [], pv_cte, f"CTE {cte.cte_name}")
     return issues
 
 
@@ -559,7 +554,7 @@ def validate_grain_consistency(
     )
     if grain not in VALID_GRAINS:
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"invalid_grain_{grain}",
                 category=FailureCategory.GRAIN_VALIDITY,
                 severity="error",
@@ -573,7 +568,7 @@ def validate_grain_consistency(
     has_having = bool(having_param)
     if grain == "grouped" and not has_group_by:
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"grouped_without_group_by_{context}",
                 category=FailureCategory.GRAIN_CONSISTENCY,
                 severity="error",
@@ -584,7 +579,7 @@ def validate_grain_consistency(
         debug("[validation_semantic.validate_grain_consistency] grouped grain without group_by")
     if grain in {"scalar", "row_level"} and has_group_by:
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"group_by_with_{grain}_{context}",
                 category=FailureCategory.GRAIN_CONSISTENCY,
                 severity="error",
@@ -600,7 +595,7 @@ def validate_grain_consistency(
     if has_agg and grain == "row_level":
         agg_funcs = [sc.expr.primary_term for sc in select_cols if sc.is_aggregated]
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"agg_with_row_level_{context}_{','.join(agg_funcs)}",
                 category=FailureCategory.GRAIN_CONSISTENCY,
                 severity="error",
@@ -611,7 +606,7 @@ def validate_grain_consistency(
         debug("[validation_semantic.validate_grain_consistency] agg funcs with row_level grain")
     if has_having and grain not in {"grouped", "scalar"}:
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"having_without_agg_{grain}_{context}",
                 category=FailureCategory.GRAIN_CONSISTENCY,
                 severity="error",
@@ -648,7 +643,7 @@ def validate_grouped_requires_aggregation(
     if hp and any(h.left_expr.has_aggregation for h in hp):
         return issues
     issues.append(
-        make_intent_issue(
+        IntentIssue.make(
             issue_id=f"grouped_without_aggregation_{context}",
             category=FailureCategory.GRAIN_CONSISTENCY,
             severity="error",
@@ -665,9 +660,7 @@ def validate_grouped_requires_aggregation(
 
 
 def validate_case_branch_aggregation_consistency(
-    case_registry: list[Any] | None,
-    group_by_cols: list[NormalizedExpr],
-    context: str = "main",
+    case_registry: list[Any] | None, group_by_cols: list[NormalizedExpr], context: str = "main"
 ) -> list[IntentIssue]:
     """Ensure CASE branch conditions that reference aggregates run in a. grouped scope. A branch like ``WHEN SUM(amount) > 1000 THEN ...`` is valid SQL only when the parent query aggregates (i.e. has at least one ``GROUP BY`` column). The intent_expr tagger sets ``CaseWhenExpr.condition_scope = "having"`` exactly when any branch's left/right expression has an aggregation; this validator emits an issue if that scope appears without ``GROUP BY``."""
 
@@ -678,10 +671,10 @@ def validate_case_branch_aggregation_consistency(
     def _check(cw: Any, label: str) -> None:
         if cw is None or not getattr(cw, "branches", None):
             return
-        if getattr(cw, "condition_scope", "filter") != "having":
+        if getattr(cw, "condition_scope", "where") != "having":
             return
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"case_branch_aggregation_without_group_by_{context}_{label}",
                 category=FailureCategory.HAVING_AGGREGATION,
                 severity="error",
@@ -707,11 +700,7 @@ def validate_case_branch_aggregation_consistency(
 
 
 def validate_semantic_contradictions(
-    select_cols: list[SelectCol],
-    natural_language: str,
-    grain: str,
-    expected_rows: str,
-    context: str = "main",
+    select_cols: list[SelectCol], natural_language: str, grain: str, expected_rows: str, context: str = "main"
 ) -> list[IntentIssue]:
     """Check for contradictory operations in the intent."""
     issues = []
@@ -725,7 +714,7 @@ def validate_semantic_contradictions(
     for set1, set2 in contradictory_pairs:
         if agg_funcs & set1 and agg_funcs & set2:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"contradictory_ops_{','.join(sorted(set1 & agg_funcs))}_{','.join(sorted(set2 & agg_funcs))}",
                     category=FailureCategory.SEMANTIC_CONTRADICTION,
                     severity="error",
@@ -742,7 +731,7 @@ def validate_semantic_contradictions(
             )
     if grain == "scalar" and expected_rows in {"few", "many"}:
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"grain_expected_mismatch_scalar_{expected_rows}",
                 category=FailureCategory.SEMANTIC_CONTRADICTION,
                 severity="error",
@@ -767,7 +756,7 @@ def validate_semantic_contradictions(
     for pattern1, pattern2 in contradiction_patterns:
         if pattern1 in nl and pattern2 in nl:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"nl_contradiction_{pattern1.replace(' ', '_')}_{pattern2.replace(' ', '_')}",
                     category=FailureCategory.SEMANTIC_CONTRADICTION,
                     severity="warning",
@@ -786,64 +775,15 @@ def validate_semantic_contradictions(
     return issues
 
 
-def validate_predicate_bool_op_filter_group_hints(
-    natural_language: str,
-    filters_param: list[FilterParam],
-    having_param: list[HavingParam],
-    context: str = "main query",
+def validate_predicate_group_hints(
+    natural_language: str, where: PredicateGroup | None, having: PredicateGroup | None, context: str = "main query"
 ) -> list[IntentIssue]:
-    """Emit soft warnings for ambiguous boolean-composition signals. Warns when ``filter_group`` is set alongside a non-``AND`` ``bool_op`` (grouped mode ignores ``bool_op``), and when the natural-language text suggests inclusive OR but no predicate row carries ``filter_group`` or ``bool_op=OR``."""
-    issues: list[IntentIssue] = []
-    for i, fp in enumerate(filters_param):
-        if fp.filter_group is not None and (fp.bool_op or "AND").strip().upper() != "AND":
-            issues.append(
-                make_intent_issue(
-                    issue_id=f"filter_both_bool_signals_{i}",
-                    category=FailureCategory.FILTER_SEMANTIC,
-                    severity="warning",
-                    message=(
-                        f"Filter row {i} sets both filter_group={fp.filter_group} and bool_op={fp.bool_op!r}; "
-                        "grouped bodies ignore bool_op — drop bool_op on grouped rows."
-                    ),
-                    context={"index": i, "location": context},
-                )
-            )
-    for i, hp in enumerate(having_param):
-        if hp.filter_group is not None and (hp.bool_op or "AND").strip().upper() != "AND":
-            issues.append(
-                make_intent_issue(
-                    issue_id=f"having_both_bool_signals_{i}",
-                    category=FailureCategory.HAVING_SEMANTIC,
-                    severity="warning",
-                    message=(
-                        f"HAVING row {i} sets both filter_group={hp.filter_group} and bool_op={hp.bool_op!r}; "
-                        "grouped bodies ignore bool_op — drop bool_op on grouped rows."
-                    ),
-                    context={"index": i, "location": context},
-                )
-            )
-    nl = (natural_language or "").lower()
-    if re.search(r"\bor\b", nl):
-        has_group = any(fp.filter_group is not None for fp in filters_param) or any(
-            hp.filter_group is not None for hp in having_param
-        )
-        has_or_op = any((fp.bool_op or "AND").strip().upper() == "OR" for fp in filters_param) or any(
-            (hp.bool_op or "AND").strip().upper() == "OR" for hp in having_param
-        )
-        if not has_group and not has_or_op:
-            issues.append(
-                make_intent_issue(
-                    issue_id="nl_or_without_predicate_signal",
-                    category=FailureCategory.FILTER_SEMANTIC,
-                    severity="warning",
-                    message=(
-                        "Question text suggests OR but no filter_group and no bool_op=OR "
-                        "on predicate rows — OR may be missing from the intent."
-                    ),
-                    context={"location": context},
-                )
-            )
-    return issues
+    """Emit soft warnings for ambiguous boolean-composition signals in predicate trees."""
+    _ = natural_language
+    _ = context
+    _ = where
+    _ = having
+    return []
 
 
 def _validate_single_expr_types(
@@ -905,7 +845,7 @@ def _validate_single_expr_types(
                     if term_has_arith and col_type in DATE_FRIENDLY_VALUE_TYPES:
                         continue
                     issues.append(
-                        make_intent_issue(
+                        IntentIssue.make(
                             issue_id=f"expr_non_numeric_{location}_{ref}",
                             category=FailureCategory.EXPRESSION_TYPE,
                             severity="error",
@@ -922,7 +862,7 @@ def _validate_single_expr_types(
                     meta = get_col_meta(ref, schema, cte_outputs)
                     role = meta.role if meta else "unknown"
                     issues.append(
-                        make_intent_issue(
+                        IntentIssue.make(
                             issue_id=f"expr_invalid_role_{location}_{ref}",
                             category=FailureCategory.EXPRESSION_TYPE,
                             severity="warning",
@@ -943,7 +883,7 @@ def _validate_single_expr_types(
                     if div_has_arith and col_type in DATE_FRIENDLY_VALUE_TYPES:
                         continue
                     issues.append(
-                        make_intent_issue(
+                        IntentIssue.make(
                             issue_id=f"expr_non_numeric_div_{location}_{ref}",
                             category=FailureCategory.EXPRESSION_TYPE,
                             severity="error",
@@ -959,18 +899,14 @@ def _validate_single_expr_types(
 
 
 def _is_date_column_subtraction(
-    expr: NormalizedExpr,
-    schema: SchemaGraph,
-    cte_outputs: dict[str, dict[str, CteOutputColumnMeta]],
+    expr: NormalizedExpr, schema: SchemaGraph, cte_outputs: dict[str, dict[str, CteOutputColumnMeta]]
 ) -> bool:
     """Return True when *expr* is a date-column minus date-column subtraction."""
     return is_date_column_subtraction(expr, schema, cte_outputs)
 
 
 def _expr_effective_result_type(
-    expr: NormalizedExpr,
-    schema: SchemaGraph,
-    cte_outputs: dict[str, dict[str, CteOutputColumnMeta]],
+    expr: NormalizedExpr, schema: SchemaGraph, cte_outputs: dict[str, dict[str, CteOutputColumnMeta]]
 ) -> str | None:
     """Resolve the comparison type produced by *expr*."""
     if is_date_integer_day_arithmetic(expr, schema, cte_outputs):
@@ -984,36 +920,34 @@ def _expr_effective_result_type(
 
 
 def _expr_vs_expr_effective_left_type(
-    fp: FilterParam,
-    schema: SchemaGraph,
-    cte_outputs: dict[str, dict[str, CteOutputColumnMeta]],
+    fp: WhereParam, schema: SchemaGraph, cte_outputs: dict[str, dict[str, CteOutputColumnMeta]]
 ) -> str | None:
     """Resolve the comparison type for the left side of an expr-vs-expr filter."""
     return _expr_effective_result_type(fp.left_expr, schema, cte_outputs)
 
 
-def validate_expr_vs_expr_filters(
-    filters_param: list[FilterParam],
+def validate_expr_vs_expr_where(
+    where_params: list[WhereParam],
     schema: SchemaGraph,
     cte_outputs: dict[str, dict[str, CteOutputColumnMeta]] | None = None,
     context: str = "main",
 ) -> list[IntentIssue]:
-    """Validate ``FilterParam`` expression-vs-expression comparisons for type compatibility. Date subtraction yields integer day counts; integer columns with temporal role compare as integers when matched against elapsed-day expressions or duration columns."""
+    """Validate ``WhereParam`` expression-vs-expression comparisons for type compatibility. Date subtraction yields integer day counts; integer columns with temporal role compare as integers when matched against elapsed-day expressions or duration columns."""
     issues = []
-    if not filters_param:
+    if not where_params:
         return []
     cte_outputs = cte_outputs or {}
-    debug("[validation_semantic.validate_expr_vs_expr_filters] checking expr-vs-expr type compatibility")
-    for fp in filters_param:
+    debug("[validation_semantic.validate_expr_vs_expr_where] checking expr-vs-expr type compatibility")
+    for fp in where_params:
         if not fp.right_expr:
             continue
         left_col = fp.left_expr.primary_column
         right_col = fp.right_expr.primary_column
         if left_col == right_col:
             issues.append(
-                make_intent_issue(
-                    issue_id=f"self_comparison_filter_{left_col}",
-                    category=FailureCategory.FILTER_SEMANTIC,
+                IntentIssue.make(
+                    issue_id=f"self_comparison_where_{left_col}",
+                    category=FailureCategory.WHERE_SEMANTIC,
                     severity="error",
                     message=f"Self-comparison in filter: {left_col} compared to itself",
                     context={
@@ -1023,7 +957,7 @@ def validate_expr_vs_expr_filters(
                     },
                 )
             )
-            debug(f"[validation_semantic.validate_expr_vs_expr_filters] self-comparison: {left_col}")
+            debug(f"[validation_semantic.validate_expr_vs_expr_where] self-comparison: {left_col}")
             continue
         left_type = _expr_vs_expr_effective_left_type(fp, schema, cte_outputs)
         right_type = _expr_effective_result_type(fp.right_expr, schema, cte_outputs)
@@ -1034,9 +968,9 @@ def validate_expr_vs_expr_filters(
             ) not in COMPATIBLE_TYPE_PAIRS:
                 if left_type != right_type:
                     issues.append(
-                        make_intent_issue(
-                            issue_id=f"filter_type_mismatch_{left_col}_{right_col}",
-                            category=FailureCategory.FILTER_SEMANTIC,
+                        IntentIssue.make(
+                            issue_id=f"where_type_mismatch_{left_col}_{right_col}",
+                            category=FailureCategory.WHERE_SEMANTIC,
                             severity="error",
                             message=f"Type mismatch in filter: {left_col} ({left_type}) vs {right_col} ({right_type})",
                             context={
@@ -1050,16 +984,35 @@ def validate_expr_vs_expr_filters(
                         )
                     )
                     debug(
-                        f"[validation_semantic.validate_expr_vs_expr_filters] type mismatch: {left_type} vs {right_type}"
+                        f"[validation_semantic.validate_expr_vs_expr_where] type mismatch: {left_type} vs {right_type}"
                     )
         left_meta = get_col_meta(left_col, schema, cte_outputs)
         right_meta = get_col_meta(right_col, schema, cte_outputs)
         if left_meta and right_meta:
+            if column_metadata_timezone_awareness_mismatch(left_meta, right_meta):
+                issues.append(
+                    IntentIssue.make(
+                        issue_id=f"where_timezone_mismatch_{left_col}_{right_col}",
+                        category=FailureCategory.WHERE_SEMANTIC,
+                        severity="error",
+                        message=(
+                            f"Timezone awareness mismatch in filter: {left_col} ({left_meta.data_type}) "
+                            f"vs {right_col} ({right_meta.data_type})"
+                        ),
+                        context={
+                            "left_col": left_col,
+                            "right_col": right_col,
+                            "param_key": fp.param_key,
+                            "location": context,
+                        },
+                    )
+                )
+                continue
             if left_meta.is_primary_key or right_meta.is_primary_key:
                 issues.append(
-                    make_intent_issue(
-                        issue_id=f"pk_comparison_filter_{left_col}_{right_col}",
-                        category=FailureCategory.FILTER_SEMANTIC,
+                    IntentIssue.make(
+                        issue_id=f"pk_comparison_where_{left_col}_{right_col}",
+                        category=FailureCategory.WHERE_SEMANTIC,
                         severity="warning",
                         message=f"Comparing primary key in filter: {left_col} vs {right_col}",
                         context={
@@ -1070,8 +1023,8 @@ def validate_expr_vs_expr_filters(
                         },
                     )
                 )
-                debug(f"[validation_semantic.validate_expr_vs_expr_filters] PK comparison: {left_col}")
-    debug(f"[validation_semantic.validate_expr_vs_expr_filters] {len(issues)} issues in {context}")
+                debug(f"[validation_semantic.validate_expr_vs_expr_where] PK comparison: {left_col}")
+    debug(f"[validation_semantic.validate_expr_vs_expr_where] {len(issues)} issues in {context}")
     return issues
 
 
@@ -1100,7 +1053,7 @@ def validate_agg_vs_agg_having(
             continue
         if left_target == right_target and left_func == right_func:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"self_comparison_having_{left_term}",
                     category=FailureCategory.HAVING_SEMANTIC,
                     severity="error",
@@ -1117,6 +1070,27 @@ def validate_agg_vs_agg_having(
         if left_target and left_target != "*" and right_target and right_target != "*":
             left_type = get_col_type(left_target, schema, cte_outputs)
             right_type = get_col_type(right_target, schema, cte_outputs)
+            left_meta = get_col_meta(left_target, schema, cte_outputs)
+            right_meta = get_col_meta(right_target, schema, cte_outputs)
+            if left_meta and right_meta and column_metadata_timezone_awareness_mismatch(left_meta, right_meta):
+                issues.append(
+                    IntentIssue.make(
+                        issue_id=f"having_timezone_mismatch_{left_term}_{right_term}",
+                        category=FailureCategory.HAVING_SEMANTIC,
+                        severity="error",
+                        message=(
+                            f"Timezone awareness mismatch in HAVING: {left_term} ({left_meta.data_type}) "
+                            f"vs {right_term} ({right_meta.data_type})"
+                        ),
+                        context={
+                            "left_term": left_term,
+                            "right_term": right_term,
+                            "param_key": hp.param_key,
+                            "location": context,
+                        },
+                    )
+                )
+                continue
             if left_type and right_type:
                 numeric_funcs = {"sum", "avg", "count"}
                 if left_func in numeric_funcs and right_func in numeric_funcs:
@@ -1127,7 +1101,7 @@ def validate_agg_vs_agg_having(
                 ) not in COMPATIBLE_TYPE_PAIRS:
                     if left_type != right_type:
                         issues.append(
-                            make_intent_issue(
+                            IntentIssue.make(
                                 issue_id=f"having_type_mismatch_{left_term}_{right_term}",
                                 category=FailureCategory.HAVING_SEMANTIC,
                                 severity="warning",
@@ -1181,16 +1155,16 @@ def validate_order_by_expr_types(
     return issues
 
 
-def validate_filter_expr_types(
-    filters_param: list[FilterParam],
+def validate_where_expr_types(
+    where_params: list[WhereParam],
     schema: SchemaGraph,
     cte_outputs: dict[str, dict[str, CteOutputColumnMeta]] | None = None,
     context: str = "main",
 ) -> list[IntentIssue]:
-    """Validate `FilterParam` expression types, cross-expression type. compatibility, and operator compatibility."""
+    """Validate `WhereParam` expression types, cross-expression type. compatibility, and operator compatibility."""
     issues: list[IntentIssue] = []
     cte_outputs = cte_outputs or {}
-    for fp in filters_param or []:
+    for fp in where_params or []:
         pk = fp.param_key or "unknown"
         issues.extend(_validate_single_expr_types(fp.left_expr, schema, cte_outputs, f"filter_{pk}_left", context))
         if fp.right_expr:
@@ -1205,8 +1179,8 @@ def validate_filter_expr_types(
                 pass
             elif left_num is not None and right_num is not None and left_num != right_num:
                 issues.append(
-                    make_intent_issue(
-                        issue_id=f"filter_cross_type_mismatch_{pk}",
+                    IntentIssue.make(
+                        issue_id=f"where_cross_type_mismatch_{pk}",
                         category=FailureCategory.EXPRESSION_TYPE,
                         severity="error",
                         message=f"Filter '{pk}' compares numeric expression to non-numeric expression in {context}",
@@ -1227,15 +1201,11 @@ def validate_filter_expr_types(
             (left_arith or right_arith)
             and not date_arith
             and fp.op not in NUMERIC_RESULT_OPS
-            and fp.op
-            not in (
-                "is null",
-                "is not null",
-            )
+            and fp.op not in ("is null", "is not null")
         ):
             issues.append(
-                make_intent_issue(
-                    issue_id=f"filter_op_on_arith_{pk}_{fp.op}",
+                IntentIssue.make(
+                    issue_id=f"where_op_on_arith_{pk}_{fp.op}",
                     category=FailureCategory.EXPRESSION_TYPE,
                     severity="error",
                     message=f"Operator '{fp.op}' invalid on arithmetic expression in filter '{pk}' in {context}. Expected: {sorted(NUMERIC_RESULT_OPS)}",
@@ -1248,7 +1218,7 @@ def validate_filter_expr_types(
                 )
             )
     if issues:
-        debug(f"[validation_semantic.validate_filter_expr_types] {len(issues)} issues in {context}")
+        debug(f"[validation_semantic.validate_where_expr_types] {len(issues)} issues in {context}")
     return issues
 
 
@@ -1272,7 +1242,7 @@ def validate_having_expr_types(
             right_num = expr_result_is_numeric(hp.right_expr, schema, cte_outputs)
             if left_num is not None and right_num is not None and left_num != right_num:
                 issues.append(
-                    make_intent_issue(
+                    IntentIssue.make(
                         issue_id=f"having_cross_type_mismatch_{pk}",
                         category=FailureCategory.EXPRESSION_TYPE,
                         severity="error",
@@ -1291,17 +1261,13 @@ def validate_having_expr_types(
 
 
 def _validate_concat_group(
-    group: MulGroup,
-    location: str,
-    context: str,
-    *,
-    parent_is_distinct_count: bool = False,
+    group: MulGroup, location: str, context: str, *, parent_is_distinct_count: bool = False
 ) -> list[IntentIssue]:
     """Enforce structural rules for a MulGroup whose outer scalar. function is CONCAT."""
     issues: list[IntentIssue] = []
     if group.divide:
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"concat_divide_{location}",
                 category=FailureCategory.STRUCTURAL,
                 severity="error",
@@ -1311,7 +1277,7 @@ def _validate_concat_group(
         )
     if group.coefficient != 1.0 or (group.coeff_param_key or "").strip():
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"concat_coeff_{location}",
                 category=FailureCategory.STRUCTURAL,
                 severity="error",
@@ -1321,7 +1287,7 @@ def _validate_concat_group(
         )
     if (group.inner_scalar_func or "").strip():
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"concat_inner_scalar_{location}",
                 category=FailureCategory.STRUCTURAL,
                 severity="error",
@@ -1332,7 +1298,7 @@ def _validate_concat_group(
     if parent_is_distinct_count:
         if group.distinct:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"concat_distinct_under_count_{location}",
                     category=FailureCategory.STRUCTURAL,
                     severity="error",
@@ -1348,7 +1314,7 @@ def _validate_concat_group(
         pass
     elif agg and agg != "count":
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"concat_agg_{location}",
                 category=FailureCategory.STRUCTURAL,
                 severity="error",
@@ -1359,7 +1325,7 @@ def _validate_concat_group(
     for pi, part in enumerate(group.multiply):
         if part.has_aggregation:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"concat_nested_agg_{location}_{pi}",
                     category=FailureCategory.STRUCTURAL,
                     severity="error",
@@ -1371,11 +1337,7 @@ def _validate_concat_group(
 
 
 def _walk_expr_concat_mulgroups(
-    expr: NormalizedExpr,
-    location: str,
-    context: str,
-    *,
-    parent_is_distinct_count: bool = False,
+    expr: NormalizedExpr, location: str, context: str, *, parent_is_distinct_count: bool = False
 ) -> list[IntentIssue]:
     """Recursively validate CONCAT MulGroup entries nested under a. NormalizedExpr."""
     issues: list[IntentIssue] = []
@@ -1386,20 +1348,12 @@ def _walk_expr_concat_mulgroups(
             child_parent_distinct_count = True
         if (g.scalar_func or "").lower() == "concat":
             issues.extend(
-                _validate_concat_group(
-                    g,
-                    loc_g,
-                    context,
-                    parent_is_distinct_count=child_parent_distinct_count,
-                )
+                _validate_concat_group(g, loc_g, context, parent_is_distinct_count=child_parent_distinct_count)
             )
         for ti, t in enumerate(g.multiply + g.divide):
             issues.extend(
                 _walk_expr_concat_mulgroups(
-                    t,
-                    f"{loc_g}_m[{ti}]",
-                    context,
-                    parent_is_distinct_count=child_parent_distinct_count,
+                    t, f"{loc_g}_m[{ti}]", context, parent_is_distinct_count=child_parent_distinct_count
                 )
             )
     for gi, g in enumerate(expr.sub_groups):
@@ -1409,20 +1363,12 @@ def _walk_expr_concat_mulgroups(
             child_parent_distinct_count = True
         if (g.scalar_func or "").lower() == "concat":
             issues.extend(
-                _validate_concat_group(
-                    g,
-                    loc_g,
-                    context,
-                    parent_is_distinct_count=child_parent_distinct_count,
-                )
+                _validate_concat_group(g, loc_g, context, parent_is_distinct_count=child_parent_distinct_count)
             )
         for ti, t in enumerate(g.multiply + g.divide):
             issues.extend(
                 _walk_expr_concat_mulgroups(
-                    t,
-                    f"{loc_g}_m[{ti}]",
-                    context,
-                    parent_is_distinct_count=child_parent_distinct_count,
+                    t, f"{loc_g}_m[{ti}]", context, parent_is_distinct_count=child_parent_distinct_count
                 )
             )
     return issues
@@ -1437,12 +1383,12 @@ def validate_concat_mulgroups_in_runtime(intent: RuntimeIntent, context: str) ->
         issues.extend(_walk_expr_concat_mulgroups(g, f"{context} group_by_cols[{idx}]", context))
     for idx, obc in enumerate(intent.order_by_cols or []):
         issues.extend(_walk_expr_concat_mulgroups(obc.expr, f"{context} order_by_cols[{idx}]", context))
-    for fp in intent.filters_param or []:
+    for fp in PredicateGroup.where_leaves(intent.where) or []:
         pk = fp.param_key or "unknown"
-        issues.extend(_walk_expr_concat_mulgroups(fp.left_expr, f"{context} filter_{pk}_left", context))
+        issues.extend(_walk_expr_concat_mulgroups(fp.left_expr, f"{context} where_{pk}_left", context))
         if fp.right_expr:
-            issues.extend(_walk_expr_concat_mulgroups(fp.right_expr, f"{context} filter_{pk}_right", context))
-    for hp in intent.having_param or []:
+            issues.extend(_walk_expr_concat_mulgroups(fp.right_expr, f"{context} where_{pk}_right", context))
+    for hp in PredicateGroup.having_leaves(intent.having) or []:
         pk = hp.param_key or "unknown"
         issues.extend(_walk_expr_concat_mulgroups(hp.left_expr, f"{context} having_{pk}_left", context))
         if hp.right_expr:
@@ -1455,12 +1401,12 @@ def validate_concat_mulgroups_in_runtime(intent: RuntimeIntent, context: str) ->
             issues.extend(_walk_expr_concat_mulgroups(g, f"{cctx} group_by_cols[{idx}]", cctx))
         for idx, obc in enumerate(cte.order_by_cols or []):
             issues.extend(_walk_expr_concat_mulgroups(obc.expr, f"{cctx} order_by_cols[{idx}]", cctx))
-        for fp in cte.filters_param or []:
+        for fp in PredicateGroup.where_leaves(cte.where) or []:
             pk = fp.param_key or "unknown"
-            issues.extend(_walk_expr_concat_mulgroups(fp.left_expr, f"{cctx} filter_{pk}_left", cctx))
+            issues.extend(_walk_expr_concat_mulgroups(fp.left_expr, f"{cctx} where_{pk}_left", cctx))
             if fp.right_expr:
-                issues.extend(_walk_expr_concat_mulgroups(fp.right_expr, f"{cctx} filter_{pk}_right", cctx))
-        for hp in cte.having_param or []:
+                issues.extend(_walk_expr_concat_mulgroups(fp.right_expr, f"{cctx} where_{pk}_right", cctx))
+        for hp in PredicateGroup.having_leaves(cte.having) or []:
             pk = hp.param_key or "unknown"
             issues.extend(_walk_expr_concat_mulgroups(hp.left_expr, f"{cctx} having_{pk}_left", cctx))
             if hp.right_expr:
@@ -1470,8 +1416,101 @@ def validate_concat_mulgroups_in_runtime(intent: RuntimeIntent, context: str) ->
     return issues
 
 
+_OPAQUE_EXPR_REFUSAL_MESSAGE: str = REFUSAL_CATALOGUE[DIAGNOSTIC_CODE_REFUSAL_OPAQUE_EXPR]["user_text"]
+
+
+def _walk_opaque_raw_sql(expr: NormalizedExpr | None, location: str, context: str) -> list[IntentIssue]:
+    """Collect issues for opaque ``raw_sql`` leaves nested under *expr*."""
+    if expr is None:
+        return []
+    issues: list[IntentIssue] = []
+    if expr.raw_sql:
+        issues.append(
+            IntentIssue.make(
+                issue_id=f"opaque_raw_sql_{location}",
+                category=FailureCategory.INTENT_PARSE_FAILED,
+                severity="error",
+                message=_OPAQUE_EXPR_REFUSAL_MESSAGE,
+                context={"location": location, "context": context},
+            )
+        )
+        emit_session_refusal_diagnostic(DIAGNOSTIC_CODE_REFUSAL_OPAQUE_EXPR, _OPAQUE_EXPR_REFUSAL_MESSAGE)
+    for gi, g in enumerate(expr.add_groups):
+        loc_g = f"{location}_add[{gi}]"
+        for ti, t in enumerate(g.multiply + g.divide):
+            issues.extend(_walk_opaque_raw_sql(t, f"{loc_g}_m[{ti}]", context))
+    for gi, g in enumerate(expr.sub_groups):
+        loc_g = f"{location}_sub[{gi}]"
+        for ti, t in enumerate(g.multiply + g.divide):
+            issues.extend(_walk_opaque_raw_sql(t, f"{loc_g}_m[{ti}]", context))
+    return issues
+
+
+def _scan_intent_opaque_raw_sql(
+    *,
+    select_cols: list[SelectCol],
+    group_by_cols: list[NormalizedExpr],
+    order_by_cols: list[OrderByCol],
+    where: PredicateGroup | None,
+    having: PredicateGroup | None,
+    distinct_on: list[NormalizedExpr],
+    context: str,
+) -> list[IntentIssue]:
+    """Walk expression surfaces on one query scope for opaque ``raw_sql`` leaves."""
+    issues: list[IntentIssue] = []
+    for idx, sc in enumerate(select_cols or []):
+        issues.extend(_walk_opaque_raw_sql(sc.expr, f"{context} select_cols[{idx}]", context))
+    for idx, g in enumerate(group_by_cols or []):
+        issues.extend(_walk_opaque_raw_sql(g, f"{context} group_by_cols[{idx}]", context))
+    for idx, obc in enumerate(order_by_cols or []):
+        issues.extend(_walk_opaque_raw_sql(obc.expr, f"{context} order_by_cols[{idx}]", context))
+    for idx, expr in enumerate(distinct_on or []):
+        issues.extend(_walk_opaque_raw_sql(expr, f"{context} distinct_on[{idx}]", context))
+    for fp in PredicateGroup.where_leaves(where) or []:
+        pk = fp.param_key or "unknown"
+        issues.extend(_walk_opaque_raw_sql(fp.left_expr, f"{context} where_{pk}_left", context))
+        if fp.right_expr:
+            issues.extend(_walk_opaque_raw_sql(fp.right_expr, f"{context} where_{pk}_right", context))
+    for hp in PredicateGroup.having_leaves(having) or []:
+        pk = hp.param_key or "unknown"
+        issues.extend(_walk_opaque_raw_sql(hp.left_expr, f"{context} having_{pk}_left", context))
+        if hp.right_expr:
+            issues.extend(_walk_opaque_raw_sql(hp.right_expr, f"{context} having_{pk}_right", context))
+    return issues
+
+
+def validate_no_opaque_raw_sql(intent: RuntimeIntent, schema: SchemaGraph) -> list[IntentIssue]:
+    """Reject intents that carry opaque ``raw_sql`` expression leaves anywhere in the tree."""
+    del schema
+    issues = _scan_intent_opaque_raw_sql(
+        select_cols=intent.select_cols or [],
+        group_by_cols=intent.group_by_cols or [],
+        order_by_cols=intent.order_by_cols or [],
+        where=intent.where,
+        having=intent.having,
+        distinct_on=intent.distinct_on or [],
+        context="main query",
+    )
+    for cte in intent.cte_steps or []:
+        cctx = f"CTE '{cte.cte_name}'"
+        issues.extend(
+            _scan_intent_opaque_raw_sql(
+                select_cols=cte.select_cols or [],
+                group_by_cols=cte.group_by_cols or [],
+                order_by_cols=cte.order_by_cols or [],
+                where=cte.where,
+                having=cte.having,
+                distinct_on=cte.distinct_on or [],
+                context=cctx,
+            )
+        )
+    if issues:
+        debug(f"[validation_semantic.validate_no_opaque_raw_sql] {len(issues)} issues")
+    return issues
+
+
 def validate_arith_expression_semantics(
-    filters_param: list[FilterParam],
+    where_params: list[WhereParam],
     having_param: list[HavingParam],
     schema: SchemaGraph,
     cte_outputs: dict[str, dict[str, CteOutputColumnMeta]] | None = None,
@@ -1481,46 +1520,30 @@ def validate_arith_expression_semantics(
     issues = []
     cte_outputs = cte_outputs or {}
     debug("[validation_semantic.validate_arith_expression_semantics] checking arithmetic semantics")
-    for fp in filters_param:
+    for fp in where_params:
         if expr_has_arithmetic(fp.left_expr):
             issues.extend(
                 _validate_single_expr_types(
-                    fp.left_expr,
-                    schema,
-                    cte_outputs,
-                    f"filter_{fp.param_key or 'unknown'}_left",
-                    context,
+                    fp.left_expr, schema, cte_outputs, f"filter_{fp.param_key or 'unknown'}_left", context
                 )
             )
         if fp.right_expr and expr_has_arithmetic(fp.right_expr):
             issues.extend(
                 _validate_single_expr_types(
-                    fp.right_expr,
-                    schema,
-                    cte_outputs,
-                    f"filter_{fp.param_key or 'unknown'}_right",
-                    context,
+                    fp.right_expr, schema, cte_outputs, f"filter_{fp.param_key or 'unknown'}_right", context
                 )
             )
     for hp in having_param:
         if expr_has_arithmetic(hp.left_expr):
             issues.extend(
                 _validate_single_expr_types(
-                    hp.left_expr,
-                    schema,
-                    cte_outputs,
-                    f"having_{hp.param_key or 'unknown'}_left",
-                    context,
+                    hp.left_expr, schema, cte_outputs, f"having_{hp.param_key or 'unknown'}_left", context
                 )
             )
         if hp.right_expr and expr_has_arithmetic(hp.right_expr):
             issues.extend(
                 _validate_single_expr_types(
-                    hp.right_expr,
-                    schema,
-                    cte_outputs,
-                    f"having_{hp.param_key or 'unknown'}_right",
-                    context,
+                    hp.right_expr, schema, cte_outputs, f"having_{hp.param_key or 'unknown'}_right", context
                 )
             )
     debug(f"[validation_semantic.validate_arith_expression_semantics] {len(issues)} issues in {context}")
@@ -1547,17 +1570,17 @@ def _term_has_aggregation(term: Any) -> bool:
     return any(upper.startswith(f"{a.upper()}(") or f" {a.upper()}(" in upper for a in VALID_AGGREGATION_FUNCTIONS)
 
 
-def validate_filter_no_aggregation(filters_param: list[FilterParam], context: str = "main") -> list[IntentIssue]:
+def validate_where_no_aggregation(where_params: list[WhereParam], context: str = "main") -> list[IntentIssue]:
     """Validate that filter (WHERE) conditions do not contain. aggregation functions."""
     issues: list[IntentIssue] = []
-    debug("[validation_semantic.validate_filter_no_aggregation] checking filter aggregation ban")
-    for fp in filters_param or []:
+    debug("[validation_semantic.validate_where_no_aggregation] checking filter aggregation ban")
+    for fp in where_params or []:
         pk = fp.param_key or "unknown"
         if fp.left_expr.has_aggregation:
             issues.append(
-                make_intent_issue(
-                    issue_id=f"filter_has_aggregation_{pk}_left",
-                    category=FailureCategory.FILTER_AGGREGATION,
+                IntentIssue.make(
+                    issue_id=f"where_has_aggregation_{pk}_left",
+                    category=FailureCategory.WHERE_AGGREGATION,
                     severity="error",
                     message=f"Filter '{pk}' left expression contains aggregation in {context}; use HAVING instead of WHERE",
                     context={"param_key": pk, "side": "left", "location": context},
@@ -1565,16 +1588,16 @@ def validate_filter_no_aggregation(filters_param: list[FilterParam], context: st
             )
         if fp.right_expr and fp.right_expr.has_aggregation:
             issues.append(
-                make_intent_issue(
-                    issue_id=f"filter_has_aggregation_{pk}_right",
-                    category=FailureCategory.FILTER_AGGREGATION,
+                IntentIssue.make(
+                    issue_id=f"where_has_aggregation_{pk}_right",
+                    category=FailureCategory.WHERE_AGGREGATION,
                     severity="error",
                     message=f"Filter '{pk}' right expression contains aggregation in {context}; use HAVING instead of WHERE",
                     context={"param_key": pk, "side": "right", "location": context},
                 )
             )
     if issues:
-        debug(f"[validation_semantic.validate_filter_no_aggregation] {len(issues)} issues in {context}")
+        debug(f"[validation_semantic.validate_where_no_aggregation] {len(issues)} issues in {context}")
     return issues
 
 
@@ -1587,7 +1610,7 @@ def validate_having_operator_is_numeric(having_param: list[HavingParam], context
         op_norm = (hp.op or "=").strip().lower()
         if op_norm not in allowed:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"having_non_numeric_op_{pk}",
                     category=FailureCategory.WRONG_HAVING,
                     severity="error",
@@ -1604,17 +1627,14 @@ def validate_having_operator_is_numeric(having_param: list[HavingParam], context
 
 
 def validate_having_requires_aggregation(
-    having_param: list[HavingParam],
-    context: str = "main",
-    *,
-    group_by_cols: list[Any] | None = None,
+    having_param: list[HavingParam], context: str = "main", *, group_by_cols: list[Any] | None = None
 ) -> list[IntentIssue]:
     """Validate that each HAVING condition contains at least one. aggregation (left or right expression). When ``group_by_cols`` is empty but ``having_param`` is non-empty, emit ``having_without_group_by``."""
     issues: list[IntentIssue] = []
     debug("[validation_semantic.validate_having_requires_aggregation] checking having aggregation requirement")
     if having_param and not (group_by_cols or []):
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id="having_without_group_by",
                 category=FailureCategory.WRONG_HAVING,
                 severity="error",
@@ -1628,7 +1648,7 @@ def validate_having_requires_aggregation(
         has_agg = hp.left_expr.has_aggregation or (hp.right_expr is not None and hp.right_expr.has_aggregation)
         if not has_agg:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"having_missing_aggregation_{pk}",
                     category=FailureCategory.HAVING_AGGREGATION,
                     severity="error",
@@ -1642,12 +1662,7 @@ def validate_having_requires_aggregation(
 
 
 def _predicate_sidedness_issues(
-    left: NormalizedExpr,
-    right: NormalizedExpr | None,
-    op: str,
-    param_key: str | None,
-    clause: str,
-    context: str,
+    left: NormalizedExpr, right: NormalizedExpr | None, op: str, param_key: str | None, clause: str, context: str
 ) -> list[IntentIssue]:
     """Return an issue when a literal-only side appears on the left of a column-bearing side."""
     if right is None:
@@ -1658,7 +1673,7 @@ def _predicate_sidedness_issues(
         return []
     pk = param_key or "unknown"
     return [
-        make_intent_issue(
+        IntentIssue.make(
             issue_id=f"predicate_literal_left_{clause}_{pk}",
             category=FailureCategory.PREDICATE_SIDEDNESS,
             severity="error",
@@ -1677,15 +1692,13 @@ def _predicate_sidedness_issues(
 
 
 def validate_predicate_sidedness(
-    filters_param: list[FilterParam],
-    having_param: list[HavingParam],
-    context: str = "main",
+    where_params: list[WhereParam], having_param: list[HavingParam], context: str = "main"
 ) -> list[IntentIssue]:
     """Validate that expr-vs-expr predicates place column-bearing sides on the left."""
     issues: list[IntentIssue] = []
     debug("[validation_semantic.validate_predicate_sidedness] checking predicate sidedness")
-    for fp in filters_param or []:
-        issues.extend(_predicate_sidedness_issues(fp.left_expr, fp.right_expr, fp.op, fp.param_key, "filter", context))
+    for fp in where_params or []:
+        issues.extend(_predicate_sidedness_issues(fp.left_expr, fp.right_expr, fp.op, fp.param_key, "where", context))
     for hp in having_param or []:
         issues.extend(_predicate_sidedness_issues(hp.left_expr, hp.right_expr, hp.op, hp.param_key, "having", context))
     if issues:
@@ -1700,7 +1713,7 @@ def _check_nested_aggregation(expr: NormalizedExpr, location: str, context: str)
         group_inline_agg = any(_term_has_aggregation(t) for t in g.multiply + g.divide)
         if expr.agg_func and g.agg_func:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"nested_agg_expr_group_{location}",
                     category=FailureCategory.NESTED_AGGREGATION,
                     severity="error",
@@ -1714,7 +1727,7 @@ def _check_nested_aggregation(expr: NormalizedExpr, location: str, context: str)
             )
         if expr.agg_func and group_inline_agg:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"nested_agg_expr_inline_{location}",
                     category=FailureCategory.NESTED_AGGREGATION,
                     severity="error",
@@ -1724,7 +1737,7 @@ def _check_nested_aggregation(expr: NormalizedExpr, location: str, context: str)
             )
         if g.agg_func and group_inline_agg:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"nested_agg_group_inline_{location}",
                     category=FailureCategory.NESTED_AGGREGATION,
                     severity="error",
@@ -1738,7 +1751,7 @@ def _check_nested_aggregation(expr: NormalizedExpr, location: str, context: str)
 def validate_no_nested_aggregation(
     select_cols: list[SelectCol],
     order_by_cols: list[OrderByCol],
-    filters_param: list[FilterParam],
+    where_params: list[WhereParam],
     having_param: list[HavingParam],
     context: str = "main",
 ) -> list[IntentIssue]:
@@ -1749,7 +1762,7 @@ def validate_no_nested_aggregation(
         issues.extend(_check_nested_aggregation(sc.expr, f"select_cols[{idx}]", context))
     for idx, obc in enumerate(order_by_cols or []):
         issues.extend(_check_nested_aggregation(obc.expr, f"order_by_cols[{idx}]", context))
-    for fp in filters_param or []:
+    for fp in where_params or []:
         pk = fp.param_key or "unknown"
         issues.extend(_check_nested_aggregation(fp.left_expr, f"filter_{pk}_left", context))
         if fp.right_expr:
@@ -1785,7 +1798,7 @@ def _check_mixed_aggregation_in_group(group: MulGroup, location: str, context: s
                     break
     if agg_terms and bare_terms:
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"mixed_agg_bare_{location}",
                 category=FailureCategory.MIXED_AGGREGATION,
                 severity="error",
@@ -1831,7 +1844,7 @@ def _check_mixed_aggregation_in_expr(expr: NormalizedExpr, location: str, contex
                     bare_groups.append(sig)
         if agg_groups and bare_groups:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"mixed_agg_across_groups_{location}",
                     category=FailureCategory.MIXED_AGGREGATION,
                     severity="error",
@@ -1849,7 +1862,7 @@ def _check_mixed_aggregation_in_expr(expr: NormalizedExpr, location: str, contex
 def validate_mixed_aggregation_in_mulgroup(
     select_cols: list[SelectCol],
     order_by_cols: list[OrderByCol],
-    filters_param: list[FilterParam],
+    where_params: list[WhereParam],
     having_param: list[HavingParam],
     context: str = "main",
 ) -> list[IntentIssue]:
@@ -1860,7 +1873,7 @@ def validate_mixed_aggregation_in_mulgroup(
         issues.extend(_check_mixed_aggregation_in_expr(sc.expr, f"select_cols[{idx}]", context))
     for idx, obc in enumerate(order_by_cols or []):
         issues.extend(_check_mixed_aggregation_in_expr(obc.expr, f"order_by_cols[{idx}]", context))
-    for fp in filters_param or []:
+    for fp in where_params or []:
         pk = fp.param_key or "unknown"
         issues.extend(_check_mixed_aggregation_in_expr(fp.left_expr, f"filter_{pk}_left", context))
         if fp.right_expr:
@@ -1886,7 +1899,7 @@ def validate_order_by_aggregation_context(
     for idx, obc in enumerate(order_by_cols or []):
         if obc.expr.has_aggregation:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"order_by_agg_row_level_{idx}",
                     category=FailureCategory.ORDER_BY_AGGREGATION,
                     severity="error",
@@ -1900,10 +1913,7 @@ def validate_order_by_aggregation_context(
 
 
 def validate_select_group_by_membership(
-    select_cols: list[SelectCol],
-    group_by_cols: list[NormalizedExpr],
-    grain: str,
-    context: str = "main",
+    select_cols: list[SelectCol], group_by_cols: list[NormalizedExpr], grain: str, context: str = "main"
 ) -> list[IntentIssue]:
     """Validate that every non-aggregated SELECT column appears in GROUP BY when mixed aggregation is present."""
     issues: list[IntentIssue] = []
@@ -1923,7 +1933,7 @@ def validate_select_group_by_membership(
             continue
         if col.lower() not in group_by_set:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"select_not_in_group_by_{idx}_{col}",
                     category=FailureCategory.GROUP_BY_MEMBERSHIP,
                     severity="error",
@@ -1943,17 +1953,17 @@ def validate_select_group_by_membership(
 
 def _validate_cte_grain_complete(cte: RuntimeCteStep, context: str) -> list[IntentIssue]:
     """Validate one CTE body against the grain state machine using. structural facts only. Emits errors only for impossible combinations of ``GROUP BY``, ``SELECT`` aggregation, ``HAVING``, and declared ``grain``. Wrong labels without structural conflict are left to deterministic repair."""
-    with registry_render_scope(cte.window_registry, cte.case_registry):
+    with WindowRegistryStep.render_scope(cte.window_registry, cte.case_registry):
         issues: list[IntentIssue] = []
         grain = cte.grain or "row_level"
         group_by = cte.group_by_cols or []
         select_cols = cte.select_cols or []
-        having_param = cte.having_param or []
+        having_param = PredicateGroup.having_leaves(cte.having) or []
         has_agg = any(sc.is_aggregated for sc in select_cols)
         all_cols_agg = all(sc.is_aggregated for sc in select_cols) if select_cols else True
         if having_param and not has_agg:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"cte_{cte.cte_name}_having_no_agg",
                     category=FailureCategory.CTE_AGGREGATION,
                     severity="error",
@@ -1967,7 +1977,7 @@ def _validate_cte_grain_complete(cte: RuntimeCteStep, context: str) -> list[Inte
             )
         if group_by and not has_agg:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"cte_group_by_without_agg_{cte.cte_name}",
                     category=FailureCategory.CTE_GRAIN_CONSISTENCY,
                     severity="error",
@@ -1977,7 +1987,7 @@ def _validate_cte_grain_complete(cte: RuntimeCteStep, context: str) -> list[Inte
             )
         if has_agg and not group_by and not all_cols_agg:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"cte_agg_mixed_select_{cte.cte_name}",
                     category=FailureCategory.CTE_GRAIN_CONSISTENCY,
                     severity="error",
@@ -1994,7 +2004,7 @@ def _validate_cte_grain_complete(cte: RuntimeCteStep, context: str) -> list[Inte
             )
         if grain == "grouped" and not group_by:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"cte_grouped_no_groupby_{cte.cte_name}",
                     category=FailureCategory.CTE_GRAIN_CONSISTENCY,
                     severity="error",
@@ -2008,7 +2018,7 @@ def _validate_cte_grain_complete(cte: RuntimeCteStep, context: str) -> list[Inte
             )
         if grain in {"scalar", "row_level"} and group_by:
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"cte_groupby_with_{grain}_{cte.cte_name}",
                     category=FailureCategory.CTE_GRAIN_CONSISTENCY,
                     severity="error",
@@ -2024,7 +2034,7 @@ def _validate_cte_grain_complete(cte: RuntimeCteStep, context: str) -> list[Inte
         if has_agg and grain == "row_level":
             agg_funcs = [sc.expr.primary_term for sc in select_cols if sc.is_aggregated]
             issues.append(
-                make_intent_issue(
+                IntentIssue.make(
                     issue_id=f"cte_agg_row_level_{cte.cte_name}",
                     category=FailureCategory.CTE_GRAIN_CONSISTENCY,
                     severity="error",
@@ -2050,7 +2060,7 @@ def _cte_step_declares_window(cte: RuntimeCteStep) -> bool:
     """Return True when any SELECT column on the CTE step carries a. window specification."""
     if cte.window_registry:
         return True
-    return any((expr_registry_ref(sc.expr) or "").startswith("w") for sc in (cte.select_cols or []))
+    return any((sc.expr.registry_ref() or "").startswith("w") for sc in (cte.select_cols or []))
 
 
 def validate_cte_dependency_grains(
@@ -2078,7 +2088,7 @@ def validate_cte_dependency_grains(
                     if _cte_step_declares_window(cte):
                         continue
                     issues.append(
-                        make_intent_issue(
+                        IntentIssue.make(
                             issue_id=f"cte_grain_incompatible_{cte_name}_{table}",
                             category=FailureCategory.CTE_GRAIN_COMPATIBILITY,
                             severity="warning",
@@ -2147,7 +2157,7 @@ def validate_cte_join_key_exposure(intent: RuntimeIntent) -> list[IntentIssue]:
             continue
         levels = sorted({lvl for lvl, count in ref_levels if count > 1})
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"cte_missing_join_key_{name}",
                 category=FailureCategory.CTE_MISSING_JOIN_KEY,
                 severity="error",
@@ -2172,33 +2182,9 @@ def validate_question_agg_keyword_coverage(
     context: str = "main",
     cte_steps: list[RuntimeCteStep] | None = None,
 ) -> list[IntentIssue]:
-    """Flag aggregation-keyword questions whose intent has no. aggregation."""
-    if not natural_language:
-        return []
-    if not AGG_KEYWORDS_RE.search(natural_language):
-        return []
-    has_agg = any(sc.is_aggregated for sc in select_cols)
-    if not has_agg and cte_steps:
-        has_agg = any(any(scl.is_aggregated for scl in (step.select_cols or [])) for step in cte_steps)
-    if has_agg or having_param:
-        return []
-    issue = make_intent_issue(
-        issue_id=f"agg_keyword_missing_{context}",
-        category=FailureCategory.AGG_KEYWORD_MISSING,
-        severity="warning",
-        message=(
-            f"Question contains an aggregation keyword but the intent "
-            f"has no aggregated column and no HAVING condition in "
-            f"{context}. Add the appropriate aggregation function and "
-            f"set grain to 'grouped'."
-        ),
-        context={"location": context},
-    )
-    debug(
-        "[validation_semantic.validate_question_agg_keyword_coverage] "
-        "aggregation keyword in question but no agg in intent"
-    )
-    return [issue]
+    """Reserved hook; NL keyword heuristics are not used to drive validation."""
+    _ = (natural_language, select_cols, having_param, context, cte_steps)
+    return []
 
 
 def _runtime_intent_column_refs(intent: RuntimeIntent) -> set[str]:
@@ -2210,7 +2196,7 @@ def _runtime_intent_column_refs(intent: RuntimeIntent) -> set[str]:
             if "." in ref:
                 refs.add(ref.lower())
 
-    def add_filters(filters: list[FilterParam] | None) -> None:
+    def add_filters(filters: list[WhereParam] | None) -> None:
         for fp in filters or []:
             add_expr(fp.left_expr)
             if fp.right_expr is not None:
@@ -2222,8 +2208,8 @@ def _runtime_intent_column_refs(intent: RuntimeIntent) -> set[str]:
             if hp.right_expr is not None:
                 add_expr(hp.right_expr)
 
-    add_filters(intent.filters_param)
-    add_having(intent.having_param)
+    add_filters(PredicateGroup.where_leaves(intent.where))
+    add_having(PredicateGroup.having_leaves(intent.having))
     for sc in intent.select_cols or []:
         add_expr(sc.expr)
     for gb in intent.group_by_cols or []:
@@ -2231,8 +2217,8 @@ def _runtime_intent_column_refs(intent: RuntimeIntent) -> set[str]:
     for ob in intent.order_by_cols or []:
         add_expr(ob.expr)
     for cte in intent.cte_steps or []:
-        add_filters(cte.filters_param)
-        add_having(cte.having_param)
+        add_filters(PredicateGroup.where_leaves(cte.where))
+        add_having(PredicateGroup.having_leaves(cte.having))
         for sc in cte.select_cols or []:
             add_expr(sc.expr)
         for gb in cte.group_by_cols or []:
@@ -2244,7 +2230,7 @@ def _runtime_intent_column_refs(intent: RuntimeIntent) -> set[str]:
 
 def validate_logical_intent_numeric_coverage(
     logical_intent: LogicalIntent | None,
-    filters_param: list[FilterParam],
+    where_params: list[WhereParam],
     having_param: list[HavingParam],
     limit: int | None,
     context: str = "main",
@@ -2272,7 +2258,7 @@ def validate_logical_intent_numeric_coverage(
 
     intent_values: set[float] = set()
     covered_number_strs: set[str] = set()
-    for fp in filters_param:
+    for fp in where_params:
         rv = fp.resolved_value(param_values)
         if rv is not None:
             try:
@@ -2322,9 +2308,9 @@ def validate_logical_intent_numeric_coverage(
         if val in intent_values:
             continue
         issues.append(
-            make_intent_issue(
+            IntentIssue.make(
                 issue_id=f"missing_numeric_{num_str}_{context}",
-                category=FailureCategory.MISSING_NUMERIC_FILTER,
+                category=FailureCategory.MISSING_NUMERIC_WHERE,
                 severity="warning",
                 message=(
                     f"Coverage text mentions number '{num_str}' which does not "
@@ -2342,10 +2328,7 @@ def validate_logical_intent_numeric_coverage(
 
 
 def validate_question_distinct_hint(
-    natural_language: str,
-    select_cols: list[SelectCol],
-    context: str = "main",
-    distinct_select_index: int = -1,
+    natural_language: str, select_cols: list[SelectCol], context: str = "main", distinct_select_index: int = -1
 ) -> list[IntentIssue]:
     """Flag when the question requests distinct results but no. `DISTINCT` appears in any expression."""
     issues: list[IntentIssue] = []
@@ -2360,7 +2343,7 @@ def validate_question_distinct_hint(
         if "DISTINCT" in raw.upper():
             return issues
     issues.append(
-        make_intent_issue(
+        IntentIssue.make(
             issue_id=f"missing_distinct_{context}",
             category=FailureCategory.MISSING_DISTINCT,
             severity="warning",
@@ -2414,7 +2397,7 @@ def validate_threshold_missing_having(
     if not match:
         return issues
     issues.append(
-        make_intent_issue(
+        IntentIssue.make(
             issue_id=f"threshold_missing_having_{context}",
             category=FailureCategory.THRESHOLD_MISSING_HAVING,
             severity="error",
@@ -2464,7 +2447,7 @@ def validate_count_threshold_missing_having(
     )
 
     issues.append(
-        make_intent_issue(
+        IntentIssue.make(
             issue_id=f"count_threshold_missing_having_{context}",
             category=FailureCategory.COUNT_THRESHOLD_MISSING_HAVING,
             severity="error",
@@ -2490,13 +2473,10 @@ def validate_count_threshold_missing_having(
     return issues
 
 
-def _resolve_word_to_table(
-    word: str,
-    schema: SchemaGraph,
-) -> str | None:
+def _resolve_word_to_table(word: str, schema: SchemaGraph) -> str | None:
     """Resolve a natural-language word to a schema table name."""
     word_lower = word.lower()
-    lower_tables = {t.lower(): t for t in schema.tables}
+    lower_tables = build_case_folded_index(schema.tables, kind="table")
     if word_lower in lower_tables:
         return lower_tables[word_lower]
     for tbl_lower, tbl_canonical in lower_tables.items():
@@ -2505,11 +2485,7 @@ def _resolve_word_to_table(
     return None
 
 
-def _find_fk_column_for_target(
-    target_table: str,
-    candidate_tables: list[str],
-    schema: SchemaGraph,
-) -> str | None:
+def _find_fk_column_for_target(target_table: str, candidate_tables: list[str], schema: SchemaGraph) -> str | None:
     """Find an FK column on `candidate_tables` referencing. `target_table`."""
     for tbl in candidate_tables:
         tbl_meta = schema.tables.get(tbl)
@@ -2530,61 +2506,6 @@ def validate_for_each_grouping(
     has_aggregation: bool,
     context: str = "main",
 ) -> list[IntentIssue]:
-    """Detect `for each X` patterns that lack a corresponding GROUP BY. when aggregation is present."""
-    issues: list[IntentIssue] = []
-    if not natural_language:
-        return issues
-    if not has_aggregation:
-        return issues
-    nl_lower = natural_language.lower()
-
-    gb_tables: set[str] = set()
-    for g in group_by_cols:
-        col = g.primary_column if hasattr(g, "primary_column") else ""
-        if col and "." in col:
-            gb_tables.add(col.split(".", 1)[0].lower())
-
-    for match in QUESTION_FOR_EACH_OR_PER_RE.finditer(nl_lower):
-        noun = match.group(1).strip().lower()
-        matched_table = _resolve_word_to_table(noun, schema)
-        if not matched_table:
-            words = noun.split()
-            if words:
-                matched_table = _resolve_word_to_table(words[-1], schema)
-        if not matched_table:
-            continue
-        if matched_table.lower() in gb_tables:
-            continue
-        preceding = nl_lower[: match.start()]
-        if match.group().startswith("per") and QUESTION_AGGREGATION_RATE_PREFIX_RE.search(preceding[-40:]):
-            debug(
-                f"[validation_semantic.validate_for_each_grouping] "
-                f"skipping '{match.group()}' — preceded by aggregation "
-                f"keyword (rate context)"
-            )
-            continue
-        issues.append(
-            make_intent_issue(
-                issue_id=f"for_each_missing_group_by_{matched_table}_{context}",
-                category=FailureCategory.FOR_EACH_GROUPING,
-                severity="error",
-                message=(
-                    f"Question says '{match.group()}' implying GROUP BY "
-                    f"on table '{matched_table}', but no column from "
-                    f"that table appears in group_by_cols. Add the "
-                    f"identifying column to group_by_cols and set "
-                    f"grain to 'grouped'."
-                ),
-                context={
-                    "matched_phrase": match.group(),
-                    "table": matched_table,
-                    "location": context,
-                },
-            )
-        )
-        debug(
-            f"[validation_semantic.validate_for_each_grouping] "
-            f"'{match.group()}' → table '{matched_table}' missing "
-            f"from group_by"
-        )
-    return issues
+    """Reserved hook; NL grouping heuristics are not used to drive validation."""
+    _ = (natural_language, group_by_cols, schema, has_aggregation, context)
+    return []

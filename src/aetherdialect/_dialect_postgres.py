@@ -6,59 +6,49 @@ import json
 import re
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, ClassVar, Literal, cast
 
 from sqlalchemy import create_engine, text
 
-from ._config import (
-    EngineConfig,
-    EngineRuntimeConfig,
-    PolicyConfig,
-    PostgresRuntimeConfig,
-)
+from ._config import EngineConfig, EngineLimits, EngineRuntimeConfig, PolicyConfig, PostgresRuntimeConfig
 from ._constants import (
     DOLLAR_PLACEHOLDER_RE,
     NAMED_PLACEHOLDER_RE,
     PG_AGG_FUNCNAMES,
+    SQL_STRING_LITERAL_CONTROL_CHAR_RE,
+    STRUCTURAL_CODE_TO_DIAG,
+    UNSAFE_PARAM_LITERAL,
 )
 from ._contracts_base import (
-    AccessError,
     EngineContext,
+    JoinEdge,
     SchemaInclude,
     SqlDiagnostic,
     SqlDiagnosticCode,
-    StatementTimeoutError,
+    TableKind,
 )
 from ._contracts_core import RuntimeIntent
-from ._contracts_schema import (
-    ColumnMetadata,
-    SchemaGraph,
-)
+from ._contracts_schema import ColumnMetadata, SchemaGraph
 from ._core_utils import (
     canonicalize_sql,
     cost_cap_active,
     debug,
     effective_explain_timeout_ms,
+    refuse_unsafe_sql_string_literal_content,
+    require_driver,
     sha256,
+    sqlalchemy_pool_kwargs_from_limits,
 )
 from ._dialect import (
     Dialect,
-    JoinEdge,
-    check_schema_references_shared,
-    emit_via_ast,
-    explain_cost_gate_violation,
-    format_interval_unit,
-    is_permission_denied_error,
-    register_dialect,
+    DialectRegistry,
 )
 from ._dialect_sqlglot_helper import (
     PartitionSqlAdapter,
-    array_storage_kind,
-    inject_partition_predicates,
-    normalize_datetrunc_sql,
-    pg_diagnostics_from_explain_json,
-    pg_root_plan_estimates,
-    quoted_json_element_token_predicate,
+    SqlAlchemyResultBackend,
+    SqlglotEngineDialect,
+    SqlglotParseMixin,
 )
 from ._schema_build import load_or_create_schema_postgresql
 from ._schema_catalog import profile_schema
@@ -72,128 +62,32 @@ except ImportError:
     _PgNodeType = ()
 
 
-def pg_walk_nodes(root: Any) -> Iterator[Any]:
-    stack: list[Any] = [root]
-    while stack:
-        node = stack.pop()
-        if node is None:
-            continue
-        yield node
-        if isinstance(node, _PgNodeType):
-            for attr in node:
-                if attr == "ancestors":
-                    continue
-                val = getattr(node, attr, None)
-                if val is None:
-                    continue
-                if isinstance(val, list | tuple):
-                    for item in val:
-                        if isinstance(item, _PgNodeType):
-                            stack.append(item)
-                elif isinstance(val, _PgNodeType):
-                    stack.append(val)
-            continue
-        try:
-            attrs = vars(node)
-        except TypeError:
-            continue
-        for value in attrs.values():
-            if isinstance(value, list | tuple):
-                for item in value:
-                    if hasattr(item, "__class__") and not isinstance(item, str | int | float | bool | bytes):
-                        stack.append(item)
-            elif hasattr(value, "__class__") and not isinstance(value, str | int | float | bool | bytes):
-                stack.append(value)
-
-
-def pg_node_kind(node: Any) -> str:
-    return getattr(node, "__class__", type("x", (), {})).__name__
-
-
-def pg_columnref_to_pair(node: Any) -> tuple[str | None, str] | None:
-    fields = getattr(node, "fields", None) or ()
-    parts: list[str] = []
-    for fld in fields:
-        kind = pg_node_kind(fld)
-        if kind == "String":
-            sval = getattr(fld, "sval", None) or getattr(fld, "str", None)
-            if isinstance(sval, str):
-                parts.append(sval)
-                continue
-            return None
-        if kind == "A_Star":
-            return None
-        return None
-    if not parts:
-        return None
-    if len(parts) == 1:
-        return None, parts[0]
-    return parts[-2], parts[-1]
-
-
-def pg_funcname(node: Any) -> str:
-    fn = getattr(node, "funcname", None) or ()
-    parts: list[str] = []
-    for f in fn:
-        sval = getattr(f, "sval", None) or getattr(f, "str", None)
-        if isinstance(sval, str):
-            parts.append(sval)
-    return ".".join(parts).lower() if parts else ""
-
-
-def _pg_plan_rows_from_explain_payload(payload: Any) -> float | None:
-    if payload is None:
-        return None
-    if isinstance(payload, str):
-        try:
-            payload = json.loads(payload)
-        except Exception:
-            return None
-    if isinstance(payload, list) and payload:
-        root = payload[0]
-        if isinstance(root, dict):
-            plan = root.get("Plan")
-            if isinstance(plan, dict):
-                pr = plan.get("Plan Rows")
-                if isinstance(pr, (int, float)):
-                    return float(pr)
-    return None
-
-
-def _stable_sql_text_for_history(sql_text: str) -> str:
-    s = re.sub(r"\b\d+\.\d+\b", "<num>", sql_text)
-    s = re.sub(r"\b\d+\b", "<num>", s)
-    s = re.sub(r"'(?:[^']|'')*'", "<str>", s)
-    return s
-
-
 @dataclass(frozen=True)
 class PostgresQueryLogSource:
+    @staticmethod
+    def _stable_sql_text_for_history(sql_text: str) -> str:
+        s = re.sub(r"\b\d+\.\d+\b", "<num>", sql_text)
+        s = re.sub(r"\b\d+\b", "<num>", s)
+        s = re.sub(r"'(?:[^']|'')*'", "<str>", s)
+        return s
+
     def is_available(self, conn: Any) -> bool:
         if conn is None:
             return False
         try:
             cur = conn.cursor()
-            cur.execute(
-                "SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements' LIMIT 1",
-            )
+            cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements' LIMIT 1")
             row = cur.fetchone()
             try:
                 cur.close()
-            except Exception:
+            except (OSError, AttributeError, TypeError):
                 pass
             return row is not None
         except Exception:
             return False
 
     def fetch(
-        self,
-        conn: Any,
-        *,
-        lookback_days: int,
-        max_queries: int,
-        min_runs: int,
-        user_filter: str | None,
+        self, conn: Any, *, lookback_days: int, max_queries: int, min_runs: int, user_filter: str | None
     ) -> list[str]:
         del lookback_days
         try:
@@ -219,12 +113,12 @@ class PostgresQueryLogSource:
         except Exception:
             try:
                 cur.close()
-            except Exception:
+            except (OSError, AttributeError, TypeError):
                 pass
             return []
         try:
             cur.close()
-        except Exception:
+        except (OSError, AttributeError, TypeError):
             pass
         out: list[str] = []
         for row in rows:
@@ -233,21 +127,14 @@ class PostgresQueryLogSource:
             raw_q = row[0]
             if raw_q is None:
                 continue
-            out.append(_stable_sql_text_for_history(str(raw_q)))
+            out.append(self._stable_sql_text_for_history(str(raw_q)))
         return out
 
 
 class _PgLastRuntime:
     """Lazy-loaded pglast bundle for PostgreSQL-only code paths."""
 
-    __slots__ = (
-        "parse_sql",
-        "ast",
-        "join_type",
-        "a_expr_kind",
-        "bool_expr_type",
-        "raw_stream_cls",
-    )
+    __slots__ = ("parse_sql", "ast", "join_type", "a_expr_kind", "bool_expr_type", "raw_stream_cls")
 
     def __init__(self) -> None:
         import pglast
@@ -265,84 +152,15 @@ class _PgLastRuntime:
 _pgl_runtime: _PgLastRuntime | None = None
 
 
-def _require_pglast() -> _PgLastRuntime:
-    global _pgl_runtime
-    if _pgl_runtime is None:
-        try:
-            _pgl_runtime = _PgLastRuntime()
-        except ImportError as exc:
-            raise ImportError(
-                "PostgresDialect requires the 'pglast' package. Install with: pip install aetherdialect[postgresql]"
-            ) from exc
-    return _pgl_runtime
-
-
 class _PgParsedSelect:
     """Container for a pglast-parsed ``SELECT`` plus its named- placeholder round-trip map."""
 
     __slots__ = ("root", "name_to_index", "index_to_name")
 
-    def __init__(
-        self,
-        root: Any,
-        name_to_index: dict[str, int],
-        index_to_name: dict[int, str],
-    ) -> None:
+    def __init__(self, root: Any, name_to_index: dict[str, int], index_to_name: dict[int, str]) -> None:
         self.root = root
         self.name_to_index = name_to_index
         self.index_to_name = index_to_name
-
-
-def _pg_encode_named_placeholders(
-    sql: str,
-) -> tuple[str, dict[str, int], dict[int, str]]:
-    """Replace ``:name`` placeholders with ``$N`` so pglast can parse the SQL."""
-    name_to_index: dict[str, int] = {}
-    index_to_name: dict[int, str] = {}
-
-    def repl(match: re.Match[str]) -> str:
-        name = match.group(1)
-        if name not in name_to_index:
-            idx = len(name_to_index) + 1
-            name_to_index[name] = idx
-            index_to_name[idx] = name
-        return f"${name_to_index[name]}"
-
-    encoded = NAMED_PLACEHOLDER_RE.sub(repl, sql)
-    return encoded, name_to_index, index_to_name
-
-
-def _pg_decode_dollar_placeholders(sql: str, index_to_name: dict[int, str]) -> str:
-    """Restore original ``:name`` placeholders from pglast-emitted ``$N`` markers."""
-    if not index_to_name:
-        return sql
-
-    def repl(match: re.Match[str]) -> str:
-        idx = int(match.group(1))
-        name = index_to_name.get(idx)
-        return f":{name}" if name is not None else match.group(0)
-
-    return DOLLAR_PLACEHOLDER_RE.sub(repl, sql)
-
-
-_PG_STRUCTURAL_CODE_TO_DIAG: dict[str, SqlDiagnosticCode] = {
-    "ast_parse_failed": SqlDiagnosticCode.AST_PARSE_FAILED,
-    "multiple_statements": SqlDiagnosticCode.MULTIPLE_STATEMENTS,
-    "no_root": SqlDiagnosticCode.NO_ROOT,
-    "not_select": SqlDiagnosticCode.NOT_SELECT,
-    "subquery_not_allowed": SqlDiagnosticCode.SUBQUERY_NOT_ALLOWED,
-    "using_not_allowed": SqlDiagnosticCode.USING_NOT_ALLOWED,
-    "cross_join_not_allowed": SqlDiagnosticCode.CROSS_JOIN_NOT_ALLOWED,
-    "self_join_not_allowed": SqlDiagnosticCode.SELF_JOIN_NOT_ALLOWED,
-    "exists_not_allowed": SqlDiagnosticCode.EXISTS_NOT_ALLOWED,
-    "lateral_not_allowed": SqlDiagnosticCode.LATERAL_NOT_ALLOWED,
-    "forbidden_structure": SqlDiagnosticCode.FORBIDDEN_STRUCTURE,
-    "cte_recursive": SqlDiagnosticCode.FORBIDDEN_STRUCTURE,
-    "cte_malformed": SqlDiagnosticCode.FORBIDDEN_STRUCTURE,
-    "cte_contains_subquery": SqlDiagnosticCode.SUBQUERY_NOT_ALLOWED,
-    "cte_contains_exists": SqlDiagnosticCode.EXISTS_NOT_ALLOWED,
-    "cte_contains_set_op": SqlDiagnosticCode.FORBIDDEN_STRUCTURE,
-}
 
 
 class PostgresDialect(Dialect):
@@ -350,7 +168,172 @@ class PostgresDialect(Dialect):
 
     name: str = "postgresql"
     sqlglot_dialect: ClassVar[str] = "postgres"
-    EXTRA_FILTER_OPS: ClassVar[frozenset[str]] = frozenset({"ilike", "not ilike"})
+    registry_canonical_rank: ClassVar[int] = 6
+
+    @staticmethod
+    def pg_walk_nodes(root: Any) -> Iterator[Any]:
+        stack: list[Any] = [root]
+        while stack:
+            node = stack.pop()
+            if node is None:
+                continue
+            yield node
+            if isinstance(node, _PgNodeType):
+                for attr in node:
+                    if attr == "ancestors":
+                        continue
+                    val = getattr(node, attr, None)
+                    if val is None:
+                        continue
+                    if isinstance(val, list | tuple):
+                        for item in val:
+                            if isinstance(item, _PgNodeType):
+                                stack.append(item)
+                    elif isinstance(val, _PgNodeType):
+                        stack.append(val)
+                continue
+            try:
+                attrs = vars(node)
+            except TypeError:
+                continue
+            for value in attrs.values():
+                if isinstance(value, list | tuple):
+                    for item in value:
+                        if hasattr(item, "__class__") and not isinstance(item, str | int | float | bool | bytes):
+                            stack.append(item)
+                elif hasattr(value, "__class__") and not isinstance(value, str | int | float | bool | bytes):
+                    stack.append(value)
+
+    @staticmethod
+    def pg_node_kind(node: Any) -> str:
+        return getattr(node, "__class__", type("x", (), {})).__name__
+
+    @staticmethod
+    def pg_columnref_to_pair(node: Any) -> tuple[str | None, str] | None:
+        fields = getattr(node, "fields", None) or ()
+        parts: list[str] = []
+        for fld in fields:
+            kind = PostgresDialect.pg_node_kind(fld)
+            if kind == "String":
+                sval = getattr(fld, "sval", None) or getattr(fld, "str", None)
+                if isinstance(sval, str):
+                    parts.append(sval)
+                    continue
+                return None
+            if kind == "A_Star":
+                return None
+            return None
+        if not parts:
+            return None
+        if len(parts) == 1:
+            return None, parts[0]
+        return parts[-2], parts[-1]
+
+    @staticmethod
+    def pg_funcname(node: Any) -> str:
+        fn = getattr(node, "funcname", None) or ()
+        parts: list[str] = []
+        for f in fn:
+            sval = getattr(f, "sval", None) or getattr(f, "str", None)
+            if isinstance(sval, str):
+                parts.append(sval)
+        return ".".join(parts).lower() if parts else ""
+
+    @staticmethod
+    def _pg_plan_rows_from_explain_payload(payload: Any) -> float | None:
+        if payload is None:
+            return None
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                return None
+        if isinstance(payload, list) and payload:
+            root = payload[0]
+            if isinstance(root, dict):
+                plan = root.get("Plan")
+                if isinstance(plan, dict):
+                    pr = plan.get("Plan Rows")
+                    if isinstance(pr, (int, float)):
+                        return float(pr)
+        return None
+
+    @staticmethod
+    def require_pglast() -> _PgLastRuntime:
+        global _pgl_runtime
+        if _pgl_runtime is None:
+            try:
+                _pgl_runtime = _PgLastRuntime()
+            except ImportError as exc:
+                raise ImportError(
+                    "PostgresDialect requires the 'pglast' package. Install with: pip install aetherdialect[postgresql]"
+                ) from exc
+        return _pgl_runtime
+
+    @staticmethod
+    def _require_pglast() -> _PgLastRuntime:
+        return PostgresDialect.require_pglast()
+
+    @staticmethod
+    def pg_encode_named_placeholders(sql: str) -> tuple[str, dict[str, int], dict[int, str]]:
+        """Replace ``:name`` placeholders with ``$N`` so pglast can parse the SQL."""
+        name_to_index: dict[str, int] = {}
+        index_to_name: dict[int, str] = {}
+
+        def repl(match: re.Match[str]) -> str:
+            name = match.group(1)
+            if name not in name_to_index:
+                idx = len(name_to_index) + 1
+                name_to_index[name] = idx
+                index_to_name[idx] = name
+            return f"${name_to_index[name]}"
+
+        encoded = NAMED_PLACEHOLDER_RE.sub(repl, sql)
+        return encoded, name_to_index, index_to_name
+
+    @staticmethod
+    def _pg_encode_named_placeholders(sql: str) -> tuple[str, dict[str, int], dict[int, str]]:
+        return PostgresDialect.pg_encode_named_placeholders(sql)
+
+    @staticmethod
+    def _pg_decode_dollar_placeholders(sql: str, index_to_name: dict[int, str]) -> str:
+        """Restore original ``:name`` placeholders from pglast-emitted ``$N`` markers."""
+        if not index_to_name:
+            return sql
+
+        def repl(match: re.Match[str]) -> str:
+            idx = int(match.group(1))
+            name = index_to_name.get(idx)
+            return f":{name}" if name is not None else match.group(0)
+
+        return DOLLAR_PLACEHOLDER_RE.sub(repl, sql)
+
+    @staticmethod
+    def append_pglast_select_targets(root: Any, expr_sqls: Sequence[str]) -> bool:
+        """Append SELECT-list target entries onto a pglast ``SelectStmt`` root."""
+        p = PostgresDialect.require_pglast()
+        targets = list(getattr(root, "targetList", None) or ())
+        for expr_sql in expr_sqls:
+            encoded, _, _ = PostgresDialect.pg_encode_named_placeholders(expr_sql)
+            try:
+                probe = p.parse_sql(f"SELECT {encoded}")
+            except Exception:
+                return False
+            if not probe:
+                return False
+            probe_select = getattr(probe[0], "stmt", None)
+            if probe_select is None or type(probe_select).__name__ != "SelectStmt":
+                return False
+            tlist = getattr(probe_select, "targetList", None) or ()
+            if len(tlist) != 1:
+                return False
+            first_target = cast(Any, tlist)[0]
+            targets.append(first_target)
+        try:
+            root.targetList = tuple(targets)
+        except Exception:
+            return False
+        return True
 
     @property
     def supports_ilike(self) -> bool:
@@ -358,31 +341,57 @@ class PostgresDialect(Dialect):
         return True
 
     @property
+    def default_deterministic_collation(self) -> str | None:
+        """Return PostgreSQL's portable binary collation for reproducible ordering."""
+        return "C"
+
+    @property
     def supports_unnest_select_item(self) -> bool:
         """Return True because PostgreSQL ``UNNEST`` is a set-returning function valid in SELECT."""
         return True
+
+    @property
+    def integer_division_truncates(self) -> bool:
+        """Return True because PostgreSQL integer division truncates."""
+        return True
+
+    def escape_string_literal(self, value: str) -> str:
+        """Escape a PostgreSQL string literal body, refusing embedded control characters."""
+        s = str(value)
+        refuse_unsafe_sql_string_literal_content(s)
+        if SQL_STRING_LITERAL_CONTROL_CHAR_RE.search(s):
+            raise ValueError(UNSAFE_PARAM_LITERAL)
+        if "\\" in s:
+            return s.replace("\\", "\\\\").replace("'", "''")
+        return s.replace("'", "''")
+
+    def quote_string_literal(self, text: str) -> str:
+        """Render a PostgreSQL string literal, using E-strings when backslashes are present."""
+        s = str(text)
+        body = self.escape_string_literal(s)
+        if "\\" in s:
+            return f"E'{body}'"
+        return f"'{body}'"
 
     @property
     def parse_backend(self) -> Literal["pglast", "sqlglot"]:
         """Return ``pglast`` as the SQL-to-intent parse backend."""
         return "pglast"
 
-    def date_window_upper_bound_sql(self, unit: str) -> str:
+    def date_window_upper_bound_sql(self, unit: str, *, anchor: datetime | None = None) -> str:
         """Return PostgreSQL current timestamp or date for inclusive window upper bounds."""
-        if unit in ("hour", "minute", "second"):
-            return "CURRENT_TIMESTAMP"
-        return "CURRENT_DATE"
+        return self.date_window_clock_sql(unit, anchor=anchor)
 
     def profile_statement_timeout_sql(self, timeout_ms: int) -> str | None:
         """Return PostgreSQL ``SET LOCAL statement_timeout`` for profiling sessions."""
         return f"SET LOCAL statement_timeout = {int(timeout_ms)}"
 
+    def session_timezone_sql(self) -> str | None:
+        """Return PostgreSQL session time-zone lookup SQL."""
+        return "SELECT current_setting('TIMEZONE')"
+
     def inject_pruning_predicates(
-        self,
-        sql: str,
-        *,
-        schema: SchemaGraph | None = None,
-        intent: RuntimeIntent | None = None,
+        self, sql: str, *, schema: SchemaGraph | None = None, intent: RuntimeIntent | None = None
     ) -> str:
         """Append declarative partition predicates when schema and intent are available."""
         if schema is None or intent is None:
@@ -392,20 +401,16 @@ class PostgresDialect(Dialect):
             format_literal=self.quote_string_literal,
             sqlglot_dialect="postgres",
         )
-        return inject_partition_predicates(adapter, sql, schema, intent)
+        return adapter.inject_partition_predicates(sql, schema, intent)
 
     def post_render_normalize(self, sql: str, *, stage: str) -> str:
         """Rewrite ``DATETRUNC(expr, unit)`` to PostgreSQL ``DATE_TRUNC(unit, expr)``."""
         if stage != "post_substitute":
             return sql
-        return normalize_datetrunc_sql(sql, sqlglot_dialect=self.sqlglot_dialect)
+        return SqlglotParseMixin.normalize_datetrunc_sql(sql, sqlglot_dialect=self.sqlglot_dialect)
 
     def explain_row_estimate(
-        self,
-        sql_text: str,
-        *,
-        schema: SchemaGraph | None = None,
-        intent: Any | None = None,
+        self, sql_text: str, *, schema: SchemaGraph | None = None, intent: Any | None = None
     ) -> float | None:
         """Return PostgreSQL planner row estimate from ``EXPLAIN (FORMAT JSON)``."""
         eng = getattr(self, "engine", None)
@@ -417,7 +422,7 @@ class PostgresDialect(Dialect):
             with eng.connect() as conn:
                 rows = conn.execute(text(explain_sql), {}).fetchall()
             payload = rows[0][0] if rows else None
-            return _pg_plan_rows_from_explain_payload(payload)
+            return self._pg_plan_rows_from_explain_payload(payload)
         except Exception:
             return None
 
@@ -425,28 +430,46 @@ class PostgresDialect(Dialect):
         """Return the PostgreSQL ``pg_stat_statements`` query-log source."""
         return PostgresQueryLogSource()
 
-    def quote_table_column(self, table: str, column: str) -> str:
-        """Double-quote PostgreSQL identifiers for ``table.column`` emission."""
-
-        def q(x: str) -> str:
-            return '"' + str(x).replace('"', '""') + '"'
-
-        return f"{q(table)}.{q(column)}"
-
-    def __init__(self, config: EngineRuntimeConfig, sqlalchemy_engine: Any | None = None):
+    def __init__(
+        self,
+        config: EngineRuntimeConfig,
+        sqlalchemy_engine: Any | None = None,
+        *,
+        limits: EngineLimits | None = None,
+    ):
         """Create a SQLAlchemy engine from `PostgresRuntimeConfig`."""
+        require_driver("postgresql")
         try:
-            _require_pglast()
+            self._require_pglast()
         except ImportError as e:
             raise ImportError(
                 "PostgresDialect requires the 'pglast' package. Install with: pip install aetherdialect[postgresql]"
             ) from e
         super().__init__(config)
         pg_config = cast(PostgresRuntimeConfig, config)
+        pool_kwargs = sqlalchemy_pool_kwargs_from_limits(limits or EngineLimits())
         if sqlalchemy_engine is not None:
             self.engine = sqlalchemy_engine
         else:
-            self.engine = create_engine(pg_config.db_url(), future=True)
+            self.engine = create_engine(pg_config.db_url(), future=True, **pool_kwargs)
+        self._result_backend = SqlAlchemyResultBackend(
+            self.engine,
+            dialect_name="postgresql",
+            timeout_sql_provider=self.profile_statement_timeout_sql,
+        )
+
+    @property
+    def result_backend(self) -> SqlAlchemyResultBackend:
+        return self._result_backend
+
+    @property
+    def supports_statement_cancellation(self) -> bool:
+        """Return True because PostgreSQL exposes ``pg_cancel_backend``."""
+        return True
+
+    @property
+    def logical_engine_name(self) -> str:
+        return "PostgreSQL"
 
     def _strip_schema(self, ident: str) -> str:
         """Strip schema prefix from an identifier and return a. lowercase. table name."""
@@ -456,9 +479,7 @@ class PostgresDialect(Dialect):
         return s
 
     def _collect_from_items(
-        self,
-        fr: Any,
-        scalar_cte_names: frozenset[str] | None = None,
+        self, fr: Any, scalar_cte_names: frozenset[str] | None = None
     ) -> tuple[bool, dict[str, str], bool, bool, bool, bool, bool]:
         """Collect FROM-clause aliases and flags for unsupported join. shapes."""
         alias_to_table: dict[str, str] = {}
@@ -532,24 +553,8 @@ class PostgresDialect(Dialect):
             if not walk(it):
                 ok = False
                 break
-            return (
-                ok,
-                alias_to_table,
-                has_subquery,
-                has_using,
-                has_cross_join,
-                has_self_join,
-                True,
-            )
-        return (
-            ok,
-            alias_to_table,
-            has_subquery,
-            has_using,
-            has_cross_join,
-            has_self_join,
-            True,
-        )
+            return (ok, alias_to_table, has_subquery, has_using, has_cross_join, has_self_join, True)
+        return (ok, alias_to_table, has_subquery, has_using, has_cross_join, has_self_join, True)
 
     def _validate_cte_bodies(self, with_clause: Any) -> tuple[bool, str]:
         """Validate CTE bodies against structural restrictions. Forbids. recursive CTEs, subqueries, EXISTS sublinks, and set operations inside any CTE body. Window functions and ``CASE`` expressions are allowed."""
@@ -601,15 +606,11 @@ class PostgresDialect(Dialect):
 
         return True, ""
 
-    def _ast_structural_valid(
-        self,
-        sql: str,
-        scalar_cte_names: frozenset[str] | None = None,
-    ) -> tuple[bool, str]:
+    def _ast_structural_valid(self, sql: str, scalar_cte_names: frozenset[str] | None = None) -> tuple[bool, str]:
         """Validate SQL structure using the pglast AST. Checks that the. SQL is a single SELECT statement free of subqueries in ``FROM``, CROSS JOINs, self-joins, USING clauses, EXISTS sublinks, LATERAL, and set operations. Window functions and ``CASE`` expressions are allowed. Also validates any CTE bodies with the same rules."""
         try:
-            p = _require_pglast()
-            encoded, _, _ = _pg_encode_named_placeholders(canonicalize_sql(sql))
+            p = self._require_pglast()
+            encoded, _, _ = self._pg_encode_named_placeholders(canonicalize_sql(sql))
             stmts = p.parse_sql(encoded)
         except Exception:
             return False, "ast_parse_failed"
@@ -634,10 +635,7 @@ class PostgresDialect(Dialect):
 
         fr = getattr(root, "fromClause", None)
         if fr is not None:
-            _, _, has_subq, has_using, has_cross, has_self, _ = self._collect_from_items(
-                fr,
-                scalar_cte_names,
-            )
+            _, _, has_subq, has_using, has_cross, has_self, _ = self._collect_from_items(fr, scalar_cte_names)
             if has_subq:
                 return False, "subquery_not_allowed"
             if has_using:
@@ -704,12 +702,12 @@ class PostgresDialect(Dialect):
         """Validate SQL via pglast structurally and (when *schema* is. given) semantically."""
         ok, code = self._ast_structural_valid(sql, scalar_cte_names=scalar_cte_names)
         if not ok:
-            mapped = _PG_STRUCTURAL_CODE_TO_DIAG.get(code, SqlDiagnosticCode.FORBIDDEN_STRUCTURE)
+            mapped = SqlDiagnosticCode(STRUCTURAL_CODE_TO_DIAG.get(code, SqlDiagnosticCode.FORBIDDEN_STRUCTURE.value))
             return [SqlDiagnostic(code=mapped, message=code, node_kind=None)]
         diags: list[SqlDiagnostic] = []
         try:
-            p = _require_pglast()
-            encoded, _, _ = _pg_encode_named_placeholders(canonicalize_sql(sql))
+            p = self._require_pglast()
+            encoded, _, _ = self._pg_encode_named_placeholders(canonicalize_sql(sql))
             stmts = p.parse_sql(encoded)
         except Exception:
             return [SqlDiagnostic(code=SqlDiagnosticCode.AST_PARSE_FAILED, message="parse failed")]
@@ -722,7 +720,7 @@ class PostgresDialect(Dialect):
         alias_to_table = self._pg_collect_table_aliases(root)
         if schema is not None:
             refs = self._pg_collect_column_refs(root)
-            diags += check_schema_references_shared(refs, alias_to_table, cte_names, schema)
+            diags += Dialect.check_schema_references_shared(refs, alias_to_table, cte_names, schema)
         diags += self._pg_check_grouping(root)
         diags += self._pg_check_cte_closure(root, cte_names)
         if declared_params is not None:
@@ -744,8 +742,8 @@ class PostgresDialect(Dialect):
     def _pg_collect_table_aliases(self, root: Any) -> dict[str, str]:
         """Return ``{alias_or_table_lc: real_table_lc}`` for every ``RangeVar`` reachable from *root*."""
         out: dict[str, str] = {}
-        for node in pg_walk_nodes(root):
-            if pg_node_kind(node) != "RangeVar":
+        for node in self.pg_walk_nodes(root):
+            if self.pg_node_kind(node) != "RangeVar":
                 continue
             relname = getattr(node, "relname", None) or ""
             if not relname:
@@ -762,10 +760,10 @@ class PostgresDialect(Dialect):
     def _pg_collect_column_refs(self, root: Any) -> list[tuple[str | None, str]]:
         """Return ``(prefix, column)`` pairs for every ``ColumnRef`` reachable from *root*."""
         out: list[tuple[str | None, str]] = []
-        for node in pg_walk_nodes(root):
-            if pg_node_kind(node) != "ColumnRef":
+        for node in self.pg_walk_nodes(root):
+            if self.pg_node_kind(node) != "ColumnRef":
                 continue
-            pair = pg_columnref_to_pair(node)
+            pair = self.pg_columnref_to_pair(node)
             if pair is not None:
                 out.append(pair)
         return out
@@ -775,9 +773,9 @@ class PostgresDialect(Dialect):
         diags: list[SqlDiagnostic] = []
         where = getattr(root, "whereClause", None)
         if where is not None:
-            for node in pg_walk_nodes(where):
-                if pg_node_kind(node) == "FuncCall":
-                    name = pg_funcname(node)
+            for node in self.pg_walk_nodes(where):
+                if self.pg_node_kind(node) == "FuncCall":
+                    name = self.pg_funcname(node)
                     if name in PG_AGG_FUNCNAMES:
                         diags.append(
                             SqlDiagnostic(
@@ -812,8 +810,8 @@ class PostgresDialect(Dialect):
                 inner = getattr(cte, "ctequery", None)
                 if inner is not None:
                     defining_queries.add(id(inner))
-        for node in pg_walk_nodes(root):
-            if pg_node_kind(node) != "RangeVar":
+        for node in self.pg_walk_nodes(root):
+            if self.pg_node_kind(node) != "RangeVar":
                 continue
             relname = getattr(node, "relname", None)
             if isinstance(relname, str) and relname.lower() in cte_names:
@@ -852,9 +850,9 @@ class PostgresDialect(Dialect):
     def parse_select(self, sql: str) -> _PgParsedSelect | None:
         """Parse *sql* with pglast after encoding ``:name`` placeholders as ``$N``. Single-line ``--`` comments are stripped before whitespace canonicalization so they do not absorb subsequent clauses when newlines collapse. Returns ``None`` for non-``SELECT`` roots, multi-statement input, or parse failure."""
         decommented = re.sub(r"--[^\n]*", "", sql)
-        encoded, name_to_index, index_to_name = _pg_encode_named_placeholders(canonicalize_sql(decommented))
+        encoded, name_to_index, index_to_name = self._pg_encode_named_placeholders(canonicalize_sql(decommented))
         try:
-            p = _require_pglast()
+            p = self._require_pglast()
             stmts = p.parse_sql(encoded)
         except Exception:
             return None
@@ -900,39 +898,24 @@ class PostgresDialect(Dialect):
             return None
         return str(relname).lower()
 
-    def attach_joins(
-        self,
-        parsed: _PgParsedSelect,
-        from_handle: Any,
-        edges: list[JoinEdge],
-    ) -> bool:
+    def attach_joins(self, parsed: _PgParsedSelect, from_handle: Any, edges: list[JoinEdge]) -> bool:
         """Build a left-deep tree of pglast ``JoinExpr`` nodes from *edges* and replace *from_handle*'s ``fromClause`` with the resulting single-element list."""
         if not edges:
             return False
         from_clause: Sequence[Any] = getattr(from_handle, "fromClause", None) or ()
         if len(from_clause) != 1:
             return False
-        p = _require_pglast()
+        p = self._require_pglast()
         current: Any = from_clause[0]
         for edge in edges:
             quals = self._pg_build_on_quals(edge.on_terms)
             if quals is None:
                 return False
-            rarg = p.ast.RangeVar(
-                relname=edge.table,
-                inh=True,
-                relpersistence="p",
-            )
+            rarg = p.ast.RangeVar(relname=edge.table, inh=True, relpersistence="p")
             if edge.alias:
                 rarg.alias = p.ast.Alias(aliasname=edge.alias)
             jt = p.join_type.JOIN_INNER if edge.kind == "INNER" else p.join_type.JOIN_LEFT
-            current = p.ast.JoinExpr(
-                jointype=jt,
-                isNatural=False,
-                larg=current,
-                rarg=rarg,
-                quals=quals,
-            )
+            current = p.ast.JoinExpr(jointype=jt, isNatural=False, larg=current, rarg=rarg, quals=quals)
         try:
             from_handle.fromClause = (current,)
         except Exception:
@@ -940,49 +923,30 @@ class PostgresDialect(Dialect):
         return True
 
     @staticmethod
-    def _pg_build_on_quals(
-        on_terms: tuple[tuple[str, str, str, str], ...],
-    ) -> Any | None:
+    def _pg_build_on_quals(on_terms: tuple[tuple[str, str, str, str], ...]) -> Any | None:
         """Return a single ``A_Expr`` or an ``AND``-joined ``BoolExpr`` over equality conjuncts."""
         if not on_terms:
             return None
-        p = _require_pglast()
+        p = PostgresDialect._require_pglast()
         eqs: list[Any] = []
         for left_token, left_col, right_token, right_col in on_terms:
-            lhs = p.ast.ColumnRef(
-                fields=(p.ast.String(sval=left_token), p.ast.String(sval=left_col)),
-            )
-            rhs = p.ast.ColumnRef(
-                fields=(p.ast.String(sval=right_token), p.ast.String(sval=right_col)),
-            )
-            eqs.append(
-                p.ast.A_Expr(
-                    kind=p.a_expr_kind.AEXPR_OP,
-                    name=(p.ast.String(sval="="),),
-                    lexpr=lhs,
-                    rexpr=rhs,
-                ),
-            )
+            lhs = p.ast.ColumnRef(fields=(p.ast.String(sval=left_token), p.ast.String(sval=left_col)))
+            rhs = p.ast.ColumnRef(fields=(p.ast.String(sval=right_token), p.ast.String(sval=right_col)))
+            eqs.append(p.ast.A_Expr(kind=p.a_expr_kind.AEXPR_OP, name=(p.ast.String(sval="="),), lexpr=lhs, rexpr=rhs))
         if len(eqs) == 1:
             return eqs[0]
         return p.ast.BoolExpr(boolop=p.bool_expr_type.AND_EXPR, args=tuple(eqs))
 
     def attach_extra_from_and_where(
-        self,
-        parsed: _PgParsedSelect,
-        from_handle: Any,
-        extra_from_tables: list[str],
-        where_edges: list[JoinEdge],
+        self, parsed: _PgParsedSelect, from_handle: Any, extra_from_tables: list[str], where_edges: list[JoinEdge]
     ) -> bool:
         """Append RangeVar entries to ``fromClause`` and AND equality predicates into ``whereClause``."""
         if not extra_from_tables and not where_edges:
             return True
-        p = _require_pglast()
+        p = self._require_pglast()
         existing_from = list(getattr(from_handle, "fromClause", None) or ())
         for tbl in extra_from_tables:
-            existing_from.append(
-                p.ast.RangeVar(relname=tbl, inh=True, relpersistence="p"),
-            )
+            existing_from.append(p.ast.RangeVar(relname=tbl, inh=True, relpersistence="p"))
         try:
             from_handle.fromClause = tuple(existing_from)
         except Exception:
@@ -992,25 +956,10 @@ class PostgresDialect(Dialect):
         new_eqs: list[Any] = []
         for edge in where_edges:
             for left_token, left_col, right_token, right_col in edge.on_terms:
-                lhs = p.ast.ColumnRef(
-                    fields=(
-                        p.ast.String(sval=left_token),
-                        p.ast.String(sval=left_col),
-                    ),
-                )
-                rhs = p.ast.ColumnRef(
-                    fields=(
-                        p.ast.String(sval=right_token),
-                        p.ast.String(sval=right_col),
-                    ),
-                )
+                lhs = p.ast.ColumnRef(fields=(p.ast.String(sval=left_token), p.ast.String(sval=left_col)))
+                rhs = p.ast.ColumnRef(fields=(p.ast.String(sval=right_token), p.ast.String(sval=right_col)))
                 new_eqs.append(
-                    p.ast.A_Expr(
-                        kind=p.a_expr_kind.AEXPR_OP,
-                        name=(p.ast.String(sval="="),),
-                        lexpr=lhs,
-                        rexpr=rhs,
-                    ),
+                    p.ast.A_Expr(kind=p.a_expr_kind.AEXPR_OP, name=(p.ast.String(sval="="),), lexpr=lhs, rexpr=rhs)
                 )
         if not new_eqs:
             return True
@@ -1038,19 +987,59 @@ class PostgresDialect(Dialect):
             return False
         return True
 
-    def replace_projection(
-        self,
-        parsed: _PgParsedSelect,
-        items: list[tuple[str, str | None]],
-    ) -> bool:
+    def attach_where_sql_fragments(self, from_handle: Any, fragments: list[str]) -> bool:
+        """AND-inject raw SQL predicate fragments into the carrier ``WHERE`` clause."""
+        if not fragments:
+            return True
+        p = self._require_pglast()
+        new_eqs: list[Any] = []
+        for frag in fragments:
+            try:
+                parsed = p.parse_sql(f"SELECT 1 WHERE {frag}")
+            except Exception:
+                return False
+            stmt = parsed[0].stmt if parsed else None
+            if stmt is None or type(stmt).__name__ != "SelectStmt":
+                return False
+            where_clause = getattr(stmt, "whereClause", None)
+            if where_clause is None:
+                return False
+            new_eqs.append(where_clause)
+        if not new_eqs:
+            return True
+        if len(new_eqs) == 1:
+            new_pred: Any = new_eqs[0]
+        else:
+            new_pred = p.ast.BoolExpr(boolop=p.bool_expr_type.AND_EXPR, args=tuple(new_eqs))
+        existing_where = getattr(from_handle, "whereClause", None)
+        if existing_where is None:
+            merged: Any = new_pred
+        elif (
+            type(existing_where).__name__ == "BoolExpr"
+            and getattr(existing_where, "boolop", None) == p.bool_expr_type.AND_EXPR
+        ):
+            merged_args = tuple(getattr(existing_where, "args", ()) or ()) + tuple(new_eqs)
+            merged = p.ast.BoolExpr(boolop=p.bool_expr_type.AND_EXPR, args=merged_args)
+        else:
+            merged = p.ast.BoolExpr(
+                boolop=p.bool_expr_type.AND_EXPR,
+                args=((existing_where, new_pred) if len(new_eqs) == 1 else (existing_where, *new_eqs)),
+            )
+        try:
+            from_handle.whereClause = merged
+        except Exception:
+            return False
+        return True
+
+    def replace_projection(self, parsed: _PgParsedSelect, items: list[tuple[str, str | None]]) -> bool:
         """Replace the outer ``SelectStmt``'s ``targetList`` with ``ResTarget`` nodes parsed from *items*."""
         root = getattr(parsed.root, "stmt", None)
         if root is None or type(root).__name__ != "SelectStmt":
             return False
-        p = _require_pglast()
+        p = self._require_pglast()
         new_targets: list[Any] = []
         for expr_sql, alias in items:
-            encoded, _, _ = _pg_encode_named_placeholders(expr_sql)
+            encoded, _, _ = self._pg_encode_named_placeholders(expr_sql)
             try:
                 probe = p.parse_sql(f"SELECT {encoded}")
             except Exception:
@@ -1073,11 +1062,11 @@ class PostgresDialect(Dialect):
 
     def emit_sql(self, parsed: _PgParsedSelect) -> str:
         """Render *parsed* via pglast ``RawStream`` and decode ``$N`` back to ``:name``."""
-        p = _require_pglast()
+        p = self._require_pglast()
         raw_stream_ctor: Any = p.raw_stream_cls
         stream_factory: Any = raw_stream_ctor()
         rendered = cast(str, stream_factory(parsed.root))
-        return _pg_decode_dollar_placeholders(rendered, parsed.index_to_name)
+        return self._pg_decode_dollar_placeholders(rendered, parsed.index_to_name)
 
     def explain_diagnose(
         self,
@@ -1088,12 +1077,7 @@ class PostgresDialect(Dialect):
         intent: RuntimeIntent | None = None,
     ) -> tuple[bool, list[SqlDiagnostic], str]:
         """Run PostgreSQL ``EXPLAIN (FORMAT JSON, COSTS true)`` and. return ``(ok, diagnostics, raw_message)``. ``ok`` is False only on hard validation failures (parse errors, unknown identifiers, timeouts). Permission-denied disables EXPLAIN for the remainder of this dialect instance and is reported as ``ok=True`` with no diagnostics so the caller can proceed without treating missing privileges as invalid SQL. Soft plan-shape findings (suspected cartesian joins, zero-row estimates, sequential scans on indexed columns) are emitted as :class:`SqlDiagnostic` entries with codes from ``SOFT_DIAGNOSTIC_CODES`` in ``_config`` so callers may apply confidence penalties without rejecting the SQL."""
-        finalized = self.finalize_render(
-            sql,
-            params or {},
-            schema=schema,
-            intent=intent,
-        )
+        finalized = self.finalize_render(sql, params or {}, schema=schema, intent=intent)
         explain_sql = f"EXPLAIN (FORMAT JSON, COSTS true) {finalized}"
         try:
             tm = effective_explain_timeout_ms()
@@ -1120,62 +1104,35 @@ class PostgresDialect(Dialect):
             if isinstance(pay, list) and pay and isinstance(pay[0], dict):
                 rp = pay[0].get("Plan")
                 if isinstance(rp, dict):
-                    est_rows, est_bytes = pg_root_plan_estimates(rp)
-            failed, why = explain_cost_gate_violation(est_rows, est_bytes)
+                    est_rows, est_bytes = SqlglotEngineDialect.pg_root_plan_estimates(rp)
+            failed, why = Dialect.explain_cost_gate_violation(est_rows, est_bytes, dialect=self)
             if failed:
-                return (
-                    False,
-                    [SqlDiagnostic(code=SqlDiagnosticCode.EXPLAIN_COST_EXCEEDED, message=why)],
-                    why,
-                )
-            soft_diags = pg_diagnostics_from_explain_json(payload, schema)
+                return (False, [SqlDiagnostic(code=SqlDiagnosticCode.EXPLAIN_COST_EXCEEDED, message=why)], why)
+            soft_diags = SqlglotEngineDialect.pg_diagnostics_from_explain_json(payload, schema)
             return True, soft_diags, ""
         except Exception as e:
             err = str(e)
             if self._disable_explain_on_permission_denied(err):
                 return True, [], ""
-            return (
-                False,
-                [SqlDiagnostic(code=SqlDiagnosticCode.EXPLAIN_OTHER, message=err)],
-                err,
-            )
+            return (False, [SqlDiagnostic(code=SqlDiagnosticCode.EXPLAIN_OTHER, message=err)], err)
 
     def execute(self, sql: str, params: dict[str, Any] | None = None) -> list[tuple[Any, ...]]:
         """Execute SQL via SQLAlchemy and return row tuples."""
-        try:
-            tm = PolicyConfig.STATEMENT_TIMEOUT_MS
-            if cost_cap_active(tm) and tm is not None:
-                ms = int(tm)
-                with self.engine.begin() as conn:
-                    conn.execute(text(f"SET LOCAL statement_timeout = {ms}"))
-                    rows = conn.execute(text(sql), params or {}).fetchall()
-            else:
-                with self.engine.connect() as conn:
-                    rows = conn.execute(text(sql), params or {}).fetchall()
-            return [tuple(r) for r in rows]
-        except Exception as e:
-            err = str(e)
-            if is_permission_denied_error(err):
-                raise AccessError("execute", err) from e
-            el = err.lower()
-            if "statement timeout" in el or "timeout expired" in el or "query canceled" in el:
-                raise StatementTimeoutError(err) from e
-            raise
+        tm = PolicyConfig.STATEMENT_TIMEOUT_MS if cost_cap_active(PolicyConfig.STATEMENT_TIMEOUT_MS) else None
+        return self._result_backend.fetch_rows(sql, params, timeout_ms=tm)
 
     def render_date_diff(
-        self,
-        left_expr: str,
-        op: str,
-        unit: str,
-        amount: int,
-        *,
-        minuend_sql: str = "",
-        subtrahend_sql: str = "",
+        self, left_expr: str, op: str, unit: str, amount: int, *, minuend_sql: str = "", subtrahend_sql: str = ""
     ) -> str:
         """Render PostgreSQL interval date-difference comparison."""
-        scaled, plural_unit = format_interval_unit(unit, amount)
+        scaled, plural_unit = Dialect.format_interval_unit(unit, amount)
         sql = f"({left_expr}) {op} INTERVAL '{scaled} {plural_unit}'"
-        return emit_via_ast(sql, "postgres")
+        return Dialect.emit_via_ast(sql, "postgres")
+
+    def render_containment(self, column_sql: str, value_param: str, value_type: str) -> str | None:
+        """Render PostgreSQL JSON-array containment with the ``@>`` operator."""
+        _ = value_type
+        return f"({column_sql})::jsonb @> jsonb_build_array(CAST({value_param} AS TEXT))"
 
     def render_array_contains(
         self,
@@ -1183,42 +1140,47 @@ class PostgresDialect(Dialect):
         param_key: str,
         *,
         column_meta: ColumnMetadata | None = None,
+        value_type: str = "string",
     ) -> str:
         """Render PostgreSQL array membership as a single. ``ANY``-comparison predicate. Avoids ``EXISTS`` / subquery / ``ARRAY[`` constructs so the fragment passes ``_enforce_select_only`` and ``_ast_structural_valid``. Lowercases both sides and trims surrounding whitespace and quote characters from the bound value for case-insensitive, quote- tolerant matching against ``text[]`` columns."""
-        kind = array_storage_kind(column_meta) if column_meta is not None else "native_array"
+        kind = SqlglotParseMixin.array_storage_kind(column_meta) if column_meta is not None else "native_array"
         if kind == "json_text_array":
-            sql = quoted_json_element_token_predicate(
+            return SqlglotParseMixin.emit_json_containment_predicate(
+                self,
                 column_sql=column_sql,
                 param_key=param_key,
-                position_fn="STRPOS",
-                value_cast="TEXT",
+                value_type=value_type,
+                sqlglot_dialect="postgres",
             )
-            return emit_via_ast(sql, "postgres")
         delimiter = "CHR(31)"
         lowered_elements = f"string_to_array(LOWER(array_to_string({column_sql}, {delimiter})), {delimiter})"
         norm_param = f"LOWER(BTRIM(CAST(:{param_key} AS TEXT), ' ' || CHR(34) || CHR(39)))"
         sql = f"{norm_param} = ANY({lowered_elements})"
-        return emit_via_ast(sql, "postgres")
+        return Dialect.emit_via_ast(sql, "postgres")
 
     def render_array_unnest(self, column_sql: str, alias: str) -> str:
         """Render PostgreSQL ``UNNEST`` for SELECT list."""
         sql = f"UNNEST({column_sql}) AS {alias}"
-        return emit_via_ast(sql, "postgres")
+        return Dialect.emit_via_ast(sql, "postgres")
 
-    def render_date_window(self, column: str, op: str, unit: str, amount: int) -> str:
+    def render_date_window(
+        self, column: str, op: str, unit: str, amount: int, *, anchor: datetime | None = None
+    ) -> str:
         """Render PostgreSQL date window boundaries."""
+        clock = self.date_window_clock_sql(unit, anchor=anchor)
         if amount == 0:
-            sql = f"{column} {op} DATE_TRUNC('{unit}', CURRENT_DATE)"
+            sql = f"{column} {op} DATE_TRUNC('{unit}', {clock})"
         else:
-            scaled, plural_unit = format_interval_unit(unit, amount)
-            sql = f"{column} {op} CURRENT_DATE - INTERVAL '{scaled} {plural_unit}'"
-        return emit_via_ast(sql, "postgres")
+            scaled, plural_unit = Dialect.format_interval_unit(unit, amount)
+            sql = f"{column} {op} {clock} - INTERVAL '{scaled} {plural_unit}'"
+        return Dialect.emit_via_ast(sql, "postgres")
 
     def reflect_schema_graph(
         self,
         *,
-        include: SchemaInclude = "tables",
+        include: SchemaInclude = SchemaInclude.TABLES,
         allow_objects: frozenset[str] | None = None,
+        deny_objects: frozenset[str] | None = None,
         sql_file: str | None = None,
     ) -> SchemaGraph:
         """Reflect PostgreSQL metadata or parse ``EngineContext.sql_file`` DDL."""
@@ -1226,6 +1188,7 @@ class PostgresDialect(Dialect):
             self.engine,
             include=include,
             allow_objects=allow_objects,
+            deny_objects=deny_objects,
             schema_json_path=EngineConfig.SCHEMA_JSON_PATH,
             sql_file=sql_file,
         )
@@ -1264,11 +1227,7 @@ class PostgresDialect(Dialect):
         profile_schema(self.engine, sg, dialect=self)
 
     def refresh_full_table_distinct_for_pk_inference(
-        self,
-        table_name: str,
-        col_name: str,
-        *,
-        table_kind: Literal["table", "view"] = "table",
+        self, table_name: str, col_name: str, *, table_kind: TableKind = TableKind.TABLE
     ) -> tuple[int, int, float] | None:
         """Run full-table statistics for PK inference after sampled. profiling."""
         try:
@@ -1277,7 +1236,7 @@ class PostgresDialect(Dialect):
             safe_col = str(col_name).replace('"', '""')
             sql = text(
                 f'SELECT COUNT(*) AS cnt, COUNT(DISTINCT "{safe_col}") AS dist, '
-                f'COUNT(*) - COUNT("{safe_col}") AS nulls FROM "{safe_tbl}"',
+                f'COUNT(*) - COUNT("{safe_col}") AS nulls FROM "{safe_tbl}"'
             )
             with self.engine.connect() as conn:
                 row = conn.execute(sql).fetchone()
@@ -1299,7 +1258,7 @@ class PostgresDialect(Dialect):
         row_count: int,
         sample_size: int,
         random_seed: int,
-        table_kind: Literal["table", "view"] = "table",
+        table_kind: TableKind = TableKind.TABLE,
     ) -> str:
         """Return a ``TABLESAMPLE BERNOULLI`` suffix for PostgreSQL. statistics."""
         if table_kind == "view":
@@ -1309,12 +1268,9 @@ class PostgresDialect(Dialect):
         pct = 100 * sample_size / row_count if row_count else 0.0
         return f"TABLESAMPLE BERNOULLI ({pct:.2f}) REPEATABLE ({random_seed})"
 
-    def profiling_stats_use_subquery_when_sampling(
-        self,
-        table_kind: Literal["table", "view"] = "table",
-    ) -> bool:
+    def profiling_stats_use_subquery_when_sampling(self, table_kind: TableKind = TableKind.TABLE) -> bool:
         """PostgreSQL samples the base table directly with. ``TABLESAMPLE``."""
         return table_kind == "view"
 
 
-register_dialect("postgresql", PostgresDialect, PostgresRuntimeConfig)
+DialectRegistry.register_dialect("postgresql", PostgresDialect, PostgresRuntimeConfig)

@@ -19,7 +19,7 @@ from aetherdialect._intent_resolve import (
 def _issue_missing_numeric(value: str) -> IntentIssue:
     return IntentIssue(
         issue_id=f"missing_numeric_{value}_main",
-        category=FailureCategory.MISSING_NUMERIC_FILTER,
+        category=FailureCategory.MISSING_NUMERIC_WHERE,
         severity="warning",
         message=f"Coverage text mentions number '{value}'",
         context={"value": value, "location": "main"},
@@ -32,7 +32,7 @@ class TestLiteralInLogicalProse:
         li = LogicalIntent(
             tables=("film",),
             select="title",
-            filter="films whose rating equals 'PG-13'",
+            where="films whose rating equals 'PG-13'",
         )
         assert literal_in_logical_prose(li, "PG-13") is True
 
@@ -40,7 +40,7 @@ class TestLiteralInLogicalProse:
         li = LogicalIntent(
             tables=("film",),
             select="title",
-            filter="rating equals pg-13",
+            where="rating equals pg-13",
         )
         assert literal_in_logical_prose(li, "PG-13") is True
 
@@ -54,7 +54,7 @@ class TestLiteralInLogicalProse:
                     name="c1",
                     tables=("a", "c0"),
                     select="y",
-                    filter="amount is greater than 5",
+                    where="amount is greater than 5",
                 ),
             ),
         )
@@ -70,7 +70,7 @@ class TestAttributePostStageBIssue:
         li = LogicalIntent(
             tables=("film",),
             select="title",
-            filter="films whose rating equals 'PG-13'",
+            where="films whose rating equals 'PG-13'",
         )
         iss = _issue_missing_numeric("PG-13")
         out = attribute_post_compose_issue(iss, li)
@@ -80,7 +80,7 @@ class TestAttributePostStageBIssue:
         li = LogicalIntent(
             tables=("film",),
             select="title",
-            filter="films with the right rating",
+            where="films with the right rating",
         )
         iss = _issue_missing_numeric("PG-13")
         out = attribute_post_compose_issue(iss, li)
@@ -90,7 +90,7 @@ class TestAttributePostStageBIssue:
         li = LogicalIntent(
             tables=("payment",),
             select="amount",
-            filter="payments above 5",
+            where="payments above 5",
         )
         iss = _issue_missing_numeric("5")
         out = attribute_post_compose_issue(iss, li)
@@ -100,7 +100,7 @@ class TestAttributePostStageBIssue:
         li = LogicalIntent(
             tables=("payment",),
             select="amount",
-            filter="payments above 5",
+            where="payments above 5",
         )
         iss = _issue_missing_numeric("13")
         out = attribute_post_compose_issue(iss, li)
@@ -110,7 +110,7 @@ class TestAttributePostStageBIssue:
         li = LogicalIntent(
             tables=("film",),
             select="film_id",
-            filter="rating = 'R'",
+            where="rating = 'R'",
         )
         iss = _issue_missing_numeric("PG-13")
         out = attribute_post_compose_issue(iss, li)
@@ -125,7 +125,7 @@ class TestAttributePostStageBIssue:
                     name="c1",
                     tables=("film",),
                     select="film_id",
-                    filter="length > 5",
+                    where="length > 5",
                 ),
             ),
         )
@@ -142,7 +142,7 @@ class TestAttributePostStageBIssue:
                     name="c1",
                     tables=("film",),
                     select="film_id",
-                    filter="length > 10",
+                    where="length > 10",
                 ),
             ),
         )

@@ -47,7 +47,9 @@ def test_artifact_lock_serializes_threads(tmp_path):
 
 
 def test_artifact_lock_timeout_raises(tmp_path):
-    """If another holder never releases, ``artifact_lock`` raises ``TimeoutError``."""
+    """If another holder never releases, ``artifact_lock`` raises ``ArtifactLockTimeoutError``."""
+    from aetherdialect._contracts_base import ArtifactLockTimeoutError
+
     d = str(tmp_path)
     holder_acquired = threading.Event()
     release_holder = threading.Event()
@@ -61,7 +63,7 @@ def test_artifact_lock_timeout_raises(tmp_path):
     th.start()
     try:
         assert holder_acquired.wait(timeout=5.0)
-        with pytest.raises(TimeoutError):
+        with pytest.raises(ArtifactLockTimeoutError):
             with artifact_lock(d, timeout=0.5):
                 pass
     finally:

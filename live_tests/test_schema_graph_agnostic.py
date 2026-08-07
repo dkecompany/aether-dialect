@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from aetherdialect._contracts_base import data_type_to_value_type
+from aetherdialect._core_utils import data_type_to_value_type
 
 from ._engine_live import build_engine_t2s, engine_schema, skip_unless_configured
 from ._schema_graph_role_spec import RENTAL_SHOP_COLUMN_ROLE_ALLOWLIST

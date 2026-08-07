@@ -4,45 +4,64 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import InitVar, asdict, dataclass, field, replace
+from pathlib import Path
 from typing import Any, ClassVar, Literal, cast
 
-from ._config import PolicyConfig
 from ._constants import (
     AGG_PATTERN,
     CASE_WHEN_QUALIFIED_COLUMN_REF_RE,
     COMPOSE_FIELDS,
+    CSV_SCHEMA_LITERAL_ORIGINAL_NAME_NOTE,
     DEFAULT_RANDOM_SEED,
-    DESCRIPTION_OWNER_VALUES,
-    EXCLUDED_FILTER_PATTERNS,
+    EXACT_NUMERIC_BASE_TYPES,
+    EXCLUDED_WHERE_PATTERNS,
+    FEDERATION_ENUM_PROMPT_CAP,
     FULL_FIELDS,
     GROUND_FIELDS,
     HIDDEN_SENSITIVITIES,
+    INEXACT_NUMERIC_BASE_TYPES,
     INTERPRET_FIELDS,
     KEPT_ISSUE_SEVERITIES,
     LOGICAL_FAILURE_CATEGORIES,
+    NUMERIC_TYPE_ARGUMENTS_RE,
+    PROMPT_SCALAR_VALUE_TYPES,
     ROLE_ALLOWED_AGGREGATIONS,
+    SCHEMA_DESCRIPTION_PROMPT_COUNT_CAP,
+    SCHEMA_DESCRIPTION_PROMPT_MAX_CHARS,
+    SCHEMA_FIELD_DERIVED,
     SCHEMA_FIELD_DESCRIPTION,
     SCHEMA_FIELD_ENUM,
     SCHEMA_FIELD_KEYS,
     SCHEMA_FIELD_ROLE,
+    SCHEMA_FIELD_SAMPLES,
     SCHEMA_FIELD_TRUTH_VALUE,
     SCHEMA_FIELD_TYPE,
+    SCHEMA_INSTRUCTION_LIKE_LINE_PATTERNS,
+    SCHEMA_INSTRUCTION_SCRUB_REPLACEMENT,
+    SENTINEL_MODE_FREQUENCY_THRESHOLD,
     STAGE_ATTRIBUTION_TABLE,
+    UNKNOWN_VALUE_TYPE,
+    UNUSABLE_NULL_RATIO_THRESHOLD,
+    WINDOW_REGISTRY_AGG_KIND_HINTS,
+    WINDOW_REGISTRY_NAV_KIND_HINTS,
+    WINDOW_REGISTRY_RANK_KIND_HINTS,
 )
 from ._contracts_base import (
+    ArrayStorageKind,
     ColumnRole,
+    ColumnTypeSemantics,
     ColumnVisibilityBlockReason,
     ComplexityTier,
+    ConfigError,
     DatabaseFeatureCapability,
+    DataQualityReport,
     DescriptionOwner,
     FailureCategory,
-    FilterParam,
     InferenceTag,
-    LogicalIntent,
     NormalizedExpr,
     OrderByCol,
     OverrideSkip,
@@ -50,30 +69,13 @@ from ._contracts_base import (
     PkInferenceTag,
     RoleOwner,
     SchemaInclude,
+    SchemaInvariantError,
     SensitivityClassification,
+    TableKind,
+    WhereParam,
     WindowFrameKind,
-    coerce_inference_tag,
-    coerce_pk_inference_tag,
-    coerce_role_owner,
-    column_sensitivity_from_dict,
-    data_type_to_value_type,
-    expr_prompt_sql,
-    normalized_expr_from_stored_json,
-    parse_expr_string_for_json,
-    parse_failure_category,
-    set_sensitivity,
+    WindowOperatorKind,
 )
-
-
-def _coerce_description_owner(raw: object) -> DescriptionOwner | None:
-    """Normalise raw cache or override input into :class:`DescriptionOwner` (``None`` when unset)."""
-    if raw is None or raw == "":
-        return None
-    if isinstance(raw, DescriptionOwner):
-        return raw
-    if isinstance(raw, str) and raw in DESCRIPTION_OWNER_VALUES:
-        return DescriptionOwner(raw)
-    raise ValueError(f"unknown description_owner: {raw!r}")
 
 
 @dataclass
@@ -82,6 +84,7 @@ class _ColumnMetadataCore:
 
     name: str
     data_type: str
+    original_name: str = ""
     enum_type_name: str | None = None
     is_primary_key: InitVar[bool] = False
     is_foreign_key: InitVar[bool] = False
@@ -91,16 +94,20 @@ class _ColumnMetadataCore:
     row_count: int = 0
     distinct_count: int = 0
     distinct_from_sample: bool = False
-    distinct_ratio: float = 0.0
-    null_ratio: float = 0.0
+    distinct_ratio: float | None = 0.0
+    null_ratio: float | None = 0.0
     min_val: str | None = None
     max_val: str | None = None
     frequent_values: list[str] = field(default_factory=list)
     value_overlap_sample: list[str] = field(default_factory=list)
+    character_set: str | None = None
+    collation: str | None = None
+    is_case_insensitive_collation: bool = False
+    overlap_comparison: str = "exact"
     is_aggregatable_override: bool | None = None
     is_groupable_override: bool | None = None
     is_filterable_override: bool | None = None
-    valid_filter_ops: list[str] = field(default_factory=list)
+    valid_where_ops: list[str] = field(default_factory=list)
     valid_aggregations: list[str] = field(default_factory=list)
     valid_having_ops: list[str] = field(default_factory=list)
     description: str = ""
@@ -114,11 +121,44 @@ class _ColumnMetadataCore:
     semantic_join_neighbors: list[tuple[str, str]] = field(default_factory=list)
     is_denied: InitVar[bool] = False
     mode_frequency_ratio: float = 0.0
+    profile_failed: bool = False
+    profile_skipped_reason: str | None = None
     is_canonical_duplicate: InitVar[bool] = True
     pk_inference_tag: PkInferenceTag | None = None
     role_owner: RoleOwner | None = None
     boolean_truth_value: str | None = None
     usable_override: bool | None = None
+    numeric_precision: int | None = None
+    numeric_scale: int | None = None
+    is_exact_numeric: bool = False
+    is_unsigned: bool = False
+    is_timezone_aware: bool = False
+    is_fixed_width_text: bool = False
+
+    def prompt_value_type(self) -> str:
+        """Return the normalized value-type token used for prompt sample guards."""
+        vt = (self.value_type or "").strip().lower()
+        if vt:
+            return vt
+        if self.data_type:
+            return ColumnTypeSemantics.data_type_to_value_type(self.data_type).strip().lower()
+        return ArrayStorageKind.UNKNOWN
+
+    def assert_prompt_value_scalar(
+        self,
+        *,
+        table_name: str | None,
+        contribution: str,
+    ) -> None:
+        """Raise when non-scalar column data would be serialized into a prompt."""
+        vt = self.prompt_value_type()
+        if vt in PROMPT_SCALAR_VALUE_TYPES:
+            return
+        loc = f"{table_name}.{self.name}" if table_name else self.name
+        raise SchemaInvariantError(
+            f"column {loc!r} has value_type {vt!r} but contributed {contribution} to a prompt; "
+            f"only {sorted(PROMPT_SCALAR_VALUE_TYPES)} may reach prompts"
+        )
 
     def __post_init__(
         self,
@@ -130,7 +170,42 @@ class _ColumnMetadataCore:
     ) -> None:
         """Set `value_type` from `data_type` when `value_type` is empty and capture PK/FK/deny seeds. ``is_primary_key``, ``is_foreign_key``, ``fk_target``, and ``is_denied`` are accepted as constructor arguments for ergonomic standalone construction (tests, ad-hoc fixtures), but they are merely seeds: the authoritative store of primary-key membership is ``TableMetadata.primary_key``, of foreign-key membership is ``TableMetadata.foreign_keys``, and of deny-list membership is ``SchemaGraph.deny_columns`` on the owning graph. When this column is attached to a :class:`TableMetadata` (and that table to a :class:`SchemaGraph`), the relevant ``__post_init__`` consolidates the seeds into the canonical containers and clears them so the :attr:`is_primary_key`, :attr:`is_foreign_key`, :attr:`fk_target`, and :attr:`is_denied` properties always read from a single owner. The seed and back- reference attributes are stored outside the dataclass field set so :func:`dataclasses.asdict` does not traverse a column-table- graph cycle."""
         if not self.value_type and self.data_type:
-            self.value_type = data_type_to_value_type(self.data_type)
+            self.value_type = ColumnTypeSemantics.data_type_to_value_type(self.data_type)
+        if (
+            self.data_type
+            and self.numeric_precision is None
+            and self.numeric_scale is None
+            and not self.is_exact_numeric
+        ):
+            match = NUMERIC_TYPE_ARGUMENTS_RE.search(self.data_type)
+            if match:
+                self.numeric_precision = int(match.group(1))
+                self.numeric_scale = int(match.group(2)) if match.group(2) is not None else None
+            base = ColumnTypeSemantics.normalize_column_type(self.data_type)
+            if base in INEXACT_NUMERIC_BASE_TYPES:
+                self.is_exact_numeric = False
+            elif base in EXACT_NUMERIC_BASE_TYPES:
+                self.is_exact_numeric = True
+            elif self.value_type == "integer":
+                self.is_exact_numeric = True
+            elif self.value_type == "number":
+                self.is_exact_numeric = base in {"decimal", "numeric", "money"}
+        seed_unsigned = self.is_unsigned
+        seed_timezone_aware = self.is_timezone_aware
+        seed_fixed_width_text = self.is_fixed_width_text
+        if self.data_type:
+            detected_unsigned = ColumnTypeSemantics.column_is_unsigned_from_data_type(self.data_type)
+            object.__setattr__(self, "is_unsigned", seed_unsigned or detected_unsigned)
+            detected_timezone_aware = ColumnTypeSemantics.column_timezone_aware_from_data_type(self.data_type)
+            object.__setattr__(self, "is_timezone_aware", seed_timezone_aware or detected_timezone_aware)
+            detected_fixed_width_text = ColumnTypeSemantics.column_is_fixed_width_text_from_data_type(self.data_type)
+            object.__setattr__(
+                self,
+                "is_fixed_width_text",
+                seed_fixed_width_text or detected_fixed_width_text,
+            )
+        if not self.is_exact_numeric and self.is_unsigned and ColumnTypeSemantics.column_unsigned_near_type_max(self):
+            object.__setattr__(self, "is_exact_numeric", True)
         object.__setattr__(self, "_seed_is_primary_key", bool(is_primary_key))
         object.__setattr__(self, "_seed_is_foreign_key", bool(is_foreign_key))
         object.__setattr__(
@@ -141,7 +216,7 @@ class _ColumnMetadataCore:
         object.__setattr__(self, "_seed_is_denied", bool(is_denied))
         object.__setattr__(self, "_seed_is_canonical_duplicate", bool(is_canonical_duplicate))
         object.__setattr__(self, "_owner_table", None)
-        set_sensitivity(self, self.sensitivity)
+        SensitivityClassification.apply_to(self, self.sensitivity)
 
     @staticmethod
     def from_dict(d: dict[str, Any]) -> ColumnMetadata:
@@ -159,7 +234,7 @@ class _ColumnMetadataCore:
         fk_target = None
         if d.get("fk_target"):
             fk_target = tuple(d["fk_target"]) if isinstance(d["fk_target"], list) else d["fk_target"]
-        sens = column_sensitivity_from_dict(d)
+        sens = SensitivityClassification.from_dict(d)
         frequent_values = list(d.get("frequent_values") or [])
         if not frequent_values:
             frequent_values = list(d.get("top_k_values") or [])
@@ -169,6 +244,7 @@ class _ColumnMetadataCore:
         return ColumnMetadata(
             name=d.get("name", ""),
             data_type=d.get("data_type", ""),
+            original_name=str(d.get("original_name", "") or ""),
             is_primary_key=d.get("is_primary_key", False),
             is_foreign_key=d.get("is_foreign_key", False),
             fk_target=fk_target,
@@ -186,11 +262,11 @@ class _ColumnMetadataCore:
             is_aggregatable_override=d.get("is_aggregatable_override"),
             is_groupable_override=d.get("is_groupable_override"),
             is_filterable_override=d.get("is_filterable_override"),
-            valid_filter_ops=d.get("valid_filter_ops", []),
+            valid_where_ops=d.get("valid_where_ops", []),
             valid_aggregations=d.get("valid_aggregations", []),
             valid_having_ops=d.get("valid_having_ops", []),
             description=d.get("description", ""),
-            description_owner=_coerce_description_owner(d.get("description_owner")),
+            description_owner=DescriptionOwner.coerce(d.get("description_owner")),
             is_unique=d.get("is_unique", False),
             is_generated=bool(d.get("is_generated", False)),
             is_identity=bool(d.get("is_identity", False)),
@@ -198,6 +274,10 @@ class _ColumnMetadataCore:
             element_type=d.get("element_type"),
             is_nullable=d.get("is_nullable", True),
             value_overlap_sample=value_overlap_sample,
+            character_set=d.get("character_set"),
+            collation=d.get("collation"),
+            is_case_insensitive_collation=bool(d.get("is_case_insensitive_collation", False)),
+            overlap_comparison=str(d.get("overlap_comparison", "exact") or "exact"),
             semantic_join_neighbors=[
                 (str(x[0]), str(x[1]))
                 for x in (d.get("semantic_join_neighbors") or [])
@@ -205,11 +285,19 @@ class _ColumnMetadataCore:
             ],
             is_denied=d.get("is_denied", False),
             mode_frequency_ratio=d.get("mode_frequency_ratio", 0.0),
+            profile_failed=bool(d.get("profile_failed", False)),
+            profile_skipped_reason=d.get("profile_skipped_reason"),
             is_canonical_duplicate=d.get("is_canonical_duplicate", True),
-            pk_inference_tag=coerce_pk_inference_tag(d.get("pk_inference_tag")),
-            role_owner=coerce_role_owner(d.get("role_owner")),
+            pk_inference_tag=PkInferenceTag.coerce(d.get("pk_inference_tag")),
+            role_owner=RoleOwner.coerce(d.get("role_owner")),
             boolean_truth_value=d.get("boolean_truth_value"),
             usable_override=d.get("usable_override"),
+            numeric_precision=d.get("numeric_precision"),
+            numeric_scale=d.get("numeric_scale"),
+            is_exact_numeric=bool(d.get("is_exact_numeric", False)),
+            is_unsigned=bool(d.get("is_unsigned", False)),
+            is_timezone_aware=bool(d.get("is_timezone_aware", False)),
+            is_fixed_width_text=bool(d.get("is_fixed_width_text", False)),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -223,6 +311,7 @@ class _ColumnMetadataCore:
         col = cast("ColumnMetadata", self)
         return {
             "name": self.name,
+            "original_name": self.original_name,
             "data_type": self.data_type,
             "is_primary_key": col.is_primary_key,
             "is_foreign_key": col.is_foreign_key,
@@ -241,7 +330,7 @@ class _ColumnMetadataCore:
             "is_aggregatable_override": self.is_aggregatable_override,
             "is_groupable_override": self.is_groupable_override,
             "is_filterable_override": self.is_filterable_override,
-            "valid_filter_ops": self.valid_filter_ops,
+            "valid_where_ops": self.valid_where_ops,
             "valid_aggregations": self.valid_aggregations,
             "valid_having_ops": self.valid_having_ops,
             "description": self.description,
@@ -254,13 +343,25 @@ class _ColumnMetadataCore:
             "element_type": self.element_type,
             "is_nullable": self.is_nullable,
             "value_overlap_sample": self.value_overlap_sample,
+            "character_set": self.character_set,
+            "collation": self.collation,
+            "is_case_insensitive_collation": self.is_case_insensitive_collation,
+            "overlap_comparison": self.overlap_comparison,
             "semantic_join_neighbors": [list(p) for p in self.semantic_join_neighbors],
             "is_denied": col.is_denied,
             "mode_frequency_ratio": self.mode_frequency_ratio,
+            "profile_failed": self.profile_failed,
+            "profile_skipped_reason": self.profile_skipped_reason,
             "is_canonical_duplicate": col.is_canonical_duplicate,
             "pk_inference_tag": (self.pk_inference_tag.value if self.pk_inference_tag is not None else None),
             "role_owner": (self.role_owner.value if self.role_owner is not None else None),
             "boolean_truth_value": self.boolean_truth_value,
+            "numeric_precision": self.numeric_precision,
+            "numeric_scale": self.numeric_scale,
+            "is_exact_numeric": self.is_exact_numeric,
+            "is_unsigned": self.is_unsigned,
+            "is_timezone_aware": self.is_timezone_aware,
+            "is_fixed_width_text": self.is_fixed_width_text,
         }
 
     def visibility_block_reason(self) -> ColumnVisibilityBlockReason | None:
@@ -287,11 +388,11 @@ class _ColumnMetadataCore:
             return ColumnVisibilityBlockReason.UNUSABLE
         return None
 
-    def get_valid_filter_ops(self) -> list[str]:
+    def get_valid_where_ops(self) -> list[str]:
         """Valid filter operators for this column, always including. null. checks. Returns: Operator strings such as `=`, `!=`, `like`, `between`, plus `is null` / `is not null`."""
         null_ops = ["is null", "is not null"]
-        if self.valid_filter_ops:
-            return sorted(set(self.valid_filter_ops + null_ops))
+        if self.valid_where_ops:
+            return sorted(set(self.valid_where_ops + null_ops))
         return null_ops
 
     def get_valid_aggregations(self) -> set[str]:
@@ -334,25 +435,24 @@ class ColumnMetadata(_ColumnMetadataCore):
     @property
     def is_selectable(self) -> bool:
         """Whether the column may be projected in a ``SELECT`` list."""
-        if self.sensitivity in (
-            SensitivityClassification.RESTRICTED,
-            SensitivityClassification.HIDDEN,
-        ):
+        if self.sensitivity in (SensitivityClassification.RESTRICTED, SensitivityClassification.HIDDEN):
             return False
         return True
 
     @property
     def is_usable(self) -> bool:
         """Whether the column has enough variance and signal to be exposed to the LLM."""
+        if (self.value_type or "").strip().lower() == UNKNOWN_VALUE_TYPE:
+            return False
         if self.is_primary_key or self.is_foreign_key:
             return True
         if self.usable_override is True:
             return True
         if self.distinct_count is not None and self.distinct_count <= 1:
             return False
-        if self.null_ratio >= PolicyConfig.UNUSABLE_NULL_RATIO_THRESHOLD:
+        if self.null_ratio is not None and self.null_ratio >= UNUSABLE_NULL_RATIO_THRESHOLD:
             return False
-        if self.mode_frequency_ratio >= PolicyConfig.SENTINEL_MODE_FREQUENCY_THRESHOLD:
+        if self.mode_frequency_ratio >= SENTINEL_MODE_FREQUENCY_THRESHOLD:
             return False
         return True
 
@@ -374,9 +474,11 @@ class ColumnMetadata(_ColumnMetadataCore):
 
             False if the name matches an excluded pattern; else override, key, or role-based rules.
         """
-        for pattern in EXCLUDED_FILTER_PATTERNS:
+        for pattern in EXCLUDED_WHERE_PATTERNS:
             if re.search(pattern, self.name, re.IGNORECASE):
                 return False
+        if (self.value_type or "").strip().lower() == UNKNOWN_VALUE_TYPE:
+            return False
         if self.is_filterable_override is not None:
             return self.is_filterable_override
         if self.is_primary_key:
@@ -404,6 +506,8 @@ class ColumnMetadata(_ColumnMetadataCore):
 
             True when override, foreign key, or role allows grouping.
         """
+        if (self.value_type or "").strip().lower() == UNKNOWN_VALUE_TYPE:
+            return False
         if self.is_groupable_override is not None:
             return self.is_groupable_override
         if self.is_foreign_key:
@@ -425,6 +529,8 @@ class ColumnMetadata(_ColumnMetadataCore):
 
             True when override is set, or role is numeric measure.
         """
+        if (self.value_type or "").strip().lower() == UNKNOWN_VALUE_TYPE:
+            return False
         if self.is_aggregatable_override is not None:
             return self.is_aggregatable_override
         return self.role == ColumnRole.NUMERIC_MEASURE.value
@@ -501,7 +607,12 @@ class TableMetadata:
     columns: dict[str, ColumnMetadata]
     primary_key: list[str]
     foreign_keys: list[FKEdge]
-    kind: Literal["table", "view"] = "table"
+    original_name: str = ""
+    source_id: str = ""
+    member_source_ids: list[str] = field(default_factory=list)
+    column_member_sources: dict[str, list[str]] = field(default_factory=dict)
+    kind: TableKind = TableKind.TABLE
+    last_refreshed_at: str | None = None
     partition_columns: list[str] = field(default_factory=list)
     partition_type: str | None = None
     require_partition_filter: bool = False
@@ -514,17 +625,15 @@ class TableMetadata:
     size_mb: float | None = None
     encoded: bool | None = None
     quote_decision: str | None = None
+    view_definition: str = ""
     role: str | None = None
     row_count: int = 0
+    profile_failed: bool = False
     description: str = ""
     description_owner: DescriptionOwner | None = None
     role_owner: RoleOwner | None = None
-    composite_descriptive_ratios: dict[tuple[str, str], float] = field(
-        default_factory=dict,
-    )
-    _user_semantic_neighbors: list[tuple[str, str, str, str]] = field(
-        default_factory=list,
-    )
+    composite_descriptive_ratios: dict[tuple[str, str], float] = field(default_factory=dict)
+    _user_semantic_neighbors: list[tuple[str, str, str, str]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         """Wire each child :class:`ColumnMetadata` back to this table and consolidate any PK / FK seeds. Tests and ad-hoc fixtures may pass ``is_primary_key``, ``is_foreign_key`` / ``fk_target`` as constructor arguments to :class:`ColumnMetadata` without separately populating :attr:`primary_key` or appending an :class:`FKEdge` to :attr:`foreign_keys`. After wiring the per-column ``_owner_table`` back-reference, this method (a) appends any PK seed to :attr:`primary_key` when not already present, and (b) synthesises a single-column :class:`FKEdge` for every column whose seed declares an FK that is not already covered by an entry in :attr:`foreign_keys`. The seeds are then cleared so the :class:`ColumnMetadata` properties always read from this table's :attr:`primary_key` and :attr:`foreign_keys` as the single source of truth."""
@@ -545,13 +654,7 @@ class TableMetadata:
             if col._seed_is_foreign_key and col._seed_fk_target is not None and cname not in covered_fk:
                 dst_t, dst_c = col._seed_fk_target
                 self.foreign_keys.append(
-                    FKEdge(
-                        src_table=self.name,
-                        src_cols=[cname],
-                        dst_table=dst_t,
-                        dst_cols=[dst_c],
-                        inference_tag=None,
-                    )
+                    FKEdge(src_table=self.name, src_cols=[cname], dst_table=dst_t, dst_cols=[dst_c], inference_tag=None)
                 )
                 covered_fk.add(cname)
             if col._seed_is_denied:
@@ -580,13 +683,25 @@ class TableMetadata:
         fk_raw = d.get("foreign_keys", [])
         foreign_keys = [FKEdge(**fk) if isinstance(fk, dict) else fk for fk in fk_raw]
         kind_raw = d.get("kind", "table")
-        kind: Literal["table", "view"] = "table" if kind_raw == "table" else "view"
+        if kind_raw == "materialized_view":
+            kind: TableKind = TableKind.MATERIALIZED_VIEW
+        elif kind_raw == "view":
+            kind = TableKind.VIEW
+        else:
+            kind = TableKind.TABLE
+        last_refreshed_raw = d.get("last_refreshed_at")
+        last_refreshed_at = str(last_refreshed_raw).strip() if last_refreshed_raw else None
         return TableMetadata(
             name=d.get("name", ""),
+            original_name=str(d.get("original_name", "") or ""),
+            source_id=str(d.get("source_id", "") or ""),
+            member_source_ids=list(d.get("member_source_ids", []) or []),
+            column_member_sources={str(k): list(v) for k, v in (d.get("column_member_sources", {}) or {}).items()},
             columns=columns,
             primary_key=d.get("primary_key", []),
             foreign_keys=foreign_keys,
             kind=kind,
+            last_refreshed_at=last_refreshed_at,
             partition_columns=d.get("partition_columns", []),
             partition_type=d.get("partition_type"),
             require_partition_filter=bool(d.get("require_partition_filter", False)),
@@ -599,11 +714,13 @@ class TableMetadata:
             size_mb=d.get("size_mb"),
             encoded=d.get("encoded"),
             quote_decision=d.get("quote_decision"),
+            view_definition=str(d.get("view_definition", "") or ""),
             role=d.get("role"),
             row_count=d.get("row_count", 0),
+            profile_failed=bool(d.get("profile_failed", False)),
             description=d.get("description", ""),
-            description_owner=_coerce_description_owner(d.get("description_owner")),
-            role_owner=coerce_role_owner(d.get("role_owner")),
+            description_owner=DescriptionOwner.coerce(d.get("description_owner")),
+            role_owner=RoleOwner.coerce(d.get("role_owner")),
             composite_descriptive_ratios={
                 tuple(k.split("|", 1)): v for k, v in d.get("composite_descriptive_ratios", {}).items() if "|" in k
             },
@@ -624,7 +741,12 @@ class TableMetadata:
         """
         return {
             "name": self.name,
+            "original_name": self.original_name,
+            "source_id": self.source_id,
+            "member_source_ids": list(self.member_source_ids),
+            "column_member_sources": {k: list(v) for k, v in self.column_member_sources.items()},
             "kind": self.kind,
+            "last_refreshed_at": self.last_refreshed_at,
             "columns": {k: v.to_dict() for k, v in self.columns.items()},
             "primary_key": self.primary_key,
             "foreign_keys": [asdict(fk) for fk in self.foreign_keys],
@@ -640,8 +762,10 @@ class TableMetadata:
             "size_mb": self.size_mb,
             "encoded": self.encoded,
             "quote_decision": self.quote_decision,
+            "view_definition": self.view_definition,
             "role": self.role,
             "row_count": self.row_count,
+            "profile_failed": self.profile_failed,
             "description": self.description,
             "description_owner": (self.description_owner.value if self.description_owner is not None else None),
             "role_owner": (self.role_owner.value if self.role_owner is not None else None),
@@ -666,18 +790,27 @@ class TableMetadata:
 _SchemaGraphStatsFn = Callable[["SchemaGraph"], dict[str, Any]]
 _SchemaGraphCapabilityFn = Callable[["SchemaGraph"], DatabaseFeatureCapability]
 
-_schema_graph_stats_fn: _SchemaGraphStatsFn | None = None
-cap_fn: _SchemaGraphCapabilityFn | None = None
 
+@dataclass
+class _DescriptionPromptBudget:
+    """Deterministic per-payload cap for schema description text."""
 
-def set_schema_helpers(
-    stats_fn: _SchemaGraphStatsFn,
-    capability_fn: _SchemaGraphCapabilityFn,
-) -> None:
-    """Wire :meth:`SchemaGraph.refresh_schema_stats` and :attr:`SchemaGraph.database_feature_capability` to the implementations in :mod:`aetherdialect._schema_build` (called once at import time from that module)."""
-    global _schema_graph_stats_fn, cap_fn
-    _schema_graph_stats_fn = stats_fn
-    cap_fn = capability_fn
+    remaining: int = SCHEMA_DESCRIPTION_PROMPT_COUNT_CAP
+    truncated_chars: list[str] = field(default_factory=list)
+    truncated_count: list[str] = field(default_factory=list)
+
+    def emit(self, key: str, text: str) -> str | None:
+        td = text.strip()
+        if not td:
+            return None
+        if self.remaining <= 0:
+            self.truncated_count.append(key)
+            return None
+        if len(td) > SCHEMA_DESCRIPTION_PROMPT_MAX_CHARS:
+            td = td[: SCHEMA_DESCRIPTION_PROMPT_MAX_CHARS - 3] + "..."
+            self.truncated_chars.append(key)
+        self.remaining -= 1
+        return td
 
 
 @dataclass
@@ -688,13 +821,14 @@ class SchemaGraph:
     join_paths_multi: dict[str, dict[str, list[list[dict[str, Any]]]]]
     structural_hash: str = ""
     profiling_hash: str = ""
+    descriptions_hash: str = ""
     scope_hash: str = ""
     effective_structural_hash: str = ""
     schema_graph_id: str = ""
     notes_hash: str = ""
     semantic_edges_hash: str = ""
     ddl_probe_hash: str = ""
-    include: SchemaInclude = "tables"
+    include: SchemaInclude = SchemaInclude.TABLES
     created_at: str = ""
     enum_values: dict[str, list[str]] | None = None
     schema_stats: dict[str, Any] | None = None
@@ -702,15 +836,25 @@ class SchemaGraph:
     disallowed_columns: dict[str, set[str]] = field(default_factory=dict)
     notes_sha256: str = ""
     scope_descriptor: dict[str, Any] | None = None
+    federation_membership: dict[str, str] | None = None
     schema_revision: int = 0
     _database_feature_capability_cache: DatabaseFeatureCapability | None = field(
         default=None, repr=False, compare=False
     )
     _stats_dirty: bool = field(default=True, repr=False, compare=False)
     _last_overrides_skipped: tuple[OverrideSkip, ...] = field(default=(), repr=False, compare=False)
+    _override_internal_blocks: dict[str, Any] | None = field(default=None, repr=False, compare=False)
+    _stats_fn: _SchemaGraphStatsFn | None = field(default=None, repr=False, compare=False)
+    _capability_fn: _SchemaGraphCapabilityFn | None = field(default=None, repr=False, compare=False)
+    _default_stats_fn: ClassVar[_SchemaGraphStatsFn | None] = None
+    _default_capability_fn: ClassVar[_SchemaGraphCapabilityFn | None] = None
 
     def __post_init__(self) -> None:
         """Wire owner-graph back-references and consolidate per-column deny seeds into ``deny_columns``. After this runs, ``deny_columns`` is the single source of truth for ``ColumnMetadata.is_denied``. Existing ``deny_columns`` entries are preserved; per-column seeds (set on standalone-built columns) and per-table pending-deny sets (collected by :meth:`TableMetadata.__post_init__`) are folded in."""
+        if self._stats_fn is None and type(self)._default_stats_fn is not None:
+            self._stats_fn = type(self)._default_stats_fn
+        if self._capability_fn is None and type(self)._default_capability_fn is not None:
+            self._capability_fn = type(self)._default_capability_fn
         deny_columns: dict[str, set[str]] = {k: set(v) for k, v in (self.deny_columns or {}).items()}
         disallowed_columns: dict[str, set[str]] = {k: set(v) for k, v in (self.disallowed_columns or {}).items()}
         for tbl_name, tbl in self.tables.items():
@@ -730,7 +874,7 @@ class SchemaGraph:
 
     def refresh_schema_stats(self) -> dict[str, Any]:
         """Unconditionally recompute :attr:`schema_stats` from the current graph and clear the dirty flag."""
-        fn = _schema_graph_stats_fn
+        fn = self._stats_fn
         if fn is None:
             raise RuntimeError("Schema helpers not wired (aetherdialect._schema_build did not load)")
         self.schema_stats = fn(self)
@@ -775,11 +919,24 @@ class SchemaGraph:
         """Cached structural feasibility snapshot for tier-conditioned. generators. Returns: :class:`DatabaseFeatureCapability` computed once per graph instance."""
         cached = self._database_feature_capability_cache
         if cached is None:
+            cap_fn = self._capability_fn
             if cap_fn is None:
                 raise RuntimeError("Schema helpers not wired (aetherdialect._schema_build did not load)")
             cached = cap_fn(self)
             object.__setattr__(self, "_database_feature_capability_cache", cached)
         return cached
+
+    def set_helpers(self, stats_fn: _SchemaGraphStatsFn, capability_fn: _SchemaGraphCapabilityFn) -> None:
+        """Wire refresh/capability helpers for this graph instance."""
+        self._stats_fn = stats_fn
+        self._capability_fn = capability_fn
+        self._database_feature_capability_cache = None
+
+    @classmethod
+    def configure_default_helpers(cls, stats_fn: _SchemaGraphStatsFn, capability_fn: _SchemaGraphCapabilityFn) -> None:
+        """Wire process-default helpers applied to new graphs that have none set."""
+        cls._default_stats_fn = stats_fn
+        cls._default_capability_fn = capability_fn
 
     def get_column(self, table: str, column: str) -> ColumnMetadata | None:
         """
@@ -798,6 +955,22 @@ class SchemaGraph:
             return self.tables[table].columns[column]
         return None
 
+    def _schema_literal_spans_multiple_sources(self) -> bool:
+        """Return True when this graph represents a multi-member federation composite."""
+        source_ids = {str(tm.source_id or "").strip() for tm in self.tables.values()}
+        source_ids.discard("")
+        return len(source_ids) >= 2
+
+    def _scrub_federation_prompt_token(self, text: str, forbidden_tokens: frozenset[str]) -> str:
+        cleaned = str(text or "").strip()
+        if not cleaned or not forbidden_tokens:
+            return cleaned
+        for token in sorted(forbidden_tokens, key=len, reverse=True):
+            if token:
+                cleaned = re.sub(re.escape(token), "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"[_\s]+", " ", cleaned).strip(" _-")
+        return cleaned
+
     def _schema_literal_public_role(self, role: str | None) -> str | None:
         if role is None:
             return None
@@ -811,8 +984,38 @@ class SchemaGraph:
         if vt:
             return vt
         if col.data_type:
-            return data_type_to_value_type(col.data_type)
-        return "unknown"
+            return ColumnTypeSemantics.data_type_to_value_type(col.data_type)
+        return ArrayStorageKind.UNKNOWN
+
+    @staticmethod
+    def scrub_schema_prose_for_prompt(text: str) -> str:
+        """Strip or neutralise instruction-like lines from schema prose before Ground payloads."""
+        raw = str(text or "")
+        if not raw.strip():
+            return raw
+        patterns = tuple(re.compile(p) for p in SCHEMA_INSTRUCTION_LIKE_LINE_PATTERNS)
+        kept: list[str] = []
+        removed_line = False
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if stripped and any(pat.search(stripped) for pat in patterns):
+                removed_line = True
+                continue
+            kept.append(line)
+        if removed_line:
+            out = "\n".join(kept).strip()
+            out = re.sub(r"\n{3,}", "\n\n", out).strip()
+            return out if out else SCHEMA_INSTRUCTION_SCRUB_REPLACEMENT
+        matched = False
+        cleaned = raw
+        for pat in patterns:
+            if pat.search(cleaned):
+                matched = True
+                cleaned = pat.sub("", cleaned)
+        if not matched:
+            return raw
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" \t\n\r.,;:-—")
+        return cleaned if cleaned else SCHEMA_INSTRUCTION_SCRUB_REPLACEMENT
 
     def _schema_literal_column_object(
         self,
@@ -821,10 +1024,15 @@ class SchemaGraph:
         fields: frozenset[str],
         table_name: str | None = None,
         description_overlay: dict[str, Any] | None = None,
+        omit_original_name: bool = False,
+        desc_budget: _DescriptionPromptBudget | None = None,
+        scrub_instruction_like: bool = False,
     ) -> dict[str, Any]:
         col_body: dict[str, Any] = {}
         if SCHEMA_FIELD_TYPE in fields:
             col_body["type"] = self._schema_literal_column_type_token(col)
+        if not omit_original_name and col.original_name and col.original_name.strip() and col.original_name != col.name:
+            col_body["original_name"] = col.original_name.strip()
         if SCHEMA_FIELD_KEYS in fields:
             if col.is_primary_key:
                 col_body["pk"] = True
@@ -832,16 +1040,31 @@ class SchemaGraph:
                 col_body["fk"] = f"{col.fk_target[0]}.{col.fk_target[1]}"
             if col.is_unique and not col.is_primary_key:
                 col_body["unique"] = True
+        if SCHEMA_FIELD_DERIVED in fields and col.is_generated:
+            col_body["derived"] = True
         if SCHEMA_FIELD_DESCRIPTION in fields:
-            desc = ""
+            overlay_desc = ""
+            overlay_owner: DescriptionOwner | None = None
             if description_overlay and table_name:
                 meta_entry = description_overlay.get("column_meta", {}).get(f"{table_name}.{col.name}")
                 if isinstance(meta_entry, dict):
-                    desc = str(meta_entry.get("description", "")).strip()
-            if not desc:
-                desc = (col.description or "").strip()
+                    overlay_desc = str(meta_entry.get("description", "")).strip()
+                    overlay_owner = DescriptionOwner.coerce(meta_entry.get("description_owner"))
+                    if overlay_owner is None and overlay_desc:
+                        overlay_owner = DescriptionOwner.SPACE_NOTES
+            desc, _ = DescriptionOwner.resolve(
+                (overlay_desc, overlay_owner),
+                (col.description, col.description_owner),
+            )
             if desc:
-                col_body["description"] = desc
+                key = f"{table_name}.{col.name}" if table_name else col.name
+                if desc_budget is not None:
+                    emitted = desc_budget.emit(key, desc)
+                    desc = emitted if emitted is not None else ""
+                if desc:
+                    if scrub_instruction_like:
+                        desc = SchemaGraph.scrub_schema_prose_for_prompt(desc)
+                    col_body["description"] = desc
         if SCHEMA_FIELD_ROLE in fields:
             pub_role = self._schema_literal_public_role(col.role)
             if pub_role is not None:
@@ -856,6 +1079,30 @@ class SchemaGraph:
                 tv = (col.boolean_truth_value or "").strip()
                 if tv:
                     col_body["truth_value"] = tv
+        if SCHEMA_FIELD_SAMPLES in fields:
+            if col.prompt_value_type() in PROMPT_SCALAR_VALUE_TYPES:
+                samples: dict[str, Any] = {}
+                if col.distinct_count:
+                    samples["distinct_count"] = col.distinct_count
+                if col.min_val is not None:
+                    samples["min_val"] = col.min_val
+                if col.max_val is not None:
+                    samples["max_val"] = col.max_val
+                if col.frequent_values:
+                    samples["frequent_values"] = [
+                        (
+                            SchemaGraph.scrub_schema_prose_for_prompt(str(value))
+                            if scrub_instruction_like
+                            else str(value)
+                        )
+                        for value in col.frequent_values
+                    ]
+                if samples:
+                    col.assert_prompt_value_scalar(
+                        table_name=table_name,
+                        contribution="prompt sample",
+                    )
+                    col_body[SCHEMA_FIELD_SAMPLES] = samples
         if not col_body and SCHEMA_FIELD_TYPE in fields:
             col_body["type"] = self._schema_literal_column_type_token(col)
         return col_body
@@ -868,9 +1115,15 @@ class SchemaGraph:
         column_filter: frozenset[str] | None = None,
         owner_master_scope: bool = False,
         description_overlay: dict[str, Any] | None = None,
+        scrub_instruction_like: bool = False,
     ) -> dict[str, Any]:
         root: dict[str, Any] = {}
+        omit_original_name = True
         col_allow_by_table: dict[str, set[str]] | None = None
+        desc_budget: _DescriptionPromptBudget | None = None
+        if SCHEMA_FIELD_DESCRIPTION in fields:
+            desc_budget = _DescriptionPromptBudget()
+            object.__setattr__(self, "_last_description_truncations", ())
         if column_filter:
             col_allow_by_table = {}
             for qc in column_filter:
@@ -895,35 +1148,102 @@ class SchemaGraph:
                     fields=fields,
                     table_name=tname,
                     description_overlay=description_overlay,
+                    omit_original_name=omit_original_name,
+                    desc_budget=desc_budget,
+                    scrub_instruction_like=scrub_instruction_like,
                 )
                 if col_obj:
                     col_map[col_name] = col_obj
             table_body: dict[str, Any] = {"columns": col_map}
             if SCHEMA_FIELD_DESCRIPTION in fields:
-                td = ""
+                overlay_desc = ""
+                overlay_owner: DescriptionOwner | None = None
                 if description_overlay:
-                    td = str(description_overlay.get("table_descriptions", {}).get(tname, "")).strip()
-                if not td:
-                    td = (tm.description or "").strip()
+                    overlay_desc = str(description_overlay.get("table_descriptions", {}).get(tname, "")).strip()
+                    if overlay_desc:
+                        owners = description_overlay.get("_table_description_owners") or {}
+                        raw_owner = owners.get(tname) if isinstance(owners, dict) else None
+                        overlay_owner = DescriptionOwner.coerce(raw_owner) if raw_owner else None
+                        if overlay_owner is None:
+                            overlay_owner = DescriptionOwner.SPACE_NOTES
+                td, _ = DescriptionOwner.resolve(
+                    (overlay_desc, overlay_owner),
+                    (tm.description, tm.description_owner),
+                )
                 if td:
-                    table_body["description"] = td
+                    if desc_budget is not None:
+                        emitted = desc_budget.emit(f"table:{tname}", td)
+                        td = emitted if emitted is not None else ""
+                    if td:
+                        if scrub_instruction_like:
+                            td = SchemaGraph.scrub_schema_prose_for_prompt(td)
+                        table_body["description"] = td
             if SCHEMA_FIELD_ROLE in fields:
                 tr = self._schema_literal_public_role(tm.role)
                 if tr is not None:
                     table_body["role"] = tr
+            if not omit_original_name and tm.original_name and tm.original_name.strip() and tm.original_name != tm.name:
+                table_body["original_name"] = tm.original_name.strip()
             root[tname] = table_body
         if SCHEMA_FIELD_ENUM in fields and self.enum_values:
             enum_block: dict[str, Any] = {}
+            truncated_enums: list[str] = []
+            forbidden_tokens = getattr(self, "_federation_description_forbidden_tokens", None) or frozenset()
             for ename in sorted(self.enum_values.keys()):
                 values = self.enum_values[ename]
-                if len(values) <= 10:
-                    enum_block[ename] = list(values)
-                else:
-                    enum_block[ename] = list(values[:10]) + ["..."]
+                if values:
+                    prompt_enum_name = ename.split("::", 1)[-1]
+                    for tname, tm in self.tables.items():
+                        for col in tm.columns.values():
+                            enum_type_name = (col.enum_type_name or "").strip()
+                            if not enum_type_name:
+                                continue
+                            if enum_type_name == ename or enum_type_name.split("::", 1)[-1] == prompt_enum_name:
+                                col.assert_prompt_value_scalar(
+                                    table_name=tname,
+                                    contribution="enum label",
+                                )
+                prompt_name = ename.split("::", 1)[-1]
+                if forbidden_tokens:
+                    prompt_name = self._scrub_federation_prompt_token(prompt_name, forbidden_tokens) or prompt_name
+                capped_values = list(values[:FEDERATION_ENUM_PROMPT_CAP])
+                if len(values) > FEDERATION_ENUM_PROMPT_CAP:
+                    capped_values.append("...")
+                    truncated_enums.append(prompt_name)
+                prompt_values: list[str] = []
+                for value in capped_values:
+                    if str(value) == "...":
+                        prompt_values.append("...")
+                        continue
+                    scrubbed = (
+                        self._scrub_federation_prompt_token(str(value), forbidden_tokens)
+                        if forbidden_tokens
+                        else str(value)
+                    )
+                    if forbidden_tokens and not scrubbed:
+                        raise ConfigError("composite enum label must not name a source or member")
+                    prompt_values.append(
+                        SchemaGraph.scrub_schema_prose_for_prompt(scrubbed) if scrub_instruction_like else scrubbed
+                    )
+                enum_block[prompt_name] = prompt_values
+            if truncated_enums:
+                object.__setattr__(self, "_last_enum_truncations", tuple(truncated_enums))
             root["enum_types"] = enum_block
+        if desc_budget is not None and (desc_budget.truncated_chars or desc_budget.truncated_count):
+            object.__setattr__(
+                self,
+                "_last_description_truncations",
+                tuple(desc_budget.truncated_chars + desc_budget.truncated_count),
+            )
+        if not omit_original_name and any(
+            (tm.original_name and tm.original_name != tm.name)
+            or any(col.original_name and col.original_name != col.name for col in tm.columns.values())
+            for tm in self.tables.values()
+        ):
+            root["upload_label_note"] = CSV_SCHEMA_LITERAL_ORIGINAL_NAME_NOTE
         return root
 
-    def _resolve_payload_filters(
+    def _resolve_payload_where(
         self,
         *,
         visible_objects: frozenset[str] | None = None,
@@ -932,22 +1252,31 @@ class SchemaGraph:
         deny_columns: frozenset[str] | None = None,
     ) -> tuple[frozenset[str] | None, frozenset[str] | None]:
         """Derive table and column filters from interactive scope kwargs."""
+        graph_tables = frozenset(self.tables.keys())
         if visible_objects is not None:
             vis_tables = frozenset(t for t in visible_objects if t in self.tables)
         else:
             vis_tables = frozenset()
         if deny_objects:
             deny_set = set(deny_objects)
-            if vis_tables:
-                vis_tables = frozenset(t for t in vis_tables if t not in deny_set)
+            base_tables = vis_tables if vis_tables else graph_tables
+            vis_tables = frozenset(t for t in base_tables if t not in deny_set)
         col_restrict = frozenset(allowed_columns) if allowed_columns else frozenset()
         if deny_columns:
             deny_col_set = set(deny_columns)
-            col_restrict = frozenset(qc for qc in col_restrict if qc not in deny_col_set)
+            if col_restrict:
+                col_restrict = frozenset(qc for qc in col_restrict if qc not in deny_col_set)
+            else:
+                all_cols = frozenset(
+                    f"{tname}.{cname}" for tname in sorted(self.tables) for cname in sorted(self.tables[tname].columns)
+                )
+                col_restrict = frozenset(qc for qc in all_cols if qc not in deny_col_set)
         if col_restrict:
-            scope_tables = vis_tables if vis_tables else frozenset(self.tables.keys())
+            scope_tables = vis_tables if vis_tables else graph_tables
             return scope_tables, col_restrict
         if vis_tables:
+            return vis_tables, None
+        if deny_objects or deny_columns:
             return vis_tables, None
         return None, None
 
@@ -959,6 +1288,7 @@ class SchemaGraph:
         column_filter: frozenset[str] | None = None,
         owner_master_scope: bool = False,
         description_overlay: dict[str, Any] | None = None,
+        scrub_instruction_like: bool = False,
     ) -> str:
         """Serialize a field-filtered schema payload for LLM prompts."""
         payload = self._schema_literal_payload(
@@ -967,6 +1297,7 @@ class SchemaGraph:
             column_filter=column_filter,
             owner_master_scope=owner_master_scope,
             description_overlay=description_overlay,
+            scrub_instruction_like=scrub_instruction_like,
         )
         return json.dumps(payload, separators=(",", ":"), sort_keys=True)
 
@@ -981,7 +1312,7 @@ class SchemaGraph:
         description_overlay: dict[str, Any] | None = None,
     ) -> str:
         """Domain-only schema payload (descriptions and enum heads) for the Interpret stage."""
-        table_filter, column_filter = self._resolve_payload_filters(
+        table_filter, column_filter = self._resolve_payload_where(
             visible_objects=visible_objects,
             allowed_columns=allowed_columns,
             deny_objects=deny_objects,
@@ -1006,7 +1337,7 @@ class SchemaGraph:
         description_overlay: dict[str, Any] | None = None,
     ) -> str:
         """Ground-stage schema payload with descriptions, roles, and value types."""
-        table_filter, column_filter = self._resolve_payload_filters(
+        table_filter, column_filter = self._resolve_payload_where(
             visible_objects=visible_objects,
             allowed_columns=allowed_columns,
             deny_objects=deny_objects,
@@ -1018,20 +1349,14 @@ class SchemaGraph:
             column_filter=column_filter,
             owner_master_scope=owner_master_scope,
             description_overlay=description_overlay,
+            scrub_instruction_like=True,
         )
 
-    def schema_payload_compose(
-        self,
-        tables: Iterable[str],
-        *,
-        owner_master_scope: bool = False,
-    ) -> str:
+    def schema_payload_compose(self, tables: Iterable[str], *, owner_master_scope: bool = False) -> str:
         """Compose-stage structural schema payload scoped to chosen tables."""
         filt = frozenset(str(t) for t in tables if t in self.tables)
         return self.schema_payload_json(
-            COMPOSE_FIELDS,
-            table_filter=filt if filt else None,
-            owner_master_scope=owner_master_scope,
+            COMPOSE_FIELDS, table_filter=filt if filt else None, owner_master_scope=owner_master_scope
         )
 
     @property
@@ -1043,15 +1368,138 @@ class SchemaGraph:
         """Schema literal JSON restricted to *allowed_tables* (consumer ``visible_objects`` whitelist)."""
         return self.schema_payload_json(FULL_FIELDS, table_filter=allowed_tables)
 
-    def schema_literal_json_for_scope(
-        self,
-        allowed_tables: frozenset[str],
-        allowed_columns: frozenset[str],
-    ) -> str:
+    def schema_literal_json_for_scope(self, allowed_tables: frozenset[str], allowed_columns: frozenset[str]) -> str:
         """Schema literal JSON restricted to *allowed_tables* and optionally *allowed_columns*."""
         table_filter = allowed_tables if allowed_tables else None
         column_filter = allowed_columns if allowed_columns else None
         return self.schema_payload_json(FULL_FIELDS, table_filter=table_filter, column_filter=column_filter)
+
+    @staticmethod
+    def resolve_intent_visible_objects(
+        *,
+        visible_objects: frozenset[str] | None,
+        execution_visible_objects: frozenset[str] | None,
+    ) -> frozenset[str] | None:
+        """Intersect space and execution visibility whitelists; ``None`` means unrestricted on that axis."""
+        if visible_objects is None:
+            return execution_visible_objects
+        if execution_visible_objects is None:
+            return frozenset(visible_objects)
+        return frozenset(visible_objects) & frozenset(execution_visible_objects)
+
+    def validate_tables_exist(self, tables: tuple[str, ...]) -> list[IntentIssue]:
+        """Emit logical-stage issues for planner table tokens absent from this schema graph."""
+        known = frozenset(self.tables.keys())
+        out: list[IntentIssue] = []
+        for name in tables:
+            if name in known:
+                continue
+            out.append(
+                IntentIssue.make(
+                    issue_id=f"unknown_table_{name}",
+                    category=FailureCategory.UNKNOWN_TABLE,
+                    severity="error",
+                    message=f"Unknown table {name!r} in planner tables list.",
+                    context={"table": name},
+                    responsible_stage="ground",
+                )
+            )
+        return out
+
+    def validate_cte_tables_and_dag(self, logical: Any) -> list[IntentIssue]:
+        """Validate CTE table tokens against schema tables and prior step names; reject cycles."""
+        issues: list[IntentIssue] = []
+        steps = list(getattr(logical, "cte_steps", None) or ())
+        if not steps:
+            return issues
+        known_schema = frozenset(self.tables.keys())
+        prior_names: set[str] = set()
+        seen_step_names: set[str] = set()
+        step_names_ordered: list[str] = []
+        for idx_, step in enumerate(steps):
+            name = (getattr(step, "name", None) or "").strip()
+            if not name:
+                issues.append(
+                    IntentIssue.make(
+                        issue_id=f"cte_empty_name_{idx_}",
+                        category=FailureCategory.CTE_TABLE_REFERENCE,
+                        severity="error",
+                        message="CTE step is missing a non-empty name.",
+                        context={"index": idx_},
+                        responsible_stage="ground",
+                    )
+                )
+                continue
+            if name in seen_step_names:
+                issues.append(
+                    IntentIssue.make(
+                        issue_id=f"cte_duplicate_name_{name}",
+                        category=FailureCategory.CTE_TABLE_REFERENCE,
+                        severity="error",
+                        message=f"Duplicate CTE step name {name!r}.",
+                        context={"cte": name, "index": idx_},
+                        responsible_stage="ground",
+                    )
+                )
+            seen_step_names.add(name)
+            step_names_ordered.append(name)
+            for token in list(getattr(step, "tables", None) or ()):
+                tok = str(token or "").strip()
+                if not tok:
+                    continue
+                if tok in known_schema or tok in prior_names:
+                    continue
+                issues.append(
+                    IntentIssue.make(
+                        issue_id=f"cte_unknown_table_{name}_{tok}",
+                        category=FailureCategory.CTE_TABLE_REFERENCE,
+                        severity="error",
+                        message=f"CTE {name!r} references unknown table token {tok!r}.",
+                        context={"cte": name, "table": tok},
+                        responsible_stage="ground",
+                    )
+                )
+            prior_names.add(name)
+        name_set = set(step_names_ordered)
+        deps: dict[str, set[str]] = {n: set() for n in step_names_ordered}
+        for step in steps:
+            name = (getattr(step, "name", None) or "").strip()
+            if not name:
+                continue
+            for token in list(getattr(step, "tables", None) or ()):
+                tok = str(token or "").strip()
+                if tok in name_set and tok != name:
+                    deps[name].add(tok)
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def _dfs(node: str) -> bool:
+            if node in visiting:
+                return True
+            if node in visited:
+                return False
+            visiting.add(node)
+            for nxt in deps.get(node, ()):
+                if _dfs(nxt):
+                    return True
+            visiting.remove(node)
+            visited.add(node)
+            return False
+
+        for n in step_names_ordered:
+            if _dfs(n):
+                issues.append(
+                    IntentIssue.make(
+                        issue_id="cte_cycle",
+                        category=FailureCategory.CTE_TABLE_REFERENCE,
+                        severity="error",
+                        message="CTE steps form a dependency cycle.",
+                        context={"steps": step_names_ordered},
+                        responsible_stage="ground",
+                    )
+                )
+                break
+        return issues
 
     def structural_schema_literal_json(self, tables: Iterable[str] | None = None) -> str:
         """
@@ -1100,20 +1548,26 @@ class SchemaGraph:
         legacy_hash = str(d.get("schema_hash", "") or "")
         structural_hash = str(d.get("structural_hash", "") or legacy_hash)
         profiling_hash = str(d.get("profiling_hash", "") or legacy_hash)
+        descriptions_hash = str(d.get("descriptions_hash", "") or "")
         scope_hash = str(d.get("scope_hash", "") or legacy_hash)
         effective_structural_hash = str(d.get("effective_structural_hash", "") or legacy_hash)
         schema_graph_id = str(d.get("schema_graph_id", "") or "")
         inc_raw = d.get("include")
-        if inc_raw in ("tables", "views", "both"):
-            include_val: SchemaInclude = inc_raw
+        if inc_raw is not None:
+            include_val = SchemaInclude.coerce(inc_raw)
         else:
             okind = d.get("object_kind", "table")
-            include_val = "views" if okind == "view" else "tables"
+            include_val = SchemaInclude.VIEWS if okind == "view" else SchemaInclude.TABLES
+        if "schema_revision" in d:
+            schema_revision = int(d.get("schema_revision") or 0)
+        else:
+            schema_revision = 1 if tables else 0
         return SchemaGraph(
             tables=tables,
             join_paths_multi=d.get("join_paths_multi", {}),
             structural_hash=structural_hash,
             profiling_hash=profiling_hash,
+            descriptions_hash=descriptions_hash,
             scope_hash=scope_hash,
             effective_structural_hash=effective_structural_hash,
             schema_graph_id=schema_graph_id,
@@ -1128,6 +1582,10 @@ class SchemaGraph:
             disallowed_columns=disallowed_columns,
             notes_sha256=str(d.get("notes_sha256", "") or ""),
             scope_descriptor=(d.get("scope_descriptor") if isinstance(d.get("scope_descriptor"), dict) else None),
+            federation_membership=(
+                dict(d["federation_membership"]) if isinstance(d.get("federation_membership"), dict) else None
+            ),
+            schema_revision=schema_revision,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -1143,13 +1601,14 @@ class SchemaGraph:
             "join_paths_multi": self.join_paths_multi,
             "structural_hash": self.structural_hash,
             "profiling_hash": self.profiling_hash,
+            "descriptions_hash": self.descriptions_hash,
             "scope_hash": self.scope_hash,
             "effective_structural_hash": self.effective_structural_hash,
             "schema_graph_id": self.schema_graph_id,
             "notes_hash": self.notes_hash,
             "semantic_edges_hash": self.semantic_edges_hash,
             "ddl_probe_hash": self.ddl_probe_hash,
-            "include": self.include,
+            "include": self.include.value,
             "created_at": self.created_at,
             "enum_values": self.enum_values,
             "schema_stats": self.schema_stats,
@@ -1157,6 +1616,8 @@ class SchemaGraph:
             "disallowed_columns": {k: sorted(v) for k, v in self.disallowed_columns.items()},
             "notes_sha256": self.notes_sha256,
             "scope_descriptor": self.scope_descriptor,
+            "federation_membership": self.federation_membership,
+            "schema_revision": self.schema_revision,
         }
 
 
@@ -1212,7 +1673,7 @@ class CteOutputColumnMeta:
     data_type: str = "unknown"
     value_type: str = ""
     groupable: bool = True
-    valid_filter_ops: list[str] = field(default_factory=list)
+    valid_where_ops: list[str] = field(default_factory=list)
     valid_aggregations: list[str] = field(default_factory=list)
     valid_having_ops: list[str] = field(default_factory=list)
     sensitivity: str | None = None
@@ -1227,7 +1688,7 @@ class CteOutputColumnMeta:
     def __post_init__(self) -> None:
         """Set `value_type` from `data_type` when `value_type` is empty."""
         if not self.value_type and self.data_type:
-            self.value_type = data_type_to_value_type(self.data_type)
+            self.value_type = ColumnTypeSemantics.data_type_to_value_type(self.data_type)
 
     @property
     def is_selectable(self) -> bool:
@@ -1236,7 +1697,7 @@ class CteOutputColumnMeta:
             return True
         return str(self.sensitivity).strip().lower() not in HIDDEN_SENSITIVITIES
 
-    def get_valid_filter_ops(self) -> list[str]:
+    def get_valid_where_ops(self) -> list[str]:
         """
         Filter operators allowed on this CTE output column.
 
@@ -1245,8 +1706,8 @@ class CteOutputColumnMeta:
             Stored ops plus null checks, or defaults when `filterable`, else null checks only.
         """
         null_ops = ["is null", "is not null"]
-        if self.valid_filter_ops:
-            return sorted(set(self.valid_filter_ops + null_ops))
+        if self.valid_where_ops:
+            return sorted(set(self.valid_where_ops + null_ops))
         if self.filterable:
             return [
                 "=",
@@ -1278,7 +1739,7 @@ class CteOutputColumnMeta:
         if rk in ROLE_ALLOWED_AGGREGATIONS:
             return {a.lower() for a in ROLE_ALLOWED_AGGREGATIONS[rk]}
         if self.aggregatable:
-            return {"count", "sum", "avg", "min", "max"}
+            return {"count", "sum", "avg", "min", "max", "stddev", "variance", "median", "string_agg"}
         return {"count"}
 
     def get_valid_having_ops(self) -> list[str]:
@@ -1317,7 +1778,7 @@ class CteOutputColumnMeta:
             data_type=d.get("data_type", "unknown"),
             value_type=d.get("value_type", ""),
             groupable=d.get("groupable", True),
-            valid_filter_ops=d.get("valid_filter_ops", []),
+            valid_where_ops=d.get("valid_where_ops", []),
             valid_aggregations=d.get("valid_aggregations", []),
             valid_having_ops=d.get("valid_having_ops", []),
             sensitivity=d.get("sensitivity"),
@@ -1388,7 +1849,7 @@ class SQLShape:
     has_group_by: bool
     has_agg: bool
     num_cte: int = 0
-    num_filters: int = 0
+    num_where: int = 0
     num_having: int = 0
     has_distinct: bool = False
 
@@ -1410,7 +1871,7 @@ class SQLShape:
             has_group_by=d.get("has_group_by", False),
             has_agg=d.get("has_agg", False),
             num_cte=d.get("num_cte", 0),
-            num_filters=d.get("num_filters", 0),
+            num_where=d.get("num_where", 0),
             num_having=d.get("num_having", 0),
             has_distinct=d.get("has_distinct", False),
         )
@@ -1435,11 +1896,12 @@ class FKEdge:
     dst_table: str
     dst_cols: list[str]
     inference_tag: InferenceTag | None = None
+    join_kind: str | None = None
 
     def __post_init__(self) -> None:
         """Coerce ``inference_tag`` from raw cache strings into :class:`InferenceTag`."""
         if not isinstance(self.inference_tag, InferenceTag):
-            self.inference_tag = coerce_inference_tag(self.inference_tag)
+            self.inference_tag = InferenceTag.coerce(self.inference_tag)
 
 
 @dataclass
@@ -1477,7 +1939,7 @@ class ValueDomain:
     def __post_init__(self) -> None:
         """Derive ``value_type`` from ``data_type`` when unset."""
         if not self.value_type and self.data_type:
-            self.value_type = data_type_to_value_type(self.data_type)
+            self.value_type = ColumnTypeSemantics.data_type_to_value_type(self.data_type)
 
 
 @dataclass
@@ -1508,7 +1970,7 @@ class IntentIssue:
         if isinstance(raw_cat, FailureCategory):
             category: FailureCategory = raw_cat
         else:
-            category = parse_failure_category(str(raw_cat) if raw_cat is not None else None) or FailureCategory.OTHER
+            category = FailureCategory.parse(str(raw_cat) if raw_cat is not None else None) or FailureCategory.OTHER
         rs = d.get("responsible_stage", "compose")
         if rs == "ground":
             stage: Literal["ground", "compose", "interpret"] = "ground"
@@ -1542,50 +2004,50 @@ class IntentIssue:
             "responsible_stage": self.responsible_stage,
         }
 
-
-def make_intent_issue(
-    *,
-    issue_id: str,
-    category: FailureCategory,
-    severity: str,
-    message: str,
-    context: dict[str, Any] | None = None,
-    responsible_stage: Literal["ground", "compose", "interpret"] | None = None,
-) -> IntentIssue:
-    """Construct an :class:`IntentIssue` with ``responsible_stage`` from. :data:`STAGE_ATTRIBUTION_TABLE` when omitted. Args: issue_id: Stable identifier; substring keys in :data:`STAGE_ATTRIBUTION_TABLE` select the default stage when *responsible_stage* is omitted. category: Failure category for the issue. severity: ``error``, ``warning``, or other severity token retained by validation. message: Human-readable explanation. context: Optional structured context copied into the issue. responsible_stage: When ``None``, the stage is inferred from *issue_id* and *category*. Returns: A new :class:`IntentIssue` with ``responsible_stage`` set explicitly or inferred."""
-    ctx = dict(context or {})
-    if responsible_stage is not None:
-        return IntentIssue(
-            issue_id=issue_id,
-            category=category,
-            severity=severity,
-            message=message,
-            context=ctx,
-            responsible_stage=responsible_stage,
-        )
-    iid = (issue_id or "").lower()
-    for key, stage in STAGE_ATTRIBUTION_TABLE.items():
-        if key in iid:
+    @staticmethod
+    def make(
+        *,
+        issue_id: str,
+        category: FailureCategory,
+        severity: str,
+        message: str,
+        context: dict[str, Any] | None = None,
+        responsible_stage: Literal["ground", "compose", "interpret"] | None = None,
+    ) -> IntentIssue:
+        """Construct an :class:`IntentIssue` with ``responsible_stage`` from attribution table when omitted."""
+        ctx = dict(context or {})
+        if responsible_stage is not None:
             return IntentIssue(
                 issue_id=issue_id,
                 category=category,
                 severity=severity,
                 message=message,
                 context=ctx,
-                responsible_stage=stage,
+                responsible_stage=responsible_stage,
             )
-    if category.value in LOGICAL_FAILURE_CATEGORIES:
-        inferred: Literal["ground", "compose"] = "ground"
-    else:
-        inferred = "compose"
-    return IntentIssue(
-        issue_id=issue_id,
-        category=category,
-        severity=severity,
-        message=message,
-        context=ctx,
-        responsible_stage=inferred,
-    )
+        iid = (issue_id or "").lower()
+        for key, stage in STAGE_ATTRIBUTION_TABLE.items():
+            if key in iid:
+                return IntentIssue(
+                    issue_id=issue_id,
+                    category=category,
+                    severity=severity,
+                    message=message,
+                    context=ctx,
+                    responsible_stage=stage,
+                )
+        if category.value in LOGICAL_FAILURE_CATEGORIES:
+            inferred: Literal["ground", "compose"] = "ground"
+        else:
+            inferred = "compose"
+        return IntentIssue(
+            issue_id=issue_id,
+            category=category,
+            severity=severity,
+            message=message,
+            context=ctx,
+            responsible_stage=inferred,
+        )
 
 
 @dataclass
@@ -1623,9 +2085,7 @@ class IntentValidationResult:
             Populated `IntentValidationResult` with deserialized `IntentIssue` objects.
         """
         issues_raw = d.get("issues", [])
-        return IntentValidationResult(
-            issues=[IntentIssue.from_dict(i) for i in issues_raw],
-        )
+        return IntentValidationResult(issues=[IntentIssue.from_dict(i) for i in issues_raw])
 
     def to_dict(self) -> dict[str, Any]:
         """
@@ -1658,10 +2118,7 @@ class TemplateStats:
 
             Populated `TemplateStats` instance.
         """
-        return TemplateStats(
-            accept=int(d.get("accept", 0)),
-            reject=int(d.get("reject", 0)),
-        )
+        return TemplateStats(accept=int(d.get("accept", 0)), reject=int(d.get("reject", 0)))
 
     def to_dict(self) -> dict[str, Any]:
         """
@@ -1680,13 +2137,25 @@ class QSimSkeleton:
 
     tables: list[str]
     has_aggregation: bool
-    num_filters: int
+    num_where: int
     num_groupby: int
     has_orderby: bool
     num_having: int
     has_distinct: bool = False
     has_expr_comparison: bool = False
     advanced_slot: str | None = None
+
+    def complexity_tier(self) -> ComplexityTier:
+        """Map this structural skeleton to the discrete tier used for quota sampling."""
+        tables_n = len(self.tables or [])
+        hav_n = int(self.num_having)
+        group_n = int(self.num_groupby)
+        agg = self.has_aggregation
+        if tables_n >= 3 or hav_n >= 1 or (agg and group_n >= 1) or self.has_expr_comparison:
+            return ComplexityTier.COMPLEX
+        if tables_n >= 2 or agg or group_n >= 1 or self.has_orderby or self.has_distinct:
+            return ComplexityTier.MODERATE
+        return ComplexityTier.SIMPLE
 
 
 @dataclass
@@ -1772,7 +2241,7 @@ class QSimSummary:
 class SchemaLimits:
     """Internal schema-based limits for adaptive parameter validation."""
 
-    max_filters: int
+    max_where_predicates: int
     max_groupby: int
     max_tables: int
 
@@ -1781,13 +2250,13 @@ class SchemaLimits:
 class SkeletonLimits:
     """Schema-derived limits for QSim skeleton enumeration."""
 
-    max_filters: int
+    max_where_predicates: int
     max_groupby: int
     max_having: int
 
 
 @dataclass
-class QSimFilter:
+class QSimWhereParam:
     """Lightweight filter for QSim intent with column reference and operator."""
 
     column: str
@@ -1801,9 +2270,9 @@ class QSimFilter:
         return bool(self.right_column)
 
     @staticmethod
-    def from_dict(d: dict[str, Any]) -> QSimFilter:
+    def from_dict(d: dict[str, Any]) -> QSimWhereParam:
         """
-        Create QSimFilter from dictionary.
+        Create QSimWhereParam from dictionary.
 
         Args:
 
@@ -1811,9 +2280,9 @@ class QSimFilter:
 
         Returns:
 
-            Populated QSimFilter instance.
+            Populated QSimWhereParam instance.
         """
-        return QSimFilter(
+        return QSimWhereParam(
             column=d.get("column", ""),
             op=d.get("op", "="),
             value_type=d.get("value_type", "categorical"),
@@ -1886,57 +2355,6 @@ class QSimHaving:
         return result
 
 
-def classify_qsim_skeleton_complexity(skeleton: QSimSkeleton) -> ComplexityTier:
-    """
-    Map a QSim structural skeleton to the discrete tier used for.
-
-    quota sampling. Args: skeleton: Enumerated shape prior to LLM fill.
-
-    Returns:
-
-        Tier bucket aligned with :func:`classify_qsim_intent_complexity`
-        outcomes.
-    """
-    tables_n = len(skeleton.tables or [])
-    hav_n = int(skeleton.num_having)
-    group_n = int(skeleton.num_groupby)
-    agg = skeleton.has_aggregation
-    if tables_n >= 3 or hav_n >= 1 or (agg and group_n >= 1) or skeleton.has_expr_comparison:
-        return ComplexityTier.COMPLEX
-    if tables_n >= 2 or agg or group_n >= 1 or skeleton.has_orderby or skeleton.has_distinct:
-        return ComplexityTier.MODERATE
-    return ComplexityTier.SIMPLE
-
-
-def classify_qsim_intent_complexity(intent: QSimIntent) -> ComplexityTier:
-    """Classify a filled QSim intent using observable SQL-shape cues. without CTE or window registries. Args: intent: Post-fill intent with string select columns. Returns: One of :class:`ComplexityTier`."""
-    tables_n = len(intent.tables or [])
-    hav_n = len(intent.having_param or [])
-    group_n = len(intent.group_by_cols or [])
-    sel_cols = intent.select_cols or []
-    has_agg = any(AGG_PATTERN.match(str(sc)) for sc in sel_cols)
-    has_ord = len(intent.order_by_cols or []) > 0
-    lim_set = intent.limit is not None
-    if tables_n >= 3 or hav_n >= 1 or (has_agg and group_n >= 1):
-        return ComplexityTier.COMPLEX
-    if tables_n >= 2 or has_agg or group_n >= 1 or has_ord or lim_set or intent.distinct:
-        return ComplexityTier.MODERATE
-    return ComplexityTier.SIMPLE
-
-
-def qsim_intent_matches_target_tier(classified: ComplexityTier, target: ComplexityTier) -> bool:
-    """Return whether a filled intent meets the structural floor. implied. by the sampled target tier. Args: classified: Tier from :func:`classify_qsim_intent_complexity`. target: Tier slot chosen for this QSim draw. Returns: True when the fill satisfies the lower bound for the target band."""
-    rank_map = {
-        ComplexityTier.SIMPLE: 0,
-        ComplexityTier.MODERATE: 1,
-        ComplexityTier.COMPLEX: 2,
-        ComplexityTier.HIGHLY_COMPLEX: 3,
-    }
-    c = rank_map[classified]
-    need = min(rank_map[target], rank_map[ComplexityTier.COMPLEX])
-    return c >= need
-
-
 @dataclass
 class QSimIntent:
     """Unified intent for QSim question generation with optional values."""
@@ -1947,13 +2365,41 @@ class QSimIntent:
     select_cols: list[str]
     group_by_cols: list[str]
     order_by_cols: list[str]
-    filters_param: list[QSimFilter]
+    where: list[QSimWhereParam]
     having_param: list[QSimHaving]
     param_values: dict[str, ParamValue] = field(default_factory=dict)
     question: str = ""
     variant_idx: int = 0
     limit: int | None = None
     distinct: bool = False
+
+    def complexity_tier(self) -> ComplexityTier:
+        """Classify using observable SQL-shape cues without CTE or window registries."""
+        tables_n = len(self.tables or [])
+        hav_n = len(self.having_param or [])
+        group_n = len(self.group_by_cols or [])
+        sel_cols = self.select_cols or []
+        has_agg = any(AGG_PATTERN.match(str(sc)) for sc in sel_cols)
+        has_ord = len(self.order_by_cols or []) > 0
+        lim_set = self.limit is not None
+        if tables_n >= 3 or hav_n >= 1 or (has_agg and group_n >= 1):
+            return ComplexityTier.COMPLEX
+        if tables_n >= 2 or has_agg or group_n >= 1 or has_ord or lim_set or self.distinct:
+            return ComplexityTier.MODERATE
+        return ComplexityTier.SIMPLE
+
+    @staticmethod
+    def matches_target_tier(classified: ComplexityTier, target: ComplexityTier) -> bool:
+        """Return whether a filled intent meets the structural floor for the target tier."""
+        rank_map = {
+            ComplexityTier.SIMPLE: 0,
+            ComplexityTier.MODERATE: 1,
+            ComplexityTier.COMPLEX: 2,
+            ComplexityTier.HIGHLY_COMPLEX: 3,
+        }
+        c = rank_map[classified]
+        need = min(rank_map[target], rank_map[ComplexityTier.COMPLEX])
+        return c >= need
 
     @staticmethod
     def from_dict(d: dict[str, Any]) -> QSimIntent:
@@ -1968,7 +2414,7 @@ class QSimIntent:
 
             Populated QSimIntent instance.
         """
-        fp_raw = d.get("filters_param", d.get("filters", []))
+        fp_raw = d.get("where", d.get("where_param", d.get("filters", [])))
         hp_raw = d.get("having_param", d.get("having", []))
         return QSimIntent(
             intent_id=d.get("intent_id", ""),
@@ -1977,7 +2423,7 @@ class QSimIntent:
             select_cols=d.get("select_cols", []),
             group_by_cols=d.get("group_by_cols", []),
             order_by_cols=d.get("order_by_cols", []),
-            filters_param=[QSimFilter.from_dict(fp) if isinstance(fp, dict) else fp for fp in fp_raw],
+            where=[QSimWhereParam.from_dict(fp) if isinstance(fp, dict) else fp for fp in fp_raw],
             having_param=[QSimHaving.from_dict(hp) if isinstance(hp, dict) else hp for hp in hp_raw],
             param_values=d.get("param_values", {}),
             question=d.get("question", ""),
@@ -2001,7 +2447,7 @@ class QSimIntent:
             "select_cols": self.select_cols,
             "group_by_cols": self.group_by_cols,
             "order_by_cols": self.order_by_cols,
-            "filters_param": [fp.to_dict() for fp in self.filters_param],
+            "where": [fp.to_dict() for fp in self.where],
             "having_param": [hp.to_dict() for hp in self.having_param],
             "param_values": self.param_values,
             "question": self.question,
@@ -2019,7 +2465,8 @@ class WindowSpec:
     partition_by: list[NormalizedExpr] = field(default_factory=list)
     order_by: list[OrderByCol] = field(default_factory=list)
     argument: NormalizedExpr | None = None
-    frame_kind: WindowFrameKind = "none"
+    numeric_argument: int | None = None
+    frame_kind: WindowFrameKind = WindowFrameKind.NONE
     frame_start: str | None = None
     frame_end: str | None = None
     frame_start_offset: int | None = None
@@ -2054,22 +2501,26 @@ class WindowSpec:
             if isinstance(p, dict):
                 partition_by.append(NormalizedExpr.from_dict(p))
             elif isinstance(p, str):
-                partition_by.append(parse_expr_string_for_json(p))
+                partition_by.append(NormalizedExpr.parse_string_for_json(p))
         ob_raw = d.get("order_by", [])
         order_by: list[OrderByCol] = []
         for o in ob_raw:
             if isinstance(o, dict):
                 order_by.append(OrderByCol.from_dict(o))
             elif isinstance(o, str):
-                order_by.append(OrderByCol(expr=parse_expr_string_for_json(o)))
+                order_by.append(OrderByCol(expr=NormalizedExpr.parse_string_for_json(o)))
         arg_raw = d.get("argument")
         argument = None
         if isinstance(arg_raw, dict):
             argument = NormalizedExpr.from_dict(arg_raw)
         elif isinstance(arg_raw, str) and arg_raw:
-            argument = parse_expr_string_for_json(arg_raw)
+            argument = NormalizedExpr.parse_string_for_json(arg_raw)
         fk_raw = (d.get("frame_kind") or "none").strip().lower()
-        frame_kind: WindowFrameKind = "rows" if fk_raw == "rows" else ("range" if fk_raw == "range" else "none")
+        frame_kind: WindowFrameKind = (
+            WindowFrameKind.ROWS
+            if fk_raw == "rows"
+            else (WindowFrameKind.RANGE if fk_raw == "range" else WindowFrameKind.NONE)
+        )
         fs = d.get("frame_start")
         fe = d.get("frame_end")
         fso = d.get("frame_start_offset")
@@ -2092,6 +2543,7 @@ class WindowSpec:
             partition_by=partition_by,
             order_by=order_by,
             argument=argument,
+            numeric_argument=_off(d.get("numeric_argument")),
             frame_kind=frame_kind,
             frame_start=str(fs).strip() if isinstance(fs, str) and fs.strip() else None,
             frame_end=str(fe).strip() if isinstance(fe, str) and fe.strip() else None,
@@ -2115,6 +2567,8 @@ class WindowSpec:
         }
         if self.argument is not None:
             out["argument"] = self.argument.to_dict()
+        if self.numeric_argument is not None:
+            out["numeric_argument"] = self.numeric_argument
         if self.frame_start is not None:
             out["frame_start"] = self.frame_start
         if self.frame_end is not None:
@@ -2133,6 +2587,8 @@ class WindowSpec:
         parts.extend(f"o:{o.signature_key}" for o in self.order_by)
         if self.argument:
             parts.append(f"a:{self.argument.signature_key}")
+        if self.numeric_argument is not None:
+            parts.append(f"n:{self.numeric_argument}")
         if self.frame_kind != "none":
             parts.append(f"fk={self.frame_kind}")
             if self.frame_start:
@@ -2146,6 +2602,7 @@ class WindowSpec:
         "partition_by": "List of SQL expressions for PARTITION BY.",
         "order_by": "Ordered sort keys with direction inside the OVER clause.",
         "argument": "Inner SQL expression for windowed aggregates and offsets.",
+        "numeric_argument": "Positive integer bucket count or offset for ntile and nth_value.",
         "frame_kind": "rows, range, or none when no explicit frame.",
         "frame_start": (
             "Frame start bound when frame_kind is rows or range (e.g. UNBOUNDED PRECEDING, CURRENT ROW, N PRECEDING)."
@@ -2161,11 +2618,13 @@ class WindowSpec:
         """Shorthand window definition for LLM JSON."""
         out: dict[str, Any] = {"function": self.function}
         if self.partition_by:
-            out["partition_by"] = [expr_prompt_sql(e) for e in self.partition_by]
+            out["partition_by"] = [e.prompt_sql() for e in self.partition_by]
         if self.order_by:
             out["order_by"] = [o.to_prompt_dict() for o in self.order_by]
         if self.argument is not None and self.argument.signature_key:
-            out["argument"] = expr_prompt_sql(self.argument)
+            out["argument"] = self.argument.prompt_sql()
+        if self.numeric_argument is not None:
+            out["numeric_argument"] = self.numeric_argument
         if self.frame_kind != "none":
             out["frame_kind"] = self.frame_kind
         if self.frame_start is not None:
@@ -2182,32 +2641,33 @@ class WindowSpec:
     def prompt_example_dict(cls) -> dict[str, Any]:
         """Example window_spec block for prompts."""
         return {
-            "function": "row_number",
+            "function": "ntile",
+            "numeric_argument": 4,
             "partition_by": [],
             "order_by": [{"expr": "table.column", "direction": "desc"}],
         }
-
-
-def _case_when_string_result_expr(value: str) -> NormalizedExpr:
-    """Interpret a JSON string CASE THEN/ELSE token as either a column. ref or a string literal. A single ``table.column`` token (two SQL identifiers separated by one dot) uses the column-reference path; every other non-empty stripped string becomes a string literal for SQL rendering. Args: value: Raw string from intent JSON. Returns: ``NormalizedExpr`` with ``column_ref`` or ``string_literal`` set, or empty when ``value`` is blank after stripping."""
-    t = (value or "").strip()
-    if not t:
-        return NormalizedExpr()
-    if CASE_WHEN_QUALIFIED_COLUMN_REF_RE.fullmatch(t):
-        return NormalizedExpr.from_column(t)
-    return NormalizedExpr(string_literal=t)
 
 
 @dataclass
 class CaseWhenBranch:
     """Single WHEN branch for a CASE expression in SELECT."""
 
-    condition: FilterParam = field(default_factory=FilterParam)
+    condition: WhereParam = field(default_factory=WhereParam)
     result: NormalizedExpr = field(default_factory=NormalizedExpr)
 
     @staticmethod
+    def string_result_expr(value: str) -> NormalizedExpr:
+        """Interpret a JSON string CASE THEN/ELSE token as column ref or string literal."""
+        t = (value or "").strip()
+        if not t:
+            return NormalizedExpr()
+        if CASE_WHEN_QUALIFIED_COLUMN_REF_RE.fullmatch(t):
+            return NormalizedExpr.from_column(t)
+        return NormalizedExpr(string_literal=t)
+
+    @staticmethod
     def from_dict(d: dict[str, Any]) -> CaseWhenBranch:
-        """Parse one `WHEN ... THEN ...` branch from a dict. Args: d: Mapping with `condition` and `result` (dict or string for result). Returns: `CaseWhenBranch` with `FilterParam` and `NormalizedExpr`."""
+        """Parse one `WHEN ... THEN ...` branch from a dict. Args: d: Mapping with `condition` and `result` (dict or string for result). Returns: `CaseWhenBranch` with `WhereParam` and `NormalizedExpr`."""
         cond = d.get("condition", {})
         lit = d.get("literal_string")
         lit_top = d.get("literal")
@@ -2220,16 +2680,11 @@ class CaseWhenBranch:
             if isinstance(res, dict):
                 res_expr = NormalizedExpr.from_dict(res)
             elif isinstance(res, str) and res.strip():
-                res_expr = _case_when_string_result_expr(str(res))
+                res_expr = CaseWhenBranch.string_result_expr(str(res))
             else:
                 res_expr = NormalizedExpr()
         return CaseWhenBranch(
-            condition=replace(
-                (FilterParam.from_dict(cond) if isinstance(cond, dict) else FilterParam()),
-                bool_op="AND",
-                filter_group=None,
-            ),
-            result=res_expr,
+            condition=replace(WhereParam.from_dict(cond) if isinstance(cond, dict) else WhereParam()), result=res_expr
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -2270,14 +2725,14 @@ class CaseWhenBranch:
         if self.result.string_literal:
             out["literal_string"] = self.result.string_literal
         else:
-            out["result"] = expr_prompt_sql(self.result)
+            out["result"] = self.result.prompt_sql()
         return out
 
     @classmethod
     def prompt_example_dict(cls) -> dict[str, Any]:
         """Example CASE branch for prompts."""
         return {
-            "condition": FilterParam.prompt_example_dict(),
+            "condition": WhereParam.prompt_example_dict(),
             "result": "table.column",
         }
 
@@ -2288,11 +2743,11 @@ class CaseWhenExpr:
 
     branches: list[CaseWhenBranch] = field(default_factory=list)
     else_result: NormalizedExpr | None = None
-    condition_scope: str = "filter"
+    condition_scope: str = "where"
 
     @staticmethod
     def from_dict(d: dict[str, Any]) -> CaseWhenExpr:
-        """Parse a full `CASE` from JSON (branches plus optional. `else_result`). Args: d: Mapping with `branches` list, optional `else_result`, and optional `condition_scope` (`"filter"` or `"having"`; defaults to `"filter"`). Returns: `CaseWhenExpr` with ordered branches and optional else expression."""
+        """Parse a full `CASE` from JSON (branches plus optional. `else_result`). Args: d: Mapping with `branches` list, optional `else_result`, and optional `condition_scope` (`"where"` or `"having"`; defaults to `"where"`). Returns: `CaseWhenExpr` with ordered branches and optional else expression."""
         br_raw = d.get("branches", [])
         branches = [CaseWhenBranch.from_dict(b) if isinstance(b, dict) else CaseWhenBranch() for b in br_raw]
         else_result = None
@@ -2304,9 +2759,11 @@ class CaseWhenExpr:
             if isinstance(er, dict):
                 else_result = NormalizedExpr.from_dict(er)
             elif isinstance(er, str) and er:
-                else_result = _case_when_string_result_expr(er)
-        scope_raw = str(d.get("condition_scope", "filter")).strip().lower()
-        scope = scope_raw if scope_raw in ("filter", "having") else "filter"
+                else_result = CaseWhenBranch.string_result_expr(er)
+        scope_raw = str(d.get("condition_scope", "where")).strip().lower()
+        if scope_raw == "filter":
+            scope_raw = "where"
+        scope = scope_raw if scope_raw in ("where", "having") else "where"
         return CaseWhenExpr(branches=branches, else_result=else_result, condition_scope=scope)
 
     def to_dict(self) -> dict[str, Any]:
@@ -2316,7 +2773,7 @@ class CaseWhenExpr:
         Returns:
 
             Dict with `branches` list; `else_result` included when set; `condition_scope`
-            included only when it differs from the default `"filter"`.
+            included only when it differs from the default `"where"`.
         """
         out: dict[str, Any] = {"branches": [b.to_dict() for b in self.branches]}
         if self.else_result is not None:
@@ -2324,7 +2781,7 @@ class CaseWhenExpr:
                 out["else_literal_string"] = self.else_result.string_literal
             else:
                 out["else_result"] = self.else_result.to_dict()
-        if self.condition_scope and self.condition_scope != "filter":
+        if self.condition_scope and self.condition_scope != "where":
             out["condition_scope"] = self.condition_scope
         return out
 
@@ -2367,7 +2824,7 @@ class CaseWhenExpr:
         "branches": "Ordered WHEN branches each with condition and result strings.",
         "else_result": "Optional ELSE SQL expression.",
         "else_literal_string": "Optional ELSE raw string literal (quoted in SQL).",
-        "condition_scope": "filter or having when branch predicates match that scope.",
+        "condition_scope": "where or having when branch predicates match that scope.",
     }
 
     def to_prompt_dict(self) -> dict[str, Any]:
@@ -2379,10 +2836,10 @@ class CaseWhenExpr:
             if self.else_result.string_literal:
                 out["else_literal_string"] = self.else_result.string_literal
             else:
-                er = expr_prompt_sql(self.else_result)
+                er = self.else_result.prompt_sql()
                 if er:
                     out["else_result"] = er
-        if self.condition_scope != "filter":
+        if self.condition_scope != "where":
             out["condition_scope"] = self.condition_scope
         return out
 
@@ -2392,7 +2849,7 @@ class CaseWhenExpr:
         return {
             "branches": [
                 {
-                    "condition": FilterParam.prompt_example_dict(),
+                    "condition": WhereParam.prompt_example_dict(),
                     "result": "table.column",
                 }
             ],
@@ -2402,31 +2859,6 @@ class CaseWhenExpr:
 
 _REGISTRY_WIN: ContextVar[tuple[Any, ...]] = ContextVar("_REGISTRY_WIN", default=())
 _REGISTRY_CASE: ContextVar[tuple[Any, ...]] = ContextVar("_REGISTRY_CASE", default=())
-
-
-@contextmanager
-def registry_render_scope(
-    window_registry: list[WindowRegistryStep] | None,
-    case_registry: list[CaseRegistryStep] | None,
-) -> Iterator[None]:
-    """Bind window/case registry lists for the current thread while rendering or analysing expressions. Select columns that use ``registry_ref`` resolve through these lists when computing ``is_aggregated`` or emitting SQL."""
-    t_w = _REGISTRY_WIN.set(tuple(window_registry or ()))
-    t_c = _REGISTRY_CASE.set(tuple(case_registry or ()))
-    try:
-        yield
-    finally:
-        _REGISTRY_WIN.reset(t_w)
-        _REGISTRY_CASE.reset(t_c)
-
-
-def current_window_registry_steps() -> tuple[WindowRegistryStep, ...]:
-    """Return the window registry list bound by :func:`registry_render_scope`."""
-    return _REGISTRY_WIN.get()
-
-
-def current_case_registry_steps() -> tuple[CaseRegistryStep, ...]:
-    """Return the case registry list bound by :func:`registry_render_scope`."""
-    return _REGISTRY_CASE.get()
 
 
 @dataclass
@@ -2443,6 +2875,51 @@ class WindowRegistryStep:
             "frame_end, frame_start_offset, frame_end_offset)."
         ),
     }
+
+    @staticmethod
+    @contextmanager
+    def render_scope(
+        window_registry: list[WindowRegistryStep] | None, case_registry: list[CaseRegistryStep] | None
+    ) -> Iterator[None]:
+        """Bind window/case registry lists for the current thread while rendering expressions."""
+        t_w = _REGISTRY_WIN.set(tuple(window_registry or ()))
+        t_c = _REGISTRY_CASE.set(tuple(case_registry or ()))
+        try:
+            yield
+        finally:
+            _REGISTRY_WIN.reset(t_w)
+            _REGISTRY_CASE.reset(t_c)
+
+    @staticmethod
+    def current_steps() -> tuple[WindowRegistryStep, ...]:
+        """Return the window registry list bound by :meth:`render_scope`."""
+        return _REGISTRY_WIN.get()
+
+    @staticmethod
+    def operator_kind(steps: list[WindowRegistryStep]) -> WindowOperatorKind:
+        """Map window registry rows to a coarse rank versus aggregate versus navigate class."""
+        if not steps:
+            return WindowOperatorKind.NONE
+        saw_rank = False
+        saw_agg = False
+        saw_nav = False
+        for st in steps:
+            fn = (st.window_spec.function or "").strip().lower()
+            if fn in WINDOW_REGISTRY_NAV_KIND_HINTS:
+                saw_nav = True
+            elif fn in WINDOW_REGISTRY_RANK_KIND_HINTS:
+                saw_rank = True
+            elif fn in WINDOW_REGISTRY_AGG_KIND_HINTS:
+                saw_agg = True
+            elif fn:
+                saw_agg = True
+        if saw_nav:
+            return WindowOperatorKind.NAVIGATE
+        if saw_rank:
+            return WindowOperatorKind.RANK
+        if saw_agg:
+            return WindowOperatorKind.AGGREGATE
+        return WindowOperatorKind.NONE
 
     @staticmethod
     def from_dict(d: dict[str, Any]) -> WindowRegistryStep:
@@ -2466,13 +2943,10 @@ class WindowRegistryStep:
             ws = WindowSpec(function="row_number")
         base_payload = d.get("base_expr")
         if base_payload not in (None, {}, []):
-            migrated = normalized_expr_from_stored_json(base_payload)
+            migrated = NormalizedExpr.from_stored_json(base_payload)
             if migrated.signature_key and ws.argument is None:
                 ws = replace(ws, argument=migrated)
-        return WindowRegistryStep(
-            registry_id=str(d.get("registry_id", "")).strip(),
-            window_spec=ws,
-        )
+        return WindowRegistryStep(registry_id=str(d.get("registry_id", "")).strip(), window_spec=ws)
 
     def to_dict(self) -> dict[str, Any]:
         """
@@ -2536,6 +3010,11 @@ class CaseRegistryStep:
     case_when: CaseWhenExpr = field(default_factory=CaseWhenExpr)
 
     @staticmethod
+    def current_steps() -> tuple[CaseRegistryStep, ...]:
+        """Return the case registry list bound by :meth:`WindowRegistryStep.render_scope`."""
+        return _REGISTRY_CASE.get()
+
+    @staticmethod
     def from_dict(d: dict[str, Any]) -> CaseRegistryStep:
         """
         Parse a case registry entry from JSON.
@@ -2551,16 +3030,14 @@ class CaseRegistryStep:
         cw_raw = d.get("case_when")
         if isinstance(cw_raw, list):
             cw = CaseWhenExpr(
-                branches=[(CaseWhenBranch.from_dict(b) if isinstance(b, dict) else CaseWhenBranch()) for b in cw_raw],
+                branches=[(CaseWhenBranch.from_dict(b) if isinstance(b, dict) else CaseWhenBranch()) for b in cw_raw]
             )
         elif isinstance(cw_raw, dict):
             cw = CaseWhenExpr.from_dict(cw_raw)
         else:
             cw = CaseWhenExpr()
         return CaseRegistryStep(
-            registry_id=str(d.get("registry_id", "")).strip(),
-            label=str(d.get("label", "")),
-            case_when=cw,
+            registry_id=str(d.get("registry_id", "")).strip(), label=str(d.get("label", "")), case_when=cw
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -2617,140 +3094,142 @@ class CaseRegistryStep:
         }
 
 
-def validate_tables_exist(tables: tuple[str, ...], schema: SchemaGraph) -> list[IntentIssue]:
-    """Emit logical-stage issues for planner table tokens that are absent from the schema graph."""
-    known = frozenset(schema.tables.keys())
-    out: list[IntentIssue] = []
-    for name in tables:
-        if name in known:
-            continue
-        out.append(
-            make_intent_issue(
-                issue_id=f"unknown_table_{name}",
-                category=FailureCategory.UNKNOWN_TABLE,
-                severity="error",
-                message=f"Unknown table {name!r} in planner tables list.",
-                context={"table": name},
-                responsible_stage="ground",
-            )
+@dataclass(frozen=True)
+class TableDiff:
+    """Per-table delta between a cached and a freshly-reflected ``SchemaGraph``. Entries are sorted tuples to keep equality + hashing deterministic in tests. ``retyped_columns`` records catalog type changes where the normalized ``value_type`` changes (profile must be refreshed). ``redeclared_columns`` holds pure ``data_type`` widenings (for example ``varchar(50)`` to ``text``) where ``value_type`` is unchanged; those updates merge metadata without clearing profiling samples. ``value_type_changed_columns`` mirrors the ``(column, old_vt, new_vt)`` entries implied by ``retyped_columns``. ``renamed_columns`` is populated by :func:`resolve_column_renames` after profile overlap matching; columns appearing here are removed from ``added_columns`` / ``dropped_columns``."""
+
+    added_columns: tuple[str, ...] = ()
+    dropped_columns: tuple[str, ...] = ()
+    redeclared_columns: tuple[tuple[str, str, str], ...] = ()
+    retyped_columns: tuple[tuple[str, str, str], ...] = ()
+    value_type_changed_columns: tuple[tuple[str, str, str], ...] = ()
+    renamed_columns: tuple[tuple[str, str], ...] = ()
+    nullability_changed_columns: tuple[str, ...] = ()
+    uniqueness_changed_columns: tuple[str, ...] = ()
+    indexes_changed: bool = False
+    view_definition_changed: bool = False
+    fk_changed: bool = False
+    pk_changed: bool = False
+
+    @property
+    def is_empty(self) -> bool:
+        return (
+            not self.added_columns
+            and not self.dropped_columns
+            and not self.redeclared_columns
+            and not self.retyped_columns
+            and not self.renamed_columns
+            and not self.nullability_changed_columns
+            and not self.uniqueness_changed_columns
+            and not self.indexes_changed
+            and not self.view_definition_changed
+            and not self.fk_changed
+            and not self.pk_changed
         )
-    return out
+
+    @property
+    def needs_profile(self) -> bool:
+        """True when applying this diff requires re-profiling the table. Pure-rename tables keep cached profiles. Adds and value-type retypes always need profiling; pure ``redeclared_columns`` (same ``value_type``) do not. Tables whose catalog PK or FK edge sets changed are pulled into :meth:`SchemaDiff.changed_table_names` so subset reprofiling refreshes statistics on those relations even when no columns were added or retyped."""
+        return bool(self.added_columns or self.retyped_columns)
 
 
-def validate_cte_tables_and_dag(logical: LogicalIntent, schema: SchemaGraph) -> list[IntentIssue]:
-    """Validate CTE tables tokens against schema tables and strictly prior step names; reject cycles."""
-    issues: list[IntentIssue] = []
-    steps = list(logical.cte_steps or ())
-    if not steps:
-        return issues
-    known_schema = frozenset(schema.tables.keys())
-    base_tables = frozenset(logical.tables)
-    all_cte_names = {(step.name or "").strip() for step in steps if (step.name or "").strip()}
-    prior_names: set[str] = set()
-    seen_step_names: set[str] = set()
-    step_names_ordered: list[str] = []
-    for idx, step in enumerate(steps):
-        name = (step.name or "").strip()
-        if not name:
-            issues.append(
-                make_intent_issue(
-                    issue_id=f"cte_empty_name_{idx}",
-                    category=FailureCategory.CTE_TABLE_REFERENCE,
-                    severity="error",
-                    message="CTE step is missing a non-empty name.",
-                    context={"index": idx},
-                    responsible_stage="ground",
-                )
-            )
-            continue
-        if name in seen_step_names:
-            issues.append(
-                make_intent_issue(
-                    issue_id=f"cte_duplicate_name_{name}",
-                    category=FailureCategory.CTE_TABLE_REFERENCE,
-                    severity="error",
-                    message=f"Duplicate CTE name {name!r}.",
-                    context={"name": name},
-                    responsible_stage="ground",
-                )
-            )
-        seen_step_names.add(name)
-        step_names_ordered.append(name)
-        for token in step.tables or ():
-            t = (token or "").strip()
-            if not t or t == name:
-                continue
-            if t in known_schema or t in base_tables:
-                continue
-            if t in prior_names:
-                continue
-            if t in all_cte_names:
-                issues.append(
-                    make_intent_issue(
-                        issue_id=f"cte_table_forward_ref_{idx}_{t}",
-                        category=FailureCategory.CTE_TABLE_REFERENCE,
-                        severity="error",
-                        message=(
-                            f"CTE {name!r} tables entry {t!r} names a later or current step; "
-                            "only strictly prior cte_steps names are allowed."
-                        ),
-                        context={"cte": name, "tables": t},
-                        responsible_stage="ground",
-                    )
-                )
-                continue
-            issues.append(
-                make_intent_issue(
-                    issue_id=f"cte_table_unknown_{idx}_{t}",
-                    category=FailureCategory.CTE_TABLE_REFERENCE,
-                    severity="error",
-                    message=(
-                        f"CTE {name!r} tables entry {t!r} is not a schema table, top-level table, "
-                        "or prior cte_steps name."
-                    ),
-                    context={"cte": name, "tables": t},
-                    responsible_stage="ground",
-                )
-            )
-        prior_names.add(name)
+@dataclass
+class SchemaDiff:
+    """Whole-graph delta consumed by :func:`apply_diff` and downstream invalidation."""
 
-    sibling_names = {n for n in step_names_ordered if n}
-    if not sibling_names:
-        return issues
-    deps: dict[str, set[str]] = {n: set() for n in sibling_names}
-    consumers: dict[str, set[str]] = {n: set() for n in sibling_names}
-    for step in steps:
-        n = (step.name or "").strip()
-        if not n:
-            continue
-        for t in step.tables or ():
-            tok = (t or "").strip()
-            if tok in sibling_names and tok != n:
-                deps[n].add(tok)
-                consumers[tok].add(n)
-    pending = {n: set(ds) for n, ds in deps.items()}
-    ready = sorted(n for n, ds in pending.items() if not ds)
-    ordered: list[str] = []
-    while ready:
-        level = list(ready)
-        ready = []
-        for n in sorted(level):
-            ordered.append(n)
-            for cons in sorted(consumers[n]):
-                pending[cons].discard(n)
-                if not pending[cons] and cons not in ordered and cons not in ready:
-                    ready.append(cons)
-        ready.sort()
-    if len(ordered) != len(sibling_names):
-        remaining = sorted(n for n in sibling_names if n not in ordered)
-        issues.append(
-            make_intent_issue(
-                issue_id="cte_tables_cycle",
-                category=FailureCategory.CTE_TABLE_REFERENCE,
-                severity="error",
-                message=f"CTE tables lists contain a cycle among steps: {remaining}.",
-                context={"remaining": remaining},
-                responsible_stage="ground",
-            )
+    added_tables: tuple[str, ...] = ()
+    dropped_tables: tuple[str, ...] = ()
+    table_renames: tuple[tuple[str, str], ...] = ()
+    per_table: dict[str, TableDiff] = field(default_factory=dict)
+    cross_table_column_moves: tuple[tuple[str, str, str, str], ...] = ()
+    dropped_user_fks: list[tuple[str, str, str, str, str]] = field(default_factory=list)
+    dropped_catalog_fks: list[tuple[str, str, str, str]] = field(default_factory=list)
+    ported_user_fks: list[tuple[str, str, str, str, str, str]] = field(default_factory=list)
+
+    @property
+    def is_empty(self) -> bool:
+        return (
+            not self.added_tables
+            and not self.dropped_tables
+            and not self.table_renames
+            and not self.per_table
+            and not self.cross_table_column_moves
         )
-    return issues
+
+    def implies_rename_remapping(self) -> bool:
+        """True when template rename migration should treat this diff as a REMAP-tier rename."""
+        if self.table_renames:
+            return True
+        return any(td.renamed_columns for td in self.per_table.values())
+
+    def changed_table_names(self) -> set[str]:
+        """Tables in the *new* graph that need subset profiling (adds, retypes, catalog PK/FK shape changes)."""
+        out: set[str] = set(self.added_tables)
+        for _old, new in self.table_renames:
+            out.add(new)
+        for tname, td in self.per_table.items():
+            if td.needs_profile or td.pk_changed or td.fk_changed:
+                out.add(tname)
+        return out
+
+
+@dataclass(frozen=True, slots=True)
+class SheetGrid:
+    """Raw tabular grid from one CSV file or one Excel worksheet."""
+
+    source_path: Path
+    sheet_name: str
+    cells: tuple[tuple[str, ...], ...]
+    merged_ranges: tuple[str, ...] = ()
+    has_charts: bool = False
+    has_images: bool = False
+    excel_tables: tuple[str, ...] = ()
+    excel_table_ranges: tuple[str, ...] = ()
+    csv_single_column: bool = False
+    header_row_confirmed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class CsvSourceSelection:
+    """Per-upload interpretation choices for CSV/Excel sources."""
+
+    sheet: str = ""
+    header_row: int | None = None
+    skip_rows: int = 0
+    table_range: str = ""
+    merge_regions: tuple[str, ...] = ()
+    append_regions: tuple[str, ...] = ()
+    column_transforms: tuple[Mapping[str, Any], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ScalarAffixColumnPlan:
+    """Accepted scalar affix strip plan for one upload column."""
+
+    duckdb_type: str
+    unit_label: str
+    has_percent: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedRelation:
+    """One loadable table derived from a validated grid."""
+
+    relation_name: str
+    source_path: Path
+    sheet_name: str
+    original_table_label: str
+    columns: tuple[str, ...]
+    original_column_labels: tuple[str, ...]
+    column_types: tuple[str, ...]
+    rows: tuple[dict[str, str], ...]
+    column_unit_labels: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class UploadIngestResult:
+    """Outcome of materialising validated uploads into an existing embedded member."""
+
+    relation_names: tuple[str, ...]
+    report: DataQualityReport
+    schema_diff: SchemaDiff | None = None

@@ -13,12 +13,10 @@ import pytest
 from aetherdialect import AetherEngine
 from aetherdialect._config import EngineConfig, QSimConfig
 from aetherdialect._contracts_base import EngineContext
+from aetherdialect._contracts_core import LiveTestRunner
 from aetherdialect._core_utils import write_gzip_json_atomic
-from aetherdialect._live_testing import LiveTestRunner, run_and_assert
-from aetherdialect._templates import (
-    load_template_store,
-    store_to_templates,
-)
+from aetherdialect._live_testing import run_and_assert
+from aetherdialect._templates import TemplateOps
 
 from ._dialect_scenarios import dialect_databricks_scenarios
 from .conftest import (
@@ -90,9 +88,11 @@ def t2s():
 
         _relax_rental_shop_selectability(instance._schema_graph, schema)
 
-        fresh_store = load_template_store(instance._schema_graph.effective_structural_hash, instance._schema_graph)
+        fresh_store = TemplateOps.load_template_store(
+            instance._schema_graph.effective_structural_hash, instance._schema_graph
+        )
         instance._store = fresh_store
-        instance._templates = store_to_templates(fresh_store)
+        instance._templates = TemplateOps.store_to_templates(fresh_store)
         instance._rejected = {}
 
         return instance

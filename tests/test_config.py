@@ -19,6 +19,9 @@ from aetherdialect._constants import (
     AGGREGATION_ALLOWED_COLUMN_TYPES,
     COLUMN_TYPE_TO_VALUE_TYPE,
     ENGINE_STORAGE_PLACEHOLDER_DIR,
+    INSTRUCTIONAL_OTHER_QUALIFIED_COLUMN_PLACEHOLDER,
+    INSTRUCTIONAL_QUALIFIED_COLUMN_PLACEHOLDER,
+    INTENT_CRITICAL_RULES,
     INTENT_SCHEMA,
     NUMERIC_ONLY_AGGREGATIONS,
     QSIM_QUESTIONS_PATTERN,
@@ -35,14 +38,14 @@ from aetherdialect._constants import (
     TABLE_COL_PATTERN,
     VALID_AGGREGATION_FUNCTIONS,
     VALID_EXPECTED_ROWS,
-    VALID_FILTER_OPS,
-    VALID_FILTER_VALUE_TYPES,
     VALID_GRAINS,
     VALID_HAVING_OPS,
     VALID_HAVING_VALUE_TYPES,
     VALID_RELATIVE_DATE_UNITS,
     VALID_SCALAR_FUNCTIONS,
     VALID_VALUE_TYPES,
+    VALID_WHERE_OPS,
+    VALID_WHERE_VALUE_TYPES,
     VALID_WINDOW_FUNCTIONS,
     VALUE_TYPE_NORMALIZATION,
     WINDOW_AGG_FUNCTIONS,
@@ -50,13 +53,17 @@ from aetherdialect._constants import (
     WINDOW_RANKING_FUNCTIONS,
     WINDOW_VALUE_FUNCTIONS,
 )
-from aetherdialect._contracts_base import normalize_column_type
+from aetherdialect._contracts_base import (
+    HavingParam,
+    WhereParam,
+)
 from aetherdialect._core_utils import (
     diagnostic_debug_enabled,
     diagnostic_force_enter,
     diagnostic_force_exit,
     effective_explain_timeout_ms,
     effective_llm_timeout_ms,
+    normalize_column_type,
     normalize_value_type,
     seed_warmup_failure_code_from_validate_sql_error,
 )
@@ -145,23 +152,23 @@ class TestNormalizeValueType:
         assert normalize_value_type("string") == "string"
         assert normalize_value_type("date") == "date"
 
-    def test_empty_to_string(self):
-        """normalize_value_type maps empty to string."""
-        assert normalize_value_type("") == "string"
+    def test_empty_to_unknown(self):
+        """normalize_value_type maps empty to unknown."""
+        assert normalize_value_type("") == "unknown"
 
-    def test_unknown_to_string(self):
-        """normalize_value_type maps unknown to string."""
-        assert normalize_value_type("xml_blob") == "string"
+    def test_unrecognized_to_unknown(self):
+        """normalize_value_type maps unrecognized types to unknown."""
+        assert normalize_value_type("xml_blob") == "unknown"
 
     def test_case_insensitive(self):
         """normalize_value_type is case-insensitive."""
         assert normalize_value_type("TIMESTAMP") == "date"
         assert normalize_value_type("Integer") == "integer"
 
-    def test_whitespace_only_returns_string(self):
-        """normalize_value_type returns string when input is only whitespace."""
-        assert normalize_value_type("   ") == "string"
-        assert normalize_value_type("\t\n") == "string"
+    def test_whitespace_only_returns_unknown(self):
+        """normalize_value_type returns unknown when input is only whitespace."""
+        assert normalize_value_type("   ") == "unknown"
+        assert normalize_value_type("\t\n") == "unknown"
 
     def test_stripped_whitespace_around_valid_type(self):
         """normalize_value_type strips leading and trailing whitespace."""
@@ -276,12 +283,22 @@ class TestValidAggregationFunctions:
     """Tests for VALID_AGGREGATION_FUNCTIONS constant."""
 
     def test_exactly_five_functions(self):
-        """VALID_AGGREGATION_FUNCTIONS has exactly 5 entries."""
-        assert len(VALID_AGGREGATION_FUNCTIONS) == 5
+        """VALID_AGGREGATION_FUNCTIONS has exactly six entries."""
+        assert len(VALID_AGGREGATION_FUNCTIONS) == 9
 
     def test_expected_members(self):
         """VALID_AGGREGATION_FUNCTIONS contains expected members."""
-        assert VALID_AGGREGATION_FUNCTIONS == {"count", "sum", "avg", "min", "max"}
+        assert VALID_AGGREGATION_FUNCTIONS == {
+            "count",
+            "sum",
+            "avg",
+            "min",
+            "max",
+            "string_agg",
+            "stddev",
+            "variance",
+            "median",
+        }
 
     def test_no_count_distinct(self):
         """count_distinct is not in VALID_AGGREGATION_FUNCTIONS."""
@@ -296,13 +313,16 @@ class TestRoleAllowedAggregations:
         assert ROLE_ALLOWED_AGGREGATIONS["IDENTIFIER"] == {"count"}
 
     def test_numeric_measure_all(self):
-        """NUMERIC_MEASURE role allows all agg functions."""
+        """NUMERIC_MEASURE role allows numeric and statistical aggregations."""
         assert ROLE_ALLOWED_AGGREGATIONS["NUMERIC_MEASURE"] == {
             "count",
             "sum",
             "avg",
             "min",
             "max",
+            "stddev",
+            "variance",
+            "median",
         }
 
     def test_audit_empty(self):
@@ -324,8 +344,8 @@ class TestNumericOnlyAggregations:
     """Tests for NUMERIC_ONLY_AGGREGATIONS constant."""
 
     def test_expected_members(self):
-        """NUMERIC_ONLY_AGGREGATIONS is sum and avg."""
-        assert NUMERIC_ONLY_AGGREGATIONS == {"sum", "avg"}
+        """NUMERIC_ONLY_AGGREGATIONS includes sample statistical aggregates."""
+        assert NUMERIC_ONLY_AGGREGATIONS == {"sum", "avg", "stddev", "variance", "median"}
 
 
 class TestValidConstants:
@@ -335,11 +355,11 @@ class TestValidConstants:
         """VALID_GRAINS has expected values."""
         assert VALID_GRAINS == {"scalar", "grouped", "row_level"}
 
-    def test_valid_filter_ops_includes_like(self):
-        """VALID_FILTER_OPS includes like operators."""
-        assert "like" in VALID_FILTER_OPS
-        assert "ilike" in VALID_FILTER_OPS
-        assert "contains" in VALID_FILTER_OPS
+    def test_valid_where_ops_includes_like(self):
+        """VALID_WHERE_OPS includes like operators."""
+        assert "like" in VALID_WHERE_OPS
+        assert "ilike" in VALID_WHERE_OPS
+        assert "contains" in VALID_WHERE_OPS
 
     def test_valid_having_ops_no_like(self):
         """VALID_HAVING_OPS does not include like."""
@@ -405,10 +425,6 @@ class TestPolicyConfig:
         """Categorical thresholds are positive."""
         assert PolicyConfig.CATEGORICAL_MAX_CARDINALITY > 0
         assert 0 < PolicyConfig.CATEGORICAL_MAX_RATIO < 1
-
-    def test_final_sql_auto_accept_threshold_in_unit_interval(self):
-        """FINAL_SQL_AUTO_ACCEPT_THRESHOLD is in (0, 1]."""
-        assert 0 < PolicyConfig.FINAL_SQL_AUTO_ACCEPT_THRESHOLD <= 1
 
     def test_debug_is_bool(self):
         """PolicyConfig.DEBUG gates developer tracing."""
@@ -577,16 +593,25 @@ class TestPostgresRuntimeConfig:
         """db_url returns proper connection string when configured."""
         orig_pw = PostgresRuntimeConfig.PASSWORD
         orig_db = PostgresRuntimeConfig.DATABASE
+        orig_user = PostgresRuntimeConfig.USER
+        orig_host = PostgresRuntimeConfig.HOST
+        orig_port = PostgresRuntimeConfig.PORT
         try:
-            PostgresRuntimeConfig.PASSWORD = "secret"
+            PostgresRuntimeConfig.PASSWORD = "unit-test-only-pw"
             PostgresRuntimeConfig.DATABASE = "mydb"
+            PostgresRuntimeConfig.USER = "postgres"
+            PostgresRuntimeConfig.HOST = "localhost"
+            PostgresRuntimeConfig.PORT = 5432
             url = PostgresRuntimeConfig.db_url()
-            assert "postgresql+psycopg2://" in url
-            assert "secret" in url
-            assert "mydb" in url
+            assert url.startswith("postgresql+psycopg://")
+            assert "unit-test-only-pw" in url
+            assert url.endswith("@localhost:5432/mydb")
         finally:
             PostgresRuntimeConfig.PASSWORD = orig_pw
             PostgresRuntimeConfig.DATABASE = orig_db
+            PostgresRuntimeConfig.USER = orig_user
+            PostgresRuntimeConfig.HOST = orig_host
+            PostgresRuntimeConfig.PORT = orig_port
 
 
 class TestDatabricksRuntimeConfig:
@@ -643,25 +668,43 @@ class TestEngineConfig:
         assert EngineConfig.RUNTIME is PostgresRuntimeConfig
 
     def test_schema_json_path(self):
-        """SCHEMA_JSON_PATH is an absolute path under ENGINE_STORAGE_PLACEHOLDER_DIR."""
+        """SCHEMA_JSON_PATH is a relative placeholder segment with the expected basename."""
         assert isinstance(EngineConfig.SCHEMA_JSON_PATH, str)
-        assert os.path.isabs(EngineConfig.SCHEMA_JSON_PATH)
-        assert os.path.dirname(EngineConfig.SCHEMA_JSON_PATH) == ENGINE_STORAGE_PLACEHOLDER_DIR
+        assert not os.path.isabs(EngineConfig.SCHEMA_JSON_PATH)
+        norm = EngineConfig.SCHEMA_JSON_PATH.replace("\\", "/")
+        assert norm.endswith("schema_graph.json.gz")
+        placeholder = ENGINE_STORAGE_PLACEHOLDER_DIR.replace("\\", "/")
+        assert norm.startswith(f"{placeholder}/")
         assert os.path.basename(EngineConfig.SCHEMA_JSON_PATH) == "schema_graph.json.gz"
+        root = EngineConfig.default_artifacts_root()
+        assert root.is_absolute()
+        assert (root / EngineConfig.SCHEMA_JSON_PATH).resolve().is_absolute()
 
     def test_template_store_dir(self):
-        """TEMPLATE_STORE_DIR is an absolute path under ENGINE_STORAGE_PLACEHOLDER_DIR."""
+        """TEMPLATE_STORE_DIR is a relative placeholder segment with the expected basename."""
         assert isinstance(EngineConfig.TEMPLATE_STORE_DIR, str)
-        assert os.path.isabs(EngineConfig.TEMPLATE_STORE_DIR)
-        assert os.path.dirname(EngineConfig.TEMPLATE_STORE_DIR) == ENGINE_STORAGE_PLACEHOLDER_DIR
+        assert not os.path.isabs(EngineConfig.TEMPLATE_STORE_DIR)
+        norm = EngineConfig.TEMPLATE_STORE_DIR.replace("\\", "/")
+        assert norm.endswith("intent_templates")
+        placeholder = ENGINE_STORAGE_PLACEHOLDER_DIR.replace("\\", "/")
+        assert norm.startswith(f"{placeholder}/")
         assert os.path.basename(EngineConfig.TEMPLATE_STORE_DIR) == "intent_templates"
+        root = EngineConfig.default_artifacts_root()
+        assert root.is_absolute()
+        assert (root / EngineConfig.TEMPLATE_STORE_DIR).resolve().is_absolute()
 
     def test_skeletons_json_path(self):
-        """QSimConfig.SKELETONS_JSON_PATH is an absolute path under ENGINE_STORAGE_PLACEHOLDER_DIR."""
+        """QSimConfig.SKELETONS_JSON_PATH is a relative placeholder segment with the expected basename."""
         assert isinstance(QSimConfig.SKELETONS_JSON_PATH, str)
-        assert os.path.isabs(QSimConfig.SKELETONS_JSON_PATH)
-        assert os.path.dirname(QSimConfig.SKELETONS_JSON_PATH) == ENGINE_STORAGE_PLACEHOLDER_DIR
+        assert not os.path.isabs(QSimConfig.SKELETONS_JSON_PATH)
+        norm = QSimConfig.SKELETONS_JSON_PATH.replace("\\", "/")
+        assert norm.endswith("qsim_skeletons.json.gz")
+        placeholder = ENGINE_STORAGE_PLACEHOLDER_DIR.replace("\\", "/")
+        assert norm.startswith(f"{placeholder}/")
         assert os.path.basename(QSimConfig.SKELETONS_JSON_PATH) == "qsim_skeletons.json.gz"
+        root = EngineConfig.default_artifacts_root()
+        assert root.is_absolute()
+        assert (root / QSimConfig.SKELETONS_JSON_PATH).resolve().is_absolute()
 
     def test_engine_config_not_importable_from_package_root(self) -> None:
         """EngineConfig is internal and must not be importable from the public ``aetherdialect`` namespace."""
@@ -690,26 +733,26 @@ class TestQSimConfig:
         """MAX_TABLES_PER_INTENT is positive."""
         assert QSimConfig.MAX_TABLES_PER_INTENT > 0
 
-    def test_max_filters_per_intent_positive(self):
-        """MAX_FILTERS_PER_INTENT is positive."""
-        assert QSimConfig.MAX_FILTERS_PER_INTENT > 0
+    def test_max_where_predicates_per_intent_positive(self):
+        """MAX_WHERE_PREDICATES_PER_INTENT is positive."""
+        assert QSimConfig.MAX_WHERE_PREDICATES_PER_INTENT > 0
 
     def test_qsim_questions_pattern_has_version_placeholder(self):
         """QSIM_QUESTIONS_PATTERN contains {version}."""
         assert "{version}" in QSIM_QUESTIONS_PATTERN
 
     def test_excluded_filter_patterns_are_valid_regex(self):
-        """EXCLUDED_FILTER_PATTERNS are valid regex strings."""
-        for pat in QSimConfig.EXCLUDED_FILTER_PATTERNS:
+        """EXCLUDED_WHERE_PATTERNS are valid regex strings."""
+        for pat in QSimConfig.EXCLUDED_WHERE_PATTERNS:
             re.compile(pat)
 
 
 class TestSeedWarmupConfig:
     """Tests for SeedWarmupConfig."""
 
-    def test_max_filters_positive(self):
-        """MAX_FILTERS is positive."""
-        assert SeedWarmupConfig.MAX_FILTERS > 0
+    def test_max_where_predicates_positive(self):
+        """MAX_WHERE_PREDICATES is positive."""
+        assert SeedWarmupConfig.MAX_WHERE_PREDICATES > 0
 
     def test_max_tables_positive(self):
         """MAX_TABLES is positive."""
@@ -780,11 +823,13 @@ class TestIntentSchema:
         """INTENT_SCHEMA required includes tables."""
         assert "tables" in INTENT_SCHEMA["required"]
 
-    def test_properties_include_filters_param_and_having_param(self):
-        """INTENT_SCHEMA properties include filters_param and having_param."""
+    def test_properties_include_where_and_having(self):
+        """INTENT_SCHEMA properties include where and having predicate trees."""
         props = INTENT_SCHEMA["properties"]
-        assert "filters_param" in props
-        assert "having_param" in props
+        assert "where" in props
+        assert "having" in props
+        assert "where_param" not in props
+        assert "having_param" not in props
 
     def test_properties_include_cte_steps(self):
         """INTENT_SCHEMA properties include cte_steps."""
@@ -796,6 +841,90 @@ class TestIntentSchema:
         assert "cte_name" in cte["required"]
         assert "select_cols" in cte["required"]
         assert "output_columns" in cte["required"]
+
+    def test_accepts_distinct_on_preserve_tables_and_emission_values(self) -> None:
+        import jsonschema
+
+        payload = {
+            "tables": ["table"],
+            "distinct_on": ["table.column"],
+            "preserve_tables": ["table"],
+            "cte_steps": [
+                {
+                    "cte_name": "probe",
+                    "select_cols": ["table.column"],
+                    "output_columns": ["column"],
+                    "emission": "semi_join",
+                    "preserve_tables": ["table"],
+                    "distinct_on": ["table.column"],
+                }
+            ],
+        }
+        for emission in ("semi_join", "anti_join"):
+            step = dict(payload["cte_steps"][0])
+            step["emission"] = emission
+            jsonschema.validate(instance={**payload, "cte_steps": [step]}, schema=INTENT_SCHEMA)
+        for emission in ("join_table", "scalar_subquery"):
+            step = dict(payload["cte_steps"][0])
+            step["emission"] = emission
+            with pytest.raises(jsonschema.ValidationError):
+                jsonschema.validate(instance={**payload, "cte_steps": [step]}, schema=INTENT_SCHEMA)
+
+    def test_rejects_invalid_emission_value(self) -> None:
+        import jsonschema
+
+        payload = {
+            "tables": ["table"],
+            "cte_steps": [
+                {
+                    "cte_name": "probe",
+                    "select_cols": ["table.column"],
+                    "output_columns": ["column"],
+                    "emission": "not_a_kind",
+                }
+            ],
+        }
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(instance=payload, schema=INTENT_SCHEMA)
+
+    def test_declarable_emission_values_round_trip_through_runtime_cte_step(self) -> None:
+        from aetherdialect._contracts_core import RuntimeCteStep
+
+        for emission in ("semi_join", "anti_join"):
+            step = RuntimeCteStep.from_dict(
+                {
+                    "cte_name": "probe",
+                    "tables": ["table"],
+                    "select_cols": ["table.column"],
+                    "output_columns": ["column"],
+                    "emission": emission,
+                }
+            )
+            assert step.emission == emission
+
+
+class TestCrossTableComparisonInstruction:
+    def test_critical_rules_include_comparison_guidance_with_placeholders_only(self) -> None:
+        comparison_rules = [
+            r
+            for r in INTENT_CRITICAL_RULES
+            if INSTRUCTIONAL_QUALIFIED_COLUMN_PLACEHOLDER in r
+            and INSTRUCTIONAL_OTHER_QUALIFIED_COLUMN_PLACEHOLDER in r
+            and "not a relationship" in r
+        ]
+        assert len(comparison_rules) == 1
+        rule = comparison_rules[0]
+        assert "join paths remain discovered downstream" in rule.lower()
+        for op in ("=", "!=", "<", ">", " ilike", " like"):
+            assert op not in rule.lower()
+
+    def test_where_and_having_right_expr_specs_describe_cross_table_comparison(self) -> None:
+        where_spec = WhereParam.PROMPT_FIELD_SPEC["right_expr"]
+        having_spec = HavingParam.PROMPT_FIELD_SPEC["right_expr"]
+        assert "different table" in where_spec
+        assert "comparison" in where_spec
+        assert "different table" in having_spec
+        assert "comparison" in having_spec
 
 
 class TestTableColPattern:
@@ -843,36 +972,36 @@ class TestScalarFunctionSets:
 class TestFilterOpSets:
     """Tests for per-role filter operator sets."""
 
-    _BOOLEAN_FILTER_OPS = frozenset({"=", "!=", "in", "not in", "is null", "is not null"})
-    _CATEGORICAL_FILTER_OPS = frozenset(
+    _BOOLEAN_WHERE_OPS = frozenset({"=", "!=", "in", "not in", "is null", "is not null"})
+    _CATEGORICAL_WHERE_OPS = frozenset(
         {"=", "!=", "like", "ilike", "not like", "not ilike", "in", "not in", "is null", "is not null"}
     )
-    _NUMERIC_CATEGORICAL_FILTER_OPS = frozenset(
+    _NUMERIC_CATEGORICAL_WHERE_OPS = frozenset(
         {"=", "!=", "<", "<=", ">", ">=", "in", "not in", "between", "is null", "is not null"}
     )
-    _NUMERIC_FILTER_OPS = frozenset(
+    _NUMERIC_WHERE_OPS = frozenset(
         {"=", "!=", "<", "<=", ">", ">=", "in", "not in", "between", "is null", "is not null"}
     )
 
     def test_boolean_ops_subset_of_valid(self):
-        """Boolean role filter ops are subset of VALID_FILTER_OPS."""
-        assert self._BOOLEAN_FILTER_OPS.issubset(VALID_FILTER_OPS)
+        """Boolean role filter ops are subset of VALID_WHERE_OPS."""
+        assert self._BOOLEAN_WHERE_OPS.issubset(VALID_WHERE_OPS)
 
     def test_categorical_ops_subset_of_valid(self):
-        """Categorical role filter ops are subset of VALID_FILTER_OPS."""
-        assert self._CATEGORICAL_FILTER_OPS.issubset(VALID_FILTER_OPS)
+        """Categorical role filter ops are subset of VALID_WHERE_OPS."""
+        assert self._CATEGORICAL_WHERE_OPS.issubset(VALID_WHERE_OPS)
 
     def test_numeric_categorical_ops_subset_of_valid(self):
-        """Numeric-categorical role filter ops are subset of VALID_FILTER_OPS."""
-        assert self._NUMERIC_CATEGORICAL_FILTER_OPS.issubset(VALID_FILTER_OPS)
+        """Numeric-categorical role filter ops are subset of VALID_WHERE_OPS."""
+        assert self._NUMERIC_CATEGORICAL_WHERE_OPS.issubset(VALID_WHERE_OPS)
 
     def test_numeric_ops_subset_of_valid(self):
-        """Numeric role filter ops are subset of VALID_FILTER_OPS."""
-        assert self._NUMERIC_FILTER_OPS.issubset(VALID_FILTER_OPS)
+        """Numeric role filter ops are subset of VALID_WHERE_OPS."""
+        assert self._NUMERIC_WHERE_OPS.issubset(VALID_WHERE_OPS)
 
     def test_boolean_no_like(self):
         """Boolean role filter ops do not include like."""
-        assert "like" not in self._BOOLEAN_FILTER_OPS
+        assert "like" not in self._BOOLEAN_WHERE_OPS
 
 
 class TestMiscConstants:
@@ -882,10 +1011,10 @@ class TestMiscConstants:
         """VALID_EXPECTED_ROWS has three values."""
         assert VALID_EXPECTED_ROWS == {"one", "few", "many"}
 
-    def test_valid_filter_value_types(self):
-        """VALID_FILTER_VALUE_TYPES has expected members."""
+    def test_valid_where_value_types(self):
+        """VALID_WHERE_VALUE_TYPES has expected members."""
         for vt in ("categorical", "numeric", "temporal", "boolean"):
-            assert vt in VALID_FILTER_VALUE_TYPES
+            assert vt in VALID_WHERE_VALUE_TYPES
 
     def test_valid_having_value_types(self):
         """VALID_HAVING_VALUE_TYPES has expected members."""
@@ -905,9 +1034,9 @@ class TestMiscConstants:
         """AGGREGATION_ALLOWED_COLUMN_TYPES keys match VALID_AGGREGATION_FUNCTIONS."""
         assert set(AGGREGATION_ALLOWED_COLUMN_TYPES.keys()) == VALID_AGGREGATION_FUNCTIONS
 
-    def test_valid_having_ops_subset_of_filter_ops(self):
-        """VALID_HAVING_OPS is subset of VALID_FILTER_OPS."""
-        assert VALID_HAVING_OPS.issubset(VALID_FILTER_OPS)
+    def test_valid_having_ops_subset_of_where_ops(self):
+        """VALID_HAVING_OPS is subset of VALID_WHERE_OPS."""
+        assert VALID_HAVING_OPS.issubset(VALID_WHERE_OPS)
 
 
 class TestPromptNeutrality:
@@ -915,9 +1044,9 @@ class TestPromptNeutrality:
 
     def test_vocab_guidance_has_no_polarity_example_tokens(self):
         """QUESTION_NORMALIZE_VOCABULARY_GUIDANCE avoids enumerated polarity pairs."""
-        from aetherdialect._utils import _QUESTION_NORMALIZE_VOCABULARY_GUIDANCE
+        from aetherdialect._constants import QUESTION_NORMALIZE_VOCABULARY_GUIDANCE
 
-        low = _QUESTION_NORMALIZE_VOCABULARY_GUIDANCE.lower()
+        low = QUESTION_NORMALIZE_VOCABULARY_GUIDANCE.lower()
         assert "positive:" not in low
         assert "negative:" not in low
 
@@ -963,7 +1092,7 @@ class TestConfigFileFullCoverage:
     """TOML ``config_file`` flattening covers every documented key."""
 
     def test_config_file_full_coverage(self, tmp_path) -> None:
-        from aetherdialect._main_execution import _load_config_file
+        from aetherdialect._main_execution import MainExecutionOps
 
         path = tmp_path / "full.toml"
         path.write_text(
@@ -981,7 +1110,6 @@ class TestConfigFileFullCoverage:
                     "",
                     "[azure_openai.deployments]",
                     'light = "al"',
-                    'medium = "am"',
                     'heavy = "ah"',
                     "",
                     "[postgresql]",
@@ -1004,19 +1132,11 @@ class TestConfigFileFullCoverage:
                     "",
                     "[llm]",
                     'provider = "openai"',
-                    "",
-                    "[execution]",
-                    "max_query_cost_rows = 100",
-                    "max_query_cost_bytes = 200",
-                    "statement_timeout_ms = 300",
-                    "llm_timeout_ms = 400",
-                    "profile_timeout_ms = 500",
-                    "explain_timeout_ms = 600",
                 ),
             ),
             encoding="utf-8",
         )
-        got, _claimed = _load_config_file(str(path))
+        got, _claimed, _named = MainExecutionOps._load_config_file(str(path))
         expected = {
             "OPENAI_API_KEY": "oak",
             "OPENAI_BASE_URL": "https://example-openai/v1",
@@ -1025,7 +1145,6 @@ class TestConfigFileFullCoverage:
             "AZURE_OPENAI_API_VERSION": "2024-01-01",
             "AZURE_OPENAI_BASE_URL": "https://ex.azure.com/base",
             "AZURE_OPENAI_DEPLOYMENT_LIGHT": "al",
-            "AZURE_OPENAI_DEPLOYMENT_MEDIUM": "am",
             "AZURE_OPENAI_DEPLOYMENT_HEAVY": "ah",
             "POSTGRES_HOST": "h",
             "POSTGRES_PORT": "5433",
@@ -1040,11 +1159,5 @@ class TestConfigFileFullCoverage:
             "DATABRICKS_SCHEMA": "ds",
             "AETHERDIALECT_ENGINE": "postgresql",
             "AETHERDIALECT_LLM_PROVIDER": "openai",
-            "AETHERDIALECT_MAX_QUERY_COST_ROWS": "100",
-            "AETHERDIALECT_MAX_QUERY_COST_BYTES": "200",
-            "AETHERDIALECT_STATEMENT_TIMEOUT_MS": "300",
-            "AETHERDIALECT_LLM_TIMEOUT_MS": "400",
-            "AETHERDIALECT_PROFILE_TIMEOUT_MS": "500",
-            "AETHERDIALECT_EXPLAIN_TIMEOUT_MS": "600",
         }
         assert got == expected

@@ -47,8 +47,8 @@ def test_sqlglot_is_null_filter(schema_graph: SchemaGraph) -> None:
     dialect = _shell(DuckDBDialect)
     sql = "SELECT customer_id FROM customers WHERE email IS NULL"
     rt = convert_sql_via_sqlglot(sql, schema_graph, dialect)
-    assert rt.filters_param
-    assert rt.filters_param[0].op == "is null"
+    assert rt.where.leaves() if rt.where else []
+    assert (rt.where.leaves() if rt.where else [])[0].op == "is null"
 
 
 def test_sqlglot_count_aggregate(schema_graph: SchemaGraph) -> None:
@@ -64,7 +64,7 @@ def test_sqlglot_in_list(schema_graph: SchemaGraph) -> None:
     sql = "SELECT customer_id FROM customers WHERE customer_id IN (1, 2, 3)"
     cr = convert_sql_to_intent(sql, schema_graph, dialect, verify_via_execute=False)
     assert cr.failure_code is None and cr.intent is not None
-    assert cr.intent.filters_param[0].op == "in"
+    assert (cr.intent.where.leaves() if cr.intent.where else [])[0].op == "in"
 
 
 def test_sqlglot_inner_join(schema_graph: SchemaGraph) -> None:
@@ -81,7 +81,7 @@ def test_sqlglot_group_by_having(schema_graph: SchemaGraph) -> None:
     cr = convert_sql_to_intent(sql, schema_graph, dialect, verify_via_execute=False)
     assert cr.failure_code is None and cr.intent is not None
     assert cr.intent.group_by_cols
-    assert cr.intent.having_param
+    assert cr.intent.having.leaves() if cr.intent.having else []
 
 
 def test_sqlglot_limit(schema_graph: SchemaGraph) -> None:

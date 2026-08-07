@@ -6,17 +6,15 @@ import tempfile
 from unittest.mock import patch
 
 from aetherdialect._contracts_base import (
-    FilterParam,
     NormalizedExpr,
+    PredicateGroup,
+    WhereParam,
 )
 from aetherdialect._contracts_core import (
     RuntimeIntent,
     SelectCol,
 )
-from aetherdialect._live_testing import (
-    deterministic_generate_validate_execute,
-    run_seeded_schema_semantic_repair,
-)
+from aetherdialect._live_testing import deterministic_generate_validate_execute, run_seeded_schema_semantic_repair
 from aetherdialect._templates import TemplateStoreView
 
 
@@ -35,8 +33,8 @@ def test_seeded_repair_fixes_mixed_grain(schema) -> None:
         ],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
-        having_param=[],
+        where=None,
+        having=None,
         natural_language="list first name and count per customer",
     )
     repaired, _warnings, llm_calls = run_seeded_schema_semantic_repair(
@@ -65,8 +63,8 @@ def test_seeded_repair_backfills_group_by(schema) -> None:
         ],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
-        having_param=[],
+        where=None,
+        having=None,
         natural_language="count customers per first name",
     )
     repaired, _warnings, llm_calls = run_seeded_schema_semantic_repair(
@@ -83,7 +81,7 @@ def test_seeded_repair_backfills_group_by(schema) -> None:
 
 def test_seeded_repair_realigns_filter_on_unrelated_table(schema) -> None:
     """A filter on a table outside ``tables`` must either be dropped or its table added."""
-    bad_filter = FilterParam(
+    bad_filter = WhereParam(
         left_expr=NormalizedExpr.from_column("store.last_update"),
         op="=",
         value_type="datetime",
@@ -96,8 +94,8 @@ def test_seeded_repair_realigns_filter_on_unrelated_table(schema) -> None:
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("customer.first_name"))],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[bad_filter],
-        having_param=[],
+        where=PredicateGroup.from_list([bad_filter]),
+        having=None,
         natural_language="first names of customers at a store last updated on 2023-02-15",
     )
     repaired, _warnings, llm_calls = run_seeded_schema_semantic_repair(
@@ -108,7 +106,7 @@ def test_seeded_repair_realigns_filter_on_unrelated_table(schema) -> None:
     assert repaired is not None
     filter_tables = {
         fp.left_expr.primary_column.split(".", 1)[0]
-        for fp in (repaired.filters_param or [])
+        for fp in (PredicateGroup.where_leaves(repaired.where) or [])
         if fp.left_expr and "." in fp.left_expr.primary_column
     }
     if filter_tables:
@@ -127,8 +125,8 @@ def test_deterministic_validation_fails_on_row_level_with_aggregate(schema, t2s)
         ],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
-        having_param=[],
+        where=None,
+        having=None,
     )
     with tempfile.TemporaryDirectory() as tmp:
         store = TemplateStoreView.empty(tmp, schema.effective_structural_hash)

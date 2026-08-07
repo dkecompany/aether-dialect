@@ -10,15 +10,16 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from aetherdialect import AetherEngine
-from aetherdialect._config import ConfigError
 from aetherdialect._constants import MIGRATION_MAP_FILENAME
 from aetherdialect._contracts_base import (
+    ConfigError,
     EngineContext,
-    FilterParam,
     LLMConfig,
     NormalizedExpr,
     OrderByCol,
+    PredicateGroup,
     RuntimeConfig,
+    WhereParam,
 )
 from aetherdialect._contracts_core import (
     RuntimeIntent,
@@ -28,7 +29,7 @@ from aetherdialect._contracts_schema import (
     QSimSummary,
 )
 from aetherdialect._core_utils import load_runtime_config
-from aetherdialect._templates import empty_template_store
+from aetherdialect._templates import TemplateOps
 
 
 def _sample_llm_execution():
@@ -49,17 +50,23 @@ def _make_aether_stub(**overrides):
         _schema_graph=MagicMock(),
         _dialect=MagicMock(),
         _artifacts_dir=Path("/tmp/aether"),
-        _store=empty_template_store("unit_test_eff"),
+        _store=TemplateOps.empty_template_store("unit_test_eff"),
         _templates={},
         _rejected={},
         _schema_terms=set(),
         _config_file=None,
         _execution_engine=None,
         _audit_sink=None,
+        _construction_phase_callback=None,
+        _ask_phase_callback=None,
         _pipeline_writer_lock=__import__("threading").Lock(),
         _schema_stats={"table_count": 10, "total_filterable": 40},
         _schema_role="owner",
         _consumer_visible_objects=None,
+        _token_provider=None,
+        _native_connection=None,
+        _sandbox_closed=False,
+        _tenant_slug=None,
     )
     defaults.update(overrides)
 
@@ -124,13 +131,13 @@ class TestGetQsimSummary:
 class TestEnsureLlm:
     """Tests for ``AetherEngine._ensure_llm``."""
 
-    @patch("aetherdialect.aetherdialect.llm_credentials_configured", return_value=False)
+    @patch("aetherdialect._config.EngineConfig.llm_credentials_configured", return_value=False)
     def test_no_credentials_raises_config_error(self, _mock_lc: MagicMock) -> None:
         t = _make_aether_stub()
         with pytest.raises(ConfigError, match="LLM is not configured"):
             t._ensure_llm()
 
-    @patch("aetherdialect.aetherdialect.llm_credentials_configured", return_value=True)
+    @patch("aetherdialect._config.EngineConfig.llm_credentials_configured", return_value=True)
     def test_configured_passes(self, _mock_lc: MagicMock) -> None:
         t = _make_aether_stub()
         t._ensure_llm()
@@ -141,7 +148,7 @@ class TestInitPatches:
 
     @patch("aetherdialect.aetherdialect.initialize_aether_engine")
     def test_init_builds_schema_and_store(self, mock_init: MagicMock) -> None:
-        from aetherdialect._main_execution import AetherEngineInitResult
+        from aetherdialect._contracts_base import AetherEngineInitResult
 
         sg = MagicMock(
             effective_structural_hash="eh",
@@ -171,7 +178,7 @@ class TestInitPatches:
 
     @patch("aetherdialect.aetherdialect.initialize_aether_engine")
     def test_init_calls_initialize_with_engine_context(self, mock_init: MagicMock) -> None:
-        from aetherdialect._main_execution import AetherEngineInitResult
+        from aetherdialect._contracts_base import AetherEngineInitResult
 
         sg = MagicMock(
             effective_structural_hash="eh",
@@ -210,7 +217,7 @@ class TestClearLearningCaches:
         mock_clear: MagicMock,
         mock_init: MagicMock,
     ) -> None:
-        from aetherdialect._main_execution import AetherEngineInitResult
+        from aetherdialect._contracts_base import AetherEngineInitResult
 
         sg = MagicMock(
             effective_structural_hash="eh",
@@ -250,7 +257,7 @@ class TestClearLearningCaches:
         mock_clear: MagicMock,
         mock_init: MagicMock,
     ) -> None:
-        from aetherdialect._main_execution import AetherEngineInitResult
+        from aetherdialect._contracts_base import AetherEngineInitResult
 
         sg = MagicMock(
             effective_structural_hash="eh",
@@ -294,7 +301,7 @@ class TestClearLearningCaches:
         mock_clear_over: MagicMock,
         mock_init: MagicMock,
     ) -> None:
-        from aetherdialect._main_execution import AetherEngineInitResult
+        from aetherdialect._contracts_base import AetherEngineInitResult
 
         sg = MagicMock(
             effective_structural_hash="eh",
@@ -339,7 +346,7 @@ class TestClearLearningCaches:
         mock_clear_over: MagicMock,
         mock_init: MagicMock,
     ) -> None:
-        from aetherdialect._main_execution import AetherEngineInitResult
+        from aetherdialect._contracts_base import AetherEngineInitResult
 
         sg = MagicMock(
             effective_structural_hash="eh",
@@ -377,7 +384,7 @@ class TestClearLearningCaches:
 class TestApplyMigrationMap:
     """Tests for ``AetherEngine.apply_migration_map``."""
 
-    def test_apply_migration_map_copies_to_cwd(self) -> None:
+    def test_apply_migration_map_copies_to_artifacts_dir(self) -> None:
         captured: dict[str, object] = {}
 
         def _capture_init(self: AetherEngine, *args: object, **kwargs: object) -> None:
@@ -387,26 +394,31 @@ class TestApplyMigrationMap:
         with tempfile.TemporaryDirectory() as td:
             src = Path(td) / "incoming_map.json"
             src.write_text('{"tables": []}', encoding="utf-8")
+            artifacts = Path(td) / "artifacts"
+            artifacts.mkdir()
+            wrong_cwd = Path(td) / "wrong_cwd"
+            wrong_cwd.mkdir()
             old = os.getcwd()
-            os.chdir(td)
+            os.chdir(wrong_cwd)
             try:
                 with patch.object(AetherEngine, "__init__", _capture_init):
                     out = AetherEngine.apply_migration_map(
                         str(src),
                         engine_context=EngineContext(),
-                        artifacts_dir="/tmp/art",
+                        artifacts_dir=str(artifacts),
                     )
                 assert isinstance(out, AetherEngine)
-                dst = Path(td) / MIGRATION_MAP_FILENAME
+                dst = artifacts / MIGRATION_MAP_FILENAME
                 assert dst.is_file()
                 assert dst.read_text(encoding="utf-8") == '{"tables": []}'
+                assert not (wrong_cwd / MIGRATION_MAP_FILENAME).is_file()
                 args = captured.get("args", ())
                 kwargs = captured.get("kwargs", {})
                 ctx = kwargs.get("engine_context")
                 if ctx is None and len(args) >= 1:
                     ctx = args[0]
                 assert ctx == EngineContext()
-                assert kwargs.get("artifacts_dir") == "/tmp/art"
+                assert kwargs.get("artifacts_dir") == str(artifacts)
             finally:
                 os.chdir(old)
 
@@ -420,19 +432,16 @@ class TestApplyMigrationMap:
         with tempfile.TemporaryDirectory() as td:
             src = Path(td) / "map.json"
             src.write_text('{"version": 1, "action": "remap"}', encoding="utf-8")
-            old = os.getcwd()
-            os.chdir(td)
-            try:
-                with patch.object(AetherEngine, "__init__", _capture_init):
-                    AetherEngine.apply_migration_map(
-                        str(src),
-                        engine_context=EngineContext(),
-                        artifacts_dir="/tmp/art",
-                        native_connection=sentinel,
-                        execution_engine=sentinel,
-                    )
-            finally:
-                os.chdir(old)
+            artifacts = Path(td) / "artifacts"
+            artifacts.mkdir()
+            with patch.object(AetherEngine, "__init__", _capture_init):
+                AetherEngine.apply_migration_map(
+                    str(src),
+                    engine_context=EngineContext(),
+                    artifacts_dir=str(artifacts),
+                    native_connection=sentinel,
+                    execution_engine=sentinel,
+                )
         kwargs = captured.get("kwargs", {})
         assert kwargs.get("native_connection") is sentinel
         assert kwargs.get("execution_engine") is sentinel
@@ -442,7 +451,7 @@ class TestBuildIntentSummary:
     """Smoke test for session intent summary projection."""
 
     def test_build_intent_summary_fields(self) -> None:
-        from aetherdialect._main_execution import _build_intent_summary
+        from aetherdialect._main_execution import MainExecutionOps
 
         intent = RuntimeIntent(
             tables=["t1"],
@@ -450,17 +459,19 @@ class TestBuildIntentSummary:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t1.id"))],
             group_by_cols=[NormalizedExpr.from_column("t1.region")],
             order_by_cols=[OrderByCol(expr=NormalizedExpr.from_column("t1.id"), direction="desc")],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("t1.status"),
-                    op="=",
-                    raw_value="open",
-                )
-            ],
+            where=PredicateGroup.from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("t1.status"),
+                        op="=",
+                        raw_value="open",
+                    )
+                ]
+            ),
             natural_language="  headline  ",
             limit=10,
         )
-        s = _build_intent_summary(intent)
+        s = MainExecutionOps._build_intent_summary(intent)
         assert s.tables == ("t1",)
         assert s.limit == 10
         assert s.natural_language == "headline"

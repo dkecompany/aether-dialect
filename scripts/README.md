@@ -9,9 +9,10 @@ Self-contained scripts to build the **rental_shop** CSV bundle (34-table multi-c
 | [Quick start](#quick-start) | CSV bundle and engine load |
 | [source_rental_shop.py](#source_rental_shoppypy) | Bundle generation |
 | [load_rental_shop_engines.py](#load_rental_shop_enginespy) | Multi-engine load |
+| [Federation build](#federation-build) | Partition seeds, live load, verify |
 | [Data sources](#data-sources) | Lexicons and external feeds |
 | [Layout](#layout) | Paths and roles |
-| [Sandbox data model](#sandbox-data-model-four-files) | Four JSON/notes files |
+| [Sandbox data model](#sandbox-data-model-corpus-metadata) | Corpus metadata files |
 | [Sandbox corpus](#sandbox-corpus) | Recording and packaging |
 | [Maintainer publish](#maintainer-publish) | Azure bundle upload |
 
@@ -52,7 +53,7 @@ Loads CSVs + canonical DDL into supported engines from `scripts/data/rental_shop
 | Flag | Behaviour |
 | --- | --- |
 | `--all` | Start from all supported engines; subtract any `--exclude-*` flags. |
-| `--postgres`, `--mysql`, … | Include only listed engines (cannot mix with excludes unless `--all` is set). |
+| `--postgresql`, `--mysql`, … | Include only listed engines (cannot mix with excludes unless `--all` is set). |
 | `--exclude-*` | Skip engines when used with `--all`. |
 | `--drop-first` | Drop/recreate target schema or tables before load. |
 | `--csv-dir` | CSV directory (default `scripts/data/rental_shop_csvs/`). |
@@ -61,6 +62,57 @@ Loads CSVs + canonical DDL into supported engines from `scripts/data/rental_shop
 With **no arguments**, all ten engines load. Include and exclude flags cannot be combined unless `--all` is present.
 
 **BigQuery:** set `BIGQUERY_LOCATION` to the dataset data region (e.g. `australia-southeast1`), not the project default.
+
+### Federation partition load
+
+`--federation-load` and `--federation-verify` operate on **federation partition targets only** — they do not load or drop the full `rental_shop` databases used by `--all`.
+
+| Target | Engine | Namespace |
+| --- | --- | --- |
+| `storefront` | PostgreSQL | schema `rental_shop_fed_storefront` |
+| `catalog` | MySQL | database `rental_shop_fed_catalog` |
+| `logistics` | PostgreSQL | schema `rental_shop_fed_logistics` |
+| `crm` | MariaDB | database `rental_shop_fed_crm` |
+
+| Flag | Behaviour |
+| --- | --- |
+| `--federation-load {storefront,catalog,logistics,crm,all}` | Apply the matching `federation_*_seed.sql` files, then run partition verify. |
+| `--federation-verify {storefront,catalog,logistics,crm,all}` | Row-count verify only — no reload. |
+| `--drop-first` | **Blast radius:** drop and recreate only the four federation partition namespaces above. Full `rental_shop` schemas/databases on those engines are **not** modified. |
+| `--verbose` | Print per-table row counts during federation verify. |
+
+**Invalid combinations** (script exits with an error before any mode runs):
+
+- `--federation-load` with `--federation-verify`, `--all`, any engine include/exclude, `--ping`, or `--extract-csv`
+- `--federation-verify` with `--all`, any engine include/exclude, `--ping`, or `--extract-csv`
+- `--federation-load` or `--federation-verify` with `--schema`, `--recreate-schema`, or `--allow-public-schema-recreate` (those flags apply to full-engine load only)
+- `--ping`, `--extract-csv`, `--all`, and engine include/exclude flags are mutually exclusive mode selectors (only one group per invocation)
+
+`--drop-first`, `--verbose`, `--env-file`, `--csv-dir`, and `--ddl` may be combined with federation modes.
+
+Credentials come from root `env.env` (`POSTGRES_*`, `MYSQL_*`, `MARIADB_*`).
+
+## Federation build
+
+Ordered maintainer sequence for the four-member offline/live federation topology (`sandbox_rental_shop` offline, `live_rental_shop` in integration tests). Steps marked **live DB** need local PostgreSQL, MySQL, and MariaDB instances.
+
+```text
+# 1 — Ensure CSV bundle (no live DB)
+.venv\Scripts\python.exe scripts\source_rental_shop.py
+
+# 2 — Corpus staging: export partition seeds and refresh federation_partition.json (no live DB)
+.venv\Scripts\python.exe scripts\sandbox_corpus.py
+
+# 3 — Load all four live partitions (live DB: postgres + mysql + mariadb)
+.venv\Scripts\python.exe scripts\load_rental_shop_engines.py --federation-load all --drop-first
+
+# 4 — Verify without reload (live DB; also runs automatically after step 3)
+.venv\Scripts\python.exe scripts\load_rental_shop_engines.py --federation-verify all
+```
+
+Step 2 calls `export_federation_partition_seeds` during `assemble_staging`, overwriting the four committed `federation_*_seed.sql` files and `federation_partition.json` from `scripts/sqlite/rental_shop.sqlite`. Until that rebuild runs, the seed files ship as **payment-only placeholders** (`NON-CANONICAL` header comment); `federation_partition.json` always lists the authoritative per-member table roster.
+
+Declaration topology is hand-maintained in `federation_declaration.json` (logical tables, cross-source joins, replica/union semantics). See [Sandbox data reference](../docs/SANDBOX_DATA_REFERENCE.md#federation-topology) for member table lists and join shape.
 
 ## Data sources
 
@@ -84,22 +136,30 @@ Activity anchor for generated dates: `2026-07-01` (`RENTAL_SHOP_AS_OF` env overr
 | `scripts/data/rental_shop_notes.txt` | Domain notes for schema context |
 | `scripts/data/rental_shop_overrides.json` | Shipped sensitivity overrides (`version` **1**) |
 | `scripts/data/sandbox_questions.txt` | Offline sandbox question corpus (`# questions`, `# validation_failures`, `# feedback_samples`) |
+| `scripts/data/federation_declaration.json` | Hand-maintained federation topology (logical tables, joins, coordinator limits) |
+| `scripts/data/federation_partition.json` | Per-member physical table roster; **committed artifact** refreshed by corpus `assemble_staging` |
+| `scripts/data/federation_storefront_seed.sql` | Storefront partition DuckDB seed (**committed artifact**; placeholder until corpus export) |
+| `scripts/data/federation_catalog_seed.sql` | Catalog partition DuckDB seed (**committed artifact**; placeholder until corpus export) |
+| `scripts/data/federation_logistics_seed.sql` | Logistics partition DuckDB seed (**committed artifact**; placeholder until corpus export) |
+| `scripts/data/federation_crm_seed.sql` | CRM partition DuckDB seed (**committed artifact**; placeholder until corpus export) |
 | `scripts/data/inputs.zip` | Frozen lexicons and name lists |
 | `scripts/sandbox_staging/` | Sandbox bundle staging (gitignored) |
 | `scripts/<engine>/` | Per-engine load wrappers |
 
-## Sandbox data model (four files)
+## Sandbox data model (corpus metadata)
 
-All four files under `scripts/data/` serve distinct roles — do not merge them with `sandbox_questions.txt`.
+Hand-maintained metadata under `scripts/data/` — distinct from `sandbox_questions.txt` and the federation files above.
 
 | File | Role | Consumed by |
 | --- | --- | --- |
 | `sandbox_expectations.json` | Deterministic per-slot terminal outcomes (`terminal_status`, `must_tables`, `sql_contains`, faithfulness) for recording validation and `AetherEngine.assert_sandbox_complete()` | `sandbox_corpus.py`, package sandbox gate |
 | `sandbox_scenarios.json` | Non-standard recording flows: validation-failure mechanisms, feedback-sample anchor questions, allowed rejection text | `sandbox_corpus.py` recording router |
-| `sandbox_paraphrase_pairs.json` | **Maintainer-only** canonical↔paraphrase mapping for doc linking, shared expectation rules, optional `--record-reuse-pairs` | `sandbox_corpus.py` — **not** a public user API |
+| `sandbox_handcrafted_fixtures.json` | Pre-authored intent/SQL fixture fragments for selected questions (bypasses live LLM for those slots) | `sandbox_corpus.py` recording router |
+| `sandbox_migration_demo.json` | Bundled column-rename migration demo map | `sandbox_corpus.py` → `migration_map_demo.json` in staging |
+| `sandbox_overrides_demo.json` | Bundled sensitivity/override demo (`staff` hidden columns, `film` description) | `sandbox_corpus.py` → `schema_overrides_demo.json` in staging |
 | `sandbox_space_catalog_notes.txt` | Second AetherSpace notes file for catalog-space demo (inherited-then-refined descriptions) | Bundled into sandbox zip |
 
-Metadata (`sandbox_expectations.json`, `sandbox_scenarios.json`) is **hand-maintained** under `scripts/data/` and copied into staging unchanged during builds. User-facing discovery ships as `sandbox_catalog.json` inside `data.zip` (built from scenarios + recorded paraphrase pairs).
+Expectations and scenarios are copied into staging unchanged during builds. User-facing discovery ships as `sandbox_catalog.json` inside `data.zip` (built from scenarios plus paraphrase pairs recorded or generated during corpus build).
 
 ## Maintainer publish
 
@@ -115,6 +175,7 @@ Rebuild the shipped offline bundle after DDL, notes, overrides, or question-corp
 ```text
 .venv\Scripts\python.exe scripts\sandbox_corpus.py
 .venv\Scripts\python.exe scripts\sandbox_corpus.py --repair
+.venv\Scripts\python.exe scripts\sandbox_corpus.py --repair --force
 ```
 
 ### Two modes
@@ -123,8 +184,11 @@ Rebuild the shipped offline bundle after DDL, notes, overrides, or question-corp
 | --- | --- |
 | *(no flags)* | Full build: assemble staging, build baseline, record fixtures, validate, and pack. |
 | `--repair` | Re-record failing fixture slots when staging fingerprint matches last build. |
+| `--force` | With `--repair` only: re-record every recording slot (not only uncommitted ones). |
 | `--smoke` | End-to-end pipeline with one practice question plus validation/feedback/scenario slots; writes `sandbox_staging.zip` only. |
 | `--record-reuse-pairs` | Record paraphrase pairs in the same warm session to capture reuse traces. |
+
+Invalid combinations are rejected at startup: `--force` without `--repair`; `--repair` with `--smoke` or `--record-reuse-pairs`.
 
 ### What full rebuild does
 
@@ -141,7 +205,7 @@ Rebuild the shipped offline bundle after DDL, notes, overrides, or question-corp
 | Template learning persistence | Fixtures only in zip; no learned templates shipped | Learning in temp `artifacts_dir`; deleted on handle close |
 | Runtime paraphrase generation on accept | N/A at record time | Skipped under mock (no live LLM credentials) |
 
-Default recording runs **owner writer slots only** (~50 live LLM traces). Pack-time validation replays **both** owner and consumer reader paths against committed fixtures — consumer expectations stay in `sandbox_expectations.json` but are not re-recorded. Optional `--record-reuse-pairs` records mapped paraphrase pairs in the same warm session to capture reuse-specific traces. Maintainer-only `fixture_copy_replacements` in `sandbox_paraphrase_pairs.json` is a last-resort hack for near-identical fixtures (for example year literal swaps).
+Default recording runs **owner writer slots only** (~50 live LLM traces). Pack-time validation replays **both** owner and consumer reader paths against committed fixtures — consumer expectations stay in `sandbox_expectations.json` but are not re-recorded. Optional `--record-reuse-pairs` records mapped paraphrase pairs in the same warm session to capture reuse-specific traces.
 
 **DuckDB config split:** root `env.env` drives live tests and dev tooling with file-backed DuckDB (`DUCKDB_PATH=scripts/duckdb/rental_shop.duckdb`). Corpus build forces `:memory:` DuckDB seeded from staged `rental_shop_seed.sql`. LLM credentials come from `env.env`.
 

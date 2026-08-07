@@ -38,8 +38,8 @@ def test_seeded_join_candidates_bridge_actor_film(schema) -> None:
         ],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
-        having_param=[],
+        where=None,
+        having=None,
     )
     join_candidates, _cmap, _cte_hints = generate_join_candidates(intent, schema)
     candidates = join_candidates.get("candidates") or []
@@ -58,8 +58,8 @@ def test_seeded_join_candidates_bridge_item_category(schema) -> None:
         ],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
-        having_param=[],
+        where=None,
+        having=None,
     )
     join_candidates, _cmap, _cte_hints = generate_join_candidates(intent, schema)
     candidates = join_candidates.get("candidates") or []
@@ -78,8 +78,8 @@ def test_seeded_join_candidates_bridge_customer_country(schema) -> None:
         ],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
-        having_param=[],
+        where=None,
+        having=None,
     )
     join_candidates, _cmap, _cte_hints = generate_join_candidates(intent, schema)
     candidates = join_candidates.get("candidates") or []

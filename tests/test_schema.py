@@ -67,6 +67,7 @@ def _col(**overrides) -> ColumnMetadata:
         distinct_count=10,
         distinct_ratio=0.5,
         row_count=20,
+        value_overlap_sample=["1", "2", "3", "4", "5"],
     )
     defaults.update(overrides)
     return ColumnMetadata(**defaults)
@@ -164,7 +165,7 @@ class TestComputeSchemaLimits:
         limits = compute_schema_limits(stats)
         assert isinstance(limits, SchemaLimits)
         assert limits.max_tables == 3
-        assert limits.max_filters >= 1
+        assert limits.max_where_predicates >= 1
         assert limits.max_groupby >= 1
 
     def test_medium_schema(self):
@@ -183,13 +184,13 @@ class TestComputeSchemaLimits:
         """Zero tables should produce valid limits without division error."""
         stats = {"table_count": 0, "total_filterable": 0, "total_groupable": 0}
         limits = compute_schema_limits(stats)
-        assert limits.max_filters == 1
+        assert limits.max_where_predicates == 1
         assert limits.max_groupby == 1
 
     def test_missing_keys_use_defaults(self):
         """Missing table_count / totals default so limits stay valid."""
         limits = compute_schema_limits({})
-        assert limits.max_filters == 1
+        assert limits.max_where_predicates == 1
         assert limits.max_groupby == 1
         assert limits.max_tables == 1
 
@@ -653,7 +654,7 @@ class TestInferMissingFks:
 
 
 class TestInferMissingFksLongestPrefixAndOverlap:
-    """Tests for Phase 13 longest-prefix matching and value-overlap validation."""
+    """Tests for longest-prefix matching and value-overlap validation."""
 
     def test_prefers_plural_table_over_singular_when_both_exist(self):
         """`customer_id` should target the longer-named table when singular and plural both exist."""
@@ -757,25 +758,25 @@ class TestInferMissingFksLongestPrefixAndOverlap:
         assert len(inferred) == 1
         assert inferred[0].dst_table == "customer"
 
-    def test_overlap_falls_open_when_samples_missing(self):
-        """When neither side has populated samples, overlap-validate should not block inference."""
+    def test_overlap_refuses_when_samples_missing(self):
+        """When neither side has populated samples, overlap validation refuses inference."""
         tables = {
             "customer": _table(
                 "customer",
-                {"customer_id": _col(name="customer_id", is_primary_key=True)},
+                {"customer_id": _col(name="customer_id", is_primary_key=True, value_overlap_sample=[])},
                 primary_key=["customer_id"],
             ),
             "orders": _table(
                 "orders",
                 {
-                    "order_id": _col(name="order_id", is_primary_key=True),
-                    "customer_id": _col(name="customer_id"),
+                    "order_id": _col(name="order_id", is_primary_key=True, value_overlap_sample=[]),
+                    "customer_id": _col(name="customer_id", value_overlap_sample=[]),
                 },
                 primary_key=["order_id"],
             ),
         }
         inferred = infer_missing_fks(tables)
-        assert len(inferred) == 1
+        assert len(inferred) == 0
 
     def test_string_int_compatible_when_string_samples_are_digits(self):
         """String↔integer FK inference should be allowed when string- side samples are digit strings."""
@@ -846,7 +847,7 @@ class TestInferMissingFksLongestPrefixAndOverlap:
 
 
 class TestInferMissingFksComposite:
-    """Tests for Phase 15 composite (multi-column) FK inference."""
+    """Tests for composite (multi-column) FK inference."""
 
     def test_infers_composite_fk_when_all_pk_columns_present(self):
         """When src table contains every column of dst's composite PK, infer the multi-column FK."""
@@ -2128,10 +2129,10 @@ class TestSchemaContextAllowColumnsParser:
         assert ctx.allow_columns == frozenset({"contacts.email", "*.name"})
 
     def test_too_many_dots_raises(self):
-        from aetherdialect._config import ConfigError
+        from aetherdialect._contracts_base import ConfigError
 
         try:
-            EngineContext(allow_columns=frozenset({"a.b.c"}))
+            EngineContext(allow_columns=frozenset({"a.b.c.d"}))
         except ConfigError as e:
             assert "allow_columns" in str(e)
         else:
@@ -2240,7 +2241,7 @@ class TestSchemaOverrideNullSkipAndPrune:
     def test_null_column_description_and_role_removed_from_document(self, schema_graph, monkeypatch):
         from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
         doc = _ov_doc(
             tables={"orders": {"columns": {"amount": {"description": None, "role": None}}}},
         )
@@ -2250,7 +2251,7 @@ class TestSchemaOverrideNullSkipAndPrune:
     def test_invalid_table_role_pruned(self, schema_graph, monkeypatch):
         from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
         prev = schema_graph.tables["orders"].role
         doc = _ov_doc(tables={"orders": {"role": "not_a_table_role"}})
         report = apply_schema_overrides_to_graph(schema_graph, doc)
@@ -2268,7 +2269,7 @@ class TestSchemaOverrideNullSkipAndPrune:
             save_overrides_sidecar,
         )
 
-        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
         cache_path = tmp_path / "schema.json.gz"
         cache_path.write_bytes(b"x")
         doc = _ov_doc(
@@ -2291,25 +2292,17 @@ class TestSchemaOverrides:
     """JSON-roundtrip user editing of the built schema graph."""
 
     def test_dump_dict_round_trips_current_state(self, schema_graph):
-        from aetherdialect._constants import SCHEMA_OVERRIDES_EXPORT_DEFAULT_OWNER, SCHEMA_OVERRIDES_VERSION
+        from aetherdialect._constants import SCHEMA_OVERRIDES_VERSION
         from aetherdialect._schema_overrides import dump_schema_overrides_dict
 
         d = dump_schema_overrides_dict(schema_graph)
         assert d["version"] == SCHEMA_OVERRIDES_VERSION
-        assert set(d["tables"].keys()) == {"customers", "orders", "products"}
-        for _tname, tval in d["tables"].items():
-            assert set(tval["description"].keys()) == {"value", "owner"}
-            assert set(tval["role"].keys()) == {"value", "owner"}
-            assert tval["description"]["owner"] == SCHEMA_OVERRIDES_EXPORT_DEFAULT_OWNER
-            assert tval["role"]["owner"] == SCHEMA_OVERRIDES_EXPORT_DEFAULT_OWNER
-            for _cname, cval in tval["columns"].items():
-                assert "description" in cval
-                assert "role" in cval
-                assert "sensitivity" in cval
-                assert set(cval["description"].keys()) == {"value", "owner"}
-                assert set(cval["role"].keys()) == {"value", "owner"}
-                assert cval["description"]["owner"] == SCHEMA_OVERRIDES_EXPORT_DEFAULT_OWNER
-                assert cval["role"]["owner"] == SCHEMA_OVERRIDES_EXPORT_DEFAULT_OWNER
+        assert set(d["tables"].keys()) == set()
+        readonly_tables = {row["name"] for row in d["_readonly"]["tables_current"]}
+        assert readonly_tables == {"customers", "orders", "products"}
+        for row in d["_readonly"]["tables_current"]:
+            assert "role" in row
+            assert "description" in row
         assert d["foreign_keys_add"] == []
 
     def test_dump_to_path_replaces_existing_atomically(self, schema_graph, tmp_path):
@@ -2393,7 +2386,7 @@ class TestSchemaOverrides:
                         "orders": {
                             "description": {
                                 "value": "Hello",
-                                "owner": "catalog",
+                                "owner": "bogus",
                             }
                         }
                     },
@@ -2408,8 +2401,7 @@ class TestSchemaOverrides:
         from aetherdialect._contracts_base import DescriptionOwner
         from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._config.llm_credentials_configured", lambda: False)
-        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
 
         apply_schema_overrides_to_graph(
             schema_graph,
@@ -2448,7 +2440,7 @@ class TestSchemaOverrides:
     def test_apply_sensitivity_pii_value_is_rejected(self, schema_graph, monkeypatch):
         from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
         prev_sensitivity = schema_graph.tables["customers"].columns["email"].sensitivity
         report = apply_schema_overrides_to_graph(
             schema_graph,
@@ -2487,7 +2479,7 @@ class TestSchemaOverrides:
     def test_apply_role_override(self, schema_graph, monkeypatch):
         from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
         report = apply_schema_overrides_to_graph(
             schema_graph,
             _ov_doc(
@@ -2503,7 +2495,7 @@ class TestSchemaOverrides:
         """Invalid role vs ``value_type`` is skipped with notify; graph and persisted doc omit the role key."""
         from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
         prev_role = schema_graph.tables["orders"].columns["amount"].role
         doc = _ov_doc(
             tables={
@@ -2527,7 +2519,7 @@ class TestSchemaOverrides:
         from aetherdialect._constants import SCHEMA_OVERRIDES_VERSION
         from aetherdialect._schema_overrides import load_schema_overrides_file
 
-        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
         path = tmp_path / "bad.json"
         path.write_text(
             json.dumps(
@@ -2544,7 +2536,7 @@ class TestSchemaOverrides:
     def test_apply_unknown_table_and_column_skipped(self, schema_graph, monkeypatch):
         from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
         report = apply_schema_overrides_to_graph(
             schema_graph,
             _ov_doc(
@@ -2592,7 +2584,7 @@ class TestSchemaOverrides:
         store_col._owner_table = schema_graph.tables["customers"]
         schema_graph.tables["customers"].columns["store_id"] = store_col
 
-        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
         before = len(schema_graph.tables["customers"].foreign_keys)
         report = apply_schema_overrides_to_graph(
             schema_graph,
@@ -2616,7 +2608,7 @@ class TestSchemaOverrides:
     def test_apply_fk_add_unknown_endpoint_skipped(self, schema_graph, monkeypatch):
         from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
         report = apply_schema_overrides_to_graph(
             schema_graph,
             _ov_doc(
@@ -2637,10 +2629,10 @@ class TestSchemaOverrides:
 
         from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: True)
+        monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: True)
 
         def _fake_llm_chat(system, user, task):
-            assert task == "schema"
+            assert task == "default"
             return json.dumps(
                 {
                     "items": [
@@ -2652,7 +2644,7 @@ class TestSchemaOverrides:
                 }
             )
 
-        monkeypatch.setattr("aetherdialect._schema_overrides.llm_chat", _fake_llm_chat)
+        monkeypatch.setattr("aetherdialect._schema_overrides.LLMProvider.chat", _fake_llm_chat)
         report = apply_schema_overrides_to_graph(
             schema_graph,
             _ov_doc(
@@ -2672,7 +2664,7 @@ class TestSchemaOverrides:
             load_schema_overrides_file,
         )
 
-        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
         path = tmp_path / "ov.json"
         import json as json
 
@@ -2720,7 +2712,7 @@ class TestBundleI:
         )
         from aetherdialect._schema_overrides import apply_diff, apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
 
         report = apply_schema_overrides_to_graph(
             schema_graph,
@@ -2769,7 +2761,7 @@ class TestBundleI:
         )
         from aetherdialect._schema_overrides import apply_diff, apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
         apply_schema_overrides_to_graph(
             schema_graph,
             _ov_doc(
@@ -2810,7 +2802,7 @@ class TestBundleI:
         from aetherdialect._contracts_schema import FKEdge
         from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
         edge = FKEdge(
             src_table="orders",
             src_cols=["order_date"],
@@ -2834,7 +2826,7 @@ class TestBundleI:
         from aetherdialect._contracts_schema import FKEdge
         from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
         edge = FKEdge(
             src_table="orders",
             src_cols=["order_date"],
@@ -2855,7 +2847,7 @@ class TestBundleI:
     def test_block_inferred_pk_demotes_column(self, schema_graph, monkeypatch):
         from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
 
         col = schema_graph.tables["orders"].columns["amount"]
         col.pk_inference_tag = "profile"
@@ -2875,7 +2867,7 @@ class TestBundleI:
     def test_block_catalog_pk_skipped(self, schema_graph, monkeypatch):
         from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
 
         report = apply_schema_overrides_to_graph(
             schema_graph,
@@ -2890,7 +2882,7 @@ class TestBundleI:
         from aetherdialect._contracts_base import PkInferenceTag
         from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
 
         tbl = schema_graph.tables["orders"]
         tbl.primary_key = []
@@ -2906,6 +2898,7 @@ class TestBundleI:
             ),
         )
         assert report.pks_added == 1
+        col = schema_graph.tables["orders"].columns["order_id"]
         assert col.is_primary_key is True
         assert col.pk_inference_tag == PkInferenceTag.USER_OVERRIDE
         assert "order_id" in schema_graph.tables["orders"].primary_key
@@ -2913,7 +2906,7 @@ class TestBundleI:
     def test_primary_keys_add_rejects_non_unique_column(self, schema_graph, monkeypatch):
         from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
 
         tbl = schema_graph.tables["orders"]
         tbl.primary_key = []
@@ -2934,7 +2927,7 @@ class TestBundleI:
             dump_schema_overrides_dict,
         )
 
-        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
 
         col = schema_graph.tables["orders"].columns["amount"]
         col.pk_inference_tag = PkInferenceTag.PROFILE
@@ -2949,6 +2942,7 @@ class TestBundleI:
         )
         assert report.pks_added == 0
         assert report.pks_endorsed == 1
+        col = schema_graph.tables["orders"].columns["amount"]
         assert col.pk_inference_tag == PkInferenceTag.USER_OVERRIDE
         assert any("endorsement" in s.reason for s in report.skipped)
         doc = dump_schema_overrides_dict(schema_graph)
@@ -2961,7 +2955,7 @@ class TestBundleI:
             dump_schema_overrides_dict,
         )
 
-        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
 
         col = schema_graph.tables["customers"].columns["customer_id"]
         assert col.pk_inference_tag is None
@@ -2974,6 +2968,7 @@ class TestBundleI:
         )
         assert report.pks_added == 0
         assert report.pks_endorsed == 1
+        col = schema_graph.tables["customers"].columns["customer_id"]
         assert col.pk_inference_tag == PkInferenceTag.USER_OVERRIDE
         assert any("endorsement" in s.reason for s in report.skipped)
         doc = dump_schema_overrides_dict(schema_graph)
@@ -2983,7 +2978,7 @@ class TestBundleI:
         from aetherdialect._contracts_base import PkInferenceTag
         from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
 
         col = schema_graph.tables["customers"].columns["customer_id"]
         col.pk_inference_tag = PkInferenceTag.USER_OVERRIDE
@@ -3002,7 +2997,7 @@ class TestBundleI:
     def test_primary_keys_remove_blocked_when_would_empty(self, schema_graph, monkeypatch):
         from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 
-        monkeypatch.setattr("aetherdialect._schema_overrides.llm_credentials_configured", lambda: False)
+        monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
 
         col = schema_graph.tables["orders"].columns["amount"]
         col.pk_inference_tag = "profile"

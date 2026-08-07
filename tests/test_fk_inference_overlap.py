@@ -1,4 +1,4 @@
-"""Tests for FK overlap containment validation (Phase D)."""
+"""Tests for FK overlap containment validation."""
 
 from __future__ import annotations
 
@@ -25,6 +25,9 @@ from aetherdialect._schema_build import (
 from aetherdialect._schema_catalog import _parse_sql_file_sqlglot
 from aetherdialect._schema_graph import (
     _fk_containment_validates,
+    _infer_missing_fks_composite,
+    fk_overlap_validates,
+    infer_missing_fks,
     promote_cross_component_semantic_edges,
     revalidate_named_fks_with_overlap,
 )
@@ -52,10 +55,88 @@ def test_containment_rejects_child_mostly_outside_parent() -> None:
     assert _fk_containment_validates(child, parent) is False
 
 
-def test_containment_auto_passes_under_min_sample() -> None:
+_SHARED_COMPOSITE_SAMPLE = ["1", "2", "3", "4", "5"]
+_DISJOINT_CHILD_SAMPLE = ["9", "8", "7", "6", "5"]
+_DISJOINT_PARENT_SAMPLE = ["1", "2", "3", "4", "0"]
+
+
+def _composite_overlap_tables(
+    *,
+    child_order_sample: list[str],
+    child_line_sample: list[str],
+    parent_order_sample: list[str],
+    parent_line_sample: list[str],
+) -> dict[str, TableMetadata]:
+    return {
+        "order_lines": TableMetadata(
+            name="order_lines",
+            columns={
+                "order_id": _col("order_id", parent_order_sample, pk=True),
+                "line_no": _col("line_no", parent_line_sample, pk=True),
+            },
+            primary_key=["order_id", "line_no"],
+            foreign_keys=[],
+        ),
+        "shipments": TableMetadata(
+            name="shipments",
+            columns={
+                "shipment_id": _col("shipment_id", ["s1"], pk=True),
+                "order_id": _col("order_id", child_order_sample),
+                "line_no": _col("line_no", child_line_sample),
+            },
+            primary_key=["shipment_id"],
+            foreign_keys=[],
+        ),
+    }
+
+
+def test_composite_fk_inference_rejects_disjoint_overlap_samples() -> None:
+    tables = _composite_overlap_tables(
+        child_order_sample=_DISJOINT_CHILD_SAMPLE,
+        child_line_sample=_SHARED_COMPOSITE_SAMPLE,
+        parent_order_sample=_DISJOINT_PARENT_SAMPLE,
+        parent_line_sample=_SHARED_COMPOSITE_SAMPLE,
+    )
+    edges = infer_missing_fks(tables)
+    composite = [edge for edge in edges if edge.inference_tag == InferenceTag.COMPOSITE]
+    assert composite == []
+
+
+def test_composite_fk_inference_accepts_overlapping_samples_per_column() -> None:
+    tables = _composite_overlap_tables(
+        child_order_sample=_SHARED_COMPOSITE_SAMPLE,
+        child_line_sample=_SHARED_COMPOSITE_SAMPLE,
+        parent_order_sample=_SHARED_COMPOSITE_SAMPLE,
+        parent_line_sample=_SHARED_COMPOSITE_SAMPLE,
+    )
+    edges = infer_missing_fks(tables)
+    composite = [edge for edge in edges if edge.inference_tag == InferenceTag.COMPOSITE]
+    assert len(composite) == 1
+    assert composite[0].src_table == "shipments"
+    assert composite[0].dst_table == "order_lines"
+
+
+def test_infer_missing_fks_composite_applies_overlap_gate_directly() -> None:
+    tables = _composite_overlap_tables(
+        child_order_sample=_DISJOINT_CHILD_SAMPLE,
+        child_line_sample=_SHARED_COMPOSITE_SAMPLE,
+        parent_order_sample=_DISJOINT_PARENT_SAMPLE,
+        parent_line_sample=_SHARED_COMPOSITE_SAMPLE,
+    )
+    inferred = _infer_missing_fks_composite(tables, {name.lower(): name for name in tables}, existing=[])
+    assert inferred == []
+
+
+def test_containment_refuses_under_min_sample() -> None:
     child = _col("customer_id", ["1", "2"])
     parent = _col("id", ["9"], pk=True)
-    assert _fk_containment_validates(child, parent) is True
+    assert _fk_containment_validates(child, parent) is False
+
+
+def test_overlap_refuses_under_min_sample() -> None:
+    src = _col("customer_id", ["1", "2"])
+    dst = _col("id", ["9"], pk=True)
+    assert fk_overlap_validates(src, dst) is False
 
 
 def test_revalidate_removes_suffix_fk_failing_containment() -> None:

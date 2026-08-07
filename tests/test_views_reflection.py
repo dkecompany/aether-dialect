@@ -5,8 +5,9 @@ from __future__ import annotations
 import pytest
 
 from aetherdialect._config import DuckDBRuntimeConfig, EngineConfig
-from aetherdialect._contracts_base import EngineContext
-from aetherdialect._dialect import get_dialect
+from aetherdialect._contracts_base import ConfigError, EngineContext, EngineIdentity
+from aetherdialect._core_utils import pop_engine_identity, push_engine_identity
+from aetherdialect._dialect import DialectRegistry
 
 _ORIG_ENGINE_TYPE = EngineConfig.TYPE
 _ORIG_ENGINE_RUNTIME = EngineConfig.RUNTIME
@@ -20,12 +21,14 @@ def _reset_duckdb_runtime_config() -> None:
     EngineConfig.SCHEMA_JSON_PATH = ""
     EngineConfig.TYPE = "duckdb"
     EngineConfig.RUNTIME = DuckDBRuntimeConfig
+    identity_token = push_engine_identity(EngineIdentity("duckdb", DuckDBRuntimeConfig))
     try:
         DuckDBRuntimeConfig.DATABASE_PATH = ":memory:"
         DuckDBRuntimeConfig.SCHEMA = "main"
         DuckDBRuntimeConfig.clear_attached_connection()
         yield
     finally:
+        pop_engine_identity(identity_token)
         DuckDBRuntimeConfig.DATABASE_PATH = orig_path
         DuckDBRuntimeConfig.SCHEMA = orig_schema
         DuckDBRuntimeConfig.NATIVE_CONNECTION = orig_connection
@@ -45,23 +48,24 @@ def test_views_only_reflection() -> None:
     duckdb = pytest.importorskip("duckdb")
     connection = duckdb.connect(":memory:")
     _seed_views_catalog(connection)
-    dialect = get_dialect("duckdb", DuckDBRuntimeConfig, native_connection=connection)
+    dialect = DialectRegistry.get("duckdb", DuckDBRuntimeConfig, native_connection=connection)
     ctx = EngineContext(include="views")
     graph = dialect.reflect_schema_graph(include=ctx.include)
     assert set(graph.tables) == {"store_revenue_v"}
     assert all(tbl.kind == "view" for tbl in graph.tables.values())
 
 
-def test_both_reflection_includes_tables_and_views() -> None:
+def test_tables_only_reflection() -> None:
     duckdb = pytest.importorskip("duckdb")
     connection = duckdb.connect(":memory:")
     _seed_views_catalog(connection)
-    dialect = get_dialect("duckdb", DuckDBRuntimeConfig, native_connection=connection)
-    ctx = EngineContext(include="both")
+    dialect = DialectRegistry.get("duckdb", DuckDBRuntimeConfig, native_connection=connection)
+    ctx = EngineContext(include="tables")
     graph = dialect.reflect_schema_graph(include=ctx.include)
-    names = set(graph.tables)
-    assert "payments" in names
-    assert "store_revenue_v" in names
-    kinds = {name: tbl.kind for name, tbl in graph.tables.items()}
-    assert kinds["payments"] == "table"
-    assert kinds["store_revenue_v"] == "view"
+    assert set(graph.tables) == {"payments"}
+    assert all(tbl.kind == "table" for tbl in graph.tables.values())
+
+
+def test_engine_context_rejects_include_both() -> None:
+    with pytest.raises(ConfigError, match="include must be 'tables' or 'views'"):
+        EngineContext(include="both")

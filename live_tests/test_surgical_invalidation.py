@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 from aetherdialect._templates import (
-    _reconcile_template_store,
-    _TemplateRefs,
-    template_is_live,
-    templates_to_store,
+    TemplateOps,
+    TemplateRefs,
 )
 
 from ._seed_helpers import seeded_runner
@@ -18,19 +16,19 @@ def test_reconcile_empty_store_round_trip(schema) -> None:
         "templates": {},
         "question_feedback": {},
     }
-    report = _reconcile_template_store(store, schema)
+    report = TemplateOps.reconcile_template_store(store, schema)
     assert report.dropped_template_ids == ()
     assert report.kept_template_ids == ()
 
 
 def test_template_is_live_flags_missing_table(schema) -> None:
     """``template_is_live`` reports a missing table against the live graph."""
-    refs = _TemplateRefs(
+    refs = TemplateRefs(
         tables=frozenset({"__nonexistent_relation__"}),
         columns=frozenset(),
         fk_edges=frozenset(),
     )
-    ok, reasons = template_is_live(refs, schema)
+    ok, reasons = TemplateRefs.template_is_live(refs, schema)
     assert ok is False
     assert any(r.startswith("missing_table:") for r in reasons)
 
@@ -45,9 +43,9 @@ def test_reconcile_preserves_seeded_baseline_templates(schema, schema_terms, t2s
         kits=("baseline_templates",),
     ) as runner:
         seeded_ids = set(runner.seeded_ids["baseline_templates"].values())
-        templates_to_store(runner.store, runner.templates)
+        TemplateOps.templates_to_store(runner.store, runner.templates)
 
-        report = _reconcile_template_store(runner.store, runner.schema)
+        report = TemplateOps.reconcile_template_store(runner.store, runner.schema)
 
         kept = set(report.kept_template_ids)
         _baseline_missing = (
@@ -77,7 +75,7 @@ def test_reconcile_preserves_seeded_rejected_aggregations(schema, schema_terms, 
     ) as runner:
         for qn in _q_norms:
             assert qn in (runner.store.question_feedback or {}), runner.store.question_feedback
-        report = _reconcile_template_store(runner.store, runner.schema)
+        report = TemplateOps.reconcile_template_store(runner.store, runner.schema)
 
         assert report.dropped_template_ids == ()
         for qn in _q_norms:

@@ -106,7 +106,7 @@ class TestSQLServerRuntimeConfigParity:
 
 
 class TestSnowflakeRuntimeConfigParity:
-    """Snowflake env alias parity and removed toggle fields."""
+    """Snowflake env alias parity."""
 
     def test_apply_environment_resolves_snowsql_aliases(self) -> None:
         orig = {
@@ -135,9 +135,6 @@ class TestSnowflakeRuntimeConfigParity:
             for key, value in orig.items():
                 setattr(SnowflakeRuntimeConfig, key, value)
 
-    def test_use_snowpark_toggle_removed(self) -> None:
-        assert not hasattr(SnowflakeRuntimeConfig, "USE_SNOWPARK")
-
     def test_snowpark_session_reachable_false_without_package(self) -> None:
         real_import = __import__("builtins").__import__
 
@@ -151,7 +148,7 @@ class TestSnowflakeRuntimeConfigParity:
 
 
 class TestBigQueryRuntimeConfigParity:
-    """BigQuery env alias parity and removed toggle fields."""
+    """BigQuery env alias parity."""
 
     def test_apply_environment_resolves_gcp_aliases(self) -> None:
         orig = {
@@ -176,12 +173,9 @@ class TestBigQueryRuntimeConfigParity:
             for key, value in orig.items():
                 setattr(BigQueryRuntimeConfig, key, value)
 
-    def test_use_storage_api_toggle_removed(self) -> None:
-        assert not hasattr(BigQueryRuntimeConfig, "USE_STORAGE_API")
-
 
 class TestRedshiftRuntimeConfigParity:
-    """Redshift env alias parity and removed dead fields."""
+    """Redshift env alias parity."""
 
     def test_apply_environment_resolves_redshift_native_aliases(self) -> None:
         orig = {
@@ -212,9 +206,6 @@ class TestRedshiftRuntimeConfigParity:
         finally:
             for key, value in orig.items():
                 setattr(RedshiftRuntimeConfig, key, value)
-
-    def test_iam_profile_field_removed(self) -> None:
-        assert not hasattr(RedshiftRuntimeConfig, "IAM_PROFILE")
 
     def test_db_url_uses_supported_sslmode(self) -> None:
         orig = {
@@ -277,7 +268,7 @@ class TestSevenEngineTomlParsing:
     """All five sqlglot-engine TOML blocks flatten to env keys."""
 
     def test_load_config_file_parses_five_sqlglot_engines(self, tmp_path) -> None:
-        from aetherdialect._main_execution import _load_config_file
+        from aetherdialect._main_execution import MainExecutionOps
 
         path = tmp_path / "engines.toml"
         path.write_text(
@@ -325,7 +316,7 @@ class TestSevenEngineTomlParsing:
             ),
             encoding="utf-8",
         )
-        got, claimed = _load_config_file(str(path))
+        got, claimed, _named = MainExecutionOps._load_config_file(str(path))
         expected = {
             "MYSQL_HOST": "mh",
             "MYSQL_PORT": "3307",

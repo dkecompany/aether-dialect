@@ -11,12 +11,15 @@ from aetherdialect._contracts_schema import (
     SchemaGraph,
     TableMetadata,
 )
-from aetherdialect._dialect_sqlglot_helper import mysql_diagnostics_from_explain_json
+from aetherdialect._dialect_sqlglot_engines import SQLServerQueryLogSource
+from aetherdialect._dialect_sqlglot_helper import SqlglotEngineDialect
 from aetherdialect._schema_build import (
     parse_mysql_enum_or_set_labels,
     parse_redshift_sortkey_columns,
 )
-from aetherdialect._sql_to_intent import SQLServerQueryLogSource
+
+ExplainDiagnostics = SqlglotEngineDialect
+InformationSchemaSupport = SqlglotEngineDialect
 
 
 def test_parse_mysql_enum_and_set_labels() -> None:
@@ -52,7 +55,7 @@ def test_mysql_index_awareness_diagnostic_with_schema() -> None:
         '{"query_block": {"table": {"access_type": "ALL", "table_name": "orders", '
         '"attached_condition": "(`orders`.`status` = \'open\')"}}}'
     )
-    diags = mysql_diagnostics_from_explain_json(payload, schema=schema)
+    diags = ExplainDiagnostics.mysql_diagnostics_from_explain_json(payload, schema=schema)
     indexed_msgs = [d for d in diags if d.code == SqlDiagnosticCode.EXPLAIN_SEQ_SCAN_INDEXED]
     assert len(indexed_msgs) >= 2
 
@@ -132,12 +135,9 @@ def test_reflect_sqlserver_identity_flag() -> None:
 def test_databricks_nullability_from_structural_index() -> None:
     """CatalogStructuralConstraintsIndex carries column nullability maps."""
     from aetherdialect._contracts_schema import CatalogStructuralConstraintsIndex
-    from aetherdialect._dialect_sqlglot_helper import (
-        column_nullability_from_information_schema_rows,
-    )
 
     rows = [{"table_name": "t1", "column_name": "id", "is_nullable": "NO"}]
     idx = CatalogStructuralConstraintsIndex(
-        column_nullability=column_nullability_from_information_schema_rows(rows),
+        column_nullability=SqlglotEngineDialect.column_nullability_from_information_schema_rows(rows),
     )
     assert idx.column_nullability["t1"]["id"] is False

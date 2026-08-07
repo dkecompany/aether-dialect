@@ -4,12 +4,24 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aetherdialect"
-version = "0.1.8"
+version = "0.2.1"
 description = "The deterministic Text-to-SQL engine"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.13"
 license = "MIT"
+license-files = ["LICENSE"]
 authors = [{name = "Akul Ameya", email = "akul.ameya@armhub.com.au"}]
+keywords = ["text-to-sql", "sql", "database", "analytics", "nlp"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = [
     "pandas>=2.0,<3",
     "packaging>=23.0,<25",
@@ -21,15 +33,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-sqlite = []
-duckdb = ["duckdb-engine>=0.13,<1"]
-csv = ["duckdb-engine>=0.13,<1"]
+duckdb = ["duckdb>=1.0,<2"]
+federation = ["duckdb>=1.0,<2"]
+sandbox = ["duckdb>=1.0,<2", "duckdb-engine>=0.13,<1"]
+csv = ["openpyxl>=3.1,<4"]
 mysql = ["pymysql>=1.1,<2"]
 mariadb = ["pymysql>=1.1,<2"]
 sqlserver = ["pyodbc>=5,<6"]
 postgresql = [
     "pglast>=5.0,<8",
-    "psycopg2-binary>=2.9,<3",
+    "psycopg[binary]>=3.1,<4",
 ]
 redshift = [
     "sqlalchemy-redshift>=1.0,<2",
@@ -58,25 +71,37 @@ dev = [
     "pip-audit>=2.7",
     "pandas-stubs>=2.0",
     "types-jsonschema>=4.0",
+    "openpyxl>=3.1,<4",
+    "duckdb>=1.0,<2",
     "duckdb-engine>=0.13,<1",
     "pymysql>=1.1,<2",
     "pyodbc>=5,<6",
     "pglast>=5.0,<8",
-    "psycopg2-binary>=2.9,<3",
+    "psycopg[binary]>=3.1,<4",
     "sqlalchemy-redshift>=1.0,<2",
     "redshift-connector>=2.1.9,<3",
     "databricks-sqlalchemy>=2.0,<3",
     "snowflake-sqlalchemy>=1.6,<2",
     "sqlalchemy-bigquery>=1.11,<2",
     "google-cloud-bigquery-storage>=2.0,<3",
+    "mutmut>=3.0.5,<4",
+]
+
+[tool.mutmut]
+paths_to_mutate = [
+    "src/aetherdialect/_validation_execute.py",
+    "src/aetherdialect/_validation_schema.py",
+    "src/aetherdialect/_validation_semantic.py",
+    "src/aetherdialect/_intent_resolve.py",
+    "src/aetherdialect/_intent_repair.py",
+    "src/aetherdialect/_core_utils.py",
 ]
 
 [tool.ruff]
 line-length = 120
-target-version = "py310"
+target-version = "py311"
 src = ["src", "tests", "live_tests", "scripts"]
 exclude = [
-    "dev_workspace",
     ".venv",
     "venv",
     ".pytest_cache",
@@ -89,12 +114,6 @@ exclude = [
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]
 ignore = ["E501"]
-
-[tool.ruff.lint.per-file-ignores]
-"src/aetherdialect/_dialect_postgres.py" = ["E402"]
-"src/aetherdialect/_sql_to_intent.py" = ["E402"]
-"src/aetherdialect/_intent_expr.py" = ["E402"]
-"src/aetherdialect/_schema_overrides.py" = ["E402"]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -139,10 +158,10 @@ module = [
     "databricks.*",
     "redshift_connector",
     "redshift_connector.*",
-    "duckdb",
-    "duckdb.*",
     "pymysql",
     "pymysql.*",
+    "pyarrow",
+    "pyarrow.*",
 ]
 ignore_missing_imports = true
 
@@ -150,8 +169,12 @@ ignore_missing_imports = true
 testpaths = ["tests", "live_tests"]
 pythonpath = ["src", "scripts", ".github/scripts", "."]
 markers = [
-    "fast: PR-loop tests; equals not requires_sandbox until data.zip passes sandbox_doctor(), then also quick sandbox corpus tests (excludes slow LLM matrix in test_sandbox_offline.py)",
-    "requires_sandbox: needs bundled src/aetherdialect/sandbox/data.zip (offline_sandbox corpus)",
+    "fast: PR-loop tests; equals not needs_corpus until data.zip passes sandbox_doctor(), then also quick sandbox corpus tests (excludes slow LLM matrix in test_sandbox_offline.py)",
+    "hygiene: static source/docs writing rules (AST/text), not behavioral coverage",
+    "needs_corpus: needs bundled src/aetherdialect/sandbox/data.zip (offline_sandbox corpus)",
+    "requires_sandbox: deprecated alias for needs_corpus",
+    "live: requires live federation partition databases and LLM credentials",
+    "live_no_llm: live database tests that must not call the LLM",
 ]
 
 [tool.coverage.run]
@@ -173,7 +196,6 @@ exclude_dirs = [
     "live_tests",
     ".venv",
     "venv",
-    "dev_workspace",
     "scripts",
     ".github",
     ".pytest_cache",
@@ -195,8 +217,12 @@ exclude = ["__pycache__"]
 
 [tool.setuptools.package-data]
 "aetherdialect" = [
+    "py.typed",
     "sandbox/data.zip",
 ]
 
 [project.urls]
 Homepage = "https://github.com/dkecompany/aether-dialect"
+Repository = "https://github.com/dkecompany/aether-dialect"
+Issues = "https://github.com/dkecompany/aether-dialect/issues"
+Documentation = "https://github.com/dkecompany/aether-dialect/blob/main/README.md"

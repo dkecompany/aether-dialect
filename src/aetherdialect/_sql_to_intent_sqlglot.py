@@ -10,35 +10,37 @@ import sqlglot
 from sqlglot import exp
 
 from ._constants import (
-    AGG_NODE_TO_NAME,
     ALLOWED_JOIN_KINDS,
-    DEFAULT_FILTER_OP_MAP,
+    DEFAULT_WHERE_OP_MAP,
+    DISTINCT_ON_CTE_NAME_PREFIX,
+    DISTINCT_ON_RANK_COLUMN,
     SELF_JOIN_CTE_NAME_PREFIX,
     SIMPLE_AGG_NAMES,
     SQL_TO_INTENT_LIMIT_OFFSET_PARAM_KEY,
     SQL_TO_INTENT_LITERAL_PLACEHOLDER_NUM,
     SQL_TO_INTENT_LITERAL_PLACEHOLDER_STR,
     SQL_TO_INTENT_PARAM_KEY_PREFIX,
+    SQLGLOT_AGG_FUNC_KEY_ALIASES,
     WINDOW_DEFAULT_FRAME_END_WITH_ORDER,
     WINDOW_DEFAULT_FRAME_END_WITHOUT_ORDER,
     WINDOW_DEFAULT_FRAME_KIND_WITH_ORDER,
     WINDOW_DEFAULT_FRAME_KIND_WITHOUT_ORDER,
     WINDOW_DEFAULT_FRAME_START_WITH_ORDER,
     WINDOW_DEFAULT_FRAME_START_WITHOUT_ORDER,
+    WINDOW_IMPORT_FUNC_ALIASES,
 )
 from ._contracts_base import (
-    FilterParam,
+    ConfigError,
     HavingParam,
     MulGroup,
     NormalizedExpr,
     OrderByCol,
+    OrderByNullPlacement,
+    PredicateGroup,
+    WhereParam,
     WindowFrameKind,
 )
-from ._contracts_core import (
-    RuntimeCteStep,
-    RuntimeIntent,
-    SelectCol,
-)
+from ._contracts_core import RuntimeCteStep, RuntimeIntent, SelectCol
 from ._contracts_schema import (
     CaseRegistryStep,
     CaseWhenBranch,
@@ -48,26 +50,30 @@ from ._contracts_schema import (
     WindowSpec,
 )
 from ._dialect import Dialect
+from ._dialect_sqlglot_helper import SqlglotEngineDialect
 
 
-@dataclass
-class SqlglotExtra:
-    """Per-select conversion scratch space for qualifier swaps and registry emission."""
+def _new_sqlglot_extra() -> Any:
+    """Return per-select conversion scratch space for qualifier swaps and registry emission."""
 
-    qual_swap: dict[str, str] = field(default_factory=dict)
-    case_registry: list[CaseRegistryStep] = field(default_factory=list)
-    window_registry: list[WindowRegistryStep] = field(default_factory=list)
-    self_join_steps: list[RuntimeCteStep] = field(default_factory=list)
-    case_counter: int = 0
-    window_counter: int = 0
+    @dataclass
+    class _SqlglotExtraLocal:
+        qual_swap: dict[str, str] = field(default_factory=dict)
+        case_registry: list[CaseRegistryStep] = field(default_factory=list)
+        window_registry: list[WindowRegistryStep] = field(default_factory=list)
+        self_join_steps: list[RuntimeCteStep] = field(default_factory=list)
+        case_counter: int = 0
+        window_counter: int = 0
 
-    def next_case_id(self) -> str:
-        self.case_counter += 1
-        return f"c{self.case_counter:02d}"
+        def next_case_id(self) -> str:
+            self.case_counter += 1
+            return f"c{self.case_counter:02d}"
 
-    def next_window_id(self) -> str:
-        self.window_counter += 1
-        return f"w{self.window_counter:02d}"
+        def next_window_id(self) -> str:
+            self.window_counter += 1
+            return f"w{self.window_counter:02d}"
+
+    return _SqlglotExtraLocal()
 
 
 def _from_clause_root(sel: exp.Select) -> exp.Expression | None:
@@ -176,8 +182,90 @@ def _dialect_preparse_sql(dialect: Any, sql: str) -> str:
     return sql
 
 
-def _dialect_map_filter_op(dialect: Any, op_raw: str | None) -> str | None:
-    fn = getattr(dialect, "map_import_filter_op", None)
+def _column_identifier_name(node: exp.Expression) -> str:
+    if isinstance(node, exp.Column):
+        return str(node.name or "").strip().lower()
+    return ""
+
+
+def _is_rank_equals_one_predicate(pred: exp.Expression) -> bool:
+    if not isinstance(pred, exp.EQ):
+        return False
+    if _column_identifier_name(pred.this) != DISTINCT_ON_RANK_COLUMN.lower():
+        return False
+    right = pred.expression
+    return isinstance(right, exp.Literal) and right.is_int and int(right.this) == 1
+
+
+def _rewrite_distinct_on_cte_wrapper_sql(sql: str, read_dialect: str) -> str:
+    """Peel deterministic ``don_*`` CTE wrappers back to DISTINCT ON for import."""
+    try:
+        tree = sqlglot.parse_one(sql, dialect=read_dialect)
+    except Exception:
+        return sql
+    if not isinstance(tree, exp.Select):
+        return sql
+    with_clause = tree.args.get("with_")
+    if with_clause is None:
+        return sql
+    ctes = list(with_clause.expressions or ())
+    if len(ctes) != 1:
+        return sql
+    cte = ctes[0]
+    if not isinstance(cte, exp.CTE):
+        return sql
+    cte_name = str(cte.alias_or_name or "").strip().lower()
+    if not cte_name.startswith(DISTINCT_ON_CTE_NAME_PREFIX):
+        return sql
+    inner = cte.this
+    if not isinstance(inner, exp.Select):
+        return sql
+
+    partition_exprs: list[exp.Expression] = []
+    window_order: exp.Order | None = None
+    kept_exprs: list[exp.Expression] = []
+    for proj in inner.expressions or ():
+        rank_alias = proj.alias_or_name.strip().lower() if isinstance(proj, exp.Alias) else ""
+        if rank_alias == DISTINCT_ON_RANK_COLUMN.lower():
+            win = proj.this if isinstance(proj, exp.Alias) else None
+            if not isinstance(win, exp.Window):
+                return sql
+            inner_fn = win.this
+            fn_key = WINDOW_IMPORT_FUNC_ALIASES.get(_func_name(inner_fn), _func_name(inner_fn))
+            if fn_key != "row_number":
+                return sql
+            partition_exprs = list(win.args.get("partition_by") or ())
+            window_order = win.args.get("order")
+            if not partition_exprs:
+                return sql
+            continue
+        kept_exprs.append(proj)
+    if not partition_exprs:
+        return sql
+
+    where_node = tree.args.get("where")
+    if where_node is not None:
+        pred = where_node.this if isinstance(where_node, exp.Where) else where_node
+        if not _is_rank_equals_one_predicate(pred):
+            return sql
+
+    outer_order = tree.args.get("order")
+    new_sel = inner.copy()
+    new_sel.set("expressions", kept_exprs)
+    new_sel.set("distinct", exp.Distinct(on=exp.Tuple(expressions=partition_exprs)))
+    if outer_order is not None:
+        new_sel.set("order", outer_order)
+    elif window_order is not None:
+        new_sel.set("order", window_order)
+    new_sel.set("with_", None)
+    try:
+        return new_sel.sql(dialect=read_dialect)
+    except Exception:
+        return sql
+
+
+def _dialect_map_where_op(dialect: Any, op_raw: str | None) -> str | None:
+    fn = getattr(dialect, "map_import_where_op", None)
     if callable(fn):
         mapped = fn(op_raw)
         if mapped is not None or op_raw is None:
@@ -185,7 +273,7 @@ def _dialect_map_filter_op(dialect: Any, op_raw: str | None) -> str | None:
     if op_raw is None:
         return None
     key = str(op_raw).strip().lower()
-    return DEFAULT_FILTER_OP_MAP.get(key)
+    return DEFAULT_WHERE_OP_MAP.get(key)
 
 
 def _dialect_map_scalar_func(dialect: Any, fn_name: str) -> str:
@@ -198,10 +286,13 @@ def _dialect_map_scalar_func(dialect: Any, fn_name: str) -> str:
 
 
 def _dialect_import_unnest_policy(dialect: Any, node: exp.Expression) -> bool:
-    fn = getattr(dialect, "import_unnest_policy", None)
-    if callable(fn):
-        return bool(fn(node))
-    return False
+    if _func_name(node).strip().lower() != "unnest":
+        return False
+    policy_fn = getattr(dialect, "import_unnest_policy", None)
+    if not callable(policy_fn):
+        return False
+    policy = policy_fn()
+    return policy in ("unsupported", "from_only")
 
 
 def _make_lit_key_factory(existing: Callable[[], str] | None = None) -> tuple[dict[str, Any], Callable[[], str]]:
@@ -257,10 +348,7 @@ def _where_literal_payload(node: exp.Expression) -> tuple[Any, str] | None:
 
 
 def _qual_column_name(
-    col: exp.Column,
-    alias_map: dict[str, str],
-    single_alias: str | None,
-    extra: SqlglotExtra | None = None,
+    col: exp.Column, alias_map: dict[str, str], single_alias: str | None, extra: Any | None = None
 ) -> str | None:
     pre = str(col.table).strip() if col.table else None
     col_name = str(col.name or "").strip()
@@ -284,7 +372,7 @@ def _func_name(node: exp.Expression) -> str:
         sql_name_fn = getattr(node, "sql_name", None)
         name = node.key or (sql_name_fn() if callable(sql_name_fn) else "")
         return str(name or "").strip().lower()
-    mapped = AGG_NODE_TO_NAME.get(type(node))
+    mapped = SqlglotEngineDialect.AGG_NODE_TO_NAME.get(type(node))
     if mapped:
         return mapped
     return str(getattr(node, "key", "") or "").strip().lower()
@@ -372,7 +460,7 @@ def _window_partition_exprs(
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Callable[[], str],
-    extra: SqlglotExtra | None,
+    extra: Any | None,
 ) -> list[NormalizedExpr] | None:
     out: list[NormalizedExpr] = []
     for n in nodes or ():
@@ -402,7 +490,7 @@ def _window_sort_clause(
     param_store: dict[str, Any],
     next_lit_key: Callable[[], str],
     select_cols: list[SelectCol],
-    extra: SqlglotExtra | None,
+    extra: Any | None,
 ) -> list[OrderByCol] | None:
     if order_node is None:
         return []
@@ -414,11 +502,17 @@ def _window_sort_clause(
     out: list[OrderByCol] = []
     for item in items:
         direction = "ASC"
+        nulls: OrderByNullPlacement | None = None
         node = item
         if isinstance(item, exp.Ordered):
             node = item.this
             desc = item.args.get("desc")
             direction = "DESC" if desc else "ASC"
+            item_sql = item.sql(dialect=None).upper()
+            if "NULLS FIRST" in item_sql:
+                nulls = OrderByNullPlacement.FIRST
+            elif "NULLS LAST" in item_sql:
+                nulls = OrderByNullPlacement.LAST
         ex: NormalizedExpr | None
         if isinstance(node, exp.Literal) and node.is_int:
             ord_i = _const_int_only(node)
@@ -440,7 +534,7 @@ def _window_sort_clause(
             )
         if ex is None:
             return None
-        out.append(OrderByCol(expr=ex, direction=direction))
+        out.append(OrderByCol(expr=ex, direction=direction, nulls=nulls))
     return out
 
 
@@ -448,14 +542,14 @@ def _window_frame_from_spec(
     spec: exp.Expression | None,
 ) -> tuple[WindowFrameKind, str | None, str | None, int | None, int | None] | None:
     if spec is None:
-        return ("none", None, None, None, None)
+        return (WindowFrameKind.NONE, None, None, None, None)
     if isinstance(spec, exp.WindowSpec):
         kind_raw = str(spec.args.get("kind") or spec.args.get("type") or "").upper()
-        frame_kind: WindowFrameKind = "none"
+        frame_kind: WindowFrameKind = WindowFrameKind.NONE
         if kind_raw in ("ROWS", "ROW"):
-            frame_kind = "rows"
-        elif kind_raw in ("RANGE",):
-            frame_kind = "range"
+            frame_kind = WindowFrameKind.ROWS
+        elif kind_raw in ("RANGE"):
+            frame_kind = WindowFrameKind.RANGE
         start = spec.args.get("start")
         end = spec.args.get("end")
         frame_start: str | None = None
@@ -469,9 +563,9 @@ def _window_frame_from_spec(
         if end is not None:
             frame_end = end.sql(dialect=None).upper()
         if frame_kind == "none" and frame_start is None and frame_end is None:
-            return ("none", None, None, None, None)
+            return (WindowFrameKind.NONE, None, None, None, None)
         return (frame_kind, frame_start, frame_end, frame_start_offset, None)
-    return ("none", None, None, None, None)
+    return (WindowFrameKind.NONE, None, None, None, None)
 
 
 def _window_def_to_spec(
@@ -483,7 +577,7 @@ def _window_def_to_spec(
     param_store: dict[str, Any],
     next_lit_key: Callable[[], str],
     select_cols: list[SelectCol],
-    extra: SqlglotExtra | None,
+    extra: Any | None,
 ) -> WindowSpec | None:
     partition_by: list[exp.Expression] = []
     order_node: exp.Expression | None = None
@@ -500,6 +594,7 @@ def _window_def_to_spec(
     else:
         return None
     fn_name = _dialect_map_scalar_func(dialect, _func_name(fn_node))
+    fn_name = WINDOW_IMPORT_FUNC_ALIASES.get(fn_name, fn_name)
     if not fn_name:
         return None
     part = _window_partition_exprs(partition_by, dialect, alias_map, single_alias, param_store, next_lit_key, extra)
@@ -511,22 +606,49 @@ def _window_def_to_spec(
     if order is None:
         return None
     arg_expr: NormalizedExpr | None = None
-    arg_source = fn_node.this if hasattr(fn_node, "this") else None
-    if arg_source is not None and not isinstance(arg_source, (exp.Star, exp.Distinct)):
-        arg_expr = _expr_full(
-            arg_source,
-            dialect,
-            alias_map,
-            single_alias,
-            param_store,
-            next_lit_key,
-            extra,
-            allow_aggregate=False,
-            allow_window=False,
-            select_cols=select_cols,
-        )
-        if arg_expr is None:
+    numeric_argument: int | None = None
+    if fn_name == "ntile":
+        numeric_argument = _const_int_only(fn_node.this) if fn_node.this is not None else None
+        if numeric_argument is None:
             return None
+    elif fn_name == "nth_value":
+        arg_source = fn_node.this if hasattr(fn_node, "this") else None
+        if arg_source is not None and not isinstance(arg_source, (exp.Star, exp.Distinct)):
+            arg_expr = _expr_full(
+                arg_source,
+                dialect,
+                alias_map,
+                single_alias,
+                param_store,
+                next_lit_key,
+                extra,
+                allow_aggregate=False,
+                allow_window=False,
+                select_cols=select_cols,
+            )
+            if arg_expr is None:
+                return None
+        offset_node = fn_node.args.get("offset") if hasattr(fn_node, "args") else None
+        numeric_argument = _const_int_only(offset_node) if offset_node is not None else None
+        if numeric_argument is None:
+            return None
+    else:
+        arg_source = fn_node.this if hasattr(fn_node, "this") else None
+        if arg_source is not None and not isinstance(arg_source, (exp.Star, exp.Distinct)):
+            arg_expr = _expr_full(
+                arg_source,
+                dialect,
+                alias_map,
+                single_alias,
+                param_store,
+                next_lit_key,
+                extra,
+                allow_aggregate=False,
+                allow_window=False,
+                select_cols=select_cols,
+            )
+            if arg_expr is None:
+                return None
     frame = _window_frame_from_spec(spec_node)
     if frame is None:
         return None
@@ -536,6 +658,7 @@ def _window_def_to_spec(
         partition_by=part,
         order_by=order,
         argument=arg_expr,
+        numeric_argument=numeric_argument,
         frame_kind=frame_kind,
         frame_start=frame_start,
         frame_end=frame_end,
@@ -553,7 +676,7 @@ def _func_with_over_to_registry_step(
     param_store: dict[str, Any],
     next_lit_key: Callable[[], str],
     select_cols: list[SelectCol],
-    extra: SqlglotExtra,
+    extra: Any,
 ) -> NormalizedExpr | None:
     over = _over_node(fn_node)
     if over is None:
@@ -575,16 +698,16 @@ def _case_to_registry_step(
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Callable[[], str],
-    extra: SqlglotExtra,
+    extra: Any,
 ) -> NormalizedExpr | None:
     branches: list[CaseWhenBranch] = []
     for cw in node.args.get("ifs") or ():
         if not isinstance(cw, exp.If):
             return None
-        cond = _single_predicate_to_filter(cw.this, dialect, alias_map, single_alias, param_store, next_lit_key, extra)
+        cond = _single_predicate_to_where(cw.this, dialect, alias_map, single_alias, param_store, next_lit_key, extra)
         if cond is None:
             return None
-        cond = replace(cond, bool_op="AND", filter_group=None)
+        cond = replace(cond)
         res = _expr_full(
             cw.args.get("true") or cw.expression,
             dialect,
@@ -619,10 +742,7 @@ def _case_to_registry_step(
             return None
     rid = extra.next_case_id()
     extra.case_registry.append(
-        CaseRegistryStep(
-            registry_id=rid,
-            case_when=CaseWhenExpr(branches=branches, else_result=else_result),
-        )
+        CaseRegistryStep(registry_id=rid, case_when=CaseWhenExpr(branches=branches, else_result=else_result))
     )
     return NormalizedExpr.from_column(rid)
 
@@ -634,7 +754,7 @@ def _coalesce_to_expr(
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Callable[[], str],
-    extra: SqlglotExtra | None,
+    extra: Any | None,
 ) -> NormalizedExpr | None:
     args: list[exp.Expression] = []
     if isinstance(node, exp.Coalesce):
@@ -705,9 +825,67 @@ def _aggregate_to_expr(
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Callable[[], str],
-    extra: SqlglotExtra | None,
+    extra: Any | None,
 ) -> NormalizedExpr | None:
+    if isinstance(node, exp.WithinGroup) and isinstance(node.this, exp.PercentileCont):
+        lit = _const_payload(node.this.this)
+        if lit is None or lit[0] != 0.5:
+            return None
+        order_node = node.args.get("expression")
+        if order_node is None:
+            return None
+        order_items = _window_sort_clause(
+            order_node, dialect, alias_map, single_alias, param_store, next_lit_key, [], extra
+        )
+        if order_items is None or len(order_items) != 1:
+            return None
+        median_operand = order_items[0].expr
+        return NormalizedExpr(add_groups=[MulGroup(multiply=[median_operand], agg_func="median")])
+
+    if isinstance(node, exp.GroupConcat):
+        col_node = node.this
+        order_cols: list[OrderByCol] = []
+        if isinstance(col_node, exp.Order):
+            parsed_order = _window_sort_clause(
+                col_node, dialect, alias_map, single_alias, param_store, next_lit_key, [], extra
+            )
+            if parsed_order is None:
+                return None
+            order_cols = parsed_order
+            col_node = col_node.this
+        concat_operand = _expr_full(
+            col_node,
+            dialect,
+            alias_map,
+            single_alias,
+            param_store,
+            next_lit_key,
+            extra,
+            allow_aggregate=False,
+            allow_window=False,
+            select_cols=None,
+        )
+        if concat_operand is None:
+            return None
+        sep_node = node.args.get("separator")
+        sep_lit = _const_payload(sep_node) if sep_node is not None else None
+        if sep_lit is None or sep_lit[1] != "string":
+            return None
+        pk = next_lit_key()
+        param_store[pk] = sep_lit[0]
+        return NormalizedExpr(
+            add_groups=[
+                MulGroup(
+                    multiply=[concat_operand],
+                    agg_func="string_agg",
+                    agg_sep_param_key=pk,
+                    agg_order_by=order_cols,
+                )
+            ]
+        )
+
     fn_name = _dialect_map_scalar_func(dialect, _func_name(node))
+    fn_name = SQLGLOT_AGG_FUNC_KEY_ALIASES.get(fn_name, fn_name)
     if fn_name not in SIMPLE_AGG_NAMES:
         return None
     distinct_flag = False
@@ -721,7 +899,7 @@ def _aggregate_to_expr(
         inner_node = node.this
     if inner_node is None:
         return NormalizedExpr.from_agg(fn_name, "*")
-    inner = _expr_full(
+    agg_operand = _expr_full(
         inner_node,
         dialect,
         alias_map,
@@ -733,9 +911,9 @@ def _aggregate_to_expr(
         allow_window=False,
         select_cols=None,
     )
-    if inner is None:
+    if agg_operand is None:
         return None
-    return NormalizedExpr(add_groups=[MulGroup(multiply=[inner], agg_func=fn_name, distinct=distinct_flag)])
+    return NormalizedExpr(add_groups=[MulGroup(multiply=[agg_operand], agg_func=fn_name, distinct=distinct_flag)])
 
 
 def _expr_leaf(
@@ -744,7 +922,7 @@ def _expr_leaf(
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Callable[[], str],
-    extra: SqlglotExtra | None = None,
+    extra: Any | None = None,
 ) -> NormalizedExpr | None:
     node = _unwrap_alias(node)
     if isinstance(node, exp.Column):
@@ -773,7 +951,7 @@ def _expr_full(
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Callable[[], str],
-    extra: SqlglotExtra | None = None,
+    extra: Any | None = None,
     *,
     allow_aggregate: bool = True,
     allow_window: bool = True,
@@ -880,6 +1058,30 @@ def _expr_full(
             if inner is None:
                 return None
             return NormalizedExpr(add_groups=[MulGroup(multiply=[inner], scalar_func=fn_name)])
+        if fn_name == "concat":
+            args = list(getattr(node, "expressions", None) or [])
+            if node.this is not None and node.this not in args:
+                args = [node.this] + args
+            if len(args) < 2:
+                return None
+            parts: list[NormalizedExpr] = []
+            for arg in args:
+                part = _expr_full(
+                    arg,
+                    dialect,
+                    alias_map,
+                    single_alias,
+                    param_store,
+                    next_lit_key,
+                    extra,
+                    allow_aggregate=False,
+                    allow_window=False,
+                    select_cols=select_cols,
+                )
+                if part is None:
+                    return None
+                parts.append(part)
+            return NormalizedExpr(add_groups=[MulGroup(multiply=parts, scalar_func="concat")])
         return None
     if isinstance(node, exp.Nullif):
         l_e = _expr_full(
@@ -1025,7 +1227,7 @@ def _projection_to_expr(
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Callable[[], str],
-    extra: SqlglotExtra | None,
+    extra: Any | None,
     select_cols: list[SelectCol],
 ) -> NormalizedExpr | None:
     if isinstance(node, exp.Alias):
@@ -1095,15 +1297,15 @@ def _comparison_op(node: exp.Expression) -> str | None:
     return None
 
 
-def _single_predicate_to_filter(
+def _single_predicate_to_where(
     p: exp.Expression,
     dialect: Any,
     alias_map: dict[str, str],
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Callable[[], str],
-    extra: SqlglotExtra | None = None,
-) -> FilterParam | None:
+    extra: Any | None = None,
+) -> WhereParam | None:
     p = _unwrap_alias(p)
     if isinstance(p, exp.Exists):
         return None
@@ -1129,7 +1331,7 @@ def _single_predicate_to_filter(
         vals, vt = collected
         pk = next_lit_key()
         param_store[pk] = vals
-        return FilterParam(left_expr=left_e, op="not in", value_type=vt, param_key=pk)
+        return WhereParam(left_expr=left_e, op="not in", value_type=vt, param_key=pk)
     if isinstance(p, exp.Is):
         left_e = _expr_full(
             p.this,
@@ -1147,9 +1349,9 @@ def _single_predicate_to_filter(
             return None
         rhs = p.expression
         if isinstance(rhs, exp.Not) and isinstance(rhs.this, exp.Null):
-            return FilterParam(left_expr=left_e, op="is not null", value_type="null")
+            return WhereParam(left_expr=left_e, op="is not null", value_type="null")
         if isinstance(rhs, exp.Null):
-            return FilterParam(left_expr=left_e, op="is null", value_type="null")
+            return WhereParam(left_expr=left_e, op="is null", value_type="null")
         return None
     if isinstance(p, exp.Between):
         left_e = _expr_full(
@@ -1175,13 +1377,7 @@ def _single_predicate_to_filter(
         pk_hi = next_lit_key()
         param_store[pk_lo] = lo_lit[0]
         param_store[pk_hi] = hi_lit[0]
-        return FilterParam(
-            left_expr=left_e,
-            op="between",
-            value_type=lo_lit[1],
-            param_key=pk_lo,
-            param_key_hi=pk_hi,
-        )
+        return WhereParam(left_expr=left_e, op="between", value_type=lo_lit[1], param_key=pk_lo, param_key_hi=pk_hi)
     if isinstance(p, exp.In):
         left_e = _expr_full(
             p.this,
@@ -1204,10 +1400,10 @@ def _single_predicate_to_filter(
         vals, vt = collected
         pk = next_lit_key()
         param_store[pk] = vals
-        return FilterParam(left_expr=left_e, op="in", value_type=vt, param_key=pk)
+        return WhereParam(left_expr=left_e, op="in", value_type=vt, param_key=pk)
     mapped = _comparison_op(p)
     if mapped is not None:
-        mapped = _dialect_map_filter_op(dialect, mapped) or mapped
+        mapped = _dialect_map_where_op(dialect, mapped) or mapped
         left_e = _expr_full(
             p.this,
             dialect,
@@ -1227,17 +1423,14 @@ def _single_predicate_to_filter(
             right_q = _qual_column_name(rexpr, alias_map, single_alias, extra)
             if right_q is None:
                 return None
-            return FilterParam(
-                left_expr=left_e,
-                op=mapped,
-                right_expr=NormalizedExpr.from_column(right_q),
-                value_type="column",
+            return WhereParam(
+                left_expr=left_e, op=mapped, right_expr=NormalizedExpr.from_column(right_q), value_type="column"
             )
         lit = _where_literal_payload(rexpr)
         if lit is not None:
             pk = next_lit_key()
             param_store[pk] = lit[0]
-            return FilterParam(left_expr=left_e, op=mapped, value_type=lit[1], param_key=pk)
+            return WhereParam(left_expr=left_e, op=mapped, value_type=lit[1], param_key=pk)
         right_e = _expr_full(
             rexpr,
             dialect,
@@ -1252,7 +1445,7 @@ def _single_predicate_to_filter(
         )
         if right_e is None:
             return None
-        return FilterParam(left_expr=left_e, op=mapped, right_expr=right_e, value_type="column")
+        return WhereParam(left_expr=left_e, op=mapped, right_expr=right_e, value_type="column")
     return None
 
 
@@ -1276,65 +1469,87 @@ def _bool_nesting_too_deep(node: exp.Expression, depth: int) -> bool:
     return False
 
 
-def _walk_bool_to_filter_groups(
+def _walk_bool_to_predicate_group(
     where: exp.Expression,
     dialect: Any,
     alias_map: dict[str, str],
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Callable[[], str],
-    extra: SqlglotExtra | None = None,
-) -> list[FilterParam] | None:
+    extra: Any | None = None,
+) -> PredicateGroup | None:
     where = _unwrap_alias(where)
     if _bool_nesting_too_deep(where, 0):
         return None
     if isinstance(where, exp.Not):
         return None
     if isinstance(where, exp.Or):
-        out_or: list[FilterParam] = []
-        gid = 1
         arms = _flatten_or_arms(where)
+        or_groups: list[PredicateGroup] = []
         for arg in arms:
             if isinstance(arg, exp.And):
                 sub = _flatten_bool_and(arg)
-                first_arm = True
+                and_preds: list[WhereParam] = []
                 for subp in sub:
                     if isinstance(subp, exp.Exists):
                         return None
-                    fp = _single_predicate_to_filter(
+                    fp = _single_predicate_to_where(
                         subp, dialect, alias_map, single_alias, param_store, next_lit_key, extra
                     )
                     if fp is None:
                         return None
-                    bo = "AND"
-                    if first_arm:
-                        first_arm = False
-                    fp = replace(fp, filter_group=gid, bool_op=bo)
-                    out_or.append(fp)
-                gid += 1
+                    and_preds.append(fp)
+                if and_preds:
+                    or_groups.append(PredicateGroup(op="and", predicates=tuple(and_preds)))
                 continue
             if isinstance(arg, exp.Exists):
                 return None
-            fp = _single_predicate_to_filter(arg, dialect, alias_map, single_alias, param_store, next_lit_key, extra)
+            fp = _single_predicate_to_where(arg, dialect, alias_map, single_alias, param_store, next_lit_key, extra)
             if fp is None:
                 return None
-            fp = replace(fp, filter_group=gid, bool_op="AND")
-            out_or.append(fp)
-            gid += 1
-        return out_or
+            or_groups.append(PredicateGroup(op="and", predicates=(fp,)))
+        if not or_groups:
+            return None
+        if len(or_groups) == 1:
+            return or_groups[0]
+        return PredicateGroup(op="or", groups=tuple(or_groups))
     if isinstance(where, exp.And):
         parts = _flatten_bool_and(where)
     else:
         parts = [where]
-    out: list[FilterParam] = []
+    preds: list[WhereParam] = []
+    nested: list[PredicateGroup] = []
     for p in parts:
         if isinstance(p, exp.Exists):
             continue
-        fp = _single_predicate_to_filter(p, dialect, alias_map, single_alias, param_store, next_lit_key, extra)
+        if isinstance(p, (exp.And, exp.Or)):
+            child = _walk_bool_to_predicate_group(p, dialect, alias_map, single_alias, param_store, next_lit_key, extra)
+            if child is None:
+                return None
+            nested.append(child)
+            continue
+        fp = _single_predicate_to_where(p, dialect, alias_map, single_alias, param_store, next_lit_key, extra)
         if fp is None:
             return None
-        out.append(fp)
-    return out
+        preds.append(fp)
+    if not preds and not nested:
+        return None
+    if not nested:
+        return PredicateGroup(op="and", predicates=tuple(preds))
+    return PredicateGroup(op="and", predicates=tuple(preds), groups=tuple(nested))
+
+
+def _walk_bool_to_where_groups(
+    where: exp.Expression,
+    dialect: Any,
+    alias_map: dict[str, str],
+    single_alias: str | None,
+    param_store: dict[str, Any],
+    next_lit_key: Callable[[], str],
+    extra: Any | None = None,
+) -> list[WhereParam] | None:
+    group = _walk_bool_to_predicate_group(where, dialect, alias_map, single_alias, param_store, next_lit_key, extra)
+    return [cast(WhereParam, leaf) for leaf in group.leaves()] if group is not None else None
 
 
 def _flatten_or_arms(node: exp.Expression) -> list[exp.Expression]:
@@ -1344,16 +1559,16 @@ def _flatten_or_arms(node: exp.Expression) -> list[exp.Expression]:
     return [node]
 
 
-def _where_to_filters(
+def _where_to_where_params(
     where: exp.Expression,
     dialect: Any,
     alias_map: dict[str, str],
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Callable[[], str],
-    extra: SqlglotExtra | None = None,
-) -> list[FilterParam] | None:
-    return _walk_bool_to_filter_groups(where, dialect, alias_map, single_alias, param_store, next_lit_key, extra)
+    extra: Any | None = None,
+) -> PredicateGroup | None:
+    return _walk_bool_to_predicate_group(where, dialect, alias_map, single_alias, param_store, next_lit_key, extra)
 
 
 def _having_to_params(
@@ -1363,7 +1578,7 @@ def _having_to_params(
     single_alias: str | None,
     param_store: dict[str, Any],
     next_lit_key: Callable[[], str],
-    extra: SqlglotExtra | None = None,
+    extra: Any | None = None,
 ) -> list[HavingParam] | None:
     having = _unwrap_alias(having)
     if isinstance(having, exp.Or):
@@ -1400,7 +1615,7 @@ def _having_to_params(
         mapped = _comparison_op(p)
         if mapped is None:
             return None
-        mapped = _dialect_map_filter_op(dialect, mapped) or mapped
+        mapped = _dialect_map_where_op(dialect, mapped) or mapped
         left_node = p.this
         right_node = p.expression
         if left_node is None or right_node is None:
@@ -1427,10 +1642,7 @@ def _having_to_params(
                 return None
             out.append(
                 HavingParam(
-                    left_expr=left_n,
-                    op=mapped,
-                    right_expr=NormalizedExpr.from_column(right_q),
-                    value_type="column",
+                    left_expr=left_n, op=mapped, right_expr=NormalizedExpr.from_column(right_q), value_type="column"
                 )
             )
             continue
@@ -1466,7 +1678,7 @@ def _group_clause(
     select_cols: list[SelectCol],
     param_store: dict[str, Any],
     next_lit_key: Callable[[], str],
-    extra: SqlglotExtra | None = None,
+    extra: Any | None = None,
 ) -> list[NormalizedExpr] | None:
     out: list[NormalizedExpr] = []
     for n in group_node.expressions or ():
@@ -1507,11 +1719,57 @@ def _sort_clause(
     param_store: dict[str, Any],
     next_lit_key: Callable[[], str],
     select_cols: list[SelectCol],
-    extra: SqlglotExtra | None = None,
+    extra: Any | None = None,
 ) -> list[OrderByCol] | None:
     return _window_sort_clause(
         order_node, dialect, alias_map, single_alias, param_store, next_lit_key, select_cols, extra
     )
+
+
+def _distinct_fields(
+    sel: exp.Select,
+    dialect: Any,
+    alias_map: dict[str, str],
+    single_alias: str | None,
+    select_cols: list[SelectCol],
+    param_store: dict[str, Any],
+    next_lit_key: Callable[[], str],
+    extra: Any | None = None,
+) -> tuple[int, list[NormalizedExpr]]:
+    """Return ``(distinct_select_index, distinct_on)`` from the SELECT distinct clause."""
+    distinct = sel.args.get("distinct")
+    if not distinct:
+        return -1, []
+    if distinct is True:
+        return 0, []
+    if isinstance(distinct, exp.Distinct):
+        on_exprs = distinct.args.get("on") or distinct.expressions or ()
+        if not on_exprs:
+            return 0, []
+        distinct_on: list[NormalizedExpr] = []
+        for dexpr in on_exprs:
+            ex = _expr_full(
+                dexpr,
+                dialect,
+                alias_map,
+                single_alias,
+                param_store,
+                next_lit_key,
+                extra,
+                allow_aggregate=False,
+                allow_window=False,
+                select_cols=select_cols,
+            )
+            if ex is None and isinstance(dexpr, exp.Column):
+                qn = _qual_column_name(dexpr, alias_map, single_alias, extra)
+                if qn:
+                    ex = NormalizedExpr.from_column(qn)
+            if ex is not None:
+                distinct_on.append(ex)
+        if distinct_on:
+            return -1, distinct_on
+        return 0, []
+    return 0, []
 
 
 def _distinct_select_index(
@@ -1519,25 +1777,13 @@ def _distinct_select_index(
     alias_map: dict[str, str],
     single_alias: str | None,
     select_cols: list[SelectCol],
-    extra: SqlglotExtra | None = None,
+    extra: Any | None = None,
 ) -> int:
-    distinct = sel.args.get("distinct")
-    if not distinct:
+    """Derive ``distinct_select_index`` from plain ``DISTINCT`` (not ``DISTINCT ON``)."""
+    idx, distinct_on = _distinct_fields(sel, None, alias_map, single_alias, select_cols, {}, lambda: "", extra)
+    if distinct_on:
         return -1
-    if distinct is True:
-        return 0
-    if isinstance(distinct, exp.Distinct):
-        on_exprs = distinct.args.get("on") or distinct.expressions or ()
-        for dexpr in on_exprs:
-            if isinstance(dexpr, exp.Column):
-                qn = _qual_column_name(dexpr, alias_map, single_alias, extra)
-                if qn:
-                    for j, sc in enumerate(select_cols):
-                        cr = (sc.expr.column_ref or "").strip()
-                        if cr == qn:
-                            return j
-        return 0
-    return 0
+    return idx
 
 
 def _infer_output_columns(sel: exp.Select) -> list[str]:
@@ -1551,9 +1797,7 @@ def _infer_output_columns(sel: exp.Select) -> list[str]:
 
 
 def _collect_range_bindings(
-    sel: exp.Select,
-    schema_tables: set[str],
-    allowed_cte: frozenset[str],
+    sel: exp.Select, schema_tables: set[str], allowed_cte: frozenset[str]
 ) -> list[tuple[str, str]] | None:
     for join in _select_join_nodes(sel):
         if not _join_is_allowed(join):
@@ -1592,8 +1836,7 @@ def _rewrite_table_to_cte(sel: exp.Select, lift_alias: str, physical: str, cte_n
         alias, rel = pair
         if alias == lift_alias and rel == physical:
             new_table = exp.Table(
-                this=exp.to_identifier(cte_name),
-                alias=exp.TableAlias(this=exp.to_identifier(cte_name)),
+                this=exp.to_identifier(cte_name), alias=exp.TableAlias(this=exp.to_identifier(cte_name))
             )
             expr.replace(new_table)
             changed = True
@@ -1616,12 +1859,7 @@ def _rewrite_table_to_cte(sel: exp.Select, lift_alias: str, physical: str, cte_n
     return changed
 
 
-def _try_lift_self_join(
-    sel: exp.Select,
-    schema_tables: set[str],
-    allowed_cte: frozenset[str],
-    extra: SqlglotExtra,
-) -> bool:
+def _try_lift_self_join(sel: exp.Select, schema_tables: set[str], allowed_cte: frozenset[str], extra: Any) -> bool:
     if _from_clause_root(sel) is None and not _select_join_nodes(sel):
         return True
     bindings = _collect_range_bindings(sel, schema_tables, allowed_cte)
@@ -1669,7 +1907,7 @@ def _try_lift_from_subqueries(
     allowed_cte: frozenset[str],
     param_store: dict[str, Any],
     next_lit_key: Callable[[], str],
-    extra: SqlglotExtra,
+    extra: Any,
 ) -> bool:
     if _from_clause_root(sel) is None and not _select_join_nodes(sel):
         return True
@@ -1700,10 +1938,7 @@ def _try_lift_from_subqueries(
         if chunk is None:
             return False
         extra.self_join_steps.extend(chunk)
-        new_table = exp.Table(
-            this=exp.to_identifier(cte_name),
-            alias=exp.TableAlias(this=exp.to_identifier(alias)),
-        )
+        new_table = exp.Table(this=exp.to_identifier(cte_name), alias=exp.TableAlias(this=exp.to_identifier(alias)))
         subq.replace(new_table)
     return True
 
@@ -1715,8 +1950,8 @@ def _runtime_cte_step_from_body(sel: exp.Select, body: RuntimeIntent, cte_name: 
         select_cols=list(body.select_cols or []),
         group_by_cols=list(body.group_by_cols or []),
         order_by_cols=list(body.order_by_cols or []),
-        filters_param=list(body.filters_param or []),
-        having_param=list(body.having_param or []),
+        where=body.where,
+        having=body.having,
         param_values={},
         output_columns=_infer_output_columns(sel),
         grain=body.grain or "row_level",
@@ -1761,7 +1996,7 @@ def _materialize_cte_body(
         sel = sel.copy()
         sel.set("with_", None)
     body_pair = _runtime_intent_body_from_select(
-        sel, schema, dialect, param_store, next_lit_key, frozenset(allowed_here), SqlglotExtra()
+        sel, schema, dialect, param_store, next_lit_key, frozenset(allowed_here), _new_sqlglot_extra()
     )
     body, sj_local = body_pair
     if body is None:
@@ -1777,11 +2012,11 @@ def _runtime_intent_body_from_select(
     param_store: dict[str, Any],
     next_lit_key: Callable[[], str],
     allowed_cte: frozenset[str],
-    extra: SqlglotExtra | None = None,
+    extra: Any | None = None,
 ) -> tuple[RuntimeIntent | None, list[RuntimeCteStep]]:
     if sel.find(exp.Union):
         return None, []
-    sx = extra if extra is not None else SqlglotExtra()
+    sx = extra if extra is not None else _new_sqlglot_extra()
     schema_tables = set(schema.tables.keys())
     if not _try_lift_from_subqueries(sel, schema, dialect, allowed_cte, param_store, next_lit_key, sx):
         return None, []
@@ -1804,15 +2039,16 @@ def _runtime_intent_body_from_select(
         if ex is None:
             return None, []
         select_cols.append(SelectCol(expr=ex))
-    distinct_idx = _distinct_select_index(sel, alias_map, single_alias, select_cols, sx)
-    filters: list[FilterParam] = []
+    distinct_idx, distinct_on = _distinct_fields(
+        sel, dialect, alias_map, single_alias, select_cols, param_store, next_lit_key, sx
+    )
+    where_group: PredicateGroup | None = None
     where_node = sel.args.get("where")
     if where_node is not None:
         pred = where_node.this if isinstance(where_node, exp.Where) else where_node
-        fp = _where_to_filters(pred, dialect, alias_map, single_alias, param_store, next_lit_key, sx)
-        if fp is None:
+        where_group = _where_to_where_params(pred, dialect, alias_map, single_alias, param_store, next_lit_key, sx)
+        if where_group is None:
             return None, []
-        filters = fp
     group_by_cols: list[NormalizedExpr] = []
     group_node = sel.args.get("group")
     if group_node is not None and isinstance(group_node, exp.Group):
@@ -1856,13 +2092,14 @@ def _runtime_intent_body_from_select(
         select_cols=select_cols,
         group_by_cols=group_by_cols,
         order_by_cols=order_by_cols,
-        filters_param=filters,
-        having_param=having_param,
+        where=where_group,
+        having=PredicateGroup.from_list(having_param),
         param_values={},
         cte_steps=[],
         natural_language="",
         limit=limit_val,
         distinct_select_index=distinct_idx,
+        distinct_on=distinct_on,
         window_registry=list(sx.window_registry),
         case_registry=list(sx.case_registry),
     )
@@ -1902,7 +2139,7 @@ def _convert_select_stmt(
         sel = sel.copy()
         sel.set("with_", None)
     body_pair = _runtime_intent_body_from_select(
-        sel, schema, dialect, param_store, next_lit_key, frozenset(allowed_cte), SqlglotExtra()
+        sel, schema, dialect, param_store, next_lit_key, frozenset(allowed_cte), _new_sqlglot_extra()
     )
     body, sj_body = body_pair
     if body is None:
@@ -1935,22 +2172,17 @@ def runtime_from_sqlglot_tree(
     tables_agg: set[str] = set(intent.tables or [])
     for st in cte_steps:
         tables_agg.update(st.tables or [])
-    return replace(
-        intent,
-        tables=sorted(tables_agg),
-        param_values=dict(store),
-        cte_steps=cte_steps,
-    )
+    return replace(intent, tables=sorted(tables_agg), param_values=dict(store), cte_steps=cte_steps)
 
 
 def convert_sql_via_sqlglot(sql: str, schema: SchemaGraph, dialect: Dialect | Any) -> RuntimeIntent:
     """Parse SQL with the dialect's sqlglot reader and extract a :class:`RuntimeIntent`."""
-    prepped = _dialect_preparse_sql(dialect, sql)
     read_dialect = str(getattr(dialect, "sqlglot_dialect", "") or "postgres")
+    prepped = _rewrite_distinct_on_cte_wrapper_sql(_dialect_preparse_sql(dialect, sql), read_dialect)
     try:
         tree = sqlglot.parse_one(prepped, dialect=read_dialect)
     except Exception as exc:
-        raise ValueError(str(exc)) from exc
+        raise ConfigError(f"sqlglot parse failed: {exc}") from exc
     if not isinstance(tree, exp.Select):
         inner = tree.find(exp.Select) if tree is not None else None
         if inner is None:

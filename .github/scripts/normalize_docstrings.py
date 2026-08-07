@@ -240,17 +240,9 @@ def _iter_docstring_exprs(tree: ast.Module) -> list[ast.Expr]:
     out: list[ast.Expr] = []
     if tree.body:
         first = tree.body[0]
-        if (
-            isinstance(first, ast.Expr)
-            and isinstance(first.value, ast.Constant)
-            and isinstance(first.value.value, str)
-        ):
+        if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str):
             out.append(first)
-        elif (
-            isinstance(first, ast.ImportFrom)
-            and first.module == "__future__"
-            and len(tree.body) > 1
-        ):
+        elif isinstance(first, ast.ImportFrom) and first.module == "__future__" and len(tree.body) > 1:
             second = tree.body[1]
             if (
                 isinstance(second, ast.Expr)
@@ -277,9 +269,7 @@ def _utf8_byte_prefix_len_chars(s: str, byte_len: int) -> int:
     return len(raw[:byte_len].decode("utf-8"))
 
 
-def _leading_whitespace_before_ast_start(
-    source: str, lineno: int, col_offset: int | None
-) -> str:
+def _leading_whitespace_before_ast_start(source: str, lineno: int, col_offset: int | None) -> str:
     if col_offset is None or lineno < 1:
         return ""
     lines = source.splitlines(keepends=True)
@@ -311,9 +301,7 @@ def replace_docstrings(source: str, tree: ast.Module, phase: Phase) -> str:
         new_inner = normalize_docstring_text(val.value, phase)
         if new_inner == val.value:
             continue
-        cont = _leading_whitespace_before_ast_start(
-            source, stmt.lineno, stmt.col_offset
-        )
+        cont = _leading_whitespace_before_ast_start(source, stmt.lineno, stmt.col_offset)
         new_seg = format_docstring_literal_slice(new_inner, cont)
         end = stmt.end_lineno
         end_col = stmt.end_col_offset

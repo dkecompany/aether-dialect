@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from aetherdialect._sql_to_intent import (
+from aetherdialect._dialect_sqlglot_engines import (
     BigQueryQueryLogSource,
     MySQLQueryLogSource,
     RedshiftQueryLogSource,
     SnowflakeQueryLogSource,
     SQLServerQueryLogSource,
+)
+from aetherdialect._sql_to_intent import (
     fetch_query_log,
 )
 

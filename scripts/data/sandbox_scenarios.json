@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": "0.2.1",
   "scenarios": [
     {
       "id": "hidden_column",
@@ -26,6 +26,60 @@
       "anchor_question": "How many books do we have?",
       "allowed_rejection_text": "The intent is wrong, count distinct films only.",
       "flow": "reject_then_accept"
+    },
+    {
+      "id": "federation_cross_source_join",
+      "recipe": "federation",
+      "question": "How many rentals are linked to film titles?",
+      "mechanism": "federation_cross_source_join"
+    },
+    {
+      "id": "federation_mapping_confirm",
+      "recipe": "federation",
+      "question": "What is the total payment amount?",
+      "mechanism": "federation_mapping_confirm"
+    },
+    {
+      "id": "federation_logical_union",
+      "recipe": "federation",
+      "question": "How many distinct customers rented horror films?",
+      "mechanism": "federation_logical_union"
+    },
+    {
+      "id": "federation_sensitive_key_reject",
+      "recipe": "federation",
+      "question": "Show payroll deductions grouped by staff member.",
+      "mechanism": "federation_sensitive_key_reject"
+    },
+    {
+      "id": "federation_ineligible_aggregate",
+      "recipe": "federation",
+      "question": "What is the average payment amount grouped by film category?",
+      "mechanism": "federation_ineligible_aggregate"
+    },
+    {
+      "id": "federation_aetherspace",
+      "recipe": "federation",
+      "question": "List all films in the catalog.",
+      "mechanism": "federation_aetherspace"
+    },
+    {
+      "id": "views_active_customers",
+      "recipe": "views",
+      "question": "How many active customers do we have?",
+      "mechanism": "views_scope"
+    },
+    {
+      "id": "views_store_revenue",
+      "recipe": "views",
+      "question": "What is the total revenue by store?",
+      "mechanism": "views_scope"
+    },
+    {
+      "id": "views_film_catalog",
+      "recipe": "views",
+      "question": "Which films are in the catalog view?",
+      "mechanism": "views_scope"
     }
   ]
 }

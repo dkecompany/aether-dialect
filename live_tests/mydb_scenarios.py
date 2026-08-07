@@ -2,7 +2,37 @@
 
 from __future__ import annotations
 
-from aetherdialect._live_testing import Expected, Scenario, SequenceScenario
+from collections.abc import Callable
+
+from aetherdialect._contracts_core import Expected, Scenario, SequenceScenario
+from live_tests.federation_oracles import (
+    RENTAL_SHOP_ACTOR_COUNT,
+    RENTAL_SHOP_CATEGORY_COUNT,
+    RENTAL_SHOP_CUSTOMER_COUNT,
+    RENTAL_SHOP_DELIVERY_STATUS_COUNT,
+    RENTAL_SHOP_FILM_CATEGORY_COUNT,
+    RENTAL_SHOP_FILM_COUNT,
+    RENTAL_SHOP_FILM_RATING_COUNT,
+    RENTAL_SHOP_GAME_PLATFORM_COUNT,
+    RENTAL_SHOP_LANGUAGE_COUNT,
+    RENTAL_SHOP_PROMOTION_COUNT,
+    RENTAL_SHOP_RENTAL_COUNT,
+    RENTAL_SHOP_STORE_COUNT,
+    RENTAL_SHOP_WAREHOUSE_COUNT,
+)
+
+
+def _rows_count_equals(n: int) -> Callable[[list[tuple]], bool]:
+    return lambda rows: len(rows) == n
+
+
+def _scalar_int_equals(n: int) -> Callable[[list[tuple]], bool]:
+    return lambda rows: len(rows) == 1 and rows[0] and int(rows[0][0]) == n
+
+
+def _grouped_rows_at_most(n: int) -> Callable[[list[tuple]], bool]:
+    return lambda rows: 1 <= len(rows) <= n
+
 
 # Post-reconcile table assertions for rental_shop item_id subtype pattern.
 FILM_SCOPED: list[list[str]] = [["film"], ["item"], ["film", "item"]]
@@ -87,30 +117,47 @@ def single_table_scenarios() -> list[Scenario]:
             question="list all film titles",
             expected=Expected(
                 tables_one_of=FILM_SCOPED,
-                min_rows=1,
-                max_rows=2000,
+                min_rows=RENTAL_SHOP_FILM_COUNT,
+                max_rows=RENTAL_SHOP_FILM_COUNT,
                 contains_join=False,
                 grain="row_level",
-                min_confidence=0.5,
+                row_value_check=_rows_count_equals(RENTAL_SHOP_FILM_COUNT),
             ),
             category="single_table",
         ),
         Scenario(
             id="ST-002",
             question="show me all customer first names and last names",
-            expected=Expected(tables=["customer"], min_rows=1, contains_join=False),
+            expected=Expected(
+                tables=["customer"],
+                min_rows=RENTAL_SHOP_CUSTOMER_COUNT,
+                max_rows=RENTAL_SHOP_CUSTOMER_COUNT,
+                contains_join=False,
+                row_value_check=_rows_count_equals(RENTAL_SHOP_CUSTOMER_COUNT),
+            ),
             category="single_table",
         ),
         Scenario(
             id="ST-003",
             question="list the distinct film ratings in the catalog",
-            expected=Expected(tables_one_of=FILM_SCOPED, min_rows=1, max_rows=10),
+            expected=Expected(
+                tables_one_of=FILM_SCOPED,
+                min_rows=RENTAL_SHOP_FILM_RATING_COUNT,
+                max_rows=RENTAL_SHOP_FILM_RATING_COUNT,
+                row_value_check=_rows_count_equals(RENTAL_SHOP_FILM_RATING_COUNT),
+            ),
             category="single_table",
         ),
         Scenario(
             id="ST-004",
             question="list all categories",
-            expected=Expected(tables=["category"], min_rows=1, max_rows=28, contains_join=False),
+            expected=Expected(
+                tables=["category"],
+                min_rows=RENTAL_SHOP_CATEGORY_COUNT,
+                max_rows=RENTAL_SHOP_CATEGORY_COUNT,
+                contains_join=False,
+                row_value_check=_rows_count_equals(RENTAL_SHOP_CATEGORY_COUNT),
+            ),
             category="single_table",
         ),
         Scenario(
@@ -121,26 +168,44 @@ def single_table_scenarios() -> list[Scenario]:
                 min_rows=1,
                 max_rows=1,
                 grain="scalar",
-                min_confidence=0.4,
+                row_value_check=_scalar_int_equals(RENTAL_SHOP_FILM_COUNT),
             ),
             category="single_table",
         ),
         Scenario(
             id="ST-006",
             question="show all actor first names and last names",
-            expected=Expected(tables=["actor"], min_rows=1, contains_join=False),
+            expected=Expected(
+                tables=["actor"],
+                min_rows=RENTAL_SHOP_ACTOR_COUNT,
+                max_rows=RENTAL_SHOP_ACTOR_COUNT,
+                contains_join=False,
+                row_value_check=_rows_count_equals(RENTAL_SHOP_ACTOR_COUNT),
+            ),
             category="single_table",
         ),
         Scenario(
             id="ST-007",
             question="list the distinct languages in the catalog",
-            expected=Expected(tables=["language"], min_rows=1, max_rows=10, contains_join=False),
+            expected=Expected(
+                tables=["language"],
+                min_rows=RENTAL_SHOP_LANGUAGE_COUNT,
+                max_rows=RENTAL_SHOP_LANGUAGE_COUNT,
+                contains_join=False,
+                row_value_check=_rows_count_equals(RENTAL_SHOP_LANGUAGE_COUNT),
+            ),
             category="single_table",
         ),
         Scenario(
             id="ST-008",
             question="list all store ids",
-            expected=Expected(tables=["store"], min_rows=1, max_rows=12, contains_join=False),
+            expected=Expected(
+                tables=["store"],
+                min_rows=RENTAL_SHOP_STORE_COUNT,
+                max_rows=RENTAL_SHOP_STORE_COUNT,
+                contains_join=False,
+                row_value_check=_rows_count_equals(RENTAL_SHOP_STORE_COUNT),
+            ),
             category="single_table",
         ),
         Scenario(
@@ -148,9 +213,10 @@ def single_table_scenarios() -> list[Scenario]:
             question="list all promotion names",
             expected=Expected(
                 tables=["promotion"],
-                min_rows=1,
-                max_rows=30,
+                min_rows=RENTAL_SHOP_PROMOTION_COUNT,
+                max_rows=RENTAL_SHOP_PROMOTION_COUNT,
                 contains_join=False,
+                row_value_check=_rows_count_equals(RENTAL_SHOP_PROMOTION_COUNT),
             ),
             category="single_table",
         ),
@@ -159,9 +225,10 @@ def single_table_scenarios() -> list[Scenario]:
             question="list the distinct delivery statuses",
             expected=Expected(
                 tables=["delivery"],
-                min_rows=1,
-                max_rows=10,
+                min_rows=RENTAL_SHOP_DELIVERY_STATUS_COUNT,
+                max_rows=RENTAL_SHOP_DELIVERY_STATUS_COUNT,
                 contains_join=False,
+                row_value_check=_rows_count_equals(RENTAL_SHOP_DELIVERY_STATUS_COUNT),
             ),
             category="single_table",
         ),
@@ -170,9 +237,10 @@ def single_table_scenarios() -> list[Scenario]:
             question="list distinct warehouse names",
             expected=Expected(
                 tables=["warehouse"],
-                min_rows=1,
-                max_rows=10,
+                min_rows=RENTAL_SHOP_WAREHOUSE_COUNT,
+                max_rows=RENTAL_SHOP_WAREHOUSE_COUNT,
                 contains_join=False,
+                row_value_check=_rows_count_equals(RENTAL_SHOP_WAREHOUSE_COUNT),
             ),
             category="single_table",
         ),
@@ -181,8 +249,10 @@ def single_table_scenarios() -> list[Scenario]:
             question="list distinct game platforms",
             expected=Expected(
                 tables_one_of=GAME_SCOPED,
-                min_rows=1,
+                min_rows=RENTAL_SHOP_GAME_PLATFORM_COUNT,
+                max_rows=RENTAL_SHOP_GAME_PLATFORM_COUNT,
                 contains_join=False,
+                row_value_check=_rows_count_equals(RENTAL_SHOP_GAME_PLATFORM_COUNT),
             ),
             category="single_table",
         ),
@@ -205,6 +275,20 @@ def single_table_scenarios() -> list[Scenario]:
                 max_rows=1,
                 grain="scalar",
                 contains_join=False,
+                row_value_check=_scalar_int_equals(RENTAL_SHOP_ACTOR_COUNT),
+            ),
+            category="single_table",
+        ),
+        Scenario(
+            id="ST-015",
+            question="list all films in the catalog",
+            expected=Expected(
+                tables_one_of=FILM_SCOPED,
+                min_rows=RENTAL_SHOP_FILM_COUNT,
+                max_rows=RENTAL_SHOP_FILM_COUNT,
+                contains_join=False,
+                grain="row_level",
+                row_value_check=_rows_count_equals(RENTAL_SHOP_FILM_COUNT),
             ),
             category="single_table",
         ),
@@ -505,6 +589,22 @@ def multi_table_scenarios() -> list[Scenario]:
             ),
             category="multi_table",
         ),
+        Scenario(
+            id="MT-026",
+            question="how many rentals are linked to film titles",
+            expected=Expected(
+                tables_one_of=[
+                    *film_with("rental", "inventory"),
+                    ["rental", "inventory", "item"],
+                    ["rental", "inventory", "item", "film"],
+                ],
+                min_rows=1,
+                max_rows=1,
+                grain="scalar",
+                contains_join=True,
+            ),
+            category="multi_table",
+        ),
     ]
     return base
 
@@ -530,9 +630,9 @@ def aggregation_scenarios() -> list[Scenario]:
                 contains_group_by=True,
                 grain="grouped",
                 min_rows=1,
-                max_rows=1000,
-                min_confidence=0.24,
+                max_rows=RENTAL_SHOP_CUSTOMER_COUNT,
                 sql_contains=["SUM"],
+                row_value_check=_grouped_rows_at_most(RENTAL_SHOP_CUSTOMER_COUNT),
             ),
             category="aggregation",
         ),
@@ -567,6 +667,7 @@ def aggregation_scenarios() -> list[Scenario]:
                 min_rows=1,
                 max_rows=1,
                 grain="scalar",
+                row_value_check=_scalar_int_equals(RENTAL_SHOP_RENTAL_COUNT),
             ),
             category="aggregation",
         ),
@@ -577,8 +678,10 @@ def aggregation_scenarios() -> list[Scenario]:
                 tables_one_of=FILM_SCOPED,
                 contains_group_by=True,
                 grain="grouped",
-                min_rows=1,
+                min_rows=RENTAL_SHOP_FILM_RATING_COUNT,
+                max_rows=RENTAL_SHOP_FILM_RATING_COUNT,
                 sql_contains=["MAX"],
+                row_value_check=_rows_count_equals(RENTAL_SHOP_FILM_RATING_COUNT),
             ),
             category="aggregation",
         ),
@@ -600,7 +703,9 @@ def aggregation_scenarios() -> list[Scenario]:
                 contains_group_by=True,
                 contains_join=True,
                 grain="grouped",
-                min_rows=1,
+                min_rows=RENTAL_SHOP_LANGUAGE_COUNT,
+                max_rows=RENTAL_SHOP_LANGUAGE_COUNT,
+                row_value_check=_rows_count_equals(RENTAL_SHOP_LANGUAGE_COUNT),
             ),
             category="aggregation",
         ),
@@ -674,7 +779,9 @@ def aggregation_scenarios() -> list[Scenario]:
                 tables=["delivery"],
                 contains_group_by=True,
                 grain="grouped",
-                min_rows=1,
+                min_rows=RENTAL_SHOP_DELIVERY_STATUS_COUNT,
+                max_rows=RENTAL_SHOP_DELIVERY_STATUS_COUNT,
+                row_value_check=_rows_count_equals(RENTAL_SHOP_DELIVERY_STATUS_COUNT),
             ),
             category="aggregation",
         ),
@@ -1133,6 +1240,43 @@ def aggregation_scenarios() -> list[Scenario]:
                 grain="grouped",
                 min_rows=1,
                 sql_contains=["AVG"],
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-053",
+            question="what is the total payment amount",
+            expected=Expected(
+                tables=["payment"],
+                min_rows=1,
+                max_rows=1,
+                grain="scalar",
+                sql_contains=["SUM"],
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-054",
+            question="what is the average payment amount grouped by film category",
+            expected=Expected(
+                contains_group_by=True,
+                grain="grouped",
+                min_rows=1,
+                sql_contains=["SUM"],
+            ),
+            category="aggregation",
+        ),
+        Scenario(
+            id="AG-055",
+            question="show payroll deductions grouped by staff member",
+            expected=Expected(
+                tables_one_of=[
+                    ["staff"],
+                    ["staff", "store"],
+                ],
+                contains_group_by=True,
+                grain="grouped",
+                min_rows=0,
             ),
             category="aggregation",
         ),
@@ -1637,15 +1781,15 @@ def repair_loop_scenarios() -> list[Scenario]:
 
 
 def confidence_scenarios() -> list[Scenario]:
-    """Confidence scoring tests with expected minimum thresholds."""
+    """Scenarios that check row and grain expectations."""
     return [
         Scenario(
             id="CF-001",
             question="how many customers are in each country",
             expected=Expected(
-                min_confidence=0.25,
                 contains_join=True,
                 min_rows=1,
+                grain="grouped",
             ),
             category="confidence",
         ),
@@ -1653,9 +1797,9 @@ def confidence_scenarios() -> list[Scenario]:
             id="CF-002",
             question="what is the average film length",
             expected=Expected(
-                min_confidence=0.4,
                 min_rows=1,
                 max_rows=1,
+                grain="scalar",
             ),
             category="confidence",
         ),
@@ -1663,8 +1807,8 @@ def confidence_scenarios() -> list[Scenario]:
             id="CF-003",
             question="list all customer email addresses",
             expected=Expected(
-                min_confidence=0.4,
                 min_rows=1,
+                tables=["customer"],
             ),
             category="confidence",
         ),
@@ -2504,6 +2648,7 @@ def count_distinct_scenarios() -> list[Scenario]:
                 min_rows=1,
                 max_rows=1,
                 grain="scalar",
+                row_value_check=_scalar_int_equals(RENTAL_SHOP_FILM_CATEGORY_COUNT),
             ),
             category="count_distinct",
         ),
@@ -2541,6 +2686,17 @@ def count_distinct_scenarios() -> list[Scenario]:
                 min_rows=1,
                 max_rows=1,
                 grain="scalar",
+            ),
+            category="count_distinct",
+        ),
+        Scenario(
+            id="CD-007",
+            question="how many distinct customers rented horror films",
+            expected=Expected(
+                min_rows=1,
+                max_rows=1,
+                grain="scalar",
+                sql_contains=["horror"],
             ),
             category="count_distinct",
         ),
@@ -3510,7 +3666,6 @@ def partition_scenarios() -> list[Scenario]:
                 min_rows=0,
                 max_rows=1000,
                 grain="scalar",
-                min_confidence=0.45,
             ),
             category="partition",
         ),
@@ -3571,6 +3726,48 @@ def all_scenarios() -> list[Scenario]:
         items = loader()
         result.extend(s for s in items if isinstance(s, Scenario))
     return result
+
+
+CORE_ISOLATED_LIVE_SCENARIO_IDS: tuple[str, ...] = (
+    "ST-001",
+    "ST-002",
+    "ST-003",
+    "ST-004",
+    "ST-005",
+    "ST-006",
+    "ST-007",
+    "ST-008",
+    "ST-009",
+    "ST-010",
+    "ST-011",
+    "ST-012",
+    "ST-014",
+    "ST-015",
+    "AG-002",
+    "AG-005",
+    "AG-006",
+    "AG-008",
+    "AG-014",
+    "CD-003",
+)
+
+
+def scenario_has_exact_row_oracle(expected: Expected) -> bool:
+    """Return whether *expected* asserts row cardinality beyond bare ``min_rows=1``."""
+    if expected.row_value_check is not None:
+        return True
+    if expected.max_rows is not None:
+        return True
+    return False
+
+
+def core_isolated_live_scenarios() -> list[Scenario]:
+    """Return the high-traffic rental_shop scenarios run on isolated runners."""
+    by_id = {scenario.id: scenario for scenario in all_scenarios()}
+    missing = [scenario_id for scenario_id in CORE_ISOLATED_LIVE_SCENARIO_IDS if scenario_id not in by_id]
+    if missing:
+        raise KeyError(f"unknown core isolated scenario ids: {missing}")
+    return [by_id[scenario_id] for scenario_id in CORE_ISOLATED_LIVE_SCENARIO_IDS]
 
 
 def bundled_rental_shop_live_scenarios() -> list[Scenario]:

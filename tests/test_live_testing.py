@@ -7,13 +7,18 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aetherdialect._constants import GenerationPath
-from aetherdialect._contracts_base import NormalizedExpr
+from aetherdialect._contracts_base import FeedbackMode, NormalizedExpr, QuestionRoute, QuestionValidationResult
 from aetherdialect._contracts_core import (
     ConcreteIntent,
+    Expected,
+    GenerationPath,
     RuntimeCteStep,
     RuntimeIntent,
+    Scenario,
     SelectCol,
+    SequenceScenario,
+    SoftAssert,
+    SoftFailure,
     SqlGenerationOutcome,
     Template,
     ValueHistory,
@@ -21,11 +26,6 @@ from aetherdialect._contracts_core import (
 from aetherdialect._contracts_schema import SQLShape, TemplateStats
 from aetherdialect._core_utils import StepResult, _make_input_responder, _make_prompt_responders
 from aetherdialect._live_testing import (
-    Expected,
-    Scenario,
-    SequenceScenario,
-    SoftAssert,
-    SoftFailure,
     _assert_scenario,
     _assertion_table_names,
     _build_reuse_intent,
@@ -118,7 +118,6 @@ class TestExpected:
         assert e.tables is None
         assert e.min_rows is None
         assert e.max_rows is None
-        assert e.min_confidence is None
         assert e.reuse_type is None
         assert e.should_fail_validation is False
         assert e.max_llm_calls is None
@@ -129,7 +128,6 @@ class TestExpected:
             tables=["orders"],
             min_rows=1,
             max_rows=100,
-            min_confidence=0.5,
             contains_join=True,
         )
         assert e.tables == ["orders"]
@@ -250,7 +248,6 @@ class TestAssertScenario:
             status="ok",
             sql="SELECT * FROM orders",
             rows=[(1,), (2,), (3,)],
-            confidence=0.85,
             reuse_type="none",
             validation_failed=False,
         )
@@ -311,20 +308,6 @@ class TestAssertScenario:
         """Too many rows should record failure."""
         result = self._make_result(rows=[(i,) for i in range(100)])
         expected = Expected(max_rows=5)
-        soft = _assert_scenario(result, expected)
-        assert not soft.passed
-
-    def test_min_confidence_pass(self):
-        """Confidence above threshold should pass."""
-        result = self._make_result(confidence=0.9)
-        expected = Expected(min_confidence=0.5)
-        soft = _assert_scenario(result, expected)
-        assert soft.passed
-
-    def test_min_confidence_fail(self):
-        """Confidence below threshold should fail."""
-        result = self._make_result(confidence=0.3)
-        expected = Expected(min_confidence=0.5)
         soft = _assert_scenario(result, expected)
         assert not soft.passed
 
@@ -426,7 +409,7 @@ class TestAssertScenario:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = self._make_result(intent=intent)
         expected = Expected(grain=("row_level", "grouped"))
@@ -443,7 +426,7 @@ class TestAssertScenario:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = self._make_result(intent=intent)
         expected = Expected(grain=("row_level", "grouped"))
@@ -480,7 +463,7 @@ class TestAssertScenario:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = self._make_result(intent=intent, rows=[("Alien",)])
         expected = Expected(column_names_one_of=[["title"]])
@@ -503,7 +486,7 @@ class TestAssertScenario:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = self._make_result(intent=intent, rows=[(1,)])
         expected = Expected(column_names_one_of=[["title"]])
@@ -527,7 +510,7 @@ class TestAssertScenario:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = self._make_result(intent=intent, rows=[("a", "b")])
         expected = Expected(
@@ -582,8 +565,8 @@ class TestBuildReuseIntent:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             column_map={},
         )
         tmpl = SimpleNamespace(intent_signature=sig)
@@ -599,8 +582,8 @@ class TestBuildReuseIntent:
             select_cols=None,
             group_by_cols=None,
             order_by_cols=None,
-            filters_param=None,
-            having_param=None,
+            where=None,
+            having=None,
             column_map=None,
         )
         tmpl = SimpleNamespace(intent_signature=sig)
@@ -617,7 +600,6 @@ def _make_passing_result() -> StepResult:
         status="ok",
         sql="SELECT 1",
         rows=[(1,)],
-        confidence=0.9,
     )
 
 
@@ -629,7 +611,6 @@ def _make_failing_result() -> StepResult:
         status="ok",
         sql="SELECT 1",
         rows=[],
-        confidence=0.9,
     )
 
 
@@ -714,7 +695,6 @@ class TestRunSequenceAndAssert:
             [
                 [
                     _make_passing_result(),
-                    _make_passing_result(),
                 ],
             ]
         )
@@ -732,7 +712,6 @@ class TestRunSequenceAndAssert:
             [
                 [_make_failing_result()],
                 [
-                    _make_passing_result(),
                     _make_passing_result(),
                 ],
             ]
@@ -790,7 +769,7 @@ class TestAssertScenarioInternalLogsAndImplicitStatus:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = StepResult(
             scenario_id="s",
@@ -810,7 +789,7 @@ class TestAssertScenarioInternalLogsAndImplicitStatus:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = StepResult(
             scenario_id="s",
@@ -825,7 +804,7 @@ class TestAssertScenarioInternalLogsAndImplicitStatus:
         assert soft.passed is False
         assert any(f.field == "internal_failure_logs" for f in soft.failures)
 
-    def test_run_and_assert_surfaces_internal_log_failure(self):
+    def test_live_testing_ops_run_and_assert_surfaces_internal_log_failure(self):
         class _Runner:
             def clone(self):
                 return self
@@ -840,7 +819,7 @@ class TestAssertScenarioInternalLogsAndImplicitStatus:
                     select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.id"))],
                     group_by_cols=[],
                     order_by_cols=[],
-                    filters_param=[],
+                    where=None,
                 )
                 return StepResult(
                     scenario_id="s",
@@ -870,7 +849,7 @@ class TestRunPipelineCoreUnionPreview:
             select_cols=[sc1, sc2],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             chosen_join_candidate_id="J00",
             chosen_join_path_signature=[],
         )
@@ -894,7 +873,7 @@ class TestRunPipelineCoreUnionPreview:
             select_cols=[sc1],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             natural_language="list order id and customer id",
         )
         templates = {"TAlign": tmpl}
@@ -944,12 +923,16 @@ class TestRunPipelineCoreUnionPreview:
                 return_value=(dialect, schema, store, templates, {}, set()),
             ),
             patch(
+                "aetherdialect._live_testing.handle_direct_sql_reuse",
+                return_value=None,
+            ),
+            patch(
                 "aetherdialect._live_testing.match_question_level_template_reuse",
                 return_value=no_reuse,
             ),
             patch(
                 "aetherdialect._live_testing.validate_question",
-                return_value=(True, "query", "q"),
+                return_value=QuestionValidationResult(accepted=True, route=QuestionRoute.ANALYTICAL, corrected="q"),
             ),
             patch(
                 "aetherdialect._live_testing.normalize_question_via_llm",
@@ -984,7 +967,11 @@ class TestRunPipelineCoreUnionPreview:
                 "aetherdialect._live_testing.generate_and_validate_sql",
                 return_value=gen_out,
             ),
-            patch("aetherdialect._live_testing.compute_final_metrics", return_value=0.99),
+            patch(
+                "aetherdialect._live_testing.build_result_dataframe",
+                return_value=None,
+            ),
+            patch("aetherdialect._live_testing.stamp_sql_shape"),
             patch(
                 "aetherdialect._live_testing.display_final_results_to_stdout",
                 return_value="ux",
@@ -1001,7 +988,7 @@ class TestRunPipelineCoreUnionPreview:
                 set(),
                 "y",
                 [],
-                feedback_mode="deferred_test",
+                feedback_mode=FeedbackMode.DEFERRED_TEST,
             )
 
         mock_mtf.assert_called_once()
@@ -1019,7 +1006,7 @@ class TestAssertionTableNames:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("cte2.line_count"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[
                 RuntimeCteStep(
                     cte_name="cte1",
@@ -1051,6 +1038,48 @@ class TestAssertionTableNames:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("tbl_a.id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         assert _assertion_table_names(intent, None) == ["tbl_a", "tbl_b"]
+
+
+def test_run_pipeline_core_refuses_federated_composite_schema() -> None:
+    from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
+    from aetherdialect._schema_graph import recompute_join_paths_multi
+    from aetherdialect._templates import TemplateOps
+
+    composite = SchemaGraph(
+        tables={
+            "left_t": TableMetadata(
+                name="left_t",
+                columns={"id": ColumnMetadata(name="id", data_type="integer", sensitivity="none")},
+                primary_key=["id"],
+                foreign_keys=[],
+                source_id="a",
+            ),
+            "right_t": TableMetadata(
+                name="right_t",
+                columns={"id": ColumnMetadata(name="id", data_type="integer", sensitivity="none")},
+                primary_key=["id"],
+                foreign_keys=[],
+                source_id="b",
+            ),
+        },
+        join_paths_multi=recompute_join_paths_multi({}),
+        schema_graph_id="sg_fed",
+    )
+    store = TemplateOps.empty_template_store("sg_fed")
+    result = _run_pipeline_core(
+        question="join left and right",
+        schema=composite,
+        store=store,
+        templates={},
+        rejected={},
+        schema_terms=set(),
+        feedback="y",
+        captured_logs=[],
+        feedback_mode=FeedbackMode.DEFERRED_TEST,
+    )
+    assert result.status == "error"
+    assert result.error is not None
+    assert "LiveTestRunner does not support federated composite schemas" in result.error

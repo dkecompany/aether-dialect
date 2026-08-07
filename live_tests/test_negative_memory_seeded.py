@@ -1,18 +1,16 @@
-"""Seeded tests for question-level feedback (validation + intent rejections). Each group seeds the artifact it owns and asserts only the observable output of that subsystem: persisted rows under ``question_feedback``, prompt collection via :func:`aetherdialect._templates.collect_question_feedback_for_prompt`, and penalty mapping via :func:`aetherdialect._templates.compute_question_feedback_penalty`."""
+"""Seeded tests for question-level feedback (validation + intent rejections). Each group seeds the artifact it owns and asserts only the observable output of that subsystem: persisted rows under ``question_feedback``, prompt collection via :func:`aetherdialect._templates.TemplateOps.collect_question_feedback_for_prompt`, and penalty mapping via :func:`aetherdialect._templates.TemplateOps.compute_question_feedback_penalty`."""
 
 from __future__ import annotations
 
 from unittest.mock import patch
 
+import pytest
+
 from aetherdialect._config import PolicyConfig
 from aetherdialect._contracts_core import FeedbackKind, Template
 from aetherdialect._contracts_schema import TemplateStats
 from aetherdialect._templates import (
-    _compute_intent_structural_signature,
-    collect_question_feedback_for_prompt,
-    compute_question_feedback_penalty,
-    record_question_feedback,
-    summarize_failure_for_memory,
+    TemplateOps,
 )
 
 from ._seed_helpers import (
@@ -28,18 +26,18 @@ from ._seed_helpers import (
 def _template_penalty(store: dict, template: Template) -> float:
     """Penalty used by the pipeline's confidence path for *template*'s question + keys."""
     q_hist = (template.value_history.questions or [""])[0]
-    return compute_question_feedback_penalty(store, q_hist, template.effective_structural_hash)
+    return TemplateOps.compute_question_feedback_penalty(store, q_hist, template.effective_structural_hash)
 
 
 _FAILURE_Q_NORM = "list customer first names with unparseable filter"
 _FAILURE_MESSAGE = "seeded intent validation issue: missing column"
 
 
-@patch("aetherdialect._templates.llm_credentials_configured", return_value=False)
+@patch("aetherdialect._config.EngineConfig.llm_credentials_configured", return_value=False)
 def test_validation_failure_feedback_surfaces_for_prompt(_mock_no_llm, schema, schema_terms, t2s) -> None:
     """Seeded structural validation row surfaces through ``collect_question_feedback_for_prompt``."""
     intent = intent_customer_first_names()
-    ish, _ = _compute_intent_structural_signature(intent)
+    ish, _ = TemplateOps._compute_intent_structural_signature(intent)
     sql = "SELECT customer.customer_id, customer.first_name FROM customer"
     with isolated_runner(schema, schema_terms, t2s, label="nm_hint") as runner:
         seed_negative_memory(
@@ -49,7 +47,7 @@ def test_validation_failure_feedback_surfaces_for_prompt(_mock_no_llm, schema, s
             reason=_FAILURE_MESSAGE,
             q_norm=_FAILURE_Q_NORM,
         )
-        rows = collect_question_feedback_for_prompt(
+        rows = TemplateOps.collect_question_feedback_for_prompt(
             runner.store, _FAILURE_Q_NORM, runner.schema.effective_structural_hash
         )
         assert rows, f"[NM-HINT] expected >=1 row; got {rows!r}"
@@ -59,22 +57,20 @@ def test_validation_failure_feedback_surfaces_for_prompt(_mock_no_llm, schema, s
         assert _FAILURE_MESSAGE in flat, f"[NM-HINT] expected seeded hint; got {rows!r}"
 
 
-@patch("aetherdialect._templates.llm_credentials_configured", return_value=False)
+@patch("aetherdialect._config.EngineConfig.llm_credentials_configured", return_value=False)
 def test_validation_failure_rows_scoped_to_schema(_mock_no_llm, schema, schema_terms, t2s) -> None:
     """Structural validation rows do not leak across schema hashes."""
     intent = intent_customer_first_names()
-    sql = "SELECT customer.customer_id, customer.first_name FROM customer"
     with isolated_runner(schema, schema_terms, t2s, label="nm_hint_scope") as runner:
-        ent = summarize_failure_for_memory(
+        ent = TemplateOps.summarize_failure_for_memory(
             question=_FAILURE_Q_NORM,
             intent=intent,
             kind=FeedbackKind.VALIDATION_FAILURE,
             schema_hash="different-schema-hash",
             validator_errors=[_FAILURE_MESSAGE],
-            sql=sql,
         )
-        record_question_feedback(runner.store, _FAILURE_Q_NORM, ent)
-        rows = collect_question_feedback_for_prompt(
+        TemplateOps.record_question_feedback(runner.store, _FAILURE_Q_NORM, ent)
+        rows = TemplateOps.collect_question_feedback_for_prompt(
             runner.store, _FAILURE_Q_NORM, runner.schema.effective_structural_hash
         )
         assert rows == [], f"[NM-HINT-SCOPE] expected no hints; got {rows!r}"
@@ -87,7 +83,7 @@ def test_rejected_template_seeds_avoid_example(schema, schema_terms, t2s) -> Non
     """A seeded rejection shows up as an avoid-intent example for matching questions."""
     with isolated_runner(schema, schema_terms, t2s, label="nm_avoid") as runner:
         intent_avoid = intent_customer_first_names()
-        ish, _ = _compute_intent_structural_signature(intent_avoid)
+        ish, _ = TemplateOps._compute_intent_structural_signature(intent_avoid)
         rt = seed_rejected(
             runner,
             q_norm=_REJECT_Q_NORM,
@@ -95,7 +91,7 @@ def test_rejected_template_seeds_avoid_example(schema, schema_terms, t2s) -> Non
             sql="SELECT customer.customer_id, customer.first_name FROM customer",
             reason="seeded wrong-aggregation rejection",
         )
-        rows = collect_question_feedback_for_prompt(
+        rows = TemplateOps.collect_question_feedback_for_prompt(
             runner.store, _REJECT_Q_NORM, runner.schema.effective_structural_hash
         )
         assert rows, f"[NM-AVOID] expected >=1 feedback row for {rt.id!r}; got {rows!r}"
@@ -159,6 +155,28 @@ def test_negative_memory_penalty_caps_at_policy_limit(schema, schema_terms, t2s)
             repeats=20,
             q_norm=q_seed,
         )
-        pen = compute_question_feedback_penalty(runner.store, q_seed, runner.schema.effective_structural_hash)
+        pen = TemplateOps.compute_question_feedback_penalty(
+            runner.store, q_seed, runner.schema.effective_structural_hash
+        )
         _cap_msg = f"[NM-PENALTY-CAP] penalty exceeds cap: {pen} > {PolicyConfig.PENALTY_CAP}"
         assert pen <= PolicyConfig.PENALTY_CAP + 1e-9, _cap_msg
+
+
+@pytest.mark.needs_corpus
+@pytest.mark.live
+def test_intent_parse_collect_call_shape_uses_effective_hash(schema, schema_terms, t2s) -> None:
+    """Deferred live: ask-path feedback collection must scope to effective_structural_hash."""
+    intent = intent_customer_first_names()
+    with isolated_runner(schema, schema_terms, t2s, label="nm_call_shape") as runner:
+        seed_negative_memory(
+            runner,
+            intent=intent,
+            sql="SELECT customer.customer_id, customer.first_name FROM customer",
+            reason="seeded structural rejection for call-shape check",
+            q_norm=_FAILURE_Q_NORM,
+        )
+        eff = runner.schema.effective_structural_hash
+        graph_id = runner.schema.schema_graph_id
+        assert eff != graph_id
+        assert TemplateOps.collect_question_feedback_for_prompt(runner.store, _FAILURE_Q_NORM, eff)
+        assert TemplateOps.collect_question_feedback_for_prompt(runner.store, _FAILURE_Q_NORM, graph_id) == []

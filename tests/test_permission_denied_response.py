@@ -6,40 +6,41 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from aetherdialect._constants import PERMISSION_DENIED_USER_MESSAGE
-from aetherdialect._contracts_base import AccessError, SessionStep
+from aetherdialect._contracts_base import AccessError
 from aetherdialect._main_execution import (
+    MainExecutionOps,
     PipelineSession,
-    _run_sql_phase_after_intent_confirm,
 )
 
 
 class TestPermissionDeniedResponse:
     def test_completed_step_hides_sql_and_intent(self) -> None:
         owner = MagicMock()
-        owner._last_turn_outcome = {
+        owner._schema_graph = MagicMock()
+        owner._schema_graph.effective_structural_hash = "test_hash"
+        owner._store = {}
+        owner._templates = {}
+        owner._rejected = {}
+        owner._schema_terms = set()
+        owner._runtime_config = MagicMock(llm_execution=MagicMock())
+        owner._audit_emit = MagicMock()
+        owner._llm_config = MagicMock(provider="mock")
+        session = PipelineSession(owner)
+        session._last_turn_outcome = {
             "outcome": "permission_denied",
             "sql": "SELECT secret FROM t",
             "intent": MagicMock(),
         }
-        owner._turn_question = "q"
-        step_obj = SessionStep(
-            done=True,
-            prompt=None,
-            kind="result",
-            sql=None,
-            message=PERMISSION_DENIED_USER_MESSAGE,
-            status="permission_denied",
-        )
-        owner._mk_step = MagicMock(return_value=step_obj)
-        owner._audit_ask_emit = MagicMock()
-        step = PipelineSession._completed_step(owner)
+        session._turn_question = "q"
+        session._session_busy = True
+        step = session._completed_step()
         assert step.message == PERMISSION_DENIED_USER_MESSAGE
         assert step.sql is None
         assert step.data is None
         assert step.intent_summary is None
         assert step.status == "permission_denied"
 
-    def test_execute_access_error_notes_permission_denied_without_sql(self) -> None:
+    def test_execute_access_error_notes_validation_failed_without_sql(self) -> None:
         port = MagicMock()
         dialect = MagicMock()
         dialect.finalize_render.return_value = "SELECT 1"
@@ -59,7 +60,7 @@ class TestPermissionDeniedResponse:
             return_value=gen_out,
         ):
             with patch("aetherdialect._main_execution.note_interactive_turn") as note:
-                out = _run_sql_phase_after_intent_confirm(
+                out = MainExecutionOps._run_sql_phase_after_intent_confirm(
                     q_norm="q",
                     intent=intent,
                     schema=MagicMock(),
@@ -81,14 +82,14 @@ class TestPermissionDeniedResponse:
                 )
         assert out is None
         note.assert_called_once()
-        assert note.call_args.kwargs["outcome"] == "permission_denied"
+        assert note.call_args.kwargs["outcome"] == "validation_failed"
         assert note.call_args.kwargs["sql"] is None
         assert note.call_args.kwargs["intent"] is None
 
     def test_feedback_reject_reader_mode_emits_queue_not_inline_save(self, monkeypatch) -> None:
-        from aetherdialect._constants import GenerationPath
         from aetherdialect._contracts_base import NormalizedExpr
         from aetherdialect._contracts_core import (
+            GenerationPath,
             RuntimeIntent,
             SelectCol,
         )
@@ -105,7 +106,7 @@ class TestPermissionDeniedResponse:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         ctx = MagicMock()
         ctx.intent = intent

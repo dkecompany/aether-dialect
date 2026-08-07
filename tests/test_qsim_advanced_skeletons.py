@@ -5,8 +5,8 @@ from __future__ import annotations
 from dataclasses import replace
 
 from aetherdialect._contracts_base import DatabaseFeatureCapability
-from aetherdialect._contracts_schema import QSimFilter, QSimIntent, QSimSkeleton
-from aetherdialect._qsim_ops import (
+from aetherdialect._contracts_schema import QSimIntent, QSimSkeleton, QSimWhereParam
+from aetherdialect._qsim import (
     _qsim_advanced_slot_detected,
     _skeleton_suitable_for_advanced,
     append_advanced_skeleton_variants,
@@ -39,7 +39,7 @@ class TestAdvancedSkeletonVariants:
         base = QSimSkeleton(
             tables=["t1"],
             has_aggregation=False,
-            num_filters=1,
+            num_where=1,
             num_groupby=0,
             has_orderby=False,
             num_having=0,
@@ -55,13 +55,13 @@ class TestAdvancedSkeletonVariants:
         sk = QSimSkeleton(
             tables=["t1"],
             has_aggregation=True,
-            num_filters=0,
+            num_where=0,
             num_groupby=1,
             has_orderby=False,
             num_having=0,
         )
         assert _skeleton_suitable_for_advanced(sk, "distinct_select") is False
-        sk2 = replace(sk, has_aggregation=False, num_groupby=0, num_filters=1)
+        sk2 = replace(sk, has_aggregation=False, num_groupby=0, num_where=1)
         assert _skeleton_suitable_for_advanced(sk2, "distinct_select") is True
 
 
@@ -74,7 +74,7 @@ class TestAdvancedSlotDetection:
             select_cols=["t1.a"],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=[],
             having_param=[],
             distinct=True,
         )
@@ -88,8 +88,8 @@ class TestAdvancedSlotDetection:
             select_cols=["t1.a"],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                QSimFilter(column="t1.created_at", op=">=", value_type="temporal"),
+            where=[
+                QSimWhereParam(column="t1.created_at", op=">=", value_type="temporal"),
             ],
             having_param=[],
         )

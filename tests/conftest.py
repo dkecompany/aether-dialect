@@ -1,22 +1,25 @@
 """Shared fixtures for aetherdialect test suite."""
 
 import os
+from pathlib import Path
 from typing import Any
 
 import pytest
 
+from aetherdialect._config import DuckDBRuntimeConfig
 from aetherdialect._contracts_base import (
     ColumnRole,
-    FilterParam,
+    EngineIdentity,
     NormalizedExpr,
+    PredicateGroup,
     TableRole,
+    WhereParam,
 )
 from aetherdialect._contracts_core import (
     RuntimeIntent,
     SelectCol,
     Template,
     ValueHistory,
-    runtime_intent_to_concrete,
 )
 from aetherdialect._contracts_schema import (
     ColumnMetadata,
@@ -27,6 +30,32 @@ from aetherdialect._contracts_schema import (
     TemplateStats,
 )
 from aetherdialect._schema_catalog import assign_column_ops
+
+
+def duckdb_engine_identity() -> EngineIdentity:
+    """DuckDB identity for federation runtime binding tests."""
+    return EngineIdentity("duckdb", DuckDBRuntimeConfig)
+
+
+@pytest.fixture(autouse=True)
+def _default_engine_identity() -> Any:
+    """Bind a default engine identity for tests that call pipeline helpers directly."""
+    from aetherdialect._config import EngineConfig
+    from aetherdialect._core_utils import pop_engine_identity, push_engine_identity
+
+    token = push_engine_identity(EngineIdentity(EngineConfig.TYPE, EngineConfig.RUNTIME))
+    yield
+    pop_engine_identity(token)
+
+
+@pytest.fixture
+def unbound_engine_identity() -> Any:
+    """Clear the autouse engine identity so unbound-path assertions can run."""
+    from aetherdialect._core_utils import _ACTIVE_ENGINE_IDENTITY
+
+    token = _ACTIVE_ENGINE_IDENTITY.set(None)
+    yield
+    _ACTIVE_ENGINE_IDENTITY.reset(token)
 
 
 def _term_str(term: Any) -> str:
@@ -108,6 +137,8 @@ _SANDBOX_BUNDLE_MODULES = frozenset(
         "test_sandbox_recording_toml.py",
         "test_sandbox_recording_trace.py",
         "test_sandbox_tail_capture.py",
+        "test_aetherspace.py",
+        "test_doc_examples_smoke.py",
     }
 )
 
@@ -116,6 +147,14 @@ _EXECUTE_STEP_SANDBOX_TESTS = frozenset(
         "test_happy_path_returns_rows",
         "test_forbidden_statement_rejected_before_execute",
         "test_consumer_out_of_scope_blocked",
+    }
+)
+
+_SANDBOX_AUTHORING_NO_CORPUS_TESTS = frozenset(
+    {
+        "test_unrecorded_question_in_recorded_corpus_mode_names_mode",
+        "test_sandbox_guide_documents_engine_session_mode_as_primary_entry",
+        "test_api_reference_documents_sandbox_authoring_surface",
     }
 )
 
@@ -144,8 +183,10 @@ def _is_live_test(item: pytest.Item) -> bool:
     return "live_tests" in parts
 
 
-def _requires_sandbox_bundle(item: pytest.Item) -> bool:
+def _requires_corpus_bundle(item: pytest.Item) -> bool:
     """Return True when the test needs bundled ``sandbox/data.zip`` (``offline_sandbox`` corpus)."""
+    if item.get_closest_marker("needs_corpus") is not None:
+        return True
     if item.get_closest_marker("requires_sandbox") is not None:
         return True
     fspath = getattr(item, "path", None) or getattr(item, "fspath", None)
@@ -153,21 +194,44 @@ def _requires_sandbox_bundle(item: pytest.Item) -> bool:
     if mod in _SANDBOX_BUNDLE_MODULES:
         return True
     base_name = item.name.split("[", 1)[0]
+    if mod == "test_sandbox_authoring.py" and base_name not in _SANDBOX_AUTHORING_NO_CORPUS_TESTS:
+        return True
     if mod == "test_execute_step.py" and base_name in _EXECUTE_STEP_SANDBOX_TESTS:
         return True
     return mod == "test_sql_gen.py" and base_name == "test_rental_shop_category_film_emits_non_empty_join_path"
 
 
 def _sandbox_bundle_ready() -> bool:
-    """Return True when bundled ``sandbox/data.zip`` is present and passes ``sandbox_doctor()``."""
-    from aetherdialect._sandbox import data_zip_path, sandbox_doctor
+    """Return True when bundled ``sandbox/data.zip`` is present and passes ``Sandbox.sandbox_doctor()``."""
+    from aetherdialect._sandbox import Sandbox
 
-    if not data_zip_path().is_file():
+    if not Sandbox.data_zip_path().is_file():
         return False
     try:
-        return sandbox_doctor() == []
+        return Sandbox.sandbox_doctor() == []
     except Exception:
         return False
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_cwd_schema_migration_map() -> Any:
+    """Remove migration map files left in the repo cwd by ``apply_migration_map`` demos."""
+    cwd = Path.cwd()
+    paths = (
+        cwd / "schema_migration_map.json",
+        cwd / "schema_migration_map.applied.json",
+        cwd / "federation_migration_map.json",
+        cwd / "federation_migration_map.applied.json",
+    )
+    for path in paths:
+        path.unlink(missing_ok=True)
+    for path in cwd.glob("federation_migration_map.applied.*.json"):
+        path.unlink(missing_ok=True)
+    yield
+    for path in paths:
+        path.unlink(missing_ok=True)
+    for path in cwd.glob("federation_migration_map.applied.*.json"):
+        path.unlink(missing_ok=True)
 
 
 @pytest.fixture
@@ -183,22 +247,18 @@ def stub_schema_llm_classifier(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     sandbox_ready = _sandbox_bundle_ready()
-    skip_sandbox = pytest.mark.skip(reason="sandbox data.zip not ready")
+    skip_corpus = pytest.mark.skip(reason="needs_corpus: bundled sandbox data.zip absent")
     for item in items:
         if _is_live_test(item):
             continue
-        if _requires_sandbox_bundle(item):
-            item.add_marker(pytest.mark.requires_sandbox)
+        if _requires_corpus_bundle(item):
+            item.add_marker(pytest.mark.needs_corpus)
             if not sandbox_ready:
-                item.add_marker(skip_sandbox)
+                item.add_marker(skip_corpus)
             elif not _is_slow_sandbox_test(item):
                 item.add_marker(pytest.mark.fast)
         elif not _is_slow_sandbox_test(item):
             item.add_marker(pytest.mark.fast)
-
-
-def pytest_configure(config: Any) -> None:
-    config.addinivalue_line("markers", "integration: mocked multi-module pipeline slices")
 
 
 def pytest_runtest_logreport(report: pytest.TestReport) -> None:
@@ -227,7 +287,7 @@ def _reset_engine_config_after_test() -> None:
         QSimConfig,
     )
     from aetherdialect._constants import ENGINE_STORAGE_PLACEHOLDER_DIR, TEMPLATE_STORE_SEGMENT
-    from aetherdialect._llm_provider import reset_mock_provider
+    from aetherdialect._llm_provider import MockProvider
 
     EngineConfig.TYPE = "postgresql"
     EngineConfig.RUNTIME = PostgresRuntimeConfig
@@ -235,7 +295,14 @@ def _reset_engine_config_after_test() -> None:
     EngineConfig.TEMPLATE_STORE_DIR = os.path.join(ENGINE_STORAGE_PLACEHOLDER_DIR, TEMPLATE_STORE_SEGMENT)
     EngineConfig.LLM_PROVIDER = "openai"
     EngineConfig.MOCK_FIXTURES_FILE = ""
-    reset_mock_provider()
+    # Credential ClassVars are mutated by tests/init; restore from the live process env
+    # after monkeypatch teardown so a prior test's sk-test token cannot force live LLM calls.
+    EngineConfig.API_TOKEN = os.environ.get("OPENAI_API_KEY")
+    EngineConfig.AZURE_API_TOKEN = os.environ.get("AZURE_OPENAI_API_KEY")
+    EngineConfig.AZURE_OPENAI_BASE_URL = os.environ.get("AZURE_OPENAI_BASE_URL")
+    EngineConfig.AZURE_OPENAI_ENDPOINT = os.environ.get("AZURE_OPENAI_ENDPOINT")
+    EngineConfig.AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION")
+    MockProvider.reset_mock_provider()
     QSimConfig.SKELETONS_JSON_PATH = os.path.join(ENGINE_STORAGE_PLACEHOLDER_DIR, "qsim_skeletons.json.gz")
 
 
@@ -462,7 +529,7 @@ def minimal_intent() -> RuntimeIntent:
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
+        where=None,
     )
 
 
@@ -478,16 +545,18 @@ def grouped_intent() -> RuntimeIntent:
         ],
         group_by_cols=[NormalizedExpr.from_column("customers.name")],
         order_by_cols=[],
-        filters_param=[
-            FilterParam(
-                left_expr=NormalizedExpr.from_column("orders.status"),
-                op="=",
-                value_type="string",
-                param_key="p1",
-                raw_value="shipped",
-            ),
-        ],
-        having_param=[],
+        where=PredicateGroup.from_list(
+            [
+                WhereParam(
+                    left_expr=NormalizedExpr.from_column("orders.status"),
+                    op="=",
+                    value_type="string",
+                    param_key="p1",
+                    raw_value="shipped",
+                ),
+            ]
+        ),
+        having=None,
         param_values={"p1": "shipped"},
         column_map={"name": "customers", "amount": "orders", "status": "orders"},
     )
@@ -499,7 +568,7 @@ def sample_template(grouped_intent) -> Template:
     return Template(
         id="T0001",
         effective_structural_hash="test_hash_abc123",
-        intent_signature=runtime_intent_to_concrete(grouped_intent, "test_id"),
+        intent_signature=grouped_intent.to_concrete("test_id"),
         intent_key="test_intent_key_hash",
         tables_used=["customers", "orders"],
         sql_param="SELECT customers.name, SUM(orders.amount) FROM orders JOIN customers ON orders.customer_id = customers.customer_id WHERE orders.status = :p1 GROUP BY customers.name",
@@ -696,3 +765,11 @@ def typed_schema() -> SchemaGraph:
     )
     assign_column_ops(sg)
     return sg
+
+
+@pytest.fixture
+def two_member_federation():
+    """Two-member duckdb federation with a declared cross-source join on ``id``."""
+    from tests.federation_helpers import build_two_member_federation
+
+    return build_two_member_federation()

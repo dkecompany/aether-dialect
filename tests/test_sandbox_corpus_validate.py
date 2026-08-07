@@ -8,21 +8,24 @@ from types import SimpleNamespace
 
 from aetherdialect._contracts_base import NormalizedExpr
 from aetherdialect._contracts_core import RuntimeCteStep, RuntimeIntent, SelectCol
-from aetherdialect._sandbox import check_sandbox_faithfulness, question_ok
+from aetherdialect._sandbox import Sandbox
+
+check_sandbox_faithfulness = Sandbox.check_sandbox_faithfulness
+question_ok = Sandbox.question_ok
 
 
 def test_question_ok_success_step_has_no_status() -> None:
     step = SimpleNamespace(done=True, sql="SELECT 1", status=None, error=None, message=None, intent=None)
-    assert question_ok(step, "How many items are in the catalog by item type?")
+    assert Sandbox.question_ok(step, "How many items are in the catalog by item type?")
     ok_step = SimpleNamespace(done=True, sql="SELECT 1", status="ok", error=None, message=None)
     bad_step = SimpleNamespace(done=True, sql=None, status="ok", error=None, message=None)
-    assert question_ok(ok_step, "How many customers are there?")
-    assert not question_ok(bad_step, "How many customers are there?")
+    assert Sandbox.question_ok(ok_step, "How many customers are there?")
+    assert not Sandbox.question_ok(bad_step, "How many customers are there?")
 
 
 def test_question_ok_allows_no_sql_for_weather_tour_question() -> None:
     step = SimpleNamespace(done=True, sql=None, error="rejected", status="invalid_question", message=None)
-    assert question_ok(step, "What's the weather today?")
+    assert Sandbox.question_ok(step, "What's the weather today?")
 
 
 def test_question_ok_json_validation_failure() -> None:
@@ -33,7 +36,7 @@ def test_question_ok_json_validation_failure() -> None:
         error="permission denied",
         message=None,
     )
-    assert question_ok(step, "How many items are there?")
+    assert Sandbox.question_ok(step, "How many items are there?")
 
 
 def test_faithfulness_gate_rejects_missing_bridge_table() -> None:
@@ -46,7 +49,7 @@ def test_faithfulness_gate_rejects_missing_bridge_table() -> None:
         message=None,
         intent=intent,
     )
-    detail = check_sandbox_faithfulness(step, "Which games support English?")
+    detail = Sandbox.check_sandbox_faithfulness(step, "Which games support English?")
     assert detail is not None
     assert "game_supported_language" in detail
 
@@ -58,7 +61,7 @@ def test_faithfulness_passes_when_required_tables_in_cte_or_sql() -> None:
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("city.name"))],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
+        where=None,
         cte_steps=[
             RuntimeCteStep(
                 cte_name="ranked_cities",
@@ -77,7 +80,7 @@ def test_faithfulness_passes_when_required_tables_in_cte_or_sql() -> None:
         message=None,
         intent=intent,
     )
-    assert check_sandbox_faithfulness(step, "Which city has the most customers?") is None
+    assert Sandbox.check_sandbox_faithfulness(step, "Which city has the most customers?") is None
 
 
 def test_question_ok_consumer_staff_expects_ok() -> None:
@@ -89,7 +92,7 @@ def test_question_ok_consumer_staff_expects_ok() -> None:
         message=None,
         intent=None,
     )
-    assert question_ok(
+    assert Sandbox.question_ok(
         step,
         "Show active staff at each store.",
         profile="consumer_reader",
@@ -106,7 +109,7 @@ def test_question_ok_owner_staff_expects_ok() -> None:
         message=None,
         intent=None,
     )
-    assert question_ok(
+    assert Sandbox.question_ok(
         step,
         "Show active staff at each store.",
         profile="owner_writer",
@@ -115,15 +118,15 @@ def test_question_ok_owner_staff_expects_ok() -> None:
 
 
 def test_expectation_index_resolves_profile_tier() -> None:
-    from aetherdialect._sandbox import _expectation_payload_for_context
+    from aetherdialect._sandbox import Sandbox
 
     question = "Show active staff at each store."
-    owner = _expectation_payload_for_context(
+    owner = Sandbox._expectation_payload_for_context(
         question,
         profile="owner_writer",
         tier="questions",
     )
-    consumer = _expectation_payload_for_context(
+    consumer = Sandbox._expectation_payload_for_context(
         question,
         profile="consumer_reader",
         tier="consumer_reader",

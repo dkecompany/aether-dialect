@@ -5,11 +5,12 @@ import pytest
 from aetherdialect._contracts_base import (
     ColumnRole,
     FailureCategory,
-    FilterParam,
     HavingParam,
     MulGroup,
     NormalizedExpr,
     OrderByCol,
+    PredicateGroup,
+    WhereParam,
 )
 from aetherdialect._contracts_core import (
     RuntimeCteStep,
@@ -26,13 +27,12 @@ from aetherdialect._contracts_schema import (
     TableMetadata,
     WindowRegistryStep,
     WindowSpec,
-    registry_render_scope,
 )
 from aetherdialect._validation_schema import (
     _validate_agg_func_valid,
-    _validate_filter_col,
     _validate_having_agg,
     _validate_scalar_func_valid,
+    _validate_where_col,
     extract_agg_col,
     extract_col_from_scalar_wrapper,
     extract_functions_from_term,
@@ -46,8 +46,6 @@ from aetherdialect._validation_schema import (
     validate_date_diff_units,
     validate_date_window_units,
     validate_expr_no_extract_epoch,
-    validate_filter_ops_per_column,
-    validate_filter_value_type_alignment,
     validate_filters_schema,
     validate_group_by_cols_schema,
     validate_having_ops_per_column,
@@ -58,6 +56,8 @@ from aetherdialect._validation_schema import (
     validate_redundant_extract_year_column_literals,
     validate_select_cols_schema,
     validate_selectability,
+    validate_where_ops_per_column,
+    validate_where_value_type_alignment,
     validate_window_partition_group_by_alignment,
     validate_window_spec_schema,
 )
@@ -134,7 +134,7 @@ class TestValidateAggFuncValid:
 
     def test_invalid_agg(self):
         """Error for unknown aggregation function."""
-        issues = _validate_agg_func_valid("median", "test", "select")
+        issues = _validate_agg_func_valid("mode", "test", "select")
         assert len(issues) == 1
         assert issues[0].severity == "error"
 
@@ -328,7 +328,7 @@ class TestValidateSelectColsSchema:
         assert any("empty" in i.message.lower() for i in issues)
 
     def test_invalid_agg_on_select(self, simple_schema):
-        expr = NormalizedExpr(add_groups=[MulGroup(multiply=["customers.id"], agg_func="median")])
+        expr = NormalizedExpr(add_groups=[MulGroup(multiply=["customers.id"], agg_func="mode")])
         sc = SelectCol(expr=expr)
         issues = validate_select_cols_schema([sc], simple_schema, {"customers", "orders"})
         assert any("Invalid aggregation" in i.message for i in issues)
@@ -440,7 +440,7 @@ class TestValidateFiltersSchema:
 
     def test_valid_filter(self, simple_schema):
         """No issues for valid filter."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("customers.name"),
             op="=",
             value_type="string",
@@ -451,7 +451,7 @@ class TestValidateFiltersSchema:
 
     def test_filter_cleared_raw_value_ok_when_param_bound(self, simple_schema):
         """Post-binding ``param_values`` satisfies FILTER when ``raw_value`` is cleared."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("customers.name"),
             op="=",
             value_type="string",
@@ -469,7 +469,7 @@ class TestValidateFiltersSchema:
 
     def test_invalid_op(self, simple_schema):
         """Error for invalid filter operator."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("customers.name"),
             op="<=>",
             value_type="string",
@@ -484,11 +484,10 @@ class TestValidateFiltersSchema:
 
     def test_valid_bool_op_and(self, simple_schema):
         """No issues for filter with bool_op 'AND'."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("customers.name"),
             op="=",
             value_type="string",
-            bool_op="AND",
         )
         issues = validate_filters_schema([fp], simple_schema, {"customers"})
         bool_op_issues = [i for i in issues if "bool_op" in i.message]
@@ -496,30 +495,27 @@ class TestValidateFiltersSchema:
 
     def test_valid_bool_op_or(self, simple_schema):
         """No issues for filter with bool_op 'OR'."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("customers.name"),
             op="=",
             value_type="string",
-            bool_op="OR",
         )
         issues = validate_filters_schema([fp], simple_schema, {"customers"})
         bool_op_issues = [i for i in issues if "bool_op" in i.message]
         assert len(bool_op_issues) == 0
 
     def test_invalid_bool_op_raises_issue(self, simple_schema):
-        fp = FilterParam.__new__(FilterParam)
-        object.__setattr__(fp, "left_expr", NormalizedExpr.from_column("customers.name"))
-        object.__setattr__(fp, "op", "=")
-        object.__setattr__(fp, "value", None)
-        object.__setattr__(fp, "value_type", "string")
-        object.__setattr__(fp, "scalar_func", None)
-        object.__setattr__(fp, "bool_op", "XOR")
-        object.__setattr__(fp, "filter_group", None)
+        """Leaf params no longer carry bool_op; schema validation ignores removed fields."""
+        fp = WhereParam(
+            left_expr=NormalizedExpr.from_column("customers.name"),
+            op="=",
+            value_type="string",
+        )
         issues = validate_filters_schema([fp], simple_schema, {"customers"})
-        assert any("bool_op" in i.message for i in issues)
+        assert not any("bool_op" in i.message for i in issues)
 
     def test_invalid_value_type_when_literal_filter(self, simple_schema):
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("customers.name"),
             op="=",
             value_type="not_a_valid_value_type",
@@ -528,7 +524,7 @@ class TestValidateFiltersSchema:
         assert any("Invalid filter value_type" in i.message for i in issues)
 
     def test_is_null_skips_value_type_validation_in_filters_schema(self, simple_schema):
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("customers.name"),
             op="is null",
             value_type="garbage",
@@ -537,7 +533,7 @@ class TestValidateFiltersSchema:
         assert not any("Invalid filter value_type" in i.message for i in issues)
 
     def test_right_expr_validated(self, simple_schema):
-        fp = FilterParam.__new__(FilterParam)
+        fp = WhereParam.__new__(WhereParam)
         object.__setattr__(fp, "left_expr", NormalizedExpr.from_column("customers.name"))
         object.__setattr__(fp, "right_expr", NormalizedExpr.from_column("orders.badcol"))
         object.__setattr__(fp, "op", "=")
@@ -546,7 +542,7 @@ class TestValidateFiltersSchema:
         object.__setattr__(fp, "raw_value", None)
         object.__setattr__(fp, "param_key", "")
         object.__setattr__(fp, "bool_op", "AND")
-        object.__setattr__(fp, "filter_group", None)
+        object.__setattr__(fp, "where_group", None)
         issues = validate_filters_schema([fp], simple_schema, {"customers", "orders"})
         assert any("right_col" in i.issue_id and "not in table" in i.message for i in issues)
 
@@ -556,7 +552,7 @@ class TestValidateFiltersSchema:
             scalar_func="extract",
             scalar_func_args=["epoch", "e"],
         )
-        fp = FilterParam(left_expr=left, op=">", value_type="integer")
+        fp = WhereParam(left_expr=left, op=">", value_type="integer")
         issues = validate_filters_schema([fp], simple_schema, {"customers"})
         assert any(i.category == "extract_epoch" for i in issues)
 
@@ -580,7 +576,6 @@ class TestValidateHavingSchema:
             left_expr=NormalizedExpr(add_groups=[MulGroup(coefficient=1.0, multiply=["COUNT(customers.id)"])]),
             op=">",
             value_type="integer",
-            bool_op="OR",
             raw_value=5,
         )
         issues = validate_having_schema([hp], simple_schema, {"customers"})
@@ -588,20 +583,14 @@ class TestValidateHavingSchema:
         assert len(bool_op_issues) == 0
 
     def test_invalid_having_bool_op_raises_issue(self, simple_schema):
-        hp = HavingParam.__new__(HavingParam)
-        object.__setattr__(
-            hp,
-            "left_expr",
-            NormalizedExpr(add_groups=[MulGroup(coefficient=1.0, multiply=["COUNT(customers.id)"])]),
+        """Leaf params no longer carry bool_op; schema validation ignores removed fields."""
+        hp = HavingParam(
+            left_expr=NormalizedExpr(add_groups=[MulGroup(coefficient=1.0, multiply=["COUNT(customers.id)"])]),
+            op=">",
+            value_type="integer",
         )
-        object.__setattr__(hp, "op", ">")
-        object.__setattr__(hp, "value", None)
-        object.__setattr__(hp, "value_type", "integer")
-        object.__setattr__(hp, "scalar_func", None)
-        object.__setattr__(hp, "bool_op", "NAND")
-        object.__setattr__(hp, "filter_group", None)
         issues = validate_having_schema([hp], simple_schema, {"customers"})
-        assert any("bool_op" in i.message for i in issues)
+        assert not any("bool_op" in i.message for i in issues)
 
     def test_having_missing_raw_value_emits_error(self, simple_schema):
         """HavingParam with no raw_value and no right_expr emits having_missing_value error."""
@@ -682,13 +671,13 @@ class TestValidateNullFilters:
 
     def test_valid_null_filter(self):
         """No issues for IS NULL with null value_type."""
-        fp = FilterParam(left_expr=NormalizedExpr.from_column("t.a"), op="is null", value_type="null")
+        fp = WhereParam(left_expr=NormalizedExpr.from_column("t.a"), op="is null", value_type="null")
         issues = validate_null_filters([fp])
         assert len(issues) == 0
 
     def test_null_filter_wrong_value_type(self):
         """Error for IS NULL with non-null value_type."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op="is null",
             value_type="string",
@@ -699,74 +688,76 @@ class TestValidateNullFilters:
 
     def test_non_null_filter_no_issue(self):
         """No issues for non-null filter with any value_type."""
-        fp = FilterParam(left_expr=NormalizedExpr.from_column("t.a"), op="=", value_type="string")
+        fp = WhereParam(left_expr=NormalizedExpr.from_column("t.a"), op="=", value_type="string")
         issues = validate_null_filters([fp])
         assert len(issues) == 0
 
     def test_cte_filter_included(self):
         cte = RuntimeCteStep(
             cte_name="s1",
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("t.a"),
-                    op="is null",
-                    value_type="string",
-                ),
-            ],
+            where=PredicateGroup.from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("t.a"),
+                        op="is null",
+                        value_type="string",
+                    ),
+                ]
+            ),
         )
         issues = validate_null_filters([], cte_steps=[cte])
         assert len(issues) == 1
 
     def test_is_null_with_empty_value_type_ok(self):
-        fp = FilterParam(left_expr=NormalizedExpr.from_column("t.a"), op="is not null", value_type="")
+        fp = WhereParam(left_expr=NormalizedExpr.from_column("t.a"), op="is not null", value_type="")
         assert validate_null_filters([fp]) == []
 
 
 class TestValidateFilterOpsPerColumn:
-    """Tests for validate_filter_ops_per_column."""
+    """Tests for validate_where_ops_per_column."""
 
     def test_valid_op_passes(self, simple_schema):
-        """validate_filter_ops_per_column no issues for valid op."""
-        fp = FilterParam(
+        """validate_where_ops_per_column no issues for valid op."""
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("customers.name"),
             op="=",
             value_type="string",
         )
-        issues = validate_filter_ops_per_column([fp], simple_schema)
+        issues = validate_where_ops_per_column([fp], simple_schema)
         assert len(issues) == 0
 
     def test_invalid_op_errors(self, simple_schema):
-        """validate_filter_ops_per_column errors for invalid op."""
-        fp = FilterParam(
+        """validate_where_ops_per_column errors for invalid op."""
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("customers.id"),
             op="like",
             value_type="string",
         )
-        issues = validate_filter_ops_per_column([fp], simple_schema)
+        issues = validate_where_ops_per_column([fp], simple_schema)
         error_issues = [i for i in issues if i.severity == "error"]
         assert len(error_issues) >= 1
 
     def test_empty_filters_no_issues(self, simple_schema):
-        """validate_filter_ops_per_column returns empty for no filters."""
-        assert validate_filter_ops_per_column([], simple_schema) == []
+        """validate_where_ops_per_column returns empty for no filters."""
+        assert validate_where_ops_per_column([], simple_schema) == []
 
     def test_cte_column_restricted_ops(self, simple_schema):
         cte = {
             "c": {
                 "x": CteOutputColumnMeta(
                     source="computed",
-                    valid_filter_ops=["="],
+                    valid_where_ops=["="],
                     data_type="varchar",
                     role=ColumnRole.CATEGORICAL.value,
                 ),
             },
         }
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("c.x"),
             op="like",
             value_type="string",
         )
-        issues = validate_filter_ops_per_column([fp], simple_schema, cte_outputs=cte)
+        issues = validate_where_ops_per_column([fp], simple_schema, cte_outputs=cte)
         assert any("not valid for CTE column" in i.message for i in issues)
 
     def test_cte_not_filterable_warns(self, simple_schema):
@@ -775,55 +766,55 @@ class TestValidateFilterOpsPerColumn:
                 "x": CteOutputColumnMeta(source="computed", filterable=False, data_type="varchar"),
             },
         }
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("c.x"),
             op="=",
             value_type="string",
         )
-        issues = validate_filter_ops_per_column([fp], simple_schema, cte_outputs=cte)
+        issues = validate_where_ops_per_column([fp], simple_schema, cte_outputs=cte)
         assert any(i.severity == "warning" for i in issues)
 
     def test_base_column_not_filterable_warns(self, typed_schema):
         typed_schema.tables["customers"].columns["name"].is_filterable_override = False
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("customers.name"),
             op="=",
             value_type="string",
         )
-        issues = validate_filter_ops_per_column([fp], typed_schema)
+        issues = validate_where_ops_per_column([fp], typed_schema)
         assert any("not recommended for filtering" in i.message for i in issues)
 
 
 class TestValidateFilterCol:
-    """Tests for _validate_filter_col."""
+    """Tests for _validate_where_col."""
 
     def test_empty_expr_no_issues(self, simple_schema):
         """No issues for empty column expression."""
-        issues = _validate_filter_col("", simple_schema, {"customers"}, {}, "main", "left_col", "pk1")
+        issues = _validate_where_col("", simple_schema, {"customers"}, {}, "main", "left_col", "pk1")
         assert len(issues) == 0
 
     def test_unqualified_column(self, simple_schema):
         """Error for unqualified column reference."""
-        issues = _validate_filter_col("name", simple_schema, {"customers"}, {}, "main", "left_col", "pk1")
+        issues = _validate_where_col("name", simple_schema, {"customers"}, {}, "main", "left_col", "pk1")
         assert len(issues) == 1
         assert issues[0].severity == "error"
         assert "qualified" in issues[0].message
 
     def test_table_not_allowed(self, simple_schema):
         """Error when table not in allowed set."""
-        issues = _validate_filter_col("orders.amount", simple_schema, {"customers"}, {}, "main", "left_col", "pk1")
+        issues = _validate_where_col("orders.amount", simple_schema, {"customers"}, {}, "main", "left_col", "pk1")
         assert len(issues) == 1
         assert "not in allowed" in issues[0].message
 
     def test_table_not_in_schema(self, simple_schema):
         """Error when table not in schema."""
-        issues = _validate_filter_col("products.name", simple_schema, {"products"}, {}, "main", "left_col", "pk1")
+        issues = _validate_where_col("products.name", simple_schema, {"products"}, {}, "main", "left_col", "pk1")
         assert len(issues) == 1
         assert "not in schema" in issues[0].message
 
     def test_column_not_found(self, simple_schema):
         """Error when column not found in table."""
-        issues = _validate_filter_col(
+        issues = _validate_where_col(
             "customers.nonexistent",
             simple_schema,
             {"customers"},
@@ -837,7 +828,7 @@ class TestValidateFilterCol:
 
     def test_valid_column(self, simple_schema):
         """No issues for valid qualified column."""
-        issues = _validate_filter_col(
+        issues = _validate_where_col(
             "customers.name",
             simple_schema,
             {"customers"},
@@ -851,7 +842,7 @@ class TestValidateFilterCol:
     def test_cte_column_found(self, simple_schema):
         """No issues for valid CTE column reference."""
         cte_outputs = {"cte1": {"total": CteOutputColumnMeta(source="computed")}}
-        issues = _validate_filter_col(
+        issues = _validate_where_col(
             "cte1.total",
             simple_schema,
             {"customers"},
@@ -865,7 +856,7 @@ class TestValidateFilterCol:
     def test_cte_column_not_found(self, simple_schema):
         """Error when column not found in CTE outputs."""
         cte_outputs = {"cte1": {"total": CteOutputColumnMeta(source="computed")}}
-        issues = _validate_filter_col(
+        issues = _validate_where_col(
             "cte1.missing",
             simple_schema,
             {"customers"},
@@ -879,7 +870,7 @@ class TestValidateFilterCol:
 
     def test_scalar_wrapped_column(self, simple_schema):
         """Validate inner column when wrapped in scalar function."""
-        issues = _validate_filter_col(
+        issues = _validate_where_col(
             "ABS(customers.balance)",
             simple_schema,
             {"customers"},
@@ -892,7 +883,7 @@ class TestValidateFilterCol:
 
     def test_right_side_param(self, simple_schema):
         """Side parameter reflected in issue IDs."""
-        issues = _validate_filter_col("name", simple_schema, {"customers"}, {}, "main", "right_col", "pk1")
+        issues = _validate_where_col("name", simple_schema, {"customers"}, {}, "main", "right_col", "pk1")
         assert "right_col" in issues[0].issue_id
 
 
@@ -921,7 +912,7 @@ class TestValidateHavingAgg:
     def test_invalid_agg_func(self, simple_schema):
         """Error for invalid aggregation function."""
         issues = _validate_having_agg(
-            "MEDIAN(customers.balance)",
+            "MODE(customers.balance)",
             simple_schema,
             {"customers"},
             {},
@@ -1075,12 +1066,12 @@ class TestValidateHavingAgg:
 
 
 class TestValidateFilterColEdgeCases:
-    """Edge-case tests for _validate_filter_col."""
+    """Edge-case tests for _validate_where_col."""
 
     def test_cte_case_insensitive_match(self, simple_schema):
         """CTE column match is case-insensitive."""
         cte_outputs = {"cte1": {"Total": CteOutputColumnMeta(source="computed")}}
-        issues = _validate_filter_col(
+        issues = _validate_where_col(
             "cte1.total",
             simple_schema,
             {"customers"},
@@ -1093,7 +1084,7 @@ class TestValidateFilterColEdgeCases:
 
     def test_dotted_table_name(self, simple_schema):
         """Handles table.column split correctly."""
-        issues = _validate_filter_col("customers.id", simple_schema, {"customers"}, {}, "main", "left_col", "pk1")
+        issues = _validate_where_col("customers.id", simple_schema, {"customers"}, {}, "main", "left_col", "pk1")
         assert len(issues) == 0
 
 
@@ -1130,7 +1121,7 @@ class TestValidateHavingAggEdgeCases:
     def test_right_side_param(self, simple_schema):
         """Side parameter reflected in issues."""
         issues = _validate_having_agg(
-            "MEDIAN(customers.balance)",
+            "MODE(customers.balance)",
             simple_schema,
             {"customers"},
             {},
@@ -1212,74 +1203,74 @@ class TestValidateFilterValueTypeAlignment:
 
     def test_string_on_fk_int_warns(self, fk_schema):
         filters = [
-            FilterParam(
+            WhereParam(
                 left_expr=NormalizedExpr.from_column("orders.category_id"),
                 op="=",
                 value_type="string",
                 raw_value="Action",
             ),
         ]
-        issues = validate_filter_value_type_alignment(filters, fk_schema)
+        issues = validate_where_value_type_alignment(filters, fk_schema)
         assert len(issues) == 1
         assert issues[0].severity == "warning"
 
     def test_integer_on_fk_int_no_issue(self, fk_schema):
         filters = [
-            FilterParam(
+            WhereParam(
                 left_expr=NormalizedExpr.from_column("orders.category_id"),
                 op="=",
                 value_type="integer",
                 raw_value=5,
             ),
         ]
-        issues = validate_filter_value_type_alignment(filters, fk_schema)
+        issues = validate_where_value_type_alignment(filters, fk_schema)
         assert issues == []
 
     def test_string_on_string_col_no_issue(self, fk_schema):
         filters = [
-            FilterParam(
+            WhereParam(
                 left_expr=NormalizedExpr.from_column("orders.status"),
                 op="=",
                 value_type="string",
                 raw_value="shipped",
             ),
         ]
-        issues = validate_filter_value_type_alignment(filters, fk_schema)
+        issues = validate_where_value_type_alignment(filters, fk_schema)
         assert issues == []
 
     def test_no_raw_value_no_issue(self, fk_schema):
         filters = [
-            FilterParam(
+            WhereParam(
                 left_expr=NormalizedExpr.from_column("orders.category_id"),
                 op="is null",
                 value_type="string",
             ),
         ]
-        issues = validate_filter_value_type_alignment(filters, fk_schema)
+        issues = validate_where_value_type_alignment(filters, fk_schema)
         assert issues == []
 
     def test_unknown_column_no_issue(self, fk_schema):
         filters = [
-            FilterParam(
+            WhereParam(
                 left_expr=NormalizedExpr.from_column("orders.unknown_col"),
                 op="=",
                 value_type="string",
                 raw_value="test",
             ),
         ]
-        issues = validate_filter_value_type_alignment(filters, fk_schema)
+        issues = validate_where_value_type_alignment(filters, fk_schema)
         assert issues == []
 
     def test_enum_on_fk_int_warns(self, fk_schema):
         filters = [
-            FilterParam(
+            WhereParam(
                 left_expr=NormalizedExpr.from_column("orders.category_id"),
                 op="=",
                 value_type="enum",
                 raw_value="Action",
             ),
         ]
-        issues = validate_filter_value_type_alignment(filters, fk_schema)
+        issues = validate_where_value_type_alignment(filters, fk_schema)
         assert len(issues) == 1
         assert issues[0].severity == "warning"
 
@@ -1289,7 +1280,7 @@ class TestValidateNoBetweenOps:
 
     def test_no_between_no_issues(self):
         """No BETWEEN ops yields empty issue list."""
-        fp = FilterParam(left_expr=NormalizedExpr.from_column("t.a"), op=">=", value_type="integer")
+        fp = WhereParam(left_expr=NormalizedExpr.from_column("t.a"), op=">=", value_type="integer")
         hp = HavingParam(
             left_expr=NormalizedExpr.from_agg("count", "t.id"),
             op=">",
@@ -1300,7 +1291,7 @@ class TestValidateNoBetweenOps:
 
     def test_filter_between_flagged(self):
         """BETWEEN on a filter produces an error issue."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op="between",
             value_type="integer",
@@ -1308,7 +1299,7 @@ class TestValidateNoBetweenOps:
         issues = validate_no_between_ops([fp], [])
         assert len(issues) == 1
         assert issues[0].severity == "error"
-        assert "filter" in issues[0].issue_id.lower()
+        assert "where" in issues[0].issue_id.lower()
 
     def test_having_between_flagged(self):
         """BETWEEN on a having produces an error issue."""
@@ -1324,7 +1315,7 @@ class TestValidateNoBetweenOps:
 
     def test_both_between_flagged(self):
         """BETWEEN on both filter and having produces two issues."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op="between",
             value_type="integer",
@@ -1344,7 +1335,7 @@ class TestValidateNoBetweenOps:
 
     def test_case_insensitive_between_flagged(self):
         """BETWEEN in any case is flagged."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op="BETWEEN",
             value_type="integer",
@@ -1539,7 +1530,7 @@ class TestValidateDateDiffUnits:
 
     def test_valid_date_diff_no_issues(self):
         """No issues for valid date_diff with day unit and numeric amount."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.col"),
             op=">",
             value_type="date_diff",
@@ -1550,7 +1541,7 @@ class TestValidateDateDiffUnits:
 
     def test_invalid_unit_raises_issue(self):
         """Invalid unit produces an issue."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.col"),
             op=">",
             value_type="date_diff",
@@ -1562,7 +1553,7 @@ class TestValidateDateDiffUnits:
 
     def test_non_date_diff_ignored(self):
         """Filters with other value_types are ignored."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.col"),
             op="=",
             value_type="string",
@@ -1576,7 +1567,7 @@ class TestContainsArrayValidator:
     """Tests for validate_contains_array_filters."""
 
     def test_contains_on_non_array(self, typed_schema):
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("orders.amount"),
             op="contains",
             value_type="string",
@@ -1598,7 +1589,7 @@ class TestContainsArrayValidator:
                 role=ColumnRole.FREE_TEXT.value,
                 element_type="text",
             )
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("orders.tags"),
             op="contains",
             value_type="string",
@@ -1697,7 +1688,7 @@ class TestSelectabilityValidator:
             )
         ]
         sc = SelectCol(expr=NormalizedExpr(column_ref="w01"))
-        with registry_render_scope(wr, None):
+        with WindowRegistryStep.render_scope(wr, None):
             issues = validate_selectability([sc], typed_schema, {}, "main")
         assert len(issues) >= 1
         assert "partition" in issues[0].message.lower()
@@ -1716,7 +1707,7 @@ class TestSelectabilityValidator:
             )
         ]
         sc = SelectCol(expr=NormalizedExpr(column_ref="w01"))
-        with registry_render_scope(wr, None):
+        with WindowRegistryStep.render_scope(wr, None):
             issues = validate_selectability([sc], typed_schema, {}, "main")
         assert issues == []
 
@@ -1756,7 +1747,7 @@ class TestValidateDateWindowUnits:
     """Tests for validate_date_window_units."""
 
     def test_valid_unit_no_issue(self):
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.d"),
             op=">=",
             value_type="date_window",
@@ -1765,7 +1756,7 @@ class TestValidateDateWindowUnits:
         assert validate_date_window_units([fp]) == []
 
     def test_invalid_unit_issue(self):
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.d"),
             op=">=",
             value_type="date_window",
@@ -1776,7 +1767,7 @@ class TestValidateDateWindowUnits:
         assert "invalid unit" in issues[0].message
 
     def test_non_dict_raw_value_skipped(self):
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.d"),
             op=">=",
             value_type="date_window",
@@ -1785,7 +1776,7 @@ class TestValidateDateWindowUnits:
         assert validate_date_window_units([fp]) == []
 
     def test_none_unit_skipped(self):
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.d"),
             op=">=",
             value_type="date_window",
@@ -1794,13 +1785,13 @@ class TestValidateDateWindowUnits:
         assert validate_date_window_units([fp]) == []
 
     def test_cte_step_filters_scanned(self):
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.d"),
             op=">=",
             value_type="date_window",
             raw_value={"unit": "bad", "amount": 1},
         )
-        cte = RuntimeCteStep(cte_name="c1", filters_param=[fp])
+        cte = RuntimeCteStep(cte_name="c1", where=PredicateGroup.from_list([fp]))
         issues = validate_date_window_units([], cte_steps=[cte])
         assert len(issues) == 1
 
@@ -1809,7 +1800,7 @@ class TestValidateDateDiffUnitsMore:
     """Extra edge cases for validate_date_diff_units."""
 
     def test_string_amount_parseable_as_int_ok(self):
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.c"),
             op=">",
             value_type="date_diff",
@@ -1818,7 +1809,7 @@ class TestValidateDateDiffUnitsMore:
         assert validate_date_diff_units([fp]) == []
 
     def test_non_numeric_amount_errors(self):
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.c"),
             op=">",
             value_type="date_diff",
@@ -1828,13 +1819,13 @@ class TestValidateDateDiffUnitsMore:
         assert any("non-numeric amount" in i.message for i in issues)
 
     def test_cte_date_diff_invalid_unit(self):
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.c"),
             op=">",
             value_type="date_diff",
             raw_value={"unit": "fortnight", "amount": 1},
         )
-        cte = RuntimeCteStep(cte_name="inner", filters_param=[fp])
+        cte = RuntimeCteStep(cte_name="inner", where=PredicateGroup.from_list([fp]))
         issues = validate_date_diff_units([], cte_steps=[cte])
         assert len(issues) == 1
 
@@ -1901,7 +1892,7 @@ class TestValidateCaseWhenSchema:
         cw = CaseWhenExpr(
             branches=[
                 CaseWhenBranch(
-                    condition=FilterParam(
+                    condition=WhereParam(
                         left_expr=NormalizedExpr.from_column("customers.id"),
                         op=">",
                         value_type="integer",
@@ -1920,7 +1911,7 @@ class TestValidateCaseWhenSchema:
         cw = CaseWhenExpr(
             branches=[
                 CaseWhenBranch(
-                    condition=FilterParam(
+                    condition=WhereParam(
                         left_expr=NormalizedExpr.from_column("customers.id"),
                         op=">",
                         value_type="integer",
@@ -1939,7 +1930,7 @@ class TestValidateCaseWhenSchema:
         cw = CaseWhenExpr(
             branches=[
                 CaseWhenBranch(
-                    condition=FilterParam(
+                    condition=WhereParam(
                         left_expr=NormalizedExpr.from_column("customers.id"),
                         op=">",
                         value_type="integer",
@@ -1960,7 +1951,7 @@ class TestValidateCaseWhenSchema:
         cw = CaseWhenExpr(
             branches=[
                 CaseWhenBranch(
-                    condition=FilterParam(
+                    condition=WhereParam(
                         left_expr=NormalizedExpr.from_column("customers.id"),
                         op=">",
                         value_type="integer",
@@ -1982,7 +1973,7 @@ class TestValidateCaseWhenSchema:
         cw = CaseWhenExpr(
             branches=[
                 CaseWhenBranch(
-                    condition=FilterParam(
+                    condition=WhereParam(
                         left_expr=NormalizedExpr.from_column("orders.amount"),
                         op=">",
                         value_type="integer",
@@ -1996,13 +1987,13 @@ class TestValidateCaseWhenSchema:
         cr = [CaseRegistryStep(registry_id="c01", case_when=cw)]
         issues = validate_case_when_schema([sc], simple_schema, {"customers"}, {}, "main", case_registry=cr)
 
-        assert any(i.category == "filter_validity" and "not in allowed tables" in i.message for i in issues)
+        assert any(i.category == "where_validity" and "not in allowed tables" in i.message for i in issues)
 
     def test_case_else_unknown_table(self, simple_schema):
         cw = CaseWhenExpr(
             branches=[
                 CaseWhenBranch(
-                    condition=FilterParam(
+                    condition=WhereParam(
                         left_expr=NormalizedExpr.from_column("customers.id"),
                         op=">",
                         value_type="integer",
@@ -2022,7 +2013,7 @@ class TestValidateCaseWhenSchema:
         cw = CaseWhenExpr(
             branches=[
                 CaseWhenBranch(
-                    condition=FilterParam(
+                    condition=WhereParam(
                         left_expr=NormalizedExpr.from_column("customers.id"),
                         op=">",
                         value_type="integer",
@@ -2031,7 +2022,7 @@ class TestValidateCaseWhenSchema:
                     result=NormalizedExpr.from_column("customers.name"),
                 ),
                 CaseWhenBranch(
-                    condition=FilterParam(
+                    condition=WhereParam(
                         left_expr=NormalizedExpr.from_column("customers.id"),
                         op="<=",
                         value_type="integer",
@@ -2058,20 +2049,20 @@ class TestValidateFilterValueTypeAlignmentCte:
                 ),
             },
         }
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("v.n"),
             op="=",
             value_type="string",
             raw_value="x",
         )
-        issues = validate_filter_value_type_alignment([fp], simple_schema, cte_outputs=cte)
+        issues = validate_where_value_type_alignment([fp], simple_schema, cte_outputs=cte)
         assert len(issues) == 1
         assert issues[0].severity == "warning"
 
 
 class TestContainsArrayFiltersMore:
     def test_skips_when_not_exactly_one_column_ref(self, simple_schema):
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr(
                 add_groups=[MulGroup(multiply=["customers.id", "customers.name"])],
             ),
@@ -2171,6 +2162,55 @@ class TestValidateWindowSpecSchemaMore:
         assert any("not groupable" in i.message.lower() for i in issues)
 
 
+class TestExtendedWindowFunctionValidation:
+    """Argument validation for ntile, percent_rank, cume_dist, and nth_value."""
+
+    def test_ntile_requires_positive_numeric_argument(self, typed_schema):
+        ws = WindowSpec(
+            function="ntile",
+            order_by=[OrderByCol(expr=NormalizedExpr.from_column("orders.id"), direction="ASC")],
+            numeric_argument=None,
+        )
+        wr = [WindowRegistryStep(registry_id="w01", window_spec=ws)]
+        sc = SelectCol(expr=NormalizedExpr(column_ref="w01"))
+        issues = validate_window_spec_schema([sc], typed_schema, {}, "main", window_registry=wr)
+        assert any("numeric_argument" in i.message for i in issues)
+
+    def test_ntile_rejects_non_positive_numeric_argument(self, typed_schema):
+        ws = WindowSpec(
+            function="ntile",
+            order_by=[OrderByCol(expr=NormalizedExpr.from_column("orders.id"), direction="ASC")],
+            numeric_argument=0,
+        )
+        wr = [WindowRegistryStep(registry_id="w01", window_spec=ws)]
+        sc = SelectCol(expr=NormalizedExpr(column_ref="w01"))
+        issues = validate_window_spec_schema([sc], typed_schema, {}, "main", window_registry=wr)
+        assert any("numeric_argument" in i.message for i in issues)
+
+    def test_percent_rank_rejects_column_argument(self, typed_schema):
+        ws = WindowSpec(
+            function="percent_rank",
+            order_by=[OrderByCol(expr=NormalizedExpr.from_column("orders.id"), direction="ASC")],
+            argument=NormalizedExpr.from_column("orders.amount"),
+        )
+        wr = [WindowRegistryStep(registry_id="w01", window_spec=ws)]
+        sc = SelectCol(expr=NormalizedExpr(column_ref="w01"))
+        issues = validate_window_spec_schema([sc], typed_schema, {}, "main", window_registry=wr)
+        assert any("must not carry an argument" in i.message for i in issues)
+
+    def test_nth_value_requires_positive_numeric_argument(self, typed_schema):
+        ws = WindowSpec(
+            function="nth_value",
+            order_by=[OrderByCol(expr=NormalizedExpr.from_column("orders.id"), direction="ASC")],
+            argument=NormalizedExpr.from_column("orders.amount"),
+            numeric_argument=-1,
+        )
+        wr = [WindowRegistryStep(registry_id="w01", window_spec=ws)]
+        sc = SelectCol(expr=NormalizedExpr(column_ref="w01"))
+        issues = validate_window_spec_schema([sc], typed_schema, {}, "main", window_registry=wr)
+        assert any("numeric_argument" in i.message for i in issues)
+
+
 class TestValidateGroupByColsEdgeCases:
     def test_empty_expr_unqualified(self, simple_schema):
         issues = validate_group_by_cols_schema([NormalizedExpr()], simple_schema, {"customers"})
@@ -2231,7 +2271,7 @@ class TestValidateWindowPartitionGroupByAlignment:
 class TestValidateRedundantExtractYearLiterals:
     def test_bare_year_equality_with_extract_errors(self):
         filters = [
-            FilterParam(
+            WhereParam(
                 left_expr=NormalizedExpr(
                     add_groups=[MulGroup(multiply=[NormalizedExpr.from_column("tbl_a.date_a")])],
                     scalar_func="extract",
@@ -2241,7 +2281,7 @@ class TestValidateRedundantExtractYearLiterals:
                 raw_value="2026",
                 value_type="integer",
             ),
-            FilterParam(
+            WhereParam(
                 left_expr=NormalizedExpr.from_column("tbl_a.date_a"),
                 op="=",
                 raw_value="2026",
@@ -2254,7 +2294,7 @@ class TestValidateRedundantExtractYearLiterals:
 
     def test_bare_year_gt_with_extract_errors(self):
         filters = [
-            FilterParam(
+            WhereParam(
                 left_expr=NormalizedExpr(
                     add_groups=[MulGroup(multiply=[NormalizedExpr.from_column("tbl_a.date_a")])],
                     scalar_func="extract",
@@ -2264,7 +2304,7 @@ class TestValidateRedundantExtractYearLiterals:
                 raw_value="2026",
                 value_type="integer",
             ),
-            FilterParam(
+            WhereParam(
                 left_expr=NormalizedExpr.from_column("tbl_a.date_a"),
                 op=">=",
                 raw_value="2025",
@@ -2273,3 +2313,61 @@ class TestValidateRedundantExtractYearLiterals:
         ]
         issues = validate_redundant_extract_year_column_literals(filters, [], "main")
         assert len(issues) == 1
+
+
+def _deep_or_predicate_tree(depth: int):
+    from aetherdialect._contracts_base import PredicateGroup, WhereParam
+
+    def _leaf(col: str) -> WhereParam:
+        return WhereParam(left_expr=NormalizedExpr.from_column(col), op="=", raw_value="x", param_key="p1")
+
+    if depth <= 1:
+        return PredicateGroup(op="and", predicates=(_leaf("t.a"), _leaf("t.b")))
+
+    left = _deep_or_predicate_tree(depth - 1)
+    right = PredicateGroup(op="and", predicates=(_leaf("t.c"),))
+    return PredicateGroup(op="or", groups=(left, right))
+
+
+@pytest.mark.fast
+def test_where_predicate_depth_four_reports_max_nesting() -> None:
+    from aetherdialect._constants import MAX_PREDICATE_NESTING_DEPTH
+    from aetherdialect._contracts_base import PredicateGroup
+    from aetherdialect._validation_schema import validate_predicate_nesting_depth
+
+    nested = _deep_or_predicate_tree(MAX_PREDICATE_NESTING_DEPTH + 1)
+    assert nested.depth() > MAX_PREDICATE_NESTING_DEPTH
+    issues = validate_predicate_nesting_depth(nested, None)
+    assert any(i.issue_id == "where_predicate_nesting_depth" for i in issues)
+    assert any(i.severity == "error" for i in issues if i.issue_id == "where_predicate_nesting_depth")
+    assert any(f"MAX_PREDICATE_NESTING_DEPTH={MAX_PREDICATE_NESTING_DEPTH}" in i.message for i in issues)
+    coerced = PredicateGroup.coerce(nested)
+    assert coerced is not None
+    assert coerced.depth() <= MAX_PREDICATE_NESTING_DEPTH
+
+
+@pytest.mark.fast
+def test_having_predicate_depth_four_reports_max_nesting() -> None:
+    from aetherdialect._constants import MAX_PREDICATE_NESTING_DEPTH
+    from aetherdialect._contracts_base import HavingParam, PredicateGroup
+    from aetherdialect._validation_schema import validate_predicate_nesting_depth
+
+    def _having_leaf() -> HavingParam:
+        return HavingParam(left_expr=NormalizedExpr.from_agg("count", "*"), op=">", raw_value=1)
+
+    def _deep_having_tree(depth: int) -> PredicateGroup:
+        if depth <= 1:
+            return PredicateGroup(op="and", predicates=(_having_leaf(), _having_leaf()))
+        left = _deep_having_tree(depth - 1)
+        right = PredicateGroup(op="and", predicates=(_having_leaf(),))
+        return PredicateGroup(op="or", groups=(left, right))
+
+    nested = _deep_having_tree(MAX_PREDICATE_NESTING_DEPTH + 1)
+    assert nested.depth() > MAX_PREDICATE_NESTING_DEPTH
+    issues = validate_predicate_nesting_depth(None, nested)
+    assert any(i.issue_id == "having_predicate_nesting_depth" for i in issues)
+    assert any(i.severity == "error" for i in issues if i.issue_id == "having_predicate_nesting_depth")
+    assert any(f"MAX_PREDICATE_NESTING_DEPTH={MAX_PREDICATE_NESTING_DEPTH}" in i.message for i in issues)
+    coerced = PredicateGroup.coerce(nested)
+    assert coerced is not None
+    assert coerced.depth() <= MAX_PREDICATE_NESTING_DEPTH

@@ -26,19 +26,16 @@ def test_pglast_exists_sublink_lift(schema_graph: SchemaGraph) -> None:
         "SELECT customer_id FROM customers c WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.customer_id)"
     )
     cr = convert_sql_to_intent(sql, schema_graph, dialect, verify_via_execute=False)
-    if cr.failure_code is not None:
-        pytest.skip(f"EXISTS lift not supported: {cr.failure_detail}")
+    assert cr.failure_code is None, cr.failure_detail
     assert cr.intent is not None
-    if not cr.intent.filters_param and not cr.intent.cte_steps:
-        pytest.skip("EXISTS produced no filters or CTE steps")
+    assert (cr.intent.where.leaves() if cr.intent.where else []) or cr.intent.cte_steps
 
 
 def test_pglast_from_subquery_lift(schema_graph: SchemaGraph) -> None:
     dialect = _pg()
     sql = "SELECT sq.customer_id FROM (SELECT customer_id FROM customers) sq"
     cr = convert_sql_to_intent(sql, schema_graph, dialect, verify_via_execute=False)
-    if cr.failure_code is not None:
-        pytest.skip(f"FROM subquery lift not supported: {cr.failure_detail}")
+    assert cr.failure_code is None, cr.failure_detail
     assert cr.intent is not None
     assert cr.intent.cte_steps
 
@@ -47,10 +44,9 @@ def test_pglast_scalar_sublink(schema_graph: SchemaGraph) -> None:
     dialect = _pg()
     sql = "SELECT customer_id FROM customers WHERE customer_id = (SELECT MAX(customer_id) FROM customers)"
     cr = convert_sql_to_intent(sql, schema_graph, dialect, verify_via_execute=False)
-    if cr.failure_code is not None:
-        pytest.skip(f"scalar sublink not supported: {cr.failure_detail}")
+    assert cr.failure_code is None, cr.failure_detail
     assert cr.intent is not None
-    assert cr.intent.cte_steps or cr.intent.filters_param
+    assert cr.intent.cte_steps or (cr.intent.where.leaves() if cr.intent.where else [])
 
 
 def test_pglast_in_sublink(schema_graph: SchemaGraph) -> None:
@@ -58,7 +54,7 @@ def test_pglast_in_sublink(schema_graph: SchemaGraph) -> None:
     sql = "SELECT customer_id FROM customers WHERE customer_id IN (SELECT customer_id FROM orders)"
     cr = convert_sql_to_intent(sql, schema_graph, dialect, verify_via_execute=False)
     assert cr.failure_code is None and cr.intent is not None
-    assert cr.intent.filters_param
+    assert cr.intent.where.leaves() if cr.intent.where else []
 
 
 def test_pglast_coalesce_projection(schema_graph: SchemaGraph) -> None:
@@ -68,10 +64,11 @@ def test_pglast_coalesce_projection(schema_graph: SchemaGraph) -> None:
     assert cr.failure_code is None and cr.intent is not None
     expr = cr.intent.select_cols[0].expr
     has_coalesce = (
-        any(g.scalar_func == "coalesce" for g in (expr.add_groups or [])) or "coalesce" in (expr.raw_sql or "").lower()
+        expr.scalar_func == "coalesce"
+        or any(g.scalar_func == "coalesce" for g in (expr.add_groups or []))
+        or "coalesce" in (expr.raw_sql or "").lower()
     )
-    if not has_coalesce:
-        pytest.skip("COALESCE not mapped to scalar_func in pglast extract")
+    assert has_coalesce, "COALESCE not mapped to scalar_func in pglast extract"
 
 
 def test_pglast_order_by_ordinal(schema_graph: SchemaGraph) -> None:

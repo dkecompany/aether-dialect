@@ -7,8 +7,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from aetherdialect._contracts_base import EngineIdentity
 from aetherdialect._contracts_schema import ColumnMetadata
-from aetherdialect._dialect import Dialect, get_dialect, resolve_dialect
+from aetherdialect._core_utils import pop_engine_identity, push_engine_identity
+from aetherdialect._dialect import Dialect, DialectRegistry
 from aetherdialect._dialect_postgres import PostgresDialect
 from aetherdialect._dialect_sqlglot_engines import (
     BigQueryDialect,
@@ -20,9 +22,11 @@ from aetherdialect._dialect_sqlglot_engines import (
     SnowflakeDialect,
     SQLiteDialect,
     SQLServerDialect,
-    databricks_normalize_datetrunc_sql,
 )
-from aetherdialect._dialect_sqlglot_helper import array_storage_kind, ast_structural_valid_sqlglot
+from aetherdialect._dialect_sqlglot_helper import SqlglotParseMixin
+
+array_storage_kind = SqlglotParseMixin.array_storage_kind
+ast_structural_valid_sqlglot = SqlglotParseMixin.ast_structural_valid_sqlglot
 
 
 def _pg_uninit() -> PostgresDialect:
@@ -53,9 +57,9 @@ def _redshift_uninit() -> RedshiftDialect:
 def test_resolve_dialect_accepts_name_or_instance() -> None:
     """``resolve_dialect`` returns the same dialect object or delegates to ``get_dialect`` for names."""
     d = _pg_uninit()
-    assert resolve_dialect(d) is d
-    with patch("aetherdialect._dialect.get_dialect", return_value=d) as m:
-        assert resolve_dialect("postgresql") is d
+    assert DialectRegistry.resolve_dialect(d) is d
+    with patch("aetherdialect._dialect.DialectRegistry.get_dialect", return_value=d) as m:
+        assert DialectRegistry.resolve_dialect("postgresql") is d
         m.assert_called_once_with("postgresql")
 
 
@@ -65,11 +69,15 @@ class TestPostgresPglastWalk:
     def test_finds_rangevars_under_cross_join(self) -> None:
         from pglast.parser import parse_sql
 
-        from aetherdialect._dialect_postgres import pg_node_kind, pg_walk_nodes
+        from aetherdialect._dialect_postgres import PostgresDialect
 
         sql = "WITH cte1 AS (SELECT 1 AS x), cte2 AS (SELECT 1 AS y FROM cte1) SELECT * FROM cte1 CROSS JOIN cte2"
         root = parse_sql(sql)[0].stmt
-        rels = {n.relname for n in pg_walk_nodes(root) if pg_node_kind(n) == "RangeVar" and getattr(n, "relname", None)}
+        rels = {
+            n.relname
+            for n in PostgresDialect.pg_walk_nodes(root)
+            if PostgresDialect.pg_node_kind(n) == "RangeVar" and getattr(n, "relname", None)
+        }
         assert "cte1" in rels
         assert "cte2" in rels
 
@@ -98,27 +106,30 @@ class TestRenderArrayContainsExpr:
         assert "LOWER(TRIM(CAST(:p2 AS STRING)" in sql
         assert "NOT `film`.`special_features` IS NULL" in sql
 
-    def test_mysql_lowercases_json_elements(self) -> None:
-        sql = _mysql_uninit().render_array_contains("film.special_features", "p1")
-        assert "LOCATE" in sql or "INSTR" in sql
-        assert "LOWER(CAST(film.special_features AS CHAR))" in sql
-        assert "LOWER(TRIM(BOTH '%' FROM CAST(:p1 AS CHAR)))" in sql
-        assert "JSON_SEARCH" not in sql
+    def test_mysql_uses_json_contains_for_json_arrays(self) -> None:
+        json_meta = ColumnMetadata(name="special_features", data_type="JSON", element_type="string")
+        sql = _mysql_uninit().render_array_contains("film.special_features", "p1", column_meta=json_meta)
+        assert "JSON_CONTAINS" in sql
+        assert "INSTR" not in sql.upper()
+        assert "LOCATE" not in sql.upper()
+
+    def test_mysql_routes_by_column_meta(self) -> None:
+        json_meta = ColumnMetadata(name="special_features", data_type="JSON", element_type="string")
+        text_meta = ColumnMetadata(name="special_features", data_type="VARCHAR", element_type="string")
+        json_sql = _mysql_uninit().render_array_contains("film.special_features", "p1", column_meta=json_meta)
+        text_sql = _mysql_uninit().render_array_contains("film.special_features", "p1", column_meta=text_meta)
+        assert array_storage_kind(json_meta) == "json_text_array"
+        assert "JSON_CONTAINS" in json_sql
+        assert "JSON_CONTAINS" in text_sql
 
     def test_snowflake_uses_transform_and_trim(self) -> None:
-        sql = _snowflake_uninit().render_array_contains("film.special_features", "p1")
+        native_meta = ColumnMetadata(name="special_features", data_type="ARRAY", element_type="string")
+        sql = _snowflake_uninit().render_array_contains("film.special_features", "p1", column_meta=native_meta)
         assert "ARRAY_CONTAINS" in sql
         assert "TRANSFORM(film.special_features" in sql
         assert "LOWER(TRIM(CAST(:p1 AS VARCHAR)" in sql
         assert "AS VARIANT" in sql
         assert sql.index("ARRAY_CONTAINS") < sql.index("TRANSFORM")
-
-    def test_redshift_matches_json_elements_case_insensitively(self) -> None:
-        sql = _redshift_uninit().render_array_contains("film.special_features", "p1")
-        assert "STRPOS" in sql or "POSITION" in sql
-        assert "LOWER(CAST(film.special_features AS VARCHAR))" in sql
-        assert "REGEXP_INSTR" not in sql
-        assert "CONCAT('\"'" in sql or "CONCAT('\"" in sql or "\"' ||" in sql
 
     def test_array_storage_kind_classifies_native_and_json_text(self) -> None:
         native = ColumnMetadata(name="special_features", data_type="VARCHAR[]", element_type="string")
@@ -136,16 +147,6 @@ class TestRenderArrayContainsExpr:
     def test_postgres_parse_select_does_not_raise(self) -> None:
         d = _pg_uninit()
         assert d.parse_select("SELECT film_id FROM film") is not None
-
-    def test_mysql_routes_by_column_meta(self) -> None:
-        json_meta = ColumnMetadata(name="special_features", data_type="JSON", element_type="string")
-        text_meta = ColumnMetadata(name="special_features", data_type="VARCHAR", element_type="string")
-        json_sql = _mysql_uninit().render_array_contains("film.special_features", "p1", column_meta=json_meta)
-        text_sql = _mysql_uninit().render_array_contains("film.special_features", "p1", column_meta=text_meta)
-        assert array_storage_kind(json_meta) == "json_text_array"
-        assert "LOCATE" in json_sql or "INSTR" in json_sql
-        assert "LOCATE" in text_sql or "INSTR" in text_sql
-        assert "JSON_CONTAINS" not in json_sql
 
 
 class TestRenderDateDiffExpr:
@@ -245,12 +246,13 @@ class TestRenderDateWindowExprDatabricks:
     def test_day_offset(self):
         """Day offset should produce date_sub."""
         result = _dbr_uninit().render_date_window("col", ">=", "day", 7)
-        assert result == "col >= DATE_ADD(CURRENT_DATE, 7 * -1)"
+        assert result == "col >= DATEADD(DAY, 7 * -1, CURRENT_DATE)"
 
     def test_week_offset(self):
-        """Week offset should multiply by 7 and use date_sub."""
+        """Week offset uses week truncation rather than day multiplication."""
         result = _dbr_uninit().render_date_window("col", ">=", "week", 2)
-        assert result == "col >= DATE_ADD(CURRENT_DATE, 14 * -1)"
+        assert "DATE_TRUNC" in result.upper() and "WEEK" in result.upper()
+        assert "14" not in result
 
     def test_month_offset(self):
         """Month offset should use add_months with negative value."""
@@ -302,23 +304,23 @@ class TestGetDialect:
             DATABASE="testdb",
             SCHEMA="public",
         )
-        mock_runtime.db_url = lambda: "postgresql://test:test@localhost:5432/testdb"
+        mock_runtime.db_url = lambda: "postgresql+psycopg://test:test@localhost:5432/testdb"
         mock_config.TYPE = "postgresql"
         mock_config.RUNTIME = mock_runtime
 
         with patch("sqlalchemy.create_engine"):
-            d = get_dialect("postgresql", mock_runtime)
+            d = DialectRegistry.get_dialect("postgresql", mock_runtime)
         assert isinstance(d, PostgresDialect)
         assert d.name == "postgresql"
 
     def test_unsupported_raises_value_error(self):
         """Unsupported dialect name should raise ValueError."""
         with pytest.raises(ValueError, match="Unsupported dialect"):
-            get_dialect("nonexistent_engine", MagicMock())
+            DialectRegistry.get_dialect("nonexistent_engine", MagicMock())
 
     @patch("aetherdialect._dialect.EngineConfig")
-    def test_none_engine_type_uses_config_type(self, mock_config):
-        """get_dialect with engine_type None uses EngineConfig.TYPE."""
+    def test_none_engine_type_uses_pushed_identity(self, mock_config):
+        """get_dialect with engine_type None uses the pushed engine identity."""
         mock_runtime = SimpleNamespace(
             HOST="localhost",
             PORT=5432,
@@ -327,12 +329,17 @@ class TestGetDialect:
             DATABASE="d",
             SCHEMA="public",
         )
-        mock_runtime.db_url = lambda: "postgresql://u:p@localhost:5432/d"
+        mock_runtime.db_url = lambda: "postgresql+psycopg://u:p@localhost:5432/d"
         mock_config.TYPE = "postgresql"
         mock_config.RUNTIME = mock_runtime
-        with patch("sqlalchemy.create_engine"):
-            d = get_dialect(engine_type=None, config=mock_runtime)
-        assert isinstance(d, PostgresDialect)
+        identity = EngineIdentity("postgresql", mock_runtime)
+        token = push_engine_identity(identity)
+        try:
+            with patch("sqlalchemy.create_engine"):
+                d = DialectRegistry.get_dialect(engine_type=None, config=mock_runtime)
+            assert isinstance(d, PostgresDialect)
+        finally:
+            pop_engine_identity(token)
 
 
 class TestDialectBase:
@@ -398,7 +405,7 @@ class TestPostgresExplainPermissionHandling:
                 DATABASE="db",
                 SCHEMA="public",
             )
-            mock_runtime.db_url = lambda: "postgresql://u:p@localhost:5432/db"
+            mock_runtime.db_url = lambda: "postgresql+psycopg://u:p@localhost:5432/db"
             d = PostgresDialect(mock_runtime)
         return d
 
@@ -648,11 +655,11 @@ class TestQualifyTablesForExecution:
 
 
 class TestDatabricksNormalizeDatetruncSql:
-    """``databricks_normalize_datetrunc_sql`` normalizes Anonymous DATETRUNC call sites."""
+    """``DatabricksDialect.databricks_normalize_datetrunc_sql`` normalizes Anonymous DATETRUNC call sites."""
 
     def test_rewrites_to_date_trunc_with_unit_first(self):
         sql = "SELECT DATETRUNC('MONTH', rental.created_at) AS m FROM rental"
-        out = databricks_normalize_datetrunc_sql(sql)
+        out = DatabricksDialect.databricks_normalize_datetrunc_sql(sql)
         assert "DATETRUNC(" not in out
         assert "DATE_TRUNC('MONTH'" in out
 
@@ -779,7 +786,7 @@ class TestDatabricksDialectInitFallback:
     @patch("aetherdialect._dialect.Dialect.__init__", return_value=None)
     def test_both_fail_raises(self, _super_init: MagicMock) -> None:
         """When connector, SQLAlchemy, and PySpark all fail, ConfigError is raised."""
-        from aetherdialect._config import ConfigError
+        from aetherdialect._contracts_base import ConfigError
 
         dbr_parent, dbr_mod = self._dbr_sql_module(connect_side_effect=RuntimeError("conn fail"))
         with patch.dict(
@@ -796,10 +803,10 @@ class TestDatabricksDialectInitFallback:
 
 
 class TestAttachExtraFromAndWhere:
-    """Tier-B semantic edge injection (FROM extension + WHERE AND- conjuncts)."""
+    """Semantic-profile edge injection (FROM extension + WHERE AND- conjuncts)."""
 
     def _edge(self, left_tok: str, lc: str, right_tok: str, rc: str):
-        from aetherdialect._dialect import JoinEdge
+        from aetherdialect._contracts_base import JoinEdge
 
         return JoinEdge(
             table=right_tok,
@@ -854,6 +861,7 @@ class TestAttachExtraFromAndWhere:
         assert dx.attach_extra_from_and_where(parsed, carriers[0], ["b"], edges) is True
         out = dx.emit_sql(parsed).lower()
         assert "b" in out
+        assert "cross join" not in out
         assert "`a`.`x`" in out and "`b`.`x`" in out
         assert "a.flag" in out
 
@@ -918,8 +926,8 @@ class TestMySQLDialect:
 
     def test_date_window_upper_bound_sql(self) -> None:
         d = _mysql_uninit()
-        assert d.date_window_upper_bound_sql("day") == "CURRENT_DATE"
-        assert d.date_window_upper_bound_sql("hour") == "CURRENT_TIMESTAMP"
+        assert d.date_window_upper_bound_sql("day") == "CURRENT_DATE()"
+        assert d.date_window_upper_bound_sql("hour") == "CURRENT_TIMESTAMP()"
 
 
 class TestDuckDBDialect:
@@ -928,26 +936,31 @@ class TestDuckDBDialect:
     def test_in_memory_shared_native_and_sqlalchemy_handles(self) -> None:
         duckdb = pytest.importorskip("duckdb")
         from aetherdialect._config import DuckDBRuntimeConfig, EngineConfig
-        from aetherdialect._dialect import get_dialect
-        from aetherdialect._dialect_sqlglot_engines import extract_static_pool_connection
+        from aetherdialect._contracts_base import EngineIdentity
+        from aetherdialect._core_utils import pop_engine_identity, push_engine_identity
+        from aetherdialect._dialect import DialectRegistry
+        from aetherdialect._dialect_sqlglot_engines import DuckDBDialect
 
         orig_path = EngineConfig.SCHEMA_JSON_PATH
         orig_type = EngineConfig.TYPE
         orig_runtime = EngineConfig.RUNTIME
+        runtime = DuckDBRuntimeConfig()
+        identity_token = push_engine_identity(EngineIdentity("duckdb", runtime))
         try:
             EngineConfig.SCHEMA_JSON_PATH = ""
             EngineConfig.TYPE = "duckdb"
-            EngineConfig.RUNTIME = DuckDBRuntimeConfig
+            EngineConfig.RUNTIME = runtime
             connection = duckdb.connect(":memory:")
             connection.execute("CREATE TABLE shared_probe (id INTEGER)")
             connection.execute("INSERT INTO shared_probe VALUES (7)")
-            dialect = get_dialect("duckdb", DuckDBRuntimeConfig, native_connection=connection)
-            pooled = extract_static_pool_connection(dialect.engine)
+            dialect = DialectRegistry.get_dialect("duckdb", runtime, native_connection=connection)
+            pooled = DuckDBDialect.extract_static_pool_connection(dialect.engine)
             assert pooled is connection
             graph = dialect.reflect_schema_graph(include="tables")
             assert "shared_probe" in graph.tables
             assert dialect.execute("SELECT id FROM shared_probe") == [(7,)]
         finally:
+            pop_engine_identity(identity_token)
             EngineConfig.SCHEMA_JSON_PATH = orig_path
             EngineConfig.TYPE = orig_type
             EngineConfig.RUNTIME = orig_runtime
@@ -971,8 +984,8 @@ class TestDuckDBDialect:
 
     def test_date_window_upper_bound_sql(self) -> None:
         d = _duckdb_uninit()
-        assert d.date_window_upper_bound_sql("day") == "current_date"
-        assert d.date_window_upper_bound_sql("hour") == "current_timestamp"
+        assert d.date_window_upper_bound_sql("day") == "CURRENT_DATE"
+        assert d.date_window_upper_bound_sql("hour") == "CURRENT_TIMESTAMP"
 
 
 class TestSQLiteDialect:
@@ -989,8 +1002,15 @@ class TestSQLiteDialect:
 
     def test_render_array_contains(self) -> None:
         sql = _sqlite_uninit().render_array_contains("film.special_features", "p0")
-        assert "instr" in sql.lower()
+        assert "instr" not in sql.lower()
         assert "EXISTS(" not in sql.upper()
+        assert _sqlite_uninit().supports_array_contains is False
+        with pytest.raises(ValueError, match="json containment"):
+            _sqlite_uninit().render_array_contains(
+                "film.special_features",
+                "p0",
+                column_meta=ColumnMetadata(name="special_features", data_type="JSON", element_type="string"),
+            )
 
     def test_render_date_diff(self) -> None:
         sql = _sqlite_uninit().render_date_diff("t.d", ">", "day", 7)
@@ -1016,8 +1036,9 @@ class TestMariaDBDialect:
 
     def test_render_array_contains(self) -> None:
         sql = _mariadb_uninit().render_array_contains("film.special_features", "p0")
-        assert "LOCATE" in sql or "INSTR" in sql
-        assert "JSON_CONTAINS" not in sql.upper()
+        assert "JSON_CONTAINS" in sql.upper()
+        assert "INSTR(" not in sql.upper()
+        assert "LOCATE(" not in sql.upper()
 
     def test_render_date_diff(self) -> None:
         sql = _mariadb_uninit().render_date_diff("t.end_date", ">", "day", 7)
@@ -1066,7 +1087,7 @@ class TestSnowflakeDialect:
 
     def test_quote_table_column_uppercase(self) -> None:
         d = _snowflake_uninit()
-        assert d.quote_table_column("orders", "status") == "ORDERS.STATUS"
+        assert d.quote_table_column("orders", "status") == '"orders"."status"'
 
     def test_render_case_insensitive_wrap(self) -> None:
         assert _snowflake_uninit().render_case_insensitive_wrap("col") == "LOWER(col)"
@@ -1095,6 +1116,8 @@ class TestBigQueryDialect:
         upper = d.render_date_window_inclusive_upper("rental.rental_date", "day")
         assert "DATE(rental.rental_date)" in upper
         assert "CURRENT_DATE()" in upper
+        upper_hour = d.render_date_window_inclusive_upper("rental.rental_ts", "hour")
+        assert "DATE(rental.rental_ts)" not in upper_hour
 
     def test_date_window_upper_bound_sql(self) -> None:
         d = _bigquery_uninit()
@@ -1114,6 +1137,12 @@ class TestResultBackendKinds:
 
             def fetchall(self):
                 return [(1, "a")]
+
+            def fetchmany(self, _size: int):
+                if not hasattr(self, "_sent"):
+                    self._sent = True
+                    return [(1, "a")]
+                return []
 
             def close(self) -> None:
                 pass
@@ -1202,6 +1231,12 @@ class TestResultBackendKinds:
             def fetchall(self):
                 return [(3, "x")]
 
+            def fetchmany(self, _size: int):
+                if not hasattr(self, "_sent"):
+                    self._sent = True
+                    return [(3, "x")]
+                return []
+
             def close(self) -> None:
                 pass
 
@@ -1214,7 +1249,7 @@ class TestResultBackendKinds:
 
 
 class TestSnowflakeQualifyTablesForExecution:
-    """Snowflake qualifies bare tables with uppercase unquoted three- part names."""
+    """Snowflake qualifies bare tables with quoted uppercase three-part names."""
 
     def test_from_film_uppercases_table(self) -> None:
         d = _snowflake_uninit()
@@ -1222,7 +1257,7 @@ class TestSnowflakeQualifyTablesForExecution:
         d.sqlglot_dialect = "snowflake"
         result = d._qualify_tables_for_execution("SELECT title FROM film")
         assert 'PUBLIC."film"' not in result
-        assert "DVDRENTAL_NEW.PUBLIC.FILM" in result.replace(" ", "")
+        assert '"DVDRENTAL_NEW"."PUBLIC"."FILM"' in result.replace(" ", "")
 
 
 class TestPerEngineQualifyTablesForExecution:

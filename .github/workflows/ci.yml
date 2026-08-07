@@ -30,7 +30,10 @@ jobs:
           key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
       - name: pre-commit
         run: pre-commit run --all-files --show-diff-on-failure
-      # Release: twine check dist/* after build (build runs in pre-commit)
+      - name: Build distribution
+        run: python -m build
+      - name: Twine check
+        run: twine check dist/*
 
   test:
     name: Tests (Python ${{ matrix.python-version }})
@@ -54,3 +57,18 @@ jobs:
           --cov-report=term-missing:skip-covered
           --cov-report=xml
           --cov-fail-under=68
+
+  test-windows:
+    name: Tests (Windows, Python 3.12)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install ".[dev]"
+      - name: Import smoke
+        run: python -c "import aetherdialect; print(aetherdialect.__version__)"
+      - name: pytest
+        run: pytest tests/ -m fast -q --tb=short

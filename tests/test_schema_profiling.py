@@ -5,14 +5,15 @@ from typing import Any
 
 import pytest
 
-from aetherdialect._config import EngineConfig, PolicyConfig, QSimConfig
+from aetherdialect._config import EngineConfig, PolicyConfig
 from aetherdialect._constants import BOOLEAN_TRUTH_PATTERN_MAP
 from aetherdialect._contracts_base import (
     ColumnRole,
-    FilterParam,
     NormalizedExpr,
+    PredicateGroup,
     RoleOwner,
     TableRole,
+    WhereParam,
 )
 from aetherdialect._contracts_core import RuntimeIntent
 from aetherdialect._contracts_schema import (
@@ -23,9 +24,7 @@ from aetherdialect._contracts_schema import (
 )
 from aetherdialect._core_utils import stable_json
 from aetherdialect._dialect_sqlglot_engines import DatabricksDialect
-from aetherdialect._dialect_sqlglot_helper import (
-    structural_constraints_index_from_information_schema_rows,
-)
+from aetherdialect._dialect_sqlglot_helper import SqlglotEngineDialect
 from aetherdialect._schema_catalog import (
     SCHEMA_CONSISTENCY_REFINE_SYSTEM,
     SCHEMA_NOTES_REFINE_SYSTEM,
@@ -59,6 +58,8 @@ from aetherdialect._schema_catalog import (
     llm_classify_schema,
     parse_sql_file,
 )
+
+InformationSchemaSupport = SqlglotEngineDialect
 
 
 class TestBooleanTruthPatternMap:
@@ -283,7 +284,7 @@ class TestParseColumnsAndConstraints:
     def test_simple_columns(self):
         """Parse simple column definitions."""
         block = "id INTEGER PRIMARY KEY, name VARCHAR, age INTEGER"
-        columns, types, pks, fks, _unique, nulls = _parse_columns_and_constraints(block)
+        columns, types, pks, fks, _unique, nulls, _comments = _parse_columns_and_constraints(block)
         assert columns == ["id", "name", "age"]
         assert types == ["INTEGER", "VARCHAR", "INTEGER"]
         assert "id" in pks
@@ -292,7 +293,7 @@ class TestParseColumnsAndConstraints:
     def test_separate_pk_constraint(self):
         """Parse PRIMARY KEY as separate constraint."""
         block = "id INTEGER, name VARCHAR, PRIMARY KEY (id)"
-        columns, types, pks, fks, _unique, nulls = _parse_columns_and_constraints(block)
+        columns, types, pks, fks, _unique, nulls, _comments = _parse_columns_and_constraints(block)
         assert columns == ["id", "name"]
         assert "id" in pks
         assert nulls == [False, True]
@@ -300,7 +301,7 @@ class TestParseColumnsAndConstraints:
     def test_foreign_key_constraint(self):
         """Parse FOREIGN KEY constraint."""
         block = "id INTEGER, customer_id INTEGER, FOREIGN KEY (customer_id) REFERENCES customers(id)"
-        columns, types, pks, fks, _unique, nulls = _parse_columns_and_constraints(block)
+        columns, types, pks, fks, _unique, nulls, _comments = _parse_columns_and_constraints(block)
         assert columns == ["id", "customer_id"]
         assert len(fks) == 1
         assert fks[0]["src_cols"] == ["customer_id"]
@@ -310,7 +311,7 @@ class TestParseColumnsAndConstraints:
 
     def test_empty_block(self):
         """Parse empty column block."""
-        columns, types, pks, fks, _unique, nulls = _parse_columns_and_constraints("")
+        columns, types, pks, fks, _unique, nulls, _comments = _parse_columns_and_constraints("")
         assert columns == []
         assert fks == []
         assert nulls == []
@@ -318,7 +319,7 @@ class TestParseColumnsAndConstraints:
     def test_quoted_column_names(self):
         """Parse quoted column names."""
         block = '"order_id" INTEGER PRIMARY KEY, "total" NUMERIC'
-        columns, types, pks, fks, _unique, nulls = _parse_columns_and_constraints(block)
+        columns, types, pks, fks, _unique, nulls, _comments = _parse_columns_and_constraints(block)
         assert "order_id" in columns
         assert "order_id" in pks
         assert nulls == [False, True]
@@ -326,7 +327,7 @@ class TestParseColumnsAndConstraints:
     def test_numeric_precision_scale_across_tokens(self):
         """NUMERIC(4, 2) with a split after the comma still forms one type."""
         block = "rental_rate NUMERIC(4, 2) NOT NULL"
-        columns, types, pks, fks, _, nulls = _parse_columns_and_constraints(block)
+        columns, types, pks, fks, _, nulls, _comments = _parse_columns_and_constraints(block)
         assert columns == ["rental_rate"]
         assert "4" in types[0] and "2" in types[0]
         assert nulls == [False]
@@ -383,17 +384,16 @@ class TestValidateColumnClassification:
     """Tests for _validate_column_classification."""
 
     def test_numeric_measure_on_string(self):
-        """Hard error for NUMERIC_MEASURE on non-numeric column."""
+        """Role/value_type mismatches are coerced, not hard validation errors."""
         col = ColumnMetadata(name="name", data_type="varchar", value_type="string")
         hard, soft = _validate_column_classification(col, ColumnRole.NUMERIC_MEASURE.value)
-        assert len(hard) > 0
-        assert "NUMERIC_MEASURE" in hard[0]
+        assert len(hard) == 0
 
-    def test_temporal_on_integer_without_duration_name_fails(self):
-        """Hard error for TEMPORAL on generic integer column."""
+    def test_temporal_on_integer_without_duration_name_ok(self):
+        """TEMPORAL on generic integer column is allowed when value_type matches."""
         col = ColumnMetadata(name="count", data_type="integer", value_type="integer")
         hard, soft = _validate_column_classification(col, ColumnRole.TEMPORAL.value)
-        assert len(hard) > 0
+        assert len(hard) == 0
 
     def test_temporal_on_integer_duration_name_ok(self):
         """TEMPORAL on integer duration-style column passes validation."""
@@ -406,6 +406,13 @@ class TestValidateColumnClassification:
         col = ColumnMetadata(name="last_update", data_type="timestamptz", value_type="date")
         hard, soft = _validate_column_classification(col, ColumnRole.AUDIT.value)
         assert len(hard) == 0
+
+    def test_temporal_on_varchar_create_date_ok(self):
+        """TEMPORAL on VARCHAR create_date (federation seed) passes with soft warning."""
+        col = ColumnMetadata(name="create_date", data_type="VARCHAR", value_type="string")
+        hard, soft = _validate_column_classification(col, ColumnRole.TEMPORAL.value)
+        assert len(hard) == 0
+        assert _infer_column_role(col) == ColumnRole.TEMPORAL
 
     def test_role_value_type_compat_temporal_integer(self):
         """Infer duration integer columns as TEMPORAL."""
@@ -445,25 +452,25 @@ class TestValidateColumnClassification:
         hard, soft = _validate_column_classification(col, ColumnRole.NUMERIC_MEASURE.value)
         assert len(hard) == 0
 
-    def test_numeric_categorical_on_string_hard_error(self):
-        """Hard error for NUMERIC_CATEGORICAL on non-numeric column."""
+    def test_numeric_categorical_on_string_not_hard_error(self):
+        """Role/value_type mismatches are coerced, not hard validation errors."""
         col = ColumnMetadata(name="code", data_type="varchar", value_type="string")
         hard, soft = _validate_column_classification(col, ColumnRole.NUMERIC_CATEGORICAL.value)
-        assert len(hard) > 0
-        assert "NUMERIC_CATEGORICAL" in hard[0]
+        assert len(hard) == 0
 
 
 class TestBuildColumnProfileForLlm:
     """Tests for _build_column_profile_for_llm."""
 
     def test_basic_fields(self):
-        """Profile contains name, data_type, is_primary_key, is_foreign_key."""
-        col = ColumnMetadata(name="id", data_type="integer", is_primary_key=True)
+        """Profile contains name, value_type, is_primary_key, is_foreign_key."""
+        col = ColumnMetadata(name="id", data_type="integer", value_type="integer", is_primary_key=True)
         result = _build_column_profile_for_llm(col)
         assert result["name"] == "id"
-        assert result["data_type"] == "integer"
+        assert result["value_type"] == "integer"
         assert result["is_primary_key"] is True
         assert result["is_foreign_key"] is False
+        assert "data_type" not in result
 
     def test_hints_with_stats(self):
         """Profile includes profile_hints when stats present."""
@@ -482,10 +489,11 @@ class TestBuildColumnProfileForLlm:
 
     def test_default_stats_included(self):
         """Profile includes default stats in hints."""
-        col = ColumnMetadata(name="x", data_type="int")
+        col = ColumnMetadata(name="x", data_type="int", value_type="integer")
         result = _build_column_profile_for_llm(col)
         assert result["name"] == "x"
-        assert result["data_type"] == "int"
+        assert result["value_type"] == "integer"
+        assert "data_type" not in result
 
     def test_hints_include_distinct_count(self):
         """Profile hints include distinct_count when set."""
@@ -665,7 +673,7 @@ class TestCoerceAntonymPairColumn:
 class TestLlmClassifySchemaRefinePasses:
     """Second LLM classification pass is always invoked (notes vs consistency)."""
 
-    def test_runs_consistency_refine_when_no_notes(self, monkeypatch):
+    def test_runs_consistency_refine_when_no_notes(self, monkeypatch, tmp_path):
         col = ColumnMetadata(name="id", data_type="integer", is_primary_key=True)
         table = TableMetadata(name="t", columns={"id": col}, primary_key=["id"], foreign_keys=[])
         sg = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"t": table})
@@ -690,7 +698,8 @@ class TestLlmClassifySchemaRefinePasses:
             calls.append((system, task))
             return raw
 
-        monkeypatch.setattr("aetherdialect._schema_catalog.llm_chat", fake_llm)
+        monkeypatch.setattr(EngineConfig, "SCHEMA_JSON_PATH", str(tmp_path / "schema_graph.json.gz"))
+        monkeypatch.setattr("aetherdialect._schema_catalog.LLMProvider.chat", fake_llm)
         out = llm_classify_schema(sg, None)
         assert len(calls) == 2
         assert calls[0][1] == "schema_base"
@@ -698,7 +707,7 @@ class TestLlmClassifySchemaRefinePasses:
         assert calls[1][1] == "schema"
         assert "t" in out
 
-    def test_runs_notes_refine_when_notes_present(self, monkeypatch):
+    def test_runs_notes_refine_when_notes_present(self, monkeypatch, tmp_path):
         col = ColumnMetadata(name="id", data_type="integer", is_primary_key=True)
         table = TableMetadata(name="t", columns={"id": col}, primary_key=["id"], foreign_keys=[])
         sg = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"t": table})
@@ -723,7 +732,8 @@ class TestLlmClassifySchemaRefinePasses:
             calls.append(system)
             return raw
 
-        monkeypatch.setattr("aetherdialect._schema_catalog.llm_chat", fake_llm)
+        monkeypatch.setattr(EngineConfig, "SCHEMA_JSON_PATH", str(tmp_path / "schema_graph.json.gz"))
+        monkeypatch.setattr("aetherdialect._schema_catalog.LLMProvider.chat", fake_llm)
         llm_classify_schema(sg, "domain notes here")
         assert len(calls) == 2
         assert calls[1] == SCHEMA_NOTES_REFINE_SYSTEM
@@ -768,6 +778,7 @@ class TestApplyColumnRolesLlmDescriptionInvariant:
             notes_content: str | None = None,
             *,
             column_scope: dict[str, frozenset[str]] | None = None,
+            **kwargs: Any,
         ):
             return {
                 "t": (
@@ -793,6 +804,7 @@ class TestApplyColumnRolesLlmDescriptionInvariant:
             notes_content: str | None = None,
             *,
             column_scope: dict[str, frozenset[str]] | None = None,
+            **kwargs: Any,
         ):
             return {
                 "t": (
@@ -820,6 +832,7 @@ class TestApplyColumnRolesLlmDescriptionInvariant:
             notes_content: str | None = None,
             *,
             column_scope: dict[str, frozenset[str]] | None = None,
+            **kwargs: Any,
         ):
             calls["n"] += 1
             return {
@@ -833,7 +846,7 @@ class TestApplyColumnRolesLlmDescriptionInvariant:
         monkeypatch.setattr("aetherdialect._schema_catalog.llm_classify_schema", fake_classify)
         with pytest.raises(RuntimeError, match="Schema LLM classification failed"):
             apply_column_roles_llm(sg)
-        assert calls["n"] == QSimConfig.MAX_ROLE_CLASSIFICATION_RETRIES + 1
+        assert calls["n"] == PolicyConfig.MAX_ROLE_CLASSIFICATION_RETRIES + 1
 
     def test_retries_then_succeeds_when_descriptions_arrive(self, monkeypatch):
         col = ColumnMetadata(name="id", data_type="integer", is_primary_key=True)
@@ -846,6 +859,7 @@ class TestApplyColumnRolesLlmDescriptionInvariant:
             notes_content: str | None = None,
             *,
             column_scope: dict[str, frozenset[str]] | None = None,
+            **kwargs: Any,
         ):
             calls["n"] += 1
             if calls["n"] < 2:
@@ -890,6 +904,7 @@ class TestApplyColumnRolesLlmPostOverrides:
             notes_content: str | None = None,
             *,
             column_scope: dict[str, frozenset[str]] | None = None,
+            **kwargs: Any,
         ):
             return {
                 "events": (
@@ -919,6 +934,7 @@ class TestApplyColumnRolesLlmPostOverrides:
             notes_content: str | None = None,
             *,
             column_scope: dict[str, frozenset[str]] | None = None,
+            **kwargs: Any,
         ):
             return {
                 "events": (
@@ -948,6 +964,7 @@ class TestApplyColumnRolesLlmPostOverrides:
             notes_content: str | None = None,
             *,
             column_scope: dict[str, frozenset[str]] | None = None,
+            **kwargs: Any,
         ):
             return {
                 "t": (
@@ -1115,7 +1132,7 @@ class TestParseSqlFileConditionalLlm:
             calls.append(args)
             return '{"tables": {}}'
 
-        monkeypatch.setattr("aetherdialect._schema_catalog.llm_chat", _capture_llm)
+        monkeypatch.setattr("aetherdialect._schema_catalog.LLMProvider.chat", _capture_llm)
 
         out = parse_sql_file(path, reflected_schema=sg)
         assert out == {}
@@ -1142,7 +1159,7 @@ class TestParseSqlFileConditionalLlm:
             calls.append(1)
             return '{"tables": {}}'
 
-        monkeypatch.setattr("aetherdialect._schema_catalog.llm_chat", _capture_llm)
+        monkeypatch.setattr("aetherdialect._schema_catalog.LLMProvider.chat", _capture_llm)
 
         out = parse_sql_file(path, reflected_schema=sg)
         assert out == {}
@@ -1168,7 +1185,7 @@ class TestParseSqlFileViaLlmNullability:
             }
         }
         monkeypatch.setattr(
-            "aetherdialect._schema_catalog.llm_chat",
+            "aetherdialect._schema_catalog.LLMProvider.chat",
             lambda *a, **k: stable_json(payload),
         )
         out = _parse_sql_file_via_llm(ddl)
@@ -1193,7 +1210,7 @@ class TestParseSqlFileViaLlmNullability:
             }
         }
         monkeypatch.setattr(
-            "aetherdialect._schema_catalog.llm_chat",
+            "aetherdialect._schema_catalog.LLMProvider.chat",
             lambda *a, **k: stable_json(payload),
         )
         out = _parse_sql_file_via_llm(ddl)
@@ -1217,8 +1234,8 @@ class TestAssignColumnOps:
         t = TableMetadata(name="t", columns={"created_at": col}, foreign_keys=[], primary_key="")
         schema = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"t": t})
         assign_column_ops(schema)
-        assert "between" in col.valid_filter_ops
-        assert "is null" in col.valid_filter_ops
+        assert "between" in col.valid_where_ops
+        assert "is null" in col.valid_where_ops
         assert col.valid_aggregations == ["count"]
         assert col.valid_having_ops == ["=", "!=", "<", "<=", ">", ">="]
 
@@ -1235,8 +1252,8 @@ class TestAssignColumnOps:
         t = TableMetadata(name="t", columns={"id": col}, foreign_keys=[], primary_key="")
         schema = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"t": t})
         assign_column_ops(schema)
-        assert "=" in col.valid_filter_ops
-        assert "between" in col.valid_filter_ops
+        assert "=" in col.valid_where_ops
+        assert "between" in col.valid_where_ops
         assert "count" in col.valid_aggregations
         assert "sum" not in col.valid_aggregations
 
@@ -1252,8 +1269,8 @@ class TestAssignColumnOps:
         t = TableMetadata(name="t", columns={"status": col}, foreign_keys=[], primary_key="")
         schema = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"t": t})
         assign_column_ops(schema)
-        assert "like" in col.valid_filter_ops
-        assert "ilike" in col.valid_filter_ops
+        assert "like" in col.valid_where_ops
+        assert "ilike" in col.valid_where_ops
 
     def test_numeric_measure(self):
         """NUMERIC_MEASURE gets sum/avg aggregations."""
@@ -1269,7 +1286,7 @@ class TestAssignColumnOps:
         assign_column_ops(schema)
         assert "sum" in col.valid_aggregations
         assert "avg" in col.valid_aggregations
-        assert "between" in col.valid_filter_ops
+        assert "between" in col.valid_where_ops
 
     def test_temporal(self):
         """TEMPORAL columns get date-appropriate ops."""
@@ -1283,7 +1300,7 @@ class TestAssignColumnOps:
         t = TableMetadata(name="t", columns={"order_date": col}, foreign_keys=[], primary_key="")
         schema = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"t": t})
         assign_column_ops(schema)
-        assert "between" in col.valid_filter_ops
+        assert "between" in col.valid_where_ops
         assert "min" in col.valid_aggregations
         assert "sum" not in col.valid_aggregations
 
@@ -1299,8 +1316,8 @@ class TestAssignColumnOps:
         t = TableMetadata(name="t", columns={"is_active": col}, foreign_keys=[], primary_key="")
         schema = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"t": t})
         assign_column_ops(schema)
-        assert "=" in col.valid_filter_ops
-        assert "between" not in col.valid_filter_ops
+        assert "=" in col.valid_where_ops
+        assert "between" not in col.valid_where_ops
 
     def test_free_text(self):
         """FREE_TEXT columns retain pattern ops despite is_filterable=False."""
@@ -1314,13 +1331,13 @@ class TestAssignColumnOps:
         t = TableMetadata(name="t", columns={"description": col}, foreign_keys=[], primary_key="")
         schema = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"t": t})
         assign_column_ops(schema)
-        assert "like" in col.valid_filter_ops
-        assert "ilike" in col.valid_filter_ops
-        assert "not like" in col.valid_filter_ops
-        assert "not ilike" in col.valid_filter_ops
-        assert "is null" in col.valid_filter_ops
-        assert "is not null" in col.valid_filter_ops
-        assert "=" not in col.valid_filter_ops
+        assert "like" in col.valid_where_ops
+        assert "ilike" in col.valid_where_ops
+        assert "not like" in col.valid_where_ops
+        assert "not ilike" in col.valid_where_ops
+        assert "is null" in col.valid_where_ops
+        assert "is not null" in col.valid_where_ops
+        assert "=" not in col.valid_where_ops
         assert col.valid_aggregations == ["count"]
 
     def test_numeric_categorical(self):
@@ -1335,8 +1352,8 @@ class TestAssignColumnOps:
         t = TableMetadata(name="t", columns={"rating": col}, foreign_keys=[], primary_key="")
         schema = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"t": t})
         assign_column_ops(schema)
-        assert "between" in col.valid_filter_ops
-        assert "like" not in col.valid_filter_ops
+        assert "between" in col.valid_where_ops
+        assert "like" not in col.valid_where_ops
 
     def test_non_filterable_empty_ops(self):
         """Non-filterable columns get empty filter ops regardless of role."""
@@ -1350,7 +1367,7 @@ class TestAssignColumnOps:
         t = TableMetadata(name="t", columns={"x": col}, foreign_keys=[], primary_key="")
         schema = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"t": t})
         assign_column_ops(schema)
-        assert col.valid_filter_ops == []
+        assert col.valid_where_ops == []
 
     def test_string_only_ops_removed_from_numeric(self):
         """String-only ops removed from non-string columns."""
@@ -1364,8 +1381,8 @@ class TestAssignColumnOps:
         t = TableMetadata(name="t", columns={"amount": col}, foreign_keys=[], primary_key="")
         schema = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"t": t})
         assign_column_ops(schema)
-        assert "like" not in col.valid_filter_ops
-        assert "ilike" not in col.valid_filter_ops
+        assert "like" not in col.valid_where_ops
+        assert "ilike" not in col.valid_where_ops
 
     def test_numeric_aggs_removed_from_string(self):
         """Numeric-only aggregations removed from string columns."""
@@ -1395,7 +1412,7 @@ class TestAssignColumnOps:
         schema = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"t": t})
         assign_column_ops(schema)
         assert col.element_type == "string"
-        assert "contains" in col.valid_filter_ops
+        assert "contains" in col.valid_where_ops
 
     def test_array_bracket_type_puts_contains_first(self):
         """Typed array columns prepend ``contains`` ahead of role-based operators."""
@@ -1409,7 +1426,7 @@ class TestAssignColumnOps:
         t = TableMetadata(name="t", columns={"ids": col}, foreign_keys=[], primary_key="")
         schema = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"t": t})
         assign_column_ops(schema)
-        assert col.valid_filter_ops[0] == "contains"
+        assert col.valid_where_ops[0] == "contains"
 
     def test_fallback_role_branch_when_filterable(self):
         """Non-enum role string hits the default branch and keeps basic equality ops when filterable."""
@@ -1424,8 +1441,8 @@ class TestAssignColumnOps:
         t = TableMetadata(name="t", columns={"x": col}, foreign_keys=[], primary_key="")
         schema = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"t": t})
         assign_column_ops(schema)
-        assert "=" in col.valid_filter_ops
-        assert "is null" in col.valid_filter_ops
+        assert "=" in col.valid_where_ops
+        assert "is null" in col.valid_where_ops
         assert col.valid_aggregations == ["count"]
 
 
@@ -1552,7 +1569,9 @@ class TestUnityStructuralConstraintsIndexFromRows:
                 "unique_constraint_name": "pk_users",
             },
         ]
-        idx = structural_constraints_index_from_information_schema_rows(tc_rows, kcu_rows, rc_rows)
+        idx = InformationSchemaSupport.structural_constraints_index_from_information_schema_rows(
+            tc_rows, kcu_rows, rc_rows
+        )
         ub = idx.tables["users"]
         assert ub.primary_keys == ["id"]
         assert "email" in ub.unique_columns
@@ -1602,6 +1621,7 @@ class TestApplyColumnRolesLlmBooleanStringValueType:
             notes_content: str | None = None,
             *,
             column_scope: dict[str, frozenset[str]] | None = None,
+            **kwargs: Any,
         ):
             return {
                 "clinical_data": (
@@ -1998,8 +2018,8 @@ class TestValidateColumnClassificationEdgeCases:
         assert len(hard) > 0 or len(soft) > 0
 
     def test_temporal_on_domain_dtype_soft_warning_only(self):
-        """TEMPORAL on a DOMAIN-typed column yields a soft warning, not a hard error."""
-        col = ColumnMetadata(name="code", data_type="INTEGER DOMAIN year_t", value_type="integer")
+        """TEMPORAL on a year-like integer column yields a soft warning, not a hard error."""
+        col = ColumnMetadata(name="release_year", data_type="INTEGER DOMAIN year_t", value_type="integer")
         hard, soft = _validate_column_classification(col, ColumnRole.TEMPORAL.value)
         assert len(hard) == 0
         assert len(soft) > 0
@@ -2066,10 +2086,10 @@ def _schema_with_partition(table: str, partition_cols: list[str]) -> SchemaGraph
     return SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={table: meta})
 
 
-def _filter_param(col: str, op: str, param_key: str | None = None, raw_value=None) -> FilterParam:
-    """Build a FilterParam for partition injection tests."""
+def _where_param(col: str, op: str, param_key: str | None = None, raw_value=None) -> WhereParam:
+    """Build a WhereParam for partition injection tests."""
     expr = NormalizedExpr.from_column(col)
-    return FilterParam(left_expr=expr, op=op, param_key=param_key or "", raw_value=raw_value)
+    return WhereParam(left_expr=expr, op=op, param_key=param_key or "", raw_value=raw_value)
 
 
 def _databricks_partition_dialect() -> DatabricksDialect:
@@ -2089,12 +2109,12 @@ class TestInjectPartitionFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[_filter_param("events.dt", "=", "p1", None)],
+            where=PredicateGroup.from_list([_where_param("events.dt", "=", "p1", None)]),
             param_values={"p1": "2024-01-15"},
         )
         sql = "SELECT * FROM events"
         result = _databricks_partition_dialect().inject_pruning_predicates(sql, schema=schema, intent=intent)
-        assert "`events`.`dt` = '2024-01-15'" in result
+        assert "`events`.`dt` = :p1" in result
         assert "WHERE" in result
 
     def test_inject_in_partition_predicate(self):
@@ -2106,15 +2126,17 @@ class TestInjectPartitionFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                _filter_param("logs.region", "=", "p1", None),
-                _filter_param("logs.region", "=", "p2", None),
-            ],
+            where=PredicateGroup.from_list(
+                [
+                    _where_param("logs.region", "=", "p1", None),
+                    _where_param("logs.region", "=", "p2", None),
+                ]
+            ),
             param_values={"p1": "us", "p2": "eu"},
         )
         sql = "SELECT * FROM logs"
         result = _databricks_partition_dialect().inject_pruning_predicates(sql, schema=schema, intent=intent)
-        assert "`logs`.`region` IN ('us', 'eu')" in result
+        assert "`logs`.`region` IN (:p1, :p2)" in result
 
     def test_inject_between_partition_predicate(self):
         """Inject BETWEEN as >= and <= partition predicates."""
@@ -2125,18 +2147,22 @@ class TestInjectPartitionFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                _filter_param("sales.dt", ">=", "p1", None),
-                _filter_param("sales.dt", "<=", "p2", None),
-            ],
+            where=PredicateGroup.from_list(
+                [
+                    _where_param("sales.dt", ">=", "p1", None),
+                    _where_param("sales.dt", "<=", "p2", None),
+                ]
+            ),
             param_values={"p1": "2024-01-01", "p2": "2024-01-31"},
         )
         sql = "SELECT * FROM sales"
         result = _databricks_partition_dialect().inject_pruning_predicates(sql, schema=schema, intent=intent)
         assert ">=" in result
         assert "<=" in result
-        assert "2024-01-01" in result
-        assert "2024-01-31" in result
+        assert ":p1" in result
+        assert ":p2" in result
+        assert "2024-01-01" not in result
+        assert "2024-01-31" not in result
 
     def test_no_partition_columns_unchanged(self):
         """SQL unchanged when table has no partition columns."""
@@ -2154,7 +2180,7 @@ class TestInjectPartitionFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[_filter_param("plain.id", "=", "p1", None)],
+            where=PredicateGroup.from_list([_where_param("plain.id", "=", "p1", None)]),
             param_values={"p1": 1},
         )
         sql = "SELECT * FROM plain WHERE id = 1"
@@ -2170,10 +2196,10 @@ class TestInjectPartitionFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[_filter_param("events.dt", "=", "p1", None)],
+            where=PredicateGroup.from_list([_where_param("events.dt", "=", "p1", None)]),
             param_values={"p1": "2024-01-15"},
         )
-        sql = "SELECT * FROM events WHERE `events`.`dt` = '2024-01-15'"
+        sql = "SELECT * FROM events WHERE `events`.`dt` = :p1"
         result = _databricks_partition_dialect().inject_pruning_predicates(sql, schema=schema, intent=intent)
         assert result == sql
 
@@ -2186,13 +2212,13 @@ class TestInjectPartitionFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[_filter_param("events.dt", "=", "p1", None)],
+            where=PredicateGroup.from_list([_where_param("events.dt", "=", "p1", None)]),
             param_values={"p1": "2024-01-15"},
         )
         sql = "SELECT * FROM events WHERE status = 'active'"
         result = _databricks_partition_dialect().inject_pruning_predicates(sql, schema=schema, intent=intent)
         assert "status = 'active'" in result
-        assert "`events`.`dt` = '2024-01-15'" in result
+        assert "`events`.`dt` = :p1" in result
         assert " AND " in result
 
 

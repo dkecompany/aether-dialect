@@ -8,15 +8,18 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from aetherdialect._config import EngineConfig, PolicyConfig
-from aetherdialect._constants import ARTIFACT_FORMAT_VERSION, ARTIFACT_MANIFEST_FILENAME
+from aetherdialect._constants import (
+    ARTIFACT_FORMAT_VERSION,
+    ARTIFACT_MANIFEST_FILENAME,
+)
 from aetherdialect._contracts_base import (
+    ArtifactManifest,
     LlmJsonExhausted,
     MigrationReport,
     MigrationTier,
 )
 from aetherdialect._core_utils import (
     RephraseHint,
-    _ArtifactManifest,
     _extract_first_json_object,
     _format_cell,
     _manifest_path,
@@ -25,7 +28,6 @@ from aetherdialect._core_utils import (
     _strip_fences,
     ask_user_choice,
     canonicalize_sql,
-    classify_migration_tier,
     colmap_signature,
     dataframe_to_row_tuples,
     debug,
@@ -64,19 +66,10 @@ from aetherdialect._core_utils import (
     write_artifact_manifest,
     write_gzip_json_atomic,
 )
-from aetherdialect._dialect import (
-    _sql_simplify_executable,
-    compute_sql_fp,
-    parameter_abstract,
-)
-from aetherdialect._llm_provider import (
-    _build_client,
-    _llm_user_text_without_sensitivity_classification,
-    _provider_order,
-    llm_chat,
-    llm_json,
-)
-from aetherdialect._templates import apply_migration_policy
+from aetherdialect._dialect import Dialect
+from aetherdialect._llm_provider import LLMProvider
+from aetherdialect._schema_graph import classify_migration_tier
+from aetherdialect._templates import TemplateOps
 
 
 class TestSha256:
@@ -364,28 +357,28 @@ class TestSafeJsonLoads:
 
 
 class TestParameterAbstract:
-    """Tests for parameter_abstract."""
+    """Tests for Dialect.parameter_abstract."""
 
     def test_replaces_string_literal(self):
-        """parameter_abstract replaces quoted strings."""
-        sql, params = parameter_abstract("SELECT * FROM t WHERE name = 'Alice'", sqlglot_dialect="postgres")
+        """Dialect.parameter_abstract replaces quoted strings."""
+        sql, params = Dialect.parameter_abstract("SELECT * FROM t WHERE name = 'Alice'", sqlglot_dialect="postgres")
         assert ":p" in sql
         assert "'Alice'" in params.values()
 
     def test_replaces_numeric_literal(self):
-        """parameter_abstract replaces numeric values."""
-        sql, params = parameter_abstract("SELECT * FROM t WHERE id = 42", sqlglot_dialect="postgres")
+        """Dialect.parameter_abstract preserves numeric literal text."""
+        sql, params = Dialect.parameter_abstract("SELECT * FROM t WHERE id = 42", sqlglot_dialect="postgres")
         assert ":p" in sql
-        assert 42 in params.values()
+        assert "42" in params.values()
 
     def test_replaces_date_literal(self):
-        """parameter_abstract replaces ISO date string literals."""
-        sql, params = parameter_abstract("SELECT * FROM t WHERE dt = '2024-01-15'", sqlglot_dialect="postgres")
+        """Dialect.parameter_abstract replaces ISO date string literals."""
+        sql, params = Dialect.parameter_abstract("SELECT * FROM t WHERE dt = '2024-01-15'", sqlglot_dialect="postgres")
         assert "'2024-01-15'" in params.values()
 
     def test_returns_dict_of_params(self):
-        """parameter_abstract returns dict with p1, p2, etc. keys."""
-        _, params = parameter_abstract("WHERE a = 1 AND b = 'x'", sqlglot_dialect="postgres")
+        """Dialect.parameter_abstract returns dict with p1, p2, etc. keys."""
+        _, params = Dialect.parameter_abstract("WHERE a = 1 AND b = 'x'", sqlglot_dialect="postgres")
         assert all(k.startswith("p") for k in params)
 
 
@@ -420,17 +413,17 @@ class TestSubstituteParams:
 
     def test_strips_trivial_coefficient(self):
         """sql_simplify_executable removes 1 * prefix."""
-        result = _sql_simplify_executable("SELECT 1 * col FROM t", sqlglot_dialect="postgres")
+        result = Dialect._sql_simplify_executable("SELECT 1 * col FROM t", sqlglot_dialect="postgres")
         assert "1 *" not in result
 
     def test_strips_trivial_offset(self):
         """sql_simplify_executable removes + 0 suffix."""
-        result = _sql_simplify_executable("SELECT col + 0 FROM t", sqlglot_dialect="postgres")
+        result = Dialect._sql_simplify_executable("SELECT col + 0 FROM t", sqlglot_dialect="postgres")
         assert "+ 0" not in result
 
     def test_strips_limit_none(self):
         """sql_simplify_executable removes LIMIT NULL."""
-        result = _sql_simplify_executable("SELECT * FROM t LIMIT NULL", sqlglot_dialect="postgres")
+        result = Dialect._sql_simplify_executable("SELECT * FROM t LIMIT NULL", sqlglot_dialect="postgres")
         assert "LIMIT" not in result.upper()
 
     def test_substitutes_quoted_string_in_list(self):
@@ -480,34 +473,36 @@ class TestNormalizeArrayContainsParamValue:
 
 
 class TestComputeSqlFp:
-    """Tests for compute_sql_fp."""
+    """Tests for Dialect.compute_sql_fp."""
 
     def test_deterministic(self):
-        assert compute_sql_fp("SELECT 1", sqlglot_dialect="postgres") == compute_sql_fp(
+        assert Dialect.compute_sql_fp("SELECT 1", sqlglot_dialect="postgres") == Dialect.compute_sql_fp(
             "SELECT 1", sqlglot_dialect="postgres"
         )
 
     def test_case_insensitive(self):
-        assert compute_sql_fp("SELECT 1", sqlglot_dialect="postgres") == compute_sql_fp(
+        assert Dialect.compute_sql_fp("SELECT 1", sqlglot_dialect="postgres") == Dialect.compute_sql_fp(
             "select 1", sqlglot_dialect="postgres"
         )
 
     def test_returns_64_hex(self):
-        result = compute_sql_fp("SELECT 1", sqlglot_dialect="postgres")
+        result = Dialect.compute_sql_fp("SELECT 1", sqlglot_dialect="postgres")
         assert len(result) == 64
 
     def test_whitespace_and_literal_forms_converge(self):
-        a = compute_sql_fp("SELECT 1 FROM t WHERE x = 'abc'", sqlglot_dialect="postgres")
-        b = compute_sql_fp("select   1   from   t   where   x   =   'abc'", sqlglot_dialect="postgres")
+        a = Dialect.compute_sql_fp("SELECT 1 FROM t WHERE x = 'abc'", sqlglot_dialect="postgres")
+        b = Dialect.compute_sql_fp("select   1   from   t   where   x   =   'abc'", sqlglot_dialect="postgres")
         assert a == b
 
     def test_different_literals_produce_same_fp(self):
-        a = compute_sql_fp("SELECT * FROM t WHERE x = 1", sqlglot_dialect="postgres")
-        b = compute_sql_fp("SELECT * FROM t WHERE x = 2", sqlglot_dialect="postgres")
+        a = Dialect.compute_sql_fp("SELECT * FROM t WHERE x = 1", sqlglot_dialect="postgres")
+        b = Dialect.compute_sql_fp("SELECT * FROM t WHERE x = 2", sqlglot_dialect="postgres")
         assert a == b
 
     def test_empty_input(self):
-        assert compute_sql_fp("", sqlglot_dialect="postgres") == compute_sql_fp("", sqlglot_dialect="postgres")
+        assert Dialect.compute_sql_fp("", sqlglot_dialect="postgres") == Dialect.compute_sql_fp(
+            "", sqlglot_dialect="postgres"
+        )
 
 
 class TestFormatCell:
@@ -880,27 +875,29 @@ class TestSafeJsonLoadsEdgeCases:
 
 
 class TestParameterAbstractEdgeCases:
-    """Edge-case tests for parameter_abstract."""
+    """Edge-case tests for Dialect.parameter_abstract."""
 
     def test_no_literals(self):
-        """parameter_abstract returns empty params for no literals."""
-        sql, params = parameter_abstract("SELECT * FROM t", sqlglot_dialect="postgres")
+        """Dialect.parameter_abstract returns empty params for no literals."""
+        sql, params = Dialect.parameter_abstract("SELECT * FROM t", sqlglot_dialect="postgres")
         assert len(params) == 0
 
     def test_multiple_string_literals(self):
-        """parameter_abstract replaces multiple string literals."""
-        sql, params = parameter_abstract("SELECT * FROM t WHERE a = 'foo' AND b = 'bar'", sqlglot_dialect="postgres")
+        """Dialect.parameter_abstract replaces multiple string literals."""
+        sql, params = Dialect.parameter_abstract(
+            "SELECT * FROM t WHERE a = 'foo' AND b = 'bar'", sqlglot_dialect="postgres"
+        )
         assert len([v for v in params.values() if isinstance(v, str) and v.startswith("'")]) == 2
 
     def test_date_format_slash(self):
-        """parameter_abstract replaces slash-format date string literals."""
-        sql, params = parameter_abstract("SELECT * FROM t WHERE dt = '01/15/2024'", sqlglot_dialect="postgres")
+        """Dialect.parameter_abstract replaces slash-format date string literals."""
+        sql, params = Dialect.parameter_abstract("SELECT * FROM t WHERE dt = '01/15/2024'", sqlglot_dialect="postgres")
         assert "'01/15/2024'" in params.values()
 
     def test_decimal_number(self):
-        """parameter_abstract replaces decimal numbers."""
-        sql, params = parameter_abstract("SELECT * FROM t WHERE price > 9.99", sqlglot_dialect="postgres")
-        assert 9.99 in params.values()
+        """Dialect.parameter_abstract preserves decimal literal text."""
+        sql, params = Dialect.parameter_abstract("SELECT * FROM t WHERE price > 9.99", sqlglot_dialect="postgres")
+        assert "9.99" in params.values()
 
 
 class TestSubstituteParamsEdgeCases:
@@ -934,14 +931,14 @@ class TestSubstituteParamsEdgeCases:
 
 
 class TestComputeSqlFpEdgeCases:
-    """Edge-case tests for compute_sql_fp."""
+    """Edge-case tests for Dialect.compute_sql_fp."""
 
     def test_empty_string(self):
-        h = compute_sql_fp("", sqlglot_dialect="postgres")
+        h = Dialect.compute_sql_fp("", sqlglot_dialect="postgres")
         assert len(h) == 64
 
     def test_whitespace_only(self):
-        h = compute_sql_fp("   ", sqlglot_dialect="postgres")
+        h = Dialect.compute_sql_fp("   ", sqlglot_dialect="postgres")
         assert len(h) == 64
 
 
@@ -1143,11 +1140,13 @@ class TestCanonicalizeSqlNotEqualPreserved:
 
 
 class TestParameterAbstractEscapedQuotes:
-    """Edge cases for parameter_abstract."""
+    """Edge cases for Dialect.parameter_abstract."""
 
     def test_sql_escaped_single_quote(self):
         """Doubled single-quote is parsed as a single string literal under the Postgres AST parser."""
-        sql, params = parameter_abstract("SELECT * FROM t WHERE note = 'it''s fine'", sqlglot_dialect="postgres")
+        sql, params = Dialect.parameter_abstract(
+            "SELECT * FROM t WHERE note = 'it''s fine'", sqlglot_dialect="postgres"
+        )
         values = [v for v in params.values() if isinstance(v, str) and v.startswith("'")]
         assert values == ["'it's fine'"]
 
@@ -1161,12 +1160,12 @@ class TestSubstituteParamsMoreCases:
 
     def test_trailing_star_one_removed(self):
         """Trailing * 1 is simplified."""
-        result = _sql_simplify_executable("SELECT col * 1 FROM t", sqlglot_dialect="postgres")
+        result = Dialect._sql_simplify_executable("SELECT col * 1 FROM t", sqlglot_dialect="postgres")
         assert "* 1" not in result
 
     def test_subtract_zero_removed(self):
         """Subtraction of zero is stripped."""
-        result = _sql_simplify_executable("SELECT col - 0 FROM t", sqlglot_dialect="postgres")
+        result = Dialect._sql_simplify_executable("SELECT col - 0 FROM t", sqlglot_dialect="postgres")
         assert "- 0" not in result
 
 
@@ -1355,7 +1354,7 @@ class TestArtifactManifest:
             return_value=MigrationTier.NO_CHANGE,
         ):
             with patch("aetherdialect._templates.write_artifact_manifest") as w:
-                rep = apply_migration_policy(d, sch)
+                rep = TemplateOps.apply_migration_policy(d, sch)
         w.assert_not_called()
         assert isinstance(rep, MigrationReport)
         assert rep.tier == MigrationTier.NO_CHANGE
@@ -1369,7 +1368,7 @@ class TestArtifactManifest:
         ):
             with patch("aetherdialect._templates.write_artifact_manifest") as w:
                 with patch("aetherdialect._templates.debug"):
-                    rep = apply_migration_policy(d, sch)
+                    rep = TemplateOps.apply_migration_policy(d, sch)
         w.assert_called_once()
         assert w.call_args[0][0] == d
         assert rep.tier == MigrationTier.SOFT_REFRESH
@@ -1385,12 +1384,12 @@ class TestArtifactManifest:
             return_value=MigrationTier.DESTRUCTIVE,
         ):
             with patch("aetherdialect._templates.debug"):
-                rep = apply_migration_policy(d, sch)
+                rep = TemplateOps.apply_migration_policy(d, sch)
         assert not os.path.isfile(stale)
         assert rep.tier == MigrationTier.DESTRUCTIVE
 
     def test_classify_profiling_change_overlap_gate(self):
-        m = _ArtifactManifest(
+        m = ArtifactManifest(
             artifact_format_version=ARTIFACT_FORMAT_VERSION,
             effective_structural_hash="e",
             structural_hash="t",
@@ -1407,13 +1406,13 @@ class TestArtifactManifest:
         sch.notes_hash = "n"
         sch.semantic_edges_hash = "s"
         prev = MagicMock()
-        with patch("aetherdialect._core_utils._profiling_value_overlap", return_value=0.5):
+        with patch("aetherdialect._schema_graph.profiling_value_overlap", return_value=0.5):
             assert classify_migration_tier(m, sch, previous_schema=prev) == MigrationTier.SOFT_REFRESH
-        with patch("aetherdialect._core_utils._profiling_value_overlap", return_value=0.01):
+        with patch("aetherdialect._schema_graph.profiling_value_overlap", return_value=0.01):
             assert classify_migration_tier(m, sch, previous_schema=prev) == MigrationTier.DESTRUCTIVE
 
     def test_classify_stale_artifact_format_is_destructive(self):
-        m = _ArtifactManifest(
+        m = ArtifactManifest(
             artifact_format_version=1,
             effective_structural_hash="e",
             structural_hash="t",
@@ -1432,7 +1431,7 @@ class TestArtifactManifest:
         assert classify_migration_tier(m, sch) == MigrationTier.DESTRUCTIVE
 
     def test_classify_package_below_manifest_min_is_destructive(self):
-        m = _ArtifactManifest(
+        m = ArtifactManifest(
             artifact_format_version=ARTIFACT_FORMAT_VERSION,
             min_compatible_package_version="99.0.0",
             effective_structural_hash="e",
@@ -1453,9 +1452,9 @@ class TestArtifactManifest:
 
     def test_classify_schema_diff_implies_remap_when_rename_plan_missing(self) -> None:
         """Non-empty diff with column renames yields REMAP when scope is stable even if try_rename is None."""
-        from aetherdialect._schema_graph import SchemaDiff, TableDiff
+        from aetherdialect._contracts_schema import SchemaDiff, TableDiff
 
-        m = _ArtifactManifest(
+        m = ArtifactManifest(
             artifact_format_version=ARTIFACT_FORMAT_VERSION,
             effective_structural_hash="e1",
             structural_hash="t1",
@@ -1543,12 +1542,12 @@ class TestLlmChat:
         mock_client = MagicMock()
         mock_client.responses.create.return_value = mock_resp
 
-        with patch("aetherdialect._llm_provider._provider_order", return_value=["openai"]):
-            with patch("aetherdialect._llm_provider._provider_is_configured", return_value=True):
-                with patch("aetherdialect._llm_provider._build_client", return_value=mock_client):
+        with patch("aetherdialect._llm_provider.LLMProvider._provider_order", return_value=["openai"]):
+            with patch("aetherdialect._llm_provider.LLMProvider._provider_is_configured", return_value=True):
+                with patch("aetherdialect._llm_provider.LLMProvider._build_client", return_value=mock_client):
                     with patch("aetherdialect._core_utils.debug"):
                         with patch("aetherdialect._core_utils.pipeline_trace"):
-                            out = llm_chat("sys", "usr", max_retries=1, task="join")
+                            out = LLMProvider.chat("sys", "usr", max_retries=1, task="join")
         assert out == '{"a": 1}'
         mock_client.responses.create.assert_called()
 
@@ -1558,27 +1557,26 @@ class TestLlmChat:
         snap_p = EngineConfig.LLM_PROVIDER
         try:
             EngineConfig.LLM_PROVIDER = "azure"
-            monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT_MEDIUM", "dep-sql")
             monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT_LIGHT", "dep0")
             monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT_HEAVY", "dep2")
             mock_resp = MagicMock()
             mock_resp.output_text = "{}"
             mock_client = MagicMock()
             mock_client.responses.create.return_value = mock_resp
-            with patch("aetherdialect._llm_provider._provider_order", return_value=["azure"]):
+            with patch("aetherdialect._llm_provider.LLMProvider._provider_order", return_value=["azure"]):
                 with patch(
-                    "aetherdialect._llm_provider._provider_is_configured",
+                    "aetherdialect._llm_provider.LLMProvider._provider_is_configured",
                     return_value=True,
                 ):
                     with patch(
-                        "aetherdialect._llm_provider._build_client",
+                        "aetherdialect._llm_provider.LLMProvider._build_client",
                         return_value=mock_client,
                     ):
                         with patch("aetherdialect._core_utils.debug"):
                             with patch("aetherdialect._core_utils.pipeline_trace"):
-                                llm_chat("sys", "usr", max_retries=1, task="join")
+                                LLMProvider.chat("sys", "usr", max_retries=1, task="join")
             call_kw = mock_client.responses.create.call_args.kwargs
-            assert call_kw["model"] == "dep2"
+            assert call_kw["model"] == "dep0"
         finally:
             EngineConfig.LLM_PROVIDER = snap_p
 
@@ -1588,47 +1586,47 @@ class TestLlmChat:
         snap_p = EngineConfig.LLM_PROVIDER
         try:
             EngineConfig.LLM_PROVIDER = "openai"
-            monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT_MEDIUM", "y")
+            monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT_LIGHT", "dep0")
             mock_resp = MagicMock()
             mock_resp.output_text = "{}"
             mock_client = MagicMock()
             mock_client.responses.create.return_value = mock_resp
-            with patch("aetherdialect._llm_provider._provider_order", return_value=["openai"]):
+            with patch("aetherdialect._llm_provider.LLMProvider._provider_order", return_value=["openai"]):
                 with patch(
-                    "aetherdialect._llm_provider._provider_is_configured",
+                    "aetherdialect._llm_provider.LLMProvider._provider_is_configured",
                     return_value=True,
                 ):
                     with patch(
-                        "aetherdialect._llm_provider._build_client",
+                        "aetherdialect._llm_provider.LLMProvider._build_client",
                         return_value=mock_client,
                     ):
                         with patch("aetherdialect._core_utils.debug"):
                             with patch("aetherdialect._core_utils.pipeline_trace"):
-                                llm_chat("sys", "usr", max_retries=1, task="join")
+                                LLMProvider.chat("sys", "usr", max_retries=1, task="join")
             call_kw = mock_client.responses.create.call_args.kwargs
-            assert call_kw["model"] == "gpt-5.4-mini"
+            assert call_kw["model"] == "gpt-5.4-nano"
         finally:
             EngineConfig.LLM_PROVIDER = snap_p
 
     def test_no_provider_raises(self):
-        with patch("aetherdialect._llm_provider._provider_order", return_value=["openai"]):
-            with patch("aetherdialect._llm_provider._provider_is_configured", return_value=False):
+        with patch("aetherdialect._llm_provider.LLMProvider._provider_order", return_value=["openai"]):
+            with patch("aetherdialect._llm_provider.LLMProvider._provider_is_configured", return_value=False):
                 with pytest.raises(RuntimeError, match="No configured"):
-                    llm_chat("s", "u", max_retries=1)
+                    LLMProvider.chat("s", "u", max_retries=1)
 
 
 class TestLlmJson:
     """llm_json behaviour via mocked llm_chat."""
 
     def test_parses_json_object(self):
-        with patch("aetherdialect._llm_provider.llm_chat", return_value='{"k": 1}'):
+        with patch("aetherdialect._llm_provider.LLMProvider.chat", return_value='{"k": 1}'):
             with patch("aetherdialect._core_utils.debug"):
-                assert llm_json("s", "u") == {"k": 1}
+                assert LLMProvider.json("s", "u") == {"k": 1}
 
     def test_wraps_raw_select(self):
-        with patch("aetherdialect._llm_provider.llm_chat", return_value="SELECT 1"):
+        with patch("aetherdialect._llm_provider.LLMProvider.chat", return_value="SELECT 1"):
             with patch("aetherdialect._core_utils.debug"):
-                d = llm_json("s", "u", retries=0)
+                d = LLMProvider.json("s", "u", retries=0)
         assert d["sql"] == "SELECT 1"
         assert d["chosen_join_candidate_id"] == "J00"
 
@@ -1639,18 +1637,18 @@ class TestLlmJson:
             calls["n"] += 1
             return "not json"
 
-        with patch("aetherdialect._llm_provider.llm_chat", side_effect=side_effect):
+        with patch("aetherdialect._llm_provider.LLMProvider.chat", side_effect=side_effect):
             with patch("aetherdialect._core_utils.debug"):
                 with pytest.raises(LlmJsonExhausted) as exc_info:
-                    llm_json("s", "u", retries=0, task="intent")
+                    LLMProvider.json("s", "u", retries=0, task="intent")
         assert exc_info.value.task == "intent"
         assert exc_info.value.attempts == 1
 
     def test_retries_exhausted_after_multiple_retries(self):
-        with patch("aetherdialect._llm_provider.llm_chat", return_value="still not json"):
+        with patch("aetherdialect._llm_provider.LLMProvider.chat", return_value="still not json"):
             with patch("aetherdialect._core_utils.debug"):
                 with pytest.raises(LlmJsonExhausted) as exc_info:
-                    llm_json("s", "u", retries=2)
+                    LLMProvider.json("s", "u", retries=2)
         assert exc_info.value.attempts == 3
 
 
@@ -1704,15 +1702,15 @@ class TestProviderOrderAndBuildClient:
 
     def test_provider_order_openai(self):
         with patch.object(EngineConfig, "LLM_PROVIDER", "openai"):
-            assert _provider_order() == ["openai"]
+            assert LLMProvider._provider_order() == ["openai"]
 
     def test_provider_order_azure(self):
         with patch.object(EngineConfig, "LLM_PROVIDER", "azure"):
-            assert _provider_order() == ["azure"]
+            assert LLMProvider._provider_order() == ["azure"]
 
     def test_provider_order_unknown_falls_back_to_openai(self):
         with patch.object(EngineConfig, "LLM_PROVIDER", "bogus"):
-            assert _provider_order() == ["openai"]
+            assert LLMProvider._provider_order() == ["openai"]
 
     def test_build_client_unsupported_raises(self):
         import aetherdialect._llm_provider
@@ -1721,7 +1719,7 @@ class TestProviderOrderAndBuildClient:
         aetherdialect._llm_provider._clients.clear()
         try:
             with pytest.raises(RuntimeError, match="Unsupported LLM provider"):
-                _build_client("not-a-provider")
+                LLMProvider._build_client("not-a-provider")
         finally:
             aetherdialect._llm_provider._clients.clear()
             aetherdialect._llm_provider._clients.update(prev)
@@ -1741,15 +1739,15 @@ class TestLlmChatBranches:
             return bad if name == "openai" else good
 
         with patch(
-            "aetherdialect._llm_provider._provider_order",
+            "aetherdialect._llm_provider.LLMProvider._provider_order",
             return_value=["openai", "azure"],
         ):
-            with patch("aetherdialect._llm_provider._provider_is_configured", return_value=True):
-                with patch("aetherdialect._llm_provider._build_client", side_effect=pick_client):
+            with patch("aetherdialect._llm_provider.LLMProvider._provider_is_configured", return_value=True):
+                with patch("aetherdialect._llm_provider.LLMProvider._build_client", side_effect=pick_client):
                     with patch("aetherdialect._core_utils.debug"):
                         with patch("aetherdialect._core_utils.pipeline_trace"):
                             with patch("aetherdialect._core_utils.debug"):
-                                out = llm_chat("s", "u", max_retries=1, task="join")
+                                out = LLMProvider.chat("s", "u", max_retries=1, task="join")
         assert out == "ok"
         assert bad.responses.create.call_count == 1
         assert good.responses.create.call_count == 1
@@ -1758,15 +1756,15 @@ class TestLlmChatBranches:
         client = MagicMock()
         client.responses.create.side_effect = ValueError("nope")
 
-        with patch("aetherdialect._llm_provider._provider_order", return_value=["openai"]):
-            with patch("aetherdialect._llm_provider._provider_is_configured", return_value=True):
-                with patch("aetherdialect._llm_provider._build_client", return_value=client):
+        with patch("aetherdialect._llm_provider.LLMProvider._provider_order", return_value=["openai"]):
+            with patch("aetherdialect._llm_provider.LLMProvider._provider_is_configured", return_value=True):
+                with patch("aetherdialect._llm_provider.LLMProvider._build_client", return_value=client):
                     with patch("aetherdialect._core_utils.debug"):
                         with patch("aetherdialect._core_utils.pipeline_trace"):
                             with patch("aetherdialect._core_utils.debug"):
                                 with patch("aetherdialect._core_utils.time.sleep"):
                                     with pytest.raises(RuntimeError, match="LLM call failed"):
-                                        llm_chat("s", "u", max_retries=2, task="join")
+                                        LLMProvider.chat("s", "u", max_retries=2, task="join")
         assert client.responses.create.call_count == 2
 
     def test_intent_task_passes_reasoning_kwarg(self):
@@ -1775,12 +1773,12 @@ class TestLlmChatBranches:
         client = MagicMock()
         client.responses.create.return_value = mock_resp
 
-        with patch("aetherdialect._llm_provider._provider_order", return_value=["openai"]):
-            with patch("aetherdialect._llm_provider._provider_is_configured", return_value=True):
-                with patch("aetherdialect._llm_provider._build_client", return_value=client):
+        with patch("aetherdialect._llm_provider.LLMProvider._provider_order", return_value=["openai"]):
+            with patch("aetherdialect._llm_provider.LLMProvider._provider_is_configured", return_value=True):
+                with patch("aetherdialect._llm_provider.LLMProvider._build_client", return_value=client):
                     with patch("aetherdialect._core_utils.debug"):
                         with patch("aetherdialect._core_utils.pipeline_trace"):
-                            llm_chat("s", "u", max_retries=1, task="intent")
+                            LLMProvider.chat("s", "u", max_retries=1, task="intent")
 
         kwargs = client.responses.create.call_args.kwargs
         assert "reasoning" in kwargs
@@ -1792,12 +1790,12 @@ class TestLlmChatBranches:
         client = MagicMock()
         client.responses.create.return_value = mock_resp
 
-        with patch("aetherdialect._llm_provider._provider_order", return_value=["openai"]):
-            with patch("aetherdialect._llm_provider._provider_is_configured", return_value=True):
-                with patch("aetherdialect._llm_provider._build_client", return_value=client):
+        with patch("aetherdialect._llm_provider.LLMProvider._provider_order", return_value=["openai"]):
+            with patch("aetherdialect._llm_provider.LLMProvider._provider_is_configured", return_value=True):
+                with patch("aetherdialect._llm_provider.LLMProvider._build_client", return_value=client):
                     with patch("aetherdialect._core_utils.debug"):
                         with patch("aetherdialect._core_utils.pipeline_trace"):
-                            llm_chat("s", "u", max_retries=1, task="join")
+                            LLMProvider.chat("s", "u", max_retries=1, task="join")
 
         kwargs = client.responses.create.call_args.kwargs
         assert "reasoning" in kwargs
@@ -1813,9 +1811,9 @@ class TestLlmJsonBranches:
         def fake_chat(*_a, **_k):
             return next(replies)
 
-        with patch("aetherdialect._llm_provider.llm_chat", side_effect=fake_chat):
+        with patch("aetherdialect._llm_provider.LLMProvider.chat", side_effect=fake_chat):
             with patch("aetherdialect._core_utils.debug"):
-                assert llm_json("s", "u", retries=1) == {"fixed": True}
+                assert LLMProvider.json("s", "u", retries=1) == {"fixed": True}
 
     def test_retry_wraps_select(self):
         replies = iter(["x", "SELECT 2"])
@@ -1823,9 +1821,9 @@ class TestLlmJsonBranches:
         def fake_chat(*_a, **_k):
             return next(replies)
 
-        with patch("aetherdialect._llm_provider.llm_chat", side_effect=fake_chat):
+        with patch("aetherdialect._llm_provider.LLMProvider.chat", side_effect=fake_chat):
             with patch("aetherdialect._core_utils.debug"):
-                d = llm_json("s", "u", retries=1)
+                d = LLMProvider.json("s", "u", retries=1)
         assert d["sql"] == "SELECT 2"
         assert d["chosen_join_candidate_id"] == "J00"
 
@@ -1835,16 +1833,16 @@ class TestLlmJsonBranches:
         def fake_chat(*_a, **_k):
             return next(replies)
 
-        with patch("aetherdialect._llm_provider.llm_chat", side_effect=fake_chat):
+        with patch("aetherdialect._llm_provider.LLMProvider.chat", side_effect=fake_chat):
             with patch("aetherdialect._core_utils.debug"):
-                assert llm_json("s", "u", retries=1) == {"only": "dict"}
+                assert LLMProvider.json("s", "u", retries=1) == {"only": "dict"}
 
 
 class TestSubstituteParamsPlusZero:
     """sql_simplify_executable strips + 0 as well as - 0."""
 
     def test_plus_zero_removed(self):
-        result = _sql_simplify_executable("SELECT col + 0 FROM t", sqlglot_dialect="postgres")
+        result = Dialect._sql_simplify_executable("SELECT col + 0 FROM t", sqlglot_dialect="postgres")
         assert "+ 0" not in result
 
 
@@ -1939,7 +1937,8 @@ class TestPrintRephraseHint:
         with diagnostic_print_listener(print):
             print_rephrase_hint(RephraseHint.RESTRICTED_QUESTION)
         out = capsys.readouterr().out.lower()
-        assert "deny_columns" in out or "allow_columns" in out
+        assert "schema" in out or "rephras" in out
+        assert "deny_columns" not in out and "allow_columns" not in out
 
     def test_vague_question_hint(self, capsys):
         with diagnostic_print_listener(print):
@@ -2041,7 +2040,7 @@ class TestLlmUserSensitivityStrip:
 
     def test_strips_nested_sensitivity(self) -> None:
         payload = '{"tables":{"t":{"columns":{"c":{"role":"x","sensitivity":"strict"}}}}}'
-        out = _llm_user_text_without_sensitivity_classification(payload)
+        out = LLMProvider._llm_user_text_without_sensitivity_classification(payload)
         data = json.loads(out)
         col = data["tables"]["t"]["columns"]["c"]
         assert "sensitivity" not in col
@@ -2049,4 +2048,4 @@ class TestLlmUserSensitivityStrip:
 
     def test_plain_text_unchanged(self) -> None:
         s = "not json at all"
-        assert _llm_user_text_without_sensitivity_classification(s) is s
+        assert LLMProvider._llm_user_text_without_sensitivity_classification(s) is s

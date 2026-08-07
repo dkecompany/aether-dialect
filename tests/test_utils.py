@@ -1,17 +1,20 @@
 """Tests for utils module: tokenization, distance, hashing, shapes."""
 
+from dataclasses import replace
 from unittest.mock import patch
 
 import pytest
 
 from aetherdialect._constants import QUESTION_STARTS_AGG, QUESTION_STARTS_GROUP, QUESTION_STARTS_LIST
 from aetherdialect._contracts_base import (
-    FilterParam,
     HavingParam,
     LlmJsonExhausted,
     MulGroup,
     NormalizedExpr,
     OrderByCol,
+    PredicateGroup,
+    QuestionRoute,
+    WhereParam,
 )
 from aetherdialect._contracts_core import (
     ConcreteIntent,
@@ -20,7 +23,6 @@ from aetherdialect._contracts_core import (
     SelectCol,
     Template,
     ValueHistory,
-    concrete_intent_to_runtime_skeleton,
 )
 from aetherdialect._contracts_schema import (
     ColumnMetadata,
@@ -35,8 +37,8 @@ from aetherdialect._utils import (
     _levenshtein_distance,
     _normalize_cte_steps,
     _normalize_cte_steps_for_key,
-    _normalize_filters,
     _normalize_having_conditions,
+    _normalize_where_predicates,
     _tokenize,
     body_similarity_key,
     body_similarity_key_for_concrete,
@@ -125,7 +127,7 @@ class TestSqlShape:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         shape = sql_shape(sql, intent, sqlglot_dialect="postgres")
         assert shape.num_joins == 1
@@ -139,7 +141,7 @@ class TestSqlShape:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         shape = sql_shape(sql, intent, sqlglot_dialect="postgres")
         assert shape.has_group_by is True
@@ -153,24 +155,24 @@ class TestSqlShape:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         shape = sql_shape(sql, intent, sqlglot_dialect="postgres")
         assert shape.has_agg is True
 
     def test_counts_filters(self):
         """sql_shape counts filters from intent."""
-        fp = FilterParam(left_expr=NormalizedExpr.from_column("t.col"), op="=", value_type="string")
+        fp = WhereParam(left_expr=NormalizedExpr.from_column("t.col"), op="=", value_type="string")
         intent = RuntimeIntent(
             tables=["t"],
             grain="row_level",
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=PredicateGroup.from_list([fp]),
         )
         shape = sql_shape("SELECT * FROM t WHERE t.col = 'x'", intent, sqlglot_dialect="postgres")
-        assert shape.num_filters == 1
+        assert shape.num_where == 1
 
     def test_detects_distinct(self):
         """sql_shape detects SELECT DISTINCT."""
@@ -181,7 +183,7 @@ class TestSqlShape:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         shape = sql_shape(sql, intent, sqlglot_dialect="postgres")
         assert shape.has_distinct is True
@@ -204,7 +206,7 @@ class TestIntentKey:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         i2 = RuntimeIntent(
             tables=["customers"],
@@ -212,7 +214,7 @@ class TestIntentKey:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("customers.customer_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         assert intent_key(i1) != intent_key(i2)
 
@@ -224,7 +226,7 @@ class TestIntentKey:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         i2 = RuntimeIntent(
             tables=["t"],
@@ -232,7 +234,7 @@ class TestIntentKey:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         assert intent_key(i1) == intent_key(i2)
 
@@ -242,190 +244,201 @@ class TestIntentKey:
         assert len(k) == 64
         assert all(c in "0123456789abcdef" for c in k)
 
-    def test_different_bool_op_different_key(self):
-        """intent_key differs when filter bool_op differs."""
-        fp_and = FilterParam(
-            left_expr=NormalizedExpr.from_column("t.col"),
-            op="=",
-            value_type="string",
-            bool_op="AND",
+    def test_legacy_bool_op_same_key_when_leaves_match(self):
+        """intent_key hashes leaf predicates; legacy bool_op does not affect the key."""
+        skeleton = {
+            "tables": ["t"],
+            "grain": "row_level",
+            "select_cols": [SelectCol(expr=NormalizedExpr.from_column("t.col"))],
+            "group_by_cols": [],
+            "order_by_cols": [],
+        }
+        legacy_and = [
+            {"left_expr": "t.col", "op": "=", "value_type": "string", "bool_op": "AND"},
+            {"left_expr": "t.other", "op": "=", "value_type": "string", "bool_op": "AND"},
+        ]
+        legacy_or = [
+            {"left_expr": "t.col", "op": "=", "value_type": "string", "bool_op": "AND"},
+            {"left_expr": "t.other", "op": "=", "value_type": "string", "bool_op": "OR"},
+        ]
+        i_and = RuntimeIntent(
+            **skeleton,
+            where=PredicateGroup.from_legacy_flat_where_dicts(legacy_and),
         )
-        fp_or = FilterParam(
-            left_expr=NormalizedExpr.from_column("t.col"),
-            op="=",
-            value_type="string",
-            bool_op="OR",
+        i_or = RuntimeIntent(
+            **skeleton,
+            where=PredicateGroup.from_legacy_flat_where_dicts(legacy_or),
         )
-        i1 = RuntimeIntent(
-            tables=["t"],
-            grain="row_level",
-            select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.col"))],
-            group_by_cols=[],
-            order_by_cols=[],
-            filters_param=[fp_and],
-        )
-        i2 = RuntimeIntent(
-            tables=["t"],
-            grain="row_level",
-            select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.col"))],
-            group_by_cols=[],
-            order_by_cols=[],
-            filters_param=[fp_or],
-        )
-        assert intent_key(i1) != intent_key(i2)
+        assert intent_key(i_and) == intent_key(i_or)
 
-    def test_different_filter_group_different_key(self):
-        """intent_key differs when filter filter_group differs."""
-        fp_none = FilterParam(left_expr=NormalizedExpr.from_column("t.col"), op="=", value_type="string")
-        fp_grp = FilterParam(
-            left_expr=NormalizedExpr.from_column("t.col"),
-            op="=",
-            value_type="string",
-            filter_group=1,
+    def test_legacy_where_group_same_key_when_leaves_match(self):
+        """intent_key hashes leaf predicates; legacy where_group does not affect the key."""
+        skeleton = {
+            "tables": ["t"],
+            "grain": "row_level",
+            "select_cols": [SelectCol(expr=NormalizedExpr.from_column("t.col"))],
+            "group_by_cols": [],
+            "order_by_cols": [],
+        }
+        legacy_grouped = [
+            {"left_expr": "t.col", "op": "=", "value_type": "string", "where_group": 1},
+            {"left_expr": "t.other", "op": "=", "value_type": "string", "where_group": 1},
+        ]
+        legacy_split = [
+            {"left_expr": "t.col", "op": "=", "value_type": "string", "where_group": 1},
+            {"left_expr": "t.other", "op": "=", "value_type": "string", "where_group": 2},
+        ]
+        i_grouped = RuntimeIntent(
+            **skeleton,
+            where=PredicateGroup.from_legacy_flat_where_dicts(legacy_grouped),
         )
-        i1 = RuntimeIntent(
-            tables=["t"],
-            grain="row_level",
-            select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.col"))],
-            group_by_cols=[],
-            order_by_cols=[],
-            filters_param=[fp_none],
+        i_split = RuntimeIntent(
+            **skeleton,
+            where=PredicateGroup.from_legacy_flat_where_dicts(legacy_split),
         )
-        i2 = RuntimeIntent(
-            tables=["t"],
-            grain="row_level",
-            select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.col"))],
-            group_by_cols=[],
-            order_by_cols=[],
-            filters_param=[fp_grp],
-        )
-        assert intent_key(i1) != intent_key(i2)
+        assert intent_key(i_grouped) == intent_key(i_split)
 
-    def test_different_having_bool_op_different_key(self):
-        """intent_key differs when having bool_op differs."""
-        hp_and = HavingParam(
-            left_expr=NormalizedExpr.from_agg("count", "t.id"),
-            op=">",
-            value_type="integer",
-            bool_op="AND",
+    def test_predicate_group_structure_same_key_when_leaves_match(self):
+        """intent_key ignores AND vs OR grouping when flattened leaves are identical."""
+        fp1 = WhereParam(left_expr=NormalizedExpr.from_column("t.a"), op="=", value_type="string")
+        fp2 = WhereParam(left_expr=NormalizedExpr.from_column("t.b"), op="=", value_type="string")
+        skeleton = {
+            "tables": ["t"],
+            "grain": "row_level",
+            "select_cols": [SelectCol(expr=NormalizedExpr.from_column("t.a"))],
+            "group_by_cols": [],
+            "order_by_cols": [],
+        }
+        i_and = RuntimeIntent(
+            **skeleton,
+            where=PredicateGroup(op="and", predicates=(fp1, fp2)),
         )
-        hp_or = HavingParam(
-            left_expr=NormalizedExpr.from_agg("count", "t.id"),
-            op=">",
-            value_type="integer",
-            bool_op="OR",
+        i_or = RuntimeIntent(
+            **skeleton,
+            where=PredicateGroup(op="or", predicates=(fp1, fp2)),
         )
-        i1 = RuntimeIntent(
-            tables=["t"],
-            grain="grouped",
-            select_cols=[],
-            group_by_cols=[],
-            order_by_cols=[],
-            filters_param=[],
-            having_param=[hp_and],
-        )
-        i2 = RuntimeIntent(
-            tables=["t"],
-            grain="grouped",
-            select_cols=[],
-            group_by_cols=[],
-            order_by_cols=[],
-            filters_param=[],
-            having_param=[hp_or],
-        )
-        assert intent_key(i1) != intent_key(i2)
+        assert intent_key(i_and) == intent_key(i_or)
 
-    def test_different_having_filter_group_different_key(self):
-        """intent_key differs when having filter_group differs."""
-        hp_none = HavingParam(
-            left_expr=NormalizedExpr.from_agg("count", "t.id"),
-            op=">",
-            value_type="integer",
+    def test_different_having_bool_op_same_key_when_leaves_match(self):
+        """intent_key hashes leaf having predicates; legacy bool_op does not affect the key."""
+        skeleton = {
+            "tables": ["t"],
+            "grain": "grouped",
+            "select_cols": [],
+            "group_by_cols": [],
+            "order_by_cols": [],
+            "where": None,
+        }
+        legacy_and = [
+            {"left_expr": "COUNT(t.id)", "op": ">", "value_type": "integer", "bool_op": "AND"},
+            {"left_expr": "SUM(t.amount)", "op": ">", "value_type": "integer", "bool_op": "AND"},
+        ]
+        legacy_or = [
+            {"left_expr": "COUNT(t.id)", "op": ">", "value_type": "integer", "bool_op": "AND"},
+            {"left_expr": "SUM(t.amount)", "op": ">", "value_type": "integer", "bool_op": "OR"},
+        ]
+        i_and = RuntimeIntent(
+            **skeleton,
+            having=PredicateGroup.from_legacy_having_dicts(legacy_and),
         )
-        hp_grp = HavingParam(
-            left_expr=NormalizedExpr.from_agg("count", "t.id"),
-            op=">",
-            value_type="integer",
-            filter_group=1,
+        i_or = RuntimeIntent(
+            **skeleton,
+            having=PredicateGroup.from_legacy_having_dicts(legacy_or),
         )
-        i1 = RuntimeIntent(
-            tables=["t"],
-            grain="grouped",
-            select_cols=[],
-            group_by_cols=[],
-            order_by_cols=[],
-            filters_param=[],
-            having_param=[hp_none],
+        assert intent_key(i_and) == intent_key(i_or)
+
+    def test_different_having_where_group_same_key_when_leaves_match(self):
+        """intent_key hashes leaf having predicates; legacy where_group does not affect the key."""
+        skeleton = {
+            "tables": ["t"],
+            "grain": "grouped",
+            "select_cols": [],
+            "group_by_cols": [],
+            "order_by_cols": [],
+            "where": None,
+        }
+        legacy_grouped = [
+            {"left_expr": "COUNT(t.id)", "op": ">", "value_type": "integer", "where_group": 1},
+            {"left_expr": "SUM(t.amount)", "op": ">", "value_type": "integer", "where_group": 1},
+        ]
+        legacy_split = [
+            {"left_expr": "COUNT(t.id)", "op": ">", "value_type": "integer", "where_group": 1},
+            {"left_expr": "SUM(t.amount)", "op": ">", "value_type": "integer", "where_group": 2},
+        ]
+        i_grouped = RuntimeIntent(
+            **skeleton,
+            having=PredicateGroup.from_legacy_having_dicts(legacy_grouped),
         )
-        i2 = RuntimeIntent(
-            tables=["t"],
-            grain="grouped",
-            select_cols=[],
-            group_by_cols=[],
-            order_by_cols=[],
-            filters_param=[],
-            having_param=[hp_grp],
+        i_split = RuntimeIntent(
+            **skeleton,
+            having=PredicateGroup.from_legacy_having_dicts(legacy_split),
         )
-        assert intent_key(i1) != intent_key(i2)
+        assert intent_key(i_grouped) == intent_key(i_split)
 
 
 class TestNormalizeFilters:
     """Tests for normalize_filters."""
 
     def test_normalizes_filter_params(self):
-        """normalize_filters converts FilterParam list."""
-        fp = FilterParam(left_expr=NormalizedExpr.from_column("t.col"), op="=", value_type="string")
-        result = _normalize_filters([fp])
+        """normalize_filters converts WhereParam list."""
+        fp = WhereParam(left_expr=NormalizedExpr.from_column("t.col"), op="=", value_type="string")
+        result = _normalize_where_predicates([fp])
         assert len(result) == 1
         assert result[0].op == "="
 
     def test_normalizes_dict_filters(self):
         """normalize_filters converts dict-based filters."""
         d = {"column": "t.col", "op": ">=", "value_type": "number"}
-        result = _normalize_filters([d])
+        result = _normalize_where_predicates([d])
         assert len(result) == 1
         assert result[0].op == ">="
 
     def test_sorts_by_signature(self):
         """normalize_filters sorts by signature_key."""
-        f1 = FilterParam(left_expr=NormalizedExpr.from_column("z.col"), op="=")
-        f2 = FilterParam(left_expr=NormalizedExpr.from_column("a.col"), op="=")
-        result = _normalize_filters([f1, f2])
+        f1 = WhereParam(left_expr=NormalizedExpr.from_column("z.col"), op="=")
+        f2 = WhereParam(left_expr=NormalizedExpr.from_column("a.col"), op="=")
+        result = _normalize_where_predicates([f1, f2])
         assert result[0].left_expr.primary_term == "a.col"
 
     def test_empty_input(self):
         """normalize_filters returns empty for empty input."""
-        assert _normalize_filters([]) == []
+        assert _normalize_where_predicates([]) == []
 
-    def test_preserves_bool_op(self):
-        """normalize_filters preserves bool_op on FilterParam."""
-        fp = FilterParam(
-            left_expr=NormalizedExpr.from_column("t.col"),
-            op="=",
-            value_type="string",
-            bool_op="OR",
-        )
-        result = _normalize_filters([fp])
-        assert result[0].bool_op == "OR"
+    def test_legacy_bool_op_migrates_via_predicate_group(self):
+        """bool_op migrates into PredicateGroup; normalize_filters returns leaves without bool_op."""
+        legacy = [
+            {"left_expr": "t.col", "op": "=", "value_type": "string", "bool_op": "AND"},
+            {"left_expr": "t.other", "op": "=", "value_type": "string", "bool_op": "OR"},
+        ]
+        group = PredicateGroup.from_legacy_flat_where_dicts(legacy)
+        assert group is not None
+        assert group.op == "or"
+        result = _normalize_where_predicates(group.leaves())
+        assert len(result) == 2
+        assert not hasattr(result[0], "bool_op")
 
-    def test_preserves_filter_group(self):
-        """normalize_filters preserves filter_group on FilterParam."""
-        fp = FilterParam(
-            left_expr=NormalizedExpr.from_column("t.col"),
-            op="=",
-            value_type="string",
-            filter_group=2,
-        )
-        result = _normalize_filters([fp])
-        assert result[0].filter_group == 2
+    def test_legacy_where_group_migrates_via_predicate_group(self):
+        """where_group migrates into PredicateGroup nesting; leaves have no where_group."""
+        legacy = [
+            {"left_expr": "a.col", "op": "=", "where_group": 2},
+            {"left_expr": "z.col", "op": "=", "where_group": 1},
+        ]
+        group = PredicateGroup.from_legacy_flat_where_dicts(legacy)
+        assert group is not None
+        assert group.op == "or"
+        assert len(group.groups) == 2
+        result = _normalize_where_predicates(group.leaves())
+        assert result[0].left_expr.primary_column == "a.col"
+        assert result[1].left_expr.primary_column == "z.col"
+        assert not hasattr(result[0], "where_group")
 
-    def test_sorts_by_filter_group_first(self):
-        """normalize_filters sorts by structural key across different filter_groups."""
-        f1 = FilterParam(left_expr=NormalizedExpr.from_column("a.col"), op="=", filter_group=2)
-        f2 = FilterParam(left_expr=NormalizedExpr.from_column("z.col"), op="=", filter_group=1)
-        result = _normalize_filters([f1, f2])
-        assert result[0].filter_group == 2
-        assert result[1].filter_group == 1
+    def test_sorts_by_signature_not_where_group(self):
+        """normalize_filters sorts by signature_key, not legacy where_group."""
+        f1 = WhereParam(left_expr=NormalizedExpr.from_column("a.col"), op="=")
+        f2 = WhereParam(left_expr=NormalizedExpr.from_column("z.col"), op="=")
+        result = _normalize_where_predicates([f2, f1])
+        assert result[0].left_expr.primary_term == "a.col"
+        assert result[1].left_expr.primary_term == "z.col"
 
 
 class TestNormalizeHavingConditions:
@@ -446,35 +459,41 @@ class TestNormalizeHavingConditions:
         """normalize_having_conditions returns empty for empty input."""
         assert _normalize_having_conditions([]) == []
 
-    def test_preserves_bool_op(self):
-        """normalize_having_conditions preserves bool_op on HavingParam."""
-        hp = HavingParam(
-            left_expr=NormalizedExpr.from_agg("count", "t.id"),
-            op=">",
-            value_type="integer",
-            bool_op="OR",
-        )
-        result = _normalize_having_conditions([hp])
-        assert result[0].bool_op == "OR"
+    def test_legacy_bool_op_migrates_via_predicate_group(self):
+        """bool_op migrates into PredicateGroup; normalize_having_conditions returns leaves without bool_op."""
+        legacy = [
+            {"left_expr": "COUNT(t.id)", "op": ">", "value_type": "integer", "bool_op": "AND"},
+            {"left_expr": "SUM(t.amount)", "op": ">", "value_type": "integer", "bool_op": "OR"},
+        ]
+        group = PredicateGroup.from_legacy_having_dicts(legacy)
+        assert group is not None
+        assert group.op == "or"
+        result = _normalize_having_conditions(group.leaves())
+        assert len(result) == 2
+        assert not hasattr(result[0], "bool_op")
 
-    def test_preserves_filter_group(self):
-        """normalize_having_conditions preserves filter_group on HavingParam."""
-        hp = HavingParam(
-            left_expr=NormalizedExpr.from_agg("count", "t.id"),
-            op=">",
-            value_type="integer",
-            filter_group=3,
-        )
-        result = _normalize_having_conditions([hp])
-        assert result[0].filter_group == 3
+    def test_legacy_where_group_migrates_via_predicate_group(self):
+        """where_group migrates into PredicateGroup nesting; leaves have no where_group."""
+        legacy = [
+            {"left_expr": "SUM(t.amount)", "op": ">", "where_group": 2},
+            {"left_expr": "COUNT(t.id)", "op": ">", "where_group": 1},
+        ]
+        group = PredicateGroup.from_legacy_having_dicts(legacy)
+        assert group is not None
+        assert group.op == "or"
+        assert len(group.groups) == 2
+        result = _normalize_having_conditions(group.leaves())
+        assert result[0].left_expr.column_ref == "COUNT(t.id)"
+        assert result[1].left_expr.column_ref == "SUM(t.amount)"
+        assert not hasattr(result[0], "where_group")
 
-    def test_sorts_by_filter_group_first(self):
-        """normalize_having_conditions sorts by structural key; group order follows first occurrence of filter_group."""
-        h1 = HavingParam(left_expr=NormalizedExpr.from_agg("sum", "t.amount"), op=">", filter_group=2)
-        h2 = HavingParam(left_expr=NormalizedExpr.from_agg("count", "t.id"), op=">", filter_group=1)
+    def test_sorts_by_signature_not_where_group(self):
+        """normalize_having_conditions sorts by signature_key, not legacy where_group."""
+        h1 = HavingParam(left_expr=NormalizedExpr.from_column("SUM(t.amount)"), op=">")
+        h2 = HavingParam(left_expr=NormalizedExpr.from_column("COUNT(t.id)"), op=">")
         result = _normalize_having_conditions([h1, h2])
-        assert result[0].filter_group == 2
-        assert result[1].filter_group == 1
+        assert result[0].left_expr.column_ref == "COUNT(t.id)"
+        assert result[1].left_expr.column_ref == "SUM(t.amount)"
 
 
 class TestExtractTablesFromSql:
@@ -537,7 +556,7 @@ class TestMatchQuestionAgainstTemplateHistory:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.a"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         return Template(
             id=tid,
@@ -688,13 +707,12 @@ class TestNormalizeCteStepsForKey:
         """normalize_cte_steps_for_key returns empty for empty input."""
         assert _normalize_cte_steps_for_key([]) == []
 
-    def test_filter_bool_op_in_key(self):
-        """normalize_cte_steps_for_key includes bool_op in filter key entries."""
-        fp = FilterParam(
+    def test_filter_signatures_in_key_from_leaves(self):
+        """normalize_cte_steps_for_key includes leaf signature_key, not legacy bool_op."""
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t1.status"),
             op="=",
             value_type="string",
-            bool_op="OR",
         )
         cte = RuntimeCteStep(
             cte_name="cte1",
@@ -703,19 +721,17 @@ class TestNormalizeCteStepsForKey:
             select_cols=[],
             group_by_cols=[],
             output_columns=[],
-            filters_param=[fp],
+            where=PredicateGroup.from_list([fp]),
         )
         result = _normalize_cte_steps_for_key([cte])
-        assert any("OR" in f for f in result[0]["filters_param"])
+        assert result[0]["where"] == [fp.signature_key]
 
-    def test_filter_group_in_key(self):
-        """normalize_cte_steps_for_key includes filter_group in filter key entries."""
-        fp = FilterParam(
-            left_expr=NormalizedExpr.from_column("t1.status"),
-            op="=",
-            value_type="string",
-            filter_group=1,
-        )
+    def test_legacy_where_group_not_in_key(self):
+        """normalize_cte_steps_for_key omits legacy where_group from filter key entries."""
+        legacy = [{"left_expr": "t1.status", "op": "=", "value_type": "string", "where_group": 1}]
+        group = PredicateGroup.from_legacy_flat_where_dicts(legacy)
+        assert group is not None
+        fp = group.leaves()[0]
         cte = RuntimeCteStep(
             cte_name="cte1",
             tables=["t1"],
@@ -723,10 +739,10 @@ class TestNormalizeCteStepsForKey:
             select_cols=[],
             group_by_cols=[],
             output_columns=[],
-            filters_param=[fp],
+            where=group,
         )
         result = _normalize_cte_steps_for_key([cte])
-        assert any("1" in f for f in result[0]["filters_param"])
+        assert result[0]["where"] == [fp.signature_key]
 
 
 class TestDescribeOperation:
@@ -788,7 +804,7 @@ class TestFlattenParamValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             param_values={"p1": "val1"},
         )
         result = flatten_param_values(intent)
@@ -811,7 +827,7 @@ class TestFlattenParamValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
             param_values={"p2": "main_val"},
         )
@@ -836,7 +852,7 @@ class TestFlattenParamValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
             param_values={"p1": "main_val"},
         )
@@ -851,7 +867,7 @@ class TestFlattenParamValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = flatten_param_values(intent)
         assert result == {}
@@ -882,7 +898,7 @@ class TestFlattenParamValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte1, cte2],
         )
         result = flatten_param_values(intent)
@@ -892,14 +908,14 @@ class TestFlattenParamValues:
     def test_contains_op_normalizes_quoted_param_values_only(self):
         """flatten_param_values unwraps quoted values for contains filters only."""
         left = NormalizedExpr(add_groups=[MulGroup(multiply=["film.special_features"])])
-        fp = FilterParam(left_expr=left, op="contains", param_key="p1", raw_value=None)
+        fp = WhereParam(left_expr=left, op="contains", param_key="p1", raw_value=None)
         intent = RuntimeIntent(
             tables=["film"],
             grain="row_level",
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=PredicateGroup.from_list([fp]),
             param_values={"p1": '"Trailers"', "p2": "'keep'"},
         )
         out = flatten_param_values(intent)
@@ -955,7 +971,7 @@ class TestSqlShapeEdgeCases:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         shape = sql_shape(sql, intent, sqlglot_dialect="postgres")
         assert shape.num_joins == 0
@@ -971,14 +987,14 @@ class TestSqlShapeEdgeCases:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         shape = sql_shape(sql, intent, sqlglot_dialect="postgres")
         assert shape.num_joins == 2
 
     def test_cte_filters_counted(self):
         """sql_shape counts CTE step filters."""
-        fp = FilterParam(left_expr=NormalizedExpr.from_column("t1.col"), op="=")
+        fp = WhereParam(left_expr=NormalizedExpr.from_column("t1.col"), op="=")
         cte = RuntimeCteStep(
             cte_name="cte1",
             tables=["t1"],
@@ -986,7 +1002,7 @@ class TestSqlShapeEdgeCases:
             select_cols=[],
             group_by_cols=[],
             output_columns=[],
-            filters_param=[fp],
+            where=PredicateGroup.from_list([fp]),
         )
         intent = RuntimeIntent(
             tables=["t"],
@@ -994,11 +1010,11 @@ class TestSqlShapeEdgeCases:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
         shape = sql_shape("SELECT * FROM t", intent, sqlglot_dialect="postgres")
-        assert shape.num_filters == 1
+        assert shape.num_where == 1
 
     def test_cte_having_counted(self):
         """sql_shape counts CTE step HAVING params."""
@@ -1014,7 +1030,7 @@ class TestSqlShapeEdgeCases:
             select_cols=[],
             group_by_cols=[],
             output_columns=[],
-            having_param=[hp],
+            having=PredicateGroup.from_list([hp]),
         )
         intent = RuntimeIntent(
             tables=["t"],
@@ -1022,7 +1038,7 @@ class TestSqlShapeEdgeCases:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
         shape = sql_shape("SELECT * FROM t", intent, sqlglot_dialect="postgres")
@@ -1030,7 +1046,7 @@ class TestSqlShapeEdgeCases:
 
     def test_expr_comparison_counted(self):
         """sql_shape counts expr comparison filters."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op="=",
             right_expr=NormalizedExpr.from_column("t.b"),
@@ -1041,14 +1057,14 @@ class TestSqlShapeEdgeCases:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=PredicateGroup.from_list([fp]),
         )
         shape = sql_shape("SELECT * FROM t WHERE a = b", intent, sqlglot_dialect="postgres")
-        assert shape.num_filters == 1
+        assert shape.num_where == 1
 
     def test_expr_comparisons_from_cte(self):
         """sql_shape counts expr comparisons in CTE filters."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op="=",
             value_type="column",
@@ -1061,7 +1077,7 @@ class TestSqlShapeEdgeCases:
             select_cols=[],
             group_by_cols=[],
             output_columns=[],
-            filters_param=[fp],
+            where=PredicateGroup.from_list([fp]),
         )
         intent = RuntimeIntent(
             tables=["t"],
@@ -1069,11 +1085,11 @@ class TestSqlShapeEdgeCases:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
         shape = sql_shape("SELECT * FROM t", intent, sqlglot_dialect="postgres")
-        assert shape.num_filters == 1
+        assert shape.num_where == 1
 
     def test_num_cte(self):
         """sql_shape counts CTE steps."""
@@ -1099,7 +1115,7 @@ class TestSqlShapeEdgeCases:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte1, cte2],
         )
         shape = sql_shape("SELECT * FROM t", intent, sqlglot_dialect="postgres")
@@ -1111,7 +1127,7 @@ class TestNormalizeFiltersEdgeCases:
 
     def test_skips_non_dict_non_filter(self):
         """normalize_filters skips invalid entries."""
-        result = _normalize_filters([42, "bad", None])
+        result = _normalize_where_predicates([42, "bad", None])
         assert len(result) == 0
 
     def test_dict_with_right_expr(self):
@@ -1122,7 +1138,7 @@ class TestNormalizeFiltersEdgeCases:
             "value_type": "column",
             "right_expr": {"groups": [{"terms": [{"column": "t.b"}]}]},
         }
-        result = _normalize_filters([d])
+        result = _normalize_where_predicates([d])
         assert len(result) == 1
         assert result[0].right_expr is not None
 
@@ -1133,33 +1149,27 @@ class TestNormalizeFiltersEdgeCases:
             "op": ">=",
             "value_type": "number",
         }
-        result = _normalize_filters([d])
+        result = _normalize_where_predicates([d])
         assert len(result) == 1
         assert result[0].op == ">="
 
-    def test_dict_preserves_bool_op(self):
-        """normalize_filters preserves bool_op from raw dict."""
+    def test_dict_ignores_legacy_bool_op(self):
+        """normalize_filters ignores bool_op dict keys; migrate via predicate_group_from_legacy_flat_where_dicts."""
         d = {"column": "t.col", "op": "=", "value_type": "string", "bool_op": "OR"}
-        result = _normalize_filters([d])
-        assert result[0].bool_op == "OR"
+        result = _normalize_where_predicates([d])
+        assert len(result) == 1
+        assert not hasattr(result[0], "bool_op")
+        legacy = [{"left_expr": "t.col", "op": "=", "value_type": "string", "bool_op": "OR"}]
+        group = PredicateGroup.from_legacy_flat_where_dicts(legacy)
+        assert group is not None
+        assert len(group.leaves()) == 1
 
-    def test_dict_preserves_filter_group(self):
-        """normalize_filters preserves filter_group from raw dict."""
-        d = {"column": "t.col", "op": "=", "value_type": "string", "filter_group": 2}
-        result = _normalize_filters([d])
-        assert result[0].filter_group == 2
-
-    def test_dict_defaults_bool_op_to_and(self):
-        """normalize_filters defaults bool_op to 'AND' when absent in dict."""
-        d = {"column": "t.col", "op": "=", "value_type": "string"}
-        result = _normalize_filters([d])
-        assert result[0].bool_op == "AND"
-
-    def test_dict_defaults_filter_group_to_none(self):
-        """normalize_filters defaults filter_group to None when absent in dict."""
-        d = {"column": "t.col", "op": "=", "value_type": "string"}
-        result = _normalize_filters([d])
-        assert result[0].filter_group is None
+    def test_dict_normalizes_without_legacy_bool_fields(self):
+        """normalize_filters ignores legacy bool_op/where_group dict keys."""
+        d = {"column": "t.col", "op": "=", "value_type": "string", "bool_op": "OR", "where_group": 2}
+        result = _normalize_where_predicates([d])
+        assert len(result) == 1
+        assert result[0].left_expr.primary_column == "t.col"
 
 
 class TestNormalizeHavingEdgeCases:
@@ -1200,39 +1210,18 @@ class TestNormalizeHavingEdgeCases:
         assert len(result) == 1
         assert result[0].right_expr is not None
 
-    def test_dict_preserves_bool_op(self):
-        """normalize_having_conditions preserves bool_op from raw dict."""
+    def test_dict_normalizes_without_legacy_bool_fields(self):
+        """normalize_having_conditions ignores legacy bool_op/where_group dict keys."""
         d = {
             "aggregation": "COUNT(t.id)",
             "op": ">",
             "value_type": "integer",
             "bool_op": "OR",
+            "where_group": 3,
         }
         result = _normalize_having_conditions([d])
-        assert result[0].bool_op == "OR"
-
-    def test_dict_preserves_filter_group(self):
-        """normalize_having_conditions preserves filter_group from raw dict."""
-        d = {
-            "aggregation": "COUNT(t.id)",
-            "op": ">",
-            "value_type": "integer",
-            "filter_group": 3,
-        }
-        result = _normalize_having_conditions([d])
-        assert result[0].filter_group == 3
-
-    def test_dict_defaults_bool_op_to_and(self):
-        """normalize_having_conditions defaults bool_op to 'AND' when absent in dict."""
-        d = {"aggregation": "COUNT(t.id)", "op": ">", "value_type": "integer"}
-        result = _normalize_having_conditions([d])
-        assert result[0].bool_op == "AND"
-
-    def test_dict_defaults_filter_group_to_none(self):
-        """normalize_having_conditions defaults filter_group to None when absent in dict."""
-        d = {"aggregation": "COUNT(t.id)", "op": ">", "value_type": "integer"}
-        result = _normalize_having_conditions([d])
-        assert result[0].filter_group is None
+        assert len(result) == 1
+        assert result[0].op == ">"
 
 
 class TestExtractTablesEdgeCases:
@@ -1306,7 +1295,7 @@ class TestNormalizeCteStepsEdgeCases:
                 "select_cols": [],
                 "group_by_cols": [],
                 "output_columns": [],
-                "filters_param": [
+                "where": [
                     {
                         "left_expr": {"groups": [{"terms": [{"column": "t1.col"}]}]},
                         "op": "=",
@@ -1317,7 +1306,7 @@ class TestNormalizeCteStepsEdgeCases:
         ]
         result = _normalize_cte_steps(steps)
         assert len(result) == 1
-        assert len(result[0].filters_param) == 1
+        assert len(PredicateGroup.where_leaves(result[0].where) or []) == 1
 
     def test_dict_with_having(self):
         """normalize_cte_steps converts dict with having params."""
@@ -1340,7 +1329,7 @@ class TestNormalizeCteStepsEdgeCases:
         ]
         result = _normalize_cte_steps(steps)
         assert len(result) == 1
-        assert len(result[0].having_param) == 1
+        assert len(PredicateGroup.having_leaves(result[0].having) or []) == 1
 
     def test_available_ctes_mutated(self):
         """normalize_cte_steps populates available_ctes dict."""
@@ -1398,7 +1387,7 @@ class TestNormalizeCteStepsForKeyEdgeCases:
 
     def test_with_filters_and_having(self):
         """normalize_cte_steps_for_key includes filter and having signatures."""
-        fp = FilterParam(left_expr=NormalizedExpr.from_column("t.col"), op="=")
+        fp = WhereParam(left_expr=NormalizedExpr.from_column("t.col"), op="=")
         hp = HavingParam(
             left_expr=NormalizedExpr.from_agg("count", "t.id"),
             op=">",
@@ -1411,12 +1400,12 @@ class TestNormalizeCteStepsForKeyEdgeCases:
             select_cols=[],
             group_by_cols=[],
             output_columns=[],
-            filters_param=[fp],
-            having_param=[hp],
+            where=PredicateGroup.from_list([fp]),
+            having=PredicateGroup.from_list([hp]),
         )
         result = _normalize_cte_steps_for_key([cte])
         assert len(result) == 1
-        assert len(result[0]["filters_param"]) == 1
+        assert len(result[0]["where"]) == 1
         assert len(result[0]["having_param"]) == 1
 
     def test_with_order_by(self):
@@ -1502,7 +1491,7 @@ class TestIntentKeyEdgeCases:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
         i2 = RuntimeIntent(
@@ -1511,7 +1500,7 @@ class TestIntentKeyEdgeCases:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         assert intent_key(i1) != intent_key(i2)
 
@@ -1528,8 +1517,8 @@ class TestIntentKeyEdgeCases:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[hp],
+            where=None,
+            having=PredicateGroup.from_list([hp]),
         )
         i2 = RuntimeIntent(
             tables=["t"],
@@ -1537,7 +1526,7 @@ class TestIntentKeyEdgeCases:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         assert intent_key(i1) != intent_key(i2)
 
@@ -1549,7 +1538,7 @@ class TestIntentKeyEdgeCases:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         i2 = RuntimeIntent(
             tables=["b", "a"],
@@ -1557,7 +1546,7 @@ class TestIntentKeyEdgeCases:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         assert intent_key(i1) == intent_key(i2)
 
@@ -1569,7 +1558,7 @@ class TestIntentKeyEdgeCases:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         i2 = RuntimeIntent(
             tables=["t"],
@@ -1577,7 +1566,7 @@ class TestIntentKeyEdgeCases:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         assert intent_key(i1) == intent_key(i2)
 
@@ -1585,45 +1574,45 @@ class TestIntentKeyEdgeCases:
 class TestValidateQuestion:
     """Tests for validate_question."""
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_valid_allowed_returns_true_and_corrected(self, mock_llm_json):
-        """validate_question returns (True, 'allowed', corrected) when LLM says valid."""
+        """validate_question maps legacy allowed to analytical and returns corrected text."""
         mock_llm_json.return_value = {
             "valid_database_question": "yes",
             "query_type": "allowed",
             "corrected": "What is the total revenue?",
         }
-        is_valid, query_type, corrected = validate_question("What is the total reveneu?")
-        assert is_valid is True
-        assert query_type == "allowed"
-        assert corrected == "What is the total revenue?"
+        result = validate_question("What is the total reveneu?")
+        assert result.accepted is True
+        assert result.route is QuestionRoute.ANALYTICAL
+        assert result.corrected == "What is the total revenue?"
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_invalid_returns_false_invalid_type(self, mock_llm_json):
-        """validate_question returns (False, 'invalid', ...) when not valid."""
+        """validate_question returns invalid route when not valid."""
         mock_llm_json.return_value = {
             "valid_database_question": "no",
             "query_type": "unspecified",
             "corrected": "fixed typo",
         }
-        is_valid, query_type, corrected = validate_question("random text")
-        assert is_valid is False
-        assert query_type == "invalid"
-        assert corrected == "fixed typo"
+        result = validate_question("random text")
+        assert result.accepted is False
+        assert result.route is QuestionRoute.INVALID
+        assert result.corrected == "fixed typo"
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_restricted_returns_false_restricted_type(self, mock_llm_json):
-        """validate_question returns (False, 'restricted', ...) for restricted query."""
+        """validate_question returns restricted route for restricted query."""
         mock_llm_json.return_value = {
             "valid_database_question": "yes",
             "query_type": "restricted",
             "corrected": "List all users",
         }
-        is_valid, query_type, corrected = validate_question("List all users")
-        assert is_valid is False
-        assert query_type == "restricted"
+        result = validate_question("List all users")
+        assert result.accepted is False
+        assert result.route is QuestionRoute.RESTRICTED
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_restricted_wins_when_valid_flag_no(self, mock_llm_json):
         """Restricted is reported even when valid_database_question is no (Group A precedence)."""
         mock_llm_json.return_value = {
@@ -1631,33 +1620,33 @@ class TestValidateQuestion:
             "query_type": "restricted",
             "corrected": "drop table t",
         }
-        is_valid, query_type, corrected = validate_question("drop table t")
-        assert is_valid is False
-        assert query_type == "restricted"
-        assert corrected == "drop table t"
+        result = validate_question("drop table t")
+        assert result.accepted is False
+        assert result.route is QuestionRoute.RESTRICTED
+        assert result.corrected == "drop table t"
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_cte_analytical_may_be_allowed_not_restricted(self, mock_llm_json):
-        """Analytical questions that mention CTEs are classified allowed when the model agrees (CJ regression)."""
+        """Analytical questions that mention CTEs are classified analytical when the model agrees (CJ regression)."""
         mock_llm_json.return_value = {
             "valid_database_question": "yes",
             "query_type": "allowed",
             "corrected": "Using a CTE show monthly revenue trends",
         }
-        ok, qt, _ = validate_question("Using a CTE show monthly revenue trends")
-        assert ok is True
-        assert qt == "allowed"
+        result = validate_question("Using a CTE show monthly revenue trends")
+        assert result.accepted is True
+        assert result.route is QuestionRoute.ANALYTICAL
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_llm_json_exhausted_returns_invalid(self, mock_llm_json):
-        """validate_question returns (False, 'invalid', original) when llm_json exhausts."""
+        """validate_question returns invalid route when llm_json exhausts."""
         mock_llm_json.side_effect = LlmJsonExhausted(task="default", attempts=2)
-        is_valid, query_type, corrected = validate_question("anything")
-        assert is_valid is False
-        assert query_type == "invalid"
-        assert corrected == "anything"
+        result = validate_question("anything")
+        assert result.accepted is False
+        assert result.route is QuestionRoute.INVALID
+        assert result.corrected == "anything"
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_missing_corrected_uses_original_question(self, mock_llm_json):
         """validate_question uses original question when corrected is missing."""
         mock_llm_json.return_value = {
@@ -1665,9 +1654,9 @@ class TestValidateQuestion:
             "query_type": "allowed",
             "corrected": "",
         }
-        is_valid, _, corrected = validate_question("Original question")
-        assert is_valid is True
-        assert corrected == "Original question"
+        result = validate_question("Original question")
+        assert result.accepted is True
+        assert result.corrected == "Original question"
 
 
 class TestNormalizationGuard:
@@ -1701,7 +1690,7 @@ class TestGenerateQuestion:
         return SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"orders": t})
 
     @patch("aetherdialect._utils.pick_question_style", return_value="How many")
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_returns_question_when_llm_returns_valid_json(self, mock_llm_json, _mock_style, minimal_schema):
         """generate_question returns question string when LLM returns valid JSON."""
         mock_llm_json.return_value = {"question": "How many orders are there?"}
@@ -1715,7 +1704,7 @@ class TestGenerateQuestion:
         )
         assert result == "How many orders are there?"
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_returns_none_when_llm_returns_empty(self, mock_llm_json, minimal_schema):
         """generate_question returns None when response lacks a usable question."""
         mock_llm_json.return_value = {}
@@ -1729,7 +1718,7 @@ class TestGenerateQuestion:
         )
         assert result is None
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_returns_none_when_question_key_missing(self, mock_llm_json, minimal_schema):
         """generate_question returns None when response has no 'question' key."""
         mock_llm_json.return_value = {"other_key": "value"}
@@ -1743,7 +1732,7 @@ class TestGenerateQuestion:
         )
         assert result is None
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_invokes_llm_with_system_and_user_prompt(self, mock_llm_json, minimal_schema):
         """generate_question calls llm_json with system and user prompt."""
         mock_llm_json.return_value = {"question": "Generated question."}
@@ -1779,12 +1768,36 @@ class TestModuleConstants:
 class TestBodySimilarityAndTemplateKeys:
     """Tests for body_similarity_key, body_similarity_key_for_concrete, template_instance_key_from_parts."""
 
-    def test_body_similarity_key_matches_intent_key(self, minimal_intent):
-        """body_similarity_key delegates to intent_key."""
+    def test_body_similarity_key_matches_intent_key_without_join_skeleton(self, minimal_intent):
+        """Without join-skeleton fields, body_similarity_key matches intent_key."""
         assert body_similarity_key(minimal_intent) == intent_key(minimal_intent)
 
-    def test_body_similarity_key_for_concrete_matches_skeleton_intent_key(self):
-        """ConcreteIntent fingerprint matches runtime skeleton hash."""
+    def test_body_similarity_key_excludes_cte_join_emission(self):
+        """CTE join-emission skeleton is in intent_key but excluded from body_similarity_key."""
+        cte_join = RuntimeCteStep(
+            cte_name="probe",
+            tables=["child", "parent"],
+            select_cols=[],
+            emission="join_table",
+            chosen_join_path_signature=["child.parent_id->parent.id"],
+        )
+        cte_semi = replace(cte_join, emission="semi_join")
+        intent_join = RuntimeIntent(
+            tables=["child", "parent"],
+            grain="row_level",
+            select_cols=[],
+            group_by_cols=[],
+            order_by_cols=[],
+            where=None,
+            cte_steps=[cte_join],
+        )
+        intent_semi = replace(intent_join, cte_steps=[cte_semi])
+
+        assert intent_key(intent_join) != intent_key(intent_semi)
+        assert body_similarity_key(intent_join) == body_similarity_key(intent_semi)
+
+    def test_body_similarity_key_for_concrete_matches_skeleton_body_key(self):
+        """ConcreteIntent fingerprint uses body_similarity_key, not full intent_key."""
         concrete = ConcreteIntent(
             intent_id="i1",
             tables=["t"],
@@ -1792,10 +1805,10 @@ class TestBodySimilarityAndTemplateKeys:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
-        sk = concrete_intent_to_runtime_skeleton(concrete)
-        assert body_similarity_key_for_concrete(concrete) == intent_key(sk)
+        sk = concrete.to_runtime_skeleton()
+        assert body_similarity_key_for_concrete(concrete) == body_similarity_key(sk)
 
     def test_template_instance_key_from_parts_deterministic(self):
         """Same parts yield the same template instance key."""
@@ -1819,7 +1832,7 @@ class TestGenerateQuestionFromSql:
         """Schema with no tables (prompt still builds)."""
         return SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={})
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_unrealistic_returns_empty_questions(self, mock_llm, empty_schema):
         """Unrealistic response omits generated questions."""
         mock_llm.return_value = {
@@ -1836,7 +1849,7 @@ class TestGenerateQuestionFromSql:
             "drop_reason_category": "other",
         }
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_unrealistic_default_drop_reason(self, mock_llm, empty_schema):
         """Missing drop_reason uses fallback string."""
         mock_llm.return_value = {"is_realistic": False, "drop_reason": None}
@@ -1844,7 +1857,7 @@ class TestGenerateQuestionFromSql:
         assert out["drop_reason"] == "unrealistic"
         assert out["drop_reason_category"] == "other"
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_is_realistic_string_coercion(self, mock_llm, empty_schema):
         """String truthiness coerces to bool before branching."""
         mock_llm.return_value = {
@@ -1857,7 +1870,7 @@ class TestGenerateQuestionFromSql:
         assert out["question"] == "First phrase?"
 
     @patch("aetherdialect._utils.generate_warmup_paraphrases_by_style", return_value=None)
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_realistic_keeps_all_parsed_questions(self, mock_llm, _mock_styles, empty_schema):
         """Parsed questions are kept when style generation is unavailable."""
         many = [f"Question number {i}?" for i in range(8)]
@@ -1866,7 +1879,7 @@ class TestGenerateQuestionFromSql:
         assert out is not None
         assert len(out["questions"]) == 8
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_realistic_dedupes_normalized_phrases(self, mock_llm, empty_schema):
         """Phrases that normalize identically are dropped."""
         mock_llm.return_value = {
@@ -1877,7 +1890,7 @@ class TestGenerateQuestionFromSql:
         assert out is not None
         assert len(out["questions"]) == 1
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_realistic_falls_back_to_legacy_question_field(self, mock_llm, empty_schema):
         """Empty questions array uses legacy question string."""
         mock_llm.return_value = {
@@ -1889,7 +1902,7 @@ class TestGenerateQuestionFromSql:
         assert out is not None
         assert out["questions"] == ["Legacy only?"]
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_realistic_empty_after_parse_returns_none(self, mock_llm, empty_schema):
         """No usable phrases after filtering yields None."""
         mock_llm.return_value = {
@@ -1899,13 +1912,13 @@ class TestGenerateQuestionFromSql:
         }
         assert generate_question_from_sql("SELECT 1", empty_schema, []) is None
 
-    @patch("aetherdialect._utils.llm_json", side_effect=RuntimeError("boom"))
+    @patch("aetherdialect._utils.LLMProvider.json", side_effect=RuntimeError("boom"))
     def test_runtime_error_propagates(self, _mock_llm, empty_schema):
         """LLM transport failures propagate to the caller."""
         with pytest.raises(RuntimeError, match="boom"):
             generate_question_from_sql("SELECT 1", empty_schema, [])
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_schema_table_descriptions_in_prompt(self, mock_llm, schema_graph):
         """Known tables contribute column lines to the user prompt."""
         mock_llm.return_value = {"is_realistic": True, "questions": ["ok?"]}
@@ -1941,7 +1954,7 @@ class TestIntentKeyLimitAndOrder:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             limit=None,
         )
         limited = RuntimeIntent(
@@ -1950,7 +1963,7 @@ class TestIntentKeyLimitAndOrder:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             limit=10,
         )
         assert intent_key(base) == intent_key(limited)
@@ -1965,7 +1978,7 @@ class TestIntentKeyLimitAndOrder:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[o1, o2],
-            filters_param=[],
+            where=None,
         )
         i2 = RuntimeIntent(
             tables=["t"],
@@ -1973,7 +1986,7 @@ class TestIntentKeyLimitAndOrder:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[o2, o1],
-            filters_param=[],
+            where=None,
         )
         assert intent_key(i1) == intent_key(i2)
 
@@ -1990,7 +2003,7 @@ class TestSqlShapeDistinctEdge:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         assert sql_shape(sql, intent, sqlglot_dialect="postgres").has_distinct is False
 
@@ -2020,7 +2033,7 @@ class TestExactQuestionMatchBudget:
 class TestValidateQuestionEdgeCases:
     """Extra branches for validate_question."""
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_corrected_none_uses_original(self, mock_llm_json):
         """Explicit null corrected falls back to original question."""
         mock_llm_json.return_value = {
@@ -2028,21 +2041,21 @@ class TestValidateQuestionEdgeCases:
             "query_type": "allowed",
             "corrected": None,
         }
-        ok, kind, corrected = validate_question("Keep me")
-        assert ok is True
-        assert corrected == "Keep me"
+        result = validate_question("Keep me")
+        assert result.accepted is True
+        assert result.corrected == "Keep me"
 
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_query_type_case_insensitive(self, mock_llm_json):
-        """query_type is normalised with lower()."""
+        """query_type is normalised with lower() and allowed maps to analytical."""
         mock_llm_json.return_value = {
             "valid_database_question": "yes",
             "query_type": "ALLOWED",
             "corrected": "x",
         }
-        ok, kind, _ = validate_question("x")
-        assert ok is True
-        assert kind == "allowed"
+        result = validate_question("x")
+        assert result.accepted is True
+        assert result.route is QuestionRoute.ANALYTICAL
 
 
 class TestGenerateQuestionPhrasing:
@@ -2061,7 +2074,7 @@ class TestGenerateQuestionPhrasing:
         return SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"orders": t})
 
     @patch("aetherdialect._utils.pick_question_style", return_value="How many")
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_phrasing_violation_returns_none(self, mock_llm_json, _mock_style, minimal_schema):
         """Question must start with template prefix from required style."""
         mock_llm_json.return_value = {"question": "What is the count of orders?"}
@@ -2078,7 +2091,7 @@ class TestGenerateQuestionPhrasing:
         )
 
     @patch("aetherdialect._utils.pick_question_style", return_value="Prefix{ignored}")
-    @patch("aetherdialect._utils.llm_json")
+    @patch("aetherdialect._utils.LLMProvider.json")
     def test_required_start_splits_on_brace(self, mock_llm_json, _mock_style, minimal_schema):
         """Brace suffix in style is stripped for startswith check."""
         mock_llm_json.return_value = {"question": "Prefix rest of question"}
@@ -2092,7 +2105,7 @@ class TestGenerateQuestionPhrasing:
         )
         assert out == "Prefix rest of question"
 
-    @patch("aetherdialect._utils.llm_json", side_effect=ValueError("bad json"))
+    @patch("aetherdialect._utils.LLMProvider.json", side_effect=ValueError("bad json"))
     @patch("aetherdialect._utils.pick_question_style", return_value="What are")
     def test_llm_exception_propagates(self, _mock_style, _mock_llm, minimal_schema):
         """Exceptions from llm_json propagate to the caller."""
@@ -2113,7 +2126,7 @@ class TestFlattenParamValuesContainsEdges:
     def test_contains_in_cte_normalizes_param(self):
         """CTE-level contains filters participate in key collection."""
         left = NormalizedExpr(add_groups=[MulGroup(multiply=["t1.tags"])])
-        fp = FilterParam(left_expr=left, op="contains", param_key="tags", raw_value=None)
+        fp = WhereParam(left_expr=left, op="contains", param_key="tags", raw_value=None)
         cte = RuntimeCteStep(
             cte_name="c1",
             tables=["t1"],
@@ -2121,7 +2134,7 @@ class TestFlattenParamValuesContainsEdges:
             select_cols=[],
             group_by_cols=[],
             output_columns=[],
-            filters_param=[fp],
+            where=PredicateGroup.from_list([fp]),
             param_values={"tags": '"x"'},
         )
         intent = RuntimeIntent(
@@ -2130,14 +2143,14 @@ class TestFlattenParamValuesContainsEdges:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
         assert flatten_param_values(intent)["tags"] == "x"
 
     def test_contains_with_right_expr_skips_normalization(self):
         """Param keys tied to contains + right_expr are not normalized."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.col"),
             op="contains",
             param_key="p1",
@@ -2150,19 +2163,19 @@ class TestFlattenParamValuesContainsEdges:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=PredicateGroup.from_list([fp]),
             param_values={"p1": '"keep"'},
         )
         assert flatten_param_values(intent)["p1"] == '"keep"'
 
 
 class TestNormalizeFiltersHavingMoreEdges:
-    """Branches in _normalize_filters / _normalize_having_conditions."""
+    """Branches in _normalize_where_predicates / _normalize_having_conditions."""
 
     def test_filter_param_defaults_none_op(self):
-        """FilterParam with missing op becomes equals."""
-        fp = FilterParam(left_expr=NormalizedExpr.from_column("t.c"), op="", value_type="string")
-        out = _normalize_filters([fp])
+        """WhereParam with missing op becomes equals."""
+        fp = WhereParam(left_expr=NormalizedExpr.from_column("t.c"), op="", value_type="string")
+        out = _normalize_where_predicates([fp])
         assert len(out) == 1
         assert out[0].op == "="
 
@@ -2190,8 +2203,8 @@ class TestNormalizeCteStepsFilterClamp:
                 "select_cols": [],
                 "group_by_cols": [],
                 "output_columns": [],
-                "filters_param": [
-                    FilterParam(
+                "where": [
+                    WhereParam(
                         left_expr=NormalizedExpr.from_column("t1.x"),
                         op="not_an_op",
                         value_type="string",
@@ -2200,7 +2213,7 @@ class TestNormalizeCteStepsFilterClamp:
             }
         ]
         out = _normalize_cte_steps(steps)
-        assert out[0].filters_param[0].op == "="
+        assert (PredicateGroup.where_leaves(out[0].where) or [])[0].op == "="
 
     def test_invalid_having_op_clamped_to_equals(self):
         steps = [
@@ -2221,7 +2234,7 @@ class TestNormalizeCteStepsFilterClamp:
             }
         ]
         out = _normalize_cte_steps(steps)
-        assert out[0].having_param[0].op == "="
+        assert (PredicateGroup.having_leaves(out[0].having) or [])[0].op == "="
 
     def test_skips_unknown_step_type(self):
         """Non-dict, non-RuntimeCteStep steps are skipped."""

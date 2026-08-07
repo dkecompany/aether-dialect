@@ -5,18 +5,18 @@ from __future__ import annotations
 import pytest
 
 from aetherdialect import AetherEngine
-from aetherdialect._llm_provider import reset_mock_provider
+from aetherdialect._llm_provider import MockProvider
 
 pytest.importorskip("duckdb")
 
-pytestmark = pytest.mark.requires_sandbox
+pytestmark = pytest.mark.needs_corpus
 
 
 @pytest.fixture(autouse=True)
 def _reset_mock() -> None:
-    reset_mock_provider()
+    MockProvider.reset_mock_provider()
     yield
-    reset_mock_provider()
+    MockProvider.reset_mock_provider()
 
 
 def test_sandbox_manual_step_snippet() -> None:

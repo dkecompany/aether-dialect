@@ -4,13 +4,17 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
+
 from aetherdialect._contracts_base import (
+    CteEmissionKind,
     FailureCategory,
-    FilterParam,
     MulGroup,
     NormalizedExpr,
+    PredicateGroup,
     SqlDiagnostic,
     SqlDiagnosticCode,
+    WhereParam,
 )
 from aetherdialect._contracts_core import (
     RuntimeCteStep,
@@ -21,12 +25,16 @@ from aetherdialect._contracts_schema import (
     CaseRegistryStep,
     CaseWhenBranch,
     CaseWhenExpr,
+    ColumnMetadata,
+    FKEdge,
     SchemaGraph,
+    TableMetadata,
 )
 from aetherdialect._core_utils import bind_params_for_sql
 from aetherdialect._dialect import Dialect
 from aetherdialect._dialect_postgres import PostgresDialect
 from aetherdialect._dialect_sqlglot_engines import DatabricksDialect
+from aetherdialect._schema_graph import recompute_join_paths_multi
 from aetherdialect._validation_execute import (
     _enforce_select_only,
     _validate_case_branches_for_scope,
@@ -34,7 +42,7 @@ from aetherdialect._validation_execute import (
     _validate_cte_output_types,
     _validate_main_query_cte_usage,
     canonicalize_rejection_reason,
-    compute_confidence,
+    validate_cte_emission_reclassification,
     validate_semantics,
     validate_sql,
 )
@@ -63,7 +71,7 @@ class TestDialectPrepareExecutionSql:
     """Tests for ``Dialect.finalize_render`` (default finalize path)."""
 
     def test_substitutes_params(self):
-        """Parameterized SQL is finalized with bound literals."""
+        """Parameterized SQL keeps bind tokens for execution-time binding."""
         schema = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={})
         intent = RuntimeIntent(
             tables=[],
@@ -71,7 +79,7 @@ class TestDialectPrepareExecutionSql:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         d = _MinimalDialect(object())
         out = d.finalize_render(
@@ -80,7 +88,7 @@ class TestDialectPrepareExecutionSql:
             schema=schema,
             intent=intent,
         )
-        assert "'x'" in out
+        assert ":p1" in out
 
 
 class TestBindParamsForSql:
@@ -258,78 +266,26 @@ class TestEnforceSelectOnly:
         assert ok is False
         assert reason == "forbidden_sql"
 
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT a::/*x*/json FROM t",
+            "SELECT ARRAY/*x*/[1, 2] FROM t",
+            "SELECT 1 FROM t FETCH/*x*/ FIRST 10 ROWS ONLY",
+            "SELECT 1 WHERE EXISTS /*x*/ (SELECT 1 FROM t)",
+        ],
+    )
+    def test_forbidden_sql_ast_catches_regex_comment_bypass(self, sql: str) -> None:
+        """AST refusal must catch constructs that slip past the regex pre-filter."""
+        ok, reason = _enforce_select_only(sql, _PG_ENFORCE)
+        assert ok is False
+        assert reason == "forbidden_sql"
 
-class TestComputeConfidence:
-    """Tests for compute_confidence."""
-
-    def test_perfect_score(self):
-        """High best_score with no penalties yields high confidence."""
-        c = compute_confidence(1.0, 0.5, False, 0.0, 0.0, 0.0)
-        assert c > 0.7
-
-    def test_zero_inputs(self):
-        """All-zero inputs with cold-start floor yields 0.5."""
-        c = compute_confidence(0.0, 0.0, False, 0.0, 0.0, 0.0)
-        assert c == 0.5
-
-    def test_cold_start_floor_reduced_by_penalties(self):
-        """Cold-start floor is reduced by negative/colmap/cte penalties."""
-        c = compute_confidence(0.0, 0.0, False, 0.0, 1.0, 0.0)
-        assert c < 0.5
-
-    def test_new_tables_penalty(self):
-        """Using new tables reduces confidence."""
-        c_no = compute_confidence(0.8, 0.3, False, 0.0, 0.0, 0.0)
-        c_yes = compute_confidence(0.8, 0.3, True, 0.0, 0.0, 0.0)
-        assert c_yes < c_no
-
-    def test_shape_penalty(self):
-        """Shape penalty reduces confidence."""
-        c_low = compute_confidence(0.8, 0.3, False, 0.0, 0.0, 0.0)
-        c_high = compute_confidence(0.8, 0.3, False, 1.0, 0.0, 0.0)
-        assert c_high < c_low
-
-    def test_negative_penalty(self):
-        """Negative memory penalty reduces confidence."""
-        c_clean = compute_confidence(0.8, 0.3, False, 0.0, 0.0, 0.0)
-        c_neg = compute_confidence(0.8, 0.3, False, 0.0, 1.0, 0.0)
-        assert c_neg < c_clean
-
-    def test_clamped_to_0_1(self):
-        """Result is always clamped to [0, 1]."""
-        c = compute_confidence(0.0, 0.0, True, 1.0, 1.0, 1.0, 1.0)
-        assert c >= 0.0
-        c2 = compute_confidence(1.0, 1.0, False, 0.0, 0.0, 0.0, 0.0)
-        assert c2 <= 1.0
-
-    def test_colmap_penalty(self):
-        """Column-map penalty reduces confidence."""
-        c_clean = compute_confidence(0.8, 0.3, False, 0.0, 0.0, 0.0)
-        c_pen = compute_confidence(0.8, 0.3, False, 0.0, 0.0, 1.0)
-        assert c_pen < c_clean
-
-    def test_cte_penalty(self):
-        """CTE count penalty reduces confidence."""
-        c_no_cte = compute_confidence(0.8, 0.3, False, 0.0, 0.0, 0.0, 0.0)
-        c_cte = compute_confidence(0.8, 0.3, False, 0.0, 0.0, 0.0, 1.0)
-        assert c_cte < c_no_cte
-
-    def test_score_gap_contribution_saturates(self):
-        """Gap term uses ``min(1, score_gap * 2)`` so huge gaps do not explode past the cap."""
-        c_low = compute_confidence(0.5, 0.6, False, 0.0, 0.0, 0.0, 0.0)
-        c_high = compute_confidence(0.5, 10.0, False, 0.0, 0.0, 0.0, 0.0)
-        assert c_high == c_low
-
-    def test_penalties_above_one_are_clamped(self):
-        """``negative_pen``, ``colmap_pen``, and ``num_cte_pen`` are clamped to ``[0, 1]`` before scaling."""
-        c_cap = compute_confidence(0.8, 0.0, False, 0.0, 2.0, 3.0, 4.0)
-        c_unit = compute_confidence(0.8, 0.0, False, 0.0, 1.0, 1.0, 1.0)
-        assert c_cap == c_unit
-
-    def test_cold_start_floor_only_when_best_score_is_exactly_zero(self):
-        """The 0.5 floor applies only for ``best_score == 0.0``, not arbitrarily small positives."""
-        c_tiny = compute_confidence(1e-9, 0.0, False, 0.0, 0.0, 0.0, 0.0)
-        assert c_tiny < 0.1
+    def test_forbidden_sql_ast_catches_regex_bypass_databricks(self) -> None:
+        sql = "SELECT 1 WHERE EXISTS /*x*/ (SELECT 1 FROM t)"
+        ok, reason = _enforce_select_only(sql, _DBR_ENFORCE)
+        assert ok is False
+        assert reason == "forbidden_sql"
 
 
 class TestValidateCteCardinality:
@@ -364,12 +320,13 @@ class TestValidateCteCardinality:
         cardinality_issues = [i for i in issues if "scalar_cardinality" in i.issue_id]
         assert cardinality_issues == []
 
-    def test_limit_1_row_level_warns(self):
-        """Row-level CTE with LIMIT 1 has expected_rows='few' which != 'one', triggers warning."""
+    def test_limit_1_row_level_errors(self):
+        """Row-level CTE with LIMIT 1 has expected_rows='few' which != 'one', triggers error."""
         cte = self._make_cte(grain="row_level", limit=1)
         issues = _validate_cte_cardinality([cte])
         ids = [i.issue_id for i in issues]
         assert any("limit1_cardinality" in iid for iid in ids)
+        assert all(i.severity == "error" for i in issues if "limit1_cardinality" in i.issue_id)
 
     def test_many_depends_on_single_row_no_info_issue_emitted(self):
         """Expansion notes are informational-only and therefore no issue is emitted."""
@@ -387,8 +344,8 @@ class TestValidateCteCardinality:
         ids = [i.issue_id for i in issues]
         assert not any("cardinality_expansion" in iid for iid in ids)
 
-    def test_scalar_grain_with_mismatched_expected_rows_warns(self):
-        """Objects with ``grain=='scalar'`` but ``expected_rows!='one'`` warn (non-RuntimeCteStep edge)."""
+    def test_scalar_grain_with_mismatched_expected_rows_errors(self):
+        """Objects with ``grain=='scalar'`` but ``expected_rows!='one'`` error (non-RuntimeCteStep edge)."""
         bad = SimpleNamespace(
             cte_name="bad_scalar",
             grain="scalar",
@@ -398,6 +355,172 @@ class TestValidateCteCardinality:
         )
         issues = _validate_cte_cardinality([bad])
         assert any(i.issue_id.startswith("cte_scalar_cardinality") for i in issues)
+        assert all(i.severity == "error" for i in issues if i.issue_id.startswith("cte_scalar_cardinality"))
+
+    def test_scalar_grain_with_limit_gt_one_errors(self):
+        """Scalar grain with LIMIT > 1 cannot render as a single-row CROSS JOIN."""
+        cte = self._make_cte(grain="scalar", limit=5)
+        issues = _validate_cte_cardinality([cte])
+        assert any(i.issue_id == "cte_scalar_multi_row_limit_cte1" for i in issues)
+        assert all(i.severity == "error" for i in issues if "scalar_multi_row_limit" in i.issue_id)
+
+    def test_scalar_subquery_emission_with_multi_row_limit_errors(self):
+        """Scalar-subquery emission with LIMIT > 1 is refused."""
+        cte = RuntimeCteStep(
+            cte_name="avg_cte",
+            tables=["orders"],
+            select_cols=[SelectCol(expr=NormalizedExpr.from_agg("avg", "orders.order_id"))],
+            output_columns=["avg_id"],
+            grain="scalar",
+            emission="scalar_subquery",
+            limit=10,
+        )
+        issues = _validate_cte_cardinality([cte])
+        assert any("scalar_multi_row_limit" in i.issue_id for i in issues)
+        assert all(i.severity == "error" for i in issues)
+
+
+def _parent_child_schema() -> SchemaGraph:
+    parent_cols = {
+        "id": ColumnMetadata(name="id", data_type="integer", sensitivity="none", is_primary_key=True),
+        "name": ColumnMetadata(name="name", data_type="text", sensitivity="none"),
+    }
+    child_cols = {
+        "id": ColumnMetadata(name="id", data_type="integer", sensitivity="none", is_primary_key=True),
+        "parent_id": ColumnMetadata(
+            name="parent_id",
+            data_type="integer",
+            sensitivity="none",
+            is_foreign_key=True,
+            fk_target=("parent", "id"),
+        ),
+        "status": ColumnMetadata(name="status", data_type="text", sensitivity="none"),
+    }
+    fk = FKEdge(
+        src_table="child",
+        src_cols=["parent_id"],
+        dst_table="parent",
+        dst_cols=["id"],
+    )
+    tables = {
+        "parent": TableMetadata(
+            name="parent",
+            columns=parent_cols,
+            primary_key=["id"],
+            foreign_keys=[],
+        ),
+        "child": TableMetadata(
+            name="child",
+            columns=child_cols,
+            primary_key=["id"],
+            foreign_keys=[fk],
+        ),
+    }
+    return SchemaGraph(
+        tables=tables,
+        join_paths_multi=recompute_join_paths_multi(tables),
+        effective_structural_hash="validation_execute_parent_child",
+    )
+
+
+class TestValidateCteEmissionReclassification:
+    """Engine-owned CTE emission mismatches are errors."""
+
+    def test_coerce_cte_emission_rejects_model_scalar_subquery(self):
+        assert CteEmissionKind.coerce("scalar_subquery") == CteEmissionKind.SCALAR_SUBQUERY
+
+    def test_model_declared_scalar_subquery_is_forbidden(self):
+        cte = RuntimeCteStep(
+            cte_name="avg_cte",
+            tables=["parent"],
+            select_cols=[SelectCol(expr=NormalizedExpr.from_agg("avg", "parent.id"))],
+            output_columns=["avg_id"],
+            emission="scalar_subquery",
+            grain="scalar",
+        )
+        intent = RuntimeIntent(
+            tables=["avg_cte"],
+            grain="row_level",
+            select_cols=[SelectCol(expr=NormalizedExpr.from_column("avg_cte.avg_id"))],
+            group_by_cols=[],
+            order_by_cols=[],
+            where=None,
+            cte_steps=[cte],
+        )
+        issues = validate_cte_emission_reclassification(intent, _parent_child_schema())
+        assert any(i.issue_id == "cte_emission_model_declared_scalar_subquery_avg_cte" for i in issues)
+        assert all(i.severity == "error" for i in issues)
+
+    def test_scalar_subquery_on_non_scalar_cte_errors(self):
+        cte = RuntimeCteStep(
+            cte_name="wide_cte",
+            tables=["parent", "child"],
+            select_cols=[
+                SelectCol(expr=NormalizedExpr.from_column("parent.id")),
+                SelectCol(expr=NormalizedExpr.from_column("child.id")),
+            ],
+            output_columns=["parent_id", "child_id"],
+            emission="scalar_subquery",
+            grain="row_level",
+        )
+        intent = RuntimeIntent(
+            tables=["parent"],
+            grain="row_level",
+            select_cols=[],
+            group_by_cols=[],
+            order_by_cols=[],
+            where=None,
+            cte_steps=[cte],
+        )
+        issues = validate_cte_emission_reclassification(intent, _parent_child_schema())
+        assert any(i.issue_id == "cte_emission_model_declared_scalar_subquery_wide_cte" for i in issues)
+        assert all(i.severity == "error" for i in issues)
+
+    def test_wrongly_declared_semi_join_reclassified_to_join_table(self):
+        semi = RuntimeCteStep(
+            cte_name="bad_semi",
+            emission="semi_join",
+            tables=["child"],
+            select_cols=[SelectCol(expr=NormalizedExpr.from_column("child.status"))],
+            output_columns=["status"],
+            group_by_cols=[],
+            order_by_cols=[],
+            where=None,
+            having=None,
+        )
+        intent = RuntimeIntent(
+            tables=["parent", "bad_semi"],
+            grain="row_level",
+            select_cols=[SelectCol(expr=NormalizedExpr.from_column("parent.id"))],
+            group_by_cols=[],
+            order_by_cols=[],
+            where=None,
+            cte_steps=[semi],
+        )
+        issues = validate_cte_emission_reclassification(intent, _parent_child_schema())
+        assert any(i.issue_id == "cte_emission_reclassified_bad_semi" for i in issues)
+        assert any(i.severity == "error" and "semi_join" in i.message and "join_table" in i.message for i in issues)
+
+    def test_engine_promotes_join_table_to_scalar_subquery_without_error(self):
+        cte = RuntimeCteStep(
+            cte_name="avg_cte",
+            tables=["parent"],
+            select_cols=[SelectCol(expr=NormalizedExpr.from_agg("avg", "parent.id"))],
+            output_columns=["avg_id"],
+            emission="join_table",
+            grain="scalar",
+        )
+        intent = RuntimeIntent(
+            tables=["avg_cte"],
+            grain="row_level",
+            select_cols=[SelectCol(expr=NormalizedExpr.from_column("avg_cte.avg_id"))],
+            group_by_cols=[],
+            order_by_cols=[],
+            where=None,
+            cte_steps=[cte],
+        )
+        issues = validate_cte_emission_reclassification(intent, _parent_child_schema())
+        assert issues == []
 
 
 class TestValidateMainQueryCteUsage:
@@ -411,7 +534,7 @@ class TestValidateMainQueryCteUsage:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         issues = _validate_main_query_cte_usage(intent, {})
         assert issues == []
@@ -424,7 +547,7 @@ class TestValidateMainQueryCteUsage:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         issues = _validate_main_query_cte_usage(intent, {"cte1": ["total"]})
         ids = [i.issue_id for i in issues]
@@ -439,7 +562,7 @@ class TestValidateMainQueryCteUsage:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         step = RuntimeCteStep(
             cte_name="cte1",
@@ -461,7 +584,7 @@ class TestValidateMainQueryCteUsage:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("cte1.total"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         issues = _validate_main_query_cte_usage(intent, {"cte1": ["total"]})
         errors = [i for i in issues if i.severity == "error"]
@@ -475,7 +598,7 @@ class TestValidateMainQueryCteUsage:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("cte1.missing_col"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         issues = _validate_main_query_cte_usage(intent, {"cte1": ["total"]})
         errors = [i for i in issues if i.severity == "error"]
@@ -489,15 +612,17 @@ class TestValidateMainQueryCteUsage:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("cte1.total"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("cte1.bad_col"),
-                    op=">",
-                    value_type="number",
-                    param_key="p1",
-                    raw_value="10",
-                )
-            ],
+            where=PredicateGroup.from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("cte1.bad_col"),
+                        op=">",
+                        value_type="number",
+                        param_key="p1",
+                        raw_value="10",
+                    )
+                ]
+            ),
         )
         issues = _validate_main_query_cte_usage(intent, {"cte1": ["total"]})
         errors = [i for i in issues if i.severity == "error"]
@@ -511,7 +636,7 @@ class TestValidateMainQueryCteUsage:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("cte1.total"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             column_map={"ghost": "cte1"},
         )
         issues = _validate_main_query_cte_usage(intent, {"cte1": ["total"]})
@@ -526,7 +651,7 @@ class TestValidateMainQueryCteUsage:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("total"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         issues = _validate_main_query_cte_usage(intent, {"cte1": ["total"]})
         col_errors = [i for i in issues if "main_col_not_in_cte" in i.issue_id]
@@ -540,7 +665,7 @@ class TestValidateMainQueryCteUsage:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("cte1.Total"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         issues = _validate_main_query_cte_usage(intent, {"CTE1": ["Total"]})
         assert not any("main_col_not_in_cte" in i.issue_id for i in issues)
@@ -567,7 +692,7 @@ class TestValidateMainQueryCteUsage:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("downstream.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         issues = _validate_main_query_cte_usage(
             intent,
@@ -810,7 +935,7 @@ class TestValidateSemantics:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = validate_semantics(intent, schema_graph)
         assert not result.is_valid
@@ -825,7 +950,7 @@ class TestValidateSemantics:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = validate_semantics(intent, schema_graph)
         assert hasattr(result, "is_valid")
@@ -847,7 +972,7 @@ class TestValidateSemantics:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("cte1.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
         result = validate_semantics(intent, schema_graph)
@@ -868,7 +993,7 @@ class TestValidateSemantics:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("cte1.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
         result = validate_semantics(intent, schema_graph)
@@ -889,7 +1014,7 @@ class TestValidateSemantics:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("cte1.id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
         result = validate_semantics(intent, schema_graph)
@@ -917,7 +1042,7 @@ class TestValidateSemantics:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("cte1.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte1, cte2],
         )
         result = validate_semantics(intent, schema_graph)
@@ -945,7 +1070,7 @@ class TestValidateSemantics:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("cte1.total"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte1, cte2],
         )
         result = validate_semantics(intent, schema_graph)
@@ -983,7 +1108,7 @@ class TestValidateCaseBranchOperators:
 
     def test_between_on_case_branch_not_flagged(self, schema_graph: SchemaGraph) -> None:
         branch = CaseWhenBranch(
-            condition=FilterParam(
+            condition=WhereParam(
                 left_expr=NormalizedExpr.from_column("orders.amount"),
                 op="between",
                 value_type="number",
@@ -1002,7 +1127,7 @@ class TestValidateCaseBranchOperators:
 
     def test_in_on_case_branch_not_flagged(self, schema_graph: SchemaGraph) -> None:
         branch = CaseWhenBranch(
-            condition=FilterParam(
+            condition=WhereParam(
                 left_expr=NormalizedExpr.from_column("orders.status"),
                 op="in",
                 value_type="string",
@@ -1019,7 +1144,7 @@ class TestValidateCaseBranchOperators:
 
     def test_not_in_on_case_branch_not_flagged(self, schema_graph: SchemaGraph) -> None:
         branch = CaseWhenBranch(
-            condition=FilterParam(
+            condition=WhereParam(
                 left_expr=NormalizedExpr.from_column("orders.status"),
                 op="not in",
                 value_type="string",

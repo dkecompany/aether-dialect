@@ -4,13 +4,14 @@ import pytest
 
 from aetherdialect._contracts_base import (
     ColumnRole,
-    FilterParam,
     HavingParam,
     MulGroup,
     NormalizedExpr,
     OrderByCol,
+    PredicateGroup,
     SqlDiagnostic,
     SqlDiagnosticCode,
+    WhereParam,
 )
 from aetherdialect._contracts_core import (
     RuntimeCteStep,
@@ -31,38 +32,38 @@ from aetherdialect._contracts_schema import (
 from aetherdialect._intent_expr import parse_expr_string
 from aetherdialect._intent_repair import (
     DIAGNOSTIC_REPAIR_DISPATCH,
-    _dedup_contradictory_filters_list,
-    _dedup_value_vs_right_expr_filters,
+    _dedup_contradictory_where_list,
+    _dedup_value_vs_right_expr_where,
     _is_impossible_having,
     _is_null_value,
     _is_pk_column,
     _strip_distinct_prefix,
     _tables_from_columns,
-    align_filter_value_type_to_exprs,
+    align_where_value_type_to_exprs,
     apply_diagnostic_repairs,
-    auto_repair_filter_having,
+    auto_repair_where_having,
     best_descriptive_column,
     best_descriptive_columns,
     collect_referenced_tables,
-    decompose_in_not_in_filters,
-    dedup_contradictory_filters,
+    decompose_in_not_in_where,
+    dedup_contradictory_where,
     dedup_extract_year_vs_column_literal,
     dedup_value_vs_right_expr,
     drop_invalid_case_registry_entries,
     enforce_sensitivity_policy_intent,
     expand_fk_select_to_descriptive,
     intent_text_has_leakable_placeholder,
-    normalize_boolean_filter_values,
-    normalize_in_filter_types,
-    normalize_null_filter_values,
+    normalize_boolean_where_values,
+    normalize_in_where_types,
+    normalize_null_where_values,
     normalize_pk_distinct,
     promote_temporal_keyword_rhs,
     reconcile_tables,
-    repair_array_filters_intent,
+    repair_array_where_intent,
     repair_case_when_intent,
-    repair_fk_filter_type_mismatch,
+    repair_fk_where_type_mismatch,
     repair_intent_placeholder_tokens,
-    repair_null_equality_filters,
+    repair_null_equality_where,
     runtime_intent_has_instructional_placeholders,
     sanitize_table_names,
     strip_impossible_having,
@@ -72,11 +73,11 @@ from aetherdialect._intent_repair import (
 from aetherdialect._intent_resolve import (
     _match_enum_value,
     _qualify_term,
-    _resolve_filter_list_cascade,
+    _resolve_where_list_cascade,
     infer_cte_output_columns,
     qualify_cte_output_columns,
     repair_window_partition_group_by_alignment,
-    resolve_filter_value_case,
+    resolve_where_value_case,
 )
 
 
@@ -99,7 +100,7 @@ class TestDropInvalidCaseRegistryEntries:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             case_registry=[cr_bad, cr_ok],
         )
         out = drop_invalid_case_registry_entries(intent, schema)
@@ -140,7 +141,7 @@ class TestEnforceSensitivityPolicyIntent:
             select_cols=[agg_col],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         out = enforce_sensitivity_policy_intent(intent, schema)
         assert len(out.select_cols or []) == 1
@@ -174,7 +175,7 @@ class TestEnforceSensitivityPolicyIntent:
             select_cols=[bare],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         with pytest.raises(ValueError, match="sensitivity_all_select_dropped"):
             enforce_sensitivity_policy_intent(intent, schema)
@@ -208,7 +209,7 @@ class TestEnforceSensitivityPolicyIntent:
             select_cols=[bare],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         out = enforce_sensitivity_policy_intent(intent, schema)
         assert len(out.select_cols or []) == 1
@@ -240,7 +241,7 @@ class TestEnforceSensitivityPolicyIntent:
             select_cols=[agg_col],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         out = enforce_sensitivity_policy_intent(intent, schema)
         assert len(out.select_cols or []) == 1
@@ -275,7 +276,7 @@ class TestEnforceSensitivityPolicyIntent:
             select_cols=[agg_col],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         out = enforce_sensitivity_policy_intent(intent, schema)
         assert len(out.select_cols or []) == 1
@@ -343,7 +344,7 @@ class TestNormalizePkDistinct:
             select_cols=[sc],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = normalize_pk_distinct(intent, pk_schema)
         assert result.select_cols[0].expr.add_groups[0].distinct is False
@@ -387,7 +388,7 @@ class TestNormalizePkDistinct:
             select_cols=[sc],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = normalize_pk_distinct(intent, non_pk_schema)
         assert result.select_cols[0].expr.add_groups[0].distinct is True
@@ -404,7 +405,7 @@ class TestPruneUnreferencedTables:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = reconcile_tables(intent)
         assert "orders" in result.tables
@@ -417,7 +418,7 @@ class TestPruneUnreferencedTables:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("customers.name"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = reconcile_tables(intent)
         assert "customers" in result.tables
@@ -480,7 +481,7 @@ class TestStripJoinConditionsFromIntent:
 
     def test_strips_fk_join_filter(self, fk_schema):
         """strip_join_conditions removes FK equi-join filter."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("orders.customer_id"),
             op="=",
             right_expr=NormalizedExpr.from_column("customers.id"),
@@ -492,14 +493,14 @@ class TestStripJoinConditionsFromIntent:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=PredicateGroup.from_list([fp]),
         )
         result = strip_join_conditions(intent, fk_schema)
-        assert len(result.filters_param) == 0
+        assert len(result.where.leaves() if result.where else []) == 0
 
     def test_keeps_non_fk_filter(self, fk_schema):
         """strip_join_conditions keeps non-FK filter."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("orders.id"),
             op=">",
             value_type="number",
@@ -511,10 +512,10 @@ class TestStripJoinConditionsFromIntent:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=PredicateGroup.from_list([fp]),
         )
         result = strip_join_conditions(intent, fk_schema)
-        assert len(result.filters_param) == 1
+        assert len(result.where.leaves() if result.where else []) == 1
 
 
 class TestIntentTextHasLeakablePlaceholder:
@@ -532,7 +533,7 @@ class TestIntentTextHasLeakablePlaceholder:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.a"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             column_map={"alias": None},
         )
         assert runtime_intent_has_instructional_placeholders(intent) is False
@@ -759,7 +760,7 @@ class TestCollectReferencedTables:
         sc = [SelectCol(expr=NormalizedExpr.from_column("orders.id"))]
         obc = [OrderByCol(expr=NormalizedExpr.from_column("customers.name"))]
         gb = [NormalizedExpr.from_column("products.category")]
-        fp = [FilterParam(left_expr=NormalizedExpr.from_column("inventory.qty"), op=">")]
+        fp = [WhereParam(left_expr=NormalizedExpr.from_column("inventory.qty"), op=">")]
         hp = [HavingParam(left_expr=NormalizedExpr.from_agg("sum", "sales.amount"), op=">")]
         result = collect_referenced_tables(sc, obc, gb, fp, hp)
         assert "orders" in result
@@ -819,24 +820,24 @@ class TestStripJoinConditionsEdgeCases:
             effective_structural_hash="",
             tables={"orders": orders, "customers": customers},
         )
-        fk_filter = FilterParam(
+        fk_filter = WhereParam(
             left_expr=NormalizedExpr.from_column("orders.customer_id"),
             op="=",
             right_expr=NormalizedExpr.from_column("customers.id"),
             value_type="integer",
         )
-        cte = RuntimeCteStep(cte_name="cte1", filters_param=[fk_filter])
+        cte = RuntimeCteStep(cte_name="cte1", where=PredicateGroup.from_list([fk_filter]))
         intent = RuntimeIntent(
             tables=["orders", "customers"],
             grain="row_level",
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
         result = strip_join_conditions(intent, schema)
-        assert len(result.cte_steps[0].filters_param) == 0
+        assert len(PredicateGroup.where_leaves(result.cte_steps[0].where) or []) == 0
 
     def test_keeps_non_equality_join(self):
         """strip_join_conditions keeps non-equality operator."""
@@ -880,7 +881,7 @@ class TestStripJoinConditionsEdgeCases:
             effective_structural_hash="",
             tables={"orders": orders, "customers": customers},
         )
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("orders.customer_id"),
             op=">",
             right_expr=NormalizedExpr.from_column("customers.id"),
@@ -892,10 +893,10 @@ class TestStripJoinConditionsEdgeCases:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=PredicateGroup.from_list([fp]),
         )
         result = strip_join_conditions(intent, schema)
-        assert len(result.filters_param) == 1
+        assert len(result.where.leaves() if result.where else []) == 1
 
 
 class TestPruneUnreferencedTablesEdgeCases:
@@ -913,7 +914,7 @@ class TestPruneUnreferencedTablesEdgeCases:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("cte1.val"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
         result = reconcile_tables(intent)
@@ -937,7 +938,7 @@ class TestPruneUnreferencedTablesEdgeCases:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("cte2.y"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte1, cte2],
         )
         result = reconcile_tables(intent)
@@ -953,7 +954,7 @@ class TestPruneUnreferencedTablesEdgeCases:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = reconcile_tables(intent)
         assert result.tables == []
@@ -1002,7 +1003,7 @@ class TestNormalizePkDistinctEdgeCases:
             select_cols=[sc],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = normalize_pk_distinct(intent, schema)
         assert result.select_cols[0].expr.add_groups[0].distinct is True
@@ -1048,7 +1049,7 @@ class TestNormalizePkDistinctEdgeCases:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
         result = normalize_pk_distinct(intent, schema)
@@ -1133,17 +1134,19 @@ class TestRepairFkFilterTypeMismatch:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("orders.category_id"),
-                    op="=",
-                    value_type="string",
-                    raw_value="Action",
-                ),
-            ],
+            where=PredicateGroup.from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("orders.category_id"),
+                        op="=",
+                        value_type="string",
+                        raw_value="Action",
+                    ),
+                ]
+            ),
         )
-        result = repair_fk_filter_type_mismatch(intent, fk_schema)
-        assert result.filters_param[0].left_expr.primary_column == "orders.category_id"
+        result = repair_fk_where_type_mismatch(intent, fk_schema)
+        assert (result.where.leaves() if result.where else [])[0].left_expr.primary_column == "orders.category_id"
         assert result.tables == intent.tables
 
     def test_no_change_when_value_type_integer(self, fk_schema):
@@ -1153,17 +1156,19 @@ class TestRepairFkFilterTypeMismatch:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("orders.category_id"),
-                    op="=",
-                    value_type="integer",
-                    raw_value=5,
-                ),
-            ],
+            where=PredicateGroup.from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("orders.category_id"),
+                        op="=",
+                        value_type="integer",
+                        raw_value=5,
+                    ),
+                ]
+            ),
         )
-        result = repair_fk_filter_type_mismatch(intent, fk_schema)
-        assert result.filters_param[0].left_expr.primary_column == "orders.category_id"
+        result = repair_fk_where_type_mismatch(intent, fk_schema)
+        assert (result.where.leaves() if result.where else [])[0].left_expr.primary_column == "orders.category_id"
 
     def test_no_change_when_column_not_fk(self, fk_schema):
         intent = RuntimeIntent(
@@ -1172,17 +1177,19 @@ class TestRepairFkFilterTypeMismatch:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("orders.amount"),
-                    op=">",
-                    value_type="string",
-                    raw_value="high",
-                ),
-            ],
+            where=PredicateGroup.from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("orders.amount"),
+                        op=">",
+                        value_type="string",
+                        raw_value="high",
+                    ),
+                ]
+            ),
         )
-        result = repair_fk_filter_type_mismatch(intent, fk_schema)
-        assert result.filters_param[0].left_expr.primary_column == "orders.amount"
+        result = repair_fk_where_type_mismatch(intent, fk_schema)
+        assert (result.where.leaves() if result.where else [])[0].left_expr.primary_column == "orders.amount"
 
     def test_no_change_when_no_descriptive_column(self):
         orders = TableMetadata(
@@ -1243,17 +1250,19 @@ class TestRepairFkFilterTypeMismatch:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("orders.tag_id"),
-                    op="=",
-                    value_type="string",
-                    raw_value="important",
-                ),
-            ],
+            where=PredicateGroup.from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("orders.tag_id"),
+                        op="=",
+                        value_type="string",
+                        raw_value="important",
+                    ),
+                ]
+            ),
         )
-        result = repair_fk_filter_type_mismatch(intent, sg)
-        assert result.filters_param[0].left_expr.primary_column == "orders.tag_id"
+        result = repair_fk_where_type_mismatch(intent, sg)
+        assert (result.where.leaves() if result.where else [])[0].left_expr.primary_column == "orders.tag_id"
 
     def test_target_table_not_duplicated(self, fk_schema):
         intent = RuntimeIntent(
@@ -1262,16 +1271,18 @@ class TestRepairFkFilterTypeMismatch:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("orders.category_id"),
-                    op="=",
-                    value_type="string",
-                    raw_value="Action",
-                ),
-            ],
+            where=PredicateGroup.from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("orders.category_id"),
+                        op="=",
+                        value_type="string",
+                        raw_value="Action",
+                    ),
+                ]
+            ),
         )
-        result = repair_fk_filter_type_mismatch(intent, fk_schema)
+        result = repair_fk_where_type_mismatch(intent, fk_schema)
         assert result.tables.count("categories") == 1
 
     def test_mixed_filters_only_bad_repaired(self, fk_schema):
@@ -1281,24 +1292,26 @@ class TestRepairFkFilterTypeMismatch:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("orders.status"),
-                    op="=",
-                    value_type="string",
-                    raw_value="shipped",
-                ),
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("orders.category_id"),
-                    op="=",
-                    value_type="string",
-                    raw_value="Action",
-                ),
-            ],
+            where=PredicateGroup.from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("orders.status"),
+                        op="=",
+                        value_type="string",
+                        raw_value="shipped",
+                    ),
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("orders.category_id"),
+                        op="=",
+                        value_type="string",
+                        raw_value="Action",
+                    ),
+                ]
+            ),
         )
-        result = repair_fk_filter_type_mismatch(intent, fk_schema)
-        assert result.filters_param[0].left_expr.primary_column == "orders.status"
-        assert result.filters_param[1].left_expr.primary_column == "orders.category_id"
+        result = repair_fk_where_type_mismatch(intent, fk_schema)
+        assert (result.where.leaves() if result.where else [])[0].left_expr.primary_column == "orders.status"
+        assert (result.where.leaves() if result.where else [])[1].left_expr.primary_column == "orders.category_id"
         assert result.tables == intent.tables
 
 
@@ -1313,7 +1326,7 @@ class TestStripSpuriousGroupBy:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("film.title"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = strip_spurious_group_by(intent)
         assert result.group_by_cols == []
@@ -1327,7 +1340,7 @@ class TestStripSpuriousGroupBy:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("film.title"))],
             group_by_cols=[NormalizedExpr.from_column("film.title")],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = strip_spurious_group_by(intent)
         assert result.group_by_cols == []
@@ -1344,7 +1357,7 @@ class TestStripSpuriousGroupBy:
             ],
             group_by_cols=[NormalizedExpr.from_column("film.rating")],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = strip_spurious_group_by(intent)
         assert len(result.group_by_cols) == 1
@@ -1358,7 +1371,7 @@ class TestStripSpuriousGroupBy:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("film.title"))],
             group_by_cols=[NormalizedExpr.from_column("film.title")],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = strip_spurious_group_by(intent)
         assert result.group_by_cols == []
@@ -1371,7 +1384,7 @@ class TestStripSpuriousGroupBy:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("customer.email"))],
             group_by_cols=[NormalizedExpr.from_column("customer.email")],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = strip_spurious_group_by(intent)
         assert result.group_by_cols == []
@@ -1390,8 +1403,8 @@ class TestStripSpuriousGroupByCte:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("film.title"))],
             group_by_cols=[NormalizedExpr.from_column("film.title")],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             output_columns=[],
         )
@@ -1401,7 +1414,7 @@ class TestStripSpuriousGroupByCte:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("film.title"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
         result = strip_spurious_group_by(intent)
@@ -1420,8 +1433,8 @@ class TestStripSpuriousGroupByCte:
             ],
             group_by_cols=[NormalizedExpr.from_column("film.rating")],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             output_columns=[],
         )
@@ -1431,7 +1444,7 @@ class TestStripSpuriousGroupByCte:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
         result = strip_spurious_group_by(intent)
@@ -1447,8 +1460,8 @@ class TestStripSpuriousGroupByCte:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("film.title"))],
             group_by_cols=[NormalizedExpr.from_column("film.title")],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             output_columns=[],
         )
@@ -1458,7 +1471,7 @@ class TestStripSpuriousGroupByCte:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("film.rating"))],
             group_by_cols=[NormalizedExpr.from_column("film.rating")],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
         result = strip_spurious_group_by(intent)
@@ -1475,14 +1488,14 @@ class TestStripSpuriousGroupByCte:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("film.title"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = strip_spurious_group_by(intent)
         assert result is intent
 
 
 class TestRepairFkFilterTypeMismatchCte:
-    """CTE parity tests for repair_fk_filter_type_mismatch."""
+    """CTE parity tests for repair_fk_where_type_mismatch."""
 
     @pytest.fixture
     def fk_schema(self):
@@ -1555,15 +1568,17 @@ class TestRepairFkFilterTypeMismatchCte:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("orders.category_id"),
-                    op="=",
-                    value_type="string",
-                    raw_value="Action",
-                ),
-            ],
-            having_param=[],
+            where=PredicateGroup.from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("orders.category_id"),
+                        op="=",
+                        value_type="string",
+                        raw_value="Action",
+                    ),
+                ]
+            ),
+            having=None,
             param_values={},
             output_columns=[],
         )
@@ -1573,11 +1588,13 @@ class TestRepairFkFilterTypeMismatchCte:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
-        result = repair_fk_filter_type_mismatch(intent, fk_schema)
-        assert result.cte_steps[0].filters_param[0].left_expr.primary_column == "orders.category_id"
+        result = repair_fk_where_type_mismatch(intent, fk_schema)
+        assert (PredicateGroup.where_leaves(result.cte_steps[0].where) or [])[
+            0
+        ].left_expr.primary_column == "orders.category_id"
         assert result.cte_steps[0].tables == cte.tables
 
     def test_cte_non_fk_filter_unchanged(self, fk_schema):
@@ -1588,15 +1605,17 @@ class TestRepairFkFilterTypeMismatchCte:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("orders.order_id"),
-                    op="=",
-                    value_type="integer",
-                    raw_value=5,
-                ),
-            ],
-            having_param=[],
+            where=PredicateGroup.from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("orders.order_id"),
+                        op="=",
+                        value_type="integer",
+                        raw_value=5,
+                    ),
+                ]
+            ),
+            having=None,
             param_values={},
             output_columns=[],
         )
@@ -1606,11 +1625,13 @@ class TestRepairFkFilterTypeMismatchCte:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
-        result = repair_fk_filter_type_mismatch(intent, fk_schema)
-        assert result.cte_steps[0].filters_param[0].left_expr.primary_column == "orders.order_id"
+        result = repair_fk_where_type_mismatch(intent, fk_schema)
+        assert (PredicateGroup.where_leaves(result.cte_steps[0].where) or [])[
+            0
+        ].left_expr.primary_column == "orders.order_id"
 
     def test_main_and_cte_both_rewired(self, fk_schema):
         """Both main and CTE FK filters are rewired."""
@@ -1620,15 +1641,17 @@ class TestRepairFkFilterTypeMismatchCte:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("orders.category_id"),
-                    op="=",
-                    value_type="string",
-                    raw_value="Drama",
-                ),
-            ],
-            having_param=[],
+            where=PredicateGroup.from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("orders.category_id"),
+                        op="=",
+                        value_type="string",
+                        raw_value="Drama",
+                    ),
+                ]
+            ),
+            having=None,
             param_values={},
             output_columns=[],
         )
@@ -1638,19 +1661,23 @@ class TestRepairFkFilterTypeMismatchCte:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("orders.category_id"),
-                    op="=",
-                    value_type="string",
-                    raw_value="Action",
-                ),
-            ],
+            where=PredicateGroup.from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("orders.category_id"),
+                        op="=",
+                        value_type="string",
+                        raw_value="Action",
+                    ),
+                ]
+            ),
             cte_steps=[cte],
         )
-        result = repair_fk_filter_type_mismatch(intent, fk_schema)
-        assert result.filters_param[0].left_expr.primary_column == "orders.category_id"
-        assert result.cte_steps[0].filters_param[0].left_expr.primary_column == "orders.category_id"
+        result = repair_fk_where_type_mismatch(intent, fk_schema)
+        assert (result.where.leaves() if result.where else [])[0].left_expr.primary_column == "orders.category_id"
+        assert (PredicateGroup.where_leaves(result.cte_steps[0].where) or [])[
+            0
+        ].left_expr.primary_column == "orders.category_id"
         assert result.tables == intent.tables
         assert result.cte_steps[0].tables == cte.tables
 
@@ -1719,7 +1746,7 @@ class TestMatchEnumValue:
 
 
 class TestResolveFilterListCascade:
-    """Tests for _resolve_filter_list_cascade."""
+    """Tests for _resolve_where_list_cascade."""
 
     @pytest.fixture
     def rating_schema(self):
@@ -1747,55 +1774,55 @@ class TestResolveFilterListCascade:
 
     def test_corrects_scalar_value(self, rating_schema):
         """Scalar string filter gets corrected via enum match."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("film.rating"),
             op="=",
             value_type="string",
             raw_value="pg",
         )
-        result, changed = _resolve_filter_list_cascade([fp], rating_schema, "")
+        result, changed = _resolve_where_list_cascade([fp], rating_schema, "")
         assert changed
         assert result[0].raw_value == "PG"
 
     def test_corrects_list_values(self, rating_schema):
         """List filter values get corrected per element."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("film.rating"),
             op="in",
             value_type="string",
             raw_value=["pg", "r"],
         )
-        result, changed = _resolve_filter_list_cascade([fp], rating_schema, "")
+        result, changed = _resolve_where_list_cascade([fp], rating_schema, "")
         assert changed
         assert result[0].raw_value == ["PG", "R"]
 
     def test_no_change_for_correct_casing(self, rating_schema):
         """Already correct casing returns unchanged."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("film.rating"),
             op="=",
             value_type="string",
             raw_value="PG",
         )
-        result, changed = _resolve_filter_list_cascade([fp], rating_schema, "")
+        result, changed = _resolve_where_list_cascade([fp], rating_schema, "")
         assert not changed
         assert result[0].raw_value == "PG"
 
     def test_non_string_value_type_unchanged(self, rating_schema):
         """Non-string value_type filters are not touched."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("film.rating"),
             op="=",
             value_type="integer",
             raw_value=5,
         )
-        result, changed = _resolve_filter_list_cascade([fp], rating_schema, "")
+        result, changed = _resolve_where_list_cascade([fp], rating_schema, "")
         assert not changed
         assert result[0].raw_value == 5
 
 
 class TestResolveFilterValueCase:
-    """Tests for resolve_filter_value_case."""
+    """Tests for resolve_where_value_case."""
 
     @pytest.fixture
     def rating_schema(self):
@@ -1823,7 +1850,7 @@ class TestResolveFilterValueCase:
 
     def test_main_query_corrected(self, rating_schema):
         """Main query filter value gets corrected."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("film.rating"),
             op="=",
             value_type="string",
@@ -1835,17 +1862,17 @@ class TestResolveFilterValueCase:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
-            having_param=[],
+            where=PredicateGroup.from_list([fp]),
+            having=None,
             param_values={},
             natural_language="Show PG-13 films",
         )
-        result = resolve_filter_value_case(intent, rating_schema, "Show PG-13 films")
-        assert result.filters_param[0].raw_value == "PG-13"
+        result = resolve_where_value_case(intent, rating_schema, "Show PG-13 films")
+        assert (result.where.leaves() if result.where else [])[0].raw_value == "PG-13"
 
     def test_cte_step_corrected(self, rating_schema):
         """CTE step filter value gets corrected."""
-        cte_fp = FilterParam(
+        cte_fp = WhereParam(
             left_expr=NormalizedExpr.from_column("film.rating"),
             op="=",
             value_type="string",
@@ -1857,8 +1884,8 @@ class TestResolveFilterValueCase:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[cte_fp],
-            having_param=[],
+            where=PredicateGroup.from_list([cte_fp]),
+            having=None,
             param_values={},
             output_columns=[],
         )
@@ -1868,18 +1895,18 @@ class TestResolveFilterValueCase:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             cte_steps=[cte],
             natural_language="test",
         )
-        result = resolve_filter_value_case(intent, rating_schema, "test")
-        assert result.cte_steps[0].filters_param[0].raw_value == "R"
+        result = resolve_where_value_case(intent, rating_schema, "test")
+        assert (PredicateGroup.where_leaves(result.cte_steps[0].where) or [])[0].raw_value == "R"
 
     def test_no_change_returns_same_intent(self, rating_schema):
         """When no corrections needed the original intent is returned."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("film.rating"),
             op="=",
             value_type="string",
@@ -1891,17 +1918,58 @@ class TestResolveFilterValueCase:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
-            having_param=[],
+            where=PredicateGroup.from_list([fp]),
+            having=None,
             param_values={},
             natural_language="test",
         )
-        result = resolve_filter_value_case(intent, rating_schema, "test")
+        result = resolve_where_value_case(intent, rating_schema, "test")
         assert result is intent
+
+    def test_member_scoped_enum_values_are_preferred_on_composite_graph(self) -> None:
+        film = TableMetadata(
+            name="film",
+            columns={
+                "rating": ColumnMetadata(
+                    name="rating",
+                    data_type="mpaa_rating",
+                    value_type="string",
+                    role=ColumnRole.CATEGORICAL.value,
+                ),
+            },
+            foreign_keys=[],
+            primary_key="",
+            source_id="storefront",
+        )
+        composite = SchemaGraph(
+            join_paths_multi={},
+            effective_structural_hash="",
+            tables={"film": film},
+            enum_values={"storefront::mpaa_rating": ["G", "PG", "PG-13", "R", "NC-17"]},
+        )
+        fp = WhereParam(
+            left_expr=NormalizedExpr.from_column("film.rating"),
+            op="=",
+            value_type="string",
+            raw_value="pg-13",
+        )
+        intent = RuntimeIntent(
+            tables=["film"],
+            grain="row_level",
+            select_cols=[],
+            group_by_cols=[],
+            order_by_cols=[],
+            where=PredicateGroup.from_list([fp]),
+            having=None,
+            param_values={},
+            natural_language="Show PG-13 films",
+        )
+        result = resolve_where_value_case(intent, composite, "Show PG-13 films")
+        assert (result.where.leaves() if result.where else [])[0].raw_value == "PG-13"
 
 
 class TestNormalizeInFilterTypes:
-    """Tests for normalize_in_filter_types."""
+    """Tests for normalize_in_where_types."""
 
     @pytest.fixture
     def int_col_schema(self):
@@ -1930,7 +1998,7 @@ class TestNormalizeInFilterTypes:
 
     def test_coerces_string_elements_to_int(self, int_col_schema):
         """String elements on an integer column are coerced to ints."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.id"),
             op="in",
             value_type="integer",
@@ -1942,18 +2010,20 @@ class TestNormalizeInFilterTypes:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
-            having_param=[],
+            where=PredicateGroup.from_list([fp]),
+            having=None,
             param_values={},
             natural_language="test",
         )
-        result = normalize_in_filter_types(intent, int_col_schema)
-        assert [fp.raw_value for fp in result.filters_param] == [1, 2, 3]
-        assert all(fp.op == "=" for fp in result.filters_param)
+        result = normalize_in_where_types(intent, int_col_schema)
+        leaves = result.where.leaves() if result.where else []
+        assert len(leaves) == 1
+        assert leaves[0].op == "in"
+        assert leaves[0].raw_value == [1, 2, 3]
 
     def test_consolidates_string_list(self, int_col_schema):
         """String list on a string column is consolidated with quotes."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.name"),
             op="in",
             value_type="string",
@@ -1965,18 +2035,20 @@ class TestNormalizeInFilterTypes:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
-            having_param=[],
+            where=PredicateGroup.from_list([fp]),
+            having=None,
             param_values={},
             natural_language="test",
         )
-        result = normalize_in_filter_types(intent, int_col_schema)
-        assert [fp.raw_value for fp in result.filters_param] == ["Alice", "Bob"]
-        assert all(fp.op == "=" for fp in result.filters_param)
+        result = normalize_in_where_types(intent, int_col_schema)
+        leaves = result.where.leaves() if result.where else []
+        assert len(leaves) == 1
+        assert leaves[0].op == "in"
+        assert leaves[0].raw_value == ["Alice", "Bob"]
 
     def test_non_in_op_unchanged(self, int_col_schema):
         """Filters with non-IN ops are not touched."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.id"),
             op="=",
             value_type="integer",
@@ -1988,17 +2060,17 @@ class TestNormalizeInFilterTypes:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
-            having_param=[],
+            where=PredicateGroup.from_list([fp]),
+            having=None,
             param_values={},
             natural_language="test",
         )
-        result = normalize_in_filter_types(intent, int_col_schema)
-        assert result.filters_param == intent.filters_param
+        result = normalize_in_where_types(intent, int_col_schema)
+        assert (result.where.leaves() if result.where else []) == (intent.where.leaves() if intent.where else [])
 
     def test_cte_step_coerced(self, int_col_schema):
         """CTE step IN filters are also coerced."""
-        cte_fp = FilterParam(
+        cte_fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.id"),
             op="in",
             value_type="integer",
@@ -2010,8 +2082,8 @@ class TestNormalizeInFilterTypes:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[cte_fp],
-            having_param=[],
+            where=PredicateGroup.from_list([cte_fp]),
+            having=None,
             param_values={},
             output_columns=[],
         )
@@ -2021,19 +2093,21 @@ class TestNormalizeInFilterTypes:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             param_values={},
             cte_steps=[cte],
             natural_language="test",
         )
-        result = normalize_in_filter_types(intent, int_col_schema)
-        assert [fp.raw_value for fp in result.cte_steps[0].filters_param] == [10, 20]
-        assert all(fp.op == "=" for fp in result.cte_steps[0].filters_param)
+        result = normalize_in_where_types(intent, int_col_schema)
+        cte_leaves = PredicateGroup.where_leaves(result.cte_steps[0].where) or []
+        assert len(cte_leaves) == 1
+        assert cte_leaves[0].op == "in"
+        assert cte_leaves[0].raw_value == [10, 20]
 
 
 class TestNormalizeBooleanFilterValues:
-    """Tests for normalize_boolean_filter_values (main + CTE)."""
+    """Tests for normalize_boolean_where_values (main + CTE)."""
 
     @pytest.fixture
     def bool_schema(self):
@@ -2068,7 +2142,7 @@ class TestNormalizeBooleanFilterValues:
 
     def test_int_1_normalised_to_true(self, bool_schema):
         """Integer 1 on boolean column becomes True."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("customer.activebool"),
             op="=",
             value_type="integer",
@@ -2080,15 +2154,15 @@ class TestNormalizeBooleanFilterValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=PredicateGroup.from_list([fp]),
         )
-        result = normalize_boolean_filter_values(intent, bool_schema)
-        assert result.filters_param[0].raw_value is True
-        assert result.filters_param[0].value_type == "boolean"
+        result = normalize_boolean_where_values(intent, bool_schema)
+        assert (result.where.leaves() if result.where else [])[0].raw_value is True
+        assert (result.where.leaves() if result.where else [])[0].value_type == "boolean"
 
     def test_string_false_normalised(self, bool_schema):
         """String 'false' on boolean column becomes False."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("customer.activebool"),
             op="=",
             value_type="string",
@@ -2100,15 +2174,15 @@ class TestNormalizeBooleanFilterValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=PredicateGroup.from_list([fp]),
         )
-        result = normalize_boolean_filter_values(intent, bool_schema)
-        assert result.filters_param[0].raw_value is False
-        assert result.filters_param[0].value_type == "boolean"
+        result = normalize_boolean_where_values(intent, bool_schema)
+        assert (result.where.leaves() if result.where else [])[0].raw_value is False
+        assert (result.where.leaves() if result.where else [])[0].value_type == "boolean"
 
     def test_already_bool_unchanged(self, bool_schema):
         """Python bool on boolean column is kept unchanged."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("customer.activebool"),
             op="=",
             value_type="boolean",
@@ -2120,15 +2194,15 @@ class TestNormalizeBooleanFilterValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=PredicateGroup.from_list([fp]),
         )
-        result = normalize_boolean_filter_values(intent, bool_schema)
-        assert result.filters_param[0].raw_value is True
-        assert result.filters_param[0].value_type == "boolean"
+        result = normalize_boolean_where_values(intent, bool_schema)
+        assert (result.where.leaves() if result.where else [])[0].raw_value is True
+        assert (result.where.leaves() if result.where else [])[0].value_type == "boolean"
 
     def test_non_boolean_column_unchanged(self, bool_schema):
         """Non-boolean column filter is not touched."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("customer.name"),
             op="=",
             value_type="string",
@@ -2140,14 +2214,14 @@ class TestNormalizeBooleanFilterValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=PredicateGroup.from_list([fp]),
         )
-        result = normalize_boolean_filter_values(intent, bool_schema)
-        assert result.filters_param[0].raw_value == "Alice"
+        result = normalize_boolean_where_values(intent, bool_schema)
+        assert (result.where.leaves() if result.where else [])[0].raw_value == "Alice"
 
     def test_no_change_returns_same_intent(self, bool_schema):
         """When nothing changes the original intent is returned."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("customer.name"),
             op="=",
             value_type="string",
@@ -2159,14 +2233,14 @@ class TestNormalizeBooleanFilterValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=PredicateGroup.from_list([fp]),
         )
-        result = normalize_boolean_filter_values(intent, bool_schema)
+        result = normalize_boolean_where_values(intent, bool_schema)
         assert result is intent
 
     def test_cte_boolean_normalised(self, bool_schema):
         """CTE step boolean filter is normalised."""
-        cte_fp = FilterParam(
+        cte_fp = WhereParam(
             left_expr=NormalizedExpr.from_column("customer.activebool"),
             op="=",
             value_type="string",
@@ -2178,8 +2252,8 @@ class TestNormalizeBooleanFilterValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[cte_fp],
-            having_param=[],
+            where=PredicateGroup.from_list([cte_fp]),
+            having=None,
             param_values={},
             output_columns=[],
         )
@@ -2189,22 +2263,22 @@ class TestNormalizeBooleanFilterValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
-        result = normalize_boolean_filter_values(intent, bool_schema)
-        assert result.cte_steps[0].filters_param[0].raw_value is True
-        assert result.cte_steps[0].filters_param[0].value_type == "boolean"
+        result = normalize_boolean_where_values(intent, bool_schema)
+        assert (PredicateGroup.where_leaves(result.cte_steps[0].where) or [])[0].raw_value is True
+        assert (PredicateGroup.where_leaves(result.cte_steps[0].where) or [])[0].value_type == "boolean"
 
     def test_main_and_cte_both_normalised(self, bool_schema):
         """Both main and CTE boolean filters are normalised."""
-        main_fp = FilterParam(
+        main_fp = WhereParam(
             left_expr=NormalizedExpr.from_column("customer.activebool"),
             op="=",
             value_type="integer",
             raw_value=0,
         )
-        cte_fp = FilterParam(
+        cte_fp = WhereParam(
             left_expr=NormalizedExpr.from_column("customer.activebool"),
             op="=",
             value_type="string",
@@ -2216,8 +2290,8 @@ class TestNormalizeBooleanFilterValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[cte_fp],
-            having_param=[],
+            where=PredicateGroup.from_list([cte_fp]),
+            having=None,
             param_values={},
             output_columns=[],
         )
@@ -2227,12 +2301,12 @@ class TestNormalizeBooleanFilterValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[main_fp],
+            where=PredicateGroup.from_list([main_fp]),
             cte_steps=[cte],
         )
-        result = normalize_boolean_filter_values(intent, bool_schema)
-        assert result.filters_param[0].raw_value is False
-        assert result.cte_steps[0].filters_param[0].raw_value is True
+        result = normalize_boolean_where_values(intent, bool_schema)
+        assert (result.where.leaves() if result.where else [])[0].raw_value is False
+        assert (PredicateGroup.where_leaves(result.cte_steps[0].where) or [])[0].raw_value is True
 
 
 class TestStripSpuriousGroupByHavingParam:
@@ -2252,8 +2326,8 @@ class TestStripSpuriousGroupByHavingParam:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.status"))],
             group_by_cols=[NormalizedExpr.from_column("orders.status")],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[hp],
+            where=None,
+            having=PredicateGroup.from_list([hp]),
         )
         result = strip_spurious_group_by(intent)
         assert len(result.group_by_cols) == 1
@@ -2273,8 +2347,8 @@ class TestStripSpuriousGroupByHavingParam:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.status"))],
             group_by_cols=[NormalizedExpr.from_column("orders.status")],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[hp],
+            where=None,
+            having=PredicateGroup.from_list([hp]),
         )
         result = strip_spurious_group_by(intent)
         assert result.group_by_cols == []
@@ -2295,8 +2369,8 @@ class TestStripSpuriousGroupByHavingParam:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("items.category"))],
             group_by_cols=[NormalizedExpr.from_column("items.category")],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[hp],
+            where=None,
+            having=PredicateGroup.from_list([hp]),
             param_values={},
             output_columns=[],
         )
@@ -2306,7 +2380,7 @@ class TestStripSpuriousGroupByHavingParam:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
         result = strip_spurious_group_by(intent)
@@ -2423,12 +2497,12 @@ class TestStripImpossibleHaving:
             ],
             group_by_cols=[NormalizedExpr.from_column("orders.status")],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[hp_bad, hp_good],
+            where=None,
+            having=PredicateGroup.from_list([hp_bad, hp_good]),
         )
         result = strip_impossible_having(intent)
-        assert len(result.having_param) == 1
-        assert result.having_param[0].op == ">"
+        assert len(result.having.leaves() if result.having else []) == 1
+        assert (result.having.leaves() if result.having else [])[0].op == ">"
 
     def test_no_change_when_all_possible(self):
         """Intent returned unchanged when all HAVING conditions are possible."""
@@ -2445,8 +2519,8 @@ class TestStripImpossibleHaving:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[hp],
+            where=None,
+            having=PredicateGroup.from_list([hp]),
         )
         result = strip_impossible_having(intent)
         assert result is intent
@@ -2459,8 +2533,8 @@ class TestStripImpossibleHaving:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
         )
         result = strip_impossible_having(intent)
         assert result is intent
@@ -2482,8 +2556,8 @@ class TestStripImpossibleHaving:
             ],
             group_by_cols=[NormalizedExpr.from_column("items.category")],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[hp_bad],
+            where=None,
+            having=PredicateGroup.from_list([hp_bad]),
             param_values={},
             output_columns=[],
         )
@@ -2493,11 +2567,11 @@ class TestStripImpossibleHaving:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[cte],
         )
         result = strip_impossible_having(intent)
-        assert result.cte_steps[0].having_param == []
+        assert (PredicateGroup.having_leaves(result.cte_steps[0].having) or []) == []
 
 
 class TestSanitizeTableNames:
@@ -2549,7 +2623,7 @@ class TestSanitizeTableNames:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = sanitize_table_names(intent, basic_schema)
         assert result.tables == ["customer"]
@@ -2562,7 +2636,7 @@ class TestSanitizeTableNames:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = sanitize_table_names(intent, basic_schema)
         assert result.tables == ["orders"]
@@ -2575,7 +2649,7 @@ class TestSanitizeTableNames:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = sanitize_table_names(intent, basic_schema)
         assert result is intent
@@ -2588,7 +2662,7 @@ class TestSanitizeTableNames:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = sanitize_table_names(intent, basic_schema)
         assert result.tables == ["DISTINCT unknown_tbl"]
@@ -2601,7 +2675,7 @@ class TestSanitizeTableNames:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = sanitize_table_names(intent, basic_schema)
         assert result.tables == ["orders"]
@@ -2679,13 +2753,15 @@ class TestPruneUnreferencedTablesWithSchemaGraph:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("orders.order_id"),
-                    op=">",
-                    raw_value=0,
-                ),
-            ],
+            where=PredicateGroup.from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("orders.order_id"),
+                        op=">",
+                        raw_value=0,
+                    ),
+                ]
+            ),
         )
         result = reconcile_tables(intent)
         assert "customer" in result.tables
@@ -2702,13 +2778,15 @@ class TestPruneUnreferencedTablesWithSchemaGraph:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("orders.order_id"),
-                    op=">",
-                    raw_value=0,
-                ),
-            ],
+            where=PredicateGroup.from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("orders.order_id"),
+                        op=">",
+                        raw_value=0,
+                    ),
+                ]
+            ),
         )
         result = reconcile_tables(intent)
         assert "orders" in result.tables
@@ -2716,7 +2794,7 @@ class TestPruneUnreferencedTablesWithSchemaGraph:
 
 
 class TestResolveFilterListCascadeLower:
-    """Tests for LOWER-based casing in _resolve_filter_list_cascade."""
+    """Tests for LOWER-based casing in _resolve_where_list_cascade."""
 
     @pytest.fixture
     def name_schema(self):
@@ -2742,25 +2820,25 @@ class TestResolveFilterListCascadeLower:
 
     def test_lowercases_non_enum_string(self, name_schema):
         """Non-enum string value is lowercased."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("customer.name"),
             op="=",
             value_type="string",
             raw_value="Alice",
         )
-        result, changed = _resolve_filter_list_cascade([fp], name_schema, "")
+        result, changed = _resolve_where_list_cascade([fp], name_schema, "")
         assert changed
         assert result[0].raw_value == "alice"
 
     def test_already_lowercase_unchanged(self, name_schema):
         """Already lowercase value is not changed."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("customer.name"),
             op="=",
             value_type="string",
             raw_value="alice",
         )
-        result, changed = _resolve_filter_list_cascade([fp], name_schema, "")
+        result, changed = _resolve_where_list_cascade([fp], name_schema, "")
         assert not changed
         assert result[0].raw_value == "alice"
 
@@ -2785,25 +2863,25 @@ class TestResolveFilterListCascadeLower:
             tables={"film": film},
             enum_values={"mpaa_rating": ["G", "PG", "PG-13", "R", "NC-17"]},
         )
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("film.rating"),
             op="=",
             value_type="string",
             raw_value="pg",
         )
-        result, changed = _resolve_filter_list_cascade([fp], sg, "")
+        result, changed = _resolve_where_list_cascade([fp], sg, "")
         assert changed
         assert result[0].raw_value == "PG"
 
     def test_list_values_lowercased(self, name_schema):
         """List filter values are lowercased for non-enum columns."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("customer.name"),
             op="in",
             value_type="string",
             raw_value=["Alice", "Bob"],
         )
-        result, changed = _resolve_filter_list_cascade([fp], name_schema, "")
+        result, changed = _resolve_where_list_cascade([fp], name_schema, "")
         assert changed
         assert result[0].raw_value == ["alice", "bob"]
 
@@ -2881,13 +2959,15 @@ class TestPruneWithFkFilterTarget:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("orders.customer_id"),
-                    op="=",
-                    raw_value=5,
-                ),
-            ],
+            where=PredicateGroup.from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("orders.customer_id"),
+                        op="=",
+                        raw_value=5,
+                    ),
+                ]
+            ),
         )
         result = reconcile_tables(intent)
         assert "customer" in result.tables
@@ -2904,13 +2984,15 @@ class TestPruneWithFkFilterTarget:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("orders.order_id"),
-                    op=">",
-                    raw_value=0,
-                ),
-            ],
+            where=PredicateGroup.from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("orders.order_id"),
+                        op=">",
+                        raw_value=0,
+                    ),
+                ]
+            ),
         )
         result = reconcile_tables(intent)
         assert "customer" in result.tables
@@ -2987,7 +3069,7 @@ class TestQualifyCteWithInferredOutputs:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[
                 RuntimeCteStep(
                     cte_name="cte1",
@@ -3042,7 +3124,7 @@ class TestIsNullValue:
 
 
 class TestRepairNullEqualityFilters:
-    """Tests for repair_null_equality_filters."""
+    """Tests for repair_null_equality_where."""
 
     def test_equality_null_becomes_is_null(self):
         """Filter with op='=' and value=None becomes op='is null'."""
@@ -3052,19 +3134,21 @@ class TestRepairNullEqualityFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("orders.return_date"),
-                    op="=",
-                    value_type="date",
-                    raw_value=None,
-                ),
-            ],
+            where=PredicateGroup.from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("orders.return_date"),
+                        op="=",
+                        value_type="date",
+                        raw_value=None,
+                    ),
+                ]
+            ),
         )
-        result = repair_null_equality_filters(intent)
-        assert result.filters_param[0].op == "is null"
-        assert result.filters_param[0].raw_value is None
-        assert result.filters_param[0].value_type == "null"
+        result = repair_null_equality_where(intent)
+        assert (result.where.leaves() if result.where else [])[0].op == "is null"
+        assert (result.where.leaves() if result.where else [])[0].raw_value is None
+        assert (result.where.leaves() if result.where else [])[0].value_type == "null"
 
     def test_equality_null_string_becomes_is_null(self):
         """Filter with op='=' and value='null' becomes op='is null'."""
@@ -3074,18 +3158,20 @@ class TestRepairNullEqualityFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("orders.return_date"),
-                    op="=",
-                    value_type="string",
-                    raw_value="null",
-                ),
-            ],
+            where=PredicateGroup.from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("orders.return_date"),
+                        op="=",
+                        value_type="string",
+                        raw_value="null",
+                    ),
+                ]
+            ),
         )
-        result = repair_null_equality_filters(intent)
-        assert result.filters_param[0].op == "is null"
-        assert result.filters_param[0].raw_value is None
+        result = repair_null_equality_where(intent)
+        assert (result.where.leaves() if result.where else [])[0].op == "is null"
+        assert (result.where.leaves() if result.where else [])[0].raw_value is None
 
     def test_not_equal_null_becomes_is_not_null(self):
         """Filter with op='!=' and value=None becomes op='is not null'."""
@@ -3095,19 +3181,21 @@ class TestRepairNullEqualityFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("orders.return_date"),
-                    op="!=",
-                    value_type="date",
-                    raw_value=None,
-                ),
-            ],
+            where=PredicateGroup.from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("orders.return_date"),
+                        op="!=",
+                        value_type="date",
+                        raw_value=None,
+                    ),
+                ]
+            ),
         )
-        result = repair_null_equality_filters(intent)
-        assert result.filters_param[0].op == "is not null"
-        assert result.filters_param[0].raw_value is None
-        assert result.filters_param[0].value_type == "null"
+        result = repair_null_equality_where(intent)
+        assert (result.where.leaves() if result.where else [])[0].op == "is not null"
+        assert (result.where.leaves() if result.where else [])[0].raw_value is None
+        assert (result.where.leaves() if result.where else [])[0].value_type == "null"
 
     def test_diamond_not_equal_null_becomes_is_not_null(self):
         """Filter with op='<>' and value=None becomes op='is not null'."""
@@ -3117,17 +3205,19 @@ class TestRepairNullEqualityFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("orders.return_date"),
-                    op="<>",
-                    value_type="date",
-                    raw_value=None,
-                ),
-            ],
+            where=PredicateGroup.from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("orders.return_date"),
+                        op="<>",
+                        value_type="date",
+                        raw_value=None,
+                    ),
+                ]
+            ),
         )
-        result = repair_null_equality_filters(intent)
-        assert result.filters_param[0].op == "is not null"
+        result = repair_null_equality_where(intent)
+        assert (result.where.leaves() if result.where else [])[0].op == "is not null"
 
     def test_non_null_equality_unchanged(self):
         """Filter with op='=' and non-null value is unchanged."""
@@ -3137,18 +3227,20 @@ class TestRepairNullEqualityFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("orders.status"),
-                    op="=",
-                    value_type="string",
-                    raw_value="active",
-                ),
-            ],
+            where=PredicateGroup.from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("orders.status"),
+                        op="=",
+                        value_type="string",
+                        raw_value="active",
+                    ),
+                ]
+            ),
         )
-        result = repair_null_equality_filters(intent)
-        assert result.filters_param[0].op == "="
-        assert result.filters_param[0].raw_value == "active"
+        result = repair_null_equality_where(intent)
+        assert (result.where.leaves() if result.where else [])[0].op == "="
+        assert (result.where.leaves() if result.where else [])[0].raw_value == "active"
 
     def test_expr_vs_expr_equality_not_converted_to_is_null(self):
         intent = RuntimeIntent(
@@ -3157,19 +3249,21 @@ class TestRepairNullEqualityFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("a.fk_id"),
-                    op="=",
-                    right_expr=NormalizedExpr.from_column("b.id"),
-                    value_type="number",
-                    raw_value=None,
-                ),
-            ],
+            where=PredicateGroup.from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("a.fk_id"),
+                        op="=",
+                        right_expr=NormalizedExpr.from_column("b.id"),
+                        value_type="number",
+                        raw_value=None,
+                    ),
+                ]
+            ),
         )
-        result = repair_null_equality_filters(intent)
-        assert result.filters_param[0].op == "="
-        assert result.filters_param[0].right_expr is not None
+        result = repair_null_equality_where(intent)
+        assert (result.where.leaves() if result.where else [])[0].op == "="
+        assert (result.where.leaves() if result.where else [])[0].right_expr is not None
 
     def test_cte_filters_also_repaired(self):
         """Null equality filters inside CTE steps are also repaired."""
@@ -3179,24 +3273,26 @@ class TestRepairNullEqualityFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[
                 RuntimeCteStep(
                     cte_name="cte1",
                     tables=["rental"],
-                    filters_param=[
-                        FilterParam(
-                            left_expr=NormalizedExpr.from_column("rental.return_date"),
-                            op="=",
-                            value_type="date",
-                            raw_value=None,
-                        ),
-                    ],
+                    where=PredicateGroup.from_list(
+                        [
+                            WhereParam(
+                                left_expr=NormalizedExpr.from_column("rental.return_date"),
+                                op="=",
+                                value_type="date",
+                                raw_value=None,
+                            ),
+                        ]
+                    ),
                 ),
             ],
         )
-        result = repair_null_equality_filters(intent)
-        assert result.cte_steps[0].filters_param[0].op == "is null"
+        result = repair_null_equality_where(intent)
+        assert (PredicateGroup.where_leaves(result.cte_steps[0].where) or [])[0].op == "is null"
 
     def test_having_equality_null_rewritten(self):
         """HAVING ``= NULL`` becomes ``is null`` like WHERE filters."""
@@ -3206,19 +3302,21 @@ class TestRepairNullEqualityFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[
-                HavingParam(
-                    left_expr=NormalizedExpr.from_column("orders.amount"),
-                    op="=",
-                    value_type="number",
-                    raw_value=None,
-                ),
-            ],
+            where=None,
+            having=PredicateGroup.from_list(
+                [
+                    HavingParam(
+                        left_expr=NormalizedExpr.from_column("orders.amount"),
+                        op="=",
+                        value_type="number",
+                        raw_value=None,
+                    ),
+                ]
+            ),
         )
-        result = repair_null_equality_filters(intent)
-        assert result.having_param[0].op == "is null"
-        assert result.having_param[0].value_type == "null"
+        result = repair_null_equality_where(intent)
+        assert (result.having.leaves() if result.having else [])[0].op == "is null"
+        assert (result.having.leaves() if result.having else [])[0].value_type == "null"
 
 
 class TestRepairNullEqualityLoopSafety:
@@ -3231,12 +3329,12 @@ class TestRepairNullEqualityLoopSafety:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=filters,
-            having_param=having or [],
+            where=PredicateGroup.from_list(filters) if filters else None,
+            having=PredicateGroup.from_list(having) if having else None,
         )
 
     def test_filter_skips_when_param_key_set_string(self) -> None:
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("orders.rating"),
             op="=",
             value_type="string",
@@ -3244,13 +3342,13 @@ class TestRepairNullEqualityLoopSafety:
             raw_value=None,
         )
         intent = self._base_intent([fp])
-        once = repair_null_equality_filters(intent)
-        twice = repair_null_equality_filters(once)
-        assert once.filters_param[0].op == "="
-        assert twice.filters_param[0].op == "="
+        once = repair_null_equality_where(intent)
+        twice = repair_null_equality_where(once)
+        assert (PredicateGroup.where_leaves(once.where) or [])[0].op == "="
+        assert (PredicateGroup.where_leaves(twice.where) or [])[0].op == "="
 
     def test_filter_skips_when_param_key_set_integer(self) -> None:
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("orders.store_id"),
             op="=",
             value_type="integer",
@@ -3258,8 +3356,8 @@ class TestRepairNullEqualityLoopSafety:
             raw_value=None,
         )
         intent = self._base_intent([fp])
-        out = repair_null_equality_filters(intent)
-        assert out.filters_param[0].op == "="
+        out = repair_null_equality_where(intent)
+        assert (out.where.leaves() if out.where else [])[0].op == "="
 
     def test_having_skips_when_param_key_set(self) -> None:
         hp = HavingParam(
@@ -3270,11 +3368,11 @@ class TestRepairNullEqualityLoopSafety:
             raw_value=None,
         )
         intent = self._base_intent([], [hp])
-        out = repair_null_equality_filters(intent)
-        assert out.having_param[0].op == "="
+        out = repair_null_equality_where(intent)
+        assert (out.having.leaves() if out.having else [])[0].op == "="
 
     def test_cte_filter_skips_when_param_key_set(self) -> None:
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("rental.rental_id"),
             op="=",
             value_type="integer",
@@ -3287,20 +3385,20 @@ class TestRepairNullEqualityLoopSafety:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[
                 RuntimeCteStep(
                     cte_name="c1",
                     tables=["rental"],
-                    filters_param=[fp],
+                    where=PredicateGroup.from_list([fp]),
                 ),
             ],
         )
-        out = repair_null_equality_filters(intent)
-        assert out.cte_steps[0].filters_param[0].op == "="
+        out = repair_null_equality_where(intent)
+        assert (PredicateGroup.where_leaves(out.cte_steps[0].where) or [])[0].op == "="
 
     def test_empty_param_key_still_rewrites_null_literal(self) -> None:
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("orders.return_date"),
             op="=",
             value_type="date",
@@ -3308,12 +3406,12 @@ class TestRepairNullEqualityLoopSafety:
             raw_value=None,
         )
         intent = self._base_intent([fp])
-        out = repair_null_equality_filters(intent)
-        assert out.filters_param[0].op == "is null"
+        out = repair_null_equality_where(intent)
+        assert (out.where.leaves() if out.where else [])[0].op == "is null"
 
 
 class TestRepairNullEqualityFiltersContinued:
-    """More repair_null_equality_filters cases grouped after loop-safety coverage."""
+    """More repair_null_equality_where cases grouped after loop-safety coverage."""
 
     def test_having_count_equal_drops_contradictory_range(self):
         """``HAVING COUNT(*) = 3 AND COUNT(*) > 10`` keeps only the equality."""
@@ -3326,15 +3424,17 @@ class TestRepairNullEqualityFiltersContinued:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[
-                HavingParam(left_expr=count_expr, op="=", raw_value=3, value_type="number"),
-                HavingParam(left_expr=count_expr, op=">", raw_value=10, value_type="number"),
-            ],
+            where=None,
+            having=PredicateGroup.from_list(
+                [
+                    HavingParam(left_expr=count_expr, op="=", raw_value=3, value_type="number"),
+                    HavingParam(left_expr=count_expr, op=">", raw_value=10, value_type="number"),
+                ]
+            ),
         )
-        result = dedup_contradictory_filters(intent)
-        assert len(result.having_param) == 1
-        assert result.having_param[0].op == "="
+        result = dedup_contradictory_where(intent)
+        assert len(result.having.leaves() if result.having else []) == 1
+        assert (result.having.leaves() if result.having else [])[0].op == "="
 
     def test_normalize_null_having_fixes_value_side(self):
         """``is null`` on HAVING gets ``value_type=null`` and cleared ``raw_value``."""
@@ -3344,19 +3444,21 @@ class TestRepairNullEqualityFiltersContinued:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[
-                HavingParam(
-                    left_expr=NormalizedExpr.from_column("t.x"),
-                    op="is null",
-                    value_type="number",
-                    raw_value=0,
-                ),
-            ],
+            where=None,
+            having=PredicateGroup.from_list(
+                [
+                    HavingParam(
+                        left_expr=NormalizedExpr.from_column("t.x"),
+                        op="is null",
+                        value_type="number",
+                        raw_value=0,
+                    ),
+                ]
+            ),
         )
-        out = normalize_null_filter_values(intent)
-        assert out.having_param[0].value_type == "null"
-        assert out.having_param[0].raw_value is None
+        out = normalize_null_where_values(intent)
+        assert (out.having.leaves() if out.having else [])[0].value_type == "null"
+        assert (out.having.leaves() if out.having else [])[0].raw_value is None
 
 
 class TestPruneKeepsAggregationTables:
@@ -3419,7 +3521,7 @@ class TestPruneKeepsAggregationTables:
             ],
             group_by_cols=[NormalizedExpr.from_column("country.country")],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = reconcile_tables(intent)
         assert "payment" in result.tables
@@ -3515,7 +3617,7 @@ class TestPruneColumnComponentSuppression:
             ],
             group_by_cols=[NormalizedExpr.from_column("film.rating")],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = reconcile_tables(intent)
         assert "film" in result.tables
@@ -3590,7 +3692,7 @@ class TestPruneUnreferencedKeepsExplicitSelectCol:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         result = reconcile_tables(intent)
         assert "film" in result.tables
@@ -3630,19 +3732,21 @@ class TestRepairIntentPlaceholderTokens:
             select_cols=[SelectCol(expr=expr)],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("table_1.special_features"),
-                    op="contains",
-                    value_type="string",
-                    raw_value="x",
-                )
-            ],
+            where=PredicateGroup.from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("table_1.special_features"),
+                        op="contains",
+                        value_type="string",
+                        raw_value="x",
+                    )
+                ]
+            ),
         )
         sg = self._film_schema()
         out = repair_intent_placeholder_tokens(intent, sg)
         assert out.select_cols[0].expr.primary_column == "film.special_features"
-        assert out.filters_param[0].left_expr.primary_column == "film.special_features"
+        assert (out.where.leaves() if out.where else [])[0].left_expr.primary_column == "film.special_features"
 
     def test_intent_text_detects_angle_placeholder(self):
         """Angle-bracket instructional tokens are detectable before repair."""
@@ -3657,7 +3761,7 @@ class TestRepairIntentPlaceholderTokens:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("table_1.film_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         assert runtime_intent_has_instructional_placeholders(intent)
 
@@ -3672,7 +3776,7 @@ class TestRepairIntentPlaceholderTokens:
             select_cols=[SelectCol(expr=expr)],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         sg = self._film_schema()
         repaired = repair_intent_placeholder_tokens(intent, sg)
@@ -3719,52 +3823,52 @@ class TestDedupValueVsRightExpr:
 
     def test_drops_quoted_string_matching_raw_value(self):
         col = NormalizedExpr.from_column("orders.region")
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=col,
             op="=",
             right_expr=parse_expr_string("'west'"),
             raw_value="west",
             value_type="string",
         )
-        out, changed = _dedup_value_vs_right_expr_filters([fp])
+        out, changed = _dedup_value_vs_right_expr_where([fp])
         assert changed
         assert out[0].right_expr is None
 
     def test_drops_numeric_literal_matching_raw_value(self):
         col = NormalizedExpr.from_column("t.amount")
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=col,
             op="=",
             right_expr=parse_expr_string("42"),
             raw_value=42,
             value_type="integer",
         )
-        out, changed = _dedup_value_vs_right_expr_filters([fp])
+        out, changed = _dedup_value_vs_right_expr_where([fp])
         assert changed
         assert out[0].right_expr is None
 
     def test_keeps_qualified_column_right_even_when_value_matches_text(self):
         col = NormalizedExpr.from_column("t.amount")
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=col,
             op="=",
             right_expr=NormalizedExpr.from_column("other.amount"),
             raw_value="other.amount",
             value_type="string",
         )
-        out, changed = _dedup_value_vs_right_expr_filters([fp])
+        out, changed = _dedup_value_vs_right_expr_where([fp])
         assert not changed
 
     def test_end_to_end_main_and_cte(self):
         col = NormalizedExpr.from_column("t.x")
-        fp_m = FilterParam(
+        fp_m = WhereParam(
             left_expr=col,
             op="=",
             right_expr=parse_expr_string("7"),
             raw_value=7,
             value_type="integer",
         )
-        fp_c = FilterParam(
+        fp_c = WhereParam(
             left_expr=col,
             op="=",
             right_expr=parse_expr_string("8"),
@@ -3777,18 +3881,18 @@ class TestDedupValueVsRightExpr:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp_m],
+            where=PredicateGroup.from_list([fp_m]),
             cte_steps=[
                 RuntimeCteStep(
                     cte_name="c1",
                     tables=["t"],
-                    filters_param=[fp_c],
+                    where=PredicateGroup.from_list([fp_c]),
                 ),
             ],
         )
         result = dedup_value_vs_right_expr(intent)
-        assert result.filters_param[0].right_expr is None
-        assert result.cte_steps[0].filters_param[0].right_expr is None
+        assert (result.where.leaves() if result.where else [])[0].right_expr is None
+        assert (PredicateGroup.where_leaves(result.cte_steps[0].where) or [])[0].right_expr is None
 
 
 class TestDedupContradictoryFilters:
@@ -3797,10 +3901,10 @@ class TestDedupContradictoryFilters:
     def test_drops_range_when_equality_on_same_column(self):
         col = NormalizedExpr.from_column("orders.status")
         filters = [
-            FilterParam(left_expr=col, op="=", raw_value="open", value_type="string"),
-            FilterParam(left_expr=col, op=">", raw_value=0, value_type="integer"),
+            WhereParam(left_expr=col, op="=", raw_value="open", value_type="string"),
+            WhereParam(left_expr=col, op=">", raw_value=0, value_type="integer"),
         ]
-        out, changed = _dedup_contradictory_filters_list(filters)
+        out, changed = _dedup_contradictory_where_list(filters)
         assert changed
         assert len(out) == 1
         assert out[0].op == "="
@@ -3808,10 +3912,10 @@ class TestDedupContradictoryFilters:
     def test_no_equality_leaves_ranges(self):
         col = NormalizedExpr.from_column("orders.amount")
         filters = [
-            FilterParam(left_expr=col, op=">", raw_value=0, value_type="number"),
-            FilterParam(left_expr=col, op="<", raw_value=100, value_type="number"),
+            WhereParam(left_expr=col, op=">", raw_value=0, value_type="number"),
+            WhereParam(left_expr=col, op="<", raw_value=100, value_type="number"),
         ]
-        out, changed = _dedup_contradictory_filters_list(filters)
+        out, changed = _dedup_contradictory_where_list(filters)
         assert not changed
         assert len(out) == 2
 
@@ -3823,24 +3927,28 @@ class TestDedupContradictoryFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(left_expr=col, op="=", raw_value=1, value_type="integer"),
-                FilterParam(left_expr=col, op=">=", raw_value=0, value_type="integer"),
-            ],
+            where=PredicateGroup.from_list(
+                [
+                    WhereParam(left_expr=col, op="=", raw_value=1, value_type="integer"),
+                    WhereParam(left_expr=col, op=">=", raw_value=0, value_type="integer"),
+                ]
+            ),
             cte_steps=[
                 RuntimeCteStep(
                     cte_name="c1",
                     tables=["t"],
-                    filters_param=[
-                        FilterParam(left_expr=col, op="=", raw_value=2, value_type="integer"),
-                        FilterParam(left_expr=col, op="<=", raw_value=9, value_type="integer"),
-                    ],
+                    where=PredicateGroup.from_list(
+                        [
+                            WhereParam(left_expr=col, op="=", raw_value=2, value_type="integer"),
+                            WhereParam(left_expr=col, op="<=", raw_value=9, value_type="integer"),
+                        ]
+                    ),
                 ),
             ],
         )
-        result = dedup_contradictory_filters(intent)
-        assert len(result.filters_param) == 1
-        assert len(result.cte_steps[0].filters_param) == 1
+        result = dedup_contradictory_where(intent)
+        assert len(result.where.leaves() if result.where else []) == 1
+        assert len(PredicateGroup.where_leaves(result.cte_steps[0].where) or []) == 1
 
 
 class TestQualifyTermBoundaries:
@@ -3866,7 +3974,7 @@ class TestQualifyCteOutputColumnsEdges:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         assert qualify_cte_output_columns(intent) is intent
 
@@ -3878,7 +3986,7 @@ class TestQualifyCteOutputColumnsEdges:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.customer_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[
                 RuntimeCteStep(
                     cte_name="rollup",
@@ -3898,7 +4006,7 @@ class TestQualifyCteOutputColumnsEdges:
             select_cols=[],
             group_by_cols=[NormalizedExpr.from_column("region_id")],
             order_by_cols=[OrderByCol(expr=NormalizedExpr.from_column("region_id"))],
-            filters_param=[],
+            where=None,
             cte_steps=[
                 RuntimeCteStep(
                     cte_name="regions",
@@ -3918,7 +4026,7 @@ class TestQualifyCteOutputColumnsEdges:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("sku"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[
                 RuntimeCteStep(
                     cte_name="inv",
@@ -4033,7 +4141,7 @@ class TestExpandFkSelectToDescriptive:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.customer_id"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         out = expand_fk_select_to_descriptive(intent, fk_customer_schema)
         terms = [sc.expr.primary_column for sc in out.select_cols]
@@ -4053,7 +4161,7 @@ class TestExpandFkSelectToDescriptive:
             select_cols=[agg],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         out = expand_fk_select_to_descriptive(intent, fk_customer_schema)
         assert len(out.select_cols) == 1
@@ -4061,7 +4169,7 @@ class TestExpandFkSelectToDescriptive:
 
 
 class TestNormalizeNullFilterValues:
-    """normalize_null_filter_values fixes value_type/raw_value for null operators."""
+    """normalize_null_where_values fixes value_type/raw_value for null operators."""
 
     def test_is_null_gets_null_type_and_none_value(self):
         intent = RuntimeIntent(
@@ -4070,17 +4178,19 @@ class TestNormalizeNullFilterValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[
-                FilterParam(
-                    left_expr=NormalizedExpr.from_column("t.x"),
-                    op="is null",
-                    value_type="string",
-                    raw_value="unused",
-                ),
-            ],
+            where=PredicateGroup.from_list(
+                [
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("t.x"),
+                        op="is null",
+                        value_type="string",
+                        raw_value="unused",
+                    ),
+                ]
+            ),
         )
-        out = normalize_null_filter_values(intent)
-        fp = out.filters_param[0]
+        out = normalize_null_where_values(intent)
+        fp = (out.where.leaves() if out.where else [])[0]
         assert fp.value_type == "null"
         assert fp.raw_value is None
 
@@ -4091,24 +4201,26 @@ class TestNormalizeNullFilterValues:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             cte_steps=[
                 RuntimeCteStep(
                     cte_name="c1",
                     tables=["t"],
-                    filters_param=[
-                        FilterParam(
-                            left_expr=NormalizedExpr.from_column("t.x"),
-                            op="is not null",
-                            value_type="integer",
-                            raw_value=0,
-                        ),
-                    ],
+                    where=PredicateGroup.from_list(
+                        [
+                            WhereParam(
+                                left_expr=NormalizedExpr.from_column("t.x"),
+                                op="is not null",
+                                value_type="integer",
+                                raw_value=0,
+                            ),
+                        ]
+                    ),
                 ),
             ],
         )
-        out = normalize_null_filter_values(intent)
-        fp = out.cte_steps[0].filters_param[0]
+        out = normalize_null_where_values(intent)
+        fp = (PredicateGroup.where_leaves(out.cte_steps[0].where) or [])[0]
         assert fp.value_type == "null"
         assert fp.raw_value is None
 
@@ -4125,7 +4237,7 @@ class TestRepairCaseWhenIntent:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("c01"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             case_registry=[step],
         )
         sg = SchemaGraph(tables={}, join_paths_multi={}, effective_structural_hash="")
@@ -4134,7 +4246,7 @@ class TestRepairCaseWhenIntent:
 
     def test_keeps_non_empty_case(self):
         branch = CaseWhenBranch(
-            condition=FilterParam(
+            condition=WhereParam(
                 left_expr=NormalizedExpr.from_column("t.flag"),
                 op="=",
                 raw_value=1,
@@ -4150,7 +4262,7 @@ class TestRepairCaseWhenIntent:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("c01"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             case_registry=[step],
         )
         sg = SchemaGraph(tables={}, join_paths_multi={}, effective_structural_hash="")
@@ -4160,7 +4272,7 @@ class TestRepairCaseWhenIntent:
 
 
 class TestRepairArrayFiltersIntent:
-    """repair_array_filters_intent normalises array-column predicates."""
+    """repair_array_where_intent normalises array-column predicates."""
 
     @pytest.fixture
     def array_schema(self):
@@ -4184,7 +4296,7 @@ class TestRepairArrayFiltersIntent:
         return SchemaGraph(tables={"article": t}, join_paths_multi={}, effective_structural_hash="h")
 
     def test_rewrites_equals_to_contains_on_array_column(self, array_schema):
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("article.tags"),
             op="=",
             raw_value="x",
@@ -4197,14 +4309,14 @@ class TestRepairArrayFiltersIntent:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=PredicateGroup.from_list([fp]),
         )
-        out = repair_array_filters_intent(intent, array_schema)
-        assert out.filters_param[0].op == "contains"
-        assert out.filters_param[0].value_type == "string"
+        out = repair_array_where_intent(intent, array_schema)
+        assert (out.where.leaves() if out.where else [])[0].op == "contains"
+        assert (out.where.leaves() if out.where else [])[0].value_type == "string"
 
     def test_rewrites_contains_to_like_on_text_column(self, array_schema):
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("article.title"),
             op="contains",
             raw_value="hello",
@@ -4217,15 +4329,15 @@ class TestRepairArrayFiltersIntent:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=PredicateGroup.from_list([fp]),
         )
-        out = repair_array_filters_intent(intent, array_schema)
-        assert len(out.filters_param) == 1
-        assert out.filters_param[0].op == "like"
-        assert out.filters_param[0].raw_value == "%hello%"
+        out = repair_array_where_intent(intent, array_schema)
+        assert len(out.where.leaves() if out.where else []) == 1
+        assert (out.where.leaves() if out.where else [])[0].op == "like"
+        assert (out.where.leaves() if out.where else [])[0].raw_value == "%hello%"
 
     def test_drops_contains_on_non_text_scalar(self, array_schema):
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("article.cnt"),
             op="contains",
             raw_value=1,
@@ -4238,13 +4350,13 @@ class TestRepairArrayFiltersIntent:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=PredicateGroup.from_list([fp]),
         )
-        out = repair_array_filters_intent(intent, array_schema)
-        assert out.filters_param == []
+        out = repair_array_where_intent(intent, array_schema)
+        assert (out.where.leaves() if out.where else []) == []
 
     def test_keeps_contains_on_array_column(self, array_schema):
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("article.tags"),
             op="contains",
             raw_value="x",
@@ -4256,14 +4368,14 @@ class TestRepairArrayFiltersIntent:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=PredicateGroup.from_list([fp]),
         )
-        out = repair_array_filters_intent(intent, array_schema)
-        assert len(out.filters_param) == 1
-        assert out.filters_param[0].op == "contains"
+        out = repair_array_where_intent(intent, array_schema)
+        assert len(out.where.leaves() if out.where else []) == 1
+        assert (out.where.leaves() if out.where else [])[0].op == "contains"
 
     def test_ilike_rewrites_to_contains(self, array_schema):
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("article.tags"),
             op="ilike",
             raw_value="%x%",
@@ -4275,22 +4387,21 @@ class TestRepairArrayFiltersIntent:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=PredicateGroup.from_list([fp]),
         )
-        out = repair_array_filters_intent(intent, array_schema)
-        assert out.filters_param[0].op == "contains"
+        out = repair_array_where_intent(intent, array_schema)
+        assert (out.where.leaves() if out.where else [])[0].op == "contains"
 
 
 class TestDecomposeInNotInFilters:
-    """decompose_in_not_in_filters expands short IN/NOT IN lists."""
+    """decompose_in_not_in_where keeps native IN/NOT IN lists."""
 
-    def test_in_list_becomes_or_chain(self):
-        fp = FilterParam(
+    def test_in_list_stays_native(self):
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.id"),
             op="in",
             raw_value=[1, 2, 3],
             value_type="integer",
-            bool_op="AND",
         )
         intent = RuntimeIntent(
             tables=["t"],
@@ -4298,18 +4409,17 @@ class TestDecomposeInNotInFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=PredicateGroup.from_list([fp]),
         )
-        out = decompose_in_not_in_filters(intent)
-        assert len(out.filters_param) == 3
-        assert out.filters_param[0].op == "="
-        assert out.filters_param[0].raw_value == 1
-        assert out.filters_param[0].bool_op == "OR"
-        assert out.filters_param[1].bool_op == "OR"
-        assert out.filters_param[2].bool_op == "AND"
+        out = decompose_in_not_in_where(intent)
+        assert out.where is not None
+        leaves = out.where.leaves() or []
+        assert len(leaves) == 1
+        assert leaves[0].op == "in"
+        assert leaves[0].raw_value == [1, 2, 3]
 
-    def test_not_in_list_becomes_and_chain_of_neq(self):
-        fp = FilterParam(
+    def test_not_in_list_stays_native(self):
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.code"),
             op="not in",
             raw_value=["a", "b"],
@@ -4321,22 +4431,21 @@ class TestDecomposeInNotInFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=PredicateGroup.from_list([fp]),
         )
-        out = decompose_in_not_in_filters(intent)
-        assert len(out.filters_param) == 2
-        assert out.filters_param[0].op == "!="
-        assert out.filters_param[1].op == "!="
-        assert out.filters_param[0].bool_op == "AND"
-        assert out.filters_param[1].bool_op == "AND"
+        out = decompose_in_not_in_where(intent)
+        assert out.where is not None
+        leaves = out.where.leaves() or []
+        assert len(leaves) == 1
+        assert leaves[0].op == "not in"
+        assert leaves[0].raw_value == ["a", "b"]
 
-    def test_in_two_elements_or_between_last_keeps_chain_bool_op(self):
-        fp = FilterParam(
+    def test_in_two_elements_stays_native(self):
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.id"),
             op="in",
             raw_value=[10, 20],
             value_type="integer",
-            bool_op="AND",
         )
         intent = RuntimeIntent(
             tables=["t"],
@@ -4344,20 +4453,20 @@ class TestDecomposeInNotInFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=PredicateGroup.from_list([fp]),
         )
-        out = decompose_in_not_in_filters(intent)
-        assert len(out.filters_param) == 2
-        assert out.filters_param[0].bool_op == "OR"
-        assert out.filters_param[1].bool_op == "AND"
+        out = decompose_in_not_in_where(intent)
+        assert out.where is not None
+        leaves = out.where.leaves() or []
+        assert len(leaves) == 1
+        assert leaves[0].op == "in"
 
-    def test_not_in_three_elements_and_chain_last_bool_op(self):
-        fp = FilterParam(
+    def test_not_in_three_elements_stays_native(self):
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.code"),
             op="not in",
             raw_value=["a", "b", "c"],
             value_type="string",
-            bool_op="OR",
         )
         intent = RuntimeIntent(
             tables=["t"],
@@ -4365,17 +4474,17 @@ class TestDecomposeInNotInFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=PredicateGroup.from_list([fp]),
         )
-        out = decompose_in_not_in_filters(intent)
-        assert len(out.filters_param) == 3
-        assert out.filters_param[0].bool_op == "AND"
-        assert out.filters_param[1].bool_op == "AND"
-        assert out.filters_param[2].bool_op == "OR"
+        out = decompose_in_not_in_where(intent)
+        assert out.where is not None
+        leaves = out.where.leaves() or []
+        assert len(leaves) == 1
+        assert leaves[0].op == "not in"
 
     def test_long_list_not_expanded(self):
         vals = list(range(11))
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.id"),
             op="in",
             raw_value=vals,
@@ -4387,11 +4496,11 @@ class TestDecomposeInNotInFilters:
             select_cols=[],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[fp],
+            where=PredicateGroup.from_list([fp]),
         )
-        out = decompose_in_not_in_filters(intent)
-        assert len(out.filters_param) == 1
-        assert out.filters_param[0].raw_value == vals
+        out = decompose_in_not_in_where(intent)
+        assert len(out.where.leaves() if out.where else []) == 1
+        assert (out.where.leaves() if out.where else [])[0].raw_value == vals
 
 
 class TestIntentTextHasLeakablePlaceholderPatterns:
@@ -4469,10 +4578,10 @@ class TestIsImpossibleHavingEdges:
 
 
 class TestResolveFilterListCascadeEdges:
-    """Branches in _resolve_filter_list_cascade."""
+    """Branches in _resolve_where_list_cascade."""
 
     def test_unqualified_column_left_unchanged(self):
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("id"),
             op="=",
             raw_value="X",
@@ -4496,12 +4605,12 @@ class TestResolveFilterListCascadeEdges:
             join_paths_multi={},
             effective_structural_hash="",
         )
-        out, changed = _resolve_filter_list_cascade([fp], sg, "")
+        out, changed = _resolve_where_list_cascade([fp], sg, "")
         assert not changed
         assert out[0].raw_value == "X"
 
     def test_non_string_scalar_skipped(self):
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.id"),
             op="=",
             raw_value=42,
@@ -4520,7 +4629,7 @@ class TestResolveFilterListCascadeEdges:
             primary_key="",
         )
         sg = SchemaGraph(tables={"t": t}, join_paths_multi={}, effective_structural_hash="")
-        out, changed = _resolve_filter_list_cascade([fp], sg, "")
+        out, changed = _resolve_where_list_cascade([fp], sg, "")
         assert not changed
 
     def test_list_mixed_enum_and_lower(self):
@@ -4542,13 +4651,13 @@ class TestResolveFilterListCascadeEdges:
             effective_structural_hash="",
             enum_values={"mpaa_rating": ["G", "PG"]},
         )
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("film.rating"),
             op="in",
             value_type="string",
             raw_value=["pg", "G", "Other"],
         )
-        out, changed = _resolve_filter_list_cascade([fp], sg, "")
+        out, changed = _resolve_where_list_cascade([fp], sg, "")
         assert changed
         assert out[0].raw_value == ["PG", "G", "other"]
 
@@ -4573,18 +4682,18 @@ class TestFlipComparisonOp:
 
 
 class TestAutoRepairFilterHaving:
-    """Tests for auto_repair_filter_having."""
+    """Tests for auto_repair_where_having."""
 
     def test_move_agg_filter_to_having(self):
         """Move aggregated filter to having list."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_agg("count", "t.a"),
             op=">",
             value_type="integer",
             param_key="p1",
         )
         gb = [NormalizedExpr.from_column("t.a")]
-        repaired_fp, repaired_hp = auto_repair_filter_having([fp], [], group_by_cols=gb)
+        repaired_fp, repaired_hp = auto_repair_where_having([fp], [], group_by_cols=gb)
         assert len(repaired_fp) == 0
         assert len(repaired_hp) == 1
         assert repaired_hp[0].param_key == "p1"
@@ -4597,52 +4706,52 @@ class TestAutoRepairFilterHaving:
             value_type="string",
             param_key="p1",
         )
-        repaired_fp, repaired_hp = auto_repair_filter_having([], [hp], group_by_cols=[])
+        repaired_fp, repaired_hp = auto_repair_where_having([], [hp], group_by_cols=[])
         assert len(repaired_fp) == 1
         assert len(repaired_hp) == 0
         assert repaired_fp[0].param_key == "p1"
 
     def test_agg_filter_not_promoted_without_group_by(self):
         """Aggregated WHERE filter stays in WHERE when there is no GROUP BY."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_agg("count", "t.a"),
             op=">",
             value_type="integer",
             param_key="p1",
         )
-        repaired_fp, repaired_hp = auto_repair_filter_having([fp], [], group_by_cols=[])
+        repaired_fp, repaired_hp = auto_repair_where_having([fp], [], group_by_cols=[])
         assert len(repaired_fp) == 1
         assert len(repaired_hp) == 0
 
     def test_agg_filter_not_promoted_with_non_numeric_op(self):
         """Aggregated filter with LIKE is not promoted to HAVING."""
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_agg("count", "t.a"),
             op="like",
             value_type="string",
             param_key="p1",
         )
         gb = [NormalizedExpr.from_column("t.a")]
-        repaired_fp, repaired_hp = auto_repair_filter_having([fp], [], group_by_cols=gb)
+        repaired_fp, repaired_hp = auto_repair_where_having([fp], [], group_by_cols=gb)
         assert len(repaired_fp) == 1
         assert len(repaired_hp) == 0
 
     def test_keep_correct_placement(self):
         """Keep correctly placed filter and having."""
-        fp = FilterParam(left_expr=NormalizedExpr.from_column("t.a"), op="=", value_type="string")
+        fp = WhereParam(left_expr=NormalizedExpr.from_column("t.a"), op="=", value_type="string")
         hp = HavingParam(
             left_expr=NormalizedExpr.from_agg("count", "t.a"),
             op=">",
             value_type="integer",
         )
         gb = [NormalizedExpr.from_column("t.a")]
-        repaired_fp, repaired_hp = auto_repair_filter_having([fp], [hp], group_by_cols=gb)
+        repaired_fp, repaired_hp = auto_repair_where_having([fp], [hp], group_by_cols=gb)
         assert len(repaired_fp) == 1
         assert len(repaired_hp) == 1
 
     def test_empty_inputs(self):
         """Handle empty input lists."""
-        repaired_fp, repaired_hp = auto_repair_filter_having([], [])
+        repaired_fp, repaired_hp = auto_repair_where_having([], [])
         assert repaired_fp == []
         assert repaired_hp == []
 
@@ -4655,7 +4764,7 @@ class TestAutoRepairFilterHaving:
             param_key="p1",
         )
         gb = [NormalizedExpr.from_column("cte.avg_col")]
-        repaired_fp, repaired_hp = auto_repair_filter_having([], [hp], group_by_cols=gb)
+        repaired_fp, repaired_hp = auto_repair_where_having([], [hp], group_by_cols=gb)
         assert len(repaired_fp) == 0
         assert len(repaired_hp) == 1
         has_agg_left = repaired_hp[0].left_expr.has_aggregation
@@ -4668,12 +4777,11 @@ class TestCaseBranchRepairCoverage:
     """Verify repairs walk into CASE WHEN branch conditions in registry layouts."""
 
     def _make_intent_with_registry_case_between(self) -> RuntimeIntent:
-        cond = FilterParam(
+        cond = WhereParam(
             left_expr=NormalizedExpr.from_column("t.amount"),
             op="between",
             raw_value=[10, 20],
             value_type="integer",
-            bool_op="AND",
         )
         cw = CaseWhenExpr(
             branches=[
@@ -4683,7 +4791,7 @@ class TestCaseBranchRepairCoverage:
                 ),
             ],
             else_result=NormalizedExpr.from_column("t.id"),
-            condition_scope="filter",
+            condition_scope="where",
         )
         step = CaseRegistryStep(registry_id="c01", case_when=cw)
         sc = SelectCol(expr=NormalizedExpr.from_column("c01"))
@@ -4693,7 +4801,7 @@ class TestCaseBranchRepairCoverage:
             select_cols=[sc],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             case_registry=[step],
         )
 
@@ -4706,15 +4814,15 @@ class TestCaseBranchRepairCoverage:
         rv = out.case_registry[0].case_when.branches[0].condition.raw_value
         assert isinstance(rv, list) and rv == [10, 20] or rv == ["10", "20"]
 
-    def test_apply_filters_to_main_and_ctes_walks_registry_case_filter_branch(self):
-        from aetherdialect._intent_repair import apply_filters_to_main_and_ctes
+    def test_apply_where_to_main_and_ctes_walks_registry_case_filter_branch(self):
+        from aetherdialect._intent_repair import apply_where_to_main_and_ctes
 
         intent = self._make_intent_with_registry_case_between()
         intent.case_registry[0].case_when.branches[0].condition.raw_value = " HELLO "
 
-        def lower_strip(filters: list[FilterParam]) -> tuple[list[FilterParam], bool]:
+        def lower_strip(filters: list[WhereParam]) -> tuple[list[WhereParam], bool]:
             changed = False
-            out: list[FilterParam] = []
+            out: list[WhereParam] = []
             for f in filters:
                 if isinstance(f.raw_value, str) and f.raw_value != f.raw_value.strip().lower():
                     changed = True
@@ -4725,18 +4833,17 @@ class TestCaseBranchRepairCoverage:
                     out.append(f)
             return out, changed
 
-        out = apply_filters_to_main_and_ctes(intent, lower_strip)
+        out = apply_where_to_main_and_ctes(intent, lower_strip)
         assert out.case_registry[0].case_when.branches[0].condition.raw_value == "hello"
 
     def test_apply_having_to_main_and_ctes_walks_having_scope_branch_only(self):
         from aetherdialect._intent_repair import apply_having_to_main_and_ctes
 
-        cond = FilterParam(
+        cond = WhereParam(
             left_expr=NormalizedExpr.from_agg("count", "t.id"),
             op=">",
             raw_value=5,
             value_type="integer",
-            bool_op="AND",
         )
         cw_having = CaseWhenExpr(
             branches=[CaseWhenBranch(condition=cond, result=NormalizedExpr.from_column("t.id"))],
@@ -4746,7 +4853,7 @@ class TestCaseBranchRepairCoverage:
         cw_filter = CaseWhenExpr(
             branches=[CaseWhenBranch(condition=cond, result=NormalizedExpr.from_column("t.id"))],
             else_result=NormalizedExpr.from_column("t.id"),
-            condition_scope="filter",
+            condition_scope="where",
         )
         intent = RuntimeIntent(
             tables=["t"],
@@ -4757,8 +4864,8 @@ class TestCaseBranchRepairCoverage:
             ],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
-            having_param=[],
+            where=None,
+            having=None,
             case_registry=[
                 CaseRegistryStep(registry_id="c01", case_when=cw_having),
                 CaseRegistryStep(registry_id="c02", case_when=cw_filter),
@@ -4863,7 +4970,7 @@ class TestDiagnosticRepairDispatch:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("customer.emial"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         diag = SqlDiagnostic(
             code=SqlDiagnosticCode.UNKNOWN_COLUMN,
@@ -4882,7 +4989,7 @@ class TestDiagnosticRepairDispatch:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("frist_name"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         diag = SqlDiagnostic(
             code=SqlDiagnosticCode.UNKNOWN_COLUMN,
@@ -4901,7 +5008,7 @@ class TestDiagnosticRepairDispatch:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("email"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         diag = SqlDiagnostic(
             code=SqlDiagnosticCode.AMBIGUOUS_COLUMN,
@@ -4921,7 +5028,7 @@ class TestDiagnosticRepairDispatch:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("custmer.email"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         diag = SqlDiagnostic(
             code=SqlDiagnosticCode.UNKNOWN_TABLE,
@@ -4941,7 +5048,7 @@ class TestDiagnosticRepairDispatch:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("customer.email"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         diag = SqlDiagnostic(
             code=SqlDiagnosticCode.NON_GROUPED_SELECT_COL,
@@ -4962,7 +5069,7 @@ class TestDiagnosticRepairDispatch:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("customer.email"))],
             group_by_cols=[existing],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         diag = SqlDiagnostic(
             code=SqlDiagnosticCode.NON_GROUPED_SELECT_COL,
@@ -4975,7 +5082,7 @@ class TestDiagnosticRepairDispatch:
 
     def test_repair_agg_in_where_promotes_to_having(self) -> None:
         schema = _two_table_schema()
-        agg_filter = FilterParam(
+        agg_filter = WhereParam(
             left_expr=NormalizedExpr.from_agg("count", "customer.customer_id"),
             op=">",
             value_type="number",
@@ -4988,8 +5095,8 @@ class TestDiagnosticRepairDispatch:
             select_cols=[SelectCol(expr=NormalizedExpr.from_agg("count", "customer.customer_id"))],
             group_by_cols=[NormalizedExpr.from_column("customer.email")],
             order_by_cols=[],
-            filters_param=[agg_filter],
-            having_param=[],
+            where=PredicateGroup.from_list([agg_filter]),
+            having=None,
         )
         diag = SqlDiagnostic(
             code=SqlDiagnosticCode.AGG_IN_WHERE,
@@ -4998,9 +5105,9 @@ class TestDiagnosticRepairDispatch:
         )
         out, changed = apply_diagnostic_repairs(intent, schema, [diag])
         assert changed is True
-        assert out.filters_param == []
-        assert len(out.having_param) == 1
-        assert out.having_param[0].param_key == "cnt"
+        assert (out.where.leaves() if out.where else []) == []
+        assert len(out.having.leaves() if out.having else []) == 1
+        assert (out.having.leaves() if out.having else [])[0].param_key == "cnt"
 
     def test_repair_cartesian_clears_chosen_join(self) -> None:
         schema = _two_table_schema()
@@ -5010,7 +5117,7 @@ class TestDiagnosticRepairDispatch:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("customer.email"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
             chosen_join_candidate_id="J01",
             chosen_join_path_signature=["customer:rental"],
         )
@@ -5026,14 +5133,14 @@ class TestDiagnosticRepairDispatch:
 
     def test_repair_param_binding_drops_unbound_filter(self) -> None:
         schema = _two_table_schema()
-        bound_filter = FilterParam(
+        bound_filter = WhereParam(
             left_expr=NormalizedExpr.from_column("customer.email"),
             op="=",
             value_type="string",
             param_key="email_v",
             raw_value="alice@example.com",
         )
-        unbound_filter = FilterParam(
+        unbound_filter = WhereParam(
             left_expr=NormalizedExpr.from_column("customer.first_name"),
             op="=",
             value_type="string",
@@ -5046,7 +5153,7 @@ class TestDiagnosticRepairDispatch:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("customer.email"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[bound_filter, unbound_filter],
+            where=PredicateGroup.from_list([bound_filter, unbound_filter]),
         )
         diag = SqlDiagnostic(
             code=SqlDiagnosticCode.PARAM_UNBOUND,
@@ -5055,8 +5162,8 @@ class TestDiagnosticRepairDispatch:
         )
         out, changed = apply_diagnostic_repairs(intent, schema, [diag])
         assert changed is True
-        assert len(out.filters_param) == 1
-        assert out.filters_param[0].param_key == "email_v"
+        assert len(out.where.leaves() if out.where else []) == 1
+        assert (out.where.leaves() if out.where else [])[0].param_key == "email_v"
 
     def test_apply_diagnostic_repairs_skips_soft_codes(self) -> None:
         schema = _two_table_schema()
@@ -5066,7 +5173,7 @@ class TestDiagnosticRepairDispatch:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("customer.email"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         diag = SqlDiagnostic(
             code=SqlDiagnosticCode.EXPLAIN_SEQ_SCAN_INDEXED,
@@ -5085,7 +5192,7 @@ class TestDiagnosticRepairDispatch:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("customer.emial"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         diag = SqlDiagnostic(
             code=SqlDiagnosticCode.UNKNOWN_COLUMN,
@@ -5104,7 +5211,7 @@ class TestDiagnosticRepairDispatch:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("customer.email"))],
             group_by_cols=[],
             order_by_cols=[],
-            filters_param=[],
+            where=None,
         )
         diag = SqlDiagnostic(
             code=SqlDiagnosticCode.SUBQUERY_NOT_ALLOWED,
@@ -5125,7 +5232,7 @@ def test_reconcile_tables_keeps_table_refs_from_raw_sql(
         select_cols=[SelectCol(expr=NormalizedExpr(raw_sql="DISTINCT customers.name"))],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
+        where=None,
     )
     result = reconcile_tables(intent)
     assert "customers" in result.tables
@@ -5153,7 +5260,7 @@ def test_align_filter_coerces_boolean_bindings_to_int_for_integer_column() -> No
         join_paths_multi={},
         effective_structural_hash="h",
     )
-    fp = FilterParam(
+    fp = WhereParam(
         left_expr=NormalizedExpr.from_column("customer.active"),
         op="=",
         value_type="boolean",
@@ -5165,16 +5272,16 @@ def test_align_filter_coerces_boolean_bindings_to_int_for_integer_column() -> No
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("customer.customer_id"))],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[fp],
+        where=PredicateGroup.from_list([fp]),
         param_values={"p1": True},
     )
-    out = align_filter_value_type_to_exprs(intent, schema)
-    assert out.filters_param[0].value_type == "number"
+    out = align_where_value_type_to_exprs(intent, schema)
+    assert (out.where.leaves() if out.where else [])[0].value_type == "number"
     assert out.param_values["p1"] == 1
 
 
 def test_promote_temporal_keyword_rhs_binds_current_timestamp_as_keyword() -> None:
-    fp = FilterParam(
+    fp = WhereParam(
         left_expr=NormalizedExpr.from_column("tbl_a.col_date"),
         op="<",
         value_type="temporal",
@@ -5186,10 +5293,10 @@ def test_promote_temporal_keyword_rhs_binds_current_timestamp_as_keyword() -> No
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("tbl_a.col_date"))],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[fp],
+        where=PredicateGroup.from_list([fp]),
     )
     out = promote_temporal_keyword_rhs(intent)
-    promoted = out.filters_param[0]
+    promoted = (out.where.leaves() if out.where else [])[0]
     assert promoted.right_expr is not None
     assert promoted.right_expr.keyword == "current_timestamp"
     assert promoted.raw_value is None
@@ -5197,14 +5304,14 @@ def test_promote_temporal_keyword_rhs_binds_current_timestamp_as_keyword() -> No
 
 
 def test_dedup_preserves_keyword_right_expr_with_duplicate_raw_value() -> None:
-    fp = FilterParam(
+    fp = WhereParam(
         left_expr=NormalizedExpr.from_column("tbl_a.col_date"),
         op="<",
         value_type="temporal",
         right_expr=NormalizedExpr(keyword="current_timestamp"),
         raw_value="CURRENT_TIMESTAMP",
     )
-    out, changed = _dedup_value_vs_right_expr_filters([fp])
+    out, changed = _dedup_value_vs_right_expr_where([fp])
     assert not changed
     assert out[0].right_expr is not None
     assert out[0].right_expr.keyword == "current_timestamp"
@@ -5212,7 +5319,7 @@ def test_dedup_preserves_keyword_right_expr_with_duplicate_raw_value() -> None:
 
 def test_dedup_extract_year_drops_redundant_equality() -> None:
     filters = [
-        FilterParam(
+        WhereParam(
             left_expr=NormalizedExpr(
                 add_groups=[MulGroup(multiply=[NormalizedExpr.from_column("tbl_a.date_a")])],
                 scalar_func="extract",
@@ -5222,7 +5329,7 @@ def test_dedup_extract_year_drops_redundant_equality() -> None:
             raw_value="2026",
             value_type="integer",
         ),
-        FilterParam(
+        WhereParam(
             left_expr=NormalizedExpr.from_column("tbl_a.date_a"),
             op="=",
             raw_value="2026",
@@ -5237,7 +5344,7 @@ def test_dedup_extract_year_drops_redundant_equality() -> None:
 
 def test_dedup_extract_year_drops_redundant_comparison_ops() -> None:
     filters = [
-        FilterParam(
+        WhereParam(
             left_expr=NormalizedExpr(
                 add_groups=[MulGroup(multiply=[NormalizedExpr.from_column("tbl_a.date_a")])],
                 scalar_func="extract",
@@ -5247,7 +5354,7 @@ def test_dedup_extract_year_drops_redundant_comparison_ops() -> None:
             raw_value="2026",
             value_type="integer",
         ),
-        FilterParam(
+        WhereParam(
             left_expr=NormalizedExpr.from_column("tbl_a.date_a"),
             op=">=",
             raw_value="2025",
@@ -5275,7 +5382,7 @@ def test_repair_window_partition_adds_missing_group_by_col() -> None:
         ],
         group_by_cols=[NormalizedExpr.from_column("tbl_a.col_a")],
         order_by_cols=[],
-        filters_param=[],
+        where=None,
         window_registry=[WindowRegistryStep(registry_id="w01", window_spec=ws)],
     )
     result = repair_window_partition_group_by_alignment(intent, schema)
@@ -5308,7 +5415,7 @@ def test_repair_window_partition_skips_row_level_outer_cte() -> None:
         select_cols=[SelectCol(expr=NormalizedExpr(column_ref="w02"))],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[],
+        where=None,
         cte_steps=[inner],
         window_registry=[WindowRegistryStep(registry_id="w02", window_spec=outer_ws)],
     )

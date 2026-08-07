@@ -4,10 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from aetherdialect._constants import GenerationPath
-from aetherdialect._contracts_core import RuntimeIntent
-from aetherdialect._live_testing import Expected, LiveTestRunner, Scenario
-from aetherdialect._templates import store_to_templates
+from aetherdialect._contracts_core import Expected, GenerationPath, LiveTestRunner, RuntimeIntent, Scenario
+from aetherdialect._templates import TemplateOps
 from aetherdialect._utils import normalize_question
 
 from ._seed_helpers import (
@@ -149,7 +147,7 @@ def test_reuse_picks_matching_history(schema, schema_terms, t2s) -> None:
             "FROM store JOIN staff ON store.manager_staff_id = staff.staff_id",
             trust_level=2,
         )
-        runner.templates = store_to_templates(runner.store)
+        runner.templates = TemplateOps.store_to_templates(runner.store)
 
         before = snapshot_store(runner)
 
@@ -192,7 +190,7 @@ def test_reuse_then_fork(schema, schema_terms, t2s) -> None:
             "FROM staff JOIN store ON staff.store_id = store.store_id",
             trust_level=2,
         )
-        runner.templates = store_to_templates(runner.store)
+        runner.templates = TemplateOps.store_to_templates(runner.store)
         before = snapshot_store(runner)
 
         manager_result = _run(

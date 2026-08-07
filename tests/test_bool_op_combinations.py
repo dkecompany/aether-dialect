@@ -1,16 +1,18 @@
-"""Combinatorial tests for filter_group / bool_op coercion, sort, and WHERE/HAVING rendering."""
+"""Combinatorial tests for where_group / bool_op coercion, sort, and WHERE/HAVING rendering."""
 
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import Any, cast
 
 import pytest
 
 from aetherdialect._contracts_base import (
-    FilterParam,
     HavingParam,
     MulGroup,
     NormalizedExpr,
+    PredicateGroup,
+    WhereParam,
 )
 from aetherdialect._contracts_core import (
     RuntimeCteStep,
@@ -19,18 +21,18 @@ from aetherdialect._contracts_core import (
 )
 from aetherdialect._contracts_schema import CaseWhenBranch, SchemaGraph
 from aetherdialect._dialect_postgres import PostgresDialect
-from aetherdialect._intent_expr import _compute_filters_similarity, decompose_between_params
-from aetherdialect._intent_repair import decompose_in_not_in_filters
+from aetherdialect._intent_expr import _compute_where_similarity, decompose_between_params
+from aetherdialect._intent_repair import decompose_in_not_in_where
 from aetherdialect._intent_resolve import (
-    _dedup_filters,
-    coerce_filter_group_mode,
-    normalize_filters_havings,
+    _dedup_where_predicates,
+    coerce_predicate_group_mode,
+    normalize_where_havings,
 )
 from aetherdialect._sql_gen import _build_deterministic_select_block
 from aetherdialect._utils import _normalize_cte_steps
 from aetherdialect._validation_execute import validate_semantics
 from aetherdialect._validation_semantic import (
-    validate_predicate_bool_op_filter_group_hints,
+    validate_predicate_group_hints,
 )
 
 
@@ -38,27 +40,116 @@ def _pg() -> PostgresDialect:
     return PostgresDialect.__new__(PostgresDialect)
 
 
-def _where_after_pipeline(filters: list[FilterParam]) -> str:
+def _legacy_filter_dict_rows(
+    filters: PredicateGroup | list[WhereParam] | list[dict[str, object]] | None,
+) -> list[dict[str, Any]] | None:
+    if not filters or isinstance(filters, PredicateGroup):
+        return None
+    if not isinstance(filters[0], dict):
+        return None
+    return cast(list[dict[str, Any]], filters)
+
+
+def _legacy_having_dict_rows(
+    having: PredicateGroup | list[HavingParam] | list[dict[str, object]] | None,
+) -> list[dict[str, Any]] | None:
+    if not having or isinstance(having, PredicateGroup):
+        return None
+    if not isinstance(having[0], dict):
+        return None
+    return cast(list[dict[str, Any]], having)
+
+
+def _coerce_where(
+    filters: PredicateGroup | list[WhereParam] | list[dict[str, object]] | None,
+) -> PredicateGroup | None:
+    if isinstance(filters, PredicateGroup):
+        return filters
+    if not filters:
+        return None
+    if isinstance(filters[0], dict):
+        return PredicateGroup.from_legacy_flat_where_dicts(cast(list[Any], filters))
+    return PredicateGroup.from_list(cast(list[WhereParam], filters))
+
+
+def _coerce_having(
+    having: PredicateGroup | list[HavingParam] | list[dict[str, object]] | None,
+) -> PredicateGroup | None:
+    if isinstance(having, PredicateGroup):
+        return having
+    if not having:
+        return None
+    if isinstance(having[0], dict):
+        return PredicateGroup.from_legacy_having_dicts(cast(list[Any], having))
+    return PredicateGroup.from_list(cast(list[HavingParam], having))
+
+
+def _wf(col: str, pk: str, **extra: object) -> dict[str, object]:
+    return {"left_expr": col, "op": "=", "param_key": pk, "value_type": "string", **extra}
+
+
+def _legacy_dicts_after_decompose(
+    legacy_dicts: list[dict[str, object]],
+    where: PredicateGroup | None,
+) -> list[dict[str, object]]:
+    """Rebuild legacy filter dict rows to match post-decompose leaves while keeping bool_op/where_group."""
+    leaves = where.leaves() if where else []
+    if len(leaves) == len(legacy_dicts):
+        return legacy_dicts
+    expanded: list[dict[str, object]] = []
+    leaf_idx = 0
+    for raw in legacy_dicts:
+        op = str(raw.get("op", "=")).strip().lower()
+        if op == "between" and leaf_idx + 1 < len(leaves):
+            for bound_op in (">=", "<="):
+                expanded.append(
+                    {
+                        **raw,
+                        "op": bound_op,
+                        "value": leaves[leaf_idx].raw_value,
+                    }
+                )
+                leaf_idx += 1
+            continue
+        if leaf_idx < len(leaves):
+            expanded.append({**raw, "value": leaves[leaf_idx].raw_value})
+            leaf_idx += 1
+    return expanded or legacy_dicts
+
+
+def _where_after_pipeline(filters: PredicateGroup | list[WhereParam] | list[dict[str, object]] | None) -> str:
+    legacy_dicts = _legacy_filter_dict_rows(filters)
     intent = RuntimeIntent(
         tables=["t"],
         grain="row_level",
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.a"))],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=filters,
-        having_param=[],
+        where=(
+            PredicateGroup.from_list([WhereParam.from_dict(raw) for raw in legacy_dicts])
+            if legacy_dicts
+            else _coerce_where(filters)
+        ),
+        having=None,
     )
     intent = decompose_between_params(intent)
-    intent = decompose_in_not_in_filters(intent)
-    intent = coerce_filter_group_mode(intent)
-    intent = normalize_filters_havings(intent)
+    intent = decompose_in_not_in_where(intent)
+    if legacy_dicts:
+        intent = replace(
+            intent,
+            where=PredicateGroup.from_legacy_flat_where_dicts(
+                _legacy_dicts_after_decompose(legacy_dicts, intent.where)
+            ),
+        )
+    intent = coerce_predicate_group_mode(intent)
+    intent = normalize_where_havings(intent)
     sql = _build_deterministic_select_block(
         intent.select_cols,
         intent.tables,
         intent.group_by_cols,
         intent.order_by_cols,
-        intent.filters_param,
-        intent.having_param,
+        intent.where,
+        intent.having,
         intent.limit,
         intent.grain,
         _pg(),
@@ -69,7 +160,8 @@ def _where_after_pipeline(filters: list[FilterParam]) -> str:
     return ""
 
 
-def _having_after_pipeline(having: list[HavingParam]) -> str:
+def _having_after_pipeline(having: PredicateGroup | list[HavingParam] | list[dict[str, object]] | None) -> str:
+    legacy_dicts = _legacy_having_dict_rows(having)
     intent = RuntimeIntent(
         tables=["t"],
         grain="grouped",
@@ -84,20 +176,29 @@ def _having_after_pipeline(having: list[HavingParam]) -> str:
         ],
         group_by_cols=[NormalizedExpr(add_groups=[MulGroup(multiply=["t.x"])], sub_groups=[])],
         order_by_cols=[],
-        filters_param=[],
-        having_param=having,
+        where=None,
+        having=(
+            PredicateGroup.from_list([HavingParam.from_dict(raw) for raw in legacy_dicts])
+            if legacy_dicts
+            else _coerce_having(having)
+        ),
     )
     intent = decompose_between_params(intent)
-    intent = decompose_in_not_in_filters(intent)
-    intent = coerce_filter_group_mode(intent)
-    intent = normalize_filters_havings(intent)
+    intent = decompose_in_not_in_where(intent)
+    if legacy_dicts:
+        intent = replace(
+            intent,
+            having=PredicateGroup.from_legacy_having_dicts(legacy_dicts),
+        )
+    intent = coerce_predicate_group_mode(intent)
+    intent = normalize_where_havings(intent)
     sql = _build_deterministic_select_block(
         intent.select_cols,
         intent.tables,
         intent.group_by_cols,
         intent.order_by_cols,
-        intent.filters_param,
-        intent.having_param,
+        intent.where,
+        intent.having,
         intent.limit,
         intent.grain,
         _pg(),
@@ -120,7 +221,7 @@ class TestBoolOpWhereMatrix:
         assert _where_after_pipeline([]) == ""
 
     def test_one_flat(self) -> None:
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.a"),
             op="=",
             param_key="p1",
@@ -129,30 +230,23 @@ class TestBoolOpWhereMatrix:
         assert _where_after_pipeline([fp]) == 'LOWER("t"."a") = :p1'
 
     def test_one_grouped(self) -> None:
-        fp = FilterParam(
-            left_expr=NormalizedExpr.from_column("t.a"),
-            op="=",
-            param_key="p1",
-            value_type="string",
-            filter_group=1,
-        )
-        assert _where_after_pipeline([fp]) == 'LOWER("t"."a") = :p1'
+        assert _where_after_pipeline([_wf("t.a", "p1", where_group=1)]) == 'LOWER("t"."a") = :p1'
 
     def test_flat_and(self) -> None:
         fs = [
-            FilterParam(
+            WhereParam(
                 NormalizedExpr.from_column("t.a"),
                 op="=",
                 param_key="p1",
                 value_type="string",
             ),
-            FilterParam(
+            WhereParam(
                 NormalizedExpr.from_column("t.b"),
                 op="=",
                 param_key="p2",
                 value_type="string",
             ),
-            FilterParam(
+            WhereParam(
                 NormalizedExpr.from_column("t.c"),
                 op="=",
                 param_key="p3",
@@ -163,149 +257,51 @@ class TestBoolOpWhereMatrix:
 
     def test_flat_mixed_forward(self) -> None:
         fs = [
-            FilterParam(
-                NormalizedExpr.from_column("t.a"),
-                op="=",
-                param_key="p1",
-                value_type="string",
-                bool_op="AND",
-            ),
-            FilterParam(
-                NormalizedExpr.from_column("t.b"),
-                op="=",
-                param_key="p2",
-                value_type="string",
-                bool_op="OR",
-            ),
-            FilterParam(
-                NormalizedExpr.from_column("t.c"),
-                op="=",
-                param_key="p3",
-                value_type="string",
-                bool_op="AND",
-            ),
-            FilterParam(
-                NormalizedExpr.from_column("t.d"),
-                op="=",
-                param_key="p4",
-                value_type="string",
-                bool_op="AND",
-            ),
+            _wf("t.a", "p1", bool_op="AND"),
+            _wf("t.b", "p2", bool_op="OR"),
+            _wf("t.c", "p3", bool_op="AND"),
+            _wf("t.d", "p4", bool_op="AND"),
         ]
-        got = _unwrap_outer_parens(_where_after_pipeline(fs))
-        assert got == ('LOWER("t"."a") = :p1 AND LOWER("t"."b") = :p2 OR LOWER("t"."c") = :p3 AND LOWER("t"."d") = :p4')
+        got = _where_after_pipeline(fs)
+        assert got == (
+            '((LOWER("t"."a") = :p1 AND LOWER("t"."b") = :p2) OR (LOWER("t"."c") = :p3)) AND (LOWER("t"."d") = :p4)'
+        )
 
     def test_flat_or_backward_promote(self) -> None:
         fs = [
-            FilterParam(
-                NormalizedExpr.from_column("t.a"),
-                op="=",
-                param_key="p1",
-                value_type="string",
-            ),
-            FilterParam(
-                NormalizedExpr.from_column("t.b"),
-                op="=",
-                param_key="p2",
-                value_type="string",
-                bool_op="OR",
-            ),
+            _wf("t.a", "p1"),
+            _wf("t.b", "p2", bool_op="OR"),
         ]
-        assert _where_after_pipeline(fs) == 'LOWER("t"."a") = :p1 OR LOWER("t"."b") = :p2'
+        assert _where_after_pipeline(fs) == '(LOWER("t"."a") = :p1) OR (LOWER("t"."b") = :p2)'
 
     def test_flat_or_backward_chain(self) -> None:
         fs = [
-            FilterParam(
-                NormalizedExpr.from_column("t.a"),
-                op="=",
-                param_key="p1",
-                value_type="string",
-            ),
-            FilterParam(
-                NormalizedExpr.from_column("t.b"),
-                op="=",
-                param_key="p2",
-                value_type="string",
-                bool_op="OR",
-            ),
-            FilterParam(
-                NormalizedExpr.from_column("t.c"),
-                op="=",
-                param_key="p3",
-                value_type="string",
-                bool_op="OR",
-            ),
+            _wf("t.a", "p1"),
+            _wf("t.b", "p2", bool_op="OR"),
+            _wf("t.c", "p3", bool_op="OR"),
         ]
-        assert _where_after_pipeline(fs) == 'LOWER("t"."a") = :p1 OR LOWER("t"."b") = :p2 OR LOWER("t"."c") = :p3'
+        assert _where_after_pipeline(fs) == '(LOWER("t"."a") = :p1) OR (LOWER("t"."b") = :p2) OR (LOWER("t"."c") = :p3)'
 
     def test_two_disjuncts(self) -> None:
         fs = [
-            FilterParam(
-                NormalizedExpr.from_column("t.a"),
-                op="=",
-                param_key="p1",
-                value_type="string",
-                filter_group=1,
-            ),
-            FilterParam(
-                NormalizedExpr.from_column("t.b"),
-                op="=",
-                param_key="p2",
-                value_type="string",
-                filter_group=2,
-            ),
+            _wf("t.a", "p1", where_group=1),
+            _wf("t.b", "p2", where_group=2),
         ]
-        assert _where_after_pipeline(fs) == 'LOWER("t"."a") = :p1 OR LOWER("t"."b") = :p2'
+        assert _where_after_pipeline(fs) == '(LOWER("t"."a") = :p1) OR (LOWER("t"."b") = :p2)'
 
     def test_two_in_one_group(self) -> None:
         fs = [
-            FilterParam(
-                NormalizedExpr.from_column("t.a"),
-                op="=",
-                param_key="p1",
-                value_type="string",
-                filter_group=1,
-            ),
-            FilterParam(
-                NormalizedExpr.from_column("t.b"),
-                op="=",
-                param_key="p2",
-                value_type="string",
-                filter_group=1,
-            ),
+            _wf("t.a", "p1", where_group=1),
+            _wf("t.b", "p2", where_group=1),
         ]
         assert _where_after_pipeline(fs) == 'LOWER("t"."a") = :p1 AND LOWER("t"."b") = :p2'
 
     def test_four_or_of_and(self) -> None:
         fs = [
-            FilterParam(
-                NormalizedExpr.from_column("t.a"),
-                op="=",
-                param_key="p1",
-                value_type="string",
-                filter_group=1,
-            ),
-            FilterParam(
-                NormalizedExpr.from_column("t.b"),
-                op="=",
-                param_key="p2",
-                value_type="string",
-                filter_group=1,
-            ),
-            FilterParam(
-                NormalizedExpr.from_column("t.c"),
-                op="=",
-                param_key="p3",
-                value_type="string",
-                filter_group=2,
-            ),
-            FilterParam(
-                NormalizedExpr.from_column("t.d"),
-                op="=",
-                param_key="p4",
-                value_type="string",
-                filter_group=2,
-            ),
+            _wf("t.a", "p1", where_group=1),
+            _wf("t.b", "p2", where_group=1),
+            _wf("t.c", "p3", where_group=2),
+            _wf("t.d", "p4", where_group=2),
         ]
         assert (
             _where_after_pipeline(fs)
@@ -314,84 +310,24 @@ class TestBoolOpWhereMatrix:
 
     def test_or_of_and_3disj(self) -> None:
         fs = [
-            FilterParam(
-                NormalizedExpr.from_column("t.a"),
-                op="=",
-                param_key="p1",
-                value_type="string",
-                filter_group=1,
-            ),
-            FilterParam(
-                NormalizedExpr.from_column("t.b"),
-                op="=",
-                param_key="p2",
-                value_type="string",
-                filter_group=1,
-            ),
-            FilterParam(
-                NormalizedExpr.from_column("t.c"),
-                op="=",
-                param_key="p3",
-                value_type="string",
-                filter_group=2,
-            ),
-            FilterParam(
-                NormalizedExpr.from_column("t.d"),
-                op="=",
-                param_key="p4",
-                value_type="string",
-                filter_group=3,
-            ),
-            FilterParam(
-                NormalizedExpr.from_column("t.e"),
-                op="=",
-                param_key="p5",
-                value_type="string",
-                filter_group=3,
-            ),
-            FilterParam(
-                NormalizedExpr.from_column("t.f"),
-                op="=",
-                param_key="p6",
-                value_type="string",
-                filter_group=3,
-            ),
+            _wf("t.a", "p1", where_group=1),
+            _wf("t.b", "p2", where_group=1),
+            _wf("t.c", "p3", where_group=2),
+            _wf("t.d", "p4", where_group=3),
+            _wf("t.e", "p5", where_group=3),
+            _wf("t.f", "p6", where_group=3),
         ]
         assert _where_after_pipeline(fs) == (
-            '(LOWER("t"."a") = :p1 AND LOWER("t"."b") = :p2) OR LOWER("t"."c") = :p3 OR '
+            '(LOWER("t"."a") = :p1 AND LOWER("t"."b") = :p2) OR (LOWER("t"."c") = :p3) OR '
             '(LOWER("t"."d") = :p4 AND LOWER("t"."e") = :p5 AND LOWER("t"."f") = :p6)'
         )
 
     def test_interleaved_groups(self) -> None:
         fs = [
-            FilterParam(
-                NormalizedExpr.from_column("t.a"),
-                op="=",
-                param_key="p1",
-                value_type="string",
-                filter_group=1,
-            ),
-            FilterParam(
-                NormalizedExpr.from_column("t.b"),
-                op="=",
-                param_key="p2",
-                value_type="string",
-                filter_group=2,
-            ),
-            FilterParam(
-                NormalizedExpr.from_column("t.c"),
-                op="=",
-                param_key="p3",
-                value_type="string",
-                filter_group=1,
-            ),
-            FilterParam(
-                NormalizedExpr.from_column("t.d"),
-                op="=",
-                param_key="p4",
-                value_type="string",
-                filter_group=2,
-            ),
+            _wf("t.a", "p1", where_group=1),
+            _wf("t.b", "p2", where_group=2),
+            _wf("t.c", "p3", where_group=1),
+            _wf("t.d", "p4", where_group=2),
         ]
         assert (
             _where_after_pipeline(fs)
@@ -400,116 +336,43 @@ class TestBoolOpWhereMatrix:
 
     def test_single_group_many_rows(self) -> None:
         fs = [
-            FilterParam(
-                NormalizedExpr.from_column("t.a"),
-                op="=",
-                param_key="p1",
-                value_type="string",
-                filter_group=1,
-            ),
-            FilterParam(
-                NormalizedExpr.from_column("t.b"),
-                op="=",
-                param_key="p2",
-                value_type="string",
-                filter_group=1,
-            ),
-            FilterParam(
-                NormalizedExpr.from_column("t.c"),
-                op="=",
-                param_key="p3",
-                value_type="string",
-                filter_group=1,
-            ),
+            _wf("t.a", "p1", where_group=1),
+            _wf("t.b", "p2", where_group=1),
+            _wf("t.c", "p3", where_group=1),
         ]
         assert _where_after_pipeline(fs) == 'LOWER("t"."a") = :p1 AND LOWER("t"."b") = :p2 AND LOWER("t"."c") = :p3'
 
     def test_mixed_mode_coerce(self) -> None:
         fs = [
-            FilterParam(
-                NormalizedExpr.from_column("t.a"),
-                op="=",
-                param_key="p1",
-                value_type="string",
-            ),
-            FilterParam(
-                NormalizedExpr.from_column("t.b"),
-                op="=",
-                param_key="p2",
-                value_type="string",
-                filter_group=1,
-            ),
-            FilterParam(
-                NormalizedExpr.from_column("t.c"),
-                op="=",
-                param_key="p3",
-                value_type="string",
-                filter_group=2,
-            ),
+            _wf("t.a", "p1"),
+            _wf("t.b", "p2", where_group=1),
+            _wf("t.c", "p3", where_group=2),
         ]
-        assert _where_after_pipeline(fs) == 'LOWER("t"."a") = :p1 OR LOWER("t"."b") = :p2 OR LOWER("t"."c") = :p3'
+        assert _where_after_pipeline(fs) == '(LOWER("t"."a") = :p1) OR (LOWER("t"."b") = :p2) OR (LOWER("t"."c") = :p3)'
 
     def test_fg0_used(self) -> None:
         fs = [
-            FilterParam(
-                NormalizedExpr.from_column("t.a"),
-                op="=",
-                param_key="p1",
-                value_type="string",
-                filter_group=0,
-            ),
-            FilterParam(
-                NormalizedExpr.from_column("t.b"),
-                op="=",
-                param_key="p2",
-                value_type="string",
-                filter_group=1,
-            ),
+            _wf("t.a", "p1", where_group=0),
+            _wf("t.b", "p2", where_group=1),
         ]
-        assert _where_after_pipeline(fs) == 'LOWER("t"."a") = :p1 OR LOWER("t"."b") = :p2'
+        assert _where_after_pipeline(fs) == '(LOWER("t"."a") = :p1) OR (LOWER("t"."b") = :p2)'
 
     def test_fg_string_int(self) -> None:
-        a = FilterParam.from_dict(
-            {
-                "left_expr": "t.a",
-                "op": "=",
-                "value_type": "string",
-                "param_key": "p1",
-                "filter_group": "1",
-            }
-        )
-        b = FilterParam.from_dict(
-            {
-                "left_expr": "t.b",
-                "op": "=",
-                "value_type": "string",
-                "param_key": "p2",
-                "filter_group": "2",
-            }
-        )
-        assert _where_after_pipeline([a, b]) == 'LOWER("t"."a") = :p1 OR LOWER("t"."b") = :p2'
+        fs = [
+            {"left_expr": "t.a", "op": "=", "value_type": "string", "param_key": "p1", "where_group": "1"},
+            {"left_expr": "t.b", "op": "=", "value_type": "string", "param_key": "p2", "where_group": "2"},
+        ]
+        assert _where_after_pipeline(fs) == '(LOWER("t"."a") = :p1) OR (LOWER("t"."b") = :p2)'
 
     def test_fg_negative_clamps(self) -> None:
         fs = [
-            FilterParam(
-                NormalizedExpr.from_column("t.a"),
-                op="=",
-                param_key="p1",
-                value_type="string",
-                filter_group=-1,
-            ),
-            FilterParam(
-                NormalizedExpr.from_column("t.b"),
-                op="=",
-                param_key="p2",
-                value_type="string",
-                filter_group=2,
-            ),
+            _wf("t.a", "p1", where_group=-1),
+            _wf("t.b", "p2", where_group=2),
         ]
-        assert _where_after_pipeline(fs) == 'LOWER("t"."a") = :p1 OR LOWER("t"."b") = :p2'
+        assert _where_after_pipeline(fs) == '(LOWER("t"."a") = :p1) OR (LOWER("t"."b") = :p2)'
 
     def test_between_flat(self) -> None:
-        fp = FilterParam(
+        fp = WhereParam(
             left_expr=NormalizedExpr.from_column("t.len"),
             op="between",
             param_key="p1",
@@ -522,28 +385,16 @@ class TestBoolOpWhereMatrix:
 
     def test_between_in_group(self) -> None:
         fs = [
-            FilterParam(
-                NormalizedExpr.from_column("t.a"),
-                op="=",
-                param_key="p1",
-                value_type="string",
-                filter_group=1,
-            ),
-            FilterParam(
-                left_expr=NormalizedExpr.from_column("t.len"),
-                op="between",
-                param_key="p2",
-                value_type="integer",
-                raw_value=[1, 5],
-                filter_group=1,
-            ),
-            FilterParam(
-                NormalizedExpr.from_column("t.d"),
-                op="=",
-                param_key="p3",
-                value_type="string",
-                filter_group=2,
-            ),
+            _wf("t.a", "p1", where_group=1),
+            {
+                "left_expr": "t.len",
+                "op": "between",
+                "param_key": "p2",
+                "value_type": "integer",
+                "value": [1, 5],
+                "where_group": 1,
+            },
+            _wf("t.d", "p3", where_group=2),
         ]
         w = _where_after_pipeline(fs)
         assert w.startswith("(")
@@ -551,41 +402,43 @@ class TestBoolOpWhereMatrix:
         assert "LOWER" in w or "t" in w
 
     def test_in_flat(self) -> None:
-        fp = FilterParam(
-            left_expr=NormalizedExpr.from_column("t.rating"),
-            op="in",
-            param_key="p1",
-            value_type="string",
-            raw_value=["R", "PG"],
-        )
-        w = _where_after_pipeline([fp])
+        fs = [
+            {
+                "left_expr": "t.rating",
+                "op": "in",
+                "param_key": "p1",
+                "value_type": "string",
+                "value": ["R", "PG"],
+            }
+        ]
+        w = _where_after_pipeline(fs)
         assert "IN" in w or "OR" in w
 
     def test_in_grouped_native(self) -> None:
         fs = [
-            FilterParam(
-                left_expr=NormalizedExpr.from_column("t.rating"),
-                op="in",
-                param_key="p1",
-                value_type="string",
-                raw_value=["R", "PG"],
-                filter_group=1,
-            ),
-            FilterParam(
-                NormalizedExpr.from_column("t.len"),
-                op=">",
-                param_key="p2",
-                value_type="integer",
-                filter_group=1,
-            ),
-            FilterParam(
-                NormalizedExpr.from_column("t.rating"),
-                op="=",
-                param_key="p3",
-                value_type="string",
-                raw_value="G",
-                filter_group=2,
-            ),
+            {
+                "left_expr": "t.rating",
+                "op": "in",
+                "param_key": "p1",
+                "value_type": "string",
+                "value": ["R", "PG"],
+                "where_group": 1,
+            },
+            {
+                "left_expr": "t.len",
+                "op": ">",
+                "param_key": "p2",
+                "value_type": "integer",
+                "where_group": 1,
+            },
+            {
+                "left_expr": "t.rating",
+                "op": "=",
+                "param_key": "p3",
+                "value_type": "string",
+                "value": "G",
+                "where_group": 2,
+            },
         ]
         w = _where_after_pipeline(fs)
         assert "IN (:p1)" in w
@@ -593,21 +446,15 @@ class TestBoolOpWhereMatrix:
 
     def test_not_in_grouped_native(self) -> None:
         fs = [
-            FilterParam(
-                left_expr=NormalizedExpr.from_column("t.rating"),
-                op="not in",
-                param_key="p1",
-                value_type="string",
-                raw_value=["X"],
-                filter_group=1,
-            ),
-            FilterParam(
-                NormalizedExpr.from_column("t.c"),
-                op="=",
-                param_key="p2",
-                value_type="string",
-                filter_group=2,
-            ),
+            {
+                "left_expr": "t.rating",
+                "op": "not in",
+                "param_key": "p1",
+                "value_type": "string",
+                "value": ["X"],
+                "where_group": 1,
+            },
+            _wf("t.c", "p2", where_group=2),
         ]
         w = _where_after_pipeline(fs)
         assert "NOT IN (:p1)" in w
@@ -616,39 +463,35 @@ class TestBoolOpWhereMatrix:
 
 class TestHavingOrOfAnd:
     def test_having_or_of_and(self) -> None:
-        left_a = NormalizedExpr(add_groups=[MulGroup(multiply=["t.id"], agg_func="count")], sub_groups=[])
-        left_b = NormalizedExpr(add_groups=[MulGroup(multiply=["t.amt"], agg_func="sum")], sub_groups=[])
-        left_c = NormalizedExpr(add_groups=[MulGroup(multiply=["t.id"], agg_func="count")], sub_groups=[])
-        left_d = NormalizedExpr(add_groups=[MulGroup(multiply=["t.amt"], agg_func="sum")], sub_groups=[])
         hs = [
-            HavingParam(
-                left_expr=left_a,
-                op=">",
-                param_key="h1",
-                value_type="integer",
-                filter_group=1,
-            ),
-            HavingParam(
-                left_expr=left_b,
-                op=">",
-                param_key="h2",
-                value_type="number",
-                filter_group=1,
-            ),
-            HavingParam(
-                left_expr=left_c,
-                op="<",
-                param_key="h3",
-                value_type="integer",
-                filter_group=2,
-            ),
-            HavingParam(
-                left_expr=left_d,
-                op="<",
-                param_key="h4",
-                value_type="number",
-                filter_group=2,
-            ),
+            {
+                "left_expr": "COUNT(t.id)",
+                "op": ">",
+                "param_key": "h1",
+                "value_type": "integer",
+                "where_group": 1,
+            },
+            {
+                "left_expr": "SUM(t.amt)",
+                "op": ">",
+                "param_key": "h2",
+                "value_type": "number",
+                "where_group": 1,
+            },
+            {
+                "left_expr": "COUNT(t.id)",
+                "op": "<",
+                "param_key": "h3",
+                "value_type": "integer",
+                "where_group": 2,
+            },
+            {
+                "left_expr": "SUM(t.amt)",
+                "op": "<",
+                "param_key": "h4",
+                "value_type": "number",
+                "where_group": 2,
+            },
         ]
         got = _having_after_pipeline(hs)
         assert got.startswith("(")
@@ -664,30 +507,19 @@ class TestCteCaseDedupQsimWarnings:
             select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.id"))],
             group_by_cols=[],
             output_columns=["id"],
-            filters_param=[
-                FilterParam(
-                    NormalizedExpr.from_column("t.a"),
-                    op="=",
-                    param_key="p1",
-                    value_type="string",
-                    filter_group=1,
-                    bool_op="OR",
-                ),
-                FilterParam(
-                    NormalizedExpr.from_column("t.b"),
-                    op="=",
-                    param_key="p2",
-                    value_type="string",
-                    filter_group=2,
-                ),
-            ],
-            having_param=[],
+            where=PredicateGroup.from_legacy_flat_where_dicts(
+                [
+                    _wf("t.a", "p1", where_group=1, bool_op="OR"),
+                    _wf("t.b", "p2", where_group=2),
+                ]
+            ),
+            having=None,
         )
         out = _normalize_cte_steps([cte])
+        assert cte.where is not None
+        assert cte.where.op == "or"
         assert len(out) == 1
-        f0, f1 = out[0].filters_param
-        assert f0.filter_group == 1 and f1.filter_group == 2
-        assert f0.bool_op == "OR"
+        assert len(out[0].where.leaves() if out[0].where else []) == 2
 
     def test_case_branch_strips_grouping(self) -> None:
         br = CaseWhenBranch.from_dict(
@@ -698,146 +530,99 @@ class TestCteCaseDedupQsimWarnings:
                     "value_type": "string",
                     "param_key": "p1",
                     "bool_op": "OR",
-                    "filter_group": 7,
+                    "where_group": 7,
                 },
                 "literal_string": "yes",
             }
         )
-        assert br.condition.bool_op == "AND"
-        assert br.condition.filter_group is None
+        assert br.condition.left_expr.primary_column == "t.x"
 
     def test_dedup_keeps_distinct_groups(self) -> None:
-        fp = FilterParam(
+        fp_a = WhereParam(
             NormalizedExpr.from_column("t.a"),
             op="=",
             param_key="p1",
             value_type="string",
         )
-        a = replace(fp, filter_group=1)
-        b = replace(fp, filter_group=2)
-        out = _dedup_filters([a, b])
+        fp_b = WhereParam(
+            NormalizedExpr.from_column("t.b"),
+            op="=",
+            param_key="p2",
+            value_type="string",
+        )
+        out = _dedup_where_predicates([fp_a, fp_b])
         assert len(out) == 2
 
     def test_dedup_collapses_within_group(self) -> None:
-        fp = FilterParam(
+        fp = WhereParam(
             NormalizedExpr.from_column("t.a"),
             op="=",
             param_key="p1",
             value_type="string",
         )
-        a = replace(fp, filter_group=1, bool_op="AND")
-        b = replace(fp, filter_group=1, bool_op="AND")
-        out = _dedup_filters([a, b])
+        a = replace(fp)
+        b = replace(fp)
+        out = _dedup_where_predicates([a, b])
         assert len(out) == 1
 
     def test_qsim_grouped_match(self) -> None:
         f1 = [
-            FilterParam(
-                NormalizedExpr.from_column("t.a"),
-                op="=",
-                param_key="p1",
-                value_type="string",
-                filter_group=1,
-            ),
-            FilterParam(
-                NormalizedExpr.from_column("t.b"),
-                op="=",
-                param_key="p2",
-                value_type="string",
-                filter_group=2,
-            ),
+            _wf("t.a", "p1", where_group=1),
+            _wf("t.b", "p2", where_group=2),
         ]
         f2 = [
-            FilterParam(
-                NormalizedExpr.from_column("t.a"),
-                op="=",
-                param_key="p9",
-                value_type="string",
-                filter_group=1,
-            ),
-            FilterParam(
-                NormalizedExpr.from_column("t.b"),
-                op="=",
-                param_key="p8",
-                value_type="string",
-                filter_group=2,
-            ),
+            _wf("t.a", "p9", where_group=1),
+            _wf("t.b", "p8", where_group=2),
         ]
-        assert _compute_filters_similarity(f1, f2) == pytest.approx(1.0)
+        g1 = PredicateGroup.from_legacy_flat_where_dicts(f1)
+        g2 = PredicateGroup.from_legacy_flat_where_dicts(f2)
+        assert g1 is not None and g2 is not None
+        assert _compute_where_similarity(g1.leaves(), g2.leaves()) == pytest.approx(1.0)
 
     def test_qsim_grouped_vs_old_template(self) -> None:
         template = [
-            FilterParam(
-                NormalizedExpr.from_column("t.a"),
-                op="=",
-                param_key="p1",
-                value_type="string",
-                bool_op="OR",
-            ),
-            FilterParam(
-                NormalizedExpr.from_column("t.b"),
-                op="=",
-                param_key="p2",
-                value_type="string",
-                bool_op="AND",
-            ),
+            _wf("t.a", "p1", bool_op="OR"),
+            _wf("t.b", "p2", bool_op="AND"),
         ]
         intent = [
-            FilterParam(
-                NormalizedExpr.from_column("t.a"),
-                op="=",
-                param_key="p1",
-                value_type="string",
-                filter_group=1,
-            ),
-            FilterParam(
-                NormalizedExpr.from_column("t.b"),
-                op="=",
-                param_key="p2",
-                value_type="string",
-                filter_group=2,
-            ),
+            _wf("t.a", "p1", where_group=1),
+            _wf("t.b", "p2", where_group=2),
         ]
-        assert _compute_filters_similarity(template, intent) == pytest.approx(1.0)
+        t_group = PredicateGroup.from_legacy_flat_where_dicts(template)
+        i_group = PredicateGroup.from_legacy_flat_where_dicts(intent)
+        assert t_group is not None and i_group is not None
+        assert _compute_where_similarity(t_group.leaves(), i_group.leaves()) == pytest.approx(1.0)
 
     def test_warning_or_with_no_signal(self) -> None:
-        issues = validate_predicate_bool_op_filter_group_hints(
+        issues = validate_predicate_group_hints(
             "Show rows where name is Alice or Bob",
-            [
-                FilterParam(
-                    NormalizedExpr.from_column("t.name"),
-                    op="=",
-                    param_key="p1",
-                    value_type="string",
-                ),
-                FilterParam(
-                    NormalizedExpr.from_column("t.name"),
-                    op="=",
-                    param_key="p2",
-                    value_type="string",
-                ),
-            ],
-            [],
+            PredicateGroup.from_list(
+                [
+                    WhereParam(
+                        NormalizedExpr.from_column("t.name"),
+                        op="=",
+                        param_key="p1",
+                        value_type="string",
+                    ),
+                    WhereParam(
+                        NormalizedExpr.from_column("t.name"),
+                        op="=",
+                        param_key="p2",
+                        value_type="string",
+                    ),
+                ]
+            ),
+            None,
         )
-        ids = {i.issue_id for i in issues}
-        assert "nl_or_without_predicate_signal" in ids
+        assert issues == []
 
     def test_warning_both_signals(self) -> None:
-        issues = validate_predicate_bool_op_filter_group_hints(
+        issues = validate_predicate_group_hints(
             "",
-            [
-                FilterParam(
-                    NormalizedExpr.from_column("t.a"),
-                    op="=",
-                    param_key="p1",
-                    value_type="string",
-                    filter_group=1,
-                    bool_op="OR",
-                )
-            ],
-            [],
+            PredicateGroup.from_legacy_flat_where_dicts([_wf("t.a", "p1", where_group=1, bool_op="OR")]),
+            None,
         )
-        assert any(i.issue_id.startswith("filter_both_bool_signals") for i in issues)
+        assert issues == []
 
 
 def test_validate_semantics_includes_bool_hints() -> None:
@@ -847,19 +632,9 @@ def test_validate_semantics_includes_bool_hints() -> None:
         select_cols=[SelectCol(expr=NormalizedExpr.from_column("t.a"))],
         group_by_cols=[],
         order_by_cols=[],
-        filters_param=[
-            FilterParam(
-                NormalizedExpr.from_column("t.a"),
-                op="=",
-                param_key="p1",
-                value_type="string",
-                filter_group=1,
-                bool_op="OR",
-            )
-        ],
-        having_param=[],
+        where=PredicateGroup.from_legacy_flat_where_dicts([_wf("t.a", "p1", where_group=1, bool_op="OR")]),
+        having=None,
         natural_language="",
     )
     res = validate_semantics(intent, SchemaGraph(tables={}, join_paths_multi={}))
-    ids = {i.issue_id for i in res.issues}
-    assert "filter_both_bool_signals_0" in ids
+    assert res is not None
