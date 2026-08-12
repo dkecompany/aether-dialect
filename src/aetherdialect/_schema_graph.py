@@ -2447,10 +2447,7 @@ def scope_descriptor_for(ctx: EngineContext | FederationContext) -> dict[str, An
 
 def schema_context_from_descriptor(desc: dict[str, Any]) -> EngineContext:
     """Reconstruct a :class:`EngineContext` from a cached scope descriptor (4 scope fields)."""
-    inc_raw = desc.get("include", "tables")
-    include_val = SchemaInclude.coerce(inc_raw)
-    if include_val not in (SchemaInclude.TABLES, SchemaInclude.VIEWS):
-        include_val = SchemaInclude.TABLES
+    include_val = SchemaInclude.coerce(desc.get("include", "tables"))
     return EngineContext(
         allow_objects=frozenset(str(x) for x in (desc.get("allow_objects") or [])),
         deny_objects=frozenset(str(x) for x in (desc.get("deny_objects") or [])),
