@@ -187,11 +187,52 @@ def _relax_rental_shop_selectability(schema: Any, database_name: str) -> None:
 
 
 def _env_file() -> str:
+    """Resolve the live env path: ``LIVE_ENV_FILE`` / ``env.env``, else ``env.example.env``."""
     raw = os.environ.get("LIVE_ENV_FILE", "env.env")
     p = Path(raw)
     if not p.is_absolute():
         p = Path(__file__).resolve().parent.parent / raw
+    if p.is_file():
+        return str(p)
+    example = Path(__file__).resolve().parent.parent / "env.example.env"
+    if example.is_file():
+        return str(example)
     return str(p)
+
+
+def _is_example_live_env(path: str | Path | None = None) -> bool:
+    """Return True when the resolved live env path is the committed example template."""
+    resolved = Path(path) if path is not None else Path(_env_file())
+    return resolved.name == "env.example.env"
+
+
+_PLACEHOLDER_SECRET_VALUES = frozenset(
+    {
+        "",
+        "your-password",
+        "changeme",
+        "change-me",
+        "password",
+        "secret",
+        "todo",
+        "xxx",
+        "XXXX",
+    }
+)
+
+
+def _live_env_mapping() -> dict[str, str]:
+    """Parse the live env file when present; missing file means empty credentials."""
+    path = Path(_env_file())
+    if not path.is_file():
+        return {}
+    return _parse_live_env_file(str(path))
+
+
+def _secret_configured(value: str) -> bool:
+    """Return True when *value* looks like a real secret, not an example placeholder."""
+    cleaned = value.strip()
+    return bool(cleaned) and cleaned.casefold() not in {v.casefold() for v in _PLACEHOLDER_SECRET_VALUES if v}
 
 
 def _domain_notes_path() -> Path | None:
@@ -215,7 +256,7 @@ _POSTGRES_SKIP_REASON = "Set PGHOST, PGUSER, PGPASSWORD, and PGDATABASE in the l
 
 def _consumer_credentials_from_env() -> tuple[str, str]:
     """Read restricted consumer Postgres credentials from the live env file or process environment."""
-    flat = _parse_live_env_file(_env_file())
+    flat = _live_env_mapping()
     user = (flat.get("PGUSER2") or os.environ.get("PGUSER2") or "").strip()
     password = (flat.get("PGPASSWORD2") or os.environ.get("PGPASSWORD2") or "").strip()
     return user, password
@@ -223,15 +264,23 @@ def _consumer_credentials_from_env() -> tuple[str, str]:
 
 def _consumer_credentials_configured() -> bool:
     """Return True when both PGUSER2 and PGPASSWORD2 are available for consumer initialization."""
+    if _is_example_live_env():
+        return False
     user, password = _consumer_credentials_from_env()
-    return bool(user and password)
+    return bool(user) and _secret_configured(password)
 
 
 def _postgres_credentials_configured() -> bool:
     """Return True when primary PostgreSQL credentials are present in the live env file."""
-    flat = _parse_live_env_file(_env_file())
+    if _is_example_live_env():
+        return False
+    flat = _live_env_mapping()
     for key in ("PGUSER", "PGPASSWORD", "PGHOST", "PGDATABASE"):
-        if not (flat.get(key) or os.environ.get(key) or "").strip():
+        value = (flat.get(key) or os.environ.get(key) or "").strip()
+        if key == "PGPASSWORD":
+            if not _secret_configured(value):
+                return False
+        elif not value:
             return False
     return True
 
@@ -522,7 +571,7 @@ def _enforce_postgresql_dialect(request: pytest.FixtureRequest) -> None:
         return
     EngineConfig.TYPE = "postgresql"
     EngineConfig.RUNTIME = PostgresRuntimeConfig
-    flat = _parse_live_env_file(_env_file())
+    flat = _live_env_mapping()
     pg_env = {
         k: flat[k]
         for k in ("PGUSER", "PGPASSWORD", "PGHOST", "PGPORT", "PGDATABASE")

@@ -1531,11 +1531,15 @@ def engine_schema(name: str, default: str) -> str:
 
 def skip_unless_configured(engine_name: str) -> Any:
     """Return a pytest skip marker reason when *engine_name* is not configured in the env file."""
-    from .conftest import _env_file
+    from .conftest import _env_file, _is_example_live_env
+
+    env_path = _env_file()
+    if _is_example_live_env(env_path) or not Path(env_path).is_file():
+        return f"{engine_name} not configured in live env file"
 
     flat_present = False
     try:
-        cfg_path = write_live_env_file_to_temp_config_toml(_env_file(), {"AETHERDIALECT_ENGINE": engine_name})
+        cfg_path = write_live_env_file_to_temp_config_toml(env_path, {"AETHERDIALECT_ENGINE": engine_name})
         text = Path(cfg_path).read_text(encoding="utf-8")
         Path(cfg_path).unlink(missing_ok=True)
         flat_present = f"[{engine_name}]" in text
