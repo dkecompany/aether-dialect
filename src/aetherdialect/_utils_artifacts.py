@@ -122,6 +122,19 @@ def _chmod_artifact_file(path: str | os.PathLike[str]) -> None:
         pass
 
 
+def replace_path_atomic(src: str, dest: str, *, attempts: int = 5) -> None:
+    """``os.replace`` with short retries for transient Windows ``PermissionError`` locks."""
+    for attempt in range(attempts):
+        try:
+            os.replace(src, dest)
+            _chmod_artifact_file(dest)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.05 * (attempt + 1))
+
+
 def write_gzip_json_atomic(path: str, obj: Any, *, sort_keys: bool) -> None:
     """Serialize ``obj`` to compact UTF-8 JSON, gzip it, and replace. ``path`` atomically."""
     raw = json.dumps(obj, ensure_ascii=False, separators=JSON_COMPACT_SEPARATORS, sort_keys=sort_keys).encode("utf-8")
@@ -134,15 +147,7 @@ def write_gzip_json_atomic(path: str, obj: Any, *, sort_keys: bool) -> None:
         try:
             with os.fdopen(fd, "wb") as tmp:
                 tmp.write(compressed)
-            for attempt in range(5):
-                try:
-                    os.replace(tmp_path, abs_path)
-                    _chmod_artifact_file(abs_path)
-                    break
-                except PermissionError:
-                    if attempt == 4:
-                        raise
-                    time.sleep(0.05 * (attempt + 1))
+            replace_path_atomic(tmp_path, abs_path)
         except BaseException:
             try:
                 os.unlink(tmp_path)
@@ -160,15 +165,7 @@ def write_text_atomic(path: str | os.PathLike[str], text: str, *, suffix: str = 
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as tmp:
             tmp.write(text)
-        for attempt in range(5):
-            try:
-                os.replace(tmp_path, abs_path)
-                _chmod_artifact_file(abs_path)
-                return
-            except PermissionError:
-                if attempt == 4:
-                    raise
-                time.sleep(0.05 * (attempt + 1))
+        replace_path_atomic(tmp_path, abs_path)
     finally:
         if os.path.isfile(tmp_path):
             try:

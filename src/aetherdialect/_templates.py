@@ -122,6 +122,7 @@ from ._utils_artifacts import (
     read_artifact_manifest,
     read_gzip_json,
     refresh_migration_auxiliary_artifacts,
+    replace_path_atomic,
     sanitize_name_segment,
     write_artifact_manifest,
     write_gzip_json_atomic,
@@ -3576,7 +3577,7 @@ class TemplateStoreLifecycleOps:
             header_staging = os.path.join(staging_dir, TEMPLATE_STORE_HEADER_FILENAME)
             write_gzip_json_atomic(header_staging, header_doc, sort_keys=True)
             header_path = os.path.join(store_dir, TEMPLATE_STORE_HEADER_FILENAME)
-            os.replace(header_staging, header_path)
+            replace_path_atomic(header_staging, header_path)
             for staging_path, live_path, delete_live in staged_commits:
                 if delete_live:
                     if os.path.isfile(live_path):
@@ -3585,7 +3586,7 @@ class TemplateStoreLifecycleOps:
                         except OSError:
                             pass
                     continue
-                os.replace(staging_path, live_path)
+                replace_path_atomic(staging_path, live_path)
             os.makedirs(store._feedback_dir(), exist_ok=True)
             for fb_staging_path, fb_live_path, delete_live in fb_staged_commits:
                 if delete_live:
@@ -3595,7 +3596,7 @@ class TemplateStoreLifecycleOps:
                         except OSError:
                             pass
                     continue
-                os.replace(fb_staging_path, fb_live_path)
+                replace_path_atomic(fb_staging_path, fb_live_path)
             store._dirty_partitions.clear()
             store._dirty_feedback_partitions.clear()
         finally:
