@@ -1,13 +1,17 @@
-"""SessionStep.refusal_diagnostic_code aligns with documented refusal field."""
+"""SessionStep.error carries structured refusal detail on terminal failures."""
 
 from __future__ import annotations
 
+from dataclasses import fields
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from aetherdialect import SessionStep
 from aetherdialect._constants import DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_UNAVAILABLE
-from aetherdialect._main_execution import MainExecutionOps, PipelineSession
+from aetherdialect._contracts_core import SessionError, SessionOutcome
+from aetherdialect._main_execution import MainExecutionOps
+from aetherdialect._main_session import PipelineSession
 
 
 def _session_owner() -> MagicMock:
@@ -25,7 +29,18 @@ def _session_owner() -> MagicMock:
 
 
 @pytest.mark.fast
-def test_validation_failed_sets_refusal_diagnostic_code() -> None:
+def test_session_step_exposes_error_without_refusal_fields() -> None:
+    names = {f.name for f in fields(SessionStep)}
+    assert "error" in names
+    assert "refusal_diagnostic_code" not in names
+    assert "refusal_code" not in names
+    assert "status" not in names
+    step = SessionStep(done=True, prompt=None, kind="result")
+    assert step.error is None
+
+
+@pytest.mark.fast
+def test_validation_failed_sets_session_error_detail_code() -> None:
     session = PipelineSession(_session_owner())
     session._turn_question = "join orders to products"
     session._last_turn_outcome = {
@@ -51,11 +66,27 @@ def test_validation_failed_sets_refusal_diagnostic_code() -> None:
     with patch.object(session, "_emit_turn_llm_usage", return_value=()):
         step = session._completed_step()
 
-    assert step.status == "validation_failed"
-    assert step.refusal_diagnostic_code == DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_UNAVAILABLE
-    assert step.refusal_code == DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_UNAVAILABLE
+    assert step.error is not None
+    assert step.error.code == SessionOutcome.VALIDATION_FAILED
+    assert step.error.detail_code == DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_UNAVAILABLE
 
     payload = MainExecutionOps.serialize_session_step(step)
     restored = MainExecutionOps.deserialize_session_step(payload)
-    assert restored.refusal_diagnostic_code == DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_UNAVAILABLE
-    assert restored.refusal_code == DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_UNAVAILABLE
+    assert restored.error is not None
+    assert restored.error.detail_code == DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_UNAVAILABLE
+    assert restored.error.code == SessionOutcome.VALIDATION_FAILED
+
+
+@pytest.mark.fast
+def test_session_error_roundtrip() -> None:
+    step = SessionStep(
+        done=True,
+        prompt=None,
+        kind="error",
+        error=SessionError(
+            code=SessionOutcome.FORBIDDEN,
+            detail_code=DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_UNAVAILABLE,
+        ),
+    )
+    restored = MainExecutionOps.deserialize_session_step(MainExecutionOps.serialize_session_step(step))
+    assert restored.error == step.error

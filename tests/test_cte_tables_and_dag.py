@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from aetherdialect._contracts_base import CteIntent, LogicalIntent
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
+from aetherdialect._contracts_schema import ColumnMetadata, CteIntent, LogicalIntent, SchemaGraph, TableMetadata
 
 
 def _graph_with_tbl_a() -> SchemaGraph:

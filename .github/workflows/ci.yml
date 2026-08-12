@@ -52,7 +52,7 @@ jobs:
       - run: pip install ".[dev]"
       - name: pytest
         run: >
-          pytest tests/ -m fast -q --tb=short
+          pytest tests/ -q --tb=short
           --cov=src/aetherdialect
           --cov-report=term-missing:skip-covered
           --cov-report=xml
@@ -71,4 +71,4 @@ jobs:
       - name: Import smoke
         run: python -c "import aetherdialect; print(aetherdialect.__version__)"
       - name: pytest
-        run: pytest tests/ -m fast -q --tb=short
+        run: pytest tests/ -q --tb=short

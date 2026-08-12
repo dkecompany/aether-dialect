@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from aetherdialect._contracts_base import ConfigError
-from aetherdialect._federation import raise_if_member_notes_name_federation_sources
+from aetherdialect._federation_manifest import raise_if_member_notes_name_federation_sources
 
 
 @pytest.mark.fast

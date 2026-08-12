@@ -11,9 +11,12 @@ import pytest
 from aetherdialect._constants import AUDIT_EVENT_FEDERATION_SEMIJOIN_KEY_TRANSFER
 from aetherdialect._contracts_base import NormalizedExpr
 from aetherdialect._contracts_core import FederationExecutionContext, RuntimeIntent, SelectCol, SourceStep
-from aetherdialect._core_utils import pop_federation_execution_context, push_federation_execution_context
-from aetherdialect._federation import member_stage_for_source, plan_federated_intent
-from aetherdialect._pipeline import _execute_federation_source_step
+from aetherdialect._federation_plan import (
+    member_stage_for_source,
+    plan_federated_intent,
+)
+from aetherdialect._pipeline_execute import _execute_federation_source_step
+from aetherdialect._utils import pop_federation_execution_context, push_federation_execution_context
 from tests.test_federation_combine_pushdown import _left_join_manifest, _left_join_schema
 
 
@@ -70,22 +73,18 @@ def test_semijoin_key_transfer_emits_audit_event(monkeypatch: pytest.MonkeyPatch
     fed_ctx = FederationExecutionContext(plan_id="plan_audit", audit_emit=_audit_emit)
     token = push_federation_execution_context(fed_ctx)
     monkeypatch.setattr(
-        "aetherdialect._pipeline.execute_guarded_sql",
+        "aetherdialect._pipeline_execute.execute_guarded_sql",
         lambda *a, **k: [(10,)],
     )
     monkeypatch.setattr(
-        "aetherdialect._pipeline.generate_and_validate_sql",
+        "aetherdialect._pipeline_execute.generate_and_validate_sql",
         lambda *a, **k: type("Out", (), {"success": True, "sql": "SELECT a_id FROM tb WHERE a_id IN (10,20,30)"})(),
     )
     monkeypatch.setattr(
-        "aetherdialect._pipeline.build_result_dataframe",
+        "aetherdialect._pipeline_execute.build_result_dataframe",
         lambda *a, **k: pd.DataFrame({"a_id": [10]}),
     )
-    monkeypatch.setattr(
-        "aetherdialect._validation_execute.validate_sql",
-        lambda *a, **k: (True, None, None, None),
-    )
-    monkeypatch.setattr("aetherdialect._pipeline.validate_federated_sub_intent", lambda *_a, **_k: None)
+    monkeypatch.setattr("aetherdialect._pipeline_execute.validate_federated_sub_intent", lambda *_a, **_k: None)
     mock_dialect = MagicMock()
     mock_dialect.finalize_render.return_value = "SELECT a_id FROM tb"
     try:

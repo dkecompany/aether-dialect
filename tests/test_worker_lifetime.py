@@ -7,13 +7,13 @@ import threading
 import pytest
 
 from aetherdialect._contracts_base import FederationCapExceededError
-from aetherdialect._core_utils import clear_connection_poison, is_connection_poisoned
+from aetherdialect._utils_artifacts import clear_connection_poison, is_connection_poisoned
 
 
 @pytest.mark.fast
 def test_timed_out_worker_connection_not_reused() -> None:
     """A stuck worker poisons its connection so the pool must not reuse it."""
-    from aetherdialect._federation import _execute_coordinator_sql_with_timeout
+    from aetherdialect._federation_execute import _execute_coordinator_sql_with_timeout
 
     hang = threading.Event()
     release = threading.Event()

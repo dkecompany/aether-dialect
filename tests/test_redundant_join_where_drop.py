@@ -12,12 +12,12 @@ from aetherdialect._contracts_base import (
 )
 from aetherdialect._contracts_core import RuntimeIntent
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import (
+from aetherdialect._intent_normalize import drop_redundant_resolved_join_where_predicates
+from aetherdialect._utils import (
     drain_diagnostic_collector,
     reset_diagnostic_collector,
     set_diagnostic_collector,
 )
-from aetherdialect._intent_repair import drop_redundant_resolved_join_where_predicates
 from tests.join_test_helpers import catalog_edge_kinds_for_signatures
 from tests.test_join_kind_preservation import _nullable_child_schema, _parent_child_schema
 

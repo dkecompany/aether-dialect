@@ -1,70 +1,76 @@
 # API reference
 
-Lookup for the `aetherdialect` package: exported types and signatures, TOML flattening keys, database connection keys, JSON file schemas, diagnostic codes, and exceptions. Requires Python 3.11 or newer. Embedding flow and suspend `kind` values: [Integrator guide](INTEGRATOR_GUIDE.md). Operator semantics: [User guide](USER_GUIDE.md). End-to-end setup: [Getting started](GETTING_STARTED.md). This file does not narrate deployment patterns.
+Lookup for the `aetherdialect` package: exported types, constructor parameters, method contracts, document shapes, and exceptions. Requires Python 3.11 or newer. Embedding flow: [Integrator guide](INTEGRATOR_GUIDE.md). Operator semantics: [User guide](USER_GUIDE.md). Diagnostic and refusal catalogues: [Troubleshooting](TROUBLESHOOTING.md).
 
-**Reading order:** [README](../README.md) -> [Getting started](GETTING_STARTED.md) -> [User guide](USER_GUIDE.md) -> [Integrator guide](INTEGRATOR_GUIDE.md) -> [Sandbox guide](SANDBOX.md) -> this document -> [How it works](HOW_IT_WORKS.md) -> [Security](SECURITY.md) -> [Support matrix](SUPPORT_MATRIX.md).
+**Reading order:** [README](../README.md) → [Getting started](GETTING_STARTED.md) → [User guide](USER_GUIDE.md) → [Integrator guide](INTEGRATOR_GUIDE.md) → [Sandbox guide](SANDBOX.md) → this document → [Troubleshooting](TROUBLESHOOTING.md) → [How it works](HOW_IT_WORKS.md) → [Security](SECURITY.md) → [Support matrix](SUPPORT_MATRIX.md).
 
 ## Sections
 
 | Section | Contents |
 | --- | --- |
 | [Exported symbols](#exported-symbols) | Package `__all__` surface |
+| [Configuration](#configuration) | Merge order, TOML flattening, limits |
 | [EngineContext](#enginecontext) | Single-engine scope fields |
 | [AetherEngine](#aetherengine) | Single-engine constructor and methods |
 | [FederationContext](#federationcontext) | Composite scope fields |
 | [AetherFederation](#aetherfederation) | Composite constructor and methods |
-| [Shared lifecycle](#shared-lifecycle) | `refresh` / `close` / `RefreshReport` |
+| [Shared lifecycle](#shared-lifecycle) | `refresh`, `close`, `RefreshReport` |
 | [SpaceContext](#spacecontext) | AetherSpace allow/deny fields |
 | [AetherSpace](#aetherspace) | Read-only space descriptor |
-| [SessionStep](#sessionstep) | Turn return type fields |
-| [Configuration](#configuration) | Merge order, TOML flattening, connection keys |
-| [PipelineSession methods](#pipelinesession-methods) | Sync session API |
-| [AsyncPipelineSession methods](#asyncpipelinesession-methods) | Async session API |
-| [Package helpers](#package-helpers) | Top-level constants |
-| [Schema overrides JSON (`schema_overrides.json`)](#schema-overrides-json-schema_overridesjson) | Analyst override editor shape |
-| [Federation and migration JSON](#federation-and-migration-json) | Manifest, mappings, migration maps |
-| [Observability](#observability) | Audit, diagnostics, LLM cost, code catalogs |
-| [Offline sandbox](#offline-sandbox) | Sandbox handle surface |
+| [Sessions](#sessions) | `PipelineSession`, `SessionStep`, outcomes |
+| [Structure and knowledge documents](#structure-and-knowledge-documents) | Dict exchange formats |
+| [Tabular upload](#tabular-upload) | `inspect_tabular_upload`, ingest |
+| [Federation documents](#federation-documents) | Declaration and migration maps |
+| [Observability](#observability) | Audit, phase, diagnostic callbacks |
+| [Sandbox](#sandbox) | Offline sandbox entry point |
 | [Exceptions](#exceptions) | Raised error types |
 
 ---
 
 ## Exported symbols
 
-Import from `aetherdialect`. Authoritative list: `aetherdialect.__all__` (aligned with `_PUBLIC_API` in `aetherdialect.py`).
+Import from `aetherdialect`. Authoritative list: `aetherdialect.__all__`.
 
 | Symbol | Kind |
 | --- | --- |
-| `AetherEngine` | Facade |
-| `AetherFederation` | Facade |
-| `AetherSpace` | Descriptor |
-| `EngineContext` | Dataclass |
-| `EngineLimits` | Dataclass |
-| `FederationLimits` | Dataclass |
-| `FederationContext` | Dataclass |
-| `SpaceContext` | Dataclass |
-| `PipelineSession` | Session |
-| `AsyncPipelineSession` | Session |
-| `SessionStep` | Dataclass |
-| `AuditEvent` | Dataclass |
-| `Diagnostic` | Dataclass |
-| `DataQualityReport` | Dataclass |
-| `ConfigSnapshot` | Dataclass |
-| `SchemaStatsSnapshot` | Dataclass |
-| `SeedWarmupSummarySnapshot` | Dataclass |
-| `QSimSummarySnapshot` | Dataclass |
-| `MigrationPreview` | Dataclass |
-| `ConfigError` | Exception |
-| `AetherError` | Exception |
 | `AccessError` | Exception |
 | `AggregateJoinFanOutError` | Exception |
+| `AetherEngine` | Facade |
+| `AetherError` | Exception |
+| `AetherFederation` | Facade |
+| `AetherSpace` | Dataclass |
 | `AmbiguousDateLiteralError` | Exception |
 | `ArtifactLockTimeoutError` | Exception |
+| `AsyncPipelineSession` | Facade |
+| `AuditEvent` | Dataclass |
+| `DomainKnowledgeEntry` | Dataclass |
 | `ClauseWidenedRowsetError` | Exception |
 | `ComparisonJoinScopeExceededError` | Exception |
+| `ConfigError` | Exception |
+| `ConfigSnapshot` | Dataclass |
 | `DatabaseConnectionError` | Exception |
 | `DatabaseExecutionError` | Exception |
-| `DatabasePingFailed` | Exception |
+| `DatabasePingFailed` | Type |
+| `DataQualityReport` | Dataclass |
+| `Diagnostic` | Dataclass |
+| `EngineContext` | Dataclass |
+| `EngineLimits` | Dataclass |
+| `FederationCapExceededError` | Exception |
+| `FederationConfigError` | Exception |
+| `FederationContext` | Dataclass |
+| `FederationDeclarationError` | Exception |
+| `FederationIneligibleError` | Exception |
+| `FederationInvariantError` | Exception |
+| `FederationJoinFanOutError` | Exception |
+| `FederationMalformedMemberAnswerError` | Exception |
+| `FederationMappingsAppliedSidecarError` | Exception |
+| `FederationMemberExecutionError` | Exception |
+| `FederationMemberProbeError` | Exception |
+| `FederationMemberUnprofilableError` | Exception |
+| `FederationPartialFailureError` | Exception |
+| `FederationRuntimeError` | Exception |
+| `FederationTurnCancelledError` | Exception |
+| `FederationLimits` | Dataclass |
 | `JoinCandidateCapExceededError` | Exception |
 | `JoinColumnCountMismatchError` | Exception |
 | `JoinInjectionAlignmentError` | Exception |
@@ -72,394 +78,76 @@ Import from `aetherdialect`. Authoritative list: `aetherdialect.__all__` (aligne
 | `JoinPathKeyTypeError` | Exception |
 | `JoinPathTieCapExceededError` | Exception |
 | `JoinProbeEdgeKindMismatchError` | Exception |
-| `LlmJsonExhausted` | Exception |
-| `LlmTransientFailure` | Exception |
+| `LlmJsonExhausted` | Type |
+| `LlmTransientFailure` | Type |
 | `MigrationPendingError` | Exception |
+| `MigrationPreview` | Dataclass |
 | `MockFixtureMissingError` | Exception |
 | `NoJoinPathError` | Exception |
 | `NullInNegatedListError` | Exception |
 | `OwnerOnlyOperationError` | Exception |
+| `PersistedFederationInspection` | Dataclass |
+| `PhaseProgressEvent` | Dataclass |
+| `PipelineSession` | Facade |
 | `PipelineSuspended` | Exception |
 | `ProbeCtePlacementError` | Exception |
-| `RegistryRenderError` | Exception |
+| `QSimSummarySnapshot` | Type |
+| `RefinementRetry` | Exception |
 | `ResultCapExceededError` | Exception |
 | `RetryableDatabaseExecutionError` | Exception |
 | `RetryableError` | Exception |
 | `RetryableFederationPartialFailureError` | Exception |
+| `RegistryRenderError` | Exception |
+| `Sandbox` | Facade |
 | `SchemaAccessError` | Exception |
 | `SchemaInvariantError` | Exception |
+| `SchemaStatsSnapshot` | Type |
+| `SeedWarmupSummarySnapshot` | Type |
 | `SessionActiveError` | Exception |
+| `SessionError` | Dataclass |
+| `SessionOutcome` | Enum |
+| `SessionStep` | Dataclass |
 | `SessionTurnCancelledError` | Exception |
+| `SpaceContext` | Dataclass |
 | `StatementTimeoutError` | Exception |
 | `SubdayDateWindowOnDateColumnError` | Exception |
 | `SuspendedSessionExpiredError` | Exception |
-| `FederationConfigError` | Exception |
-| `FederationDeclarationError` | Exception |
-| `FederationIneligibleError` | Exception |
-| `FederationInvariantError` | Exception |
-| `FederationPartialFailureError` | Exception |
-| `FederationRuntimeError` | Exception |
-| `FederationMemberExecutionError` | Exception |
-| `FederationCapExceededError` | Exception |
-| `FederationJoinFanOutError` | Exception |
-| `FederationMalformedMemberAnswerError` | Exception |
-| `FederationMappingsAppliedSidecarError` | Exception |
-| `FederationMemberProbeError` | Exception |
-| `FederationMemberUnprofilableError` | Exception |
-| `FederationTurnCancelledError` | Exception |
-| `PersistedFederationInspection` | Dataclass |
-| `BusinessKnowledgeEntry` | Dataclass |
-| `PhaseProgressEvent` | Dataclass |
-| `TablePreviewResult` | Dataclass |
-| `PlanPreviewResult` | Dataclass |
 | `UploadIngestResult` | Dataclass |
-| `Sandbox` | Authoring environment |
 | `inspect_tabular_upload` | Function |
-| `__version__` | `str` |
-
-## EngineContext
-
-Frozen scope input to `AetherEngine`. **Setup:** [Getting started - EngineContext](GETTING_STARTED.md#step-4-wire-enginecontext-and-construct-the-engine). **Operator semantics:** [User guide - EngineContext](USER_GUIDE.md#enginecontext). **Build pipeline:** [How it works - Schema compilation](HOW_IT_WORKS.md#2-schema-compilation).
-
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `include` | `"tables" \| "views"` | Reflect base tables or views (default `"tables"`). `"both"` is rejected - run separate passes when both kinds are needed. |
-| `allow_objects` / `deny_objects` | `frozenset[str]` | Table allow/deny lists. |
-| `allow_columns` / `deny_columns` | `frozenset[str]` | Qualified `table.column` (or `*.column`) allow/deny lists. |
-| `notes_file` | `str \| None` | Path to domain notes. Mutually exclusive with `notes`. |
-| `notes` | `str \| None` | Inline domain notes text. Mutually exclusive with `notes_file`. |
-| `sql_file` | `str \| None` | Path to guidance DDL. |
-
-`EngineContext` is registered by constructing `AetherEngine(EngineContext(...))` for master scope, or by name via saved scope presets. The implicit master scope is selected by constructing with an `EngineContext` object. Saved scope presets are registered on a master-bound owner and later selected by passing that preset name string to `AetherEngine(...)`.
-
-`notes`, `notes_file`, and `sql_file` are set only on `EngineContext` at construction. They are **not** environment variables and are **not** flattened from `config_file` TOML. Set at most one of `notes` and `notes_file`.
-
-`deny_columns` entries are absent from the built schema graph while the deny remains effective - unlike **restricted** or **hidden** sensitivity, which keep the column in the graph ([User guide - Sensitivity classification](USER_GUIDE.md#sensitivity-classification)).
-
-## AetherEngine
-
-Public facade for one database connection. The engine **name** is the connection identity (artifacts slug).
-
-### Constructor
-
-```python
-AetherEngine(
-    engine_context: EngineContext | str | None = None,
-    *,
-    artifacts_dir: str | None = None,
-    config_file: str | os.PathLike[str] | None = None,
-    connection: str | None = None,
-    execution_engine: Any = None,
-    native_connection: Any = None,
-    source_selections: Mapping[str, Mapping[str, Any]] | None = None,
-    audit_sink: Callable[[AuditEvent], None] | None = None,
-    construction_phase_callback: Callable[[PhaseProgressEvent], None] | None = None,
-    ask_phase_callback: Callable[[PhaseProgressEvent], None] | None = None,
-    role: SchemaRole = "owner",
-) -> None
-```
-
-| Parameter | Type | Meaning |
-| --- | --- | --- |
-| `engine_context` | `EngineContext \| str \| None` | Pass an `EngineContext` to define master scope (owner). Pass a `str` name to bind a saved scope preset (consumers must use a preset name only). When omitted, load persisted master from artifacts or raise `ConfigError`. |
-| `artifacts_dir` | `str \| None` | Optional root; engine files under `<root>/aetherdialect/<slug>/` |
-| `config_file` | `str \| os.PathLike[str] \| None` | TOML config path; when omitted, settings come from `os.environ` only |
-| `connection` | `str \| None` | Named TOML connection sub-block when multiple databases share one engine type |
-| `execution_engine` | `Any` | Optional SQLAlchemy engine (caller-owned pool or read replica) |
-| `native_connection` | `Any` | Optional native DuckDB or SQLite connection for embedded in-memory DBs |
-| `source_selections` | `Mapping[str, Mapping[str, Any]] \| None` | CSV file engine only: per-filename interpretation (`header_row`, `table_range`, `append_regions`, etc.) |
-| `audit_sink` | `Callable[[AuditEvent], None] \| None` | Optional lifecycle audit callback |
-| `construction_phase_callback` | `Callable[[PhaseProgressEvent], None] \| None` | Optional callback during engine construction (profiling, graph build, template load). |
-| `ask_phase_callback` | `Callable[[PhaseProgressEvent], None] \| None` | Optional callback during `session.ask` / `step` turns on this engine. |
-| `role` | `"owner" \| "consumer"` | `owner` may mutate shared artifacts; `consumer` pins owner snapshot id |
-
-Federation is configured through `AetherFederation`, not `AetherEngine`. Raises `ConfigError`, `DatabaseConnectionError`, `MigrationPendingError`, or other failures under [Exceptions](#exceptions).
-
-**Concurrency.** One `AetherEngine` or `AetherFederation` instance supports concurrent reader-mode `PipelineSession` turns. Mutating facade methods — those that write to the template store or artifacts directory — take `_pipeline_writer_lock` and run serially. The guarded method names are listed in `MUTATING_ENGINE_METHODS` and `MUTATING_FEDERATION_METHODS` on `aetherdialect.aetherdialect`.
-
-**Fork safety.** Database connections are not fork-safe. Construct a new engine in each child process after `fork()`. A fork child that reuses a parent-owned dialect or connection handle raises `RuntimeError`.
-
-### Methods
-
-Methods marked **(master context only)** require the instance to be bound to the master engine context (typically `role="owner"` with a full `EngineContext`). Lifecycle methods `refresh` / `close` are documented under [Shared lifecycle](#shared-lifecycle).
-
-| Method | Returns | Description |
-| --- | --- | --- |
-| `apply_migration_map(path="schema_migration_map.json", *, config_file=None, engine_context, artifacts_dir, execution_engine=None, native_connection=None, role="owner")` classmethod | `AetherEngine` | Copies the editor map into `schema_migration_map.json`, then constructs `AetherEngine`. Pair with [User guide - Migration](USER_GUIDE.md#migration). |
-| `preview_migration_map()` | `MigrationPreview` | Read-only preview of schema migration impact against stored artifacts. |
-| `data_quality_report` (property) | `DataQualityReport \| None` | Upload validation report from successful file-engine construction. |
-| `inspect_tabular_upload(path)` (module) | `DataQualityReport` | Inspect one CSV/Excel upload without constructing an engine. Raises `ConfigError` on fatal file failures. |
-| `aetherspace(name, space_context=None, *, notes_file=None, notes=None)` **(master context only)** | `AetherSpace` | With `space_context`: owner define/overwrite snapshot. Notes via `SpaceContext.notes` / `SpaceContext.notes_file`, or the optional `notes` / `notes_file` kwargs (at most one). Without `space_context`: existence check. Cannot redefine `master`. |
-| `export_aetherspace(name)` **(master context only)** | `Path` | JSON export of one named space (or implicit `master`) for review or apply. |
-| `apply_aetherspace(name, *, source=None)` **(master context only)** | `AetherSpace` | Owner: persist one named space from the default export file or an explicit `source` path. Version mismatch is fatal with no migration. |
-| `delete_aetherspace(name)` **(master context only)** | `bool` | Owner: remove one persisted named space snapshot (`master` cannot be deleted). |
-| `list_aetherspaces()` **(master context only)** | `tuple[str, ...]` | Saved space names plus implicit `master`. |
-| `export_context(name)` **(master context only)** | `Path` | Read-only JSON dump of one saved scope preset (or implicit `master`). |
-| `list_contexts()` **(master context only)** | `tuple[str, ...]` | Saved scope-preset names plus implicit `master`. |
-| `list_templates(*, space="master")` | `tuple[StoredTemplateSummary, ...]` | Caller-visible summaries: `StoredTemplateSummary(id, approval_state)` only. |
-| `fetch_template(template_id, *, space="master")` | `StoredTemplateDetail` | Detail for one template by `id`, including parameterized `sql` and p-param bindings. |
-| `execute_template(template_id, params=None, *, space="master", as_dataframe=False)` | rows or `DataFrame` | Re-run a stored template by `id` with a p-param dict (no re-ask). Raises `ConfigError` when `approval_state` is `pending`. Agent re-runs use `SessionStep.template_id`. |
-| `export_knowledge()` | `dict` | Wrapper of engine-level plus per-space business knowledge (no table inventory). Keys: `format_version` (`"0.2.1"`), `engine` (`business_knowledge_version`, `business_knowledge` as `[{key, kind, text}, …]`), `spaces` (map of space name → space-only BK fields). |
-| `export_space_knowledge(space=None)` | `dict` | Per-space (or master) business knowledge only. Keys: `format_version` (`"0.2.1"`), `scope`, `business_knowledge_version`, `business_knowledge` (`[{key, kind, text}, …]`). |
-| `export_metadata(space=None)` | `dict` | Deterministic inventory: tables/columns/counts (and roles/descriptions). Keys: `format_version` (`"0.2.1"`), `table_count`, `tables` (`[{name, description, columns: [{name, data_type, role, description}, …]}, …]`). No natural-language prose beyond stored descriptions. |
-| `export_overrides()` | `Path` | Writes `./schema_overrides.json` atomically from the live graph. |
-| `apply_overrides()` | `None` | Validates `./schema_overrides.json`, mutates graph, persists cache and archives editor files. |
-| `show_config()` | `ConfigSnapshot` | Redacted snapshot of engine, schema scope, database, and LLM settings. |
-| `session(*, mode="writer", space="master")` | `PipelineSession` | Context manager; exit cancels in-flight work then resets turn state. |
-| `asession(*, mode="writer", space="master")` | `AsyncPipelineSession` | Same as `session` on worker threads. |
-| `run_interactive(*, space="master")` | `None` | Prints to stdout; one question per call. Prefer `session` for services. |
-| `run_seed_warmup(seed_filepath, interactive_gold=True, *, abort_on_gold_failure=False, max_kept_intents=2000)` | `None` | Full seed warmup; `max_kept_intents=None` keeps every intent that passes quality/dedup. |
-| `run_seed_warmup_from_history(sql_history_filepath, *, expand=False, max_kept_intents=2000)` | `None` | SQL-history warmup. |
-| `run_seed_warmup_from_query_log(lookback_days=730, max_queries=5000, *, expand=False, max_kept_intents=2000, min_runs=1, user_filter=None)` | `None` | Warehouse query-log warmup. |
-| `get_seed_warmup_summary()` | `SeedWarmupSummarySnapshot` | Newest seed-warmup summary file if present. |
-| `get_qsim_summary(start, end)` | `QSimSummarySnapshot` | QSim summary lines for inclusive version range; reads per-run files under `qsim/summary_<run_id>.json` via `qsim/index.jsonl`. |
-| `get_questions_only(version)` | `None` | Prints numbered questions and writes `qsim_v{version}_questions.txt`. |
-| `run_qsim(num_intents=20, num_questions=100, seed=None)` | `None` | QSim generator; writes `qsim/summary_<version>.json` and appends one line to `qsim/index.jsonl`. |
-| `clear_persisted_overrides()` | `bool` | Removes overrides sidecar and schema cache when present; rebuilds. |
-| `clear_template_store()` | `bool` | Removes template tree; rebuilds. |
-| `clear_simulation_caches()` | `int` | Deletes QSim and seed-warmup artifacts; returns removed file count. |
-| `clear_all_learning(*, keep_overrides=True)` | `None` | Clears templates, simulation caches, and optionally overrides. |
-| `offline_sandbox(...)` classmethod | `SandboxHandle` | Offline practice handle ([Offline sandbox](#offline-sandbox)). |
-| `sandbox_questions()` classmethod | `list` | Curated offline practice questions. |
-| `sandbox_paraphrase_pairs()` classmethod | `list` | Canonical->paraphrase pairs from the bundled catalog. |
-| `sandbox_validation_failure_demo()` classmethod | object | Questions that should end in terminal validation errors. |
-| `sandbox_feedback_demo()` classmethod | object | Anchor question + allowed rejection text. |
-
-## FederationContext
-
-Frozen composite scope for `AetherFederation(..., context=...)`. **Operator semantics:** [User guide - FederationContext](USER_GUIDE.md#federationcontext).
-
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `include` | `"tables" \| "views"` | Include mode (default `"tables"`). `"both"` is rejected. |
-| `allow_objects` / `deny_objects` | `frozenset[str]` | Composite table allow/deny lists. |
-| `allow_columns` / `deny_columns` | `frozenset[str]` | Qualified `table.column`, `source.table.column`, or `*.column`. |
-| `notes_file` | `str \| None` | Composite domain notes (master federation context). Mutually exclusive with `notes`. |
-| `notes` | `str \| None` | Inline composite domain notes. Mutually exclusive with `notes_file`. |
-
-## AetherFederation
-
-Composite facade over named member `AetherEngine` instances. The federation **name** must match `federation_id` in the manifest; artifact tree is `fed_<federation_id>/`.
-
-### Constructor
-
-```python
-AetherFederation(
-    name: str,
-    *,
-    members: Mapping[str, AetherEngine],
-    declaration_file: str,
-    context: FederationContext | None = None,
-    artifacts_dir: str | None = None,
-    role: SchemaRole = "owner",
-    audit_sink: Callable[[AuditEvent], None] | None = None,
-    construction_phase_callback: Callable[[PhaseProgressEvent], None] | None = None,
-    ask_phase_callback: Callable[[PhaseProgressEvent], None] | None = None,
-) -> None
-```
-
-| Parameter | Type | Meaning |
-| --- | --- | --- |
-| `name` | `str` | Stable federation name; must match `federation_id` in the declaration JSON; artifact tree is `fed_<federation_id>/` |
-| `members` | `Mapping[str, AetherEngine]` | Member engines keyed by federation ``source_id`` (the name used in joins, logical tables/columns, aliases, and diagnostics) |
-| `declaration_file` | `str` | Required path to authored `federation_declaration.json` (joins, aliases, coordinator caps, optional logical mappings) |
-| `context` | `FederationContext \| None` | Optional composite scope |
-| `artifacts_dir` | `str \| None` | Root for member trees and the federation tree |
-| `role` | `"owner" \| "consumer"` | Owner may change declarations; consumer reads the composite |
-| `audit_sink` | `Callable[[AuditEvent], None] \| None` | Optional lifecycle audit callback |
-| `construction_phase_callback` | `Callable[[PhaseProgressEvent], None] \| None` | Optional callback during federation construction (member profiling, composite graph build). |
-| `ask_phase_callback` | `Callable[[PhaseProgressEvent], None] \| None` | Optional callback during `session.ask` / `step` turns on this federation. |
-
-Declaration format and annotated example: [Sandbox - Federation declaration format](SANDBOX.md#federation-declaration-format). Persisted sidecar shapes: [Federation and migration JSON](#federation-and-migration-json).
-
-The `members` argument is a **mapping from federation ``source_id`` to member engine**. Keys are the names you use in the declaration, in `add_engine` / `remove_engine`, and in `export_overrides(connection_name)`; they are not the TOML ``connection=`` sub-block on each engine. When an engine's federation handle (`_connection`) is set, it must equal its registration key. Values are fully constructed `AetherEngine` instances (each with its own database connection and member artifact tree under the shared `artifacts_dir` root).
-
-```python
-from aetherdialect import AetherEngine, AetherFederation, EngineContext
-
-storefront = AetherEngine(
-    EngineContext(notes_file="rental_shop_notes.txt"),
-    artifacts_dir="/data/artifacts",
-    config_file="aetherdialect.toml",
-    connection="storefront_pg",
-)
-catalog = AetherEngine(
-    EngineContext(notes_file="rental_shop_notes.txt"),
-    artifacts_dir="/data/artifacts",
-    config_file="aetherdialect.toml",
-    connection="catalog_mysql",
-)
-
-fed = AetherFederation(
-    "sandbox_rental_shop",
-    members={
-        "storefront": storefront,
-        "catalog": catalog,
-    },
-    declaration_file="/path/to/federation_declaration.json",
-    artifacts_dir="/data/artifacts",
-)
-```
-
-Raises `FederationConfigError`, `FederationDeclarationError`, `FederationInvariantError`, or `MigrationPendingError` on misconfiguration. Embedding narrative: [Integrator guide - Embedding a federation](INTEGRATOR_GUIDE.md#embedding-a-federation).
-
-### Methods
-
-Lifecycle methods `refresh` / `close` are documented under [Shared lifecycle](#shared-lifecycle).
-
-| Method | Returns | Description |
-| --- | --- | --- |
-| `add_engine(connection_name, engine)` | `None` | Owner: register member, recompose, persist. |
-| `remove_engine(connection_name)` | `None` | Owner: remove member, prune plan templates, recompose. |
-| `export_federation_declaration()` | `Path` | Owner: write authored `federation_declaration.json` to the working directory. |
-| `apply_federation_declaration()` | `None` | Owner: apply the full authored declaration from working-directory `federation_declaration.json` and recompose. |
-| `apply_migration_map(path="federation_migration_map.json")` | `None` | Owner: copy a federation migration map into the working directory and recompose. |
-| `aetherspace(name, space_context=None, *, notes_file=None, notes=None)` | `AetherSpace` | Define or check a space on the composite graph. Notes via `SpaceContext.notes` / `SpaceContext.notes_file`, or the optional `notes` / `notes_file` kwargs (at most one). |
-| `export_aetherspace(name)` | `Path` | JSON export of one named space (or implicit `master`) for review or apply. |
-| `apply_aetherspace(name, *, source=None)` | `AetherSpace` | Owner: persist one named space from the default export file or an explicit `source` path. Version mismatch is fatal with no migration. |
-| `delete_aetherspace(name)` | `bool` | Owner: remove one persisted named space snapshot (`master` cannot be deleted). |
-| `list_aetherspaces()` | `tuple[str, ...]` | Saved space names plus implicit `master`. |
-| `export_context(name)` | `Path` | Read-only JSON dump of one saved federation context preset (or implicit `master`). |
-| `list_contexts()` | `tuple[str, ...]` | Saved federation-context names plus implicit `master`. |
-| `session(*, mode="writer", space="master")` | `PipelineSession` | Same session contract as `AetherEngine`. |
-| `asession(*, mode="writer", space="master")` | `AsyncPipelineSession` | Async session. |
-| `list_templates(*, space="master")` | `tuple[StoredTemplateSummary, ...]` | Caller-visible summaries from the federation artifact template store: `StoredTemplateSummary(id, approval_state)` only. |
-| `fetch_template(template_id, *, space="master")` | `StoredTemplateDetail` | Detail by `id`, including parameterized SQL and p-param bindings. |
-| `execute_template(template_id, params=None, *, space="master", as_dataframe=False)` | rows or `DataFrame` | Re-run a federation-stored template by `id` with a p-param dict (agent bridge; same contract as `AetherEngine.execute_template`). |
-| `export_knowledge()` | `dict` | Same shape as `AetherEngine.export_knowledge` for federation-level plus per-space business knowledge. |
-| `export_space_knowledge(space=None)` | `dict` | Same shape as `AetherEngine.export_space_knowledge` for master or one named space on the composite. |
-| `export_metadata(space=None)` | `dict` | Same inventory shape as `AetherEngine.export_metadata`, plus federation `members` / `member_count` when members are present. |
-| `export_overrides(connection_name=None)` | `Path` | Composite override export when `connection_name` is omitted; otherwise member-scoped export for that `source_id`. |
-| `apply_overrides(connection_name=None)` | `None` | Composite override apply when `connection_name` is omitted; otherwise member-scoped apply then recompose. |
-| `run_interactive(*, space="master")` | `None` | Stdout interactive turn. |
-| `show_config()` | `ConfigSnapshot` | Redacted federation topology snapshot. |
-| `clear_persisted_overrides(connection_name)` | `bool` | Member-scoped clear, then recompose. |
-| `clear_template_store()` | `bool` | Clear composite, plan-record, and member templates. |
-| `clear_simulation_caches()` | `int` | Clear federation and member QSim / seed-warmup artifacts. |
-| `clear_all_learning(*, keep_overrides=True)` | `None` | Clear federation + member learning. |
-| `run_qsim(num_intents=20, num_questions=100, seed=None)` | `None` | QSim routed through federation decomposition checks. |
-| `run_seed_warmup(seed_filepath, interactive_gold=True, *, abort_on_gold_failure=False, max_kept_intents=2000)` | - | Raises `ConfigError` (`warmup is not supported on AetherFederation`). Run seed warmup on each member `AetherEngine`. |
-| `run_seed_warmup_from_history(sql_history_filepath, *, expand=False, max_kept_intents=2000)` | - | Raises `ConfigError` (`warmup is not supported on AetherFederation`). Run SQL-history warmup on each member `AetherEngine`. |
-| `run_seed_warmup_from_query_log(lookback_days=730, max_queries=5000, *, expand=False, max_kept_intents=2000, min_runs=1, user_filter=None)` | - | Raises `ConfigError` (`warmup is not supported on AetherFederation`). Run query-log warmup on each member `AetherEngine`. |
-
-## Shared lifecycle
-
-`refresh` and `close` are shared by `AetherEngine` and `AetherFederation`. Long-running hosts should call `refresh()` on a schedule to reconcile artifacts against schema drift, collect orphaned shards and migration checkpoints, and report growth — rather than reconstructing the facade on every drift event. Call `close()` when tearing down a long-lived service.
-
-| Method | Returns | Description |
-| --- | --- | --- |
-| `refresh(*, reflect=True)` | `RefreshReport` | Re-run post-connection artifact reconciliation. With `reflect=True` (default), probe the live database for drift, apply automatic migration policy, reconcile the template store, prune expired orphans, and emit growth diagnostics. With `reflect=False`, skip the live probe and perform artifact-side work only (checkpoint collection, reconcile, orphan pruning, growth reporting). Raises the same errors as construction for pending migrations. On `AetherFederation`, refreshes each member then recomposes and prunes federation plan templates. |
-| `close()` | `None` | Idempotent teardown. On `AetherEngine`: dispose the dialect-owned pool, remove the artifact lock file, and clear cached model clients. On `AetherFederation`: dispose federation-owned source runtimes and the coordinator dialect; call `close()` only on member engines the federation constructed itself, never on engines you passed in. |
-
-### RefreshReport
-
-Frozen outcome of `AetherEngine.refresh()` or `AetherFederation.refresh()`.
-
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `migration_tier` | `MigrationTier` | Classified migration severity applied during refresh |
-| `schema_changed` | `bool` | Whether the schema diff was non-empty |
-| `objects_added` | `tuple[str, ...]` | Tables added during refresh |
-| `objects_removed` | `tuple[str, ...]` | Tables removed during refresh |
-| `templates_invalidated` | `int` | Templates dropped by store reconciliation |
-| `orphans_removed` | `int` | Expired orphan directories removed |
-| `bytes_reclaimed` | `int` | Bytes reclaimed from orphan removal |
-| `diagnostics` | `tuple[Diagnostic, ...]` | Growth and checkpoint diagnostics emitted during refresh |
-
-## SpaceContext
-
-Frozen knowledge scope for [AetherSpace](#aetherspace) definitions. **Conceptual guide:** [User guide - AetherSpace](USER_GUIDE.md#aetherspace). Parallel to `EngineContext` and `FederationContext`: allow/deny lists plus optional notes.
-
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `tables` | `frozenset[str]` | Allowed table/view names (empty means no extra table filter beyond master). |
-| `columns` | `frozenset[str]` | Qualified `table.column` allow list for the space. |
-| `deny_objects` | `frozenset[str]` | Tables/views excluded from space knowledge. |
-| `deny_columns` | `frozenset[str]` | Qualified `table.column` deny list for the space. |
-| `notes_file` | `str \| None` | Optional path to domain notes. Mutually exclusive with `notes`. Content (text plus hash) is baked into the aetherspace snapshot; it does **not** enter a catalog-rebuild fingerprint. Defining a space does not rebuild engine artifacts. |
-| `notes` | `str \| None` | Inline domain notes. Mutually exclusive with `notes_file`. Baked into the snapshot like `notes_file`. |
-
-Every table/column must exist on the master graph at write time. There is no TOML block for spaces - snapshots persist under the engine or federation storage directory.
-
-## AetherSpace
-
-Read-only descriptor returned by `AetherEngine.aetherspace(name)` / `AetherFederation.aetherspace(name)` (existence check) or after a successful define/overwrite. The space **name** identifies this object. No `session()` method - select the space via `session(..., space=name)`.
-
-| Member / method | Type | Meaning |
-| --- | --- | --- |
-| `name` | `str` | Normalised space name |
-| `list_scope()` | `dict[str, tuple[str, ...]]` | Keys `"tables"` and `"columns"` with tuple values |
-| `notes` | `str \| None` | Optional merged notes text when `SpaceContext.notes` or `SpaceContext.notes_file` was set at define time |
-
-## SessionStep
-
-Return type of `PipelineSession.ask` / `step` and the async equivalents. Suspend `kind` values and the embedding loop: [Integrator guide - Session contract](INTEGRATOR_GUIDE.md#the-session-contract-suspend-and-terminal-steps).
-
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `done` | `bool` | `True` when the turn finished (success or terminal error). |
-| `prompt` | `str \| None` | Short line to show before collecting input. |
-| `kind` | `str` | Public stage id (`awaiting_intent_confirm`, `result`, `error`, `meta`, ...). |
-| `sql` | `str \| dict[str, str] \| None` | Dialect-specific **parameterized** SQL when present. Single-engine (and one-member federation) turns use `str`. Multi-member federation turns use `dict` mapping `source_id` → that member’s parameterized SQL (insertion order is member execution order). `None` when the step has no SQL (meta, error, pre-SQL suspends). Branch with `isinstance(step.sql, dict)`. |
-| `data` | `DataFrame \| None` | Preview or full result rows. |
-| `message` | `str \| None` | Optional multi-line body. |
-| `error` | `str \| None` | Terminal failure text when `done` and failed. |
-| `intent_summary` | object \| `None` | Compact intent headline when present. |
-| `diagnostics` | `tuple[Diagnostic, ...]` | Turn-level tracing rows, including structured refusal codes on terminal failures (see [Diagnostic code catalog](#diagnostic-code-catalog)). |
-| `llm_usage` | `LlmTurnUsageSummary \| None` | On terminal steps: request count, prompt/completion token totals, and provider-reported `cost_usd` when available. |
-| `status` | `str \| None` | Coarse failure category on terminal error steps (`permission_denied`, `restricted`, `validation_failed`, `cancelled`, ...). |
-| `refusal_code` | `str \| None` | Back-compat alias for the primary refusal code on terminal steps; when set, matches the refusal row in `diagnostics`. |
-| `retryable` | `bool` | On terminal failure steps, whether the caller may retry the same question (transient database or federation errors). |
-| `notices` | `tuple[SessionNotice, ...]` | Structured bookkeeping notices separate from `message` (for example `turn_saved`, `feedback_noted`). |
-| `data_truncated` | `bool` | `True` when `data` was trimmed to the configured row cap. |
-| `reply_shape` | `"yes_no" \| "free_text" \| None` | Input shape while suspended. |
-| `semantic_warnings` | `tuple[str, ...]` | Intent-confirmation warnings. |
-| `interpretation` | object \| `None` | Structured interpretation when present. |
-| `parameters` | `tuple[ParameterBinding, ...]` | P-param bindings (`^p[0-9]+$` only) whenever `sql` is not `None` and a matched/accepted template supplies slots; otherwise `()`. |
-| `template_id` | `str \| None` | Matched or newly accepted template `id` on SQL-bearing success / SQL confirm; `None` on meta, error, or no-template turns. Prefer this with `execute_template` for agent re-runs. |
-| `meta_payload` | `dict \| None` | Structured body for `kind="meta"` turns; `None` on analytical turns. Schema-catalog shape: `response_kind="schema_catalog"`, `headline`, `counts` (`tables`/`columns`/`members` as int or null; optional `columns_in_table` / `tables_in_member`), `tables`, `relationships`, `notes`. Pure-count answers may leave `tables`/`relationships` empty. Business-knowledge shape: `{"response_kind": "business_knowledge"}` (prose lives in `message`). |
-| `federated_bundle` | object \| `None` | Private-ish per-member execution artifact. Prefer `step.sql` (`str` or `dict`) for integrator-facing member SQL; keep the bundle only if you need row counts / timings. |
-| `federation_source_id` | `str \| None` | Member `source_id` on federation terminal errors that name a failing member. |
-| `federation_phase` | `str \| None` | Federation stage (`member` or `coordinator`) when a terminal error is federation-scoped. |
-| `federation_limit_key` | `str \| None` | Cap name (for example `row_cap`) when `FederationCapExceededError` surfaces on the step. |
-| `federation_succeeded` | `tuple[tuple[str, int, str], ...]` | On partial failure, tuples describing members that completed before the failing member (`source_id`, row count, phase). Empty on other errors. |
-
-### ParameterBinding
-
-One p-param slot projected on SQL-bearing `SessionStep`s (and on `fetch_template` detail).
-
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `handle` | `str` | Bind handle such as `p1` (public projection never includes `s*` structural handles). |
-| `current_value` | scalar \| list \| `None` | Bound value for this turn. |
-| `display_name` | `str` | Human label (never empty when `handle` is set; falls back to the handle). |
-| `column_expr` | `str` | Predicate/column expression from slot meta (for example `payment.payment_date`); empty when meta has no expr. |
-| `upper_handle` | `str` | Range upper handle or `""`. |
-| `unit_handle` | `str` | Unit handle or `""`. |
-
-Caller bridge for `execute_template`: `{b.handle: b.current_value for b in step.parameters}`.
-
-## PhaseProgressEvent
-
-Coarse phase transition during engine or federation construction, or during an ask turn. Delivered via `construction_phase_callback` and `ask_phase_callback` on `AetherEngine` / `AetherFederation` construction.
-
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `phase` | `str` | Phase label (for example a profiling stage name). |
-| `timestamp_iso` | `str` | UTC timestamp when emitted. |
-| `source` | `str \| None` | Federation member `source_id` when scoped to one member. |
-| `stage` | `int \| str \| None` | Optional sub-stage index or label. |
-| `turn_id` | `str \| None` | Correlation id for the active ask turn. |
+| `__version__` | str |
 
 ## Configuration
 
 ### Merge order
 
 1. Start from a string copy of `os.environ`.
-2. When **config_file** is omitted, that copy is the effective environment for `AetherEngine`.
-3. When **config_file** is provided, the parsed TOML is the single source of truth for every field listed in the flattening table that appears in the file: non-empty values replace `os.environ`, and fields present with empty values remove the corresponding key from the effective mapping so shell-inherited secrets cannot override an explicit empty assignment. Keys for sections or fields absent from the file keep their `os.environ` values.
+2. When **`connection=`** is a mapping, merge those keys into the effective environment for this instance only (values are never written to `os.environ`). Validate every key against the active engine's accepted connection key set; unknown keys raise `ConfigError`. The reserved `name` key sets federation member identity when present.
+3. When **`config_file`** is provided, parsed TOML is authoritative for every flattened key that appears in the file: non-empty values replace the effective mapping, and fields present with empty values remove the corresponding key so shell-inherited secrets cannot override an explicit empty assignment. Keys for sections or fields absent from the file keep their values from steps 1–2.
+4. When **`config_file`** is omitted and **`connection=`** is not a mapping, step 1 is the effective environment.
+5. Pass **`limits=`** on the constructor, or load `[limits]` / `[federation_limits]` via `EngineLimits.from_config_file` / `FederationLimits.from_config_file`. Limits are not flattened into the environment.
 
 The library never mutates `os.environ` during reads. When a TOML key shadows an environment value, one diagnostic per key is emitted with code `CONFIG_FILE_VALUE_APPLIED`.
+
+Runtime URL builders percent-encode user, password, and database name components when the library constructs SQLAlchemy URLs. Hand-built URL strings must encode special characters in credentials.
+
+### Artifact storage slug
+
+Engine artifacts live under `<artifacts_root>/aetherdialect/<connection_slug>/`. Federation artifacts live under `<artifacts_root>/aetherdialect/fed_<federation_id>/`. The slug derives from database location keys only (never credentials). Hosts serving multiple customers pass distinct `artifacts_dir` roots.
+
+| Engine | Slug key order |
+| --- | --- |
+| `postgresql` | `host`, `port`, `database`, `schema` |
+| `redshift` | `host`, `port`, `database`, `schema` |
+| `mysql` | `host`, `port`, `database`, `schema` |
+| `mariadb` | `host`, `port`, `database`, `schema` |
+| `sqlserver` | `host`, `port`, `database`, `schema` |
+| `oracle` | `host`, `port`, `service_name`, `sid`, `schema` |
+| `snowflake` | `account`, `database`, `schema` |
+| `bigquery` | `project`, `dataset` |
+| `databricks` | `host`, `catalog`, `schema` |
+| `duckdb` | `database`, `schema` |
+| `sqlite` | `database`, `schema` |
+| `csv` | `source`, `schema` |
 
 ### `config_file` TOML flattening
 
@@ -505,6 +193,18 @@ Every value is coerced with `str(...)`. Absent sections are skipped. Fields pres
 | `[sqlserver].tenant_id` | `SQLSERVER_TENANT_ID` | `MSSQL_TENANT_ID`, `AZURE_TENANT_ID` | - | yes when Azure AD password auth is used |
 | `[sqlserver].client_id` | `SQLSERVER_CLIENT_ID` | `MSSQL_CLIENT_ID`, `AZURE_CLIENT_ID` | - | yes when Azure AD service principal auth is used |
 | `[sqlserver].client_secret` | `SQLSERVER_CLIENT_SECRET` | `MSSQL_CLIENT_SECRET`, `AZURE_CLIENT_SECRET` | - | yes when Azure AD service principal auth is used |
+| `[oracle].host` | `ORACLE_HOST` | `ORACLE_SERVER` | `localhost` | no |
+| `[oracle].port` | `ORACLE_PORT` | - | `1521` | no |
+| `[oracle].user` | `ORACLE_USER` | `ORACLE_USERNAME` | - | yes when password auth is used |
+| `[oracle].password` | `ORACLE_PASSWORD` | `ORACLE_PWD` | - | yes when password auth is used |
+| `[oracle].service_name` | `ORACLE_SERVICE_NAME` | `ORACLE_SERVICE` | - | yes when `sid` is unset |
+| `[oracle].sid` | `ORACLE_SID` | - | - | yes when `service_name` is unset |
+| `[oracle].schema` | `ORACLE_SCHEMA` | `ORACLE_DEFAULT_SCHEMA` | uppercased user | no |
+| `[oracle].auth_mode` | `ORACLE_AUTH_MODE` | - | `password` | no |
+| `[oracle].wallet_location` | `ORACLE_WALLET_LOCATION` | `ORACLE_WALLET` | - | yes when wallet auth is used |
+| `[oracle].config_dir` | `ORACLE_CONFIG_DIR` | - | - | yes when wallet auth needs `tnsnames`/`sqlnet` |
+| `[oracle].token` | `ORACLE_TOKEN` | `ORACLE_ACCESS_TOKEN` | - | yes when token auth is used |
+| `[oracle].thick_mode` | `ORACLE_THICK_MODE` | - | `false` | no |
 | `[postgresql].host` | `POSTGRES_HOST` | `POSTGRES_SERVER`, `POSTGRES_HOSTNAME`, `PGHOST`, `PGHOSTADDR` | `localhost` | no |
 | `[postgresql].port` | `POSTGRES_PORT` | `PGPORT` | `5432` | no |
 | `[postgresql].database` | `POSTGRES_DB` | `POSTGRES_DATABASE`, `PGDATABASE` | - | yes when PostgreSQL is selected |
@@ -544,567 +244,779 @@ Every value is coerced with `str(...)`. Absent sections are skipped. Fields pres
 | `[engine].selected` | `AETHERDIALECT_ENGINE` | - | - | yes when multiple database engines are configured |
 | `[engine].connection` | `AETHERDIALECT_CONNECTION` | - | - | yes when multiple named connection sub-tables exist for the selected engine |
 | `[llm].provider` | `AETHERDIALECT_LLM_PROVIDER` | - | - | yes when both LLM stacks are configured |
-| `[mock].fixtures_file` | `AETHERDIALECT_MOCK_FIXTURES_FILE` | - | - | yes when `[llm] provider = "mock"` |
-| `[execution].max_query_cost_rows` | `AETHERDIALECT_MAX_QUERY_COST_ROWS` | - | `50000000` | no |
-| `[execution].max_query_cost_bytes` | `AETHERDIALECT_MAX_QUERY_COST_BYTES` | - | `50000000000` | no |
-| `[execution].statement_timeout_ms` | `AETHERDIALECT_STATEMENT_TIMEOUT_MS` | - | `30000` | no |
-| `[execution].llm_timeout_ms` | `AETHERDIALECT_LLM_TIMEOUT_MS` | - | `60000` | no |
-| `[execution].profile_timeout_ms` | `AETHERDIALECT_PROFILE_TIMEOUT_MS` | - | `120000` | no |
+| `[sandbox].fixtures_file` | `AETHERDIALECT_SANDBOX_FIXTURES_FILE` | `AETHERDIALECT_MOCK_FIXTURES_FILE` | - | yes when `[llm] provider = "sandbox"` |
+| `[mock].fixtures_file` | `AETHERDIALECT_MOCK_FIXTURES_FILE` | - | - | synonym for `[sandbox].fixtures_file` |
 
-Profiling statement timeouts are applied on engines that expose portable session timeout SQL (PostgreSQL `statement_timeout`, MySQL `MAX_EXECUTION_TIME`, DuckDB `statement_timeout`, and similar). **Databricks, Spark, and SQL Server** do not implement `profile_statement_timeout_sql`; per-member `profile_timeout_ms` limits still resolve for federation members but cannot bound profiling queries on those engines until a portable hook exists.
-| `[execution].explain_timeout_ms` | `AETHERDIALECT_EXPLAIN_TIMEOUT_MS` | - | falls back to `statement_timeout_ms` | no |
-| - | `AETHERDIALECT_LLM_BATCH_ENABLED` | - | `false` | no; OpenAI-only offline corpus batching |
 
-On **BigQuery**, when `AETHERDIALECT_MAX_QUERY_COST_BYTES` is active, execution sets `maximum_bytes_billed` on query jobs from that cap (in addition to optional `job_timeout_ms` from `statement_timeout_ms`).
 
-`AETHERDIALECT_ENGINE` / `[engine] selected` accepts: `sqlite`, `duckdb`, `csv`, `mysql`, `mariadb`, `sqlserver`, `postgresql`, `redshift`, `databricks`, `snowflake`, `bigquery`. The TOML `[excel]` section aliases to the `csv` engine; do not set `AETHERDIALECT_ENGINE=excel`. When more than one engine block is complete and selectable, `[engine] selected` is required.
 
-When Snowflake `database` is unset, `apply_environment` leaves it empty and the connection slug uses the placeholder segment `db`.
 
-### Database connection reference
+### EngineLimits
 
-Optional DDL for join hints is supplied only via `EngineContext.sql_file` at construction (not env/TOML). Connection slug shapes: [How it works - Engine storage](HOW_IT_WORKS.md#3-engine-storage-and-fingerprints).
+Pass `limits: EngineLimits | None = None` to [`AetherEngine`](#aetherengine) (default `EngineLimits()`). Property: `engine.limits`. Optional fields that accept `None` mean unlimited.
 
-| Engine | SQLAlchemy URL form (conceptual) | Primary env keys | Notes |
+| Field | Default | Notes |
+| --- | --- | --- |
+| `pool_size` | `1` | SQLAlchemy pool size (≥ 1) |
+| `pool_max_overflow` | `4` | |
+| `pool_recycle_seconds` | `1800` | |
+| `pool_pre_ping` | `True` | |
+| `pool_timeout_seconds` | `30` | |
+| `statement_timeout_ms` | `30000` | `None` = unlimited |
+| `profile_timeout_ms` | `120000` | `None` = unlimited |
+| `profiling_total_budget_seconds` | `None` | |
+| `max_result_rows` | `100000` | `None` = unlimited |
+| `max_result_bytes` | `268435456` | `None` = unlimited |
+| `max_upload_bytes` | `268435456` | |
+| `result_fetch_batch_rows` | `10000` | must not exceed `max_result_rows` when both set |
+| `prompt_payload_max_bytes` | `262144` | |
+| `write_queue_max_record_bytes` | `1048576` | |
+| `write_queue_max_file_bytes` | `None` | |
+| `template_store_max_count` | `None` | |
+| `template_store_max_disk_bytes` | `None` | |
+| `template_value_history_depth` | `64` | |
+| `feedback_rows_per_question` | `8` | |
+| `template_partition_cache_size` | `32` | |
+| `artifact_lock_timeout_seconds` | `30` | |
+| `applied_map_archive_count` | `3` | |
+| `suspended_session_ttl_seconds` | `None` | |
+
+`EngineLimits.from_config_file(path)` reads the `[limits]` table only.
+
+### FederationLimits
+
+Pass `limits: FederationLimits | None = None` to [`AetherFederation`](#aetherfederation) (default `FederationLimits()`). Property: `federation.limits`. When `member_defaults` is set, member engines constructed without explicit `limits=` receive those defaults.
+
+| Field | Default | Notes |
+| --- | --- | --- |
+| `member_defaults` | `None` | nested `EngineLimits` applied to members without explicit limits |
+| `max_members` | `8` | |
+| `max_parallel_members` | `4` | ≤ `max_members` |
+| `member_row_cap` | `100000` | `None` = unlimited |
+| `member_bytes_cap` | `268435456` | |
+| `member_statement_timeout_ms` | `None` | |
+| `member_probe_timeout_seconds` | `10` | |
+| `transfer_max_bytes` | `536870912` | |
+| `reduction_key_max_count` | `10000` | |
+| `plan_step_count_max` | `32` | |
+| `coordinator_memory_limit_bytes` | `2147483648` | |
+| `coordinator_threads` | `4` | |
+| `coordinator_temp_dir` | `None` | |
+| `coordinator_spill_max_bytes` | `None` | |
+| `federation_plan_template_count` | `None` | |
+
+`FederationLimits.from_config_file(path)` reads the `[federation_limits]` table only.
+
+### Limits behaviour
+
+Behavioural limits arrive through `limits=` or the `[limits]` / `[federation_limits]` tables. They are not part of environment flattening. Cost ceilings `AETHERDIALECT_MAX_QUERY_COST_ROWS` and `AETHERDIALECT_MAX_QUERY_COST_BYTES` remain policy class variables. `AETHERDIALECT_LLM_TIMEOUT_MS` and `AETHERDIALECT_LLM_BATCH_ENABLED` remain LLM policy keys.
+
+Profiling statement timeouts apply on engines that expose portable session timeout SQL (PostgreSQL `statement_timeout`, MySQL `MAX_EXECUTION_TIME`, DuckDB `statement_timeout`, and similar). **Databricks, Spark, SQL Server, and Oracle** do not implement `profile_statement_timeout_sql`, so per-member `profile_timeout_ms` still resolves for federation members but does not bound profiling queries on those engines.
+
+On **BigQuery**, when `AETHERDIALECT_MAX_QUERY_COST_BYTES` is active, execution sets `maximum_bytes_billed` on query jobs from that cap (in addition to optional `job_timeout_ms` from `EngineLimits.statement_timeout_ms`).
+
+`AETHERDIALECT_ENGINE` / `[engine] selected` accepts: `sqlite`, `duckdb`, `csv`, `mysql`, `mariadb`, `sqlserver`, `postgresql`, `redshift`, `databricks`, `snowflake`, `bigquery`, `oracle`. The TOML `[excel]` section aliases to the `csv` engine. When more than one engine block is complete and selectable, `[engine] selected` is required.
+
+When Snowflake `database` is unset, the connection slug uses the placeholder segment `db`.
+
+Documents passed to `apply_structure`, `apply_knowledge`, `apply_federation`, `apply_migration_map`, `export_context`, and nested `connection=` / `source_selections` bodies are validated in full before any mutation. Unknown keys raise `ConfigError`.
+
+---
+
+## EngineContext
+
+Frozen scope input to [`AetherEngine`](#aetherengine). **Setup:** [Getting started — EngineContext](GETTING_STARTED.md#step-4-wire-enginecontext-and-construct-the-engine). **Operator semantics:** [User guide — EngineContext](USER_GUIDE.md#enginecontext).
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `include` | `"tables"` \| `"views"` | Kind selector when `allow_objects` and `deny_objects` are both empty (default `"tables"`). Ignored when `allow_objects` is non-empty. |
+| `allow_objects` / `deny_objects` | `frozenset[str]` | Allow-list or deny-after-both-kinds lists. See reflection mode below. |
+| `allow_columns` / `deny_columns` | `frozenset[str]` | Qualified `table.column` or `*.column` allow/deny lists. |
+| `notes_file` | `str` \| `None` | Path to domain notes. Mutually exclusive with `notes`. |
+| `notes` | `str` \| `None` | Inline domain notes. Mutually exclusive with `notes_file`. |
+| `sql_file` | `str` \| `None` | Path to guidance DDL. |
+
+Register master scope by constructing with an [`EngineContext`](#enginecontext) object. Register named presets on an owner instance; consumers bind by preset name string.
+
+`notes`, `notes_file`, and `sql_file` are set only on `EngineContext` at construction. They are not environment variables and are not flattened from TOML.
+
+**Reflection mode**
+
+| `allow_objects` | `deny_objects` | Effective mode | Behaviour |
 | --- | --- | --- | --- |
-| SQLite | `sqlite:///{path}` (`sqlite:///:memory:` in-memory) | `SQLITE_PATH` or `SQLITE_DATABASE` | Path aliases: `SQLITE_DATABASE_PATH`, `SQLITE_FILE`, `SQLITE_DB`, `SQLITE_DSN`, `SQLITE3_DATABASE`. Schema is always `main`. Stdlib `pysqlite`. |
-| DuckDB | `duckdb:///{path}` (`duckdb:///:memory:` in-memory) | `DUCKDB_PATH` or `DUCKDB_DATABASE` | Path aliases: `DUCKDB_DATABASE_PATH`, `DUCKDB_FILE`, `DUCKDB_DB`, `DUCKDB_DSN`. Optional `DUCKDB_SCHEMA` / `DUCKDB_DEFAULT_SCHEMA` (default `main`). |
-| CSV | In-memory DuckDB backend (no persistent URL) | `CSV_DIRECTORY` or `CSV_FILES` | Mutually exclusive. Accepts `.csv` and `.xlsx` (not `.xls`). `[excel]` TOML aliases here. Reflection rebuilds the graph per session. |
-| MySQL | `mysql+pymysql://{user}:{password}@{host}:{port}/{database}?charset=utf8mb4` | `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_USER`, `MYSQL_PASSWORD`, `MYSQL_DATABASE` | Host aliases: `MYSQL_SERVER`, `MYSQL_HOSTNAME`. Port: `MYSQL_TCP_PORT`. User: `MYSQL_USERNAME`. Password: `MYSQL_PWD`. Database: `MYSQL_DB`. |
-| MariaDB | `mysql+pymysql://{user}:{password}@{host}:{port}/{database}?charset=utf8mb4` | `MARIADB_HOST`, `MARIADB_PORT`, `MARIADB_USER`, `MARIADB_PASSWORD`, `MARIADB_DATABASE` | **MARIADB_* only** - no `MYSQL_*` fallback. Same sqlglot read=`mysql` backend as MySQL. |
-| SQL Server | `mssql+pyodbc://...` (auth-mode dependent) | `SQLSERVER_HOST`, `SQLSERVER_PORT`, `SQLSERVER_DATABASE`, `SQLSERVER_USER`, `SQLSERVER_PASSWORD` | `MSSQL_*` and `AZURE_*` aliases in the flattening table above. `SQLSERVER_AUTH_MODE`: `sql` (default), `windows`, `aad_password`, `aad_sp`. |
-| PostgreSQL | `postgresql+psycopg://{user}:{password}@{host}:{port}/{database}` | `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DATABASE` / `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` | `PG*` and `POSTGRES_*` aliases in the flattening table above. Optional `POSTGRES_SCHEMA` (default `public`). |
-| Redshift | `redshift+redshift_connector://...` | `REDSHIFT_HOST`, `REDSHIFT_PORT`, `REDSHIFT_USER`, `REDSHIFT_PASSWORD`, `REDSHIFT_DATABASE` | **Redshift-native aliases only** (no `PGHOST` / `PGUSER`). IAM: `REDSHIFT_USE_IAM`, `REDSHIFT_CLUSTER_IDENTIFIER` or `REDSHIFT_WORKGROUP`, optional `REDSHIFT_REGION`. |
-| Databricks | SQL warehouse via `databricks-sql-connector`; optional SQLAlchemy URL | `DATABRICKS_HOST`, `DATABRICKS_HTTP_PATH`, `DATABRICKS_ACCESS_TOKEN` | Token aliases: `DATABRICKS_TOKEN`, `DATABRICKS_PAT`, `ACCESS_TOKEN`. Optional `DATABRICKS_CATALOG`, `DATABRICKS_SCHEMA`. **Fallback:** Databricks connector -> SQLAlchemy -> PySpark / `DatabricksSession` when the warehouse trio is absent or connect fails. |
-| Snowflake | `snowflake://{auth}@{account}/?...` | `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER` | `database` optional (slug uses `db` when unset). Password, key-pair, OAuth, or external-browser auth per env. **Fallback:** Snowflake connector (Arrow) -> SQLAlchemy -> Snowpark active session. |
-| BigQuery | `bigquery://{project}/{dataset}?location=...` | `BIGQUERY_PROJECT`, `BIGQUERY_DATASET` | Dataset aliases: `BIGQUERY_DB`, `GCP_DATASET`, `BQ_DATASET`. ADC when `BIGQUERY_CREDENTIALS_PATH` unset. **Result fetch:** `bq_storage` -> `bq_client` -> SQLAlchemy. |
+| non-empty | any | `allow_list` | Resolve each allow name to its catalog kind; `include` is ignored. Apply `deny_objects` after. |
+| empty | non-empty | `both_then_deny` | Reflect tables and views, then remove denied names. |
+| empty | empty | `single_kind` | Reflect only the kind named by `include`. |
 
-## PipelineSession methods
+---
 
-Sync session API on `AetherEngine.session()` and `AetherFederation.session()`. One **turn** is a question from `ask` through terminal `done` (success or error). While `step.done` is `False`, the engine is **suspended** and expects your next input via `step(...)`.
+## AetherEngine
 
-| Pattern | When to use |
-| --- | --- |
-| `ask(question)` + `step(response)` loop | Production UIs that show each suspend prompt and collect real user input. |
-| `ask_until_done(question, on_confirm="y")` | Scripts that auto-confirm yes/no suspends only; raises if a free-text suspend appears. |
-| `accept_until_done(question)` | Offline sandbox and smoke tests: auto-confirms yes/no and free-text suspends until the turn ends. |
+Public facade for one database connection. Artifact identity is the connection slug under `artifacts_dir`.
+
+### Constructor
+
+```python
+AetherEngine(
+    engine_context: EngineContext | str | None = None,
+    *,
+    artifacts_dir: str | None = None,
+    config_file: str | os.PathLike[str] | None = None,
+    connection: str | Mapping[str, Any] | None = None,
+    execution_engine: Any = None,
+    native_connection: Any = None,
+    source_selections: Mapping[str, Mapping[str, Any]] | None = None,
+    audit_sink: Callable[[AuditEvent], None] | None = None,
+    phase_callback: Callable[[PhaseProgressEvent], None] | None = None,
+    diagnostic_sink: Callable[[Diagnostic], None] | None = None,
+    role: SchemaRole = "owner",
+    token_provider: Callable[[], str | Mapping[str, str]] | None = None,
+    limits: EngineLimits | None = None,
+) -> None
+```
+
+| Parameter | Type | Meaning |
+| --- | --- | --- |
+| `engine_context` | `EngineContext` \| `str` \| `None` | `EngineContext` defines master scope (owner). `str` binds a saved preset (consumers must use a preset name). When omitted, load persisted master from artifacts or raise `ConfigError`. |
+| `artifacts_dir` | `str` \| `None` | Root directory; engine files under `<root>/aetherdialect/<connection_slug>/` |
+| `config_file` | path \| `None` | TOML config path |
+| `connection` | `str` \| mapping \| `None` | **String:** named TOML sub-block. **Mapping:** per-instance credentials (validated key set per engine). String form selects credentials and the artifact slug. |
+| `execution_engine` | `Any` | Optional SQLAlchemy engine (caller-owned pool) for engines that accept it |
+| `native_connection` | `Any` | Optional native DuckDB or SQLite connection (`duckdb`, `sqlite` only; raises `ConfigError` for other engines) |
+| `source_selections` | mapping \| `None` | `csv` engine only: per-filename interpretation after [`inspect_tabular_upload`](#tabular-upload) |
+| `audit_sink` | callable \| `None` | Optional [`AuditEvent`](#auditevent) callback |
+| `phase_callback` | callable \| `None` | Optional [`PhaseProgressEvent`](#phaseprogressevent) callback during construction and ask turns |
+| `diagnostic_sink` | callable \| `None` | Optional [`Diagnostic`](#diagnostic) callback |
+| `role` | `"owner"` \| `"consumer"` | `owner` may mutate shared artifacts; `consumer` pins owner snapshot id |
+| `token_provider` | callable \| `None` | Returns a fresh secret or credential-field mapping for [`refresh`](#shared-lifecycle) |
+| `limits` | [`EngineLimits`](#enginelimits) \| `None` | Behavioural limits (default `EngineLimits()`) |
+
+Raises `ConfigError`, `DatabaseConnectionError`, `MigrationPendingError`, or failures listed under [Exceptions](#exceptions).
+
+**Properties**
+
+| Property | Type | Meaning |
+| --- | --- | --- |
+| `dialect` | `str` | Selected SQL engine identity |
+| `limits` | [`EngineLimits`](#enginelimits) | Effective behavioural limits |
+| `data_quality_report` | [`DataQualityReport`](#dataqualityreport) \| `None` | Confirmed upload state after file-engine construction or ingestion |
+| `default_space_uid` | `str` | Default aetherspace uid for sessions and exports |
+
+**Concurrency.** One instance supports concurrent reader-mode sessions. Mutating methods serialize on an instance writer lock. Database connections are not fork-safe; construct a new engine in each child process after `fork()`.
+
+Owner-only methods require `role="owner"`. Methods marked **(owner)** refuse with `ConfigError` when `role="consumer"` before mutating shared artifacts. `list_aetherspaces` is visibility-scoped for every role. `export_knowledge` for a named visible space is available to consumers; `apply_knowledge` and all structure writes are owner-only.
+
+`space=None` on session, export, and apply methods resolves to [`default_space_uid`](#aetherengine).
+
+Mutating facade methods take the instance writer lock and run serially. Guarded names are listed in the exported `MUTATING_ENGINE_METHODS` and `MUTATING_FEDERATION_METHODS` tuples.
+
+### Methods
+
+Lifecycle methods [`refresh`](#shared-lifecycle) and [`close`](#shared-lifecycle) are documented under [Shared lifecycle](#shared-lifecycle).
+
+| Method | Returns | Description |
+| --- | --- | --- |
+| `preview_migration_map()` | [`MigrationPreview`](#migrationpreview) | Read-only preview of schema migration impact against stored artifacts. |
+| `data_quality_report` (property) | [`DataQualityReport`](#dataqualityreport) \| `None` | Upload validation report after successful file-engine construction or ingestion, including `confirmed_selections`. |
+| `ingest_upload_sources(paths, *, source_selections=None, relation_names=None, log_sink=None)` **(owner)** | [`UploadIngestResult`](#uploadingestresult) | Validate uploads and materialise accepted relations into this embedded member (`csv` or `duckdb` engines). |
+| `aetherspace(name=None, space_context=None, *, uid=None, notes_file=None, notes=None)` **(owner)** for writes | [`AetherSpace`](#aetherspace) | **Create:** `name` + `space_context` mints a new `S####` uid (duplicate names raise). **Update:** `uid` + `space_context` overwrites that space (optional `name=` renames the label). **Read:** `uid=` or unique visible `name=` (ambiguous names raise). Define and update require scope ⊆ effective visibility. Cannot redefine the default master space. |
+| `delete_aetherspace(name=None, *, uid=None, persist_learning=True)` **(owner)** | `AetherspaceDeleteResult` | Delete one persisted space and its learning partition. Prefer `uid=`; `name=` only when unique among visible spaces. The default master space cannot be deleted. |
+| `list_aetherspaces(*, include_system=False)` | `tuple[AetherSpace, ...]` | Return visible [`AetherSpace`](#aetherspace) descriptors. Owners include the implicit master space. Consumers omit master. Credential-default system spaces are omitted unless `include_system=True`. |
+| `default_space_uid` (property) | `str` | Default aetherspace uid for this instance: master for an owner, visibility-keyed default for a consumer. |
+| `export_context(name)` **(owner)** | `dict` | Read-only export document for one saved scope preset (or implicit `master`). |
+| `list_contexts()` **(owner)** | `tuple[str, ...]` | Saved scope-preset names plus implicit `master`. |
+| `list_templates(*, space=None)` | `tuple[StoredTemplateSummary, ...]` | Caller-visible template summaries for the resolved space. |
+| `fetch_template(template_ref, *, space=None)` | [`StoredTemplateDetail`](#storedtemplatedetail) | Detail for one template by `id`, including parameterized SQL and bind slots. |
+| `execute_template(template_id, params=None, *, space=None, as_dataframe=False)` | rows or `DataFrame` | Re-run a stored template by `id` with a p-param dict. Raises `ConfigError` when `approval_state` is `pending`. Deterministic replay; does not learn. |
+| `export_structure(space=None)` | `dict` | Structural inventory merged with editable structure for the default or one named space. See [Structure document](#structure-document). Suggested persistence name: `schema_structure.json`. |
+| `apply_structure(document)` **(owner)** | `None` | Apply a structural document declaratively; the document becomes the truth. Deleting an entry on round-trip removes it. |
+| `export_knowledge(space=None)` | `dict` | Knowledge payload for the default or one named space. See [Knowledge document](#knowledge-document). |
+| `apply_knowledge(space, document)` **(owner)** | `None` | Replace space domain knowledge and description overlays from one exported document. |
+| `apply_migration_map(document)` **(owner)** | `None` | Validate and persist a schema migration map document, then call `refresh()`. |
+| `session(*, mode="writer", space=None, ephemeral_scope=None, data_row_cap=None)` | [`PipelineSession`](#pipelinesession) | Programmatic session sharing this instance's schema graph and template store. `writer` persists space-partition learning; `reader` is read-only. Consumers may open `writer` for learning only — structural APIs stay owner-only. |
+| `asession(*, mode="writer", space=None)` | [`AsyncPipelineSession`](#asyncpipelinesession) | Async wrapper around [`session`](#pipelinesession) using worker threads. |
+| `run_interactive(*, space=None)` | `None` | Stdout interactive loop; prefer `session` for services. |
+| `run_seed_warmup(seed_filepath, interactive_gold=True, *, abort_on_gold_failure=False, max_kept_intents=2000)` **(owner)** | `None` | Full seed warmup; `max_kept_intents=None` keeps every intent that passes quality checks. |
+| `run_seed_warmup_from_history(sql_history_filepath, *, expand=False, max_kept_intents=2000)` **(owner)** | `None` | SQL-history warmup. |
+| `run_seed_warmup_from_query_log(lookback_days=730, max_queries=5000, *, expand=False, max_kept_intents=2000, min_runs=1, user_filter=None)` **(owner)** | `None` | Warehouse query-log warmup. |
+| `get_seed_warmup_summary()` | [`SeedWarmupSummarySnapshot`](#seedwarmupsummarysnapshot) | Newest seed-warmup summary text if present. |
+| `get_qsim_summary(start, end)` | [`QSimSummarySnapshot`](#qsimsummarysnapshot) | QSim summary lines for inclusive version range. |
+| `get_questions_only(version)` | `None` | Print numbered questions and write `qsim_v{version}_questions.txt`. |
+| `run_qsim(num_intents=20, num_questions=100, seed=None)` **(owner)** | `None` | QSim generator; writes per-run summary files under `qsim/`. |
+| `clear_template_store(*, space=None)` **(owner)** | `bool` | Remove template learning then reload. `space=None` clears every partition; otherwise one space uid. |
+| `clear_simulation_caches()` **(owner)** | `int` | Delete QSim and seed-warmup artifacts; return removed file count. |
+| `clear_all_learning(*, keep_structure=True, space=None)` **(owner)** | `None` | With `space` set, clear only that template partition. Without `space`, clear all templates, simulation caches, and optionally applied structure. Domain knowledge is cleared via `export_knowledge` / `apply_knowledge`. |
+
+---
+
+## FederationContext
+
+Frozen composite scope for [`AetherFederation`](#aetherfederation). **Operator semantics:** [User guide — FederationContext](USER_GUIDE.md#federationcontext).
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `include` | `"tables"` \| `"views"` | Include mode (default `"tables"`). |
+| `allow_objects` / `deny_objects` | `frozenset[str]` | Composite table allow/deny lists (logical names for collapsed tables). |
+| `allow_columns` / `deny_columns` | `frozenset[str]` | Qualified `table.column`, `source.table.column`, or `*.column`. |
+| `notes_file` | `str` \| `None` | Composite domain notes path. Mutually exclusive with `notes`. |
+| `notes` | `str` \| `None` | Inline composite domain notes. Mutually exclusive with `notes_file`. |
+
+No `sql_file` field on federation scope.
+
+---
+
+## AetherFederation
+
+Composite facade over member [`AetherEngine`](#aetherengine) instances. Artifact tree: `fed_<federation_id>/`.
+
+### Constructor
+
+```python
+AetherFederation(
+    name: str,
+    *,
+    members: Sequence[AetherEngine],
+    declaration: str | os.PathLike[str] | Mapping[str, Any],
+    context: FederationContext | None = None,
+    artifacts_dir: str | None = None,
+    role: SchemaRole = "owner",
+    limits: FederationLimits | None = None,
+    audit_sink: Callable[[AuditEvent], None] | None = None,
+    phase_callback: Callable[[PhaseProgressEvent], None] | None = None,
+    diagnostic_sink: Callable[[Diagnostic], None] | None = None,
+) -> None
+```
+
+| Parameter | Type | Meaning |
+| --- | --- | --- |
+| `name` | `str` | Stable federation name matching `federation_id` in the declaration |
+| `members` | `Sequence[AetherEngine]` | At least two distinct members. Each member's `source_id` is its connection name (TOML sub-block or `name` key in a `connection=` mapping). Duplicate connection names raise `FederationConfigError`. |
+| `declaration` | path \| `dict` | Federation declaration document or path to any JSON file |
+| `context` | [`FederationContext`](#federationcontext) \| `None` | Optional composite scope |
+| `artifacts_dir` | `str` \| `None` | Root for member trees and federation tree |
+| `role` | `"owner"` \| `"consumer"` | Owner may change declarations; consumer reads the composite |
+| `limits` | [`FederationLimits`](#federationlimits) \| `None` | Federation coordination limits |
+| `audit_sink` | callable \| `None` | Optional [`AuditEvent`](#auditevent) callback |
+| `phase_callback` | callable \| `None` | Optional [`PhaseProgressEvent`](#phaseprogressevent) callback |
+| `diagnostic_sink` | callable \| `None` | Optional [`Diagnostic`](#diagnostic) callback |
+
+Engine-only constructor parameters (`config_file`, `connection`, `execution_engine`, `native_connection`, `source_selections`, `token_provider`) belong on each member [`AetherEngine`](#aetherengine).
+
+```python
+storefront = AetherEngine(..., connection="storefront_pg")
+catalog = AetherEngine(..., connection="catalog_mysql")
+fed = AetherFederation(
+    "sandbox_rental_shop",
+    members=(storefront, catalog),
+    declaration=declaration_dict,
+    artifacts_dir="/data/artifacts",
+)
+```
+
+Raises `FederationConfigError`, `FederationDeclarationError`, `FederationInvariantError`, or `MigrationPendingError` on misconfiguration.
+
+**Properties**
+
+| Property | Type | Meaning |
+| --- | --- | --- |
+| `dialect` | `str` | Federation engine label (`federation`) |
+| `limits` | [`FederationLimits`](#federationlimits) | Federation coordination limits |
+| `default_space_uid` | `str` | Default aetherspace uid for sessions and exports |
+
+Owner-only methods require `role="owner"`. Methods marked **(owner)** refuse with `ConfigError` when `role="consumer"` before mutating shared artifacts. `list_aetherspaces` is visibility-scoped for every role. `export_knowledge` for a named visible space is available to consumers; `apply_knowledge` and all structure writes are owner-only.
+
+`space=None` on session, export, and apply methods resolves to [`default_space_uid`](#aetherfederation).
+
+Mutating facade methods take the instance writer lock and run serially. Guarded names are listed in the exported `MUTATING_ENGINE_METHODS` and `MUTATING_FEDERATION_METHODS` tuples.
+
+### Methods
+
+| Method | Returns | Description |
+| --- | --- | --- |
+| `inspect_persisted(federation_id, *, artifacts_dir, role="owner")` classmethod | [`PersistedFederationInspection`](#persistedfederationinspection) | Load declaration and roster from a persisted `fed_<id>` tree without member engines. |
+| `add_engine(engine)` **(owner)** | `None` | Register a member engine (its `source_id` is its connection name), recompose, and persist. |
+| `remove_engine(connection_name)` **(owner)** | `None` | Remove a member engine, prune plan templates, recompose, and persist. |
+| `export_federation()` **(owner)** | `dict` | Return the federation declaration document (topology and mappings). |
+| `apply_federation(document)` **(owner)** | `None` | Apply a federation declaration document and recompose. |
+| `preview_migration_map()` | [`MigrationPreview`](#migrationpreview) | Read-only preview of schema migration impact against stored artifacts. |
+| `aetherspace(name=None, space_context=None, *, uid=None, notes_file=None, notes=None)` **(owner)** for writes | [`AetherSpace`](#aetherspace) | **Create:** `name` + `space_context` mints a new `S####` uid (duplicate names raise). **Update:** `uid` + `space_context` overwrites that space (optional `name=` renames the label). **Read:** `uid=` or unique visible `name=` (ambiguous names raise). Define and update require scope ⊆ effective visibility. Cannot redefine the default master space. |
+| `delete_aetherspace(name=None, *, uid=None, persist_learning=True)` **(owner)** | `AetherspaceDeleteResult` | Delete one persisted space and its learning partition. Prefer `uid=`; `name=` only when unique among visible spaces. The default master space cannot be deleted. |
+| `list_aetherspaces(*, include_system=False)` | `tuple[AetherSpace, ...]` | Return visible [`AetherSpace`](#aetherspace) descriptors. Owners include the implicit master space. Consumers omit master. Credential-default system spaces are omitted unless `include_system=True`. |
+| `default_space_uid` (property) | `str` | Default aetherspace uid for this instance: master for an owner, visibility-keyed default for a consumer. |
+| `export_context(name)` **(owner)** | `dict` | Read-only export document for one saved scope preset (or implicit `master`). |
+| `list_contexts()` **(owner)** | `tuple[str, ...]` | Saved federation-context names plus implicit `master`. |
+| `list_templates(*, space=None)` | `tuple[StoredTemplateSummary, ...]` | Caller-visible template summaries from the federation artifact template store. |
+| `fetch_template(template_ref, *, space=None)` | [`StoredTemplateDetail`](#storedtemplatedetail) | Detail by `id`, including parameterized SQL and bind slots. |
+| `execute_template(template_id, params=None, *, space=None, as_dataframe=False)` | rows or `DataFrame` | Re-run a federation-stored template by `id` with a p-param dict. |
+| `export_structure(space=None)` | `dict` | Structural inventory merged with editable structure for the default or one named space, plus federation `members` / `member_count` when members are present. See [Structure document](#structure-document). |
+| `apply_structure(document)` **(owner)** | `None` | Apply a structural document to the composite federation graph declaratively; the document becomes the truth. |
+| `export_knowledge(space=None)` | `dict` | Knowledge payload for the default or one named space on the composite graph. See [Knowledge document](#knowledge-document). |
+| `apply_knowledge(space, document)` **(owner)** | `None` | Replace space domain knowledge and description overlays from one exported document. |
+| `apply_migration_map(document)` **(owner)** | `None` | Validate and persist a federation migration map document, then recompose. |
+| `session(*, mode="writer", space=None, ephemeral_scope=None, data_row_cap=None)` | [`PipelineSession`](#pipelinesession) | Programmatic session sharing the composite schema graph and template store. `writer` persists space-partition learning; consumers may open `writer` for learning only. |
+| `asession(*, mode="writer", space=None)` | [`AsyncPipelineSession`](#asyncpipelinesession) | Async wrapper around [`session`](#pipelinesession) using worker threads. |
+| `run_interactive(*, space=None)` | `None` | Stdout interactive loop; prefer `session` for services. |
+| `run_seed_warmup(...)` **(owner)** | — | Raises `ConfigError` (`warmup is not supported on AetherFederation`). Run seed warmup on each member [`AetherEngine`](#aetherengine). |
+| `run_seed_warmup_from_history(...)` **(owner)** | — | Raises `ConfigError` (`warmup is not supported on AetherFederation`). Run SQL-history warmup on each member engine. |
+| `run_seed_warmup_from_query_log(...)` **(owner)** | — | Raises `ConfigError` (`warmup is not supported on AetherFederation`). Run query-log warmup on each member engine. |
+| `get_seed_warmup_summary()` | [`SeedWarmupSummarySnapshot`](#seedwarmupsummarysnapshot) | Newest seed-warmup summary text if present. |
+| `get_qsim_summary(start, end)` | [`QSimSummarySnapshot`](#qsimsummarysnapshot) | QSim summary lines for inclusive version range. |
+| `get_questions_only(version)` | `None` | Print numbered questions and write `qsim_v{version}_questions.txt`. |
+| `run_qsim(num_intents=20, num_questions=100, seed=None)` **(owner)** | `None` | QSim routed through federation decomposition checks. |
+| `clear_template_store(*, space=None)` **(owner)** | `bool` | Clear composite and member templates (`space=None` clears every partition plus plan templates). |
+| `clear_simulation_caches()` **(owner)** | `int` | Clear federation and member QSim and seed-warmup artifacts. |
+| `clear_all_learning(*, keep_structure=True, space=None)` **(owner)** | `None` | Clear federation and member learning (space-scoped like the engine when `space` is set). Optionally retain applied structure when `keep_structure=True`. |
+
+---
+
+## Shared lifecycle
+
+[`refresh`](#shared-lifecycle) and [`close`](#shared-lifecycle) are shared by [`AetherEngine`](#aetherengine) and [`AetherFederation`](#aetherfederation).
+
+| Method | Returns | Description |
+| --- | --- | --- |
+| `refresh(*, reflect=True, credentials=None)` | [`RefreshReport`](#refreshreport) | Re-resolve credentials through `token_provider` or `credentials`, reopen the connection, and reconcile artifacts against the live schema. With `reflect=False`, skip the live probe and perform artifact-side work only. On federation, refresh each member then recompose. |
+| `close()` | `None` | Idempotent teardown. Disposes the coordinator or dialect-owned pool, removes the artifact lock file, and clears cached model clients. Member engines passed in by the caller remain open; the federation does not close them. |
+
+### RefreshReport
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `migration_tier` | `MigrationTier` | Classified migration severity |
+| `schema_changed` | `bool` | Whether the schema diff was non-empty |
+| `tables_added` | `tuple[str, ...]` | Tables added during refresh |
+| `tables_removed` | `tuple[str, ...]` | Tables removed during refresh |
+| `columns_added` | `tuple[tuple[str, str], ...]` | `(table, column)` pairs added |
+| `columns_removed` | `tuple[tuple[str, str], ...]` | `(table, column)` pairs removed |
+| `templates_invalidated` | `int` | Templates dropped by store reconciliation |
+| `orphans_removed` | `int` | Expired orphan directories removed |
+| `bytes_reclaimed` | `int` | Bytes reclaimed from orphan removal |
+| `diagnostics` | `tuple[Diagnostic, ...]` | Growth and checkpoint diagnostics |
+
+---
+
+## SpaceContext
+
+Frozen scope for [`AetherSpace`](#aetherspace) definitions. **Concept:** [User guide — AetherSpace](USER_GUIDE.md#aetherspace).
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `tables` | `frozenset[str]` | Allowed table/view names |
+| `columns` | `frozenset[str]` | Qualified `table.column` allow list |
+| `deny_objects` | `frozenset[str]` | Tables/views excluded from the space |
+| `deny_columns` | `frozenset[str]` | Qualified `table.column` deny list |
+| `notes_file` | `str` \| `None` | Optional notes path (mutually exclusive with `notes`) |
+| `notes` | `str` \| `None` | Inline notes baked into the space snapshot |
+
+Every table and column must exist on the master graph at write time.
+
+---
+
+## AetherSpace
+
+Read-only descriptor returned by [`aetherspace`](#aetherengine). Durable identity is **`uid`**; **`name`** is a display label.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `uid` | `str` | Stable opaque identity (`master` or `S####`) |
+| `name` | `str` | Display label (unique among visible spaces on create) |
+| `tables` | `tuple[str, ...]` | Table names in this space subset |
+| `columns` | `tuple[str, ...]` | Qualified `table.column` names in this subset |
+| `notes` | `str` \| `None` | Merged notes text baked at define time |
+
+Open a session with `session(..., space=uid)` or a unique visible name.
+
+---
+
+## Sessions
+
+### PipelineSession
+
+Sync session from [`AetherEngine.session`](#aetherengine) or [`AetherFederation.session`](#aetherfederation). One **turn** runs from `ask` through terminal `done`. While `done` is `False`, call `step(...)`.
 
 | Method | Returns | Contract |
 | --- | --- | --- |
-| `ask(question: str)` | `SessionStep` | Starts a turn; raises `SessionActiveError` if busy. |
-| `step(response=None)` | `SessionStep` | Supplies user text for a suspend (`"y"` / `"n"` for yes/no, or free text for feedback). |
-| `ask_until_done(question, *, on_confirm="y")` | `SessionStep` | Auto-answers yes-or-no suspends; `on_confirm` is `"y"` or `"n"`; raises on free-text suspends. |
-| `accept_until_done(question, *, on_yes_no="y", on_free_text="looks good")` | `SessionStep` | Auto-answers yes-or-no and free-text suspends until the turn ends. |
-| `reuse_saved_question(question_old, question_new, new_values)` | `SessionStep` | Re-execute a stored template with caller-supplied bind values; returns a terminal step. Raises `SessionActiveError`, `TypeError`, or `ConfigError`. |
-| `awaiting_prompt()` | `bool` | `True` when the next input must go to `step`. |
-| `reset()` | `None` | Clears suspend state and partial turn state. |
-| `cancel()` | `bool` | Cooperative cancel for the in-flight turn, including any active database statement. |
-| `cancel_active_federation_turn()` | `bool` | Deprecated alias for `cancel()`. |
-| `__enter__` / `__exit__` | `PipelineSession` / `None` | Exit calls `cancel()` then `reset()`. Does not close the engine or release connections. |
+| `ask(question: str)` | [`SessionStep`](#sessionstep) | Start a turn; raises `SessionActiveError` if busy |
+| `step(response=None)` | [`SessionStep`](#sessionstep) | Supply user text for a suspend (`"y"` / `"n"` or free text) |
+| `ask_until_done(question, *, on_confirm="y")` | [`SessionStep`](#sessionstep) | Auto-answer yes/no suspends only |
+| `accept_until_done(question, *, on_yes_no="y", on_free_text="looks good")` | [`SessionStep`](#sessionstep) | Auto-answer until the turn ends |
+| `awaiting_prompt()` | `bool` | `True` when the next input must go to `step` |
+| `reset()` | `None` | Clear suspend state |
+| `cancel()` | `bool` | Cooperative cancel for the in-flight turn |
+| `__enter__` / `__exit__` | context manager | Exit calls `cancel()` then `reset()` |
 
-`mode="reader"` skips durable template and feedback writes. `mode="writer"` is the default and serialises writer turns with a per-instance lock. Session exit releases turn state and cancels in-flight database work; engine connections, the template store, and artifacts remain open until `AetherEngine.close()` or `AetherFederation.close()`. Suspend `kind` values and the embedding loop: [Integrator guide - The session contract](INTEGRATOR_GUIDE.md#the-session-contract-suspend-and-terminal-steps).
+`mode="reader"` skips durable template writes. `mode="writer"` persists space-partition learning and serialises writer turns on the instance lock; consumers may use `writer` for learning only. Suspend `kind` values: [Troubleshooting — SessionStep kinds](TROUBLESHOOTING.md#sessionstep-kind-values).
 
-## AsyncPipelineSession methods
+### AsyncPipelineSession
 
 | Method | Returns | Contract |
 | --- | --- | --- |
-| `ask(question)` | `SessionStep` | Delegates to `PipelineSession.ask` on a worker thread. |
-| `step(response=None)` | `SessionStep` | Delegates to `PipelineSession.step`. |
-| `ask_until_done(question, *, on_confirm="y")` | `SessionStep` | Delegates to `PipelineSession.ask_until_done`. |
-| `accept_until_done(question, *, on_yes_no="y", on_free_text="looks good")` | `SessionStep` | Delegates to `PipelineSession.accept_until_done`. |
-| `reset()` | `None` | Delegates via `asyncio.to_thread`. |
-| `awaiting_prompt()` | `bool` | Delegates via `asyncio.to_thread`. |
-| `cancel()` | `bool` | Cooperative cancel for the in-flight turn, including any active database statement. Returns `True` only when that session has an active turn. |
-| `cancel_active_federation_turn()` | `bool` | Deprecated alias for `cancel()`. |
-| `__aenter__` / `__aexit__` | `AsyncPipelineSession` / `bool` | Async context manager forwarding to the inner session. |
+| `ask(question)` | [`SessionStep`](#sessionstep) | Delegates to `PipelineSession.ask` on a worker thread |
+| `step(response=None)` | [`SessionStep`](#sessionstep) | Delegates to `PipelineSession.step` |
+| `ask_until_done(question, *, on_confirm="y")` | [`SessionStep`](#sessionstep) | Delegates to `PipelineSession.ask_until_done` |
+| `accept_until_done(question, *, on_yes_no="y", on_free_text="looks good")` | [`SessionStep`](#sessionstep) | Delegates to `PipelineSession.accept_until_done` |
+| `reset()` | `None` | Delegates via `asyncio.to_thread` |
+| `awaiting_prompt()` | `bool` | Delegates via `asyncio.to_thread` |
+| `cancel()` | `bool` | Cooperative cancel for the in-flight turn |
+| `__aenter__` / `__aexit__` | async context manager | Forwards to the inner session |
 
-## Package helpers
+### SessionStep
 
-| Symbol | Signature / value | Notes |
+| Field | Type | Meaning |
 | --- | --- | --- |
-| `__version__` | `str` | Package version string (currently `0.2.1`). |
-| `MigrationPreview` | dataclass | `tier` (`compatible` / `remap` / `destructive`), `affected_tables`, `affected_columns`, `skeleton_path`. |
+| `done` | `bool` | `True` when the turn finished or ended in error |
+| `prompt` | `str` \| `None` | Short instruction before collecting input on suspends |
+| `kind` | `str` | Stable stage identifier; see [Troubleshooting](TROUBLESHOOTING.md#sessionstep-kind-values) |
+| `reply_shape` | `"yes_no"` \| `"free_text"` \| `None` | Input shape when `done` is `False` |
+| `sql` | `str` \| `dict[str, str]` \| `None` | SQL under discussion (dict form carries per-source statements on federation) |
+| `data` | `DataFrame` \| `None` | Rows available at this step |
+| `data_truncated` | `bool` | Whether more rows exist beyond `data` |
+| `parameters` | `tuple[ParameterBinding, ...]` | Bind slots for template replay |
+| `intent_summary` | [`IntentSummary`](#intentsummary) \| `None` | Structured intent headline on intent-related steps |
+| `semantic_warnings` | `tuple[str, ...]` | Model-authored caveats on intent confirmation |
+| `answer` | `str` \| `None` | Rendered metadata answer on terminal non-SQL steps |
+| `diagnostics` | `tuple[Diagnostic, ...]` | Structured diagnostics for the step |
+| `error` | [`SessionError`](#sessionerror) \| `None` | Structured terminal failure |
+| `template_id` | `str` \| `None` | Stored template identifier when relevant |
+| `turn_id` | `str` \| `None` | Turn correlation id |
+| `elapsed_ms` | `int` \| `None` | Wall time for the step |
+| `llm_usage` | [`LlmTurnUsageSummary`](#llmturnusagesummary) \| `None` | Aggregated LLM usage for the turn |
 
-Federation cancellation lives on `PipelineSession` / `AsyncPipelineSession.cancel()`, not as a package-level helper.
+Terminal steps have exactly one populated outcome shape: `answer` for metadata, `sql` with `data` for analytical success, or `error` for failure.
 
-## Schema overrides JSON (`schema_overrides.json`)
+### SessionError
 
-Export and apply use package-style `version: "0.2.1"`. Export writes `./schema_overrides.json` in the process working directory. Apply reads the same path. Workflow: [User guide - Schema overrides](USER_GUIDE.md#schema-overrides).
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `code` | [`SessionOutcome`](#sessionoutcome) | Closed outcome that ended the turn |
+| `detail_code` | `str` \| `None` | One [`DiagnosticCode`](TROUBLESHOOTING.md#diagnosticcode-catalogue) or [`SqlDiagnosticCode`](TROUBLESHOOTING.md#sqldiagnosticcode-catalogue) responsible for the failure |
+| `source_id` | `str` \| `None` | Federation member identity when attributable to one source |
+| `phase` | `str` \| `None` | Federation stage (`member`, `coordinator`, …) when relevant |
+| `limit_key` | `str` \| `None` | Configured limit name on cost or cap breaches |
 
-Hand-edited files for `apply_overrides` should use **plain strings** for descriptions and roles and `null` or a string for `sensitivity`. Do **not** add `owner` keys; the engine treats missing owner as analyst content.
+### SessionOutcome
 
-| Location | Editable fields |
+Closed enum on [`SessionError.code`](#sessionerror). Mapping guidance: [Troubleshooting — SessionOutcome](TROUBLESHOOTING.md#sessionoutcome).
+
+| Member | Value |
 | --- | --- |
-| Each table | `description` (string), `role` (string) |
-| Each column | `description` (string), `role` (string), `sensitivity` (`null` or string), `usable` (`false` only - marks column unusable; cannot re-enable profiler-omitted columns) |
-| Graph | `foreign_keys_add[]`, `foreign_keys_remove[]` |
-| Primary keys | `primary_keys_add[]`, `primary_keys_remove[]` |
-| Internal persistence | `_internal` (block lists; engine-maintained, not hand-authored) |
+| `FORBIDDEN` | `forbidden` |
+| `UNSUPPORTED_OPERATION` | `unsupported_operation` |
+| `UNANSWERABLE` | `unanswerable` |
+| `INSUFFICIENT_KNOWLEDGE` | `insufficient_knowledge` |
+| `NOT_A_QUESTION` | `not_a_question` |
+| `PARSE_FAILED` | `parse_failed` |
+| `VALIDATION_FAILED` | `validation_failed` |
+| `EXECUTION_FAILED` | `execution_failed` |
+| `EXECUTION_TIMEOUT` | `execution_timeout` |
+| `COST_EXCEEDED` | `cost_exceeded` |
+| `LIMIT_EXCEEDED` | `limit_exceeded` |
+| `DECLINED` | `declined` |
+| `CANCELLED` | `cancelled` |
+| `MIGRATION_PENDING` | `migration_pending` |
+| `INTERNAL_ERROR` | `internal_error` |
 
-```json
-{
-  "version": "0.2.1",
-  "tables": {
-    "staff": {
-      "columns": {
-        "ssn": {
-          "sensitivity": "hidden"
-        },
-        "password": {
-          "sensitivity": "hidden"
-        }
-      }
-    },
-    "film": {
-      "description": "Rental Shop film catalog.",
-      "role": null
-    }
-  },
-  "foreign_keys_add": [],
-  "foreign_keys_remove": [],
-  "primary_keys_add": [],
-  "primary_keys_remove": []
-}
+### ParameterBinding
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `handle` | `str` | Bind token identifying this slot |
+| `current_value` | `ParamValue` \| `None` | Bound value in effect |
+| `display_name` | `str` | Human-readable label |
+| `column_expr` | `str` | Column expression the slot binds against, when known |
+
+### IntentSummary
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `tables` | `tuple[str, ...]` | Tables referenced |
+| `select_cols` | `tuple[str, ...]` | Projected columns |
+| `filters` | `tuple[str, ...]` | Filter expressions |
+| `group_by` | `tuple[str, ...]` | Grouping columns |
+| `order_by` | `tuple[str, ...]` | Sort keys |
+| `limit` | `int` \| `None` | Row limit when present |
+| `natural_language` | `str` | Short natural-language headline |
+
+### LlmTurnUsageSummary
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `request_count` | `int` | Model requests on the turn |
+| `input_tokens` | `int` | Input tokens |
+| `cached_input_tokens` | `int` | Cached prefix tokens |
+| `output_tokens` | `int` | Output tokens |
+| `cost_usd` | `float` \| `None` | Estimated USD cost when priced |
+
+### StoredTemplateSummary
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `id` | `str` | Template identifier |
+| `approval_state` | `str` | `approved` or `pending` |
+
+### StoredTemplateDetail
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `summary` | [`StoredTemplateSummary`](#storedtemplatesummary) | Summary row |
+| `parameters` | `tuple[ParameterBinding, ...]` | Bind slots |
+| `approval_state` | `str` | `approved` or `pending` |
+
+### ConfigSnapshot
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `text` | `str` | Frozen redacted configuration text for integrators |
+
+### SchemaStatsSnapshot
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `stats` | `dict[str, Any]` | Schema statistics mapping |
+
+### SeedWarmupSummarySnapshot
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `text` | `str` | Newest seed-warmup summary text |
+
+### QSimSummarySnapshot
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `lines` | `tuple[str, ...]` | QSim summary lines for a version range |
+
+---
+
+## Structure and knowledge documents
+
+Export methods return dicts; apply methods accept dicts. The library performs no disk I/O for export or apply. Callers own persistence for round-trip edits. Suggested caller-owned file names: `schema_structure.json`, `knowledge.json`, `federation_declaration.json`. After `apply_structure`, the library persists the applied document as `applied_structure.json` under the engine artifact tree.
+
+### Structure document
+
+Returned by [`export_structure`](#aetherengine). Accepted by [`apply_structure`](#aetherengine).
+
+Top-level keys: `table_count`, `tables`, `relationships`, `foreign_keys_add`, `foreign_keys_remove`, `primary_keys_add`, `primary_keys_remove`. Federation exports may also include `members` and `member_count`.
+
+Each `tables[]` entry: `name`, `columns` (each with `name`, `data_type`, and optional `role`, `sensitivity`, `usable`, `boolean_truth_value`), optional `primary_key`, `foreign_keys`, optional table `role`.
+
+Removing a structure edit: `export_structure()`, delete the entry, `apply_structure(document)`.
+
+### Knowledge document
+
+Returned by [`export_knowledge`](#aetherengine). Accepted by [`apply_knowledge`](#aetherengine).
+
+Top-level keys: `uid` (optional), `domain_knowledge`, `table_descriptions`, `column_descriptions`.
+
+Each `domain_knowledge[]` entry: `key`, `kind`, `text`, `referenced_entities` (schema entity names; empty list allowed for glossary entries).
+
+### DomainKnowledgeEntry
+
+Dataclass mirroring one `domain_knowledge[]` row. Construct entries in application code before building a knowledge document.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `key` | `str` | Stable entry key |
+| `kind` | `str` | Entry kind label |
+| `text` | `str` | Prose body |
+| `referenced_entities` | `tuple[str, ...]` | Anchored schema entities |
+
+---
+
+## Tabular upload
+
+### inspect_tabular_upload
+
+```python
+inspect_tabular_upload(
+    source: str | os.PathLike[str] | bytes | bytearray | memoryview | IO[bytes] | IO[str],
+    *,
+    filename: str | None = None,
+    log_sink: Callable[[str], None] | None = None,
+) -> DataQualityReport
 ```
 
-Bundled sandbox demo (`sandbox_overrides_demo.json` in the corpus) matches the shape above: `staff.ssn` and `staff.password` are **hidden** for sensitivity exercises; `film` gets an analyst description.
+Module-level function (not an engine method). Inspects one CSV or Excel upload before any engine exists. Accepts a path, bytes, or a readable stream. Raises `ConfigError` on fatal file failures.
 
-`_readonly` is regenerated on export and ignored on apply. Successful apply persists `applied_overrides.json` beside the gzip schema cache and archives the editor JSON to `*.applied.json`.
+### DataQualityReport
 
-## Federation and migration JSON
+| Field / property | Type | Meaning |
+| --- | --- | --- |
+| `ok` | `bool` | Whether construction may proceed without blocking issues |
+| `issues` | `tuple[Diagnostic, ...]` | Structured findings |
+| `narrative` | `str` | Human-readable summary for operators |
+| `suggested_selections` | `dict[str, dict[str, Any]]` | Per-filename interpretation hints (same shape as `source_selections`) |
+| `confirmed_selections` | `dict[str, dict[str, Any]]` | Selections confirmed after construction or ingest |
+| `requires_review` | `bool` (property) | `True` when any issue needs caller confirmation |
 
-### `federation_declaration.json`
+`report.suggested_selections` feeds directly into `AetherEngine(source_selections=report.suggested_selections)`.
 
-Single authored input document (passed to `declaration_file=`). Combines manifest fields and optional logical mapping sections. Complete annotated example: [Sandbox - Federation declaration format](SANDBOX.md#federation-declaration-format).
+### source_selections
 
-### `federation_manifest.json` (persisted sidecar)
+Outer mapping keys are **file names** (not paths). Each value accepts exactly these keys:
 
-Persisted federation tree sidecar storing `federation_id`, joins, optional aliases, and coordinator caps.
+| Key | Type | Meaning |
+| --- | --- | --- |
+| `sheet` | `str` | Excel sheet name |
+| `header_row` | `int` | 1-based header row index |
+| `skip_rows` | `int` | Leading rows to skip before header detection |
+| `table_range` | `str` | A1 range (for example `A1:F120`) |
+| `merge_regions` | `tuple[str, ...]` | Merged cell regions to honour |
+| `append_regions` | `tuple[str, ...]` | Additional rectangular regions to append |
+| `column_transforms` | `tuple[dict, ...]` | Per-column normalisation transforms |
+
+Valid only on the `csv` engine at construction. Raises `ConfigError` when supplied for other engines.
+
+### ingest_upload_sources
+
+[`AetherEngine.ingest_upload_sources`](#aetherengine) validates uploads and materialises relations into an existing `csv` or `duckdb` engine (owner-only).
+
+### Two report surfaces
+
+- [`inspect_tabular_upload`](#inspect-tabular-upload) reports on files before an engine exists.
+- [`engine.data_quality_report`](#aetherengine) reports the confirmed post-construction or post-ingest state, including `confirmed_selections`.
+
+### UploadIngestResult
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `federation_id` | `str` | Stable federation name; artifact tree is `fed_<federation_id>/` |
-| `cross_source_joins[]` | array | `left`, `right` (`table.column`), `kind`, `logical_key` |
-| `aliases` | object | Optional map of logical alias -> `{source, table}` |
-| `coordinator` | object | Cap settings only: `row_cap`, `default_source_row_cap`, `default_source_timeout_ms`, `semijoin_key_cap`, `spill_row_threshold`, `max_parallel_members`, `total_input_byte_cap` (coordinator is always in-process DuckDB; no `engine` key) |
+| `relation_names` | `tuple[str, ...]` | Relation names created or updated |
+| `report` | [`DataQualityReport`](#dataqualityreport) | Validation report for the ingest |
+| `schema_diff` | `SchemaDiff` \| `None` | Schema change summary when applicable |
 
-An `engine` key inside `coordinator` is rejected - the coordinator is always in-process DuckDB.
+---
 
-### `federation_mappings.json` (persisted sidecar)
+## Federation documents
 
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `version` | `int` | Sidecar format version |
-| `logical_columns[]` | array | `logical`, `members` (`table.column` per source), `role`, `unify_in_graph` |
-| `logical_tables[]` | array | `logical`, `semantics` (`union` or `replica`), `members[]` with `source`, `table`, `columns` |
+### Declaration document
 
-For `replica` semantics, designate one member as the authoritative source in the mapping (required for `replica`; rejected for `union`).
+Accepted by [`apply_federation`](#aetherfederation). Returned by [`export_federation`](#aetherfederation). Worked example: [Sandbox — Federation declaration format](SANDBOX.md#federation-declaration-format).
 
-### `schema_migration_map.json`
+Top-level keys accepted on apply: `federation_id`, `aliases`, `cross_source_joins`, `coordinator`, `logical_columns`, `logical_tables`. Export may also include composed connection metadata and `table_namespace` — do not author those fields.
 
-Written in the working directory when migration requires operator action; consumed on the next successful `AetherEngine(...)` construction and renamed to `schema_migration_map.applied.json` (timestamped variant when a prior applied file exists). Workflow: [User guide - Migration](USER_GUIDE.md#migration).
+| Section | Keys |
+| --- | --- |
+| `aliases[]` | `alias`, `source`, `table` |
+| `cross_source_joins[]` | `left`, `right`, `kind`, `logical_key` |
+| `coordinator` | `row_cap`, `default_source_row_cap`, `default_source_timeout_ms`, `coordinator_timeout_ms`, `plan_timeout_ms`, `semijoin_key_cap`, `spill_row_threshold`, `max_parallel_members`, `total_input_byte_cap` |
+| `logical_columns[]` | `logical`, `members`, `role`, `unify_in_graph` |
+| `logical_tables[]` | `logical`, `semantics`, `members`, `authoritative_source` |
+| `logical_tables[].members[]` | `source`, `table`, `columns` |
 
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `version` | `int` | Map format version (`1` today) |
-| `action` | `str` | `remap`, `destructive`, or `abort` |
-| `table_renames` | array | Objects with `from` / `to` table names |
-| `column_renames` | array | Objects with `table`, `from`, `to` column names |
-| `dropped_tables` | array of `str` | Tables removed from the warehouse |
-| `dropped_columns` | array | Objects with `table` and `column` |
-| `added_tables` | array of `str` | Tables added to the warehouse |
-| `added_columns` | array | Objects with `table` and `column` |
-| `refresh_existing_descriptions_on_addition` | `bool` | Default `false`; may refresh descriptions when tables are added |
+### Migration maps
 
-### `federation_migration_map.json`
+[`preview_migration_map`](#aetherengine) returns a [`MigrationPreview`](#migrationpreview) with `skeleton_document` when migration is pending. `MigrationPendingError` carries the skeleton dict. Apply via [`apply_migration_map`](#aetherengine) with the edited document.
 
-Consumed on the next successful federation construction when present in the working directory; archived to `federation_migration_map.applied.json` on success. Per-source drift still uses `schema_migration_map.json` on each member tree.
+### MigrationPreview
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `version` | `int` | Map format version (`1`) |
-| `action` | `str` | `remap`, `destructive`, or `abort` |
-| `qualified_column_renames` | array | Objects with `from` / `to` qualified `table.column` refs |
-| `namespace_renames` | array | Objects with `from` / `to` logical table names in `table_namespace` |
-| `dropped_cross_source_joins` | array | Objects with `left` / `right` join endpoints to remove |
+| `tier` | `"compatible"` \| `"remap"` \| `"destructive"` | Severity class |
+| `affected_tables` | `tuple[str, ...]` | Tables impacted |
+| `affected_columns` | `tuple[tuple[str, str], ...]` | `(table, column)` pairs impacted |
+| `skeleton_document` | `dict` | Migration map skeleton to edit |
 
-Complete example (`schema_migration_map.json`):
+### PersistedFederationInspection
 
-```json
-{
-  "version": 1,
-  "action": "remap",
-  "table_renames": [],
-  "column_renames": [
-    {
-      "table": "item",
-      "from": "title",
-      "to": "item_title"
-    }
-  ],
-  "dropped_tables": [],
-  "dropped_columns": [],
-  "added_tables": [],
-  "added_columns": [],
-  "refresh_existing_descriptions_on_addition": false
-}
-```
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `federation_id` | `str` | Federation identifier |
+| `federation_dir` | `str` | Persisted tree path |
+| `manifest` | `FederationManifest` | Parsed manifest |
+| `mappings` | `FederationMappings` | Parsed mappings |
+| `roster` | `tuple[tuple[str, str, str, str], ...]` | Registered member tuples |
 
-The bundled sandbox migration demo uses the same `item.title` -> `item_title` remap ([Sandbox guide - Migration demo](SANDBOX.md#migration-demo)).
+---
 
 ## Observability
 
-Three channels: [Integrator guide - Observability](INTEGRATOR_GUIDE.md#observability). Types and catalogs only below.
+### audit_sink
 
-### `audit_sink`
+Constructor parameter on [`AetherEngine`](#aetherengine) and [`AetherFederation`](#aetherfederation). Receives [`AuditEvent`](#auditevent) records at lifecycle boundaries. Event inventory: [Troubleshooting — Audit events](TROUBLESHOOTING.md#audit-events).
 
-Optional `Callable[[AuditEvent], None] \| None` on `AetherEngine` / `AetherFederation` construction. Not a boolean flag and does not print by itself.
-
-### `Diagnostic`
+### AuditEvent
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `stage` | `str` | Pipeline stage that emitted the row |
-| `level` | `DiagnosticSeverity` | `info`, `warning`, or `error` |
-| `code` | `str` | Stable code string (see catalog below) |
-| `message` | `str` | Human-readable text |
-| `details` | `tuple[tuple[str, str], ...]` | Optional key-value metadata |
-| `duration_ms` | `int \| None` | Wall-clock duration when applicable |
-| `source_id` | `str \| None` | Federation member id when applicable |
-| `phase` | `str \| None` | Pipeline phase or stage that produced the diagnostic |
-| `remediation` | `str \| None` | Operator action guidance when applicable |
-| `subject` | `str \| None` | Subject entity the diagnostic refers to (for example `sql`) |
-| `count` | `int` | Occurrence count when aggregated (default `1`) |
+| `event_type` | `str` | Event name |
+| `timestamp_iso` | `str` | UTC timestamp |
+| `question` | `str` \| `None` | Active question when relevant |
+| `schema_hash` | `str` \| `None` | Schema fingerprint |
+| `provider` | `"openai"` \| `"azure"` \| `"sandbox"` | LLM provider |
+| `details` | `tuple[tuple[str, str], ...]` | Structured detail pairs |
+| `turn_id` | `str` \| `None` | Turn correlation id |
 
-### `DataQualityReport`
+### phase_callback
 
-Frozen outcome of CSV upload validation during `AetherEngine` construction (file engine only). Blocking issues raise `ConfigError` with `narrative` as the message before the engine instance exists.
+Constructor parameter. Receives [`PhaseProgressEvent`](#phaseprogressevent) during construction and ask turns. The event names its own phase; branch in the callback when you need construction versus ask progress.
+
+### PhaseProgressEvent
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `ok` | `bool` | `True` when no blocking or review upload issues remain |
-| `issues` | `tuple[Diagnostic, ...]` | Deterministic findings with exact `file!sheet!cell` locations |
-| `narrative` | `str` | Plain-language summary (LLM when available) |
-| `suggested_selections` | `dict[str, dict]` | Per-filename interpretation map for `source_selections` |
-| `confirmed_selections` | `dict[str, dict]` | Caller-accepted interpretation (empty until supplied) |
-| `requires_review` (property) | `bool` | `True` when any issue needs caller confirmation before construction |
-
-`to_json_dict()` returns `{ok, narrative, issues, suggested_selections, confirmed_selections, requires_review}`. `to_dict()` returns `{heading: detail}` for UI consumers. On successful construction, `audit_sink` receives `event_type="data_quality"` with `ok` and `issue_count` in `details`.
-
-### `AuditEvent`
-
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `event_type` | `str` | Discriminator (see catalog below) |
+| `phase` | `str` | Phase label |
 | `timestamp_iso` | `str` | UTC timestamp when emitted |
-| `question` | `str \| None` | Active question when relevant |
-| `schema_hash` | `str \| None` | Schema fingerprint when relevant |
-| `provider` | `"openai" \| "azure" \| "mock"` | LLM provider for the event |
-| `details` | `tuple[tuple[str, str], ...]` | Lightweight metadata |
+| `source` | `str` \| `None` | Federation member `source_id` when scoped to one member |
+| `stage` | `int` \| `str` \| `None` | Optional sub-stage |
+| `turn_id` | `str` \| `None` | Turn correlation id |
+| `elapsed_ms` | `int` \| `None` | Milliseconds since previous phase emit on ask turns |
 
-#### Audit `event_type` catalog
+### diagnostic_sink
 
-**Session lifecycle**
+Constructor parameter. Receives [`Diagnostic`](#diagnostic) records on the diagnostic channel (symmetric with `audit_sink`).
 
-| `event_type` | When emitted |
-| --- | --- |
-| `init` | After successful `AetherEngine` / `AetherFederation` construction |
-| `data_quality` | After successful construction when the file engine validated uploads |
-| `ask_begin` | Start of `session.ask(...)` |
-| `ask_suspend` | Pipeline returned a deferred prompt (`session.step` required) |
-| `ask_cancelled` | Turn ended by cooperative `session.cancel()` |
-| `ask_done` | Turn completed (`details` includes `outcome`, `kind`) |
-| `ask_error` | Terminal failure or fatal guard error |
-| `ask_blocked` | `ask` rejected before raise (non-`str` question or `SessionActiveError`) |
+### Diagnostic
 
-**Admin operations**
-
-| `event_type` | When emitted |
-| --- | --- |
-| `apply_schema_overrides` | After `apply_overrides` persists (audit event name retained) |
-| `clear_persisted_overrides` | After overrides sidecar removal and rebuild |
-| `clear_template_store` | After template tree removal and reload |
-| `clear_simulation_caches` | After QSim or seed-warmup cache deletion |
-| `clear_all_learning` | After combined learning clears |
-| `close` | After `AetherEngine.close()` or `AetherFederation.close()` disposes connections |
-
-**Federation execution**
-
-| `event_type` | When emitted |
-| --- | --- |
-| `federation_semijoin_key_transfer` | During federated execution when semijoin key reduction transfers keys between members (`details`: `source_member`, `target_member`, `column`, `key_count`). |
-
-**Write queue drain** (legacy residual files; reader sessions no longer enqueue)
-
-| `event_type` | When emitted |
-| --- | --- |
-| `write_queue_feedback_record` | Writer applied a queued `feedback_record` |
-| `write_queue_template_reject` | Writer applied a queued `template_reject` |
-| `write_queue_template_accept` | Writer applied a queued `template_accept` |
-| `write_queue_override_proposal` | Writer materialised a queued `override_proposal` |
-
-**LLM usage** (emitted at turn end when the turn made model calls)
-
-| `event_type` | When emitted |
-| --- | --- |
-| `llm_call` | Once per model request in the turn. `details` include `task`, `logical_model`, `api_model`, `input_tokens`, `cached_input_tokens`, `output_tokens`, `attempt`, `elapsed_ms`. When `provider` is `openai` and the logical model is in the shipped price table, `cost_usd` is present; unknown OpenAI models carry `unpriced` instead. Azure and mock providers emit token counts only - no `cost_usd`. |
-| `llm_turn` | Once per completed turn summarising all `llm_call` rows for that turn. OpenAI summaries include `cost_usd` (sum of priced calls), `price_table_as_of`, and `unpriced_models` when any call lacked a rate. |
-
-### LLM usage and cost
-
-Terminal steps also expose structured totals on `SessionStep.llm_usage` (`request_count`, `input_tokens`, `cached_input_tokens`, `output_tokens`, and `cost_usd` when available). The same turn totals appear on `SessionStep.diagnostics` as code **`LLM_TURN_COST`** (`stage="llm"`, `level="info"`). `message` and `details` carry `requests`, `input_tokens`, `cached_input_tokens`, `output_tokens`, and - for `provider="openai"` only - `cost_usd` and `price_table_as_of`.
-
-| Provider | `cost_usd` on diagnostic / audit | Notes |
+| Field | Type | Meaning |
 | --- | --- | --- |
-| `openai` | Yes when the logical model is in the built-in table | List-price estimate from input, cached-input, and output token counts |
-| `azure` | No | Token counts only - deployment rates are tenant-specific |
-| `mock` | No | Offline sandbox |
+| `code` | `str` | [`DiagnosticCode`](TROUBLESHOOTING.md#diagnosticcode-catalogue) or [`SqlDiagnosticCode`](TROUBLESHOOTING.md#sqldiagnosticcode-catalogue) value |
+| `level` | `str` | Severity (`info`, `warning`, `error`, …) |
+| `message` | `str` | Short message |
+| `details` | `tuple[tuple[str, str], ...]` | Structured detail pairs |
 
-**Shipped OpenAI price table** (USD per million tokens; as-of date in `price_table_as_of` detail field):
+Full code catalogues: [Troubleshooting — Diagnostic codes](TROUBLESHOOTING.md#diagnostic-codes).
 
-| Logical model | Input | Cached input | Output |
-| --- | --- | --- | --- |
-| `gpt-5.4-mini` | 0.40 | 0.10 | 1.60 |
-| `gpt-5.4-nano` | 0.10 | 0.025 | 0.40 |
-| `gpt-5-mini` | 0.25 | 0.0625 | 2.00 |
-| `gpt-5-nano` | 0.05 | 0.0125 | 0.40 |
-| `gpt-4.1-mini` | 0.40 | 0.10 | 1.60 |
-| `gpt-4.1-nano` | 0.10 | 0.025 | 0.40 |
+### LLM usage
 
-The as-of date is **`2026-07-26`** for this build. Figures are indicative for operator dashboards, not billing authority.
+[`SessionStep.llm_usage`](#sessionstep) carries per-turn totals. [`Diagnostic`](#diagnostic) rows with code `LLM_TURN_COST` include token and cost detail keys documented under [Troubleshooting](TROUBLESHOOTING.md#common-diagnosticdetails-keys).
 
-Per-phase token breakdown may also appear as `LLM_TURN_COST` or `ENGINE_INFO` rows from `emit_llm_usage_summary_diagnostics` when enabled.
+---
 
-### Diagnostic code catalog
+## Sandbox
 
-**Pipeline semantics**
+Offline sandbox entry point. Walkthrough: [Sandbox guide](SANDBOX.md). Corpus reference: [Sandbox data reference](SANDBOX_DATA_REFERENCE.md).
 
-| Code | Typical use |
-| --- | --- |
-| `REUSE_HIT` | Template reuse matched |
-| `REUSE_MISS` | No template reuse hit |
-| `LOW_CONFIDENCE` | Low-confidence execution path |
-| `LARGE_RESULT_WARNING` | Large result-set warning |
-| `SENSITIVITY_GATE_HIT` | Sensitive field gate during repair |
-| `INTERPRET_GROUND_RETRY` | Logical intent retry |
-| `COMPOSE_REPAIR` | Schema or semantic repair pass |
-| `FALLBACK_FRESH_RESTART` | Fresh restart after repair exhaustion |
-| `SCHEMA_OVERRIDE_SKIP` | Override entry skipped during apply |
-| `ZERO_ROW_WHERE_SUGGESTION` | Fuzzy WHERE suggestion when a filter returned zero rows |
-| `ZERO_ROW_WHERE_AUTO_FIXED` | WHERE clause auto-corrected after a zero-row result |
-| `SQL_PARSE_FAILED` | SQL-to-intent conversion or parse validation failed |
-
-**LLM usage**
-
-| Code | Typical use |
-| --- | --- |
-| `LLM_TURN_COST` | Turn-total token (and OpenAI cost) summary on `SessionStep.diagnostics` |
-| `ENUM_PROMPT_TRUNCATED` | Enum prompt capped during federation or intent processing |
-| `DESCRIPTION_PROMPT_TRUNCATED` | Description-enrichment prompt truncated to fit token budget |
-| `DESCRIPTION_ENRICHMENT_FAILED` | LLM description enrichment failed for a schema object |
-| `DESCRIPTION_ENRICHMENT_NOOP` | Description enrichment skipped because no change was needed |
-
-**Configuration**
-
-| Code | Typical use |
-| --- | --- |
-| `CONFIG_FILE_VALUE_APPLIED` | TOML value overrode `os.environ` for a key |
-| `CONFIGURATION_KEY_IGNORED` | Legacy environment variable ignored in favour of current config |
-
-**Artifacts and write queue**
-
-| Code | Typical use |
-| --- | --- |
-| `STALE_ARTIFACT_LOCK` | Stale artifact-directory lock removed before acquisition |
-| `ARTIFACTS_DIR_NOT_LOCAL` | Artifacts directory is not on a local filesystem |
-| `WRITE_QUEUE_CORRUPT` | Write-queue file could not be parsed |
-| `WRITE_QUEUE_FULL` | Write-queue depth exceeded configured cap |
-| `ARTIFACT_GROWTH` | Artifact store size crossed a growth threshold |
-| `ARTIFACT_LIMIT_NEAR` | Artifact store approaching configured size limit |
-| `MIGRATION_CHECKPOINT_ORPHANED` | Template migration checkpoint left without a matching store entry |
-
-**Schema profiling**
-
-| Code | Typical use |
-| --- | --- |
-| `COMPOSITE_DESCRIPTIVE_PROFILE_FAILED` | Composite descriptive profile could not be computed |
-| `COLUMN_PROFILE_FAILED` | Per-column profile sampling failed |
-| `COLUMN_CHARSET_MISMATCH` | Reflected column charset differs from connection default |
-| `PROFILE_TABLE_CLONE_FAILED` | Profiling clone of a table failed |
-| `SCHEMA_FK_CATALOG_ABSENT` | Foreign-key catalog unavailable during schema build |
-| `SCHEMA_ROLE_TYPE_COERCED` | LLM-assigned role incompatible with value_type; coerced via heuristics |
-| `SCHEMA_UNKNOWN_TYPE_UNUSABLE` | Column mapped to unknown value_type; hard-unusable for LLM scope |
-| `PK_INFERENCE_PROMPT` | Primary-key inference surfaced a disambiguation prompt |
-| `MATERIALIZED_VIEW_ANSWER` | Turn read from a materialized view |
-
-**Schema overrides**
-
-| Code | Typical use |
-| --- | --- |
-| `OVERRIDE_NEEDS_RECONFIRMATION` | Applied override requires user reconfirmation |
-
-**Join semantics**
-
-| Code | Typical use |
-| --- | --- |
-| `JOIN_ORPHAN_RATE_HIGH` | INNER join on an ambiguous edge exceeds orphan-rate floor |
-| `JOIN_NULLABLE_KEY` | Nullable FK edge rendered as LEFT or refused as INNER |
-| `JOIN_PATH_TIE_CEILING_EXCEEDED` | Too many equal-length join paths to disambiguate |
-| `JOIN_CANDIDATE_CAP` | Join path enumeration hit refusal cap |
-| `SEMANTIC_PROFILE_WHERE_EDGE` | Profile overlap rendered as a WHERE equality |
-| `REDUNDANT_JOIN_WHERE_DROPPED` | Redundant join predicate removed from WHERE |
-| `REDUNDANT_KEY_JOIN_ELIMINATED` | Redundant key join eliminated from the plan |
-| `REDUNDANT_KEY_JOIN_CAP_REACHED` | Redundant-key-join elimination iteration cap reached |
-| `COMPARISON_JOIN_DETOUR` | Comparison-only table joined through a short bridge |
-
-**Template store**
-
-| Code | Typical use |
-| --- | --- |
-| `TEMPLATE_STORE_ORPHANED` | Template store entry moved to orphaned segment |
-| `TEMPLATE_REMAP_DIVERGED` | Template remap fingerprint diverged from stored state |
-
-**Upload validation (file engine)**
-
-| Code | Typical use |
-| --- | --- |
-| `DATA_QUALITY_BLOCKING` | Structural issue that blocks engine construction |
-| `DATA_QUALITY_ADVISORY` | Issue reported but not blocking |
-| `DATA_QUALITY_AUTO_READ` | Encoding/newline/whitespace read normalization |
-| `DATA_QUALITY_AUTO_CORRECTED` | Lossless blank-border trim applied in pipeline |
-| `UPLOAD_UNIT_AFFIX_STRIPPED` | Uniform scalar currency/percent affixes stripped to numeric |
-| `UPLOAD_TRANSFORM_REJECTED` | Proposed column transform failed full-column verification |
-| `UPLOAD_TRANSFORM_APPLIED` | Proposed column transform verified and applied |
-
-**Terminal refusals**
-
-Stable codes on terminal `SessionStep` rows when the engine refuses to compile or execute a question. Each code appears in `SessionStep.diagnostics`; `refusal_code` mirrors the primary code when present.
-
-| Code | Typical use |
-| --- | --- |
-| `REFUSAL_JOIN_PATH_UNAVAILABLE` | No join path between required tables |
-| `REFUSAL_AGGREGATE_FAN_OUT` | Join would duplicate parent rows under an aggregate |
-| `REFUSAL_HOP_CEILING` | Cross-table comparison exceeds allowed join hops |
-| `REFUSAL_CTE_CAP` | CTE step count or reference depth exceeded |
-| `REFUSAL_CAPABILITY_GAP` | Question shape unsupported by one or more federation members |
-| `REFUSAL_NULL_IN_NEGATED_LIST` | NOT IN list includes null and cannot be expressed safely |
-| `REFUSAL_SUBDAY_DATE_WINDOW_ON_DATE_COLUMN` | Date column cannot answer hour, minute, or second windows |
-| `REFUSAL_AMBIGUOUS_DATE_LITERAL` | Date bound is not valid ISO 8601 and cannot be interpreted safely |
-| `REFUSAL_UNION_COLUMN_MISSING` | Union logical column is absent from one or more members |
-| `REFUSAL_UNSUPPORTED_COLUMN_TYPE` | Filter or aggregate targets a column with an unsupported data type |
-| `REFUSAL_NOT_AVAILABLE_IN_CONTEXT` | Question refers to information not available in this context |
-| `REFUSAL_OPAQUE_EXPR` | Expression structure is opaque or unsupported and cannot be compiled safely |
-| `REFUSAL_PERMISSION_DENIED` | Database refused access to required tables or columns |
-| `REFUSAL_SCOPE_VIOLATION` | Question references tables or columns outside the visible schema |
-| `REFUSAL_INVALID_QUESTION` | Question could not be mapped to specific tables or columns |
-| `REFUSAL_PARSE_FAILURE` | Question structure could not be parsed |
-| `REFUSAL_DECLINED_SCHEMA` | Proposed table and column mapping was declined |
-| `REFUSAL_JOIN_PATH_TIE_CAP` | Too many equally short join paths between required tables |
-| `REFUSAL_CLAUSE_WIDENED_ROWSET` | Limit, sort, or distinct conflicts with join-multiplied rows |
-| `REFUSAL_PROBE_CTE_PLACEMENT` | Filter step cannot be used in the required join position |
-
-**Federation diagnostics**
-
-| Code | Typical use |
-| --- | --- |
-| `FEDERATION_INELIGIBLE` | Intent cannot be decomposed into a federated plan |
-| `FEDERATION_PARTIAL_FAILURE` | One member failed after others succeeded |
-| `FEDERATION_MEMBER_FAILED` | Member generation or execution failed |
-| `FEDERATION_MEMBER_PROBE_FAILED` | Member probe failed during federation init |
-| `FEDERATION_MEMBER_GENERATED` | Per-member SQL generated during prepare |
-| `FEDERATION_MEMBER_EXECUTED` | Member statement executed |
-| `FEDERATION_COORDINATOR_EXECUTED` | Coordinator combine finished |
-| `FEDERATION_SOURCES_QUERIED` | Audit summary of sources touched in a turn |
-| `FEDERATION_PLAN_REPLAY` | Question-level reuse replayed a stored plan template |
-| `FEDERATION_SEMIJOIN_SKIPPED` | Semi-join reduction skipped (disabled or ineligible) |
-| `FEDERATION_REDUCTION_NULL_KEYS` | Equality reduction dropped rows with unknown join keys before transfer |
-| `FEDERATION_CAP_EXCEEDED` | Coordinator or member row, timeout, or semijoin cap exceeded |
-| `FEDERATION_MALFORMED_MEMBER_ANSWER` | Member result shape or projection does not match the federated plan |
-| `FEDERATION_JOIN_FAN_OUT` | Coordinator join multiplied rows beyond the declared grain |
-| `FEDERATION_TIME_ANCHOR` | Relative date-window anchor bound for a federated turn |
-| `FEDERATION_TIMESTAMP_NORMALISED` | Aware timestamp column normalised to UTC during coordinator transfer |
-| `FEDERATION_MAPPING_DRIFT` | Federation mapping fingerprint drifted from stored declaration |
-| `FEDERATION_JOIN_CANDIDATE_CAP` | Federated join candidate cross-product cap exceeded |
-| `FEDERATION_TURN_CANCELLED` | Federated turn cancelled cooperatively |
-| `FEDERATION_COORDINATOR_DECIMAL_FALLBACK` | Coordinator fell back to decimal combine for mixed numeric types |
-| `FEDERATION_COORDINATOR_ARROW_SPILL_FALLBACK` | Coordinator spilled member frames to Arrow during combine |
-| `FEDERATION_MEMBER_TIMEZONE_MISMATCH` | Member timezone disagrees with federation anchor |
-| `FEDERATION_MEMBER_REMOVED` | Member dropped from an active federation roster |
-| `FEDERATION_POOL_UNDERSIZED` | Federation worker pool smaller than member count |
-| `MEMBER_LIMIT_NARROWED` | Per-member row limit narrowed to respect coordinator cap |
-| `COORDINATOR_LIMITS` | Coordinator row, byte, or timeout limits applied for the turn |
-| `ROUNDING_MODE_MIXED` | Federated members disagree on rounding tie-breaking |
-
-**Catch-all**
-
-| Code | Typical use |
-| --- | --- |
-| `ENGINE_INFO` | Progress, CLI echo, schema summaries |
-| `CANCEL_NOT_SUPPORTED` | Engine does not support statement cancellation |
-
-**Validation (lowercase)** - `SessionStep.diagnostics` may also carry EXPLAIN- and validator-derived codes (for example `explain_seq_scan_indexed`, `explain_sort_spill`, `explain_temporary_table`). Treat unknown codes as opaque.
-
-## Offline sandbox
-
-Walkthrough: [Sandbox guide](SANDBOX.md).
-
-### `Sandbox` authoring environment
-
-`Sandbox` is exported from `aetherdialect`. It unpacks the bundled corpus, seeds in-memory DuckDB datasets, writes (or accepts) LLM configuration, and exposes production-shaped constructors.
+### Sandbox
 
 | Member | Returns | Purpose |
 | --- | --- | --- |
-| `Sandbox(*, llm_config=None, artifacts_dir=None, bundle_dir=None, cleanup=True, auto_seed=True)` | context manager | Enter the environment |
-| `sandbox.engine(engine_context=None, *, role="owner", include="tables")` | `AetherEngine` | Build an engine on the default `main` dataset |
-| `sandbox.federation(federation_id, *, declaration_file=None, members=None, context=None)` | `AetherFederation` | Build a federation over named datasets |
-| `sandbox.load_dataset(name, *, seed_sql=None, sql_file=None)` | `str` | Seed an additional in-memory database |
-| `sandbox.datasets` | `tuple[str, ...]` | Currently loaded dataset names |
-| `sandbox.connection(name="main")` | driver connection | DuckDB connection for manual `AetherEngine(...)` construction |
+| `Sandbox(*, llm_config=None, artifacts_dir=None, bundle_dir=None, cleanup=True, auto_seed=True, maintainer_access=False)` | context manager | Enter the authoring environment |
+| `sandbox.engine(engine_context=None, *, role="owner", include="tables", limits=None)` | [`AetherEngine`](#aetherengine) | Build an engine on the default dataset |
+| `sandbox.federation(federation_id, *, declaration_file=None, members=None, context=None)` | [`AetherFederation`](#aetherfederation) | Build a federation over named datasets |
+| `sandbox.load_dataset(name, *, seed_sql=None, sql_file=None)` | `str` | Maintainer: seed an additional in-memory database |
+| `sandbox.datasets` | `tuple[str, ...]` | Loaded dataset names |
+| `sandbox.connection(name="main")` | connection | DuckDB connection for manual construction |
 | `sandbox.artifacts_dir` | `str` | Shared artifacts root |
-| `sandbox.config_file` | `str \| None` | TOML path (temporary mock config or caller `llm_config`) |
-| `sandbox.adopt(engine)` | `None` | Apply sandbox mode to a caller-built engine |
-| `sandbox.questions()` | `tuple[str, ...]` | Recorded corpus questions when mock mode is active |
+| `sandbox.config_file` | `str` \| `None` | TOML path for sandbox LLM configuration |
+| `sandbox.adopt(engine)` | `None` | Idempotent: apply sandbox mock configuration (auto-runs on construction for sandbox-hosted connections) |
 | `sandbox.close()` | `None` | Release connections, temp extract dir, and owned artifacts |
 
-### `AetherEngine.offline_sandbox` quick path
+`with Sandbox() as sandbox:` plus production-shaped `AetherEngine(..., native_connection=sandbox.connection(), ...)` is the supported offline entry point. `sandbox.engine()` is a convenience wrapper over that constructor. Warmup and QSim raise `ConfigError` on sandbox instances.
 
-`AetherEngine.offline_sandbox(**kwargs)` forwards to `create_offline_sandbox` and returns a **`SandboxHandle`** (not a top-level `__all__` export). Use it when you want a working engine immediately; use `Sandbox()` when you want to construct engines yourself.
+### SandboxHandle
 
-| Parameter | Type | Default | Meaning |
-| --- | --- | --- | --- |
-| `engine_context` | `EngineContext \| None` | none | Scope, notes, and SQL overrides |
-| `notes_file` / `sql_file` | `str \| None` | none | Override bundled notes/SQL paths |
-| `llm_config` | `str \| os.PathLike \| None` | none | TOML path replacing bundled mock provider |
-| `maintainer_access` | `bool` | `False` | Maintainer corpus access for bundled sandbox fixtures |
-| `artifacts_dir` | `str \| None` | temp dir owned by handle | Share learning between sandbox instances |
-| `cleanup_artifacts` | `bool` | `True` | Remove owned temp artifacts on `close()` |
-| `seed_sql` | `str \| None` | none | Maintainer: alternate seed SQL for the main dataset |
-| `deny_columns` | `frozenset[str] \| None` | none | Column-security practice |
-| `include` | `"tables" \| "views"` | `"tables"` | Reflection target (`"views"` applies bundled view DDL) |
-| `bundle_dir` | `str \| None` | none | Maintainer: read bundle files from a directory instead of extracting `data.zip` |
-| `connection` | `Any \| None` | none | Reuse an existing DuckDB connection |
-| `owns_connection` | `bool \| None` | inferred | Whether the handle disposes `connection` on `close()` |
+Returned when using sandbox helpers that own ephemeral resources. Not exported from `__all__`; documented here for sandbox guide cross-links.
 
-| `SandboxHandle` member | Role |
+| Member | Role |
 | --- | --- |
-| `engine` | The `AetherEngine` or `AetherFederation` instance |
-| `connection` | Primary DuckDB connection (main dataset or federation coordinator view) |
-| `member_connections` | `tuple` of per-member connections for federation handles, else `None` |
+| `engine` | The [`AetherEngine`](#aetherengine) or [`AetherFederation`](#aetherfederation) instance |
+| `connection` | Primary DuckDB connection |
+| `member_connections` | Per-member connections for federation handles, else `None` |
 | `artifacts_dir` | Artifacts directory string |
-| `adopt(engine)` | Delegate to the backing `Sandbox.adopt` when present |
-| `session(...)` | Alias for `engine.session(...)` with default writer mode |
-| `apply_bundled_schema_overrides()` | Copy bundled override JSON and apply or enqueue |
-| `close()` | Release temp extract dir, connections, and owned artifacts |
+| `adopt(engine)` | Idempotent sandbox configuration for a caller-built engine (auto-runs on construction for sandbox-hosted connections) |
+| `close()` | Release temp resources and owned artifacts |
 
-| Symbol | Role |
-| --- | --- |
-| `AetherEngine.sandbox_questions()` | Curated offline practice question list |
-| `AetherEngine.sandbox_paraphrase_pairs()` | Canonical->paraphrase pairs |
-| `AetherEngine.sandbox_validation_failure_demo()` | Questions that should end in terminal validation errors |
-| `AetherEngine.sandbox_feedback_demo()` | Anchor question + allowed rejection text |
-| `MockFixtureMissingError` | Mock LLM has no recorded answer (exported from `aetherdialect`) |
-
-Warmup and QSim raise `ConfigError` on sandbox instances. Always use `with AetherEngine.offline_sandbox() as sb:` or call `sb.close()`.
+---
 
 ## Exceptions
 
@@ -1113,7 +1025,7 @@ Catch `AetherError` for a single handler over every library failure. Catch `Retr
 | Exception | Bases | When raised | What to do |
 | --- | --- | --- | --- |
 | `AetherError` | `Exception` | Base type for every library failure. | Catch once at service boundaries; branch on subclasses when needed. |
-| `AccessError` | `SchemaAccessError`, `RuntimeError` | Database refused `EXPLAIN`, `execute`, or `preview_table`. | Treat as permission denial; inspect `operation` and `SessionStep.status`. |
+| `AccessError` | `SchemaAccessError`, `RuntimeError` | Database refused `EXPLAIN` or `execute`. | Treat as permission denial; inspect `operation` and `SessionStep.status`. |
 | `AggregateJoinFanOutError` | `AetherError` | Join path would duplicate rows at parent grain. | Rephrase or narrow scope; fix schema join metadata. |
 | `AmbiguousDateLiteralError` | `AetherError` | Absolute date bound is not valid ISO 8601. | Ask the user for an unambiguous date. |
 | `ArtifactLockTimeoutError` | `RuntimeError`, `RetryableError` | Artifact directory lock not acquired in time. | Retry after the holder releases the lock. |
@@ -1146,13 +1058,14 @@ Catch `AetherError` for a single handler over every library failure. Catch `Retr
 | `JoinProbeEdgeKindMismatchError` | `AetherError` | Join signature / edge-kind lists misaligned. | Internal join metadata inconsistency. |
 | `LlmJsonExhausted` | `AetherError` | `llm_json` exhausted retries without valid JSON. | Retry turn or switch model/deployment. |
 | `LlmTransientFailure` | `RuntimeError`, `RetryableError` | Transient LLM HTTP failure. | Retry with backoff. |
-| `MigrationPendingError` | `AetherError`, `ValueError` | Migration map missing, invalid, or `abort`. | Edit migration map and restart. |
+| `MigrationPendingError` | `AetherError`, `ValueError` | Migration map missing, invalid, or `abort`. | Edit the migration map document and call `apply_migration_map`. |
 | `MockFixtureMissingError` | `RuntimeError` | Mock LLM lacks a recorded answer. | Add fixture or ask a recorded question. |
 | `NoJoinPathError` | `AetherError` | Requested tables have no join path. | Declare FK/semantic edges or fewer tables. |
 | `NullInNegatedListError` | `AetherError` | `NOT IN` list contains null. | Rephrase filter predicate. |
-| `OwnerOnlyOperationError` | `ConfigError` | Consumer attempted owner-only mutation. | Use an owner-role engine instance. |
+| `OwnerOnlyOperationError` | `ConfigError` | Consumer attempted an owner-only mutation (`apply_structure`, `apply_knowledge`, space writes, and related owner surfaces). | Use an owner-role engine instance. |
 | `PipelineSuspended` | `AetherError` | Programmatic turn awaits `session.step`. | Not an error; resume with `step`. |
 | `ProbeCtePlacementError` | `AetherError` | Probe CTE used as illegal join anchor. | Rephrase semi/anti-join intent. |
+| `RefinementRetry` | `AetherError` | User declined intent/SQL and the turn must restart refinement. | Catch and continue the interactive loop. |
 | `RegistryRenderError` | `AetherError` | Window or CASE registry token cannot be resolved during SQL render. | Ensure registry ids match declared steps. |
 | `ResultCapExceededError` | `RuntimeError` | Single-engine row/byte cap exceeded. | Narrow question or raise caps. |
 | `RetryableDatabaseExecutionError` | `DatabaseExecutionError`, `RetryableError` | Transient database execution failure. | Retry the statement/turn. |

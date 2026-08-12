@@ -71,7 +71,7 @@ def test_mock_ignores_retries_and_timeout(tmp_path: Path) -> None:
     assert out == '{"ok": true}'
     sleep_mock.assert_not_called()
 
-    EngineConfig.LLM_PROVIDER = "mock"
+    EngineConfig.LLM_PROVIDER = "sandbox"
     EngineConfig.MOCK_FIXTURES_FILE = str(path)
     MockProvider.reset_mock_provider()
 
@@ -106,8 +106,8 @@ def test_live_transient_transport_error_raises_llm_transient_failure() -> None:
     with patch("aetherdialect._llm_provider.LLMProvider._provider_order", return_value=["openai"]):
         with patch("aetherdialect._llm_provider.LLMProvider._provider_is_configured", return_value=True):
             with patch("aetherdialect._llm_provider.LLMProvider._build_client", return_value=client):
-                with patch("aetherdialect._core_utils.debug"):
-                    with patch("aetherdialect._core_utils.pipeline_trace"):
+                with patch("aetherdialect._utils.debug"):
+                    with patch("aetherdialect._utils.pipeline_trace"):
                         with patch("aetherdialect._llm_provider.time.sleep"):
                             with pytest.raises(LlmTransientFailure, match="LLM call failed"):
                                 LLMProvider.chat("s", "u", max_retries=1, task="join")
@@ -124,8 +124,8 @@ def test_live_non_transient_transport_error_raises_runtime_error() -> None:
     with patch("aetherdialect._llm_provider.LLMProvider._provider_order", return_value=["openai"]):
         with patch("aetherdialect._llm_provider.LLMProvider._provider_is_configured", return_value=True):
             with patch("aetherdialect._llm_provider.LLMProvider._build_client", return_value=client):
-                with patch("aetherdialect._core_utils.debug"):
-                    with patch("aetherdialect._core_utils.pipeline_trace"):
+                with patch("aetherdialect._utils.debug"):
+                    with patch("aetherdialect._utils.pipeline_trace"):
                         with patch("aetherdialect._llm_provider.time.sleep"):
                             with pytest.raises(RuntimeError, match="LLM call failed"):
                                 LLMProvider.chat("s", "u", max_retries=1, task="join")

@@ -7,11 +7,11 @@ from dataclasses import replace
 import pytest
 
 from aetherdialect._constants import ARTIFACT_FORMAT_VERSION
-from aetherdialect._contracts_base import ArtifactManifest, ColumnRole, MigrationTier
-from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import write_artifact_manifest
+from aetherdialect._contracts_base import ArtifactManifest, MigrationTier
+from aetherdialect._contracts_schema import ColumnMetadata, ColumnRole, FKEdge, SchemaGraph, TableMetadata
 from aetherdialect._schema_graph import classify_migration_tier, diff_schemas
-from aetherdialect._templates import TemplateOps
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils_artifacts import write_artifact_manifest
 
 
 def _col(

@@ -6,7 +6,7 @@ import pytest
 
 from aetherdialect._config import DuckDBRuntimeConfig
 from aetherdialect._contracts_base import EngineIdentity
-from aetherdialect._core_utils import (
+from aetherdialect._utils import (
     notify,
     pop_engine_identity,
     push_engine_identity,

@@ -1,18 +1,20 @@
-"""export_knowledge wrapper returns per-level BK for metadata-review read-back."""
+"""export_knowledge keeps master and named-space layers distinct."""
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
-from aetherdialect import AetherEngine, BusinessKnowledgeEntry
-from aetherdialect._contracts_base import BusinessKnowledgeHolder, EngineContext, LLMConfig, RuntimeConfig
+from aetherdialect import AetherEngine, DomainKnowledgeEntry
+from aetherdialect._contracts_base import DomainKnowledgeHolder, EngineContext
+from aetherdialect._contracts_core import LLMConfig, RuntimeConfig
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import load_runtime_config
-from aetherdialect._templates import TemplateOps
+from aetherdialect._main_execution import MainExecutionOps
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils_artifacts import load_runtime_config
 
 
 def _schema() -> SchemaGraph:
@@ -55,10 +57,11 @@ def _minimal_engine(tmp_path: Path) -> AetherEngine:
     obj._schema_role = "owner"
     obj._consumer_visible_objects = None
     obj._schema_stats = {"table_count": 1, "total_filterable": 1}
-    obj._construction_phase_callback = None
-    obj._ask_phase_callback = None
+    obj._phase_callback = None
+    obj._phase_callback = None
     obj._token_provider = None
-    obj._business_knowledge = BusinessKnowledgeHolder()
+    obj._context_name = "master"
+    obj._domain_knowledge = DomainKnowledgeHolder()
     return obj
 
 
@@ -66,33 +69,38 @@ def _minimal_engine(tmp_path: Path) -> AetherEngine:
 def test_engine_and_space_layers_distinct(tmp_path: Path) -> None:
     engine = _minimal_engine(tmp_path)
     engine_entries = (
-        BusinessKnowledgeEntry(key="arr", text="engine arr", kind="glossary"),
-        BusinessKnowledgeEntry(key="fy", text="engine fy", kind="policy"),
+        DomainKnowledgeEntry(key="arr", text="engine arr", kind="glossary"),
+        DomainKnowledgeEntry(key="fy", text="engine fy", kind="policy"),
     )
-    engine.set_business_knowledge(engine_entries)
+    engine._replace_domain_knowledge(engine_entries)
     space_snap: dict[str, Any] = {
+        "uid": "analytics",
         "tables": ["orders"],
-        "business_knowledge": [
-            {"key": "arr", "kind": "glossary", "text": "space arr"},
-            {"key": "nrr", "kind": "metric", "text": "space only"},
+        "columns": ["orders.id"],
+        "table_descriptions": {},
+        "column_meta": {},
+        "domain_knowledge": [
+            {"key": "arr", "kind": "glossary", "text": "space arr", "referenced_entities": []},
+            {"key": "nrr", "kind": "metric", "text": "space only", "referenced_entities": []},
         ],
     }
-    with patch(
-        "aetherdialect.aetherdialect.list_saved_aetherspace_names",
-        return_value=("analytics",),
-    ):
-        with patch(
-            "aetherdialect.aetherdialect.load_aetherspace_snapshot",
-            return_value=space_snap,
-        ):
-            layers = engine.export_knowledge()
-    assert layers["format_version"] == "0.2.1"
-    assert layers["engine"]["business_knowledge"] == [
-        {"key": "arr", "kind": "glossary", "text": "engine arr"},
-        {"key": "fy", "kind": "policy", "text": "engine fy"},
+    MainExecutionOps.save_aetherspace_snapshot(str(tmp_path), "analytics", space_snap)
+    master = engine.export_knowledge()
+    named = engine.export_knowledge(space="analytics")
+    assert master["uid"] == "master"
+    assert named["uid"] == "analytics"
+    assert master["domain_knowledge"] == [
+        {"key": "arr", "kind": "glossary", "text": "engine arr", "referenced_entities": []},
+        {"key": "fy", "kind": "policy", "text": "engine fy", "referenced_entities": []},
     ]
-    assert layers["spaces"]["analytics"]["business_knowledge"] == [
-        {"key": "arr", "kind": "glossary", "text": "space arr"},
-        {"key": "nrr", "kind": "metric", "text": "space only"},
+    assert named["domain_knowledge"] == [
+        MainExecutionOps._domain_knowledge_entry_to_dict(e)
+        for e in MainExecutionOps.merge_domain_knowledge(
+            engine_entries,
+            (
+                DomainKnowledgeEntry(key="arr", text="space arr", kind="glossary"),
+                DomainKnowledgeEntry(key="nrr", text="space only", kind="metric"),
+            ),
+        )
     ]
-    assert layers["spaces"]["analytics"]["business_knowledge"] != layers["engine"]["business_knowledge"]
+    assert named["domain_knowledge"] != master["domain_knowledge"]

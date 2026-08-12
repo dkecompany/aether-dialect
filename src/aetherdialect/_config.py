@@ -1,9 +1,11 @@
-"""Engine and policy settings, tunable thresholds, and shared validation constants. `BOOLEAN_TRUTH_PATTERN_MAP` maps lowercased two-valued top-K sets to the canonical affirmative literal (lowercase) used when recording ``ColumnMetadata.boolean_truth_value``. ``REMOVED_BEHAVIOUR_ENVIRONMENT_KEYS`` maps retired behaviour-tuning environment variables (formerly applied via ``apply_environment``) to their ``PolicyConfig`` / ``EngineLimits`` / ``FederationLimits`` replacements; connection identity keys stay on the config-file / environment path."""
+"""Engine and policy settings, tunable thresholds, and shared validation constants. `BOOLEAN_TRUTH_PATTERN_MAP` maps lowercased two-valued top-K sets to the canonical affirmative literal (lowercase) used when recording ``ColumnMetadata.boolean_truth_value``. Connection identity keys stay on the config-file / environment path."""
 
 from __future__ import annotations
 
 import hashlib
+import inspect
 import os
+import re
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
@@ -30,7 +32,6 @@ from ._constants import (
     DUCKDB_ENV_PATH,
     DUCKDB_ENV_SCHEMA,
     ENGINE_STORAGE_PLACEHOLDER_DIR,
-    EXCLUDED_WHERE_PATTERNS,
     MARIADB_ENV_DATABASE,
     MARIADB_ENV_HOST,
     MARIADB_ENV_PASSWORD,
@@ -41,6 +42,18 @@ from ._constants import (
     MYSQL_ENV_PASSWORD,
     MYSQL_ENV_PORT,
     MYSQL_ENV_USER,
+    ORACLE_ENV_AUTH_MODE,
+    ORACLE_ENV_CONFIG_DIR,
+    ORACLE_ENV_HOST,
+    ORACLE_ENV_PASSWORD,
+    ORACLE_ENV_PORT,
+    ORACLE_ENV_SCHEMA,
+    ORACLE_ENV_SERVICE_NAME,
+    ORACLE_ENV_SID,
+    ORACLE_ENV_THICK_MODE,
+    ORACLE_ENV_TOKEN,
+    ORACLE_ENV_USER,
+    ORACLE_ENV_WALLET_LOCATION,
     POSTGRES_ENV_DATABASE,
     POSTGRES_ENV_HOST,
     POSTGRES_ENV_PASSWORD,
@@ -57,7 +70,6 @@ from ._constants import (
     REDSHIFT_ENV_USE_IAM,
     REDSHIFT_ENV_USER,
     REDSHIFT_ENV_WORKGROUP,
-    REMOVED_BEHAVIOUR_ENVIRONMENT_KEYS,
     SEED_WARMUP_CACHE_ZIP,
     SENTINEL_MODE_FREQUENCY_THRESHOLD,
     SNOWFLAKE_ENV_ACCOUNT,
@@ -83,10 +95,10 @@ from ._constants import (
     SQLSERVER_ENV_SCHEMA,
     SQLSERVER_ENV_TENANT_ID,
     SQLSERVER_ENV_USER,
-    STOPWORDS_GRAMMATICAL_PARTICLES,
     UNUSABLE_NULL_RATIO_THRESHOLD,
     WARMUP_ANCHOR_LATTICE_SUBDIR,
 )
+from ._constants_runtime import STOPWORDS_GRAMMATICAL_PARTICLES
 from ._contracts_base import ConfigError
 
 
@@ -259,7 +271,7 @@ class FederationLimits:
 
 
 class PolicyConfig:
-    """ClassVar thresholds, penalties, stopwords, and SQL rejection patterns. Developer tracing: set ClassVar ``DEBUG``. ``telemetry_capture(..., force_diagnostic_flags=True)`` bumps an internal depth counter so diagnostics emit into the capture buffer without mutating ClassVars. Live tests opt in per session via ``live_tests/conftest.py`` (``PolicyConfig.DEBUG``) so failures and optional full logs can be written to ``live_tests/results.txt``. Cache rebuild shortcuts: set ``REGENERATE_TEMPLATE_STORE``, ``REGENERATE_SCHEMA_GRAPH``, or ``REGENERATE_SKELETON_CACHE`` to skip loading the corresponding on-disk artifact when present. Semantic join hints (non-FK overlap): profiling stores ``frequent_values`` and a separate ascending distinct ``value_overlap_sample`` (``VALUE_OVERLAP_SAMPLE_LIMIT``) for overlap; ``compute_semantic_profile_join_neighbors`` stores symmetric edges on ``ColumnMetadata.semantic_join_neighbors``. ``SEMANTIC_JOIN_MIN_OVERLAP_RATIO`` is the minimum ``|intersection| / min(|A|,|B|)`` on those two samples before an edge is recorded."""
+    """ClassVar thresholds, penalties, stopwords, and SQL rejection patterns. Developer tracing: set ClassVar ``DEBUG``. ``telemetry_capture(..., force_diagnostic_flags=True)`` bumps an internal depth counter so diagnostics emit into the capture buffer without mutating ClassVars. Integrators can set ``PolicyConfig.DEBUG`` so failures and optional full diagnostic logs are emitted for capture. Cache rebuild shortcuts: set ``REGENERATE_TEMPLATE_STORE``, ``REGENERATE_SCHEMA_GRAPH``, or ``REGENERATE_SKELETON_CACHE`` to skip loading the corresponding on-disk artifact when present. Semantic join hints (non-FK overlap): profiling stores ``frequent_values`` and a separate ascending distinct ``value_overlap_sample`` (``VALUE_OVERLAP_SAMPLE_LIMIT``) for overlap; ``compute_semantic_profile_join_neighbors`` stores symmetric edges on ``ColumnMetadata.semantic_join_neighbors``. ``SEMANTIC_JOIN_MIN_OVERLAP_RATIO`` is the minimum ``|intersection| / min(|A|,|B|)`` on those two samples before an edge is recorded."""
 
     SCHEMA_CACHE_HASH_DEBUG_CLIP_CHARS: ClassVar[int] = 800
 
@@ -471,6 +483,16 @@ class EngineRuntimeConfig(metaclass=_RuntimeConfigMeta):
     _PROCESS_DEFAULTS_BY_CLASS: ClassVar[dict[type[EngineRuntimeConfig], EngineRuntimeConfig]] = {}
 
     @classmethod
+    def attach_connection(cls, connection: Any) -> None:
+        """Attach a process-scoped native connection for engines that borrow an open handle."""
+        EngineRuntimeConfig._attached_natives[cls] = connection
+
+    @classmethod
+    def clear_attached_connection(cls) -> None:
+        """Clear any process-scoped native connection attached to this runtime class."""
+        EngineRuntimeConfig._attached_natives.pop(cls, None)
+
+    @classmethod
     def process_default_for_class(cls, target: type[EngineRuntimeConfig] | EngineRuntimeConfig) -> EngineRuntimeConfig:
         if not isinstance(target, type):
             return target
@@ -539,6 +561,29 @@ class EngineRuntimeConfig(metaclass=_RuntimeConfigMeta):
     def connection_slug_keys(cls) -> tuple[str, ...]:
         """Return ordered keys from :meth:`connection_slug_fields` that participate in storage slugs."""
         return ()
+
+    @classmethod
+    def accepted_connection_keys(cls) -> frozenset[str]:
+        """Return the environment variable names this engine's :meth:`apply_environment` recognizes, derived from its ``*_ENV_*`` alias tuples. Walks the MRO directly (skipping the metaclass ``apply_environment`` wrapper) to find the real implementation."""
+        func = None
+        for klass in cls.__mro__:
+            candidate = klass.__dict__.get("apply_environment")
+            if candidate is not None:
+                func = candidate
+                break
+        if func is None:
+            return frozenset()
+        try:
+            source = inspect.getsource(func)
+        except (OSError, TypeError):
+            return frozenset()
+        tuple_names = set(re.findall(r"\b([A-Z][A-Z0-9]*_ENV_[A-Z0-9_]+)\b", source))
+        keys: set[str] = set()
+        for name in tuple_names:
+            value = globals().get(name)
+            if isinstance(value, tuple):
+                keys.update(str(v) for v in value)
+        return frozenset(keys)
 
     @classmethod
     def redacted_fields(cls) -> frozenset[str]:
@@ -922,16 +967,6 @@ class DuckDBRuntimeConfig(EngineRuntimeConfig):
     DATABASE_PATH: str = ":memory:"
     SCHEMA: str = "main"
 
-    @classmethod
-    def attach_connection(cls, connection: Any) -> None:
-        """Deprecated: pass ``native_connection`` to :func:`~aetherdialect._dialect.get_dialect` instead."""
-        EngineRuntimeConfig._attached_natives[cls] = connection
-
-    @classmethod
-    def clear_attached_connection(cls) -> None:
-        """Deprecated: clear the class-scoped native connection slot."""
-        EngineRuntimeConfig._attached_natives.pop(cls, None)
-
     def db_url(self) -> str:
         """Build a SQLAlchemy DuckDB URL from the configured file path or :memory:."""
         path = str(self.DATABASE_PATH or ":memory:")
@@ -970,7 +1005,7 @@ class DuckDBRuntimeConfig(EngineRuntimeConfig):
 
 @dataclass
 class CsvRuntimeConfig(EngineRuntimeConfig):
-    """CSV/Excel file-source connection defaults for the in-memory DuckDB backend."""
+    """CSV/Excel file-source connection defaults for the DuckDB upload store."""
 
     ENGINE_NAME: ClassVar[str] = "csv"
 
@@ -979,18 +1014,8 @@ class CsvRuntimeConfig(EngineRuntimeConfig):
     SOURCE_SELECTIONS: dict[str, dict[str, Any]] = field(default_factory=dict)
     SCHEMA: str = "main"
 
-    @classmethod
-    def attach_connection(cls, connection: Any) -> None:
-        """Deprecated: pass ``native_connection`` to :func:`~aetherdialect._dialect.get_dialect` instead."""
-        EngineRuntimeConfig._attached_natives[cls] = connection
-
-    @classmethod
-    def clear_attached_connection(cls) -> None:
-        """Deprecated: clear the class-scoped native connection slot."""
-        EngineRuntimeConfig._attached_natives.pop(cls, None)
-
     def db_url(self) -> str:
-        """Return the in-memory DuckDB SQLAlchemy URL used by the CSV backend."""
+        """Return the DuckDB SQLAlchemy URL used by the CSV backend (memory when no artifacts)."""
         return "duckdb:///:memory:"
 
     def connect_args(self) -> dict[str, Any]:
@@ -1110,16 +1135,6 @@ class SQLiteRuntimeConfig(EngineRuntimeConfig):
 
     DATABASE_PATH: str = ":memory:"
     SCHEMA: str = "main"
-
-    @classmethod
-    def attach_connection(cls, connection: Any) -> None:
-        """Deprecated: pass ``native_connection`` to :func:`~aetherdialect._dialect.get_dialect` instead."""
-        EngineRuntimeConfig._attached_natives[cls] = connection
-
-    @classmethod
-    def clear_attached_connection(cls) -> None:
-        """Deprecated: clear the class-scoped native connection slot."""
-        EngineRuntimeConfig._attached_natives.pop(cls, None)
 
     def db_url(self) -> str:
         """Build a SQLAlchemy SQLite URL from the configured file path or :memory:."""
@@ -1409,6 +1424,167 @@ class SQLServerRuntimeConfig(EngineRuntimeConfig):
 
 
 @dataclass
+class OracleRuntimeConfig(EngineRuntimeConfig):
+    """Oracle connection defaults (ClassVars)."""
+
+    ENGINE_NAME: ClassVar[str] = "oracle"
+
+    HOST: str = "localhost"
+    PORT: int = 1521
+    USER: str | None = None
+    PASSWORD: str | None = None
+    SERVICE_NAME: str | None = None
+    SID: str | None = None
+    SCHEMA: str | None = None
+    AUTH_MODE: str = "password"
+    WALLET_LOCATION: str | None = None
+    CONFIG_DIR: str | None = None
+    TOKEN: str | None = None
+    THICK_MODE: bool = False
+
+    def db_url(self) -> str:
+        """Build a SQLAlchemy ``oracle+oracledb`` URL from ClassVars."""
+        service = (self.SERVICE_NAME or "").strip()
+        sid = (self.SID or "").strip()
+        if not service and not sid:
+            raise ValueError("Oracle service_name or sid required")
+        if service and sid:
+            raise ValueError("Oracle service_name and sid are mutually exclusive")
+        host = self.HOST or "localhost"
+        port = int(self.PORT)
+        mode = (self.AUTH_MODE or "password").strip().lower()
+        if mode == "token":
+            if not self.TOKEN:
+                raise ValueError("Oracle token required for token authentication")
+            user_q = quote(str(self.USER or ""), safe="") if self.USER else ""
+            auth = f"{user_q}@" if user_q else ""
+        elif mode == "wallet":
+            if not self.WALLET_LOCATION and not self.CONFIG_DIR:
+                raise ValueError("Oracle wallet_location or config_dir required for wallet authentication")
+            user_q = quote(str(self.USER or ""), safe="") if self.USER else ""
+            if self.USER and self.PASSWORD:
+                pwd_q = quote(str(self.PASSWORD), safe="")
+                auth = f"{user_q}:{pwd_q}@"
+            elif user_q:
+                auth = f"{user_q}@"
+            else:
+                auth = ""
+        else:
+            if not self.USER or not self.PASSWORD:
+                raise ValueError("Oracle user and password required for password authentication")
+            user_q = quote(str(self.USER), safe="")
+            pwd_q = quote(str(self.PASSWORD), safe="")
+            auth = f"{user_q}:{pwd_q}@"
+        if service:
+            query = f"service_name={quote(service, safe='')}"
+        else:
+            query = f"sid={quote(sid, safe='')}"
+        return f"oracle+oracledb://{auth}{host}:{port}/?{query}"
+
+    def connect_args(self) -> dict[str, Any]:
+        """Return python-oracledb connect arguments for wallet or token auth."""
+        out: dict[str, Any] = {}
+        mode = (self.AUTH_MODE or "password").strip().lower()
+        if self.CONFIG_DIR:
+            out["config_dir"] = str(self.CONFIG_DIR)
+        if self.WALLET_LOCATION:
+            out["wallet_location"] = str(self.WALLET_LOCATION)
+        if mode == "token" and self.TOKEN:
+            out["access_token"] = str(self.TOKEN)
+        return out
+
+    def ensure_driver_mode(self) -> None:
+        """Initialize thick-mode Oracle client libraries when configured."""
+        if not self.THICK_MODE:
+            return
+        import oracledb
+
+        if getattr(oracledb, "is_thin_mode", lambda: True)():
+            oracledb.init_oracle_client()
+
+    def has_password_auth(self) -> bool:
+        """Return True when password authentication is configured."""
+        return (self.AUTH_MODE or "password").strip().lower() == "password" and bool(self.USER and self.PASSWORD)
+
+    def has_wallet_auth(self) -> bool:
+        """Return True when wallet authentication is selected with a wallet path."""
+        return (self.AUTH_MODE or "").strip().lower() == "wallet" and bool(self.WALLET_LOCATION or self.CONFIG_DIR)
+
+    def has_token_auth(self) -> bool:
+        """Return True when token authentication is selected with a token."""
+        return (self.AUTH_MODE or "").strip().lower() == "token" and bool(self.TOKEN)
+
+    def apply_environment(self, env: Mapping[str, str]) -> None:
+        """Apply Oracle environment variables to ClassVars."""
+        self.HOST = EngineConfig.env_first_nonempty(env, *ORACLE_ENV_HOST) or "localhost"
+        port_raw = EngineConfig.env_first_nonempty(env, *ORACLE_ENV_PORT)
+        self.PORT = int(port_raw) if port_raw else 1521
+        user = EngineConfig.env_first_nonempty(env, *ORACLE_ENV_USER)
+        self.USER = user or None
+        self.PASSWORD = EngineConfig.env_first_nonempty(env, *ORACLE_ENV_PASSWORD) or None
+        service = EngineConfig.env_first_nonempty(env, *ORACLE_ENV_SERVICE_NAME)
+        self.SERVICE_NAME = service or None
+        sid = EngineConfig.env_first_nonempty(env, *ORACLE_ENV_SID)
+        self.SID = sid or None
+        schema = EngineConfig.env_first_nonempty(env, *ORACLE_ENV_SCHEMA)
+        if schema:
+            self.SCHEMA = schema
+        elif self.USER:
+            self.SCHEMA = str(self.USER).upper()
+        else:
+            self.SCHEMA = None
+        auth_mode = EngineConfig.env_first_nonempty(env, *ORACLE_ENV_AUTH_MODE)
+        self.AUTH_MODE = auth_mode.lower() if auth_mode else "password"
+        self.WALLET_LOCATION = EngineConfig.env_first_nonempty(env, *ORACLE_ENV_WALLET_LOCATION) or None
+        self.CONFIG_DIR = EngineConfig.env_first_nonempty(env, *ORACLE_ENV_CONFIG_DIR) or None
+        self.TOKEN = EngineConfig.env_first_nonempty(env, *ORACLE_ENV_TOKEN) or None
+        thick_raw = EngineConfig.env_first_nonempty(env, *ORACLE_ENV_THICK_MODE)
+        self.THICK_MODE = bool(thick_raw) and thick_raw.strip().lower() not in {"0", "false", "no", "off"}
+
+    @classmethod
+    def env_complete(cls, env: Mapping[str, str]) -> bool:
+        """Return True when required Oracle env vars are present."""
+        auth = (EngineConfig.env_first_nonempty(env, *ORACLE_ENV_AUTH_MODE) or "password").strip().lower()
+        has_target = EngineConfig.env_any_nonempty(env, ORACLE_ENV_SERVICE_NAME) or EngineConfig.env_any_nonempty(
+            env, ORACLE_ENV_SID
+        )
+        if not has_target:
+            return False
+        if auth == "wallet":
+            return EngineConfig.env_any_nonempty(env, ORACLE_ENV_WALLET_LOCATION) or EngineConfig.env_any_nonempty(
+                env, ORACLE_ENV_CONFIG_DIR
+            )
+        if auth == "token":
+            return EngineConfig.env_any_nonempty(env, ORACLE_ENV_TOKEN)
+        return EngineConfig.env_any_nonempty(env, ORACLE_ENV_USER) and EngineConfig.env_any_nonempty(
+            env, ORACLE_ENV_PASSWORD
+        )
+
+    def connection_slug_fields(self) -> dict[str, str]:
+        """Return Oracle connection values for slug and introspection."""
+        return {
+            "host": self.HOST or "localhost",
+            "port": str(int(self.PORT)),
+            "service_name": self.SERVICE_NAME or "",
+            "sid": self.SID or "",
+            "schema": self.SCHEMA or (str(self.USER).upper() if self.USER else ""),
+            "user": self.USER or "",
+            "password": self.PASSWORD or "",
+            "auth_mode": self.AUTH_MODE or "password",
+        }
+
+    @classmethod
+    def connection_slug_keys(cls) -> tuple[str, ...]:
+        """Return slug field order for Oracle storage paths."""
+        return ("host", "port", "service_name", "sid", "schema")
+
+    @classmethod
+    def redacted_fields(cls) -> frozenset[str]:
+        """Return Oracle secret field names."""
+        return frozenset({"password", "token"})
+
+
+@dataclass
 class SnowflakeRuntimeConfig(EngineRuntimeConfig):
     """Snowflake connection defaults (ClassVars)."""
 
@@ -1638,21 +1814,20 @@ class EngineConfig:
 
     RUNTIME: ClassVar[type[EngineRuntimeConfig] | EngineRuntimeConfig] = PostgresRuntimeConfig
 
-    REMOVED_BEHAVIOUR_ENVIRONMENT_KEYS: ClassVar[Mapping[str, str]] = REMOVED_BEHAVIOUR_ENVIRONMENT_KEYS
-
     API_TOKEN: ClassVar[str | None] = None
     AZURE_API_TOKEN: ClassVar[str | None] = None
     LLM_PROVIDER: ClassVar[str] = "openai"
     MOCK_FIXTURES_FILE: ClassVar[str] = ""
-    OPENAI_MODEL: ClassVar[str] = "gpt-4.1-nano"
+    OPENAI_MODEL: ClassVar[str] = "gpt-4.1-mini"
     OPENAI_MODEL_INTENT: ClassVar[str] = "gpt-5.4-mini"
     OPENAI_MODEL_JOIN: ClassVar[str] = "gpt-5.4-nano"
     OPENAI_MODEL_SCHEMA_BASE: ClassVar[str] = "gpt-4.1-mini"
-    OPENAI_MODEL_DDL: ClassVar[str] = "gpt-4.1-nano"
+    OPENAI_MODEL_DDL: ClassVar[str] = "gpt-4.1-mini"
     OPENAI_MODEL_SCHEMA: ClassVar[str] = "gpt-5-mini"
+    OPENAI_MODEL_DOMAIN_KNOWLEDGE: ClassVar[str] = "gpt-5.4-mini"
     OPENAI_MODEL_SYNTH: ClassVar[str] = "gpt-5-mini"
     OPENAI_MODEL_SYNTH_VARIETY: ClassVar[str] = "gpt-5-nano"
-    OPENAI_MODEL_INTENT_FORMAT: ClassVar[str] = "gpt-4.1-nano"
+    OPENAI_MODEL_INTENT_FORMAT: ClassVar[str] = "gpt-4.1-mini"
     OPENAI_MODEL_INTENT_SCHEMA_REPAIR: ClassVar[str] = "gpt-5.4-nano"
     OPENAI_MODEL_UPLOAD_SUMMARY: ClassVar[str] = "gpt-5.4-nano"
     OPENAI_MODEL_UPLOAD_INTERPRET: ClassVar[str] = "gpt-5-mini"
@@ -1689,13 +1864,26 @@ class EngineConfig:
         return document
 
     @staticmethod
+    def normalize_llm_provider(raw: str) -> str:
+        """Return the canonical LLM provider label (``mock`` maps to ``sandbox``)."""
+        value = str(raw or "").strip().lower()
+        if value == "mock":
+            return "sandbox"
+        return value
+
+    @staticmethod
+    def is_sandbox_llm_provider(provider: str | None) -> bool:
+        """Return True when *provider* selects offline sandbox fixture replay."""
+        return EngineConfig.normalize_llm_provider(str(provider or "")) == "sandbox"
+
+    @staticmethod
     def llm_credentials_configured() -> bool:
         """Return True when at least one LLM provider has required credentials on ``EngineConfig``."""
 
         def _non_empty_str(value: object) -> bool:
             return isinstance(value, str) and bool(value.strip())
 
-        if EngineConfig.LLM_PROVIDER == "mock":
+        if EngineConfig.is_sandbox_llm_provider(EngineConfig.LLM_PROVIDER):
             return _non_empty_str(EngineConfig.MOCK_FIXTURES_FILE)
         openai_ok = _non_empty_str(EngineConfig.API_TOKEN)
         azure_ok = (
@@ -1775,8 +1963,6 @@ class QSimConfig:
         "highly_complex": 0.10,
     }
 
-    EXCLUDED_WHERE_PATTERNS = EXCLUDED_WHERE_PATTERNS
-
     SKELETONS_JSON_PATH = os.path.join(ENGINE_STORAGE_PLACEHOLDER_DIR, "qsim_skeletons.json.gz")
 
     MIN_ADVANCED_FEATURE_RATIO = 0.15
@@ -1818,7 +2004,7 @@ class SeedWarmupConfig:
     SEED_WARMUP_CODE_VERSION: str = "3"
 
     WARMUP_ANCHOR_LATTICE_SUBDIR: str = WARMUP_ANCHOR_LATTICE_SUBDIR
-    WARMUP_ANCHOR_LATTICE_CODE_VERSION: str = "3"
+    WARMUP_ANCHOR_LATTICE_CODE_VERSION: str = "4"
 
     WARMUP_QUESTION_STYLES: tuple[str, ...] = (
         "formal",
@@ -1828,7 +2014,7 @@ class SeedWarmupConfig:
         "descriptive",
         "concise",
         "keyword",
-        "business_jargon",
+        "domain_jargon",
         "beginner",
         "verbose",
     )
@@ -1841,7 +2027,7 @@ class SeedWarmupConfig:
         "descriptive": "Neutral narrative statement of the insight or figures requested.",
         "concise": "Minimal words; one short sentence or tight fragment only.",
         "keyword": "Search-bar style; short keyword phrases without full grammar.",
-        "business_jargon": "Domain analyst jargon and KPI language where natural.",
+        "domain_jargon": "Domain-specific jargon and measure language where natural.",
         "beginner": "Plain language for a newcomer; avoid insider abbreviations.",
         "verbose": "Fully spelled-out, slightly longer wording with explicit context.",
     }

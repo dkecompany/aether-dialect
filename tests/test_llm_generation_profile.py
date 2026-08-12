@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from aetherdialect._config import EngineConfig
-from aetherdialect._constants import TASK_PROFILES
+from aetherdialect._constants_runtime import TASK_PROFILES
 from aetherdialect._llm_provider import LLMProvider
 
 

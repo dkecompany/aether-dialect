@@ -1,4 +1,4 @@
-"""Tests for atomic schema-override application and writer-lock serialization."""
+"""Atomic structure-document application and writer-lock serialization."""
 
 from __future__ import annotations
 
@@ -10,10 +10,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aetherdialect._contracts_base import ColumnRole, EngineContext, TableRole
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
+from aetherdialect._contracts_base import EngineContext
+from aetherdialect._contracts_schema import ColumnMetadata, ColumnRole, SchemaGraph, TableMetadata, TableRole
+from aetherdialect._schema_finalize import apply_structure_to_graph
 from aetherdialect._schema_graph import assign_schema_graph_hashes, recompute_join_paths_multi
-from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
 from tests.test_aetherdialect import _make_aether_stub
 from tests.test_schema import _ov_doc
 
@@ -61,7 +61,7 @@ def _paths_match_tables(sg: SchemaGraph) -> bool:
     return sg.join_paths_multi == recompute_join_paths_multi(sg.tables)
 
 
-def test_apply_schema_overrides_to_graph_live_graph_consistent_mid_apply(
+def test_apply_structure_to_graph_live_graph_consistent_mid_apply(
     schema_graph: SchemaGraph,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -75,9 +75,9 @@ def test_apply_schema_overrides_to_graph_live_graph_consistent_mid_apply(
         pre_recompute_checks.append(_paths_match_tables(live))
         return real_recompute(tables, **kwargs)
 
-    monkeypatch.setattr("aetherdialect._schema_overrides.recompute_join_paths_multi", probe_recompute)
+    monkeypatch.setattr("aetherdialect._schema_finalize.recompute_join_paths_multi", probe_recompute)
     monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
-    report = apply_schema_overrides_to_graph(
+    report = apply_structure_to_graph(
         schema_graph,
         _ov_doc(
             foreign_keys_add=[
@@ -94,14 +94,14 @@ def test_apply_schema_overrides_to_graph_live_graph_consistent_mid_apply(
     assert all(pre_recompute_checks)
 
 
-def test_apply_overrides_acquires_pipeline_writer_lock(
+def test_apply_structure_acquires_pipeline_writer_lock(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Owner apply_overrides must serialize on the pipeline writer lock."""
+    """Owner apply_structure must serialize on the pipeline writer lock."""
     art_dir = tmp_path / "artifacts"
     art_dir.mkdir()
-    (art_dir / "schema_overrides.json").write_text(json.dumps({"tables": {}}), encoding="utf-8")
+    (art_dir / "schema_structure.json").write_text(json.dumps({"tables": {}}), encoding="utf-8")
 
     lock = threading.Lock()
     acquired: list[bool] = []
@@ -120,7 +120,7 @@ def test_apply_overrides_acquires_pipeline_writer_lock(
     engine._schema_graph.effective_structural_hash = "eff"
 
     with patch(
-        "aetherdialect.aetherdialect.apply_overrides_and_persist",
+        "aetherdialect.aetherdialect.apply_structure_document",
         return_value=MagicMock(
             table_edits=0,
             column_edits=0,
@@ -131,8 +131,17 @@ def test_apply_overrides_acquires_pipeline_writer_lock(
             pks_blocked=0,
             coerced_columns=0,
             collapsed_inferences=0,
+            domain_knowledge_entries=None,
         ),
     ):
-        engine.apply_overrides()
-
+        engine.apply_structure(
+            {
+                "version": "0.2.3",
+                "tables": {},
+                "foreign_keys_add": [],
+                "foreign_keys_remove": [],
+                "primary_keys_add": [],
+                "primary_keys_remove": [],
+            }
+        )
     assert acquired == [True]

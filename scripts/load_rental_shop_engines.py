@@ -39,6 +39,7 @@ RedshiftRuntimeConfig = _cfg.RedshiftRuntimeConfig
 SnowflakeRuntimeConfig = _cfg.SnowflakeRuntimeConfig
 SQLiteRuntimeConfig = _cfg.SQLiteRuntimeConfig
 SQLServerRuntimeConfig = _cfg.SQLServerRuntimeConfig
+OracleRuntimeConfig = _cfg.OracleRuntimeConfig
 
 DEFAULT_ENV_FILE = _REPO_ROOT / "env.env"
 
@@ -265,6 +266,11 @@ def translate_create(engine: str, create_sql: str, *, schema: str) -> str:
         body = _translate_body_sqlserver(body)
         return f"CREATE TABLE [{schema}].[{table}] (\n{body}\n)"
 
+    if engine == "oracle":
+        body = _translate_body_oracle(body)
+        owner = schema.upper()
+        return f'CREATE TABLE "{owner}"."{table.upper()}" (\n{body}\n)'
+
     if engine == "snowflake":
         body = _translate_body_snowflake(body)
         return f"CREATE TABLE {schema}.{table} (\n{body}\n)"
@@ -369,6 +375,26 @@ def _translate_body_sqlserver(body: str) -> str:
     return s
 
 
+def _translate_body_oracle(body: str) -> str:
+    s = body
+    s = re.sub(r"\bTEXT\s*\[\s*\]", "CLOB", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bJSONB\b", "CLOB", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bfulltext\s+TSVECTOR\b", '"fulltext" CLOB', s, flags=re.IGNORECASE)
+    s = re.sub(r"\bTSVECTOR\b", "CLOB", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bSMALLINT\b", "NUMBER(10)", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bINTEGER\b", "NUMBER(10)", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bBOOLEAN\b", "NUMBER(1)", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bTEXT\b", "CLOB", s, flags=re.IGNORECASE)
+    s = re.sub(r"NUMERIC\((\d+,\d+)\)", r"NUMBER(\1)", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bVARCHAR\((\d+)\)", r"VARCHAR2(\1)", s, flags=re.IGNORECASE)
+    s = re.sub(r"(?<![A-Za-z])CHAR\((\d+)\)", r"CHAR(\1)", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bTIMESTAMP\b", "TIMESTAMP", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bDATE\b", "DATE", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bBLOB\b", "BLOB", s, flags=re.IGNORECASE)
+    s = _strip_defaults(s)
+    return s
+
+
 def _translate_body_snowflake(body: str) -> str:
     s = body
     s = re.sub(r"\bTEXT\s*\[\s*\]", "ARRAY", s, flags=re.IGNORECASE)
@@ -449,6 +475,10 @@ def translate_alter_pk(engine: str, table: str, schema: str, pk_cols: list[str])
         return f"ALTER TABLE `{table}` ADD PRIMARY KEY ({cols})"
     if engine == "sqlserver":
         return f"ALTER TABLE [{schema}].[{table}] ADD CONSTRAINT [{table}_pkey] PRIMARY KEY ({cols})"
+    if engine == "oracle":
+        owner = schema.upper()
+        col_list = ", ".join(c.upper() for c in pk_cols)
+        return f'ALTER TABLE "{owner}"."{table.upper()}" ADD CONSTRAINT "{table.upper()}_PKEY" PRIMARY KEY ({col_list})'
     if engine == "snowflake":
         return f"ALTER TABLE {schema}.{table} ADD PRIMARY KEY ({cols})"
     if engine == "databricks":
@@ -468,6 +498,23 @@ def translate_alter_fk(engine: str, table: str, schema: str, fk: str, constraint
         return f"ALTER TABLE `{table}` ADD CONSTRAINT `{constraint_name}` {fk_clean}"
     if engine == "sqlserver":
         return f"ALTER TABLE [{schema}].[{table}] ADD CONSTRAINT [{constraint_name}] {fk_clean}"
+    if engine == "oracle":
+        owner = schema.upper()
+        fk_clean = re.sub(
+            r"\bREFERENCES\s+(\w+)\s*\(",
+            lambda m: f'REFERENCES "{owner}"."{m.group(1).upper()}" (',
+            fk_clean,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        fk_clean = re.sub(
+            r"FOREIGN\s+KEY\s*\(([^)]+)\)",
+            lambda m: "FOREIGN KEY (" + ", ".join(p.strip().upper() for p in m.group(1).split(",")) + ")",
+            fk_clean,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        return f'ALTER TABLE "{owner}"."{table.upper()}" ADD CONSTRAINT "{constraint_name.upper()}" {fk_clean}'
     if engine == "snowflake":
         fk_clean = re.sub(
             r"\bREFERENCES\s+(\w+)\s*\(",
@@ -520,6 +567,7 @@ _SUPPORTED = {
     "mysql": MySQLRuntimeConfig,
     "mariadb": MariaDBRuntimeConfig,
     "sqlserver": SQLServerRuntimeConfig,
+    "oracle": OracleRuntimeConfig,
     "snowflake": SnowflakeRuntimeConfig,
     "bigquery": BigQueryRuntimeConfig,
     "redshift": RedshiftRuntimeConfig,
@@ -564,7 +612,7 @@ _TABLE_ORDER = [
     "promotion_redemption",
 ]
 
-_LEGACY_DROP_TABLES = (
+_STAGING_DROP_TABLES = (
     "film_stg",
     "game_stg",
 )
@@ -575,7 +623,16 @@ _RENTAL_SHOP_VIEW_NAMES = ("active_customer_v", "store_revenue_v", "film_catalog
 
 def _iter_rental_shop_view_statements() -> list[str]:
     text = _RENTAL_SHOP_VIEWS_SQL.read_text(encoding="utf-8")
-    return [stmt.strip() for stmt in text.split(";") if stmt.strip()]
+    stmts: list[str] = []
+    for raw in text.split(";"):
+        stmt = raw.strip()
+        if not stmt:
+            continue
+        lines = [line for line in stmt.splitlines() if line.strip() and not line.strip().startswith("--")]
+        cleaned = "\n".join(lines).strip()
+        if cleaned:
+            stmts.append(cleaned)
+    return stmts
 
 
 def _drop_rental_shop_views(execute: Any) -> None:
@@ -593,6 +650,12 @@ def _default_schema(engine: str) -> str:
         return os.environ.get("REDSHIFT_SCHEMA", "dvdrental_new")
     if engine == "sqlserver":
         return os.environ.get("SQLSERVER_SCHEMA", "dbo")
+    if engine == "oracle":
+        return (
+            os.environ.get("ORACLE_SCHEMA")
+            or (OracleRuntimeConfig.SCHEMA if OracleRuntimeConfig.SCHEMA else None)
+            or (str(OracleRuntimeConfig.USER).upper() if OracleRuntimeConfig.USER else "RENTAL_SHOP")
+        )
     if engine == "snowflake":
         return os.environ.get("SNOWFLAKE_SCHEMA", "PUBLIC")
     if engine == "bigquery":
@@ -616,6 +679,9 @@ def _drop_table_sql(engine: str, schema: str, table: str) -> str:
         return f'DROP TABLE IF EXISTS "{table}"'
     if engine == "sqlserver":
         return f"IF OBJECT_ID(N'[{schema}].[{table}]', N'U') IS NOT NULL DROP TABLE [{schema}].[{table}]"
+    if engine == "oracle":
+        owner = schema.upper()
+        return f'DROP TABLE IF EXISTS "{owner}"."{table.upper()}" CASCADE CONSTRAINTS'
     if engine == "snowflake":
         return f"DROP TABLE IF EXISTS {schema}.{table}"
     if engine == "bigquery":
@@ -646,6 +712,18 @@ def _drop_sqlserver_foreign_keys(conn, schema: str) -> None:
         ),
         {"schema": schema},
     )
+
+
+def _drop_oracle_foreign_keys(conn, schema: str) -> None:
+    """Drop all FK constraints in *schema* before table drops (store↔staff cycle)."""
+
+    owner = schema.upper()
+    rows = conn.execute(
+        text("SELECT table_name, constraint_name FROM all_constraints WHERE owner = :owner AND constraint_type = 'R'"),
+        {"owner": owner},
+    ).fetchall()
+    for table_name, constraint_name in rows:
+        conn.execute(text(f'ALTER TABLE "{owner}"."{table_name}" DROP CONSTRAINT "{constraint_name}"'))
 
 
 def _drop_databricks_foreign_keys(conn, target_schema: str, fk_map: dict[str, list[str]]) -> None:
@@ -723,7 +801,7 @@ def _strip_pg_tz_offset(cell: object) -> object:
     return s
 
 
-_NAIVE_DATETIME_ENGINES = frozenset({"mysql", "mariadb", "sqlserver", "redshift", "bigquery"})
+_NAIVE_DATETIME_ENGINES = frozenset({"mysql", "mariadb", "sqlserver", "oracle", "redshift", "bigquery"})
 
 
 def _prepare_dataframe(engine: str, table: str, frame: pd.DataFrame) -> pd.DataFrame:
@@ -947,7 +1025,7 @@ def _load_duckdb(args: argparse.Namespace) -> None:
     try:
         if args.drop_first:
             _drop_rental_shop_views(con.execute)
-            for table in reversed(_LEGACY_DROP_TABLES):
+            for table in reversed(_STAGING_DROP_TABLES):
                 con.execute(f'DROP TABLE IF EXISTS "{table}"')
             for table in reversed(_TABLE_ORDER):
                 con.execute(f'DROP TABLE IF EXISTS "{table}"')
@@ -1005,7 +1083,7 @@ def _load_sqlite(args: argparse.Namespace) -> None:
     try:
         if args.drop_first:
             _drop_rental_shop_views(conn.execute)
-            for table in reversed(_LEGACY_DROP_TABLES):
+            for table in reversed(_STAGING_DROP_TABLES):
                 conn.execute(f'DROP TABLE IF EXISTS "{table}"')
             for table in reversed(_TABLE_ORDER):
                 conn.execute(f'DROP TABLE IF EXISTS "{table}"')
@@ -1057,6 +1135,10 @@ def _load_sqlalchemy_engine(engine_name: str, args: argparse.Namespace) -> None:
         database = runtime_cls.DATABASE or __import__("os").environ.get("SQLSERVER_DATABASE", "rental_shop")
         runtime_cls.DATABASE = database
         _ensure_sqlserver_database(runtime_cls, database)
+    if engine_name == "oracle":
+        runtime_cls.ensure_driver_mode()
+        if not runtime_cls.SCHEMA:
+            runtime_cls.SCHEMA = str(runtime_cls.USER).upper() if runtime_cls.USER else "RENTAL_SHOP"
 
     url = runtime_cls.db_url()
     connect_args = runtime_cls.connect_args() if hasattr(runtime_cls, "connect_args") else {}
@@ -1091,6 +1173,10 @@ def _load_sqlalchemy_engine(engine_name: str, args: argparse.Namespace) -> None:
         if engine_name == "snowflake":
             _ensure_snowflake_schema(conn, schema)
             conn.execute(text(f"USE SCHEMA {schema}"))
+        if engine_name == "oracle":
+            conn.execute(text("ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD'"))
+            conn.execute(text("ALTER SESSION SET NLS_TIMESTAMP_FORMAT = 'YYYY-MM-DD HH24:MI:SS'"))
+            conn.execute(text("ALTER SESSION SET NLS_TIMESTAMP_TZ_FORMAT = 'YYYY-MM-DD HH24:MI:SS'"))
         if engine_name == "redshift":
             if args.drop_first:
                 conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
@@ -1101,8 +1187,10 @@ def _load_sqlalchemy_engine(engine_name: str, args: argparse.Namespace) -> None:
                 conn.execute(text("SET FOREIGN_KEY_CHECKS = 0"))
             if engine_name == "sqlserver":
                 _drop_sqlserver_foreign_keys(conn, schema)
+            if engine_name == "oracle":
+                _drop_oracle_foreign_keys(conn, schema)
             if engine_name != "redshift":
-                for table in reversed(_LEGACY_DROP_TABLES):
+                for table in reversed(_STAGING_DROP_TABLES):
                     conn.execute(text(_drop_table_sql(engine_name, schema, table)))
                 for table in reversed(_TABLE_ORDER):
                     conn.execute(text(_drop_table_sql(engine_name, schema, table)))
@@ -1144,6 +1232,17 @@ def _load_sqlalchemy_engine(engine_name: str, args: argparse.Namespace) -> None:
                         table,
                         conn,
                         schema=schema,
+                        if_exists="append",
+                        index=False,
+                        chunksize=100,
+                    )
+                elif engine_name == "oracle":
+                    upper_frame = frame.copy()
+                    upper_frame.columns = [str(c).upper() for c in upper_frame.columns]
+                    upper_frame.to_sql(
+                        table.upper(),
+                        conn,
+                        schema=schema.upper(),
                         if_exists="append",
                         index=False,
                         chunksize=100,
@@ -1225,7 +1324,7 @@ def _load_postgresql(args: argparse.Namespace) -> None:
         cur.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(args.schema)))
 
     if args.drop_first:
-        for name in reversed(_LEGACY_DROP_TABLES):
+        for name in reversed(_STAGING_DROP_TABLES):
             cur.execute(f"DROP TABLE IF EXISTS {args.schema}.{name} CASCADE")
         for name, _, _ in reversed(parsed):
             cur.execute(f"DROP TABLE IF EXISTS {args.schema}.{name} CASCADE")
@@ -1271,6 +1370,7 @@ _ENGINE_CONFIG = {
     "mysql": MySQLRuntimeConfig,
     "mariadb": MariaDBRuntimeConfig,
     "sqlserver": SQLServerRuntimeConfig,
+    "oracle": OracleRuntimeConfig,
     "snowflake": SnowflakeRuntimeConfig,
     "bigquery": BigQueryRuntimeConfig,
     "databricks": DatabricksRuntimeConfig,
@@ -1302,10 +1402,11 @@ def _cmd_ping(args: argparse.Namespace) -> None:
     engine = create_engine(url, connect_args=connect_args, future=True)
     try:
         with engine.connect() as conn:
-            row = conn.execute(text("SELECT 1")).scalar_one()
+            ping_sql = "SELECT 1 FROM DUAL" if args.engine == "oracle" else "SELECT 1"
+            row = conn.execute(text(ping_sql)).scalar_one()
     finally:
         engine.dispose()
-    print(f"OK {args.engine} via {env_path} (SELECT 1 -> {row})")
+    print(f"OK {args.engine} via {env_path} ({ping_sql} -> {row})")
 
 
 _EXPECTED_FILM_ROWS = 1000
@@ -1319,6 +1420,10 @@ def _verify_schema_name(engine: str, schema_arg: str | None) -> str:
         return os.environ.get("REDSHIFT_SCHEMA", "dvdrental_new")
     if engine == "sqlserver":
         return os.environ.get("SQLSERVER_SCHEMA", "dbo")
+    if engine == "oracle":
+        return os.environ.get("ORACLE_SCHEMA") or (
+            str(OracleRuntimeConfig.USER).upper() if OracleRuntimeConfig.USER else "RENTAL_SHOP"
+        )
     if engine == "snowflake":
         return os.environ.get("SNOWFLAKE_SCHEMA", "PUBLIC")
     if engine == "bigquery":
@@ -1337,6 +1442,8 @@ def _qualified_table(engine: str, schema: str, table: str) -> str:
         return f'"{table}"'
     if engine == "sqlserver":
         return f"[{schema}].[{table}]"
+    if engine == "oracle":
+        return f'"{schema.upper()}"."{table.upper()}"'
     if engine == "snowflake":
         return f"{schema}.{table.lower()}"
     if engine == "bigquery":
@@ -1629,6 +1736,7 @@ _ALL_ENGINES = sorted(
         "mysql",
         "mariadb",
         "sqlserver",
+        "oracle",
         "snowflake",
         "bigquery",
         "redshift",
@@ -1699,7 +1807,7 @@ def _project_create_table_sql(create_sql: str, table: str, projections: dict[str
 
 
 def _filter_payment_frame(frame: pd.DataFrame, *, source_id: str, csv_dir: Path) -> pd.DataFrame:
-    from sandbox_corpus import PAYMENT_UNION_SPLIT_STORE_THRESHOLD, payment_store_id_by_rental_id
+    from source_rental_shop import PAYMENT_UNION_SPLIT_STORE_THRESHOLD, payment_store_id_by_rental_id
 
     if "rental_id" not in frame.columns:
         return frame
@@ -1803,9 +1911,57 @@ def _load_federation_postgresql_partition(args: argparse.Namespace, *, source_id
     for name in _partition_table_order(partition):
         for i, fk in enumerate(fk_map.get(name, [])):
             cur.execute(alter_fk_sql(name, schema, fk, f"{name}_fk_{i}"))
+    loaded_tables = {name for name, _, _ in parsed}
+    _load_federation_postgres_corpus_extras(
+        cur,
+        schema=schema,
+        source_id=source_id,
+        missing_tables=sorted(partition - loaded_tables),
+    )
     cur.close()
     conn.close()
     _log_progress(f"[federation] postgresql {source_id}: finished (schema={schema}, database={database})")
+
+
+def _load_federation_postgres_corpus_extras(
+    cur: Any,
+    *,
+    schema: str,
+    source_id: str,
+    missing_tables: list[str],
+) -> None:
+    """Create/load partition tables present only in federation schema+CSV artifacts."""
+    if not missing_tables:
+        return
+    schema_path = _DATA / f"federation_{source_id}_schema.sql"
+    data_dir = _DATA / f"federation_{source_id}_data"
+    if not schema_path.is_file():
+        raise SystemExit(
+            f"federation {source_id}: missing corpus schema for extras {missing_tables}: {schema_path}",
+        )
+    creates: dict[str, str] = {}
+    for block in iter_create_table_blocks(schema_path.read_text(encoding="utf-8")):
+        name, no_fk, _fks = split_block(block)
+        creates[name] = qualify_table_name(no_fk, schema)
+    for table in missing_tables:
+        create_sql = creates.get(table)
+        if create_sql is None:
+            raise SystemExit(f"federation {source_id}: no CREATE for corpus-only table {table!r} in {schema_path}")
+        csv_path = data_dir / f"{table}.csv"
+        if not csv_path.is_file():
+            raise SystemExit(f"federation {source_id}: missing corpus CSV for {table}: {csv_path}")
+        cur.execute(f"DROP TABLE IF EXISTS {schema}.{table} CASCADE")
+        cur.execute(create_sql)
+        frame = pd.read_csv(csv_path)
+        frame = _prepare_dataframe("postgresql", table, frame)
+        fq = f"{schema}.{table}"
+        copy_sql = f"COPY {fq} FROM STDIN WITH (FORMAT csv, HEADER true, NULL '')"
+        buf = io.StringIO()
+        frame.to_csv(buf, index=False, header=True, na_rep="")
+        buf.seek(0)
+        with cur.copy(copy_sql) as copy:
+            copy.write(buf.getvalue())
+        _log_load_table("postgresql", table, len(frame))
 
 
 def _load_federation_mysql_partition(
@@ -1892,6 +2048,16 @@ def _validate_federation_partition_metrics(source_id: str, engine_label: str, co
         raise SystemExit(f"{engine_label} federation verify failed: missing or empty tables: {', '.join(missing)}")
 
 
+def _count_federation_table(conn: Any, engine_name: str, schema: str, table: str) -> int:
+    """Return row count for a federation partition table, isolating query failures."""
+    fq = _qualified_table(engine_name, schema, table)
+    try:
+        return int(conn.execute(text(f"SELECT COUNT(*) FROM {fq}")).scalar_one())
+    except Exception:
+        conn.rollback()
+        return 0
+
+
 def _log_federation_verify_summary(source_id: str, counts: dict[str, int]) -> None:
     if _VERIFY_VERBOSE:
         parts = ", ".join(f"{table}={counts[table]}" for table in sorted(counts))
@@ -1914,11 +2080,7 @@ def _verify_federation_postgresql_partition(args: argparse.Namespace, *, source_
     counts: dict[str, int] = {}
     with sa_engine.connect() as conn:
         for table in sorted(partition):
-            fq = _qualified_table("postgresql", schema, table)
-            try:
-                counts[table] = int(conn.execute(text(f"SELECT COUNT(*) FROM {fq}")).scalar_one())
-            except Exception:
-                counts[table] = 0
+            counts[table] = _count_federation_table(conn, "postgresql", schema, table)
     _validate_federation_partition_metrics(source_id, f"postgresql {source_id}", counts)
     _log_federation_verify_summary(source_id, counts)
 
@@ -1944,11 +2106,7 @@ def _verify_federation_mysql_partition(
     counts: dict[str, int] = {}
     with sa_engine.connect() as conn:
         for table in sorted(partition):
-            fq = _qualified_table(engine_name, schema, table)
-            try:
-                counts[table] = int(conn.execute(text(f"SELECT COUNT(*) FROM {fq}")).scalar_one())
-            except Exception:
-                counts[table] = 0
+            counts[table] = _count_federation_table(conn, engine_name, schema, table)
     _validate_federation_partition_metrics(source_id, f"{engine_name} {source_id}", counts)
     _log_federation_verify_summary(source_id, counts)
 

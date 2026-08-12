@@ -8,9 +8,9 @@ from unittest.mock import patch
 
 import pytest
 
-import aetherdialect._constants
+import aetherdialect._constants_runtime
 from aetherdialect import inspect_tabular_upload
-from aetherdialect._constants import (
+from aetherdialect._constants_runtime import (
     DATA_QUALITY_ISSUE_DUPLICATE_HEADER,
     DATA_QUALITY_ISSUE_EMPTY_FILE,
     DATA_QUALITY_ISSUE_MIXED_TYPES,
@@ -37,7 +37,7 @@ from aetherdialect._data_quality import (
 def _all_data_quality_issue_constants() -> set[str]:
     return {
         value
-        for name, value in vars(aetherdialect._constants).items()
+        for name, value in vars(aetherdialect._constants_runtime).items()
         if name.startswith("DATA_QUALITY_ISSUE_") and isinstance(value, str)
     }
 

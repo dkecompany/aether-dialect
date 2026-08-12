@@ -8,16 +8,15 @@ from typing import Any
 import pytest
 
 from aetherdialect._config import EngineConfig, PolicyConfig
-from aetherdialect._constants import (
+from aetherdialect._constants import DIAGNOSTIC_CODE_SCHEMA_ROLE_TYPE_COERCED
+from aetherdialect._constants_runtime import (
     COMPOSE_FIELDS,
-    DIAGNOSTIC_CODE_SCHEMA_ROLE_TYPE_COERCED,
     GROUND_FIELDS,
     SCHEMA_CLASSIFY_SYSTEM,
     SCHEMA_FIELD_RAW_TYPE,
 )
-from aetherdialect._contracts_base import ColumnRole, TableRole
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._schema_catalog import (
+from aetherdialect._contracts_schema import ColumnMetadata, ColumnRole, SchemaGraph, TableMetadata, TableRole
+from aetherdialect._schema_profile import (
     _build_column_profile_for_llm,
     _schema_classification_cache_path,
     apply_column_roles_llm,
@@ -87,6 +86,7 @@ def test_string_revenue_coerces_not_raise(monkeypatch: pytest.MonkeyPatch) -> No
         *,
         column_scope: dict[str, frozenset[str]] | None = None,
         cache_payload_out: list[dict[str, Any]] | None = None,
+        structural_knowledge=None,
     ):
         payload = _classify_payload(
             "sales",
@@ -104,8 +104,8 @@ def test_string_revenue_coerces_not_raise(monkeypatch: pytest.MonkeyPatch) -> No
             )
         }
 
-    monkeypatch.setattr("aetherdialect._schema_catalog.notify", capture_notify)
-    monkeypatch.setattr("aetherdialect._schema_catalog.llm_classify_schema", fake_classify)
+    monkeypatch.setattr("aetherdialect._schema_profile.notify", capture_notify)
+    monkeypatch.setattr("aetherdialect._schema_profile.llm_classify_schema", fake_classify)
     apply_column_roles_llm(sg)
     assert revenue.role != ColumnRole.NUMERIC_MEASURE.value
     assert revenue.description == "total revenue"
@@ -130,6 +130,7 @@ def test_string_promo_type_never_stays_numeric_categorical(monkeypatch: pytest.M
         *,
         column_scope: dict[str, frozenset[str]] | None = None,
         cache_payload_out: list[dict[str, Any]] | None = None,
+        structural_knowledge=None,
     ):
         return {
             "promotions": (
@@ -139,7 +140,7 @@ def test_string_promo_type_never_stays_numeric_categorical(monkeypatch: pytest.M
             )
         }
 
-    monkeypatch.setattr("aetherdialect._schema_catalog.llm_classify_schema", fake_classify)
+    monkeypatch.setattr("aetherdialect._schema_profile.llm_classify_schema", fake_classify)
     apply_column_roles_llm(sg)
     assert promo_type.role == ColumnRole.CATEGORICAL.value
 
@@ -157,6 +158,7 @@ def test_type_mismatch_does_not_retry_llm(monkeypatch: pytest.MonkeyPatch) -> No
         *,
         column_scope: dict[str, frozenset[str]] | None = None,
         cache_payload_out: list[dict[str, Any]] | None = None,
+        structural_knowledge=None,
     ):
         calls["n"] += 1
         return {
@@ -167,13 +169,13 @@ def test_type_mismatch_does_not_retry_llm(monkeypatch: pytest.MonkeyPatch) -> No
             )
         }
 
-    monkeypatch.setattr("aetherdialect._schema_catalog.llm_classify_schema", fake_classify)
+    monkeypatch.setattr("aetherdialect._schema_profile.llm_classify_schema", fake_classify)
     apply_column_roles_llm(sg)
     assert calls["n"] == 1
 
 
 @pytest.mark.fast
-def test_empty_description_still_retries_then_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_empty_description_retries_then_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     col = ColumnMetadata(name="id", data_type="integer", is_primary_key=True)
     table = TableMetadata(name="t", columns={"id": col}, primary_key=["id"], foreign_keys=[])
     sg = SchemaGraph(join_paths_multi={}, effective_structural_hash="h", tables={"t": table})
@@ -185,6 +187,7 @@ def test_empty_description_still_retries_then_fails(monkeypatch: pytest.MonkeyPa
         *,
         column_scope: dict[str, frozenset[str]] | None = None,
         cache_payload_out: list[dict[str, Any]] | None = None,
+        structural_knowledge=None,
     ):
         calls["n"] += 1
         return {
@@ -195,7 +198,7 @@ def test_empty_description_still_retries_then_fails(monkeypatch: pytest.MonkeyPa
             )
         }
 
-    monkeypatch.setattr("aetherdialect._schema_catalog.llm_classify_schema", fake_classify)
+    monkeypatch.setattr("aetherdialect._schema_profile.llm_classify_schema", fake_classify)
     with pytest.raises(RuntimeError, match="Schema LLM classification failed"):
         apply_column_roles_llm(sg)
     assert calls["n"] == PolicyConfig.MAX_ROLE_CLASSIFICATION_RETRIES + 1
@@ -212,7 +215,7 @@ def test_cache_not_written_until_validation_passes(
     cache_path = tmp_path / "schema_graph.json.gz"
     monkeypatch.setattr(EngineConfig, "SCHEMA_JSON_PATH", str(cache_path))
     scope = {"sales": frozenset({"revenue"})}
-    content_hash = schema_classification_content_hash(sg, None, scope)
+    content_hash = schema_classification_content_hash(sg, None, scope, structural_knowledge=())
     expected_cache = _schema_classification_cache_path(content_hash)
     assert expected_cache is not None
     mode = {"fail": True}
@@ -223,6 +226,7 @@ def test_cache_not_written_until_validation_passes(
         *,
         column_scope: dict[str, frozenset[str]] | None = None,
         cache_payload_out: list[dict[str, Any]] | None = None,
+        structural_knowledge=None,
     ):
         payload = _classify_payload(
             "sales",
@@ -246,7 +250,7 @@ def test_cache_not_written_until_validation_passes(
             )
         }
 
-    monkeypatch.setattr("aetherdialect._schema_catalog.llm_classify_schema", fake_classify)
+    monkeypatch.setattr("aetherdialect._schema_profile.llm_classify_schema", fake_classify)
     with pytest.raises(RuntimeError, match="Schema LLM classification failed"):
         apply_column_roles_llm(sg)
     assert not expected_cache.is_file()
@@ -281,7 +285,7 @@ def test_classify_payload_has_value_type_not_data_type(tmp_path, monkeypatch: py
         )
 
     monkeypatch.setattr(EngineConfig, "SCHEMA_JSON_PATH", str(tmp_path / "schema_graph.json.gz"))
-    monkeypatch.setattr("aetherdialect._schema_catalog.LLMProvider.chat", fake_llm)
+    monkeypatch.setattr("aetherdialect._schema_profile.LLMProvider.chat", fake_llm)
     llm_classify_schema(sg, None)
     assert captured_users
     user_payload = json.loads(captured_users[0])

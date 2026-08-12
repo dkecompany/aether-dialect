@@ -6,7 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from aetherdialect._core_utils import StepResult, append_failure_trace
+from aetherdialect._contracts_core import StepResult
+from aetherdialect._utils_artifacts import append_failure_trace
 
 
 def _fill_to_threshold(path: Path, *, threshold: int, pad_char: str = "x") -> str:
@@ -28,7 +29,7 @@ def _failure_step(question: str, *, error: str = "boom") -> StepResult:
 @pytest.mark.fast
 def test_trace_rotates_at_threshold(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     threshold = 64
-    monkeypatch.setattr("aetherdialect._core_utils.FAILURE_TRACE_ROTATE_BYTES", threshold)
+    monkeypatch.setattr("aetherdialect._utils_artifacts.FAILURE_TRACE_ROTATE_BYTES", threshold)
 
     trace_path = tmp_path / "results.txt"
     rotated_path = tmp_path / "results.txt.1"

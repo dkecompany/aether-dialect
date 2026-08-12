@@ -14,8 +14,8 @@ from aetherdialect._contracts_base import (
 )
 from aetherdialect._contracts_core import RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import telemetry_capture
-from aetherdialect._intent_repair import eliminate_redundant_key_joins, reconcile_tables
+from aetherdialect._intent_normalize import eliminate_redundant_key_joins, reconcile_tables
+from aetherdialect._utils import telemetry_capture
 
 
 def _col(name: str, *, nullable: bool = False, is_pk: bool = False) -> ColumnMetadata:

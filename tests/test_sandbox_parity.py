@@ -1,4 +1,4 @@
-"""Sandbox production-parity gaps: stages, migration, consumer baseline, malformed fixtures, warmup guard."""
+"""Sandbox production parity: stages, migration, consumer baseline, malformed fixtures, warmup guard."""
 
 from __future__ import annotations
 
@@ -10,8 +10,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from aetherdialect import AetherEngine, AetherFederation, EngineContext, Sandbox
-from aetherdialect._constants import CONSUMER_ALLOW_OBJECTS
-from aetherdialect._contracts_base import ConfigError, MigrationPreview
+from aetherdialect._contracts_base import ConfigError
+from aetherdialect._contracts_core import MigrationPreview
 
 _baseline_dir_for_preset = Sandbox._baseline_dir_for_preset
 _consumer_reader_schema_context = Sandbox._consumer_reader_schema_context
@@ -35,7 +35,6 @@ _STAGE_DOC_TOKENS: dict[str, tuple[str, ...]] = {
     "cold_build_descriptions_and_classification": ("description", "classification"),
     "member_cold_reflect_profile_and_member_drift_migration_pending": (
         "member",
-        "composition",
         "drift",
         "migration",
     ),
@@ -68,8 +67,8 @@ def _minimal_sandbox_host(tmp_path: Path) -> tuple[Path, str]:
 
 @pytest.mark.fast
 def test_sandbox_unexercised_production_stages_are_catalogued() -> None:
-    """Every skipped production stage must be named in code and docs (not silently omitted)."""
-    from aetherdialect._constants import SANDBOX_UNEXERCISED_PRODUCTION_STAGES
+    """Skipped production stages are named in code and docs."""
+    from aetherdialect._constants_runtime import SANDBOX_UNEXERCISED_PRODUCTION_STAGES
 
     catalogued = frozenset(SANDBOX_UNEXERCISED_PRODUCTION_STAGES)
     assert catalogued == _EXPECTED_UNEXERCISED_PRODUCTION_STAGES
@@ -109,7 +108,7 @@ def test_sandbox_owner_can_preview_migration_for_user_corpus_variant() -> None:
             tier="compatible",
             affected_tables=(),
             affected_columns=(),
-            skeleton_path="",
+            skeleton_document={},
         )
         result = engine.preview_migration_map()
     assert isinstance(result, MigrationPreview)
@@ -135,8 +134,8 @@ def test_sandbox_consumer_baseline_seeded_after_owner_uses_consumer_graph(tmp_pa
 
 
 @pytest.mark.fast
-def test_sandbox_consumer_scope_narrowed_at_construction(tmp_path: Path) -> None:
-    """Consumer engine_context must be narrowed at construction, not only execution_context."""
+def test_sandbox_consumer_scope_matches_owner_at_construction(tmp_path: Path) -> None:
+    """Consumer engine_context defaults to the full owner scope, resolved at construction."""
     from aetherdialect import Sandbox
 
     owner_ctx = Sandbox._owner_writer_schema_context()
@@ -149,8 +148,8 @@ def test_sandbox_consumer_scope_narrowed_at_construction(tmp_path: Path) -> None
         def __init__(self, schema_context: EngineContext, **kwargs: object) -> None:
             del kwargs
             contexts_at_init.append(frozenset(schema_context.allow_objects or ()))
-            from aetherdialect._contracts_base import RuntimeConfig
-            from aetherdialect._main_execution import load_runtime_config
+            from aetherdialect._contracts_core import RuntimeConfig
+            from aetherdialect._utils_artifacts import load_runtime_config
 
             llm_exec = load_runtime_config(merged_env={})
             self._schema_graph = MagicMock(schema_literal_json="{}")
@@ -164,15 +163,11 @@ def test_sandbox_consumer_scope_narrowed_at_construction(tmp_path: Path) -> None
             self._schema_role = "consumer"
 
     import aetherdialect._sandbox
+    from tests._sandbox_csv_bundle import write_main_csv_ddl_bundle
 
     bundle = tmp_path / "bundle"
     bundle.mkdir()
-    (bundle / "rental_shop_seed.sql").write_text("CREATE TABLE customer (customer_id INTEGER);", encoding="utf-8")
-    (bundle / "rental_shop.sql").write_text("SELECT 1;", encoding="utf-8")
-    (bundle / "rental_shop_notes.txt").write_text("notes", encoding="utf-8")
-    fixtures = bundle / "fixtures"
-    fixtures.mkdir()
-    (fixtures / "rental_shop_mock.json").write_text('{"fixtures": []}', encoding="utf-8")
+    write_main_csv_ddl_bundle(bundle, tables=(("customer", "customer_id"),))
 
     original = aetherdialect._sandbox.Sandbox._aether_engine_cls
     aetherdialect._sandbox.Sandbox._aether_engine_cls = lambda: FakeEngine
@@ -183,13 +178,13 @@ def test_sandbox_consumer_scope_narrowed_at_construction(tmp_path: Path) -> None
     finally:
         aetherdialect._sandbox.Sandbox._aether_engine_cls = original
 
-    assert contexts_at_init == [CONSUMER_ALLOW_OBJECTS]
+    assert contexts_at_init == [frozenset()]
 
 
 @pytest.mark.fast
 def test_bundled_mock_fixtures_include_malformed_repair_exercises() -> None:
     """Mock corpus must include deliberately malformed outputs that exercise repair paths."""
-    from aetherdialect._constants import SANDBOX_MALFORMED_MOCK_FIXTURE_QUESTIONS
+    from aetherdialect._constants_runtime import SANDBOX_MALFORMED_MOCK_FIXTURE_QUESTIONS
 
     questions = tuple(SANDBOX_MALFORMED_MOCK_FIXTURE_QUESTIONS)
     assert len(questions) >= 1
@@ -200,7 +195,7 @@ def test_bundled_mock_fixtures_include_malformed_repair_exercises() -> None:
 @pytest.mark.fast
 def test_malformed_mock_fixture_entries_declare_repair_stage() -> None:
     """Malformed fixture specs must declare compose-stage breakage and repair replay."""
-    from aetherdialect._constants import SANDBOX_MALFORMED_MOCK_FIXTURE_SPECS
+    from aetherdialect._constants_runtime import SANDBOX_MALFORMED_MOCK_FIXTURE_SPECS
 
     specs = tuple(SANDBOX_MALFORMED_MOCK_FIXTURE_SPECS)
     assert len(specs) >= 1
@@ -215,13 +210,14 @@ def test_malformed_compose_repair_uses_intent_format_task() -> None:
     """Malformed compose override is one-shot; format-repair uses intent_format task."""
     import json
 
-    from aetherdialect._constants import (
+    from aetherdialect._constants_runtime import (
         INTENT_COMPOSE_SYSTEM,
         SANDBOX_MALFORMED_MOCK_FIXTURE_QUESTIONS,
         SANDBOX_MALFORMED_MOCK_FIXTURE_SPECS,
     )
-    from aetherdialect._intent_process import build_intent_format_repair_prompt
-    from aetherdialect._llm_provider import MockFixtureMissingError, MockProvider, SandboxRuntimeState
+    from aetherdialect._contracts_base import MockFixtureMissingError
+    from aetherdialect._intent_loop import build_intent_format_repair_prompt
+    from aetherdialect._llm_provider import MockProvider, SandboxRuntimeState
 
     question = SANDBOX_MALFORMED_MOCK_FIXTURE_QUESTIONS[0]
     spec = SANDBOX_MALFORMED_MOCK_FIXTURE_SPECS[0]
@@ -258,7 +254,7 @@ def test_malformed_mock_fixture_replay_returns_invalid_json_first() -> None:
     """Compose replay must return malformed JSON before the repair response."""
     import json
 
-    from aetherdialect._constants import (
+    from aetherdialect._constants_runtime import (
         INTENT_COMPOSE_SYSTEM,
         SANDBOX_MALFORMED_MOCK_FIXTURE_QUESTIONS,
         SANDBOX_MALFORMED_MOCK_FIXTURE_SPECS,
@@ -298,7 +294,7 @@ def test_sandbox_handle_applies_bundled_migration_variant() -> None:
 
     if not Sandbox.data_zip_path().exists():
         pytest.skip("sandbox bundle not present")
-    with AetherEngine.offline_sandbox() as handle:
+    with Sandbox.create_offline_sandbox(AetherEngine) as handle:
         preview = handle.preview_migration_corpus_variant()
         assert preview.tier in {"compatible", "remap", "destructive"}
         migrated = handle.apply_migration_corpus_variant()
@@ -363,7 +359,7 @@ def test_federation_run_seed_warmup_blocked_in_sandbox() -> None:
 
 @pytest.mark.fast
 def test_aether_engine_run_seed_warmup_blocked_in_sandbox() -> None:
-    """Control — AetherEngine.run_seed_warmup is already gated in sandbox mode."""
+    """AetherEngine.run_seed_warmup is gated in sandbox mode."""
     with patch("aetherdialect.aetherdialect.initialize_aether_engine") as init:
         init.return_value = MagicMock(
             runtime_config=MagicMock(engine="duckdb"),
@@ -396,3 +392,142 @@ def test_baseline_dir_for_preset_resolves_consumer_and_owner_dirs(tmp_path: Path
     assert owner_dir is not None and consumer_dir is not None
     assert owner_dir.name == "owner"
     assert consumer_dir.name == "consumer"
+
+
+def _write_minimal_sandbox_bundle(root: Path) -> None:
+    from tests._sandbox_csv_bundle import write_main_csv_ddl_bundle
+
+    write_main_csv_ddl_bundle(root, tables=(("customer", "customer_id"),))
+
+
+@pytest.mark.fast
+def test_sandbox_engine_session_ask_uses_pipeline_session(tmp_path: Path) -> None:
+    """Sandbox.engine().session().ask must be a PipelineSession contract."""
+    from aetherdialect import SessionStep
+    from aetherdialect._contracts_core import RuntimeConfig
+    from aetherdialect._main_session import PipelineSession
+    from aetherdialect._utils_artifacts import load_runtime_config
+
+    ask_questions: list[str] = []
+
+    class FakeEngine:
+        def __init__(self, schema_context: EngineContext, **kwargs: object) -> None:
+            del kwargs
+            llm_exec = load_runtime_config(merged_env={})
+            self._schema_graph = MagicMock(schema_literal_json="{}")
+            self._runtime_config = RuntimeConfig(
+                engine="duckdb",
+                artifacts_dir="/tmp/sandbox_session_parity",
+                engine_context=schema_context,
+                llm_execution=llm_exec,
+                execution_context=schema_context,
+            )
+            self._schema_role = "owner"
+            self._sandbox_mode = True
+            self._closed = False
+            self._store = {}
+            self._templates = {}
+            self._rejected = {}
+            self._schema_terms = set()
+            self.dialect = "duckdb"
+
+        def session(self, **kwargs: object) -> PipelineSession:
+            del kwargs
+            session = PipelineSession(self, mode="reader")
+
+            def _ask(question: str) -> SessionStep:
+                ask_questions.append(question)
+                return SessionStep(done=True, prompt=None, kind="result", sql="SELECT 1")
+
+            session.ask = _ask
+            return session
+
+    import aetherdialect._sandbox
+
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    _write_minimal_sandbox_bundle(bundle)
+    original = aetherdialect._sandbox.Sandbox._aether_engine_cls
+    aetherdialect._sandbox.Sandbox._aether_engine_cls = lambda: FakeEngine
+    try:
+        with Sandbox(maintainer_access=True, bundle_dir=str(bundle), auto_seed=False) as sandbox:
+            sandbox.load_dataset("main")
+            engine = sandbox.engine(role="owner")
+            session = engine.session()
+            assert isinstance(session, PipelineSession)
+            assert callable(session.ask)
+            step = session.ask("How many customers?")
+            assert step.done is True
+            assert ask_questions == ["How many customers?"]
+    finally:
+        aetherdialect._sandbox.Sandbox._aether_engine_cls = original
+
+
+@pytest.mark.fast
+def test_aether_engine_warmup_entrypoints_blocked_in_sandbox() -> None:
+    """Warmup and qsim entrypoints raise when `_sandbox_mode` is set."""
+    with patch("aetherdialect.aetherdialect.initialize_aether_engine") as init:
+        init.return_value = MagicMock(
+            runtime_config=MagicMock(engine="duckdb"),
+            llm_config=MagicMock(),
+            schema_graph=MagicMock(),
+            dialect=MagicMock(),
+            artifacts_dir="/tmp/engine_warmup_parity",
+            store=MagicMock(),
+            templates={},
+            rejected={},
+            schema_terms=set(),
+            schema_stats={},
+            schema_role="owner",
+            consumer_visible_objects=None,
+            context_name="master",
+            data_quality_report=None,
+        )
+        engine = AetherEngine()
+    engine._sandbox_mode = True
+
+    with (
+        patch("aetherdialect.aetherdialect.seed_warmup_run_once") as warmup,
+        patch("aetherdialect.aetherdialect.run_seed_warmup_from_history_execution") as from_history,
+        patch("aetherdialect.aetherdialect.run_seed_warmup_from_query_log_execution") as from_log,
+        patch("aetherdialect.aetherdialect.qsim_run_once") as qsim,
+    ):
+        with pytest.raises(ConfigError, match="run_seed_warmup"):
+            engine.run_seed_warmup("/tmp/seed_questions.txt")
+        with pytest.raises(ConfigError, match="run_seed_warmup_from_history"):
+            engine.run_seed_warmup_from_history("/tmp/history.sql")
+        with pytest.raises(ConfigError, match="run_seed_warmup_from_query_log"):
+            engine.run_seed_warmup_from_query_log()
+        with pytest.raises(ConfigError, match="run_qsim"):
+            engine.run_qsim()
+        warmup.assert_not_called()
+        from_history.assert_not_called()
+        from_log.assert_not_called()
+        qsim.assert_not_called()
+
+
+@pytest.mark.fast
+def test_sandbox_provider_selects_fixture_llm_offline(tmp_path: Path) -> None:
+    """Provider ``sandbox`` selects fixture LLM replay (`uses_network` false)."""
+    from aetherdialect._config import EngineConfig
+    from aetherdialect._llm_provider import LLMProvider, MockProvider
+
+    assert EngineConfig.is_sandbox_llm_provider("sandbox") is True
+    assert EngineConfig.normalize_llm_provider("sandbox") == "sandbox"
+
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    _write_minimal_sandbox_bundle(bundle)
+    with Sandbox(maintainer_access=True, bundle_dir=str(bundle), auto_seed=False) as sandbox:
+        assert sandbox.llm_mode == "sandbox"
+        assert sandbox.uses_network is False
+
+    with (
+        patch.object(EngineConfig, "LLM_PROVIDER", "sandbox"),
+        patch.object(MockProvider, "get") as get_mock,
+    ):
+        get_mock.return_value.chat_text.return_value = '{"ok": true}'
+        text = LLMProvider.chat("system", "user", task="intent", max_retries=0, timeout=1.0)
+        assert text == '{"ok": true}'
+        get_mock.assert_called_once()
+        get_mock.return_value.chat_text.assert_called_once()

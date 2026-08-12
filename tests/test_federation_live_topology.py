@@ -50,7 +50,7 @@ def test_federation_load_cli_lists_logistics_and_crm_targets() -> None:
 
 @pytest.mark.fast
 def test_oracle_module_names_both_live_and_sandbox_corpora() -> None:
-    oracles = importlib.import_module("live_tests.federation_oracles")
+    oracles = importlib.import_module("live_tests.mydb_profile")
     assert oracles.LIVE_FULL_PAYMENT_TOTAL != oracles.SANDBOX_SUBSET_PAYMENT_TOTAL
     assert oracles.LIVE_FULL_JOIN_RENTAL_LINKED_TITLES != oracles.SANDBOX_SUBSET_JOIN_RENTAL_LINKED_TITLES
 
@@ -64,6 +64,6 @@ def test_live_and_live_no_llm_markers_are_registered() -> None:
 
 @pytest.mark.fast
 def test_missing_partition_engine_probe_lists_three_families(monkeypatch: pytest.MonkeyPatch) -> None:
-    live = importlib.import_module("live_tests._federation_live")
+    live = importlib.import_module("live_tests.live_support")
     monkeypatch.setattr(live, "_ENV_FILE", Path("/nonexistent/env.env"))
     assert live.missing_federation_partition_engines() == ["postgresql", "mysql", "mariadb"]

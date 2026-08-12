@@ -8,15 +8,17 @@ import pytest
 
 from aetherdialect import AetherFederation
 from aetherdialect._constants import ARTIFACT_DIRECTORY_SEGMENT, DIAGNOSTIC_CODE_FEDERATION_MEMBER_REMOVED
-from aetherdialect._contracts_base import FederationMappings
-from aetherdialect._core_utils import drain_diagnostic_collector, reset_diagnostic_collector, set_diagnostic_collector
-from aetherdialect._federation import (
-    binding_from_member_engine,
-    compose_composite_graph,
+from aetherdialect._contracts_schema import FederationMappings
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_execute import (
     federation_source_artifacts_dir,
-    parse_federation_manifest,
     persist_federation_tree,
 )
+from aetherdialect._federation_manifest import (
+    binding_from_member_engine,
+    parse_federation_manifest,
+)
+from aetherdialect._utils import drain_diagnostic_collector, reset_diagnostic_collector, set_diagnostic_collector
 from tests.federation_helpers import write_federation_declaration_file
 from tests.test_aether_federation_public_surface import _minimal_member
 from tests.test_federation_member_removal import _three_member_manifest
@@ -34,7 +36,7 @@ _TWO_MEMBER_DECL = {
 def test_departed_member_tree_removed_at_init(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
     manifest_payload = _three_member_manifest()
-    declaration_path = write_federation_declaration_file(tmp_path, _TWO_MEMBER_DECL, {"version": "0.2.1"})
+    declaration_path = write_federation_declaration_file(tmp_path, _TWO_MEMBER_DECL, {"version": "0.2.3"})
     manifest = parse_federation_manifest(manifest_payload)
     members = {
         "a": _member_graph("left_t", source_id="a"),
@@ -46,11 +48,11 @@ def test_departed_member_tree_removed_at_init(tmp_path: Path, monkeypatch: pytes
     persist_federation_tree(
         str(fed_dir),
         manifest=manifest,
-        mappings=FederationMappings(version="0.2.1"),
+        mappings=FederationMappings(version="0.2.3"),
         composite=composite,
         member_graphs=members,
     )
-    binding_c = binding_from_member_engine("c", _minimal_member(connection="c"))
+    binding_c = binding_from_member_engine(_minimal_member(connection="c"))
     member_tree = Path(
         federation_source_artifacts_dir(
             str(tmp_path),
@@ -69,8 +71,8 @@ def test_departed_member_tree_removed_at_init(tmp_path: Path, monkeypatch: pytes
     try:
         AetherFederation(
             "fed_remove",
-            members={"a": member_a, "b": member_b},
-            declaration_file=str(declaration_path),
+            members=(member_a, member_b),
+            declaration=str(declaration_path),
             artifacts_dir=str(tmp_path),
         )
         diags = drain_diagnostic_collector()

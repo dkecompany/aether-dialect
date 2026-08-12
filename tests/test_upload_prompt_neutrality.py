@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from aetherdialect._constants import (
+from aetherdialect._constants_runtime import (
     CSV_IDENTIFIER_NAMING_SYSTEM,
     UPLOAD_COLUMN_TRANSFORMS_SYSTEM,
     UPLOAD_INTERPRET_SYSTEM,
@@ -18,7 +18,7 @@ from aetherdialect._constants import (
 )
 from aetherdialect._contracts_base import UploadColumnTransformId
 
-_CONSTANTS = importlib.import_module("aetherdialect._constants")
+_CONSTANTS = importlib.import_module("aetherdialect._constants_runtime")
 
 _DENYLIST_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bUSD\b"),

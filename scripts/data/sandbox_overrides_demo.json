@@ -1,5 +1,5 @@
 {
-  "version": "0.2.1",
+  "version": "0.2.3",
   "tables": {
     "staff": {
       "columns": {
@@ -10,10 +10,6 @@
           "sensitivity": "hidden"
         }
       }
-    },
-    "film": {
-      "description": "Sandbox demo override: Rental Shop film catalog.",
-      "role": null
     }
   },
   "foreign_keys_add": [],

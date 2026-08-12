@@ -5,24 +5,13 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 from aetherdialect._config import PolicyConfig
-from aetherdialect._contracts_base import (
-    InferenceTag,
-)
 from aetherdialect._contracts_schema import (
     ColumnMetadata,
     FKEdge,
+    InferenceTag,
     SchemaGraph,
     TableMetadata,
 )
-from aetherdialect._schema_build import (
-    _merge_ddl_column_constraints_into_schema_graph,
-    _merge_ddl_primary_keys_into_schema_graph,
-    _merge_svv_foreign_keys_into_tables_meta,
-    _reflect_duckdb_catalog,
-    _reflect_sqlite_catalog,
-    merge_ddl_foreign_keys_into_schema_graph,
-)
-from aetherdialect._schema_catalog import _parse_sql_file_sqlglot
 from aetherdialect._schema_graph import (
     _fk_containment_validates,
     _infer_missing_fks_composite,
@@ -30,6 +19,15 @@ from aetherdialect._schema_graph import (
     infer_missing_fks,
     promote_cross_component_semantic_edges,
     revalidate_named_fks_with_overlap,
+)
+from aetherdialect._schema_profile import _parse_sql_file_sqlglot
+from aetherdialect._schema_reflect import (
+    _merge_ddl_column_constraints_into_schema_graph,
+    _merge_ddl_primary_keys_into_schema_graph,
+    _merge_svv_foreign_keys_into_tables_meta,
+    _reflect_duckdb_catalog,
+    _reflect_sqlite_catalog,
+    merge_ddl_foreign_keys_into_schema_graph,
 )
 
 

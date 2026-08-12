@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import json
 
-from aetherdialect._contracts_base import ColumnRole
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
+from aetherdialect._constants import JOIN_CHOICE_SCOPE_MAIN
+from aetherdialect._contracts_schema import ColumnMetadata, ColumnRole, SchemaGraph, TableMetadata
 from aetherdialect._schema_graph import recompute_join_paths_multi
 from aetherdialect._sql_gen import (
-    JOIN_CHOICE_SCOPE_MAIN,
     _serialize_join_candidate_row,
     build_join_choice_prompt,
     join_hints_multi,

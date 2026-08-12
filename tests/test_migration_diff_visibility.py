@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import pytest
 
-from aetherdialect._contracts_base import ColumnRole, SchemaInvariantError
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaDiff, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import structural_hash_fp
+from aetherdialect._contracts_base import SchemaInvariantError
+from aetherdialect._contracts_schema import ColumnMetadata, ColumnRole, SchemaDiff, SchemaGraph, TableMetadata
 from aetherdialect._schema_graph import (
     diff_schemas,
     raise_if_schema_diff_covers_structural_change,
     tables_structural_payload,
 )
+from aetherdialect._utils import structural_hash_fp
 
 
 def _col(

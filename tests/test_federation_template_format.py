@@ -8,12 +8,12 @@ import tempfile
 import pytest
 
 from aetherdialect._constants import FEDERATION_PLAN_TEMPLATE_FORMAT_VERSION
-from aetherdialect._contracts_base import FederationPlanTemplate
-from aetherdialect._federation import (
-    federation_artifact_paths,
+from aetherdialect._contracts_schema import FederationPlanTemplate
+from aetherdialect._federation_execute import (
     load_federation_plan_templates,
     save_federation_plan_template,
 )
+from aetherdialect._federation_manifest import federation_artifact_paths
 
 
 def _plan_template(plan_id: str) -> FederationPlanTemplate:

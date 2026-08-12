@@ -1,4 +1,4 @@
-"""Question validation routes: analytical / schema_catalog / business_knowledge / restricted / invalid."""
+"""Question validation routes: analytical / schema_catalog / domain_knowledge / restricted / invalid."""
 
 from __future__ import annotations
 
@@ -8,13 +8,13 @@ from unittest.mock import patch
 
 import pytest
 
-from aetherdialect import _utils
-from aetherdialect._contracts_base import QuestionRoute, QuestionValidationResult
-from aetherdialect._utils import validate_question
+from aetherdialect import _utils_intent
+from aetherdialect._contracts_core import QuestionRoute, QuestionValidationResult
+from aetherdialect._utils_intent import validate_question
 
 
 def _llm_json(payload: dict[str, str]):
-    return patch("aetherdialect._utils.LLMProvider.json", return_value=payload)
+    return patch("aetherdialect._utils_intent.LLMProvider.json", return_value=payload)
 
 
 @pytest.mark.fast
@@ -62,17 +62,17 @@ def test_schema_catalog_count_question_fixture() -> None:
 
 
 @pytest.mark.fast
-def test_business_knowledge_route() -> None:
+def test_domain_knowledge_route() -> None:
     with _llm_json(
         {
             "valid_database_question": "yes",
-            "query_type": "business_knowledge",
+            "query_type": "domain_knowledge",
             "corrected": "what does ARR mean",
         }
     ):
         result = validate_question("what does ARR mean")
     assert result.accepted is True
-    assert result.route is QuestionRoute.BUSINESS_KNOWLEDGE
+    assert result.route is QuestionRoute.DOMAIN_KNOWLEDGE
 
 
 @pytest.mark.fast
@@ -112,19 +112,19 @@ def test_no_regex_router_helper_exists() -> None:
         "question_route_from_text",
         "detect_meta_question",
         "is_schema_catalog_question",
-        "is_business_knowledge_question",
+        "is_domain_knowledge_question",
     )
-    for name, obj in inspect.getmembers(_utils):
+    for name, obj in inspect.getmembers(_utils_intent):
         if name in forbidden_names:
-            raise AssertionError(f"unexpected router helper {_utils.__name__}.{name}")
+            raise AssertionError(f"unexpected router helper {_utils_intent.__name__}.{name}")
         if callable(obj) and name.startswith("_") and "route" in name.lower() and "question" in name.lower():
             src = inspect.getsource(obj)
             if re.search(r"re\.(search|match|findall|compile)", src):
                 raise AssertionError(f"question route helper uses regex: {name}")
-    from aetherdialect._constants import QUESTION_VALIDATION_SYSTEM
+    from aetherdialect._constants_runtime import QUESTION_VALIDATION_SYSTEM
 
     assert "analytical" in QUESTION_VALIDATION_SYSTEM
     assert "schema_catalog" in QUESTION_VALIDATION_SYSTEM
-    assert "business_knowledge" in QUESTION_VALIDATION_SYSTEM
+    assert "domain_knowledge" in QUESTION_VALIDATION_SYSTEM
     assert '"allowed" if' not in QUESTION_VALIDATION_SYSTEM
     assert 'query_type": "allowed"' not in QUESTION_VALIDATION_SYSTEM

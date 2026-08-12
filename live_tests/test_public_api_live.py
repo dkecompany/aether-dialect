@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
-from aetherdialect._contracts_base import AuditEvent
+from aetherdialect._contracts_core import AuditEvent
 
 
 def test_session_ask_until_done_happy_path(t2s) -> None:

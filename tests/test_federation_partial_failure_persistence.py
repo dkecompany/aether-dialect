@@ -8,14 +8,18 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
-from aetherdialect._contracts_base import FederationMappings, FederationPartialFailureError
+from aetherdialect._contracts_base import FederationPartialFailureError
 from aetherdialect._contracts_core import SourceStep
-from aetherdialect._federation import (
+from aetherdialect._contracts_schema import FederationMappings
+from aetherdialect._federation_execute import (
     compute_federation_storage_dir,
     federation_source_artifacts_dir,
     persist_federation_tree,
 )
-from aetherdialect._pipeline import execute_federated_prepare, execute_federated_sql_plan
+from aetherdialect._pipeline_execute import (
+    execute_federated_prepare,
+    execute_federated_sql_plan,
+)
 from tests.federation_helpers import (
     TwoMemberFederation,
     build_staged_two_member_prepare_outcome,
@@ -30,7 +34,7 @@ def _seed_artifact_tree(tmp_path: Any, fed: TwoMemberFederation) -> dict[str, in
     persist_federation_tree(
         federation_dir,
         manifest=fed.manifest,
-        mappings=FederationMappings(version="0.2.1"),
+        mappings=FederationMappings(version="0.2.3"),
         composite=fed.composite,
         member_graphs=fed.member_graphs,
     )
@@ -67,9 +71,9 @@ def test_mid_execution_member_failure_leaves_artifact_tree_unchanged(
     prepared, composite, manifest = build_staged_two_member_prepare_outcome(fed)
 
     with (
-        patch("aetherdialect._pipeline.revalidate_prepared_federation_plan"),
+        patch("aetherdialect._federation_execute.revalidate_prepared_federation_plan"),
         patch(
-            "aetherdialect._pipeline._execute_federation_source_step",
+            "aetherdialect._pipeline_execute._execute_federation_source_step",
             side_effect=_member_executor_that_fails_on_second(fed),
         ),
     ):
@@ -97,9 +101,9 @@ def test_mid_execution_member_failure_leaves_template_store_row_count_unchanged(
     prepared, composite, manifest = build_staged_two_member_prepare_outcome(fed)
 
     with (
-        patch("aetherdialect._pipeline.revalidate_prepared_federation_plan"),
+        patch("aetherdialect._federation_execute.revalidate_prepared_federation_plan"),
         patch(
-            "aetherdialect._pipeline._execute_federation_source_step",
+            "aetherdialect._pipeline_execute._execute_federation_source_step",
             side_effect=_member_executor_that_fails_on_second(fed),
         ),
     ):
@@ -129,13 +133,13 @@ def test_execution_failure_stamps_prepared_outcome_with_member_phase_and_error(
     prepared, composite, manifest = build_staged_two_member_prepare_outcome(fed)
 
     with (
-        patch("aetherdialect._pipeline.prepare_federated_sql_plan", return_value=prepared),
-        patch("aetherdialect._pipeline.revalidate_prepared_federation_plan"),
+        patch("aetherdialect._pipeline_execute.prepare_federated_sql_plan", return_value=prepared),
+        patch("aetherdialect._federation_execute.revalidate_prepared_federation_plan"),
         patch(
-            "aetherdialect._pipeline._execute_federation_source_step",
+            "aetherdialect._pipeline_execute._execute_federation_source_step",
             side_effect=_member_executor_that_fails_on_second(fed),
         ),
-        patch("aetherdialect._pipeline.persist_federated_member_stores") as persist_stores,
+        patch("aetherdialect._pipeline_execute.persist_federated_member_stores") as persist_stores,
     ):
         outcome = execute_federated_sql_plan(
             "join left and right",

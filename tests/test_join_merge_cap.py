@@ -8,9 +8,10 @@ from unittest.mock import patch
 import pytest
 
 from aetherdialect._constants import JOIN_PATH_TIE_REFUSAL_CEILING
+from aetherdialect._contracts_core import JoinCandidateCapExceededError
 from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
 from aetherdialect._schema_graph import recompute_join_paths_multi
-from aetherdialect._sql_gen import JoinCandidateCapExceededError, _candidate_join_paths_for_tables
+from aetherdialect._sql_gen import _candidate_join_paths_for_tables
 
 
 def _col(name: str) -> ColumnMetadata:

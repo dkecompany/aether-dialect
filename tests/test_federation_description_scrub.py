@@ -6,15 +6,15 @@ import json
 
 import pytest
 
-from aetherdialect._contracts_base import ConfigError, LogicalIntent
-from aetherdialect._contracts_schema import ColumnMetadata
-from aetherdialect._federation import compose_composite_graph, parse_federation_manifest
-from aetherdialect._intent_process import _build_intent_compose_prompt
+from aetherdialect._contracts_schema import ColumnMetadata, LogicalIntent
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_manifest import parse_federation_manifest
+from aetherdialect._intent_loop import _build_intent_compose_prompt
 from tests.federation_helpers import federation_member_graph
 
 
 @pytest.mark.fast
-def test_compose_rejects_table_description_naming_member_identifier() -> None:
+def test_compose_scrubs_table_description_naming_member_identifier() -> None:
     manifest = parse_federation_manifest(
         {
             "federation_id": "fed_desc_scrub",
@@ -28,8 +28,8 @@ def test_compose_rejects_table_description_naming_member_identifier() -> None:
         "storefront": federation_member_graph("payment", source_id="storefront"),
     }
     members["storefront"].tables["payment"].description = "storefront payment ledger"
-    with pytest.raises(ConfigError, match="must not name a source or member"):
-        compose_composite_graph(members, manifest)
+    composite = compose_composite_graph(members, manifest)
+    assert "storefront" not in (composite.tables["payment"].description or "").lower()
 
 
 @pytest.mark.fast

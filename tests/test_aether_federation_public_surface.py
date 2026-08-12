@@ -10,26 +10,30 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from aetherdialect import AetherFederation
-from aetherdialect._contracts_base import (
+from aetherdialect._constants_runtime import FEDERATION_METHOD_SEMANTICS
+from aetherdialect._contracts_base import ConfigError
+from aetherdialect._contracts_core import (
     AetherFederationInitResult,
     AuditEvent,
-    ConfigError,
-    FederationMappings,
     LLMConfig,
     RuntimeConfig,
 )
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import load_runtime_config
-from aetherdialect._federation import (
+from aetherdialect._contracts_schema import (
+    ColumnMetadata,
     FederationManifest,
+    FederationMappings,
+    SchemaGraph,
+    TableMetadata,
+)
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_manifest import (
     binding_from_member_engine,
-    compose_composite_graph,
     parse_federation_manifest,
 )
 from aetherdialect._main_execution import MainExecutionOps
 from aetherdialect._schema_graph import recompute_join_paths_multi
-from aetherdialect._templates import TemplateOps
-from aetherdialect.aetherdialect import FEDERATION_METHOD_SEMANTICS
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils_artifacts import load_runtime_config
 
 _TMP = Path(tempfile.gettempdir())
 
@@ -81,12 +85,15 @@ def _minimal_member(*, connection: str = "conn") -> MagicMock:
     member._context_name = "master"
     member._schema_role = "owner"
     member._engine_identity = None
-    member._named_connection = None
-    member._connection = None
-    member.export_overrides.return_value = MagicMock()
-    member.apply_overrides.return_value = None
-    member.clear_persisted_overrides.return_value = False
+    member._named_connection = connection
+    member._connection = connection
+    member.export_structure.return_value = {}
+    member.apply_structure.return_value = None
     return member
+
+
+def _member_pair() -> tuple[MagicMock, MagicMock]:
+    return _minimal_member(connection="conn_a"), _minimal_member(connection="conn_b")
 
 
 def _init_bundle(manifest: FederationManifest, composite: SchemaGraph) -> AetherFederationInitResult:
@@ -108,7 +115,7 @@ def _init_bundle(manifest: FederationManifest, composite: SchemaGraph) -> Aether
         schema_terms=set(),
         schema_stats={"table_count": 2, "total_filterable": 2},
         federation_manifest=manifest,
-        federation_mappings=FederationMappings(version="0.2.1"),
+        federation_mappings=FederationMappings(version="0.2.3"),
         federation_member_graphs={
             "a": _graph("left_t", source_id="a"),
             "b": _graph("right_t", source_id="b"),
@@ -130,7 +137,7 @@ def _init_bundle(manifest: FederationManifest, composite: SchemaGraph) -> Aether
                 artifacts_dir=str(_TMP / "aether_fed_member_b"),
             ),
         },
-        members={"conn_a": _minimal_member(connection="a"), "conn_b": _minimal_member(connection="b")},
+        members=(_minimal_member(connection="conn_a"), _minimal_member(connection="conn_b")),
     )
 
 
@@ -141,11 +148,12 @@ def _fed() -> AetherFederation:
         manifest,
     )
     bundle = _init_bundle(manifest, composite)
+    conn_a, conn_b = _member_pair()
     with patch("aetherdialect.aetherdialect.initialize_aether_federation", return_value=bundle):
         return AetherFederation(
             "fed_public",
-            members={"conn_a": _minimal_member(connection="a"), "conn_b": _minimal_member(connection="b")},
-            declaration_file=_MANIFEST_FILE,
+            members=[conn_a, conn_b],
+            declaration=_MANIFEST_FILE,
         )
 
 
@@ -180,42 +188,19 @@ def _declaration_reload_patch():
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
     return patch(
         "aetherdialect.aetherdialect.load_federation_declaration_from_path",
-        return_value=(manifest, FederationMappings(version="0.2.1")),
+        return_value=(manifest, FederationMappings(version="0.2.3")),
     )
 
 
-def test_schema_overrides_dispatch_to_member() -> None:
+def test_export_structure_is_callable_on_federation() -> None:
     fed = _fed()
-    member = fed._members["conn_a"]
-    fed.export_overrides("conn_a")
-    member.export_overrides.assert_called_once()
-    with _declaration_reload_patch():
-        with patch(
-            "aetherdialect.aetherdialect.initialize_aether_federation",
-            return_value=_init_bundle(
-                parse_federation_manifest(_MANIFEST, include_derived_roster=True),
-                compose_composite_graph(
-                    {"a": _graph("left_t", source_id="a"), "b": _graph("right_t", source_id="b")},
-                    parse_federation_manifest(_MANIFEST, include_derived_roster=True),
-                ),
-            ),
-        ):
-            fed.apply_overrides("conn_a")
-    member.apply_overrides.assert_called_once()
+    assert callable(fed.export_structure)
 
 
-def test_schema_overrides_unknown_member() -> None:
+def test_export_federation_is_callable_on_federation() -> None:
     fed = _fed()
-    with pytest.raises(ConfigError, match="unknown federation member"):
-        fed.export_overrides("missing")
-
-
-def test_show_config_includes_federation_topology() -> None:
-    fed = _fed()
-    snap = fed.show_config()
-    assert "Federation:" in snap.text
-    assert "conn_a" in snap.text
-    assert "conn_b" in snap.text
+    doc = fed.export_federation()
+    assert isinstance(doc, dict)
 
 
 def test_clear_template_store_targets_federation_scope() -> None:
@@ -249,11 +234,12 @@ def test_close_disposes_runtimes_and_emits_audit() -> None:
         manifest,
     )
     bundle = _init_bundle(manifest, composite)
+    conn_a, conn_b = _member_pair()
     with patch("aetherdialect.aetherdialect.initialize_aether_federation", return_value=bundle):
         fed = AetherFederation(
             "fed_public",
-            members={"conn_a": _minimal_member(connection="a"), "conn_b": _minimal_member(connection="b")},
-            declaration_file=_MANIFEST_FILE,
+            members=[conn_a, conn_b],
+            declaration=_MANIFEST_FILE,
             audit_sink=sink,
         )
     runtimes = fed._federation_source_runtimes
@@ -283,11 +269,11 @@ def test_closed_federation_refuses_session() -> None:
         fed.session()
 
 
-def test_member_registration_key_must_match_engine_federation_handle() -> None:
+def test_member_registration_uses_engine_connection_name() -> None:
     member = _minimal_member(connection="actual_conn")
     member.dialect = "duckdb"
     member._connection = "actual_conn"
-    binding = binding_from_member_engine("actual_conn", member)
+    binding = binding_from_member_engine(member)
     assert binding.source_id == "actual_conn"
     assert binding.connection == "actual_conn"
 

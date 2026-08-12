@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from aetherdialect._constants import (
+from aetherdialect._constants_runtime import (
     COMPOSE_FIELDS,
     FULL_FIELDS,
     GROUND_FIELDS,
@@ -17,8 +17,8 @@ from aetherdialect._constants import (
     SCHEMA_FIELD_TRUTH_VALUE,
     SCHEMA_FIELD_TYPE,
 )
-from aetherdialect._contracts_base import SensitivityClassification, TableRole
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
+from aetherdialect._contracts_base import SensitivityClassification
+from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata, TableRole
 
 
 def _make_graph_with_hidden_column() -> SchemaGraph:

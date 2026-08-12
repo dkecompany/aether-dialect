@@ -7,10 +7,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aetherdialect._contracts_base import FederationPlanTemplate, SessionActiveError
-from aetherdialect._federation import clear_federated_turn_state
-from aetherdialect._main_execution import PipelineSession
-from aetherdialect._templates import TemplateOps
+from aetherdialect._contracts_base import SessionActiveError
+from aetherdialect._contracts_schema import FederationPlanTemplate
+from aetherdialect._federation_execute import clear_federated_turn_state
+from aetherdialect._main_session import PipelineSession
+from aetherdialect._templates_ops import TemplateOps
 
 
 def _session_owner() -> MagicMock:
@@ -45,7 +46,7 @@ def test_concurrent_ask_only_one_turn_starts() -> None:
         release_drive.wait(timeout=5)
 
     def run_ask() -> None:
-        with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once", side_effect=block_run):
+        with patch("aetherdialect._main_init.MainInitOps.interactive_run_once", side_effect=block_run):
             session.ask("question")
 
     def run_second_ask() -> None:

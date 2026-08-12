@@ -1,12 +1,11 @@
-"""LLM-facing INTENT_SCHEMA emission enum is probe-only."""
+"""LLM-facing INTENT_SCHEMA accepts all CTE emission kinds."""
 
 from __future__ import annotations
 
 import jsonschema
 import pytest
-from jsonschema.exceptions import ValidationError
 
-from aetherdialect._constants import INTENT_SCHEMA
+from aetherdialect._constants_runtime import INTENT_SCHEMA
 from aetherdialect._contracts_base import CteEmissionKind
 from aetherdialect._contracts_core import RuntimeCteStep
 
@@ -17,8 +16,8 @@ def _cte_payload(emission: str) -> dict:
         "select_cols": [{"expr": "customer.customer_id"}],
         "group_by_cols": [],
         "order_by_cols": [],
-        "where": [],
-        "having": [],
+        "where": None,
+        "having": None,
         "limit": None,
         "natural_language": "probe",
         "cte_steps": [
@@ -35,11 +34,9 @@ def _cte_payload(emission: str) -> dict:
 
 
 @pytest.mark.fast
-def test_llm_schema_rejects_join_table() -> None:
-    with pytest.raises(ValidationError):
-        jsonschema.validate(_cte_payload("join_table"), INTENT_SCHEMA)
-    with pytest.raises(ValidationError):
-        jsonschema.validate(_cte_payload("scalar_subquery"), INTENT_SCHEMA)
+@pytest.mark.parametrize("emission", ["semi_join", "anti_join", "join_table", "scalar_subquery"])
+def test_llm_schema_accepts_all_emission_kinds(emission: str) -> None:
+    jsonschema.validate(_cte_payload(emission), INTENT_SCHEMA)
 
 
 @pytest.mark.fast
@@ -53,4 +50,4 @@ def test_internal_cte_accepts_scalar_subquery() -> None:
     )
     assert step.emission == CteEmissionKind.SCALAR_SUBQUERY
     enum = INTENT_SCHEMA["properties"]["cte_steps"]["items"]["properties"]["emission"]["enum"]
-    assert enum == ["semi_join", "anti_join"]
+    assert enum == ["semi_join", "anti_join", "join_table", "scalar_subquery"]

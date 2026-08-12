@@ -6,14 +6,24 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aetherdialect._constants import REPHRASE_HINT_MESSAGES
-from aetherdialect._contracts_base import FailureCategory, NoJoinPathError, SqlDiagnostic, SqlDiagnosticCode
-from aetherdialect._contracts_core import FeedbackKind, GenerationPath, RejectionBucket, RuntimeIntent, SelectCol
+from aetherdialect._constants_runtime import REPHRASE_HINT_MESSAGES
+from aetherdialect._contracts_base import FailureCategory, NormalizedExpr, SqlDiagnostic, SqlDiagnosticCode
+from aetherdialect._contracts_core import (
+    FeedbackKind,
+    GenerationPath,
+    NoJoinPathError,
+    RejectionBucket,
+    RephraseHint,
+    RuntimeIntent,
+    SelectCol,
+)
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import RephraseHint
-from aetherdialect._intent_process import NormalizedExpr
-from aetherdialect._pipeline import _join_path_failure_outcome, _resolve_joins_fresh, generate_and_validate_sql
-from aetherdialect._templates import TemplateOps
+from aetherdialect._pipeline_generate import (
+    _join_path_failure_outcome,
+    _resolve_joins_fresh,
+    generate_and_validate_sql,
+)
+from aetherdialect._templates_ops import TemplateOps
 
 
 def _disconnected_schema() -> SchemaGraph:
@@ -51,8 +61,8 @@ def test_join_path_failure_hint_is_distinct_from_sql_validation_hint() -> None:
     assert "relationship" in join_hint.lower()
 
 
-@patch("aetherdialect._pipeline.print_rephrase_hint")
-@patch("aetherdialect._templates.TemplateOps.save_template_store")
+@patch("aetherdialect._pipeline_generate.print_rephrase_hint")
+@patch("aetherdialect._templates_ops.TemplateOps.save_template_store")
 def test_join_path_failure_outcome_records_feedback_and_user_message(
     _mock_save,
     mock_hint,
@@ -114,15 +124,15 @@ def test_join_edges_from_signature_raises_when_path_is_disconnected() -> None:
     assert "could not be connected" in exc_info.value.user_message
 
 
-@patch("aetherdialect._pipeline.print_rephrase_hint")
-@patch("aetherdialect._templates.TemplateOps.save_template_store")
-@patch("aetherdialect._pipeline.finalize_substitute_sql", return_value="SELECT alpha.id FROM alpha")
-@patch("aetherdialect._pipeline._run_sql_validation_cascade")
-@patch("aetherdialect._pipeline.apply_diagnostic_repairs")
-@patch("aetherdialect._pipeline._resolve_joins_fresh")
-@patch("aetherdialect._pipeline.build_deterministic_sql", return_value="SELECT alpha.id FROM alpha, beta")
+@patch("aetherdialect._pipeline_generate.print_rephrase_hint")
+@patch("aetherdialect._templates_ops.TemplateOps.save_template_store")
+@patch("aetherdialect._pipeline_generate.finalize_substitute_sql", return_value="SELECT alpha.id FROM alpha")
+@patch("aetherdialect._pipeline_generate.run_sql_validation_cascade")
+@patch("aetherdialect._pipeline_generate.apply_diagnostic_repairs")
+@patch("aetherdialect._pipeline_generate._resolve_joins_fresh")
+@patch("aetherdialect._sql_gen.build_deterministic_sql", return_value="SELECT alpha.id FROM alpha, beta")
 @patch(
-    "aetherdialect._pipeline._join_signatures_for_deterministic_from_anchor",
+    "aetherdialect._pipeline_generate._join_signatures_for_deterministic_from_anchor",
     return_value=([], {}),
 )
 def test_b3_diagnostic_retry_routes_no_join_path_to_join_failure_outcome(
@@ -191,20 +201,20 @@ def test_resolve_joins_fresh_pass_two_does_not_mutate_shared_join_candidates() -
         return {"candidates": jc["candidates"]}, {}
 
     with (
-        patch("aetherdialect._pipeline.merge_join_hints_for_na_scopes", side_effect=_mutate_candidates),
+        patch("aetherdialect._sql_gen.merge_join_hints_for_na_scopes", side_effect=_mutate_candidates),
         patch(
-            "aetherdialect._pipeline.get_join_choice_from_llm",
+            "aetherdialect._pipeline_generate.get_join_choice_from_llm",
             side_effect=[
                 {"join_choice:main": "NA"},
                 {"join_choice:main": "J01"},
             ],
         ),
         patch(
-            "aetherdialect._pipeline.join_scope_pass1_plan",
+            "aetherdialect._sql_gen.join_scope_pass1_plan",
             return_value=({}, [{"scope": "join_choice:main"}], {"join_choice:main": True}, {}),
         ),
         patch(
-            "aetherdialect._pipeline.join_scope_pass2_llm_scopes",
+            "aetherdialect._sql_gen.join_scope_pass2_llm_scopes",
             return_value=[{"scope": "join_choice:main"}],
         ),
         pytest.raises(NoJoinPathError),

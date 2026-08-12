@@ -9,9 +9,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from aetherdialect._constants import (
-    COMPOSE_FIELDS,
     DIAGNOSTIC_CODE_REFUSAL_UNSUPPORTED_COLUMN_TYPE,
     DIAGNOSTIC_CODE_SCHEMA_UNKNOWN_TYPE_UNUSABLE,
+)
+from aetherdialect._constants_runtime import (
+    COMPOSE_FIELDS,
     GROUND_FIELDS,
     INTERPRET_FIELDS,
     SCHEMA_FIELD_RAW_TYPE,
@@ -23,16 +25,15 @@ from aetherdialect._contracts_base import (
 )
 from aetherdialect._contracts_core import RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import data_type_to_value_type, refusal_diagnostic_code_for_intent_issue
 from aetherdialect._dialect_sqlglot_engines import DuckDBDialect
-from aetherdialect._schema_catalog import (
+from aetherdialect._schema_graph import compute_semantic_profile_join_neighbors, infer_missing_fks
+from aetherdialect._schema_profile import (
     _profile_column,
-    compute_semantic_profile_join_neighbors,
     emit_schema_unknown_type_unusable_warnings,
     llm_classification_column_scope,
 )
-from aetherdialect._schema_graph import infer_missing_fks
-from aetherdialect._validation_execute import validate_semantics
+from aetherdialect._utils import data_type_to_value_type, refusal_diagnostic_code_for_intent_issue
+from aetherdialect._validation_sql import validate_semantics
 
 _LLM_SCHEMA_FIELD_SLICES = (INTERPRET_FIELDS, GROUND_FIELDS, COMPOSE_FIELDS)
 
@@ -130,7 +131,7 @@ def test_unknown_hard_unusable_ignores_usable_override() -> None:
     def capture_notify(message: str, *, code: str = "", **_kwargs: Any) -> None:
         notified.append((message, code))
 
-    with patch("aetherdialect._schema_catalog.notify", side_effect=capture_notify):
+    with patch("aetherdialect._schema_profile.notify", side_effect=capture_notify):
         emit_schema_unknown_type_unusable_warnings(graph)
 
     assert any(code == DIAGNOSTIC_CODE_SCHEMA_UNKNOWN_TYPE_UNUSABLE for _msg, code in notified)

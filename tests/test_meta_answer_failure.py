@@ -7,10 +7,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from aetherdialect._constants import SESSION_KIND_ERROR
-from aetherdialect._contracts_base import Diagnostic, FailureCategory, QuestionRoute
+from aetherdialect._contracts_base import Diagnostic
+from aetherdialect._contracts_core import QuestionRoute
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import drain_diagnostic_collector, reset_diagnostic_collector, set_diagnostic_collector
 from aetherdialect._main_execution import MainExecutionOps
+from aetherdialect._utils import drain_diagnostic_collector, reset_diagnostic_collector, set_diagnostic_collector
 
 
 def _schema() -> SchemaGraph:
@@ -67,7 +68,7 @@ def test_failed_meta_step_status_meta_error() -> None:
     buf: list[Diagnostic] = []
     tok = set_diagnostic_collector(buf)
     try:
-        with patch("aetherdialect._main_execution.LLMProvider.json", return_value=bad) as llm_mock:
+        with patch("aetherdialect._llm_provider.LLMProvider.json", return_value=bad) as llm_mock:
             step = MainExecutionOps.answer_metadata_question(
                 MagicMock(), "how many tables", QuestionRoute.SCHEMA_CATALOG, _schema(), None, None
             )
@@ -80,9 +81,8 @@ def test_failed_meta_step_status_meta_error() -> None:
     assert llm_mock.call_count == 2
     assert step.done is True
     assert step.kind == SESSION_KIND_ERROR
-    assert step.status == FailureCategory.META_ERROR.value
-    assert step.meta_payload is None
+    assert step.error is not None
     assert step.sql is None
-    assert isinstance(step.error, str) and step.error.strip()
+    assert step.error.detail_code == "meta.answer.failed" or "meta.answer.failed" in {d.code for d in step.diagnostics}
     assert "meta.answer.failed" in codes
     assert "meta.answer.repair" in codes

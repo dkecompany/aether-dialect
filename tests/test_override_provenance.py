@@ -1,4 +1,4 @@
-"""Override entries record structural provenance and refuse replay after object recreation."""
+"""Structure edits record provenance and refuse replay after object recreation."""
 
 from __future__ import annotations
 
@@ -8,22 +8,22 @@ from typing import Any
 import pytest
 
 from aetherdialect._config import EngineConfig
-from aetherdialect._constants import SCHEMA_OVERRIDES_VERSION
-from aetherdialect._contracts_base import DescriptionOwner, EngineContext
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import reset_diagnostic_collector, set_diagnostic_collector
-from aetherdialect._schema_graph import assign_schema_graph_hashes, recompute_join_paths_multi, table_structural_hash_fp
-from aetherdialect._schema_overrides import (
-    apply_schema_overrides_to_graph,
-    finalize_with_overrides,
-    load_overrides_sidecar,
+from aetherdialect._constants import STRUCTURE_DOCUMENT_VERSION
+from aetherdialect._contracts_base import EngineContext
+from aetherdialect._contracts_schema import ColumnMetadata, RoleOwner, SchemaGraph, TableMetadata
+from aetherdialect._schema_finalize import (
+    apply_structure_to_graph,
+    finalize_with_structure,
+    load_structure_sidecar,
     reconfirm_override,
-    save_overrides_sidecar,
     save_schema_to_cache,
+    save_structure_sidecar,
 )
+from aetherdialect._schema_graph import assign_schema_graph_hashes, recompute_join_paths_multi, table_structural_hash_fp
+from aetherdialect._utils import reset_diagnostic_collector, set_diagnostic_collector
 
 
-def _orders_table(*, description: str = "Catalog orders") -> TableMetadata:
+def _orders_table(*, role: str | None = None) -> TableMetadata:
     return TableMetadata(
         name="orders",
         columns={
@@ -43,7 +43,8 @@ def _orders_table(*, description: str = "Catalog orders") -> TableMetadata:
         },
         primary_key=["order_id"],
         foreign_keys=[],
-        description=description,
+        description="Catalog orders",
+        role=role,
         row_count=10,
     )
 
@@ -70,19 +71,19 @@ def test_recreated_object_does_not_inherit_overrides(tmp_path: Any, monkeypatch:
     assign_schema_graph_hashes(original_graph, ctx, "")
     save_schema_to_cache(original_graph, str(cache_path))
 
-    apply_schema_overrides_to_graph(
+    apply_structure_to_graph(
         original_graph,
         {
-            "version": SCHEMA_OVERRIDES_VERSION,
-            "tables": {"orders": {"description": "User-authored order text."}},
+            "version": STRUCTURE_DOCUMENT_VERSION,
+            "tables": {"orders": {"role": "dimension"}},
         },
     )
-    save_overrides_sidecar(
+    save_structure_sidecar(
         cache_path,
         {
             "tables": {
                 "orders": {
-                    "description": "User-authored order text.",
+                    "role": "dimension",
                     "authored_against_structural_hash": table_structural_hash_fp(original_orders),
                     "authored_at": "2026-01-01T00:00:00+00:00",
                 },
@@ -99,7 +100,7 @@ def test_recreated_object_does_not_inherit_overrides(tmp_path: Any, monkeypatch:
     previous_graph.join_paths_multi = {}
     save_schema_to_cache(previous_graph, str(cache_path))
 
-    recreated_orders = _orders_table(description="Fresh catalog orders")
+    recreated_orders = _orders_table(role="fact")
     recreated_orders.columns["amount"] = ColumnMetadata(
         name="amount",
         data_type="numeric",
@@ -112,15 +113,15 @@ def test_recreated_object_does_not_inherit_overrides(tmp_path: Any, monkeypatch:
     diags_buf: list[Any] = []
     token = set_diagnostic_collector(diags_buf)
     try:
-        finalize_with_overrides(recreated_graph, cache_path)
+        finalize_with_structure(recreated_graph, cache_path)
     finally:
         reset_diagnostic_collector(token)
 
-    assert recreated_graph.tables["orders"].description == "Fresh catalog orders"
-    assert recreated_graph.tables["orders"].description_owner != DescriptionOwner.USER_OVERRIDE
+    assert recreated_graph.tables["orders"].role == "fact"
+    assert recreated_graph.tables["orders"].role_owner != RoleOwner.USER_OVERRIDE
     codes = {d.code for d in diags_buf}
-    assert "OVERRIDE_NEEDS_RECONFIRMATION" in codes
-    sidecar = load_overrides_sidecar(cache_path)
+    assert "STRUCTURE_NEEDS_RECONFIRMATION" in codes
+    sidecar = load_structure_sidecar(cache_path)
     assert sidecar is not None
     entry = sidecar["tables"]["orders"]
     assert entry.get("needs_reconfirmation") is True
@@ -140,7 +141,7 @@ def test_reconfirmation_reactivates(tmp_path: Any, monkeypatch: pytest.MonkeyPat
     assign_schema_graph_hashes(original_graph, ctx, "")
     authored_hash = table_structural_hash_fp(original_orders)
 
-    recreated_orders = _orders_table(description="Fresh catalog orders")
+    recreated_orders = _orders_table(role="fact")
     recreated_orders.columns["amount"] = ColumnMetadata(
         name="amount",
         data_type="numeric",
@@ -150,12 +151,12 @@ def test_reconfirmation_reactivates(tmp_path: Any, monkeypatch: pytest.MonkeyPat
     recreated_graph = _graph_with_orders(recreated_orders)
     assign_schema_graph_hashes(recreated_graph, ctx, "")
 
-    save_overrides_sidecar(
+    save_structure_sidecar(
         cache_path,
         {
             "tables": {
                 "orders": {
-                    "description": "User-authored order text.",
+                    "role": "dimension",
                     "authored_against_structural_hash": authored_hash,
                     "authored_at": "2026-01-01T00:00:00+00:00",
                     "needs_reconfirmation": True,
@@ -172,11 +173,11 @@ def test_reconfirmation_reactivates(tmp_path: Any, monkeypatch: pytest.MonkeyPat
     previous_graph.join_paths_multi = {}
 
     assert reconfirm_override(cache_path, "tables.orders", recreated_graph) is True
-    finalize_with_overrides(recreated_graph, cache_path, previous_schema=previous_graph)
+    finalize_with_structure(recreated_graph, cache_path, previous_schema=previous_graph)
 
-    assert recreated_graph.tables["orders"].description == "User-authored order text."
-    assert recreated_graph.tables["orders"].description_owner == DescriptionOwner.USER_OVERRIDE
-    sidecar = load_overrides_sidecar(cache_path)
+    assert recreated_graph.tables["orders"].role == "dimension"
+    assert recreated_graph.tables["orders"].role_owner == RoleOwner.USER_OVERRIDE
+    sidecar = load_structure_sidecar(cache_path)
     assert sidecar is not None
     entry = sidecar["tables"]["orders"]
     assert entry.get("needs_reconfirmation") is not True

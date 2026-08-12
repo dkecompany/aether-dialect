@@ -11,15 +11,8 @@ from aetherdialect._constants import (
     DIAGNOSTIC_CODE_COMPOSITE_DESCRIPTIVE_PROFILE_FAILED,
     DIAGNOSTIC_CODE_PROFILE_TABLE_CLONE_FAILED,
 )
-from aetherdialect._contracts_base import DescriptionOwner
-from aetherdialect._contracts_schema import ColumnMetadata, TableMetadata
-from aetherdialect._core_utils import (
-    drain_diagnostic_collector,
-    reset_diagnostic_collector,
-    set_diagnostic_collector,
-)
-from aetherdialect._schema_build import tables_meta_to_schema_graph
-from aetherdialect._schema_catalog import (
+from aetherdialect._contracts_schema import ColumnMetadata, DescriptionOwner, TableMetadata
+from aetherdialect._schema_profile import (
     _build_frequent_values_sql,
     _build_minmax_sql,
     _build_mode_sql,
@@ -29,8 +22,14 @@ from aetherdialect._schema_catalog import (
     apply_catalog_descriptions_from_tables_meta,
     apply_profile_timeout_to_dialect,
     profile_schema,
+    profile_table_clone,
 )
-from aetherdialect._schema_graph import _profile_table_clone
+from aetherdialect._schema_reflect import tables_meta_to_schema_graph
+from aetherdialect._utils import (
+    drain_diagnostic_collector,
+    reset_diagnostic_collector,
+    set_diagnostic_collector,
+)
 
 
 def _name_pair_table() -> TableMetadata:
@@ -110,7 +109,7 @@ def test_profile_table_clone_failure_sets_profile_failed_on_table() -> None:
 
     token = set_diagnostic_collector([])
     try:
-        clone = _profile_table_clone(dialect, table, notes_content=None)
+        clone = profile_table_clone(dialect, table, notes_content=None)
         diags = drain_diagnostic_collector()
     finally:
         reset_diagnostic_collector(token)
@@ -319,7 +318,7 @@ def test_apply_catalog_descriptions_respects_higher_owner() -> None:
 
 
 def test_apply_column_roles_llm_with_notes_uses_notes_owner(monkeypatch: pytest.MonkeyPatch) -> None:
-    from aetherdialect._schema_catalog import apply_column_roles_llm
+    from aetherdialect._schema_profile import apply_column_roles_llm
 
     table = TableMetadata(
         name="orders",
@@ -342,7 +341,7 @@ def test_apply_column_roles_llm_with_notes_uses_notes_owner(monkeypatch: pytest.
         }
 
     monkeypatch.setattr(
-        "aetherdialect._schema_catalog.llm_classify_schema",
+        "aetherdialect._schema_profile.llm_classify_schema",
         _fake_classify,
     )
     apply_column_roles_llm(sg, notes_content="Domain notes about orders.")

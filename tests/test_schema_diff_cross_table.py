@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import pytest
 
-from aetherdialect._contracts_base import ColumnRole, MigrationTier
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
+from aetherdialect._contracts_base import MigrationTier
+from aetherdialect._contracts_schema import ColumnMetadata, ColumnRole, SchemaGraph, TableMetadata
 from aetherdialect._schema_graph import diff_schemas, schema_diff_cross_table_limitation_note
-from aetherdialect._templates import TemplateOps
+from aetherdialect._templates_ops import TemplateOps
 
 
 def _col(name: str, data_type: str = "integer") -> ColumnMetadata:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from aetherdialect import AetherEngine
-from aetherdialect._constants import PERMISSION_DENIED_USER_MESSAGE
+from aetherdialect._constants_runtime import PERMISSION_DENIED_USER_MESSAGE
 from aetherdialect._contracts_base import (
     ConfigError,
     EngineContext,
@@ -13,10 +13,10 @@ from aetherdialect._contracts_base import (
     SpaceContext,
 )
 from live_tests.conftest import (
-    _RENTAL_SHOP_CONSUMER_ALLOW_OBJECTS,
     _build_rbac_consumer_engine,
     _consumer_engine_context,
 )
+from live_tests.mydb_profile import PROFILE_CONSUMER_ALLOW_OBJECTS as _RENTAL_SHOP_CONSUMER_ALLOW_OBJECTS
 
 
 def _ask_until_settled(session, question: str):
@@ -129,8 +129,8 @@ class TestAetherSpacePostgres:
         """Saved aetherspace snapshot exposes scoped tables."""
         t2s_rbac_owner.aetherspace("rentals_only", SpaceContext(tables=frozenset({"rental"})))
         desc = t2s_rbac_owner.aetherspace("rentals_only")
-        scope = desc.list_scope()
-        assert "rental" in scope.get("tables", [])
+        scope = desc.tables
+        assert "rental" in scope
 
     def test_unknown_space_raises(self, t2s_rbac_owner: AetherEngine) -> None:
         """session(space=...) on unknown name raises ConfigError."""
@@ -203,12 +203,36 @@ class TestConsumerWriterBlocked:
             with t2s_consumer_pguser2.session(mode="writer"):
                 pass
 
-    def test_consumer_aetherspace_write_raises(self, t2s_consumer_pguser2: AetherEngine) -> None:
-        """Consumer cannot define aetherspace snapshots."""
-        with pytest.raises(OwnerOnlyOperationError):
+    def test_consumer_aetherspace_within_visibility(self, t2s_consumer_pguser2: AetherEngine) -> None:
+        """Consumer may define an aetherspace over tables in their effective visibility."""
+        visible = t2s_consumer_pguser2._consumer_visible_objects or frozenset()
+        table_keys = sorted(v for v in visible if "." not in v)
+        assert table_keys, "consumer must have at least one visible table"
+        name = "consumer_visible_space"
+        desc = t2s_consumer_pguser2.aetherspace(
+            name,
+            SpaceContext(tables=frozenset({table_keys[0]})),
+        )
+        assert desc is not None
+        assert desc.name == name
+        assert any(s.uid == desc.uid for s in t2s_consumer_pguser2.list_aetherspaces())
+
+    def test_consumer_aetherspace_outside_visibility_raises(self, t2s_consumer_pguser2: AetherEngine) -> None:
+        """Consumer cannot define an aetherspace naming tables outside their visibility."""
+        visible = t2s_consumer_pguser2._consumer_visible_objects or frozenset()
+        table_keys = {v for v in visible if "." not in v}
+        # staff is typically owner-only under the pguser2 grant script; fall back to any
+        # owner-graph table the consumer cannot see.
+        forbidden = "staff" if "staff" not in table_keys else None
+        if forbidden is None:
+            owner_tables = set(t2s_consumer_pguser2._schema_graph.tables)
+            candidates = sorted(owner_tables - table_keys)
+            assert candidates, "need at least one table outside consumer visibility"
+            forbidden = candidates[0]
+        with pytest.raises(ConfigError, match="outside visible scope"):
             t2s_consumer_pguser2.aetherspace(
-                "blocked",
-                SpaceContext(tables=frozenset({"film"})),
+                "blocked_outside",
+                SpaceContext(tables=frozenset({forbidden})),
             )
 
 

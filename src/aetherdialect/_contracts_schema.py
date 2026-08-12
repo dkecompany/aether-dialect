@@ -8,30 +8,40 @@ from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import InitVar, asdict, dataclass, field, replace
+from enum import Enum, StrEnum
 from pathlib import Path
 from typing import Any, ClassVar, Literal, cast
 
 from ._constants import (
     AGG_PATTERN,
     CASE_WHEN_QUALIFIED_COLUMN_REF_RE,
-    COMPOSE_FIELDS,
-    CSV_SCHEMA_LITERAL_ORIGINAL_NAME_NOTE,
     DEFAULT_RANDOM_SEED,
+    DESCRIPTION_OWNER_VALUES,
     EXACT_NUMERIC_BASE_TYPES,
-    EXCLUDED_WHERE_PATTERNS,
     FEDERATION_ENUM_PROMPT_CAP,
-    FULL_FIELDS,
-    GROUND_FIELDS,
     HIDDEN_SENSITIVITIES,
     INEXACT_NUMERIC_BASE_TYPES,
-    INTERPRET_FIELDS,
+    INFERENCE_TAG_VALUES,
     KEPT_ISSUE_SEVERITIES,
     LOGICAL_FAILURE_CATEGORIES,
     NUMERIC_TYPE_ARGUMENTS_RE,
+    PK_INFERENCE_TAG_VALUES,
     PROMPT_SCALAR_VALUE_TYPES,
     ROLE_ALLOWED_AGGREGATIONS,
-    SCHEMA_DESCRIPTION_PROMPT_COUNT_CAP,
-    SCHEMA_DESCRIPTION_PROMPT_MAX_CHARS,
+    ROLE_OWNER_VALUES,
+    SENTINEL_MODE_FREQUENCY_THRESHOLD,
+    UNKNOWN_VALUE_TYPE,
+    UNUSABLE_NULL_RATIO_THRESHOLD,
+    WINDOW_REGISTRY_AGG_KIND_HINTS,
+    WINDOW_REGISTRY_NAV_KIND_HINTS,
+    WINDOW_REGISTRY_RANK_KIND_HINTS,
+)
+from ._constants_runtime import (
+    COMPOSE_FIELDS,
+    CSV_SCHEMA_LITERAL_ORIGINAL_NAME_NOTE,
+    FULL_FIELDS,
+    GROUND_FIELDS,
+    INTERPRET_FIELDS,
     SCHEMA_FIELD_DERIVED,
     SCHEMA_FIELD_DESCRIPTION,
     SCHEMA_FIELD_ENUM,
@@ -42,39 +52,31 @@ from ._constants import (
     SCHEMA_FIELD_TYPE,
     SCHEMA_INSTRUCTION_LIKE_LINE_PATTERNS,
     SCHEMA_INSTRUCTION_SCRUB_REPLACEMENT,
-    SENTINEL_MODE_FREQUENCY_THRESHOLD,
     STAGE_ATTRIBUTION_TABLE,
-    UNKNOWN_VALUE_TYPE,
-    UNUSABLE_NULL_RATIO_THRESHOLD,
-    WINDOW_REGISTRY_AGG_KIND_HINTS,
-    WINDOW_REGISTRY_NAV_KIND_HINTS,
-    WINDOW_REGISTRY_RANK_KIND_HINTS,
 )
 from ._contracts_base import (
     ArrayStorageKind,
-    ColumnRole,
     ColumnTypeSemantics,
     ColumnVisibilityBlockReason,
     ComplexityTier,
     ConfigError,
     DatabaseFeatureCapability,
     DataQualityReport,
-    DescriptionOwner,
     FailureCategory,
-    InferenceTag,
     NormalizedExpr,
     OrderByCol,
     OverrideSkip,
     ParamValue,
-    PkInferenceTag,
-    RoleOwner,
     SchemaInclude,
     SchemaInvariantError,
+    SchemaRole,
     SensitivityClassification,
+    StructuralKnowledgeFact,
     TableKind,
     WhereParam,
     WindowFrameKind,
     WindowOperatorKind,
+    WorkloadFamily,
 )
 
 
@@ -112,6 +114,7 @@ class _ColumnMetadataCore:
     valid_having_ops: list[str] = field(default_factory=list)
     description: str = ""
     description_owner: DescriptionOwner | None = None
+    base_description: str = ""
     is_unique: bool = False
     is_generated: bool = False
     is_identity: bool = False
@@ -236,11 +239,7 @@ class _ColumnMetadataCore:
             fk_target = tuple(d["fk_target"]) if isinstance(d["fk_target"], list) else d["fk_target"]
         sens = SensitivityClassification.from_dict(d)
         frequent_values = list(d.get("frequent_values") or [])
-        if not frequent_values:
-            frequent_values = list(d.get("top_k_values") or [])
         value_overlap_sample = list(d.get("value_overlap_sample") or [])
-        if not value_overlap_sample:
-            value_overlap_sample = list(d.get("semantic_distinct_values") or [])
         return ColumnMetadata(
             name=d.get("name", ""),
             data_type=d.get("data_type", ""),
@@ -267,6 +266,7 @@ class _ColumnMetadataCore:
             valid_having_ops=d.get("valid_having_ops", []),
             description=d.get("description", ""),
             description_owner=DescriptionOwner.coerce(d.get("description_owner")),
+            base_description=str(d.get("base_description", "") or ""),
             is_unique=d.get("is_unique", False),
             is_generated=bool(d.get("is_generated", False)),
             is_identity=bool(d.get("is_identity", False)),
@@ -335,6 +335,7 @@ class _ColumnMetadataCore:
             "valid_having_ops": self.valid_having_ops,
             "description": self.description,
             "description_owner": (self.description_owner.value if self.description_owner is not None else None),
+            "base_description": self.base_description,
             "is_unique": self.is_unique,
             "is_generated": self.is_generated,
             "is_identity": self.is_identity,
@@ -472,11 +473,13 @@ class ColumnMetadata(_ColumnMetadataCore):
 
         Returns:
 
-            False if the name matches an excluded pattern; else override, key, or role-based rules.
+            False when denied, classified restricted/hidden, or value type is unknown;
+            else override, key, or role-based rules.
         """
-        for pattern in EXCLUDED_WHERE_PATTERNS:
-            if re.search(pattern, self.name, re.IGNORECASE):
-                return False
+        if self.is_denied:
+            return False
+        if self.sensitivity in (SensitivityClassification.RESTRICTED, SensitivityClassification.HIDDEN):
+            return False
         if (self.value_type or "").strip().lower() == UNKNOWN_VALUE_TYPE:
             return False
         if self.is_filterable_override is not None:
@@ -631,6 +634,7 @@ class TableMetadata:
     profile_failed: bool = False
     description: str = ""
     description_owner: DescriptionOwner | None = None
+    base_description: str = ""
     role_owner: RoleOwner | None = None
     composite_descriptive_ratios: dict[tuple[str, str], float] = field(default_factory=dict)
     _user_semantic_neighbors: list[tuple[str, str, str, str]] = field(default_factory=list)
@@ -720,6 +724,7 @@ class TableMetadata:
             profile_failed=bool(d.get("profile_failed", False)),
             description=d.get("description", ""),
             description_owner=DescriptionOwner.coerce(d.get("description_owner")),
+            base_description=str(d.get("base_description", "") or ""),
             role_owner=RoleOwner.coerce(d.get("role_owner")),
             composite_descriptive_ratios={
                 tuple(k.split("|", 1)): v for k, v in d.get("composite_descriptive_ratios", {}).items() if "|" in k
@@ -768,6 +773,7 @@ class TableMetadata:
             "profile_failed": self.profile_failed,
             "description": self.description,
             "description_owner": (self.description_owner.value if self.description_owner is not None else None),
+            "base_description": self.base_description,
             "role_owner": (self.role_owner.value if self.role_owner is not None else None),
             "composite_descriptive_ratios": {
                 f"{c1}|{c2}": ratio for (c1, c2), ratio in self.composite_descriptive_ratios.items()
@@ -792,28 +798,6 @@ _SchemaGraphCapabilityFn = Callable[["SchemaGraph"], DatabaseFeatureCapability]
 
 
 @dataclass
-class _DescriptionPromptBudget:
-    """Deterministic per-payload cap for schema description text."""
-
-    remaining: int = SCHEMA_DESCRIPTION_PROMPT_COUNT_CAP
-    truncated_chars: list[str] = field(default_factory=list)
-    truncated_count: list[str] = field(default_factory=list)
-
-    def emit(self, key: str, text: str) -> str | None:
-        td = text.strip()
-        if not td:
-            return None
-        if self.remaining <= 0:
-            self.truncated_count.append(key)
-            return None
-        if len(td) > SCHEMA_DESCRIPTION_PROMPT_MAX_CHARS:
-            td = td[: SCHEMA_DESCRIPTION_PROMPT_MAX_CHARS - 3] + "..."
-            self.truncated_chars.append(key)
-        self.remaining -= 1
-        return td
-
-
-@dataclass
 class SchemaGraph:
     """Schema graph with nested tables, join paths, and metadata."""
 
@@ -835,6 +819,7 @@ class SchemaGraph:
     deny_columns: dict[str, set[str]] = field(default_factory=dict)
     disallowed_columns: dict[str, set[str]] = field(default_factory=dict)
     notes_sha256: str = ""
+    structural_knowledge: tuple[StructuralKnowledgeFact, ...] = ()
     scope_descriptor: dict[str, Any] | None = None
     federation_membership: dict[str, str] | None = None
     schema_revision: int = 0
@@ -842,7 +827,7 @@ class SchemaGraph:
         default=None, repr=False, compare=False
     )
     _stats_dirty: bool = field(default=True, repr=False, compare=False)
-    _last_overrides_skipped: tuple[OverrideSkip, ...] = field(default=(), repr=False, compare=False)
+    _last_structure_skipped: tuple[OverrideSkip, ...] = field(default=(), repr=False, compare=False)
     _override_internal_blocks: dict[str, Any] | None = field(default=None, repr=False, compare=False)
     _stats_fn: _SchemaGraphStatsFn | None = field(default=None, repr=False, compare=False)
     _capability_fn: _SchemaGraphCapabilityFn | None = field(default=None, repr=False, compare=False)
@@ -876,7 +861,7 @@ class SchemaGraph:
         """Unconditionally recompute :attr:`schema_stats` from the current graph and clear the dirty flag."""
         fn = self._stats_fn
         if fn is None:
-            raise RuntimeError("Schema helpers not wired (aetherdialect._schema_build did not load)")
+            raise RuntimeError("Schema helpers not wired (aetherdialect._schema_reflect did not load)")
         self.schema_stats = fn(self)
         self._stats_dirty = False
         return self.schema_stats
@@ -910,18 +895,13 @@ class SchemaGraph:
         return list(self.tables.keys())
 
     @property
-    def schema_hash(self) -> str:
-        """Alias for ``effective_structural_hash`` for legacy call sites."""
-        return self.effective_structural_hash
-
-    @property
     def database_feature_capability(self) -> DatabaseFeatureCapability:
         """Cached structural feasibility snapshot for tier-conditioned. generators. Returns: :class:`DatabaseFeatureCapability` computed once per graph instance."""
         cached = self._database_feature_capability_cache
         if cached is None:
             cap_fn = self._capability_fn
             if cap_fn is None:
-                raise RuntimeError("Schema helpers not wired (aetherdialect._schema_build did not load)")
+                raise RuntimeError("Schema helpers not wired (aetherdialect._schema_reflect did not load)")
             cached = cap_fn(self)
             object.__setattr__(self, "_database_feature_capability_cache", cached)
         return cached
@@ -1025,7 +1005,6 @@ class SchemaGraph:
         table_name: str | None = None,
         description_overlay: dict[str, Any] | None = None,
         omit_original_name: bool = False,
-        desc_budget: _DescriptionPromptBudget | None = None,
         scrub_instruction_like: bool = False,
     ) -> dict[str, Any]:
         col_body: dict[str, Any] = {}
@@ -1057,14 +1036,9 @@ class SchemaGraph:
                 (col.description, col.description_owner),
             )
             if desc:
-                key = f"{table_name}.{col.name}" if table_name else col.name
-                if desc_budget is not None:
-                    emitted = desc_budget.emit(key, desc)
-                    desc = emitted if emitted is not None else ""
-                if desc:
-                    if scrub_instruction_like:
-                        desc = SchemaGraph.scrub_schema_prose_for_prompt(desc)
-                    col_body["description"] = desc
+                if scrub_instruction_like:
+                    desc = SchemaGraph.scrub_schema_prose_for_prompt(desc)
+                col_body["description"] = desc
         if SCHEMA_FIELD_ROLE in fields:
             pub_role = self._schema_literal_public_role(col.role)
             if pub_role is not None:
@@ -1082,7 +1056,7 @@ class SchemaGraph:
         if SCHEMA_FIELD_SAMPLES in fields:
             if col.prompt_value_type() in PROMPT_SCALAR_VALUE_TYPES:
                 samples: dict[str, Any] = {}
-                if col.distinct_count:
+                if col.distinct_count and col.sensitivity != SensitivityClassification.RESTRICTED:
                     samples["distinct_count"] = col.distinct_count
                 if col.min_val is not None:
                     samples["min_val"] = col.min_val
@@ -1120,10 +1094,6 @@ class SchemaGraph:
         root: dict[str, Any] = {}
         omit_original_name = True
         col_allow_by_table: dict[str, set[str]] | None = None
-        desc_budget: _DescriptionPromptBudget | None = None
-        if SCHEMA_FIELD_DESCRIPTION in fields:
-            desc_budget = _DescriptionPromptBudget()
-            object.__setattr__(self, "_last_description_truncations", ())
         if column_filter:
             col_allow_by_table = {}
             for qc in column_filter:
@@ -1149,7 +1119,6 @@ class SchemaGraph:
                     table_name=tname,
                     description_overlay=description_overlay,
                     omit_original_name=omit_original_name,
-                    desc_budget=desc_budget,
                     scrub_instruction_like=scrub_instruction_like,
                 )
                 if col_obj:
@@ -1171,13 +1140,9 @@ class SchemaGraph:
                     (tm.description, tm.description_owner),
                 )
                 if td:
-                    if desc_budget is not None:
-                        emitted = desc_budget.emit(f"table:{tname}", td)
-                        td = emitted if emitted is not None else ""
-                    if td:
-                        if scrub_instruction_like:
-                            td = SchemaGraph.scrub_schema_prose_for_prompt(td)
-                        table_body["description"] = td
+                    if scrub_instruction_like:
+                        td = SchemaGraph.scrub_schema_prose_for_prompt(td)
+                    table_body["description"] = td
             if SCHEMA_FIELD_ROLE in fields:
                 tr = self._schema_literal_public_role(tm.role)
                 if tr is not None:
@@ -1229,12 +1194,6 @@ class SchemaGraph:
             if truncated_enums:
                 object.__setattr__(self, "_last_enum_truncations", tuple(truncated_enums))
             root["enum_types"] = enum_block
-        if desc_budget is not None and (desc_budget.truncated_chars or desc_budget.truncated_count):
-            object.__setattr__(
-                self,
-                "_last_description_truncations",
-                tuple(desc_budget.truncated_chars + desc_budget.truncated_count),
-            )
         if not omit_original_name and any(
             (tm.original_name and tm.original_name != tm.name)
             or any(col.original_name and col.original_name != col.name for col in tm.columns.values())
@@ -1380,7 +1339,7 @@ class SchemaGraph:
         visible_objects: frozenset[str] | None,
         execution_visible_objects: frozenset[str] | None,
     ) -> frozenset[str] | None:
-        """Intersect space and execution visibility whitelists; ``None`` means unrestricted on that axis."""
+        """Intersect space and credential/execution whitelists for post- LLM gates. Used at SQL generation and execution time. LLM prompt payloads must not apply ``execution_visible_objects``; those stay owner- graph complete aside from optional aetherspace ``visible_objects`` filters."""
         if visible_objects is None:
             return execution_visible_objects
         if execution_visible_objects is None:
@@ -1388,7 +1347,7 @@ class SchemaGraph:
         return frozenset(visible_objects) & frozenset(execution_visible_objects)
 
     def validate_tables_exist(self, tables: tuple[str, ...]) -> list[IntentIssue]:
-        """Emit logical-stage issues for planner table tokens absent from this schema graph."""
+        """Emit logical-stage issues for interpret table tokens absent from this schema graph."""
         known = frozenset(self.tables.keys())
         out: list[IntentIssue] = []
         for name in tables:
@@ -1399,7 +1358,7 @@ class SchemaGraph:
                     issue_id=f"unknown_table_{name}",
                     category=FailureCategory.UNKNOWN_TABLE,
                     severity="error",
-                    message=f"Unknown table {name!r} in planner tables list.",
+                    message=f"Unknown table {name!r} in interpret tables list.",
                     context={"table": name},
                     responsible_stage="ground",
                 )
@@ -1519,6 +1478,59 @@ class SchemaGraph:
         return self.schema_payload_json(COMPOSE_FIELDS, table_filter=filt)
 
     @staticmethod
+    def _structural_knowledge_from_cache(raw: Any) -> tuple[StructuralKnowledgeFact, ...]:
+        """Parse cached ``structural_knowledge`` list into facts. Rejects unknown shapes."""
+        if raw is None:
+            return ()
+        if not isinstance(raw, list):
+            raise ConfigError("structural_knowledge cache must be a list")
+        out: list[StructuralKnowledgeFact] = []
+        seen: set[str] = set()
+        allowed_fact_keys = frozenset({"kind", "text", "referenced_entities", "payload"})
+        for item in raw:
+            if not isinstance(item, dict):
+                raise ConfigError("structural_knowledge cache items must be objects")
+            keys = set(item.keys())
+            if keys == {"target", "text"} or keys == {"text", "target"}:
+                raise ConfigError("structural_knowledge target/text facts are not supported; re-derive from notes")
+            extra = keys - allowed_fact_keys
+            if extra:
+                raise ConfigError(f"structural_knowledge fact has unexpected keys: {sorted(extra)}")
+            if "kind" not in item or "text" not in item:
+                raise ConfigError("structural_knowledge fact requires kind and text")
+            kind = str(item.get("kind") or "").strip().lower()
+            if kind == "residual":
+                raise ConfigError("structural knowledge kind residual is not supported; re-derive from notes")
+            text_val = str(item.get("text") or "").strip()
+            if "referenced_entities" not in item:
+                raise ConfigError("structural_knowledge fact requires referenced_entities")
+            raw_referenced = item.get("referenced_entities")
+            if not isinstance(raw_referenced, list) or not all(isinstance(r, str) for r in raw_referenced):
+                raise ConfigError("structural_knowledge referenced_entities must be a list of strings")
+            referenced_entities = frozenset(r.strip() for r in raw_referenced if r.strip())
+            payload_raw = item.get("payload")
+            if payload_raw is None:
+                payload: dict[str, Any] | None = None if "payload" not in item else {}
+            elif isinstance(payload_raw, dict):
+                payload = payload_raw
+            else:
+                raise ConfigError("structural_knowledge payload must be an object when present")
+            fact = StructuralKnowledgeFact.normalize(
+                StructuralKnowledgeFact(
+                    kind=kind,
+                    text=text_val,
+                    referenced_entities=referenced_entities,
+                    payload=payload,
+                )
+            )
+            dedupe = f"{fact.kind}::{fact.text.lower()}"
+            if dedupe in seen:
+                continue
+            seen.add(dedupe)
+            out.append(fact)
+        return tuple(out)
+
+    @staticmethod
     def from_dict(d: dict[str, Any]) -> SchemaGraph:
         """
         Create `SchemaGraph` from a dictionary.
@@ -1545,12 +1557,11 @@ class SchemaGraph:
             for tbl, cols in disallowed_raw.items():
                 if isinstance(cols, list):
                     disallowed_columns[str(tbl)] = set(str(c) for c in cols)
-        legacy_hash = str(d.get("schema_hash", "") or "")
-        structural_hash = str(d.get("structural_hash", "") or legacy_hash)
-        profiling_hash = str(d.get("profiling_hash", "") or legacy_hash)
+        structural_hash = str(d.get("structural_hash", "") or "")
+        profiling_hash = str(d.get("profiling_hash", "") or "")
         descriptions_hash = str(d.get("descriptions_hash", "") or "")
-        scope_hash = str(d.get("scope_hash", "") or legacy_hash)
-        effective_structural_hash = str(d.get("effective_structural_hash", "") or legacy_hash)
+        scope_hash = str(d.get("scope_hash", "") or "")
+        effective_structural_hash = str(d.get("effective_structural_hash", "") or "")
         schema_graph_id = str(d.get("schema_graph_id", "") or "")
         inc_raw = d.get("include")
         if inc_raw is not None:
@@ -1581,6 +1592,7 @@ class SchemaGraph:
             deny_columns=deny_columns,
             disallowed_columns=disallowed_columns,
             notes_sha256=str(d.get("notes_sha256", "") or ""),
+            structural_knowledge=SchemaGraph._structural_knowledge_from_cache(d.get("structural_knowledge")),
             scope_descriptor=(d.get("scope_descriptor") if isinstance(d.get("scope_descriptor"), dict) else None),
             federation_membership=(
                 dict(d["federation_membership"]) if isinstance(d.get("federation_membership"), dict) else None
@@ -1608,205 +1620,18 @@ class SchemaGraph:
             "notes_hash": self.notes_hash,
             "semantic_edges_hash": self.semantic_edges_hash,
             "ddl_probe_hash": self.ddl_probe_hash,
-            "include": self.include.value,
+            "include": SchemaInclude.coerce(self.include).value,
             "created_at": self.created_at,
             "enum_values": self.enum_values,
             "schema_stats": self.schema_stats,
             "deny_columns": {k: sorted(v) for k, v in self.deny_columns.items()},
             "disallowed_columns": {k: sorted(v) for k, v in self.disallowed_columns.items()},
             "notes_sha256": self.notes_sha256,
+            "structural_knowledge": [f.to_dict() for f in self.structural_knowledge],
             "scope_descriptor": self.scope_descriptor,
             "federation_membership": self.federation_membership,
             "schema_revision": self.schema_revision,
         }
-
-
-@dataclass
-class ExpansionMetadata:
-    """Metadata for intent expansion operations."""
-
-    operator: str
-    parent_intent_id: str | None = None
-    depth: int = 0
-    expansion_path: list[str] = field(default_factory=list)
-
-    @staticmethod
-    def from_dict(d: dict[str, Any]) -> ExpansionMetadata:
-        """
-        Create `ExpansionMetadata` from a dictionary.
-
-        Args:
-
-            d: Dictionary with keys matching `ExpansionMetadata` fields.
-
-        Returns:
-
-            Populated `ExpansionMetadata` instance.
-        """
-        return ExpansionMetadata(
-            operator=d.get("operator", ""),
-            parent_intent_id=d.get("parent_intent_id"),
-            depth=d.get("depth", 0),
-            expansion_path=d.get("expansion_path", []),
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        """
-        Serialize expansion metadata to a plain dict.
-
-        Returns:
-
-            `asdict` of all fields.
-        """
-        return asdict(self)
-
-
-@dataclass
-class CteOutputColumnMeta:
-    """Metadata for a CTE output column, including source, role, and aggregation info."""
-
-    source: str
-    agg_func: str = ""
-    role: str | None = None
-    filterable: bool = True
-    aggregatable: bool = True
-    data_type: str = "unknown"
-    value_type: str = ""
-    groupable: bool = True
-    valid_where_ops: list[str] = field(default_factory=list)
-    valid_aggregations: list[str] = field(default_factory=list)
-    valid_having_ops: list[str] = field(default_factory=list)
-    sensitivity: str | None = None
-    lineage_phys_table: str | None = None
-    lineage_phys_column: str | None = None
-    lineage_inherits_pk: bool = False
-    lineage_fk_to_table: str | None = None
-    lineage_fk_to_column: str | None = None
-    semantic_distinct_values: list[str] = field(default_factory=list)
-    semantic_join_neighbors: list[tuple[str, str]] = field(default_factory=list)
-
-    def __post_init__(self) -> None:
-        """Set `value_type` from `data_type` when `value_type` is empty."""
-        if not self.value_type and self.data_type:
-            self.value_type = ColumnTypeSemantics.data_type_to_value_type(self.data_type)
-
-    @property
-    def is_selectable(self) -> bool:
-        """Whether the CTE output column may be projected; derived from ``sensitivity`` (hidden tags suppress selection)."""
-        if self.sensitivity is None:
-            return True
-        return str(self.sensitivity).strip().lower() not in HIDDEN_SENSITIVITIES
-
-    def get_valid_where_ops(self) -> list[str]:
-        """
-        Filter operators allowed on this CTE output column.
-
-        Returns:
-
-            Stored ops plus null checks, or defaults when `filterable`, else null checks only.
-        """
-        null_ops = ["is null", "is not null"]
-        if self.valid_where_ops:
-            return sorted(set(self.valid_where_ops + null_ops))
-        if self.filterable:
-            return [
-                "=",
-                "!=",
-                "<",
-                "<=",
-                ">",
-                ">=",
-                "in",
-                "not in",
-                "is null",
-                "is not null",
-            ]
-        return null_ops
-
-    def get_valid_aggregations(self) -> set[str]:
-        """
-        Aggregation names allowed on this CTE output column.
-
-        Returns:
-
-            Lowercased `valid_aggregations`, or defaults by `aggregatable` flag.
-        """
-        if self.valid_aggregations:
-            return set(agg.lower() for agg in self.valid_aggregations)
-        if not self.role:
-            return set()
-        rk = self.role.upper()
-        if rk in ROLE_ALLOWED_AGGREGATIONS:
-            return {a.lower() for a in ROLE_ALLOWED_AGGREGATIONS[rk]}
-        if self.aggregatable:
-            return {"count", "sum", "avg", "min", "max", "stddev", "variance", "median", "string_agg"}
-        return {"count"}
-
-    def get_valid_having_ops(self) -> list[str]:
-        """
-        `HAVING` operators allowed on this CTE output column.
-
-        Returns:
-
-            Stored list, comparison ops when `aggregatable`, or an empty list.
-        """
-        if self.valid_having_ops:
-            return list(self.valid_having_ops)
-        if self.aggregatable:
-            return ["=", "!=", "<", "<=", ">", ">="]
-        return []
-
-    @staticmethod
-    def from_dict(d: dict[str, Any]) -> CteOutputColumnMeta:
-        """
-        Create `CteOutputColumnMeta` from a dictionary.
-
-        Args:
-
-            d: Dictionary with keys matching `CteOutputColumnMeta` fields.
-
-        Returns:
-
-            Populated `CteOutputColumnMeta` instance.
-        """
-        return CteOutputColumnMeta(
-            source=d.get("source", "passthrough"),
-            agg_func=d.get("agg_func", ""),
-            role=d.get("role"),
-            filterable=d.get("filterable", True),
-            aggregatable=d.get("aggregatable", True),
-            data_type=d.get("data_type", "unknown"),
-            value_type=d.get("value_type", ""),
-            groupable=d.get("groupable", True),
-            valid_where_ops=d.get("valid_where_ops", []),
-            valid_aggregations=d.get("valid_aggregations", []),
-            valid_having_ops=d.get("valid_having_ops", []),
-            sensitivity=d.get("sensitivity"),
-            lineage_phys_table=d.get("lineage_phys_table"),
-            lineage_phys_column=d.get("lineage_phys_column"),
-            lineage_inherits_pk=d.get("lineage_inherits_pk", False),
-            lineage_fk_to_table=d.get("lineage_fk_to_table"),
-            lineage_fk_to_column=d.get("lineage_fk_to_column"),
-            semantic_distinct_values=d.get("semantic_distinct_values", []),
-            semantic_join_neighbors=[
-                (str(x[0]), str(x[1]))
-                for x in (d.get("semantic_join_neighbors") or [])
-                if isinstance(x, (list, tuple)) and len(x) == 2
-            ],
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        """
-        Serialize CTE column meta to a plain dict.
-
-        Returns:
-
-            Plain dict including JSON-friendly neighbor pairs.
-        """
-        d = asdict(self)
-        d["is_selectable"] = self.is_selectable
-        d["semantic_join_neighbors"] = [list(p) for p in self.semantic_join_neighbors]
-        return d
 
 
 @dataclass
@@ -2414,8 +2239,8 @@ class QSimIntent:
 
             Populated QSimIntent instance.
         """
-        fp_raw = d.get("where", d.get("where_param", d.get("filters", [])))
-        hp_raw = d.get("having_param", d.get("having", []))
+        fp_raw = d.get("where", [])
+        hp_raw = d.get("having", [])
         return QSimIntent(
             intent_id=d.get("intent_id", ""),
             tables=d.get("tables", []),
@@ -2480,7 +2305,7 @@ class WindowSpec:
 
             None.
         """
-        self.function = self.function.strip().lower()
+        self.function = str(self.function or "").strip().lower()
 
     @staticmethod
     def from_dict(d: dict[str, Any]) -> WindowSpec:
@@ -2497,14 +2322,14 @@ class WindowSpec:
         """
         part_raw = d.get("partition_by", [])
         partition_by: list[NormalizedExpr] = []
-        for p in part_raw:
+        for p in part_raw or []:
             if isinstance(p, dict):
                 partition_by.append(NormalizedExpr.from_dict(p))
             elif isinstance(p, str):
                 partition_by.append(NormalizedExpr.parse_string_for_json(p))
         ob_raw = d.get("order_by", [])
         order_by: list[OrderByCol] = []
-        for o in ob_raw:
+        for o in ob_raw or []:
             if isinstance(o, dict):
                 order_by.append(OrderByCol.from_dict(o))
             elif isinstance(o, str):
@@ -2515,7 +2340,7 @@ class WindowSpec:
             argument = NormalizedExpr.from_dict(arg_raw)
         elif isinstance(arg_raw, str) and arg_raw:
             argument = NormalizedExpr.parse_string_for_json(arg_raw)
-        fk_raw = (d.get("frame_kind") or "none").strip().lower()
+        fk_raw = str(d.get("frame_kind") or "none").strip().lower()
         frame_kind: WindowFrameKind = (
             WindowFrameKind.ROWS
             if fk_raw == "rows"
@@ -2538,8 +2363,10 @@ class WindowSpec:
             except (TypeError, ValueError):
                 return None
 
+        fn_raw = d.get("function")
+        function = str(fn_raw).strip() if isinstance(fn_raw, str) else ""
         return WindowSpec(
-            function=d.get("function", ""),
+            function=function,
             partition_by=partition_by,
             order_by=order_by,
             argument=argument,
@@ -2859,6 +2686,8 @@ class CaseWhenExpr:
 
 _REGISTRY_WIN: ContextVar[tuple[Any, ...]] = ContextVar("_REGISTRY_WIN", default=())
 _REGISTRY_CASE: ContextVar[tuple[Any, ...]] = ContextVar("_REGISTRY_CASE", default=())
+_REGISTRY_WIN_FALLBACK: ContextVar[tuple[Any, ...]] = ContextVar("_REGISTRY_WIN_FALLBACK", default=())
+_REGISTRY_CASE_FALLBACK: ContextVar[tuple[Any, ...]] = ContextVar("_REGISTRY_CASE_FALLBACK", default=())
 
 
 @dataclass
@@ -2870,9 +2699,7 @@ class WindowRegistryStep:
     PROMPT_FIELD_SPEC: ClassVar[dict[str, str]] = {
         "registry_id": "Window registry token such as w01 referenced from expressions.",
         "window_spec": (
-            "Nested object whose keys are exactly those listed for WindowSpec in structural_json_keys "
-            "(function, partition_by, order_by, optional argument, optional frame_kind, frame_start, "
-            "frame_end, frame_start_offset, frame_end_offset)."
+            "Nested object whose keys are exactly those listed for WindowSpec in structural_json_keys (function, partition_by, order_by, optional argument, optional frame_kind, frame_start, frame_end, frame_start_offset, frame_end_offset)."
         ),
     }
 
@@ -2891,9 +2718,37 @@ class WindowRegistryStep:
             _REGISTRY_CASE.reset(t_c)
 
     @staticmethod
+    @contextmanager
+    def render_fallback_scope(
+        window_registry: list[WindowRegistryStep] | None, case_registry: list[CaseRegistryStep] | None
+    ) -> Iterator[None]:
+        """Bind intent-wide registry fallbacks consulted when the active scope misses an id."""
+        t_w = _REGISTRY_WIN_FALLBACK.set(tuple(window_registry or ()))
+        t_c = _REGISTRY_CASE_FALLBACK.set(tuple(case_registry or ()))
+        try:
+            yield
+        finally:
+            _REGISTRY_WIN_FALLBACK.reset(t_w)
+            _REGISTRY_CASE_FALLBACK.reset(t_c)
+
+    @staticmethod
     def current_steps() -> tuple[WindowRegistryStep, ...]:
         """Return the window registry list bound by :meth:`render_scope`."""
         return _REGISTRY_WIN.get()
+
+    @staticmethod
+    def lookup(registry_id: str) -> WindowRegistryStep | None:
+        """Resolve a window registry id from the active scope, then the intent-wide fallback."""
+        rid = str(registry_id or "").strip()
+        if not rid:
+            return None
+        for step in _REGISTRY_WIN.get():
+            if getattr(step, "registry_id", None) == rid:
+                return cast(WindowRegistryStep, step)
+        for step in _REGISTRY_WIN_FALLBACK.get():
+            if getattr(step, "registry_id", None) == rid:
+                return cast(WindowRegistryStep, step)
+        return None
 
     @staticmethod
     def operator_kind(steps: list[WindowRegistryStep]) -> WindowOperatorKind:
@@ -2928,8 +2783,7 @@ class WindowRegistryStep:
 
         Args:
 
-            d: Mapping with ``registry_id`` and ``window_spec``. Legacy ``base_expr`` is merged
-            into ``window_spec.argument`` when ``argument`` is unset.
+            d: Mapping with ``registry_id`` and ``window_spec``. When ``base_expr`` is present and ``window_spec.argument`` is unset, ``base_expr`` is merged into ``argument``.
 
         Returns:
 
@@ -3015,6 +2869,20 @@ class CaseRegistryStep:
         return _REGISTRY_CASE.get()
 
     @staticmethod
+    def lookup(registry_id: str) -> CaseRegistryStep | None:
+        """Resolve a case registry id from the active scope, then the intent-wide fallback."""
+        rid = str(registry_id or "").strip()
+        if not rid:
+            return None
+        for step in _REGISTRY_CASE.get():
+            if getattr(step, "registry_id", None) == rid:
+                return cast(CaseRegistryStep, step)
+        for step in _REGISTRY_CASE_FALLBACK.get():
+            if getattr(step, "registry_id", None) == rid:
+                return cast(CaseRegistryStep, step)
+        return None
+
+    @staticmethod
     def from_dict(d: dict[str, Any]) -> CaseRegistryStep:
         """
         Parse a case registry entry from JSON.
@@ -3070,8 +2938,7 @@ class CaseRegistryStep:
         "label": "Optional human-readable label for diagnostics.",
         "case_when": (
             "CASE body object named exactly case_when (not alternate wrapper keys). "
-            "Its keys are exactly those listed for CaseWhenExpr in structural_json_keys "
-            "(branches, optional else_result, optional condition_scope)."
+            "Its keys are exactly those listed for CaseWhenExpr in structural_json_keys (branches, optional else_result, optional condition_scope)."
         ),
     }
 
@@ -3233,3 +3100,667 @@ class UploadIngestResult:
     relation_names: tuple[str, ...]
     report: DataQualityReport
     schema_diff: SchemaDiff | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FederationSourceLimits:
+    """Per-source row cap and timeout overrides from a federation manifest."""
+
+    row_cap: int | None = None
+    timeout_ms: int | None = None
+    semijoin_enabled: bool = True
+    max_query_cost_rows: float | None = None
+    max_query_cost_bytes: float | None = None
+    profile_timeout_ms: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FederationSourceBinding:
+    """One member-source binding in a federation manifest. Identifies a federated member by ``source_id`` (the registration key used in ``members`` maps, plan ``source_ids``, and composite ``table_namespace``). When deriving a binding from a live engine via :func:`~aetherdialect._federation_manifest.binding_from_member_engine`, a non-empty engine connection handle must equal that registration key. Args: source_id: Stable member identity / registration key. engine: Dialect/engine type label for the member (for example ``postgresql``, ``duckdb``). connection: Named connection handle within the engine config. Empty string (default) means unset; when set on a live engine it must match ``source_id``. context: Named engine-context label the member is bound under (default ``master``). role: Schema identity role for the member: ``owner`` or ``consumer`` (default ``consumer``). limits: Optional per-source row-cap / timeout / semijoin overrides. ``None`` (default) means use coordinator defaults. Raises: FederationConfigError: Not raised by this dataclass constructor itself; raised by :func:`~aetherdialect._federation_manifest.binding_from_member_engine` when the registration key disagrees with a non-empty engine connection handle (or the member role is not ``owner`` / ``consumer``)."""
+
+    source_id: str
+    engine: str
+    connection: str = ""
+    context: str = "master"
+    role: SchemaRole = SchemaRole.CONSUMER
+    limits: FederationSourceLimits | None = None
+    session_timezone: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FederationCoordinatorConfig:
+    """In-process DuckDB coordinator bounds and default per-source execution limits. The federation coordinator always materializes and combines member frames in DuckDB; engine selection is not configurable. Args: row_cap: Maximum total coordinator input/result rows. default_source_row_cap: Default per-member row cap when a source omits limits. default_source_timeout_ms: Default per-member timeout when a source omits limits. coordinator_timeout_ms: Wall-clock timeout for coordinator glue SQL execution. plan_timeout_ms: Wall- clock budget for an entire federated plan execution. semijoin_key_cap: Maximum distinct keys pushed as a semijoin filter. spill_row_threshold: Row count above which member frames spill to parquet. max_parallel_members: Maximum concurrent member query executions. total_input_byte_cap: Maximum total in-memory bytes across coordinator inputs."""
+
+    row_cap: int = 500_000
+    default_source_row_cap: int = 500_000
+    default_source_timeout_ms: int = 30_000
+    coordinator_timeout_ms: int = 30_000
+    plan_timeout_ms: int = 300_000
+    semijoin_key_cap: int = 50_000
+    semijoin_key_distinct_floor: int = 2
+    spill_row_threshold: int = 50_000
+    max_parallel_members: int = 4
+    total_input_byte_cap: int = 2_000_000_000
+
+
+@dataclass(frozen=True, slots=True)
+class FederationCrossSourceJoin:
+    """Declared cross-source join edge (``left``/``right`` are ``table.column`` qualified)."""
+
+    left: str
+    right: str
+    kind: str
+    logical_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class FederationTableAlias:
+    """Explicit composite table name for one member physical table."""
+
+    alias: str
+    source: str
+    table: str
+
+
+@dataclass(frozen=True, slots=True)
+class FederationManifest:
+    """Authoritative federation deployment description."""
+
+    federation_id: str
+    sources: tuple[FederationSourceBinding, ...]
+    table_namespace: dict[str, str]
+    cross_source_joins: tuple[FederationCrossSourceJoin, ...]
+    coordinator: FederationCoordinatorConfig
+    aliases: tuple[FederationTableAlias, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class LogicalColumnMapping:
+    """Operator-declared equivalence for one logical attribute across sources."""
+
+    logical: str
+    members: tuple[str, ...]
+    role: str
+    unify_in_graph: bool
+
+
+@dataclass(frozen=True, slots=True)
+class LogicalTableMember:
+    """One physical table backing a logical federated table."""
+
+    source: str
+    table: str
+    columns: dict[str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class LogicalTableMapping:
+    """Operator-declared equivalence for one logical table across sources."""
+
+    logical: str
+    members: tuple[LogicalTableMember, ...]
+    semantics: Literal["union", "replica"]
+    authoritative_source: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class FederationMappings:
+    """Cross-source mapping sidecar replayed on composite rebuild."""
+
+    version: str
+    logical_columns: tuple[LogicalColumnMapping, ...] = ()
+    logical_tables: tuple[LogicalTableMapping, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class FederationPlanTemplate:
+    """Stored federation decomposition fingerprint keyed on the composite graph."""
+
+    plan_id: str
+    composite_schema_graph_id: str
+    intent_key: str
+    step_fingerprints: tuple[tuple[str, str], ...]
+    combine_hash: str
+    question: str = ""
+    accepted_questions: tuple[str, ...] = ()
+    format_version: str = "0.2.3"
+    member_template_ids: tuple[tuple[str, str], ...] = ()
+    residual_hash: str = ""
+    join_feedback: tuple[str, ...] = ()
+    manifest_hash: str = ""
+    member_tuple_hash: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class FederationQualifiedRename:
+    """One qualified ``table.column`` rename inside a federation migration map."""
+
+    from_ref: str
+    to_ref: str
+
+
+@dataclass(frozen=True, slots=True)
+class FederationMigrationMap:
+    """Operator-authored federation migration consumed once at composite init."""
+
+    version: int
+    action: str
+    qualified_column_renames: tuple[FederationQualifiedRename, ...] = ()
+    namespace_renames: tuple[tuple[str, str], ...] = ()
+    dropped_cross_source_joins: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class FederationMappingSuggestion:
+    """Advisory cross-source mapping candidate; never applied without operator action."""
+
+    logical: str
+    members: tuple[str, ...]
+    kind: str
+    score: float
+    role: str = "join_key"
+
+
+@dataclass(frozen=True, slots=True)
+class SourceRuntime:
+    """Per-source bound dialect and artifact scope for federated execution."""
+
+    source_id: str
+    engine: str
+    connection: str
+    artifacts_dir: str
+    dialect: Any
+    sqlglot_dialect: str = ""
+    native_connection: Any = None
+    sqlalchemy_engine: Any = None
+
+
+@dataclass(frozen=True, slots=True)
+class CteIntent:
+    """Planner-only natural-language description of one reusable intermediate aligned with a runtime CTE step."""
+
+    name: str
+    tables: tuple[str, ...] = ()
+    select: str = ""
+    where: str = ""
+    group_by: str = ""
+    having: str = ""
+    order_by: str = ""
+    limit: str | None = None
+    window: str = ""
+    case: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class LogicalIntent:
+    """Interpret-stage natural-language plan consumed by ground and compose; not persisted and not structural IR."""
+
+    tables: tuple[str, ...]
+    select: str
+    where: str = ""
+    group_by: str = ""
+    having: str = ""
+    order_by: str = ""
+    limit: str | None = None
+    window: str = ""
+    case: str = ""
+    cte_steps: tuple[CteIntent, ...] = ()
+
+
+class ColumnRole(Enum):
+    """Column role for profiling and question simulation."""
+
+    IDENTIFIER = "identifier"
+    CATEGORICAL = "categorical"
+    NUMERIC_CATEGORICAL = "numeric_categorical"
+    NUMERIC_MEASURE = "numeric_measure"
+    TEMPORAL = "temporal"
+    BOOLEAN = "boolean"
+    FREE_TEXT = "free_text"
+    AUDIT = "audit"
+
+
+class TableRole(Enum):
+    """Table role for join constraint validation."""
+
+    DIMENSION = "dimension"
+    FACT = "fact"
+    BRIDGE = "bridge"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class WorkloadFamilySpec:
+    """Declarative workload shape metadata for schema realization, sampling, and coverage keys."""
+
+    family: WorkloadFamily
+    preferred_complexity: ComplexityTier | None
+    ranking_policy: str
+    comparison_mode: str
+    cardinality_regime: str
+    required_table_roles: tuple[str, ...]
+
+
+WORKLOAD_FAMILY_SPECS: dict[WorkloadFamily, WorkloadFamilySpec] = {
+    WorkloadFamily.STATUS_REPORT: WorkloadFamilySpec(
+        WorkloadFamily.STATUS_REPORT, ComplexityTier.MODERATE, "rank_none", "none", "small", ("fact",)
+    ),
+    WorkloadFamily.BREAKDOWN: WorkloadFamilySpec(
+        WorkloadFamily.BREAKDOWN, ComplexityTier.MODERATE, "none", "categorical_slice", "medium", ("fact", "dimension")
+    ),
+    WorkloadFamily.LEADERBOARD: WorkloadFamilySpec(
+        WorkloadFamily.LEADERBOARD, ComplexityTier.MODERATE, "top_k", "ordered_metric", "small", ("fact",)
+    ),
+    WorkloadFamily.TREND: WorkloadFamilySpec(
+        WorkloadFamily.TREND, ComplexityTier.COMPLEX, "time_series", "temporal_sequence", "medium", ("fact",)
+    ),
+    WorkloadFamily.CHANGE_OVER_TIME: WorkloadFamilySpec(
+        WorkloadFamily.CHANGE_OVER_TIME,
+        ComplexityTier.COMPLEX,
+        "period_over_period",
+        "temporal_delta",
+        "medium",
+        ("fact",),
+    ),
+    WorkloadFamily.SHARE_OF_TOTAL: WorkloadFamilySpec(
+        WorkloadFamily.SHARE_OF_TOTAL, ComplexityTier.COMPLEX, "ratio", "part_whole", "small", ("fact", "dimension")
+    ),
+    WorkloadFamily.SEGMENT_COMPARISON: WorkloadFamilySpec(
+        WorkloadFamily.SEGMENT_COMPARISON,
+        ComplexityTier.COMPLEX,
+        "none",
+        "cohort_contrast",
+        "medium",
+        ("fact", "dimension"),
+    ),
+    WorkloadFamily.THRESHOLD_EXCEPTION: WorkloadFamilySpec(
+        WorkloadFamily.THRESHOLD_EXCEPTION,
+        ComplexityTier.MODERATE,
+        "exception_filter",
+        "predicate_cutoff",
+        "small",
+        ("fact",),
+    ),
+    WorkloadFamily.EXTRACT: WorkloadFamilySpec(
+        WorkloadFamily.EXTRACT, ComplexityTier.SIMPLE, "none", "none", "many", ("fact",)
+    ),
+    WorkloadFamily.LIFECYCLE_COHORT: WorkloadFamilySpec(
+        WorkloadFamily.LIFECYCLE_COHORT,
+        ComplexityTier.HIGHLY_COMPLEX,
+        "cohort_retention",
+        "lifecycle",
+        "medium",
+        ("fact", "dimension"),
+    ),
+    WorkloadFamily.EXPLORATION_FOLLOWUP: WorkloadFamilySpec(
+        WorkloadFamily.EXPLORATION_FOLLOWUP, ComplexityTier.SIMPLE, "none", "ad_hoc", "many", ("fact",)
+    ),
+}
+
+
+class InferenceTag(StrEnum):
+    """Provenance tag for an :class:`FKEdge`. A catalog-declared edge is represented by ``None`` rather than a member of this enum so that presence-of-tag and identity-of- inferred-layer are reflected by a single attribute. Inherits ``str`` so members compare equal to their wire value and round-trip through JSON without custom encoding."""
+
+    SUFFIX = "suffix"
+    SELF = "self"
+    COMPOSITE = "composite"
+    SEMANTIC = "semantic"
+    SEMANTIC_PROMOTED = "semantic_promoted"
+    NOTES_STRUCTURAL = "notes_structural"
+    USER_STRUCTURAL = "user_override_structural"
+    USER_SEMANTIC = "user_override_semantic"
+    CROSS_SOURCE = "cross_source"
+    VIEW_LINEAGE = "view_lineage"
+
+    @classmethod
+    def coerce(cls, raw: object) -> InferenceTag | None:
+        """Normalise raw cache or override input into :class:`InferenceTag` (``None`` for catalog)."""
+        if raw is None or raw == "":
+            return None
+        if isinstance(raw, cls):
+            return raw
+        if isinstance(raw, str) and raw in INFERENCE_TAG_VALUES:
+            return cls(raw)
+        raise ValueError(f"unknown FK inference_tag: {raw!r}")
+
+
+class PkInferenceTag(StrEnum):
+    """Provenance tag for an inferred or user-supplied primary key. Engine-reflected catalog keys use ``None`` (locked). SQL-file- declared keys use ``DDL`` (overridable). Inferred and user-supplied keys use the remaining members."""
+
+    DDL = "ddl"
+    IDENTITY = "identity"
+    PROFILE = "profile"
+    USER_OVERRIDE = "user_override"
+
+    @classmethod
+    def coerce(cls, raw: object) -> PkInferenceTag | None:
+        """Normalise raw cache or override input into :class:`PkInferenceTag` (``None`` for catalog)."""
+        if raw is None or raw == "":
+            return None
+        if isinstance(raw, cls):
+            return raw
+        if isinstance(raw, str) and raw in PK_INFERENCE_TAG_VALUES:
+            return cls(raw)
+        raise ValueError(f"unknown pk_inference_tag: {raw!r}")
+
+
+class RoleOwner(StrEnum):
+    """Provenance for the writer that last set :attr:`ColumnMetadata.role`. The members are ordered by ascending precedence: a writer with strictly greater precedence may overwrite a role assigned by a lower-precedence owner, while equal-or-lower-precedence writers must skip the column. PK/FK coercion is treated as the highest authority because it is required for join correctness; user overrides win over LLM inference, which in turn wins over profile heuristics, which in turn wins over the default catalog fallback."""
+
+    CATALOG = "catalog"
+    PROFILE = "profile"
+    LLM = "llm"
+    BOOLEAN_COERCION = "boolean_coercion"
+    USER_OVERRIDE = "user_override"
+    PK_FK_COERCION = "pk_fk_coercion"
+
+    @classmethod
+    def coerce(cls, raw: object) -> RoleOwner | None:
+        """Normalise raw cache or override input into :class:`RoleOwner` (``None`` when unset)."""
+        if raw is None or raw == "":
+            return None
+        if isinstance(raw, cls):
+            return raw
+        if isinstance(raw, str) and raw in ROLE_OWNER_VALUES:
+            return cls(raw)
+        raise ValueError(f"unknown role_owner: {raw!r}")
+
+    @classmethod
+    def can_overwrite(cls, current: RoleOwner | None, candidate: RoleOwner) -> bool:
+        """Return whether a writer with provenance *candidate* may overwrite a role currently owned by *current*."""
+        if current is None:
+            return True
+        return _ROLE_OWNER_PRECEDENCE[candidate] > _ROLE_OWNER_PRECEDENCE[current]
+
+
+_ROLE_OWNER_PRECEDENCE: dict[RoleOwner, int] = {
+    RoleOwner.CATALOG: 0,
+    RoleOwner.PROFILE: 1,
+    RoleOwner.LLM: 2,
+    RoleOwner.BOOLEAN_COERCION: 3,
+    RoleOwner.USER_OVERRIDE: 4,
+    RoleOwner.PK_FK_COERCION: 5,
+}
+
+
+class DescriptionOwner(StrEnum):
+    """Provenance for the writer that last set a description on a table or column. Members are ordered by ascending precedence; :meth:`set_on` enforces a strict-greater-precedence rule so a later writer can only overwrite an existing description when its provenance outranks the incumbent owner."""
+
+    CATALOG = "catalog"
+    PROFILE = "profile"
+    NOTES = "notes"
+    LLM_REFINEMENT = "llm_refinement"
+    SPACE_NOTES = "space_notes"
+    USER_OVERRIDE = "user_override"
+
+    @classmethod
+    def coerce(cls, raw: object) -> DescriptionOwner | None:
+        """Normalise raw cache or override input into :class:`DescriptionOwner` (``None`` when unset)."""
+        if raw is None or raw == "":
+            return None
+        if isinstance(raw, cls):
+            return raw
+        if isinstance(raw, str) and raw in DESCRIPTION_OWNER_VALUES:
+            return cls(raw)
+        raise ValueError(f"unknown description_owner: {raw!r}")
+
+    @classmethod
+    def _rank(cls, owner: DescriptionOwner | None) -> int:
+        if owner is None:
+            return _DESCRIPTION_OWNER_PRECEDENCE[cls.CATALOG]
+        if not isinstance(owner, cls):
+            owner = cls(owner)
+        return _DESCRIPTION_OWNER_PRECEDENCE[owner]
+
+    @classmethod
+    def resolve(
+        cls,
+        *candidates: tuple[str | None, DescriptionOwner | None],
+    ) -> tuple[str, DescriptionOwner | None]:
+        """Resolve simultaneous description candidates using owner precedence."""
+        nonempty: list[tuple[str, DescriptionOwner | None]] = []
+        for text, owner in candidates:
+            cleaned = str(text or "").strip()
+            if not cleaned:
+                continue
+            coerced = owner
+            if coerced is not None and not isinstance(coerced, cls):
+                coerced = cls(coerced)
+            nonempty.append((cleaned, coerced))
+        if not nonempty:
+            return "", None
+        max_rank = max(cls._rank(owner) for _, owner in nonempty)
+        tier = [(text, owner) for text, owner in nonempty if cls._rank(owner) == max_rank]
+        distinct_texts = sorted({text for text, _ in tier})
+        if len(distinct_texts) == 1:
+            winner_owner = next(owner for text, owner in tier if text == distinct_texts[0])
+            return distinct_texts[0], winner_owner
+        return "", None
+
+    @classmethod
+    def set_on(cls, target: Any, text: str | None, owner: DescriptionOwner) -> bool:
+        """Single writer for ``description`` on tables and columns."""
+        if text is None:
+            return False
+        current_owner = getattr(target, "description_owner", None)
+        if current_owner is not None:
+            if not isinstance(current_owner, cls):
+                current_owner = cls(current_owner)
+            if _DESCRIPTION_OWNER_PRECEDENCE[owner] < _DESCRIPTION_OWNER_PRECEDENCE[current_owner]:
+                return False
+        cur_desc = (getattr(target, "description", None) or "").strip()
+        new_desc = str(text).strip()
+        if cur_desc == new_desc and current_owner == owner:
+            return False
+        target.description = new_desc
+        target.description_owner = owner
+        return True
+
+
+_DESCRIPTION_OWNER_PRECEDENCE: dict[DescriptionOwner, int] = {
+    DescriptionOwner.CATALOG: 0,
+    DescriptionOwner.PROFILE: 1,
+    DescriptionOwner.NOTES: 2,
+    DescriptionOwner.LLM_REFINEMENT: 3,
+    DescriptionOwner.SPACE_NOTES: 4,
+    DescriptionOwner.USER_OVERRIDE: 5,
+}
+
+
+@dataclass
+class ExpansionMetadata:
+    """Metadata for intent expansion operations."""
+
+    operator: str
+    parent_intent_id: str | None = None
+    depth: int = 0
+    expansion_path: list[str] = field(default_factory=list)
+
+    @staticmethod
+    def from_dict(d: dict[str, Any]) -> ExpansionMetadata:
+        """
+        Create `ExpansionMetadata` from a dictionary.
+
+        Args:
+
+            d: Dictionary with keys matching `ExpansionMetadata` fields.
+
+        Returns:
+
+            Populated `ExpansionMetadata` instance.
+        """
+        return ExpansionMetadata(
+            operator=d.get("operator", ""),
+            parent_intent_id=d.get("parent_intent_id"),
+            depth=d.get("depth", 0),
+            expansion_path=d.get("expansion_path", []),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """
+        Serialize expansion metadata to a plain dict.
+
+        Returns:
+
+            `asdict` of all fields.
+        """
+        return asdict(self)
+
+
+@dataclass
+class CteOutputColumnMeta:
+    """Metadata for a CTE output column, including source, role, and aggregation info."""
+
+    source: str
+    agg_func: str = ""
+    role: str | None = None
+    filterable: bool = True
+    aggregatable: bool = True
+    data_type: str = "unknown"
+    value_type: str = ""
+    groupable: bool = True
+    valid_where_ops: list[str] = field(default_factory=list)
+    valid_aggregations: list[str] = field(default_factory=list)
+    valid_having_ops: list[str] = field(default_factory=list)
+    sensitivity: str | None = None
+    lineage_phys_table: str | None = None
+    lineage_phys_column: str | None = None
+    lineage_inherits_pk: bool = False
+    lineage_fk_to_table: str | None = None
+    lineage_fk_to_column: str | None = None
+    semantic_distinct_values: list[str] = field(default_factory=list)
+    semantic_join_neighbors: list[tuple[str, str]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        """Set `value_type` from `data_type` when `value_type` is empty."""
+        if not self.value_type and self.data_type:
+            self.value_type = ColumnTypeSemantics.data_type_to_value_type(self.data_type)
+
+    @property
+    def is_selectable(self) -> bool:
+        """Whether the CTE output column may be projected; derived from ``sensitivity`` (hidden tags suppress selection)."""
+        if self.sensitivity is None:
+            return True
+        return str(self.sensitivity).strip().lower() not in HIDDEN_SENSITIVITIES
+
+    def get_valid_where_ops(self) -> list[str]:
+        """
+        Filter operators allowed on this CTE output column.
+
+        Returns:
+
+            Stored ops plus null checks, or defaults when `filterable`, else null checks only.
+        """
+        null_ops = ["is null", "is not null"]
+        if self.valid_where_ops:
+            return sorted(set(self.valid_where_ops + null_ops))
+        if self.filterable:
+            return [
+                "=",
+                "!=",
+                "<",
+                "<=",
+                ">",
+                ">=",
+                "in",
+                "not in",
+                "is null",
+                "is not null",
+            ]
+        return null_ops
+
+    def get_valid_aggregations(self) -> set[str]:
+        """
+        Aggregation names allowed on this CTE output column.
+
+        Returns:
+
+            Lowercased `valid_aggregations`, or defaults by `aggregatable` flag.
+        """
+        if self.valid_aggregations:
+            return set(agg.lower() for agg in self.valid_aggregations)
+        if not self.role:
+            return set()
+        rk = self.role.upper()
+        if rk in ROLE_ALLOWED_AGGREGATIONS:
+            return {a.lower() for a in ROLE_ALLOWED_AGGREGATIONS[rk]}
+        if self.aggregatable:
+            return {"count", "sum", "avg", "min", "max", "stddev", "variance", "median", "string_agg"}
+        return {"count"}
+
+    def get_valid_having_ops(self) -> list[str]:
+        """
+        `HAVING` operators allowed on this CTE output column.
+
+        Returns:
+
+            Stored list, comparison ops when `aggregatable`, or an empty list.
+        """
+        if self.valid_having_ops:
+            return list(self.valid_having_ops)
+        if self.aggregatable:
+            return ["=", "!=", "<", "<=", ">", ">="]
+        return []
+
+    @staticmethod
+    def from_dict(d: dict[str, Any]) -> CteOutputColumnMeta:
+        """
+        Create `CteOutputColumnMeta` from a dictionary.
+
+        Args:
+
+            d: Dictionary with keys matching `CteOutputColumnMeta` fields.
+
+        Returns:
+
+            Populated `CteOutputColumnMeta` instance.
+        """
+        return CteOutputColumnMeta(
+            source=d.get("source", "passthrough"),
+            agg_func=d.get("agg_func", ""),
+            role=d.get("role"),
+            filterable=d.get("filterable", True),
+            aggregatable=d.get("aggregatable", True),
+            data_type=d.get("data_type", "unknown"),
+            value_type=d.get("value_type", ""),
+            groupable=d.get("groupable", True),
+            valid_where_ops=d.get("valid_where_ops", []),
+            valid_aggregations=d.get("valid_aggregations", []),
+            valid_having_ops=d.get("valid_having_ops", []),
+            sensitivity=d.get("sensitivity"),
+            lineage_phys_table=d.get("lineage_phys_table"),
+            lineage_phys_column=d.get("lineage_phys_column"),
+            lineage_inherits_pk=d.get("lineage_inherits_pk", False),
+            lineage_fk_to_table=d.get("lineage_fk_to_table"),
+            lineage_fk_to_column=d.get("lineage_fk_to_column"),
+            semantic_distinct_values=d.get("semantic_distinct_values", []),
+            semantic_join_neighbors=[
+                (str(x[0]), str(x[1]))
+                for x in (d.get("semantic_join_neighbors") or [])
+                if isinstance(x, (list, tuple)) and len(x) == 2
+            ],
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """
+        Serialize CTE column meta to a plain dict.
+
+        Returns:
+
+            Plain dict including JSON-friendly neighbor pairs.
+        """
+        d = asdict(self)
+        d["is_selectable"] = self.is_selectable
+        d["semantic_join_neighbors"] = [list(p) for p in self.semantic_join_neighbors]
+        return d
+
+
+@dataclass(frozen=True, slots=True)
+class PersistedFederationInspection:
+    """Declaration and roster loaded from a persisted ``fed_<id>`` artifact tree."""
+
+    federation_id: str
+    federation_dir: str
+    manifest: FederationManifest
+    mappings: FederationMappings
+    roster: tuple[tuple[str, str, str, str], ...]

@@ -10,16 +10,16 @@ from typing import Any
 
 import pytest
 
-from aetherdialect._constants import (
-    CONSUMER_ALLOW_OBJECTS,
+from aetherdialect._constants_runtime import (
     INTERPRET_FIELDS,
     PROMPT_NEUTRALITY_AUDIT_CONSTANTS,
+    SANDBOX_MEMBER_SPACE_TABLES,
+    UPLOAD_PROMPT_NEUTRALITY_AUDIT_CONSTANTS,
 )
-from aetherdialect._contracts_base import LogicalIntent
 from aetherdialect._contracts_core import InterpretPlan
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import federation_prompt_fields_for_schema
-from aetherdialect._intent_process import (
+from aetherdialect._contracts_schema import ColumnMetadata, LogicalIntent, SchemaGraph, TableMetadata
+from aetherdialect._federation_manifest import federation_prompt_fields_for_schema
+from aetherdialect._intent_loop import (
     _build_intent_compose_prompt,
     build_intent_ground_prompt,
     build_intent_interpret_prompt,
@@ -30,6 +30,7 @@ from aetherdialect._sql_gen import _serialize_join_candidate_row, build_join_cho
 from tests.federation_helpers import build_two_member_federation
 
 _CONSTANTS = importlib.import_module("aetherdialect._constants")
+_CONSTANTS_RUNTIME = importlib.import_module("aetherdialect._constants_runtime")
 
 _SINGLE_DATABASE_PHRASES: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bthis database\b", re.IGNORECASE),
@@ -58,6 +59,24 @@ _MULTI_SOURCE_PHRASES: tuple[re.Pattern[str], ...] = (
     re.compile(r"\blogical table mappings?\b", re.IGNORECASE),
 )
 
+_PIPELINE_JARGON_PHRASES: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\baetherspace\b", re.IGNORECASE),
+    re.compile(r"\bfederation\b", re.IGNORECASE),
+    re.compile(r"\bmember\b", re.IGNORECASE),
+    re.compile(r"\bsource_label\b", re.IGNORECASE),
+    re.compile(r"\bwithheld\b", re.IGNORECASE),
+    re.compile(r"\bhidden_columns\b", re.IGNORECASE),
+    re.compile(r"\bout-of-scope\b", re.IGNORECASE),
+    re.compile(r"\bactive space\b", re.IGNORECASE),
+)
+
+_PIPELINE_JARGON_EXEMPT_CONSTANTS: frozenset[str] = frozenset(
+    {
+        # SCHEMA_CLASSIFY may name restricted/hidden sensitivity enum values.
+        "SCHEMA_CLASSIFY_SYSTEM",
+    }
+)
+
 _VERTICAL_TOKENS: frozenset[str] = frozenset(
     {
         "dvdrental",
@@ -75,7 +94,8 @@ _VERTICAL_TOKENS: frozenset[str] = frozenset(
     }
 ) | frozenset(
     token
-    for token in CONSUMER_ALLOW_OBJECTS
+    for tables in SANDBOX_MEMBER_SPACE_TABLES.values()
+    for token in tables
     if token
     not in {
         "actor",
@@ -120,7 +140,10 @@ def _iter_text_fragments(value: Any) -> Iterable[str]:
 
 
 def _audit_constant_text(name: str) -> str:
-    value = getattr(_CONSTANTS, name)
+    if hasattr(_CONSTANTS, name):
+        value = getattr(_CONSTANTS, name)
+    else:
+        value = getattr(_CONSTANTS_RUNTIME, name)
     return "\n".join(_iter_text_fragments(value))
 
 
@@ -180,6 +203,32 @@ def test_model_facing_constants_avoid_vertical_table_names() -> None:
         if hits:
             violations.append(f"{name}: {hits}")
     assert not violations
+
+
+@pytest.mark.fast
+def test_model_facing_constants_avoid_pipeline_jargon() -> None:
+    violations: list[str] = []
+    for name in sorted(PROMPT_NEUTRALITY_AUDIT_CONSTANTS):
+        if name in _PIPELINE_JARGON_EXEMPT_CONSTANTS:
+            continue
+        matches = _matching_patterns(_audit_constant_text(name), _PIPELINE_JARGON_PHRASES)
+        if matches:
+            violations.append(f"{name}: {matches}")
+    assert not violations
+
+
+@pytest.mark.fast
+def test_prompt_neutrality_audit_constants_cover_every_system_prompt() -> None:
+    system_prompts = {
+        name
+        for name, val in sorted(vars(_CONSTANTS_RUNTIME).items())
+        if name.endswith("_SYSTEM") and isinstance(val, str)
+    }
+    audited = PROMPT_NEUTRALITY_AUDIT_CONSTANTS | UPLOAD_PROMPT_NEUTRALITY_AUDIT_CONSTANTS
+    missing = sorted(system_prompts - audited)
+    assert not missing, f"prompt neutrality audit missing *_SYSTEM prompts: {missing}"
+    non_system_extras = sorted(name for name in PROMPT_NEUTRALITY_AUDIT_CONSTANTS if not name.endswith("_SYSTEM"))
+    assert non_system_extras, "PROMPT_NEUTRALITY_AUDIT_CONSTANTS should retain non-_SYSTEM rule constants"
 
 
 @pytest.mark.fast

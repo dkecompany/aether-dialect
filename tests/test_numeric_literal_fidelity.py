@@ -8,8 +8,8 @@ from decimal import Decimal
 
 import pytest
 
-from aetherdialect._core_utils import parse_sql_numeric_literal, render_sql_numeric_literal
 from aetherdialect._dialect import Dialect
+from aetherdialect._utils import parse_sql_numeric_literal, render_sql_numeric_literal
 
 
 def _parameter_abstract_fingerprint(sql: str) -> str:

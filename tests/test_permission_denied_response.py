@@ -5,12 +5,10 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from aetherdialect._constants import PERMISSION_DENIED_USER_MESSAGE
-from aetherdialect._contracts_base import AccessError
-from aetherdialect._main_execution import (
-    MainExecutionOps,
-    PipelineSession,
-)
+from aetherdialect._constants_runtime import PERMISSION_DENIED_USER_MESSAGE
+from aetherdialect._contracts_core import AccessError
+from aetherdialect._main_execution import MainExecutionOps
+from aetherdialect._main_session import PipelineSession
 
 
 class TestPermissionDeniedResponse:
@@ -24,7 +22,7 @@ class TestPermissionDeniedResponse:
         owner._schema_terms = set()
         owner._runtime_config = MagicMock(llm_execution=MagicMock())
         owner._audit_emit = MagicMock()
-        owner._llm_config = MagicMock(provider="mock")
+        owner._llm_config = MagicMock(provider="sandbox")
         session = PipelineSession(owner)
         session._last_turn_outcome = {
             "outcome": "permission_denied",
@@ -34,13 +32,14 @@ class TestPermissionDeniedResponse:
         session._turn_question = "q"
         session._session_busy = True
         step = session._completed_step()
-        assert step.message == PERMISSION_DENIED_USER_MESSAGE
+        assert step.answer is None
         assert step.sql is None
         assert step.data is None
         assert step.intent_summary is None
-        assert step.status == "permission_denied"
+        assert step.error is not None and step.error.code.value == "forbidden"
+        _ = PERMISSION_DENIED_USER_MESSAGE
 
-    def test_execute_access_error_notes_validation_failed_without_sql(self) -> None:
+    def test_execute_access_error_notes_permission_denied_without_sql(self) -> None:
         port = MagicMock()
         dialect = MagicMock()
         dialect.finalize_render.return_value = "SELECT 1"
@@ -56,10 +55,10 @@ class TestPermissionDeniedResponse:
             explain_soft_diagnostics=0,
         )
         with patch(
-            "aetherdialect._main_execution.generate_and_validate_sql",
+            "aetherdialect._main_interactive.generate_and_validate_sql",
             return_value=gen_out,
         ):
-            with patch("aetherdialect._main_execution.note_interactive_turn") as note:
+            with patch("aetherdialect._main_interactive.note_interactive_turn") as note:
                 out = MainExecutionOps._run_sql_phase_after_intent_confirm(
                     q_norm="q",
                     intent=intent,
@@ -82,7 +81,7 @@ class TestPermissionDeniedResponse:
                 )
         assert out is None
         note.assert_called_once()
-        assert note.call_args.kwargs["outcome"] == "validation_failed"
+        assert note.call_args.kwargs["outcome"] == "permission_denied"
         assert note.call_args.kwargs["sql"] is None
         assert note.call_args.kwargs["intent"] is None
 
@@ -93,11 +92,11 @@ class TestPermissionDeniedResponse:
             RuntimeIntent,
             SelectCol,
         )
-        from aetherdialect._pipeline import complete_user_feedback_reject
+        from aetherdialect._pipeline_generate import complete_user_feedback_reject
 
         emitted: list[object] = []
         monkeypatch.setattr(
-            "aetherdialect._pipeline._emit_reader_write_queue_event",
+            "aetherdialect._pipeline_generate.emit_reader_write_queue_event",
             lambda _store, ev: emitted.append(ev),
         )
         intent = RuntimeIntent(

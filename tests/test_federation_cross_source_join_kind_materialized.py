@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-from aetherdialect._contracts_base import InferenceTag
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import (
-    _materialize_cross_source_edges,
+from aetherdialect._contracts_schema import ColumnMetadata, InferenceTag, SchemaGraph, TableMetadata
+from aetherdialect._federation_compose import _materialize_cross_source_edges
+from aetherdialect._federation_manifest import (
     parse_federation_manifest,
     parse_federation_mappings,
 )
@@ -49,7 +48,7 @@ def test_declared_cross_source_join_kind_reaches_materialized_edge(kind: str) ->
         },
         include_derived_roster=True,
     )
-    mappings = parse_federation_mappings({"version": "0.2.1", "logical_columns": []})
+    mappings = parse_federation_mappings({"version": "0.2.3", "logical_columns": []})
     edges = _materialize_cross_source_edges(manifest, mappings)
     declared = [edge for edge in edges if edge.inference_tag == InferenceTag.CROSS_SOURCE]
     assert len(declared) == 1

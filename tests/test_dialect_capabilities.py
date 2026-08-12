@@ -9,18 +9,18 @@ import sqlglot
 
 from aetherdialect._constants import DIAGNOSTIC_CODE_SCHEMA_FK_CATALOG_ABSENT
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import (
+from aetherdialect._dialect import Dialect, DialectRegistry
+from aetherdialect._dialect_postgres import PostgresDialect
+from aetherdialect._dialect_sqlglot_engines import BigQueryDialect, MySQLDialect
+from aetherdialect._federation_manifest import stamp_federation_member_graph
+from aetherdialect._schema_finalize import _add_profiling_data
+from aetherdialect._schema_graph import compute_database_feature_capability, recompute_join_paths_multi
+from aetherdialect._utils import (
     drain_diagnostic_collector,
     reset_diagnostic_collector,
     set_diagnostic_collector,
     substitute_params,
 )
-from aetherdialect._dialect import Dialect, DialectRegistry
-from aetherdialect._dialect_postgres import PostgresDialect
-from aetherdialect._dialect_sqlglot_engines import BigQueryDialect, MySQLDialect
-from aetherdialect._federation import stamp_federation_member_graph
-from aetherdialect._schema_graph import compute_database_feature_capability, recompute_join_paths_multi
-from aetherdialect._schema_overrides import _add_profiling_data
 
 
 def _member_graph(engine: str) -> SchemaGraph:
@@ -101,15 +101,15 @@ def test_bigquery_empty_catalog_fk_emits_join_inference_warning() -> None:
     token = set_diagnostic_collector([])
     try:
         with pytest.MonkeyPatch.context() as monkeypatch:
-            monkeypatch.setattr("aetherdialect._schema_overrides.apply_column_roles_llm", lambda *args, **kwargs: None)
+            monkeypatch.setattr("aetherdialect._schema_finalize.apply_column_roles_llm", lambda *args, **kwargs: None)
             monkeypatch.setattr(
-                "aetherdialect._schema_overrides.run_fk_inference_if_disconnected", lambda *args, **kwargs: 0
+                "aetherdialect._schema_finalize.run_fk_inference_if_disconnected", lambda *args, **kwargs: 0
             )
             monkeypatch.setattr(
-                "aetherdialect._schema_overrides.infer_missing_pks_from_profile", lambda *args, **kwargs: None
+                "aetherdialect._schema_finalize.infer_missing_pks_from_profile", lambda *args, **kwargs: None
             )
             monkeypatch.setattr(
-                "aetherdialect._schema_overrides.load_inference_block_lists",
+                "aetherdialect._schema_finalize.load_inference_block_lists",
                 lambda *args, **kwargs: (frozenset(), frozenset()),
             )
             _add_profiling_data(dialect, graph, notes_content=None)

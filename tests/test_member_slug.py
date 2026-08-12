@@ -13,18 +13,20 @@ from aetherdialect._constants import (
     ARTIFACT_DIRECTORY_SEGMENT,
     FEDERATION_SOURCE_STORAGE_PREFIX,
 )
-from aetherdialect._contracts_base import FederationMappings, FederationSourceBinding
-from aetherdialect._federation import (
-    _legacy_federation_source_storage_slug,
+from aetherdialect._contracts_schema import FederationMappings, FederationSourceBinding
+from aetherdialect._federation_execute import (
     _raise_federation_artifact_format_version_mismatch,
     compute_federation_storage_dir,
     detect_federation_member_engine_drift,
-    federation_artifact_paths,
     federation_source_artifacts_dir,
-    federation_source_storage_slug,
     load_federation_member_manifest,
     persist_federation_tree,
     write_federation_member_manifest,
+)
+from aetherdialect._federation_manifest import (
+    engine_connection_federation_source_storage_slug,
+    federation_artifact_paths,
+    federation_source_storage_slug,
 )
 from tests.federation_helpers import build_two_member_federation
 
@@ -97,18 +99,18 @@ def test_v10_member_trees_migrate_to_source_id_directories() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         artifacts_root = str(Path(tmp) / "artifacts")
         fed_dir = compute_federation_storage_dir(artifacts_root, manifest.federation_id)
-        legacy_binding = next(row for row in manifest.sources if row.source_id == "a")
-        legacy_slug = _legacy_federation_source_storage_slug(legacy_binding)
-        legacy_dir = os.path.join(artifacts_root, ARTIFACT_DIRECTORY_SEGMENT, legacy_slug)
-        os.makedirs(legacy_dir, exist_ok=True)
-        legacy_marker = os.path.join(legacy_dir, "schema_graph.json.gz")
-        with open(legacy_marker, "wb") as handle:
+        prior_binding = next(row for row in manifest.sources if row.source_id == "a")
+        prior_slug = engine_connection_federation_source_storage_slug(prior_binding)
+        prior_dir = os.path.join(artifacts_root, ARTIFACT_DIRECTORY_SEGMENT, prior_slug)
+        os.makedirs(prior_dir, exist_ok=True)
+        prior_marker = os.path.join(prior_dir, "schema_graph.json.gz")
+        with open(prior_marker, "wb") as handle:
             handle.write(b"{}")
 
         persist_federation_tree(
             fed_dir,
             manifest=manifest,
-            mappings=FederationMappings(version="0.2.1"),
+            mappings=FederationMappings(version="0.2.3"),
             composite=composite,
             member_graphs=members,
         )

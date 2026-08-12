@@ -15,8 +15,8 @@ from aetherdialect._constants import (
     TEMPLATE_STORE_SPACES_SEGMENT,
     WRITE_QUEUE_FILENAME,
 )
-from aetherdialect._core_utils import write_artifact_manifest
 from aetherdialect._main_execution import MainExecutionOps
+from aetherdialect._utils_artifacts import write_artifact_manifest
 
 
 def _template_shard_dir(artifacts_dir: str) -> str:
@@ -93,8 +93,8 @@ def test_prune_removes_stale_warmup_lattices(tmp_path: Path) -> None:
     artifacts_dir = str(tmp_path)
     lattice_dir = tmp_path / "anchor_lattice"
     lattice_dir.mkdir()
-    stale = lattice_dir / "lattice_sg_stale000000000001__dead_v3.json"
-    active = lattice_dir / "lattice_sg_active000000000001__live_v3.json"
+    stale = lattice_dir / "lattice_sg_stale000000000001__dead_v4.json"
+    active = lattice_dir / "lattice_sg_active000000000001__live_v4.json"
     stale.write_text("{}", encoding="utf-8")
     active.write_text("{}", encoding="utf-8")
 
@@ -153,14 +153,13 @@ def test_prune_removes_orphaned_federation_trees(tmp_path: Path) -> None:
         FEDERATION_COMPOSITE_SCHEMA_FILENAME,
         FEDERATION_STORAGE_PREFIX,
     )
-    from aetherdialect._federation import compute_federation_storage_dir
+    from aetherdialect._federation_execute import compute_federation_storage_dir
 
     root = str(tmp_path)
-    active = compute_federation_storage_dir(root, "crm", tenant_slug="tenant-a")
+    active = compute_federation_storage_dir(root, "crm")
     orphan = os.path.join(
         os.path.abspath(root),
         ARTIFACT_DIRECTORY_SEGMENT,
-        "tenant-a",
         f"{FEDERATION_STORAGE_PREFIX}legacy",
     )
     os.makedirs(orphan, exist_ok=True)
@@ -169,7 +168,7 @@ def test_prune_removes_orphaned_federation_trees(tmp_path: Path) -> None:
 
     from aetherdialect._main_execution import MainExecutionOps
 
-    MainExecutionOps._prune_orphaned_federation_trees(os.path.dirname(active), active_fed_dir=active)
+    MainExecutionOps.prune_orphaned_federation_trees(os.path.dirname(active), active_fed_dir=active)
 
     assert os.path.isdir(active)
     assert not os.path.exists(orphan)

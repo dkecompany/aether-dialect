@@ -6,18 +6,18 @@ from decimal import Decimal
 
 import pytest
 
-from aetherdialect._core_utils import llm_usage_question_scope
+from aetherdialect._utils import llm_usage_question_scope
 
-from ._federation_live import (
+from .live_support import (
     build_federation_live_engine,
     ensure_federation_partitions_loaded,
     federation_partitions_available,
 )
-from .federation_oracles import (
-    HORROR_DISTINCT_CUSTOMERS,
-    HORROR_PARTIAL_SUM_WRONG,
-    JOIN_RENTAL_LINKED_TITLES,
-    PAYMENT_TOTAL,
+from .mydb_profile import (
+    SANDBOX_SUBSET_HORROR_DISTINCT_CUSTOMERS,
+    SANDBOX_SUBSET_HORROR_PARTIAL_SUM_WRONG,
+    SANDBOX_SUBSET_JOIN_RENTAL_LINKED_TITLES,
+    SANDBOX_SUBSET_PAYMENT_TOTAL,
 )
 
 pytestmark = pytest.mark.live
@@ -63,8 +63,8 @@ def test_federated_horror_partial_sum_oracle(federation_engine) -> None:
     assert not step.error
     value = _scalar_value(step)
     assert value is not None
-    assert int(value) == HORROR_DISTINCT_CUSTOMERS
-    assert int(value) != HORROR_PARTIAL_SUM_WRONG
+    assert int(value) == SANDBOX_SUBSET_HORROR_DISTINCT_CUSTOMERS
+    assert int(value) != SANDBOX_SUBSET_HORROR_PARTIAL_SUM_WRONG
 
 
 @pytest.mark.skipif(_SKIP, reason="postgres/mysql federation partitions unavailable")
@@ -75,7 +75,7 @@ def test_federated_type_fidelity_payment_decimal(federation_engine) -> None:
     value = _scalar_value(step)
     assert value is not None
     assert isinstance(value, (Decimal, float, int))
-    assert abs(Decimal(str(value)) - PAYMENT_TOTAL) < Decimal("0.05")
+    assert abs(Decimal(str(value)) - SANDBOX_SUBSET_PAYMENT_TOTAL) < Decimal("0.05")
 
 
 @pytest.mark.skipif(_SKIP, reason="postgres/mysql federation partitions unavailable")
@@ -88,7 +88,7 @@ def test_federated_type_fidelity_join_count_integer(federation_engine) -> None:
     assert not step.error
     value = _scalar_value(step)
     assert value is not None
-    assert int(value) == JOIN_RENTAL_LINKED_TITLES
+    assert int(value) == SANDBOX_SUBSET_JOIN_RENTAL_LINKED_TITLES
 
 
 @pytest.mark.skipif(_SKIP, reason="postgres/mysql federation partitions unavailable")
@@ -101,7 +101,7 @@ def test_federated_literal_casing_horror_filter(federation_engine) -> None:
     assert not step.error
     value = _scalar_value(step)
     assert value is not None
-    assert int(value) == HORROR_DISTINCT_CUSTOMERS
+    assert int(value) == SANDBOX_SUBSET_HORROR_DISTINCT_CUSTOMERS
 
 
 @pytest.mark.skipif(_SKIP, reason="postgres/mysql federation partitions unavailable")

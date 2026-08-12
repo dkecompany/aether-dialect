@@ -8,13 +8,13 @@ import pytest
 
 from aetherdialect._constants import DIAGNOSTIC_CODE_FEDERATION_INELIGIBLE
 from aetherdialect._contracts_core import FederatedPlan
-from aetherdialect._core_utils import (
+from aetherdialect._federation_execute import federation_user_facing_ineligible_message
+from aetherdialect._main_execution import MainExecutionOps
+from aetherdialect._utils import (
     drain_diagnostic_collector,
     reset_diagnostic_collector,
     set_diagnostic_collector,
 )
-from aetherdialect._federation import federation_user_facing_ineligible_message
-from aetherdialect._main_execution import MainExecutionOps
 
 _CROSS_SOURCE_VOCAB = (
     "cross-source",
@@ -66,7 +66,7 @@ def test_ineligible_handler_user_diagnostics_are_sanitized() -> None:
     plan = FederatedPlan(steps=(), ineligible_reason=raw_reason)
     token = set_diagnostic_collector([])
     try:
-        with patch("aetherdialect._main_execution.print_rephrase_hint"):
+        with patch("aetherdialect._utils.print_rephrase_hint"):
             MainExecutionOps._handle_federation_ineligible_plan(
                 plan,
                 choice_port=None,

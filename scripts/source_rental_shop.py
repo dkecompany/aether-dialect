@@ -32,6 +32,36 @@ _load_rental_shop_engines = importlib.import_module("load_rental_shop_engines")
 DEFAULT_ENV_FILE = _load_rental_shop_engines.DEFAULT_ENV_FILE
 load_env_file = _load_rental_shop_engines.load_env_file
 DEFAULT_RANDOM_SEED = importlib.import_module("aetherdialect._config").DEFAULT_RANDOM_SEED
+_sandbox_export = importlib.import_module("rental_shop_sandbox_export")
+CORPUS_REALISM_COUNTRY_CATALOG_DRIFT = _sandbox_export.CORPUS_REALISM_COUNTRY_CATALOG_DRIFT
+CORPUS_REALISM_COUNTRY_CATALOG_ONLY = _sandbox_export.CORPUS_REALISM_COUNTRY_CATALOG_ONLY
+CORPUS_REALISM_COUNTRY_STOREFRONT_ONLY = _sandbox_export.CORPUS_REALISM_COUNTRY_STOREFRONT_ONLY
+CORPUS_REALISM_ORPHAN_DELIVERY_RENTAL_IDS = _sandbox_export.CORPUS_REALISM_ORPHAN_DELIVERY_RENTAL_IDS
+CRM_CUSTOMER_ADDRESS_DESYNC_OFFSET = _sandbox_export.CRM_CUSTOMER_ADDRESS_DESYNC_OFFSET
+CRM_CUSTOMER_DESYNC_IDS = _sandbox_export.CRM_CUSTOMER_DESYNC_IDS
+CRM_CUSTOMER_LOYALTY_TIERS = _sandbox_export.CRM_CUSTOMER_LOYALTY_TIERS
+FEDERATION_PARTITION_TABLES = _sandbox_export.FEDERATION_PARTITION_TABLES
+PAYMENT_UNION_SPLIT_STORE_THRESHOLD = _sandbox_export.PAYMENT_UNION_SPLIT_STORE_THRESHOLD
+SANDBOX_SAMPLE_SEED = _sandbox_export.SANDBOX_SAMPLE_SEED
+SMALL_TABLES_WHOLE = _sandbox_export.SMALL_TABLES_WHOLE
+SUBSCRIPTION_RETAIL_RESKIN_REPLACEMENTS = _sandbox_export.SUBSCRIPTION_RETAIL_RESKIN_REPLACEMENTS
+compute_sandbox_subset = _sandbox_export.compute_sandbox_subset
+crm_customer_desync_address_id = _sandbox_export.crm_customer_desync_address_id
+crm_customer_desync_first_name = _sandbox_export.crm_customer_desync_first_name
+export_federation_member_data_dirs_from_existing_csvs = (
+    _sandbox_export.export_federation_member_data_dirs_from_existing_csvs
+)
+export_sandbox_federation_partition_data_dirs = _sandbox_export.export_sandbox_federation_partition_data_dirs
+export_sandbox_federation_partition_schemas = _sandbox_export.export_sandbox_federation_partition_schemas
+export_sandbox_main_data_dir = _sandbox_export.export_sandbox_main_data_dir
+load_federation_partition_map = _sandbox_export.load_federation_partition_map
+parse_seed_insert_column_values = _sandbox_export.parse_seed_insert_column_values
+payment_store_id_by_payment_id = _sandbox_export.payment_store_id_by_payment_id
+payment_store_id_by_rental_id = _sandbox_export.payment_store_id_by_rental_id
+reskin_subscription_retail_text = _sandbox_export.reskin_subscription_retail_text
+row_allowed = _sandbox_export.row_allowed
+set_export_log_callback = _sandbox_export.set_export_log_callback
+storefront_rental_create_sql = _sandbox_export.storefront_rental_create_sql
 
 STORE_COUNT = 12
 STAFF_COUNT = 24
@@ -1055,7 +1085,7 @@ def _load_film_lexicon_source() -> list[dict[str, str]]:
     return _read_csv("film")
 
 
-OBSOLETE_CSVS = (
+STALE_CSV_NAMES = (
     "film_category.csv",
     "customer_profile.csv",
     "customer_segment_history.csv",
@@ -2586,8 +2616,8 @@ def generate_reservations(
     )
 
 
-def remove_obsolete_csvs() -> None:
-    for name in OBSOLETE_CSVS:
+def remove_stale_csvs() -> None:
+    for name in STALE_CSV_NAMES:
         path = OUT_DIR / name
         if path.is_file():
             path.unlink()
@@ -2976,7 +3006,7 @@ def _run_post_gen_sanity_checks() -> None:
     bad_domains = ("rentalshop.org",)
     bad_emails = [r for r in customers if str(r.get("email", "")).split("@")[-1].lower() in bad_domains]
     if bad_emails:
-        raise SystemExit(f"Sanity: {len(bad_emails)} customer emails still use legacy domains")
+        raise SystemExit(f"Sanity: {len(bad_emails)} customer emails use blocked domains")
 
     film_items = [r for r in _read_csv("item") if r.get("item_type") == "film"]
     years = {r.get("release_year") for r in film_items if r.get("release_year")}
@@ -3107,7 +3137,7 @@ def _verify_bundle_allowlist(out_dir: Path) -> list[str]:
     for path in sorted(out_dir.glob("*.csv")):
         stem = path.stem
         if stem.startswith("_"):
-            errors.append(f"reject legacy CSV {path.name}")
+            errors.append(f"reject underscore-prefixed CSV {path.name}")
         elif stem not in _TABLE_ORDER:
             errors.append(f"unexpected CSV {path.name}")
     for table in _TABLE_ORDER:
@@ -3360,7 +3390,7 @@ def _run_download() -> None:
     print(f"rental_shop CSVs ready in {OUT_DIR} (FK integrity OK)")
 
 
-def _purge_legacy_sidecar_csvs() -> None:
+def _remove_underscore_prefixed_csvs() -> None:
     for path in sorted(OUT_DIR.glob("_*.csv")):
         path.unlink()
 
@@ -3446,8 +3476,8 @@ def _run_generate(*, enrich_llm: bool = False) -> None:
         generate_inventory_status_history(inventory, rentals)
         generate_damage_reports(rentals)
         generate_reservations(customers, item_rows, rentals)
-        remove_obsolete_csvs()
-        _purge_legacy_sidecar_csvs()
+        remove_stale_csvs()
+        _remove_underscore_prefixed_csvs()
 
         _log_progress("[generate] finalizing customer create_date + payment amounts")
         customers = _finalize_customer_create_dates(_read_csv("customer"), _read_csv("rental"))

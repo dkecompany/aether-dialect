@@ -10,7 +10,7 @@ from aetherdialect._contracts_schema import (
     SchemaGraph,
     TableMetadata,
 )
-from aetherdialect._pipeline import parse_intent_via_llm
+from aetherdialect._pipeline_generate import parse_intent_via_llm
 
 
 def _table(name: str) -> TableMetadata:
@@ -64,7 +64,8 @@ class TestPermissionFilteredIntentScope:
         assert "a" in payload
         assert "b" not in payload
 
-    def test_parse_intent_via_llm_uses_execution_visible_objects(self) -> None:
+    def test_parse_intent_via_llm_ignores_execution_rbac_for_prompt(self) -> None:
+        """Internal LLM querying uses the owner graph; RBAC applies at execution."""
         port = MagicMock()
         port.visible_objects = None
         port.execution_visible_objects = frozenset({"a"})
@@ -73,23 +74,23 @@ class TestPermissionFilteredIntentScope:
         port.space_deny_columns = None
         port.space_description_overlay = None
         with patch(
-            "aetherdialect._pipeline.invoke_intent_parse_with_hints",
+            "aetherdialect._pipeline_generate.invoke_intent_parse_with_hints",
             return_value=(None, [], 0, None),
         ) as mock_parse:
             parse_intent_via_llm("question", _owner_graph(), {}, {}, choice_port=port)
-        assert mock_parse.call_args.kwargs["visible_objects"] == frozenset({"a"})
+        assert mock_parse.call_args.kwargs["visible_objects"] is None
 
-    def test_parse_intent_via_llm_intersects_space_with_execution(self) -> None:
+    def test_parse_intent_via_llm_keeps_space_scope_without_rbac_intersect(self) -> None:
         port = MagicMock()
-        port.visible_objects = frozenset({"a"})
-        port.execution_visible_objects = frozenset({"a", "b"})
+        port.visible_objects = frozenset({"a", "b"})
+        port.execution_visible_objects = frozenset({"a"})
         port.space_columns = None
         port.space_deny_objects = None
         port.space_deny_columns = None
         port.space_description_overlay = None
         with patch(
-            "aetherdialect._pipeline.invoke_intent_parse_with_hints",
+            "aetherdialect._pipeline_generate.invoke_intent_parse_with_hints",
             return_value=(None, [], 0, None),
         ) as mock_parse:
             parse_intent_via_llm("question", _owner_graph(), {}, {}, choice_port=port)
-        assert mock_parse.call_args.kwargs["visible_objects"] == frozenset({"a"})
+        assert mock_parse.call_args.kwargs["visible_objects"] == frozenset({"a", "b"})

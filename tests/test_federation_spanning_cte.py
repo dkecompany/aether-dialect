@@ -10,8 +10,9 @@ from aetherdialect._contracts_base import (
     WhereParam,
 )
 from aetherdialect._contracts_core import RuntimeCteStep, RuntimeIntent
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import FederationMappings, parse_federation_manifest, plan_federated_intent
+from aetherdialect._contracts_schema import ColumnMetadata, FederationMappings, SchemaGraph, TableMetadata
+from aetherdialect._federation_manifest import parse_federation_manifest
+from aetherdialect._federation_plan import plan_federated_intent
 from aetherdialect._schema_graph import recompute_join_paths_multi
 
 
@@ -88,7 +89,7 @@ def test_spanning_cte_with_where_is_ineligible() -> None:
         cte_steps=[cte],
         param_values={"p1": "open"},
     )
-    plan = plan_federated_intent(intent, composite, manifest, FederationMappings(version="0.2.1"))
+    plan = plan_federated_intent(intent, composite, manifest, FederationMappings(version="0.2.3"))
     assert plan.ineligible_reason is not None
     assert "span_cte" in plan.ineligible_reason
     assert "cross-source CTE" in plan.ineligible_reason

@@ -7,12 +7,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from aetherdialect._constants import PIPELINE_SUSPEND_ID_DIRECT_REUSE, PIPELINE_SUSPEND_ID_SQL
-from aetherdialect._contracts_base import PipelineSuspended
 from aetherdialect._contracts_core import (
     ConcreteIntent,
     DirectReuseSuspendContext,
     GenerationPath,
     InteractiveTailSnapshot,
+    PipelineSuspended,
     RuntimeIntent,
     SqlFeedbackSuspendContext,
     SqlGenerationOutcome,
@@ -20,7 +20,7 @@ from aetherdialect._contracts_core import (
     ValueHistory,
 )
 from aetherdialect._contracts_schema import SQLShape, TemplateStats
-from aetherdialect._main_execution import PipelineSession
+from aetherdialect._main_session import PipelineSession
 
 
 def _tmpl() -> Template:
@@ -66,8 +66,8 @@ def _owner(tmpl: Template) -> MagicMock:
     owner._sandbox_closed = False
     owner._pipeline_writer_lock = None
     owner._artifacts_dir = None
-    owner._business_knowledge = None
-    owner._ask_phase_callback = None
+    owner._domain_knowledge = None
+    owner._phase_callback = None
     owner._store_by_space = {}
     owner._templates_by_space = {}
     owner._schema_terms = set()

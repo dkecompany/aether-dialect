@@ -10,33 +10,28 @@ from aetherdialect._constants import (
     DIAGNOSTIC_CODE_REFUSAL_AGGREGATE_FAN_OUT,
     DIAGNOSTIC_CODE_REFUSAL_CAPABILITY_GAP,
 )
-from aetherdialect._contracts_base import (
+from aetherdialect._contracts_base import NormalizedExpr
+from aetherdialect._contracts_core import (
     AggregateJoinFanOutError,
     ClauseWidenedRowsetError,
-    NoJoinPathError,
-)
-from aetherdialect._contracts_core import (
     ConcreteIntent,
     GenerationPath,
-    NormalizedExpr,
+    NoJoinPathError,
     RuntimeIntent,
     SelectCol,
-    SQLShape,
     Template,
-    TemplateStats,
     ValueHistory,
 )
-from aetherdialect._contracts_schema import SchemaGraph
-from aetherdialect._core_utils import (
+from aetherdialect._contracts_schema import SchemaGraph, SQLShape, TemplateStats
+from aetherdialect._pipeline_execute import (
+    execute_reuse_with_params,
+    prepare_federated_sql_plan,
+)
+from aetherdialect._pipeline_generate import federation_ineligible_refusal_outcome, sql_validation_refusal_outcome
+from aetherdialect._utils import (
     refusal_diagnostic_code_for_exception,
     refusal_diagnostic_code_for_federation_reason,
     refusal_message_for_exception,
-)
-from aetherdialect._pipeline import (
-    _sql_validation_refusal_outcome,
-    execute_reuse_with_params,
-    federation_ineligible_refusal_outcome,
-    prepare_federated_sql_plan,
 )
 from tests.test_join_fan_out import _join_signature, _parent_child_schema
 
@@ -127,7 +122,7 @@ def test_same_condition_same_refusal_on_every_path(condition: str, exc_factory) 
     expected_code = refusal_diagnostic_code_for_exception(exc)
     expected_message = refusal_message_for_exception(exc)
 
-    ask_outcome = _sql_validation_refusal_outcome(
+    ask_outcome = sql_validation_refusal_outcome(
         exc,
         generation_path=GenerationPath.FRESH,
         matched_template=None,
@@ -145,7 +140,7 @@ def test_same_condition_same_refusal_on_every_path(condition: str, exc_factory) 
     dialect = MagicMock()
     dialect.finalize_render.return_value = "SELECT 1"
 
-    with patch("aetherdialect._pipeline.TemplateRefs.template_is_live", return_value=(True, ())):
+    with patch("aetherdialect._templates.TemplateRefs.template_is_live", return_value=(True, ())):
         replay_outcome = execute_reuse_with_params(
             "q",
             tmpl,
@@ -171,7 +166,7 @@ def test_same_condition_same_refusal_on_every_path(condition: str, exc_factory) 
 @pytest.mark.fast
 def test_federation_ineligible_ask_and_prepare_share_refusal() -> None:
     from aetherdialect._contracts_core import FederatedPlan
-    from aetherdialect._federation import federation_user_facing_ineligible_message
+    from aetherdialect._federation_execute import federation_user_facing_ineligible_message
 
     reason = "member capability: where operator 'ilike' is not supported by federation member 'sqlite'"
     expected_message = federation_user_facing_ineligible_message(reason)

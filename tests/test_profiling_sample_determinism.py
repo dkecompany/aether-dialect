@@ -6,7 +6,7 @@ import pytest
 
 from aetherdialect._constants import DEFAULT_RANDOM_SEED
 from aetherdialect._dialect import Dialect, DialectRegistry
-from aetherdialect._schema_catalog import _build_profile_stats_sql
+from aetherdialect._schema_profile import _build_profile_stats_sql
 
 
 def _uninit(cls: type) -> object:
@@ -66,7 +66,7 @@ def test_profiling_sample_engine_behavior_documented(engine: str) -> None:
         assert honors_seed
     elif engine in {"duckdb", "snowflake", "databricks", "csv"}:
         assert honors_seed
-    elif engine in {"bigquery", "sqlserver"}:
+    elif engine in {"bigquery", "sqlserver", "oracle"}:
         assert suffix.upper().startswith("ORDER BY")
     else:
         assert honors_seed or probabilistic

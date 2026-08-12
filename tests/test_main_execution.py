@@ -12,19 +12,16 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import aetherdialect._main_execution
-from aetherdialect._config import (
-    ConfigError,
-    DatabricksRuntimeConfig,
-    EngineConfig,
-    PostgresRuntimeConfig,
-)
+from aetherdialect._config import DatabricksRuntimeConfig, EngineConfig, PostgresRuntimeConfig
 from aetherdialect._constants import ARTIFACT_DIRECTORY_SEGMENT
-from aetherdialect._contracts_base import EngineContext
+from aetherdialect._contracts_base import ConfigError, EngineContext, SchemaRole
+from aetherdialect._contracts_core import LLMConfig, RuntimeConfig
 from aetherdialect._contracts_schema import (
     QSimSummary,
     SeedWarmupSummary,
 )
 from aetherdialect._main_execution import MainExecutionOps
+from aetherdialect._utils_artifacts import load_runtime_config
 
 
 def _snapshot_os_environ() -> dict[str, str]:
@@ -100,7 +97,7 @@ class TestLoadConfigFile:
             ),
             encoding="utf-8",
         )
-        got, claimed, named = aetherdialect._main_execution.MainExecutionOps._load_config_file(str(path))
+        got, claimed, named = aetherdialect._main_init.MainInitOps._load_config_file(str(path))
         expected = {
             "OPENAI_API_KEY": "oak",
             "OPENAI_BASE_URL": "https://example-openai/v1",
@@ -153,13 +150,13 @@ def test_load_config_file_named_connections_flatten_selected(tmp_path) -> None:
         ),
         encoding="utf-8",
     )
-    flat, claimed, named = aetherdialect._main_execution.MainExecutionOps._load_config_file(str(path))
+    flat, claimed, named = aetherdialect._main_init.MainInitOps._load_config_file(str(path))
     assert named == {"postgresql": frozenset({"crm", "warehouse"})}
     assert flat.get("AETHERDIALECT_ENGINE") == "postgresql"
     assert flat.get("AETHERDIALECT_CONNECTION") == "warehouse"
     assert "POSTGRES_HOST" not in flat
 
-    selected, claimed2, _ = aetherdialect._main_execution.MainExecutionOps._load_config_file(
+    selected, claimed2, _ = aetherdialect._main_init.MainInitOps._load_config_file(
         str(path),
         connection="warehouse",
     )
@@ -184,7 +181,7 @@ def test_load_config_file_single_named_connection_auto_flattens(tmp_path) -> Non
         ),
         encoding="utf-8",
     )
-    flat, _claimed, named = aetherdialect._main_execution.MainExecutionOps._load_config_file(str(path))
+    flat, _claimed, named = aetherdialect._main_init.MainInitOps._load_config_file(str(path))
     assert named == {"postgresql": frozenset({"crm"})}
     assert flat["POSTGRES_HOST"] == "crm.internal"
     assert flat["POSTGRES_DB"] == "crm"
@@ -204,7 +201,7 @@ def test_load_config_file_rejects_scalar_and_named_mix(tmp_path) -> None:
         encoding="utf-8",
     )
     with pytest.raises(ConfigError, match="mixes scalar keys"):
-        aetherdialect._main_execution.MainExecutionOps._load_config_file(str(path))
+        aetherdialect._main_init.MainInitOps._load_config_file(str(path))
 
 
 def test_select_connection_name_requires_explicit_when_multiple() -> None:
@@ -242,7 +239,7 @@ def test_load_config_file_claims_empty_openai_api_key_without_flat_value(
 ) -> None:
     path = tmp_path / "empty_key.toml"
     path.write_text('[openai]\napi_key = ""\n', encoding="utf-8")
-    flat, claimed, _named = aetherdialect._main_execution.MainExecutionOps._load_config_file(str(path))
+    flat, claimed, _named = aetherdialect._main_init.MainInitOps._load_config_file(str(path))
     assert flat == {}
     assert "OPENAI_API_KEY" in claimed
 
@@ -252,15 +249,13 @@ def test_merge_configuration_environment_precedence(
 ) -> None:
     monkeypatch.setenv("POSTGRES_HOST", "from_os")
     config_values = {"POSTGRES_HOST": "from_toml"}
-    merged, _keys = aetherdialect._main_execution.MainExecutionOps._merge_configuration_environment(config_values)
+    merged, _keys = aetherdialect._main_init.MainInitOps._merge_configuration_environment(config_values)
     assert merged["POSTGRES_HOST"] == "from_toml"
 
 
 def test_merge_toml_diagnostic_when_toml_wins(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("POSTGRES_HOST", "os_host")
-    merged, keys = aetherdialect._main_execution.MainExecutionOps._merge_configuration_environment(
-        {"POSTGRES_HOST": "toml_host"}
-    )
+    merged, keys = aetherdialect._main_init.MainInitOps._merge_configuration_environment({"POSTGRES_HOST": "toml_host"})
     assert merged["POSTGRES_HOST"] == "toml_host"
     assert "POSTGRES_HOST" in keys
 
@@ -269,7 +264,7 @@ def test_merge_configuration_environment_ssot_clears_claimed_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "from_env")
-    merged, _diag = aetherdialect._main_execution.MainExecutionOps._merge_configuration_environment(
+    merged, _diag = aetherdialect._main_init.MainInitOps._merge_configuration_environment(
         {},
         toml_claimed_keys=frozenset({"OPENAI_API_KEY"}),
     )
@@ -280,7 +275,7 @@ def test_merge_configuration_environment_ssot_toml_wins(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("POSTGRES_HOST", "from_os")
-    merged, keys = aetherdialect._main_execution.MainExecutionOps._merge_configuration_environment(
+    merged, keys = aetherdialect._main_init.MainInitOps._merge_configuration_environment(
         {"POSTGRES_HOST": "from_toml"},
         toml_claimed_keys=frozenset({"POSTGRES_HOST"}),
     )
@@ -835,6 +830,48 @@ class TestConfigureRuntimeFromEnvironment:
                 setattr(PostgresRuntimeConfig, k, v)
 
 
+class TestDescribeRuntimeConfig:
+    """Tests for describe_runtime_config scope disclosure."""
+
+    def test_owner_sees_deny_names(self) -> None:
+        runtime = RuntimeConfig(
+            engine="duckdb",
+            artifacts_dir=".",
+            engine_context=EngineContext(
+                deny_columns=frozenset({"t.secret"}),
+                deny_objects=frozenset({"audit_log"}),
+            ),
+            llm_execution=load_runtime_config(merged_env={}),
+        )
+        text = MainExecutionOps.describe_runtime_config(
+            runtime,
+            LLMConfig(provider="openai"),
+            schema_role=SchemaRole.OWNER,
+        )
+        assert "t.secret" in text
+        assert "audit_log" in text
+
+    def test_consumer_sees_deny_counts_only(self) -> None:
+        runtime = RuntimeConfig(
+            engine="duckdb",
+            artifacts_dir=".",
+            engine_context=EngineContext(
+                deny_columns=frozenset({"t.secret"}),
+                deny_objects=frozenset({"audit_log"}),
+            ),
+            llm_execution=load_runtime_config(merged_env={}),
+        )
+        text = MainExecutionOps.describe_runtime_config(
+            runtime,
+            LLMConfig(provider="openai"),
+            schema_role=SchemaRole.CONSUMER,
+        )
+        assert "t.secret" not in text
+        assert "audit_log" not in text
+        assert "deny_columns=1" in text
+        assert "deny_objects=1" in text
+
+
 class TestSchemaContextCache:
     """Tests for write/load helpers on the persisted EngineContext."""
 
@@ -851,11 +888,11 @@ class TestSchemaContextCache:
             sql_file=str(sql_path),
             notes_file=str(notes_file),
         )
-        out = aetherdialect._main_execution.MainExecutionOps.write_schema_context_cache(adir, ctx)
+        out = aetherdialect._main_init.MainInitOps.write_schema_context_cache(adir, ctx)
         assert os.path.exists(out)
         with open(out, encoding="utf-8") as f:
             data = json.load(f)
-        assert data["version"] == aetherdialect._main_execution.SCHEMA_CONTEXT_CACHE_VERSION
+        assert data["version"] == aetherdialect._main_init.SCHEMA_CONTEXT_CACHE_VERSION
         assert data["sql_text"] == "CREATE TABLE t (id INT);\n"
         assert data["notes_text"] == "hello notes"
         assert "public.t" in data["allow_objects"]
@@ -870,8 +907,8 @@ class TestSchemaContextCache:
             allow_objects=frozenset({"public.t"}),
             sql_file=str(sql_path),
         )
-        aetherdialect._main_execution.MainExecutionOps.write_schema_context_cache(adir, ctx)
-        loaded = aetherdialect._main_execution.MainExecutionOps.load_schema_context_cache(adir)
+        aetherdialect._main_init.MainInitOps.write_schema_context_cache(adir, ctx)
+        loaded = aetherdialect._main_init.MainInitOps.load_schema_context_cache(adir)
         assert loaded is not None
         assert "public.t" in loaded.allow_objects
         assert loaded.sql_file is not None
@@ -880,16 +917,16 @@ class TestSchemaContextCache:
             assert f.read() == "SELECT 1;"
 
     def test_load_missing_returns_none(self, tmp_path) -> None:
-        loaded = aetherdialect._main_execution.MainExecutionOps.load_schema_context_cache(str(tmp_path))
+        loaded = aetherdialect._main_init.MainInitOps.load_schema_context_cache(str(tmp_path))
         assert loaded is None
 
     def test_load_bad_version_raises_config_error(self, tmp_path) -> None:
         adir = str(tmp_path)
-        path = os.path.join(adir, aetherdialect._main_execution.SCHEMA_CONTEXT_CACHE_NAME)
+        path = os.path.join(adir, aetherdialect._main_init.SCHEMA_CONTEXT_CACHE_NAME)
         with open(path, "w", encoding="utf-8") as f:
             json.dump({"version": 999}, f)
         with pytest.raises(ConfigError, match=r"version .*999"):
-            aetherdialect._main_execution.MainExecutionOps.load_schema_context_cache(adir)
+            aetherdialect._main_init.MainInitOps.load_schema_context_cache(adir)
 
 
 class TestPipelineSessionSuspendToStep:
@@ -897,15 +934,15 @@ class TestPipelineSessionSuspendToStep:
 
     def test_sql_feedback_suspend_populates_message_prompt(self) -> None:
         from aetherdialect._constants import PIPELINE_SUSPEND_ID_SQL
-        from aetherdialect._contracts_base import PipelineSuspended
         from aetherdialect._contracts_core import (
             GenerationPath,
             InteractiveTailSnapshot,
+            PipelineSuspended,
             RuntimeIntent,
             SqlFeedbackSuspendContext,
             SqlGenerationOutcome,
         )
-        from aetherdialect._main_execution import PipelineSession
+        from aetherdialect._main_session import PipelineSession
 
         ri = RuntimeIntent(
             tables=[],
@@ -957,20 +994,86 @@ class TestPipelineSessionSuspendToStep:
         sess = PipelineSession(owner)
         ex = PipelineSuspended(PIPELINE_SUSPEND_ID_SQL, "ignored", ctx)
         step = PipelineSession._suspend_to_step(sess, ex)
-        assert step.message == ""
+        assert step.answer is None
         assert step.prompt == "Is this correct? (y/n): "
         assert step.sql == "SELECT 1"
         assert step.data is None
 
+    def test_sql_feedback_suspend_surfaces_scalar_preview(self) -> None:
+        from aetherdialect._constants import PIPELINE_SUSPEND_ID_SQL
+        from aetherdialect._contracts_core import (
+            GenerationPath,
+            InteractiveTailSnapshot,
+            PipelineSuspended,
+            RuntimeIntent,
+            SqlFeedbackSuspendContext,
+            SqlGenerationOutcome,
+        )
+        from aetherdialect._main_session import PipelineSession
+
+        ri = RuntimeIntent(
+            tables=["store"],
+            grain="scalar",
+            select_cols=[],
+            group_by_cols=[],
+            order_by_cols=[],
+            where=None,
+        )
+        tail = InteractiveTailSnapshot(
+            q_norm="how many stores",
+            intent=ri,
+            schema=None,
+            store={},
+            templates={},
+            rejected={},
+            schema_terms=set(),
+            dialect=None,
+            semantic_warnings=(),
+            has_union_match=False,
+            cols_changed=False,
+            matched_template=None,
+            union_select_cols=None,
+            structural_match_templates=(),
+            ikey="k",
+            intent_sim=0.0,
+        )
+        gen_out = SqlGenerationOutcome(
+            sql="SELECT COUNT(*) AS count_store_id FROM store",
+            success=True,
+            generation_path=GenerationPath.EXACT_QUESTION_REUSE,
+            matched_template=None,
+        )
+        ctx = SqlFeedbackSuspendContext(
+            tail=tail,
+            execution_intent=ri,
+            sql="SELECT COUNT(*) AS count_store_id FROM store",
+            preview_rows=((2,),),
+            sql_parameters=(),
+            suspended_at=None,
+            tmpl_sd=None,
+            gen_out=gen_out,
+            matched_rejected_template=None,
+            force_feedback=True,
+        )
+        owner = MagicMock()
+        owner._audit_emit = MagicMock()
+        owner._schema_graph = MagicMock(effective_structural_hash="h")
+        sess = PipelineSession(owner)
+        ex = PipelineSuspended(PIPELINE_SUSPEND_ID_SQL, "ignored", ctx)
+        step = PipelineSession._suspend_to_step(sess, ex)
+        assert step.data is not None
+        assert int(step.data.iloc[0, 0]) == 2
+        assert step.prompt == "Is this correct? (y/n): "
+
     def test_direct_reuse_suspend_populates_sql_data_message(self) -> None:
         from aetherdialect._constants import PIPELINE_SUSPEND_ID_DIRECT_REUSE
-        from aetherdialect._contracts_base import PipelineSuspended
         from aetherdialect._contracts_core import (
             DirectReuseSuspendContext,
             GenerationPath,
+            PipelineSuspended,
             RuntimeIntent,
         )
-        from aetherdialect._main_execution import PipelineSession
+        from aetherdialect._main_session import PipelineSession
 
         ri = RuntimeIntent(
             tables=[],
@@ -1000,7 +1103,7 @@ class TestPipelineSessionSuspendToStep:
         sess = PipelineSession(MagicMock())
         ex = PipelineSuspended(PIPELINE_SUSPEND_ID_DIRECT_REUSE, "ignored", ctx)
         step = PipelineSession._suspend_to_step(sess, ex)
-        assert step.message == ""
+        assert step.answer is None
         assert step.prompt == "Is this correct? (y/n): "
         assert step.sql == "SELECT 42 AS n"
         assert step.data is not None
@@ -1009,28 +1112,32 @@ class TestPipelineSessionSuspendToStep:
 
     def test_user_feedback_reject_suspend_reason_prompt(self) -> None:
         from aetherdialect._constants import PIPELINE_SUSPEND_ID_USER_FEEDBACK_REJECT
-        from aetherdialect._contracts_base import PipelineSuspended
-        from aetherdialect._main_execution import SESSION_PROMPT_REASON, PipelineSession
+        from aetherdialect._constants_runtime import SESSION_PROMPT_REASON
+        from aetherdialect._contracts_core import PipelineSuspended
+        from aetherdialect._main_session import PipelineSession
 
         sess = PipelineSession(MagicMock())
         ex = PipelineSuspended(PIPELINE_SUSPEND_ID_USER_FEEDBACK_REJECT, "What was wrong?", None)
         step = PipelineSession._suspend_to_step(sess, ex)
         assert step.prompt == SESSION_PROMPT_REASON
-        assert "What was wrong?" in (step.message or "")
+        assert step.reply_shape == "free_text"
+        assert step.answer is None
 
 
 def test_reader_mode_does_not_save_templates(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     from aetherdialect._config import EngineConfig
     from aetherdialect._contracts_core import RuntimeIntent
-    from aetherdialect._pipeline import _intent_decline_feedback_bucket
-    from aetherdialect._templates import TemplateOps
+    from aetherdialect._pipeline_generate import _intent_decline_feedback_bucket
+    from aetherdialect._templates_ops import TemplateOps
 
     store_dir = tmp_path / "intent_templates"
     store_dir.mkdir()
     monkeypatch.setattr(EngineConfig, "TEMPLATE_STORE_DIR", str(store_dir))
 
     saved: list[int] = []
-    monkeypatch.setattr("aetherdialect._templates.TemplateOps.save_template_store", lambda *_a, **_k: saved.append(1))
+    monkeypatch.setattr(
+        "aetherdialect._templates_ops.TemplateOps.save_template_store", lambda *_a, **_k: saved.append(1)
+    )
 
     store = TemplateOps.empty_template_store("hash_a")
     schema = MagicMock()
@@ -1046,7 +1153,7 @@ def test_reader_mode_does_not_save_templates(monkeypatch: pytest.MonkeyPatch, tm
     choice_port = MagicMock()
     choice_port.has_pending_choice.return_value = True
     choice_port._consume_next_queued_choice = MagicMock(return_value="wrong table")
-    with patch("aetherdialect._pipeline.print_info", lambda *a, **k: None):
+    with patch("aetherdialect._pipeline_generate.print_info", lambda *a, **k: None):
         bucket = _intent_decline_feedback_bucket(
             intent,
             store,
@@ -1068,15 +1175,15 @@ def test_writer_drain_applies_reader_event(monkeypatch: pytest.MonkeyPatch, tmp_
 
     from aetherdialect._config import EngineConfig
     from aetherdialect._constants import AUDIT_EVENT_WRITE_QUEUE_FEEDBACK_RECORD
-    from aetherdialect._contracts_base import WriteQueueEvent
     from aetherdialect._contracts_core import (
         FeedbackKind,
         QuestionFeedbackEntry,
         RejectionBucket,
+        WriteQueueEvent,
     )
-    from aetherdialect._core_utils import emit_write_queue_event
     from aetherdialect._main_execution import MainExecutionOps
-    from aetherdialect._templates import TemplateOps
+    from aetherdialect._templates_ops import TemplateOps
+    from aetherdialect._utils_artifacts import emit_write_queue_event
 
     store_dir = tmp_path / "intent_templates"
     store_dir.mkdir()
@@ -1113,11 +1220,11 @@ def test_writer_drain_applies_reader_event(monkeypatch: pytest.MonkeyPatch, tmp_
         produced_at=ts,
         payload=(("q_norm", "q1"), ("entry_json", json.dumps(entry.to_dict()))),
     )
-    emit_write_queue_event(str(tmp_path), ev)
+    emit_write_queue_event(str(tmp_path), ev, space_name="master")
 
     saves: list[int] = []
     monkeypatch.setattr(
-        "aetherdialect._templates.TemplateOps.save_template_store",
+        "aetherdialect._templates_ops.TemplateOps.save_template_store",
         lambda s: saves.append(1),
     )
     n = MainExecutionOps.drain_write_queue(owner, str(tmp_path))
@@ -1131,8 +1238,8 @@ def test_writer_drain_applies_reader_event(monkeypatch: pytest.MonkeyPatch, tmp_
 def test_writer_lock_reentered_on_resume() -> None:
     from contextlib import nullcontext
 
-    from aetherdialect._contracts_base import PipelineSuspended
-    from aetherdialect._main_execution import PipelineSession
+    from aetherdialect._contracts_core import PipelineSuspended
+    from aetherdialect._main_session import PipelineSession
 
     lock = MagicMock()
     owner = MagicMock()
@@ -1144,9 +1251,9 @@ def test_writer_lock_reentered_on_resume() -> None:
     sess._suspended = PipelineSuspended("st", "m", MagicMock())
 
     with patch(
-        "aetherdialect._main_execution.llm_execution_scope",
+        "aetherdialect._main_session.llm_execution_scope",
         lambda *_a, **_k: nullcontext(),
     ):
-        with patch("aetherdialect._main_execution.MainExecutionOps.dispatch_pipeline_resume", lambda s, e: None):
+        with patch("aetherdialect._main_interactive.MainInteractiveOps.dispatch_pipeline_resume", lambda s, e: None):
             sess._resume_from_suspend()
     assert lock.__enter__.call_count >= 1

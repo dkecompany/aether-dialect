@@ -2,16 +2,16 @@
 
 import pytest
 
+from aetherdialect._contracts_base import NormalizedExpr
 from aetherdialect._contracts_core import ConcreteIntent, RuntimeIntent, SeedWarmupIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
-from aetherdialect._intent_process import NormalizedExpr
-from aetherdialect._intent_resolve import (
+from aetherdialect._intent_bind import (
     join_path_key_concrete,
     join_path_key_runtime,
     join_path_segments_fingerprint_concrete,
     join_path_segments_fingerprint_runtime,
 )
-from aetherdialect._pipeline import _resolve_joins_fresh
+from aetherdialect._pipeline_generate import _resolve_joins_fresh
 from aetherdialect._sql_gen import (
     _canonicalize_join_sig_segments,
     _orient_join_sig_for_from,
@@ -137,7 +137,7 @@ def test_resolve_joins_fresh_stores_oriented_signature_for_hub_on_right_star() -
     det = "SELECT film.film_id FROM film\nWHERE 1=1"
     dialect = PostgresDialect.__new__(PostgresDialect)
 
-    with patch("aetherdialect._pipeline.get_join_choice_from_llm", return_value={"main": "J01"}):
+    with patch("aetherdialect._sql_gen.get_join_choice_from_llm", return_value={"main": "J01"}):
         _resolve_joins_fresh(
             det,
             intent,

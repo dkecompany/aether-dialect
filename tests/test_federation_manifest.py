@@ -10,29 +10,34 @@ from unittest.mock import MagicMock
 import pytest
 
 from aetherdialect import AetherFederation
-from aetherdialect._contracts_base import ConfigError, LLMConfig, RuntimeConfig
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import load_runtime_config, write_gzip_json_atomic
-from aetherdialect._federation import (
+from aetherdialect._contracts_base import (
+    ConfigError,
     FederationConfigError,
     FederationDeclarationError,
     FederationMemberUnprofilableError,
-    build_federation_manifest_from_members,
-    compose_composite_graph,
+)
+from aetherdialect._contracts_core import LLMConfig, RuntimeConfig
+from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_execute import (
     compute_federation_storage_dir,
+    federation_source_artifacts_dir,
+)
+from aetherdialect._federation_manifest import (
+    build_federation_manifest_from_members,
     export_federation_manifest,
     federation_artifact_paths,
     federation_manifest_document,
     federation_manifest_is_active,
-    federation_source_artifacts_dir,
     manifest_hash,
     mappings_hash,
     parse_federation_declaration,
     parse_federation_manifest,
     parse_federation_mappings,
-    resolve_federation_qualified_ref,
 )
 from aetherdialect._schema_graph import recompute_join_paths_multi
+from aetherdialect._schema_reflect import resolve_federation_qualified_ref
+from aetherdialect._utils_artifacts import load_runtime_config, write_gzip_json_atomic
 from tests.federation_helpers import (
     enriched_manifest,
     union_member_graph_pair,
@@ -196,7 +201,7 @@ def test_sensitive_cross_source_key_rejected() -> None:
 
 
 def test_mappings_hash_stable() -> None:
-    mappings = parse_federation_mappings({"version": "0.2.1", "logical_columns": []})
+    mappings = parse_federation_mappings({"version": "0.2.3", "logical_columns": []})
     assert mappings_hash(mappings) == mappings_hash(mappings)
 
 
@@ -243,11 +248,8 @@ def test_invalid_declaration_raises_without_persisting(tmp_path: Path) -> None:
         manifest_path = write_federation_declaration_file(tmp_path, _MANIFEST)
         AetherFederation(
             "fed_alpha",
-            members={
-                "alpha": _member(alpha_graph, "alpha"),
-                "beta": _member(beta_graph, "beta"),
-            },
-            declaration_file=str(manifest_path),
+            members=(_member(alpha_graph, "alpha"), _member(beta_graph, "beta")),
+            declaration=str(manifest_path),
             artifacts_dir=str(tmp_path),
         )
 
@@ -335,11 +337,8 @@ def test_unprofiled_member_raises_at_init_without_persisting_tree(tmp_path: Path
         manifest_path = write_federation_declaration_file(tmp_path, _MANIFEST)
         AetherFederation(
             "fed_alpha",
-            members={
-                "alpha": _mock_member(alpha_graph, "alpha", tmp_path),
-                "beta": _mock_member(beta_graph, "beta", tmp_path),
-            },
-            declaration_file=str(manifest_path),
+            members=(_mock_member(alpha_graph, "alpha", tmp_path), _mock_member(beta_graph, "beta", tmp_path)),
+            declaration=str(manifest_path),
             artifacts_dir=str(tmp_path),
         )
 
@@ -372,7 +371,7 @@ def test_partial_member_artifact_roster_raises_without_composing(tmp_path: Path)
         AetherFederation(
             "fed_four",
             members=mock_members,
-            declaration_file=str(declaration_path),
+            declaration=str(declaration_path),
             artifacts_dir=str(tmp_path),
         )
 
@@ -395,7 +394,7 @@ _UNION_MANIFEST = {
 def _union_mappings() -> object:
     return parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -420,14 +419,45 @@ def test_one_member_roster_composes() -> None:
 
 
 def test_binding_raises_when_member_key_disagrees_with_connection() -> None:
-    member = MagicMock()
+    member = MagicMock(
+        spec=[
+            "dialect",
+            "_connection",
+            "_named_connection",
+            "_connection_mapping",
+            "_context_name",
+            "_schema_role",
+            "_schema_graph",
+        ]
+    )
     member.dialect = "duckdb"
-    member._connection = ""
+    member._connection = "registry_key"
+    member._named_connection = "registry_key"
+    member._connection_mapping = None
     member._context_name = "master"
     member._schema_role = "owner"
+    member._schema_graph = None
+    member2 = MagicMock(
+        spec=[
+            "dialect",
+            "_connection",
+            "_named_connection",
+            "_connection_mapping",
+            "_context_name",
+            "_schema_role",
+            "_schema_graph",
+        ]
+    )
+    member2.dialect = "duckdb"
+    member2._connection = "other"
+    member2._named_connection = "other"
+    member2._connection_mapping = None
+    member2._context_name = "master"
+    member2._schema_role = "owner"
+    member2._schema_graph = _simple_graph("t", source_id="other")
     with pytest.raises(FederationConfigError, match="does not expose a schema graph"):
         build_federation_manifest_from_members(
-            {"registry_key": member},
+            {"registry_key": member, "other": member2},
             declaration=parse_federation_manifest({"federation_id": "fed_bind", "cross_source_joins": []}),
         )
 
@@ -483,7 +513,7 @@ def test_declaration_manifest_resolves_mapping_refs_without_sources() -> None:
 
 
 def test_split_fk_endpoint_uses_shared_resolver_with_manifest() -> None:
-    from aetherdialect._schema_build import split_fk_endpoint
+    from aetherdialect._schema_reflect import split_fk_endpoint
 
     members = _members()
     manifest = enriched_manifest(_engine_members(), _MANIFEST, member_graphs=members)
@@ -493,11 +523,11 @@ def test_split_fk_endpoint_uses_shared_resolver_with_manifest() -> None:
 
 @pytest.mark.fast
 def test_load_inference_block_lists_resolves_fk_blocks_with_manifest(tmp_path: Path) -> None:
-    from aetherdialect._schema_build import load_inference_block_lists, overrides_sidecar_path
+    from aetherdialect._schema_reflect import load_inference_block_lists, structure_sidecar_path
 
     cache_path = tmp_path / "schema.json.gz"
     cache_path.write_bytes(b"")
-    sidecar = overrides_sidecar_path(cache_path)
+    sidecar = structure_sidecar_path(cache_path)
     sidecar.write_text(
         json.dumps(
             {
@@ -550,7 +580,7 @@ def test_parse_federation_manifest_coordinator_defaults_without_engine() -> None
 
 @pytest.mark.fast
 def test_load_federation_manifest_from_path_reports_declarations_file(tmp_path: Path) -> None:
-    from aetherdialect._federation import load_federation_manifest_from_path
+    from aetherdialect._federation_manifest import load_federation_manifest_from_path
 
     path = tmp_path / "federation_manifest.json"
     path.write_text("{not json", encoding="utf-8")

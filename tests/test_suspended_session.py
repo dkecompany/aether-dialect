@@ -9,17 +9,19 @@ import pytest
 
 from aetherdialect._config import EngineLimits
 from aetherdialect._constants import PIPELINE_SUSPEND_ID_EXECUTE
-from aetherdialect._contracts_base import PipelineSuspended, SuspendedSessionExpiredError
+from aetherdialect._contracts_base import SuspendedSessionExpiredError
 from aetherdialect._contracts_core import (
     GenerationPath,
     InteractiveTailSnapshot,
+    PipelineSuspended,
     RuntimeIntent,
     SqlExecuteSuspendContext,
     SqlGenerationOutcome,
 )
-from aetherdialect._main_execution import MainExecutionOps, PipelineSession
+from aetherdialect._main_execution import MainExecutionOps
+from aetherdialect._main_session import PipelineSession
 
-_PREVIEW_CAP = 5
+_PREVIEW_CAP = 10
 
 
 def _runtime_intent() -> RuntimeIntent:
@@ -56,11 +58,15 @@ def _tail(intent: RuntimeIntent | None = None) -> InteractiveTailSnapshot:
 
 
 def _gen_out() -> SqlGenerationOutcome:
+    matched = MagicMock()
+    matched.trust_level = 2
+    matched.feedback_by_question = {}
+    matched.stats = MagicMock(accept=1, reject=0)
     return SqlGenerationOutcome(
         sql="SELECT film_id FROM film",
         success=True,
         generation_path=GenerationPath.INTENT_DIRECT_MATCH,
-        matched_template=None,
+        matched_template=matched,
     )
 
 
@@ -117,14 +123,14 @@ def test_resume_reexecutes() -> None:
     )
 
     with patch(
-        "aetherdialect._main_execution.MainExecutionOps._run_pipeline_sql_rows",
+        "aetherdialect._main_interactive.MainInteractiveOps._run_pipeline_sql_rows",
         return_value=[(99,)],
     ) as run_rows:
-        with patch("aetherdialect._main_execution.MainExecutionOps._offer_sql_feedback_after_execute"):
+        with patch("aetherdialect._main_interactive.MainInteractiveOps._offer_sql_feedback_after_execute"):
             MainExecutionOps._complete_interactive_execute(execute_ctx, "y")
         assert run_rows.call_count == 1
 
-        with patch("aetherdialect._main_execution.handle_user_feedback"):
+        with patch("aetherdialect._main_interactive.handle_user_feedback"):
             MainExecutionOps._complete_interactive_sql_feedback(feedback_ctx, "y")
         assert run_rows.call_count == 2
 
@@ -136,9 +142,9 @@ def test_expired_suspension_reports() -> None:
     owner._runtime_config.llm_execution = MagicMock()
     owner._sandbox_closed = False
     owner._pipeline_writer_lock = None
-    owner._ask_phase_callback = None
+    owner._phase_callback = None
     owner._audit_emit = MagicMock()
-    owner._business_knowledge = None
+    owner._domain_knowledge = None
 
     intent = _runtime_intent()
     ctx = SqlExecuteSuspendContext(

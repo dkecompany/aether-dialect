@@ -8,7 +8,7 @@ import time
 
 import pytest
 
-from aetherdialect._core_utils import artifact_lock, write_gzip_json_atomic
+from aetherdialect._utils_artifacts import artifact_lock, write_gzip_json_atomic
 
 
 def test_artifact_lock_reentrant_same_thread(tmp_path):

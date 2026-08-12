@@ -1,4 +1,4 @@
-"""Tests for :mod:`aetherdialect._pipeline` and programmatic session flows that call it."""
+"""Tests for pipeline generate/execute APIs and programmatic session flows that call them."""
 
 import csv
 import os
@@ -28,13 +28,7 @@ from aetherdialect._constants import (
     TEMPLATE_QUESTION_TOKEN_INDEX_KEY,
     TEMPLATE_UNION_FAMILY_INDEX_KEY,
 )
-from aetherdialect._contracts_base import (
-    FailureCategory,
-    NoJoinPathError,
-    NormalizedExpr,
-    PipelineSuspended,
-    SessionActiveError,
-)
+from aetherdialect._contracts_base import FailureCategory, NormalizedExpr, SessionActiveError
 from aetherdialect._contracts_core import (
     ConcreteIntent,
     DirectReuseSuspendContext,
@@ -42,6 +36,8 @@ from aetherdialect._contracts_core import (
     FeedbackKind,
     GenerationPath,
     InteractiveTailSnapshot,
+    NoJoinPathError,
+    PipelineSuspended,
     QuestionFeedbackEntry,
     QuestionReuseMatch,
     RefinementContext,
@@ -53,6 +49,7 @@ from aetherdialect._contracts_core import (
     SqlGenerationOutcome,
     StructuralCompareResult,
     Template,
+    TrustedTemplateHit,
     UserFeedbackRejectSuspendContext,
     ValueHistory,
 )
@@ -63,49 +60,48 @@ from aetherdialect._contracts_schema import (
     TableMetadata,
     TemplateStats,
 )
-from aetherdialect._core_utils import bind_params_for_sql, diagnostic_print_listener
 from aetherdialect._dialect import Dialect
-from aetherdialect._intent_process import TrustedTemplateHit
-from aetherdialect._main_execution import PipelineSession
-from aetherdialect._pipeline import (
+from aetherdialect._main_session import PipelineSession
+from aetherdialect._pipeline_execute import (
+    build_result_dataframe,
+    complete_direct_sql_reuse_user_choice,
+    display_final_results_to_stdout,
+    extract_column_headers,
+    handle_direct_sql_reuse,
+    save_result_csv,
+)
+from aetherdialect._pipeline_generate import (
     _choose_generation_path,
     _join_signatures_for_deterministic_from_anchor,
-    _most_frequent_natural_language,
     _remap_value_history_structural_keys,
     _resolve_joins_fresh,
-    _run_sql_validation_cascade,
     _sql_phase_join_resources,
     _structural_key_remap_from_assignment_order,
     align_template_to_widened_intent,
     best_accepted_template_similarity,
     build_interactive_tail_snapshot,
-    build_result_dataframe,
-    complete_direct_sql_reuse_user_choice,
     complete_user_feedback_reject,
     confirm_intent_with_user,
-    display_final_results_to_stdout,
     enriched_display_alias_map,
-    extract_column_headers,
     generate_and_validate_sql,
     generate_join_candidates,
-    handle_direct_sql_reuse,
     handle_user_feedback,
     load_pipeline_resources,
     match_question_level_template_reuse,
     merge_structural_defaults_for_reuse,
+    most_frequent_natural_language,
     other_template_owns_question_string,
     parse_intent_via_llm,
     prepare_union_match_join_phase,
     refinement_retry_available,
-    save_result_csv,
+    run_sql_validation_cascade,
     should_skip_intent_confirmation,
     stamp_sql_shape,
 )
 from aetherdialect._sql_gen import generate_col_alias
-from aetherdialect._templates import (
-    TemplateOps,
-)
-from aetherdialect._utils import intent_key
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils import bind_params_for_sql, pop_diagnostic_sink, push_diagnostic_sink
+from aetherdialect._utils_intent import intent_key
 
 
 class TestChooseGenerationPath:
@@ -152,30 +148,30 @@ class TestChooseGenerationPath:
 
 
 class TestMostFrequentNaturalLanguage:
-    """Tests for _most_frequent_natural_language."""
+    """Tests for most_frequent_natural_language."""
 
     def test_returns_most_common(self):
-        """_most_frequent_natural_language returns most frequent string."""
+        """most_frequent_natural_language returns most frequent string."""
         vh = ValueHistory(
             param_values=[{}, {}, {}],
             questions=["q1", "q2", "q3"],
             natural_language=["total sales", "total sales", "revenue"],
         )
-        assert _most_frequent_natural_language(vh) == "total sales"
+        assert most_frequent_natural_language(vh) == "total sales"
 
     def test_empty_returns_empty(self):
-        """_most_frequent_natural_language returns empty for empty list."""
+        """most_frequent_natural_language returns empty for empty list."""
         vh = ValueHistory(param_values=[], questions=[], natural_language=[])
-        assert _most_frequent_natural_language(vh) == ""
+        assert most_frequent_natural_language(vh) == ""
 
     def test_skips_empty_strings(self):
-        """_most_frequent_natural_language skips empty strings."""
+        """most_frequent_natural_language skips empty strings."""
         vh = ValueHistory(
             param_values=[{}, {}],
             questions=["q1", "q2"],
             natural_language=["", "actual text"],
         )
-        assert _most_frequent_natural_language(vh) == "actual text"
+        assert most_frequent_natural_language(vh) == "actual text"
 
 
 class TestExtractColumnHeaders:
@@ -338,26 +334,26 @@ class TestExtractColumnHeadersEdgeCases:
 
 
 class TestMostFrequentNaturalLanguageEdgeCases:
-    """Edge-case tests for _most_frequent_natural_language."""
+    """Edge-case tests for most_frequent_natural_language."""
 
     def test_tie_returns_first(self):
-        """_most_frequent_natural_language returns first on tie."""
+        """most_frequent_natural_language returns first on tie."""
         vh = ValueHistory(
             param_values=[{}, {}],
             questions=["q1", "q2"],
             natural_language=["alpha", "beta"],
         )
-        result = _most_frequent_natural_language(vh)
+        result = most_frequent_natural_language(vh)
         assert result in ("alpha", "beta")
 
     def test_all_empty_returns_empty(self):
-        """_most_frequent_natural_language returns empty when all entries are empty."""
+        """most_frequent_natural_language returns empty when all entries are empty."""
         vh = ValueHistory(
             param_values=[{}],
             questions=["q"],
             natural_language=[""],
         )
-        assert _most_frequent_natural_language(vh) == ""
+        assert most_frequent_natural_language(vh) == ""
 
 
 def _make_pipeline_template(
@@ -432,14 +428,14 @@ def _stale_pipeline_template() -> Template:
 class TestMatchQuestionLevelTemplateReuse:
     """Tests for match_question_level_template_reuse."""
 
-    @patch("aetherdialect._pipeline.find_trusted_template_match", return_value=None)
+    @patch("aetherdialect._pipeline_generate.find_trusted_template_match", return_value=None)
     def test_no_match_returns_none_type(self, mock_skip):
         """No match returns reuse_type='none'."""
         result = match_question_level_template_reuse("random question", {})
         assert result.reuse_type == "none"
         assert result.best_template is None
 
-    @patch("aetherdialect._pipeline.find_trusted_template_match")
+    @patch("aetherdialect._pipeline_generate.find_trusted_template_match")
     def test_exact_match_returns_direct_reuse(self, mock_skip):
         """Exact match returns reuse_type='direct_reuse' with score 1.0."""
         tmpl = _make_pipeline_template(trust_level=2)
@@ -459,7 +455,7 @@ class TestMatchQuestionLevelTemplateReuse:
         assert result.best_template.id == "T0001"
         assert result.reuse_candidate_normalized == "test question"
 
-    @patch("aetherdialect._pipeline.find_trusted_template_match")
+    @patch("aetherdialect._pipeline_generate.find_trusted_template_match")
     def test_template_store_forwards_shape_token_intent_and_union_indexes(self, mock_ftm):
         """Persisted store indexes and optional runtime intent are passed through to the trusted matcher."""
         tmpl = _make_pipeline_template(trust_level=2)
@@ -501,28 +497,28 @@ class TestMatchQuestionLevelTemplateReuse:
 class TestLoadPipelineResources:
     """Tests for load_pipeline_resources."""
 
-    @patch("aetherdialect._config.EngineConfig.llm_credentials_configured", return_value=False)
+    @patch("aetherdialect._pipeline_generate.EngineConfig.llm_credentials_configured", return_value=False)
     def test_missing_api_token(self, _mock_lc):
         """Missing LLM credentials raises RuntimeError."""
         with _pt.raises(RuntimeError, match="No OpenAI/Azure OpenAI API key configured"):
             load_pipeline_resources(schema="s", store="st", templates="t", rejected="r", schema_terms=set())
 
-    @patch("aetherdialect._config.EngineConfig.llm_credentials_configured", return_value=True)
-    @patch("aetherdialect._pipeline.EngineConfig")
-    @patch("aetherdialect._pipeline.DialectRegistry.get_dialect")
-    def test_missing_schema_raises(self, mock_gd, mock_ec, _mock_lc):
+    @patch("aetherdialect._pipeline_generate.DialectRegistry.get_dialect")
+    @patch("aetherdialect._pipeline_generate.EngineConfig")
+    def test_missing_schema_raises(self, mock_ec, mock_gd):
         """None schema raises RuntimeError."""
+        mock_ec.llm_credentials_configured.return_value = True
         mock_ec.TYPE = "postgresql"
         mock_ec.RUNTIME = SimpleNamespace(db_url=lambda: "postgresql://localhost/db")
         mock_gd.return_value = SimpleNamespace(engine=None)
         with _pt.raises(RuntimeError, match="Schema"):
             load_pipeline_resources(schema=None, store={}, templates={}, rejected={}, schema_terms=set())
 
-    @patch("aetherdialect._config.EngineConfig.llm_credentials_configured", return_value=True)
-    @patch("aetherdialect._pipeline.EngineConfig")
-    @patch("aetherdialect._pipeline.DialectRegistry.get_dialect")
-    def test_success_returns_tuple(self, mock_gd, mock_ec, _mock_lc):
+    @patch("aetherdialect._pipeline_generate.DialectRegistry.get_dialect")
+    @patch("aetherdialect._pipeline_generate.EngineConfig")
+    def test_success_returns_tuple(self, mock_ec, mock_gd):
         """Valid inputs return 6-element tuple."""
+        mock_ec.llm_credentials_configured.return_value = True
         mock_ec.TYPE = "postgresql"
         mock_ec.RUNTIME = SimpleNamespace(db_url=lambda: "postgresql://localhost/db")
         mock_gd.return_value = SimpleNamespace(engine="engine")
@@ -534,9 +530,9 @@ class TestLoadPipelineResources:
 class TestGenerateJoinCandidates:
     """Tests for generate_join_candidates."""
 
-    @patch("aetherdialect._pipeline.join_candidate_map", return_value={"J00": []})
+    @patch("aetherdialect._pipeline_generate.join_candidate_map", return_value={"J00": []})
     @patch(
-        "aetherdialect._pipeline.join_hints_multi",
+        "aetherdialect._pipeline_generate.join_hints_multi",
         return_value={"candidates": [{"candidate_id": "J00", "join_path_signature": []}]},
     )
     def test_single_table_no_cte(self, mock_jh, mock_jcm):
@@ -556,12 +552,12 @@ class TestGenerateJoinCandidates:
         assert cte_hints == {}
 
     @patch(
-        "aetherdialect._pipeline.cte_to_intent_for_ranking",
+        "aetherdialect._pipeline_generate.cte_to_intent_for_ranking",
         return_value=SimpleNamespace(tables=["orders", "customers"]),
     )
-    @patch("aetherdialect._pipeline.join_candidate_map", return_value={"J00": []})
+    @patch("aetherdialect._pipeline_generate.join_candidate_map", return_value={"J00": []})
     @patch(
-        "aetherdialect._pipeline.join_hints_multi",
+        "aetherdialect._pipeline_generate.join_hints_multi",
         return_value={"candidates": [{"candidate_id": "J00", "join_path_signature": []}]},
     )
     def test_cte_multi_table_gets_hints(self, mock_jh, mock_jcm, mock_cte_intent):
@@ -591,8 +587,8 @@ class TestGenerateJoinCandidates:
         jc, cmap, cte_hints = generate_join_candidates(intent, schema)
         assert "cte1" in cte_hints
 
-    @patch("aetherdialect._pipeline.join_candidate_map", return_value={"J00": []})
-    @patch("aetherdialect._pipeline.join_hints_multi", return_value={"candidates": []})
+    @patch("aetherdialect._pipeline_generate.join_candidate_map", return_value={"J00": []})
+    @patch("aetherdialect._pipeline_generate.join_hints_multi", return_value={"candidates": []})
     def test_cte_single_table_j00(self, mock_jh, mock_jcm):
         """CTE with single table gets default J00 candidate."""
         cte = RuntimeCteStep(
@@ -615,9 +611,9 @@ class TestGenerateJoinCandidates:
         _, _, cte_hints = generate_join_candidates(intent, schema)
         assert cte_hints["cte1"]["candidates"][0]["candidate_id"] == "J00"
 
-    @patch("aetherdialect._pipeline.join_candidate_map", return_value={})
+    @patch("aetherdialect._pipeline_generate.join_candidate_map", return_value={})
     @patch(
-        "aetherdialect._pipeline.join_hints_multi",
+        "aetherdialect._pipeline_generate.join_hints_multi",
         return_value={"candidates": [{"candidate_id": "J01", "join_path_signature": ["x"]}]},
     )
     def test_main_join_hints_use_schema_tables_only(self, mock_jh, mock_jcm):
@@ -652,7 +648,7 @@ class TestGenerateJoinCandidates:
 class TestDisplayFinalResultsToStdout:
     """Tests for display_final_results_to_stdout."""
 
-    @patch("aetherdialect._pipeline.print_query_result")
+    @patch("aetherdialect._pipeline_execute.print_query_result")
     def test_prints_result_rows(self, mock_print):
         """Invokes ``print_query_result`` with resolved display SQL."""
         intent = RuntimeIntent(
@@ -671,7 +667,7 @@ class TestStampSqlShape:
     """Tests for stamp_sql_shape."""
 
     @patch(
-        "aetherdialect._pipeline.sql_shape",
+        "aetherdialect._pipeline_generate.sql_shape",
         return_value=SQLShape(num_joins=1, has_group_by=True, has_agg=False),
     )
     def test_sets_sql_shape(self, _mock_shape):
@@ -730,7 +726,7 @@ class TestShouldPromptSqlFeedback:
 class TestHandleUserFeedback:
     """Tests for handle_user_feedback."""
 
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
     def test_invalid_choice_saves_and_returns(self, mock_save, schema_graph, capsys):
         """Invalid choice (not y/n) prints a hint, saves the store, and returns None."""
         store = {
@@ -747,7 +743,8 @@ class TestHandleUserFeedback:
             order_by_cols=[],
             where=None,
         )
-        with diagnostic_print_listener(print):
+        token = push_diagnostic_sink(lambda d: print(d.message))
+        try:
             result = handle_user_feedback(
                 "x",
                 intent,
@@ -761,22 +758,24 @@ class TestHandleUserFeedback:
                 None,
                 None,
             )
+        finally:
+            pop_diagnostic_sink(token)
         assert result is None
         mock_save.assert_called_once()
         captured = capsys.readouterr().out
         assert "Invalid choice" in captured
 
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
     @patch(
-        "aetherdialect._pipeline.sql_shape",
+        "aetherdialect._pipeline_generate.sql_shape",
         return_value=SQLShape(num_joins=0, has_group_by=False, has_agg=False),
     )
-    @patch("aetherdialect._pipeline.intent_key", return_value="ik1")
-    @patch("aetherdialect._templates.colmap_signature", return_value="cm1")
-    @patch("aetherdialect._pipeline.Dialect.compute_sql_fp", return_value="fp1")
-    @patch("aetherdialect._templates.TemplateOps.promote_trust")
-    @patch("aetherdialect._templates.TemplateOps.record_template_feedback")
-    @patch("aetherdialect._pipeline.flatten_param_values", return_value={})
+    @patch("aetherdialect._utils_intent.intent_key", return_value="ik1")
+    @patch("aetherdialect._utils.colmap_signature", return_value="cm1")
+    @patch("aetherdialect._dialect.Dialect.compute_sql_fp", return_value="fp1")
+    @patch("aetherdialect._templates_ops.TemplateOps.promote_trust")
+    @patch("aetherdialect._templates_ops.TemplateOps.record_template_feedback")
+    @patch("aetherdialect._utils_intent.flatten_param_values", return_value={})
     def test_accept_existing_template(self, _flat, _rec, _promote, _fp, _cm, _ik, _shape, _save, schema_graph):
         """Accept with existing template promotes trust."""
         intent = RuntimeIntent(
@@ -833,24 +832,24 @@ class TestHandleUserFeedback:
         _rec.assert_called_once()
         _promote.assert_called_once()
 
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
-    @patch("aetherdialect._templates.TemplateOps.templates_to_store", side_effect=lambda s, t: s)
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
+    @patch("aetherdialect._templates_ops.TemplateOps.templates_to_store", side_effect=lambda s, t: s)
     @patch(
-        "aetherdialect._pipeline.other_template_owns_question_string",
+        "aetherdialect._pipeline_generate.other_template_owns_question_string",
         return_value=False,
     )
     @patch.object(RuntimeIntent, "to_concrete")
     @patch(
-        "aetherdialect._pipeline.flatten_param_values",
+        "aetherdialect._pipeline_generate.flatten_param_values",
         return_value={"s1": 5, "f_status": "open"},
     )
-    @patch("aetherdialect._templates.TemplateOps.promote_trust")
-    @patch("aetherdialect._templates.TemplateOps.record_template_feedback")
-    @patch("aetherdialect._pipeline.Dialect.compute_sql_fp", return_value="fp_union")
-    @patch("aetherdialect._pipeline.intent_key", return_value="ik_union")
-    @patch("aetherdialect._templates.colmap_signature", return_value="cm1")
+    @patch("aetherdialect._templates_ops.TemplateOps.promote_trust")
+    @patch("aetherdialect._templates_ops.TemplateOps.record_template_feedback")
+    @patch("aetherdialect._dialect.Dialect.compute_sql_fp", return_value="fp_union")
+    @patch("aetherdialect._pipeline_generate.intent_key", return_value="ik_union")
+    @patch("aetherdialect._utils.colmap_signature", return_value="cm1")
     @patch(
-        "aetherdialect._pipeline.sql_shape",
+        "aetherdialect._pipeline_generate.sql_shape",
         return_value=SQLShape(num_joins=0, has_group_by=False, has_agg=False),
     )
     def test_accept_intent_union_match_updates_template_sql_and_signature(
@@ -947,18 +946,18 @@ class TestHandleUserFeedback:
         _rec.assert_called_once()
         _promote.assert_called_once()
 
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
-    @patch("aetherdialect._templates.TemplateOps.templates_to_store", side_effect=lambda s, t: s)
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
+    @patch("aetherdialect._templates_ops.TemplateOps.templates_to_store", side_effect=lambda s, t: s)
     @patch(
-        "aetherdialect._pipeline.sql_shape",
+        "aetherdialect._pipeline_generate.sql_shape",
         return_value=SQLShape(num_joins=0, has_group_by=False, has_agg=False),
     )
-    @patch("aetherdialect._pipeline.intent_key", return_value="ik1")
-    @patch("aetherdialect._templates.colmap_signature", return_value="cm1")
-    @patch("aetherdialect._pipeline.Dialect.compute_sql_fp", return_value="fp1")
-    @patch("aetherdialect._templates.TemplateOps.delete_rejected_templates_matching_question")
-    @patch("aetherdialect._templates.TemplateOps.record_template_feedback")
-    @patch("aetherdialect._templates.TemplateOps.promote_trust")
+    @patch("aetherdialect._utils_intent.intent_key", return_value="ik1")
+    @patch("aetherdialect._utils.colmap_signature", return_value="cm1")
+    @patch("aetherdialect._dialect.Dialect.compute_sql_fp", return_value="fp1")
+    @patch("aetherdialect._templates_ops.TemplateOps.delete_rejected_templates_matching_question")
+    @patch("aetherdialect._templates_ops.TemplateOps.record_template_feedback")
+    @patch("aetherdialect._templates_ops.TemplateOps.promote_trust")
     def test_accept_exact_question_reuse_records_stats_and_promotes(
         self,
         _promote,
@@ -1027,17 +1026,17 @@ class TestHandleUserFeedback:
         _rec.assert_called_once_with(tmpl, accept=True)
         _promote.assert_called_once_with(tmpl, "q")
 
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
-    @patch("aetherdialect._templates.TemplateOps.templates_to_store", side_effect=lambda s, t: s)
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
+    @patch("aetherdialect._templates_ops.TemplateOps.templates_to_store", side_effect=lambda s, t: s)
     @patch(
-        "aetherdialect._pipeline.sql_shape",
+        "aetherdialect._pipeline_generate.sql_shape",
         return_value=SQLShape(num_joins=0, has_group_by=False, has_agg=False),
     )
-    @patch("aetherdialect._pipeline.intent_key", return_value="ik1")
-    @patch("aetherdialect._templates.colmap_signature", return_value="cm1")
-    @patch("aetherdialect._pipeline.Dialect.compute_sql_fp", return_value="fp1")
-    @patch("aetherdialect._templates.TemplateOps.reject_out_per_question", return_value=(False, False))
-    @patch("aetherdialect._templates.TemplateOps.record_template_feedback")
+    @patch("aetherdialect._utils_intent.intent_key", return_value="ik1")
+    @patch("aetherdialect._utils.colmap_signature", return_value="cm1")
+    @patch("aetherdialect._dialect.Dialect.compute_sql_fp", return_value="fp1")
+    @patch("aetherdialect._templates_ops.TemplateOps.reject_out_per_question", return_value=(False, False))
+    @patch("aetherdialect._templates_ops.TemplateOps.record_template_feedback")
     def test_reject_routes_to_matched_template_not_intent_key_lookup(
         self,
         _rec,
@@ -1106,19 +1105,19 @@ class TestHandleUserFeedback:
         assert _rec.call_args[0][0] is tmpl
         _reject_out.assert_called_once_with(templates, tmpl, "q")
 
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
-    @patch("aetherdialect._templates.TemplateOps.templates_to_store", side_effect=lambda s, t: s)
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
+    @patch("aetherdialect._templates_ops.TemplateOps.templates_to_store", side_effect=lambda s, t: s)
     @patch(
-        "aetherdialect._pipeline.sql_shape",
+        "aetherdialect._pipeline_generate.sql_shape",
         return_value=SQLShape(num_joins=0, has_group_by=False, has_agg=False),
     )
-    @patch("aetherdialect._pipeline.intent_key", return_value="ik_p3")
-    @patch("aetherdialect._templates.colmap_signature", return_value="cm1")
-    @patch("aetherdialect._pipeline.Dialect.compute_sql_fp", return_value="fp1")
-    @patch("aetherdialect._templates.TemplateOps.record_question_feedback")
-    @patch("aetherdialect._templates.TemplateOps.summarize_failure_for_memory")
-    @patch("aetherdialect._templates.TemplateOps.reject_out_per_question", return_value=(False, False))
-    @patch("aetherdialect._templates.TemplateOps.record_template_feedback")
+    @patch("aetherdialect._utils_intent.intent_key", return_value="ik_p3")
+    @patch("aetherdialect._utils.colmap_signature", return_value="cm1")
+    @patch("aetherdialect._dialect.Dialect.compute_sql_fp", return_value="fp1")
+    @patch("aetherdialect._templates_ops.TemplateOps.record_question_feedback")
+    @patch("aetherdialect._templates_ops.TemplateOps.summarize_failure_for_memory")
+    @patch("aetherdialect._templates_ops.TemplateOps.reject_out_per_question", return_value=(False, False))
+    @patch("aetherdialect._templates_ops.TemplateOps.record_template_feedback")
     @patch("builtins.input", return_value="wrong cols")
     def test_reject_intent_direct_match_records_question_feedback(
         self,
@@ -1200,17 +1199,17 @@ class TestHandleUserFeedback:
         mock_sum.assert_called_once()
         mock_rqf.assert_called_once()
 
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
-    @patch("aetherdialect._templates.TemplateOps.templates_to_store", side_effect=lambda s, t: s)
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
+    @patch("aetherdialect._templates_ops.TemplateOps.templates_to_store", side_effect=lambda s, t: s)
     @patch(
-        "aetherdialect._pipeline.sql_shape",
+        "aetherdialect._pipeline_generate.sql_shape",
         return_value=SQLShape(num_joins=0, has_group_by=False, has_agg=False),
     )
-    @patch("aetherdialect._pipeline.intent_key", return_value="ik_fresh")
-    @patch("aetherdialect._templates.colmap_signature", return_value="cm1")
-    @patch("aetherdialect._pipeline.Dialect.compute_sql_fp", return_value="fp1")
-    @patch("aetherdialect._templates.TemplateOps.record_question_feedback")
-    @patch("aetherdialect._templates.TemplateOps.summarize_failure_for_memory")
+    @patch("aetherdialect._utils_intent.intent_key", return_value="ik_fresh")
+    @patch("aetherdialect._utils.colmap_signature", return_value="cm1")
+    @patch("aetherdialect._dialect.Dialect.compute_sql_fp", return_value="fp1")
+    @patch("aetherdialect._templates_ops.TemplateOps.record_question_feedback")
+    @patch("aetherdialect._templates_ops.TemplateOps.summarize_failure_for_memory")
     @patch("builtins.input", return_value="wrong columns")
     def test_reject_fresh_records_question_feedback_when_no_matched_template(
         self,
@@ -1287,8 +1286,8 @@ class TestConfirmIntentWithUser:
     def _make_store() -> dict:
         return {"templates": {}, "next_id": 1}
 
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
-    @patch("aetherdialect._pipeline.interactive_yes_no", return_value="y")
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
+    @patch("aetherdialect._pipeline_generate.interactive_yes_no", return_value="y")
     def test_warnings_user_confirms(self, mock_choice, mock_save):
         """Semantic warnings are folded into the intent body; one confirmation prompt."""
         result = confirm_intent_with_user(
@@ -1302,8 +1301,8 @@ class TestConfirmIntentWithUser:
         assert mock_choice.call_count == 1
         assert "Is this correct?" in mock_choice.call_args[0][1]
 
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
-    @patch("aetherdialect._pipeline.interactive_yes_no", return_value="n")
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
+    @patch("aetherdialect._pipeline_generate.interactive_yes_no", return_value="n")
     def test_warnings_user_declines(self, mock_choice, mock_save):
         """Branch 1: warnings present, user says no → False, store saved (Path 5 uses low similarity)."""
         result = confirm_intent_with_user(
@@ -1315,8 +1314,8 @@ class TestConfirmIntentWithUser:
         assert result is False
         mock_save.assert_called_once()
 
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
-    @patch("aetherdialect._pipeline.interactive_yes_no")
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
+    @patch("aetherdialect._pipeline_generate.interactive_yes_no")
     def test_high_similarity_auto_proceeds(self, mock_choice, mock_save):
         """Branch 2: no warnings, high similarity → auto-proceed, no prompt."""
         result = confirm_intent_with_user(
@@ -1329,8 +1328,8 @@ class TestConfirmIntentWithUser:
         mock_choice.assert_not_called()
         mock_save.assert_not_called()
 
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
-    @patch("aetherdialect._pipeline.interactive_yes_no", return_value="y")
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
+    @patch("aetherdialect._pipeline_generate.interactive_yes_no", return_value="y")
     def test_low_similarity_user_confirms(self, mock_choice, mock_save):
         """Low similarity without warnings or schema issues skips confirmation (gate returns True)."""
         result = confirm_intent_with_user(
@@ -1342,8 +1341,8 @@ class TestConfirmIntentWithUser:
         assert result is True
         mock_choice.assert_not_called()
 
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
-    @patch("aetherdialect._pipeline.interactive_yes_no", return_value="n")
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
+    @patch("aetherdialect._pipeline_generate.interactive_yes_no", return_value="n")
     def test_low_similarity_user_declines(self, mock_choice, mock_save):
         """Same gate skips the decline path when confirmation is not offered."""
         result = confirm_intent_with_user(
@@ -1356,8 +1355,8 @@ class TestConfirmIntentWithUser:
         mock_choice.assert_not_called()
         mock_save.assert_not_called()
 
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
-    @patch("aetherdialect._pipeline.interactive_yes_no", return_value=None)
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
+    @patch("aetherdialect._pipeline_generate.interactive_yes_no", return_value=None)
     def test_warnings_none_choice_declines(self, mock_choice, mock_save):
         """Branch 1: warnings present, interactive_yes_no returns None → False."""
         result = confirm_intent_with_user(
@@ -1368,8 +1367,8 @@ class TestConfirmIntentWithUser:
         )
         assert result is False
 
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
-    @patch("aetherdialect._pipeline.interactive_yes_no")
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
+    @patch("aetherdialect._pipeline_generate.interactive_yes_no")
     def test_empty_warnings_list_is_no_warnings(self, mock_choice, mock_save):
         """Empty warnings list treated as no warnings (falsy)."""
         result = confirm_intent_with_user(
@@ -1381,8 +1380,8 @@ class TestConfirmIntentWithUser:
         assert result is True
         mock_choice.assert_not_called()
 
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
-    @patch("aetherdialect._pipeline.interactive_yes_no", return_value="y")
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
+    @patch("aetherdialect._pipeline_generate.interactive_yes_no", return_value="y")
     def test_fallback_nl_summary(self, mock_choice, mock_save):
         """Empty natural_language still auto-skips confirmation when the gate applies."""
         intent = self._make_intent(nl="")
@@ -1395,9 +1394,9 @@ class TestConfirmIntentWithUser:
         assert result is True
         mock_choice.assert_not_called()
 
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
-    @patch("aetherdialect._pipeline.interactive_yes_no", return_value="y")
-    @patch("aetherdialect._pipeline.print_info")
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
+    @patch("aetherdialect._pipeline_generate.interactive_yes_no", return_value="y")
+    @patch("aetherdialect._pipeline_generate.print_info")
     def test_intent_already_confirmed_skips_print_and_prompt(self, mock_print_info, mock_choice, mock_save):
         result = confirm_intent_with_user(
             self._make_intent(),
@@ -1413,7 +1412,7 @@ class TestConfirmIntentWithUser:
 
 
 class TestRunSqlValidationCascade:
-    """Tests for _run_sql_validation_cascade helper."""
+    """Tests for run_sql_validation_cascade helper."""
 
     def _make_intent(self, tables=None, grain="row_level", select_cols=None):
         """Build a minimal RuntimeIntent."""
@@ -1428,11 +1427,15 @@ class TestRunSqlValidationCascade:
             having=None,
         )
 
-    @patch("aetherdialect._pipeline.validate_sql", return_value=(True, None, None, []))
-    def test_all_pass(self, mock_sql):
+    @patch(
+        "aetherdialect._pipeline_generate._validation_sql_for_explain",
+        side_effect=lambda sql, intent, dialect: sql,
+    )
+    @patch("aetherdialect._pipeline_generate.validate_sql", return_value=(True, None, None, []))
+    def test_all_pass(self, mock_sql, _mock_canon):
         """When validate_sql passes, cascade returns (True, '')."""
         intent = self._make_intent()
-        ok, err, cat, diags = _run_sql_validation_cascade(
+        ok, err, cat, diags = run_sql_validation_cascade(
             "SELECT t.id FROM t",
             intent,
             None,
@@ -1443,7 +1446,11 @@ class TestRunSqlValidationCascade:
         assert diags == []
 
     @patch(
-        "aetherdialect._pipeline.validate_sql",
+        "aetherdialect._pipeline_generate._validation_sql_for_explain",
+        side_effect=lambda sql, intent, dialect: sql,
+    )
+    @patch(
+        "aetherdialect._pipeline_generate.validate_sql",
         return_value=(
             False,
             "explain_error",
@@ -1451,10 +1458,10 @@ class TestRunSqlValidationCascade:
             [],
         ),
     )
-    def test_explain_failure_detected(self, mock_sql):
+    def test_explain_failure_detected(self, mock_sql, _mock_canon):
         """EXPLAIN failure stops cascade."""
         intent = self._make_intent(grain="grouped")
-        ok, err, cat, diags = _run_sql_validation_cascade(
+        ok, err, cat, diags = run_sql_validation_cascade(
             "SELECT t.id FROM t",
             intent,
             None,
@@ -1463,7 +1470,7 @@ class TestRunSqlValidationCascade:
         assert err == "explain_error"
         assert cat == FailureCategory.EXECUTION_EXPLAIN_FAILED
 
-    @patch("aetherdialect._pipeline.validate_sql", return_value=(True, None, None, []))
+    @patch("aetherdialect._pipeline_generate.validate_sql", return_value=(True, None, None, []))
     def test_unreachable_resolved_join_scope_refuses_before_sql_validation(self, mock_sql):
         """Join reachability is checked before validate_sql on every cascade entry."""
         from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
@@ -1518,7 +1525,7 @@ class TestRunSqlValidationCascade:
             where=None,
             resolved_join_tables=["a", "bridge", "c", "island"],
         )
-        ok, err, cat, diags = _run_sql_validation_cascade(
+        ok, err, cat, diags = run_sql_validation_cascade(
             "SELECT a.id FROM a JOIN bridge ON a.id = bridge.aid JOIN c ON bridge.cid = c.id",
             intent,
             None,
@@ -1533,7 +1540,7 @@ class TestRunSqlValidationCascade:
 class TestResolveJoinsFresh:
     """Tests for _resolve_joins_fresh join selection and injection."""
 
-    @patch("aetherdialect._pipeline.get_join_choice_from_llm")
+    @patch("aetherdialect._pipeline_generate.get_join_choice_from_llm")
     def test_fallback_when_llm_choice_has_empty_signature(self, mock_llm):
         """Use another candidate when the LLM id maps to an empty path."""
         mock_llm.return_value = {JOIN_CHOICE_SCOPE_MAIN: "J01"}
@@ -1632,7 +1639,7 @@ class TestResolveJoinsFresh:
             return det_sql
 
         with patch(
-            "aetherdialect._pipeline.inject_join_into_deterministic_sql",
+            "aetherdialect._pipeline_generate.inject_join_into_deterministic_sql",
             side_effect=_inj,
         ):
             _resolve_joins_fresh(
@@ -1656,7 +1663,7 @@ class TestResolveJoinsFresh:
 class TestPrepareUnionMatchJoinPhase:
     """Tests for prepare_union_match_join_phase."""
 
-    @patch("aetherdialect._pipeline.generate_join_candidates")
+    @patch("aetherdialect._pipeline_generate.generate_join_candidates")
     def test_no_union_candidates_calls_generate_join_candidates(self, mock_gjc, schema_graph: SchemaGraph):
         mock_gjc.return_value = ({"candidates": []}, {}, {})
         intent = RuntimeIntent(
@@ -1677,7 +1684,7 @@ class TestEnrichedDisplayAliasMap:
     """Tests for enriched_display_alias_map."""
 
     @patch(
-        "aetherdialect._pipeline.LLMProvider.chat",
+        "aetherdialect._llm_provider.LLMProvider.chat",
         return_value='{"aliases":{"col=t.a":"column_a"}}',
     )
     def test_simple_select_uses_llm_for_scalar_column(self, _mock_llm):
@@ -1698,7 +1705,7 @@ class TestGeneratePath43RuntimeSubset:
     """``RUNTIME_SUBSET_TEMPLATE_WIDE`` widens in-memory ``select_cols`` to the template projection."""
 
     @patch(
-        "aetherdialect._pipeline._run_sql_validation_cascade",
+        "aetherdialect._pipeline_generate.run_sql_validation_cascade",
         return_value=(True, "", None, []),
     )
     def test_widens_intent_select_cols(self, _mock_val, schema_graph: SchemaGraph):
@@ -1752,10 +1759,10 @@ class TestGeneratePath43RuntimeSubset:
 class TestGenerationPathSqlBranches:
     """Forced ``generate_and_validate_sql`` outcomes for paths ``3``, ``4.1``, ``4.2``, ``5`` (validation mocked)."""
 
-    @patch("aetherdialect._pipeline.align_template_to_widened_intent")
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
+    @patch("aetherdialect._pipeline_generate.align_template_to_widened_intent")
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
     @patch(
-        "aetherdialect._pipeline._run_sql_validation_cascade",
+        "aetherdialect._pipeline_generate.run_sql_validation_cascade",
         return_value=(True, "", None, []),
     )
     def test_path3_intent_direct_match(self, _mock_val, _mock_save, mock_align, schema_graph: SchemaGraph):
@@ -1799,9 +1806,9 @@ class TestGenerationPathSqlBranches:
         assert len(intent.select_cols) == 1
         mock_align.assert_not_called()
 
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
     @patch(
-        "aetherdialect._pipeline._run_sql_validation_cascade",
+        "aetherdialect._pipeline_generate.run_sql_validation_cascade",
         side_effect=[
             (False, "forced_fail", FailureCategory.EXECUTION_SCHEMA_ERROR, []),
             (True, "", None, []),
@@ -1831,7 +1838,7 @@ class TestGenerationPathSqlBranches:
         dialect = _StubDialect()
         join_candidates, cmap, cte_hints = generate_join_candidates(intent, schema_graph)
         with patch(
-            "aetherdialect._pipeline._resolve_joins_fresh",
+            "aetherdialect._pipeline_generate._resolve_joins_fresh",
             return_value=("SELECT orders.order_id FROM orders", {}),
         ) as mock_fresh:
             out = generate_and_validate_sql(
@@ -1854,9 +1861,9 @@ class TestGenerationPathSqlBranches:
         assert out.matched_template is None
         mock_save.assert_not_called()
 
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
     @patch(
-        "aetherdialect._pipeline._run_sql_validation_cascade",
+        "aetherdialect._pipeline_generate.run_sql_validation_cascade",
         return_value=(True, "", None, []),
     )
     def test_path3_stale_template_falls_through_to_fresh(self, _mock_val, _mock_save, schema_graph: SchemaGraph):
@@ -1883,9 +1890,9 @@ class TestGenerationPathSqlBranches:
         assert out.generation_path == GenerationPath.FRESH
         assert out.matched_template is None
 
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
     @patch(
-        "aetherdialect._pipeline._run_sql_validation_cascade",
+        "aetherdialect._pipeline_generate.run_sql_validation_cascade",
         return_value=(True, "", None, []),
     )
     def test_path43_stale_template_falls_through_to_fresh(self, _mock_val, _mock_save, schema_graph: SchemaGraph):
@@ -1920,12 +1927,14 @@ class TestGenerationPathSqlBranches:
         assert out.generation_path == GenerationPath.FRESH
         assert out.matched_template is None
 
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
     @patch(
-        "aetherdialect._pipeline._run_sql_validation_cascade",
+        "aetherdialect._pipeline_generate.run_sql_validation_cascade",
         return_value=(True, "", None, []),
     )
-    def test_path41_stale_template_falls_through_to_fresh(self, _mock_val, _mock_save, schema_graph: SchemaGraph):
+    def test_union_template_widen_stale_template_falls_through_to_fresh(
+        self, _mock_val, _mock_save, schema_graph: SchemaGraph
+    ):
         sc1 = SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))
         sc2 = SelectCol(expr=NormalizedExpr.from_column("orders.customer_id"))
         intent = _single_table_intent("orders", "order_id")
@@ -1950,12 +1959,14 @@ class TestGenerationPathSqlBranches:
         assert out.generation_path == GenerationPath.FRESH
         assert out.matched_template is None
 
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
     @patch(
-        "aetherdialect._pipeline._run_sql_validation_cascade",
+        "aetherdialect._pipeline_generate.run_sql_validation_cascade",
         return_value=(True, "", None, []),
     )
-    def test_path42_stale_template_falls_through_to_fresh(self, _mock_val, _mock_save, schema_graph: SchemaGraph):
+    def test_union_template_and_runtime_widen_stale_template_falls_through_to_fresh(
+        self, _mock_val, _mock_save, schema_graph: SchemaGraph
+    ):
         sc1 = SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))
         sc2 = SelectCol(expr=NormalizedExpr.from_column("orders.customer_id"))
         intent = _single_table_intent("orders", "order_id")
@@ -1980,17 +1991,17 @@ class TestGenerationPathSqlBranches:
         assert out.generation_path == GenerationPath.FRESH
         assert out.matched_template is None
 
-    @patch("aetherdialect._pipeline.align_template_to_widened_intent")
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
+    @patch("aetherdialect._pipeline_generate.align_template_to_widened_intent")
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
     @patch(
-        "aetherdialect._pipeline.build_deterministic_sql",
+        "aetherdialect._sql_gen.build_deterministic_sql",
         return_value="SELECT orders.order_id, orders.customer_id FROM orders WHERE 1=1",
     )
     @patch(
-        "aetherdialect._pipeline._run_sql_validation_cascade",
+        "aetherdialect._pipeline_generate.run_sql_validation_cascade",
         return_value=(True, "", None, []),
     )
-    def test_path41_union_template_widen_runtime_select_stays_narrow(
+    def test_union_template_widen_runtime_select_stays_narrow(
         self, _mock_val, _mock_build, _mock_save, mock_align, schema_graph: SchemaGraph
     ):
         sc1 = SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))
@@ -2034,18 +2045,18 @@ class TestGenerationPathSqlBranches:
         assert len(intent.select_cols) == 1
         mock_align.assert_called_once()
 
-    @patch("aetherdialect._pipeline._join_matches_template_intent", return_value=False)
-    @patch("aetherdialect._pipeline.align_template_to_widened_intent")
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
+    @patch("aetherdialect._pipeline_generate._join_matches_template_intent", return_value=False)
+    @patch("aetherdialect._pipeline_generate.align_template_to_widened_intent")
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
     @patch(
-        "aetherdialect._pipeline.build_deterministic_sql",
+        "aetherdialect._sql_gen.build_deterministic_sql",
         return_value="SELECT orders.order_id, orders.customer_id FROM orders WHERE 1=1",
     )
     @patch(
-        "aetherdialect._pipeline._run_sql_validation_cascade",
+        "aetherdialect._pipeline_generate.run_sql_validation_cascade",
         return_value=(True, "", None, []),
     )
-    def test_path41_union_widen_skips_align_when_join_fingerprint_mismatches(
+    def test_union_template_widen_skips_align_when_join_fingerprint_mismatches(
         self,
         _mock_val,
         _mock_build,
@@ -2094,17 +2105,17 @@ class TestGenerationPathSqlBranches:
         assert out.join_matches_template is False
         mock_align.assert_not_called()
 
-    @patch("aetherdialect._pipeline.align_template_to_widened_intent")
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
+    @patch("aetherdialect._pipeline_generate.align_template_to_widened_intent")
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
     @patch(
-        "aetherdialect._pipeline.build_deterministic_sql",
+        "aetherdialect._sql_gen.build_deterministic_sql",
         return_value="SELECT orders.order_id, orders.customer_id FROM orders WHERE 1=1",
     )
     @patch(
-        "aetherdialect._pipeline._run_sql_validation_cascade",
+        "aetherdialect._pipeline_generate.run_sql_validation_cascade",
         return_value=(True, "", None, []),
     )
-    def test_path42_union_template_and_runtime_widen(
+    def test_union_template_and_runtime_widen(
         self, _mock_val, _mock_build, _mock_save, mock_align, schema_graph: SchemaGraph
     ):
         sc1 = SelectCol(expr=NormalizedExpr.from_column("orders.order_id"))
@@ -2174,7 +2185,7 @@ class TestAlignTemplateToWidenedIntent:
 class TestSqlPhaseJoinResources:
     """Tests for _sql_phase_join_resources pinned-join shortcut."""
 
-    @patch("aetherdialect._pipeline.generate_join_candidates")
+    @patch("aetherdialect._pipeline_generate.generate_join_candidates")
     def test_pinned_template_match_skips_join_llm(self, mock_gjc, schema_graph: SchemaGraph):
         mock_gjc.return_value = ({}, {}, {})
         tmpl = _make_pipeline_template()
@@ -2211,7 +2222,7 @@ class TestSqlPhaseJoinResources:
             order_by_cols=[],
             where=None,
         )
-        with patch("aetherdialect._pipeline.generate_join_candidates") as mock_gjc:
+        with patch("aetherdialect._pipeline_generate.generate_join_candidates") as mock_gjc:
             mock_gjc.return_value = ({"candidates": []}, {}, {})
             _sql_phase_join_resources(intent, schema_graph, None, None)
         mock_gjc.assert_called_once()
@@ -2302,9 +2313,9 @@ class TestBuildInteractiveTailSnapshot:
 class TestParseIntentViaLlmMocked:
     """``parse_intent_via_llm`` branches without a real LLM parse."""
 
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
     @patch(
-        "aetherdialect._pipeline.invoke_intent_parse_with_hints",
+        "aetherdialect._pipeline_generate.invoke_intent_parse_with_hints",
         return_value=(None, ["w"], 4, None),
     )
     def test_none_intent_records_failure(self, mock_full, mock_save):
@@ -2320,8 +2331,8 @@ class TestParseIntentViaLlmMocked:
         assert calls == 4
         mock_save.assert_called_once()
 
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
-    @patch("aetherdialect._pipeline.interactive_yes_no", return_value="n")
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
+    @patch("aetherdialect._pipeline_generate.interactive_yes_no", return_value="n")
     def test_schema_invalid_user_declines_at_intent_confirm(self, mock_yes, mock_save):
         bad = RuntimeIntent(
             tables=["t"],
@@ -2358,14 +2369,14 @@ class TestParseIntentViaLlmMocked:
         port = MagicMock()
         port.has_pending_choice.return_value = False
         with patch(
-            "aetherdialect._pipeline.invoke_intent_parse_with_hints",
+            "aetherdialect._pipeline_generate.invoke_intent_parse_with_hints",
             return_value=(bad, [], 0, None),
         ):
             intent, _, _, _ = parse_intent_via_llm("q", MagicMock(schema_hash="h"), {}, {}, choice_port=port)
         assert intent is not None
         assert intent.schema_invalid is True
 
-    @patch("aetherdialect._pipeline.interactive_yes_no", return_value="y")
+    @patch("aetherdialect._pipeline_generate.interactive_yes_no", return_value="y")
     def test_schema_invalid_user_accepts(self, mock_yes):
         bad = RuntimeIntent(
             tables=["t"],
@@ -2393,7 +2404,7 @@ class TestCaptureParsePromptRecordsInvoke:
     """``_invoke_intent_parse_with_hints`` forwards ``in_turn_seed`` into ``full_intent_parse``."""
 
     def test_invoke_forwards_in_turn_seed(self):
-        import aetherdialect._intent_process
+        import aetherdialect._intent_loop
 
         stub = (None, [], 0, None)
         seed = [
@@ -2406,8 +2417,8 @@ class TestCaptureParsePromptRecordsInvoke:
                 "is_post_restart": "False",
             }
         ]
-        with patch.object(aetherdialect._intent_process, "full_intent_parse", return_value=stub) as mock_fp:
-            aetherdialect._intent_process.invoke_intent_parse_with_hints(
+        with patch.object(aetherdialect._intent_loop, "full_intent_parse", return_value=stub) as mock_fp:
+            aetherdialect._pipeline_generate.invoke_intent_parse_with_hints(
                 "how many rows?",
                 MagicMock(schema_hash="sh"),
                 store={},
@@ -2423,7 +2434,7 @@ class TestBestAcceptedSimilarityAndSkipConfirmation:
     def test_best_similarity_empty_templates(self):
         assert best_accepted_template_similarity(MagicMock(), {}) == 0.0
 
-    @patch("aetherdialect._pipeline.structural_compare")
+    @patch("aetherdialect._pipeline_generate.structural_compare")
     def test_best_similarity_takes_max(self, mock_sc):
         intent = RuntimeIntent(
             tables=["orders"],
@@ -2581,10 +2592,10 @@ class TestUserRefinementBudget:
         )
         port = SimpleNamespace(_refinement_ctx=RefinementContext("question text"))
         with (
-            patch("aetherdialect._templates.TemplateOps.summarize_failure_for_memory") as sm,
-            patch("aetherdialect._templates.TemplateOps.record_question_feedback"),
-            patch("aetherdialect._templates.TemplateOps.templates_to_store", return_value=ctx_rej.store),
-            patch("aetherdialect._templates.TemplateOps.save_template_store"),
+            patch("aetherdialect._templates_ops.TemplateOps.summarize_failure_for_memory") as sm,
+            patch("aetherdialect._templates_ops.TemplateOps.record_question_feedback"),
+            patch("aetherdialect._templates_ops.TemplateOps.templates_to_store", return_value=ctx_rej.store),
+            patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store"),
         ):
             sm.return_value = SimpleNamespace(buckets=[SimpleNamespace(value=RejectionBucket.OTHER.value)])
             with _pt.raises(RefinementRetry):
@@ -2596,7 +2607,7 @@ class TestUserRefinementBudget:
                 )
 
     def test_complete_user_feedback_reject_terminates_when_max_is_zero(self, monkeypatch):
-        """With ``MAX_USER_REFINEMENTS=0`` the path matches legacy single-attempt behavior (no retry)."""
+        """With ``MAX_USER_REFINEMENTS=0`` rejection terminates without a refinement retry."""
         monkeypatch.setattr(PolicyConfig, "MAX_USER_REFINEMENTS", 0)
         intent = RuntimeIntent(
             tables=["t"],
@@ -2624,10 +2635,10 @@ class TestUserRefinementBudget:
         )
         port = SimpleNamespace(_refinement_ctx=RefinementContext("question text"))
         with (
-            patch("aetherdialect._templates.TemplateOps.summarize_failure_for_memory") as sm,
-            patch("aetherdialect._templates.TemplateOps.record_question_feedback"),
-            patch("aetherdialect._templates.TemplateOps.templates_to_store", return_value=ctx_rej.store),
-            patch("aetherdialect._templates.TemplateOps.save_template_store"),
+            patch("aetherdialect._templates_ops.TemplateOps.summarize_failure_for_memory") as sm,
+            patch("aetherdialect._templates_ops.TemplateOps.record_question_feedback"),
+            patch("aetherdialect._templates_ops.TemplateOps.templates_to_store", return_value=ctx_rej.store),
+            patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store"),
         ):
             sm.return_value = SimpleNamespace(buckets=[SimpleNamespace(value=RejectionBucket.OTHER.value)])
             out = complete_user_feedback_reject(
@@ -2642,7 +2653,7 @@ class TestUserRefinementBudget:
 class TestOtherTemplateOwnsQuestionString:
     """``other_template_owns_question_string`` dedupe gate."""
 
-    @patch("aetherdialect._pipeline.exact_question_match", return_value=True)
+    @patch("aetherdialect._utils_intent.exact_question_match", return_value=True)
     def test_true_when_other_template_matches_question(self, mock_eq):
         a = _make_pipeline_template(tid="A")
         b = _make_pipeline_template(tid="B")
@@ -2713,7 +2724,7 @@ class TestStructuralKeyRemap:
     """``_structural_key_remap_from_assignment_order`` and value-history remap."""
 
     @patch(
-        "aetherdialect._pipeline.structural_s_key_assignment_order",
+        "aetherdialect._pipeline_generate.structural_s_key_assignment_order",
         side_effect=[["s1", "s2"], ["s9", "s8"]],
     )
     def test_remap_zip_when_same_length(self, mock_ord):
@@ -2737,7 +2748,7 @@ class TestStructuralKeyRemap:
         assert m == {"s1": "s9", "s2": "s8"}
 
     @patch(
-        "aetherdialect._pipeline.structural_s_key_assignment_order",
+        "aetherdialect._pipeline_generate.structural_s_key_assignment_order",
         side_effect=[["s1"], ["s1", "s2"]],
     )
     def test_remap_empty_when_length_mismatch(self, mock_ord):
@@ -2773,8 +2784,8 @@ class TestStructuralKeyRemap:
 class TestCompleteDirectSqlReuseUserChoice:
     """``complete_direct_sql_reuse_user_choice``."""
 
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
-    @patch("aetherdialect._templates.TemplateOps.reject_out_per_question", return_value=(False, False))
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
+    @patch("aetherdialect._templates_ops.TemplateOps.reject_out_per_question", return_value=(False, False))
     def test_decline_bumps_reject(self, mock_reject_out, mock_save):
         tmpl = _make_pipeline_template(trust_level=2)
         intent = RuntimeIntent(
@@ -2809,12 +2820,12 @@ class TestCompleteDirectSqlReuseUserChoice:
         assert tmpl.stats.reject == 1
         mock_reject_out.assert_called_once_with({}, tmpl, "q")
 
-    @patch("aetherdialect._pipeline.LLMProvider.chat", return_value='{"aliases":{}}')
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
-    @patch("aetherdialect._templates.TemplateOps.templates_to_store", side_effect=lambda s, t: s)
-    @patch("aetherdialect._templates.TemplateOps.delete_rejected_templates_matching_question")
-    @patch("aetherdialect._pipeline.save_result_csv_for_store")
-    @patch("aetherdialect._templates.TemplateOps.promote_trust")
+    @patch("aetherdialect._llm_provider.LLMProvider.chat", return_value='{"aliases":{}}')
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
+    @patch("aetherdialect._templates_ops.TemplateOps.templates_to_store", side_effect=lambda s, t: s)
+    @patch("aetherdialect._templates_ops.TemplateOps.delete_rejected_templates_matching_question")
+    @patch("aetherdialect._pipeline_execute.save_result_csv_for_store")
+    @patch("aetherdialect._templates_ops.TemplateOps.promote_trust")
     def test_accept_saves_csv_and_promotes(self, mock_promote, mock_csv, mock_del, mock_tts, mock_save, _mock_llm):
         tmpl = _make_pipeline_template(trust_level=2)
         intent = RuntimeIntent(
@@ -2852,17 +2863,15 @@ class TestCompleteDirectSqlReuseUserChoice:
 class TestHandleDirectSqlReuseMocked:
     """``handle_direct_sql_reuse`` without DB or extraction LLM."""
 
-    @patch("aetherdialect._pipeline.LLMProvider.chat", return_value='{"aliases":{}}')
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
-    @patch("aetherdialect._templates.TemplateOps.templates_to_store", side_effect=lambda s, t: s)
-    @patch("aetherdialect._templates.TemplateOps.delete_rejected_templates_matching_question")
-    @patch("aetherdialect._pipeline.save_result_csv_for_store")
-    @patch("aetherdialect._pipeline.print_query_result")
-    @patch("aetherdialect._templates.TemplateOps.promote_trust")
-    @patch("aetherdialect._pipeline.validate_sql", return_value=(True, None, None, []))
+    @patch("aetherdialect._llm_provider.LLMProvider.chat", return_value='{"aliases":{}}')
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
+    @patch("aetherdialect._templates_ops.TemplateOps.templates_to_store", side_effect=lambda s, t: s)
+    @patch("aetherdialect._templates_ops.TemplateOps.delete_rejected_templates_matching_question")
+    @patch("aetherdialect._pipeline_execute.save_result_csv_for_store")
+    @patch("aetherdialect._pipeline_execute.print_query_result")
+    @patch("aetherdialect._templates_ops.TemplateOps.promote_trust")
     def test_exact_question_auto_accepts_high_trust(
         self,
-        mock_val,
         mock_promote,
         mock_print,
         mock_csv,
@@ -2903,6 +2912,8 @@ class TestHandleDirectSqlReuseMocked:
         dialect.finalize_render.return_value = "EXEC"
         dialect.explain_validation_sql = lambda sql, _pv: sql
         dialect.execute.return_value = [("row",)]
+        dialect.ast_validate_full.return_value = []
+        dialect.can_explain.return_value = False
         store: dict = {"templates": {"T1": tmpl}}
         result = handle_direct_sql_reuse(
             "norm_q",
@@ -2919,22 +2930,20 @@ class TestHandleDirectSqlReuseMocked:
         mock_csv.assert_called_once()
         mock_promote.assert_called_once_with(tmpl, "norm_q")
 
-    @patch("aetherdialect._pipeline.LLMProvider.chat", return_value='{"aliases":{}}')
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
-    @patch("aetherdialect._templates.TemplateOps.templates_to_store", side_effect=lambda s, t: s)
-    @patch("aetherdialect._templates.TemplateOps.delete_rejected_templates_matching_question")
-    @patch("aetherdialect._pipeline.save_result_csv_for_store")
-    @patch("aetherdialect._pipeline.print_query_result")
-    @patch("aetherdialect._templates.TemplateOps.promote_trust")
-    @patch("aetherdialect._pipeline.validate_sql", return_value=(True, None, None, []))
+    @patch("aetherdialect._llm_provider.LLMProvider.chat", return_value='{"aliases":{}}')
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
+    @patch("aetherdialect._templates_ops.TemplateOps.templates_to_store", side_effect=lambda s, t: s)
+    @patch("aetherdialect._templates_ops.TemplateOps.delete_rejected_templates_matching_question")
+    @patch("aetherdialect._pipeline_execute.save_result_csv_for_store")
+    @patch("aetherdialect._pipeline_execute.print_query_result")
+    @patch("aetherdialect._templates_ops.TemplateOps.promote_trust")
     @patch(
-        "aetherdialect._pipeline.extract_fuzzy_reuse_params",
+        "aetherdialect._pipeline_generate.extract_fuzzy_reuse_params",
         return_value={"p1": 7, "s1": 10},
     )
     def test_fuzzy_reuse_literal_structural_path_2_1(
         self,
         mock_extract,
-        mock_val,
         mock_promote,
         mock_print,
         mock_csv,
@@ -2977,6 +2986,8 @@ class TestHandleDirectSqlReuseMocked:
         dialect.finalize_render.return_value = "EXEC"
         dialect.explain_validation_sql = lambda sql, _pv: sql
         dialect.execute.return_value = [("row",)]
+        dialect.ast_validate_full.return_value = []
+        dialect.can_explain.return_value = False
         store: dict = {"templates": {"T1": tmpl}}
         result = handle_direct_sql_reuse(
             "new_fuzzy_q",
@@ -2993,22 +3004,20 @@ class TestHandleDirectSqlReuseMocked:
         mock_extract.assert_called_once()
         assert mock_extract.call_args.kwargs.get("literal_structural_only") is True
 
-    @patch("aetherdialect._pipeline.LLMProvider.chat", return_value='{"aliases":{}}')
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
-    @patch("aetherdialect._templates.TemplateOps.templates_to_store", side_effect=lambda s, t: s)
-    @patch("aetherdialect._templates.TemplateOps.delete_rejected_templates_matching_question")
-    @patch("aetherdialect._pipeline.save_result_csv_for_store")
-    @patch("aetherdialect._pipeline.print_query_result")
-    @patch("aetherdialect._templates.TemplateOps.promote_trust")
-    @patch("aetherdialect._pipeline.validate_sql", return_value=(True, None, None, []))
+    @patch("aetherdialect._llm_provider.LLMProvider.chat", return_value='{"aliases":{}}')
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
+    @patch("aetherdialect._templates_ops.TemplateOps.templates_to_store", side_effect=lambda s, t: s)
+    @patch("aetherdialect._templates_ops.TemplateOps.delete_rejected_templates_matching_question")
+    @patch("aetherdialect._pipeline_execute.save_result_csv_for_store")
+    @patch("aetherdialect._pipeline_execute.print_query_result")
+    @patch("aetherdialect._templates_ops.TemplateOps.promote_trust")
     @patch(
-        "aetherdialect._pipeline.extract_fuzzy_reuse_params",
+        "aetherdialect._pipeline_generate.extract_fuzzy_reuse_params",
         return_value={"p1": 7, "s1": 99},
     )
     def test_fuzzy_reuse_full_params_path_2_2(
         self,
         mock_extract,
-        mock_val,
         mock_promote,
         mock_print,
         mock_csv,
@@ -3051,6 +3060,8 @@ class TestHandleDirectSqlReuseMocked:
         dialect.finalize_render.return_value = "EXEC"
         dialect.explain_validation_sql = lambda sql, _pv: sql
         dialect.execute.return_value = [("row",)]
+        dialect.ast_validate_full.return_value = []
+        dialect.can_explain.return_value = False
         store: dict = {"templates": {"T1": tmpl}}
         result = handle_direct_sql_reuse(
             "new_fuzzy_q",
@@ -3071,10 +3082,10 @@ class TestHandleDirectSqlReuseMocked:
 class TestLoadPipelineResourcesMore:
     """Extra ``load_pipeline_resources`` validation paths."""
 
-    @patch("aetherdialect._config.EngineConfig.llm_credentials_configured", return_value=True)
-    @patch("aetherdialect._pipeline.EngineConfig")
-    @patch("aetherdialect._pipeline.DialectRegistry.get_dialect", return_value=SimpleNamespace(engine="e"))
-    def test_unsupported_engine_type(self, mock_gd, mock_ec, _lc):
+    @patch("aetherdialect._pipeline_generate.DialectRegistry.get_dialect", return_value=SimpleNamespace(engine="e"))
+    @patch("aetherdialect._pipeline_generate.EngineConfig")
+    def test_unsupported_engine_type(self, mock_ec, mock_gd):
+        mock_ec.llm_credentials_configured.return_value = True
         mock_ec.TYPE = "bogus_engine"
         mock_ec.RUNTIME = SimpleNamespace(db_url=lambda: "mysql://x")
         with _pt.raises(ValueError, match="Unsupported engine"):
@@ -3086,10 +3097,10 @@ class TestLoadPipelineResourcesMore:
                 schema_terms=set(),
             )
 
-    @patch("aetherdialect._config.EngineConfig.llm_credentials_configured", return_value=True)
-    @patch("aetherdialect._pipeline.EngineConfig")
-    @patch("aetherdialect._pipeline.DialectRegistry.get_dialect", return_value=SimpleNamespace(engine="e"))
-    def test_missing_store(self, mock_gd, mock_ec, _lc):
+    @patch("aetherdialect._pipeline_generate.DialectRegistry.get_dialect", return_value=SimpleNamespace(engine="e"))
+    @patch("aetherdialect._pipeline_generate.EngineConfig")
+    def test_missing_store(self, mock_ec, mock_gd):
+        mock_ec.llm_credentials_configured.return_value = True
         mock_ec.TYPE = "postgresql"
         mock_ec.RUNTIME = SimpleNamespace(db_url=lambda: "postgresql://x")
         with _pt.raises(RuntimeError, match="Store must be provided"):
@@ -3105,7 +3116,7 @@ class TestLoadPipelineResourcesMore:
 class TestMatchQuestionLevelTemplateReuseListTemplates:
     """``match_question_level_template_reuse`` accepts dict or list of templates."""
 
-    @patch("aetherdialect._pipeline.find_trusted_template_match")
+    @patch("aetherdialect._pipeline_generate.find_trusted_template_match")
     def test_passes_list_to_matcher_when_dict(self, mock_find):
         mock_find.return_value = None
         tmpl = _make_pipeline_template()
@@ -3114,7 +3125,7 @@ class TestMatchQuestionLevelTemplateReuseListTemplates:
         assert isinstance(passed, list)
         assert passed == [tmpl]
 
-    @patch("aetherdialect._pipeline.find_trusted_template_match")
+    @patch("aetherdialect._pipeline_generate.find_trusted_template_match")
     def test_passes_list_through_when_already_list(self, mock_find):
         mock_find.return_value = None
         tmpl = _make_pipeline_template()
@@ -3125,8 +3136,8 @@ class TestMatchQuestionLevelTemplateReuseListTemplates:
 class TestConfirmIntentSuspendAndUnionSkip:
     """More ``confirm_intent_with_user`` branches."""
 
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
-    @patch("aetherdialect._pipeline.interactive_yes_no", return_value="y")
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
+    @patch("aetherdialect._pipeline_generate.interactive_yes_no", return_value="y")
     def test_warnings_deferred_suspend(self, mock_yes, mock_save):
         tail = MagicMock(spec=InteractiveTailSnapshot)
         port = MagicMock()
@@ -3142,8 +3153,8 @@ class TestConfirmIntentSuspendAndUnionSkip:
             )
         assert ei.value.state_id == PIPELINE_SUSPEND_ID_INTENT_CONFIRM
 
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
-    @patch("aetherdialect._pipeline.interactive_yes_no", return_value="y")
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
+    @patch("aetherdialect._pipeline_generate.interactive_yes_no", return_value="y")
     def test_prior_wrong_join_forces_confirm_despite_union_col_similarity(self, mock_yes, mock_save):
         intent = TestConfirmIntentWithUser._make_intent()
         store = TestConfirmIntentWithUser._make_store()
@@ -3179,7 +3190,7 @@ class TestConfirmIntentSuspendAndUnionSkip:
 class TestHandleUserFeedbackMore:
     """Extra ``handle_user_feedback`` edge cases."""
 
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
     def test_raises_when_reuse_path_requires_template(self, mock_save, schema_graph):
         intent = RuntimeIntent(
             tables=["orders"],
@@ -3204,20 +3215,20 @@ class TestHandleUserFeedbackMore:
                 None,
             )
 
-    @patch("aetherdialect._templates.TemplateOps.save_template_store")
-    @patch("aetherdialect._templates.TemplateOps.templates_to_store", side_effect=lambda s, t: s)
-    @patch("aetherdialect._templates.TemplateOps.delete_rejected_templates_matching_question")
+    @patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store")
+    @patch("aetherdialect._templates_ops.TemplateOps.templates_to_store", side_effect=lambda s, t: s)
+    @patch("aetherdialect._templates_ops.TemplateOps.delete_rejected_templates_matching_question")
     @patch(
-        "aetherdialect._templates.TemplateOps.promote_rejected_to_template",
+        "aetherdialect._templates_ops.TemplateOps.promote_rejected_to_template",
         return_value=_make_pipeline_template(tid="NEW"),
     )
     @patch(
-        "aetherdialect._pipeline.sql_shape",
+        "aetherdialect._pipeline_generate.sql_shape",
         return_value=SQLShape(num_joins=0, has_group_by=False, has_agg=False),
     )
-    @patch("aetherdialect._pipeline.intent_key", return_value="ik")
-    @patch("aetherdialect._templates.colmap_signature", return_value="")
-    @patch("aetherdialect._pipeline.Dialect.compute_sql_fp", return_value="fp")
+    @patch("aetherdialect._utils_intent.intent_key", return_value="ik")
+    @patch("aetherdialect._utils.colmap_signature", return_value="")
+    @patch("aetherdialect._dialect.Dialect.compute_sql_fp", return_value="fp")
     def test_accept_promotes_matched_rejected_template(
         self,
         _fp,
@@ -3364,7 +3375,7 @@ def bare_session() -> PipelineSession:
 
 
 def test_ask_completes_when_pipeline_returns(bare_session: PipelineSession) -> None:
-    with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once") as mock_run:
+    with patch("aetherdialect._main_init.MainInitOps.interactive_run_once") as mock_run:
         mock_run.return_value = None
         step = bare_session.ask("show rows")
     mock_run.assert_called_once()
@@ -3375,7 +3386,7 @@ def test_ask_completes_when_pipeline_returns(bare_session: PipelineSession) -> N
 
 def test_reset_clears_pending_suspend(bare_session: PipelineSession) -> None:
     suspended = PipelineSuspended(PIPELINE_SUSPEND_ID_INTENT_CONFIRM, "p", None)
-    with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once", side_effect=suspended):
+    with patch("aetherdialect._main_init.MainInitOps.interactive_run_once", side_effect=suspended):
         bare_session.ask("q")
     assert bare_session.awaiting_prompt() is True
     bare_session.reset()
@@ -3388,7 +3399,7 @@ def test_ask_captures_suspend(bare_session: PipelineSession) -> None:
         "ignored",
         None,
     )
-    with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once", side_effect=suspended):
+    with patch("aetherdialect._main_init.MainInitOps.interactive_run_once", side_effect=suspended):
         step = bare_session.ask("q")
     assert step.done is False
     assert step.kind == SESSION_KIND_AWAITING_INTENT_CONFIRM
@@ -3398,9 +3409,9 @@ def test_ask_captures_suspend(bare_session: PipelineSession) -> None:
 
 def test_step_resumes_and_completes(bare_session: PipelineSession) -> None:
     suspended = PipelineSuspended(PIPELINE_SUSPEND_ID_INTENT_CONFIRM, "prompt", None)
-    with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once", side_effect=suspended):
+    with patch("aetherdialect._main_init.MainInitOps.interactive_run_once", side_effect=suspended):
         bare_session.ask("q")
-    with patch("aetherdialect._main_execution.MainExecutionOps.dispatch_pipeline_resume") as mock_dispatch:
+    with patch("aetherdialect._main_interactive.MainInteractiveOps.dispatch_pipeline_resume") as mock_dispatch:
         step = bare_session.step("y")
     mock_dispatch.assert_called_once()
     assert step.done is True
@@ -3411,24 +3422,24 @@ def test_step_resumes_and_completes(bare_session: PipelineSession) -> None:
 def test_step_second_suspend(bare_session: PipelineSession) -> None:
     first = PipelineSuspended(PIPELINE_SUSPEND_ID_INTENT_CONFIRM, "first", None)
     second = PipelineSuspended(PIPELINE_SUSPEND_ID_SQL, "second", None)
-    with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once", side_effect=first):
+    with patch("aetherdialect._main_init.MainInitOps.interactive_run_once", side_effect=first):
         bare_session.ask("q")
-    with patch("aetherdialect._main_execution.MainExecutionOps.dispatch_pipeline_resume", side_effect=second):
+    with patch("aetherdialect._main_interactive.MainInteractiveOps.dispatch_pipeline_resume", side_effect=second):
         step = bare_session.step("y")
     assert step.done is False
     assert step.kind == SESSION_KIND_AWAITING_SQL_CONFIRM
     assert step.prompt == "Is this correct? (y/n): "
-    assert step.message == "second"
+    assert step.answer is None
     assert bare_session.awaiting_prompt() is True
 
 
 def test_step_invalid_token(bare_session: PipelineSession) -> None:
     suspended = PipelineSuspended(PIPELINE_SUSPEND_ID_INTENT_CONFIRM, "p", None)
-    with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once", side_effect=suspended):
+    with patch("aetherdialect._main_init.MainInitOps.interactive_run_once", side_effect=suspended):
         bare_session.ask("q")
     step = bare_session.step("maybe")
     assert step.done is False
-    assert step.message == "Invalid choice — please answer y or n."
+    assert step.answer is None
     assert step.kind == SESSION_KIND_AWAITING_INTENT_CONFIRM
     assert step.prompt == "Is this correct? (y/n): "
     assert step.reply_shape == "yes_no"
@@ -3444,11 +3455,11 @@ def test_step_invalid_token_no_suspend(bare_session: PipelineSession) -> None:
 
 def test_step_invalid_then_valid_resumes(bare_session: PipelineSession) -> None:
     suspended = PipelineSuspended(PIPELINE_SUSPEND_ID_INTENT_CONFIRM, "p", None)
-    with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once", side_effect=suspended):
+    with patch("aetherdialect._main_init.MainInitOps.interactive_run_once", side_effect=suspended):
         bare_session.ask("q")
     first = bare_session.step("maybe")
-    assert first.done is False and first.message == "Invalid choice — please answer y or n."
-    with patch("aetherdialect._main_execution.MainExecutionOps.dispatch_pipeline_resume") as mock_dispatch:
+    assert first.done is False and first.answer is None
+    with patch("aetherdialect._main_interactive.MainInteractiveOps.dispatch_pipeline_resume") as mock_dispatch:
         second = bare_session.step("y")
     mock_dispatch.assert_called_once()
     assert second.done is True
@@ -3458,7 +3469,7 @@ def test_step_invalid_then_valid_resumes(bare_session: PipelineSession) -> None:
 
 def test_ask_while_busy_raises(bare_session: PipelineSession) -> None:
     suspended = PipelineSuspended(PIPELINE_SUSPEND_ID_INTENT_CONFIRM, "p", None)
-    with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once", side_effect=suspended):
+    with patch("aetherdialect._main_init.MainInitOps.interactive_run_once", side_effect=suspended):
         bare_session.ask("q")
     with _pt.raises(SessionActiveError):
         bare_session.ask("other")
@@ -3503,11 +3514,11 @@ def test_reset_clears_suspend_and_queue_partial_state(
 
 def test_reset_clears_suspend_before_second_ask(bare_session: PipelineSession) -> None:
     suspended = PipelineSuspended(PIPELINE_SUSPEND_ID_INTENT_CONFIRM, "p", None)
-    with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once", side_effect=suspended):
+    with patch("aetherdialect._main_init.MainInitOps.interactive_run_once", side_effect=suspended):
         bare_session.ask("one")
     assert bare_session.awaiting_prompt() is True
     bare_session.reset()
-    with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once", return_value=None):
+    with patch("aetherdialect._main_init.MainInitOps.interactive_run_once", return_value=None):
         bare_session.ask("two")
     assert bare_session.awaiting_prompt() is False
 
@@ -3516,11 +3527,11 @@ def test_intent_confirm_suspend_step_resume_completes(
     bare_session: PipelineSession,
 ) -> None:
     suspended = PipelineSuspended(PIPELINE_SUSPEND_ID_INTENT_CONFIRM, "continue?", None)
-    with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once", side_effect=suspended):
+    with patch("aetherdialect._main_init.MainInitOps.interactive_run_once", side_effect=suspended):
         step = bare_session.ask("q")
     assert step.done is False
     assert step.kind == SESSION_KIND_AWAITING_INTENT_CONFIRM
-    with patch("aetherdialect._main_execution.MainExecutionOps.dispatch_pipeline_resume"):
+    with patch("aetherdialect._main_interactive.MainInteractiveOps.dispatch_pipeline_resume"):
         step2 = bare_session.step("y")
     assert step2.done is True
     assert step2.kind == SESSION_KIND_RESULT
@@ -3530,10 +3541,10 @@ def test_direct_reuse_suspend_step_resume_completes(
     bare_session: PipelineSession,
 ) -> None:
     suspended = PipelineSuspended(PIPELINE_SUSPEND_ID_DIRECT_REUSE, "correct?", None)
-    with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once", side_effect=suspended):
+    with patch("aetherdialect._main_init.MainInitOps.interactive_run_once", side_effect=suspended):
         step = bare_session.ask("q")
     assert step.kind == SESSION_KIND_AWAITING_REUSE_CONFIRM
-    with patch("aetherdialect._main_execution.MainExecutionOps.dispatch_pipeline_resume"):
+    with patch("aetherdialect._main_interactive.MainInteractiveOps.dispatch_pipeline_resume"):
         step2 = bare_session.step("y")
     assert step2.done is True
 
@@ -3541,11 +3552,12 @@ def test_direct_reuse_suspend_step_resume_completes(
 def test_step_after_completed_turn_requires_new_ask(
     bare_session: PipelineSession,
 ) -> None:
-    with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once", return_value=None):
+    with patch("aetherdialect._main_init.MainInitOps.interactive_run_once", return_value=None):
         bare_session.ask("q")
     step = bare_session.step("y")
     assert step.kind == SESSION_KIND_IDLE
-    assert "ask()" in (step.error or "")
+    assert step.error is not None
+    assert "ask()" in str(step.error.code.value) or step.error.code.value == "internal_error"
 
 
 class _StubDialect(Dialect):
@@ -3585,7 +3597,7 @@ def test_generate_path5_sql_validation_failure_carries_error(
     dialect = _StubDialect()
     with (
         patch(
-            "aetherdialect._pipeline._run_sql_validation_cascade",
+            "aetherdialect._pipeline_generate.run_sql_validation_cascade",
             return_value=(
                 False,
                 "forced_fail",
@@ -3593,7 +3605,7 @@ def test_generate_path5_sql_validation_failure_carries_error(
                 [],
             ),
         ),
-        patch("aetherdialect._templates.TemplateOps.save_template_store") as mock_save,
+        patch("aetherdialect._pipeline_generate.TemplateOps.save_template_store") as mock_save,
     ):
         out = generate_and_validate_sql(
             "list customer ids",
@@ -3637,7 +3649,7 @@ def test_bigquery_pre_execute_rewrite_single_at_prefix() -> None:
 
 
 def test_run_sql_validation_cascade_uses_canonical_sql(monkeypatch) -> None:
-    from aetherdialect._pipeline import _run_sql_validation_cascade
+    from aetherdialect._pipeline_generate import run_sql_validation_cascade
 
     captured: list[str] = []
 
@@ -3645,7 +3657,7 @@ def test_run_sql_validation_cascade_uses_canonical_sql(monkeypatch) -> None:
         captured.append(sql)
         return True, "", None, []
 
-    monkeypatch.setattr("aetherdialect._pipeline.validate_sql", _fake_validate)
+    monkeypatch.setattr("aetherdialect._pipeline_generate.validate_sql", _fake_validate)
     intent = RuntimeIntent(
         tables=["film"],
         grain="row_level",
@@ -3657,7 +3669,7 @@ def test_run_sql_validation_cascade_uses_canonical_sql(monkeypatch) -> None:
         param_values={"p1": "PG"},
     )
     dialect = SimpleNamespace(explain_validation_sql=lambda sql, _pv: sql)
-    ok, _, _, _ = _run_sql_validation_cascade(
+    ok, _, _, _ = run_sql_validation_cascade(
         "SELECT title FROM film WHERE rating = @p1",
         intent,
         dialect,
@@ -3669,7 +3681,7 @@ def test_run_sql_validation_cascade_uses_canonical_sql(monkeypatch) -> None:
 
 def test_generate_and_validate_sql_aborts_on_schema_invalid() -> None:
     from aetherdialect._contracts_base import FailureCategory
-    from aetherdialect._pipeline import generate_and_validate_sql
+    from aetherdialect._pipeline_generate import generate_and_validate_sql
 
     intent = RuntimeIntent(
         tables=["film"],
@@ -3702,7 +3714,7 @@ def test_finalize_planner_schema_invalid_trusts_interpret() -> None:
         SelectCol,
     )
     from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-    from aetherdialect._intent_process import finalize_planner_schema_invalid_flag
+    from aetherdialect._intent_loop import finalize_interpret_schema_invalid_flag
 
     schema = SchemaGraph(
         tables={
@@ -3730,12 +3742,12 @@ def test_finalize_planner_schema_invalid_trusts_interpret() -> None:
         where=None,
         schema_invalid=False,
     )
-    finalized = finalize_planner_schema_invalid_flag(intent, plan, schema)
+    finalized = finalize_interpret_schema_invalid_flag(intent, plan, schema)
     assert finalized.schema_invalid is True
 
 
-def test_clear_planner_schema_invalid_after_user_accept() -> None:
-    from aetherdialect._pipeline import clear_planner_schema_invalid_after_user_accept
+def test_clear_interpret_schema_invalid_after_user_accept() -> None:
+    from aetherdialect._pipeline_generate import clear_interpret_schema_invalid_after_user_accept
 
     intent = RuntimeIntent(
         tables=["film"],
@@ -3746,7 +3758,7 @@ def test_clear_planner_schema_invalid_after_user_accept() -> None:
         where=None,
         schema_invalid=True,
     )
-    clear_planner_schema_invalid_after_user_accept(intent)
+    clear_interpret_schema_invalid_after_user_accept(intent)
     assert intent.schema_invalid is False
 
 

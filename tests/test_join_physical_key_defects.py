@@ -11,17 +11,24 @@ import pytest
 from aetherdialect._config import EngineConfig
 from aetherdialect._contracts_base import (
     EngineContext,
-    FederationCoordinatorConfig,
-    FederationCrossSourceJoin,
     FederationDeclarationError,
     SchemaInvariantError,
 )
-from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
+from aetherdialect._contracts_core import JoinColumnCountMismatchError
+from aetherdialect._contracts_schema import (
+    ColumnMetadata,
+    FederationCoordinatorConfig,
+    FederationCrossSourceJoin,
+    FederationManifest,
+    FKEdge,
+    SchemaGraph,
+    TableMetadata,
+)
 from aetherdialect._dialect import Dialect
-from aetherdialect._federation import FederationManifest, validate_cross_source_keys_on_graph
+from aetherdialect._federation_compose import validate_cross_source_keys_on_graph
+from aetherdialect._schema_finalize import build_schema_graph_with_diff
 from aetherdialect._schema_graph import refuse_incompatible_catalog_foreign_keys
-from aetherdialect._schema_overrides import build_schema_graph_with_diff
-from aetherdialect._sql_gen import JoinColumnCountMismatchError, _join_edges_from_signature
+from aetherdialect._sql_gen import _join_edges_from_signature
 
 pytestmark = pytest.mark.usefixtures("stub_schema_llm_classifier")
 
@@ -89,7 +96,7 @@ def test_catalog_fk_type_refusal_runs_before_join_path_computation(
 
     monkeypatch.setattr(EngineConfig, "SCHEMA_JSON_PATH", str(tmp_path / "schema_graph.json.gz"))
     monkeypatch.setattr(
-        "aetherdialect._schema_overrides.recompute_join_paths_multi",
+        "aetherdialect._schema_graph.recompute_join_paths_multi",
         _track_recompute,
     )
     dialect = _FullBuildStubDialect(schema)

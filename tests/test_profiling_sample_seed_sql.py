@@ -6,12 +6,12 @@ import pytest
 
 from aetherdialect._constants import DEFAULT_RANDOM_SEED
 from aetherdialect._dialect import Dialect, DialectRegistry
-from aetherdialect._schema_catalog import _build_profile_stats_sql
+from aetherdialect._schema_profile import _build_profile_stats_sql
 
 _SEEDED_RAND_ENGINES = frozenset({"mysql", "mariadb"})
 _SEEDED_TABLESAMPLE_ENGINES = frozenset({"postgresql", "snowflake", "duckdb", "csv", "databricks"})
 _HASH_PREDICATE_ENGINES = frozenset({"redshift", "sqlite"})
-_ORDERED_LIMIT_ENGINES = frozenset({"bigquery", "sqlserver"})
+_ORDERED_LIMIT_ENGINES = frozenset({"bigquery", "sqlserver", "oracle"})
 
 
 def _uninit(cls: type) -> object:

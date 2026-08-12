@@ -7,16 +7,16 @@ from unittest.mock import MagicMock
 import pandas as pd
 import pytest
 
+from aetherdialect._contracts_base import FederationDeclarationError
 from aetherdialect._contracts_core import RuntimeIntent, SourceStep
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import (
-    FederationDeclarationError,
-    compose_composite_graph,
-    parse_federation_manifest,
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_manifest import parse_federation_manifest
+from aetherdialect._federation_plan import (
     plan_federated_intent,
     semijoin_key_is_allowed,
 )
-from aetherdialect._pipeline import _execute_federation_source_step
+from aetherdialect._pipeline_execute import _execute_federation_source_step
 from aetherdialect._schema_graph import recompute_join_paths_multi
 
 
@@ -113,17 +113,17 @@ def test_semijoin_skips_restricted_driving_key(monkeypatch: pytest.MonkeyPatch) 
         calls.append("execute")
         return [(1,)]
 
-    monkeypatch.setattr("aetherdialect._pipeline.execute_guarded_sql", _fake_execute_guarded_sql)
+    monkeypatch.setattr("aetherdialect._pipeline_execute.execute_guarded_sql", _fake_execute_guarded_sql)
     monkeypatch.setattr(
-        "aetherdialect._pipeline.generate_and_validate_sql",
+        "aetherdialect._pipeline_execute.generate_and_validate_sql",
         lambda *a, **k: type("Out", (), {"success": True, "sql": "SELECT id FROM right_t"})(),
     )
     monkeypatch.setattr(
-        "aetherdialect._pipeline.build_result_dataframe",
+        "aetherdialect._pipeline_execute.build_result_dataframe",
         lambda *a, **k: pd.DataFrame({"id": [1]}),
     )
     monkeypatch.setattr(
-        "aetherdialect._validation_execute.validate_sql",
+        "aetherdialect._federation_execute.validate_sql",
         lambda *a, **k: (True, None, None, None),
     )
     mock_dialect = MagicMock()

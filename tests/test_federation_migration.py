@@ -5,8 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import (
-    compose_composite_graph,
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_manifest import (
     federation_member_hash_tuple,
     manifest_hash,
     parse_federation_manifest,
@@ -82,7 +82,10 @@ def test_member_hash_tuple_sorted_by_source_id() -> None:
 
 
 def test_topology_add_detected() -> None:
-    from aetherdialect._federation import detect_federation_topology_change, prune_cross_source_joins
+    from aetherdialect._federation_execute import (
+        detect_federation_topology_change,
+        prune_cross_source_joins,
+    )
 
     m = _full_manifest(["a", "b", "c"])
     assert detect_federation_topology_change(["a", "b"], m) == "add"
@@ -91,7 +94,10 @@ def test_topology_add_detected() -> None:
 
 
 def test_topology_remove_detected() -> None:
-    from aetherdialect._federation import detect_federation_topology_change, prune_cross_source_joins
+    from aetherdialect._federation_execute import (
+        detect_federation_topology_change,
+        prune_cross_source_joins,
+    )
 
     m = _full_manifest(["a", "b"])
     assert detect_federation_topology_change(["a", "b", "c"], m) == "remove"
@@ -100,13 +106,13 @@ def test_topology_remove_detected() -> None:
 
 
 def test_federation_migration_map_renames_join_keys() -> None:
-    from aetherdialect._federation import (
+    from aetherdialect._federation_execute import (
         apply_federation_migration_map,
         parse_federation_migration_map,
     )
 
     manifest = _full_manifest(["a", "b"])
-    mappings = parse_federation_mappings({"version": "0.2.1", "logical_columns": [], "logical_tables": []})
+    mappings = parse_federation_mappings({"version": "0.2.3", "logical_columns": [], "logical_tables": []})
     migration = parse_federation_migration_map(
         {
             "version": "1",
@@ -124,13 +130,13 @@ def test_federation_migration_map_renames_join_keys() -> None:
 
 
 def test_federation_migration_map_drops_reversed_inner_join() -> None:
-    from aetherdialect._federation import (
+    from aetherdialect._federation_execute import (
         apply_federation_migration_map,
         parse_federation_migration_map,
     )
 
     manifest = _full_manifest(["a", "b"])
-    mappings = parse_federation_mappings({"version": "0.2.1", "logical_columns": [], "logical_tables": []})
+    mappings = parse_federation_mappings({"version": "0.2.3", "logical_columns": [], "logical_tables": []})
     migration = parse_federation_migration_map(
         {
             "version": "1",
@@ -143,10 +149,10 @@ def test_federation_migration_map_drops_reversed_inner_join() -> None:
 
 
 def test_per_source_column_rename_propagates() -> None:
-    from aetherdialect._federation import apply_per_source_column_renames
+    from aetherdialect._federation_execute import apply_per_source_column_renames
 
     manifest = _full_manifest(["a", "b"])
-    mappings = parse_federation_mappings({"version": "0.2.1", "logical_columns": [], "logical_tables": []})
+    mappings = parse_federation_mappings({"version": "0.2.3", "logical_columns": [], "logical_tables": []})
     updated_manifest, _ = apply_per_source_column_renames(
         manifest,
         mappings,
@@ -157,7 +163,8 @@ def test_per_source_column_rename_propagates() -> None:
 
 
 def test_member_allow_tables_includes_union_partition_members() -> None:
-    from aetherdialect._federation import member_allow_tables_for_source, parse_federation_mappings
+    from aetherdialect._federation_compose import member_allow_tables_for_source
+    from aetherdialect._federation_manifest import parse_federation_mappings
 
     manifest = parse_federation_manifest(
         {
@@ -174,7 +181,7 @@ def test_member_allow_tables_includes_union_partition_members() -> None:
     )
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_columns": [],
             "logical_tables": [
                 {
@@ -208,11 +215,11 @@ def test_federation_migration_map_apply_is_owner_gated() -> None:
 
 def test_federation_migration_map_archive_uses_storage_dir(tmp_path: Path) -> None:
     """Applied federation migration maps are archived under federation storage, not cwd."""
-    from aetherdialect._federation import archive_federation_migration_map_file
+    from aetherdialect._federation_execute import archive_federation_migration_map_file
 
     archive_dir = tmp_path / "fed_storage"
     map_path = tmp_path / "federation_migration_map.json"
-    map_path.write_text('{"version": "0.2.1"}', encoding="utf-8")
+    map_path.write_text('{"version": "0.2.3"}', encoding="utf-8")
     archive_federation_migration_map_file(map_path, archive_dir=archive_dir)
     assert not map_path.is_file()
     assert (archive_dir / "federation_migration_map.applied.json").is_file()

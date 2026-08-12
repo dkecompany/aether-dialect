@@ -8,7 +8,7 @@ from aetherdialect._contracts_base import MulGroup, NormalizedExpr
 from aetherdialect._contracts_core import ResidualSpec, RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
 from aetherdialect._dialect import DialectRegistry
-from aetherdialect._federation import aggregate_identity_row_for_residual
+from aetherdialect._federation_plan import aggregate_identity_row_for_residual
 from aetherdialect._schema_graph import recompute_join_paths_multi
 from aetherdialect._sql_gen import build_deterministic_sql
 

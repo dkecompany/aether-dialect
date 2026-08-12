@@ -6,11 +6,11 @@ import pytest
 
 from aetherdialect._config import PolicyConfig
 from aetherdialect._constants import SELF_JOIN_CTE_NAME_PREFIX
-from aetherdialect._contracts_base import SchemaInvariantError
-from aetherdialect._contracts_core import NormalizedExpr, RuntimeCteStep, RuntimeIntent, SelectCol
+from aetherdialect._contracts_base import NormalizedExpr, SchemaInvariantError
+from aetherdialect._contracts_core import RuntimeCteStep, RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._intent_resolve import encode_inline_self_join_as_cte
-from aetherdialect._validation_schema import max_cte_reference_depth, validate_cte_limits
+from aetherdialect._intent_bind import encode_inline_self_join_as_cte
+from aetherdialect._validation_shape import max_cte_reference_depth, validate_cte_limits
 
 
 def _schema() -> SchemaGraph:

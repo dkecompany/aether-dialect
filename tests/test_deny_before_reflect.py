@@ -9,13 +9,15 @@ from unittest.mock import MagicMock
 
 import pytest
 
-import aetherdialect._schema_overrides
+import aetherdialect._schema_finalize
+import aetherdialect._schema_reflect
 from aetherdialect._config import EngineConfig
 from aetherdialect._contracts_base import EngineContext
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._dialect import Dialect
+from aetherdialect._schema_finalize import build_schema_graph
 from aetherdialect._schema_graph import apply_deny_objects_filter, assign_schema_graph_hashes
-from aetherdialect._schema_overrides import build_schema_graph, save_schema_to_cache
+from aetherdialect._schema_reflect import save_schema_to_cache
 
 pytestmark = [pytest.mark.fast, pytest.mark.usefixtures("stub_schema_llm_classifier")]
 
@@ -60,7 +62,8 @@ class _FullRebuildStubDialect(Dialect):
         super().__init__(MagicMock())
         self._reflected = reflected_sg
         self.reflect_calls = 0
-        self.reflect_deny_objects: frozenset[str] | None = None
+        self.reflect_deny_objects: Any = object()
+        self.reflect_deny_objects_args: list[Any] = []
         self.profiled_tables: list[tuple[str, ...]] = []
         self.build_events: list[str] = []
 
@@ -77,7 +80,8 @@ class _FullRebuildStubDialect(Dialect):
     ) -> SchemaGraph:
         self.reflect_calls += 1
         self.build_events.append("reflect")
-        self.reflect_deny_objects = frozenset(deny_objects or ())
+        self.reflect_deny_objects = deny_objects
+        self.reflect_deny_objects_args.append(deny_objects)
         reflected = copy.deepcopy(self._reflected)
         if deny_objects:
             deny = {str(x).lower() for x in deny_objects}
@@ -147,8 +151,9 @@ def test_full_rebuild_passes_deny_objects_into_reflection(
 
     out = build_schema_graph(dialect, ctx, notes_content="n")
 
-    assert dialect.reflect_calls == 1
-    assert dialect.reflect_deny_objects == frozenset({"secret"})
+    assert dialect.reflect_calls == 2
+    assert dialect.reflect_deny_objects_args == [None, None]
+    assert dialect.reflect_deny_objects is None
     assert "secret" not in out.tables
 
 
@@ -182,18 +187,18 @@ def test_full_rebuild_deny_filter_runs_before_profiling(
 
     phase_events: list[str] = []
     real_apply_deny = apply_deny_objects_filter
-    real_add_profiling = aetherdialect._schema_overrides._add_profiling_data
+    real_add_profiling = aetherdialect._schema_finalize._add_profiling_data
 
     def _track_profile(*args: Any, **kwargs: Any) -> None:
         phase_events.append("profile")
         return real_add_profiling(*args, **kwargs)
 
-    def _track_deny(sg: SchemaGraph, engine_context: EngineContext) -> None:
+    def _track_deny(sg: SchemaGraph, engine_context: EngineContext, *, strict: bool = False) -> None:
         phase_events.append("deny")
-        return real_apply_deny(sg, engine_context)
+        return real_apply_deny(sg, engine_context, strict=strict)
 
-    monkeypatch.setattr(aetherdialect._schema_overrides, "_add_profiling_data", _track_profile)
-    monkeypatch.setattr(aetherdialect._schema_overrides, "apply_deny_objects_filter", _track_deny)
+    monkeypatch.setattr(aetherdialect._schema_finalize, "_add_profiling_data", _track_profile)
+    monkeypatch.setattr(aetherdialect._schema_reflect, "apply_deny_objects_filter", _track_deny)
 
     build_schema_graph(dialect, ctx, notes_content="n")
 
@@ -218,11 +223,11 @@ def test_partial_probe_path_applies_deny_objects_after_reflect(
     deny_calls: list[tuple[str, ...]] = []
     real_apply_deny = apply_deny_objects_filter
 
-    def _track_deny(sg: SchemaGraph, engine_context: EngineContext) -> None:
+    def _track_deny(sg: SchemaGraph, engine_context: EngineContext, *, strict: bool = False) -> None:
         deny_calls.append(tuple(sorted(sg.tables.keys())))
-        real_apply_deny(sg, engine_context)
+        real_apply_deny(sg, engine_context, strict=strict)
 
-    monkeypatch.setattr(aetherdialect._schema_overrides, "apply_deny_objects_filter", _track_deny)
+    monkeypatch.setattr(aetherdialect._schema_finalize, "apply_deny_objects_filter", _track_deny)
 
     out = build_schema_graph(dialect, ctx, notes_content="notes")
 

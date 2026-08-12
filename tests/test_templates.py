@@ -30,13 +30,10 @@ from aetherdialect._contracts_core import (
     ValueHistory,
 )
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, SQLShape, TableMetadata, TemplateStats
-from aetherdialect._core_utils import read_gzip_json, write_gzip_json_atomic
-from aetherdialect._templates import (
-    TemplateOps,
-    TemplateRefs,
-    TemplateStoreView,
-)
-from aetherdialect._utils import intent_key, question_token_fingerprint_from_raw
+from aetherdialect._templates import TemplateRefs, TemplateStoreView
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils_artifacts import read_gzip_json, write_gzip_json_atomic
+from aetherdialect._utils_intent import intent_key, question_token_fingerprint_from_raw
 
 
 def _minimal_intent() -> RuntimeIntent:
@@ -198,7 +195,7 @@ class TestSummarizeFailureForMemory:
     def test_llm_chat_runtime_error_propagates(self):
         with (
             patch("aetherdialect._config.EngineConfig.llm_credentials_configured", return_value=True),
-            patch("aetherdialect._templates.LLMProvider.chat", side_effect=RuntimeError("down")),
+            patch("aetherdialect._llm_provider.LLMProvider.chat", side_effect=RuntimeError("down")),
         ):
             with pytest.raises(RuntimeError, match="down"):
                 TemplateOps.summarize_failure_for_memory(
@@ -212,7 +209,7 @@ class TestSummarizeFailureForMemory:
     def test_bad_json_coerces_to_other(self):
         with (
             patch("aetherdialect._config.EngineConfig.llm_credentials_configured", return_value=True),
-            patch("aetherdialect._templates.LLMProvider.chat", return_value="not json"),
+            patch("aetherdialect._llm_provider.LLMProvider.chat", return_value="not json"),
         ):
             ent = TemplateOps.summarize_failure_for_memory(
                 question="q",
@@ -297,15 +294,15 @@ class TestSchemaMigrationMapParse:
     """``schema_migration_map.json`` optional fields."""
 
     def test_refresh_descriptions_defaults_false(self):
-        from aetherdialect._templates import TemplateOps
+        from aetherdialect._templates_ops import TemplateOps
 
-        m = TemplateOps._parse_schema_migration_map_payload({"version": 1, "action": "remap"})
+        m = TemplateOps.parse_schema_migration_map_payload({"version": 1, "action": "remap"})
         assert m.refresh_existing_descriptions_on_addition is False
 
     def test_refresh_descriptions_true(self):
-        from aetherdialect._templates import TemplateOps
+        from aetherdialect._templates_ops import TemplateOps
 
-        m = TemplateOps._parse_schema_migration_map_payload(
+        m = TemplateOps.parse_schema_migration_map_payload(
             {
                 "version": 1,
                 "action": "remap",
@@ -316,10 +313,10 @@ class TestSchemaMigrationMapParse:
 
     def test_refresh_descriptions_rejects_non_bool(self):
         from aetherdialect._contracts_base import MigrationPendingError
-        from aetherdialect._templates import TemplateOps
+        from aetherdialect._templates_ops import TemplateOps
 
         with pytest.raises(MigrationPendingError, match="refresh_existing_descriptions_on_addition"):
-            TemplateOps._parse_schema_migration_map_payload(
+            TemplateOps.parse_schema_migration_map_payload(
                 {
                     "version": 1,
                     "action": "remap",

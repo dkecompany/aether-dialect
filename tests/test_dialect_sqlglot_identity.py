@@ -11,7 +11,7 @@ import sqlglot
 from aetherdialect._config import EngineConfig
 from aetherdialect._constants import SQLGLOT_DIALECT_BY_ENGINE
 from aetherdialect._dialect import DialectRegistry
-from aetherdialect._schema_catalog import (
+from aetherdialect._schema_profile import (
     _parse_sql_file_fallback,
     _parse_sql_file_sqlglot,
     _sqlglot_column_def_name_type,
@@ -84,7 +84,7 @@ def test_parse_sql_file_fallback_dispatches_databricks_sql_file_dialect() -> Non
         captured.append(dialect_token)
         return {}
 
-    with patch("aetherdialect._schema_catalog._parse_sql_file_sqlglot", side_effect=capture):
+    with patch("aetherdialect._schema_profile._parse_sql_file_sqlglot", side_effect=capture):
         orig = EngineConfig.TYPE
         try:
             EngineConfig.TYPE = "databricks"

@@ -19,6 +19,25 @@ from typing import IO, Any
 from ._config import EngineLimits, PolicyConfig
 from ._constants import (
     BARE_SCALAR_NUMBER_RE,
+    DIAGNOSTIC_CODE_DATA_QUALITY_ADVISORY,
+    DIAGNOSTIC_CODE_DATA_QUALITY_AUTO_CORRECTED,
+    DIAGNOSTIC_CODE_DATA_QUALITY_AUTO_READ,
+    DIAGNOSTIC_CODE_DATA_QUALITY_BLOCKING,
+    DIAGNOSTIC_CODE_UPLOAD_TRANSFORM_APPLIED,
+    DIAGNOSTIC_CODE_UPLOAD_TRANSFORM_REJECTED,
+    DIAGNOSTIC_CODE_UPLOAD_UNIT_AFFIX_STRIPPED,
+    ISO_DATE_ONLY_RE,
+    ISO_DATETIME_RE,
+    REVIEW_GATED_UPLOAD_COLUMN_TRANSFORMS,
+    UPLOAD_BAND_VALUE_MAP_MAX_DISTINCT,
+    UPLOAD_COLUMN_TRANSFORM_IDS,
+    UPLOAD_CURRENCY_AFFIX_TOKENS,
+    UPLOAD_INTERPRET_MAX_ROWS,
+    UPLOAD_SAMPLE_MAX_ROWS,
+    UPLOAD_SCALAR_AFFIX_TOKENS_SORTED,
+    UPLOAD_SCALAR_BAND_PATTERNS,
+)
+from ._constants_runtime import (
     CSV_IDENTIFIER_NAMING_SCHEMA,
     CSV_IDENTIFIER_NAMING_SYSTEM,
     DATA_QUALITY_DETAIL_CANDIDATE_HEADER_ROW,
@@ -66,27 +85,10 @@ from ._constants import (
     DATA_QUALITY_SQL_RESERVED_WORDS,
     DATA_QUALITY_TOTAL_PREFIXES,
     DATA_QUALITY_ZERO_WIDTH_CHARS,
-    DIAGNOSTIC_CODE_DATA_QUALITY_ADVISORY,
-    DIAGNOSTIC_CODE_DATA_QUALITY_AUTO_CORRECTED,
-    DIAGNOSTIC_CODE_DATA_QUALITY_AUTO_READ,
-    DIAGNOSTIC_CODE_DATA_QUALITY_BLOCKING,
-    DIAGNOSTIC_CODE_UPLOAD_TRANSFORM_APPLIED,
-    DIAGNOSTIC_CODE_UPLOAD_TRANSFORM_REJECTED,
-    DIAGNOSTIC_CODE_UPLOAD_UNIT_AFFIX_STRIPPED,
-    ISO_DATE_RE,
-    ISO_TIMESTAMP_RE,
-    REVIEW_GATED_UPLOAD_COLUMN_TRANSFORMS,
-    UPLOAD_BAND_VALUE_MAP_MAX_DISTINCT,
-    UPLOAD_COLUMN_TRANSFORM_IDS,
     UPLOAD_COLUMN_TRANSFORMS_SCHEMA,
     UPLOAD_COLUMN_TRANSFORMS_SYSTEM,
-    UPLOAD_CURRENCY_AFFIX_TOKENS,
-    UPLOAD_INTERPRET_MAX_ROWS,
     UPLOAD_INTERPRET_SCHEMA,
     UPLOAD_INTERPRET_SYSTEM,
-    UPLOAD_SAMPLE_MAX_ROWS,
-    UPLOAD_SCALAR_AFFIX_TOKENS_SORTED,
-    UPLOAD_SCALAR_BAND_PATTERNS,
     UPLOAD_SUMMARY_SCHEMA,
     UPLOAD_SUMMARY_SYSTEM,
 )
@@ -104,16 +106,33 @@ from ._contracts_schema import (
     SchemaGraph,
     SheetGrid,
 )
-from ._core_utils import active_engine_limits, debug, notify, require_driver, stable_json
 from ._llm_provider import LLMProvider
+from ._utils import active_engine_limits, debug, notify, require_driver, require_exact_keys, stable_json
 
 _XLSX_DECLARED_COLUMN_TYPES: dict[tuple[str, str], tuple[str, ...]] = {}
 
 
 def parse_source_selections(raw: Mapping[str, Mapping[str, Any]]) -> dict[str, CsvSourceSelection]:
     """Convert config JSON objects into :class:`CsvSourceSelection` records."""
+    selection_keys = frozenset(
+        {
+            "sheet",
+            "header_row",
+            "skip_rows",
+            "table_range",
+            "merge_regions",
+            "append_regions",
+            "column_transforms",
+        }
+    )
     out: dict[str, CsvSourceSelection] = {}
     for name, body in raw.items():
+        require_exact_keys(
+            body,
+            allowed=selection_keys,
+            required=frozenset(),
+            context=f"source_selections[{name!r}]",
+        )
         header_raw = body.get("header_row")
         header_row = int(header_raw) if header_raw is not None and str(header_raw).strip() else None
         merge_raw = body.get("merge_regions", ())
@@ -285,8 +304,7 @@ def detect_grid_issues(grid: SheetGrid) -> list[Diagnostic]:
                 code=DATA_QUALITY_ISSUE_REPEATED_HEADER,
                 level="error",
                 message=(
-                    "Remove the repeated header rows inside the data — this sheet looks like a "
-                    "stacked report, not one plain table."
+                    "Remove the repeated header rows inside the data — this sheet looks like a stacked report, not one plain table."
                 ),
                 location=row_loc,
                 blocking=True,
@@ -453,8 +471,7 @@ def detect_grid_issues(grid: SheetGrid) -> list[Diagnostic]:
                 code=DATA_QUALITY_ISSUE_SECTION_HEADING,
                 level="error",
                 message=(
-                    "Remove the section title rows inside the table — this sheet looks like a "
-                    "formatted report, not one plain table."
+                    "Remove the section title rows inside the table — this sheet looks like a formatted report, not one plain table."
                 ),
                 location=location_prefix,
                 blocking=True,
@@ -1049,9 +1066,9 @@ def excel_cell_to_text(cell: object) -> str:
 
 def _temporal_sample_kind(value: str) -> str | None:
     text = value.strip()
-    if ISO_DATE_RE.match(text):
+    if ISO_DATE_ONLY_RE.match(text):
         return "date"
-    if ISO_TIMESTAMP_RE.match(text):
+    if ISO_DATETIME_RE.match(text):
         return "timestamp"
     return None
 
@@ -1511,8 +1528,7 @@ def _mergeable_regions_advisory(grid: SheetGrid) -> Diagnostic | None:
         level="info",
         message=(
             f"This sheet has {len(ranges)} blocks with the same headers ({range_text}). "
-            "They were loaded as separate tables. To combine them, set merge_regions in "
-            "CSV_SOURCE_SELECTIONS, or remove the blank rows between them and re-upload."
+            "They were loaded as separate tables. To combine them, set merge_regions in CSV_SOURCE_SELECTIONS, or remove the blank rows between them and re-upload."
         ),
         location=_grid_location_prefix(grid),
         blocking=False,
@@ -1543,8 +1559,7 @@ def _appendable_regions_advisory(grid: SheetGrid) -> Diagnostic | None:
         level="info",
         message=(
             f"This sheet has {len(ranges)} blocks with the same headers ({range_text}). "
-            "They were loaded as separate tables. To append them into one table, set append_regions "
-            "in CSV_SOURCE_SELECTIONS, or remove the blank rows between them and re-upload."
+            "They were loaded as separate tables. To append them into one table, set append_regions in CSV_SOURCE_SELECTIONS, or remove the blank rows between them and re-upload."
         ),
         location=_grid_location_prefix(grid),
         blocking=False,
@@ -2406,20 +2421,46 @@ def _llm_upload_interpret(payload: Mapping[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         debug(f"[data_quality._llm_upload_interpret] llm unavailable: {exc!r}")
         return {}
+    if not isinstance(response, dict):
+        raise ValueError(
+            f"[data_quality._llm_upload_interpret] LLM JSON is not an object; got {type(response).__name__}"
+        )
+    allowed = frozenset({"header_row", "table_range", "append_regions", "merge_regions"})
+    unexpected = set(response) - allowed
+    if unexpected:
+        raise ValueError(f"[data_quality._llm_upload_interpret] unexpected keys: {sorted(unexpected)}")
     out: dict[str, Any] = {}
-    header_row = response.get("header_row")
-    if header_row is not None:
-        out["header_row"] = int(header_row)
-    table_range = str(response.get("table_range", "")).strip()
-    if table_range:
-        out["table_range"] = table_range
-    append_raw = response.get("append_regions")
-    if isinstance(append_raw, Sequence) and not isinstance(append_raw, (str, bytes)):
+    if "header_row" in response:
+        header_row = response["header_row"]
+        if isinstance(header_row, bool) or not isinstance(header_row, int):
+            raise ValueError(
+                f"[data_quality._llm_upload_interpret] header_row must be int; got {type(header_row).__name__}"
+            )
+        out["header_row"] = header_row
+    if "table_range" in response:
+        table_range = response["table_range"]
+        if not isinstance(table_range, str):
+            raise ValueError(
+                f"[data_quality._llm_upload_interpret] table_range must be str; got {type(table_range).__name__}"
+            )
+        if table_range.strip():
+            out["table_range"] = table_range.strip()
+    if "append_regions" in response:
+        append_raw = response["append_regions"]
+        if not isinstance(append_raw, Sequence) or isinstance(append_raw, (str, bytes)):
+            raise ValueError(
+                f"[data_quality._llm_upload_interpret] append_regions must be a sequence; "
+                f"got {type(append_raw).__name__}"
+            )
         append_regions = [str(item).strip() for item in append_raw if str(item).strip()]
         if append_regions:
             out["append_regions"] = append_regions
-    merge_raw = response.get("merge_regions")
-    if isinstance(merge_raw, Sequence) and not isinstance(merge_raw, (str, bytes)):
+    if "merge_regions" in response:
+        merge_raw = response["merge_regions"]
+        if not isinstance(merge_raw, Sequence) or isinstance(merge_raw, (str, bytes)):
+            raise ValueError(
+                f"[data_quality._llm_upload_interpret] merge_regions must be a sequence; got {type(merge_raw).__name__}"
+            )
         merge_regions = [str(item).strip() for item in merge_raw if str(item).strip()]
         if merge_regions:
             out["merge_regions"] = merge_regions
@@ -2458,13 +2499,25 @@ def _llm_upload_column_transforms(payload: Mapping[str, Any]) -> list[dict[str, 
     except Exception as exc:
         debug(f"[data_quality._llm_upload_column_transforms] llm unavailable: {exc!r}")
         return []
-    raw_transforms = response.get("column_transforms", [])
+    if not isinstance(response, dict):
+        raise ValueError(
+            f"[data_quality._llm_upload_column_transforms] LLM JSON is not an object; got {type(response).__name__}"
+        )
+    if "column_transforms" not in response:
+        raise ValueError("[data_quality._llm_upload_column_transforms] LLM JSON missing 'column_transforms' key")
+    raw_transforms = response["column_transforms"]
     if not isinstance(raw_transforms, list):
-        return []
+        raise ValueError(
+            f"[data_quality._llm_upload_column_transforms] 'column_transforms' must be a list; "
+            f"got {type(raw_transforms).__name__}"
+        )
     out: list[dict[str, Any]] = []
     for item in raw_transforms:
         if not isinstance(item, Mapping):
-            continue
+            raise ValueError(
+                f"[data_quality._llm_upload_column_transforms] transform item must be an object; "
+                f"got {type(item).__name__}"
+            )
         normalized = _normalize_column_transform(item)
         if normalized is not None:
             out.append(normalized)
@@ -3123,7 +3176,14 @@ def _llm_identifier(label: str, *, kind: str) -> str:
     except Exception as exc:
         debug(f"[data_quality._llm_identifier] llm unavailable: {exc!r}")
         return ""
-    ident = str(response.get("identifier", "")).strip()
+    if not isinstance(response, dict):
+        raise ValueError(f"[data_quality._llm_identifier] LLM JSON is not an object; got {type(response).__name__}")
+    if "identifier" not in response:
+        raise ValueError("[data_quality._llm_identifier] LLM JSON missing 'identifier' key")
+    ident_raw = response["identifier"]
+    if not isinstance(ident_raw, str):
+        raise ValueError(f"[data_quality._llm_identifier] 'identifier' must be str; got {type(ident_raw).__name__}")
+    ident = ident_raw.strip()
     if _valid_identifier(ident):
         return ident
     return ""

@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-from aetherdialect._contracts_base import CteIntent, LogicalIntent
-from aetherdialect._contracts_core import NormalizedExpr, RuntimeCteStep, RuntimeIntent, SelectCol
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._intent_process import _align_runtime_tables_to_planner
-from aetherdialect._intent_repair import (
+from aetherdialect._contracts_base import NormalizedExpr
+from aetherdialect._contracts_core import RuntimeCteStep, RuntimeIntent, SelectCol
+from aetherdialect._contracts_schema import ColumnMetadata, CteIntent, LogicalIntent, SchemaGraph, TableMetadata
+from aetherdialect._intent_loop import _align_runtime_tables_to_interpret
+from aetherdialect._intent_normalize import (
     append_table_scope_repairs,
     reconcile_tables,
     table_scope_repair_warning_messages,
-    validate_table_scope_repairs,
 )
-from aetherdialect._pipeline import _resolve_joins_fresh
+from aetherdialect._pipeline_generate import _resolve_joins_fresh
+from aetherdialect._validation_shape import validate_table_scope_repairs
 
 
 def _col(name: str) -> ColumnMetadata:
@@ -49,7 +49,7 @@ def _bridge_schema() -> SchemaGraph:
     )
 
 
-def test_align_runtime_tables_to_planner_records_planner_bridge_additions() -> None:
+def test_align_runtime_tables_to_interpret_records_planner_bridge_additions() -> None:
     logical = LogicalIntent(
         tables=("film", "inventory", "rental", "payment"),
         select="",
@@ -62,14 +62,14 @@ def test_align_runtime_tables_to_planner_records_planner_bridge_additions() -> N
         order_by_cols=[],
         where=None,
     )
-    out = _align_runtime_tables_to_planner(runtime, logical)
+    out = _align_runtime_tables_to_interpret(runtime, logical)
     assert out.tables == ["film", "inventory", "rental", "payment"]
     msgs = table_scope_repair_warning_messages(out)
-    assert any("inventory" in m and "planner" in m.lower() for m in msgs)
+    assert any("inventory" in m and "interpret" in m.lower() for m in msgs)
     assert any("rental" in m for m in msgs)
 
 
-def test_align_runtime_tables_to_planner_records_cte_bridge_additions() -> None:
+def test_align_runtime_tables_to_interpret_records_cte_bridge_additions() -> None:
     logical = LogicalIntent(
         tables=("film",),
         select="",
@@ -84,7 +84,7 @@ def test_align_runtime_tables_to_planner_records_cte_bridge_additions() -> None:
         where=None,
         cte_steps=[RuntimeCteStep(cte_name="step_a", tables=["a", "c"])],
     )
-    out = _align_runtime_tables_to_planner(runtime, logical)
+    out = _align_runtime_tables_to_interpret(runtime, logical)
     msgs = table_scope_repair_warning_messages(out)
     assert any("bridge" in m and "CTE 'step_a'" in m for m in msgs)
 
@@ -106,7 +106,9 @@ def test_reconcile_tables_records_expression_add_and_unreferenced_remove() -> No
     assert "unused_tbl" not in out.tables
     msgs = table_scope_repair_warning_messages(out)
     assert any("customers" in m and "expression" in m.lower() for m in msgs)
-    assert any("unused_tbl" in m and "not referenced" in m.lower() for m in msgs)
+    # Routine unreferenced prune is recorded but not user-facing.
+    assert not any("unused_tbl" in m for m in msgs)
+    assert any(r.reason == "unreferenced_table" and "unused_tbl" in r.tables for r in out.table_scope_repairs)
 
 
 def test_validate_table_scope_repairs_emits_warnings() -> None:

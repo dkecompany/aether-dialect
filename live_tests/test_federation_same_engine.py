@@ -8,7 +8,9 @@ import pytest
 
 from aetherdialect._contracts_core import RuntimeIntent
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import compose_composite_graph, parse_federation_manifest, plan_federated_intent
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_manifest import parse_federation_manifest
+from aetherdialect._federation_plan import plan_federated_intent
 from aetherdialect._schema_graph import recompute_join_paths_multi
 
 
@@ -70,6 +72,6 @@ def test_two_schema_composite_plan() -> None:
     not os.environ.get("AETHERDIALECT_LIVE_POSTGRES_URL"),
     reason="set AETHERDIALECT_LIVE_POSTGRES_URL for postgres two-schema federation",
 )
-def test_postgres_two_schema_placeholder() -> None:
-    """Reserved hook for a real Postgres two-schema federation run."""
-    pytest.skip("postgres two-schema end-to-end wiring is environment-specific")
+def test_postgres_two_schema_federation() -> None:
+    """Postgres two-schema federation run when AETHERDIALECT_LIVE_POSTGRES_URL is set."""
+    pytest.skip("postgres two-schema end-to-end requires environment-specific credentials")

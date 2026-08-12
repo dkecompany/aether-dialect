@@ -6,8 +6,8 @@ import pytest
 
 from aetherdialect._config import DuckDBRuntimeConfig, EngineConfig
 from aetherdialect._contracts_base import ConfigError, EngineContext, EngineIdentity
-from aetherdialect._core_utils import pop_engine_identity, push_engine_identity
 from aetherdialect._dialect import DialectRegistry
+from aetherdialect._utils import pop_engine_identity, push_engine_identity
 
 _ORIG_ENGINE_TYPE = EngineConfig.TYPE
 _ORIG_ENGINE_RUNTIME = EngineConfig.RUNTIME
@@ -25,7 +25,7 @@ def _reset_duckdb_runtime_config() -> None:
     try:
         DuckDBRuntimeConfig.DATABASE_PATH = ":memory:"
         DuckDBRuntimeConfig.SCHEMA = "main"
-        DuckDBRuntimeConfig.clear_attached_connection()
+        DuckDBRuntimeConfig.NATIVE_CONNECTION = None
         yield
     finally:
         pop_engine_identity(identity_token)

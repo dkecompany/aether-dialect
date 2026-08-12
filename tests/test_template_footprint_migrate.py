@@ -9,8 +9,9 @@ import pytest
 from aetherdialect._contracts_base import NormalizedExpr
 from aetherdialect._contracts_core import ConcreteIntent, SelectCol, Template, ValueHistory
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, SQLShape, TableMetadata, TemplateStats
-from aetherdialect._templates import TemplateOps, TemplateRefs
-from aetherdialect._utils import intent_key
+from aetherdialect._templates import TemplateRefs
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils_intent import intent_key
 
 
 def _col(name: str, data_type: str = "integer") -> ColumnMetadata:
@@ -153,7 +154,7 @@ def test_footprint_column_dropped_orphans() -> None:
 
 
 @pytest.mark.fast
-def test_agent_ref_still_resolves_after_additive_ingest() -> None:
+def test_template_ref_resolves_across_additive_ingest() -> None:
     old = _orders_schema("sg_old")
     new = _orders_schema("sg_new", extra_table=True)
     tmpl = _template(old)

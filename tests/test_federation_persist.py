@@ -8,16 +8,16 @@ import tempfile
 
 import pytest
 
-from aetherdialect._contracts_base import (
-    FederationMappings,
-    FederationMappingsAppliedSidecarError,
-)
-from aetherdialect._federation import (
-    federation_artifact_paths,
-    load_federation_mappings_from_path,
+from aetherdialect._contracts_base import FederationMappingsAppliedSidecarError
+from aetherdialect._contracts_schema import FederationMappings
+from aetherdialect._federation_execute import (
     mappings_replay_matches,
     persist_federation_tree,
     validate_federation_mappings_applied_sidecar,
+)
+from aetherdialect._federation_manifest import (
+    federation_artifact_paths,
+    load_federation_mappings_from_path,
 )
 from tests.federation_helpers import build_two_member_federation
 
@@ -34,7 +34,7 @@ def test_applied_sidecar_rewritten_on_persist() -> None:
     bundle = build_two_member_federation(federation_id="fed_sidecar")
     manifest = bundle.manifest
     members = bundle.member_graphs
-    mappings = FederationMappings(version="0.2.1")
+    mappings = FederationMappings(version="0.2.3")
     composite = bundle.composite
     with tempfile.TemporaryDirectory() as tmp:
         paths = federation_artifact_paths(tmp)
@@ -53,7 +53,7 @@ def test_applied_sidecar_rewritten_on_persist() -> None:
         assert applied["logical_columns"] == live["logical_columns"]
         assert applied["logical_tables"] == live["logical_tables"]
 
-        updated = FederationMappings(version="0.2.1", logical_columns=mappings.logical_columns, logical_tables=())
+        updated = FederationMappings(version="0.2.3", logical_columns=mappings.logical_columns, logical_tables=())
         persist_federation_tree(
             tmp,
             manifest=manifest,
@@ -70,7 +70,7 @@ def test_inconsistent_sidecar_refused() -> None:
     bundle = build_two_member_federation(federation_id="fed_sidecar_bad")
     manifest = bundle.manifest
     members = bundle.member_graphs
-    mappings = FederationMappings(version="0.2.1")
+    mappings = FederationMappings(version="0.2.3")
     composite = bundle.composite
     with tempfile.TemporaryDirectory() as tmp:
         persist_federation_tree(

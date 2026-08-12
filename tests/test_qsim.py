@@ -6,23 +6,21 @@ from types import SimpleNamespace
 
 import pytest
 
-from aetherdialect._config import QSimConfig
 from aetherdialect._constants import (
     HAVING_COUNT_VALUES,
     HAVING_MIN_MAX_VALUES,
     HAVING_SUM_AVG_VALUES,
 )
-from aetherdialect._contracts_base import (
-    ColumnRole,
-)
 from aetherdialect._contracts_schema import (
     ColumnMetadata,
+    ColumnRole,
     FKEdge,
     QSimHaving,
     QSimIntent,
     QSimSkeleton,
     QSimWhereParam,
     SchemaGraph,
+    SensitivityClassification,
     TableMetadata,
     ValueDomain,
 )
@@ -32,7 +30,6 @@ from aetherdialect._qsim import (
     _format_date,
     _identify_range_pairs,
     _instantiate_intent,
-    _is_excluded_where_column,
     _is_integer_type,
     _parse_date,
     _sample_boolean,
@@ -266,36 +263,22 @@ class TestEnumerateTableSets:
         assert len(pairs) == 0
 
 
-class TestIsExcludedFilterColumn:
-    """Tests for is_excluded_filter_column."""
-
-    def test_normal_column(self):
-        """Normal column not excluded."""
-        assert _is_excluded_where_column("name") is False
-
-    def test_audit_column(self):
-        """Audit-pattern column excluded if pattern matches."""
-        patterns = QSimConfig.EXCLUDED_WHERE_PATTERNS
-        if patterns:
-            for p in patterns:
-                assert _is_excluded_where_column(p) is True
-                break
-
-    def test_empty_string_not_excluded(self):
-        """Empty string matches no pattern."""
-        assert _is_excluded_where_column("") is False
-
-    def test_substring_match(self):
-        """Column containing pattern substring is excluded."""
-        assert _is_excluded_where_column("user_password") is True
-
-    def test_case_insensitive(self):
-        """Pattern match is case-insensitive."""
-        assert _is_excluded_where_column("PASSWORD") is True
-
-
 class TestGetFilterableColumns:
     """Tests for get_filterable_columns."""
+
+    def test_excludes_restricted_sensitivity(self, three_table_schema, column_roles):
+        """Restricted columns are omitted from filterable results."""
+        three_table_schema.tables["orders"].columns["amount"].sensitivity = SensitivityClassification.RESTRICTED
+        result = get_filterable_columns("orders", three_table_schema, column_roles)
+        col_names = [c for c, _ in result]
+        assert not any("amount" in c for c in col_names)
+
+    def test_excludes_hidden_sensitivity(self, three_table_schema, column_roles):
+        """Hidden columns are omitted from filterable results."""
+        three_table_schema.tables["orders"].columns["amount"].sensitivity = SensitivityClassification.HIDDEN
+        result = get_filterable_columns("orders", three_table_schema, column_roles)
+        col_names = [c for c, _ in result]
+        assert not any("amount" in c for c in col_names)
 
     def test_returns_filterable(self, three_table_schema, column_roles):
         """Return filterable columns for table."""
@@ -521,7 +504,7 @@ class TestLoadOrCreateSkeletons:
     def test_creates_cache_file(self, three_table_schema, column_roles, tmp_path, monkeypatch):
         """Creates cache gzip JSON file when none exists."""
         _skeleton_cache.clear()
-        cache_file = str(tmp_path / "skeletons.json.gz")
+        cache_file = str(tmp_path / "qsim_skeletons.json.gz")
         monkeypatch.setattr("aetherdialect._qsim.QSimConfig.SKELETONS_JSON_PATH", cache_file)
         result = load_or_create_skeletons(three_table_schema, column_roles)
         assert os.path.exists(cache_file)
@@ -530,7 +513,7 @@ class TestLoadOrCreateSkeletons:
     def test_loads_from_existing_cache(self, three_table_schema, column_roles, tmp_path, monkeypatch):
         """Loads from existing cache file with matching schema hash."""
         _skeleton_cache.clear()
-        cache_file = str(tmp_path / "skeletons.json.gz")
+        cache_file = str(tmp_path / "qsim_skeletons.json.gz")
         monkeypatch.setattr("aetherdialect._qsim.QSimConfig.SKELETONS_JSON_PATH", cache_file)
         load_or_create_skeletons(three_table_schema, column_roles)
         first_count = len(_skeleton_cache)
@@ -540,10 +523,10 @@ class TestLoadOrCreateSkeletons:
 
     def test_hash_mismatch_regenerates(self, three_table_schema, column_roles, tmp_path, monkeypatch):
         """Schema hash mismatch triggers regeneration."""
-        from aetherdialect._core_utils import read_gzip_json, write_gzip_json_atomic
+        from aetherdialect._utils_artifacts import read_gzip_json, write_gzip_json_atomic
 
         _skeleton_cache.clear()
-        cache_file = str(tmp_path / "skeletons.json.gz")
+        cache_file = str(tmp_path / "qsim_skeletons.json.gz")
         monkeypatch.setattr("aetherdialect._qsim.QSimConfig.SKELETONS_JSON_PATH", cache_file)
         load_or_create_skeletons(three_table_schema, column_roles)
         data = read_gzip_json(cache_file)
@@ -556,7 +539,7 @@ class TestLoadOrCreateSkeletons:
     def test_corrupt_cache_file(self, three_table_schema, column_roles, tmp_path, monkeypatch):
         """Corrupt cache file triggers regeneration instead of crash."""
         _skeleton_cache.clear()
-        cache_file = str(tmp_path / "skeletons.json.gz")
+        cache_file = str(tmp_path / "qsim_skeletons.json.gz")
         with open(cache_file, "wb") as f:
             f.write(b"NOT GZIP JSON")
         monkeypatch.setattr("aetherdialect._qsim.QSimConfig.SKELETONS_JSON_PATH", cache_file)
@@ -565,10 +548,10 @@ class TestLoadOrCreateSkeletons:
 
     def test_cache_file_contains_valid_json(self, three_table_schema, column_roles, tmp_path, monkeypatch):
         """Written cache file contains valid JSON with expected keys."""
-        from aetherdialect._core_utils import read_gzip_json
+        from aetherdialect._utils_artifacts import read_gzip_json
 
         _skeleton_cache.clear()
-        cache_file = str(tmp_path / "skeletons.json.gz")
+        cache_file = str(tmp_path / "qsim_skeletons.json.gz")
         monkeypatch.setattr("aetherdialect._qsim.QSimConfig.SKELETONS_JSON_PATH", cache_file)
         load_or_create_skeletons(three_table_schema, column_roles)
         data = read_gzip_json(cache_file)

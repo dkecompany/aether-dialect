@@ -10,7 +10,7 @@ import pytest
 
 from aetherdialect._config import FederationLimits
 from aetherdialect._contracts_base import ConfigError
-from aetherdialect._federation import _resolve_coordinator_temp_directory, compute_federation_storage_dir
+from aetherdialect._federation_execute import _resolve_coordinator_temp_directory, compute_federation_storage_dir
 
 pre_fix_failure: dict[str, str | None] = {
     "default_root": None,
@@ -37,7 +37,7 @@ def test_unwritable_default_root_names_the_problem(tmp_path: Path, monkeypatch: 
     blocked.mkdir()
     _deny_write_access(monkeypatch, blocked)
     monkeypatch.setattr(
-        "aetherdialect._federation.user_data_dir",
+        "aetherdialect._federation_execute.user_data_dir",
         lambda appname, appauthor: str(blocked),
     )
 

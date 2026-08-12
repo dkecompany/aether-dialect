@@ -4,16 +4,16 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-from aetherdialect._config import SQLServerRuntimeConfig
+from aetherdialect._config import OracleRuntimeConfig, SQLServerRuntimeConfig
 from aetherdialect._contracts_base import SqlDiagnosticCode
 from aetherdialect._contracts_schema import (
     ColumnMetadata,
     SchemaGraph,
     TableMetadata,
 )
-from aetherdialect._dialect_sqlglot_engines import SQLServerQueryLogSource
+from aetherdialect._dialect_sqlglot_engines import OracleQueryLogSource, SQLServerQueryLogSource
 from aetherdialect._dialect_sqlglot_helper import SqlglotEngineDialect
-from aetherdialect._schema_build import (
+from aetherdialect._schema_reflect import (
     parse_mysql_enum_or_set_labels,
     parse_redshift_sortkey_columns,
 )
@@ -78,6 +78,46 @@ def test_sqlserver_aad_db_url_modes() -> None:
     assert "ActiveDirectoryServicePrincipal" in sp_url
 
 
+def test_oracle_wallet_and_token_db_url_modes() -> None:
+    """Oracle db_url supports wallet and token auth without ODBC."""
+    orig = {
+        "AUTH_MODE": OracleRuntimeConfig.AUTH_MODE,
+        "USER": OracleRuntimeConfig.USER,
+        "PASSWORD": OracleRuntimeConfig.PASSWORD,
+        "HOST": OracleRuntimeConfig.HOST,
+        "PORT": OracleRuntimeConfig.PORT,
+        "SERVICE_NAME": OracleRuntimeConfig.SERVICE_NAME,
+        "SID": OracleRuntimeConfig.SID,
+        "WALLET_LOCATION": OracleRuntimeConfig.WALLET_LOCATION,
+        "CONFIG_DIR": OracleRuntimeConfig.CONFIG_DIR,
+        "TOKEN": OracleRuntimeConfig.TOKEN,
+    }
+    try:
+        OracleRuntimeConfig.HOST = "localhost"
+        OracleRuntimeConfig.PORT = 1521
+        OracleRuntimeConfig.SERVICE_NAME = "FREEPDB1"
+        OracleRuntimeConfig.SID = None
+        OracleRuntimeConfig.AUTH_MODE = "wallet"
+        OracleRuntimeConfig.USER = "app"
+        OracleRuntimeConfig.PASSWORD = "secret"
+        OracleRuntimeConfig.WALLET_LOCATION = "/wallet"
+        OracleRuntimeConfig.CONFIG_DIR = "/config"
+        wallet_url = OracleRuntimeConfig.db_url()
+        assert wallet_url.startswith("oracle+oracledb://")
+        assert "service_name=FREEPDB1" in wallet_url
+        assert OracleRuntimeConfig.connect_args()["wallet_location"] == "/wallet"
+
+        OracleRuntimeConfig.AUTH_MODE = "token"
+        OracleRuntimeConfig.TOKEN = "access-token"
+        OracleRuntimeConfig.PASSWORD = None
+        token_url = OracleRuntimeConfig.db_url()
+        assert token_url.startswith("oracle+oracledb://")
+        assert "access_token" in OracleRuntimeConfig.connect_args()
+    finally:
+        for key, value in orig.items():
+            setattr(OracleRuntimeConfig, key, value)
+
+
 def test_sqlserver_query_store_preferred_over_dmv() -> None:
     """SQL Server query log uses Query Store when availability probe succeeds."""
     source = SQLServerQueryLogSource()
@@ -94,9 +134,23 @@ def test_sqlserver_query_store_preferred_over_dmv() -> None:
     assert "query_store" in fetch_sql.lower()
 
 
+def test_oracle_query_log_fetch_stabilizes_literals() -> None:
+    """Oracle V$SQL fetch masks literals in returned statement texts."""
+    source = OracleQueryLogSource()
+    fetch_cursor = MagicMock()
+    fetch_cursor.fetchall.return_value = [("SELECT * FROM t WHERE id = 42",)]
+    conn = MagicMock()
+    conn.cursor.return_value = fetch_cursor
+
+    texts = source.fetch(conn, lookback_days=7, max_queries=5, min_runs=1, user_filter=None)
+    assert texts == ["SELECT * FROM t WHERE id = <num>"]
+    fetch_sql = str(fetch_cursor.execute.call_args.args[0]).upper()
+    assert "V$SQL" in fetch_sql
+
+
 def test_reflect_redshift_unique_columns_from_meta() -> None:
     """Redshift reflection populates unique_columns on table metadata."""
-    from aetherdialect._schema_build import tables_meta_to_schema_graph
+    from aetherdialect._schema_reflect import tables_meta_to_schema_graph
 
     meta = {
         "items": {
@@ -114,7 +168,7 @@ def test_reflect_redshift_unique_columns_from_meta() -> None:
 
 def test_reflect_sqlserver_identity_flag() -> None:
     """SQL Server reflection stores is_identity without promoting to PK."""
-    from aetherdialect._schema_build import tables_meta_to_schema_graph
+    from aetherdialect._schema_reflect import tables_meta_to_schema_graph
 
     meta = {
         "orders": {

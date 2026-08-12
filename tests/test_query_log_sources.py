@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import pytest
+
 from aetherdialect._dialect_sqlglot_engines import (
     BigQueryQueryLogSource,
     MySQLQueryLogSource,
+    OracleQueryLogSource,
     RedshiftQueryLogSource,
     SnowflakeQueryLogSource,
     SQLServerQueryLogSource,
@@ -137,3 +140,33 @@ def test_fetch_query_log_dispatches_mysql(monkeypatch) -> None:
 
     out = fetch_query_log("mysql", _Conn(), lookback_days=1, max_queries=5, min_runs=1, user_filter=None)
     assert out == ["SELECT <num>"]
+
+
+@pytest.mark.fast
+def test_oracle_query_log_source_unavailable_without_privilege() -> None:
+    class _Conn:
+        def cursor(self):
+            raise RuntimeError("ORA-00942: table or view does not exist")
+
+    src = OracleQueryLogSource()
+    assert src.is_available(_Conn()) is False
+
+
+@pytest.mark.fast
+def test_oracle_query_log_source_available_on_probe() -> None:
+    class _Cur:
+        def execute(self, stmt):
+            self.stmt = stmt
+
+        def fetchall(self):
+            return [(1,)]
+
+        def close(self):
+            return None
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+    src = OracleQueryLogSource()
+    assert src.is_available(_Conn()) is True

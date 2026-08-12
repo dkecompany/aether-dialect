@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
+import aetherdialect._federation_execute
 from aetherdialect._contracts_base import FederationCapExceededError, FederationPartialFailureError
 from aetherdialect._contracts_core import (
     FederatedPlan,
@@ -21,14 +22,14 @@ from aetherdialect._contracts_core import (
     SourceStep,
 )
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import (
-    compose_composite_graph,
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_execute import (
     execute_federation_coordinator,
     federation_plan_combine_hash,
-    parse_federation_manifest,
-    plan_federated_intent,
 )
-from aetherdialect._pipeline import execute_federated_prepare
+from aetherdialect._federation_manifest import parse_federation_manifest
+from aetherdialect._federation_plan import plan_federated_intent
+from aetherdialect._pipeline_execute import execute_federated_prepare
 from aetherdialect._schema_graph import recompute_join_paths_multi
 
 
@@ -149,9 +150,7 @@ def test_execute_federation_coordinator_accepts_coordinator_timeout_ms() -> None
 
 @pytest.mark.fast
 def test_coordinator_glue_execution_uses_timeout_helper(monkeypatch: pytest.MonkeyPatch) -> None:
-    import aetherdialect._federation
-
-    assert hasattr(aetherdialect._federation, "_execute_coordinator_sql_with_timeout")
+    assert hasattr(aetherdialect._federation_execute, "_execute_coordinator_sql_with_timeout")
     plan, composite, _manifest = _join_plan()
     frames = {
         "a": pd.DataFrame({"id": [1, 2]}),
@@ -163,7 +162,7 @@ def test_coordinator_glue_execution_uses_timeout_helper(monkeypatch: pytest.Monk
         captured["timeout_ms"] = timeout_ms
         return conn.execute(sql, bind_map or {})
 
-    monkeypatch.setattr(aetherdialect._federation, "_execute_coordinator_sql_with_timeout", _recording)
+    monkeypatch.setattr(aetherdialect._federation_execute, "_execute_coordinator_sql_with_timeout", _recording)
     result = execute_federation_coordinator(
         frames,
         plan,
@@ -176,8 +175,6 @@ def test_coordinator_glue_execution_uses_timeout_helper(monkeypatch: pytest.Monk
 
 @pytest.mark.fast
 def test_coordinator_glue_timeout_raises_cap_exceeded(monkeypatch: pytest.MonkeyPatch) -> None:
-    import aetherdialect._federation
-
     plan, composite, _manifest = _join_plan()
     frames = {
         "a": pd.DataFrame({"id": [1]}),
@@ -191,7 +188,7 @@ def test_coordinator_glue_timeout_raises_cap_exceeded(monkeypatch: pytest.Monkey
             source_id="coordinator",
         )
 
-    monkeypatch.setattr(aetherdialect._federation, "_execute_coordinator_sql_with_timeout", _timeout)
+    monkeypatch.setattr(aetherdialect._federation_execute, "_execute_coordinator_sql_with_timeout", _timeout)
     with pytest.raises(FederationCapExceededError, match="coordinator glue timeout exceeded") as exc_info:
         execute_federation_coordinator(
             frames,
@@ -217,12 +214,12 @@ def test_execute_federated_prepare_passes_manifest_coordinator_timeout() -> None
         return pd.DataFrame({"id": [1]})
 
     with (
-        patch("aetherdialect._pipeline.revalidate_prepared_federation_plan"),
+        patch("aetherdialect._pipeline_execute.revalidate_prepared_federation_plan"),
         patch(
-            "aetherdialect._pipeline._execute_federation_source_step",
+            "aetherdialect._pipeline_execute._execute_federation_source_step",
             return_value=pd.DataFrame({"id": [1]}),
         ),
-        patch("aetherdialect._pipeline.execute_federation_coordinator", side_effect=_coordinator),
+        patch("aetherdialect._pipeline_execute.execute_federation_coordinator", side_effect=_coordinator),
     ):
         execute_federated_prepare(
             prepared,
@@ -245,10 +242,10 @@ def test_execute_federated_prepare_enforces_plan_timeout() -> None:
         return 0.0 if perf_calls["n"] <= 6 else 70.0
 
     with (
-        patch("aetherdialect._pipeline.revalidate_prepared_federation_plan"),
-        patch("aetherdialect._pipeline.time.perf_counter", side_effect=_fake_perf),
+        patch("aetherdialect._federation_execute.revalidate_prepared_federation_plan"),
+        patch("aetherdialect._pipeline_execute.time.perf_counter", side_effect=_fake_perf),
         patch(
-            "aetherdialect._pipeline._execute_federation_source_step",
+            "aetherdialect._pipeline_execute._execute_federation_source_step",
             return_value=pd.DataFrame({"id": [1]}),
         ),
     ):
@@ -268,7 +265,7 @@ def test_execute_federated_prepare_enforces_plan_timeout() -> None:
 
 @pytest.mark.fast
 def test_execute_coordinator_sql_with_timeout_interrupts_hanging_query() -> None:
-    from aetherdialect._federation import _execute_coordinator_sql_with_timeout
+    from aetherdialect._federation_execute import _execute_coordinator_sql_with_timeout
 
     hang = threading.Event()
     release = threading.Event()

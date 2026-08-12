@@ -7,13 +7,13 @@ import tempfile
 
 import pytest
 
-from aetherdialect._contracts_base import FederationPlanTemplate
-from aetherdialect._federation import (
-    federation_artifact_paths,
+from aetherdialect._contracts_schema import FederationPlanTemplate
+from aetherdialect._federation_execute import (
     load_federation_plan_templates,
     prune_federation_plan_templates_for_sources,
     save_federation_plan_template,
 )
+from aetherdialect._federation_manifest import federation_artifact_paths
 
 
 def _plan(
@@ -30,7 +30,7 @@ def _plan(
         combine_hash="combine_hash",
         question="cross-source question",
         accepted_questions=("accepted",),
-        format_version="0.2.1",
+        format_version="0.2.3",
         member_template_ids=member_template_ids,
         residual_hash="residual_hash",
         join_feedback=(),

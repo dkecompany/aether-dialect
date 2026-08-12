@@ -13,24 +13,26 @@ from aetherdialect._constants import (
     AETHERSPACE_ARTIFACT_VERSION,
     FEDERATION_ARTIFACT_FORMAT_VERSION,
     SCHEMA_CONTEXT_CACHE_VERSION,
-    SCHEMA_OVERRIDES_VERSION,
+    STRUCTURE_DOCUMENT_VERSION,
 )
-from aetherdialect._contracts_base import ConfigError, EngineContext, FederationConfigError, FederationMappings
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import (
-    compose_composite_graph,
-    federation_artifact_paths,
+from aetherdialect._contracts_base import ConfigError, EngineContext, FederationConfigError
+from aetherdialect._contracts_schema import ColumnMetadata, FederationMappings, SchemaGraph, TableMetadata
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_execute import (
     load_federation_composite_graph,
     mappings_replay_matches,
-    parse_federation_manifest,
     persist_federation_tree,
+)
+from aetherdialect._federation_manifest import (
+    federation_artifact_paths,
+    parse_federation_manifest,
 )
 from aetherdialect._main_execution import (
     MainExecutionOps,
 )
-from aetherdialect._schema_build import overrides_sidecar_path
+from aetherdialect._schema_finalize import load_structure_sidecar, save_structure_sidecar
 from aetherdialect._schema_graph import recompute_join_paths_multi
-from aetherdialect._schema_overrides import load_overrides_sidecar, save_overrides_sidecar
+from aetherdialect._schema_reflect import structure_sidecar_path
 
 
 def _member_graph(table: str, source_id: str = "") -> SchemaGraph:
@@ -81,7 +83,9 @@ def test_aetherspace_snapshot_version_mismatch_distinct_from_missing(tmp_path: P
 
     wrong = dict(current)
     wrong["version"] = "9.9.9"
-    MainExecutionOps.save_aetherspace_snapshot(engine_dir, "stale", wrong)
+    spaces = Path(engine_dir) / "aetherspaces"
+    spaces.mkdir(parents=True, exist_ok=True)
+    (spaces / "stale.json").write_text(json.dumps(wrong), encoding="utf-8")
     with pytest.raises(ConfigError, match=r"version .*" + str(AETHERSPACE_ARTIFACT_VERSION)) as exc_info:
         MainExecutionOps.load_aetherspace_snapshot(engine_dir, "stale")
     msg = str(exc_info.value)
@@ -123,7 +127,7 @@ def test_schema_context_cache_rejects_include_both(tmp_path: Path) -> None:
     cache_path.write_text(
         json.dumps(
             {
-                "version": "0.2.1",
+                "version": "0.2.3",
                 "include": "both",
                 "allow_objects": [],
                 "deny_objects": [],
@@ -138,7 +142,7 @@ def test_schema_context_cache_rejects_include_both(tmp_path: Path) -> None:
 
 
 @pytest.mark.fast
-def test_schema_context_cache_legacy_v3_is_mismatch(tmp_path: Path) -> None:
+def test_schema_context_cache_v3_is_mismatch(tmp_path: Path) -> None:
     adir = str(tmp_path)
     cache_path = os.path.join(adir, "schema_context.json")
     with open(cache_path, "w", encoding="utf-8") as fh:
@@ -162,38 +166,38 @@ def test_schema_context_cache_legacy_v3_is_mismatch(tmp_path: Path) -> None:
 def test_overrides_sidecar_version_mismatch_distinct_from_missing(tmp_path: Path) -> None:
     cache_path = tmp_path / "schema.json.gz"
     cache_path.write_bytes(b"")
-    assert load_overrides_sidecar(cache_path) is None
+    assert load_structure_sidecar(cache_path) is None
 
     doc = {
-        "version": SCHEMA_OVERRIDES_VERSION,
+        "version": STRUCTURE_DOCUMENT_VERSION,
         "tables": {},
         "foreign_keys_add": [],
         "foreign_keys_remove": [],
         "primary_keys_add": [],
         "primary_keys_remove": [],
     }
-    save_overrides_sidecar(cache_path, doc, source_schema_hash="abc", metadata_hash="0" * 64)
-    loaded = load_overrides_sidecar(cache_path)
+    save_structure_sidecar(cache_path, doc, source_schema_hash="abc", metadata_hash="0" * 64)
+    loaded = load_structure_sidecar(cache_path)
     assert loaded is not None
-    assert loaded["version"] == SCHEMA_OVERRIDES_VERSION
+    assert loaded["version"] == STRUCTURE_DOCUMENT_VERSION
 
-    sidecar = overrides_sidecar_path(cache_path)
+    sidecar = structure_sidecar_path(cache_path)
     with sidecar.open(encoding="utf-8") as fh:
         payload = json.load(fh)
     payload["version"] = "9.9.9"
     sidecar.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ConfigError, match=r"version .*") as exc_info:
-        load_overrides_sidecar(cache_path)
+        load_structure_sidecar(cache_path)
     msg = str(exc_info.value)
     assert "9.9.9" in msg
-    assert str(SCHEMA_OVERRIDES_VERSION) in msg
+    assert str(STRUCTURE_DOCUMENT_VERSION) in msg
     assert "Delete" in msg
 
 
 @pytest.mark.fast
 def test_mappings_replay_matches_version_mismatch_distinct_from_missing() -> None:
     manifest = parse_federation_manifest(_FED_MANIFEST, include_derived_roster=True)
-    mappings = FederationMappings(version="0.2.1")
+    mappings = FederationMappings(version="0.2.3")
     members = {"a": _member_graph("left_t", "a"), "b": _member_graph("right_t", "b")}
     with tempfile.TemporaryDirectory() as tmp:
         assert mappings_replay_matches(tmp, members, manifest, mappings) is False
@@ -226,7 +230,7 @@ def test_mappings_replay_matches_version_mismatch_distinct_from_missing() -> Non
 @pytest.mark.fast
 def test_load_federation_composite_graph_version_mismatch_distinct_from_missing() -> None:
     manifest = parse_federation_manifest(_FED_MANIFEST, include_derived_roster=True)
-    mappings = FederationMappings(version="0.2.1")
+    mappings = FederationMappings(version="0.2.3")
     members = {"a": _member_graph("left_t", "a"), "b": _member_graph("right_t", "b")}
     with tempfile.TemporaryDirectory() as tmp:
         assert load_federation_composite_graph(tmp) is None

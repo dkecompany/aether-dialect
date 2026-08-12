@@ -9,7 +9,7 @@ import pandas
 import pytest
 
 from aetherdialect._contracts_schema import SchemaGraph
-from aetherdialect._pipeline import save_result_csv
+from aetherdialect._pipeline_execute import save_result_csv
 from aetherdialect._seed_warmup import SeedWarmupCacheSession
 
 
@@ -57,5 +57,5 @@ def test_written_files_use_fixed_line_endings(
                 assert b"\r\n" not in body
 
     if os.name == "nt":
-        # On Windows, default text mode would emit CRLF; this guard is the regression signal.
+        # On Windows, default text mode would emit CRLF; owned exports must still use LF.
         assert csv_bytes.count(b"\n") >= 1

@@ -40,7 +40,7 @@ _NAMED_TRANSIENT_CONDITIONS: tuple[tuple[str, str], ...] = (
 )
 def test_classification_table_covers_named_conditions(message: str, label: str) -> None:
     global pre_fix_failure
-    from aetherdialect._core_utils import classify_database_error
+    from aetherdialect._utils import classify_database_error
 
     exc = RuntimeError(message)
     got = classify_database_error(exc)
@@ -52,7 +52,7 @@ def test_classification_table_covers_named_conditions(message: str, label: str) 
 def test_unknown_classification_is_not_retryable() -> None:
     global pre_fix_failure
     from aetherdialect._contracts_base import DatabaseExecutionError
-    from aetherdialect._core_utils import classify_database_error
+    from aetherdialect._utils import classify_database_error
 
     exc = RuntimeError("syntax error at or near SELECT")
     classification = classify_database_error(exc)

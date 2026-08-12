@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-from aetherdialect._contracts_base import ColumnRole
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import data_type_to_value_type, structural_hash_fp
+from aetherdialect._contracts_schema import ColumnMetadata, ColumnRole, SchemaGraph, TableMetadata
 from aetherdialect._schema_graph import diff_schemas, tables_structural_payload
+from aetherdialect._utils import data_type_to_value_type, structural_hash_fp
 
 
 def _col(name: str, data_type: str) -> ColumnMetadata:
@@ -61,7 +60,7 @@ def test_semantic_type_aliases_share_structural_hash() -> None:
 
 
 @pytest.mark.fast
-def test_integer_to_bigint_still_redeclared() -> None:
+def test_integer_to_bigint_is_redeclared() -> None:
     old = _schema({"t": _table("t", {"x": _col("x", "integer")})})
     new = _schema({"t": _table("t", {"x": _col("x", "bigint")})})
     diff = diff_schemas(old, new)
@@ -70,7 +69,7 @@ def test_integer_to_bigint_still_redeclared() -> None:
 
 
 @pytest.mark.fast
-def test_varchar_to_text_still_redeclared() -> None:
+def test_varchar_to_text_is_redeclared() -> None:
     old = _schema({"t": _table("t", {"x": _col("x", "varchar(50)")})})
     new = _schema({"t": _table("t", {"x": _col("x", "text")})})
     diff = diff_schemas(old, new)

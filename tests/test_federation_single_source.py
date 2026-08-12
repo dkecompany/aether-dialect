@@ -6,23 +6,28 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from aetherdialect._contracts_base import NormalizedExpr
 from aetherdialect._contracts_core import RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._dialect import DialectRegistry
-from aetherdialect._federation import (
-    build_federation_manifest_from_members,
+from aetherdialect._federation_compose import (
     compose_composite_graph,
-    federation_plan_is_degenerate,
-    parse_federation_manifest,
-    plan_federated_intent,
-    resolve_federated_member_schema,
     source_ids_for_intent,
 )
-from aetherdialect._intent_process import NormalizedExpr
+from aetherdialect._federation_manifest import (
+    build_federation_manifest_from_members,
+    parse_federation_manifest,
+)
+from aetherdialect._federation_plan import (
+    federation_plan_is_degenerate,
+    plan_federated_intent,
+    resolve_federated_member_schema,
+)
 from aetherdialect._main_execution import MainExecutionOps
-from aetherdialect._pipeline import generate_and_validate_sql, prepare_federated_sql_plan
+from aetherdialect._pipeline_execute import prepare_federated_sql_plan
+from aetherdialect._pipeline_generate import generate_and_validate_sql
 from aetherdialect._schema_graph import recompute_join_paths_multi
-from aetherdialect._templates import TemplateOps
+from aetherdialect._templates_ops import TemplateOps
 from tests.conftest import duckdb_engine_identity
 from tests.federation_helpers import enriched_manifest
 
@@ -166,7 +171,7 @@ def test_degenerate_federated_prepare_matches_direct_member_sql() -> None:
     )
     store = TemplateOps.empty_template_store(composite.schema_graph_id)
     with patch(
-        "aetherdialect._pipeline._run_sql_validation_cascade",
+        "aetherdialect._pipeline_generate.run_sql_validation_cascade",
         return_value=(True, "", None, []),
     ):
 
@@ -175,7 +180,7 @@ def test_degenerate_federated_prepare_matches_direct_member_sql() -> None:
             _federation_dialects = {sid: runtime.dialect for sid, runtime in runtimes.items()}
 
         owner = _Owner()
-        single_source = MainExecutionOps._federation_single_source_sql_context(
+        single_source = MainExecutionOps.federation_single_source_sql_context(
             owner,
             intent,
             composite,
@@ -216,8 +221,8 @@ def test_degenerate_federated_prepare_matches_direct_member_sql() -> None:
 
 
 def test_federated_step_sql_context_prefers_runtime_dialect() -> None:
-    from aetherdialect._federation import plan_federated_intent
-    from aetherdialect._pipeline import _federated_step_sql_context
+    from aetherdialect._federation_plan import plan_federated_intent
+    from aetherdialect._pipeline_execute import _federated_step_sql_context
 
     manifest = _composed_manifest()
     composite = compose_composite_graph(_member_graphs(), manifest)

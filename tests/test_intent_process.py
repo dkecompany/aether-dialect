@@ -8,6 +8,11 @@ from unittest.mock import patch
 import pytest
 
 from aetherdialect._constants import MAX_NON_AGG_COL_DIFF, VALID_HAVING_OPS
+from aetherdialect._constants_runtime import (
+    INTENT_CRITICAL_RULES,
+    INTENT_FORMAT_REPAIR_JSON_RULES,
+    INTENT_PARSE_RULES_APPEND,
+)
 from aetherdialect._contracts_base import (
     FailureCategory,
     HavingParam,
@@ -39,7 +44,13 @@ from aetherdialect._contracts_schema import (
     WindowRegistryStep,
     WindowSpec,
 )
-from aetherdialect._core_utils import stable_json
+from aetherdialect._intent_bind import (
+    check_qualified_refs_exist,
+    classify_union_merge_case,
+    compute_intent_union,
+    join_path_key_concrete,
+    join_path_key_runtime,
+)
 from aetherdialect._intent_expr import (
     _base_similarity,
     _compute_having_similarity,
@@ -52,10 +63,7 @@ from aetherdialect._intent_expr import (
     intent_similarity,
     logical_intent_from_parsed,
 )
-from aetherdialect._intent_process import (
-    INTENT_CRITICAL_RULES,
-    INTENT_FORMAT_REPAIR_JSON_RULES,
-    INTENT_PARSE_RULES_APPEND,
+from aetherdialect._intent_loop import (
     _apply_post_processing,
     _compute_error_signature_issues,
     _compute_error_signature_strings,
@@ -63,7 +71,6 @@ from aetherdialect._intent_process import (
     _diff_cols_span_disjoint_tables,
     _format_repair_loop,
     _normalize_cte_output_aliases,
-    _post_processing_revalidation_passes,
     _runtime_intent_case_registry_has_empty_branches,
     _structural_body_matches,
     _union_family_index_from_templates,
@@ -77,6 +84,7 @@ from aetherdialect._intent_process import (
     invoke_intent_parse_with_hints,
     logical_intent_to_serialisable,
     match_template_for_union,
+    post_processing_revalidation_passes,
     reconcile_union_family_after_mutation,
     reconcile_union_family_body_join_after_mutation,
     resolve_repair_instruction,
@@ -86,14 +94,8 @@ from aetherdialect._intent_process import (
     structural_compare_runtime,
     union_template_compatibility,
 )
-from aetherdialect._intent_resolve import (
-    check_qualified_refs_exist,
-    classify_union_merge_case,
-    compute_intent_union,
-    join_path_key_concrete,
-    join_path_key_runtime,
-)
-from aetherdialect._utils import body_similarity_key, intent_key
+from aetherdialect._utils import stable_json
+from aetherdialect._utils_intent import body_similarity_key, intent_key
 
 
 class TestJaccard:
@@ -298,7 +300,7 @@ class TestFormatRepairLoop:
                 "select_cols": ["film.film_id"],
             }
         )
-        with patch("aetherdialect._intent_process.LLMProvider.chat") as chat:
+        with patch("aetherdialect._intent_loop.LLMProvider.chat") as chat:
             intent, calls = _format_repair_loop("sys", raw, "q", max_retries=3)
         assert calls == 0
         assert chat.call_count == 0
@@ -320,7 +322,7 @@ class TestFormatRepairLoop:
                 "select_cols": ["film.film_id"],
             }
         )
-        with patch("aetherdialect._intent_process.LLMProvider.chat", return_value=good) as chat:
+        with patch("aetherdialect._intent_loop.LLMProvider.chat", return_value=good) as chat:
             intent, calls = _format_repair_loop("sys", bad, "q", max_retries=3)
         assert calls == 1
         assert chat.call_count == 1
@@ -751,29 +753,29 @@ class TestBuildIntentParsePrompt:
 
 
 class TestPlannerSingleOutputWindowRule:
-    """Planner Stage-A decomposition includes the no-CTE-for-single- window rule (WF-009)."""
+    """Planner Stage-A decomposition includes the no-CTE-for-single- window rule."""
 
     def test_logical_decomposition_guidance_contains_rule(self):
-        from aetherdialect._constants import (
+        from aetherdialect._constants_runtime import (
+            INTERPRET_CARDINALITY_RELATIONSHIP_RULE,
+            INTERPRET_SHARED_PK_TABLE_SCOPE_RULE,
+            INTERPRET_SINGLE_OUTPUT_WINDOW_NO_CTE_RULE,
             LOGICAL_DECOMPOSITION_GUIDANCE,
-            PLANNER_CARDINALITY_RELATIONSHIP_RULE,
-            PLANNER_SHARED_PK_TABLE_SCOPE_RULE,
-            PLANNER_SINGLE_OUTPUT_WINDOW_NO_CTE_RULE,
         )
         from aetherdialect._contracts_core import InterpretPlan
-        from aetherdialect._intent_process import build_intent_ground_prompt
+        from aetherdialect._intent_loop import build_intent_ground_prompt
 
         guidance = stable_json(list(LOGICAL_DECOMPOSITION_GUIDANCE))
         q = "list rentals with rental id and next rental date for the same inventory item ordered by rental date"
         plan = InterpretPlan(approach="list entity rows with ordering", tables=("tbl_a",))
         payload = build_intent_ground_prompt(q, plan, "{}", "", guidance, (), ())
-        assert PLANNER_SINGLE_OUTPUT_WINDOW_NO_CTE_RULE in payload
-        assert PLANNER_CARDINALITY_RELATIONSHIP_RULE in payload
-        assert PLANNER_SHARED_PK_TABLE_SCOPE_RULE in payload
+        assert INTERPRET_SINGLE_OUTPUT_WINDOW_NO_CTE_RULE in payload
+        assert INTERPRET_CARDINALITY_RELATIONSHIP_RULE in payload
+        assert INTERPRET_SHARED_PK_TABLE_SCOPE_RULE in payload
 
     def test_ground_prompt_receives_full_interpret_projection(self):
         from aetherdialect._contracts_core import InterpretPlan
-        from aetherdialect._intent_process import build_intent_ground_prompt
+        from aetherdialect._intent_loop import build_intent_ground_prompt
 
         plan = InterpretPlan(
             approach="count grouped rows",
@@ -1664,7 +1666,7 @@ class TestNormalizeCteOutputAliases:
         assert out.select_cols[0].expr.primary_column == "sq.film_id"
 
     def test_window_registry_outputs_and_qualified_refs(self):
-        """SB-004: index-aligned output_columns remap resolves qualified CTE refs."""
+        """Index-aligned output_columns remap resolves qualified CTE refs."""
         film = TableMetadata(
             name="film",
             columns={
@@ -1814,7 +1816,7 @@ class TestReconcileUnionFamilies:
         assert keeper.value_history.questions == ["q1", "q2"]
 
     def test_reconcile_union_family_with_union_family_index_matches_full_scan(self):
-        """Indexed path should remove the same ids as the legacy full scan."""
+        """Indexed path removes the same ids as the full-scan path."""
 
         def pair() -> dict[str, Template]:
             sig = _concrete(["t"], [_col("t", "a")])
@@ -1853,13 +1855,13 @@ class TestReconcileUnionFamilies:
             return {"T0001": t_lo, "T0002": t_hi}
 
         indexed = pair()
-        legacy = pair()
+        full_scan = pair()
         ufi = _union_family_index_from_templates(indexed)
         removed_i = reconcile_union_family_after_mutation(indexed, union_family_index=ufi)
-        removed_l = reconcile_union_family_after_mutation(legacy)
+        removed_l = reconcile_union_family_after_mutation(full_scan)
         assert removed_i == removed_l == ["T0002"]
-        assert indexed.keys() == legacy.keys() == {"T0001"}
-        assert indexed["T0001"].value_history.questions == legacy["T0001"].value_history.questions
+        assert indexed.keys() == full_scan.keys() == {"T0001"}
+        assert indexed["T0001"].value_history.questions == full_scan["T0001"].value_history.questions
 
     def test_reconcile_body_join_merges_same_body_and_join_path(self):
         sig = _concrete(["t"], [_col("t", "a")])
@@ -1904,7 +1906,7 @@ class TestReconcileUnionFamilies:
 
 
 class TestPhaseGPostValidation:
-    """Tests for _post_processing_revalidation_passes."""
+    """Tests for post_processing_revalidation_passes."""
 
     @staticmethod
     def _minimal_schema() -> SchemaGraph:
@@ -1932,11 +1934,11 @@ class TestPhaseGPostValidation:
         )
 
     def test_passes_when_schema_and_semantics_clean(self):
-        assert _post_processing_revalidation_passes(self._valid_intent(), self._minimal_schema()) is True
+        assert post_processing_revalidation_passes(self._valid_intent(), self._minimal_schema()) is True
 
     def test_fails_on_schema_error(self):
         intent = replace(self._valid_intent(), tables=["does_not_exist"])
-        assert _post_processing_revalidation_passes(intent, self._minimal_schema()) is False
+        assert post_processing_revalidation_passes(intent, self._minimal_schema()) is False
 
 
 class TestApplyPostProcessingMissingParams:
@@ -1987,14 +1989,14 @@ class TestFormatRepairLoopEdgeCases:
                 "select_cols": ["film.film_id"],
             }
         )
-        with patch("aetherdialect._intent_process.LLMProvider.chat", return_value=good) as chat:
+        with patch("aetherdialect._intent_loop.LLMProvider.chat", return_value=good) as chat:
             intent, calls = _format_repair_loop("sys", "not json {", "q", max_retries=3)
         assert calls == 1
         assert chat.call_count == 1
         assert intent is not None
 
     def test_exhausted_retries_returns_last_parse_attempt(self):
-        with patch("aetherdialect._intent_process.LLMProvider.chat", return_value="still not json") as chat:
+        with patch("aetherdialect._intent_loop.LLMProvider.chat", return_value="still not json") as chat:
             intent, calls = _format_repair_loop("sys", "{broken", "q", max_retries=2)
         assert calls == 2
         assert chat.call_count == 2
@@ -2383,7 +2385,7 @@ class TestInvokeIntentParseWithHints:
             }
         ]
         with patch(
-            "aetherdialect._intent_process.full_intent_parse",
+            "aetherdialect._intent_loop.full_intent_parse",
             side_effect=_stub_full_parse,
         ):
             invoke_intent_parse_with_hints(
@@ -2453,7 +2455,7 @@ class TestApplyRuntimePostProcessingLite:
 
 
 class TestLogicalIntentNlRoundTrip:
-    """Planner NL fields survive parse then serialise for the encoder."""
+    """Interpret NL fields survive parse then serialise for compose."""
 
     def test_root_logical_round_trip(self) -> None:
         raw = {
@@ -2526,11 +2528,11 @@ class TestApplyPostProcessingIdempotence:
 
 
 class TestAlignRuntimeTablesToPlanner:
-    """Tests for _align_runtime_tables_to_planner."""
+    """Tests for _align_runtime_tables_to_interpret."""
 
     def test_main_tables_replaced(self) -> None:
-        from aetherdialect._contracts_base import LogicalIntent
-        from aetherdialect._intent_process import _align_runtime_tables_to_planner
+        from aetherdialect._contracts_schema import LogicalIntent
+        from aetherdialect._intent_loop import _align_runtime_tables_to_interpret
 
         logical = LogicalIntent(
             tables=("film", "inventory", "rental", "payment"),
@@ -2547,12 +2549,12 @@ class TestAlignRuntimeTablesToPlanner:
             param_values={},
             natural_language="q",
         )
-        out = _align_runtime_tables_to_planner(runtime, logical)
+        out = _align_runtime_tables_to_interpret(runtime, logical)
         assert out.tables == ["film", "inventory", "rental", "payment"]
 
     def test_cte_tables_aligned_by_name(self) -> None:
-        from aetherdialect._contracts_base import CteIntent, LogicalIntent
-        from aetherdialect._intent_process import _align_runtime_tables_to_planner
+        from aetherdialect._contracts_schema import CteIntent, LogicalIntent
+        from aetherdialect._intent_loop import _align_runtime_tables_to_interpret
 
         logical = LogicalIntent(
             tables=("film",),
@@ -2577,12 +2579,12 @@ class TestAlignRuntimeTablesToPlanner:
             natural_language="q",
             cte_steps=[cte],
         )
-        out = _align_runtime_tables_to_planner(runtime, logical)
+        out = _align_runtime_tables_to_interpret(runtime, logical)
         assert out.cte_steps[0].tables == ["a", "b", "bridge", "c"]
 
     def test_unmatched_cte_unchanged(self) -> None:
-        from aetherdialect._contracts_base import LogicalIntent
-        from aetherdialect._intent_process import _align_runtime_tables_to_planner
+        from aetherdialect._contracts_schema import LogicalIntent
+        from aetherdialect._intent_loop import _align_runtime_tables_to_interpret
 
         logical = LogicalIntent(tables=("x",), select="")
         cte = RuntimeCteStep(cte_name="orphan", tables=["only"])
@@ -2598,15 +2600,15 @@ class TestAlignRuntimeTablesToPlanner:
             natural_language="q",
             cte_steps=[cte],
         )
-        out = _align_runtime_tables_to_planner(runtime, logical)
+        out = _align_runtime_tables_to_interpret(runtime, logical)
         assert out.cte_steps[0].tables == ["only"]
 
 
 class TestSchemaInvalidContinuesPipeline:
-    """Interpret schema_invalid must not skip Ground or Compose."""
+    """Interpret schema_invalid must not skip Ground or Compose when tables remain."""
 
     def test_full_intent_parse_calls_ground_when_schema_invalid(self, schema_graph: SchemaGraph):
-        from aetherdialect._intent_process import full_intent_parse
+        from aetherdialect._intent_loop import full_intent_parse
 
         llm_calls = {"count": 0}
 
@@ -2626,12 +2628,34 @@ class TestSchemaInvalidContinuesPipeline:
                 )
             return "{}"
 
-        with patch("aetherdialect._intent_process.LLMProvider.chat", side_effect=_fake_llm):
+        with patch("aetherdialect._intent_loop.LLMProvider.chat", side_effect=_fake_llm):
             try:
                 full_intent_parse("list customers", schema_graph, max_retries=0)
             except Exception:
                 pass
         assert llm_calls["count"] >= 2
+
+    def test_full_intent_parse_short_circuits_empty_schema_invalid(self, schema_graph: SchemaGraph):
+        from aetherdialect._intent_loop import full_intent_parse
+
+        llm_calls = {"count": 0}
+
+        def _fake_llm(system: str, user: str, **kwargs: Any) -> str:
+            llm_calls["count"] += 1
+            return (
+                '{"approach":"","tables":[],"schema_invalid":true,'
+                '"missing":"cities and stores are outside this space","grounding":[]}'
+            )
+
+        with patch("aetherdialect._intent_loop.LLMProvider.chat", side_effect=_fake_llm):
+            intent, warnings, calls, plan = full_intent_parse("how many cities?", schema_graph, max_retries=0)
+        assert intent is None
+        assert warnings == []
+        assert llm_calls["count"] == 1
+        assert calls == 1
+        assert plan is not None
+        assert plan.schema_invalid is True
+        assert plan.tables == ()
 
 
 class TestParseInterpretPlanLegacyMissing:
@@ -2650,11 +2674,20 @@ class TestParseInterpretPlanLegacyMissing:
         assert plan.schema_invalid is True
         assert plan.missing == "legacy reason field"
 
+    def test_empty_schema_invalid_plan_is_accepted(self):
+        from aetherdialect._intent_expr import interpret_plan_is_unanswerable, parse_interpret_plan_response
+
+        raw = '{"approach":"","tables":[],"schema_invalid":true,"missing":"out of space","grounding":[]}'
+        plan, issues = parse_interpret_plan_response(raw)
+        assert issues == []
+        assert plan is not None
+        assert interpret_plan_is_unanswerable(plan) is True
+
 
 def test_structural_tables_includes_prose_qualified_columns() -> None:
     """Prose table.column tokens union into compose structural schema without mutating logical.tables."""
-    from aetherdialect._contracts_base import LogicalIntent
-    from aetherdialect._intent_process import _structural_tables_for_logical
+    from aetherdialect._contracts_schema import LogicalIntent
+    from aetherdialect._intent_loop import _structural_tables_for_logical
 
     logical = LogicalIntent(
         tables=("table", "other_table"),

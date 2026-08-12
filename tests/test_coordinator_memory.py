@@ -7,12 +7,10 @@ import pytest
 
 from aetherdialect._contracts_core import RuntimeIntent
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import (
-    compose_composite_graph,
-    execute_federation_coordinator,
-    parse_federation_manifest,
-    plan_federated_intent,
-)
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_execute import execute_federation_coordinator
+from aetherdialect._federation_manifest import parse_federation_manifest
+from aetherdialect._federation_plan import plan_federated_intent
 from aetherdialect._schema_graph import recompute_join_paths_multi
 
 
@@ -62,7 +60,7 @@ def _join_plan() -> object:
 @pytest.mark.fast
 def test_result_fetched_once(monkeypatch: pytest.MonkeyPatch) -> None:
     """Coordinator glue SQL is executed once; fan-out uses the held frame, not a second fetch."""
-    from aetherdialect import _federation
+    from aetherdialect import _federation_execute
 
     plan = _join_plan()
     frames = {
@@ -70,7 +68,7 @@ def test_result_fetched_once(monkeypatch: pytest.MonkeyPatch) -> None:
         "b": pd.DataFrame({"id": [2, 3]}),
     }
     call_count = 0
-    real_execute = _federation._execute_coordinator_sql_with_timeout
+    real_execute = _federation_execute._execute_coordinator_sql_with_timeout
 
     def _counting_execute(
         conn: object,
@@ -83,7 +81,7 @@ def test_result_fetched_once(monkeypatch: pytest.MonkeyPatch) -> None:
         call_count += 1
         return real_execute(conn, sql, bind_map or {}, timeout_ms=timeout_ms)
 
-    monkeypatch.setattr(_federation, "_execute_coordinator_sql_with_timeout", _counting_execute)
+    monkeypatch.setattr(_federation_execute, "_execute_coordinator_sql_with_timeout", _counting_execute)
     result = execute_federation_coordinator(frames, plan, row_cap=100)
     assert len(result) == 1
     assert call_count == 1

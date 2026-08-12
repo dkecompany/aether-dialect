@@ -9,8 +9,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from aetherdialect import AetherEngine, AetherFederation
-from aetherdialect._contracts_base import AetherFederationInitResult, LLMConfig, RuntimeConfig
-from aetherdialect._core_utils import (
+from aetherdialect._contracts_core import AetherFederationInitResult, LLMConfig, RuntimeConfig
+from aetherdialect._utils_artifacts import (
     open_resource_inventory,
     register_live_connection,
     track_close_temp_directory,
@@ -107,6 +107,11 @@ def test_federation_close_disposes_coordinator() -> None:
     member = MagicMock()
     member._execution_engine = None
     member._native_connection = None
+    member._named_connection = "a"
+    member2 = MagicMock()
+    member2._execution_engine = None
+    member2._native_connection = None
+    member2._named_connection = "b"
     with (
         patch(
             "aetherdialect.aetherdialect.initialize_aether_federation",
@@ -116,7 +121,7 @@ def test_federation_close_disposes_coordinator() -> None:
         patch("aetherdialect.aetherdialect.dispose_federation_source_runtimes"),
         patch.object(AetherFederation, "_audit_emit"),
     ):
-        fed = AetherFederation("fed", members={"a": member}, declaration_file="/tmp/decl.json")
+        fed = AetherFederation("fed", members=[member, member2], declaration="/tmp/decl.json")
         fed.close()
     assert any(call.args[0] is coordinator for call in dispose_mock.call_args_list)
 

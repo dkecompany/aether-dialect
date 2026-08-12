@@ -22,26 +22,21 @@ from ._constants import (
     EMPTY_JOIN_CANDIDATES,
     JOIN_CHOICE_SCOPE_MAIN,
     JSON_COMPACT_SEPARATORS,
-    REALISM_DROP_REASON_CATEGORIES,
     SEED_FAILURE_CODE_REALISM_DROPPED,
     SEED_NORMALIZATION_BATCH_SIZE,
-    SEED_QUESTION_CLARIFY_SYSTEM,
     SEED_WARMUP_DROP_CODES,
     SEED_WARMUP_FAILURE_CODES,
     WARMUP_OPERATOR_FEATURE_TUPLE_4BIT_CARDINALITY,
 )
-from ._contracts_base import (
-    HavingParam,
-    LlmBatchRequest,
-    LlmJsonExhausted,
-    PredicateGroup,
-    WhereParam,
-)
+from ._constants_runtime import REALISM_DROP_REASON_CATEGORIES, SEED_QUESTION_CLARIFY_SYSTEM
+from ._contracts_base import HavingParam, PredicateGroup, WhereParam
 from ._contracts_core import (
     AnchorLattice,
     AnchorLatticeCell,
     AnchorLatticeKey,
     GenerationPath,
+    LlmBatchRequest,
+    LlmJsonExhausted,
     QuestionFormStorage,
     RuntimeCteStep,
     RuntimeIntent,
@@ -51,47 +46,27 @@ from ._contracts_core import (
     ValueHistory,
 )
 from ._contracts_schema import SchemaGraph, TemplateStats, ValueDomain
-from ._core_utils import (
-    StepResult,
-    append_failure_trace,
-    artifact_lock,
-    ask_user_choice,
-    bind_params_for_sql,
-    debug,
-    normalize_question,
-    notify,
-    pipeline_capture,
-    reconcile_execute_bind_params,
-    seed_warmup_failure_code_from_validate_sql_error,
-    sha256,
-    stable_json,
-    telemetry_capture,
-    write_json_atomic,
-)
 from ._dialect import Dialect
-from ._federation import schema_spans_multiple_sources
+from ._federation_manifest import schema_spans_multiple_sources
+from ._intent_bind import (
+    check_qualified_refs_exist,
+    join_path_key_runtime,
+    prune_unused_cte_steps,
+)
 from ._intent_expr import apply_default_structural_values
-from ._intent_process import (
+from ._intent_loop import (
     apply_deterministic_repairs,
     apply_runtime_post_processing_lite,
     collect_structural_match_templates,
     full_intent_parse,
     structural_compare,
 )
-from ._intent_repair import apply_diagnostic_repairs
-from ._intent_resolve import (
-    check_qualified_refs_exist,
-    join_path_key_runtime,
-    prune_unused_cte_steps,
-)
+from ._intent_normalize import apply_diagnostic_repairs
 from ._llm_provider import LLMProvider
-from ._pipeline import (
-    execute_federated_warmup_intent,
-    finalize_substitute_sql,
-    other_template_owns_question_string,
-    persist_federated_warmup_learning,
-)
+from ._pipeline_execute import execute_federated_warmup_intent, persist_federated_warmup_learning
+from ._pipeline_generate import finalize_substitute_sql, other_template_owns_question_string
 from ._qsim import (
+    active_simulation_artifact_partition_fp,
     deterministic_having_value,
     greedy_cover_indices_by_atoms,
     sample_coordinated_range,
@@ -107,8 +82,25 @@ from ._sql_gen import (
     join_hints_multi,
     physical_tables_for_join_hints,
 )
-from ._templates import TemplateOps, TemplateRefs
+from ._templates import TemplateRefs
+from ._templates_ops import TemplateOps
 from ._utils import (
+    StepResult,
+    ask_user_choice,
+    bind_params_for_sql,
+    debug,
+    normalize_question,
+    notify,
+    pipeline_capture,
+    reconcile_execute_bind_params,
+    seed_warmup_failure_code_from_validate_sql_error,
+    sha256,
+    stable_json,
+    telemetry_capture,
+    warmup_lattice_filename,
+)
+from ._utils_artifacts import append_failure_trace, artifact_lock, write_json_atomic
+from ._utils_intent import (
     body_similarity_key,
     exact_question_match,
     flatten_warmup_paraphrases_by_style,
@@ -118,8 +110,12 @@ from ._utils import (
     template_instance_key_for_concrete,
     template_instance_key_for_runtime,
 )
-from ._validation_execute import curated_warmup_post_binding_issues, curated_warmup_semantic_issues, validate_sql
-from ._validation_schema import assert_execution_parameters_validated
+from ._validation_sql import (
+    assert_execution_parameters_validated,
+    curated_warmup_post_binding_issues,
+    curated_warmup_semantic_issues,
+    validate_sql,
+)
 
 JoinCacheEntry = tuple[str, list[str], dict[str, Any]]
 JoinCacheKey = tuple[frozenset[str], str]
@@ -272,10 +268,20 @@ class SeedWarmupCacheSession:
         }
 
     @staticmethod
-    def _warmup_anchor_lattice_json_path(output_root: str, schema: SchemaGraph) -> str:
+    def _warmup_anchor_lattice_json_path(
+        output_root: str,
+        schema: SchemaGraph,
+        *,
+        partition_fp: str | None = None,
+    ) -> str:
         """Absolute path to persisted anchor-lattice JSON for *schema* under. *output_root*."""
         base = os.path.join(output_root, SeedWarmupConfig.WARMUP_ANCHOR_LATTICE_SUBDIR)
-        fn = f"lattice_{schema.schema_graph_id}_v{SeedWarmupConfig.WARMUP_ANCHOR_LATTICE_CODE_VERSION}.json"
+        fp = active_simulation_artifact_partition_fp() if partition_fp is None else str(partition_fp or "")
+        fn = warmup_lattice_filename(
+            str(schema.schema_graph_id or ""),
+            fp,
+            SeedWarmupConfig.WARMUP_ANCHOR_LATTICE_CODE_VERSION,
+        )
         return os.path.join(base, fn)
 
     @staticmethod
@@ -317,6 +323,7 @@ class SeedWarmupCacheSession:
             payload = {
                 "schema_fp": schema.schema_graph_id,
                 "code_version": SeedWarmupConfig.WARMUP_ANCHOR_LATTICE_CODE_VERSION,
+                "partition_fp": active_simulation_artifact_partition_fp(),
                 "cells": {k: {"anchors": v} for k, v in sorted(cells.items())},
             }
             write_json_atomic(path, payload, sort_keys=False)
@@ -426,12 +433,7 @@ class SeedWarmupCacheSession:
         ):
             identity_ok = True
         seed_ok = identity_ok
-        prev_id = str(
-            manifest.get("schema_graph_id")
-            or manifest.get("effective_structural_hash")
-            or manifest.get("schema_hash")
-            or ""
-        )
+        prev_id = str(manifest.get("schema_graph_id") or manifest.get("effective_structural_hash") or "")
         eff_ok = prev_id == schema.schema_graph_id
         prev_prof = str(manifest.get("profiling_hash") or "")
 
@@ -449,7 +451,6 @@ class SeedWarmupCacheSession:
         }
         manifest = {
             **manifest,
-            "schema_hash": schema.schema_hash,
             "schema_graph_id": schema.schema_graph_id,
             "effective_structural_hash": schema.effective_structural_hash,
             "structural_hash": schema.structural_hash,
@@ -510,9 +511,9 @@ class SeedWarmupCacheSession:
                 continue
             cr = structural_compare(runtime, tmpl)
             if cr.union_eligible and cr.union_sql_path == GenerationPath.UNION_TEMPLATE_WIDEN:
-                return "warmup_path41_not_allowed"
+                return "warmup_union_template_widen_not_allowed"
             if cr.union_eligible and cr.union_sql_path == GenerationPath.UNION_TEMPLATE_AND_RUNTIME_WIDEN:
-                return "warmup_path42_not_allowed"
+                return "warmup_union_template_and_runtime_widen_not_allowed"
         return None
 
     @staticmethod
@@ -563,20 +564,40 @@ class SeedWarmupCacheSession:
                 parsed_by_id = {}
 
         for custom_id, batch, user in batch_chunks:
-            parsed = parsed_by_id.get(custom_id, {})
-            if not parsed:
+            parsed = parsed_by_id.get(custom_id)
+            llm_succeeded = isinstance(parsed, dict) and bool(parsed)
+            if not llm_succeeded:
                 try:
                     parsed = LLMProvider.json(SEED_QUESTION_CLARIFY_SYSTEM, user, retries=2, task="default")
+                    llm_succeeded = True
                 except LlmJsonExhausted as exc:
                     debug(f"[seed_warmup.run_seed_question_normalization] llm_json exhausted on {custom_id}: {exc}")
                     parsed = {}
-            lines = parsed.get("lines")
-            if not isinstance(lines, list):
+                    llm_succeeded = False
+            if llm_succeeded:
+                if not isinstance(parsed, dict):
+                    raise ValueError(
+                        f"[seed_warmup.run_seed_question_normalization] LLM JSON is not an object for {custom_id}"
+                    )
+                if "lines" not in parsed:
+                    raise ValueError(
+                        f"[seed_warmup.run_seed_question_normalization] LLM JSON missing 'lines' for {custom_id}"
+                    )
+                lines = parsed["lines"]
+                if not isinstance(lines, list):
+                    raise ValueError(
+                        f"[seed_warmup.run_seed_question_normalization] 'lines' must be a list "
+                        f"for {custom_id}; got {type(lines).__name__}"
+                    )
+            else:
                 lines = []
             got: dict[int, str] = {}
             for row in lines:
                 if not isinstance(row, dict):
-                    continue
+                    raise ValueError(
+                        f"[seed_warmup.run_seed_question_normalization] line item must be an object "
+                        f"for {custom_id}; got {type(row).__name__}"
+                    )
                 idx = row.get("index")
                 nm = str(row.get("clarified") or row.get("normalized") or "").strip()
                 if idx is not None and nm:
@@ -933,7 +954,8 @@ class SeedWarmupCacheSession:
             grain = str(intent.get("grain") or "")
             select_cols = SeedWarmupCacheSession._object_list(intent.get("select_cols"))
             group_by = SeedWarmupCacheSession._object_list(intent.get("group_by_cols"))
-            filters = SeedWarmupCacheSession._object_list(intent.get("where", intent.get("where_param")))
+            where_group = PredicateGroup.parse_where_field(intent)
+            filters = [cast(object, f) for f in (PredicateGroup.where_leaves(where_group) or [])]
             limit = SeedWarmupCacheSession._optional_int(intent.get("limit"))
             cte_steps = SeedWarmupCacheSession._object_list(intent.get("cte_steps"))
             window_registry = SeedWarmupCacheSession._object_list(intent.get("window_registry"))
@@ -1352,7 +1374,7 @@ class SeedWarmupCacheSession:
 
     @staticmethod
     def _warmup_scenario_atom(intent: SeedWarmupIntent) -> str:
-        """Business-shape scenario atom replacing raw seed-index bucketing."""
+        """Domain-shape scenario atom replacing raw seed-index bucketing."""
         fam = intent.workload_family()
         tier = intent.complexity_tier().value
         tables = ",".join(sorted(intent.tables or []))
@@ -2175,6 +2197,7 @@ class SeedWarmupCacheSession:
         warmup_cache: SeedWarmupCacheSession | None = None,
         warmup_report_version: int = 1,
         warmup_lattice_root: str | None = None,
+        warmup_results_path: str | os.PathLike[str] | None = None,
         max_kept_intents: int | None | _WarmupCapDefaultSentinel = _WARMUP_CAP_DEFAULT,
         federation_manifest: Any | None = None,
         federation_mappings: Any | None = None,
@@ -2218,8 +2241,8 @@ class SeedWarmupCacheSession:
         template_instance_exists_count = 0
         not_sampled_after_execute = 0
         all_questions_dropped = 0
-        warmup_path41_drop = 0
-        warmup_path42_drop = 0
+        warmup_union_template_widen_drop = 0
+        warmup_union_template_and_runtime_widen_drop = 0
         drop_audit: list[dict[str, Any]] = []
         sampled_work_unit_ids: list[str] = []
 
@@ -2228,11 +2251,10 @@ class SeedWarmupCacheSession:
 
         if not warmup_lattice_root or not str(warmup_lattice_root).strip():
             raise ValueError("warmup_lattice_root is required for warmup failure logging and artifact paths")
-        results_root = Path(os.path.abspath(warmup_lattice_root))
-        cwd = Path.cwd().resolve()
-        results_file: Path | None = None
-        if results_root.resolve() != cwd:
-            results_file = results_root / "live_tests" / "results.txt"
+        if warmup_results_path is not None and str(warmup_results_path).strip():
+            results_file: Path | None = Path(os.path.abspath(str(warmup_results_path)))
+        else:
+            results_file = Path.cwd() / "results.txt"
 
         ordered_intents = sorted(intents, key=SeedWarmupCacheSession._seed_warmup_intent_sort_key)
         cap_n = SeedWarmupConfig.MAX_WARMUP_EXECUTE_UNITS
@@ -2381,10 +2403,10 @@ class SeedWarmupCacheSession:
                                 validation_drop += 1
                             elif fch == "template_instance_exists":
                                 template_instance_exists_count += 1
-                            elif fch == "warmup_path41_not_allowed":
-                                warmup_path41_drop += 1
-                            elif fch == "warmup_path42_not_allowed":
-                                warmup_path42_drop += 1
+                            elif fch == "warmup_union_template_widen_not_allowed":
+                                warmup_union_template_widen_drop += 1
+                            elif fch == "warmup_union_template_and_runtime_widen_not_allowed":
+                                warmup_union_template_and_runtime_widen_drop += 1
                             continue
                         tik_hit = str(er_hit.get("template_instance_key") or "")
                         if tik_hit in store_keys:
@@ -2459,10 +2481,10 @@ class SeedWarmupCacheSession:
                         result.error = syn_drop
                         results.append(result)
                         fail_count += 1
-                        if syn_drop == "warmup_path41_not_allowed":
-                            warmup_path41_drop += 1
+                        if syn_drop == "warmup_union_template_widen_not_allowed":
+                            warmup_union_template_widen_drop += 1
                         else:
-                            warmup_path42_drop += 1
+                            warmup_union_template_and_runtime_widen_drop += 1
                         _wu_record(runtime, ok=False, final_sql=None, fc=syn_drop, err=syn_drop, tik="")
                         continue
                 except Exception as e:
@@ -3079,8 +3101,8 @@ class SeedWarmupCacheSession:
             "execute_ok_count": len(pending_success),
             "cache_execute_hits": warmup_cache.execute_hits if warmup_cache else 0,
             "warmup_drop_audit": drop_audit,
-            "warmup_path41_not_allowed": warmup_path41_drop,
-            "warmup_path42_not_allowed": warmup_path42_drop,
+            "warmup_union_template_widen_not_allowed": warmup_union_template_widen_drop,
+            "warmup_union_template_and_runtime_widen_not_allowed": warmup_union_template_and_runtime_widen_drop,
             "warmup_touched_work_unit_ids": (list(warmup_cache.touched_work_unit_ids) if warmup_cache else []),
             "warmup_sampled_work_unit_ids": sampled_work_unit_ids,
             "warmup_fillback_batches": fillback_batches,

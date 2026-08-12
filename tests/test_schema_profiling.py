@@ -6,32 +6,34 @@ from typing import Any
 import pytest
 
 from aetherdialect._config import EngineConfig, PolicyConfig
-from aetherdialect._constants import BOOLEAN_TRUTH_PATTERN_MAP
+from aetherdialect._constants_runtime import (
+    BOOLEAN_TRUTH_PATTERN_MAP,
+    SCHEMA_CONSISTENCY_REFINE_SYSTEM,
+    SCHEMA_ENTITY_ENRICH_SYSTEM,
+)
 from aetherdialect._contracts_base import (
-    ColumnRole,
     NormalizedExpr,
     PredicateGroup,
-    RoleOwner,
-    TableRole,
+    SensitivityClassification,
+    StructuralKnowledgeFact,
     WhereParam,
 )
 from aetherdialect._contracts_core import RuntimeIntent
 from aetherdialect._contracts_schema import (
     ColumnMetadata,
+    ColumnRole,
     FKEdge,
+    RoleOwner,
     SchemaGraph,
     TableMetadata,
+    TableRole,
 )
-from aetherdialect._core_utils import stable_json
 from aetherdialect._dialect_sqlglot_engines import DatabricksDialect
 from aetherdialect._dialect_sqlglot_helper import SqlglotEngineDialect
-from aetherdialect._schema_catalog import (
-    SCHEMA_CONSISTENCY_REFINE_SYSTEM,
-    SCHEMA_NOTES_REFINE_SYSTEM,
+from aetherdialect._schema_profile import (
     _build_column_profile_for_llm,
     _coerce_antonym_pair_column,
     _coerce_zero_one_column,
-    _cursor_rows_as_dicts,
     _enrich_fk_column_descriptions,
     _extract_column_block_from_create,
     _extract_fk_definition,
@@ -39,10 +41,8 @@ from aetherdialect._schema_catalog import (
     _has_boolean_like_values,
     _infer_column_role,
     _normalize_llm_classification_payload,
-    _parse_catalog_constraints_from_ddl,
     _parse_column_name_and_sql_type,
     _parse_columns_and_constraints,
-    _parse_partition_columns_from_create_stmt,
     _parse_sql_file_fallback,
     _parse_sql_file_via_llm,
     _partition_column_names_from_create_ddl,
@@ -55,9 +55,13 @@ from aetherdialect._schema_catalog import (
     array_element_type_from_data_type,
     assign_column_ops,
     collect_profiling_frequent_values,
+    cursor_rows_as_dicts,
     llm_classify_schema,
+    parse_catalog_constraints_from_ddl,
+    parse_partition_columns_from_create_stmt,
     parse_sql_file,
 )
+from aetherdialect._utils import stable_json
 
 InformationSchemaSupport = SqlglotEngineDialect
 
@@ -407,17 +411,16 @@ class TestValidateColumnClassification:
         hard, soft = _validate_column_classification(col, ColumnRole.AUDIT.value)
         assert len(hard) == 0
 
-    def test_temporal_on_varchar_create_date_ok(self):
-        """TEMPORAL on VARCHAR create_date (federation seed) passes with soft warning."""
+    def test_temporal_on_varchar_create_date_requires_classified_role(self):
+        """String columns need classified metadata; name heuristics do not infer TEMPORAL."""
         col = ColumnMetadata(name="create_date", data_type="VARCHAR", value_type="string")
         hard, soft = _validate_column_classification(col, ColumnRole.TEMPORAL.value)
-        assert len(hard) == 0
-        assert _infer_column_role(col) == ColumnRole.TEMPORAL
+        assert len(hard) > 0
 
     def test_role_value_type_compat_temporal_integer(self):
-        """Infer duration integer columns as TEMPORAL."""
+        """Integer columns without date value_type infer NUMERIC_CATEGORICAL when low cardinality."""
         col = ColumnMetadata(name="lead_time_days", data_type="integer", value_type="integer")
-        assert _infer_column_role(col) == ColumnRole.TEMPORAL
+        assert _infer_column_role(col) == ColumnRole.NUMERIC_CATEGORICAL
 
     def test_boolean_high_cardinality(self):
         """Hard error for BOOLEAN with distinct_count > 2."""
@@ -699,7 +702,7 @@ class TestLlmClassifySchemaRefinePasses:
             return raw
 
         monkeypatch.setattr(EngineConfig, "SCHEMA_JSON_PATH", str(tmp_path / "schema_graph.json.gz"))
-        monkeypatch.setattr("aetherdialect._schema_catalog.LLMProvider.chat", fake_llm)
+        monkeypatch.setattr("aetherdialect._schema_profile.LLMProvider.chat", fake_llm)
         out = llm_classify_schema(sg, None)
         assert len(calls) == 2
         assert calls[0][1] == "schema_base"
@@ -707,7 +710,55 @@ class TestLlmClassifySchemaRefinePasses:
         assert calls[1][1] == "schema"
         assert "t" in out
 
-    def test_runs_notes_refine_when_notes_present(self, monkeypatch, tmp_path):
+    def test_runs_structural_enrich_when_facts_present(self, monkeypatch, tmp_path):
+        col = ColumnMetadata(name="id", data_type="integer", is_primary_key=True)
+        table = TableMetadata(name="t", columns={"id": col}, primary_key=["id"], foreign_keys=[])
+        sg = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"t": table})
+        raw = json.dumps(
+            {
+                "t": {
+                    "table_role": "dimension",
+                    "description": "d enriched",
+                    "columns": {"id": {"role": "identifier", "description": "h", "sensitivity": None}},
+                },
+            }
+        )
+        calls: list[str] = []
+        users: list[str] = []
+
+        def fake_llm(
+            system: str,
+            user: str,
+            max_retries: int = 3,
+            timeout: Any = None,
+            task: str = "default",
+        ) -> str:
+            calls.append(system)
+            users.append(user)
+            if system == SCHEMA_ENTITY_ENRICH_SYSTEM:
+                return json.dumps({"table_role": "dimension", "description": "d enriched"})
+            return raw
+
+        monkeypatch.setattr(EngineConfig, "SCHEMA_JSON_PATH", str(tmp_path / "schema_graph.json.gz"))
+        monkeypatch.setattr("aetherdialect._schema_profile.LLMProvider.chat", fake_llm)
+        llm_classify_schema(
+            sg,
+            structural_knowledge=(
+                StructuralKnowledgeFact(
+                    kind="relation",
+                    text="catalog entity",
+                    referenced_entities=frozenset({"t"}),
+                ),
+            ),
+        )
+        assert len(calls) == 2
+        assert calls[1] == SCHEMA_ENTITY_ENRICH_SYSTEM
+        assert "structural_facts" in users[1]
+        assert "entity" in users[1]
+        assert "domain_notes" not in users[1]
+        assert '"target"' not in users[1]
+
+    def test_notes_text_alone_does_not_trigger_notes_refine(self, monkeypatch, tmp_path):
         col = ColumnMetadata(name="id", data_type="integer", is_primary_key=True)
         table = TableMetadata(name="t", columns={"id": col}, primary_key=["id"], foreign_keys=[])
         sg = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"t": table})
@@ -733,10 +784,10 @@ class TestLlmClassifySchemaRefinePasses:
             return raw
 
         monkeypatch.setattr(EngineConfig, "SCHEMA_JSON_PATH", str(tmp_path / "schema_graph.json.gz"))
-        monkeypatch.setattr("aetherdialect._schema_catalog.LLMProvider.chat", fake_llm)
+        monkeypatch.setattr("aetherdialect._schema_profile.LLMProvider.chat", fake_llm)
         llm_classify_schema(sg, "domain notes here")
         assert len(calls) == 2
-        assert calls[1] == SCHEMA_NOTES_REFINE_SYSTEM
+        assert calls[1] == SCHEMA_CONSISTENCY_REFINE_SYSTEM
 
 
 class TestApplyColumnRolesLlmDescriptionInvariant:
@@ -788,7 +839,7 @@ class TestApplyColumnRolesLlmDescriptionInvariant:
                 )
             }
 
-        monkeypatch.setattr("aetherdialect._schema_catalog.llm_classify_schema", fake_classify)
+        monkeypatch.setattr("aetherdialect._schema_profile.llm_classify_schema", fake_classify)
         apply_column_roles_llm(sg)
         assert usable.description == "row id"
         assert unusable.description
@@ -817,7 +868,7 @@ class TestApplyColumnRolesLlmDescriptionInvariant:
                 )
             }
 
-        monkeypatch.setattr("aetherdialect._schema_catalog.llm_classify_schema", fake_classify)
+        monkeypatch.setattr("aetherdialect._schema_profile.llm_classify_schema", fake_classify)
         with pytest.raises(RuntimeError, match="unexpected in LLM response"):
             apply_column_roles_llm(sg)
 
@@ -843,7 +894,7 @@ class TestApplyColumnRolesLlmDescriptionInvariant:
                 )
             }
 
-        monkeypatch.setattr("aetherdialect._schema_catalog.llm_classify_schema", fake_classify)
+        monkeypatch.setattr("aetherdialect._schema_profile.llm_classify_schema", fake_classify)
         with pytest.raises(RuntimeError, match="Schema LLM classification failed"):
             apply_column_roles_llm(sg)
         assert calls["n"] == PolicyConfig.MAX_ROLE_CLASSIFICATION_RETRIES + 1
@@ -878,7 +929,7 @@ class TestApplyColumnRolesLlmDescriptionInvariant:
                 )
             }
 
-        monkeypatch.setattr("aetherdialect._schema_catalog.llm_classify_schema", fake_classify)
+        monkeypatch.setattr("aetherdialect._schema_profile.llm_classify_schema", fake_classify)
         apply_column_roles_llm(sg)
         assert calls["n"] == 2
         assert table.description == "lookup table"
@@ -914,7 +965,7 @@ class TestApplyColumnRolesLlmPostOverrides:
                 )
             }
 
-        monkeypatch.setattr("aetherdialect._schema_catalog.llm_classify_schema", fake_classify)
+        monkeypatch.setattr("aetherdialect._schema_profile.llm_classify_schema", fake_classify)
         apply_column_roles_llm(sg)
         assert col.role == ColumnRole.TEMPORAL.value
 
@@ -944,7 +995,7 @@ class TestApplyColumnRolesLlmPostOverrides:
                 )
             }
 
-        monkeypatch.setattr("aetherdialect._schema_catalog.llm_classify_schema", fake_classify)
+        monkeypatch.setattr("aetherdialect._schema_profile.llm_classify_schema", fake_classify)
         apply_column_roles_llm(sg)
         assert col.role == ColumnRole.AUDIT.value
 
@@ -974,7 +1025,7 @@ class TestApplyColumnRolesLlmPostOverrides:
                 )
             }
 
-        monkeypatch.setattr("aetherdialect._schema_catalog.llm_classify_schema", fake_classify)
+        monkeypatch.setattr("aetherdialect._schema_profile.llm_classify_schema", fake_classify)
         apply_column_roles_llm(sg)
         assert col.role == ColumnRole.FREE_TEXT.value
 
@@ -1012,7 +1063,7 @@ class TestApplyBooleanCoercionPass:
 
 
 class TestCursorRowsAsDicts:
-    """Tests for _cursor_rows_as_dicts."""
+    """Tests for cursor_rows_as_dicts."""
 
     def test_no_description_returns_empty(self):
         class C:
@@ -1021,7 +1072,7 @@ class TestCursorRowsAsDicts:
             def fetchall(self):
                 return [("a",)]
 
-        assert _cursor_rows_as_dicts(C()) == []
+        assert cursor_rows_as_dicts(C()) == []
 
     def test_maps_rows(self):
         class C:
@@ -1030,7 +1081,7 @@ class TestCursorRowsAsDicts:
             def fetchall(self):
                 return [(1, "y")]
 
-        assert _cursor_rows_as_dicts(C()) == [{"cnt": 1, "x": "y"}]
+        assert cursor_rows_as_dicts(C()) == [{"cnt": 1, "x": "y"}]
 
 
 class TestEnrichFkColumnDescriptions:
@@ -1120,9 +1171,9 @@ class TestParseSqlFileConditionalLlm:
         tb = TableMetadata(name="b", columns={"id": pid}, foreign_keys=[], primary_key=["id"])
         sg = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"a": ta, "b": tb})
 
-        monkeypatch.setattr("aetherdialect._schema_catalog._parse_sql_file_fallback", lambda _c: {})
+        monkeypatch.setattr("aetherdialect._schema_profile._parse_sql_file_fallback", lambda _c: {})
         monkeypatch.setattr(
-            "aetherdialect._schema_catalog._parse_sql_file_regex_reflect",
+            "aetherdialect._schema_profile._parse_sql_file_regex_reflect",
             lambda _c: {},
         )
 
@@ -1132,7 +1183,7 @@ class TestParseSqlFileConditionalLlm:
             calls.append(args)
             return '{"tables": {}}'
 
-        monkeypatch.setattr("aetherdialect._schema_catalog.LLMProvider.chat", _capture_llm)
+        monkeypatch.setattr("aetherdialect._schema_profile.LLMProvider.chat", _capture_llm)
 
         out = parse_sql_file(path, reflected_schema=sg)
         assert out == {}
@@ -1147,9 +1198,9 @@ class TestParseSqlFileConditionalLlm:
         t = TableMetadata(name="t", columns={"id": cid}, foreign_keys=[], primary_key=["id"])
         sg = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"t": t})
 
-        monkeypatch.setattr("aetherdialect._schema_catalog._parse_sql_file_fallback", lambda _c: {})
+        monkeypatch.setattr("aetherdialect._schema_profile._parse_sql_file_fallback", lambda _c: {})
         monkeypatch.setattr(
-            "aetherdialect._schema_catalog._parse_sql_file_regex_reflect",
+            "aetherdialect._schema_profile._parse_sql_file_regex_reflect",
             lambda _c: {},
         )
 
@@ -1159,7 +1210,7 @@ class TestParseSqlFileConditionalLlm:
             calls.append(1)
             return '{"tables": {}}'
 
-        monkeypatch.setattr("aetherdialect._schema_catalog.LLMProvider.chat", _capture_llm)
+        monkeypatch.setattr("aetherdialect._schema_profile.LLMProvider.chat", _capture_llm)
 
         out = parse_sql_file(path, reflected_schema=sg)
         assert out == {}
@@ -1185,7 +1236,7 @@ class TestParseSqlFileViaLlmNullability:
             }
         }
         monkeypatch.setattr(
-            "aetherdialect._schema_catalog.LLMProvider.chat",
+            "aetherdialect._schema_profile.LLMProvider.chat",
             lambda *a, **k: stable_json(payload),
         )
         out = _parse_sql_file_via_llm(ddl)
@@ -1210,7 +1261,7 @@ class TestParseSqlFileViaLlmNullability:
             }
         }
         monkeypatch.setattr(
-            "aetherdialect._schema_catalog.LLMProvider.chat",
+            "aetherdialect._schema_profile.LLMProvider.chat",
             lambda *a, **k: stable_json(payload),
         )
         out = _parse_sql_file_via_llm(ddl)
@@ -1356,20 +1407,21 @@ class TestAssignColumnOps:
         assert "like" not in col.valid_where_ops
 
     def test_non_filterable_empty_ops(self):
-        """Non-filterable columns get empty filter ops regardless of role."""
+        """Restricted columns get empty filter ops regardless of role."""
         col = ColumnMetadata(
             name="user_password",
             data_type="varchar",
             value_type="string",
             role=ColumnRole.CATEGORICAL.value,
             distinct_count=100,
+            sensitivity=SensitivityClassification.RESTRICTED,
         )
         t = TableMetadata(name="t", columns={"x": col}, foreign_keys=[], primary_key="")
         schema = SchemaGraph(join_paths_multi={}, effective_structural_hash="", tables={"t": t})
         assign_column_ops(schema)
         assert col.valid_where_ops == []
 
-    def test_string_only_ops_removed_from_numeric(self):
+    def test_string_only_ops_omitted_from_numeric(self):
         """String-only ops removed from non-string columns."""
         col = ColumnMetadata(
             name="amount",
@@ -1384,7 +1436,7 @@ class TestAssignColumnOps:
         assert "like" not in col.valid_where_ops
         assert "ilike" not in col.valid_where_ops
 
-    def test_numeric_aggs_removed_from_string(self):
+    def test_numeric_aggs_omitted_from_string(self):
         """Numeric-only aggregations removed from string columns."""
         col = ColumnMetadata(
             name="status",
@@ -1447,19 +1499,19 @@ class TestAssignColumnOps:
 
 
 class TestParseUnityCatalogConstraints:
-    """Tests for _parse_catalog_constraints_from_ddl."""
+    """Tests for parse_catalog_constraints_from_ddl."""
 
     def test_pk_constraint(self):
         """Extract PK from CONSTRAINT clause."""
         stmt = "CREATE TABLE t (id INT, CONSTRAINT pk_t PRIMARY KEY (id))"
-        pks, fks, _unique = _parse_catalog_constraints_from_ddl(stmt)
+        pks, fks, _unique = parse_catalog_constraints_from_ddl(stmt)
         assert pks == ["id"]
         assert fks == []
 
     def test_fk_constraint(self):
         """Extract FK from CONSTRAINT clause."""
         stmt = "CREATE TABLE t (id INT, user_id INT, CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users(id))"
-        pks, fks, _unique = _parse_catalog_constraints_from_ddl(stmt)
+        pks, fks, _unique = parse_catalog_constraints_from_ddl(stmt)
         assert len(fks) == 1
         assert fks[0]["src_cols"] == ["user_id"]
         assert fks[0]["dst_table"] == "users"
@@ -1468,13 +1520,13 @@ class TestParseUnityCatalogConstraints:
     def test_composite_pk(self):
         """Extract composite PK columns."""
         stmt = "CONSTRAINT pk_t PRIMARY KEY (a, b)"
-        pks, fks, _unique = _parse_catalog_constraints_from_ddl(stmt)
+        pks, fks, _unique = parse_catalog_constraints_from_ddl(stmt)
         assert pks == ["a", "b"]
 
     def test_no_constraints(self):
         """Return empty lists when no constraints present."""
         stmt = "CREATE TABLE t (id INT, name VARCHAR)"
-        pks, fks, _unique = _parse_catalog_constraints_from_ddl(stmt)
+        pks, fks, _unique = parse_catalog_constraints_from_ddl(stmt)
         assert pks == []
         assert fks == []
 
@@ -1484,13 +1536,13 @@ class TestParseUnityCatalogConstraints:
         CONSTRAINT fk1 FOREIGN KEY (a_id) REFERENCES a(id),
         CONSTRAINT fk2 FOREIGN KEY (b_id) REFERENCES b(id)
         """
-        pks, fks, _unique = _parse_catalog_constraints_from_ddl(stmt)
+        pks, fks, _unique = parse_catalog_constraints_from_ddl(stmt)
         assert len(fks) == 2
 
     def test_anonymous_fk_without_constraint_name(self):
         """Parse FOREIGN KEY without a leading CONSTRAINT name clause."""
         stmt = "CREATE TABLE t (user_id INT, FOREIGN KEY (user_id) REFERENCES users(id))"
-        pks, fks, _unique = _parse_catalog_constraints_from_ddl(stmt)
+        pks, fks, _unique = parse_catalog_constraints_from_ddl(stmt)
         assert len(fks) == 1
         assert fks[0]["src_cols"] == ["user_id"]
         assert fks[0]["dst_table"] == "users"
@@ -1499,14 +1551,14 @@ class TestParseUnityCatalogConstraints:
     def test_qualified_reference_table_trailing_name(self):
         """Reduce qualified REFERENCES targets to the trailing table identifier."""
         stmt = "CREATE TABLE t (a_id INT, FOREIGN KEY (a_id) REFERENCES my_cat.my_sch.parent(id))"
-        pks, fks, _unique = _parse_catalog_constraints_from_ddl(stmt)
+        pks, fks, _unique = parse_catalog_constraints_from_ddl(stmt)
         assert len(fks) == 1
         assert fks[0]["dst_table"] == "parent"
 
     def test_backticked_qualified_reference_table(self):
         """Parse REFERENCES targets that use backticked dotted identifiers."""
         stmt = "CREATE TABLE t (x INT, FOREIGN KEY (x) REFERENCES `c`.`s`.`p`(`id`))"
-        pks, fks, _unique = _parse_catalog_constraints_from_ddl(stmt)
+        pks, fks, _unique = parse_catalog_constraints_from_ddl(stmt)
         assert len(fks) == 1
         assert fks[0]["dst_table"] == "p"
         assert fks[0]["dst_cols"] == ["id"]
@@ -1585,7 +1637,7 @@ class TestUnityStructuralConstraintsIndexFromRows:
 
 
 class TestApplyColumnRolesLlmBooleanStringValueType:
-    """Regression tests for boolean role with string ``value_type``."""
+    """Boolean role with string ``value_type``."""
 
     def test_no_llm_mismatch_notify_for_boolean_on_two_valued_string(self, monkeypatch):
         """Widened compat prevents user-visible mismatch lines for yes/no string columns."""
@@ -1594,7 +1646,7 @@ class TestApplyColumnRolesLlmBooleanStringValueType:
         def capture_notify(msg: str) -> None:
             captured.append(msg)
 
-        monkeypatch.setattr("aetherdialect._core_utils.notify", capture_notify)
+        monkeypatch.setattr("aetherdialect._schema_profile.notify", capture_notify)
         col = ColumnMetadata(
             name="blood_culture_before_antibiotics",
             data_type="string",
@@ -1637,7 +1689,7 @@ class TestApplyColumnRolesLlmBooleanStringValueType:
                 ),
             }
 
-        monkeypatch.setattr("aetherdialect._schema_catalog.llm_classify_schema", fake_classify)
+        monkeypatch.setattr("aetherdialect._schema_profile.llm_classify_schema", fake_classify)
         apply_column_roles_llm(sg)
         assert col.role == ColumnRole.BOOLEAN.value
         assert not any("LLM role/value_type mismatch" in m for m in captured)
@@ -1891,36 +1943,36 @@ class TestPartitionColumnNamesFromCreateDdl:
 
 
 class TestParsePartitionColumnsFromCreateStmt:
-    """Tests for _parse_partition_columns_from_create_stmt."""
+    """Tests for parse_partition_columns_from_create_stmt."""
 
     def test_single_partition_column(self):
         """Extract single partition column."""
         stmt = "CREATE TABLE t (id INT, dt DATE) PARTITIONED BY (dt)"
-        assert _parse_partition_columns_from_create_stmt(stmt) == ["dt"]
+        assert parse_partition_columns_from_create_stmt(stmt) == ["dt"]
 
     def test_multiple_partition_columns(self):
         """Extract multiple partition columns."""
         stmt = "CREATE TABLE t (id INT, r STRING, dt DATE) PARTITIONED BY (r, dt)"
-        assert _parse_partition_columns_from_create_stmt(stmt) == ["r", "dt"]
+        assert parse_partition_columns_from_create_stmt(stmt) == ["r", "dt"]
 
     def test_backtick_quoted_columns(self):
         """Strip backticks from partition column names."""
         stmt = "CREATE TABLE t (id INT) PARTITIONED BY (`dt`)"
-        assert _parse_partition_columns_from_create_stmt(stmt) == ["dt"]
+        assert parse_partition_columns_from_create_stmt(stmt) == ["dt"]
 
     def test_case_insensitive(self):
         """PARTITIONED BY matches case-insensitively."""
         stmt = "CREATE TABLE t (id INT) partitioned by (dt)"
-        assert _parse_partition_columns_from_create_stmt(stmt) == ["dt"]
+        assert parse_partition_columns_from_create_stmt(stmt) == ["dt"]
 
     def test_no_partitioned_by(self):
         """Return empty list when no PARTITIONED BY."""
         stmt = "CREATE TABLE t (id INT, name VARCHAR)"
-        assert _parse_partition_columns_from_create_stmt(stmt) == []
+        assert parse_partition_columns_from_create_stmt(stmt) == []
 
     def test_empty_statement(self):
         """Return empty list for empty string."""
-        assert _parse_partition_columns_from_create_stmt("") == []
+        assert parse_partition_columns_from_create_stmt("") == []
 
 
 class TestExtractColumnBlockFromCreate:
@@ -2012,17 +2064,17 @@ class TestValidateColumnClassificationEdgeCases:
         assert len(soft) > 0
 
     def test_temporal_on_year_column(self):
-        """TEMPORAL on year-like integer column gives soft warning."""
+        """Integer value_type is compatible with TEMPORAL; year semantics are LLM/classification responsibility."""
         col = ColumnMetadata(name="birth_year", data_type="integer", value_type="integer")
         hard, soft = _validate_column_classification(col, ColumnRole.TEMPORAL.value)
-        assert len(hard) > 0 or len(soft) > 0
+        assert len(hard) == 0
 
-    def test_temporal_on_domain_dtype_soft_warning_only(self):
-        """TEMPORAL on a year-like integer column yields a soft warning, not a hard error."""
+    def test_temporal_on_domain_dtype_integer_ok(self):
+        """Integer domain columns may be classified TEMPORAL when value_type is integer."""
         col = ColumnMetadata(name="release_year", data_type="INTEGER DOMAIN year_t", value_type="integer")
         hard, soft = _validate_column_classification(col, ColumnRole.TEMPORAL.value)
         assert len(hard) == 0
-        assert len(soft) > 0
+        assert len(soft) == 0
 
     def test_boolean_distinct_none(self):
         """BOOLEAN with no distinct_count passes validation."""

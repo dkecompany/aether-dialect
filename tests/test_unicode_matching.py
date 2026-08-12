@@ -6,12 +6,12 @@ import pytest
 
 from aetherdialect._contracts_base import NormalizedExpr, WhereParam
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import (
-    normalize_text_value,
+from aetherdialect._intent_bind import _match_frequent_value, _resolve_where_list_cascade
+from aetherdialect._schema_profile import (
     normalized_value_overlap_sets,
     value_overlap_ratio_for_columns,
 )
-from aetherdialect._intent_resolve import _match_frequent_value, _resolve_where_list_cascade
+from aetherdialect._utils import normalize_text_value
 
 _COMPOSED = "caf\u00e9"
 _DECOMPOSED = "caf\u0065\u0301"

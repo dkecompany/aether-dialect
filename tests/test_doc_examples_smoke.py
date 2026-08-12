@@ -6,6 +6,7 @@ import pytest
 
 from aetherdialect import AetherEngine
 from aetherdialect._llm_provider import MockProvider
+from aetherdialect._sandbox import Sandbox
 
 pytest.importorskip("duckdb")
 
@@ -20,12 +21,12 @@ def _reset_mock() -> None:
 
 
 def test_sandbox_manual_step_snippet() -> None:
-    question = AetherEngine.sandbox_questions()[0]
+    question = Sandbox._sandbox_questions()[0]
     namespace: dict[str, object] = {"AetherEngine": AetherEngine, "question": question}
     exec(
         compile(
             """
-with AetherEngine.offline_sandbox() as sb:
+with Sandbox.create_offline_sandbox(AetherEngine) as sb:
     with sb.engine.session() as session:
         step = session.ask(question)
         while not step.done:
@@ -44,12 +45,12 @@ with AetherEngine.offline_sandbox() as sb:
 
 
 def test_sandbox_accept_until_done_snippet() -> None:
-    question = AetherEngine.sandbox_questions()[0]
+    question = Sandbox._sandbox_questions()[0]
     namespace: dict[str, object] = {"AetherEngine": AetherEngine, "question": question}
     exec(
         compile(
             """
-with AetherEngine.offline_sandbox() as sb:
+with Sandbox.create_offline_sandbox(AetherEngine) as sb:
     with sb.engine.session() as session:
         step = session.accept_until_done(question)
         assert step.done

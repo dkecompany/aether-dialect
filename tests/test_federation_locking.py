@@ -9,11 +9,11 @@ from unittest.mock import patch
 import pytest
 
 from aetherdialect._contracts_base import FederationContext
-from aetherdialect._federation import (
-    load_federation_declaration_from_path,
+from aetherdialect._federation_execute import (
     load_federation_member_graphs,
     persist_federation_tree,
 )
+from aetherdialect._federation_manifest import load_federation_declaration_from_path
 from aetherdialect._main_execution import MainExecutionOps
 from tests.federation_helpers import write_federation_declaration_file
 from tests.test_migration_cache_drift import _MANIFEST, _member_graph, _mock_member
@@ -61,10 +61,10 @@ def test_composition_holds_the_lock_throughout(tmp_path: Path, monkeypatch: pyte
         return persist_federation_tree(*args, **kwargs)
 
     with (
-        patch("aetherdialect._main_execution.artifact_lock", side_effect=_combined_lock_cm),
-        patch("aetherdialect._federation.artifact_lock", side_effect=_combined_lock_cm),
-        patch("aetherdialect._main_execution.load_federation_member_graphs", side_effect=_tracked_load),
-        patch("aetherdialect._main_execution.persist_federation_tree", side_effect=_tracked_persist),
+        patch("aetherdialect._main_init.artifact_lock", side_effect=_combined_lock_cm),
+        patch("aetherdialect._federation_execute.artifact_lock", side_effect=_combined_lock_cm),
+        patch("aetherdialect._main_init.load_federation_member_graphs", side_effect=_tracked_load),
+        patch("aetherdialect._main_init.persist_federation_tree", side_effect=_tracked_persist),
     ):
         MainExecutionOps.initialize_aether_federation(
             "fed_gate",
@@ -79,3 +79,29 @@ def test_composition_holds_the_lock_throughout(tmp_path: Path, monkeypatch: pyte
     assert load_during_fed_lock
     assert persist_during_fed_lock
     assert member_refresh_during_lock
+
+
+@pytest.mark.fast
+def test_initialize_federation_without_ambient_engine_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unbound_engine_identity: None
+) -> None:
+    """Federation init binds a duckdb coordinator identity; ambient identity is not required."""
+    monkeypatch.chdir(tmp_path)
+    members = {
+        "alpha": _member_graph("entity_a", source_id="alpha"),
+        "beta": _member_graph("entity_b", source_id="beta"),
+    }
+    member_dict = {sid: _mock_member(graph, sid, tmp_path) for sid, graph in members.items()}
+    declaration_path = write_federation_declaration_file(tmp_path, _MANIFEST)
+    authored_manifest, fed_mappings = load_federation_declaration_from_path(str(declaration_path))
+    bundle = MainExecutionOps.initialize_aether_federation(
+        "fed_gate",
+        members=member_dict,
+        declaration_file=str(declaration_path),
+        declaration=(authored_manifest, fed_mappings),
+        artifacts_dir=str(tmp_path),
+        master_context=FederationContext(),
+        log_sink=lambda _msg: None,
+    )
+    assert bundle.engine_identity is not None
+    assert bundle.engine_identity.engine_type == "duckdb"

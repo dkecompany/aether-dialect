@@ -1,21 +1,14 @@
-"""Tests for forced template reuse and parameter bindings on session steps."""
+"""Template reuse helpers and parameter binding tests (not reuse_saved_question API)."""
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from aetherdialect import SessionStep
-from aetherdialect._contracts_base import (
-    NormalizedExpr,
-    ParameterBinding,
-    PredicateGroup,
-    WhereParam,
-)
-from aetherdialect._contracts_core import ConcreteIntent, Template, ValueHistory
+from aetherdialect._contracts_base import NormalizedExpr, PredicateGroup, WhereParam
+from aetherdialect._contracts_core import ConcreteIntent, ParameterBinding, Template, ValueHistory
 from aetherdialect._contracts_schema import SQLShape, TemplateStats
-from aetherdialect._templates import (
-    TemplateOps,
-)
+from aetherdialect._templates_ops import TemplateOps
 
 
 def _minimal_template(*, question: str = "count of item in category x") -> Template:
@@ -92,27 +85,3 @@ def test_build_parameter_bindings_uses_cached_display_names() -> None:
 def test_session_step_accepts_parameters_default_empty() -> None:
     step = SessionStep(done=True, prompt=None, kind="result")
     assert step.parameters == ()
-
-
-def test_pipeline_session_exposes_reuse_saved_question() -> None:
-    from aetherdialect._main_execution import PipelineSession
-
-    owner = MagicMock()
-    owner._schema_graph = MagicMock()
-    owner._store = MagicMock()
-    owner._templates = {}
-    owner._rejected = {}
-    owner._schema_terms = set()
-    owner._runtime_config = MagicMock(llm_execution=MagicMock())
-    owner._dialect = MagicMock()
-    owner._audit_emit = MagicMock()
-    owner._pipeline_writer_lock = __import__("threading").Lock()
-    sess = PipelineSession(owner)
-    assert hasattr(sess, "reuse_saved_question")
-    with patch("aetherdialect._main_execution.force_reuse_saved_question") as forced:
-        forced.return_value = MagicMock(success=True)
-        with patch.object(sess, "_completed_step", return_value=SessionStep(done=True, prompt=None, kind="result")):
-            with patch.object(sess, "_resources", return_value=(MagicMock(), {}, {}, {}, set())):
-                step = sess.reuse_saved_question("old q", "new q", {"p1": "y"})
-    assert step.done is True
-    forced.assert_called_once()

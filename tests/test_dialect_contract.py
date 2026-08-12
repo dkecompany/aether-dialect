@@ -44,6 +44,7 @@ _QUOTE_FIXTURES: dict[str, str] = {
     "mysql": "`fixture`.`column`",
     "redshift": '"fixture"."column"',
     "sqlserver": "[fixture].[column]",
+    "oracle": '"FIXTURE"."COLUMN"',
     "snowflake": '"fixture"."column"',
     "bigquery": "`fixture`.`column`",
     "postgresql": '"fixture"."column"',
@@ -62,6 +63,7 @@ _QUERY_LOG_ENGINES: frozenset[str] = frozenset(
         "mysql",
         "redshift",
         "sqlserver",
+        "oracle",
         "snowflake",
         "bigquery",
         "postgresql",
@@ -77,12 +79,12 @@ _PROFILE_TIMEOUT_ENGINES: dict[str, str] = {
 }
 
 _SAMPLE_SUFFIX_ENGINES: frozenset[str] = frozenset(
-    {"mysql", "redshift", "sqlserver", "snowflake", "bigquery", "databricks"},
+    {"mysql", "redshift", "sqlserver", "oracle", "snowflake", "bigquery", "databricks"},
 )
 
 _SAMPLE_SUFFIX_WHERE_ENGINES: frozenset[str] = frozenset({"mysql", "redshift"})
 
-_SAMPLE_SUFFIX_ORDERED_LIMIT_ENGINES: frozenset[str] = frozenset({"sqlserver", "bigquery"})
+_SAMPLE_SUFFIX_ORDERED_LIMIT_ENGINES: frozenset[str] = frozenset({"sqlserver", "oracle", "bigquery"})
 
 
 def _uninit_dialect(cls: type[Dialect]) -> Dialect:
@@ -172,7 +174,7 @@ def test_registered_dialect_satisfies_contract(engine: str) -> None:
 
 
 class _StubDialect(Dialect):
-    """Deliberately incomplete dialect used to prove the contract harness detects gaps."""
+    """Incomplete dialect used so the contract harness detects missing members."""
 
     name = "_stub"
     sqlglot_dialect = "postgres"

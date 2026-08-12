@@ -6,9 +6,8 @@ import copy
 
 import pytest
 
-from aetherdialect._contracts_base import ColumnRole, TableRole
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import _merge_column_metadata_union_statistics
+from aetherdialect._contracts_schema import ColumnMetadata, ColumnRole, SchemaGraph, TableMetadata, TableRole
+from aetherdialect._federation_compose import _merge_column_metadata_union_statistics
 from aetherdialect._schema_graph import (
     infer_missing_fks,
     promote_cross_component_semantic_edges,

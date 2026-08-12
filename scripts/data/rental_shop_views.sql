@@ -1,5 +1,5 @@
--- Local-engine views only (not shipped in rental_shop.sql or sandbox seed).
--- Created by scripts/load_rental_shop_engines.py after CSV load.
+-- Bundled for sandbox and local loaders (CREATE VIEW only).
+-- Applied after base tables and rows are loaded. Used when include="views" or allow-list selects views.
 
 CREATE VIEW active_customer_v AS
 SELECT

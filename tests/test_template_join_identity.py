@@ -7,11 +7,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from aetherdialect._config import EngineConfig
+from aetherdialect._contracts_base import NormalizedExpr
 from aetherdialect._contracts_core import GenerationPath, RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
-from aetherdialect._intent_process import NormalizedExpr
-from aetherdialect._pipeline import execute_reuse_with_params
-from aetherdialect._templates import TemplateOps, TemplateRefs
+from aetherdialect._pipeline_execute import execute_reuse_with_params
+from aetherdialect._templates import TemplateRefs
+from aetherdialect._templates_ops import TemplateOps
 
 
 def _film_star_schema() -> SchemaGraph:
@@ -188,21 +189,19 @@ def test_matching_join_paths_merge_into_one_template() -> None:
     TemplateOps.clear_sandbox_paraphrase_source()
 
 
-@patch("aetherdialect._pipeline.LLMProvider.chat", return_value='{"aliases":{}}')
-@patch("aetherdialect._templates.TemplateOps.save_template_store")
-@patch("aetherdialect._templates.TemplateOps.templates_to_store", side_effect=lambda s, t: s)
-@patch("aetherdialect._templates.TemplateOps.delete_rejected_templates_matching_question")
-@patch("aetherdialect._pipeline.save_result_csv_for_store")
-@patch("aetherdialect._pipeline.print_query_result")
-@patch("aetherdialect._templates.TemplateOps.promote_trust")
-@patch("aetherdialect._pipeline.validate_sql", return_value=(True, None, None, []))
-@patch("aetherdialect._pipeline._resolve_joins_fresh")
-@patch("aetherdialect._pipeline.generate_join_candidates")
+@patch("aetherdialect._llm_provider.LLMProvider.chat", return_value='{"aliases":{}}')
+@patch("aetherdialect._templates_ops.TemplateOps.save_template_store")
+@patch("aetherdialect._templates_ops.TemplateOps.templates_to_store", side_effect=lambda s, t: s)
+@patch("aetherdialect._templates_ops.TemplateOps.delete_rejected_templates_matching_question")
+@patch("aetherdialect._pipeline_execute.save_result_csv_for_store")
+@patch("aetherdialect._pipeline_execute.print_query_result")
+@patch("aetherdialect._templates_ops.TemplateOps.promote_trust")
+@patch("aetherdialect._pipeline_generate._resolve_joins_fresh")
+@patch("aetherdialect._pipeline_generate.generate_join_candidates")
 @pytest.mark.fast
 def test_direct_question_reuse_skips_join_enumeration(
     mock_generate_join_candidates,
     mock_resolve_joins_fresh,
-    _mock_val,
     _mock_promote,
     _mock_print,
     _mock_csv,
@@ -211,7 +210,8 @@ def test_direct_question_reuse_skips_join_enumeration(
     _mock_save,
     _mock_llm,
 ) -> None:
-    from aetherdialect._contracts_core import ConcreteIntent, SQLShape, Template, TemplateStats, ValueHistory
+    from aetherdialect._contracts_core import ConcreteIntent, Template, ValueHistory
+    from aetherdialect._contracts_schema import SQLShape, TemplateStats
 
     pinned_sig = ["child.parent_id->parent.id"]
     concrete = ConcreteIntent(
@@ -247,6 +247,8 @@ def test_direct_question_reuse_skips_join_enumeration(
     dialect.finalize_render.return_value = "EXEC"
     dialect.explain_validation_sql = lambda sql, _pv: sql
     dialect.execute.return_value = [("row",)]
+    dialect.ast_validate_full.return_value = []
+    dialect.can_explain.return_value = False
     store: dict = {"templates": {"T1": tmpl}}
 
     outcome = execute_reuse_with_params(

@@ -6,13 +6,13 @@ import pytest
 
 from aetherdialect._live_testing import run_and_assert
 
-from ._dialect_scenarios import dialect_redshift_scenarios
-from ._engine_live import (
+from .live_support import (
     build_engine_t2s,
     build_runner,
     engine_schema,
     skip_unless_configured,
 )
+from .mydb_scenarios import dialect_redshift_scenarios
 
 _ENGINE = "redshift"
 _SKIP_REASON = skip_unless_configured(_ENGINE)

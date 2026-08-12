@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
-from aetherdialect._contracts_base import TemplateExecutionResult
+from aetherdialect._contracts_core import TemplateExecutionResult
 from aetherdialect.aetherdialect import (
     MUTATING_ENGINE_METHODS,
     MUTATING_FEDERATION_METHODS,
@@ -16,8 +16,8 @@ from aetherdialect.aetherdialect import (
     AetherFederation,
     guarded_by_writer_lock,
 )
+from tests.template_fixtures import _minimal_template
 from tests.test_aetherdialect import _make_aether_stub
-from tests.test_reuse_saved_question import _minimal_template
 
 
 @pytest.mark.fast

@@ -9,7 +9,7 @@ import pytest
 import aetherdialect._dialect_sqlglot_engines
 from aetherdialect._config import CsvRuntimeConfig, DuckDBRuntimeConfig, EngineConfig
 from aetherdialect._dialect import DialectRegistry
-from aetherdialect._schema_overrides import apply_schema_overrides_to_graph, load_schema_overrides_file
+from aetherdialect._schema_finalize import apply_structure_to_graph, load_structure_document_file
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _CSV_DIRS = (_REPO_ROOT / "scripts" / "data" / "rental_shop_csvs",)
@@ -55,7 +55,7 @@ def csv_dialect():
     dialect = DialectRegistry.get("csv", CsvRuntimeConfig)
     graph = dialect.reflect_schema_graph(include="tables")
     if _OVERRIDES.is_file():
-        apply_schema_overrides_to_graph(graph, load_schema_overrides_file(str(_OVERRIDES)))
+        apply_structure_to_graph(graph, load_structure_document_file(str(_OVERRIDES)))
     probe = list(dialect.execute("SELECT COUNT(*) FROM item WHERE item_type = 'film'"))
     if not probe:
         pytest.skip("CSV engine loaded but item table is empty or unavailable")
@@ -84,7 +84,7 @@ def duckdb_dialect():
     dialect = DialectRegistry.get("duckdb", DuckDBRuntimeConfig, native_connection=connection)
     graph = dialect.reflect_schema_graph(include="tables")
     if _OVERRIDES.is_file():
-        apply_schema_overrides_to_graph(graph, load_schema_overrides_file(str(_OVERRIDES)))
+        apply_structure_to_graph(graph, load_structure_document_file(str(_OVERRIDES)))
     yield dialect, graph
     DuckDBRuntimeConfig.clear_attached_connection()
     EngineConfig.TYPE = _ORIG_ENGINE_TYPE

@@ -131,7 +131,7 @@ def test_deterministic_validation_fails_on_row_level_with_aggregate(schema, t2s)
     with tempfile.TemporaryDirectory() as tmp:
         store = TemplateStoreView.empty(tmp, schema.effective_structural_hash)
         with patch(
-            "aetherdialect._pipeline.get_join_choice_from_llm",
+            "aetherdialect._sql_gen.get_join_choice_from_llm",
             side_effect=_llm_forbidden,
         ):
             gen_out, rows = deterministic_generate_validate_execute(

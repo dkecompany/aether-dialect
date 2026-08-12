@@ -2,26 +2,22 @@
 
 from __future__ import annotations
 
-from aetherdialect._contracts_base import (
-    ColumnRole,
-    InferenceTag,
-    OverrideSkip,
-    TableRole,
-)
+from aetherdialect._contracts_base import OverrideSkip
 from aetherdialect._contracts_schema import (
     ColumnMetadata,
+    ColumnRole,
     FKEdge,
+    InferenceTag,
     SchemaGraph,
     TableMetadata,
+    TableRole,
 )
 from aetherdialect._schema_graph import (
     collapse_redundant_inferences,
     infer_missing_fks,
     pair_targeted_fk_inference,
 )
-from aetherdialect._validation_schema import (
-    validate_join_path_reachability_for_tables,
-)
+from aetherdialect._validation_shape import validate_join_path_reachability_for_tables
 
 
 def _col(**overrides) -> ColumnMetadata:
@@ -59,7 +55,7 @@ class TestPairTargetedInference:
     def test_infer_missing_fks_single_table_restrict_allows_self_candidates(
         self,
     ) -> None:
-        """Regression: restrict_tables may contain one table for self-FK naming patterns."""
+        """``restrict_tables`` may contain one table for self-FK naming patterns."""
         t = _table(
             "node",
             {

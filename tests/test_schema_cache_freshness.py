@@ -8,14 +8,14 @@ from unittest.mock import MagicMock
 
 import pytest
 
-import aetherdialect._schema_overrides
+import aetherdialect._schema_finalize
 from aetherdialect._config import EngineConfig
 from aetherdialect._contracts_base import EngineContext
 from aetherdialect._contracts_schema import SchemaGraph
-from aetherdialect._core_utils import stable_json
 from aetherdialect._dialect import Dialect
 from aetherdialect._schema_graph import assign_schema_graph_hashes
-from aetherdialect._schema_overrides import save_schema_to_cache
+from aetherdialect._schema_reflect import save_schema_to_cache
+from aetherdialect._utils import stable_json
 
 pytestmark = pytest.mark.usefixtures("stub_schema_llm_classifier")
 
@@ -88,19 +88,19 @@ def cache_path(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> str:
 
 
 def _patch_build_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(aetherdialect._schema_overrides, "finalize_with_overrides", lambda *a, **k: False)
-    monkeypatch.setattr(aetherdialect._schema_overrides, "notify_schema_path_health", lambda sg: None)
-    monkeypatch.setattr(aetherdialect._schema_overrides, "validate_scope_against_graph", lambda sg, c: None)
-    monkeypatch.setattr(aetherdialect._schema_overrides, "raise_if_schema_unusable", lambda sg, c: None)
+    monkeypatch.setattr(aetherdialect._schema_finalize, "finalize_with_structure", lambda *a, **k: False)
+    monkeypatch.setattr(aetherdialect._schema_finalize, "notify_schema_path_health", lambda sg: None)
+    monkeypatch.setattr(aetherdialect._schema_finalize, "validate_scope_against_graph", lambda sg, c: None)
+    monkeypatch.setattr(aetherdialect._schema_finalize, "raise_if_schema_unusable", lambda sg, c: None)
 
 
-def _save_legacy_fingerprint_cache(
+def _save_fingerprint_only_cache(
     schema_graph: SchemaGraph,
     cache_path: str,
     *,
     notes: str = "",
 ) -> None:
-    """Persist a legacy cache with no ddl_probe_hash (fingerprint self- check path only)."""
+    """Persist a fingerprint-only cache with no ddl_probe_hash (fingerprint self-check path only)."""
     ctx = EngineContext()
     schema_graph.notes_sha256 = hashlib.sha256(notes.encode()).hexdigest()
     assign_schema_graph_hashes(schema_graph, ctx, schema_graph.notes_sha256)
@@ -116,12 +116,12 @@ def test_fingerprint_cache_hit_probes_live_row_counts_on_drift(
 ) -> None:
     """Fingerprint-only cache hit must compare live row counts, not profiling_hash alone."""
     notes = ""
-    _save_legacy_fingerprint_cache(schema_graph, cache_path, notes=notes)
+    _save_fingerprint_only_cache(schema_graph, cache_path, notes=notes)
 
     dialect = _FreshnessStubDialect(ddl_probe="", live_row_counts={"customers": 9999})
     _patch_build_helpers(monkeypatch)
 
-    sg, diff = aetherdialect._schema_overrides.build_schema_graph_with_diff(
+    sg, diff = aetherdialect._schema_finalize.build_schema_graph_with_diff(
         dialect,
         EngineContext(),
         notes_content=notes,
@@ -142,12 +142,12 @@ def test_fingerprint_cache_hit_skips_reprofile_when_live_row_counts_match(
 ) -> None:
     """Live row-count probe that matches cached statistics must not re- profile."""
     notes = ""
-    _save_legacy_fingerprint_cache(schema_graph, cache_path, notes=notes)
+    _save_fingerprint_only_cache(schema_graph, cache_path, notes=notes)
 
     dialect = _FreshnessStubDialect(ddl_probe="")
     _patch_build_helpers(monkeypatch)
 
-    sg, diff = aetherdialect._schema_overrides.build_schema_graph_with_diff(
+    sg, diff = aetherdialect._schema_finalize.build_schema_graph_with_diff(
         dialect,
         EngineContext(),
         notes_content=notes,
@@ -172,7 +172,7 @@ def test_fingerprint_cache_hit_refuses_stale_cache_when_ddl_probe_drift_detected
     from aetherdialect._contracts_schema import ColumnMetadata
 
     notes = ""
-    _save_legacy_fingerprint_cache(schema_graph, cache_path, notes=notes)
+    _save_fingerprint_only_cache(schema_graph, cache_path, notes=notes)
 
     live_struct = copy.deepcopy(schema_graph)
     live_struct.tables["customers"].columns["loyalty_tier"] = ColumnMetadata(
@@ -188,14 +188,14 @@ def test_fingerprint_cache_hit_refuses_stale_cache_when_ddl_probe_drift_detected
     )
     _patch_build_helpers(monkeypatch)
     monkeypatch.setattr(
-        aetherdialect._schema_overrides,
+        aetherdialect._schema_finalize,
         "compute_dialect_probe",
         lambda _d, _c: "LIVE_DDL_DIGEST",
     )
-    monkeypatch.setattr(aetherdialect._schema_overrides, "_add_profiling_data", lambda *a, **k: None)
-    monkeypatch.setattr(aetherdialect._schema_overrides, "migrate_sidecar_for_diff", lambda *a, **k: None)
+    monkeypatch.setattr(aetherdialect._schema_finalize, "_add_profiling_data", lambda *a, **k: None)
+    monkeypatch.setattr(aetherdialect._schema_finalize, "migrate_sidecar_for_diff", lambda *a, **k: None)
 
-    sg, diff = aetherdialect._schema_overrides.build_schema_graph_with_diff(
+    sg, diff = aetherdialect._schema_finalize.build_schema_graph_with_diff(
         dialect,
         EngineContext(),
         notes_content=notes,

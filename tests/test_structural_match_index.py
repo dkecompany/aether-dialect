@@ -7,7 +7,8 @@ from unittest.mock import patch
 
 import pytest
 
-from aetherdialect._intent_process import body_similarity_key, collect_structural_match_templates, structural_compare
+from aetherdialect._intent_loop import collect_structural_match_templates, structural_compare
+from aetherdialect._utils_intent import body_similarity_key
 from tests.test_intent_process import TestMatchTemplateForUnion, _col, _runtime
 
 
@@ -33,7 +34,7 @@ def test_match_uses_union_family_index() -> None:
         return real_compare(intent_obj, tmpl, mode=mode)
 
     ufi = {bk: ["T0001"]}
-    with patch("aetherdialect._intent_process.structural_compare", side_effect=_spy):
+    with patch("aetherdialect._intent_loop.structural_compare", side_effect=_spy):
         out = collect_structural_match_templates(intent, templates, union_family_index=ufi)
     assert [t.id for t in out] == ["T0001"]
     assert len(indexed_calls) == 1
@@ -42,6 +43,6 @@ def test_match_uses_union_family_index() -> None:
         full_calls.append(tmpl.id)
         return real_compare(intent_obj, tmpl, mode=mode)
 
-    with patch("aetherdialect._intent_process.structural_compare", side_effect=_spy_full):
+    with patch("aetherdialect._intent_loop.structural_compare", side_effect=_spy_full):
         collect_structural_match_templates(intent, templates)
     assert len(full_calls) == len(templates)

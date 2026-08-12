@@ -9,10 +9,7 @@ import pytest
 
 from aetherdialect._contracts_schema import ColumnMetadata
 from aetherdialect._dialect_sqlglot_engines import DuckDBDialect
-from aetherdialect._schema_catalog import (
-    _new_profiling_deep_query_budget,
-    _profile_column,
-)
+from aetherdialect._schema_profile import _new_profiling_deep_query_budget, _profile_column
 
 
 def _recording_engine() -> tuple[MagicMock, list[str]]:

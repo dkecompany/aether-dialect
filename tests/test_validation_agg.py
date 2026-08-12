@@ -1,7 +1,6 @@
 """Tests for validation_agg module."""
 
 from aetherdialect._contracts_base import (
-    ColumnRole,
     ExprValue,
     HavingParam,
     MulGroup,
@@ -11,11 +10,14 @@ from aetherdialect._contracts_base import (
 from aetherdialect._contracts_core import SelectCol
 from aetherdialect._contracts_schema import (
     ColumnMetadata,
+    ColumnRole,
     CteOutputColumnMeta,
     SchemaGraph,
     TableMetadata,
 )
-from aetherdialect._validation_execute import (
+from aetherdialect._intent_expr import expr_has_arithmetic
+from aetherdialect._validation_rules import (
+    expr_result_is_numeric,
     validate_column_types,
     validate_having_agg_per_role,
     validate_order_by_agg_per_role,
@@ -26,10 +28,6 @@ from aetherdialect._validation_execute import (
     validate_select_agg_per_role,
     validate_select_agg_semantics,
     validate_temporal_columns,
-)
-from aetherdialect._validation_schema import (
-    expr_has_arithmetic,
-    expr_result_is_numeric,
 )
 
 
@@ -885,8 +883,8 @@ class TestValidateTemporalColumns:
         sc_hint = SelectCol(expr=NormalizedExpr.from_column("customers.created_at"))
         assert validate_temporal_columns([sc_latest, sc_hint], typed_schema) == []
 
-    def test_temporal_op_on_unknown_table_name_hint(self, simple_schema):
-        """Hints in the column name work even when the table is not in the schema."""
+    def test_temporal_op_on_unknown_table_without_metadata(self, simple_schema):
+        """Unknown tables without classified metadata do not satisfy temporal evidence."""
         sc_latest = SelectCol(
             expr=NormalizedExpr(
                 agg_func="latest",
@@ -894,7 +892,9 @@ class TestValidateTemporalColumns:
             ),
         )
         sc_other = SelectCol(expr=NormalizedExpr.from_column("other.event_date"))
-        assert validate_temporal_columns([sc_latest, sc_other], simple_schema) == []
+        issues = validate_temporal_columns([sc_latest, sc_other], simple_schema)
+        assert len(issues) == 1
+        assert issues[0].category == "missing_temporal_column"
 
     def test_empty_select_cols(self, typed_schema):
         """Empty SELECT list returns no issues."""

@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-from aetherdialect._templates import (
-    TemplateOps,
-    TemplateRefs,
-)
+from aetherdialect._templates import TemplateRefs
+from aetherdialect._templates_ops import TemplateOps
 
-from ._seed_helpers import seeded_runner
+from .live_support import seeded_runner
 
 
 def test_reconcile_empty_store_round_trip(schema) -> None:

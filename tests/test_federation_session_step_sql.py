@@ -7,10 +7,8 @@ from unittest.mock import MagicMock
 import pytest
 
 from aetherdialect._contracts_core import FederatedSqlBundle, FederatedStatementRecord, GenerationPath
-from aetherdialect._main_execution import (
-    MainExecutionOps,
-    PipelineSession,
-)
+from aetherdialect._main_execution import MainExecutionOps
+from aetherdialect._main_session import PipelineSession
 
 
 @pytest.mark.fast
@@ -39,8 +37,8 @@ def test_multi_member_federated_step_has_member_sql_mapping_and_bundle() -> None
     }
     step = sess._completed_step()
     assert step.sql == {"a": "SELECT id FROM left_t", "b": "SELECT id FROM right_t"}
-    assert step.federated_bundle is bundle
-    assert len(step.federated_bundle.statements) == 2
+    assert step.data is not None
+    assert list(step.data.columns) == ["id"]
 
 
 @pytest.mark.fast
@@ -52,12 +50,11 @@ def test_single_member_federated_step_carries_member_statement_sql() -> None:
     )
     assert MainExecutionOps._federation_session_step_sql(federated_bundle=bundle) == "SELECT id FROM left_t"
     assert (
-        MainExecutionOps._resolved_session_step_sql("SELECT display", federated_bundle=bundle)
-        == "SELECT id FROM left_t"
+        MainExecutionOps.resolved_session_step_sql("SELECT display", federated_bundle=bundle) == "SELECT id FROM left_t"
     )
 
 
 @pytest.mark.fast
 def test_single_engine_step_keeps_display_sql() -> None:
-    assert MainExecutionOps._resolved_session_step_sql("SELECT 1") == "SELECT 1"
+    assert MainExecutionOps.resolved_session_step_sql("SELECT 1") == "SELECT 1"
     assert MainExecutionOps._federation_session_step_sql() is None

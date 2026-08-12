@@ -8,7 +8,7 @@ from aetherdialect._contracts_base import ConfigError, NormalizedExpr
 from aetherdialect._contracts_core import RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._intent_expr import parse_expr_string
-from aetherdialect._validation_semantic import validate_no_opaque_raw_sql
+from aetherdialect._validation_rules import validate_no_opaque_raw_sql
 
 
 def _graph() -> SchemaGraph:

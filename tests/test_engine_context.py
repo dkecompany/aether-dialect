@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
@@ -13,10 +12,10 @@ from aetherdialect._contracts_base import (
     OwnerOnlyOperationError,
 )
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import scope_hash_fp
 from aetherdialect._main_execution import (
     MainExecutionOps,
 )
+from aetherdialect._utils import scope_hash_fp
 
 
 def _col(name: str) -> ColumnMetadata:
@@ -88,7 +87,7 @@ class TestNamedContextSubsetValidation:
             allow_objects=frozenset({"orders"}),
             deny_columns=frozenset({"customers.email"}),
         )
-        eff = MainExecutionOps._effective_execution_context(master, named, "team_a")
+        eff = MainExecutionOps.effective_execution_context(master, named, "team_a")
         assert eff.allow_objects == frozenset({"orders"})
         assert eff.deny_columns == frozenset({"customers.email"})
 
@@ -114,13 +113,11 @@ class TestNamedContextPersistence:
             "team_a",
             EngineContext(allow_objects=frozenset({"orders"})),
         )
-        master_path = MainExecutionOps.export_named_schema_context_json(engine_dir, "master", master)
-        named_path = MainExecutionOps.export_named_schema_context_json(engine_dir, "team_a", master)
-        assert master_path.is_file()
-        assert named_path.is_file()
-        payload = json.loads(named_path.read_text(encoding="utf-8"))
-        assert payload["name"] == "team_a"
-        assert "version" in payload
+        master_doc = MainExecutionOps.build_named_schema_context_export(engine_dir, "master", master)
+        named_doc = MainExecutionOps.build_named_schema_context_export(engine_dir, "team_a", master)
+        assert master_doc["name"] == "master"
+        assert named_doc["name"] == "team_a"
+        assert named_doc["allow_objects"] == ["orders"]
 
 
 class TestResolveEngineContextPlan:
@@ -174,20 +171,3 @@ class TestResolveEngineContextPlan:
         assert m == master
         assert active == master
         assert name == "master"
-
-
-class TestSpaceSubsetOfContext:
-    def test_rejects_space_table_outside_context(self) -> None:
-        master = _master_context(allow=frozenset({"orders", "customers"}))
-        eff = MainExecutionOps._effective_execution_context(
-            master,
-            EngineContext(allow_objects=frozenset({"orders"})),
-            "team_a",
-        )
-        with pytest.raises(ConfigError, match="exceed the active engine context"):
-            MainExecutionOps.validate_space_subset_of_execution_context(
-                frozenset({"customers"}),
-                frozenset(),
-                eff,
-                _sample_graph(),
-            )

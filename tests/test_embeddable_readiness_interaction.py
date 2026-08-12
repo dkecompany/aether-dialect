@@ -10,43 +10,40 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aetherdialect import AsyncPipelineSession, BusinessKnowledgeEntry
+from aetherdialect import AsyncPipelineSession, DomainKnowledgeEntry
 from aetherdialect._constants import (
-    PERMISSION_DENIED_USER_MESSAGE,
     PIPELINE_SUSPEND_ID_SQL,
     SESSION_KIND_AWAITING_SQL_CONFIRM,
     SESSION_KIND_META,
 )
-from aetherdialect._contracts_base import (
-    AccessError,
-    JoinEdge,
-    NormalizedExpr,
-    ParameterBinding,
-    PipelineSuspended,
-    PredicateGroup,
-    QuestionRoute,
-    QuestionValidationResult,
-    SessionStep,
-    WhereParam,
-)
+from aetherdialect._constants_runtime import PERMISSION_DENIED_USER_MESSAGE
+from aetherdialect._contracts_base import JoinEdge, NormalizedExpr, PredicateGroup, WhereParam
 from aetherdialect._contracts_core import (
+    AccessError,
     ConcreteIntent,
     FederatedSqlBundle,
     FederatedStatementRecord,
     GenerationPath,
     InteractiveTailSnapshot,
+    ParameterBinding,
+    PipelineSuspended,
+    QuestionRoute,
+    QuestionValidationResult,
     RuntimeIntent,
+    SessionStep,
     SqlFeedbackSuspendContext,
     SqlGenerationOutcome,
     Template,
     ValueHistory,
 )
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, SQLShape, TableMetadata, TemplateStats
-from aetherdialect._core_utils import business_knowledge_scope
 from aetherdialect._dialect_sqlglot_engines import DatabricksDialect
 from aetherdialect._intent_expr import parse_intent_response
-from aetherdialect._main_execution import MainExecutionOps, PipelineSession
-from aetherdialect._templates import TemplateOps
+from aetherdialect._main_execution import MainExecutionOps
+from aetherdialect._main_init import MainInitOps
+from aetherdialect._main_session import PipelineSession
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils import domain_knowledge_scope
 
 
 def _session_owner() -> MagicMock:
@@ -63,9 +60,9 @@ def _session_owner() -> MagicMock:
     owner._pipeline_writer_lock = threading.Lock()
     owner._runtime_config = MagicMock()
     owner._runtime_config.llm_execution = MagicMock()
-    owner._ask_phase_callback = None
-    owner._business_knowledge = MagicMock()
-    owner._business_knowledge.scope_kwargs.return_value = {"entries": (), "digest": None}
+    owner._phase_callback = None
+    owner._domain_knowledge = MagicMock()
+    owner._domain_knowledge.scope_kwargs.return_value = {"entries": (), "digest": None}
     owner._dialect = MagicMock()
     owner.dialect = "postgresql"
     owner.limits = MagicMock()
@@ -207,8 +204,8 @@ def test_pparams_on_sql_suspend() -> None:
     owner._sandbox_closed = False
     owner._pipeline_writer_lock = None
     owner._artifacts_dir = None
-    owner._business_knowledge = None
-    owner._ask_phase_callback = None
+    owner._domain_knowledge = None
+    owner._phase_callback = None
     owner._store_by_space = {}
     owner._templates_by_space = {}
     owner._schema_terms = set()
@@ -292,8 +289,7 @@ def test_ask_schema_catalog_meta_count() -> None:
         prompt=None,
         kind=SESSION_KIND_META,
         sql=None,
-        message=MainExecutionOps.format_meta_schema_message(answer),
-        meta_payload=answer,
+        answer=MainExecutionOps.format_meta_schema_message(answer),
     )
     validation = QuestionValidationResult(
         accepted=True, route=QuestionRoute.SCHEMA_CATALOG, corrected="how many tables"
@@ -303,37 +299,34 @@ def test_ask_schema_catalog_meta_count() -> None:
         return dialect or MagicMock(), schema or schema_g, store, templates, rejected, schema_terms
 
     with (
-        patch("aetherdialect._pipeline.EngineConfig.llm_credentials_configured", return_value=True),
-        patch("aetherdialect._main_execution.load_pipeline_resources", side_effect=_load),
-        patch("aetherdialect._main_execution.validate_question", return_value=validation),
-        patch("aetherdialect._main_execution.match_question_level_template_reuse", side_effect=_reuse_none),
-        patch.object(MainExecutionOps, "answer_metadata_question", return_value=meta_step),
-        patch("aetherdialect._main_execution.normalize_question_via_llm") as normalize_mock,
+        patch("aetherdialect._config.EngineConfig.llm_credentials_configured", return_value=True),
+        patch("aetherdialect._main_init.load_pipeline_resources", side_effect=_load),
+        patch("aetherdialect._main_init.validate_question", return_value=validation),
+        patch("aetherdialect._main_init.match_question_level_template_reuse", side_effect=_reuse_none),
+        patch.object(MainInitOps, "answer_metadata_question", return_value=meta_step),
+        patch("aetherdialect._main_init.normalize_question_via_llm") as normalize_mock,
     ):
         step = sess.ask("how many tables")
     assert step.kind == SESSION_KIND_META
     assert step.sql is None
-    assert step.meta_payload is not None
-    assert step.meta_payload["counts"]["tables"] == dump["inventory"]["table_count"]
-    assert str(dump["inventory"]["table_count"]) in (step.message or "")
+    assert str(dump["inventory"]["table_count"]) in (step.answer or "")
     normalize_mock.assert_not_called()
     assert "meta.route.schema_catalog" in {d.code for d in step.diagnostics}
 
 
 @pytest.mark.fast
-def test_ask_business_knowledge_prose() -> None:
-    entries = (BusinessKnowledgeEntry(key="arr", text="Annual recurring revenue.", kind="metric"),)
-    llm_answer = {"response_kind": "business_knowledge", "message": "ARR is annual recurring revenue."}
+def test_ask_domain_knowledge_prose() -> None:
+    entries = (DomainKnowledgeEntry(key="arr", text="Annual recurring revenue.", kind="metric"),)
+    llm_answer = {"response_kind": "domain_knowledge", "message": "ARR is annual recurring revenue."}
     with (
-        business_knowledge_scope(entries=entries, digest="d1"),
-        patch("aetherdialect._main_execution.LLMProvider.json", return_value=llm_answer),
+        domain_knowledge_scope(entries=entries, digest="d1"),
+        patch("aetherdialect._llm_provider.LLMProvider.json", return_value=llm_answer),
     ):
         step = MainExecutionOps.answer_metadata_question(
-            MagicMock(), "what is ARR", QuestionRoute.BUSINESS_KNOWLEDGE, None, None, None
+            MagicMock(), "what is ARR", QuestionRoute.DOMAIN_KNOWLEDGE, None, None, None
         )
     assert step.kind == SESSION_KIND_META
-    assert step.message == "ARR is annual recurring revenue."
-    assert step.meta_payload == {"response_kind": "business_knowledge"}
+    assert step.answer == "ARR is annual recurring revenue."
 
 
 @pytest.mark.fast
@@ -346,13 +339,13 @@ def test_analytical_ask_no_meta_diagnostics() -> None:
         return dialect or MagicMock(), schema, store, templates, rejected, schema_terms
 
     with (
-        patch("aetherdialect._pipeline.EngineConfig.llm_credentials_configured", return_value=True),
-        patch("aetherdialect._main_execution.load_pipeline_resources", side_effect=_load),
-        patch("aetherdialect._main_execution.validate_question", return_value=validation),
-        patch("aetherdialect._main_execution.match_question_level_template_reuse", side_effect=_reuse_none),
-        patch.object(MainExecutionOps, "answer_metadata_question") as answer_mock,
+        patch("aetherdialect._config.EngineConfig.llm_credentials_configured", return_value=True),
+        patch("aetherdialect._main_init.load_pipeline_resources", side_effect=_load),
+        patch("aetherdialect._main_init.validate_question", return_value=validation),
+        patch("aetherdialect._main_init.match_question_level_template_reuse", side_effect=_reuse_none),
+        patch.object(MainInitOps, "answer_metadata_question") as answer_mock,
         patch(
-            "aetherdialect._main_execution.normalize_question_via_llm",
+            "aetherdialect._main_init.normalize_question_via_llm",
             side_effect=RuntimeError("stop_after_analytical_branch"),
         ),
     ):
@@ -399,8 +392,8 @@ def test_execute_template_after_accept_returns_rows() -> None:
     owner._sandbox_closed = False
     owner._pipeline_writer_lock = None
     owner._artifacts_dir = None
-    owner._business_knowledge = None
-    owner._ask_phase_callback = None
+    owner._domain_knowledge = None
+    owner._phase_callback = None
     owner._store_by_space = {}
     owner._templates_by_space = {}
     owner._schema_terms = set()
@@ -430,7 +423,7 @@ def test_federation_multi_member_sql_dict() -> None:
         ),
         display_sql="/* federated */",
     )
-    sql = MainExecutionOps._resolved_session_step_sql(
+    sql = MainExecutionOps.resolved_session_step_sql(
         None,
         federated_bundle=bundle,
         generation_path=GenerationPath.FEDERATION_PLAN,
@@ -447,9 +440,9 @@ def test_owner_warehouse_access_error_no_contact_admin(monkeypatch: pytest.Monke
     def _capture(_choice_port: object, **kwargs: object) -> None:
         noted.update(kwargs)
 
-    monkeypatch.setattr("aetherdialect._main_execution.note_interactive_turn", _capture)
+    monkeypatch.setattr("aetherdialect._main_interactive.note_interactive_turn", _capture)
     port = SimpleNamespace(_owner=SimpleNamespace(_schema_role="owner"))
-    MainExecutionOps._note_access_error_turn(
+    MainExecutionOps.note_access_error_turn(
         port, AccessError("execute", "warehouse privilege missing", reason="warehouse")
     )
     assert noted.get("outcome") == "validation_failed"

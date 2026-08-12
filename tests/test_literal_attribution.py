@@ -2,18 +2,13 @@
 
 from __future__ import annotations
 
-from aetherdialect._contracts_base import (
+from aetherdialect._contracts_base import FailureCategory
+from aetherdialect._contracts_schema import (
     CteIntent,
-    FailureCategory,
+    IntentIssue,
     LogicalIntent,
 )
-from aetherdialect._contracts_schema import (
-    IntentIssue,
-)
-from aetherdialect._intent_resolve import (
-    attribute_post_compose_issue,
-    literal_in_logical_prose,
-)
+from aetherdialect._intent_bind import attribute_post_compose_issue, literal_in_logical_prose
 
 
 def _issue_missing_numeric(value: str) -> IntentIssue:

@@ -1,4 +1,4 @@
-"""Contract tests for the agent-shaped programmatic surface (session- only, no engine stdout)."""
+"""Contract tests for the programmatic session surface (session-only, no engine stdout)."""
 
 from __future__ import annotations
 
@@ -9,10 +9,10 @@ import pytest
 
 import aetherdialect
 from aetherdialect import AetherEngine, AsyncPipelineSession, SessionStep
-from aetherdialect._templates import TemplateOps
+from aetherdialect._templates_ops import TemplateOps
 
 
-def test_public_all_excludes_legacy_types() -> None:
+def test_public_all_excludes_removed_types() -> None:
     assert "QueryResult" not in aetherdialect.__all__
     assert "ConversationContext" not in aetherdialect.__all__
     assert "RecentTurn" not in aetherdialect.__all__
@@ -24,9 +24,9 @@ def test_aetherengine_session_surface() -> None:
     assert hasattr(AetherEngine, "asession")
 
 
-@patch("aetherdialect._core_utils.diagnostic_debug_enabled", return_value=False)
+@patch("aetherdialect._utils.diagnostic_debug_enabled", return_value=False)
 def test_notify_emits_no_stdio_without_print_listener(_mock_dbg: object, capsys: pytest.CaptureFixture[str]) -> None:
-    from aetherdialect._core_utils import notify
+    from aetherdialect._utils import notify
 
     notify("hello from contract test", stage="test")
     out, err = capsys.readouterr()
@@ -34,7 +34,7 @@ def test_notify_emits_no_stdio_without_print_listener(_mock_dbg: object, capsys:
     assert err == ""
 
 
-def test_session_step_agent_fields_exist() -> None:
+def test_session_step_reply_shape_fields_exist() -> None:
     s = SessionStep(
         done=False,
         prompt="ok?",
@@ -44,7 +44,7 @@ def test_session_step_agent_fields_exist() -> None:
     )
     assert s.reply_shape == "yes_no"
     assert s.semantic_warnings == ("warn1",)
-    assert s.status is None
+    assert s.error is None
 
 
 def _session_owner() -> MagicMock:
@@ -61,7 +61,7 @@ def _session_owner() -> MagicMock:
 
 
 def test_pipeline_session_ask_typeerror_non_str() -> None:
-    from aetherdialect._main_execution import PipelineSession
+    from aetherdialect._main_session import PipelineSession
 
     sess = PipelineSession(_session_owner())
     with pytest.raises(TypeError, match="str"):
@@ -69,17 +69,15 @@ def test_pipeline_session_ask_typeerror_non_str() -> None:
 
 
 def test_pipeline_session_ask_blocked_emits_audit() -> None:
+    from aetherdialect._constants import PIPELINE_SUSPEND_ID_INTENT_CONFIRM
     from aetherdialect._contracts_base import SessionActiveError
-    from aetherdialect._main_execution import PipelineSession
-    from aetherdialect._pipeline import (
-        PIPELINE_SUSPEND_ID_INTENT_CONFIRM,
-        PipelineSuspended,
-    )
+    from aetherdialect._contracts_core import PipelineSuspended
+    from aetherdialect._main_session import PipelineSession
 
     owner = _session_owner()
     sess = PipelineSession(owner)
     suspended = PipelineSuspended(PIPELINE_SUSPEND_ID_INTENT_CONFIRM, "p", None)
-    with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once", side_effect=suspended):
+    with patch("aetherdialect._main_init.MainInitOps.interactive_run_once", side_effect=suspended):
         sess.ask("first")
     with pytest.raises(SessionActiveError):
         sess.ask("second")
@@ -89,18 +87,16 @@ def test_pipeline_session_ask_blocked_emits_audit() -> None:
 
 
 def test_ask_until_done_yes_resumes_to_completion() -> None:
-    from aetherdialect._main_execution import PipelineSession
-    from aetherdialect._pipeline import (
-        PIPELINE_SUSPEND_ID_INTENT_CONFIRM,
-        PipelineSuspended,
-    )
+    from aetherdialect._constants import PIPELINE_SUSPEND_ID_INTENT_CONFIRM
+    from aetherdialect._contracts_core import PipelineSuspended
+    from aetherdialect._main_session import PipelineSession
 
     owner = _session_owner()
     sess = PipelineSession(owner)
     suspended = PipelineSuspended(PIPELINE_SUSPEND_ID_INTENT_CONFIRM, "p", None)
     with (
-        patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once", side_effect=suspended),
-        patch("aetherdialect._main_execution.MainExecutionOps.dispatch_pipeline_resume") as disp,
+        patch("aetherdialect._main_init.MainInitOps.interactive_run_once", side_effect=suspended),
+        patch("aetherdialect._main_interactive.MainInteractiveOps.dispatch_pipeline_resume") as disp,
     ):
         step = sess.ask_until_done("q", on_confirm="y")
     assert step.done is True
@@ -108,17 +104,15 @@ def test_ask_until_done_yes_resumes_to_completion() -> None:
 
 
 def test_ask_until_done_free_text_suspend_raises() -> None:
+    from aetherdialect._constants import PIPELINE_SUSPEND_ID_INTENT_FEEDBACK
     from aetherdialect._contracts_base import SessionActiveError
-    from aetherdialect._main_execution import PipelineSession
-    from aetherdialect._pipeline import (
-        PIPELINE_SUSPEND_ID_INTENT_FEEDBACK,
-        PipelineSuspended,
-    )
+    from aetherdialect._contracts_core import PipelineSuspended
+    from aetherdialect._main_session import PipelineSession
 
     owner = _session_owner()
     sess = PipelineSession(owner)
     suspended = PipelineSuspended(PIPELINE_SUSPEND_ID_INTENT_FEEDBACK, "why?", None)
-    with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once", side_effect=suspended):
+    with patch("aetherdialect._main_init.MainInitOps.interactive_run_once", side_effect=suspended):
         with pytest.raises(SessionActiveError, match="free-text"):
             sess.ask_until_done("q", on_confirm="y")
 
@@ -141,8 +135,8 @@ def test_suspend_reply_shape_by_kind(state_id: str, expected_reply: str) -> None
         PIPELINE_SUSPEND_ID_SQL,
         PIPELINE_SUSPEND_ID_USER_FEEDBACK_REJECT,
     )
-    from aetherdialect._contracts_base import PipelineSuspended
-    from aetherdialect._main_execution import PipelineSession
+    from aetherdialect._contracts_core import PipelineSuspended
+    from aetherdialect._main_session import PipelineSession
 
     sid_map = {
         "pipeline_suspend_intent_confirm": PIPELINE_SUSPEND_ID_INTENT_CONFIRM,
@@ -171,7 +165,7 @@ def test_run_interactive_stdout_smoke(monkeypatch: pytest.MonkeyPatch, capsys: p
                 done=True,
                 prompt=None,
                 kind=SESSION_KIND_RESULT,
-                message="ok",
+                answer="ok",
             )
             return self.inner
 
@@ -200,13 +194,13 @@ def test_run_interactive_stdout_smoke(monkeypatch: pytest.MonkeyPatch, capsys: p
 
 def test_async_pipeline_session_ask_smoke() -> None:
     from aetherdialect._constants import SESSION_KIND_RESULT
-    from aetherdialect._main_execution import PipelineSession
+    from aetherdialect._main_session import PipelineSession
 
     owner = _session_owner()
     inner = PipelineSession(owner)
 
     async def _run() -> None:
-        with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once", return_value=None):
+        with patch("aetherdialect._main_init.MainInitOps.interactive_run_once", return_value=None):
             ap = AsyncPipelineSession(inner)
             step = await ap.ask("q")
         assert step.done is True
@@ -216,7 +210,7 @@ def test_async_pipeline_session_ask_smoke() -> None:
 
 
 def test_async_pipeline_session_awaiting_prompt_delegates() -> None:
-    from aetherdialect._main_execution import PipelineSession
+    from aetherdialect._main_session import PipelineSession
 
     owner = _session_owner()
     inner = PipelineSession(owner)
@@ -229,10 +223,9 @@ def test_async_pipeline_session_awaiting_prompt_delegates() -> None:
     asyncio.run(_run())
 
 
-def test_completed_step_sets_status_after_final_sql_reject() -> None:
-    from aetherdialect._contracts_base import FailureCategory
-    from aetherdialect._contracts_core import RuntimeIntent
-    from aetherdialect._main_execution import PipelineSession
+def test_completed_step_sets_declined_after_final_sql_reject() -> None:
+    from aetherdialect._contracts_core import RuntimeIntent, SessionOutcome
+    from aetherdialect._main_session import PipelineSession
 
     owner = _session_owner()
     sess = PipelineSession(owner)
@@ -255,12 +248,13 @@ def test_completed_step_sets_status_after_final_sql_reject() -> None:
         "intent": ri,
     }
     step = sess._completed_step()
-    assert step.status == FailureCategory.RESULT_OKAY_INTENT_WRONG.value
+    assert step.error is not None
+    assert step.error.code == SessionOutcome.DECLINED
     assert step.done is True
 
 
 def test_async_pipeline_session_ask_typeerror() -> None:
-    from aetherdialect._main_execution import PipelineSession
+    from aetherdialect._main_session import PipelineSession
 
     owner = _session_owner()
     inner = PipelineSession(owner)
@@ -274,7 +268,7 @@ def test_async_pipeline_session_ask_typeerror() -> None:
 
 
 def test_pipeline_session_accept_until_done_typeerror() -> None:
-    from aetherdialect._main_execution import PipelineSession
+    from aetherdialect._main_session import PipelineSession
 
     sess = PipelineSession(_session_owner())
     with pytest.raises(TypeError, match="str"):
@@ -282,7 +276,7 @@ def test_pipeline_session_accept_until_done_typeerror() -> None:
 
 
 def test_async_pipeline_session_accept_until_done_delegates() -> None:
-    from aetherdialect._main_execution import PipelineSession
+    from aetherdialect._main_session import PipelineSession
 
     owner = _session_owner()
     inner = PipelineSession(owner)
@@ -292,11 +286,10 @@ def test_async_pipeline_session_accept_until_done_delegates() -> None:
         kind="ok",
         sql="SELECT 1",
         data=None,
-        message=None,
+        answer=None,
         error=None,
         diagnostics=(),
         intent_summary=None,
-        status=None,
         reply_shape=None,
         semantic_warnings=(),
     )

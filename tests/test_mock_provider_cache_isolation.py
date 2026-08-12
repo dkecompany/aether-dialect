@@ -34,7 +34,7 @@ def test_parallel_fixture_files_isolated(tmp_path: Path) -> None:
     orig_provider = EngineConfig.LLM_PROVIDER
     orig_mock = EngineConfig.MOCK_FIXTURES_FILE
     try:
-        EngineConfig.LLM_PROVIDER = "mock"
+        EngineConfig.LLM_PROVIDER = "sandbox"
         runtime_a = SandboxRuntimeState()
         runtime_b = SandboxRuntimeState()
         token_a = SandboxRuntimeState.bind_sandbox_runtime(runtime_a)

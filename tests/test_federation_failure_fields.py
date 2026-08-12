@@ -6,8 +6,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from aetherdialect._contracts_base import SessionStep
-from aetherdialect._main_execution import PipelineSession
+from aetherdialect._contracts_core import SessionStep
+from aetherdialect._main_session import PipelineSession
 
 
 def _session_with_outcome(outcome: str, **extra: object) -> PipelineSession:
@@ -34,7 +34,7 @@ def _session_with_outcome(outcome: str, **extra: object) -> PipelineSession:
         **extra,
     }
     session._owner = MagicMock()
-    session._owner._llm_config = MagicMock(provider="mock")
+    session._owner._llm_config = MagicMock(provider="sandbox")
     session._owner._audit_emit = None
     session._turn_llm_usage_start = 0
     session._session_busy = True
@@ -64,13 +64,14 @@ def test_prepare_failure_outcome_carries_federation_fields_on_session_step(outco
     session = _session_with_outcome(outcome)
     step = session._completed_step()
     assert isinstance(step, SessionStep)
-    assert step.federation_source_id == "west"
-    assert step.federation_phase == "prepare"
+    assert step.error is not None
+    assert step.error.source_id == "west"
+    assert step.error.phase == "prepare"
 
 
 @pytest.mark.fast
 def test_federation_partial_failure_still_carries_federation_fields() -> None:
-    """Regression: partial failure attribution remains on SessionStep."""
+    """Partial failure attribution must remain on SessionStep."""
     session = _session_with_outcome(
         "federation_partial_failure",
         error=None,
@@ -78,7 +79,7 @@ def test_federation_partial_failure_still_carries_federation_fields() -> None:
         retryable=True,
     )
     step = session._completed_step()
-    assert step.federation_source_id == "west"
-    assert step.federation_phase == "prepare"
-    assert step.retryable is True
-    assert step.federation_succeeded == (("east", 2, "2026-01-01T00:00:00+00:00"),)
+    assert step.error is not None
+    assert step.error.source_id == "west"
+    assert step.error.phase == "prepare"
+    assert any(d.code for d in step.diagnostics)

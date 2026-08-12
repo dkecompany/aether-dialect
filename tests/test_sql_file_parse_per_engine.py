@@ -7,10 +7,7 @@ from unittest.mock import patch
 import pytest
 
 from aetherdialect._config import EngineConfig
-from aetherdialect._schema_catalog import (
-    _parse_sql_file_fallback,
-    _parse_sql_file_sqlglot,
-)
+from aetherdialect._schema_profile import _parse_sql_file_fallback, _parse_sql_file_sqlglot
 
 MYSQL_DDL = """
 CREATE TABLE `orders` (
@@ -97,6 +94,7 @@ def test_parse_sql_file_sqlglot_extracts_foreign_keys_per_engine(
         ("mysql", "sqlglot"),
         ("databricks", "sqlglot"),
         ("sqlserver", "sqlglot"),
+        ("oracle", "sqlglot"),
         ("bigquery", "sqlglot"),
         ("duckdb", "sqlglot"),
         ("sqlite", "sqlglot"),
@@ -107,11 +105,11 @@ def test_parse_sql_file_fallback_dispatches_by_engine(engine: str, expected_pars
     ddl = MYSQL_DDL if engine != "postgresql" else "CREATE TABLE orders (id INT PRIMARY KEY);"
     with patch.object(EngineConfig, "TYPE", engine):
         with patch(
-            "aetherdialect._schema_catalog._parse_sql_file_pglast_postgres",
+            "aetherdialect._schema_profile._parse_sql_file_pglast_postgres",
             return_value={"t": {}},
         ) as pg_mock:
             with patch(
-                "aetherdialect._schema_catalog._parse_sql_file_sqlglot",
+                "aetherdialect._schema_profile._parse_sql_file_sqlglot",
                 return_value={"t": {}},
             ) as sg_mock:
                 _parse_sql_file_fallback(ddl)

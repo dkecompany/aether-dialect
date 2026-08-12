@@ -24,7 +24,7 @@ def _base_intent(**kwargs: object) -> SeedWarmupIntent:
         "grain": "row_level",
         "select_cols": [],
         "group_by_cols": [],
-        "where": [],
+        "where": None,
     }
     data.update(kwargs)
     return SeedWarmupIntent.from_dict(data)

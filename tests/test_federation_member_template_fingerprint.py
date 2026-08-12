@@ -7,12 +7,13 @@ from unittest.mock import patch
 
 import pytest
 
+from aetherdialect._contracts_base import NormalizedExpr
 from aetherdialect._contracts_core import RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._dialect import Dialect, DialectRegistry
-from aetherdialect._intent_process import NormalizedExpr
 from aetherdialect._schema_graph import recompute_join_paths_multi
-from aetherdialect._templates import TemplateOps, TemplateStoreView
+from aetherdialect._templates import TemplateStoreView
+from aetherdialect._templates_ops import TemplateOps
 
 
 def _member_schema(source_id: str) -> SchemaGraph:
@@ -66,7 +67,7 @@ def test_member_template_sql_fp_unchanged_after_postgresql_coordinator_reload() 
 
     raw = tmpl.to_dict()
     with patch(
-        "aetherdialect._templates.Dialect.active_sqlglot_dialect",
+        "aetherdialect._dialect.Dialect.active_sqlglot_dialect",
         return_value=DialectRegistry.sqlglot_dialect_for_engine("postgresql"),
     ):
         reloaded = TemplateStoreView._template_from_store_dict(tmpl.id, raw)

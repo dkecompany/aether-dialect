@@ -9,15 +9,15 @@ import pytest
 from aetherdialect._constants import DIAGNOSTIC_CODE_MATERIALIZED_VIEW_ANSWER
 from aetherdialect._contracts_core import RuntimeIntent
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import (
-    drain_diagnostic_collector,
-    reset_diagnostic_collector,
-    set_diagnostic_collector,
-)
-from aetherdialect._schema_build import (
+from aetherdialect._schema_reflect import (
     _reflect_materialized_view_last_refreshed_at,
     emit_materialized_view_answer_diagnostics,
     tables_meta_to_schema_graph,
+)
+from aetherdialect._utils import (
+    drain_diagnostic_collector,
+    reset_diagnostic_collector,
+    set_diagnostic_collector,
 )
 
 

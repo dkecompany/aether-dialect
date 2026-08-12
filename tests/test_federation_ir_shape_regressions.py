@@ -12,12 +12,7 @@ import pytest
 
 from aetherdialect._config import PolicyConfig
 from aetherdialect._constants import MAX_PREDICATE_NESTING_DEPTH
-from aetherdialect._contracts_base import (
-    FederationMappings,
-    MulGroup,
-    PredicateGroup,
-    WhereParam,
-)
+from aetherdialect._contracts_base import FederationConfigError, MulGroup, NormalizedExpr, PredicateGroup, WhereParam
 from aetherdialect._contracts_core import (
     FederatedPlan,
     JoinSpec,
@@ -26,26 +21,31 @@ from aetherdialect._contracts_core import (
     SelectCol,
     SourceStep,
 )
-from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
+from aetherdialect._contracts_schema import ColumnMetadata, FederationMappings, FKEdge, SchemaGraph, TableMetadata
 from aetherdialect._dialect import DialectRegistry
-from aetherdialect._federation import (
-    FederationConfigError,
-    _apply_coordinator_probe_joins,
+from aetherdialect._federation_compose import (
     assert_composite_invariants,
     compose_composite_graph,
+)
+from aetherdialect._federation_execute import (
     execute_federation_coordinator,
-    federation_artifact_paths,
-    federation_plan_is_degenerate,
     load_federation_composite_graph,
     mappings_replay_matches,
-    parse_federation_manifest,
     persist_federation_tree,
+)
+from aetherdialect._federation_manifest import (
+    federation_artifact_paths,
+    parse_federation_manifest,
+)
+from aetherdialect._federation_plan import (
+    _apply_coordinator_probe_joins,
+    federation_plan_is_degenerate,
     plan_federated_intent,
     render_federation_glue,
 )
-from aetherdialect._intent_process import NormalizedExpr
 from aetherdialect._main_execution import MainExecutionOps
-from aetherdialect._pipeline import generate_and_validate_sql, prepare_federated_sql_plan
+from aetherdialect._pipeline_execute import prepare_federated_sql_plan
+from aetherdialect._pipeline_generate import generate_and_validate_sql
 from aetherdialect._schema_graph import recompute_join_paths_multi
 from aetherdialect._sql_gen import (
     _build_deterministic_select_block,
@@ -54,12 +54,14 @@ from aetherdialect._sql_gen import (
     build_deterministic_sql,
     inject_join_into_deterministic_sql,
 )
-from aetherdialect._templates import TemplateOps
-from aetherdialect._validation_schema import (
-    validate_cte_emission_shapes,
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._validation_shape import (
     validate_distinct_on_schema,
-    validate_predicate_nesting_depth,
     validate_preserve_tables,
+)
+from aetherdialect._validation_sql import (
+    validate_cte_emission_shapes,
+    validate_predicate_nesting_depth,
 )
 from tests.conftest import duckdb_engine_identity
 from tests.federation_helpers import build_two_member_federation
@@ -557,7 +559,7 @@ def test_preserve_tables_noop_declaration_raises() -> None:
         ("distinct_on", lambda: _distinct_on_intent()),
     ],
 )
-def test_new_shape_sql_has_no_legacy_tokens(
+def test_new_shape_sql_has_no_forbidden_tokens(
     shape: str,
     intent_factory,
     simple_schema: SchemaGraph,
@@ -591,7 +593,7 @@ def test_single_source_federated_plan_renders_byte_identical_sql() -> None:
     )
     store = TemplateOps.empty_template_store(composite.schema_graph_id)
     with patch(
-        "aetherdialect._pipeline._run_sql_validation_cascade",
+        "aetherdialect._pipeline_generate.run_sql_validation_cascade",
         return_value=(True, "", None, []),
     ):
 
@@ -600,7 +602,7 @@ def test_single_source_federated_plan_renders_byte_identical_sql() -> None:
             _federation_dialects = {sid: runtime.dialect for sid, runtime in runtimes.items()}
 
         owner = _Owner()
-        single_source = MainExecutionOps._federation_single_source_sql_context(
+        single_source = MainExecutionOps.federation_single_source_sql_context(
             owner,
             intent,
             composite,
@@ -772,7 +774,7 @@ def test_compose_twice_is_byte_identical_on_identity_fields() -> None:
     assert fed.composite.schema_graph_id == second.schema_graph_id
     assert fed.composite.structural_hash == second.structural_hash
     assert fed.composite.effective_structural_hash == second.effective_structural_hash
-    assert_composite_invariants(second, fed.member_graphs, fed.manifest, FederationMappings(version="0.2.1"))
+    assert_composite_invariants(second, fed.member_graphs, fed.manifest, FederationMappings(version="0.2.3"))
 
 
 @pytest.mark.fast
@@ -801,7 +803,7 @@ def test_federation_artifact_version_mismatch_reports_expected_version() -> None
     from aetherdialect._constants import FEDERATION_ARTIFACT_FORMAT_VERSION
 
     fed = build_two_member_federation()
-    mappings = FederationMappings(version="0.2.1")
+    mappings = FederationMappings(version="0.2.3")
     with tempfile.TemporaryDirectory() as tmp:
         persist_federation_tree(
             tmp,

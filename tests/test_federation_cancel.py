@@ -12,7 +12,7 @@ import pytest
 
 import aetherdialect
 from aetherdialect import AsyncPipelineSession
-from aetherdialect._contracts_base import FederationPartialFailureError, FederationRuntimeError, LlmExecutionConfig
+from aetherdialect._contracts_base import FederationPartialFailureError, FederationRuntimeError
 from aetherdialect._contracts_core import (
     FederatedPlan,
     FederatedPreparedStep,
@@ -20,30 +20,29 @@ from aetherdialect._contracts_core import (
     FederatedStage,
     FederationExecutionContext,
     JoinSpec,
+    LlmExecutionConfig,
     RuntimeIntent,
     SourceStep,
 )
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import (
-    LLM_EXECUTION_CONTEXT,
-    federation_turn_cancelled,
-    llm_execution_scope,
-    pop_federation_execution_context,
-    push_federation_execution_context,
-)
-from aetherdialect._federation import (
-    compose_composite_graph,
-    federation_plan_combine_hash,
-    parse_federation_manifest,
-)
-from aetherdialect._main_execution import PipelineSession
-from aetherdialect._pipeline import (
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_execute import federation_plan_combine_hash
+from aetherdialect._federation_manifest import parse_federation_manifest
+from aetherdialect._main_session import PipelineSession
+from aetherdialect._pipeline_execute import (
     _execute_federation_steps_parallel,
     _raise_partial_member_failure,
     execute_federated_prepare,
     prepare_federated_sql_plan,
 )
 from aetherdialect._schema_graph import recompute_join_paths_multi
+from aetherdialect._utils import (
+    LLM_EXECUTION_CONTEXT,
+    federation_turn_cancelled,
+    llm_execution_scope,
+    pop_federation_execution_context,
+    push_federation_execution_context,
+)
 
 
 def _graph(table: str, *, source_id: str) -> SchemaGraph:
@@ -136,7 +135,7 @@ def _staged_prepared() -> tuple[FederatedPrepareOutcome, SchemaGraph, Any]:
 @pytest.mark.fast
 def test_cancel_with_no_active_turn_returns_false() -> None:
     session = PipelineSession(MagicMock())
-    assert session.cancel_active_federation_turn() is False
+    assert session.cancel() is False
 
 
 @pytest.mark.fast
@@ -160,10 +159,10 @@ def test_session_cross_thread_cancel_stops_at_stage_boundary() -> None:
     def _run_turn() -> None:
         try:
             with (
-                patch("aetherdialect._pipeline.revalidate_prepared_federation_plan"),
-                patch("aetherdialect._pipeline._execute_federation_source_step", side_effect=_slow_member),
+                patch("aetherdialect._federation_execute.revalidate_prepared_federation_plan"),
+                patch("aetherdialect._pipeline_execute._execute_federation_source_step", side_effect=_slow_member),
                 patch(
-                    "aetherdialect._pipeline.execute_federation_coordinator",
+                    "aetherdialect._federation_execute.execute_federation_coordinator",
                     return_value=pd.DataFrame({"id": [1]}),
                 ),
             ):
@@ -181,7 +180,7 @@ def test_session_cross_thread_cancel_stops_at_stage_boundary() -> None:
     worker = threading.Thread(target=_run_turn)
     worker.start()
     assert first_entered.wait(timeout=5.0)
-    assert session.cancel_active_federation_turn() is True
+    assert session.cancel() is True
     release_first.set()
     worker.join(timeout=5.0)
     assert not worker.is_alive()
@@ -189,7 +188,7 @@ def test_session_cross_thread_cancel_stops_at_stage_boundary() -> None:
     assert isinstance(error_box[0], FederationRuntimeError)
     assert "cancelled" in str(error_box[0]).lower()
     assert started_sources == ["a"]
-    assert session._active_federation_execution_context is None
+    assert session.active_federation_execution_context is None
 
 
 @pytest.mark.fast
@@ -209,10 +208,10 @@ def test_async_cancel_during_in_flight_ask() -> None:
 
     def _blocking_ask(_question: str) -> Any:
         with (
-            patch("aetherdialect._pipeline.revalidate_prepared_federation_plan"),
-            patch("aetherdialect._pipeline._execute_federation_source_step", side_effect=_slow_member),
+            patch("aetherdialect._federation_execute.revalidate_prepared_federation_plan"),
+            patch("aetherdialect._pipeline_execute._execute_federation_source_step", side_effect=_slow_member),
             patch(
-                "aetherdialect._pipeline.execute_federation_coordinator",
+                "aetherdialect._federation_execute.execute_federation_coordinator",
                 return_value=pd.DataFrame({"id": [1]}),
             ),
         ):
@@ -228,13 +227,13 @@ def test_async_cancel_during_in_flight_ask() -> None:
     async def _run() -> None:
         ask_task = asyncio.create_task(asyncio.to_thread(_blocking_ask, "q"))
         assert await asyncio.to_thread(first_entered.wait, 5.0)
-        assert await async_sess.cancel_active_federation_turn() is True
+        assert await async_sess.cancel() is True
         release_first.set()
         with pytest.raises(FederationRuntimeError, match="cancelled"):
             await ask_task
 
     asyncio.run(_run())
-    assert session._active_federation_execution_context is None
+    assert session.active_federation_execution_context is None
 
 
 @pytest.mark.fast
@@ -268,8 +267,8 @@ def test_cancel_is_cooperative_between_stages_not_mid_statement() -> None:
         if step.source_id == "a":
             first_entered.set()
             assert cancel_during_first.wait(timeout=5.0)
-            assert session._active_federation_execution_context is not None
-            assert session._active_federation_execution_context.cancelled is True
+            assert session.active_federation_execution_context is not None
+            assert session.active_federation_execution_context.cancelled is True
             assert release_first.wait(timeout=5.0)
             completed_sources.append("a")
             return pd.DataFrame({"id": [1]})
@@ -281,10 +280,10 @@ def test_cancel_is_cooperative_between_stages_not_mid_statement() -> None:
     def _run_turn() -> None:
         try:
             with (
-                patch("aetherdialect._pipeline.revalidate_prepared_federation_plan"),
-                patch("aetherdialect._pipeline._execute_federation_source_step", side_effect=_slow_member),
+                patch("aetherdialect._federation_execute.revalidate_prepared_federation_plan"),
+                patch("aetherdialect._pipeline_execute._execute_federation_source_step", side_effect=_slow_member),
                 patch(
-                    "aetherdialect._pipeline.execute_federation_coordinator",
+                    "aetherdialect._federation_execute.execute_federation_coordinator",
                     return_value=pd.DataFrame({"id": [1]}),
                 ),
             ):
@@ -302,7 +301,7 @@ def test_cancel_is_cooperative_between_stages_not_mid_statement() -> None:
     worker = threading.Thread(target=_run_turn)
     worker.start()
     assert first_entered.wait(timeout=5.0)
-    assert session.cancel_active_federation_turn() is True
+    assert session.cancel() is True
     cancel_during_first.set()
     release_first.set()
     worker.join(timeout=5.0)
@@ -441,7 +440,7 @@ def test_parallel_member_worker_observes_cancellation_context() -> None:
             release_workers.set()
 
         cancel_thread = threading.Thread(target=_cancel_when_ready)
-        with patch("aetherdialect._pipeline._execute_federation_source_step", side_effect=_member):
+        with patch("aetherdialect._pipeline_execute._execute_federation_source_step", side_effect=_member):
             cancel_thread.start()
             with pytest.raises(FederationRuntimeError, match="cancelled"):
                 _execute_federation_steps_parallel(
@@ -496,7 +495,7 @@ def test_parallel_member_worker_inherits_llm_execution_scope() -> None:
         return pd.DataFrame({"id": [1]})
 
     with llm_execution_scope(cfg):
-        with patch("aetherdialect._pipeline._execute_federation_source_step", side_effect=_member):
+        with patch("aetherdialect._pipeline_execute._execute_federation_source_step", side_effect=_member):
             _execute_federation_steps_parallel(
                 prepared.plan.steps,
                 prepared_by_source=prepared_by_source,
@@ -535,7 +534,7 @@ def test_parallel_member_pool_shutdown_cancels_pending_futures() -> None:
 
     with (
         patch.object(ThreadPoolExecutor, "shutdown", _record_shutdown),
-        patch("aetherdialect._pipeline._execute_federation_source_step", side_effect=_member),
+        patch("aetherdialect._pipeline_execute._execute_federation_source_step", side_effect=_member),
     ):
         _execute_federation_steps_parallel(
             prepared.plan.steps,
@@ -557,10 +556,10 @@ def test_parallel_member_pool_shutdown_cancels_pending_futures() -> None:
 
 @pytest.mark.fast
 def test_public_surface_drops_module_helpers_keeps_exceptions() -> None:
-    assert "cancel_active_federation_turn" not in aetherdialect.__all__
+    assert "cancel" not in aetherdialect.__all__
     with pytest.raises(ImportError):
         exec(
-            "from aetherdialect import cancel_active_federation_turn",
+            "from aetherdialect import cancel",
             {"__builtins__": __builtins__},
         )
     assert aetherdialect.FederationMemberExecutionError is not None

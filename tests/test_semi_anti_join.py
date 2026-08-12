@@ -7,15 +7,11 @@ from unittest.mock import patch
 
 import pytest
 
-from aetherdialect._contracts_base import (
-    CteEmissionKind,
-    ProbeCtePlacementError,
-)
-from aetherdialect._contracts_core import RuntimeCteStep, RuntimeIntent, SelectCol
+from aetherdialect._contracts_base import CteEmissionKind, NormalizedExpr
+from aetherdialect._contracts_core import ProbeCtePlacementError, RuntimeCteStep, RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
 from aetherdialect._dialect_postgres import PostgresDialect
-from aetherdialect._intent_process import NormalizedExpr
-from aetherdialect._pipeline import _resolve_joins_fresh
+from aetherdialect._pipeline_generate import _resolve_joins_fresh
 from aetherdialect._schema_graph import recompute_join_paths_multi
 from aetherdialect._sql_gen import (
     _join_kind_for_edge,
@@ -23,11 +19,9 @@ from aetherdialect._sql_gen import (
     build_deterministic_sql,
     inject_join_into_deterministic_sql,
 )
-from aetherdialect._validation_execute import (
+from aetherdialect._validation_sql import (
     enforce_probe_cte_anchor_placement_post_resolution,
     validate_cte_emission_reclassification,
-)
-from aetherdialect._validation_schema import (
     validate_cte_emission_shapes,
     validate_probe_cte_anchor_placement,
 )
@@ -91,7 +85,7 @@ def _forbidden_tokens(sql: str) -> list[str]:
     return hits
 
 
-def _assert_no_legacy_semi_anti_tokens(sql: str) -> None:
+def _assert_no_forbidden_semi_anti_tokens(sql: str) -> None:
     assert _forbidden_tokens(sql) == [], sql
 
 
@@ -148,8 +142,8 @@ def test_semi_join_renders_distinct_without_exists() -> None:
     low = joined.lower()
     assert "select distinct" in low
     assert "inner join" in low
-    _assert_no_legacy_semi_anti_tokens(det)
-    _assert_no_legacy_semi_anti_tokens(joined)
+    _assert_no_forbidden_semi_anti_tokens(det)
+    _assert_no_forbidden_semi_anti_tokens(joined)
 
 
 def test_anti_join_presence_predicates_attach_without_string_fragments() -> None:
@@ -229,8 +223,8 @@ def test_anti_join_renders_left_join_and_presence_null_without_except() -> None:
     assert "left join" in low
     assert presence.lower() in low
     assert "is null" in low
-    _assert_no_legacy_semi_anti_tokens(det)
-    _assert_no_legacy_semi_anti_tokens(joined)
+    _assert_no_forbidden_semi_anti_tokens(det)
+    _assert_no_forbidden_semi_anti_tokens(joined)
 
 
 def test_semi_join_rejects_payload_column() -> None:
@@ -461,7 +455,7 @@ def test_set_difference_forces_distinct_outer_projection() -> None:
     )
     sql = build_deterministic_sql(intent, None, schema, _pg_render())
     assert "SELECT DISTINCT" in sql.upper()
-    _assert_no_legacy_semi_anti_tokens(sql)
+    _assert_no_forbidden_semi_anti_tokens(sql)
 
 
 def test_probe_cte_cannot_be_main_anchor() -> None:
@@ -609,7 +603,7 @@ def test_resolve_joins_fresh_enforces_probe_anchor_in_cte_scope() -> None:
     det = "WITH probe AS (SELECT child.parent_id FROM child), wrapper AS (SELECT parent.id FROM probe, parent) SELECT parent.id FROM parent"
 
     with patch(
-        "aetherdialect._pipeline.inject_join_into_deterministic_sql",
+        "aetherdialect._pipeline_generate.inject_join_into_deterministic_sql",
         side_effect=lambda det_sql, *_args, **_kwargs: det_sql,
     ):
         with pytest.raises(ProbeCtePlacementError, match="left operand"):
@@ -655,7 +649,7 @@ def test_probe_cte_left_operand_emits_intent_issue_not_join_error() -> None:
     assert all(i.category.name == "CTE_STRUCTURE" for i in issues if "left_operand" in i.issue_id)
 
 
-def test_model_declared_scalar_subquery_is_forbidden() -> None:
+def test_model_declared_scalar_subquery_is_allowed() -> None:
     cte = RuntimeCteStep(
         cte_name="avg_cte",
         tables=["parent"],
@@ -674,11 +668,11 @@ def test_model_declared_scalar_subquery_is_forbidden() -> None:
         cte_steps=[cte],
     )
     issues = validate_cte_emission_reclassification(intent, _parent_child_schema())
-    assert any(i.issue_id == "cte_emission_model_declared_scalar_subquery_avg_cte" for i in issues)
-    assert all(i.severity == "error" for i in issues if "model_declared_scalar_subquery" in i.issue_id)
+    assert not any("model_declared_scalar_subquery" in i.issue_id for i in issues)
+    assert not any(i.severity == "error" for i in issues)
 
 
-def test_scalar_subquery_on_non_scalar_cte_emits_reclassification_error() -> None:
+def test_scalar_subquery_on_non_scalar_cte_reclassifies_via_engine() -> None:
     cte = RuntimeCteStep(
         cte_name="wide_cte",
         tables=["parent", "child"],
@@ -700,8 +694,11 @@ def test_scalar_subquery_on_non_scalar_cte_emits_reclassification_error() -> Non
         cte_steps=[cte],
     )
     issues = validate_cte_emission_reclassification(intent, _parent_child_schema())
-    assert any(i.issue_id == "cte_emission_model_declared_scalar_subquery_wide_cte" for i in issues)
-    assert all(i.severity == "error" for i in issues)
+    assert not any("model_declared_scalar_subquery" in i.issue_id for i in issues)
+    from aetherdialect._sql_gen import classify_cte_emission
+
+    classified = classify_cte_emission(cte, intent, _parent_child_schema())
+    assert (classified.value if hasattr(classified, "value") else str(classified)) == "join_table"
 
 
 def test_wrongly_declared_semi_join_reclassified_to_join_table() -> None:

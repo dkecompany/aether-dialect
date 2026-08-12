@@ -12,9 +12,12 @@ from aetherdialect._contracts_base import (
 )
 from aetherdialect._contracts_core import RuntimeCteStep, RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._pipeline import _execution_scope_gate_active, _run_sql_validation_cascade
+from aetherdialect._pipeline_generate import (
+    execution_scope_gate_active,
+    run_sql_validation_cascade,
+)
 from aetherdialect._schema_graph import assert_consumer_intent_in_scope
-from aetherdialect._validation_execute import validate_semantics
+from aetherdialect._validation_sql import validate_semantics
 
 
 def _col(name: str) -> ColumnMetadata:
@@ -72,7 +75,7 @@ def _schema_with_denied_secret() -> SchemaGraph:
 
 class TestUnscopedOwnerGateInactive:
     def test_execution_scope_gate_inactive_for_unscoped_owner(self) -> None:
-        gate = _execution_scope_gate_active(EngineContext(), None, "owner")
+        gate = execution_scope_gate_active(EngineContext(), None, "owner")
         assert gate is False
 
     def test_consumer_sql_scope_gate_skipped_for_unscoped_owner(self) -> None:
@@ -87,7 +90,7 @@ class TestUnscopedOwnerGateInactive:
             where=None,
             resolved_join_tables=["a", "bridge", "c", "island"],
         )
-        gate = _execution_scope_gate_active(EngineContext(), None, "owner")
+        gate = execution_scope_gate_active(EngineContext(), None, "owner")
         assert gate is False
         assert assert_consumer_intent_in_scope(intent, EngineContext(), schema, None) is True
 
@@ -104,12 +107,12 @@ class TestUnscopedOwnerJoinBridgeValidation:
             where=None,
             resolved_join_tables=["a", "bridge", "c", "island"],
         )
-        assert _execution_scope_gate_active(EngineContext(), None, "owner") is False
+        assert execution_scope_gate_active(EngineContext(), None, "owner") is False
         result = validate_semantics(intent, schema)
         errors = [i for i in result.issues if i.severity == "error"]
         assert any("island" in i.message for i in errors)
 
-    @patch("aetherdialect._pipeline.validate_sql", return_value=(True, None, None, []))
+    @patch("aetherdialect._pipeline_generate.validate_sql", return_value=(True, None, None, []))
     def test_cascade_unreachable_bridge_when_gate_inactive(self, _mock_validate_sql: object) -> None:
         schema = _bridge_schema()
         intent = RuntimeIntent(
@@ -121,8 +124,8 @@ class TestUnscopedOwnerJoinBridgeValidation:
             where=None,
             resolved_join_tables=["a", "bridge", "c", "island"],
         )
-        assert _execution_scope_gate_active(EngineContext(), None, "owner") is False
-        ok, err, _cat, _diags = _run_sql_validation_cascade(
+        assert execution_scope_gate_active(EngineContext(), None, "owner") is False
+        ok, err, _cat, _diags = run_sql_validation_cascade(
             "SELECT a.id FROM a JOIN bridge ON a.id = bridge.aid JOIN c ON bridge.cid = c.id",
             intent,
             None,
@@ -150,7 +153,7 @@ class TestUnscopedOwnerNonTerminalCteDenyValidation:
             having=None,
             cte_steps=[inner],
         )
-        assert _execution_scope_gate_active(EngineContext(), None, "owner") is False
+        assert execution_scope_gate_active(EngineContext(), None, "owner") is False
         result = validate_semantics(intent, schema)
         errors = [i for i in result.issues if i.severity == "error"]
         assert any(i.category.value == "deny_bare_select" for i in errors)
@@ -182,7 +185,7 @@ class TestUnscopedOwnerNonTerminalCteDenyValidation:
             having=None,
             cte_steps=[inner],
         )
-        assert _execution_scope_gate_active(EngineContext(), None, "owner") is False
+        assert execution_scope_gate_active(EngineContext(), None, "owner") is False
         result = validate_semantics(intent, schema)
         errors = [i for i in result.issues if i.severity == "error"]
         assert any(i.category.value == "denied_reference" for i in errors)

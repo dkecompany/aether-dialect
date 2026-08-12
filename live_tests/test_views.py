@@ -12,14 +12,14 @@ from aetherdialect._contracts_base import EngineContext
 from aetherdialect._contracts_schema import SchemaGraph
 from aetherdialect._live_testing import run_and_assert
 
-from ._engine_live import (
+from .conftest import _POSTGRES_SKIP_REASON, _postgres_credentials_configured
+from .live_support import (
     build_engine_t2s,
     build_runner,
     engine_schema,
     reflect_rental_shop_schema_for_live_test,
     skip_unless_configured,
 )
-from .conftest import _POSTGRES_SKIP_REASON, _postgres_credentials_configured
 from .mydb_scenarios import Expected, Scenario
 
 _VIEW_NAMES = ("active_customer_v", "store_revenue_v", "film_catalog_v")
@@ -95,15 +95,14 @@ def test_both_reflection_coexist(engine_bundle) -> None:
     assert any(k == "view" for k in kinds.values())
 
 
-def test_preview_store_revenue_view(engine_bundle) -> None:
-    """Approved preview against store_revenue_v returns aggregated rows."""
+def test_select_store_revenue_view(engine_bundle) -> None:
+    """Direct select against store_revenue_v returns aggregated rows."""
     _engine, t2s = engine_bundle
     if "store_revenue_v" not in t2s._schema_graph.tables:
         pytest.skip("store_revenue_v not loaded")
-    preview = t2s.preview_table("store_revenue_v", limit=5)
-    assert preview.rows
-    assert len(preview.columns) >= 2
-    assert len(preview.rows[0]) == len(preview.columns)
+    rows = t2s._dialect.execute('SELECT * FROM "store_revenue_v" LIMIT 5')
+    assert rows
+    assert len(rows[0]) >= 2
 
 
 def test_pipeline_question_on_store_revenue_view(engine_bundle) -> None:

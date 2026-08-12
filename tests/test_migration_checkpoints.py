@@ -14,8 +14,8 @@ from aetherdialect._constants import (
     MIGRATION_CHECKPOINT_PREFIX,
     TEMPLATE_STORE_SEGMENT,
 )
-from aetherdialect._core_utils import write_artifact_manifest
-from aetherdialect._templates import TemplateOps
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils_artifacts import write_artifact_manifest
 
 
 def _write_manifest(path: str, *, schema_graph_id: str, structural_hash: str = "s") -> None:

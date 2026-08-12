@@ -40,7 +40,7 @@ def test_recipe_routes_federation_from_mechanism_without_tier() -> None:
         "recipe": "federation",
     }
     assert sc._recipe_for_slot(slot, scenario) == "federation"
-    assert sc._mock_preset_for_slot(slot)[0] == "federation"
+    assert sc._construction_for_slot(slot).surface == "federation"
 
 
 @pytest.mark.fast
@@ -51,8 +51,8 @@ def test_owner_question_mock_verify_targets_include_federation_recipe() -> None:
         label="How many books do we have?",
         preset="owner_writer",
     )
-    presets = [target[0] for target in sc._mock_verify_targets_for_slot(slot)]
-    assert presets == ["owner_writer", "consumer_reader", "federation"]
+    presets = [target[0].surface for target in sc._mock_verify_targets_for_slot(slot)]
+    assert presets == ["single", "single"]
 
 
 @pytest.mark.fast
@@ -71,9 +71,13 @@ def test_crm_staff_column_projection_limits_exported_columns() -> None:
 
 @pytest.mark.fast
 def test_partition_export_helpers_exist_without_running_corpus_build() -> None:
+    src = importlib.import_module("source_rental_shop")
     sc = _sandbox_corpus()
-    assert callable(sc.export_federation_partition_seeds)
+    assert callable(src.export_sandbox_federation_partition_schemas)
+    assert callable(src.export_sandbox_federation_partition_data_dirs)
+    assert callable(src.export_federation_member_data_dirs_from_existing_csvs)
     assert callable(sc.assemble_staging)
+    assert callable(sc.run_staging_pack_assertions)
 
 
 @pytest.mark.fast
@@ -91,11 +95,37 @@ def test_partition_seed_export_strips_cross_partition_foreign_keys() -> None:
 
 
 @pytest.mark.fast
-def test_default_federation_member_specs_list_four_partition_seeds(tmp_path: Path) -> None:
-    from aetherdialect._constants import SANDBOX_BUNDLED_MEMBER_SEEDS
+def test_default_federation_member_specs_list_four_partition_schemas(tmp_path: Path) -> None:
+    from aetherdialect._constants_runtime import SANDBOX_BUNDLED_MEMBER_SCHEMAS
     from aetherdialect._sandbox import Sandbox
 
-    for _member_name, seed_name in SANDBOX_BUNDLED_MEMBER_SEEDS:
-        (tmp_path / seed_name).write_text("-- stub", encoding="utf-8")
+    for _member_name, schema_name in SANDBOX_BUNDLED_MEMBER_SCHEMAS:
+        (tmp_path / schema_name).write_text("-- stub", encoding="utf-8")
     specs = Sandbox._default_federation_member_specs(tmp_path)
-    assert [name for name, _path in specs] == [name for name, _seed in SANDBOX_BUNDLED_MEMBER_SEEDS]
+    assert [name for name, _path in specs] == [name for name, _schema in SANDBOX_BUNDLED_MEMBER_SCHEMAS]
+
+
+@pytest.mark.fast
+def test_member_space_questions_are_subsets_of_practice_corpus() -> None:
+    from aetherdialect import Sandbox
+    from aetherdialect._constants_runtime import SANDBOX_MEMBER_SPACE_QUESTIONS
+
+    sc = _sandbox_corpus()
+    practice = set(sc.parse_questions_file(_REPO / "scripts" / "data" / "sandbox_questions.txt")["questions"])
+    mapping = Sandbox._sandbox_member_space_questions()
+    assert isinstance(mapping, dict)
+    assert set(mapping) == set(SANDBOX_MEMBER_SPACE_QUESTIONS)
+    for space_name, questions in mapping.items():
+        assert questions
+        assert set(questions) <= practice
+        assert Sandbox._sandbox_member_space_questions(space_name) == questions
+
+
+@pytest.mark.fast
+def test_space_packing_slot_is_single_member_spaces_row() -> None:
+    sc = _sandbox_corpus()
+    questions = sc.parse_questions_file(_REPO / "scripts" / "data" / "sandbox_questions.txt")
+    space_slots = [slot for slot in sc.iter_recording_slots(questions) if slot.kind == "space"]
+    assert len(space_slots) == 1
+    assert space_slots[0].label == "member_spaces"
+    assert sc.slot_id_for(space_slots[0]) == "owner:writer:member_spaces"

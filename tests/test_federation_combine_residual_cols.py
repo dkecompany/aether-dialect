@@ -10,7 +10,7 @@ from aetherdialect._contracts_base import (
     WhereParam,
 )
 from aetherdialect._contracts_core import FederatedPlan, ResidualSpec, RuntimeIntent, SourceStep
-from aetherdialect._federation import _combine_select_column_names
+from aetherdialect._federation_plan import combine_select_column_names
 
 
 @pytest.mark.fast
@@ -42,6 +42,6 @@ def test_combine_select_harvests_residual_where_column() -> None:
             ),
         ),
     )
-    cols = _combine_select_column_names(plan)
+    cols = combine_select_column_names(plan)
     assert cols is not None
     assert "filter_col" in cols

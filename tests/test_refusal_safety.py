@@ -17,29 +17,32 @@ from aetherdialect._constants import (
     DIAGNOSTIC_CODE_REFUSAL_UNION_COLUMN_MISSING,
     DIAGNOSTIC_CODE_REFUSAL_UNSUPPORTED_COLUMN_TYPE,
     REFUSAL_DIAGNOSTIC_CODES,
+)
+from aetherdialect._constants_runtime import (
     REFUSAL_NULL_IN_NEGATED_LIST_MESSAGE,
     REFUSAL_SUBDAY_DATE_WINDOW_ON_DATE_COLUMN_MESSAGE,
     REFUSAL_UNSUPPORTED_COLUMN_TYPE_MESSAGE,
 )
-from aetherdialect._contracts_base import (
+from aetherdialect._contracts_base import FailureCategory, NormalizedExpr
+from aetherdialect._contracts_core import (
     AggregateJoinFanOutError,
     AmbiguousDateLiteralError,
     ComparisonJoinScopeExceededError,
-    FailureCategory,
     NoJoinPathError,
     NullInNegatedListError,
+    RuntimeIntent,
+    SelectCol,
     SubdayDateWindowOnDateColumnError,
 )
-from aetherdialect._contracts_core import NormalizedExpr, RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, IntentIssue, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import (
+from aetherdialect._intent_normalize import refusal_for_join_unreachable_table_removal
+from aetherdialect._utils import (
     refusal_diagnostic_code_for_exception,
     refusal_diagnostic_code_for_federation_reason,
     refusal_diagnostic_code_for_intent_issue,
     refusal_message_for_exception,
     refusal_user_text_for_code,
 )
-from aetherdialect._intent_repair import refusal_for_join_unreachable_table_removal
 
 _SENSITIVE_TOKENS = (
     "secret_ssn",

@@ -7,10 +7,25 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from aetherdialect import AetherEngine
-from aetherdialect._contracts_base import ApprovalState, ConfigError, TemplateExecutionResult
-from aetherdialect._contracts_core import Template
+from aetherdialect._contracts_base import ApprovalState, ConfigError
+from aetherdialect._contracts_core import Template, TemplateExecutionResult
+from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
+from tests.template_fixtures import _minimal_template
 from tests.test_aetherdialect import _make_aether_stub
-from tests.test_reuse_saved_question import _minimal_template
+
+
+def _schema_with_t1() -> SchemaGraph:
+    return SchemaGraph(
+        tables={
+            "t1": TableMetadata(
+                name="t1",
+                columns={"category": ColumnMetadata(name="category", data_type="text")},
+                primary_key=[],
+                foreign_keys=[],
+            )
+        },
+        join_paths_multi={},
+    )
 
 
 def _engine(tmpl: Template) -> AetherEngine:
@@ -18,7 +33,13 @@ def _engine(tmpl: Template) -> AetherEngine:
     dialect.sqlglot_dialect = "postgresql"
     dialect.name = "postgresql"
     dialect.config = MagicMock()
-    return _make_aether_stub(_templates={tmpl.id: tmpl}, _dialect=dialect, _context_name="master", _store={})
+    return _make_aether_stub(
+        _templates={tmpl.id: tmpl},
+        _dialect=dialect,
+        _context_name="master",
+        _store={},
+        _schema_graph=_schema_with_t1(),
+    )
 
 
 @pytest.mark.fast

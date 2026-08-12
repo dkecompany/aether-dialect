@@ -7,34 +7,36 @@ from unittest.mock import patch
 
 import pytest
 
-from aetherdialect._contracts_base import FederationPlanTemplate, LlmUsageRecord
 from aetherdialect._contracts_core import (
     ConcreteIntent,
     FederatedPreparedStep,
     FeedbackKind,
     GenerationPath,
+    LlmUsageRecord,
     QuestionFeedbackEntry,
     RejectionBucket,
     RuntimeIntent,
     SqlGenerationOutcome,
-    SQLShape,
     Template,
-    TemplateStats,
     ValueHistory,
 )
-from aetherdialect._core_utils import (
+from aetherdialect._contracts_schema import FederationPlanTemplate, SQLShape, TemplateStats
+from aetherdialect._federation_execute import (
+    credit_federation_plan_accept,
+    load_federation_plan_templates,
+    save_federation_plan_template,
+)
+from aetherdialect._pipeline_generate import (
+    credit_federation_accept,
+    emit_explain_soft_diagnostics,
+)
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils import (
     emit_llm_usage_summary_diagnostics,
     phase_timer,
     set_diagnostic_collector,
     summarize_llm_usage_by_phase_and_source,
 )
-from aetherdialect._federation import (
-    credit_federation_plan_accept,
-    load_federation_plan_templates,
-    save_federation_plan_template,
-)
-from aetherdialect._pipeline import credit_federation_accept, emit_explain_soft_diagnostics
-from aetherdialect._templates import TemplateOps
 
 
 def test_lookup_join_feedback_filters_by_member() -> None:
@@ -107,7 +109,7 @@ def test_llm_usage_summary_by_phase_and_source() -> None:
             task="interpret",
             logical_model="gpt",
             api_model="gpt",
-            provider="mock",
+            provider="sandbox",
             input_tokens=10,
             cached_input_tokens=0,
             output_tokens=5,
@@ -123,7 +125,7 @@ def test_llm_usage_summary_by_phase_and_source() -> None:
             task="join",
             logical_model="gpt",
             api_model="gpt",
-            provider="mock",
+            provider="sandbox",
             input_tokens=20,
             cached_input_tokens=0,
             output_tokens=8,
@@ -150,7 +152,7 @@ def test_emit_llm_usage_summary_diagnostics() -> None:
                 task="interpret",
                 logical_model="gpt",
                 api_model="gpt",
-                provider="mock",
+                provider="sandbox",
                 input_tokens=3,
                 cached_input_tokens=0,
                 output_tokens=1,
@@ -165,8 +167,8 @@ def test_emit_llm_usage_summary_diagnostics() -> None:
     assert any("LLM question/interpret" in d.message for d in diags)
 
 
-@patch("aetherdialect._templates.TemplateOps.save_template_store")
-@patch("aetherdialect._pipeline.credit_federation_plan_accept")
+@patch("aetherdialect._templates_ops.TemplateOps.save_template_store")
+@patch("aetherdialect._pipeline_generate.credit_federation_plan_accept")
 def test_credit_federation_accept_credits_member_and_plan(
     mock_plan_credit: pytest.Mock,
     mock_save: pytest.Mock,

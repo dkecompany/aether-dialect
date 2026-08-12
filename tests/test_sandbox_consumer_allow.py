@@ -8,21 +8,15 @@ from unittest.mock import MagicMock
 import pytest
 
 from aetherdialect import EngineContext, Sandbox
-from aetherdialect._constants import CONSUMER_EXAMPLE_NARROW_ALLOW_OBJECTS
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._schema_graph import assert_consumer_sql_in_scope, recompute_join_paths_multi
+from tests._sandbox_csv_bundle import write_main_csv_ddl_bundle
+
+_NARROW_ALLOW_OBJECTS = frozenset({"customer", "payment", "rental", "address", "city", "country"})
 
 
 def _write_consumer_test_bundle(root: Path) -> None:
-    (root / "rental_shop_seed.sql").write_text(
-        "CREATE TABLE customer (customer_id INTEGER PRIMARY KEY);",
-        encoding="utf-8",
-    )
-    (root / "rental_shop.sql").write_text("SELECT 1;", encoding="utf-8")
-    (root / "rental_shop_notes.txt").write_text("owner notes", encoding="utf-8")
-    fixtures = root / "fixtures"
-    fixtures.mkdir()
-    (fixtures / "rental_shop_mock.json").write_text('{"fixtures": []}', encoding="utf-8")
+    write_main_csv_ddl_bundle(root, tables=(("customer", "customer_id"),))
 
 
 def _minimal_schema_graph(table_names: tuple[str, ...]) -> SchemaGraph:
@@ -59,11 +53,11 @@ def test_any_subset_consumer_no_special_path(tmp_path: Path) -> None:
             contexts_at_init.append(
                 frozenset(schema_context.allow_objects) if schema_context.allow_objects else None,
             )
-            from aetherdialect._contracts_base import RuntimeConfig
-            from aetherdialect._main_execution import load_runtime_config
+            from aetherdialect._contracts_core import RuntimeConfig
+            from aetherdialect._utils_artifacts import load_runtime_config
 
             llm_exec = load_runtime_config(merged_env={})
-            self._schema_graph = _minimal_schema_graph(tuple(CONSUMER_EXAMPLE_NARROW_ALLOW_OBJECTS | wider))
+            self._schema_graph = _minimal_schema_graph(tuple(_NARROW_ALLOW_OBJECTS | wider))
             self._runtime_config = RuntimeConfig(
                 engine="duckdb",
                 artifacts_dir="/tmp/sandbox_consumer_allow",
@@ -105,8 +99,8 @@ def test_example_narrow_allow_denies_out_of_scope_question(tmp_path: Path) -> No
     class FakeEngine:
         def __init__(self, schema_context: EngineContext, **kwargs: object) -> None:
             del kwargs
-            from aetherdialect._contracts_base import RuntimeConfig
-            from aetherdialect._main_execution import load_runtime_config
+            from aetherdialect._contracts_core import RuntimeConfig
+            from aetherdialect._utils_artifacts import load_runtime_config
 
             llm_exec = load_runtime_config(merged_env={})
             self._schema_graph = _minimal_schema_graph(("customer", "staff"))
@@ -128,7 +122,7 @@ def test_example_narrow_allow_denies_out_of_scope_question(tmp_path: Path) -> No
         with Sandbox(maintainer_access=True, bundle_dir=str(bundle), auto_seed=False) as sandbox:
             sandbox.load_dataset("main")
             engine = sandbox.engine(
-                EngineContext(allow_objects=CONSUMER_EXAMPLE_NARROW_ALLOW_OBJECTS),
+                EngineContext(allow_objects=_NARROW_ALLOW_OBJECTS),
                 role="consumer",
             )
     finally:

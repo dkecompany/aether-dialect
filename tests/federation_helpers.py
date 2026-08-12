@@ -10,12 +10,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from aetherdialect._contracts_base import FederationMappings
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import (
+from aetherdialect._contracts_schema import (
+    ColumnMetadata,
     FederationManifest,
+    FederationMappings,
+    SchemaGraph,
+    TableMetadata,
+)
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_manifest import (
     build_federation_manifest_from_members,
-    compose_composite_graph,
     federation_declaration_document,
     parse_federation_manifest,
 )
@@ -94,9 +98,9 @@ def stamp_union_disjointness_profiling(
 def stamp_sandbox_payment_union_profiling(members: Mapping[str, SchemaGraph]) -> None:
     """Stamp disjointness profiling for the sandbox payment union across three members."""
     for source_id, table_name, key_col, samples in (
-        ("storefront", "payment", "amount", ("sf_a1", "sf_a2")),
-        ("catalog", "payment", "amount", ("cat_a1", "cat_a2")),
-        ("logistics", "receipts", "amt", ("log_a1", "log_a2")),
+        ("storefront", "payment", "payment_id", ("sf_p1", "sf_p2")),
+        ("catalog", "payment", "payment_id", ("cat_p1", "cat_p2")),
+        ("logistics", "receipts", "rcpt_id", ("log_p1", "log_p2")),
     ):
         table = members[source_id].tables[table_name]
         table.columns = copy.deepcopy(table.columns)
@@ -294,8 +298,8 @@ def write_federation_declaration_file(
 ) -> Path:
     """Write a unified federation declaration JSON file and return its path."""
     from aetherdialect._constants import FEDERATION_MAPPINGS_VERSION
-    from aetherdialect._contracts_base import FederationMappings
-    from aetherdialect._federation import parse_federation_mappings
+    from aetherdialect._contracts_schema import FederationMappings
+    from aetherdialect._federation_manifest import parse_federation_mappings
 
     manifest = parse_federation_manifest(manifest_payload)
     mappings = (
@@ -330,9 +334,9 @@ def enriched_manifest(
     if isinstance(declaration, FederationManifest) and declaration.sources:
         return declaration
     if graphs is not None and members and all(isinstance(value, SchemaGraph) for value in members.values()):
-        from aetherdialect._federation import _manifest_with_derived_roster
+        from aetherdialect._federation_manifest import manifest_with_derived_roster
 
-        return _manifest_with_derived_roster(parsed, member_graphs=graphs, mappings=mappings)
+        return manifest_with_derived_roster(parsed, member_graphs=graphs, mappings=mappings)
     return build_federation_manifest_from_members(
         members,
         declaration=parsed,
@@ -352,7 +356,7 @@ def hash_directory_tree(root: Path) -> str:
 
 def template_store_partition_count(artifacts_dir: str, graph: SchemaGraph) -> int:
     """Return the number of template partitions persisted for *graph*."""
-    from aetherdialect._templates import TemplateOps
+    from aetherdialect._templates_ops import TemplateOps
 
     store = TemplateOps.load_template_store(str(graph.schema_graph_id), graph, artifacts_dir=artifacts_dir)
     return len(store.partition_map)
@@ -364,8 +368,8 @@ def seed_member_template_stores(
     member_graphs: Mapping[str, SchemaGraph],
 ) -> None:
     """Persist empty on-disk template stores for every federation member."""
-    from aetherdialect._federation import federation_source_artifacts_dir
-    from aetherdialect._templates import TemplateOps
+    from aetherdialect._federation_execute import federation_source_artifacts_dir
+    from aetherdialect._templates_ops import TemplateOps
 
     for binding in manifest.sources:
         graph = member_graphs[binding.source_id]
@@ -392,7 +396,7 @@ def build_staged_two_member_prepare_outcome(
         RuntimeIntent,
         SourceStep,
     )
-    from aetherdialect._federation import federation_plan_combine_hash
+    from aetherdialect._federation_execute import federation_plan_combine_hash
 
     intent_a = RuntimeIntent(
         tables=[fed.left_table],

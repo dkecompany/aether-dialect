@@ -6,7 +6,8 @@ import pytest
 
 from aetherdialect._config import DuckDBRuntimeConfig
 from aetherdialect._contracts_base import EngineIdentity
-from aetherdialect._core_utils import (
+from aetherdialect._main_session import PipelineSession
+from aetherdialect._utils import (
     bind_construction_orphan_identity,
     notify,
     release_construction_orphan_identity,
@@ -14,7 +15,6 @@ from aetherdialect._core_utils import (
     set_diagnostic_collector,
     take_and_clear_orphan_diagnostics,
 )
-from aetherdialect._main_execution import PipelineSession
 
 
 @pytest.mark.fast

@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from aetherdialect._contracts_base import Diagnostic, DiagnosticSeverity
-from aetherdialect._main_execution import PipelineSession
+from aetherdialect._main_session import PipelineSession
 
 
 @pytest.mark.fast

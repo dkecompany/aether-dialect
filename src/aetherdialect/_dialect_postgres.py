@@ -11,7 +11,7 @@ from typing import Any, ClassVar, Literal, cast
 
 from sqlalchemy import create_engine, text
 
-from ._config import EngineConfig, EngineLimits, EngineRuntimeConfig, PolicyConfig, PostgresRuntimeConfig
+from ._config import EngineConfig, EngineLimits, EngineRuntimeConfig, PostgresRuntimeConfig
 from ._constants import (
     DOLLAR_PLACEHOLDER_RE,
     NAMED_PLACEHOLDER_RE,
@@ -30,16 +30,6 @@ from ._contracts_base import (
 )
 from ._contracts_core import RuntimeIntent
 from ._contracts_schema import ColumnMetadata, SchemaGraph
-from ._core_utils import (
-    canonicalize_sql,
-    cost_cap_active,
-    debug,
-    effective_explain_timeout_ms,
-    refuse_unsafe_sql_string_literal_content,
-    require_driver,
-    sha256,
-    sqlalchemy_pool_kwargs_from_limits,
-)
 from ._dialect import (
     Dialect,
     DialectRegistry,
@@ -50,8 +40,18 @@ from ._dialect_sqlglot_helper import (
     SqlglotEngineDialect,
     SqlglotParseMixin,
 )
-from ._schema_build import load_or_create_schema_postgresql
-from ._schema_catalog import profile_schema
+from ._schema_profile import profile_schema
+from ._schema_reflect import load_or_create_schema_postgresql
+from ._utils import (
+    canonicalize_sql,
+    debug,
+    effective_explain_timeout_ms,
+    effective_statement_timeout_ms,
+    refuse_unsafe_sql_string_literal_content,
+    require_driver,
+    sha256,
+    sqlalchemy_pool_kwargs_from_limits,
+)
 
 _PgNodeType: Any
 try:
@@ -169,6 +169,7 @@ class PostgresDialect(Dialect):
     name: str = "postgresql"
     sqlglot_dialect: ClassVar[str] = "postgres"
     registry_canonical_rank: ClassVar[int] = 6
+    registry_qualified_table_ref: ClassVar[bool] = True
 
     @staticmethod
     def pg_walk_nodes(root: Any) -> Iterator[Any]:
@@ -265,14 +266,8 @@ class PostgresDialect(Dialect):
             try:
                 _pgl_runtime = _PgLastRuntime()
             except ImportError as exc:
-                raise ImportError(
-                    "PostgresDialect requires the 'pglast' package. Install with: pip install aetherdialect[postgresql]"
-                ) from exc
+                raise ImportError("PostgresDialect requires the 'pglast' package (optional postgresql extra).") from exc
         return _pgl_runtime
-
-    @staticmethod
-    def _require_pglast() -> _PgLastRuntime:
-        return PostgresDialect.require_pglast()
 
     @staticmethod
     def pg_encode_named_placeholders(sql: str) -> tuple[str, dict[str, int], dict[int, str]]:
@@ -290,10 +285,6 @@ class PostgresDialect(Dialect):
 
         encoded = NAMED_PLACEHOLDER_RE.sub(repl, sql)
         return encoded, name_to_index, index_to_name
-
-    @staticmethod
-    def _pg_encode_named_placeholders(sql: str) -> tuple[str, dict[str, int], dict[int, str]]:
-        return PostgresDialect.pg_encode_named_placeholders(sql)
 
     @staticmethod
     def _pg_decode_dollar_placeholders(sql: str, index_to_name: dict[int, str]) -> str:
@@ -437,26 +428,41 @@ class PostgresDialect(Dialect):
         *,
         limits: EngineLimits | None = None,
     ):
-        """Create a SQLAlchemy engine from `PostgresRuntimeConfig`."""
+        """Create a SQLAlchemy engine from `PostgresRuntimeConfig`. When ``SCHEMA`` is set, session ``search_path`` is pinned so unqualified identifiers resolve into that schema for reflection, profiling, and execution."""
         require_driver("postgresql")
         try:
-            self._require_pglast()
+            self.require_pglast()
         except ImportError as e:
-            raise ImportError(
-                "PostgresDialect requires the 'pglast' package. Install with: pip install aetherdialect[postgresql]"
-            ) from e
+            raise ImportError("PostgresDialect requires the 'pglast' package (optional postgresql extra).") from e
         super().__init__(config)
         pg_config = cast(PostgresRuntimeConfig, config)
         pool_kwargs = sqlalchemy_pool_kwargs_from_limits(limits or EngineLimits())
         if sqlalchemy_engine is not None:
             self.engine = sqlalchemy_engine
         else:
-            self.engine = create_engine(pg_config.db_url(), future=True, **pool_kwargs)
+            connect_args: dict[str, Any] = {}
+            schema = str(pg_config.SCHEMA or "").strip()
+            if schema and all(ch.isalnum() or ch == "_" for ch in schema):
+                connect_args["options"] = f"-csearch_path={schema},public"
+            self.engine = create_engine(
+                pg_config.db_url(),
+                future=True,
+                connect_args=connect_args,
+                **pool_kwargs,
+            )
         self._result_backend = SqlAlchemyResultBackend(
             self.engine,
             dialect_name="postgresql",
             timeout_sql_provider=self.profile_statement_timeout_sql,
         )
+
+    def qualified_table_ref(self, table: str, kind: TableKind = TableKind.TABLE) -> str:
+        """Return a schema-qualified table reference when ``SCHEMA`` is configured."""
+        _ = kind
+        schema = self.schema_name()
+        if schema:
+            return f"{self.quote_identifier(schema)}.{self.quote_identifier(table)}"
+        return self.quote_identifier(table)
 
     @property
     def result_backend(self) -> SqlAlchemyResultBackend:
@@ -472,7 +478,7 @@ class PostgresDialect(Dialect):
         return "PostgreSQL"
 
     def _strip_schema(self, ident: str) -> str:
-        """Strip schema prefix from an identifier and return a. lowercase. table name."""
+        """Strip schema prefix from an identifier and return a lowercase table name."""
         s = (ident or "").strip().lower()
         if "." in s:
             s = s.split(".")[-1]
@@ -481,7 +487,7 @@ class PostgresDialect(Dialect):
     def _collect_from_items(
         self, fr: Any, scalar_cte_names: frozenset[str] | None = None
     ) -> tuple[bool, dict[str, str], bool, bool, bool, bool, bool]:
-        """Collect FROM-clause aliases and flags for unsupported join. shapes."""
+        """Collect FROM-clause aliases and flags for unsupported join shapes."""
         alias_to_table: dict[str, str] = {}
         has_subquery = False
         has_using = False
@@ -557,7 +563,7 @@ class PostgresDialect(Dialect):
         return (ok, alias_to_table, has_subquery, has_using, has_cross_join, has_self_join, True)
 
     def _validate_cte_bodies(self, with_clause: Any) -> tuple[bool, str]:
-        """Validate CTE bodies against structural restrictions. Forbids. recursive CTEs, subqueries, EXISTS sublinks, and set operations inside any CTE body. Window functions and ``CASE`` expressions are allowed."""
+        """Validate CTE bodies against structural restrictions. Forbids recursive CTEs, subqueries, EXISTS sublinks, and set operations inside any CTE body. Window functions and ``CASE`` expressions are allowed."""
         if with_clause is None:
             return True, ""
 
@@ -607,10 +613,10 @@ class PostgresDialect(Dialect):
         return True, ""
 
     def _ast_structural_valid(self, sql: str, scalar_cte_names: frozenset[str] | None = None) -> tuple[bool, str]:
-        """Validate SQL structure using the pglast AST. Checks that the. SQL is a single SELECT statement free of subqueries in ``FROM``, CROSS JOINs, self-joins, USING clauses, EXISTS sublinks, LATERAL, and set operations. Window functions and ``CASE`` expressions are allowed. Also validates any CTE bodies with the same rules."""
+        """Validate SQL structure using the pglast AST. Checks that the SQL is a single SELECT statement free of subqueries in ``FROM``, CROSS JOINs, self-joins, USING clauses, EXISTS sublinks, LATERAL, and set operations. Window functions and ``CASE`` expressions are allowed. Also validates any CTE bodies with the same rules."""
         try:
-            p = self._require_pglast()
-            encoded, _, _ = self._pg_encode_named_placeholders(canonicalize_sql(sql))
+            p = self.require_pglast()
+            encoded, _, _ = self.pg_encode_named_placeholders(canonicalize_sql(sql))
             stmts = p.parse_sql(encoded)
         except Exception:
             return False, "ast_parse_failed"
@@ -699,15 +705,15 @@ class PostgresDialect(Dialect):
         declared_params: set[str] | None = None,
         scalar_cte_names: frozenset[str] | None = None,
     ) -> list[SqlDiagnostic]:
-        """Validate SQL via pglast structurally and (when *schema* is. given) semantically."""
+        """Validate SQL via pglast structurally and (when *schema* is given) semantically."""
         ok, code = self._ast_structural_valid(sql, scalar_cte_names=scalar_cte_names)
         if not ok:
             mapped = SqlDiagnosticCode(STRUCTURAL_CODE_TO_DIAG.get(code, SqlDiagnosticCode.FORBIDDEN_STRUCTURE.value))
             return [SqlDiagnostic(code=mapped, message=code, node_kind=None)]
         diags: list[SqlDiagnostic] = []
         try:
-            p = self._require_pglast()
-            encoded, _, _ = self._pg_encode_named_placeholders(canonicalize_sql(sql))
+            p = self.require_pglast()
+            encoded, _, _ = self.pg_encode_named_placeholders(canonicalize_sql(sql))
             stmts = p.parse_sql(encoded)
         except Exception:
             return [SqlDiagnostic(code=SqlDiagnosticCode.AST_PARSE_FAILED, message="parse failed")]
@@ -769,7 +775,7 @@ class PostgresDialect(Dialect):
         return out
 
     def _pg_check_grouping(self, root: Any) -> list[SqlDiagnostic]:
-        """Emit grain diagnostics for *root*: aggregates in WHERE and HAVING-without-GROUP-BY. The non-grouped-select-col check is intentionally omitted because the renderer's own grain enforcement is more accurate than a string-level reconstruction here."""
+        """Emit grain diagnostics for *root*: aggregates in WHERE and HAVING-without-GROUP-BY. Skips the non-grouped-select-col check; renderer grain enforcement is the authoritative path."""
         diags: list[SqlDiagnostic] = []
         where = getattr(root, "whereClause", None)
         if where is not None:
@@ -850,9 +856,9 @@ class PostgresDialect(Dialect):
     def parse_select(self, sql: str) -> _PgParsedSelect | None:
         """Parse *sql* with pglast after encoding ``:name`` placeholders as ``$N``. Single-line ``--`` comments are stripped before whitespace canonicalization so they do not absorb subsequent clauses when newlines collapse. Returns ``None`` for non-``SELECT`` roots, multi-statement input, or parse failure."""
         decommented = re.sub(r"--[^\n]*", "", sql)
-        encoded, name_to_index, index_to_name = self._pg_encode_named_placeholders(canonicalize_sql(decommented))
+        encoded, name_to_index, index_to_name = self.pg_encode_named_placeholders(canonicalize_sql(decommented))
         try:
-            p = self._require_pglast()
+            p = self.require_pglast()
             stmts = p.parse_sql(encoded)
         except Exception:
             return None
@@ -905,7 +911,7 @@ class PostgresDialect(Dialect):
         from_clause: Sequence[Any] = getattr(from_handle, "fromClause", None) or ()
         if len(from_clause) != 1:
             return False
-        p = self._require_pglast()
+        p = self.require_pglast()
         current: Any = from_clause[0]
         for edge in edges:
             quals = self._pg_build_on_quals(edge.on_terms)
@@ -927,7 +933,7 @@ class PostgresDialect(Dialect):
         """Return a single ``A_Expr`` or an ``AND``-joined ``BoolExpr`` over equality conjuncts."""
         if not on_terms:
             return None
-        p = PostgresDialect._require_pglast()
+        p = PostgresDialect.require_pglast()
         eqs: list[Any] = []
         for left_token, left_col, right_token, right_col in on_terms:
             lhs = p.ast.ColumnRef(fields=(p.ast.String(sval=left_token), p.ast.String(sval=left_col)))
@@ -943,7 +949,7 @@ class PostgresDialect(Dialect):
         """Append RangeVar entries to ``fromClause`` and AND equality predicates into ``whereClause``."""
         if not extra_from_tables and not where_edges:
             return True
-        p = self._require_pglast()
+        p = self.require_pglast()
         existing_from = list(getattr(from_handle, "fromClause", None) or ())
         for tbl in extra_from_tables:
             existing_from.append(p.ast.RangeVar(relname=tbl, inh=True, relpersistence="p"))
@@ -991,7 +997,7 @@ class PostgresDialect(Dialect):
         """AND-inject raw SQL predicate fragments into the carrier ``WHERE`` clause."""
         if not fragments:
             return True
-        p = self._require_pglast()
+        p = self.require_pglast()
         new_eqs: list[Any] = []
         for frag in fragments:
             try:
@@ -1036,10 +1042,10 @@ class PostgresDialect(Dialect):
         root = getattr(parsed.root, "stmt", None)
         if root is None or type(root).__name__ != "SelectStmt":
             return False
-        p = self._require_pglast()
+        p = self.require_pglast()
         new_targets: list[Any] = []
         for expr_sql, alias in items:
-            encoded, _, _ = self._pg_encode_named_placeholders(expr_sql)
+            encoded, _, _ = self.pg_encode_named_placeholders(expr_sql)
             try:
                 probe = p.parse_sql(f"SELECT {encoded}")
             except Exception:
@@ -1062,7 +1068,7 @@ class PostgresDialect(Dialect):
 
     def emit_sql(self, parsed: _PgParsedSelect) -> str:
         """Render *parsed* via pglast ``RawStream`` and decode ``$N`` back to ``:name``."""
-        p = self._require_pglast()
+        p = self.require_pglast()
         raw_stream_ctor: Any = p.raw_stream_cls
         stream_factory: Any = raw_stream_ctor()
         rendered = cast(str, stream_factory(parsed.root))
@@ -1076,7 +1082,7 @@ class PostgresDialect(Dialect):
         schema: SchemaGraph | None = None,
         intent: RuntimeIntent | None = None,
     ) -> tuple[bool, list[SqlDiagnostic], str]:
-        """Run PostgreSQL ``EXPLAIN (FORMAT JSON, COSTS true)`` and. return ``(ok, diagnostics, raw_message)``. ``ok`` is False only on hard validation failures (parse errors, unknown identifiers, timeouts). Permission-denied disables EXPLAIN for the remainder of this dialect instance and is reported as ``ok=True`` with no diagnostics so the caller can proceed without treating missing privileges as invalid SQL. Soft plan-shape findings (suspected cartesian joins, zero-row estimates, sequential scans on indexed columns) are emitted as :class:`SqlDiagnostic` entries with codes from ``SOFT_DIAGNOSTIC_CODES`` in ``_config`` so callers may apply confidence penalties without rejecting the SQL."""
+        """Run PostgreSQL ``EXPLAIN (FORMAT JSON, COSTS true)`` and return ``(ok, diagnostics, raw_message)``. ``ok`` is False only on hard validation failures (parse errors, unknown identifiers, timeouts). Permission-denied disables EXPLAIN for the remainder of this dialect instance and is reported as ``ok=True`` with no diagnostics so the caller can proceed without treating missing privileges as invalid SQL. Soft plan-shape findings (suspected cartesian joins, zero-row estimates, sequential scans on indexed columns) are emitted as :class:`SqlDiagnostic` entries with codes from ``SOFT_DIAGNOSTIC_CODES`` in ``_config`` so callers may apply confidence penalties without rejecting the SQL."""
         finalized = self.finalize_render(sql, params or {}, schema=schema, intent=intent)
         explain_sql = f"EXPLAIN (FORMAT JSON, COSTS true) {finalized}"
         try:
@@ -1118,7 +1124,7 @@ class PostgresDialect(Dialect):
 
     def execute(self, sql: str, params: dict[str, Any] | None = None) -> list[tuple[Any, ...]]:
         """Execute SQL via SQLAlchemy and return row tuples."""
-        tm = PolicyConfig.STATEMENT_TIMEOUT_MS if cost_cap_active(PolicyConfig.STATEMENT_TIMEOUT_MS) else None
+        tm = effective_statement_timeout_ms()
         return self._result_backend.fetch_rows(sql, params, timeout_ms=tm)
 
     def render_date_diff(
@@ -1142,7 +1148,7 @@ class PostgresDialect(Dialect):
         column_meta: ColumnMetadata | None = None,
         value_type: str = "string",
     ) -> str:
-        """Render PostgreSQL array membership as a single. ``ANY``-comparison predicate. Avoids ``EXISTS`` / subquery / ``ARRAY[`` constructs so the fragment passes ``_enforce_select_only`` and ``_ast_structural_valid``. Lowercases both sides and trims surrounding whitespace and quote characters from the bound value for case-insensitive, quote- tolerant matching against ``text[]`` columns."""
+        """Render PostgreSQL array membership as a single ``ANY``-comparison predicate. Avoids ``EXISTS`` / subquery / ``ARRAY[`` constructs so the fragment passes ``_enforce_select_only`` and ``_ast_structural_valid``. Lowercases both sides and trims surrounding whitespace and quote characters from the bound value for case-insensitive, quote-tolerant matching against ``text[]`` columns."""
         kind = SqlglotParseMixin.array_storage_kind(column_meta) if column_meta is not None else "native_array"
         if kind == "json_text_array":
             return SqlglotParseMixin.emit_json_containment_predicate(
@@ -1175,6 +1181,27 @@ class PostgresDialect(Dialect):
             sql = f"{column} {op} {clock} - INTERVAL '{scaled} {plural_unit}'"
         return Dialect.emit_via_ast(sql, "postgres")
 
+    def filter_selectable_relation_names(self, schema_name: str, names: Sequence[str]) -> list[str]:
+        """Drop relations the current login cannot ``SELECT`` (catalog may still list them)."""
+        ordered = [str(n) for n in names if str(n).strip()]
+        if not ordered:
+            return []
+        sql = text(
+            "SELECT c.relname FROM pg_catalog.pg_class AS c "
+            "JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = :schema AND c.relname = ANY(:names) "
+            "AND has_table_privilege(c.oid, 'SELECT') "
+            "ORDER BY c.relname"
+        )
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(sql, {"schema": schema_name, "names": ordered}).fetchall()
+        except Exception as exc:
+            debug(f"[dialect.PostgresDialect.filter_selectable_relation_names] skipped: {exc!r}")
+            return ordered
+        allowed = {str(r[0]) for r in rows}
+        return [n for n in ordered if n in allowed]
+
     def reflect_schema_graph(
         self,
         *,
@@ -1191,6 +1218,8 @@ class PostgresDialect(Dialect):
             deny_objects=deny_objects,
             schema_json_path=EngineConfig.SCHEMA_JSON_PATH,
             sql_file=sql_file,
+            schema_name=str(cast(PostgresRuntimeConfig, self.config).SCHEMA or "public"),
+            relation_name_filter=self.filter_selectable_relation_names,
         )
 
     def compute_ddl_probe(self, schema_context: EngineContext) -> str:
@@ -1229,7 +1258,7 @@ class PostgresDialect(Dialect):
     def refresh_full_table_distinct_for_pk_inference(
         self, table_name: str, col_name: str, *, table_kind: TableKind = TableKind.TABLE
     ) -> tuple[int, int, float] | None:
-        """Run full-table statistics for PK inference after sampled. profiling."""
+        """Run full-table statistics for PK inference after sampled profiling."""
         try:
             _ = table_kind
             safe_tbl = str(table_name).replace('"', '""')
@@ -1260,7 +1289,7 @@ class PostgresDialect(Dialect):
         random_seed: int,
         table_kind: TableKind = TableKind.TABLE,
     ) -> str:
-        """Return a ``TABLESAMPLE BERNOULLI`` suffix for PostgreSQL. statistics."""
+        """Return a ``TABLESAMPLE BERNOULLI`` suffix for PostgreSQL statistics."""
         if table_kind == "view":
             return ""
         if not use_sample:
@@ -1269,7 +1298,7 @@ class PostgresDialect(Dialect):
         return f"TABLESAMPLE BERNOULLI ({pct:.2f}) REPEATABLE ({random_seed})"
 
     def profiling_stats_use_subquery_when_sampling(self, table_kind: TableKind = TableKind.TABLE) -> bool:
-        """PostgreSQL samples the base table directly with. ``TABLESAMPLE``."""
+        """PostgreSQL samples the base table directly with ``TABLESAMPLE``."""
         return table_kind == "view"
 
 

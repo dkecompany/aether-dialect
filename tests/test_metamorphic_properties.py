@@ -6,14 +6,13 @@ from dataclasses import replace
 
 import pytest
 
-from aetherdialect._contracts_base import EngineContext
+from aetherdialect._contracts_base import EngineContext, NormalizedExpr
 from aetherdialect._contracts_core import ConcreteIntent, RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._dialect import DialectRegistry
-from aetherdialect._intent_process import NormalizedExpr
 from aetherdialect._schema_graph import filter_schema_graph_by_scope, recompute_join_paths_multi
 from aetherdialect._sql_gen import build_deterministic_sql
-from aetherdialect._templates import TemplateOps
+from aetherdialect._templates_ops import TemplateOps
 
 # Recorded for operator live_deferred manifests (needs_corpus only).
 NEEDS_CORPUS_NODE_IDS = (

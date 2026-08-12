@@ -12,7 +12,9 @@ from aetherdialect._constants import (
 )
 from aetherdialect._contracts_core import RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import compose_composite_graph, parse_federation_manifest, plan_federated_intent
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_manifest import parse_federation_manifest
+from aetherdialect._federation_plan import plan_federated_intent
 from aetherdialect._intent_expr import parse_expr_string, parse_intent_response
 from aetherdialect._schema_graph import recompute_join_paths_multi
 
@@ -139,8 +141,8 @@ def test_single_engine_statistical_agg_infers_scalar_grain() -> None:
             "select_cols": [{"expr": "stddev(orders.amount)"}],
             "group_by_cols": [],
             "order_by_cols": [],
-            "where": [],
-            "having_param": [],
+            "where": None,
+            "having": None,
             "natural_language": "stddev of order amount",
         }
     )
@@ -162,8 +164,8 @@ def test_single_engine_statistical_agg_with_group_by_infers_grouped_grain() -> N
             ],
             "group_by_cols": ["orders.customer_id"],
             "order_by_cols": [],
-            "where": [],
-            "having_param": [],
+            "where": None,
+            "having": None,
             "natural_language": "stddev of amount per customer",
         }
     )

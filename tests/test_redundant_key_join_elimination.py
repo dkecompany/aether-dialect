@@ -7,15 +7,10 @@ from dataclasses import replace
 import pytest
 
 from aetherdialect._config import PolicyConfig
-from aetherdialect._contracts_base import (
-    InferenceTag,
-    NormalizedExpr,
-    PredicateGroup,
-    WhereParam,
-)
+from aetherdialect._contracts_base import NormalizedExpr, PredicateGroup, WhereParam
 from aetherdialect._contracts_core import RuntimeCteStep, RuntimeIntent, SelectCol
-from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
-from aetherdialect._intent_repair import eliminate_redundant_key_joins, reconcile_tables
+from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, InferenceTag, SchemaGraph, TableMetadata
+from aetherdialect._intent_normalize import eliminate_redundant_key_joins, reconcile_tables
 
 
 def _col(name: str, *, nullable: bool = False, is_pk: bool = False) -> ColumnMetadata:

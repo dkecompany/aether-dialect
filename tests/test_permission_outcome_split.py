@@ -6,16 +6,17 @@ from types import SimpleNamespace
 
 import pytest
 
-from aetherdialect._constants import PERMISSION_DENIED_USER_MESSAGE
-from aetherdialect._contracts_base import AccessError, EngineContext
+from aetherdialect._constants_runtime import PERMISSION_DENIED_USER_MESSAGE
+from aetherdialect._contracts_base import EngineContext
+from aetherdialect._contracts_core import AccessError
 from aetherdialect._dialect import Dialect
 from aetherdialect._main_execution import MainExecutionOps
-from aetherdialect._pipeline import _execution_scope_gate_active
+from aetherdialect._pipeline_generate import execution_scope_gate_active
 
 
 @pytest.mark.fast
 def test_default_owner_gate_inactive() -> None:
-    assert _execution_scope_gate_active(EngineContext(), None, "owner", context_name="master") is False
+    assert execution_scope_gate_active(EngineContext(), None, "owner", context_name="master") is False
 
 
 @pytest.mark.fast
@@ -32,10 +33,10 @@ def test_owner_warehouse_access_error_not_contact_admin(monkeypatch: pytest.Monk
     def _capture(choice_port: object, **kwargs: object) -> None:
         noted.update(kwargs)
 
-    monkeypatch.setattr("aetherdialect._main_execution.note_interactive_turn", _capture)
+    monkeypatch.setattr("aetherdialect._main_interactive.note_interactive_turn", _capture)
     owner = SimpleNamespace(_schema_role="owner")
     port = SimpleNamespace(_owner=owner)
-    MainExecutionOps._note_access_error_turn(
+    MainExecutionOps.note_access_error_turn(
         port, AccessError("execute", "warehouse privilege missing", reason="warehouse")
     )
     assert noted.get("outcome") == "validation_failed"
@@ -49,10 +50,10 @@ def test_consumer_warehouse_scrubbed(monkeypatch: pytest.MonkeyPatch) -> None:
     def _capture(choice_port: object, **kwargs: object) -> None:
         noted.update(kwargs)
 
-    monkeypatch.setattr("aetherdialect._main_execution.note_interactive_turn", _capture)
+    monkeypatch.setattr("aetherdialect._main_interactive.note_interactive_turn", _capture)
     owner = SimpleNamespace(_schema_role="consumer")
     port = SimpleNamespace(_owner=owner)
-    MainExecutionOps._note_access_error_turn(port, AccessError("execute", "secret table name xyz", reason="warehouse"))
+    MainExecutionOps.note_access_error_turn(port, AccessError("execute", "secret table name xyz", reason="warehouse"))
     assert noted.get("outcome") == "permission_denied"
     assert noted.get("error") is None
 

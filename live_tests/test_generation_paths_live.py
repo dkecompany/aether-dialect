@@ -13,7 +13,7 @@ from aetherdialect._contracts_core import (
 from aetherdialect._live_testing import run_and_assert
 from live_tests.mydb_scenarios import FILM_SCOPED
 
-from ._seed_helpers import (
+from .live_support import (
     deterministic_join_choice_patch,
     isolated_runner,
     seed_template,

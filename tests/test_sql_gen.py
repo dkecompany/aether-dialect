@@ -5,14 +5,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from aetherdialect import Sandbox
 from aetherdialect._constants import JOIN_CHOICE_SCOPE_MAIN
+from aetherdialect._constants_runtime import JOIN_PRIOR_FEEDBACK_HEADING
 from aetherdialect._contracts_base import (
-    ColumnRole,
     ExprValue,
     HavingParam,
-    JoinInjectionAlignmentError,
-    JoinInjectionFailedError,
-    LlmJsonExhausted,
     MulGroup,
     NormalizedExpr,
     OrderByCol,
@@ -21,10 +19,14 @@ from aetherdialect._contracts_base import (
 )
 from aetherdialect._contracts_core import (
     FeedbackKind,
+    JoinInjectionAlignmentError,
+    JoinInjectionFailedError,
+    LlmJsonExhausted,
     QuestionFeedbackEntry,
     RejectionBucket,
     RuntimeCteStep,
     RuntimeIntent,
+    ScopeClass,
     SelectCol,
 )
 from aetherdialect._contracts_schema import (
@@ -32,6 +34,7 @@ from aetherdialect._contracts_schema import (
     CaseWhenBranch,
     CaseWhenExpr,
     ColumnMetadata,
+    ColumnRole,
     SchemaGraph,
     TableMetadata,
     VirtualColumnSpec,
@@ -39,16 +42,10 @@ from aetherdialect._contracts_schema import (
     WindowRegistryStep,
     WindowSpec,
 )
-from aetherdialect._core_utils import (
-    _format_scalar_for_structural_sql_inline,
-    reduce_structural_sql_placeholders,
-)
 from aetherdialect._dialect import Dialect
 from aetherdialect._dialect_postgres import PostgresDialect
 from aetherdialect._dialect_sqlglot_engines import DatabricksDialect
 from aetherdialect._sql_gen import (
-    JOIN_PRIOR_FEEDBACK_HEADING,
-    ScopeClass,
     _analyze_join_topology,
     _build_deterministic_select_block,
     _candidate_join_paths_for_tables,
@@ -59,7 +56,6 @@ from aetherdialect._sql_gen import (
     _maybe_render_array_unnest_select,
     _orient_join_sig_for_from,
     _parse_join_choice_payload,
-    _render_case_branch_sql,
     _render_case_when_sql,
     _render_group_sql,
     _render_window_over_sql,
@@ -79,6 +75,7 @@ from aetherdialect._sql_gen import (
     join_hints_multi,
     merge_join_hints_for_na_scopes,
     physical_tables_for_join_hints,
+    render_case_branch_sql,
     render_expr_sql,
     render_order_by_sql,
     render_select_col_sql,
@@ -86,7 +83,11 @@ from aetherdialect._sql_gen import (
     sql_gen_type_scope,
     tables_in_join_scope,
 )
-from aetherdialect._templates import TemplateOps
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils import (
+    _format_scalar_for_structural_sql_inline,
+    reduce_structural_sql_placeholders,
+)
 from tests.join_test_helpers import catalog_edge_kinds_for_signatures
 
 
@@ -352,9 +353,9 @@ class TestCountDistinctConcatShapeA:
         assert "LAST_NAME" in upper
 
     def test_parse_validate_repair_round_trip_preserves_distinct(self, simple_schema) -> None:
+        from aetherdialect._intent_bind import normalize_pk_distinct
         from aetherdialect._intent_expr import parse_expr_string
-        from aetherdialect._intent_repair import normalize_pk_distinct
-        from aetherdialect._validation_semantic import validate_concat_mulgroups_in_runtime
+        from aetherdialect._validation_rules import validate_concat_mulgroups_in_runtime
 
         parsed = parse_expr_string(
             "COUNT(DISTINCT CONCAT(customers.name, customers.email))",
@@ -909,7 +910,7 @@ class TestJoinHintsMulti:
         assert result["candidates"][0]["candidate_tier"] == "base"
 
     def test_tables_in_join_scope_keeps_virtual(self):
-        """Virtual CTE names listed in intent are retained for join enumeration."""
+        """Virtual CTE names listed in intent remain available for join enumeration."""
         schema = SchemaGraph(
             tables={"film": TableMetadata(name="film", columns={}, foreign_keys=[], primary_key="id")},
             join_paths_multi={},
@@ -1359,7 +1360,8 @@ class TestJoinEdgesFromSignatureMixed:
     def test_self_join_in_join_bucket_raises(self):
         import pytest
 
-        from aetherdialect._sql_gen import NoJoinPathError, _join_edges_from_signature
+        from aetherdialect._contracts_core import NoJoinPathError
+        from aetherdialect._sql_gen import _join_edges_from_signature
 
         sig = ["film.parent_film_id->film.film_id"]
         with pytest.raises(NoJoinPathError):
@@ -2099,7 +2101,7 @@ class TestJoinKindForEdge:
         )
         assert _join_kind_for_edge("missing", "only", ["x"], schema) == " INNER"
 
-    def test_dimension_role_no_longer_biases_to_left(self) -> None:
+    def test_dimension_role_does_not_bias_to_left(self) -> None:
         dim = TableMetadata(
             name="dim",
             columns={
@@ -2224,7 +2226,7 @@ class TestRenderCaseWhenSql:
             op="is null",
             value_type="string",
         )
-        assert _render_case_branch_sql(fp) == "t.x IS NULL"
+        assert render_case_branch_sql(fp) == "t.x IS NULL"
 
     def test_param_comparison(self) -> None:
         fp = WhereParam(
@@ -2233,7 +2235,7 @@ class TestRenderCaseWhenSql:
             value_type="integer",
             param_key="p1",
         )
-        assert _render_case_branch_sql(fp) == "t.a = :p1"
+        assert render_case_branch_sql(fp) == "t.a = :p1"
 
     def test_in_branch_renders_param_in_parens(self) -> None:
         fp = WhereParam(
@@ -2242,7 +2244,7 @@ class TestRenderCaseWhenSql:
             value_type="string",
             param_key="p1",
         )
-        assert _render_case_branch_sql(fp) == "t.kind IN (:p1)"
+        assert render_case_branch_sql(fp) == "t.kind IN (:p1)"
 
     def test_not_in_branch_renders_param_in_parens(self) -> None:
         fp = WhereParam(
@@ -2251,7 +2253,7 @@ class TestRenderCaseWhenSql:
             value_type="string",
             param_key="p2",
         )
-        assert _render_case_branch_sql(fp) == "t.kind NOT IN (:p2)"
+        assert render_case_branch_sql(fp) == "t.kind NOT IN (:p2)"
 
     def test_case_when_string_literal_branch_quotes_apostrophe(self) -> None:
         cw = CaseWhenExpr(
@@ -2494,7 +2496,7 @@ class TestBuildDeterministicSqlEdgeCases:
 
 
 class TestInjectJoinStripsCommentWhenComplete:
-    """Stray ``-- <JOIN ...>`` markers in legacy input pass straight through the AST emit."""
+    """Stray ``-- <JOIN ...>`` markers in input pass straight through the AST emit."""
 
     def test_marker_is_not_re_emitted(self) -> None:
         det = "SELECT a FROM t\n-- <JOIN: integrate from join candidates>\nWHERE 1=1"
@@ -2541,9 +2543,10 @@ class TestJoinChoicePromptAndValidation:
             scopes,
             prior_join_feedback=["joined wrong dimension"],
         )
-        assert JOIN_PRIOR_FEEDBACK_HEADING in system
-        assert "wrong dimension" in system
+        assert JOIN_PRIOR_FEEDBACK_HEADING in user
+        assert "wrong dimension" in user
         assert "scopes" in user
+        assert JOIN_PRIOR_FEEDBACK_HEADING not in system
 
     def test_join_feedback_injection_includes_verified_signature_when_present(self) -> None:
         verified_sig = "orders.customer_id->customers.id"
@@ -2577,9 +2580,10 @@ class TestJoinChoicePromptAndValidation:
             scopes,
             prior_join_feedback=feedback_lines,
         )
-        assert JOIN_PRIOR_FEEDBACK_HEADING in system
-        assert verified_sig in system
+        assert JOIN_PRIOR_FEEDBACK_HEADING in user
+        assert verified_sig in user
         assert "scopes" in user
+        assert JOIN_PRIOR_FEEDBACK_HEADING not in system
 
     def test_parse_join_choice_payload(self) -> None:
         got = _parse_join_choice_payload(
@@ -2594,7 +2598,8 @@ class TestJoinChoicePromptAndValidation:
         assert got[join_choice_scope_key_cte("c1")] == "J01"
 
     def test_parse_join_choice_payload_not_dict(self) -> None:
-        assert _parse_join_choice_payload({"choices": "x"}) == {}
+        with pytest.raises(ValueError, match="choices"):
+            _parse_join_choice_payload({"choices": "x"})
 
     def test_join_choice_payload_invalid_when_scope_missing(self) -> None:
         llm_scopes = [
@@ -3000,11 +3005,12 @@ class TestCandidateJoinPathsBridgeFallback:
 class TestJoinHintsMultiCategoryFilm:
     """M:N category–film scope must emit a substantive join candidate on rental_shop schema."""
 
+    @pytest.mark.not_fast
     def test_rental_shop_category_film_emits_non_empty_join_path(self) -> None:
         pytest.importorskip("duckdb")
         from aetherdialect import AetherEngine
 
-        with AetherEngine.offline_sandbox() as sb:
+        with Sandbox.create_offline_sandbox(AetherEngine) as sb:
             schema = sb.engine._schema_graph
         hints = join_hints_multi(schema, ["category", "film"])
         substantive = [c for c in hints.get("candidates", []) if c.get("join_path_signature")]
@@ -3040,7 +3046,7 @@ class TestRegistrySqlParity:
 
 
 class TestPromotedSemanticEdgeFlowsThroughJoinHints:
-    """Integration: semantic→FK promotion + two-pass disambiguation surfaces. Verifies the Turn A promotion path so the existing two-pass LLM join machinery (pass 1 base FKs, pass 2 with semantics) sees promoted edges as first-class FK candidates and only falls back to semantic candidates for genuinely non-promotable edges."""
+    """Semantic→FK promotion feeds two-pass join disambiguation: pass 1 sees promoted edges as FK candidates; pass 2 keeps non-promotable semantic edges."""
 
     def _build_pair(
         self,

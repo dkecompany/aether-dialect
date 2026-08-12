@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import pandas as pd
 
-from aetherdialect._contracts_base import FederationPlanTemplate, PredicateGroup
+from aetherdialect._contracts_base import PredicateGroup
 from aetherdialect._contracts_core import JoinSpec, RuntimeIntent, SourceStep
-from aetherdialect._federation import (
+from aetherdialect._contracts_schema import FederationPlanTemplate
+from aetherdialect._federation_execute import (
     distinct_semijoin_keys,
     federation_plan_combine_hash,
     federation_plan_matches_template,
@@ -15,7 +16,7 @@ from aetherdialect._federation import (
     order_federation_execution_steps,
     semijoin_key_columns,
 )
-from aetherdialect._utils import intent_key
+from aetherdialect._utils_intent import intent_key
 
 
 def test_distinct_semijoin_keys_respects_cap() -> None:
@@ -59,7 +60,7 @@ def test_inject_semijoin_where_empty_keys_uses_sentinel() -> None:
 
 def test_column_where_value_type_prefers_integer_for_int_columns() -> None:
     from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-    from aetherdialect._federation import column_where_value_type
+    from aetherdialect._federation_execute import column_where_value_type
     from aetherdialect._schema_graph import recompute_join_paths_multi
 
     tables = {

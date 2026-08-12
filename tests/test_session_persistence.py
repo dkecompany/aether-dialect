@@ -6,8 +6,10 @@ import pandas as pd
 import pytest
 
 from aetherdialect._constants import SESSION_PERSISTENCE_FORMAT_VERSION, SUSPEND_STATE_FORMAT_VERSION
-from aetherdialect._contracts_base import ConfigError, Diagnostic, IntentSummary, SessionStep
+from aetherdialect._contracts_base import ConfigError, Diagnostic
+from aetherdialect._contracts_core import IntentSummary, SessionStep
 from aetherdialect._main_execution import MainExecutionOps
+from aetherdialect._main_session import MainSessionSerdeOps
 
 
 def _sample_step(*, with_data: bool = False) -> SessionStep:
@@ -20,7 +22,6 @@ def _sample_step(*, with_data: bool = False) -> SessionStep:
         kind="awaiting_intent_confirm",
         sql="SELECT id, name FROM customers",
         data=data,
-        message="Intent looks correct.",
         error=None,
         intent_summary=IntentSummary(
             tables=("customers",),
@@ -42,10 +43,8 @@ def _sample_step(*, with_data: bool = False) -> SessionStep:
                 source_id="primary",
             ),
         ),
-        status=None,
         reply_shape="yes_no",
         semantic_warnings=("ambiguous join",),
-        retryable=False,
     )
 
 
@@ -88,12 +87,12 @@ def test_suspended_state_roundtrip(monkeypatch: pytest.MonkeyPatch) -> None:
         suspended_at = None
 
     monkeypatch.setattr(
-        MainExecutionOps,
+        MainSessionSerdeOps,
         "_serialize_pipeline_suspend_payload",
         lambda state_id, payload: {"type": "intent_confirm"},
     )
     monkeypatch.setattr(
-        MainExecutionOps,
+        MainSessionSerdeOps,
         "_deserialize_pipeline_suspend_payload",
         lambda state_id, raw, *, owner=None: _Payload(),
     )
@@ -124,7 +123,7 @@ def test_suspended_state_version_mismatch_refuses(monkeypatch: pytest.MonkeyPatc
         suspended_at = None
 
     monkeypatch.setattr(
-        MainExecutionOps,
+        MainSessionSerdeOps,
         "_serialize_pipeline_suspend_payload",
         lambda state_id, payload: {"type": "execute"},
     )

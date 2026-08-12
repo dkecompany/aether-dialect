@@ -15,29 +15,28 @@ from aetherdialect._constants import (
     DIAGNOSTIC_CODE_REFUSAL_CTE_CAP,
     DIAGNOSTIC_CODE_REFUSAL_DECLINED_SCHEMA,
     DIAGNOSTIC_CODE_REFUSAL_HOP_CEILING,
-    DIAGNOSTIC_CODE_REFUSAL_INVALID_QUESTION,
     DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_TIE_CAP,
     DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_UNAVAILABLE,
     DIAGNOSTIC_CODE_REFUSAL_NOT_AVAILABLE_IN_CONTEXT,
     DIAGNOSTIC_CODE_REFUSAL_NULL_IN_NEGATED_LIST,
+    DIAGNOSTIC_CODE_REFUSAL_OPERATION_NOT_SUPPORTED,
     DIAGNOSTIC_CODE_REFUSAL_PARSE_FAILURE,
     DIAGNOSTIC_CODE_REFUSAL_PERMISSION_DENIED,
     DIAGNOSTIC_CODE_REFUSAL_PROBE_CTE_PLACEMENT,
-    DIAGNOSTIC_CODE_REFUSAL_SCOPE_VIOLATION,
     DIAGNOSTIC_CODE_REFUSAL_SUBDAY_DATE_WINDOW_ON_DATE_COLUMN,
     DIAGNOSTIC_CODE_REFUSAL_UNION_COLUMN_MISSING,
-    REFUSAL_CATALOGUE,
+    DIAGNOSTIC_CODE_REFUSAL_UNMAPPABLE_QUESTION,
     REFUSAL_CONDITION_CODES,
     REFUSAL_DIAGNOSTIC_CODES,
-    REPHRASE_HINT_MESSAGES,
     REPHRASE_HINT_REFUSAL_CODES,
 )
-from aetherdialect._contracts_base import (
+from aetherdialect._constants_runtime import REFUSAL_CATALOGUE, REPHRASE_HINT_MESSAGES
+from aetherdialect._contracts_base import FailureCategory
+from aetherdialect._contracts_core import (
     AggregateJoinFanOutError,
     AmbiguousDateLiteralError,
     ClauseWidenedRowsetError,
     ComparisonJoinScopeExceededError,
-    FailureCategory,
     JoinPathTieCapExceededError,
     NoJoinPathError,
     NullInNegatedListError,
@@ -46,7 +45,7 @@ from aetherdialect._contracts_base import (
     SubdayDateWindowOnDateColumnError,
 )
 from aetherdialect._contracts_schema import IntentIssue
-from aetherdialect._core_utils import (
+from aetherdialect._utils import (
     refusal_diagnostic_code_for_exception,
     refusal_diagnostic_code_for_federation_reason,
     refusal_diagnostic_code_for_intent_issue,
@@ -70,14 +69,20 @@ _CATALOGUE_HELPER_FUNCTIONS = frozenset(
     }
 )
 
-_SKIP_INLINE_REFUSAL_SCAN = frozenset(
-    {
-        "_federation.py",
-        "_pipeline.py",
-        "_intent_process.py",
-        "_validation_semantic.py",
-    }
-)
+
+def _refusal_catalogue_literal_ranges(tree: ast.AST) -> list[tuple[int, int]]:
+    """Line ranges of ``REFUSAL_CATALOGUE`` assignments (the only allowed user_text literals)."""
+    ranges: list[tuple[int, int]] = []
+    for node in tree.body if isinstance(tree, ast.Module) else []:
+        end = getattr(node, "end_lineno", None) or node.lineno
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            if node.target.id == "REFUSAL_CATALOGUE":
+                ranges.append((node.lineno, end))
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "REFUSAL_CATALOGUE":
+                    ranges.append((node.lineno, end))
+    return ranges
 
 
 @pytest.mark.fast
@@ -88,10 +93,14 @@ def test_every_refusal_condition_has_a_code() -> None:
         assert code in REFUSAL_DIAGNOSTIC_CODES
 
     assert refusal_diagnostic_code_for_outcome("permission_denied") == DIAGNOSTIC_CODE_REFUSAL_PERMISSION_DENIED
-    assert refusal_diagnostic_code_for_outcome("restricted") == DIAGNOSTIC_CODE_REFUSAL_SCOPE_VIOLATION
-    assert refusal_diagnostic_code_for_outcome("invalid_question") == DIAGNOSTIC_CODE_REFUSAL_INVALID_QUESTION
+    assert refusal_diagnostic_code_for_outcome("restricted") == DIAGNOSTIC_CODE_REFUSAL_OPERATION_NOT_SUPPORTED
+    assert refusal_diagnostic_code_for_outcome("invalid_question") == DIAGNOSTIC_CODE_REFUSAL_UNMAPPABLE_QUESTION
     assert refusal_diagnostic_code_for_outcome("parse_failed") == DIAGNOSTIC_CODE_REFUSAL_PARSE_FAILURE
     assert refusal_diagnostic_code_for_outcome("schema_invalid_declined") == DIAGNOSTIC_CODE_REFUSAL_DECLINED_SCHEMA
+    assert (
+        refusal_diagnostic_code_for_outcome("not_available_in_context")
+        == DIAGNOSTIC_CODE_REFUSAL_NOT_AVAILABLE_IN_CONTEXT
+    )
 
     assert (
         refusal_diagnostic_code_for_exception(NoJoinPathError("main query", ["a", "b"]))
@@ -187,14 +196,20 @@ def test_every_refusal_condition_has_a_code() -> None:
 def test_every_entry_has_a_reformulation_hint() -> None:
     for code, entry in REFUSAL_CATALOGUE.items():
         assert "user_text" in entry and entry["user_text"].strip()
-        assert "reformulation_hint" in entry and entry["reformulation_hint"].strip()
-        assert refusal_reformulation_hint_for_code(code) == entry["reformulation_hint"]
+        assert "reformulation_hint" in entry
+        effective_hint = entry["reformulation_hint"].strip() or entry["user_text"].strip()
+        assert effective_hint
+        assert refusal_reformulation_hint_for_code(code) == (
+            entry["reformulation_hint"] if entry["reformulation_hint"].strip() else entry["user_text"]
+        )
 
 
 @pytest.mark.fast
 def test_no_inline_refusal_strings() -> None:
     for key, code in REPHRASE_HINT_REFUSAL_CODES.items():
-        assert REPHRASE_HINT_MESSAGES[key] == REFUSAL_CATALOGUE[code]["reformulation_hint"]
+        entry = REFUSAL_CATALOGUE[code]
+        expected = entry["reformulation_hint"] or entry["user_text"]
+        assert REPHRASE_HINT_MESSAGES[key] == expected
 
     catalogue_user_texts = {entry["user_text"] for entry in REFUSAL_CATALOGUE.values()}
     for code in REFUSAL_DIAGNOSTIC_CODES:
@@ -202,10 +217,12 @@ def test_no_inline_refusal_strings() -> None:
 
     offenders: list[str] = []
     for path in sorted(_SRC_ROOT.rglob("*.py")):
-        if path.name in _SKIP_INLINE_REFUSAL_SCAN or path.name == "_constants.py":
-            continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        visitor = _InlineRefusalStringVisitor(catalogue_user_texts, path)
+        visitor = _InlineRefusalStringVisitor(
+            catalogue_user_texts,
+            path,
+            allowed_ranges=_refusal_catalogue_literal_ranges(tree),
+        )
         visitor.visit(tree)
         offenders.extend(visitor.offenders)
 
@@ -213,10 +230,20 @@ def test_no_inline_refusal_strings() -> None:
 
 
 class _InlineRefusalStringVisitor(ast.NodeVisitor):
-    def __init__(self, catalogue_texts: set[str], path: Path) -> None:
+    def __init__(
+        self,
+        catalogue_texts: set[str],
+        path: Path,
+        *,
+        allowed_ranges: list[tuple[int, int]],
+    ) -> None:
         self._catalogue_texts = catalogue_texts
         self._path = path
+        self._allowed_ranges = allowed_ranges
         self.offenders: list[str] = []
+
+    def _in_allowed_range(self, lineno: int) -> bool:
+        return any(start <= lineno <= end for start, end in self._allowed_ranges)
 
     def visit_Call(self, node: ast.Call) -> None:
         func = node.func
@@ -234,5 +261,5 @@ class _InlineRefusalStringVisitor(ast.NodeVisitor):
         text = node.value.strip()
         if len(text) < 24:
             return
-        if text in self._catalogue_texts and self._path.name != "_core_utils.py":
+        if text in self._catalogue_texts and not self._in_allowed_range(node.lineno):
             self.offenders.append(f"{self._path}:{node.lineno}:{text[:48]}...")

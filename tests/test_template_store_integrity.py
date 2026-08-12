@@ -10,21 +10,13 @@ import pytest
 
 from aetherdialect._config import EngineConfig, PolicyConfig
 from aetherdialect._constants import TEMPLATE_STORE_HEADER_FILENAME, TEMPLATE_STORE_PARTITION_PREFIX
-from aetherdialect._contracts_core import (
-    ConcreteIntent,
-    SelectCol,
-    Template,
-    TemplateStats,
-    ValueHistory,
-)
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, SQLShape, TableMetadata
-from aetherdialect._core_utils import read_gzip_json, write_gzip_json_atomic
-from aetherdialect._intent_process import NormalizedExpr
+from aetherdialect._contracts_base import NormalizedExpr
+from aetherdialect._contracts_core import ConcreteIntent, SelectCol, Template, ValueHistory
+from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, SQLShape, TableMetadata, TemplateStats
 from aetherdialect._schema_graph import recompute_join_paths_multi
-from aetherdialect._templates import (
-    TemplateOps,
-    TemplateStoreView,
-)
+from aetherdialect._templates import TemplateStoreView
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils_artifacts import read_gzip_json, write_gzip_json_atomic
 
 
 def _tiny_schema(*, schema_graph_id: str = "sg_test000000000001__abcd1234") -> SchemaGraph:
@@ -103,7 +95,7 @@ def test_prune_enforces_template_count_and_disk_size_on_save(tmp_path, monkeypat
     from aetherdialect._config import EngineLimits
 
     monkeypatch.setattr(
-        "aetherdialect._templates.TemplateOps._resolve_engine_limits",
+        "aetherdialect._templates.TemplateStoreLifecycleOps._resolve_engine_limits",
         lambda: EngineLimits(template_store_max_count=2, template_store_max_disk_bytes=512),
     )
     store_dir = str(tmp_path / "intent_templates")

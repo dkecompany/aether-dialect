@@ -2,12 +2,12 @@
   "decision": "Baseline seeded without a full mutmut campaign; operator must run `python scripts/run_mutation_testing.py --update` after installing the dev extra.",
   "status": "operator_run_required",
   "targets": {
-    "_core_utils.py": null,
-    "_intent_repair.py": null,
-    "_intent_resolve.py": null,
-    "_validation_execute.py": null,
-    "_validation_schema.py": null,
-    "_validation_semantic.py": null
+    "_utils.py": null,
+    "_intent_bind.py": null,
+    "_intent_normalize.py": null,
+    "_validation_rules.py": null,
+    "_validation_shape.py": null,
+    "_validation_sql.py": null
   },
   "tool": "mutmut",
   "version": 1

@@ -7,27 +7,20 @@ import os
 import pytest
 
 from aetherdialect._config import EngineConfig
-from aetherdialect._contracts_base import ColumnRole, MigrationTier
-from aetherdialect._contracts_core import (
-    ConcreteIntent,
-    NormalizedExpr,
-    SelectCol,
-    Template,
-    ValueHistory,
-)
+from aetherdialect._contracts_base import MigrationTier, NormalizedExpr
+from aetherdialect._contracts_core import ConcreteIntent, SelectCol, Template, ValueHistory
 from aetherdialect._contracts_schema import (
     ColumnMetadata,
+    ColumnRole,
     SchemaGraph,
     SQLShape,
     TableMetadata,
     TemplateStats,
 )
-from aetherdialect._core_utils import write_artifact_manifest
 from aetherdialect._main_execution import MainExecutionOps
 from aetherdialect._schema_graph import consumer_graph_is_permission_subset, diff_schemas
-from aetherdialect._templates import (
-    TemplateOps,
-)
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils_artifacts import write_artifact_manifest
 
 
 def _col(name: str, *, pk: bool = False) -> ColumnMetadata:

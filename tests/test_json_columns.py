@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from aetherdialect._contracts_base import ColumnRole
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._schema_catalog import assign_column_ops
+from aetherdialect._contracts_schema import ColumnMetadata, ColumnRole, SchemaGraph, TableMetadata
+from aetherdialect._schema_profile import assign_column_ops
 
 
 @pytest.mark.fast

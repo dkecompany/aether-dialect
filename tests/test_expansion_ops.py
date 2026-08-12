@@ -17,13 +17,11 @@ from aetherdialect._constants import (
     WHERE_EXPR_ADD,
 )
 from aetherdialect._contracts_base import (
-    ColumnRole,
     ExprValue,
     HavingParam,
     NormalizedExpr,
     OrderByCol,
     PredicateGroup,
-    TableRole,
     WhereParam,
 )
 from aetherdialect._contracts_core import (
@@ -36,10 +34,12 @@ from aetherdialect._contracts_schema import (
     CaseWhenBranch,
     CaseWhenExpr,
     ColumnMetadata,
+    ColumnRole,
     ExpansionMetadata,
     FKEdge,
     SchemaGraph,
     TableMetadata,
+    TableRole,
     WindowRegistryStep,
     WindowSpec,
 )
@@ -97,8 +97,8 @@ from aetherdialect._expansion_ops import (
     _window_sum_partition_add,
     expand_gold_intents,
 )
-from aetherdialect._schema_catalog import assign_column_ops
-from aetherdialect._utils import intent_key
+from aetherdialect._schema_profile import assign_column_ops
+from aetherdialect._utils_intent import intent_key
 
 
 def _all_operator_id_strings() -> set[str]:

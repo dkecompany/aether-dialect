@@ -7,24 +7,21 @@ from unittest.mock import MagicMock
 import pytest
 
 from aetherdialect._constants import DIAGNOSTIC_CODE_FEDERATION_MAPPING_DRIFT
-from aetherdialect._contracts_base import FederationDeclarationError
+from aetherdialect._contracts_base import FederationConfigError, FederationDeclarationError, FederationMemberProbeError
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import (
+from aetherdialect._federation_compose import _resolve_composite_table_names, compose_composite_graph
+from aetherdialect._federation_execute import probe_federation_member_connections
+from aetherdialect._federation_manifest import (
+    derive_table_namespace,
+    parse_federation_manifest,
+    parse_federation_mappings,
+)
+from aetherdialect._schema_graph import recompute_join_paths_multi
+from aetherdialect._utils import (
     drain_diagnostic_collector,
     reset_diagnostic_collector,
     set_diagnostic_collector,
 )
-from aetherdialect._federation import (
-    FederationConfigError,
-    FederationMemberProbeError,
-    _resolve_composite_table_names,
-    compose_composite_graph,
-    derive_table_namespace,
-    parse_federation_manifest,
-    parse_federation_mappings,
-    probe_federation_member_connections,
-)
-from aetherdialect._schema_graph import recompute_join_paths_multi
 
 
 def _graph(
@@ -80,9 +77,11 @@ def _multi_table_graph(source_id: str, table_names: list[str]) -> SchemaGraph:
 
 @pytest.mark.fast
 def test_probe_raises_when_execution_engine_missing() -> None:
-    engine = MagicMock()
+    engine = MagicMock(spec=["dialect", "_execution_engine", "_runtime_config", "_dialect"])
     engine.dialect = "postgresql"
     engine._execution_engine = None
+    engine._dialect = None
+    engine._runtime_config = None
     with pytest.raises(FederationConfigError, match="member_a"):
         probe_federation_member_connections({"member_a": engine})
 
@@ -109,7 +108,7 @@ def test_probe_fails_on_missing_declared_column() -> None:
     )
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_tables": [
                 {
                     "logical": "orders",
@@ -167,7 +166,7 @@ def test_probe_fails_when_live_object_missing_despite_stale_graph() -> None:
     )
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_tables": [
                 {
                     "logical": "orders",
@@ -211,7 +210,7 @@ def test_probe_fails_when_live_table_missing_despite_stale_graph() -> None:
     )
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_tables": [
                 {
                     "logical": "orders",
@@ -258,7 +257,7 @@ def test_compose_refuses_on_hard_mapping_drift() -> None:
     }
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_columns": [
                 {
                     "logical": "entity_id",
@@ -305,7 +304,7 @@ def test_parse_rejects_join_key_without_unify_in_graph() -> None:
     with pytest.raises(FederationDeclarationError, match="unify_in_graph"):
         parse_federation_mappings(
             {
-                "version": "0.2.1",
+                "version": "0.2.3",
                 "logical_columns": [
                     {
                         "logical": "shared_id",
@@ -323,7 +322,7 @@ def test_parse_rejects_unknown_logical_column_role() -> None:
     with pytest.raises(FederationDeclarationError, match="role"):
         parse_federation_mappings(
             {
-                "version": "0.2.1",
+                "version": "0.2.3",
                 "logical_columns": [
                     {
                         "logical": "attr",
@@ -355,7 +354,7 @@ def test_replica_merge_raises_on_data_type_mismatch() -> None:
     }
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_tables": [
                 {
                     "logical": "orders",

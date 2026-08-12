@@ -4,18 +4,25 @@ from __future__ import annotations
 
 import pytest
 
-from aetherdialect._contracts_base import AggregateJoinFanOutError, ClauseWidenedRowsetError, OrderByCol
-from aetherdialect._contracts_core import NormalizedExpr, RuntimeCteStep, RuntimeIntent, SelectCol
+from aetherdialect._contracts_base import NormalizedExpr, OrderByCol
+from aetherdialect._contracts_core import (
+    AggregateJoinFanOutError,
+    ClauseWidenedRowsetError,
+    RuntimeCteStep,
+    RuntimeIntent,
+    SelectCol,
+)
 from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
-from aetherdialect._pipeline import _resolve_joins_fresh, _validate_replay_join_semantics
+from aetherdialect._pipeline_generate import _resolve_joins_fresh
 from aetherdialect._schema_graph import recompute_join_paths_multi
 from aetherdialect._sql_gen import join_hints_multi
-from aetherdialect._validation_execute import (
-    validate_aggregate_join_fan_out,
+from aetherdialect._validation_rules import validate_aggregate_join_fan_out
+from aetherdialect._validation_shape import multiplying_edges_for_table
+from aetherdialect._validation_sql import (
     validate_execute_join_semantics,
+    validate_replay_join_semantics,
     validate_semantics,
 )
-from aetherdialect._validation_schema import multiplying_edges_for_table
 
 
 def _parent_child_schema() -> SchemaGraph:
@@ -542,8 +549,8 @@ class TestAggregateFanOut:
     def test_execute_guarded_sql_refuses_parent_sum_fan_out(self) -> None:
         from unittest.mock import MagicMock
 
-        from aetherdialect._contracts_base import AggregateJoinFanOutError
-        from aetherdialect._validation_execute import execute_guarded_sql
+        from aetherdialect._contracts_core import AggregateJoinFanOutError
+        from aetherdialect._validation_sql import execute_guarded_sql
 
         schema = _parent_child_schema()
         intent = RuntimeIntent(
@@ -661,7 +668,7 @@ class TestAggregateFanOut:
             where=None,
             chosen_join_path_signature=_join_signature(schema),
         )
-        err = _validate_replay_join_semantics(intent, schema)
+        err = validate_replay_join_semantics(intent, schema)
         assert isinstance(err, AggregateJoinFanOutError)
         assert "parent.amount" in err.message_for_caller
 
@@ -677,5 +684,5 @@ class TestAggregateFanOut:
             limit=5,
             chosen_join_path_signature=_join_signature(schema),
         )
-        err = _validate_replay_join_semantics(intent, schema)
+        err = validate_replay_join_semantics(intent, schema)
         assert isinstance(err, ClauseWidenedRowsetError)

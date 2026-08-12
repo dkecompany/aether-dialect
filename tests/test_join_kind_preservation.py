@@ -9,14 +9,9 @@ from aetherdialect._constants import (
     DIAGNOSTIC_CODE_JOIN_ORPHAN_RATE_HIGH,
     JOIN_ORPHAN_RATE_DIAGNOSTIC_FLOOR,
 )
-from aetherdialect._contracts_base import MulGroup, NoJoinPathError, NormalizedExpr
-from aetherdialect._contracts_core import RuntimeCteStep, RuntimeIntent, SelectCol
+from aetherdialect._contracts_base import MulGroup, NormalizedExpr
+from aetherdialect._contracts_core import NoJoinPathError, RuntimeCteStep, RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import (
-    drain_diagnostic_collector,
-    reset_diagnostic_collector,
-    set_diagnostic_collector,
-)
 from aetherdialect._dialect import DialectRegistry
 from aetherdialect._schema_graph import recompute_join_paths_multi
 from aetherdialect._sql_gen import (
@@ -28,9 +23,14 @@ from aetherdialect._sql_gen import (
     emit_join_orphan_rate_diagnostics,
     inject_join_into_deterministic_sql,
 )
-from aetherdialect._validation_schema import (
+from aetherdialect._utils import (
+    drain_diagnostic_collector,
+    reset_diagnostic_collector,
+    set_diagnostic_collector,
+)
+from aetherdialect._validation_shape import validate_preserve_tables
+from aetherdialect._validation_sql import (
     validate_cte_emission_shapes,
-    validate_preserve_tables,
     validate_probe_cte_modifiers,
 )
 from tests.join_test_helpers import catalog_edge_kinds_for_signatures

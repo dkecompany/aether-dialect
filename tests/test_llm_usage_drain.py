@@ -1,4 +1,4 @@
-"""LLM usage accumulator must drain after each ask turn."""
+"""LLM usage turn cursor isolates asks without wiping the session accumulator."""
 
 from __future__ import annotations
 
@@ -6,13 +6,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from aetherdialect._core_utils import (
+from aetherdialect._main_session import PipelineSession
+from aetherdialect._utils import (
     llm_usage_session_scope,
     record_llm_usage,
     reset_llm_usage_accumulator,
     snapshot_llm_usage_records,
 )
-from aetherdialect._main_execution import PipelineSession
 
 
 @pytest.fixture(autouse=True)
@@ -50,9 +50,12 @@ def test_two_asks_do_not_double_count_buffer() -> None:
         sess._turn_llm_usage_start = 0
         sess._emit_turn_llm_usage(question="first ask", diagnostics=())
 
+        # Cursor advanced; prior ask remains in the session buffer for invoice flush.
+        assert len(snapshot_llm_usage_records()) == 1
         sess._turn_llm_usage_start = len(snapshot_llm_usage_records())
         _record_question_usage(task="intent_pass_2")
         turn_records = sess._turn_llm_usage_records()
 
     assert len(turn_records) == 1
     assert turn_records[0].task == "intent_pass_2"
+    assert len(snapshot_llm_usage_records()) == 2

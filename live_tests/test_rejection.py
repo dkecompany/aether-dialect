@@ -8,11 +8,11 @@ import pytest
 
 from aetherdialect._contracts_core import FeedbackKind, GenerationPath, UserFeedbackRejectSuspendContext
 from aetherdialect._dialect import DialectRegistry
-from aetherdialect._pipeline import complete_user_feedback_reject
-from aetherdialect._templates import TemplateOps
-from aetherdialect._utils import intent_key
+from aetherdialect._pipeline_generate import complete_user_feedback_reject
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils_intent import intent_key
 
-from ._seed_helpers import (
+from .live_support import (
     assert_new_rejected_template,
     intent_customer_first_names,
     isolated_runner,
@@ -88,7 +88,7 @@ def test_seeded_rejection_feedback(
 
 
 def test_seeded_structural_rejection_bucket(schema, schema_terms, t2s) -> None:
-    """Seeding a rejection records the intent_key + reason via ``seed_rejected`` (question_feedback). Asserts the legacy ``negative_memory`` store section is absent (memory lives under ``question_feedback``)."""
+    """Seeding a rejection records the intent_key + reason via ``seed_rejected`` (question_feedback). Asserts the store has no ``negative_memory`` section (memory lives under ``question_feedback``)."""
     ikey = intent_key(intent_customer_first_names())
     with isolated_runner(schema, schema_terms, t2s, label="rej_struct") as runner:
         rt = seed_rejected(

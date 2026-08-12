@@ -11,9 +11,9 @@ from aetherdialect._constants import MASTER_AETHERSPACE_NAME
 from aetherdialect._contracts_base import EngineContext, NormalizedExpr
 from aetherdialect._contracts_core import RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import parse_federation_manifest
+from aetherdialect._federation_manifest import parse_federation_manifest
 from aetherdialect._main_execution import MainExecutionOps
-from aetherdialect._pipeline import _execution_scope_gate_active, generate_and_validate_sql
+from aetherdialect._pipeline_generate import execution_scope_gate_active, generate_and_validate_sql
 
 
 def _two_table_graph() -> SchemaGraph:
@@ -40,13 +40,13 @@ def _two_table_graph() -> SchemaGraph:
 @pytest.mark.fast
 def test_execution_scope_gate_active_for_named_context_without_scope_lists() -> None:
     ctx = EngineContext()
-    assert _execution_scope_gate_active(ctx, None, "owner", context_name="team_a") is True
+    assert execution_scope_gate_active(ctx, None, "owner", context_name="team_a") is True
 
 
 @pytest.mark.fast
 def test_execution_scope_gate_inactive_for_master_without_scope_lists() -> None:
     ctx = EngineContext()
-    assert _execution_scope_gate_active(ctx, None, "owner", context_name=MASTER_AETHERSPACE_NAME) is False
+    assert execution_scope_gate_active(ctx, None, "owner", context_name=MASTER_AETHERSPACE_NAME) is False
 
 
 @pytest.mark.fast
@@ -56,7 +56,7 @@ def test_consumer_sql_gate_kwargs_includes_context_name() -> None:
     owner._context_name = "team_a"
     owner._runtime_config = MagicMock(engine_context=EngineContext(), execution_context=EngineContext())
     port = MagicMock(_owner=owner, execution_visible_objects=None, space_tables=None, space_columns=None)
-    kwargs = MainExecutionOps._consumer_sql_gate_kwargs(port)
+    kwargs = MainExecutionOps.consumer_sql_gate_kwargs(port)
     assert kwargs["context_name"] == "team_a"
 
 
@@ -75,19 +75,19 @@ def test_federation_gate_kwargs_named_context_sets_context_name(tmp_path) -> Non
     )
     member_dir = tmp_path / "aetherdialect" / "conn_alpha"
     member_dir.mkdir(parents=True)
-    (member_dir / "schema_context.restricted.json").write_text(json.dumps({"version": "0.2.1"}), encoding="utf-8")
+    (member_dir / "schema_context.restricted.json").write_text(json.dumps({"version": "0.2.3"}), encoding="utf-8")
     owner = MagicMock()
     owner._artifacts_root = tmp_path
     owner._runtime_config = MagicMock(engine_context=EngineContext())
     owner._federation_source_runtimes = {"alpha": MagicMock(artifacts_dir=str(member_dir))}
-    gates = MainExecutionOps._federation_gate_kwargs_by_source(owner, None, manifest)
+    gates = MainExecutionOps.federation_gate_kwargs_by_source(owner, None, manifest)
     assert gates["alpha"]["context_name"] == "restricted"
     assert gates["alpha"]["schema_context"] == EngineContext()
 
 
 @pytest.mark.fast
-@patch("aetherdialect._pipeline._run_sql_validation_cascade", return_value=(True, None, None, []))
-@patch("aetherdialect._pipeline.assert_consumer_intent_in_scope", return_value=True)
+@patch("aetherdialect._pipeline_generate.run_sql_validation_cascade", return_value=(True, None, None, []))
+@patch("aetherdialect._pipeline_generate.assert_consumer_intent_in_scope", return_value=True)
 def test_generate_and_validate_sql_runs_scope_gate_for_named_empty_context(
     mock_assert_scope: MagicMock,
     _mock_validate: MagicMock,

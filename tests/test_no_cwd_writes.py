@@ -11,20 +11,21 @@ import pytest
 from aetherdialect._contracts_base import NormalizedExpr
 from aetherdialect._contracts_core import (
     ConcreteIntent,
+    DirectReuseSuspendContext,
     GenerationPath,
     RuntimeIntent,
     SelectCol,
+    Template,
     ValueHistory,
 )
 from aetherdialect._contracts_schema import SQLShape, TemplateStats
-from aetherdialect._pipeline import (
-    DirectReuseSuspendContext,
+from aetherdialect._pipeline_execute import (
     complete_direct_sql_reuse_user_choice,
     results_csv_output_path,
     save_result_csv,
 )
 from aetherdialect._seed_warmup import SeedWarmupCacheSession
-from aetherdialect._templates import Template, TemplateOps
+from aetherdialect._templates_ops import TemplateOps
 
 
 def _cwd_snapshot(cwd: Path) -> set[str]:
@@ -104,7 +105,7 @@ def test_no_file_written_to_working_directory(tmp_path: Path, monkeypatch: pytes
         sd_reuse=None,
     )
     with (
-        patch("aetherdialect._pipeline.LLMProvider.chat", return_value='{"aliases":{}}'),
+        patch("aetherdialect._llm_provider.LLMProvider.chat", return_value='{"aliases":{}}'),
         patch.object(TemplateOps, "save_template_store"),
         patch.object(TemplateOps, "templates_to_store", side_effect=lambda s, t: s),
         patch.object(TemplateOps, "delete_rejected_templates_matching_question"),
@@ -155,12 +156,12 @@ def test_results_csv_skipped_without_store_artifacts_root(tmp_path: Path, monkey
         sd_reuse=None,
     )
     with (
-        patch("aetherdialect._pipeline.LLMProvider.chat", return_value='{"aliases":{}}'),
+        patch("aetherdialect._llm_provider.LLMProvider.chat", return_value='{"aliases":{}}'),
         patch.object(TemplateOps, "save_template_store"),
         patch.object(TemplateOps, "templates_to_store", side_effect=lambda s, t: s),
         patch.object(TemplateOps, "delete_rejected_templates_matching_question"),
         patch.object(TemplateOps, "promote_trust"),
-        patch("aetherdialect._pipeline.save_result_csv") as save_csv,
+        patch("aetherdialect._pipeline_execute.save_result_csv") as save_csv,
     ):
         complete_direct_sql_reuse_user_choice(ctx, "y")
         save_csv.assert_not_called()

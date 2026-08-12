@@ -5,8 +5,8 @@ from __future__ import annotations
 import pytest
 
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._schema_build import tables_meta_to_schema_graph
-from aetherdialect._validation_schema import validate_join_path_key_types
+from aetherdialect._schema_reflect import tables_meta_to_schema_graph
+from aetherdialect._validation_rules import validate_join_path_key_types
 
 
 @pytest.mark.fast

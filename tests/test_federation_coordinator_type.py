@@ -4,16 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from aetherdialect._contracts_base import FederationDeclarationError
+from aetherdialect._contracts_base import FederationDeclarationError, NormalizedExpr
 from aetherdialect._contracts_core import RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import (
-    _schema_column_duckdb_type,
-    compose_composite_graph,
-    parse_federation_manifest,
-    plan_federated_intent,
-)
-from aetherdialect._intent_process import NormalizedExpr
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_manifest import parse_federation_manifest
+from aetherdialect._federation_plan import plan_federated_intent, schema_column_duckdb_type
 from aetherdialect._schema_graph import recompute_join_paths_multi
 
 
@@ -55,8 +51,8 @@ _MANIFEST = {
 
 @pytest.mark.fast
 def test_unknown_schema_type_maps_to_none_not_varchar() -> None:
-    assert _schema_column_duckdb_type("jsonb") is None
-    assert _schema_column_duckdb_type("integer") == "INTEGER"
+    assert schema_column_duckdb_type("jsonb") is None
+    assert schema_column_duckdb_type("integer") == "INTEGER"
 
 
 @pytest.mark.fast

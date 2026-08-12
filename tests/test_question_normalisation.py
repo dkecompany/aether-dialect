@@ -6,7 +6,7 @@ import os
 
 import pytest
 
-from aetherdialect._core_utils import normalize_question
+from aetherdialect._utils import normalize_question
 
 
 @pytest.mark.fast
@@ -42,12 +42,10 @@ def test_stale_question_index_version_triggers_rebuild(tmp_path) -> None:
     from aetherdialect._contracts_base import NormalizedExpr
     from aetherdialect._contracts_core import ConcreteIntent, SelectCol, Template, ValueHistory
     from aetherdialect._contracts_schema import SQLShape, TemplateStats
-    from aetherdialect._core_utils import read_gzip_json, write_gzip_json_atomic
-    from aetherdialect._templates import (
-        TemplateOps,
-        TemplateStoreView,
-    )
-    from aetherdialect._utils import question_token_fingerprint_from_raw
+    from aetherdialect._templates import TemplateStoreView
+    from aetherdialect._templates_ops import TemplateOps
+    from aetherdialect._utils_artifacts import read_gzip_json, write_gzip_json_atomic
+    from aetherdialect._utils_intent import question_token_fingerprint_from_raw
 
     artifacts_dir = str(tmp_path)
     store_dir = TemplateOps.template_store_dir_for_space(artifacts_dir, "master")

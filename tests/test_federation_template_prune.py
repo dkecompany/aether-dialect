@@ -9,13 +9,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aetherdialect._contracts_base import FederationPlanTemplate
-from aetherdialect._federation import (
-    federation_artifact_paths,
+from aetherdialect._contracts_schema import FederationPlanTemplate
+from aetherdialect._federation_execute import (
     load_federation_plan_templates,
     prune_federation_plan_templates_for_sources,
     save_federation_plan_template,
 )
+from aetherdialect._federation_manifest import federation_artifact_paths
 
 
 def _full_template(
@@ -32,7 +32,7 @@ def _full_template(
         combine_hash="combine_hash",
         question="show joined entities",
         accepted_questions=("accepted q",),
-        format_version="0.2.1",
+        format_version="0.2.3",
         member_template_ids=member_template_ids,
         residual_hash="residual_hash",
         join_feedback=("join hint",),
@@ -64,7 +64,7 @@ def test_prune_preserves_all_fields_on_survivors() -> None:
         assert survivor.residual_hash == "residual_hash"
         assert survivor.manifest_hash == "manifest_hash"
         assert survivor.member_tuple_hash == "member_tuple_hash"
-        assert survivor.format_version == "0.2.1"
+        assert survivor.format_version == "0.2.3"
 
         path = federation_artifact_paths(fed_dir)["plan_templates"]
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -74,7 +74,7 @@ def test_prune_preserves_all_fields_on_survivors() -> None:
         assert row["residual_hash"] == "residual_hash"
         assert row["manifest_hash"] == "manifest_hash"
         assert row["member_tuple_hash"] == "member_tuple_hash"
-        assert row["format_version"] == "0.2.1"
+        assert row["format_version"] == "0.2.3"
 
 
 @pytest.mark.fast
@@ -108,8 +108,8 @@ def test_prune_writes_under_artifact_lock_atomically() -> None:
         )
 
         with (
-            patch("aetherdialect._federation.artifact_lock") as lock_cm,
-            patch("aetherdialect._federation._write_federation_json_atomic") as write_atomic,
+            patch("aetherdialect._federation_execute.artifact_lock") as lock_cm,
+            patch("aetherdialect._federation_execute._write_federation_json_atomic") as write_atomic,
         ):
             lock_cm.return_value.__enter__ = MagicMock(return_value=None)
             lock_cm.return_value.__exit__ = MagicMock(return_value=False)
@@ -126,7 +126,7 @@ def test_prune_writes_under_artifact_lock_atomically() -> None:
 
 @pytest.mark.fast
 def test_prune_on_member_drift_drops_affected_templates() -> None:
-    from aetherdialect._federation import prune_federation_plan_templates_on_drift
+    from aetherdialect._federation_execute import prune_federation_plan_templates_on_drift
 
     with tempfile.TemporaryDirectory() as fed_dir:
         save_federation_plan_template(fed_dir, _full_template("plan_alpha"))
@@ -163,14 +163,14 @@ def test_prune_on_member_drift_drops_affected_templates() -> None:
 
         with (
             patch(
-                "aetherdialect._federation.federation_member_hash_tuple",
+                "aetherdialect._federation_manifest.federation_member_hash_tuple",
                 return_value=(
                     ("alpha", "sg_alpha_drift", "eff_alpha_drift", "profile_alpha", "", ""),
                     ("beta", "sg_beta", "eff_beta", "profile_beta", "", ""),
                 ),
             ),
             patch(
-                "aetherdialect._federation._load_federation_artifact_manifest_dict",
+                "aetherdialect._federation_manifest.load_federation_artifact_manifest_dict",
                 return_value={
                     "federation_members": [
                         ["alpha", "sg_alpha", "eff_alpha", "profile_alpha", "", ""],

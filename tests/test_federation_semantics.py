@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from aetherdialect._contracts_base import FederationConfigError
-from aetherdialect._federation import parse_federation_mappings
+from aetherdialect._federation_manifest import parse_federation_mappings
 
 
 @pytest.mark.fast
@@ -14,7 +14,7 @@ def test_unsupported_logical_table_semantics_names_supported_set(semantics: str)
     with pytest.raises(FederationConfigError) as exc_info:
         parse_federation_mappings(
             {
-                "version": "0.2.1",
+                "version": "0.2.3",
                 "logical_tables": [
                     {
                         "logical": "orders",

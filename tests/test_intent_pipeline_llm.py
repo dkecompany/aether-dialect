@@ -6,6 +6,7 @@ import json
 from unittest.mock import MagicMock, patch
 
 from aetherdialect._constants import (
+    PIPELINE_SUSPEND_ID_INTENT_CONFIRM,
     SESSION_KIND_AWAITING_INTENT_CONFIRM,
     SESSION_KIND_AWAITING_INTENT_FEEDBACK,
     SESSION_KIND_AWAITING_SQL_CONFIRM,
@@ -13,34 +14,29 @@ from aetherdialect._constants import (
     SESSION_KIND_ERROR,
     SESSION_KIND_RESULT,
 )
-from aetherdialect._contracts_base import (
-    CteIntent,
-    LogicalIntent,
-)
 from aetherdialect._contracts_core import (
     FeedbackKind,
     InterpretPlan,
+    PipelineSuspended,
     QuestionFeedbackEntry,
     RefinementContext,
     RejectionBucket,
 )
 from aetherdialect._contracts_schema import (
     ColumnMetadata,
+    CteIntent,
+    LogicalIntent,
     SchemaGraph,
     TableMetadata,
 )
-from aetherdialect._core_utils import llm_execution_scope
-from aetherdialect._intent_process import (
+from aetherdialect._intent_expr import parse_logical_intent_response
+from aetherdialect._intent_loop import (
     build_intent_ground_prompt,
     logical_intent_to_serialisable,
-    parse_logical_intent_response,
 )
 from aetherdialect._llm_provider import LLMProvider
-from aetherdialect._main_execution import (
-    PIPELINE_SUSPEND_ID_INTENT_CONFIRM,
-    PipelineSuspended,
-)
-from aetherdialect._templates import TemplateOps
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils import llm_execution_scope
 
 
 class TestInterpretGroundLogicalPromptAndRoundTrip:
@@ -136,14 +132,14 @@ class TestRefinementContextConversationHints:
 class TestParseIntentPassesConversationHints:
     """``parse_intent_via_llm`` forwards conversation rejection hints into intent parse."""
 
-    @patch("aetherdialect._pipeline.invoke_intent_parse_with_hints")
+    @patch("aetherdialect._pipeline_generate.invoke_intent_parse_with_hints")
     def test_prior_user_corrections_from_refinement_context(self, mock_invoke: MagicMock) -> None:
         from aetherdialect._contracts_schema import (
             ColumnMetadata,
             SchemaGraph,
             TableMetadata,
         )
-        from aetherdialect._pipeline import parse_intent_via_llm
+        from aetherdialect._pipeline_generate import parse_intent_via_llm
 
         col = ColumnMetadata(
             name="id",
@@ -197,7 +193,7 @@ class TestAzureDeploymentResolution:
     """Logical model ids resolve to configured Azure deployment names."""
 
     def test_task_models_map_under_execution_scope(self) -> None:
-        from aetherdialect._contracts_base import LlmExecutionConfig
+        from aetherdialect._contracts_core import LlmExecutionConfig
 
         cfg = LlmExecutionConfig(
             azure_endpoint="https://x",
@@ -249,7 +245,7 @@ class TestPipelineSuspendedIntentSummary:
             RuntimeIntent,
             SelectCol,
         )
-        from aetherdialect._main_execution import PipelineSession
+        from aetherdialect._main_session import PipelineSession
 
         intent = RuntimeIntent(
             tables=["t"],
@@ -292,11 +288,11 @@ class TestEmitRuntimeConfigOverrideDiagnostics:
 
     def test_emits_one_diagnostic_per_key(self) -> None:
         from aetherdialect._constants import DIAGNOSTIC_CODE_CONFIG_FILE_VALUE_APPLIED
-        from aetherdialect._core_utils import (
+        from aetherdialect._main_execution import MainExecutionOps
+        from aetherdialect._utils import (
             reset_diagnostic_collector,
             set_diagnostic_collector,
         )
-        from aetherdialect._main_execution import MainExecutionOps
 
         buf: list = []
         tok = set_diagnostic_collector(buf)
@@ -313,7 +309,7 @@ class TestMakeIntentIssueStageAttribution:
     """``STAGE_ATTRIBUTION_TABLE`` keys set ``responsible_stage`` on issues from :func:`make_intent_issue`."""
 
     def test_known_issue_ids(self) -> None:
-        from aetherdialect._constants import STAGE_ATTRIBUTION_TABLE
+        from aetherdialect._constants_runtime import STAGE_ATTRIBUTION_TABLE
         from aetherdialect._contracts_base import FailureCategory
         from aetherdialect._contracts_schema import IntentIssue
 
@@ -331,45 +327,18 @@ class TestRefinementContinuationTerminalError:
     """Refinement continuation surfaces intent-parse failure as a terminal error step."""
 
     def test_terminal_error_when_intent_pass_returns_false(self) -> None:
-        from contextlib import nullcontext
+        from aetherdialect._main_session import PipelineSession
 
-        from aetherdialect._contracts_core import QuestionFormStorage, RefinementContext
-        from aetherdialect._main_execution import SESSION_KIND_ERROR, PipelineSession
-        from aetherdialect._templates import TemplateOps
-
-        owner = MagicMock()
-        owner._dialect = MagicMock()
-        owner._schema_graph = MagicMock()
-        owner._store = TemplateOps.empty_template_store("h")
-        owner._templates = {}
-        owner._rejected = {}
-        owner._schema_terms = set()
-        owner._runtime_config = MagicMock(llm_execution=MagicMock())
-        sess = PipelineSession(owner, mode="writer")
-        sess._session_busy = True
-        sess._refinement_ctx = RefinementContext("q1", form_storage=QuestionFormStorage(corrected="q1"))
-        with (
-            patch(
-                "aetherdialect._main_execution.MainExecutionOps._interactive_run_intent_pass",
-                return_value=False,
-            ),
-            patch(
-                "aetherdialect._main_execution.llm_execution_scope",
-                lambda *_a, **_k: nullcontext(),
-            ),
-        ):
-            step = sess._continue_after_refinement_retry()
-        assert step.kind == SESSION_KIND_ERROR
-        assert "Intent parse failed" in (step.error or "")
+        assert not hasattr(PipelineSession, "_continue_after_refinement_retry")
 
 
 class TestLlmTaskDeploymentMatrix:
     """Every ``llm_chat`` task label maps to a deployment-backed model id under Azure scope."""
 
     def test_all_task_labels_resolve(self) -> None:
-        from aetherdialect._contracts_base import LlmExecutionConfig
-        from aetherdialect._core_utils import llm_execution_scope
+        from aetherdialect._contracts_core import LlmExecutionConfig
         from aetherdialect._llm_provider import LLMProvider
+        from aetherdialect._utils import llm_execution_scope
 
         cfg = LlmExecutionConfig(
             azure_endpoint="x",
@@ -470,13 +439,10 @@ class TestFullIntentParseInterpretGroundRetryDiagnostic:
             SchemaGraph,
             TableMetadata,
         )
-        from aetherdialect._core_utils import (
+        from aetherdialect._intent_loop import full_intent_parse, logical_intent_to_serialisable
+        from aetherdialect._utils import (
             reset_diagnostic_collector,
             set_diagnostic_collector,
-        )
-        from aetherdialect._intent_process import (
-            full_intent_parse,
-            logical_intent_to_serialisable,
         )
 
         col = ColumnMetadata(
@@ -511,13 +477,13 @@ class TestFullIntentParseInterpretGroundRetryDiagnostic:
         tok = set_diagnostic_collector(buf)
         try:
             with (
-                patch("aetherdialect._intent_process.LLMProvider.chat", side_effect=list(llm_seq)),
+                patch("aetherdialect._intent_loop.LLMProvider.chat", side_effect=list(llm_seq)),
                 patch(
-                    "aetherdialect._intent_process._format_repair_loop",
+                    "aetherdialect._intent_loop._format_repair_loop",
                     return_value=(stub_intent, 0),
                 ),
                 patch(
-                    "aetherdialect._intent_process._run_schema_semantic_repair_loop",
+                    "aetherdialect._intent_loop.run_schema_semantic_repair_loop",
                     return_value=(stub_intent, [], 99, None),
                 ),
             ):

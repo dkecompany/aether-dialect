@@ -16,7 +16,7 @@ from aetherdialect.aetherdialect import AetherFederation
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 COORDINATOR_MODULES = (
-    REPO_ROOT / "src" / "aetherdialect" / "_federation.py",
+    REPO_ROOT / "src" / "aetherdialect" / "_federation_execute.py",
     REPO_ROOT / "src" / "aetherdialect" / "_dialect_sqlglot_engines.py",
 )
 
@@ -64,7 +64,7 @@ import aetherdialect
 
 
 @pytest.mark.fast
-def test_federation_construction_names_the_extra(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_federation_construction_requires_duckdb() -> None:
     real_import = builtins.__import__
 
     def _blocked_import(name: str, *args: object, **kwargs: object) -> object:
@@ -73,9 +73,9 @@ def test_federation_construction_names_the_extra(monkeypatch: pytest.MonkeyPatch
         return real_import(name, *args, **kwargs)
 
     with patch("builtins.__import__", side_effect=_blocked_import):
-        with pytest.raises(ConfigError, match=r"pip install aetherdialect\[(federation|duckdb)\]"):
+        with pytest.raises(ConfigError, match=r"duckdb"):
             AetherFederation(
                 "fed",
-                members={"src": object()},
-                declaration_file="missing.json",
+                members=(object(), object()),
+                declaration="missing.json",
             )

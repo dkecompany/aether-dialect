@@ -8,18 +8,19 @@ from unittest.mock import MagicMock
 
 import pytest
 
-import aetherdialect._schema_overrides
+import aetherdialect._schema_finalize
 from aetherdialect._config import EngineConfig
 from aetherdialect._contracts_base import EngineContext
 from aetherdialect._contracts_schema import SchemaGraph
-from aetherdialect._core_utils import read_gzip_json
 from aetherdialect._dialect import Dialect
+from aetherdialect._schema_finalize import build_schema_graph
 from aetherdialect._schema_graph import (
     _sql_file_content_sha256,
     assign_schema_graph_hashes,
     compute_dialect_probe,
 )
-from aetherdialect._schema_overrides import build_schema_graph, save_schema_to_cache
+from aetherdialect._schema_reflect import save_schema_to_cache
+from aetherdialect._utils_artifacts import read_gzip_json
 
 
 class _ProbeStubDialect(Dialect):
@@ -165,7 +166,7 @@ def test_cache_hit_via_probe_skips_reflect_and_profile(
 
     classify_calls = []
     monkeypatch.setattr(
-        aetherdialect._schema_overrides,
+        aetherdialect._schema_finalize,
         "apply_column_roles_llm",
         lambda sg, notes_content=None, **kwargs: classify_calls.append(notes_content),
     )
@@ -198,11 +199,19 @@ def test_notes_only_refresh_reruns_classifier_only(
     classify_calls: list[str | None] = []
     boolean_calls: list[int] = []
     monkeypatch.setattr(
-        "aetherdialect._schema_graph.apply_column_roles_llm",
+        "aetherdialect._schema_profile.apply_column_roles_llm",
         lambda sg, notes_content=None, **kwargs: classify_calls.append(notes_content),
     )
     monkeypatch.setattr(
-        "aetherdialect._schema_graph.apply_boolean_coercion_pass",
+        "aetherdialect._schema_profile.apply_boolean_coercion_pass",
+        lambda sg: boolean_calls.append(1),
+    )
+    monkeypatch.setattr(
+        "aetherdialect._schema_profile.apply_column_roles_llm",
+        lambda sg, notes_content=None, **kwargs: classify_calls.append(notes_content),
+    )
+    monkeypatch.setattr(
+        "aetherdialect._schema_profile.apply_boolean_coercion_pass",
         lambda sg: boolean_calls.append(1),
     )
 
@@ -225,7 +234,7 @@ def test_probe_match_with_scope_mismatch_does_not_take_fast_path(
     cache_path: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When probe matches but scope is *orthogonal* (neither subset nor superset), legacy validation runs."""
+    """When probe matches but scope is *orthogonal* (neither subset nor superset), fingerprint validation runs."""
     ctx_saved = EngineContext(deny_columns=frozenset({"customers.email"}))
     dialect = _ProbeStubDialect(probe_value="DIALECT_DIGEST")
     combined_probe = compute_dialect_probe(dialect, ctx_saved)
@@ -239,7 +248,7 @@ def test_probe_match_with_scope_mismatch_does_not_take_fast_path(
 
     classify_calls: list[Any] = []
     monkeypatch.setattr(
-        aetherdialect._schema_overrides,
+        aetherdialect._schema_finalize,
         "apply_column_roles_llm",
         lambda sg, notes_content=None, **kwargs: classify_calls.append(notes_content),
     )
@@ -250,7 +259,7 @@ def test_probe_match_with_scope_mismatch_does_not_take_fast_path(
     assert classify_calls == []
 
 
-def test_legacy_cache_without_probe_falls_to_legacy_branch_and_backfills(
+def test_cache_without_probe_falls_to_fingerprint_branch_and_backfills(
     schema_graph: SchemaGraph,
     cache_path: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -277,7 +286,7 @@ def test_legacy_cache_without_probe_falls_to_legacy_branch_and_backfills(
     assert raw_after["ddl_probe_hash"] == combined_probe
 
 
-def test_dialect_with_empty_probe_uses_legacy_branch(
+def test_dialect_with_empty_probe_uses_fingerprint_branch(
     schema_graph: SchemaGraph,
     cache_path: str,
 ) -> None:

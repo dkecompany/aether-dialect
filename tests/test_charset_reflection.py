@@ -9,13 +9,13 @@ from aetherdialect._constants import (
     MYSQL_CONNECTION_CHARSET,
 )
 from aetherdialect._contracts_schema import ColumnMetadata
-from aetherdialect._core_utils import (
+from aetherdialect._dialect import DialectRegistry
+from aetherdialect._schema_reflect import tables_meta_to_schema_graph
+from aetherdialect._utils import (
     drain_diagnostic_collector,
     reset_diagnostic_collector,
     set_diagnostic_collector,
 )
-from aetherdialect._dialect import DialectRegistry
-from aetherdialect._schema_build import tables_meta_to_schema_graph
 
 
 @pytest.mark.fast

@@ -5,17 +5,16 @@ from __future__ import annotations
 import pytest
 
 from aetherdialect._contracts_base import (
+    NormalizedExpr,
     PredicateGroup,
     WhereParam,
 )
 from aetherdialect._contracts_core import RuntimeIntent
-from aetherdialect._federation import (
-    _federation_unsupported_operator_reason,
+from aetherdialect._federation_execute import (
     federation_ineligible_answerable_hint,
     federation_ineligible_reason_code,
-    parse_federation_manifest,
 )
-from aetherdialect._intent_process import NormalizedExpr
+from aetherdialect._federation_manifest import federation_unsupported_operator_reason, parse_federation_manifest
 
 
 @pytest.mark.fast
@@ -49,7 +48,7 @@ def test_unsupported_contains_names_lacking_member_and_resolves_member_capabilit
             ]
         ),
     )
-    reason = _federation_unsupported_operator_reason(intent, manifest)
+    reason = federation_unsupported_operator_reason(intent, manifest)
     assert reason is not None
     assert "member capability" in reason
     assert "'b'" in reason or "csv" in reason
@@ -94,7 +93,7 @@ def test_unsupported_having_operator_names_lacking_member() -> None:
             ]
         ),
     )
-    reason = _federation_unsupported_operator_reason(intent, manifest)
+    reason = federation_unsupported_operator_reason(intent, manifest)
     assert reason is not None
     assert "member capability" in reason
     assert "'a'" in reason or "'b'" in reason

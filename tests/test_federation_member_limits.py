@@ -10,9 +10,11 @@ import pytest
 from aetherdialect._config import PolicyConfig
 from aetherdialect._contracts_base import SqlDiagnostic, SqlDiagnosticCode
 from aetherdialect._contracts_core import FederatedPlan, RuntimeIntent, SourceStep
-from aetherdialect._federation import compose_composite_graph, parse_federation_manifest
-from aetherdialect._schema_graph import ColumnMetadata, SchemaGraph, TableMetadata, recompute_join_paths_multi
-from aetherdialect._validation_execute import execute_guarded_sql
+from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_manifest import parse_federation_manifest
+from aetherdialect._schema_graph import recompute_join_paths_multi
+from aetherdialect._validation_sql import execute_guarded_sql
 
 
 def _graph(table: str, *, source_id: str = "a") -> SchemaGraph:
@@ -54,7 +56,7 @@ _MANIFEST = {
 
 @pytest.mark.fast
 def test_member_execute_passes_resolved_cost_and_profile_limits() -> None:
-    from aetherdialect._pipeline import _execute_federation_source_step
+    from aetherdialect._pipeline_execute import _execute_federation_source_step
 
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
     composite = compose_composite_graph({"a": _graph("left_t"), "b": _graph("right_t")}, manifest)
@@ -72,9 +74,9 @@ def test_member_execute_passes_resolved_cost_and_profile_limits() -> None:
     prepared_by_source = {
         "a": type("Prep", (), {"sub_intent": step.sub_intent, "sql": "SELECT 1", "structural_defaults": {}})(),
     }
-    with patch("aetherdialect._pipeline.execute_guarded_sql") as exec_mock:
+    with patch("aetherdialect._pipeline_execute.execute_guarded_sql") as exec_mock:
         exec_mock.return_value = [{"id": 1}]
-        with patch("aetherdialect._pipeline.build_result_dataframe", return_value=pd.DataFrame({"id": [1]})):
+        with patch("aetherdialect._pipeline_execute.build_result_dataframe", return_value=pd.DataFrame({"id": [1]})):
             mock_dialect = MagicMock()
             mock_dialect.finalize_render.return_value = "SELECT 1"
             _execute_federation_source_step(
@@ -98,6 +100,34 @@ def test_member_execute_passes_resolved_cost_and_profile_limits() -> None:
     assert kwargs["max_query_cost_rows"] == 100.0
     assert kwargs["max_query_cost_bytes"] == 200.0
     assert kwargs["profile_timeout_ms"] == 9_999
+
+
+@pytest.mark.fast
+def test_execute_guarded_sql_emits_sql_execution_audit() -> None:
+    from aetherdialect._constants import AUDIT_EVENT_SQL_EXECUTION
+    from aetherdialect._utils import pop_audit_emit, push_audit_emit, sha256
+
+    dialect = MagicMock()
+    dialect.parse_select.return_value = "SELECT"
+    dialect.ast_validate_full.return_value = []
+    dialect.can_explain.return_value = True
+    dialect.execute.return_value = [(1,), (2,)]
+    dialect.explain_diagnose.return_value = (True, [], "")
+
+    audit = MagicMock()
+    token = push_audit_emit(audit)
+    try:
+        rows = execute_guarded_sql(dialect, "SELECT 1", max_query_cost_rows=1000.0)
+    finally:
+        pop_audit_emit(token)
+
+    assert rows == [(1,), (2,)]
+    audit.assert_called_once()
+    assert audit.call_args.args[0] == AUDIT_EVENT_SQL_EXECUTION
+    details = dict(audit.call_args.kwargs.get("details") or ())
+    assert details["statement_hash"] == sha256("SELECT 1")
+    assert details["row_count"] == "2"
+    assert "elapsed_ms" in details
 
 
 @pytest.mark.fast
@@ -185,6 +215,6 @@ def test_explain_diagnose_honors_profile_timeout_ms_override() -> None:
         seen.append(getattr(d, "profile_timeout_ms", None))
         return True, None, None, []
 
-    with patch("aetherdialect._validation_execute.validate_sql", side_effect=_capture_validate):
+    with patch("aetherdialect._validation_sql.validate_sql", side_effect=_capture_validate):
         execute_guarded_sql(dialect, "SELECT 1", profile_timeout_ms=42)
     assert seen == [42]

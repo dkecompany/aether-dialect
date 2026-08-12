@@ -8,27 +8,25 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from aetherdialect._constants import SCHEMA_OVERRIDES_VERSION
-from aetherdialect._contracts_base import (
-    InferenceTag,
-)
+from aetherdialect._constants import STRUCTURE_DOCUMENT_VERSION
 from aetherdialect._contracts_schema import (
     ColumnMetadata,
     FKEdge,
+    InferenceTag,
     SchemaDiff,
     SchemaGraph,
     TableDiff,
     TableMetadata,
 )
-from aetherdialect._schema_build import overrides_sidecar_path
-from aetherdialect._schema_graph import (
-    collapse_redundant_inferences,
-)
-from aetherdialect._schema_overrides import (
+from aetherdialect._schema_finalize import (
     _resync_column_key_flags,
     apply_diff,
     migrate_sidecar_for_diff,
 )
+from aetherdialect._schema_graph import (
+    collapse_redundant_inferences,
+)
+from aetherdialect._schema_reflect import structure_sidecar_path
 
 pytestmark = pytest.mark.usefixtures("stub_schema_llm_classifier")
 
@@ -157,11 +155,11 @@ def test_resync_column_key_flags_after_pk_change() -> None:
 
 def test_sidecar_list_endpoint_survives_rename(tmp_path: Path) -> None:
     schema_path = tmp_path / "schema.json.gz"
-    sidecar_path = overrides_sidecar_path(schema_path)
+    sidecar_path = structure_sidecar_path(schema_path)
     sidecar_path.write_text(
         json.dumps(
             {
-                "version": SCHEMA_OVERRIDES_VERSION,
+                "version": STRUCTURE_DOCUMENT_VERSION,
                 "tables": {},
                 "foreign_keys_add": [
                     {
@@ -253,7 +251,7 @@ def test_catalog_only_rename_stays_remap_despite_inferred_mismatch() -> None:
         ],
     )
     new = SchemaGraph(tables={"clients": new_c, "orders": new_o}, join_paths_multi={}, created_at="")
-    from aetherdialect._core_utils import _fk_maps_consistent
+    from aetherdialect._schema_graph import _fk_maps_consistent
 
     tmap = {"customers": "clients", "orders": "orders"}
     colmap = {

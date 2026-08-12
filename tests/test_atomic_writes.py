@@ -15,14 +15,14 @@ import pytest
 from aetherdialect._config import SeedWarmupConfig
 from aetherdialect._constants import WRITE_QUEUE_FILENAME
 from aetherdialect._contracts_schema import SchemaGraph
-from aetherdialect._core_utils import write_artifact_manifest
-from aetherdialect._federation import _write_federation_json_atomic, archive_federation_editor_file
-from aetherdialect._schema_graph import upgrade_artifacts_schema_graph_id
-from aetherdialect._schema_overrides import (
+from aetherdialect._federation_execute import _write_federation_json_atomic, archive_federation_editor_file
+from aetherdialect._schema_finalize import (
     _write_overrides_sidecar_payload,
-    dump_schema_overrides_to_path,
+    dump_structure_to_path,
 )
+from aetherdialect._schema_graph import upgrade_artifacts_schema_graph_id
 from aetherdialect._seed_warmup import SeedWarmupCacheSession
+from aetherdialect._utils_artifacts import write_artifact_manifest
 
 save_seed_warmup_cache_zip = SeedWarmupCacheSession.save_seed_warmup_cache_zip
 
@@ -38,7 +38,7 @@ def test_temp_file_created_in_target_directory(tmp_path, monkeypatch) -> None:
         captured_dirs.append(kwargs.get("dir"))
         return real_mkstemp(*args, **kwargs)
 
-    monkeypatch.setattr("aetherdialect._federation.tempfile.mkstemp", tracking_mkstemp)
+    monkeypatch.setattr("tempfile.mkstemp", tracking_mkstemp)
     _write_federation_json_atomic("bare.json", {"k": "v"})
     assert captured_dirs == [str(tmp_path)]
     assert json.loads((tmp_path / "bare.json").read_text(encoding="utf-8")) == {"k": "v"}
@@ -79,19 +79,19 @@ def test_no_partial_file_after_failed_write(
 ) -> None:
     """A failed write must not corrupt or truncate an existing target file."""
     if write_case == "overrides_editor":
-        target = tmp_path / "schema_overrides.json"
+        target = tmp_path / "schema_structure.json"
         good = json.dumps({"tables": {}, "version": 4}, indent=2, sort_keys=True) + "\n"
         target.write_text(good, encoding="utf-8")
-        module = "aetherdialect._core_utils"
+        module = "aetherdialect._utils"
         with _fail_replace_to(target, module), pytest.raises(OSError, match="simulated replace failure"):
-            dump_schema_overrides_to_path(schema_graph, target)
+            dump_structure_to_path(schema_graph, target)
         assert target.read_text(encoding="utf-8") == good
 
     elif write_case == "overrides_sidecar":
         target = tmp_path / "schema_overrides.sidecar.json"
         good = json.dumps({"version": 1, "tables": {}}, indent=2, sort_keys=True) + "\n"
         target.write_text(good, encoding="utf-8")
-        module = "aetherdialect._core_utils"
+        module = "aetherdialect._utils"
         with _fail_replace_to(target, module), pytest.raises(OSError, match="simulated replace failure"):
             _write_overrides_sidecar_payload(
                 target,
@@ -122,7 +122,7 @@ def test_no_partial_file_after_failed_write(
         target = artifacts_dir / WRITE_QUEUE_FILENAME
         good = '{"schema_graph_id": "legacy", "kind": "note"}\n'
         target.write_text(good, encoding="utf-8")
-        module = "aetherdialect._core_utils"
+        module = "aetherdialect._utils"
         with _fail_replace_to(target, module), pytest.raises(OSError, match="simulated replace failure"):
             upgrade_artifacts_schema_graph_id(str(artifacts_dir))
         assert target.read_text(encoding="utf-8") == good
@@ -133,7 +133,7 @@ def test_no_partial_file_after_failed_write(
         target = tmp_path / "federation_manifest.applied.json"
         good = '{"version": 0, "archived": true}\n'
         target.write_text(good, encoding="utf-8")
-        module = "aetherdialect._core_utils"
+        module = "aetherdialect._utils"
         with _fail_replace_to(target, module), pytest.raises(OSError, match="simulated replace failure"):
             archive_federation_editor_file(str(editor))
         assert target.read_text(encoding="utf-8") == good

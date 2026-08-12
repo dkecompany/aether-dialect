@@ -12,10 +12,16 @@ import pytest
 
 from aetherdialect._config import EngineConfig
 from aetherdialect._constants import MIGRATION_MAP_ACTION_REMAP
-from aetherdialect._contracts_base import ColumnRole, MigrationTier, SchemaMigrationMap, SchemaMigrationMapEntry
-from aetherdialect._contracts_core import ConcreteIntent, NormalizedExpr, SelectCol, Template, ValueHistory
+from aetherdialect._contracts_base import (
+    MigrationTier,
+    NormalizedExpr,
+    SchemaMigrationMap,
+    SchemaMigrationMapEntry,
+)
+from aetherdialect._contracts_core import ConcreteIntent, SelectCol, Template, ValueHistory
 from aetherdialect._contracts_schema import (
     ColumnMetadata,
+    ColumnRole,
     SchemaDiff,
     SchemaGraph,
     SQLShape,
@@ -23,10 +29,8 @@ from aetherdialect._contracts_schema import (
     TableMetadata,
     TemplateStats,
 )
-from aetherdialect._core_utils import write_artifact_manifest
-from aetherdialect._templates import (
-    TemplateOps,
-)
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils_artifacts import write_artifact_manifest
 
 
 def _col(name: str, dt: str = "integer", *, pk: bool = False) -> ColumnMetadata:
@@ -176,12 +180,16 @@ def test_apply_schema_migration_map_holds_lock_for_remap_surgery_stamp(tmp_path)
         phases.append(f"stamp_depth_{lock_depth}")
 
     with (
-        patch("aetherdialect._templates.artifact_lock", side_effect=_tracking_lock),
-        patch("aetherdialect._templates.TemplateOps._apply_schema_rename_migration_to_store", side_effect=_remap_track),
-        patch("aetherdialect._templates.TemplateOps.surgical_invalidate_templates_by_diff", side_effect=_surgery_track),
-        patch("aetherdialect._templates.TemplateOps._stamp_manifest", side_effect=_stamp_track),
-        patch("aetherdialect._templates.TemplateOps.apply_structural_migration_from_map"),
-        patch("aetherdialect._templates.migrate_sidecar_for_diff"),
+        patch("aetherdialect._templates_ops.artifact_lock", side_effect=_tracking_lock),
+        patch(
+            "aetherdialect._templates_ops.TemplateOps._apply_schema_rename_migration_to_store", side_effect=_remap_track
+        ),
+        patch(
+            "aetherdialect._templates_ops.TemplateOps.surgical_invalidate_templates_by_diff", side_effect=_surgery_track
+        ),
+        patch("aetherdialect._templates_ops.TemplateOps._stamp_manifest", side_effect=_stamp_track),
+        patch("aetherdialect._templates_ops.TemplateOps.apply_structural_migration_from_map"),
+        patch("aetherdialect._templates_ops.migrate_sidecar_for_diff"),
     ):
         TemplateOps.apply_schema_migration_map(map_obj, str(tmp_path), schema, tmp_path / "schema.json.gz")
 

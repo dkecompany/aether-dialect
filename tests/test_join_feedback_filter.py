@@ -17,7 +17,7 @@ from aetherdialect._contracts_core import (
     SelectCol,
 )
 from aetherdialect._sql_gen import get_join_choice_from_llm
-from aetherdialect._templates import TemplateOps
+from aetherdialect._templates_ops import TemplateOps
 
 
 def _feedback_row(candidate_id: str, *, effective_hash: str = "h") -> dict[str, object]:

@@ -30,7 +30,7 @@ def test_schema_migration_map_read_from_artifacts_dir(tmp_path: Path, monkeypatc
     assert "Path(adir)" in source
 
     observed: list[str] = []
-    from aetherdialect._templates import TemplateOps
+    from aetherdialect._templates_ops import TemplateOps
 
     real_load = TemplateOps.load_schema_migration_map
 
@@ -59,7 +59,7 @@ def test_print_questions_bundle_writes_under_artifacts_dir(tmp_path: Path, monke
     with open(qsim_path, "w", encoding="utf-8") as fh:
         fh.write("1. How many rows?\n")
 
-    with patch("aetherdialect._main_execution.notify"):
+    with patch("aetherdialect._main_init.notify"):
         _main_execution.MainExecutionOps.print_questions_bundle(2, artifacts_dir)
 
     expected = os.path.join(artifacts_dir, "qsim_v2_questions.txt")

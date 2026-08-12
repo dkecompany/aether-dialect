@@ -1,4 +1,4 @@
-"""Schema override migration fixes: scope superset diff, sidecar prune, export round-trip."""
+"""Structure document migration: scope superset diff, sidecar prune, and export round-trip."""
 
 from __future__ import annotations
 
@@ -10,27 +10,26 @@ from unittest.mock import MagicMock
 import pytest
 
 from aetherdialect._config import EngineConfig
-from aetherdialect._constants import SCHEMA_OVERRIDES_VERSION
-from aetherdialect._contracts_base import ArtifactManifest, DescriptionOwner, EngineContext, MigrationTier, RoleOwner
-from aetherdialect._contracts_schema import FKEdge, SchemaGraph, TableMetadata
+from aetherdialect._constants import STRUCTURE_DOCUMENT_VERSION
+from aetherdialect._contracts_base import ArtifactManifest, EngineContext, MigrationTier
+from aetherdialect._contracts_schema import FKEdge, RoleOwner, SchemaDiff, SchemaGraph, TableMetadata
 from aetherdialect._dialect import Dialect
+from aetherdialect._schema_finalize import (
+    apply_diff,
+    apply_structure_to_graph,
+    build_schema_graph_with_diff,
+    dump_structure_edits,
+    load_structure_sidecar,
+    migrate_sidecar_for_diff,
+    reconcile_sidecar_against_graph,
+    save_schema_to_cache,
+    save_structure_sidecar,
+)
 from aetherdialect._schema_graph import (
-    SchemaDiff,
     assign_schema_graph_hashes,
     classify_migration_tier,
     compute_dialect_probe,
     diff_schemas,
-)
-from aetherdialect._schema_overrides import (
-    apply_diff,
-    apply_schema_overrides_to_graph,
-    build_schema_graph_with_diff,
-    dump_schema_overrides_dict,
-    load_overrides_sidecar,
-    migrate_sidecar_for_diff,
-    reconcile_sidecar_against_graph,
-    save_overrides_sidecar,
-    save_schema_to_cache,
 )
 
 pytestmark = [pytest.mark.fast, pytest.mark.usefixtures("stub_schema_llm_classifier")]
@@ -38,7 +37,7 @@ pytestmark = [pytest.mark.fast, pytest.mark.usefixtures("stub_schema_llm_classif
 
 def _ov_doc(**kwargs: Any) -> dict[str, Any]:
     base: dict[str, Any] = {
-        "version": SCHEMA_OVERRIDES_VERSION,
+        "version": STRUCTURE_DOCUMENT_VERSION,
         "tables": {},
         "foreign_keys_add": [],
         "foreign_keys_remove": [],
@@ -106,19 +105,19 @@ def cache_path(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> str:
 
 
 def _stub_schema_build_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("aetherdialect._schema_overrides.finalize_with_overrides", lambda *a, **k: False)
-    monkeypatch.setattr("aetherdialect._schema_overrides.notify_schema_path_health", lambda sg: None)
-    monkeypatch.setattr("aetherdialect._schema_overrides.validate_scope_against_graph", lambda sg, c: None)
-    monkeypatch.setattr("aetherdialect._schema_overrides.raise_if_schema_unusable", lambda sg, c: None)
-    monkeypatch.setattr("aetherdialect._schema_overrides.apply_column_roles_llm", lambda *a, **k: None)
-    monkeypatch.setattr("aetherdialect._schema_overrides.apply_boolean_coercion_pass", lambda sg: None)
-    monkeypatch.setattr("aetherdialect._schema_overrides.assign_column_ops", lambda sg: None)
-    monkeypatch.setattr("aetherdialect._schema_overrides.infer_missing_pks_from_profile", lambda *a, **k: None)
-    monkeypatch.setattr("aetherdialect._schema_overrides.run_fk_inference_if_disconnected", lambda *a, **k: None)
-    monkeypatch.setattr("aetherdialect._schema_overrides.redact_hidden_sensitivity_profile_values", lambda sg: None)
-    monkeypatch.setattr("aetherdialect._schema_overrides.mark_canonical_duplicates", lambda sg: None)
-    monkeypatch.setattr("aetherdialect._schema_overrides.coerce_pk_fk_columns_to_identifier", lambda sg: [])
-    monkeypatch.setattr("aetherdialect._schema_overrides.collapse_redundant_inferences", lambda sg, skipped: 0)
+    monkeypatch.setattr("aetherdialect._schema_finalize.finalize_with_structure", lambda *a, **k: False)
+    monkeypatch.setattr("aetherdialect._schema_finalize.notify_schema_path_health", lambda sg: None)
+    monkeypatch.setattr("aetherdialect._schema_graph.validate_scope_against_graph", lambda sg, c: None)
+    monkeypatch.setattr("aetherdialect._schema_graph.raise_if_schema_unusable", lambda sg, c: None)
+    monkeypatch.setattr("aetherdialect._schema_profile.apply_column_roles_llm", lambda *a, **k: None)
+    monkeypatch.setattr("aetherdialect._schema_profile.apply_boolean_coercion_pass", lambda sg: None)
+    monkeypatch.setattr("aetherdialect._schema_profile.assign_column_ops", lambda sg: None)
+    monkeypatch.setattr("aetherdialect._schema_graph.infer_missing_pks_from_profile", lambda *a, **k: None)
+    monkeypatch.setattr("aetherdialect._schema_graph.run_fk_inference_if_disconnected", lambda *a, **k: None)
+    monkeypatch.setattr("aetherdialect._schema_graph.redact_hidden_sensitivity_profile_values", lambda sg: None)
+    monkeypatch.setattr("aetherdialect._schema_graph.mark_canonical_duplicates", lambda sg: None)
+    monkeypatch.setattr("aetherdialect._schema_finalize.coerce_pk_fk_columns_to_identifier", lambda sg: [])
+    monkeypatch.setattr("aetherdialect._schema_graph.collapse_redundant_inferences", lambda sg, skipped: 0)
 
 
 def _save_cached(
@@ -195,11 +194,11 @@ def test_sidecar_pruned_after_partial_rebuild_drop(
     schema_graph.tables["ghost"] = ghost_tbl
     sidecar_doc = _ov_doc(
         tables={
-            "ghost": {"description": "stale override"},
-            "orders": {"description": {"value": "keep me", "owner": "user"}},
+            "ghost": {"role": "dimension"},
+            "orders": {"role": {"value": "dimension", "owner": "user"}},
         },
     )
-    save_overrides_sidecar(
+    save_structure_sidecar(
         cache_path,
         sidecar_doc,
         source_schema_hash="h",
@@ -219,7 +218,7 @@ def test_sidecar_pruned_after_partial_rebuild_drop(
             return None
 
     apply_diff(schema_graph, new_sg, diff, _FakeDialect(), schema_json_path=cache_path)
-    loaded = load_overrides_sidecar(cache_path)
+    loaded = load_structure_sidecar(cache_path)
     assert loaded is not None
     assert "ghost" not in loaded.get("tables", {})
     assert "orders" in loaded.get("tables", {})
@@ -230,9 +229,9 @@ def test_migration_map_reconcile_prunes_dropped_sidecar_entries(
     schema_graph: SchemaGraph, cache_path: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """REMAP migration path must reconcile sidecar entries for dropped objects."""
-    save_overrides_sidecar(
+    save_structure_sidecar(
         cache_path,
-        _ov_doc(tables={"ghost": {"description": "gone"}}),
+        _ov_doc(tables={"ghost": {"role": "dimension"}}),
         source_schema_hash="h",
         metadata_hash="m",
     )
@@ -242,7 +241,7 @@ def test_migration_map_reconcile_prunes_dropped_sidecar_entries(
     diff = SchemaDiff(dropped_tables=("ghost",))
     migrate_sidecar_for_diff(cache_path, diff)
     reconcile_sidecar_against_graph(new_sg, cache_path)
-    loaded = load_overrides_sidecar(cache_path)
+    loaded = load_structure_sidecar(cache_path)
     assert loaded is not None
     assert "ghost" not in loaded.get("tables", {})
 
@@ -251,14 +250,15 @@ def test_migration_map_reconcile_prunes_dropped_sidecar_entries(
 def test_export_only_includes_overridden_tables(schema_graph: SchemaGraph, monkeypatch: pytest.MonkeyPatch) -> None:
     """Export must include only tables/columns with user overrides, not the full graph."""
     monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
-    apply_schema_overrides_to_graph(
+    apply_structure_to_graph(
         schema_graph,
-        _ov_doc(tables={"orders": {"description": {"value": "User order text.", "owner": "user"}}}),
+        _ov_doc(tables={"orders": {"role": {"value": "dimension", "owner": "user"}}}),
     )
-    exported = dump_schema_overrides_dict(schema_graph)
+    exported = dump_structure_edits(schema_graph)
     assert set(exported["tables"].keys()) == {"orders"}
     assert "customers" not in exported["tables"]
     assert "products" not in exported["tables"]
+    assert "description" not in exported["tables"]["orders"]
 
 
 @pytest.mark.fast
@@ -267,27 +267,25 @@ def test_export_edit_apply_export_preserves_user_provenance(
 ) -> None:
     """Export → edit → apply → export must preserve user authorship."""
     monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
-    apply_schema_overrides_to_graph(
+    apply_structure_to_graph(
         schema_graph,
         _ov_doc(
             tables={
                 "orders": {
-                    "description": {"value": "Round trip.", "owner": "user"},
                     "role": {"value": "dimension", "owner": "user"},
                 }
             }
         ),
     )
-    first = dump_schema_overrides_dict(schema_graph)
+    first = dump_structure_edits(schema_graph)
     fresh = deepcopy(schema_graph)
     for tbl in fresh.tables.values():
-        tbl.description_owner = DescriptionOwner.CATALOG
         tbl.role_owner = RoleOwner.CATALOG
-    apply_schema_overrides_to_graph(fresh, first)
-    second = dump_schema_overrides_dict(fresh)
-    assert second["tables"]["orders"]["description"]["owner"] == "user"
+    apply_structure_to_graph(fresh, first)
+    second = dump_structure_edits(fresh)
+    assert "description" not in second["tables"]["orders"]
     assert second["tables"]["orders"]["role"]["owner"] == "user"
-    assert fresh.tables["orders"].description_owner == DescriptionOwner.USER_OVERRIDE
+    assert fresh.tables["orders"].role_owner == RoleOwner.USER_OVERRIDE
 
 
 @pytest.mark.fast
@@ -307,7 +305,7 @@ def test_export_persists_fk_pk_removal_lists(schema_graph: SchemaGraph, monkeypa
         )
         inferred = [schema_graph.tables["orders"].foreign_keys[-1]]
     fk = inferred[0]
-    apply_schema_overrides_to_graph(
+    apply_structure_to_graph(
         schema_graph,
         _ov_doc(
             foreign_keys_remove=[
@@ -318,7 +316,7 @@ def test_export_persists_fk_pk_removal_lists(schema_graph: SchemaGraph, monkeypa
             ],
         ),
     )
-    exported = dump_schema_overrides_dict(schema_graph)
+    exported = dump_structure_edits(schema_graph)
     assert exported["foreign_keys_remove"]
     assert isinstance(exported["primary_keys_remove"], list)
 
@@ -327,16 +325,16 @@ def test_export_persists_fk_pk_removal_lists(schema_graph: SchemaGraph, monkeypa
 def test_apply_ignores_readonly_envelope_edits(schema_graph: SchemaGraph, monkeypatch: pytest.MonkeyPatch) -> None:
     """Mutations under _readonly must not be applied."""
     monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
-    exported = dump_schema_overrides_dict(schema_graph)
-    original_desc = schema_graph.tables["orders"].description or ""
+    exported = dump_structure_edits(schema_graph)
+    original_role = schema_graph.tables["orders"].role
     readonly = exported.setdefault("_readonly", {})
     tables_current = list(readonly.get("tables_current", []))
     for rec in tables_current:
         if rec.get("name") == "orders":
-            rec["description"] = "READONLY INJECTION"
+            rec["role"] = "READONLY_INJECTION"
     readonly["tables_current"] = tables_current
-    apply_schema_overrides_to_graph(schema_graph, exported)
-    assert (schema_graph.tables["orders"].description or "") == original_desc
+    apply_structure_to_graph(schema_graph, exported)
+    assert schema_graph.tables["orders"].role == original_role
 
 
 @pytest.mark.fast
@@ -351,7 +349,7 @@ def test_foreign_keys_add_refuses_resurrected_catalog_edge(
     schema_graph.tables["orders"].foreign_keys = [
         e for e in schema_graph.tables["orders"].foreign_keys if e.inference_tag is not None
     ]
-    report = apply_schema_overrides_to_graph(
+    report = apply_structure_to_graph(
         schema_graph,
         _ov_doc(
             foreign_keys_add=[{"from": from_str, "to": to_str, "kind": "structural"}],
@@ -376,7 +374,7 @@ def test_user_fk_addition_does_not_change_effective_structural_hash(
     ctx = EngineContext()
     assign_schema_graph_hashes(schema_graph, ctx, "")
     before = schema_graph.effective_structural_hash
-    apply_schema_overrides_to_graph(
+    apply_structure_to_graph(
         schema_graph,
         _ov_doc(
             foreign_keys_add=[
@@ -402,7 +400,7 @@ def test_user_pk_addition_does_not_change_effective_structural_hash(
     schema_graph.tables["orders"].primary_key = ["order_id"]
     assign_schema_graph_hashes(schema_graph, ctx, "")
     before = schema_graph.effective_structural_hash
-    apply_schema_overrides_to_graph(
+    apply_structure_to_graph(
         schema_graph,
         _ov_doc(primary_keys_add=[{"table": "orders", "column": "status"}]),
     )

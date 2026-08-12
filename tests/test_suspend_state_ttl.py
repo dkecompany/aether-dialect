@@ -8,7 +8,8 @@ from types import SimpleNamespace
 import pytest
 
 from aetherdialect._contracts_base import SuspendedSessionExpiredError
-from aetherdialect._main_execution import PipelineSession, PipelineSuspended
+from aetherdialect._contracts_core import PipelineSuspended
+from aetherdialect._main_session import PipelineSession
 
 
 @pytest.mark.fast

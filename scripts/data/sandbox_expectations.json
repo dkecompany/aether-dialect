@@ -1,5 +1,5 @@
 {
-  "version": "0.2.1",
+  "version": "0.2.3",
   "slots": [
     {
       "slot_id": "owner:writer:How many items are in the catalog by item type?",
@@ -282,9 +282,13 @@
         "terminal_status": "ok",
         "sql_required": true,
         "grain": "scalar",
-        "must_tables": [],
+        "must_tables": [
+          "item"
+        ],
         "must_where": [],
-        "sql_contains": [],
+        "sql_contains": [
+          "rental_duration"
+        ],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
@@ -1156,9 +1160,13 @@
         "terminal_status": "ok",
         "sql_required": true,
         "grain": "scalar",
-        "must_tables": [],
+        "must_tables": [
+          "item"
+        ],
         "must_where": [],
-        "sql_contains": [],
+        "sql_contains": [
+          "rental_duration"
+        ],
         "forbidden_sql_tokens": [],
         "contains_join": null
       }
@@ -1691,8 +1699,8 @@
       }
     },
     {
-      "slot_id": "owner:writer:catalog",
-      "question": "catalog",
+      "slot_id": "owner:writer:member_spaces",
+      "question": "member_spaces",
       "kind": "space",
       "profile": "feedback",
       "mode": null,
@@ -1776,14 +1784,14 @@
       "mode": null,
       "tier": "federation",
       "expect": {
-        "terminal_status": "ok",
-        "sql_required": true,
-        "grain": "row_level",
+        "terminal_status": "error",
+        "sql_required": false,
+        "grain": "none",
         "must_tables": [],
         "must_where": [],
         "sql_contains": [],
         "forbidden_sql_tokens": [],
-        "contains_join": null
+        "validation_failure": true
       }
     },
     {

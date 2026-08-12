@@ -9,7 +9,7 @@ import sys
 import pytest
 
 _SUBPROCESS_SNIPPET = """
-from aetherdialect._core_utils import stable_bucket
+from aetherdialect._utils import stable_bucket
 from aetherdialect._contracts_schema import ValueDomain
 from aetherdialect._qsim import _sample_categorical
 

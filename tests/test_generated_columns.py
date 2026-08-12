@@ -6,9 +6,8 @@ import json
 
 import pytest
 
-from aetherdialect._constants import COMPOSE_FIELDS, GROUND_FIELDS, SCHEMA_FIELD_DERIVED
-from aetherdialect._contracts_base import PkInferenceTag
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
+from aetherdialect._constants_runtime import COMPOSE_FIELDS, GROUND_FIELDS, SCHEMA_FIELD_DERIVED
+from aetherdialect._contracts_schema import ColumnMetadata, PkInferenceTag, SchemaGraph, TableMetadata
 from aetherdialect._schema_graph import infer_missing_fks, infer_missing_pks_from_profile
 
 

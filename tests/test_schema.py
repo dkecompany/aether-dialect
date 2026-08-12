@@ -5,30 +5,16 @@ from __future__ import annotations
 import pytest
 
 from aetherdialect._config import PolicyConfig
-from aetherdialect._constants import SCHEMA_OVERRIDES_VERSION
-from aetherdialect._contracts_base import (
-    ColumnRole,
-    EngineContext,
-    SchemaAccessError,
-    TableRole,
-)
+from aetherdialect._constants import STRUCTURE_DOCUMENT_VERSION
+from aetherdialect._contracts_base import EngineContext, SchemaAccessError, SensitivityClassification
 from aetherdialect._contracts_schema import (
     ColumnMetadata,
+    ColumnRole,
     FKEdge,
     SchemaGraph,
     SchemaLimits,
     TableMetadata,
-)
-from aetherdialect._core_utils import schema_hash_fp
-from aetherdialect._schema_build import (
-    fingerprint_tables_after_document_round_trip,
-    first_table_where_stable_json_differs,
-    load_or_create_schema_postgresql,
-    merge_ddl_foreign_keys_into_schema_graph,
-    resolve_graph_table_name,
-    schema_cache_json_blob,
-    tables_meta_to_schema_graph,
-    tables_payload_through_model_round_trip,
+    TableRole,
 )
 from aetherdialect._schema_graph import (
     _analyze_fk_path_topology,
@@ -52,6 +38,17 @@ from aetherdialect._schema_graph import (
     table_to_dict,
     validate_scope_against_graph,
 )
+from aetherdialect._schema_reflect import (
+    fingerprint_tables_after_document_round_trip,
+    first_table_where_stable_json_differs,
+    load_or_create_schema_postgresql,
+    merge_ddl_foreign_keys_into_schema_graph,
+    resolve_graph_table_name,
+    schema_cache_json_blob,
+    tables_meta_to_schema_graph,
+    tables_payload_through_model_round_trip,
+)
+from aetherdialect._utils import schema_hash_fp
 
 
 def _col(**overrides) -> ColumnMetadata:
@@ -88,9 +85,9 @@ def _table(name, columns, **overrides) -> TableMetadata:
 
 
 def _ov_doc(**kwargs) -> dict:
-    """Minimal valid v4 overrides document for :func:`apply_schema_overrides_to_graph` tests."""
+    """Minimal valid v4 overrides document for :func:`apply_structure_to_graph` tests."""
     base: dict = {
-        "version": SCHEMA_OVERRIDES_VERSION,
+        "version": STRUCTURE_DOCUMENT_VERSION,
         "tables": {},
         "foreign_keys_add": [],
         "foreign_keys_remove": [],
@@ -602,7 +599,7 @@ class TestInferMissingFks:
         assert any(e.src_table == "order_line" and e.dst_table == "customer_v" for e in inferred)
 
     def test_same_name_column_without_suffix_does_not_infer(self):
-        """Same-name-as-PK inference was removed; only suffix heuristics apply."""
+        """Same-name-as-PK columns do not infer FKs; only suffix heuristics apply."""
         tables = {
             "product": _table(
                 "product",
@@ -1095,8 +1092,8 @@ class TestTablesMetaToSchemaGraph:
             },
         }
         sg = tables_meta_to_schema_graph(meta)
-        assert sg.schema_hash
-        assert isinstance(sg.schema_hash, str)
+        assert sg.effective_structural_hash
+        assert isinstance(sg.effective_structural_hash, str)
 
     def test_fk_marks_column_as_foreign_key(self):
         """FK columns should have is_foreign_key=True and fk_target set."""
@@ -1194,7 +1191,16 @@ class TestComputeSchemaStatsEdgeCases:
 
     def test_no_filterable_columns_anywhere(self):
         """When no column is filterable, min_filterable stays 0 and list is empty."""
-        t = _table("t", {"c": _col(name="user_password", role=ColumnRole.CATEGORICAL.value)})
+        t = _table(
+            "t",
+            {
+                "c": _col(
+                    name="user_password",
+                    role=ColumnRole.CATEGORICAL.value,
+                    sensitivity=SensitivityClassification.RESTRICTED,
+                )
+            },
+        )
         sg = SchemaGraph(tables={"t": t}, join_paths_multi={}, effective_structural_hash="x")
         stats = compute_schema_stats(sg)
         assert stats["total_filterable"] == 0
@@ -1279,9 +1285,9 @@ class TestMergeDdlForeignKeys:
             },
         }
         sg = tables_meta_to_schema_graph(meta)
-        h_before = sg.schema_hash
+        h_before = sg.effective_structural_hash
         merge_ddl_foreign_keys_into_schema_graph(sg, {})
-        assert sg.schema_hash == h_before
+        assert sg.effective_structural_hash == h_before
         merge_ddl_foreign_keys_into_schema_graph(
             SchemaGraph(tables={}, join_paths_multi={}, effective_structural_hash="z"),
             {"t": {"foreign_keys": [{"src_cols": ["id"], "dst_table": "t", "dst_cols": ["id"]}]}},
@@ -1448,7 +1454,7 @@ class TestLoadOrCreateSchemaPostgresqlDdlMerge:
         baseline = tables_meta_to_schema_graph(tables_meta)
 
         monkeypatch.setattr(
-            "aetherdialect._schema_build._reflect_schema",
+            "aetherdialect._schema_reflect._reflect_schema",
             lambda *a, **k: baseline,
         )
 
@@ -1463,7 +1469,7 @@ class TestLoadOrCreateSchemaPostgresqlDdlMerge:
                 ]
             }
         }
-        monkeypatch.setattr("aetherdialect._schema_build.parse_sql_file", lambda _p, **_kw: ddl)
+        monkeypatch.setattr("aetherdialect._schema_reflect.parse_sql_file", lambda _p, **_kw: ddl)
 
         sg = load_or_create_schema_postgresql(None, include="tables", sql_file=str(sql_path))
         assert len(sg.tables["child"].foreign_keys) == 1
@@ -1482,15 +1488,15 @@ class TestLoadOrCreateSchemaPostgresqlDdlMerge:
         }
         baseline = tables_meta_to_schema_graph(tables_meta)
         monkeypatch.setattr(
-            "aetherdialect._schema_build._reflect_schema",
+            "aetherdialect._schema_reflect._reflect_schema",
             lambda *a, **k: baseline,
         )
         monkeypatch.setattr(
-            "aetherdialect._schema_build.enrich_postgresql_partition_columns",
+            "aetherdialect._schema_reflect.enrich_postgresql_partition_columns",
             lambda *a, **k: None,
         )
         ddl = {"events": {"partition_columns": ["dt"]}}
-        monkeypatch.setattr("aetherdialect._schema_build.parse_sql_file", lambda _p, **_kw: ddl)
+        monkeypatch.setattr("aetherdialect._schema_reflect.parse_sql_file", lambda _p, **_kw: ddl)
 
         sg = load_or_create_schema_postgresql(None, include="tables", sql_file=str(sql_path))
         assert sg.tables["events"].partition_columns == ["dt"]
@@ -2236,25 +2242,25 @@ class TestMarkCanonicalDuplicates:
 
 
 class TestSchemaOverrideNullSkipAndPrune:
-    """Null description/role keys are dropped from the overrides document; invalid roles notify and prune."""
+    """Null role keys are dropped from the overrides document; invalid roles notify and prune."""
 
-    def test_null_column_description_and_role_removed_from_document(self, schema_graph, monkeypatch):
-        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
+    def test_null_column_description_and_role_omitted_from_document(self, schema_graph, monkeypatch):
+        from aetherdialect._schema_finalize import apply_structure_to_graph
 
         monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
         doc = _ov_doc(
-            tables={"orders": {"columns": {"amount": {"description": None, "role": None}}}},
+            tables={"orders": {"columns": {"amount": {"role": None}}}},
         )
-        apply_schema_overrides_to_graph(schema_graph, doc)
+        apply_structure_to_graph(schema_graph, doc)
         assert "orders" not in (doc.get("tables") or {})
 
     def test_invalid_table_role_pruned(self, schema_graph, monkeypatch):
-        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
+        from aetherdialect._schema_finalize import apply_structure_to_graph
 
         monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
         prev = schema_graph.tables["orders"].role
         doc = _ov_doc(tables={"orders": {"role": "not_a_table_role"}})
-        report = apply_schema_overrides_to_graph(schema_graph, doc)
+        report = apply_structure_to_graph(schema_graph, doc)
         assert schema_graph.tables["orders"].role == prev
         assert "orders" not in (doc.get("tables") or {})
         assert any(s.code == "invalid_role_override" for s in report.skipped)
@@ -2262,27 +2268,27 @@ class TestSchemaOverrideNullSkipAndPrune:
     def test_save_sidecar_reflects_pruned_document(self, schema_graph, monkeypatch, tmp_path):
         import json
 
-        from aetherdialect._constants import SCHEMA_OVERRIDES_SIDECAR_FILENAME
-        from aetherdialect._schema_overrides import (
-            apply_schema_overrides_to_graph,
+        from aetherdialect._constants import STRUCTURE_SIDECAR_FILENAME
+        from aetherdialect._schema_finalize import (
+            apply_structure_to_graph,
             compute_metadata_hash,
-            save_overrides_sidecar,
+            save_structure_sidecar,
         )
 
         monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
         cache_path = tmp_path / "schema.json.gz"
         cache_path.write_bytes(b"x")
         doc = _ov_doc(
-            tables={"orders": {"columns": {"amount": {"role": None, "description": None}}}},
+            tables={"orders": {"columns": {"amount": {"role": None}}}},
         )
-        apply_schema_overrides_to_graph(schema_graph, doc)
-        save_overrides_sidecar(
+        apply_structure_to_graph(schema_graph, doc)
+        save_structure_sidecar(
             cache_path,
             doc,
             source_schema_hash=schema_graph.effective_structural_hash,
             metadata_hash=compute_metadata_hash(schema_graph),
         )
-        side_path = tmp_path / SCHEMA_OVERRIDES_SIDECAR_FILENAME
+        side_path = tmp_path / STRUCTURE_SIDECAR_FILENAME
         assert side_path.is_file()
         raw = json.loads(side_path.read_text(encoding="utf-8"))
         assert "orders" not in (raw.get("tables") or {})
@@ -2292,26 +2298,26 @@ class TestSchemaOverrides:
     """JSON-roundtrip user editing of the built schema graph."""
 
     def test_dump_dict_round_trips_current_state(self, schema_graph):
-        from aetherdialect._constants import SCHEMA_OVERRIDES_VERSION
-        from aetherdialect._schema_overrides import dump_schema_overrides_dict
+        from aetherdialect._constants import STRUCTURE_DOCUMENT_VERSION
+        from aetherdialect._schema_finalize import dump_structure_edits
 
-        d = dump_schema_overrides_dict(schema_graph)
-        assert d["version"] == SCHEMA_OVERRIDES_VERSION
+        d = dump_structure_edits(schema_graph)
+        assert d["version"] == STRUCTURE_DOCUMENT_VERSION
         assert set(d["tables"].keys()) == set()
         readonly_tables = {row["name"] for row in d["_readonly"]["tables_current"]}
         assert readonly_tables == {"customers", "orders", "products"}
         for row in d["_readonly"]["tables_current"]:
             assert "role" in row
-            assert "description" in row
+            assert "description" not in row
         assert d["foreign_keys_add"] == []
 
     def test_dump_to_path_replaces_existing_atomically(self, schema_graph, tmp_path):
-        from aetherdialect._schema_overrides import dump_schema_overrides_to_path
+        from aetherdialect._schema_finalize import dump_structure_to_path
 
         target = tmp_path / "ov.json"
-        first = dump_schema_overrides_to_path(schema_graph, target)
+        first = dump_structure_to_path(schema_graph, target)
         assert first.is_file()
-        second = dump_schema_overrides_to_path(schema_graph, target)
+        second = dump_structure_to_path(schema_graph, target)
         assert second == first
         assert second.is_file()
 
@@ -2320,39 +2326,39 @@ class TestSchemaOverrides:
 
         import pytest
 
-        from aetherdialect._schema_overrides import load_schema_overrides_file
+        from aetherdialect._schema_finalize import load_structure_document_file
 
         path = tmp_path / "bad.json"
         path.write_text(json.dumps({"version": 999, "tables": {}, "foreign_keys_add": []}))
         with pytest.raises(ValueError, match="version"):
-            load_schema_overrides_file(path)
+            load_structure_document_file(path)
 
     def test_load_rejects_unknown_top_level_key(self, tmp_path):
         import json as json
 
         import pytest
 
-        from aetherdialect._constants import SCHEMA_OVERRIDES_VERSION
-        from aetherdialect._schema_overrides import load_schema_overrides_file
+        from aetherdialect._constants import STRUCTURE_DOCUMENT_VERSION
+        from aetherdialect._schema_finalize import load_structure_document_file
 
         path = tmp_path / "bad.json"
-        path.write_text(json.dumps({"version": SCHEMA_OVERRIDES_VERSION, "tables": {}, "synonyms": {}}))
+        path.write_text(json.dumps({"version": STRUCTURE_DOCUMENT_VERSION, "tables": {}, "synonyms": {}}))
         with pytest.raises(ValueError, match="unsupported top-level"):
-            load_schema_overrides_file(path)
+            load_structure_document_file(path)
 
     def test_load_rejects_bad_role_enum(self, tmp_path):
         import json as json
 
         import pytest
 
-        from aetherdialect._constants import SCHEMA_OVERRIDES_VERSION
-        from aetherdialect._schema_overrides import load_schema_overrides_file
+        from aetherdialect._constants import STRUCTURE_DOCUMENT_VERSION
+        from aetherdialect._schema_finalize import load_structure_document_file
 
         path = tmp_path / "bad.json"
         path.write_text(
             json.dumps(
                 {
-                    "version": SCHEMA_OVERRIDES_VERSION,
+                    "version": STRUCTURE_DOCUMENT_VERSION,
                     "tables": {
                         "orders": {
                             "columns": {
@@ -2367,21 +2373,21 @@ class TestSchemaOverrides:
             )
         )
         with pytest.raises(ValueError, match="role"):
-            load_schema_overrides_file(path)
+            load_structure_document_file(path)
 
     def test_load_rejects_description_owner_key(self, tmp_path):
         import json as json
 
         import pytest
 
-        from aetherdialect._constants import SCHEMA_OVERRIDES_VERSION
-        from aetherdialect._schema_overrides import load_schema_overrides_file
+        from aetherdialect._constants import STRUCTURE_DOCUMENT_VERSION
+        from aetherdialect._schema_finalize import load_structure_document_file
 
         path = tmp_path / "bad.json"
         path.write_text(
             json.dumps(
                 {
-                    "version": SCHEMA_OVERRIDES_VERSION,
+                    "version": STRUCTURE_DOCUMENT_VERSION,
                     "tables": {
                         "orders": {
                             "description": {
@@ -2394,55 +2400,50 @@ class TestSchemaOverrides:
                 }
             )
         )
-        with pytest.raises(ValueError, match="engine-managed"):
-            load_schema_overrides_file(path)
+        with pytest.raises(ValueError, match=r"apply_knowledge"):
+            load_structure_document_file(path)
 
-    def test_apply_accepts_bare_string_description_and_envelope_value_only(self, schema_graph, monkeypatch):
-        from aetherdialect._contracts_base import DescriptionOwner
-        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
+    def test_apply_accepts_bare_string_description_and_envelope_value_only(self, schema_graph, monkeypatch, tmp_path):
+        from aetherdialect._schema_finalize import load_structure_document_file
 
         monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
+        path = tmp_path / "bad.json"
+        import json as json
 
-        apply_schema_overrides_to_graph(
-            schema_graph,
-            _ov_doc(tables={"orders": {"description": "Bare human text."}}),
-        )
-        assert schema_graph.tables["orders"].description == "Bare human text."
-        assert schema_graph.tables["orders"].description_owner == DescriptionOwner.USER_OVERRIDE
-
-        apply_schema_overrides_to_graph(
-            schema_graph,
-            _ov_doc(tables={"orders": {"description": {"value": "Envelope without owner."}}}),
-        )
-        assert schema_graph.tables["orders"].description == "Envelope without owner."
+        path.write_text(json.dumps(_ov_doc(tables={"orders": {"description": "Bare human text."}})))
+        with pytest.raises(ValueError, match=r"apply_knowledge"):
+            load_structure_document_file(path)
+        path.write_text(json.dumps(_ov_doc(tables={"orders": {"description": {"value": "Envelope without owner."}}})))
+        with pytest.raises(ValueError, match=r"apply_knowledge"):
+            load_structure_document_file(path)
 
     def test_load_rejects_bad_sensitivity(self, tmp_path):
         import json as json
 
         import pytest
 
-        from aetherdialect._constants import SCHEMA_OVERRIDES_VERSION
-        from aetherdialect._schema_overrides import load_schema_overrides_file
+        from aetherdialect._constants import STRUCTURE_DOCUMENT_VERSION
+        from aetherdialect._schema_finalize import load_structure_document_file
 
         path = tmp_path / "bad.json"
         path.write_text(
             json.dumps(
                 {
-                    "version": SCHEMA_OVERRIDES_VERSION,
+                    "version": STRUCTURE_DOCUMENT_VERSION,
                     "tables": {"customers": {"columns": {"email": {"sensitivity": "secret"}}}},
                     "foreign_keys_add": [],
                 }
             )
         )
         with pytest.raises(ValueError, match="sensitivity"):
-            load_schema_overrides_file(path)
+            load_structure_document_file(path)
 
     def test_apply_sensitivity_pii_value_is_rejected(self, schema_graph, monkeypatch):
-        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
+        from aetherdialect._schema_finalize import apply_structure_to_graph
 
         monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
         prev_sensitivity = schema_graph.tables["customers"].columns["email"].sensitivity
-        report = apply_schema_overrides_to_graph(
+        report = apply_structure_to_graph(
             schema_graph,
             _ov_doc(
                 tables={"customers": {"columns": {"email": {"sensitivity": "pii"}}}},
@@ -2455,32 +2456,32 @@ class TestSchemaOverrides:
         assert len(report.skipped) == 1
         assert report.skipped[0].reason == "invalid sensitivity value"
 
-    def test_apply_legacy_pii_key_is_rejected(self, tmp_path):
+    def test_apply_pii_key_is_rejected(self, tmp_path):
         import json as json
 
         import pytest
 
-        from aetherdialect._constants import SCHEMA_OVERRIDES_VERSION
-        from aetherdialect._schema_overrides import load_schema_overrides_file
+        from aetherdialect._constants import STRUCTURE_DOCUMENT_VERSION
+        from aetherdialect._schema_finalize import load_structure_document_file
 
         path = tmp_path / "bad.json"
         path.write_text(
             json.dumps(
                 {
-                    "version": SCHEMA_OVERRIDES_VERSION,
+                    "version": STRUCTURE_DOCUMENT_VERSION,
                     "tables": {"customers": {"columns": {"email": {"pii": True}}}},
                     "foreign_keys_add": [],
                 }
             )
         )
         with pytest.raises(ValueError, match=r"unsupported keys.*'pii'"):
-            load_schema_overrides_file(path)
+            load_structure_document_file(path)
 
     def test_apply_role_override(self, schema_graph, monkeypatch):
-        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
+        from aetherdialect._schema_finalize import apply_structure_to_graph
 
         monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
-        report = apply_schema_overrides_to_graph(
+        report = apply_structure_to_graph(
             schema_graph,
             _ov_doc(
                 tables={
@@ -2493,7 +2494,7 @@ class TestSchemaOverrides:
 
     def test_user_role_override_incompatible_with_value_type_is_discarded(self, schema_graph, monkeypatch):
         """Invalid role vs ``value_type`` is skipped with notify; graph and persisted doc omit the role key."""
-        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
+        from aetherdialect._schema_finalize import apply_structure_to_graph
 
         monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
         prev_role = schema_graph.tables["orders"].columns["amount"].role
@@ -2502,7 +2503,7 @@ class TestSchemaOverrides:
                 "orders": {"columns": {"amount": {"role": _orole(ColumnRole.TEMPORAL.value)}}},
             },
         )
-        report = apply_schema_overrides_to_graph(schema_graph, doc)
+        report = apply_structure_to_graph(schema_graph, doc)
         assert schema_graph.tables["orders"].columns["amount"].role == prev_role
         assert any("incompatible" in s.reason for s in report.skipped)
         tbls = doc.get("tables") or {}
@@ -2516,28 +2517,28 @@ class TestSchemaOverrides:
 
         import pytest
 
-        from aetherdialect._constants import SCHEMA_OVERRIDES_VERSION
-        from aetherdialect._schema_overrides import load_schema_overrides_file
+        from aetherdialect._constants import STRUCTURE_DOCUMENT_VERSION
+        from aetherdialect._schema_finalize import load_structure_document_file
 
         monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
         path = tmp_path / "bad.json"
         path.write_text(
             json.dumps(
                 {
-                    "version": SCHEMA_OVERRIDES_VERSION,
+                    "version": STRUCTURE_DOCUMENT_VERSION,
                     "tables": {"customers": {"columns": {"customer_id": {"is_selectable": False}}}},
                     "foreign_keys_add": [],
                 }
             )
         )
         with pytest.raises(ValueError, match=r"unsupported keys.*'is_selectable'"):
-            load_schema_overrides_file(path)
+            load_structure_document_file(path)
 
     def test_apply_unknown_table_and_column_skipped(self, schema_graph, monkeypatch):
-        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
+        from aetherdialect._schema_finalize import apply_structure_to_graph
 
         monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
-        report = apply_schema_overrides_to_graph(
+        report = apply_structure_to_graph(
             schema_graph,
             _ov_doc(
                 tables={
@@ -2551,7 +2552,7 @@ class TestSchemaOverrides:
         assert "unknown column" in reasons
 
     def test_apply_fk_add_valid_creates_edge(self, schema_graph, monkeypatch):
-        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
+        from aetherdialect._schema_finalize import apply_structure_to_graph
 
         schema_graph.tables["store"] = TableMetadata(
             name="store",
@@ -2586,7 +2587,7 @@ class TestSchemaOverrides:
 
         monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
         before = len(schema_graph.tables["customers"].foreign_keys)
-        report = apply_schema_overrides_to_graph(
+        report = apply_structure_to_graph(
             schema_graph,
             _ov_doc(
                 foreign_keys_add=[
@@ -2606,10 +2607,10 @@ class TestSchemaOverrides:
         assert schema_graph.tables["customers"].columns["store_id"].is_foreign_key is True
 
     def test_apply_fk_add_unknown_endpoint_skipped(self, schema_graph, monkeypatch):
-        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
+        from aetherdialect._schema_finalize import apply_structure_to_graph
 
         monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
-        report = apply_schema_overrides_to_graph(
+        report = apply_structure_to_graph(
             schema_graph,
             _ov_doc(
                 foreign_keys_add=[
@@ -2624,53 +2625,39 @@ class TestSchemaOverrides:
         assert report.fks_added == 0
         assert any("unknown destination table" in s.reason for s in report.skipped)
 
-    def test_apply_description_uses_llm_when_enabled(self, schema_graph, monkeypatch):
+    def test_apply_description_uses_llm_when_enabled(self, schema_graph, monkeypatch, tmp_path):
         import json as json
 
-        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
+        from aetherdialect._schema_finalize import load_structure_document_file
 
         monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: True)
-
-        def _fake_llm_chat(system, user, task):
-            assert task == "default"
-            return json.dumps(
-                {
-                    "items": [
-                        {
-                            "path": "tables.orders.description",
-                            "text": "REFINED text for orders.",
-                        }
-                    ]
-                }
+        path = tmp_path / "bad.json"
+        path.write_text(
+            json.dumps(
+                _ov_doc(
+                    tables={
+                        "orders": {"description": _odesc("Orders placed by customers; raw human text.")},
+                    },
+                )
             )
-
-        monkeypatch.setattr("aetherdialect._schema_overrides.LLMProvider.chat", _fake_llm_chat)
-        report = apply_schema_overrides_to_graph(
-            schema_graph,
-            _ov_doc(
-                tables={
-                    "orders": {"description": _odesc("Orders placed by customers; raw human text.")},
-                },
-            ),
         )
-        assert report.table_edits == 1
-        assert report.descriptions_refined == 1
-        assert schema_graph.tables["orders"].description == "REFINED text for orders."
+        with pytest.raises(ValueError, match=r"apply_knowledge"):
+            load_structure_document_file(path)
 
     def test_round_trip_dump_and_apply_no_changes(self, schema_graph, monkeypatch, tmp_path):
-        from aetherdialect._schema_overrides import (
-            apply_schema_overrides_to_graph,
-            dump_schema_overrides_dict,
-            load_schema_overrides_file,
+        from aetherdialect._schema_finalize import (
+            apply_structure_to_graph,
+            dump_structure_edits,
+            load_structure_document_file,
         )
 
         monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
         path = tmp_path / "ov.json"
         import json as json
 
-        path.write_text(json.dumps(dump_schema_overrides_dict(schema_graph)))
-        loaded = load_schema_overrides_file(path)
-        report = apply_schema_overrides_to_graph(schema_graph, loaded)
+        path.write_text(json.dumps(dump_structure_edits(schema_graph)))
+        loaded = load_structure_document_file(path)
+        report = apply_structure_to_graph(schema_graph, loaded)
         assert report.table_edits == 0
         assert report.column_edits == 0
         assert report.fks_added == 0
@@ -2678,13 +2665,13 @@ class TestSchemaOverrides:
 
 
 @pytest.mark.usefixtures("stub_schema_llm_classifier")
-class TestBundleI:
-    """Bundle I — schema layer model: drift-safe FK merge, sidecar, denylists, readonly snapshot."""
+class TestStructureSidecarModel:
+    """Structure sidecar model: drift-safe FK merge, denylists, and readonly snapshot."""
 
     def test_dump_includes_readonly_envelope_and_denylists(self, schema_graph):
-        from aetherdialect._schema_overrides import dump_schema_overrides_dict
+        from aetherdialect._schema_finalize import dump_structure_edits
 
-        d = dump_schema_overrides_dict(schema_graph)
+        d = dump_structure_edits(schema_graph)
         assert "_readonly" in d
         assert set(d["_readonly"].keys()) == {
             "foreign_keys_current",
@@ -2707,14 +2694,14 @@ class TestBundleI:
     def test_apply_diff_preserves_user_override_fk_when_catalog_changes(self, schema_graph, monkeypatch):
         import copy
 
+        from aetherdialect._schema_finalize import apply_diff, apply_structure_to_graph
         from aetherdialect._schema_graph import (
             diff_schemas,
         )
-        from aetherdialect._schema_overrides import apply_diff, apply_schema_overrides_to_graph
 
         monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
 
-        report = apply_schema_overrides_to_graph(
+        report = apply_structure_to_graph(
             schema_graph,
             _ov_doc(
                 foreign_keys_add=[
@@ -2756,13 +2743,13 @@ class TestBundleI:
     def test_apply_diff_drops_user_override_fk_when_endpoint_disappears(self, schema_graph, monkeypatch):
         import copy
 
+        from aetherdialect._schema_finalize import apply_diff, apply_structure_to_graph
         from aetherdialect._schema_graph import (
             diff_schemas,
         )
-        from aetherdialect._schema_overrides import apply_diff, apply_schema_overrides_to_graph
 
         monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
-        apply_schema_overrides_to_graph(
+        apply_structure_to_graph(
             schema_graph,
             _ov_doc(
                 foreign_keys_add=[
@@ -2800,7 +2787,7 @@ class TestBundleI:
 
     def test_block_inferred_fk_removes_edge_and_persists(self, schema_graph, monkeypatch):
         from aetherdialect._contracts_schema import FKEdge
-        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
+        from aetherdialect._schema_finalize import apply_structure_to_graph
 
         monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
         edge = FKEdge(
@@ -2813,7 +2800,7 @@ class TestBundleI:
         schema_graph.tables["orders"].foreign_keys.append(edge)
 
         before = len(schema_graph.tables["orders"].foreign_keys)
-        report = apply_schema_overrides_to_graph(
+        report = apply_structure_to_graph(
             schema_graph,
             _ov_doc(
                 foreign_keys_remove=[{"from": "orders.order_date", "to": "customers.created_at"}],
@@ -2824,7 +2811,7 @@ class TestBundleI:
 
     def test_remove_inferred_fk_writes_denylist(self, schema_graph, monkeypatch):
         from aetherdialect._contracts_schema import FKEdge
-        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
+        from aetherdialect._schema_finalize import apply_structure_to_graph
 
         monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
         edge = FKEdge(
@@ -2839,13 +2826,13 @@ class TestBundleI:
         doc: dict[str, object] = _ov_doc(
             foreign_keys_remove=[{"from": "orders.order_date", "to": "customers.created_at"}],
         )
-        report = apply_schema_overrides_to_graph(schema_graph, doc)
+        report = apply_structure_to_graph(schema_graph, doc)
         assert report.fks_removed == 1
 
         assert len(doc["_internal"]["fk_block_inferred"]) == 1
 
     def test_block_inferred_pk_demotes_column(self, schema_graph, monkeypatch):
-        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
+        from aetherdialect._schema_finalize import apply_structure_to_graph
 
         monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
 
@@ -2854,7 +2841,7 @@ class TestBundleI:
         if "amount" not in schema_graph.tables["orders"].primary_key:
             schema_graph.tables["orders"].primary_key.append("amount")
 
-        report = apply_schema_overrides_to_graph(
+        report = apply_structure_to_graph(
             schema_graph,
             _ov_doc(
                 primary_keys_remove=[{"table": "orders", "column": "amount"}],
@@ -2865,11 +2852,11 @@ class TestBundleI:
         assert "amount" not in schema_graph.tables["orders"].primary_key
 
     def test_block_catalog_pk_skipped(self, schema_graph, monkeypatch):
-        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
+        from aetherdialect._schema_finalize import apply_structure_to_graph
 
         monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
 
-        report = apply_schema_overrides_to_graph(
+        report = apply_structure_to_graph(
             schema_graph,
             _ov_doc(
                 primary_keys_remove=[{"table": "customers", "column": "customer_id"}],
@@ -2879,8 +2866,8 @@ class TestBundleI:
         assert any("catalog PK" in s.reason for s in report.skipped)
 
     def test_primary_keys_add_user_promotes_unique_column(self, schema_graph, monkeypatch):
-        from aetherdialect._contracts_base import PkInferenceTag
-        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
+        from aetherdialect._contracts_schema import PkInferenceTag
+        from aetherdialect._schema_finalize import apply_structure_to_graph
 
         monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
 
@@ -2891,7 +2878,7 @@ class TestBundleI:
         col.distinct_count = 500
         col.row_count = 500
 
-        report = apply_schema_overrides_to_graph(
+        report = apply_structure_to_graph(
             schema_graph,
             _ov_doc(
                 primary_keys_add=[{"table": "orders", "column": "order_id"}],
@@ -2904,14 +2891,14 @@ class TestBundleI:
         assert "order_id" in schema_graph.tables["orders"].primary_key
 
     def test_primary_keys_add_rejects_non_unique_column(self, schema_graph, monkeypatch):
-        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
+        from aetherdialect._schema_finalize import apply_structure_to_graph
 
         monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
 
         tbl = schema_graph.tables["orders"]
         tbl.primary_key = []
 
-        report = apply_schema_overrides_to_graph(
+        report = apply_structure_to_graph(
             schema_graph,
             _ov_doc(
                 primary_keys_add=[{"table": "orders", "column": "amount"}],
@@ -2921,10 +2908,10 @@ class TestBundleI:
         assert any("not unique" in s.reason for s in report.skipped)
 
     def test_primary_keys_add_endorses_profile_inferred_pk(self, schema_graph, monkeypatch):
-        from aetherdialect._contracts_base import PkInferenceTag
-        from aetherdialect._schema_overrides import (
-            apply_schema_overrides_to_graph,
-            dump_schema_overrides_dict,
+        from aetherdialect._contracts_schema import PkInferenceTag
+        from aetherdialect._schema_finalize import (
+            apply_structure_to_graph,
+            dump_structure_edits,
         )
 
         monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
@@ -2934,7 +2921,7 @@ class TestBundleI:
         if "amount" not in schema_graph.tables["orders"].primary_key:
             schema_graph.tables["orders"].primary_key.append("amount")
 
-        report = apply_schema_overrides_to_graph(
+        report = apply_structure_to_graph(
             schema_graph,
             _ov_doc(
                 primary_keys_add=[{"table": "orders", "column": "amount"}],
@@ -2945,14 +2932,14 @@ class TestBundleI:
         col = schema_graph.tables["orders"].columns["amount"]
         assert col.pk_inference_tag == PkInferenceTag.USER_OVERRIDE
         assert any("endorsement" in s.reason for s in report.skipped)
-        doc = dump_schema_overrides_dict(schema_graph)
+        doc = dump_structure_edits(schema_graph)
         assert {"table": "orders", "column": "amount"} in doc["primary_keys_add"]
 
     def test_primary_keys_add_endorses_catalog_pk(self, schema_graph, monkeypatch):
-        from aetherdialect._contracts_base import PkInferenceTag
-        from aetherdialect._schema_overrides import (
-            apply_schema_overrides_to_graph,
-            dump_schema_overrides_dict,
+        from aetherdialect._contracts_schema import PkInferenceTag
+        from aetherdialect._schema_finalize import (
+            apply_structure_to_graph,
+            dump_structure_edits,
         )
 
         monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
@@ -2960,7 +2947,7 @@ class TestBundleI:
         col = schema_graph.tables["customers"].columns["customer_id"]
         assert col.pk_inference_tag is None
 
-        report = apply_schema_overrides_to_graph(
+        report = apply_structure_to_graph(
             schema_graph,
             _ov_doc(
                 primary_keys_add=[{"table": "customers", "column": "customer_id"}],
@@ -2971,19 +2958,19 @@ class TestBundleI:
         col = schema_graph.tables["customers"].columns["customer_id"]
         assert col.pk_inference_tag == PkInferenceTag.USER_OVERRIDE
         assert any("endorsement" in s.reason for s in report.skipped)
-        doc = dump_schema_overrides_dict(schema_graph)
+        doc = dump_structure_edits(schema_graph)
         assert {"table": "customers", "column": "customer_id"} in doc["primary_keys_add"]
 
     def test_primary_keys_add_idempotent_when_already_user_override(self, schema_graph, monkeypatch):
-        from aetherdialect._contracts_base import PkInferenceTag
-        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
+        from aetherdialect._contracts_schema import PkInferenceTag
+        from aetherdialect._schema_finalize import apply_structure_to_graph
 
         monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
 
         col = schema_graph.tables["customers"].columns["customer_id"]
         col.pk_inference_tag = PkInferenceTag.USER_OVERRIDE
 
-        report = apply_schema_overrides_to_graph(
+        report = apply_structure_to_graph(
             schema_graph,
             _ov_doc(
                 primary_keys_add=[{"table": "customers", "column": "customer_id"}],
@@ -2995,7 +2982,7 @@ class TestBundleI:
         assert not any("endorsement" in s.reason for s in report.skipped)
 
     def test_primary_keys_remove_blocked_when_would_empty(self, schema_graph, monkeypatch):
-        from aetherdialect._schema_overrides import apply_schema_overrides_to_graph
+        from aetherdialect._schema_finalize import apply_structure_to_graph
 
         monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
 
@@ -3003,7 +2990,7 @@ class TestBundleI:
         col.pk_inference_tag = "profile"
         schema_graph.tables["orders"].primary_key = ["amount"]
 
-        report = apply_schema_overrides_to_graph(
+        report = apply_structure_to_graph(
             schema_graph,
             _ov_doc(
                 primary_keys_remove=[{"table": "orders", "column": "amount"}],
@@ -3014,21 +3001,20 @@ class TestBundleI:
         assert "amount" in schema_graph.tables["orders"].primary_key
 
     def test_sidecar_round_trip(self, schema_graph, tmp_path, monkeypatch):
-        from aetherdialect._schema_build import overrides_sidecar_path
-        from aetherdialect._schema_overrides import (
-            load_overrides_sidecar,
-            save_overrides_sidecar,
+        from aetherdialect._schema_finalize import (
+            load_structure_sidecar,
+            save_structure_sidecar,
         )
+        from aetherdialect._schema_reflect import structure_sidecar_path
 
         cache_path = tmp_path / "schema.json.gz"
         cache_path.write_bytes(b"")
         doc = {
             **{
-                "version": SCHEMA_OVERRIDES_VERSION,
+                "version": STRUCTURE_DOCUMENT_VERSION,
                 "tables": {
                     "orders": {
-                        "description": _odesc("Orders."),
-                        "role": _orole(None),
+                        "role": "dimension",
                         "columns": {},
                     }
                 },
@@ -3042,62 +3028,59 @@ class TestBundleI:
                 "pk_block_inferred": [{"table": "t", "column": "c"}],
             },
         }
-        path = save_overrides_sidecar(
+        path = save_structure_sidecar(
             cache_path,
             doc,
             source_schema_hash="abc123",
             metadata_hash="0" * 64,
         )
-        assert path == overrides_sidecar_path(cache_path)
-        loaded = load_overrides_sidecar(cache_path)
+        assert path == structure_sidecar_path(cache_path)
+        loaded = load_structure_sidecar(cache_path)
         assert loaded is not None
         assert loaded["source_schema_hash"] == "abc123"
         assert loaded["metadata_hash"] == "0" * 64
         assert loaded["_internal"]["fk_block_inferred"] == [{"from": "a.x", "to": "b.y"}]
 
     def test_sidecar_corrupt_returns_none(self, tmp_path):
-        from aetherdialect._schema_build import overrides_sidecar_path
-        from aetherdialect._schema_overrides import (
-            load_overrides_sidecar,
-        )
+        from aetherdialect._schema_finalize import load_structure_sidecar
+        from aetherdialect._schema_reflect import structure_sidecar_path
 
         cache_path = tmp_path / "schema.json.gz"
         cache_path.write_bytes(b"")
-        sidecar = overrides_sidecar_path(cache_path)
+        sidecar = structure_sidecar_path(cache_path)
         sidecar.parent.mkdir(parents=True, exist_ok=True)
         sidecar.write_text("{not valid json")
-        assert load_overrides_sidecar(cache_path) is None
+        assert load_structure_sidecar(cache_path) is None
 
-    def test_clear_persisted_overrides(self, tmp_path):
-        from aetherdialect._schema_build import overrides_sidecar_path
-        from aetherdialect._schema_overrides import (
-            clear_persisted_overrides,
-            save_overrides_sidecar,
-        )
+    def test_clear_structure_sidecar(self, tmp_path):
+        from aetherdialect._schema_finalize import save_structure_sidecar
+        from aetherdialect._schema_reflect import structure_sidecar_path
 
         cache_path = tmp_path / "schema.json.gz"
         cache_path.write_bytes(b"")
-        save_overrides_sidecar(
+        save_structure_sidecar(
             cache_path,
             _ov_doc(),
             source_schema_hash="x",
             metadata_hash="1" * 64,
         )
-        assert overrides_sidecar_path(cache_path).is_file()
-        assert clear_persisted_overrides(cache_path) is True
-        assert clear_persisted_overrides(cache_path) is False
+        side = structure_sidecar_path(cache_path)
+        assert side.is_file()
+        side.unlink()
+        assert not side.is_file()
+        assert not side.exists()
 
     def test_load_validates_new_top_level_keys(self, tmp_path):
         import json as json
 
-        from aetherdialect._constants import SCHEMA_OVERRIDES_VERSION
-        from aetherdialect._schema_overrides import load_schema_overrides_file
+        from aetherdialect._constants import STRUCTURE_DOCUMENT_VERSION
+        from aetherdialect._schema_finalize import load_structure_document_file
 
         path = tmp_path / "ov.json"
         path.write_text(
             json.dumps(
                 {
-                    "version": SCHEMA_OVERRIDES_VERSION,
+                    "version": STRUCTURE_DOCUMENT_VERSION,
                     "tables": {},
                     "foreign_keys_add": [],
                     "foreign_keys_remove": [{"from": "a.b", "to": "c.d"}],
@@ -3106,7 +3089,7 @@ class TestBundleI:
                 }
             )
         )
-        loaded = load_schema_overrides_file(path)
+        loaded = load_structure_document_file(path)
         assert loaded["foreign_keys_remove"][0]["from"] == "a.b"
         assert loaded["primary_keys_remove"][0]["table"] == "t"
 
@@ -3159,7 +3142,7 @@ class TestBundleI:
 
 
 class TestRelaxDvdrentalSelectability:
-    """``_relax_rental_shop_selectability`` gates used by live rental_shop- shaped fixtures."""
+    """``_relax_rental_shop_selectability`` gates used by live rental_shop-shaped fixtures."""
 
     def test_restores_visibility_after_sentinel_profile(self):
         from live_tests.conftest import _relax_rental_shop_selectability

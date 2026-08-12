@@ -7,21 +7,21 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aetherdialect._contracts_base import (
-    ConfigError,
+from aetherdialect._contracts_base import ConfigError, FederationConfigError
+from aetherdialect._contracts_core import FederatedPreparedStep, FederatedPrepareOutcome, RuntimeIntent
+from aetherdialect._contracts_schema import (
     FederationCoordinatorConfig,
     FederationManifest,
     FederationPlanTemplate,
     FederationSourceBinding,
+    SchemaGraph,
 )
-from aetherdialect._contracts_core import FederatedPreparedStep, FederatedPrepareOutcome, RuntimeIntent
-from aetherdialect._contracts_schema import SchemaGraph
-from aetherdialect._federation import (
-    FederationConfigError,
-    assert_query_log_warmup_allowed,
-    qsim_intent_eligible_on_federation,
+from aetherdialect._federation_compose import assert_query_log_warmup_allowed
+from aetherdialect._federation_plan import qsim_intent_eligible_on_federation
+from aetherdialect._pipeline_execute import (
+    execute_federated_warmup_intent,
+    persist_federated_warmup_learning,
 )
-from aetherdialect._pipeline import execute_federated_warmup_intent, persist_federated_warmup_learning
 from aetherdialect.aetherdialect import AetherFederation
 
 
@@ -114,7 +114,7 @@ def test_qsim_eligibility_probe_uses_row_level_grain() -> None:
         grains.append(str(getattr(intent, "grain", "")))
         return {"a"}
 
-    with patch("aetherdialect._federation.source_ids_for_intent", side_effect=_capture_sources):
+    with patch("aetherdialect._federation_plan.source_ids_for_intent", side_effect=_capture_sources):
         assert qsim_intent_eligible_on_federation(
             ["t_a"],
             SchemaGraph(tables={}, join_paths_multi={}),
@@ -159,11 +159,11 @@ def test_execute_federated_warmup_routes_per_source_dialects() -> None:
         return prepared
 
     with (
-        patch("aetherdialect._pipeline.plan_federated_intent", return_value=plan),
-        patch("aetherdialect._pipeline.generate_join_candidates", return_value=({}, {}, {})),
-        patch("aetherdialect._pipeline.prepare_federated_sql_plan", side_effect=_prepare),
+        patch("aetherdialect._pipeline_execute.plan_federated_intent", return_value=plan),
+        patch("aetherdialect._pipeline_generate.generate_join_candidates", return_value=({}, {}, {})),
+        patch("aetherdialect._pipeline_execute.prepare_federated_sql_plan", side_effect=_prepare),
         patch(
-            "aetherdialect._pipeline.execute_federated_prepare",
+            "aetherdialect._pipeline_execute.execute_federated_prepare",
             return_value=SimpleNamespace(rows=((1,),), bundle=None),
         ),
     ):
@@ -222,17 +222,20 @@ def test_federated_warmup_learning_lands_in_member_stores_and_plan() -> None:
         return tmpl_a if store is store_a else tmpl_b
 
     with (
-        patch("aetherdialect._templates.TemplateOps.insert_template", side_effect=_insert),
-        patch("aetherdialect._templates.TemplateOps.save_template_store") as save_store,
-        patch("aetherdialect._pipeline.stamp_federation_member_template"),
-        patch("aetherdialect._pipeline.member_schema_slice", return_value=SchemaGraph(tables={}, join_paths_multi={})),
+        patch("aetherdialect._templates_ops.TemplateOps.insert_template", side_effect=_insert),
+        patch("aetherdialect._templates_ops.TemplateOps.save_template_store") as save_store,
+        patch("aetherdialect._federation_manifest.stamp_federation_member_template"),
         patch(
-            "aetherdialect._pipeline.save_federation_plan_template",
+            "aetherdialect._pipeline_execute.member_schema_slice",
+            return_value=SchemaGraph(tables={}, join_paths_multi={}),
+        ),
+        patch(
+            "aetherdialect._pipeline_execute.save_federation_plan_template",
             side_effect=lambda *_a, **_k: saved_plan.append(_a[1]),
         ),
-        patch("aetherdialect._pipeline.federation_plan_residual_hash", return_value="rh"),
-        patch("aetherdialect._pipeline.federation_plan_topology_identity", return_value=("mh", "mth")),
-        patch("aetherdialect._pipeline.intent_key", return_value="plan_key"),
+        patch("aetherdialect._pipeline_execute.federation_plan_residual_hash", return_value="rh"),
+        patch("aetherdialect._pipeline_execute.federation_plan_topology_identity", return_value=("mh", "mth")),
+        patch("aetherdialect._pipeline_execute.intent_key", return_value="plan_key"),
     ):
         created = persist_federated_warmup_learning(
             "warmup question",
@@ -293,10 +296,10 @@ def test_federated_warmup_failed_turn_persists_nothing() -> None:
     plan = MagicMock()
     plan.ineligible_reason = None
     with (
-        patch("aetherdialect._pipeline.plan_federated_intent", return_value=plan),
-        patch("aetherdialect._pipeline.generate_join_candidates", return_value=({}, {}, {})),
+        patch("aetherdialect._pipeline_execute.plan_federated_intent", return_value=plan),
+        patch("aetherdialect._pipeline_generate.generate_join_candidates", return_value=({}, {}, {})),
         patch(
-            "aetherdialect._pipeline.prepare_federated_sql_plan",
+            "aetherdialect._pipeline_execute.prepare_federated_sql_plan",
             return_value=FederatedPrepareOutcome(
                 success=False,
                 plan=plan,
@@ -304,7 +307,7 @@ def test_federated_warmup_failed_turn_persists_nothing() -> None:
                 sql_validation_error="prepare failed",
             ),
         ),
-        patch("aetherdialect._pipeline.persist_federated_warmup_learning") as persist_learning,
+        patch("aetherdialect._pipeline_execute.persist_federated_warmup_learning") as persist_learning,
     ):
         ok, err, rows, _sql, learning = execute_federated_warmup_intent(
             "q",
@@ -330,14 +333,14 @@ def test_federated_warmup_partial_failure_persists_nothing() -> None:
     plan.ineligible_reason = None
     prepared = FederatedPrepareOutcome(success=True, plan=plan, display_sql="sql", steps=())
     with (
-        patch("aetherdialect._pipeline.plan_federated_intent", return_value=plan),
-        patch("aetherdialect._pipeline.generate_join_candidates", return_value=({}, {}, {})),
-        patch("aetherdialect._pipeline.prepare_federated_sql_plan", return_value=prepared),
+        patch("aetherdialect._pipeline_execute.plan_federated_intent", return_value=plan),
+        patch("aetherdialect._pipeline_generate.generate_join_candidates", return_value=({}, {}, {})),
+        patch("aetherdialect._pipeline_execute.prepare_federated_sql_plan", return_value=prepared),
         patch(
-            "aetherdialect._pipeline.execute_federated_prepare",
+            "aetherdialect._pipeline_execute.execute_federated_prepare",
             side_effect=FederationPartialFailureError("member failed", source_id="a", phase="member", succeeded=()),
         ),
-        patch("aetherdialect._pipeline.persist_federated_warmup_learning") as persist_learning,
+        patch("aetherdialect._pipeline_execute.persist_federated_warmup_learning") as persist_learning,
     ):
         ok, err, rows, _sql, learning = execute_federated_warmup_intent(
             "q",

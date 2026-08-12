@@ -8,8 +8,11 @@ from pathlib import Path
 import pytest
 
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
+from aetherdialect._schema_finalize import (
+    apply_structure_to_graph,
+    load_structure_document_file,
+)
 from aetherdialect._schema_graph import recompute_join_paths_multi
-from aetherdialect._schema_overrides import apply_schema_overrides_to_graph, load_schema_overrides_file
 from tests.test_schema import _ov_doc
 
 
@@ -37,7 +40,7 @@ def test_member_foreign_key_override_to_other_member_table_names_manifest_path(
 ) -> None:
     monkeypatch.setattr("aetherdialect._config.EngineConfig.llm_credentials_configured", lambda: False)
     graph = _member_graph()
-    editor = tmp_path / "schema_overrides.json"
+    editor = tmp_path / "schema_structure.json"
     editor.write_text(
         json.dumps(
             _ov_doc(
@@ -52,7 +55,7 @@ def test_member_foreign_key_override_to_other_member_table_names_manifest_path(
         ),
         encoding="utf-8",
     )
-    document = load_schema_overrides_file(editor)
-    report = apply_schema_overrides_to_graph(graph, document, strict=False)
+    document = load_structure_document_file(editor)
+    report = apply_structure_to_graph(graph, document, strict=False)
     reasons = [skip.reason for skip in report.skipped]
     assert any("federation manifest" in reason for reason in reasons)

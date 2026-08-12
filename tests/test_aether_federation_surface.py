@@ -5,12 +5,19 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 from aetherdialect import AetherFederation
-from aetherdialect._contracts_base import AetherFederationInitResult, FederationMappings, LLMConfig, RuntimeConfig
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import load_runtime_config
-from aetherdialect._federation import FederationManifest, compose_composite_graph, parse_federation_manifest
+from aetherdialect._contracts_core import AetherFederationInitResult, LLMConfig, RuntimeConfig
+from aetherdialect._contracts_schema import (
+    ColumnMetadata,
+    FederationManifest,
+    FederationMappings,
+    SchemaGraph,
+    TableMetadata,
+)
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_manifest import parse_federation_manifest
 from aetherdialect._schema_graph import recompute_join_paths_multi
-from aetherdialect._templates import TemplateOps
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils_artifacts import load_runtime_config
 
 
 def _graph(table: str, *, source_id: str) -> SchemaGraph:
@@ -41,12 +48,13 @@ _MANIFEST = {
 _MANIFEST_FILE = "/tmp/aether_fed_surface_declaration.json"
 
 
-def _minimal_member() -> MagicMock:
+def _minimal_member(*, connection: str = "conn") -> MagicMock:
     llm_exec = load_runtime_config(merged_env={})
     member = MagicMock()
+    member.dialect = "duckdb"
     member._runtime_config = RuntimeConfig(
         engine="duckdb",
-        artifacts_dir="/tmp/aether_fed_member",
+        artifacts_dir=f"/tmp/aether_fed_member_{connection}",
         engine_context=MagicMock(),
         llm_execution=llm_exec,
     )
@@ -56,7 +64,10 @@ def _minimal_member() -> MagicMock:
     member._execution_engine = None
     member._native_connection = None
     member._context_name = "master"
+    member._schema_role = "owner"
     member._engine_identity = None
+    member._named_connection = connection
+    member._connection = connection
     return member
 
 
@@ -79,12 +90,12 @@ def _init_bundle(manifest: FederationManifest, composite: SchemaGraph) -> Aether
         schema_terms=set(),
         schema_stats={"table_count": 2, "total_filterable": 2},
         federation_manifest=manifest,
-        federation_mappings=FederationMappings(version="0.2.1"),
+        federation_mappings=FederationMappings(version="0.2.3"),
         federation_member_graphs={
             "a": _graph("left_t", source_id="a"),
             "b": _graph("right_t", source_id="b"),
         },
-        members={"conn_a": _minimal_member(), "conn_b": _minimal_member()},
+        members=(_minimal_member(connection="conn_a"), _minimal_member(connection="conn_b")),
     )
 
 
@@ -98,7 +109,7 @@ def test_prepared_federated_outcome_returns_staged_prepare() -> None:
     with patch("aetherdialect.aetherdialect.initialize_aether_federation", return_value=bundle):
         fed = AetherFederation(
             "fed_surface",
-            members={"conn_a": _minimal_member(), "conn_b": _minimal_member()},
-            declaration_file=_MANIFEST_FILE,
+            members=(_minimal_member(connection="conn_a"), _minimal_member(connection="conn_b")),
+            declaration=_MANIFEST_FILE,
         )
     assert fed.prepared_federated_outcome() is None

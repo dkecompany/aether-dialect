@@ -21,37 +21,34 @@ from openai import AzureOpenAI, OpenAI
 
 from ._config import EngineConfig, PolicyConfig
 from ._constants import (
+    LLM_SENSITIVITY_STRIP_KEYS,
+    TASK_MODEL_TO_DEPLOYMENT_FIELD,
+)
+from ._constants_runtime import (
     INTENT_COMPOSE_SYSTEM,
     INTENT_GROUND_SYSTEM,
     INTENT_INTERPRET_SYSTEM,
-    LLM_SENSITIVITY_STRIP_KEYS,
     MOCK_FIXTURE_STUB_SCHEMA_LITERALS,
     SANDBOX_INTERPRET_DOMAIN_FILENAME,
     SANDBOX_MALFORMED_MOCK_FIXTURE_SPECS,
     SANDBOX_SCHEMA_LITERALS_FILENAME,
-    TASK_MODEL_TO_DEPLOYMENT_FIELD,
     TASK_PROFILES,
 )
-from ._contracts_base import (
-    LlmBatchRequest,
-    LlmExecutionConfig,
-    LlmJsonExhausted,
-    LlmTransientFailure,
-    MockFixtureMissingError,
-)
-from ._core_utils import (
+from ._contracts_base import LlmTransientFailure, MockFixtureMissingError
+from ._contracts_core import LlmBatchRequest, LlmExecutionConfig, LlmJsonExhausted
+from ._utils import (
     LLM_EXECUTION_CONTEXT,
-    active_business_knowledge_digest,
+    active_domain_knowledge_digest,
     active_prompt_cache_schema_hash,
     debug,
     diagnostic_debug_enabled,
     effective_llm_timeout_ms,
     pipeline_trace,
     record_llm_usage,
-    register_after_fork_callback,
     safe_json_loads,
     stable_json,
 )
+from ._utils_artifacts import register_after_fork_callback
 
 _clients: dict[tuple[str, int, str], OpenAI | AzureOpenAI] = {}
 _clients_lock = threading.Lock()
@@ -102,8 +99,7 @@ class SandboxRuntimeState:
             return
         if count is not None:
             raise RuntimeError(
-                "set_sandbox_recorded_corpus_question_count requires an active Sandbox runtime; "
-                "create Sandbox() or bind_sandbox_runtime() first.",
+                "set_sandbox_recorded_corpus_question_count requires an active Sandbox runtime; create Sandbox() or bind_sandbox_runtime() first.",
             )
         global _sandbox_recorded_corpus_questions
         _sandbox_recorded_corpus_questions = count
@@ -203,16 +199,18 @@ class LLMProvider:
     @staticmethod
     def _task_model_for_profile(task: str) -> str:
         """Return the configured logical model name for *task* from ``EngineConfig``."""
-        if task in ("intent", "conversation"):
+        if task in ("intent", "intent_interpret", "intent_ground", "intent_compose", "conversation"):
             return str(EngineConfig.OPENAI_MODEL_INTENT)
         if task == "intent_format":
             return str(EngineConfig.OPENAI_MODEL_INTENT_FORMAT)
         if task == "intent_schema_repair":
             return str(EngineConfig.OPENAI_MODEL_INTENT_SCHEMA_REPAIR)
-        if task == "feedback":
+        if task in ("feedback", "intake_validate", "intake_normalize", "meta_dk", "meta_schema", "meta_both"):
             return str(EngineConfig.OPENAI_MODEL)
         if task == "schema":
             return str(EngineConfig.OPENAI_MODEL_SCHEMA)
+        if task == "domain_knowledge":
+            return str(EngineConfig.OPENAI_MODEL_DOMAIN_KNOWLEDGE)
         if task == "schema_base":
             return str(EngineConfig.OPENAI_MODEL_SCHEMA_BASE)
         if task == "ddl":
@@ -265,16 +263,17 @@ class LLMProvider:
         kwargs["temperature"] = profile.get("temperature", 0)
 
     @staticmethod
-    def _provider_order() -> list[Literal["openai", "azure", "mock"]]:
+    def _provider_order() -> list[Literal["openai", "azure", "sandbox"]]:
         """Return the single resolved provider stored on :class:`EngineConfig`."""
-        if EngineConfig.LLM_PROVIDER in {"openai", "azure", "mock"}:
-            return [cast(Literal["openai", "azure", "mock"], EngineConfig.LLM_PROVIDER)]
+        provider = EngineConfig.normalize_llm_provider(EngineConfig.LLM_PROVIDER)
+        if provider in {"openai", "azure", "sandbox"}:
+            return [cast(Literal["openai", "azure", "sandbox"], provider)]
         return ["openai"]
 
     @staticmethod
     def _provider_is_configured(provider: str) -> bool:
         """Return whether a provider has required credentials configured."""
-        if provider == "mock":
+        if EngineConfig.is_sandbox_llm_provider(provider):
             return bool((EngineConfig.MOCK_FIXTURES_FILE or "").strip())
         if provider == "openai":
             return bool(EngineConfig.API_TOKEN and EngineConfig.OPENAI_BASE_URL)
@@ -399,6 +398,9 @@ class LLMProvider:
             "text": {"format": {"type": "json_object"}},
         }
         LLMProvider._apply_generation_profile(kwargs, profile, model)
+        cache_key = LLMProvider.resolve_prompt_cache_key(task)
+        if cache_key is not None:
+            kwargs["prompt_cache_key"] = cache_key
         return kwargs
 
     @staticmethod
@@ -409,29 +411,38 @@ class LLMProvider:
 
     @staticmethod
     def resolve_prompt_cache_key(task: str) -> str | None:
-        """Return a provider ``prompt_cache_key`` when a schema scope is active."""
+        """Return a provider ``prompt_cache_key`` for the stable prefix family of *task*. Keys are always emitted for live calls so intake/meta/intent/join/schema families can cache in parallel. Schema and domain-knowledge digests are included when an active scope provides them."""
         schema_hash = active_prompt_cache_schema_hash()
-        if not schema_hash:
-            return None
-        business_digest = active_business_knowledge_digest()
-        if business_digest:
-            raw = f"{task}:{schema_hash}:{business_digest[:16]}"
-        else:
-            raw = f"{task}:{schema_hash}"
+        domain_digest = active_domain_knowledge_digest()
+        family = str(task or "default").strip() or "default"
+        parts: list[str] = [family]
+        if schema_hash:
+            parts.append(str(schema_hash)[:32])
+        if domain_digest:
+            parts.append(str(domain_digest)[:16])
+        raw = ":".join(parts)
         if len(raw) <= 64:
             return raw
-        return f"{task[:8]}:{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:24]}"
+        return f"{family[:8]}:{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:24]}"
 
     @staticmethod
-    def _usage_tokens_from_response(usage: Any) -> tuple[int, int, int]:
-        """Return ``(input_tokens, output_tokens, cached_input_tokens)`` from a provider usage object."""
+    def _usage_tokens_from_response(usage: Any) -> tuple[int, int, int, int]:
+        """Return ``(input_tokens, output_tokens, cached_input_tokens, cache_write_tokens)`` from usage."""
         in_tok = int(getattr(usage, "input_tokens", 0) or 0)
         out_tok = int(getattr(usage, "output_tokens", 0) or 0)
         cached = 0
+        cache_write = 0
         details = getattr(usage, "input_tokens_details", None)
+        if details is None:
+            details = getattr(usage, "prompt_tokens_details", None)
         if details is not None:
-            cached = int(getattr(details, "cached_tokens", 0) or 0)
-        return in_tok, out_tok, cached
+            cached_val = getattr(details, "cached_tokens", None)
+            if isinstance(cached_val, (int, float)) and not isinstance(cached_val, bool):
+                cached = int(cached_val)
+            cache_write_val = getattr(details, "cache_write_tokens", None)
+            if isinstance(cache_write_val, (int, float)) and not isinstance(cache_write_val, bool):
+                cache_write = int(cache_write_val)
+        return in_tok, out_tok, cached, cache_write
 
     @staticmethod
     def chat(
@@ -475,7 +486,7 @@ class LLMProvider:
         pipeline_trace(f"llm_chat.request task={task} system_message", lambda: system)
         pipeline_trace(f"llm_chat.request task={task} user_message", lambda: user_for_llm)
 
-        if EngineConfig.LLM_PROVIDER == "mock":
+        if EngineConfig.is_sandbox_llm_provider(EngineConfig.LLM_PROVIDER):
             return MockProvider.get().chat_text(
                 system,
                 user_for_llm,
@@ -513,7 +524,9 @@ class LLMProvider:
                         f"completed in {elapsed:.1f}s (attempt {attempt + 1}/{max_retries}){tok_str}"
                     )
                     if usage is not None:
-                        usage_in, usage_out, usage_cached = LLMProvider._usage_tokens_from_response(usage)
+                        usage_in, usage_out, usage_cached, usage_cache_write = LLMProvider._usage_tokens_from_response(
+                            usage
+                        )
                         record_llm_usage(
                             task=task,
                             logical_model=model,
@@ -522,7 +535,7 @@ class LLMProvider:
                             input_tokens=usage_in,
                             cached_input_tokens=usage_cached,
                             output_tokens=usage_out,
-                            cache_write_tokens=None,
+                            cache_write_tokens=usage_cache_write,
                             attempt=attempt + 1,
                             elapsed_ms=int(elapsed * 1000),
                         )
@@ -936,8 +949,8 @@ class MockProvider:
         return MockProvider._normalize_mock_lookup_text(canonical)
 
     @staticmethod
-    def legacy_mock_fixture_user_key(user: str, *, literals: dict[str, str] | None = None) -> str:
-        """Pre-stable-json mock lookup key kept for fixtures recorded before canonical compaction."""
+    def raw_mock_fixture_user_key(user: str, *, literals: dict[str, str] | None = None) -> str:
+        """Mock lookup key from rewritten user text without stable-json compaction."""
         if literals is None:
             literals = MockProvider.load_canonical_schema_literals()
         rewritten = MockProvider.rewrite_user_schema_literals(user, literals)
@@ -960,7 +973,7 @@ class MockProvider:
 
     @staticmethod
     def _extract_gatekeeper_question_text(user: str) -> str | None:
-        """Return embedded ``question`` text from legacy gatekeeper JSON user payloads."""
+        """Return embedded ``question`` text from gatekeeper JSON user payloads."""
         text = str(user).strip()
         if not text.startswith("{"):
             return None
@@ -989,20 +1002,35 @@ class MockProvider:
             (
                 str(task),
                 str(system),
-                MockProvider.legacy_mock_fixture_user_key(user, literals=literals),
+                MockProvider.raw_mock_fixture_user_key(user, literals=literals),
             ),
         ]
-        if task == "default":
+        alias_tasks: list[str] = []
+        if task in ("intent_interpret", "intent_ground", "intent_compose"):
+            alias_tasks.append("intent")
+        if task in ("intake_validate", "intake_normalize", "meta_dk", "meta_schema", "meta_both"):
+            alias_tasks.append("default")
+        for alias in alias_tasks:
+            keys.append(MockProvider.mock_fixture_lookup_key(alias, system, user, literals=literals))
+            keys.append(
+                (
+                    str(alias),
+                    str(system),
+                    MockProvider.raw_mock_fixture_user_key(user, literals=literals),
+                ),
+            )
+        if task in ("default", "intake_validate", "intake_normalize", "meta_dk", "meta_schema", "meta_both"):
             question = MockProvider._extract_gatekeeper_question_text(user)
             if question:
-                keys.append(MockProvider.mock_fixture_lookup_key(task, system, question, literals=literals))
-                keys.append(
-                    (
-                        str(task),
-                        str(system),
-                        MockProvider.legacy_mock_fixture_user_key(question, literals=literals),
-                    ),
-                )
+                for lookup_task in (task, "default"):
+                    keys.append(MockProvider.mock_fixture_lookup_key(lookup_task, system, question, literals=literals))
+                    keys.append(
+                        (
+                            str(lookup_task),
+                            str(system),
+                            MockProvider.raw_mock_fixture_user_key(question, literals=literals),
+                        ),
+                    )
         deduped: list[tuple[str, str, str]] = []
         seen: set[tuple[str, str, str]] = set()
         for key in keys:

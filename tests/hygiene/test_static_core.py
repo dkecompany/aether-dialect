@@ -11,6 +11,8 @@ import pytest
 _ROOT = Path(__file__).resolve().parents[2]
 _SRC = _ROOT / "src" / "aetherdialect"
 _SCRIPTS = _ROOT / "scripts"
+# ``ast.TypeAlias`` (PEP 695 ``type X = ...``) exists only on Python 3.12+.
+_AST_TYPE_ALIAS: type[ast.AST] | None = getattr(ast, "TypeAlias", None)
 
 # Public façades only: definitions in config/constants/contracts are scanned for cross-module ``_`` leaks.
 _PREFIX_EXEMPT = {
@@ -22,6 +24,7 @@ _PREFIX_EXEMPT = {
 # membership tables; ``_config.py`` is not exempt (no module-level SCREAMING registries).
 _CONST_EXEMPT = {
     "_constants.py",
+    "_constants_runtime.py",
     "_contracts_base.py",
     "_contracts_core.py",
     "_contracts_schema.py",
@@ -36,10 +39,10 @@ _REEXPORT_ALLOWED = {
 
 _FACADE_MODULES = frozenset({"__init__", "aetherdialect"})
 
-# Cross-module imports of public template helpers are allowed without a private-prefix exemption.
-_ALLOWED_PRIVATE_SYMBOL_IMPORTS = frozenset()
+# (module_stem, symbol) pairs exempt from the private-import ban.
+_ALLOWED_PRIVATE_SYMBOL_IMPORTS: frozenset[tuple[str, str]] = frozenset()
 
-_DATA_MODULES = frozenset({"_constants"})
+_DATA_MODULES = frozenset({"_constants", "_constants_runtime"})
 
 _CLASS_MODULES = frozenset(
     {
@@ -53,9 +56,14 @@ _CLASS_MODULES = frozenset(
         "_dialect_sqlglot_engines",
         "_sandbox",
         "_templates",
+        "_templates_ops",
         "_llm_provider",
         "_seed_warmup",
         "_main_execution",
+        "_main_spaces",
+        "_main_interactive",
+        "_main_init",
+        "_main_session",
     }
 )
 
@@ -64,6 +72,7 @@ _EXPECTED_PACKAGE_MODULES = frozenset(
         "__init__",
         "aetherdialect",
         "_constants",
+        "_constants_runtime",
         "_contracts_base",
         "_contracts_core",
         "_contracts_schema",
@@ -74,31 +83,45 @@ _EXPECTED_PACKAGE_MODULES = frozenset(
         "_dialect_sqlglot_engines",
         "_sandbox",
         "_templates",
+        "_templates_ops",
         "_llm_provider",
         "_seed_warmup",
         "_main_execution",
+        "_main_spaces",
+        "_main_interactive",
+        "_main_init",
+        "_main_session",
         "_data_quality",
         "_expansion_ops",
         "_intent_expr",
-        "_intent_repair",
-        "_intent_resolve",
-        "_intent_process",
+        "_intent_normalize",
+        "_intent_bind",
+        "_intent_loop",
         "_qsim",
-        "_schema_build",
-        "_schema_overrides",
-        "_schema_catalog",
+        "_schema_reflect",
+        "_schema_finalize",
+        "_schema_profile",
         "_schema_graph",
-        "_utils",
-        "_validation_execute",
-        "_validation_schema",
-        "_validation_semantic",
+        "_utils_intent",
+        "_validation_sql",
+        "_validation_shape",
+        "_validation_rules",
         "_sql_gen",
         "_sql_to_intent",
         "_sql_to_intent_sqlglot",
-        "_core_utils",
-        "_federation",
-        "_pipeline",
+        "_utils",
+        "_utils_artifacts",
+        "_federation_manifest",
+        "_federation_compose",
+        "_federation_plan",
+        "_federation_execute",
+        "_pipeline_generate",
+        "_pipeline_execute",
         "_live_testing",
+        "_knowledge_claims",
+        "_knowledge_staleness",
+        "_knowledge_merge",
+        "_knowledge_join",
     }
 )
 
@@ -127,15 +150,27 @@ _FORBIDDEN_PATTERNS = [
 _DIRS_TO_SCAN = ["src", "scripts", "tests", "live_tests"]
 
 # Low-level modules must not depend on orchestration layers.
-_ORCHESTRATION_MODULES = frozenset({"_pipeline", "_main_execution"})
+_ORCHESTRATION_MODULES = frozenset(
+    {
+        "_pipeline_generate",
+        "_pipeline_execute",
+        "_main_execution",
+        "_main_spaces",
+        "_main_interactive",
+        "_main_init",
+        "_main_session",
+    }
+)
 _LOW_LEVEL_MODULES = frozenset(
     {
         "_constants",
+        "_constants_runtime",
         "_config",
         "_contracts_base",
         "_contracts_core",
         "_contracts_schema",
-        "_core_utils",
+        "_utils",
+        "_utils_artifacts",
     }
 )
 
@@ -302,7 +337,7 @@ def _is_module_constant_name(name: str) -> bool:
 
 
 def _is_mutable_runtime_global(node: ast.AST | None, *, allow_empty_containers: bool = True) -> bool:
-    """Return True for module globals that are intentionally mutable runtime state."""
+    """Return True for module globals that are mutable runtime state."""
     if node is None:
         return True
     if isinstance(node, ast.Constant) and node.value is None:
@@ -376,6 +411,61 @@ def _is_literal_type_alias_assignment(node: ast.AST) -> bool:
     return _is_literal_subscript(value)
 
 
+def _annotation_is_typealias(annotation: ast.AST | None) -> bool:
+    """Return True when *annotation* is ``TypeAlias`` or ``typing.TypeAlias``."""
+    if isinstance(annotation, ast.Name) and annotation.id == "TypeAlias":
+        return True
+    return isinstance(annotation, ast.Attribute) and annotation.attr == "TypeAlias"
+
+
+def _is_bare_type_expression(node: ast.AST | None) -> bool:
+    """Return True for typing RHS shapes such as ``tuple[...]``, ``Mapping[...]``, or ``str | int``."""
+    if node is None:
+        return False
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return True
+    return isinstance(node, ast.Subscript)
+
+
+def _is_pep695_type_alias(node: ast.AST) -> bool:
+    """Return True when *node* is a PEP 695 ``type`` statement (Python 3.12+ only)."""
+    return _AST_TYPE_ALIAS is not None and isinstance(node, _AST_TYPE_ALIAS)
+
+
+def _is_type_alias_assignment(node: ast.AST) -> bool:
+    """Return True for module-level type-alias forms (``type``, ``TypeAlias``, or bare typing RHS)."""
+    if _is_pep695_type_alias(node):
+        return True
+    if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+        if _annotation_is_typealias(node.annotation):
+            return True
+        return False
+    if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) for t in node.targets):
+        value = node.value
+        if _is_literal_subscript(value):
+            return True
+        if _is_constant_like_value(value):
+            return False
+        return _is_bare_type_expression(value)
+    return False
+
+
+def _data_module_assignment_names(node: ast.AST) -> list[tuple[str, int]]:
+    """Return ``(name, lineno)`` for top-level Assign/AnnAssign/TypeAlias targets (imports excluded)."""
+    names: list[tuple[str, int]] = []
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                names.append((target.id, node.lineno))
+    elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+        names.append((node.target.id, node.lineno))
+    elif _is_pep695_type_alias(node):
+        name_node = getattr(node, "name", None)
+        if isinstance(name_node, ast.Name):
+            names.append((name_node.id, node.lineno))
+    return names
+
+
 def _top_level_defs(tree: ast.Module) -> tuple[list[ast.FunctionDef | ast.AsyncFunctionDef], list[ast.ClassDef]]:
     functions: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
     classes: list[ast.ClassDef] = []
@@ -444,11 +534,9 @@ def test_no_lazy_or_local_imports(file_path: Path) -> None:
     tree = ast.parse(content)
 
     for node in ast.walk(tree):
-        # We only care about imports inside functions or classes
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             for subnode in ast.walk(node):
                 if isinstance(subnode, (ast.Import, ast.ImportFrom)):
-                    # Check if it imports from . or aetherdialect
                     is_package_import = False
                     if isinstance(subnode, ast.Import):
                         for alias in subnode.names:
@@ -721,6 +809,73 @@ def test_prefix_reachability() -> None:
         pytest.fail("\n".join(violations))
 
 
+def _is_single_underscore_private(name: str) -> bool:
+    return name.startswith("_") and not name.startswith("__")
+
+
+def _imported_internal_locals(tree: ast.AST, *, file_stem: str) -> dict[str, str]:
+    """Map local names to the internal module stem they were imported from."""
+    imported: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        is_internal = node.level > 0 or (
+            node.module is not None and (node.module == "aetherdialect" or node.module.startswith("aetherdialect."))
+        )
+        if not is_internal:
+            continue
+        if node.module is None:
+            continue
+        mod_stem = node.module.rsplit(".", 1)[-1]
+        for alias in node.names:
+            local = alias.asname or alias.name
+            if local == "*":
+                continue
+            imported[local] = mod_stem
+    imported.pop(file_stem, None)
+    return imported
+
+
+def _attribute_receiver_root(node: ast.AST) -> ast.AST:
+    current: ast.AST = node
+    if isinstance(current, ast.Call):
+        current = current.func
+    return current
+
+
+@pytest.mark.fast
+def test_no_cross_module_private_attribute_access() -> None:
+    """Imported sibling symbols must not be used to reach ``_``-prefixed attributes. ``self._x`` / ``cls._x`` and same-module attribute access remain allowed. Instance slots on parameters (``owner._runtime_config``) are out of scope for this static check. Dunders are exempt."""
+    violations: list[str] = []
+    for path in _get_src_files():
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        imported = _imported_internal_locals(tree, file_stem=path.stem)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Attribute) or not _is_single_underscore_private(node.attr):
+                continue
+            root = _attribute_receiver_root(node.value)
+            if isinstance(root, ast.Name):
+                if root.id in {"self", "cls"}:
+                    continue
+                src_mod = imported.get(root.id)
+                if src_mod is not None and src_mod != path.stem:
+                    violations.append(
+                        f"{path.name}:{node.lineno} accesses {root.id}.{node.attr} imported from {src_mod}"
+                    )
+            elif isinstance(root, ast.Attribute) and isinstance(root.value, ast.Name):
+                # aetherdialect._intent_loop._private  or  pkg.mod._private
+                if root.attr.startswith("_") and not root.attr.startswith("__"):
+                    continue
+                base = root.value.id
+                if base == "aetherdialect" or base in imported:
+                    if _is_single_underscore_private(node.attr):
+                        violations.append(
+                            f"{path.name}:{node.lineno} accesses {ast.unparse(node)} via package/module path"
+                        )
+    if violations:
+        pytest.fail("Cross-module private attribute access:\n" + "\n".join(violations))
+
+
 @pytest.mark.fast
 @pytest.mark.parametrize("file_path", list(_get_src_files()))
 def test_no_namespace_imports(file_path: Path) -> None:
@@ -841,6 +996,12 @@ def test_module_kind_purity() -> None:
                     f"{path.name}: data module must have zero FunctionDef/ClassDef "
                     f"(functions={fn_names}, classes={class_names})"
                 )
+            for node in tree.body:
+                for name, lineno in _data_module_assignment_names(node):
+                    if not _CONST_NAME_RE.match(name):
+                        data_violators.append(
+                            f"{path.name}:{lineno}: data module assignment {name!r} must be SCREAMING_SNAKE"
+                        )
             continue
         if stem in _CLASS_MODULES:
             if functions:
@@ -894,19 +1055,23 @@ def test_constants_define_no_functions() -> None:
 
 @pytest.mark.fast
 def test_constants_define_no_classes_or_literal_types() -> None:
-    """``_constants.py`` must not define classes or ``Name = Literal[...]`` aliases."""
+    """``_constants.py`` must not define classes or type aliases; other modules ban ``Literal`` aliases."""
     constants_path = _SRC / "_constants.py"
     tree = ast.parse(constants_path.read_text(encoding="utf-8"))
     _, classes = _top_level_defs(tree)
     violations: list[str] = [f"line {node.lineno}: class {node.name}" for node in classes]
     for node in tree.body:
-        if _is_literal_type_alias_assignment(node):
-            if isinstance(node, ast.Assign):
-                names = ", ".join(t.id for t in node.targets if isinstance(t, ast.Name))
-            else:
-                assert isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
-                names = node.target.id
-            violations.append(f"line {node.lineno}: Literal type alias {names}")
+        if not _is_type_alias_assignment(node):
+            continue
+        if _is_pep695_type_alias(node):
+            name_node = getattr(node, "name", None)
+            names = name_node.id if isinstance(name_node, ast.Name) else "<type>"
+        elif isinstance(node, ast.Assign):
+            names = ", ".join(t.id for t in node.targets if isinstance(t, ast.Name))
+        else:
+            assert isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+            names = node.target.id
+        violations.append(f"line {node.lineno}: type alias {names}")
 
     for path in _get_src_files():
         if path.name == "_constants.py":
@@ -922,7 +1087,7 @@ def test_constants_define_no_classes_or_literal_types() -> None:
                 violations.append(f"{path.name}:{node.lineno}: Literal type alias {names}")
 
     if violations:
-        pytest.fail("ClassDef / Literal type alias violations:\n" + "\n".join(violations))
+        pytest.fail("ClassDef / type alias violations:\n" + "\n".join(violations))
 
 
 @pytest.mark.fast
@@ -1017,3 +1182,159 @@ def test_identifier_naming_convention() -> None:
                     violations.append(f"{path.name}:{node.lineno}: constant {name} is not SCREAMING_SNAKE")
     if violations:
         pytest.fail("Identifier naming violations:\n" + "\n".join(violations))
+
+
+_ABSENT_DOMAIN_REGEX_CONSTANTS = frozenset(
+    {
+        "AGG_QUANTITY_RE",
+        "QUESTION_TOP_N_PHRASE_RE",
+        "CUMULATIVE_PHRASING_RE",
+        "QUESTION_AGGREGATION_RATE_PREFIX_RE",
+        "COUNT_THRESHOLD_TABLE_RE",
+        "QUESTION_DISTINCT_KEYWORD_RE",
+        "NAME_COLUMN_PATTERN",
+        "DATE_COLUMN_NAME_TOKENS",
+        "DURATION_COLUMN_NAME_TOKENS",
+        "YEAR_LIKE_COLUMN_NAME_TOKENS",
+    }
+)
+
+_ABSENT_DOMAIN_HELPERS: tuple[tuple[str, str], ...] = (
+    ("aetherdialect._schema_profile", "copy_base_descriptions"),
+    ("aetherdialect._intent_loop", "repair_cumulative_phrasing_window_intent"),
+)
+
+
+@pytest.mark.fast
+def test_absent_domain_regex_and_helpers() -> None:
+    """Named semantic-regex constants and description-copy helpers must not exist in the package."""
+    import importlib
+
+    constants = importlib.import_module("aetherdialect._constants")
+    present = sorted(name for name in _ABSENT_DOMAIN_REGEX_CONSTANTS if hasattr(constants, name))
+    if present:
+        pytest.fail(f"Forbidden constants still exported from _constants.py: {', '.join(present)}")
+
+    for module_name, symbol in _ABSENT_DOMAIN_HELPERS:
+        mod = importlib.import_module(module_name)
+        assert not hasattr(mod, symbol), f"{symbol} must not exist on {module_name}"
+
+
+@pytest.mark.fast
+def test_no_public_private_name_twins() -> None:
+    """Forbid defining both ``foo`` and ``_foo`` as functions or methods in the same module or class scope."""
+    violations: list[str] = []
+    for path in _get_src_files():
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        module_funcs = {
+            node.name: node.lineno for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        for name, lineno in sorted(module_funcs.items()):
+            if name.startswith("_") and not name.startswith("__") and name[1:] in module_funcs:
+                pub_line = module_funcs[name[1:]]
+                violations.append(f"{path.name}:{lineno}: module defines both {name} and {name[1:]} (line {pub_line})")
+        for node in tree.body:
+            if not isinstance(node, ast.ClassDef):
+                continue
+            methods = {
+                item.name: item.lineno
+                for item in node.body
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+            for name, lineno in sorted(methods.items()):
+                if name.startswith("_") and not name.startswith("__") and name[1:] in methods:
+                    pub_line = methods[name[1:]]
+                    violations.append(
+                        f"{path.name}:{lineno}: {node.name} defines both {name} and {name[1:]} (line {pub_line})"
+                    )
+    if violations:
+        pytest.fail("Public/private name-twin violations:\n" + "\n".join(violations))
+
+
+# Modules allowed to load ``aetherdialect.*`` via importlib (lazy public API, dialect
+# registry trampolines pending DAG purge, plugin paths, or already-loaded debug patching).
+_ALLOWED_AETHERDIALECT_IMPORTLIB_MODULES = frozenset(
+    {
+        "__init__",
+        "_schema_graph",
+        "_schema_profile",
+        "_utils",
+        "_dialect",
+    }
+)
+
+_BANNED_CYCLE_HACK_MARKERS = (
+    "register_profile_schema_native_dispatch",
+    "_PROFILE_SCHEMA_NATIVE_DISPATCH",
+)
+
+
+def _importlib_aetherdialect_target(arg: ast.AST) -> str | None:
+    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+        return arg.value
+    if isinstance(arg, ast.JoinedStr):
+        parts: list[str] = []
+        for value in arg.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                parts.append(value.value)
+            else:
+                parts.append("{…}")
+        return "".join(parts)
+    return None
+
+
+@pytest.mark.fast
+def test_no_pip_install_recipes_in_src() -> None:
+    """Install how-tos stay in docs; package source must not embed ``pip install`` strings."""
+    violations: list[str] = []
+    for path in _get_src_files():
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            if "pip install" in line.lower():
+                violations.append(f"{path.name}:{lineno}: {line.strip()}")
+    if violations:
+        pytest.fail("pip install recipe(s) in src:\n" + "\n".join(violations))
+
+
+@pytest.mark.fast
+def test_no_sibling_importlib_cycle_dodges() -> None:
+    """Ban deferred ``importlib.import_module('aetherdialect…')`` cycle hacks outside the allowlist."""
+    violations: list[str] = []
+    for path in _get_src_files():
+        stem = _module_stem(path)
+        if stem in _ALLOWED_AETHERDIALECT_IMPORTLIB_MODULES:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not node.args:
+                continue
+            func = node.func
+            is_import_module = (
+                isinstance(func, ast.Attribute)
+                and func.attr == "import_module"
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "importlib"
+            ) or (isinstance(func, ast.Name) and func.id == "import_module")
+            if not is_import_module:
+                continue
+            target = _importlib_aetherdialect_target(node.args[0])
+            if target is None:
+                continue
+            if target == "aetherdialect" or target.startswith("aetherdialect."):
+                violations.append(f"{path.name}:{node.lineno}: importlib.import_module({target!r})")
+    if violations:
+        pytest.fail("Deferred aetherdialect importlib load(s):\n" + "\n".join(violations))
+
+
+@pytest.mark.fast
+def test_no_profile_schema_dispatch_register_slot() -> None:
+    """Profile dispatch must use Dialect method override, not a ClassVar register slot."""
+    violations: list[str] = []
+    for path in _get_src_files():
+        text = path.read_text(encoding="utf-8")
+        for marker in _BANNED_CYCLE_HACK_MARKERS:
+            if marker in text:
+                for lineno, line in enumerate(text.splitlines(), start=1):
+                    if marker in line:
+                        violations.append(f"{path.name}:{lineno}: {marker}")
+    if violations:
+        pytest.fail("Banned profile-dispatch cycle hack marker(s):\n" + "\n".join(violations))

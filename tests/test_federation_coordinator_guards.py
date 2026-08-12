@@ -4,24 +4,25 @@ from __future__ import annotations
 
 import pytest
 
-from aetherdialect._contracts_base import FederationDeclarationError, FederationJoinFanOutError
-from aetherdialect._contracts_core import (
-    FederatedPlan,
-    JoinSpec,
-    NormalizedExpr,
-    RuntimeIntent,
-    SelectCol,
-)
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import (
+from aetherdialect._constants import FEDERATION_COMBINE_SEMI_KIND
+from aetherdialect._contracts_base import (
     FederationConfigError,
+    FederationDeclarationError,
+    FederationJoinFanOutError,
+    NormalizedExpr,
+)
+from aetherdialect._contracts_core import FederatedPlan, JoinSpec, RuntimeIntent, SelectCol
+from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
+from aetherdialect._federation_compose import (
     compose_composite_graph,
-    parse_federation_manifest,
-    parse_federation_mappings,
-    plan_federated_intent,
-    validate_coordinator_join_fan_out,
     validate_cross_source_keys_on_graph,
 )
+from aetherdialect._federation_execute import validate_coordinator_join_fan_out
+from aetherdialect._federation_manifest import (
+    parse_federation_manifest,
+    parse_federation_mappings,
+)
+from aetherdialect._federation_plan import plan_federated_intent
 from aetherdialect._schema_graph import recompute_join_paths_multi
 
 
@@ -88,7 +89,7 @@ def _two_member_join_manifest(*, kind: str = "inner") -> tuple[object, object]:
         },
         include_derived_roster=True,
     )
-    mappings = parse_federation_mappings({"version": "0.2.1", "logical_columns": []})
+    mappings = parse_federation_mappings({"version": "0.2.3", "logical_columns": []})
     return manifest, mappings
 
 
@@ -186,7 +187,7 @@ def test_coordinator_join_fan_out_not_masked_by_residual_limit() -> None:
 
 
 @pytest.mark.fast
-def test_residual_aggregate_sum_join_fan_out_refuses() -> None:
+def test_residual_aggregate_sum_join_fan_out_rewrites_to_semi_combine() -> None:
     manifest, mappings = _two_member_join_manifest()
     schema = SchemaGraph(
         tables={
@@ -267,10 +268,10 @@ def test_residual_aggregate_sum_join_fan_out_refuses() -> None:
         order_by_cols=[],
         where=None,
     )
-    with pytest.raises(FederationJoinFanOutError) as exc_info:
-        plan_federated_intent(intent, schema, manifest, mappings)
-    assert "sum" in str(exc_info.value).lower() or "aggregate" in str(exc_info.value).lower()
-    assert exc_info.value.phase == "coordinator"
+    plan = plan_federated_intent(intent, schema, manifest, mappings)
+    assert plan.ineligible_reason is None
+    assert plan.combine is not None
+    assert plan.combine[0].kind == FEDERATION_COMBINE_SEMI_KIND
 
 
 # --- Cross-source key uniqueness ---
@@ -361,7 +362,7 @@ def test_join_key_clique_non_unique_endpoint_refuses_at_declaration() -> None:
     )
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_columns": [
                 {
                     "logical": "join_id",
@@ -482,7 +483,7 @@ def _union_members_and_mappings(
     )
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -581,7 +582,7 @@ def test_disagreeing_primary_keys_raise_at_collapse() -> None:
     )
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_tables": [
                 {
                     "logical": "entity",
@@ -647,7 +648,7 @@ def test_disagreeing_member_grains_raise_at_collapse() -> None:
     )
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_tables": [
                 {
                     "logical": "entity",
@@ -692,7 +693,7 @@ def test_replica_merge_raises_on_conflicting_value_type() -> None:
     )
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_tables": [
                 {
                     "logical": "entity",

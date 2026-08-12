@@ -8,9 +8,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from aetherdialect._constants import DIAGNOSTIC_CODE_LLM_TURN_COST
-from aetherdialect._contracts_base import LlmTurnUsageSummary
-from aetherdialect._main_execution import PipelineSession
-from aetherdialect._templates import TemplateOps
+from aetherdialect._contracts_core import LlmTurnUsageSummary
+from aetherdialect._main_session import PipelineSession
+from aetherdialect._templates_ops import TemplateOps
 
 
 def _session_owner() -> MagicMock:
@@ -33,7 +33,7 @@ def _session_owner() -> MagicMock:
 @pytest.mark.fast
 def test_turn_reports_usage() -> None:
     """Terminal steps carry structured LLM usage totals for the turn."""
-    from aetherdialect._core_utils import record_llm_usage
+    from aetherdialect._utils import record_llm_usage
 
     owner = _session_owner()
     session = PipelineSession(owner, mode="writer")
@@ -58,8 +58,8 @@ def test_turn_reports_usage() -> None:
             columns=("x",),
         )
 
-    with patch("aetherdialect._main_execution.llm_execution_scope", lambda *_a, **_k: nullcontext()):
-        with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once", side_effect=run_with_usage):
+    with patch("aetherdialect._main_session.llm_execution_scope", lambda *_a, **_k: nullcontext()):
+        with patch("aetherdialect._main_init.MainInitOps.interactive_run_once", side_effect=run_with_usage):
             step = session.ask("how many rows")
 
     assert step.done

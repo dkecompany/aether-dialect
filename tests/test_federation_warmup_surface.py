@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from aetherdialect import AetherFederation
-from aetherdialect._constants import FEDERATION_WARMUP_UNSUPPORTED_MESSAGE
+from aetherdialect._constants_runtime import FEDERATION_WARMUP_UNSUPPORTED_MESSAGE
 from aetherdialect._contracts_base import ConfigError
 
 

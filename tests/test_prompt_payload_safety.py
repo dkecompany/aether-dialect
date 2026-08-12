@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from aetherdialect._constants import GROUND_FIELDS, SCHEMA_FIELD_SAMPLES
+from aetherdialect._constants_runtime import GROUND_FIELDS, SCHEMA_FIELD_SAMPLES
 from aetherdialect._contracts_base import SchemaInvariantError
 from aetherdialect._contracts_schema import (
     ColumnMetadata,

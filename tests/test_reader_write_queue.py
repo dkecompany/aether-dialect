@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from aetherdialect._constants import WRITE_QUEUE_FILENAME
+from aetherdialect._contracts_base import NormalizedExpr
 from aetherdialect._contracts_core import (
     GenerationPath,
     RuntimeIntent,
@@ -15,9 +16,8 @@ from aetherdialect._contracts_core import (
     ValueHistory,
 )
 from aetherdialect._contracts_schema import SQLShape, TemplateStats
-from aetherdialect._intent_process import NormalizedExpr
-from aetherdialect._pipeline import handle_user_feedback
-from aetherdialect._templates import TemplateOps
+from aetherdialect._pipeline_generate import handle_user_feedback
+from aetherdialect._templates_ops import TemplateOps
 
 
 def _matched_template() -> Template:
@@ -71,8 +71,8 @@ def test_reader_accept_does_not_grow_queue_file(tmp_path) -> None:
     queue_path = tmp_path / WRITE_QUEUE_FILENAME
     assert not queue_path.is_file()
 
-    with patch("aetherdialect._pipeline.notify", lambda *a, **k: None):
-        with patch("aetherdialect._pipeline.print_rephrase_hint", lambda *a, **k: None):
+    with patch("aetherdialect._pipeline_generate.notify", lambda *a, **k: None):
+        with patch("aetherdialect._pipeline_generate.print_rephrase_hint", lambda *a, **k: None):
             handle_user_feedback(
                 "y",
                 intent,

@@ -6,9 +6,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from aetherdialect._constants import PERMISSION_DENIED_USER_MESSAGE
-from aetherdialect._contracts_base import AccessError, EngineContext, NormalizedExpr
-from aetherdialect._contracts_core import ConcreteIntent, RuntimeIntent, SelectCol, Template, ValueHistory
+from aetherdialect._constants_runtime import PERMISSION_DENIED_USER_MESSAGE
+from aetherdialect._contracts_base import EngineContext, NormalizedExpr
+from aetherdialect._contracts_core import AccessError, ConcreteIntent, RuntimeIntent, SelectCol, Template, ValueHistory
 from aetherdialect._contracts_schema import (
     ColumnMetadata,
     SchemaGraph,
@@ -16,9 +16,10 @@ from aetherdialect._contracts_schema import (
     TableMetadata,
     TemplateStats,
 )
-from aetherdialect._core_utils import normalize_question
-from aetherdialect._pipeline import _execute_intent_sql_rows, match_question_level_template_reuse
-from aetherdialect._utils import intent_key
+from aetherdialect._pipeline_execute import _execute_intent_sql_rows
+from aetherdialect._pipeline_generate import match_question_level_template_reuse
+from aetherdialect._utils import normalize_question
+from aetherdialect._utils_intent import intent_key
 
 
 def _schema() -> SchemaGraph:

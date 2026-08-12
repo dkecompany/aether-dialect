@@ -15,21 +15,21 @@ import pytest
 
 from aetherdialect._config import EngineConfig, PolicyConfig
 from aetherdialect._constants import MIGRATION_MAP_ACTION_REMAP
-from aetherdialect._contracts_base import ColumnRole, SchemaMigrationMap, SchemaMigrationMapEntry
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import read_artifact_manifest, read_gzip_json, write_artifact_manifest
-from aetherdialect._federation import (
-    FederationMappings,
-    federation_artifact_paths,
+from aetherdialect._contracts_base import SchemaMigrationMap, SchemaMigrationMapEntry
+from aetherdialect._contracts_schema import ColumnMetadata, ColumnRole, FederationMappings, SchemaGraph, TableMetadata
+from aetherdialect._federation_execute import (
     load_federation_composite_graph,
     persist_federation_tree,
 )
-from aetherdialect._schema_overrides import (
-    apply_overrides_and_persist,
-    load_overrides_sidecar,
-    save_schema_to_cache,
+from aetherdialect._federation_manifest import federation_artifact_paths
+from aetherdialect._schema_finalize import apply_structure_from_path, load_structure_sidecar
+from aetherdialect._schema_reflect import save_schema_to_cache
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils_artifacts import (
+    read_artifact_manifest,
+    read_gzip_json,
+    write_artifact_manifest,
 )
-from aetherdialect._templates import TemplateOps
 from tests.federation_helpers import TwoMemberFederation, build_two_member_federation
 from tests.test_migration_atomic import _make_template, _schema, _seed_store
 from tests.test_schema import _ov_doc
@@ -126,7 +126,7 @@ def test_crash_second_write_leaves_coherent_usable_state(
         sg.effective_structural_hash = "eff_new"
         sg.structural_hash = "eff_new"
         with patch(
-            "aetherdialect._schema_overrides.write_gzip_json_atomic",
+            "aetherdialect._schema_reflect.write_gzip_json_atomic",
             side_effect=OSError("graph crash"),
         ):
             with pytest.raises(OSError, match="graph crash"):
@@ -145,7 +145,7 @@ def test_crash_second_write_leaves_coherent_usable_state(
         persist_federation_tree(
             fed_dir,
             manifest=fed.manifest,
-            mappings=FederationMappings(version="0.2.1"),
+            mappings=FederationMappings(version="0.2.3"),
             composite=fed.composite,
             member_graphs=fed.member_graphs,
         )
@@ -162,12 +162,12 @@ def test_crash_second_write_leaves_coherent_usable_state(
                 raise OSError("federation second write failed")
             return real_write(path, payload)
 
-        with patch("aetherdialect._federation._write_federation_json_atomic", side_effect=_flaky_write):
+        with patch("aetherdialect._federation_execute._write_federation_json_atomic", side_effect=_flaky_write):
             with pytest.raises(OSError, match="federation second write failed"):
                 persist_federation_tree(
                     fed_dir,
                     manifest=fed.manifest,
-                    mappings=FederationMappings(version="0.2.1"),
+                    mappings=FederationMappings(version="0.2.3"),
                     composite=new_composite,
                     member_graphs=fed.member_graphs,
                 )
@@ -217,10 +217,12 @@ def test_crash_second_write_leaves_coherent_usable_state(
             added_columns=(),
         )
         with (
-            patch("aetherdialect._templates.TemplateOps._apply_schema_rename_migration_to_store", return_value=(1, 0)),
-            patch("aetherdialect._templates.TemplateOps._stamp_manifest", side_effect=OSError("stamp failed")),
-            patch("aetherdialect._templates.TemplateOps.apply_structural_migration_from_map"),
-            patch("aetherdialect._templates.migrate_sidecar_for_diff"),
+            patch(
+                "aetherdialect._templates_ops.TemplateOps._apply_schema_rename_migration_to_store", return_value=(1, 0)
+            ),
+            patch("aetherdialect._templates_ops.TemplateOps._stamp_manifest", side_effect=OSError("stamp failed")),
+            patch("aetherdialect._templates_ops.TemplateOps.apply_structural_migration_from_map"),
+            patch("aetherdialect._schema_finalize.migrate_sidecar_for_diff"),
         ):
             with pytest.raises(OSError, match="stamp failed"):
                 TemplateOps.apply_schema_migration_map(
@@ -239,22 +241,22 @@ def test_crash_second_write_leaves_coherent_usable_state(
         artifacts_dir = tmp_path / "artifacts"
         artifacts_dir.mkdir()
         schema_path = artifacts_dir / "schema_graph.json.gz"
-        overrides_path = artifacts_dir / "schema_overrides.json"
+        overrides_path = artifacts_dir / "schema_structure.json"
         overrides_path.write_text(json.dumps(_ov_doc()), encoding="utf-8")
         sg = deepcopy(schema_graph)
         save_schema_to_cache(sg, str(schema_path))
         before = _snapshot_tree(tmp_path)
         with patch(
-            "aetherdialect._schema_overrides._write_overrides_sidecar_payload",
+            "aetherdialect._schema_finalize._write_overrides_sidecar_payload",
             side_effect=OSError("sidecar crash"),
         ):
             with pytest.raises(OSError, match="sidecar crash"):
-                apply_overrides_and_persist(sg, overrides_path, schema_json_path=str(schema_path))
+                apply_structure_from_path(sg, overrides_path, schema_json_path=str(schema_path))
         after = _snapshot_tree(tmp_path)
         assert _state_matches(before, after, None)
         payload = read_gzip_json(str(schema_path))
         assert isinstance(payload.get("tables"), dict)
-        sidecar = load_overrides_sidecar(str(schema_path))
+        sidecar = load_structure_sidecar(str(schema_path))
         assert sidecar is None or isinstance(sidecar, dict)
 
     else:
@@ -297,7 +299,7 @@ def test_graph_manifest_pair_all_or_nothing(
                 raise OSError("simulated crash on second commit replace")
         return real_replace(src, dst)
 
-    with patch("aetherdialect._schema_overrides.os.replace", side_effect=_side_effect):
+    with patch("aetherdialect._schema_reflect.os.replace", side_effect=_side_effect):
         with pytest.raises(OSError, match="simulated crash"):
             save_schema_to_cache(sg, str(schema_path))
 
@@ -355,7 +357,7 @@ def test_federation_persist_torn_tree_refused_or_old(tmp_path: Path) -> None:
     persist_federation_tree(
         fed_dir,
         manifest=fed.manifest,
-        mappings=FederationMappings(version="0.2.1"),
+        mappings=FederationMappings(version="0.2.3"),
         composite=fed.composite,
         member_graphs=fed.member_graphs,
     )
@@ -385,7 +387,7 @@ def test_federation_persist_torn_tree_refused_or_old(tmp_path: Path) -> None:
                 raise OSError("simulated crash before federation manifest commit")
         return real_replace(src, dst)
 
-    with patch("aetherdialect._federation.os.replace", side_effect=_side_effect):
+    with patch("os.replace", side_effect=_side_effect):
         with pytest.raises(OSError, match="simulated crash"):
             persist_federation_tree(
                 fed_dir,

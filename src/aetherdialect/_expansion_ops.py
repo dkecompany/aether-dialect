@@ -78,7 +78,6 @@ from ._constants import (
     WINDOW_SUM_PARTITION_ADD,
 )
 from ._contracts_base import (
-    ColumnRole,
     CteEmissionKind,
     ExprValue,
     HavingParam,
@@ -87,7 +86,6 @@ from ._contracts_base import (
     OrderByCol,
     PredicateGroup,
     RawValue,
-    TableRole,
     WhereParam,
 )
 from ._contracts_core import (
@@ -100,21 +98,23 @@ from ._contracts_schema import (
     CaseRegistryStep,
     CaseWhenBranch,
     CaseWhenExpr,
+    ColumnRole,
     ExpansionMetadata,
     SchemaGraph,
     SchemaLimits,
+    TableRole,
     WindowRegistryStep,
     WindowSpec,
 )
-from ._core_utils import column_has_unknown_value_type, debug, escape_sql_string_literal_body_base, stable_bucket
 from ._dialect import DialectRegistry
+from ._intent_bind import check_qualified_refs_exist
 from ._intent_expr import extract_columns_from_expr, replace_refs_in_expr
-from ._intent_process import apply_deterministic_repairs
-from ._intent_repair import drop_invalid_case_registry_entries, repair_case_when_intent
-from ._intent_resolve import check_qualified_refs_exist
-from ._utils import intent_key
-from ._validation_execute import curated_warmup_semantic_issues
-from ._validation_schema import runtime_scope_registry_error_messages
+from ._intent_loop import apply_deterministic_repairs
+from ._intent_normalize import drop_invalid_case_registry_entries, repair_case_when_intent
+from ._utils import column_has_unknown_value_type, debug, escape_sql_string_literal_body_base, stable_bucket
+from ._utils_intent import intent_key
+from ._validation_shape import runtime_scope_registry_error_messages
+from ._validation_sql import curated_warmup_semantic_issues
 
 
 def _expansion_path_ops(intent: SeedWarmupIntent) -> list[str]:
@@ -308,7 +308,7 @@ def _strip_order_by_for_distinct_select(intent: SeedWarmupIntent) -> None:
 
 
 def _intent_has_window_select(intent: SeedWarmupIntent) -> bool:
-    """Return True when the intent declares window functions via. ``window_registry`` or select refs."""
+    """Return True when the intent declares window functions via ``window_registry`` or select refs."""
     if intent.window_registry:
         return True
     return any((sc.expr.registry_ref() or "").startswith("w") for sc in (intent.select_cols or []))
@@ -342,9 +342,7 @@ def _build_column_metadata(schema: SchemaGraph) -> dict[str, dict[str, dict[str,
                 "is_foreign_key": bool(col.is_foreign_key),
                 "fk_target": tuple(col.fk_target) if col.fk_target else None,
                 "element_type": col.element_type or "",
-                "sample_values": list(
-                    getattr(col, "value_overlap_sample", None) or getattr(col, "semantic_distinct_values", None) or []
-                )[:5],
+                "sample_values": list(getattr(col, "value_overlap_sample", None) or [])[:5],
             }
     return result
 
@@ -367,7 +365,7 @@ def _build_fk_map(schema: SchemaGraph) -> dict[str, list[dict[str, str]]]:
 
 
 def _tables_are_connected(tables: list[str], fk_map: dict[str, list[dict[str, str]]]) -> bool:
-    """Return whether all tables in `tables` form one connected. component via `fk_map`."""
+    """Return whether all tables in `tables` form one connected component via `fk_map`."""
     if len(tables) <= 1:
         return True
     adjacency: dict[str, set[str]] = {t: set() for t in tables}
@@ -443,7 +441,7 @@ def _get_numeric_measure_columns(schema: SchemaGraph, table_name: str) -> list[s
 
 
 def _get_categorical_identifier_columns(schema: SchemaGraph, table_name: str) -> list[str]:
-    """Return `table.column` references suitable as `PARTITION BY` keys. for windows."""
+    """Return `table.column` references suitable as `PARTITION BY` keys for windows."""
     if table_name not in schema.tables:
         return []
     table = schema.tables[table_name]
@@ -455,7 +453,7 @@ def _get_categorical_identifier_columns(schema: SchemaGraph, table_name: str) ->
 
 
 def _where_value_type_and_op_from_metadata(meta: dict[str, Any]) -> tuple[str | None, str]:
-    """Map schema column metadata to a ``WhereParam`` semantic type. and. default comparison op."""
+    """Map schema column metadata to a ``WhereParam`` semantic type and default comparison op."""
     if meta.get("element_type"):
         return None, "="
     vt = (meta.get("value_type") or "").strip().lower()
@@ -474,7 +472,7 @@ def _where_value_type_and_op_from_metadata(meta: dict[str, Any]) -> tuple[str | 
 
 
 def _rewrite_table_qualifier(intent: SeedWarmupIntent, old_table: str, new_table: str, schema: SchemaGraph) -> bool:
-    """Rewrite qualified ``old_table`` column references to. ``new_table`` when bare names exist."""
+    """Rewrite qualified ``old_table`` column references to ``new_table`` when bare names exist."""
     new_tm = schema.tables.get(new_table)
     if new_tm is None:
         return False
@@ -713,7 +711,7 @@ def _where_expr_add(
 
 
 def _swap_agg_func(expr: NormalizedExpr, new_agg: str) -> NormalizedExpr:
-    """Return `expr` with its aggregation function switched to. `new_agg`."""
+    """Return `expr` with its aggregation function switched to `new_agg`."""
     if expr.agg_func:
         return replace(expr, agg_func=new_agg)
     if expr.add_groups and expr.add_groups[0].agg_func:
@@ -1552,7 +1550,7 @@ def _select_expr_pair_multiply(
 def _select_case_label_add(
     intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
-    """Append a numeric-labeled CASE over one measure column (threshold. vs else)."""
+    """Append a numeric-labeled CASE over one measure column (threshold vs else)."""
     _ = column_metadata
     if intent.grain == "grouped":
         return []
@@ -1635,7 +1633,7 @@ def _window_lead_add(
 def _where_ilike_add(
     intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
-    """Add case-insensitive `ilike` filters on categorical string. columns (PostgreSQL only)."""
+    """Add case-insensitive `ilike` filters on categorical string columns (PostgreSQL only)."""
     _ = column_metadata
     if "ilike" not in DialectRegistry.extra_where_ops_for_engine():
         return []
@@ -1667,7 +1665,7 @@ def _where_ilike_add(
 def _where_array_contains_add(
     intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]]
 ) -> list[SeedWarmupIntent]:
-    """Add `contains` filters for columns that declare an array. `element_type`."""
+    """Add `contains` filters for columns that declare an array `element_type`."""
     _ = column_metadata
     current_where_cols = {f.left_expr.primary_column for f in (PredicateGroup.where_leaves(intent.where) or [])}
     if len(current_where_cols) >= SeedWarmupConfig.MAX_WHERE_PREDICATES:
@@ -1812,7 +1810,7 @@ def _splice_subtree(
     *,
     pool_key: str = "",
 ) -> list[SeedWarmupIntent]:
-    """Borrow one filter predicate from the subtree pool when table. overlap exists."""
+    """Borrow one filter predicate from the subtree pool when table overlap exists."""
     _ = schema, fk_map, column_metadata
     pool = _EXPANSION_SUBTREE_POOL.get(str(pool_key or ""), [])
     if not pool:
@@ -2395,7 +2393,7 @@ def _emi_equivalence_augment(
     column_metadata: dict[str, dict[str, dict[str, Any]]],
     fk_map: dict[str, list[dict[str, str]]],
 ) -> list[SeedWarmupIntent]:
-    """Duplicate an existing AND filter to preserve row sets under. conjunctive semantics."""
+    """Duplicate an existing AND filter to preserve row sets under conjunctive semantics."""
     _ = schema, fk_map, column_metadata
     fps = PredicateGroup.where_leaves(intent.where) or []
     if not fps:
@@ -2411,7 +2409,7 @@ def _emi_equivalence_augment(
 def _expansion_noop(
     intent: SeedWarmupIntent, schema: SchemaGraph, column_metadata: dict[str, dict[str, dict[str, Any]]] | None = None
 ) -> list[SeedWarmupIntent]:
-    """Placeholder expansion operator reserved for a future deterministic transform."""
+    """No-op expansion operator: returns no variants."""
     _ = intent, schema, column_metadata
     return []
 
@@ -2489,7 +2487,7 @@ def _build_operator_registry(
 
 
 def _deterministic_repair_warmup_seed(seed: SeedWarmupIntent, schema: SchemaGraph) -> SeedWarmupIntent:
-    """Run the same deterministic repair chain as interactive parsing. on. a seed intent."""
+    """Run the same deterministic repair chain as interactive parsing on a seed intent."""
     rt: RuntimeIntent = seed.to_runtime_intent()
     nl = seed.natural_language or seed.intent_id or ""
     repaired = apply_deterministic_repairs(rt, schema, nl)
@@ -2519,7 +2517,7 @@ def _expand_single_depth(
     seen_keys: set[str],
     source_tag: str,
 ) -> list[SeedWarmupIntent]:
-    """Run every registered operator on each intent and collect unique. accepted variants."""
+    """Run every registered operator on each intent and collect unique accepted variants."""
     results: list[SeedWarmupIntent] = []
     for intent in intents:
         for op_name, op_func in operators.items():
@@ -2551,7 +2549,7 @@ def expand_gold_intents(
     *,
     pool_key: str | None = None,
 ) -> list[SeedWarmupIntent]:
-    """Expand gold intents into synthetic intents via multi-depth. deterministic expansion."""
+    """Expand gold intents into synthetic intents via multi-depth deterministic expansion."""
     if limits is not None:
         SeedWarmupConfig.MAX_WHERE_PREDICATES = limits.max_where_predicates
         SeedWarmupConfig.MAX_GROUPBY = limits.max_groupby

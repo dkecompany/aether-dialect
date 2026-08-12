@@ -12,9 +12,9 @@ from aetherdialect._contracts_base import (
     WhereParam,
 )
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import pop_engine_identity, push_engine_identity
 from aetherdialect._dialect import DialectRegistry
-from aetherdialect._validation_schema import validate_contains_array_filters
+from aetherdialect._utils import pop_engine_identity, push_engine_identity
+from aetherdialect._validation_shape import validate_contains_array_filters
 
 
 def _uninit(engine: str):
@@ -61,7 +61,7 @@ def test_containment_uses_native_operator_per_dialect(engine: str, marker: str) 
 
 
 @pytest.mark.fast
-@pytest.mark.parametrize("engine", ["sqlite", "sqlserver", "redshift", "snowflake", "bigquery"])
+@pytest.mark.parametrize("engine", ["sqlite", "sqlserver", "oracle", "redshift", "snowflake", "bigquery"])
 def test_containment_refused_where_unsupported(engine: str) -> None:
     dialect = _uninit(engine)
     assert dialect.render_containment("film.special_features", ":p1", "string") is None

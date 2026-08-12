@@ -2,7 +2,7 @@
 
 Threat model, credential inheritance, why SQL injection is impossible, what schema construction learns and discloses, the per-phase LLM disclosure inventory, sensitivity tiers, deny lists, and operational local-machine disclosure. Pipeline narrative and operator day-to-day semantics live in [How it works](HOW_IT_WORKS.md) and the [User guide](USER_GUIDE.md). Per-engine SQL capability limits live in the [Support matrix](SUPPORT_MATRIX.md).
 
-**Reading order:** [README](../README.md) -> [Getting started](GETTING_STARTED.md) -> [User guide](USER_GUIDE.md) -> [Integrator guide](INTEGRATOR_GUIDE.md) -> [Sandbox guide](SANDBOX.md) -> [API reference](API_REFERENCE.md) -> [How it works](HOW_IT_WORKS.md) -> this document -> [Support matrix](SUPPORT_MATRIX.md).
+**Reading order:** [README](../README.md) → [Getting started](GETTING_STARTED.md) → [User guide](USER_GUIDE.md) → [Integrator guide](INTEGRATOR_GUIDE.md) → [Sandbox guide](SANDBOX.md) → [API reference](API_REFERENCE.md) → [Troubleshooting](TROUBLESHOOTING.md) → [How it works](HOW_IT_WORKS.md) → this document → [Support matrix](SUPPORT_MATRIX.md).
 
 ## Sections
 
@@ -36,7 +36,7 @@ The engine is built for the case where:
 | User crafts a question that runs arbitrary SQL | Structured intent IR, deterministic SQL generation, `PolicyConfig.FORBIDDEN_SQL` regex list, dialect AST structural rejection, schema/scope/sensitivity gates, EXPLAIN gate before execution ([Section 4](#4-why-sql-injection-is-not-possible)). |
 | LLM output escapes the analytical subset | Same gates; constructs the IR cannot represent are refused or reformulated ([Support matrix](SUPPORT_MATRIX.md)). |
 | Sensitive column data leaks through prompts or artifacts | Sensitivity tiers (`none`, `restricted`, `hidden`), deny lists, visibility gates, capped enum heads (unioned across members on a composite graph), and the rule that cross-source join keys must be `sensitivity == none`. |
-| User assumes AetherSpace replaces database RBAC | `SpaceContext` narrows knowledge and template partition only; warehouse grants plus `EngineContext` / `FederationContext` remain the execution boundary ([Section 2](#2-execution-boundary-and-credentials)). |
+| User assumes AetherSpace replaces database RBAC | A space narrows which objects a turn may reference and refuses questions that reach past it, and it is not a permission boundary because it can neither be defined nor entered beyond what credentials already permit ([Section 2](#2-execution-boundary-and-credentials)). |
 | Cross-source join or semi-join keys transmit restricted values | Declared cross-source keys that are not `none` fail federation validation; mapping suggestions exclude non-`none` columns; semi-join reduction at execution raises if a reducing key is not allowed. |
 | Semi-join reduction copies key values across members | At execution, distinct key values from one member's result frame are bound as filters in another member's SQL. This is not an LLM disclosure - it is cross-database data movement under the connected roles. Keys must be `sensitivity == none`. |
 
@@ -46,33 +46,35 @@ The engine is built for the case where:
 
 **`EngineContext` and `FederationContext` are a small additive layer on top of those inherited permissions - not a replacement for them.** Their allow/deny object and column lists remove tables and columns from the in-memory schema graph and block references at validation and execution time. They tighten what the analytical surface can reach among objects the role already permits. They can never grant access the database would refuse.
 
-**`SpaceContext` is knowledge-and-template partitioning only.** It narrows which tables and columns appear in LLM-facing payloads and which template partition a question uses. It has no effect on SQL execution scope.
+**`SpaceContext` narrows knowledge and template partitions at question time.** A space narrows which objects a turn may reference and refuses questions that reach past it, and it is not a permission boundary because it can neither be defined nor entered beyond what credentials already permit. Effective SQL and meta gates use **context ∩ credential reflection ∩ non-HIDDEN** ([User guide — AetherSpace](USER_GUIDE.md#aetherspace)).
 
 Three-way summary:
 
-| Scope type | Tightens the in-memory analytical surface? | Changes what the warehouse will execute? |
+| Scope type | Tightens the in-memory analytical surface? | Refuses out-of-scope questions? |
 | --- | --- | --- |
-| Connected database role | Indirectly (reflection only sees what the role can see) | **Yes - this is the hard boundary** |
-| `EngineContext` / `FederationContext` | Yes (graph removal + execution-time reference checks) | No elevation; only further restriction |
-| `SpaceContext` | Knowledge / prompt / template partition only | **No** |
+| Connected database role | Indirectly (reflection only sees what the role can see) | **Yes — warehouse grants are the hard boundary** |
+| `EngineContext` / `FederationContext` | Yes (graph removal + execution-time reference checks) | Yes — further restriction only; no elevation |
+| `SpaceContext` | Yes — knowledge, prompts, and template partition | Yes — `unanswerable` when the question reaches past the active space |
 
 **Consumer deployments** pair restricted database logins with named `EngineContext` subsets and optional AetherSpaces. Align context allow lists with each login's grants ([Integrator guide - Multi-user deployment](INTEGRATOR_GUIDE.md#multi-user-deployment)).
+
+**Credential reflection snapshot.** When a consumer role reflects a subset of the owner-published schema, the engine stores that visible object set and intersects it with context allow/deny and sensitivity for SQL gates, meta answers, and `export_structure`. Prefer refusing before EXPLAIN/execute when the intent references objects outside that intersection. If grants drift after the snapshot and the warehouse still rejects the statement, the user-facing message asks them to contact an administrator — by then warehouse query history may already record the SQL, so that path is drift fallback only, not the primary authorization control.
 
 ## 3. Schema profiling, roles, and classification
 
 At first construction (and on cache invalidation), the engine builds a compiled schema graph. Security-relevant detail:
 
-1. **Reflect.** Catalog reflection loads table and column names, data types, primary keys, and foreign keys where the dialect exposes them (for example InnoDB / `information_schema`, PostgreSQL, Unity Catalog, Snowflake, `PRAGMA foreign_key_list` on SQLite). BigQuery returns no live FK metadata from the catalog; join edges then come from `EngineContext.sql_file`, overrides, or inference.
+1. **Reflect.** Catalog reflection loads table and column names, data types, primary keys, and foreign keys where the dialect exposes them (for example InnoDB / `information_schema`, PostgreSQL, Unity Catalog, Snowflake, `PRAGMA foreign_key_list` on SQLite). BigQuery returns no live FK metadata from the catalog; join edges then come from `EngineContext.sql_file`, `export_structure` / `apply_structure`, or inference.
 
-2. **Profile (read-only aggregates only).** For each column still in scope the profiler runs aggregate queries: row counts, distinct counts, null counts / null rates, min/max for numerics and dates, mode-frequency ratios, and capped frequent-value samples for categorical columns (`PolicyConfig.CATEGORICAL_SAMPLE_SIZE`, currently 20). Bounded distinct-value samples also feed foreign-key overlap probes (`value_overlap_sample`). Profiling never bulk-exports row payloads to the LLM. Progress prints as `Profiling [i/n] <table>` on stdout.
+2. **Profile (read-only aggregates only).** For each column still in scope the profiler runs aggregate queries: row counts, distinct counts, null counts / null rates, min/max for numerics and dates, mode-frequency ratios, and capped frequent-value samples for categorical columns (`PolicyConfig.CATEGORICAL_SAMPLE_SIZE`, default 20). Bounded distinct-value samples also feed foreign-key overlap probes. Profiling never bulk-exports row payloads to the LLM. Progress prints as `Profiling [i/n] <table>` on stdout.
 
-3. **Usability gates.** Columns that fail statistical gates are marked unusable and omitted from LLM-facing schema literals (unless they are primary or foreign keys). Gates include: distinct count <= 1; null ratio at or above `UNUSABLE_NULL_RATIO_THRESHOLD` (0.99); mode frequency ratio at or above `SENTINEL_MODE_FREQUENCY_THRESHOLD` (0.99). Schema overrides may set `usable: true` to re-enable a profiler-rejected column for classification and visibility. Overrides reject `usable: false` - withhold a column with sensitivity tiers or deny lists instead.
+3. **Usability gates.** Columns that fail statistical gates are marked unusable and omitted from LLM-facing schema literals (unless they are primary or foreign keys). Gates include: distinct count <= 1; null ratio at or above `UNUSABLE_NULL_RATIO_THRESHOLD` (0.99); mode frequency ratio at or above `SENTINEL_MODE_FREQUENCY_THRESHOLD` (0.99). Structure documents may set `usable: true` to re-enable a profiler-rejected column for classification and visibility. `apply_structure` rejects `usable: false` - withhold a column with sensitivity tiers or deny lists instead.
 
 4. **Role and sensitivity classification.** A construction-time LLM pass receives per-column profiling summaries (name, type, PK/FK flags, and profile hints such as distinct count, distinct ratio, null ratio) plus optional domain notes - not arbitrary row dumps. It assigns column **roles** (identifier, measure, dimension / categorical, temporal, free text, boolean, audit, and similar) and **sensitivity** tiers (`none`, `restricted`, `hidden`). Assignments are metadata that steer intent validation and prompt shaping.
 
-5. **Foreign-key inference.** When the catalog graph is disconnected, name-overlap heuristics and bounded value-containment / overlap probes on `value_overlap_sample` may add inferred edges. Inference never requires shipping full tables to the model.
+5. **Foreign-key inference.** When the catalog graph is disconnected, name-overlap heuristics and bounded value-containment / overlap probes may add inferred edges. Inference never requires shipping full tables to the model.
 
-**Federation mapping suggestions (no provider call).** When operators build or extend cross-source mappings, `suggest_cross_source_mappings` proposes candidate column and table equivalences from identifier overlap and bounded value-overlap comparison on join-key columns (`value_overlap_sample`). Scoring and ranking are entirely deterministic; **no provider call**. Proposals are advisory only and are **never applied without explicit confirmation** through the mappings editor workflow. Candidate cross-source join-key columns must be `sensitivity == none`; restricted or hidden columns are excluded from scoring (`validate_cross_source_keys_on_graph`).
+**Federation mapping suggestions (no provider call).** When operators build or extend cross-source mappings, `suggest_cross_source_mappings` proposes candidate column and table equivalences from identifier overlap and bounded value-overlap comparison on join-key columns. Scoring and ranking are entirely deterministic; **no provider call**. Proposals are advisory only and are **never applied without explicit confirmation** through the mappings editor workflow. Candidate cross-source join-key columns must be `sensitivity == none`; restricted or hidden columns are excluded from scoring.
 
 ## 4. Why SQL injection is not possible
 
@@ -80,7 +82,7 @@ User questions and model output never become executable SQL strings directly. Th
 
 1. **Bounded intent slots - the model never emits SQL.** Interpret, ground, and compose stages fill structured JSON (tables, columns, filters, aggregates, CTE steps). Free-form SQL fragments are not a legal intent shape; parse and schema validators reject them.
 
-2. **Typed intermediate representation.** Intent JSON is parsed into a typed runtime IR (`RuntimeIntent` and related structures). Slot values are schema-bound identifiers or bound parameter handles, not statement text.
+2. **Typed intermediate representation.** Intent JSON is parsed into a typed runtime IR. Slot values are schema-bound identifiers or bound parameter handles, not statement text.
 
 3. **Deterministic SQL generation.** The SQL generator renders the IR through dialect adapters. Filter and having literals from the question become bind parameters (`:param` / dialect equivalents). User text can influence parameter *values*; it cannot rewrite statement structure, introduce a second statement, or concatenate predicate text into the SQL string.
 
@@ -90,13 +92,13 @@ User questions and model output never become executable SQL strings directly. Th
 
 6. **Schema, scope, usability, and sensitivity gates.** Every referenced table and column must exist in the compiled graph, survive `EngineContext` / `FederationContext` allow/deny scope, pass usability and selectability rules, and satisfy sensitivity validators (bare restricted/hidden projection dropped or rejected; literal-value filters on non-selectable columns rejected; sensitive `GROUP BY` / `ORDER BY` rejected). Denied columns are treated as absent.
 
-**Federation replica projections.** The CRM `staff` mirror is the worked example: the partition seed exports only `staff_id`, `first_name`, `last_name`, and `store_id` - `password` and government-id columns never enter the CRM database file, so reflection cannot surface them even before mappings apply. The declaration's column map on the CRM member repeats that subset for documentation; the authoritative `storefront` member retains the full table. Post-composition re-redaction removes profile samples for any column marked `hidden` on any member, so a sensitive field hidden on one side stays hidden and unsampled on the composite graph.
+**Federation replica projections.** The CRM `staff` mirror is the worked example: the partition seed exports only `staff_id`, `first_name`, `last_name`, and `store_id` - `password` and government-id columns never enter the CRM database file, so reflection cannot surface them even before mappings apply. The declaration's column map on the CRM member declares that same column subset; the authoritative `storefront` member retains the full table. Post-composition re-redaction removes profile samples for any column marked `hidden` on any member, so a sensitive field hidden on one side stays hidden and unsampled on the composite graph.
 
-**Semi-join key gating at execution:** `semijoin_key_is_allowed` requires `sensitivity == none`. When a reducing or semi-join edge references a restricted or hidden key, federation execution **raises** `FederationRuntimeError` (rejected - not silently skipped). Separately, plan-time eligibility omits non-`none` joins from the eligible cross-source set, and declaration-time validation rejects non-`none` declared keys. Low distinct-count keys fail with a cardinality diagnostic and fall back to a different plan shape when one exists; the decision is deterministic for a fixed profile.
+**Semi-join key gating at execution:** Reducing and semi-join keys must be `sensitivity == none`. When a reducing or semi-join edge references a restricted or hidden key, federation execution **raises** `FederationRuntimeError` (rejected - not silently skipped). Separately, plan-time eligibility omits non-`none` joins from the eligible cross-source set, and declaration-time validation rejects non-`none` declared keys. Low distinct-count keys fail with a cardinality diagnostic and fall back to a different plan shape when an alternate shape is available; the decision is deterministic for a fixed profile.
 
-7. **EXPLAIN-class gate.** When the dialect still has a usable EXPLAIN backend (`dialect.can_explain()`), `validate_sql` runs `dialect.explain_diagnose` before execution (warehouse `EXPLAIN` / `EXPLAIN COST` / `SHOWPLAN_*`, or BigQuery dry-run). Permission-denied on EXPLAIN disables further EXPLAIN for that dialect instance rather than elevating privileges. Cost caps can reject plans as `EXPLAIN_COST_EXCEEDED`.
+7. **EXPLAIN-class gate.** When the dialect still has a usable EXPLAIN backend, validation runs an EXPLAIN-class diagnose before execution (warehouse `EXPLAIN` / `EXPLAIN COST` / `SHOWPLAN_*`, or BigQuery dry-run). Permission-denied on EXPLAIN disables further EXPLAIN for that dialect instance rather than elevating privileges. Cost caps can reject plans as `EXPLAIN_COST_EXCEEDED`.
 
-**Honest conclusion:** even a fully compromised or adversarial model cannot emit DML/DDL, multi-statement batches, or concatenated predicate text that reaches the database. Those shapes are not produced by the deterministic generator from legal IR, and they do not survive the forbidden-SQL list, AST structural rules, schema/scope/sensitivity gates, or the EXPLAIN gate.
+Even a fully compromised or adversarial model cannot emit DML/DDL, multi-statement batches, or concatenated predicate text that reaches the database. Those shapes are not produced by the deterministic generator from legal IR, and they do not survive the forbidden-SQL list, AST structural rules, schema/scope/sensitivity gates, or the EXPLAIN gate.
 
 ## 5. LLM context inventory
 
@@ -137,35 +139,27 @@ Each subsection below states the task, exactly what content is sent to the confi
 
 ### 5.5 Join selection (generation-time)
 
-- **Task:** Disambiguate among enumerated join-path candidates when more than one valid path remains within a scope (single-engine scopes) or among declared cross-source keys for a member pair (federation).
-- **Deterministic context assembly:** Question, deterministic SQL preview for the current intent, and a closed-set candidate list per scope (`candidate_id`, path signature, edge kinds - no row values). For federation, each unordered source pair lists only declared cross-source join keys; non-`none` sensitivity keys are excluded before the payload is built. When only one candidate exists for a scope, no provider call is made.
-- **Provider-mediated:** Per-scope `candidate_id` choice among the closed set; **provider output is not deterministic**.
-- **Content:** Same as assembled context above.
-- **Data sent:** Metadata and path signatures only.
-
-### 5.6 Repair and validation
-
-When validation fails, the same Compose system prompt is reused with error rows and the structural payload for implicated tables. The engine never sends raw database warehouse rows to the provider for repair. Assembly of error rows and structural payloads is **deterministic**; repair slot values are **provider-mediated** and **provider output is not deterministic**. Diagnostic codes for retries and repairs include `INTERPRET_GROUND_RETRY`, `COMPOSE_REPAIR`, `SENSITIVITY_GATE_HIT`, and `FALLBACK_FRESH_RESTART` ([API reference - Diagnostic code catalog](API_REFERENCE.md#diagnostic-code-catalog)).
-
-### 5.7 Join selection — deterministic context assembly and provider assist
-
 Join selection is the canonical example of **deterministic selection, then configured provider**:
 
 1. **Deterministic candidate enumeration.** The engine computes eligible join paths or declared cross-source keys from the compiled graph, scope gates, and sensitivity rules. The resulting candidate list is a function of schema state and intent only — not provider output.
-2. **Deterministic context assembly.** For each scope with more than one candidate, the engine builds a fixed JSON payload: question text, SQL preview, and the closed candidate list with path signatures. The same intent and graph always produce the same payload.
-3. **Configured provider disambiguation.** The assembled payload is sent to the configured provider, which returns one `candidate_id` per scope from the closed set only.
-4. **Provider output is not deterministic.** Two provider calls with identical assembled context may choose different `candidate_id` values. Post-selection validation (schema binding, sensitivity, and SQL gates) remains **deterministic**.
+2. **Deterministic context assembly.** For each scope with more than one candidate, the engine builds a fixed JSON payload: question text, SQL preview, and the closed candidate list with path signatures (`candidate_id`, path signature, edge kinds — no row values). For federation, each unordered source pair lists only declared cross-source join keys; non-`none` sensitivity keys are excluded before the payload is built. The same intent and graph always produce the same payload.
+3. **Configured provider disambiguation.** The assembled payload is sent to the configured provider, which returns one `candidate_id` per scope from the closed set only. **Provider output is not deterministic** — two calls with identical assembled context may choose different `candidate_id` values.
+4. **Post-selection validation** — schema binding, sensitivity, and SQL gates remain **deterministic**.
 
 Single-candidate scopes skip step 3 entirely.
 
-### 5.8 Upload inspection (CSV file engine)
+### 5.6 Repair and validation
+
+When validation fails, the same Compose system prompt is reused with error rows and the structural payload for implicated tables. The engine never sends raw database warehouse rows to the provider for repair. Assembly of error rows and structural payloads is **deterministic**; repair slot values are **provider-mediated** and **provider output is not deterministic**. Diagnostic codes for retries and repairs: [Troubleshooting — Diagnostic codes](TROUBLESHOOTING.md#diagnostic-codes).
+
+### 5.7 Upload inspection (CSV file engine)
 
 Called from `inspect_tabular_upload` and `validate_upload_sources` during CSV/Excel engine construction.
 
-- **Identifier naming (`_llm_identifier`):** Propose a SQL identifier for one messy upload label when deterministic normalization is insufficient.
+- **Identifier naming:** Propose a SQL identifier for one messy upload label when deterministic normalization is insufficient.
   - **Deterministic context assembly:** Single column or table label text and the identifier JSON schema.
   - **Provider-mediated:** Proposed identifier string; **provider output is not deterministic**.
-  - **Calls:** `validate_upload_sources` / `inspect_tabular_upload` when `_label_needs_llm_identifier` is true.
+  - **Calls:** `validate_upload_sources` / `inspect_tabular_upload` when a label fails deterministic identifier normalization.
   - **Content:** Label text only; no row data.
 
 - **Upload summary (when `TABULAR_LLM_ASSIST` enabled):** Compress structured inspection findings into one operator-facing explanation.
@@ -184,7 +178,7 @@ Called from `inspect_tabular_upload` and `validate_upload_sources` during CSV/Ex
 
 **Policy flag — `TABULAR_LLM_ASSIST`:** Upload interpretation, upload summary, and upload column-transform proposals are the questioning-surface call sites that may send **sampled cell content** to the configured provider. `PolicyConfig.TABULAR_LLM_ASSIST` defaults to enabled. Set environment variable `AETHERDIALECT_TABULAR_LLM_ASSIST=false` (or assign `PolicyConfig.TABULAR_LLM_ASSIST = False` before calling `inspect_tabular_upload`) to turn off model-assisted upload interpretation, the provider-written upload summary, and column-transform proposal shipping. With the flag disabled, inspection context assembly for layout scoring remains **deterministic**: structural scoring resolves header rows and table regions without shipping cell text; issue severities (**Advisory**, **Review**, **Blocking**, **Fatal**), `suggested_selections` from deterministic rules, and auto-correct reshaping still run unchanged. Native Excel temporal typing, deterministic scalar-affix heuristics, and empty-column detection still run at ingest without model assistance. Identifier naming for messy labels (label text only, no row data) is a separate call and is unaffected by this flag.
 
-### 5.9 Provider call site inventory
+### 5.8 Provider call site inventory
 
 Every questioning-surface path that calls the configured provider appears below. Corpus generators, qsim fill, and other offline synth tools use separate `synth` / `synth_variety` tasks and are not part of the analyst questioning surface.
 
@@ -207,29 +201,27 @@ Every questioning-surface path that calls the configured provider appears below.
 | Upload column transforms | `prepare_relations_for_paths` / `validate_upload_sources` when `TABULAR_LLM_ASSIST` | `upload_column_transforms` | Up to five shuffled data rows, header labels, optional distinct sets (≤25 values) |
 | Role / sensitivity classification | `apply_column_roles_llm` at schema build | `schema_base`, `schema` | Per-column profiling summaries |
 | Schema notes refinement | schema catalog notes pass | `schema_base`, `schema` | Table/column description drafts |
-| Description refinement | `refine_descriptions` on overrides apply | `default` | Operator-edited description text |
+| Description refinement | `refine_descriptions` on `apply_structure` | `default` | Operator-edited description text |
 | DDL assistance | schema catalog DDL helper | `ddl` | Structural DDL context |
 | Seed question clarify | seed warmup normalization (offline) | `default` | Seed question text |
 
 Assembly of every row's **Content** column is **deterministic** for fixed inputs. **Provider output is not deterministic** for any row.
 
-### 5.10 Role and sensitivity classification (construction-time)
+### 5.9 Role and sensitivity classification (construction-time)
 
-During schema build, `apply_column_roles_llm` sends per-column profiling summaries (name, type, PK/FK flags, distinct/null ratios) and optional domain notes to the configured provider - not arbitrary row dumps. Assembly of profiling summaries is **deterministic**; assigned **table and column roles** and **sensitivity tiers** are **provider-mediated** and **provider output is not deterministic**. Assignments persist in the schema graph and overrides layer. Domain notes may tighten sensitivity to `restricted` or `hidden` only when they explicitly mark sensitive data.
+During schema build, `apply_column_roles_llm` sends per-column profiling summaries (name, type, PK/FK flags, distinct/null ratios) and optional domain notes to the configured provider - not arbitrary row dumps. Assembly of profiling summaries is **deterministic**; assigned **table and column roles** and **sensitivity tiers** are **provider-mediated** and **provider output is not deterministic**. Assignments persist in the schema graph and structure layer. Domain notes may tighten sensitivity to `restricted` or `hidden` only when they explicitly mark sensitive data.
 
 ## 6. Sensitivity tags
 
-Canonical definitions - repeated elsewhere only as a one-line skim with a pointer here.
+Tier definitions (`none`, `restricted`, `hidden`): [User guide — Sensitivity classification](USER_GUIDE.md#sensitivity-classification). This section covers enforcement consequences only.
 
-| Tier | Model visibility | Query behavior |
-| --- | --- | --- |
-| **none** | Full visibility in schema payloads (when usable and not denied). | Normal `SELECT`, filter, group, and order behavior. Required for cross-source join keys and semi-join reduction keys. |
-| **restricted** | Column name, type, role, and description appear in LLM-facing schema literals when usable. | Bare row projection is not selectable; the repair pass may drop offending `SELECT` entries (`SENSITIVITY_GATE_HIT`). Literal-value filters on the column in `WHERE` / `HAVING` are rejected (`validate_non_selectable_predicates`; null-checks alone are exempt). `GROUP BY` and `ORDER BY` on the column are rejected. Aggregations that wrap the column may still be emitted when role policy allows. |
-| **hidden** | Column is omitted from all LLM-facing schema literals. | Invisible to the questioning surface - analysts and the model cannot target it by name. Remains in the compiled graph for profiling and override bookkeeping unless removed by `deny_columns`. Same non-selectable predicate / group / order rules as restricted when somehow referenced. |
+- **Restricted and hidden columns** — bare row projection is not selectable; literal-value filters in `WHERE` / `HAVING` are rejected (null-checks alone are exempt); `GROUP BY` and `ORDER BY` on the column are rejected. The repair pass may drop offending `SELECT` entries (`SENSITIVITY_GATE_HIT`).
+- **Hidden columns** — omitted from all LLM-facing schema literals; remain in the compiled graph unless removed by `deny_columns`.
+- **Cross-source join keys and semi-join reduction keys** — must be `sensitivity == none`; declaration-time validation rejects non-`none` declared keys; plan-time eligibility omits them; execution raises `FederationRuntimeError` when a reducing key is not allowed.
 
-Assign tiers through schema overrides or domain notes; demo hidden columns in the offline sandbox: [Sandbox guide - Sensitivity](SANDBOX.md#sensitivity).
+Assign tiers through `export_structure` / `apply_structure` or domain notes. Demo hidden columns: [Sandbox guide — Column security](SANDBOX.md#column-security).
 
-**Cross-source semi-join keys at execution:** `semijoin_key_is_allowed` requires `sensitivity == none`. When a reducing or semi-join edge references a restricted or hidden key, federation execution **raises** `FederationRuntimeError` (rejected - not silently skipped). Separately, plan-time eligibility omits non-`none` joins from the eligible cross-source set, and declaration-time validation rejects non-`none` declared keys.
+**Cross-source semi-join keys at execution:** Reducing and semi-join keys must be `sensitivity == none`. When a reducing or semi-join edge references a restricted or hidden key, federation execution **raises** `FederationRuntimeError` (rejected - not silently skipped). Separately, plan-time eligibility omits non-`none` joins from the eligible cross-source set, and declaration-time validation rejects non-`none` declared keys.
 
 ## 7. Deny lists
 
@@ -251,13 +243,13 @@ When debug logging is enabled, the engine may log resolved bind maps during SQL 
 
 When the operator supplies an `audit_sink` callback on `AetherEngine` or `AetherFederation`, the library emits structured `AuditEvent` records at lifecycle boundaries. Each event carries `event_type`, `timestamp_iso`, the normalised question (when applicable), `schema_hash`, `provider`, and a `details` tuple of key/value pairs.
 
-These events are **not** LLM disclosures and are **not** written unless a sink is configured. Typical `event_type` values include `init`, `ask_begin`, `ask_done`, `ask_error`, `ask_blocked`, schema override and cache maintenance operations, and federation-specific events that name the member sources touched on a federated turn. Integrators use the sink for operator audit trails, SIEM forwarding, or compliance logging on the application side.
+These events are **not** LLM disclosures and are **not** written unless a sink is configured. Typical `event_type` values include `init`, `ask_begin`, `ask_done`, `ask_error`, `ask_blocked`, structure and cache maintenance operations, and federation-specific events that name the member sources touched on a federated turn. Integrators use the sink for operator audit trails, SIEM forwarding, or compliance logging on the application side.
 
 The sink receives metadata about what ran (question text, schema identity, diagnostic codes in `details`) - not warehouse row payloads.
 
 ### Session diagnostics
 
-Every `session.ask` / `session.step` returns `SessionStep.diagnostics`: turn-level tracing rows (`REUSE_HIT`, `COMPOSE_REPAIR`, `FEDERATION_*`, `LLM_TURN_COST`, and similar). These are returned to the embedding application, not written to disk unless you forward them. Full code catalog: [API reference - Diagnostic code catalog](API_REFERENCE.md#diagnostic-code-catalog).
+Every `session.ask` / `session.step` returns `SessionStep.diagnostics`: turn-level tracing rows (`REUSE_HIT`, `COMPOSE_REPAIR`, `FEDERATION_*`, `LLM_TURN_COST`, and similar). These are returned to the embedding application, not written to disk unless you forward them. Full code catalog: [Troubleshooting — Diagnostic codes](TROUBLESHOOTING.md#diagnostic-codes).
 
 ## 9. Federation coordinator spill
 
@@ -273,4 +265,4 @@ When member result frames exceed in-memory coordinator budgets (`spill_row_thres
 
 ---
 
-**See also:** [Getting started](GETTING_STARTED.md) | [User guide](USER_GUIDE.md) | [Integrator guide](INTEGRATOR_GUIDE.md) | [Sandbox guide](SANDBOX.md) | [API reference](API_REFERENCE.md) | [How it works](HOW_IT_WORKS.md) | [Support matrix](SUPPORT_MATRIX.md) | [README](../README.md)
+**See also:** [Getting started](GETTING_STARTED.md) | [User guide](USER_GUIDE.md) | [Integrator guide](INTEGRATOR_GUIDE.md) | [Sandbox guide](SANDBOX.md) | [API reference](API_REFERENCE.md) | [Troubleshooting](TROUBLESHOOTING.md) | [How it works](HOW_IT_WORKS.md) | [Support matrix](SUPPORT_MATRIX.md) | [README](../README.md)

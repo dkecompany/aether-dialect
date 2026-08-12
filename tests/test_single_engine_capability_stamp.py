@@ -7,7 +7,7 @@ from aetherdialect._contracts_core import SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._dialect_sqlglot_engines import MySQLDialect
 from aetherdialect._schema_graph import assign_schema_graph_hashes, compute_dialect_probe
-from aetherdialect._validation_schema import validate_select_cols_schema
+from aetherdialect._validation_shape import validate_select_cols_schema
 
 
 def _mysql_graph() -> SchemaGraph:

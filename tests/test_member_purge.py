@@ -9,8 +9,9 @@ from pathlib import Path
 import pytest
 
 from aetherdialect._constants import ARTIFACT_DIRECTORY_SEGMENT
-from aetherdialect._contracts_base import FederationConfigError, FederationMappings
-from aetherdialect._federation import (
+from aetherdialect._contracts_base import FederationConfigError
+from aetherdialect._contracts_schema import FederationMappings
+from aetherdialect._federation_execute import (
     federation_source_artifacts_dir,
     persist_federation_tree,
     purge_federation_member_artifacts,
@@ -30,7 +31,7 @@ def test_purge_removes_the_member_tree() -> None:
         persist_federation_tree(
             fed_dir,
             manifest=manifest,
-            mappings=FederationMappings(version="0.2.1"),
+            mappings=FederationMappings(version="0.2.3"),
             composite=composite,
             member_graphs=members,
         )

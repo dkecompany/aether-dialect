@@ -29,9 +29,9 @@ def test_each_run_writes_its_own_summary(tmp_path: Path) -> None:
     qsim_dir = tmp_path / "qsim"
 
     with (
-        patch("aetherdialect._main_execution.generate_all_intents", return_value=[]),
-        patch("aetherdialect._main_execution.instantiate_all", return_value=[]),
-        patch("aetherdialect._main_execution.generate_all_questions", return_value=[]),
+        patch("aetherdialect._main_interactive.generate_all_intents", return_value=[]),
+        patch("aetherdialect._main_interactive.instantiate_all", return_value=[]),
+        patch("aetherdialect._main_interactive.generate_all_questions", return_value=[]),
     ):
         MainExecutionOps.qsim_run_once(artifacts_dir=artifacts_dir, schema=schema, seed=1)
         MainExecutionOps.qsim_run_once(artifacts_dir=artifacts_dir, schema=schema, seed=2)

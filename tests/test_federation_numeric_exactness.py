@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import pytest
 
-from aetherdialect._contracts_base import MulGroup
+from aetherdialect._contracts_base import MulGroup, NormalizedExpr
 from aetherdialect._contracts_core import ResidualSpec, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import render_federation_residual_sql
-from aetherdialect._intent_process import NormalizedExpr
+from aetherdialect._federation_plan import render_federation_residual_sql
 
 
 def _graph_with_amount_columns() -> SchemaGraph:

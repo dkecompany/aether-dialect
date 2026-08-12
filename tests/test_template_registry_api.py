@@ -7,10 +7,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from aetherdialect import AetherEngine
-from aetherdialect._contracts_base import ConfigError, TemplateExecutionResult
-from aetherdialect._contracts_core import Template
+from aetherdialect._contracts_base import ConfigError
+from aetherdialect._contracts_core import Template, TemplateExecutionResult
+from tests.template_fixtures import _minimal_template
 from tests.test_aetherdialect import _make_aether_stub
-from tests.test_reuse_saved_question import _minimal_template
 
 
 def _engine_with_templates(*templates: Template) -> AetherEngine:

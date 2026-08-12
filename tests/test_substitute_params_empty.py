@@ -1,10 +1,10 @@
-"""Regression tests for bind-parameter substitution edge cases."""
+"""Bind-parameter substitution edge cases."""
 
 from __future__ import annotations
 
 import pytest
 
-from aetherdialect._core_utils import reconcile_execute_bind_params, substitute_params
+from aetherdialect._utils import reconcile_execute_bind_params, substitute_params
 
 
 def test_substitute_params_rejects_empty_string_scalar() -> None:

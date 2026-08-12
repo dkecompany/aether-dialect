@@ -9,26 +9,36 @@ from unittest.mock import MagicMock
 import pytest
 
 from aetherdialect import OwnerOnlyOperationError
-from aetherdialect._contracts_base import FederationMappings, FederationPlanTemplate, InferenceTag
-from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
-from aetherdialect._federation import (
-    FederationConfigError,
-    FederationDeclarationError,
+from aetherdialect._contracts_base import FederationConfigError, FederationDeclarationError
+from aetherdialect._contracts_schema import (
+    ColumnMetadata,
+    FederationMappings,
+    FederationPlanTemplate,
+    FKEdge,
+    InferenceTag,
+    SchemaGraph,
+    TableMetadata,
+)
+from aetherdialect._federation_compose import (
     _merge_enum_values,
     assert_federation_sql_history_warmup_allowed,
     compose_composite_graph,
     composite_schema_payload_counts,
-    credit_federation_plan_accept,
-    federation_artifact_paths,
     federation_composite_semantic_edges_hash,
+)
+from aetherdialect._federation_execute import (
+    credit_federation_plan_accept,
     load_federation_composite_graph,
     mappings_replay_matches,
-    parse_federation_manifest,
-    parse_federation_mappings,
     persist_federation_tree,
-    qsim_intent_eligible_on_federation,
     save_federation_plan_template,
 )
+from aetherdialect._federation_manifest import (
+    federation_artifact_paths,
+    parse_federation_manifest,
+    parse_federation_mappings,
+)
+from aetherdialect._federation_plan import qsim_intent_eligible_on_federation
 from aetherdialect._schema_graph import recompute_join_paths_multi
 from tests.federation_helpers import stamp_union_disjointness_profiling
 
@@ -121,7 +131,7 @@ def test_collapse_unions_column_statistics_from_all_members() -> None:
     stamp_union_disjointness_profiling(members["b"].tables["payment"], overlap_sample=("3", "4"))
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -142,7 +152,7 @@ def test_collapse_unions_column_statistics_from_all_members() -> None:
 
 def test_load_composite_graph_rejects_stale_fingerprint() -> None:
     manifest = parse_federation_manifest(_PAYMENT_MANIFEST, include_derived_roster=True)
-    mappings = FederationMappings(version="0.2.1")
+    mappings = FederationMappings(version="0.2.3")
     members = {
         "a": _table("payment", source_id="a", profiling_hash="p_a", notes_sha256="n_a"),
         "b": _table("payment", source_id="b", profiling_hash="p_b", notes_sha256="n_b"),

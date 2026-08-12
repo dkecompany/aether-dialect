@@ -5,9 +5,9 @@ from __future__ import annotations
 import pytest
 
 from aetherdialect._config import EngineConfig
-from aetherdialect._contracts_base import LlmExecutionConfig
-from aetherdialect._core_utils import llm_execution_scope
+from aetherdialect._contracts_core import LlmExecutionConfig
 from aetherdialect._llm_provider import LLMProvider, _clients
+from aetherdialect._utils import llm_execution_scope
 
 
 def _azure_llm_cfg(api_key: str) -> LlmExecutionConfig:

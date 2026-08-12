@@ -1,21 +1,21 @@
-"""Regression tests for coordinator residual GROUP BY and DISTINCT null semantics."""
+"""Coordinator residual GROUP BY and DISTINCT null semantics."""
 
 from __future__ import annotations
 
 import pandas as pd
 import pytest
 
+from aetherdialect._contracts_base import NormalizedExpr, OrderByCol
 from aetherdialect._contracts_core import (
     FederatedPlan,
     JoinSpec,
-    OrderByCol,
     ResidualSpec,
     RuntimeIntent,
     SelectCol,
     SourceStep,
 )
-from aetherdialect._federation import federation_residual_column_headers, render_federation_glue
-from aetherdialect._intent_process import NormalizedExpr
+from aetherdialect._federation_manifest import federation_residual_column_headers
+from aetherdialect._federation_plan import render_federation_glue
 
 _LEFT_TABLE = "left_t"
 _RIGHT_TABLE = "right_t"

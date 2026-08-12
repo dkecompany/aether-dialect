@@ -11,15 +11,15 @@ from aetherdialect._constants import (
     SESSION_KIND_RESULT,
     SUSPEND_STATE_FORMAT_VERSION,
 )
-from aetherdialect._contracts_base import PipelineSuspended
 from aetherdialect._contracts_core import (
     GenerationPath,
     InteractiveTailSnapshot,
+    PipelineSuspended,
     RuntimeIntent,
     SqlFeedbackSuspendContext,
     SqlGenerationOutcome,
 )
-from aetherdialect._main_execution import PipelineSession
+from aetherdialect._main_session import PipelineSession
 
 
 def _session_owner() -> MagicMock:
@@ -37,14 +37,14 @@ def _session_owner() -> MagicMock:
     owner._sandbox_closed = False
     owner._pipeline_writer_lock = None
     owner._artifacts_dir = None
-    owner._business_knowledge = None
-    owner._ask_phase_callback = None
+    owner._domain_knowledge = None
+    owner._phase_callback = None
     owner._store_by_space = {}
     owner._templates_by_space = {}
     owner._schema_terms = set()
 
     def _open_session(**kwargs):
-        from aetherdialect._main_execution import PipelineSession
+        from aetherdialect._main_session import PipelineSession
 
         return PipelineSession(
             owner,
@@ -132,10 +132,10 @@ def test_step_after_restore_completes_yes_path() -> None:
     assert isinstance(restored._suspended.payload, SqlFeedbackSuspendContext)
 
     with patch(
-        "aetherdialect._main_execution.MainExecutionOps._reexecute_suspend_sql_rows",
+        "aetherdialect._main_interactive.MainInteractiveOps._reexecute_suspend_sql_rows",
         return_value=([(1,)], None),
     ):
-        with patch("aetherdialect._main_execution.handle_user_feedback"):
+        with patch("aetherdialect._main_interactive.handle_user_feedback"):
             step = restored.step("y")
 
     assert step.done is True

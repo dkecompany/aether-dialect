@@ -8,9 +8,9 @@ import pytest
 
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._dialect_sqlglot_engines import DuckDBDialect
-from aetherdialect._intent_repair import best_descriptive_columns
-from aetherdialect._schema_catalog import _profile_table
+from aetherdialect._intent_normalize import best_descriptive_columns
 from aetherdialect._schema_graph import recompute_join_paths_multi
+from aetherdialect._schema_profile import _profile_table
 
 
 @pytest.mark.fast

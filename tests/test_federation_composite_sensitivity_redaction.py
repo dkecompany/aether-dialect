@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from aetherdialect._contracts_base import SensitivityClassification
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import compose_composite_graph, parse_federation_manifest, parse_federation_mappings
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_manifest import (
+    parse_federation_manifest,
+    parse_federation_mappings,
+)
 from aetherdialect._schema_graph import recompute_join_paths_multi
 from tests.federation_helpers import stamp_union_disjointness_profiling
 
@@ -68,7 +72,7 @@ def test_hidden_member_sensitivity_strips_profile_samples_on_composite() -> None
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_columns": [],
             "logical_tables": [
                 {

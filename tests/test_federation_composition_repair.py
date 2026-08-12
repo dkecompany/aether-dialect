@@ -6,20 +6,25 @@ import copy
 
 import pytest
 
-from aetherdialect._contracts_base import EngineContext, SensitivityClassification
+from aetherdialect._contracts_base import (
+    EngineContext,
+    FederationConfigError,
+    NormalizedExpr,
+    SensitivityClassification,
+)
 from aetherdialect._contracts_core import RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
-from aetherdialect._federation import (
-    FederationConfigError,
+from aetherdialect._federation_compose import (
     compose_composite_graph,
+    reconcile_composite_classifications,
+)
+from aetherdialect._federation_manifest import (
     manifest_hash,
     mappings_hash,
     parse_federation_manifest,
     parse_federation_mappings,
-    plan_federated_intent,
-    reconcile_composite_classifications,
 )
-from aetherdialect._intent_process import NormalizedExpr
+from aetherdialect._federation_plan import plan_federated_intent
 from aetherdialect._schema_graph import assign_schema_graph_hashes, recompute_join_paths_multi
 from tests.federation_helpers import stamp_union_disjointness_profiling
 
@@ -170,7 +175,7 @@ def test_collapse_remaps_foreign_keys() -> None:
     stamp_union_disjointness_profiling(members["b"].tables["payment"], overlap_sample=("b1", "b2"))
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -200,7 +205,7 @@ def test_collapse_sums_row_count_for_union() -> None:
     )
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -225,7 +230,7 @@ def test_collapse_rejects_partition_mismatch() -> None:
     )
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -274,7 +279,7 @@ def test_collapse_uses_strictest_sensitivity() -> None:
     )
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -307,7 +312,7 @@ def test_reconcile_composite_classifications_agrees_deterministically() -> None:
     )
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -334,7 +339,7 @@ def test_classification_conflict_reconciles_without_notes(monkeypatch: pytest.Mo
     )
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -353,7 +358,7 @@ def test_classification_conflict_reconciles_without_notes(monkeypatch: pytest.Mo
         calls.append(notes)
         return {"payment": (None, "Unified payments", {})}
 
-    monkeypatch.setattr("aetherdialect._federation.llm_classify_schema", _fake_classify)
+    monkeypatch.setattr("aetherdialect._federation_compose.llm_classify_schema", _fake_classify)
     composite = compose_composite_graph(members, manifest, mappings)
     assert calls
     assert composite.tables["payment"].description == "Unified payments"
@@ -363,7 +368,7 @@ def test_replica_requires_authoritative_source() -> None:
     with pytest.raises(FederationConfigError, match="authoritative_source"):
         parse_federation_mappings(
             {
-                "version": "0.2.1",
+                "version": "0.2.3",
                 "logical_tables": [
                     {
                         "logical": "payment",
@@ -379,11 +384,11 @@ def test_replica_requires_authoritative_source() -> None:
 
 
 def test_replica_plan_uses_authoritative_member_only() -> None:
-    from aetherdialect._federation import _union_specs_for_intent
+    from aetherdialect._federation_plan import _union_specs_for_intent
 
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -410,7 +415,7 @@ def test_unresolved_mapping_member_raises() -> None:
     }
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -442,7 +447,7 @@ def test_composition_created_at_is_deterministic() -> None:
 def test_mappings_hash_is_order_independent() -> None:
     mapping_a = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -457,7 +462,7 @@ def test_mappings_hash_is_order_independent() -> None:
     )
     mapping_b = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -531,7 +536,7 @@ def test_column_coverage_marks_ineligible_plan() -> None:
     )
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_tables": [
                 {
                     "logical": "payment",

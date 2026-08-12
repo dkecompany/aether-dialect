@@ -6,23 +6,19 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aetherdialect._contracts_base import FailureCategory, JoinPathKeyTypeError, NoJoinPathError, WhereParam
-from aetherdialect._contracts_core import (
-    NormalizedExpr,
-    RuntimeIntent,
-    SelectCol,
-)
+from aetherdialect._contracts_base import FailureCategory, NormalizedExpr, WhereParam
+from aetherdialect._contracts_core import JoinPathKeyTypeError, NoJoinPathError, RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import join_resolved_scope_tables
-from aetherdialect._pipeline import _resolve_joins_fresh, generate_and_validate_sql
+from aetherdialect._intent_expr import join_resolved_scope_tables
+from aetherdialect._pipeline_generate import _resolve_joins_fresh, generate_and_validate_sql
 from aetherdialect._schema_graph import assert_intent_in_scope
-from aetherdialect._validation_execute import validate_semantics
-from aetherdialect._validation_schema import (
+from aetherdialect._validation_rules import validate_join_path_key_types
+from aetherdialect._validation_shape import (
     validate_filters_schema,
-    validate_join_path_key_types,
     validate_join_path_reachability,
     validate_select_cols_schema,
 )
+from aetherdialect._validation_sql import validate_semantics
 
 
 def _col(name: str) -> ColumnMetadata:
@@ -311,14 +307,14 @@ def test_resolve_joins_raises_on_incompatible_bridge_join_key_types() -> None:
         )
 
 
-@patch("aetherdialect._pipeline._run_sql_validation_cascade", return_value=(True, None, None, []))
+@patch("aetherdialect._pipeline_generate.run_sql_validation_cascade", return_value=(True, None, None, []))
 @patch(
-    "aetherdialect._pipeline.finalize_substitute_sql",
+    "aetherdialect._pipeline_generate.finalize_substitute_sql",
     return_value="SELECT a.id FROM a JOIN bridge ON a.id = bridge.aid JOIN c ON bridge.cid = c.id",
 )
-@patch("aetherdialect._pipeline.build_deterministic_sql", return_value="SELECT a.id FROM a, c")
+@patch("aetherdialect._sql_gen.build_deterministic_sql", return_value="SELECT a.id FROM a, c")
 @patch(
-    "aetherdialect._pipeline._join_signatures_for_deterministic_from_anchor",
+    "aetherdialect._pipeline_generate._join_signatures_for_deterministic_from_anchor",
     return_value=([], {}),
 )
 def test_generate_and_validate_sql_refuses_denied_bridge_post_resolution(
@@ -362,7 +358,7 @@ def test_generate_and_validate_sql_refuses_denied_bridge_post_resolution(
             }
         ]
     }
-    with patch("aetherdialect._pipeline._resolve_joins_fresh", side_effect=_fake_resolve):
+    with patch("aetherdialect._pipeline_generate._resolve_joins_fresh", side_effect=_fake_resolve):
         out = generate_and_validate_sql(
             "list a ids via c",
             intent,

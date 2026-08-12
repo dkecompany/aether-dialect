@@ -9,70 +9,92 @@ from dataclasses import replace
 from typing import Any
 from unittest.mock import patch
 
-import aetherdialect._core_utils
 import aetherdialect._dialect
 import aetherdialect._expansion_ops
+import aetherdialect._intent_bind
 import aetherdialect._intent_expr
-import aetherdialect._intent_process
-import aetherdialect._intent_repair
-import aetherdialect._intent_resolve
+import aetherdialect._intent_loop
+import aetherdialect._intent_normalize
 import aetherdialect._main_execution
-import aetherdialect._pipeline
+import aetherdialect._pipeline_execute
+import aetherdialect._pipeline_generate
 import aetherdialect._qsim
-import aetherdialect._schema_build
-import aetherdialect._schema_catalog
+import aetherdialect._schema_finalize
 import aetherdialect._schema_graph
-import aetherdialect._schema_overrides
+import aetherdialect._schema_profile
+import aetherdialect._schema_reflect
 import aetherdialect._seed_warmup
 import aetherdialect._sql_gen
 import aetherdialect._templates
 import aetherdialect._utils
-import aetherdialect._validation_execute
-import aetherdialect._validation_schema
-import aetherdialect._validation_semantic
+import aetherdialect._utils_intent
+import aetherdialect._validation_rules
+import aetherdialect._validation_shape
+import aetherdialect._validation_sql
 
 from ._config import PolicyConfig
-from ._contracts_base import FeedbackMode, QuestionRoute
+from ._contracts_base import EngineIdentity
 from ._contracts_core import (
     Expected,
+    FeedbackMode,
     GenerationPath,
     LiveTestRunner,
     PendingFeedback,
     QuestionFormStorage,
+    QuestionRoute,
     RuntimeIntent,
     Scenario,
     SequenceScenario,
     SoftAssert,
     SqlGenerationOutcome,
 )
-from ._core_utils import StepResult, debug, pipeline_capture, substitute_params
 from ._dialect import Dialect, DialectRegistry
-from ._federation import schema_spans_multiple_sources
-from ._intent_process import collect_structural_match_templates, match_template_for_union
+from ._federation_manifest import schema_spans_multiple_sources
+from ._intent_loop import collect_structural_match_templates, match_template_for_union
 from ._main_execution import MainExecutionOps
-from ._pipeline import (
-    best_accepted_template_similarity,
+from ._pipeline_execute import (
     build_result_dataframe,
-    confirm_intent_with_user,
     display_final_results_to_stdout,
+    handle_direct_sql_reuse,
+    results_csv_output_path,
+    save_result_csv,
+)
+from ._pipeline_generate import (
+    best_accepted_template_similarity,
+    confirm_intent_with_user,
     emit_explain_soft_diagnostics,
     generate_and_validate_sql,
     generate_join_candidates,
-    handle_direct_sql_reuse,
     handle_user_feedback,
     load_pipeline_resources,
     match_question_level_template_reuse,
     merge_structural_defaults_for_reuse,
     parse_intent_via_llm,
     prepare_union_match_join_phase,
-    results_csv_output_path,
-    save_result_csv,
     stamp_sql_shape,
 )
-from ._templates import TemplateOps, TemplateStoreView
-from ._utils import flatten_param_values, normalize_question_via_llm, validate_question
+from ._templates import TemplateStoreView
+from ._templates_ops import TemplateOps
+from ._utils import (
+    StepResult,
+    debug,
+    pipeline_capture,
+    pop_engine_identity,
+    push_engine_identity,
+    substitute_params,
+)
+from ._utils_intent import flatten_param_values, normalize_question_via_llm, validate_question
 
 """Live pipeline test runners and assertion helpers."""
+
+
+def _push_runner_engine_identity(dialect: Any) -> Any | None:
+    """Bind the dialect's runtime config for pipeline SQL finalization, matching session ask."""
+    runtime_cfg = getattr(dialect, "config", None)
+    engine_type = str(getattr(dialect, "name", "") or "").strip()
+    if runtime_cfg is None or isinstance(runtime_cfg, type) or not engine_type:
+        return None
+    return push_engine_identity(EngineIdentity(engine_type=engine_type, runtime_config=runtime_cfg))
 
 
 def run_live_test(runner: LiveTestRunner, scenario: Scenario, retries: int = 0) -> StepResult | None:
@@ -84,21 +106,26 @@ def run_live_test(runner: LiveTestRunner, scenario: Scenario, retries: int = 0) 
         t0 = time.monotonic()
         try:
             with pipeline_capture(list(auto), scenario.reject_reason, csv_dir=runner.csv_dir) as cap:
-                step = _run_pipeline_core(
-                    question=scenario.question,
-                    schema=runner.schema,
-                    store=runner.store,
-                    templates=runner.templates,
-                    rejected=runner.rejected,
-                    schema_terms=runner.schema_terms,
-                    feedback=scenario.feedback,
-                    captured_logs=cap["logs"],
-                    reject_reason=scenario.reject_reason,
-                    feedback_mode=FeedbackMode.LIVE,
-                    force_intent_confirm=_scenario_requires_intent_prompt(scenario),
-                    dialect=runner.dialect,
-                    csv_dir=runner.csv_dir,
-                )
+                identity_token = _push_runner_engine_identity(getattr(runner, "dialect", None))
+                try:
+                    step = _run_pipeline_core(
+                        question=scenario.question,
+                        schema=runner.schema,
+                        store=runner.store,
+                        templates=runner.templates,
+                        rejected=runner.rejected,
+                        schema_terms=runner.schema_terms,
+                        feedback=scenario.feedback,
+                        captured_logs=cap["logs"],
+                        reject_reason=scenario.reject_reason,
+                        feedback_mode=FeedbackMode.LIVE,
+                        force_intent_confirm=_scenario_requires_intent_prompt(scenario),
+                        dialect=runner.dialect,
+                        csv_dir=runner.csv_dir,
+                    )
+                finally:
+                    if identity_token is not None:
+                        pop_engine_identity(identity_token)
         except Exception:
             step = StepResult(
                 scenario_id=scenario.id,
@@ -126,21 +153,26 @@ def run_live_test_deferred(runner: LiveTestRunner, scenario: Scenario, retries: 
         t0 = time.monotonic()
         try:
             with pipeline_capture(list(auto), scenario.reject_reason, csv_dir=runner.csv_dir) as cap:
-                step = _run_pipeline_core(
-                    question=scenario.question,
-                    schema=runner.schema,
-                    store=runner.store,
-                    templates=runner.templates,
-                    rejected=runner.rejected,
-                    schema_terms=runner.schema_terms,
-                    feedback=scenario.feedback,
-                    captured_logs=cap["logs"],
-                    reject_reason=scenario.reject_reason,
-                    feedback_mode=FeedbackMode.DEFERRED_TEST,
-                    force_intent_confirm=_scenario_requires_intent_prompt(scenario),
-                    dialect=runner.dialect,
-                    csv_dir=runner.csv_dir,
-                )
+                identity_token = _push_runner_engine_identity(getattr(runner, "dialect", None))
+                try:
+                    step = _run_pipeline_core(
+                        question=scenario.question,
+                        schema=runner.schema,
+                        store=runner.store,
+                        templates=runner.templates,
+                        rejected=runner.rejected,
+                        schema_terms=runner.schema_terms,
+                        feedback=scenario.feedback,
+                        captured_logs=cap["logs"],
+                        reject_reason=scenario.reject_reason,
+                        feedback_mode=FeedbackMode.DEFERRED_TEST,
+                        force_intent_confirm=_scenario_requires_intent_prompt(scenario),
+                        dialect=runner.dialect,
+                        csv_dir=runner.csv_dir,
+                    )
+                finally:
+                    if identity_token is not None:
+                        pop_engine_identity(identity_token)
         except Exception:
             step = StepResult(
                 scenario_id=scenario.id,
@@ -267,10 +299,7 @@ def _run_pipeline_core(
 
     if schema_spans_multiple_sources(schema):
         result.status = "error"
-        result.error = (
-            "LiveTestRunner does not support federated composite schemas; "
-            "use AetherEngine.session() or AetherFederation.session() instead."
-        )
+        result.error = "LiveTestRunner does not support federated composite schemas; use AetherEngine.session() or AetherFederation.session() instead."
         return result
 
     dialect, schema, store, templates, rejected, schema_terms = load_pipeline_resources(
@@ -309,7 +338,10 @@ def _run_pipeline_core(
                 result.intent = _build_reuse_intent(best_template)
                 return result
 
-    validation = validate_question(raw_question)
+    validation = validate_question(
+        raw_question,
+        table_names=tuple(getattr(schema, "tables", {}) or {}),
+    )
     if not validation.accepted:
         result.status = "restricted" if validation.route == QuestionRoute.RESTRICTED else "invalid_question"
         return result
@@ -349,12 +381,14 @@ def _run_pipeline_core(
                 return result
 
     neg_drop = False
-    normalized_canonical = normalize_question_via_llm(corrected_text, raw_original=raw_question)
-    if normalized_canonical != corrected_text and TemplateOps.has_any_rejection_history_for_question(
-        store, corrected_text
-    ):
-        neg_drop = True
-        normalized_canonical = corrected_text
+    normalized_canonical = corrected_text
+    if validation.route == QuestionRoute.ANALYTICAL:
+        normalized_canonical = normalize_question_via_llm(corrected_text, raw_original=raw_question)
+        if normalized_canonical != corrected_text and TemplateOps.has_any_rejection_history_for_question(
+            store, corrected_text
+        ):
+            neg_drop = True
+            normalized_canonical = corrected_text
 
     tmpl_norm = None
     if normalized_canonical != corrected_text:
@@ -502,7 +536,7 @@ def _run_pipeline_core(
         execution_sql_override=None,
         structural_defaults=tmpl_sd,
     )
-    rows = dialect.execute(exec_sql, aetherdialect._core_utils.reconcile_execute_bind_params(exec_sql, exec_params))
+    rows = dialect.execute(exec_sql, aetherdialect._utils.reconcile_execute_bind_params(exec_sql, exec_params))
     row_list = [tuple(row) for row in rows] if rows else []
     if len(row_list) == 0:
         fixed_intent, fixed_rows = MainExecutionOps.try_zero_row_where_remediation(intent, schema, dialect, tmpl_sd)
@@ -632,7 +666,7 @@ def commit_pending_feedback(result: StepResult) -> None:
     if pending.choice == "n":
         reason = pending.canned_reject_reason or "incorrect results"
 
-        def _stdin_reject(_prompt: str = "") -> str:
+        def _stdin_reject(prompt: str = "") -> str:
             return reason
 
         with patch("builtins.input", _stdin_reject):
@@ -697,7 +731,7 @@ def _assertion_table_names(intent: RuntimeIntent, sql: str | None) -> list[str]:
     if not cte_steps:
         return sorted(intent.tables or [])
     cte_aliases = {(step.cte_name or "").strip() for step in cte_steps if (step.cte_name or "").strip()}
-    cte_aliases.update(str(name).strip() for name in (intent.planner_cte_names or []) if str(name).strip())
+    cte_aliases.update(str(name).strip() for name in (intent.interpret_cte_names or []) if str(name).strip())
     base_from_ctes: set[str] = set()
     for step in cte_steps:
         base_from_ctes.update(t for t in (step.tables or []) if t and t not in cte_aliases)
@@ -741,12 +775,14 @@ def _assert_scenario(result: StepResult, expected: Expected, soft: SoftAssert | 
 
     if result.intent is not None:
         actual_tables = _assertion_table_names(result.intent, result.sql if result.intent.cte_steps else None)
+        actual_tables_cf = sorted(t.casefold() for t in actual_tables)
         if expected.tables_one_of is not None:
-            allowed = [sorted(t) for t in expected.tables_one_of]
-            soft.check(actual_tables in allowed, "tables", expected.tables_one_of, actual_tables)
+            allowed = [sorted(t.casefold() for t in group) for group in expected.tables_one_of]
+            soft.check(actual_tables_cf in allowed, "tables", expected.tables_one_of, actual_tables)
         elif expected.tables is not None:
             expected_tables = sorted(expected.tables)
-            soft.check(actual_tables == expected_tables, "tables", expected_tables, actual_tables)
+            expected_tables_cf = sorted(t.casefold() for t in expected_tables)
+            soft.check(actual_tables_cf == expected_tables_cf, "tables", expected_tables, actual_tables)
 
     if expected.grain is not None and result.intent is not None:
         if isinstance(expected.grain, tuple):
@@ -876,11 +912,16 @@ def run_and_assert(
                 status="error",
                 error="runner returned no result",
             )
-        last_soft = _assert_scenario(result, scenario.expected)
-        if last_soft.passed:
-            commit_pending_feedback(result)
-            runner.adopt_state_from(attempt_runner)
-            return
+        identity_token = _push_runner_engine_identity(getattr(attempt_runner, "dialect", None))
+        try:
+            last_soft = _assert_scenario(result, scenario.expected)
+            if last_soft.passed:
+                commit_pending_feedback(result)
+                runner.adopt_state_from(attempt_runner)
+                return
+        finally:
+            if identity_token is not None:
+                pop_engine_identity(identity_token)
     if last_soft is not None:
         last_soft.report(header=header)
 
@@ -903,10 +944,15 @@ def run_sequence_and_assert(
                     status="error",
                     error="runner returned no result",
                 )
-            _assert_scenario(result, step_scenario.expected, soft=last_soft)
-            if not last_soft.passed:
-                break
-            commit_pending_feedback(result)
+            identity_token = _push_runner_engine_identity(getattr(attempt_runner, "dialect", None))
+            try:
+                _assert_scenario(result, step_scenario.expected, soft=last_soft)
+                if not last_soft.passed:
+                    break
+                commit_pending_feedback(result)
+            finally:
+                if identity_token is not None:
+                    pop_engine_identity(identity_token)
         if last_soft.passed:
             runner.adopt_state_from(attempt_runner)
             return
@@ -917,12 +963,12 @@ def run_sequence_and_assert(
 def run_seeded_schema_semantic_repair(
     question: str, seeded_intent: RuntimeIntent, schema_graph: Any, *, max_retries: int | None = None
 ) -> tuple[RuntimeIntent | None, list[str], int]:
-    """Run schema and semantic repair from a pre-built intent (live and harness entrypoint). Forwards the seed intent to :func:`aetherdialect._intent_process._run_schema_semantic_repair_loop` with no template store and no in-turn summary rows."""
+    """Run schema and semantic repair from a pre-built intent (live and harness entrypoint). Forwards the seed intent to :func:`aetherdialect._intent_loop.run_schema_semantic_repair_loop` with no template store and no in-turn summary rows."""
     mr = PolicyConfig.MAX_ASK_COMPOSE_REPAIRS if max_retries is None else max_retries
     table_list = sorted(schema_graph.tables.keys())
     schema_literal_json = schema_graph.schema_literal_json
-    system, _ = aetherdialect._intent_process.build_intent_parse_prompt(question, schema_literal_json, table_list)
-    return aetherdialect._intent_process._run_schema_semantic_repair_loop(
+    system, _ = aetherdialect._intent_loop.build_intent_parse_prompt(question, schema_literal_json, table_list)
+    return aetherdialect._intent_loop.run_schema_semantic_repair_loop(
         intent=seeded_intent,
         question=question,
         system=system,
@@ -934,5 +980,5 @@ def run_seeded_schema_semantic_repair(
     )[:3]
 
 
-LiveTestRunner._run_impl = run_live_test
-LiveTestRunner._run_deferred_impl = run_live_test_deferred
+LiveTestRunner.run_impl = run_live_test
+LiveTestRunner.run_deferred_impl = run_live_test_deferred

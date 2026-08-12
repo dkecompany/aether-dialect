@@ -9,11 +9,11 @@ from aetherdialect._contracts_base import (
     WhereParam,
 )
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import telemetry_capture
 from aetherdialect._dialect import DialectRegistry
-from aetherdialect._schema_build import tables_meta_to_schema_graph
-from aetherdialect._schema_catalog import _column_value_overlap_eligible
+from aetherdialect._schema_profile import _column_value_overlap_eligible
+from aetherdialect._schema_reflect import tables_meta_to_schema_graph
 from aetherdialect._sql_gen import _render_predicate_clause
+from aetherdialect._utils import telemetry_capture
 
 
 def _schema_with_char_column() -> SchemaGraph:

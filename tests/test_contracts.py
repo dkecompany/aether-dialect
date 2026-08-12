@@ -7,7 +7,6 @@ import pytest
 
 from aetherdialect._constants import ROLE_ALLOWED_AGGREGATIONS, VALID_AGGREGATION_FUNCTIONS
 from aetherdialect._contracts_base import (
-    ColumnRole,
     ComplexityTier,
     ConfigError,
     EngineContext,
@@ -42,6 +41,7 @@ from aetherdialect._contracts_schema import (
     CaseWhenBranch,
     CaseWhenExpr,
     ColumnMetadata,
+    ColumnRole,
     CteOutputColumnMeta,
     ExpansionMetadata,
     FKEdge,
@@ -64,7 +64,7 @@ from aetherdialect._contracts_schema import (
     WindowRegistryStep,
     WindowSpec,
 )
-from aetherdialect._core_utils import (
+from aetherdialect._utils import (
     data_type_to_value_type,
     is_date_type,
     is_numeric_type,
@@ -323,52 +323,32 @@ class TestWhereParam:
         assert fp.op == ">"
 
     def test_from_dict_ignores_bool_op(self):
-        """WhereParam.from_dict does not store legacy bool_op on the leaf."""
+        """WhereParam.from_dict does not store bool_op on the leaf."""
         d = {"left_expr": "t.c", "op": "=", "bool_op": "OR"}
         fp = WhereParam.from_dict(d)
         assert not hasattr(fp, "bool_op")
         assert "bool_op" not in fp.to_dict()
 
     def test_from_dict_ignores_where_group(self):
-        """WhereParam.from_dict does not store legacy where_group on the leaf."""
+        """WhereParam.from_dict does not store where_group on the leaf."""
         d = {"left_expr": "t.c", "op": "=", "where_group": 3}
         fp = WhereParam.from_dict(d)
         assert not hasattr(fp, "where_group")
         assert "where_group" not in fp.to_dict()
 
-    def test_to_dict_never_includes_legacy_bool_fields(self):
+    def test_to_dict_omits_bool_op_and_where_group(self):
         """WhereParam.to_dict never emits bool_op or where_group."""
         fp = WhereParam(left_expr=NormalizedExpr.from_column("t.c"), op="=")
         d = fp.to_dict()
         assert "bool_op" not in d
         assert "where_group" not in d
 
-    def test_legacy_bool_op_migrates_via_predicate_group(self):
-        """Legacy bool_op in filter dicts is consumed by predicate_group_from_legacy_flat_where_dicts."""
-        legacy = [
-            {"left_expr": "t.a", "op": "=", "value": 1, "bool_op": "AND"},
-            {"left_expr": "t.b", "op": "=", "value": 2, "bool_op": "OR"},
-        ]
-        group = PredicateGroup.from_legacy_flat_where_dicts(legacy)
-        assert group is not None
-        assert group.op == "or"
-        assert len(group.leaves()) == 2
-        for leaf in group.leaves():
-            assert not hasattr(leaf, "bool_op")
-
-    def test_legacy_where_group_migrates_via_predicate_group(self):
-        """Legacy where_group in filter dicts is consumed by predicate_group_from_legacy_flat_where_dicts."""
-        legacy = [
-            {"left_expr": "t.a", "op": "=", "value": 1, "where_group": 1},
-            {"left_expr": "t.b", "op": "=", "value": 2, "where_group": 1},
-            {"left_expr": "t.c", "op": "=", "value": 3, "where_group": 2},
-        ]
-        group = PredicateGroup.from_legacy_flat_where_dicts(legacy)
-        assert group is not None
-        assert group.op == "or"
-        assert len(group.groups) == 2
-        for leaf in group.leaves():
-            assert not hasattr(leaf, "where_group")
+    def test_flat_where_list_hard_fails(self):
+        """Flat where lists and where_param keys are rejected on deserialize."""
+        with pytest.raises(ConfigError, match="flat list|where_param"):
+            PredicateGroup.parse_where_field({"where": [{"left_expr": "t.a", "op": "="}]})
+        with pytest.raises(ConfigError, match="where_param"):
+            PredicateGroup.parse_where_field({"where_param": [{"left_expr": "t.a", "op": "="}]})
 
 
 class TestHavingParam:
@@ -392,52 +372,32 @@ class TestHavingParam:
         assert hp.value_type == "number"
 
     def test_from_dict_ignores_bool_op(self):
-        """HavingParam.from_dict does not store legacy bool_op on the leaf."""
+        """HavingParam.from_dict does not store bool_op on the leaf."""
         d = {"left_expr": "COUNT(t.id)", "op": ">", "bool_op": "OR"}
         hp = HavingParam.from_dict(d)
         assert not hasattr(hp, "bool_op")
         assert "bool_op" not in hp.to_dict()
 
     def test_from_dict_ignores_where_group(self):
-        """HavingParam.from_dict does not store legacy where_group on the leaf."""
+        """HavingParam.from_dict does not store where_group on the leaf."""
         d = {"left_expr": "COUNT(t.id)", "op": ">", "where_group": 2}
         hp = HavingParam.from_dict(d)
         assert not hasattr(hp, "where_group")
         assert "where_group" not in hp.to_dict()
 
-    def test_to_dict_never_includes_legacy_bool_fields(self):
+    def test_to_dict_omits_bool_op_and_where_group(self):
         """HavingParam.to_dict never emits bool_op or where_group."""
         hp = HavingParam(left_expr=NormalizedExpr.from_agg("count", "t.id"), op=">")
         d = hp.to_dict()
         assert "bool_op" not in d
         assert "where_group" not in d
 
-    def test_legacy_bool_op_migrates_via_predicate_group(self):
-        """Legacy bool_op in having dicts is consumed by predicate_group_from_legacy_having_dicts."""
-        legacy = [
-            {"left_expr": "COUNT(t.a)", "op": ">", "value": 1, "bool_op": "AND"},
-            {"left_expr": "COUNT(t.b)", "op": ">", "value": 2, "bool_op": "OR"},
-        ]
-        group = PredicateGroup.from_legacy_having_dicts(legacy)
-        assert group is not None
-        assert group.op == "or"
-        assert len(group.leaves()) == 2
-        for leaf in group.leaves():
-            assert not hasattr(leaf, "bool_op")
-
-    def test_legacy_where_group_migrates_via_predicate_group(self):
-        """Legacy where_group in having dicts is consumed by predicate_group_from_legacy_having_dicts."""
-        legacy = [
-            {"left_expr": "COUNT(t.a)", "op": ">", "value": 1, "where_group": 1},
-            {"left_expr": "COUNT(t.b)", "op": ">", "value": 2, "where_group": 1},
-            {"left_expr": "COUNT(t.c)", "op": ">", "value": 3, "where_group": 2},
-        ]
-        group = PredicateGroup.from_legacy_having_dicts(legacy)
-        assert group is not None
-        assert group.op == "or"
-        assert len(group.groups) == 2
-        for leaf in group.leaves():
-            assert not hasattr(leaf, "where_group")
+    def test_flat_having_list_hard_fails(self):
+        """Flat having lists and having_param keys are rejected on deserialize."""
+        with pytest.raises(ConfigError, match="flat list|having_param"):
+            PredicateGroup.parse_having_field({"having": [{"left_expr": "t.a", "op": "="}]})
+        with pytest.raises(ConfigError, match="having_param"):
+            PredicateGroup.parse_having_field({"having_param": [{"left_expr": "t.a", "op": "="}]})
 
     def test_post_init_swaps_literal_left_agg_right(self):
         """HavingParam.__post_init__ swaps literal-only left with aggregate right and flips op."""
@@ -949,7 +909,7 @@ class TestColumnMetadataRoles:
         assert "ilike" in ops
 
     def test_is_filterable_audit_column(self):
-        """AUDIT role columns may appear in predicates when not excluded by name patterns."""
+        """AUDIT role columns may appear in predicates when not sensitivity-blocked."""
         cm = ColumnMetadata(
             name="created_at",
             data_type="timestamp",
@@ -1020,8 +980,8 @@ class TestSQLShape:
         assert rebuilt.has_distinct is True
 
 
-class TestNoCountDistinctRegression:
-    """Regression tests verifying count_distinct is NOT a valid agg_func anywhere."""
+class TestCountDistinctNotValidAgg:
+    """count_distinct is not a valid agg_func anywhere."""
 
     def test_no_count_distinct_in_valid_agg(self):
         """count_distinct is not in VALID_AGGREGATION_FUNCTIONS."""
@@ -1050,7 +1010,7 @@ class TestNoCountDistinctRegression:
         assert not hasattr(intent, "distinct")
 
     def test_qsim_intent_has_distinct(self):
-        """QSimIntent still has distinct field."""
+        """QSimIntent exposes a distinct field."""
         qi = QSimIntent(
             intent_id="t",
             tables=[],
@@ -1084,17 +1044,17 @@ class TestWhereParamSignatureKey:
         assert fp1.signature_key != fp2.signature_key
 
     def test_signature_key_ignores_bool_op(self):
-        """WhereParam.signature_key does not include legacy bool_op."""
+        """WhereParam.signature_key does not include bool_op from input dicts."""
         fp_plain = WhereParam(left_expr=NormalizedExpr.from_column("t.c"), op="=")
-        fp_legacy = WhereParam.from_dict({"left_expr": "t.c", "op": "=", "bool_op": "OR"})
-        assert fp_plain.signature_key == fp_legacy.signature_key
+        fp_with_bool = WhereParam.from_dict({"left_expr": "t.c", "op": "=", "bool_op": "OR"})
+        assert fp_plain.signature_key == fp_with_bool.signature_key
         assert "bool_op" not in fp_plain.signature_key
 
     def test_signature_key_ignores_where_group(self):
-        """WhereParam.signature_key does not include legacy where_group."""
+        """WhereParam.signature_key does not include where_group from input dicts."""
         fp_plain = WhereParam(left_expr=NormalizedExpr.from_column("t.c"), op="=")
-        fp_legacy = WhereParam.from_dict({"left_expr": "t.c", "op": "=", "where_group": 5})
-        assert fp_plain.signature_key == fp_legacy.signature_key
+        fp_with_group = WhereParam.from_dict({"left_expr": "t.c", "op": "=", "where_group": 5})
+        assert fp_plain.signature_key == fp_with_group.signature_key
         assert "where_group" not in fp_plain.signature_key
 
 
@@ -1334,7 +1294,7 @@ class TestTemplate:
         """Template to_dict/from_dict round trip."""
         rebuilt = Template.from_dict(sample_template.to_dict())
         assert rebuilt.id == sample_template.id
-        assert rebuilt.schema_hash == sample_template.schema_hash
+        assert rebuilt.effective_structural_hash == sample_template.effective_structural_hash
         assert rebuilt.trust_level == sample_template.trust_level
 
     def test_display_alias_map_round_trip(self, sample_template):
@@ -1345,11 +1305,11 @@ class TestTemplate:
         rebuilt = Template.from_dict(tmpl.to_dict())
         assert rebuilt.display_alias_map == {"sig_a": "alias_a"}
 
-    def test_legacy_execution_sql_keys_ignored(self, sample_template):
-        """Legacy ``execution_sql`` / ``spark_sql_param`` JSON keys are ignored."""
+    def test_unknown_execution_sql_keys_ignored(self, sample_template):
+        """Unknown ``execution_sql`` / ``spark_sql_param`` JSON keys are ignored."""
         d = sample_template.to_dict()
-        d["execution_sql"] = "SELECT * FROM legacy_exec"
-        d["spark_sql_param"] = "SELECT * FROM legacy_spark"
+        d["execution_sql"] = "SELECT * FROM ignored_exec"
+        d["spark_sql_param"] = "SELECT * FROM ignored_spark"
         rebuilt = Template.from_dict(d)
         assert rebuilt.sql_param == sample_template.sql_param
 
@@ -1769,7 +1729,7 @@ class TestSchemaGraphMethods:
         """SchemaGraph to_dict/from_dict round trip."""
         rebuilt = SchemaGraph.from_dict(schema_graph.to_dict())
         assert set(rebuilt.table_names) == set(schema_graph.table_names)
-        assert rebuilt.schema_hash == schema_graph.schema_hash
+        assert rebuilt.effective_structural_hash == schema_graph.effective_structural_hash
 
 
 class TestColumnMetadataRoundTrip:
@@ -2013,14 +1973,27 @@ class TestColumnMetadataRoundTrip:
         cm = ColumnMetadata(name="x", data_type="varchar(100)", value_type="integer")
         assert cm.value_type == "integer"
 
-    def test_is_filterable_excluded_pattern(self):
-        """ColumnMetadata.is_filterable False when name matches excluded pattern."""
+    def test_is_filterable_restricted_sensitivity(self):
+        """ColumnMetadata.is_filterable False when sensitivity is RESTRICTED."""
         cm = ColumnMetadata(
             name="user_password",
             data_type="varchar",
             role=ColumnRole.CATEGORICAL.value,
             distinct_count=10,
             row_count=100,
+            sensitivity=SensitivityClassification.RESTRICTED,
+        )
+        assert cm.is_filterable is False
+
+    def test_is_filterable_hidden_sensitivity(self):
+        """ColumnMetadata.is_filterable False when sensitivity is HIDDEN."""
+        cm = ColumnMetadata(
+            name="secret_token",
+            data_type="varchar",
+            role=ColumnRole.CATEGORICAL.value,
+            distinct_count=10,
+            row_count=100,
+            sensitivity=SensitivityClassification.HIDDEN,
         )
         assert cm.is_filterable is False
 
@@ -2143,14 +2116,14 @@ class TestColumnMetadataRoundTrip:
         )
         assert cm.get_valid_aggregations() == {"count"}
 
-    def test_get_valid_aggregations_audit_allows_none(self):
-        """ColumnMetadata.get_valid_aggregations AUDIT returns empty set."""
+    def test_get_valid_aggregations_audit_allows_count(self):
+        """ColumnMetadata.get_valid_aggregations AUDIT allows count only."""
         cm = ColumnMetadata(
             name="updated_at",
             data_type="timestamp",
             role=ColumnRole.AUDIT.value,
         )
-        assert cm.get_valid_aggregations() == set()
+        assert cm.get_valid_aggregations() == {"count"}
 
     def test_get_valid_having_ops_uses_stored_when_set(self):
         """ColumnMetadata.get_valid_having_ops returns stored when set."""
@@ -2526,7 +2499,7 @@ class TestWindowCaseRegistry:
 
     def test_duplicate_case_registry_id_emits_issue(self) -> None:
         """validate_scope_registries flags duplicate case ids."""
-        from aetherdialect._validation_schema import validate_scope_registries
+        from aetherdialect._validation_shape import validate_scope_registries
 
         cr = CaseRegistryStep(
             registry_id="c01",
@@ -2749,14 +2722,17 @@ class TestPipelineFeatureTags:
                 "grain": "grouped",
                 "select_cols": [{"expr": "count(*)", "is_aggregated": True}],
                 "group_by_cols": ["t1.id"],
-                "having_param": [
-                    {
-                        "left_expr": "count(*)",
-                        "op": ">",
-                        "value_type": "number",
-                        "param_key": "p1",
-                    }
-                ],
+                "having": {
+                    "op": "and",
+                    "predicates": [
+                        {
+                            "left_expr": "count(*)",
+                            "op": ">",
+                            "value_type": "number",
+                            "param_key": "p1",
+                        }
+                    ],
+                },
                 "distinct_select_index": 0,
             }
         )

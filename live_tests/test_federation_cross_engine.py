@@ -6,14 +6,14 @@ from decimal import Decimal
 
 import pytest
 
-from aetherdialect._core_utils import llm_usage_question_scope
+from aetherdialect._utils import llm_usage_question_scope
 
-from ._federation_live import (
+from .live_support import (
     build_federation_live_engine,
     ensure_federation_partitions_loaded,
     federation_partitions_available,
 )
-from .federation_oracles import (
+from .mydb_profile import (
     LIVE_FULL_HORROR_DISTINCT_CUSTOMERS,
     LIVE_FULL_JOIN_RENTAL_LINKED_TITLES,
     LIVE_FULL_PAYMENT_TOTAL,

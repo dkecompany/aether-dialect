@@ -6,13 +6,12 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from aetherdialect._contracts_base import FederationContext
+from aetherdialect._contracts_base import ConfigError, FederationConfigError, FederationContext
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import (
-    FederationConfigError,
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_manifest import (
     binding_from_member_engine,
     build_federation_manifest_from_members,
-    compose_composite_graph,
     parse_federation_manifest,
 )
 from aetherdialect._schema_graph import recompute_join_paths_multi
@@ -67,9 +66,21 @@ def _orders_table() -> TableMetadata:
     )
 
 
+def _owner_member(connection: str = "b") -> MagicMock:
+    member = MagicMock()
+    member.dialect = "duckdb"
+    member._named_connection = connection
+    member._connection = connection
+    member._context_name = "master"
+    member._schema_role = "owner"
+    member._runtime_config = None
+    return member
+
+
 def _consumer_member(connection: str = "a") -> MagicMock:
     member = MagicMock()
     member.dialect = "duckdb"
+    member._named_connection = connection
     member._connection = connection
     member._context_name = "master"
     member._schema_role = "consumer"
@@ -80,14 +91,17 @@ def _consumer_member(connection: str = "a") -> MagicMock:
 @pytest.mark.fast
 def test_binding_from_member_engine_rejects_consumer_role() -> None:
     with pytest.raises(FederationConfigError, match="must be an owner engine"):
-        binding_from_member_engine("a", _consumer_member("a"))
+        binding_from_member_engine(_consumer_member("a"))
 
 
 @pytest.mark.fast
 def test_build_federation_manifest_from_members_rejects_consumer_role() -> None:
-    members = {"a": _consumer_member("a")}
+    members = {"a": _consumer_member("a"), "b": _owner_member("b")}
     declaration = parse_federation_manifest({"federation_id": "fed_scope", "cross_source_joins": []})
-    member_graphs = {"a": _graph("customers", source_id="a")}
+    member_graphs = {
+        "a": _graph("customers", source_id="a"),
+        "b": _graph("orders", source_id="b"),
+    }
     with pytest.raises(FederationConfigError, match="must be an owner engine"):
         build_federation_manifest_from_members(
             members,
@@ -149,3 +163,15 @@ def test_compose_applies_federation_context_deny_columns() -> None:
     assert "email" in composite.deny_columns.get("customers", set())
     assert "email" not in composite.tables["customers"].columns
     assert "id" in composite.tables["customers"].columns
+
+
+@pytest.mark.fast
+def test_compose_rejects_federation_deny_absent_from_composite() -> None:
+    manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
+    members = {
+        "a": _graph("customers", source_id="a"),
+        "b": _graph("orders", source_id="b", tables={"orders": _orders_table()}),
+    }
+    ctx = FederationContext(deny_objects=frozenset({"staff"}))
+    with pytest.raises(ConfigError, match=r"deny_objects references unknown table"):
+        compose_composite_graph(members, manifest, master_context=ctx)

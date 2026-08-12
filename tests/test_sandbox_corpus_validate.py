@@ -15,16 +15,16 @@ question_ok = Sandbox.question_ok
 
 
 def test_question_ok_success_step_has_no_status() -> None:
-    step = SimpleNamespace(done=True, sql="SELECT 1", status=None, error=None, message=None, intent=None)
+    step = SimpleNamespace(done=True, sql="SELECT 1", error=None, answer=None, intent=None)
     assert Sandbox.question_ok(step, "How many items are in the catalog by item type?")
-    ok_step = SimpleNamespace(done=True, sql="SELECT 1", status="ok", error=None, message=None)
-    bad_step = SimpleNamespace(done=True, sql=None, status="ok", error=None, message=None)
+    ok_step = SimpleNamespace(done=True, sql="SELECT 1", error=None, answer=None)
+    bad_step = SimpleNamespace(done=True, sql=None, error=None, answer=None)
     assert Sandbox.question_ok(ok_step, "How many customers are there?")
     assert not Sandbox.question_ok(bad_step, "How many customers are there?")
 
 
 def test_question_ok_allows_no_sql_for_weather_tour_question() -> None:
-    step = SimpleNamespace(done=True, sql=None, error="rejected", status="invalid_question", message=None)
+    step = SimpleNamespace(done=True, sql=None, error="rejected", status="invalid_question", answer=None)
     assert Sandbox.question_ok(step, "What's the weather today?")
 
 
@@ -34,7 +34,7 @@ def test_question_ok_json_validation_failure() -> None:
         sql=None,
         status="permission_denied",
         error="permission denied",
-        message=None,
+        answer=None,
     )
     assert Sandbox.question_ok(step, "How many items are there?")
 
@@ -44,9 +44,8 @@ def test_faithfulness_gate_rejects_missing_bridge_table() -> None:
     step = SimpleNamespace(
         done=True,
         sql='SELECT "language"."name" FROM "item" JOIN "language" ON "item"."language_id" = "language"."language_id"',
-        status="ok",
         error=None,
-        message=None,
+        answer=None,
         intent=intent,
     )
     detail = Sandbox.check_sandbox_faithfulness(step, "Which games support English?")
@@ -70,14 +69,13 @@ def test_faithfulness_passes_when_required_tables_in_cte_or_sql() -> None:
                 output_columns=["name"],
             )
         ],
-        planner_cte_names=["ranked_cities"],
+        interpret_cte_names=["ranked_cities"],
     )
     step = SimpleNamespace(
         done=True,
         sql='SELECT "city"."city" FROM "city" JOIN "customer" ON "customer"."city_id" = "city"."city_id"',
-        status="ok",
         error=None,
-        message=None,
+        answer=None,
         intent=intent,
     )
     assert Sandbox.check_sandbox_faithfulness(step, "Which city has the most customers?") is None
@@ -87,9 +85,8 @@ def test_question_ok_consumer_staff_expects_ok() -> None:
     step = SimpleNamespace(
         done=True,
         sql='SELECT "staff"."first_name" FROM "staff"',
-        status="ok",
         error=None,
-        message=None,
+        answer=None,
         intent=None,
     )
     assert Sandbox.question_ok(
@@ -104,9 +101,8 @@ def test_question_ok_owner_staff_expects_ok() -> None:
     step = SimpleNamespace(
         done=True,
         sql='SELECT "staff"."first_name" FROM "staff"',
-        status="ok",
         error=None,
-        message=None,
+        answer=None,
         intent=None,
     )
     assert Sandbox.question_ok(

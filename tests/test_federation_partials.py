@@ -1,4 +1,4 @@
-"""Regression tests for federation partial implementation slices."""
+"""Regression tests for federation compose, cancel, and partial-failure paths."""
 
 from __future__ import annotations
 
@@ -9,43 +9,36 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from aetherdialect._config import PolicyConfig
-from aetherdialect._constants import (
+from aetherdialect._constants_runtime import (
     FEDERATION_COMPOSITE_RECONCILIATION_NOTE,
     REPHRASE_HINT_MESSAGES,
 )
-from aetherdialect._contracts_base import (
-    FederationSourceBinding,
-    PredicateGroup,
-    WhereParam,
-)
+from aetherdialect._contracts_base import FederationConfigError, FederationDeclarationError, PredicateGroup, WhereParam
 from aetherdialect._contracts_core import (
+    AnchoredTemporalBind,
     FederationExecutionContext,
     GenerationPath,
+    RephraseHint,
     RuntimeIntent,
     SourceStep,
     SqlGenerationOutcome,
 )
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import (
-    RephraseHint,
-    federation_turn_cancelled,
-    pop_federation_execution_context,
-    push_federation_execution_context,
-)
-from aetherdialect._federation import (
-    AnchoredTemporalBind,
-    FederationConfigError,
-    FederationDeclarationError,
-    build_federation_manifest_from_members,
-    cached_or_suggest_cross_source_mappings,
+from aetherdialect._contracts_schema import ColumnMetadata, FederationSourceBinding, SchemaGraph, TableMetadata
+from aetherdialect._federation_compose import (
     compare_replica_member_parity,
     compose_composite_graph,
+    member_schema_slice,
+)
+from aetherdialect._federation_execute import (
     federation_member_execution_batches,
     federation_member_parallelism_cap,
+)
+from aetherdialect._federation_manifest import (
+    build_federation_manifest_from_members,
+    cached_or_suggest_cross_source_mappings,
     federation_prompt_fields_for_schema,
     federation_scaled_join_candidate_cap,
     federation_scaled_join_path_tie_cap,
-    member_schema_slice,
     parse_federation_declaration,
     parse_federation_manifest,
     parse_federation_mappings,
@@ -55,6 +48,11 @@ from aetherdialect._federation import (
 )
 from aetherdialect._main_execution import MainExecutionOps
 from aetherdialect._schema_graph import recompute_join_paths_multi
+from aetherdialect._utils import (
+    federation_turn_cancelled,
+    pop_federation_execution_context,
+    push_federation_execution_context,
+)
 from tests.federation_helpers import stamp_sandbox_payment_union_profiling
 
 
@@ -147,6 +145,17 @@ def test_sandbox_replica_mappings_compose() -> None:
         "last_name": ColumnMetadata(name="last_name", data_type="text", sensitivity="none"),
         "store_id": ColumnMetadata(name="store_id", data_type="integer", sensitivity="none"),
     }
+    city_cols = {
+        "city_id": ColumnMetadata(name="city_id", data_type="integer", sensitivity="none"),
+        "city": ColumnMetadata(name="city", data_type="text", sensitivity="none"),
+        "country_id": ColumnMetadata(name="country_id", data_type="integer", sensitivity="none"),
+        "last_update": ColumnMetadata(name="last_update", data_type="timestamp", sensitivity="none"),
+    }
+    country_cols = {
+        "country_id": ColumnMetadata(name="country_id", data_type="integer", sensitivity="none"),
+        "country": ColumnMetadata(name="country", data_type="text", sensitivity="none"),
+        "last_update": ColumnMetadata(name="last_update", data_type="timestamp", sensitivity="none"),
+    }
     members = {
         "storefront": SchemaGraph(
             tables={
@@ -161,6 +170,20 @@ def test_sandbox_replica_mappings_compose() -> None:
                     name="staff",
                     columns=dict(staff_cols),
                     primary_key=["staff_id"],
+                    foreign_keys=[],
+                    source_id="storefront",
+                ),
+                "city": TableMetadata(
+                    name="city",
+                    columns=dict(city_cols),
+                    primary_key=["city_id"],
+                    foreign_keys=[],
+                    source_id="storefront",
+                ),
+                "country": TableMetadata(
+                    name="country",
+                    columns=dict(country_cols),
+                    primary_key=["country_id"],
                     foreign_keys=[],
                     source_id="storefront",
                 ),
@@ -206,6 +229,20 @@ def test_sandbox_replica_mappings_compose() -> None:
                     name="item",
                     columns={"item_id": ColumnMetadata(name="item_id", data_type="integer", sensitivity="none")},
                     primary_key=["item_id"],
+                    foreign_keys=[],
+                    source_id="catalog",
+                ),
+                "city": TableMetadata(
+                    name="city",
+                    columns=dict(city_cols),
+                    primary_key=["city_id"],
+                    foreign_keys=[],
+                    source_id="catalog",
+                ),
+                "country": TableMetadata(
+                    name="country",
+                    columns=dict(country_cols),
+                    primary_key=["country_id"],
                     foreign_keys=[],
                     source_id="catalog",
                 ),
@@ -295,7 +332,7 @@ def test_replica_mapping_requires_authoritative_source() -> None:
     with pytest.raises(FederationConfigError, match="authoritative_source"):
         parse_federation_mappings(
             {
-                "version": "0.2.1",
+                "version": "0.2.3",
                 "logical_tables": [
                     {
                         "logical": "entity",
@@ -312,8 +349,20 @@ def test_replica_mapping_requires_authoritative_source() -> None:
 
 def test_all_file_member_federation_rejected_at_build() -> None:
     members = {
-        "files_a": MagicMock(dialect="csv", _schema_role="owner", _context_name="master", _connection=""),
-        "files_b": MagicMock(dialect="csv", _schema_role="owner", _context_name="master", _connection=""),
+        "files_a": MagicMock(
+            dialect="csv",
+            _schema_role="owner",
+            _context_name="master",
+            _connection="files_a",
+            _named_connection="files_a",
+        ),
+        "files_b": MagicMock(
+            dialect="csv",
+            _schema_role="owner",
+            _context_name="master",
+            _connection="files_b",
+            _named_connection="files_b",
+        ),
     }
     declaration = parse_federation_manifest({"federation_id": "fed_files", "cross_source_joins": []})
     with pytest.raises(FederationDeclarationError, match="all file engines"):
@@ -355,7 +404,7 @@ def test_compose_and_member_slice_use_storage_ceiling_at_build_time() -> None:
         include_derived_roster=True,
     )
     members = {"a": _graph("t_a", source_id="a"), "b": _graph("t_b", source_id="b")}
-    with patch("aetherdialect._federation.recompute_join_paths_multi", return_value={}) as mock_recompute:
+    with patch("aetherdialect._federation_compose.recompute_join_paths_multi", return_value={}) as mock_recompute:
         composite = compose_composite_graph(members, manifest)
         composite_call = mock_recompute.call_args
         assert composite_call is not None
@@ -410,7 +459,7 @@ def test_gate_kwargs_load_named_context_from_member_tree(tmp_path) -> None:
     member_dir = tmp_path / "aetherdialect" / "conn_alpha"
     member_dir.mkdir(parents=True)
     context_payload = {
-        "version": "0.2.1",
+        "version": "0.2.3",
         "allow_objects": ["entity_a"],
         "deny_objects": [],
         "deny_columns": [],
@@ -421,7 +470,7 @@ def test_gate_kwargs_load_named_context_from_member_tree(tmp_path) -> None:
     owner._artifacts_root = tmp_path
     owner._runtime_config = MagicMock(engine_context=MagicMock())
     owner._federation_source_runtimes = {"alpha": MagicMock(artifacts_dir=str(member_dir))}
-    gates = MainExecutionOps._federation_gate_kwargs_by_source(owner, None, manifest)
+    gates = MainExecutionOps.federation_gate_kwargs_by_source(owner, None, manifest)
     assert "entity_a" in gates["alpha"]["schema_context"].allow_objects
 
 
@@ -436,7 +485,7 @@ def test_federation_stores_honor_session_space_name() -> None:
             captured["space_name"] = kwargs.get("space_name", "")
             return MagicMock()
 
-        mp.setattr("aetherdialect._templates.TemplateOps.load_template_store", _fake_load)
+        mp.setattr("aetherdialect._templates_ops.TemplateOps.load_template_store", _fake_load)
         MainExecutionOps.federation_stores_by_source(owner, graphs, space_name="sales")
         assert captured["space_name"] == "sales"
 
@@ -446,7 +495,7 @@ def test_session_space_name_prefers_choice_port() -> None:
     port.space_name = "finance"
     owner = MagicMock()
     owner._context_name = "master"
-    assert MainExecutionOps._session_space_name_for_federation(owner, port) == "finance"
+    assert MainExecutionOps.session_space_name_for_federation(owner, port) == "finance"
 
 
 def test_resolve_anchored_temporal_bind_for_date_window() -> None:
@@ -549,7 +598,7 @@ def test_compare_replica_member_parity_detects_column_drift() -> None:
     }
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_tables": [
                 {
                     "logical": "entity",
@@ -675,7 +724,7 @@ def test_federation_member_execution_batches_groups_shared_connections() -> None
 
 
 @pytest.mark.fast
-def test_cancel_active_federation_turn() -> None:
+def test_cancel() -> None:
     """Same-thread ContextVar cancel path used by coordinator partial- failure handling."""
     ctx = FederationExecutionContext(plan_id="plan-1")
     token = push_federation_execution_context(ctx)

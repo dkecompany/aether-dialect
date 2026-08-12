@@ -20,7 +20,7 @@ from aetherdialect._constants import (
     TEMPLATE_STORE_PARTITION_PREFIX,
     WRITE_QUEUE_FILENAME,
 )
-from aetherdialect._contracts_base import EngineIdentity, FederationPlanTemplate, WriteQueueEvent
+from aetherdialect._contracts_base import EngineIdentity, NormalizedExpr
 from aetherdialect._contracts_core import (
     ConcreteIntent,
     FeedbackKind,
@@ -28,21 +28,23 @@ from aetherdialect._contracts_core import (
     RejectionBucket,
     SelectCol,
     Template,
-    TemplateStats,
     ValueHistory,
+    WriteQueueEvent,
 )
-from aetherdialect._contracts_schema import SQLShape
-from aetherdialect._core_utils import (
-    emit_write_queue_event,
+from aetherdialect._contracts_schema import FederationPlanTemplate, SQLShape, TemplateStats
+from aetherdialect._federation_execute import (
+    load_federation_plan_templates,
+    save_federation_plan_template,
+)
+from aetherdialect._main_execution import MainExecutionOps
+from aetherdialect._templates import TemplateStoreView
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils import (
     normalize_question,
     pop_engine_identity,
     push_engine_identity,
-    read_gzip_json,
 )
-from aetherdialect._federation import load_federation_plan_templates, save_federation_plan_template
-from aetherdialect._intent_process import NormalizedExpr
-from aetherdialect._main_execution import MainExecutionOps
-from aetherdialect._templates import TemplateOps, TemplateStoreView
+from aetherdialect._utils_artifacts import emit_write_queue_event, read_gzip_json
 
 _GRAPH_ID = "sg_test000000000001__abcd1234"
 _ROUNDS = 8
@@ -127,7 +129,7 @@ def _plan_template(plan_id: str) -> FederationPlanTemplate:
         combine_hash="combine_hash",
         question="show joined entities",
         accepted_questions=("accepted q",),
-        format_version="0.2.1",
+        format_version="0.2.3",
         member_template_ids=(("alpha", "T0001"), ("beta", "T0002")),
         residual_hash="residual_hash",
         join_feedback=("join hint",),
@@ -171,7 +173,7 @@ def _template_save_worker(artifacts_dir: str, template_id: str, errors: Any) -> 
                     template_id,
                     TemplateOps._convert_to_json_serializable(template.to_dict()),
                 )
-                TemplateStoreView._refresh_template_store_indexes(store, template_objs=[template])
+                TemplateStoreView.refresh_template_store_indexes(store, template_objs=[template])
                 TemplateOps.save_template_store(store)
 
             _retry_transient(_round)
@@ -276,6 +278,7 @@ def test_concurrent_write_queue_drains_persist_multiprocess(tmp_path) -> None:
                 produced_at=ts,
                 payload=(("q_norm", q_norm), ("entry_json", json.dumps(entry.to_dict()))),
             ),
+            space_name="master",
         )
     queue_path = tmp_path / WRITE_QUEUE_FILENAME
     assert queue_path.stat().st_size > 0

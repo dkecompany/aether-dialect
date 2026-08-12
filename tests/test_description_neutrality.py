@@ -6,24 +6,24 @@ import json
 
 import pytest
 
-from aetherdialect._constants import FEDERATION_COMPOSE_SUPPORTED_CAPABILITIES
-from aetherdialect._contracts_base import ConfigError, DescriptionOwner, LogicalIntent
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import (
+from aetherdialect._constants_runtime import FEDERATION_COMPOSE_SUPPORTED_CAPABILITIES
+from aetherdialect._contracts_base import ConfigError
+from aetherdialect._contracts_schema import ColumnMetadata, DescriptionOwner, LogicalIntent, SchemaGraph, TableMetadata
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_manifest import (
     collect_federation_description_forbidden_tokens,
-    compose_composite_graph,
     parse_federation_manifest,
     parse_federation_mappings,
     raise_if_descriptions_name_federation_sources,
 )
-from aetherdialect._intent_process import _build_intent_compose_prompt
-from aetherdialect._schema_catalog import (
+from aetherdialect._intent_loop import _build_intent_compose_prompt
+from aetherdialect._schema_graph import recompute_join_paths_multi
+from aetherdialect._schema_profile import (
     _enrich_fk_column_descriptions,
     description_neutrality_violations,
     sanitize_description_text,
     sanitize_schema_graph_descriptions,
 )
-from aetherdialect._schema_graph import recompute_join_paths_multi
 from tests.federation_helpers import federation_member_graph
 
 
@@ -83,8 +83,10 @@ def test_compose_composite_sanitizes_member_descriptions_with_source_id() -> Non
     }
     members["storefront"].tables["payment"].primary_key = ["payment_id"]
     members["storefront"].tables["payment"].description = "storefront payment ledger"
-    with pytest.raises(ConfigError, match="must not name a source or member"):
-        compose_composite_graph(members, manifest)
+    composite = compose_composite_graph(members, manifest)
+    payment = composite.tables["payment"]
+    assert "storefront" not in (payment.description or "").lower()
+    assert "storefront" not in (payment.columns["payment_id"].description or "").lower()
 
 
 @pytest.mark.fast
@@ -99,8 +101,19 @@ def test_raise_if_descriptions_name_federation_sources_rejects_member_text() -> 
 
 
 @pytest.mark.fast
+def test_scrub_member_descriptions_removes_source_id_tokens() -> None:
+    from aetherdialect._federation_compose import scrub_federation_member_description_source_tokens
+
+    graph = federation_member_graph("payment", source_id="storefront")
+    graph.tables["payment"].description = "catalog inventory payment ledger"
+    scrub_federation_member_description_source_tokens({"storefront": graph}, ["storefront", "catalog"])
+    assert "catalog" not in (graph.tables["payment"].description or "").lower()
+    raise_if_descriptions_name_federation_sources({"storefront": graph}, ["storefront", "catalog"])
+
+
+@pytest.mark.fast
 def test_fk_enrich_description_sanitized_with_forbidden_tokens() -> None:
-    from aetherdialect._federation import _resolve_composite_table_names
+    from aetherdialect._federation_compose import _resolve_composite_table_names
 
     legacy_customer = TableMetadata(
         name="legacy_customer",
@@ -147,7 +160,7 @@ def test_fk_enrich_description_sanitized_with_forbidden_tokens() -> None:
     tokens = collect_federation_description_forbidden_tokens(
         members,
         manifest,
-        parse_federation_mappings({"version": "0.2.1"}),
+        parse_federation_mappings({"version": "0.2.3"}),
         composite_names,
     )
     sanitize_schema_graph_descriptions(member_graph, tokens)
@@ -214,13 +227,13 @@ def test_collect_federation_description_forbidden_tokens_includes_aliases() -> N
             },
         ),
     }
-    from aetherdialect._federation import _resolve_composite_table_names
+    from aetherdialect._federation_compose import _resolve_composite_table_names
 
     composite_names = _resolve_composite_table_names(members, manifest)
     tokens = collect_federation_description_forbidden_tokens(
         members,
         manifest,
-        parse_federation_mappings({"version": "0.2.1"}),
+        parse_federation_mappings({"version": "0.2.3"}),
         composite_names,
     )
     assert "legacy_payment" in tokens

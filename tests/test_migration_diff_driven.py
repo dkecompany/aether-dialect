@@ -6,11 +6,7 @@ import os
 
 from aetherdialect._config import EngineConfig
 from aetherdialect._constants import TEMPLATE_QUESTION_TOKEN_INDEX_KEY, TEMPLATE_STORE_HEADER_FILENAME
-from aetherdialect._contracts_base import (
-    ColumnRole,
-    MigrationTier,
-    NormalizedExpr,
-)
+from aetherdialect._contracts_base import MigrationTier, NormalizedExpr
 from aetherdialect._contracts_core import (
     ConcreteIntent,
     SelectCol,
@@ -19,6 +15,7 @@ from aetherdialect._contracts_core import (
 )
 from aetherdialect._contracts_schema import (
     ColumnMetadata,
+    ColumnRole,
     SchemaDiff,
     SchemaGraph,
     SQLShape,
@@ -26,14 +23,12 @@ from aetherdialect._contracts_schema import (
     TableMetadata,
     TemplateStats,
 )
-from aetherdialect._core_utils import (
+from aetherdialect._templates import TemplateStoreView
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils_artifacts import (
     read_gzip_json,
     write_artifact_manifest,
     write_gzip_json_atomic,
-)
-from aetherdialect._templates import (
-    TemplateOps,
-    TemplateStoreView,
 )
 
 
@@ -402,8 +397,8 @@ class TestApplyMigrationPolicyDiffDriven:
         assert report.remapped_templates == 1
 
 
-class TestBackwardsCompatNoDiff:
-    """When ``schema_diff`` is None the legacy ``try_rename_migration_plan`` path runs."""
+class TestMigrationWithoutDiff:
+    """When ``schema_diff`` is None, soft refresh runs from the current graph and store."""
 
     def test_no_diff_soft_refresh_when_only_eff_hash_changed(self, tmp_path) -> None:
         schema = _two_table_schema()

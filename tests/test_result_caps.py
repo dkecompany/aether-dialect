@@ -11,9 +11,12 @@ import pytest
 from aetherdialect._config import EngineLimits
 from aetherdialect._contracts_base import ResultCapExceededError
 from aetherdialect._contracts_core import RuntimeIntent
-from aetherdialect._core_utils import pop_engine_limits, push_engine_limits
 from aetherdialect._dialect_sqlglot_helper import ResultBackend
-from aetherdialect._pipeline import _fetch_capped_result_rows, _push_result_row_limit_sql
+from aetherdialect._pipeline_execute import (
+    _fetch_capped_result_rows,
+    _push_result_row_limit_sql,
+)
+from aetherdialect._utils import pop_engine_limits, push_engine_limits
 
 
 class _CountingBackend:

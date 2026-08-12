@@ -12,7 +12,9 @@ from aetherdialect._contracts_base import (
 )
 from aetherdialect._contracts_core import RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import compose_composite_graph, parse_federation_manifest, plan_federated_intent
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_manifest import parse_federation_manifest
+from aetherdialect._federation_plan import plan_federated_intent
 from aetherdialect._schema_graph import recompute_join_paths_multi
 
 

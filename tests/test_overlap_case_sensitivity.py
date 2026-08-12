@@ -5,9 +5,14 @@ from __future__ import annotations
 import pytest
 
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import parse_federation_mappings, rescore_declared_mapping_drift
-from aetherdialect._schema_catalog import compute_semantic_profile_join_neighbors, value_overlap_stats_for_columns
-from aetherdialect._schema_graph import _column_profiling_dict, fk_overlap_validates
+from aetherdialect._federation_compose import rescore_declared_mapping_drift
+from aetherdialect._federation_manifest import parse_federation_mappings
+from aetherdialect._schema_graph import (
+    _column_profiling_dict,
+    compute_semantic_profile_join_neighbors,
+    fk_overlap_validates,
+)
+from aetherdialect._schema_profile import value_overlap_stats_for_columns
 
 
 def _col(
@@ -78,7 +83,7 @@ def test_case_insensitive_member_matches_case_sensitive_member() -> None:
     }
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_columns": [
                 {
                     "logical": "shared_code",

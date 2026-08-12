@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aetherdialect"
-version = "0.2.1"
+version = "0.2.4"
 description = "The deterministic Text-to-SQL engine"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
@@ -30,16 +30,15 @@ dependencies = [
     "platformdirs>=2.0.0,<5",
     "sqlglot>=29.0,<30",
     "SQLAlchemy>=2.0,<3",
+    "duckdb-engine>=0.13,<1",
 ]
 
 [project.optional-dependencies]
-duckdb = ["duckdb>=1.0,<2"]
-federation = ["duckdb>=1.0,<2"]
-sandbox = ["duckdb>=1.0,<2", "duckdb-engine>=0.13,<1"]
 csv = ["openpyxl>=3.1,<4"]
 mysql = ["pymysql>=1.1,<2"]
 mariadb = ["pymysql>=1.1,<2"]
 sqlserver = ["pyodbc>=5,<6"]
+oracle = ["oracledb>=2,<4"]
 postgresql = [
     "pglast>=5.0,<8",
     "psycopg[binary]>=3.1,<4",
@@ -76,6 +75,7 @@ dev = [
     "duckdb-engine>=0.13,<1",
     "pymysql>=1.1,<2",
     "pyodbc>=5,<6",
+    "oracledb>=2,<4",
     "pglast>=5.0,<8",
     "psycopg[binary]>=3.1,<4",
     "sqlalchemy-redshift>=1.0,<2",
@@ -94,7 +94,7 @@ paths_to_mutate = [
     "src/aetherdialect/_validation_semantic.py",
     "src/aetherdialect/_intent_resolve.py",
     "src/aetherdialect/_intent_repair.py",
-    "src/aetherdialect/_core_utils.py",
+    "src/aetherdialect/_utils.py",
 ]
 
 [tool.ruff]
@@ -162,19 +162,23 @@ module = [
     "pymysql.*",
     "pyarrow",
     "pyarrow.*",
+    "oracledb",
+    "oracledb.*",
 ]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
-testpaths = ["tests", "live_tests"]
+testpaths = ["tests"]
 pythonpath = ["src", "scripts", ".github/scripts", "."]
 markers = [
-    "fast: PR-loop tests; equals not needs_corpus until data.zip passes sandbox_doctor(), then also quick sandbox corpus tests (excludes slow LLM matrix in test_sandbox_offline.py)",
+    "fast: PR-loop tests; equals not needs_corpus until data.zip passes sandbox_doctor(), then also quick sandbox corpus tests (excludes items marked not_fast)",
+    "not_fast: slower unit tests under tests/ only (pytest testpaths); excluded from auto-applied fast marker and from pytest -m fast; live_tests are collected only via pytest live_tests",
     "hygiene: static source/docs writing rules (AST/text), not behavioral coverage",
     "needs_corpus: needs bundled src/aetherdialect/sandbox/data.zip (offline_sandbox corpus)",
+    "sandbox: offline sandbox corpus tests; apply alongside needs_corpus; select via pytest -m sandbox",
     "requires_sandbox: deprecated alias for needs_corpus",
-    "live: requires live federation partition databases and LLM credentials",
-    "live_no_llm: live database tests that must not call the LLM",
+    "live: requires live federation partition databases and LLM credentials; collect via pytest live_tests",
+    "live_no_llm: live database tests that must not call the LLM; collect via pytest live_tests",
 ]
 
 [tool.coverage.run]

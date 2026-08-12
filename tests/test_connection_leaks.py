@@ -24,9 +24,9 @@ def test_query_log_read_returns_connection_to_pool() -> None:
     engine._store = {}
     engine._templates = {}
     with (
-        patch("aetherdialect._main_execution.assert_query_log_warmup_allowed"),
-        patch("aetherdialect._main_execution.fetch_query_log", return_value=[]),
-        patch("aetherdialect._main_execution.MainExecutionOps._run_seed_warmup_sql_history_pipeline"),
+        patch("aetherdialect._federation_compose.assert_query_log_warmup_allowed"),
+        patch("aetherdialect._sql_to_intent.fetch_query_log", return_value=[]),
+        patch("aetherdialect._main_interactive.MainInteractiveOps._run_seed_warmup_sql_history_pipeline"),
     ):
         MainExecutionOps.run_seed_warmup_from_query_log_execution(engine)
     raw.close.assert_called_once()

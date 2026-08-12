@@ -6,12 +6,12 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from aetherdialect._contracts_base import SpaceContext
-from aetherdialect._contracts_core import NormalizedExpr, RuntimeIntent, SelectCol
+from aetherdialect._contracts_base import NormalizedExpr, SpaceContext
+from aetherdialect._contracts_core import RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._main_execution import MainExecutionOps
-from aetherdialect._pipeline import generate_and_validate_sql
-from aetherdialect._templates import TemplateOps
+from aetherdialect._pipeline_generate import generate_and_validate_sql
+from aetherdialect._templates_ops import TemplateOps
 
 
 def _column(name: str) -> ColumnMetadata:

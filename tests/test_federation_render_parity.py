@@ -14,7 +14,8 @@ from aetherdialect._contracts_base import (
 from aetherdialect._contracts_core import RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._dialect import DialectRegistry
-from aetherdialect._federation import parse_federation_manifest, plan_federated_intent
+from aetherdialect._federation_manifest import parse_federation_manifest
+from aetherdialect._federation_plan import plan_federated_intent
 from aetherdialect._schema_graph import recompute_join_paths_multi
 from aetherdialect._sql_gen import build_deterministic_sql
 
@@ -25,6 +26,7 @@ _MEMBER_ENGINES = (
     "mysql",
     "mariadb",
     "sqlserver",
+    "oracle",
     "snowflake",
     "bigquery",
     "redshift",

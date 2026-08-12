@@ -1,4 +1,4 @@
-"""Slim StoredTemplateSummary / StoredTemplateDetail for agent registry bridge."""
+"""Slim StoredTemplateSummary / StoredTemplateDetail field contracts."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ from unittest.mock import MagicMock
 import pytest
 
 from aetherdialect._contracts_base import ApprovalState
-from aetherdialect._templates import TemplateOps
-from tests.test_reuse_saved_question import _minimal_template
+from aetherdialect._templates_ops import TemplateOps
+from tests.template_fixtures import _minimal_template
 
 
 @pytest.mark.fast

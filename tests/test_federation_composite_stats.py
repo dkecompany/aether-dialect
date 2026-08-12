@@ -5,10 +5,9 @@ from __future__ import annotations
 import pytest
 
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import (
+from aetherdialect._federation_compose import _merge_column_metadata_union_statistics, compose_composite_graph
+from aetherdialect._federation_manifest import (
     _cross_source_column_suggestion_score,
-    _merge_column_metadata_union_statistics,
-    compose_composite_graph,
     parse_federation_manifest,
     parse_federation_mappings,
 )
@@ -93,7 +92,7 @@ def _replica_members_and_mappings(
     )
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_tables": [
                 {
                     "logical": "entity",
@@ -148,7 +147,7 @@ def _union_members_and_mappings(
     )
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_tables": [
                 {
                     "logical": "payment",

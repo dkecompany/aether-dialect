@@ -3,7 +3,6 @@
 import pytest
 
 from aetherdialect._contracts_base import (
-    ColumnRole,
     ExprValue,
     HavingParam,
     MulGroup,
@@ -19,18 +18,14 @@ from aetherdialect._contracts_core import (
 )
 from aetherdialect._contracts_schema import (
     ColumnMetadata,
+    ColumnRole,
     CteOutputColumnMeta,
     SchemaGraph,
     TableMetadata,
     WindowRegistryStep,
     WindowSpec,
 )
-from aetherdialect._intent_expr import (
-    parse_expr_string,
-    promote_date_subtraction_to_date_diff,
-    replace_refs_in_expr,
-)
-from aetherdialect._intent_resolve import (
+from aetherdialect._intent_bind import (
     _canonicalize_condition_order,
     _dedup_having,
     _dedup_where_predicates,
@@ -62,6 +57,11 @@ from aetherdialect._intent_resolve import (
     sort_having,
     sort_select_cols,
     sort_where_predicates,
+)
+from aetherdialect._intent_expr import (
+    parse_expr_string,
+    promote_date_subtraction_to_date_diff,
+    replace_refs_in_expr,
 )
 from aetherdialect._sql_gen import (
     _render_predicate_group_sql,
@@ -244,7 +244,7 @@ class TestQualifyCountStarMulgroups:
         ]
 
     def test_leaves_multi_table_count_star_unchanged(self):
-        from aetherdialect._intent_repair import reconcile_tables
+        from aetherdialect._intent_normalize import reconcile_tables
 
         schema = SchemaGraph(
             join_paths_multi={},
@@ -371,7 +371,7 @@ class TestCanonicalizeConditionOrder:
         assert result[1].left_expr.primary_term == "t.z"
 
     def test_forward_links_returns_and_connectors(self):
-        """``_forward_links`` is a legacy helper that always returns AND connectors."""
+        """``_forward_links`` always returns AND connectors."""
         fa = WhereParam(left_expr=NormalizedExpr.from_column("t.a"), op="=")
         fb = WhereParam(left_expr=NormalizedExpr.from_column("t.b"), op="=")
         fc = WhereParam(left_expr=NormalizedExpr.from_column("t.c"), op="=")
@@ -1173,10 +1173,9 @@ class TestEnforceGrainConsistency:
             where=None,
         )
         result = enforce_grain_consistency(intent, grain_schema)
-        assert result.grain == "row_level"
-
-    def test_enforce_grain_consistency_preserves_window_select(self, grain_schema):
-        """Partition keys on window specs do not promote grain or synthesise ``group_by_cols``."""
+        assert result.grain == "scalar"
+        """Partition keys on window specs do not promote grain or
+        synthesise ``group_by_cols``."""
         ws = WindowSpec(
             function="row_number",
             partition_by=[NormalizedExpr.from_column("orders.customer_id")],
@@ -1549,8 +1548,8 @@ class TestNormalizeCteNames:
         result = normalize_cte_names(intent)
         assert result.cte_steps[0].output_columns == ["rate"]
 
-    def test_planner_cte_alias_rewrites_window_registry_refs(self):
-        """Planner-only CTE aliases map to canonical cteN names (RS-004)."""
+    def test_interpret_cte_alias_rewrites_window_registry_refs(self):
+        """Planner-only CTE aliases map to canonical cteN names."""
         cte = RuntimeCteStep(
             cte_name="customer_totals",
             tables=["customer"],
@@ -1565,7 +1564,7 @@ class TestNormalizeCteNames:
             order_by_cols=[],
             where=None,
             cte_steps=[cte],
-            planner_cte_names=["customer_totals"],
+            interpret_cte_names=["customer_totals"],
             window_registry=[
                 WindowRegistryStep(
                     registry_id="w01",
@@ -2029,7 +2028,7 @@ class TestFilterAndHavingStructuralKeys:
 
 
 class TestShiftMultiGroupRepresentatives:
-    """Tests for legacy no-op group representative helpers."""
+    """No-op group representative helpers."""
 
     def test_single_filter_unchanged(self):
         fp = WhereParam(left_expr=NormalizedExpr.from_column("t.a"), op="=")
@@ -2339,7 +2338,7 @@ class TestEnforceGrainConsistencyExtended:
         cols["weird"] = weird_col
         isolated = SchemaGraph(
             join_paths_multi=dict(grain_schema.join_paths_multi),
-            effective_structural_hash=grain_schema.schema_hash,
+            effective_structural_hash=grain_schema.effective_structural_hash,
             tables={
                 **grain_schema.tables,
                 "orders": TableMetadata(
@@ -2772,7 +2771,7 @@ class TestDedupHavingEmpty:
 def test_lift_distinct_select_from_raw_sql_promotes_structured_select(
     schema_graph: SchemaGraph,
 ) -> None:
-    from aetherdialect._intent_resolve import lift_distinct_select_from_raw_sql
+    from aetherdialect._intent_bind import lift_distinct_select_from_raw_sql
 
     cte = RuntimeCteStep(
         cte_name="c1",
@@ -2800,7 +2799,7 @@ def test_lift_distinct_select_from_raw_sql_promotes_structured_select(
 
 
 def test_simplify_exprs_preserves_last_select_col(schema_graph: SchemaGraph) -> None:
-    from aetherdialect._intent_resolve import simplify_exprs
+    from aetherdialect._intent_bind import simplify_exprs
 
     _ = schema_graph
     intent = RuntimeIntent(
@@ -2815,8 +2814,77 @@ def test_simplify_exprs_preserves_last_select_col(schema_graph: SchemaGraph) -> 
     assert out.select_cols[0].expr.raw_sql == "DISTINCT customers.name"
 
 
+def test_simplify_exprs_preserves_or_where_shape(schema_graph: SchemaGraph) -> None:
+    """Leaf simplification must not flatten OR trees into AND via from_list."""
+    from aetherdialect._contracts_base import PredicateGroup, WhereParam
+    from aetherdialect._intent_bind import simplify_exprs
+
+    _ = schema_graph
+    where = PredicateGroup(
+        op="or",
+        predicates=(
+            WhereParam(
+                left_expr=NormalizedExpr.from_column("item.rental_rate"), op=">", raw_value=3, value_type="number"
+            ),
+            WhereParam(left_expr=NormalizedExpr.from_column("film.length"), op="<", raw_value=60, value_type="integer"),
+        ),
+    )
+    nested = PredicateGroup(
+        op="or",
+        groups=(
+            PredicateGroup(
+                op="and",
+                predicates=(
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("film.rating"),
+                        op="=",
+                        raw_value="PG-13",
+                        value_type="string",
+                    ),
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("film.length"),
+                        op="<",
+                        raw_value=90,
+                        value_type="integer",
+                    ),
+                ),
+            ),
+            PredicateGroup(
+                op="and",
+                predicates=(
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("film.rating"),
+                        op="=",
+                        raw_value="G",
+                        value_type="string",
+                    ),
+                    WhereParam(
+                        left_expr=NormalizedExpr.from_column("item.rental_rate"),
+                        op=">",
+                        raw_value=2,
+                        value_type="number",
+                    ),
+                ),
+            ),
+        ),
+    )
+    for tree in (where, nested):
+        intent = RuntimeIntent(
+            tables=["film", "item"],
+            grain="row_level",
+            select_cols=[SelectCol(expr=NormalizedExpr.from_column("film.rating"))],
+            group_by_cols=[],
+            order_by_cols=[],
+            where=tree,
+        )
+        out = simplify_exprs(intent)
+        assert out.where is not None
+        assert out.where.op == "or"
+        assert len(out.where.leaves()) == len(tree.leaves())
+
+
 def test_prune_unused_cte_steps_drops_orphan() -> None:
-    from aetherdialect._intent_resolve import prune_unused_cte_steps
+    from aetherdialect._intent_bind import prune_unused_cte_steps
 
     orphan = RuntimeCteStep(
         cte_name="dead",
@@ -2893,7 +2961,7 @@ class TestPruneUnusedCteOutputColumns:
         )
 
     def test_downstream_reference_only_preserves_referenced_column(self) -> None:
-        from aetherdialect._intent_resolve import prune_unused_cte_output_columns
+        from aetherdialect._intent_bind import prune_unused_cte_output_columns
 
         cte = RuntimeCteStep(
             cte_name="c1",
@@ -2921,7 +2989,7 @@ class TestPruneUnusedCteOutputColumns:
         assert out.cte_steps[0].output_columns == ["title"]
 
     def test_pk_passthrough_preserved_without_reference(self) -> None:
-        from aetherdialect._intent_resolve import prune_unused_cte_output_columns
+        from aetherdialect._intent_bind import prune_unused_cte_output_columns
 
         cte = RuntimeCteStep(
             cte_name="c1",
@@ -2949,7 +3017,7 @@ class TestPruneUnusedCteOutputColumns:
         assert set(out.cte_steps[0].output_columns) == {"film_id", "title"}
 
     def test_fk_passthrough_preserved_without_reference(self) -> None:
-        from aetherdialect._intent_resolve import prune_unused_cte_output_columns
+        from aetherdialect._intent_bind import prune_unused_cte_output_columns
 
         cte = RuntimeCteStep(
             cte_name="p1",
@@ -2977,7 +3045,7 @@ class TestPruneUnusedCteOutputColumns:
         assert set(out.cte_steps[0].output_columns) == {"customer_id", "payment_id"}
 
     def test_computed_expression_not_auto_preserved_without_reference(self) -> None:
-        from aetherdialect._intent_resolve import prune_unused_cte_output_columns
+        from aetherdialect._intent_bind import prune_unused_cte_output_columns
 
         expr_pk_plus = NormalizedExpr(
             add_groups=[
@@ -3019,9 +3087,7 @@ class TestCollectColumnRefsConcatMultiply:
     """collect_column_refs_for_post_processing walks CONCAT multiply parts."""
 
     def test_concat_multiply_column_refs(self) -> None:
-        from aetherdialect._intent_resolve import (
-            collect_column_refs_for_post_processing,
-        )
+        from aetherdialect._intent_bind import collect_column_refs_for_post_processing
 
         expr = NormalizedExpr(
             add_groups=[

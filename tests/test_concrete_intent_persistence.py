@@ -11,7 +11,7 @@ from aetherdialect._contracts_core import RuntimeCteStep, RuntimeIntent, SelectC
 
 @pytest.mark.fast
 def test_distinct_on_and_preserve_tables_survive_store_round_trip() -> None:
-    assert TEMPLATE_STORE_FORMAT_VERSION == "0.2.1"
+    assert TEMPLATE_STORE_FORMAT_VERSION == "0.2.3"
     intent = RuntimeIntent(
         tables=["orders", "customers"],
         grain="row_level",

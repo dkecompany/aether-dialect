@@ -6,9 +6,9 @@ import pytest
 
 from aetherdialect._config import DuckDBRuntimeConfig, EngineConfig
 from aetherdialect._contracts_base import EngineIdentity
-from aetherdialect._core_utils import pop_engine_identity, push_engine_identity
 from aetherdialect._dialect import DialectRegistry
 from aetherdialect._dialect_sqlglot_engines import DuckDBDialect
+from aetherdialect._utils import pop_engine_identity, push_engine_identity
 
 _ORIG_ENGINE_TYPE = EngineConfig.TYPE
 _ORIG_ENGINE_RUNTIME = EngineConfig.RUNTIME
@@ -31,15 +31,15 @@ def _reset_duckdb_runtime_config() -> None:
     try:
         DuckDBRuntimeConfig.DATABASE_PATH = ":memory:"
         DuckDBRuntimeConfig.SCHEMA = "main"
-        DuckDBRuntimeConfig.clear_attached_connection()
+        DuckDBRuntimeConfig.NATIVE_CONNECTION = None
         yield
     finally:
         pop_engine_identity(identity_token)
         DuckDBRuntimeConfig.DATABASE_PATH = orig_path
         DuckDBRuntimeConfig.SCHEMA = orig_schema
-        DuckDBRuntimeConfig.clear_attached_connection()
+        DuckDBRuntimeConfig.NATIVE_CONNECTION = None
         if orig_connection is not None:
-            DuckDBRuntimeConfig.attach_connection(orig_connection)
+            DuckDBRuntimeConfig.NATIVE_CONNECTION = orig_connection
         EngineConfig.TYPE = _ORIG_ENGINE_TYPE
         EngineConfig.RUNTIME = _ORIG_ENGINE_RUNTIME
 
@@ -61,7 +61,7 @@ def test_in_memory_via_attach_connection() -> None:
 
     connection = duckdb.connect(":memory:")
     _seed_memory_table(connection)
-    DuckDBRuntimeConfig.attach_connection(connection)
+    DuckDBRuntimeConfig.NATIVE_CONNECTION = connection
     dialect = DialectRegistry.get("duckdb", DuckDBRuntimeConfig())
     graph = dialect.reflect_schema_graph(include="tables")
     assert "items" in graph.tables

@@ -84,7 +84,7 @@ def test_one_live_handle_per_engine(
         return mock_native
 
     with ExitStack() as stack:
-        stack.enter_context(patch("aetherdialect._core_utils.require_driver"))
+        stack.enter_context(patch("aetherdialect._utils.require_driver"))
         stack.enter_context(patch("aetherdialect._dialect_sqlglot_helper.require_driver"))
         stack.enter_context(
             patch("aetherdialect._dialect_sqlglot_helper.create_engine", side_effect=_record_create_engine)

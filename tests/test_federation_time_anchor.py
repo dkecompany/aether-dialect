@@ -7,22 +7,23 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from aetherdialect._contracts_base import (
+    NormalizedExpr,
     PredicateGroup,
     WhereParam,
 )
 from aetherdialect._contracts_core import AnchoredTemporalBind, FederationExecutionContext, RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata
-from aetherdialect._core_utils import pop_federation_execution_context, push_federation_execution_context
 from aetherdialect._dialect import DialectRegistry
-from aetherdialect._federation import (
-    compose_composite_graph,
-    federation_plan_step_fingerprints,
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_execute import federation_plan_step_fingerprints
+from aetherdialect._federation_manifest import (
     parse_federation_mappings,
-    plan_federated_intent,
     resolve_anchored_temporal_bind,
 )
-from aetherdialect._intent_process import NormalizedExpr, intent_key
+from aetherdialect._federation_plan import plan_federated_intent
 from aetherdialect._sql_gen import build_deterministic_sql
+from aetherdialect._utils import pop_federation_execution_context, push_federation_execution_context
+from aetherdialect._utils_intent import intent_key
 from tests.federation_helpers import enriched_manifest, federation_member_graph, stamp_union_disjointness_profiling
 
 ANCHOR = datetime(2026, 1, 15, 12, 30, 0, tzinfo=UTC)
@@ -64,7 +65,7 @@ def _three_member_union_bundle() -> tuple[dict[str, object], object, object, obj
     )
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_tables": [
                 {
                     "logical": "events",

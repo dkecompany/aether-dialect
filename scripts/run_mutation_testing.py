@@ -1,8 +1,8 @@
 """Mutation-testing harness for high-risk validator and identity modules.
 
-Targets ``_validation_execute.py``, ``_validation_schema.py``,
-``_validation_semantic.py``, ``_intent_resolve.py`` (identity helpers),
-``_intent_repair.py`` (elimination guards), and ``_core_utils.py`` (hashing).
+Targets ``_validation_sql.py``, ``_validation_shape.py``,
+``_validation_rules.py``, ``_intent_bind.py`` (identity helpers),
+``_intent_normalize.py`` (elimination guards), and ``_utils.py`` (hashing).
 
 Operator workflow (not run in CI or pre-commit):
 
@@ -32,12 +32,12 @@ DEFAULT_BASELINE = REPO_ROOT / "scripts" / "mutation_baseline.json"
 PACKAGE_SRC = REPO_ROOT / "src" / "aetherdialect"
 
 TARGET_MODULES: tuple[str, ...] = (
-    "_validation_execute.py",
-    "_validation_schema.py",
-    "_validation_semantic.py",
-    "_intent_resolve.py",
-    "_intent_repair.py",
-    "_core_utils.py",
+    "_validation_sql.py",
+    "_validation_shape.py",
+    "_validation_rules.py",
+    "_intent_bind.py",
+    "_intent_normalize.py",
+    "_utils.py",
 )
 
 BASELINE_VERSION = 1
@@ -158,9 +158,7 @@ def run_mutmut_update() -> dict[str, int | None]:
     ]
     proc = subprocess.run(run_cmd, cwd=REPO_ROOT, check=False, capture_output=True, text=True)
     if proc.returncode not in (0, 1, 2):
-        raise RuntimeError(
-            f"mutmut run failed (exit {proc.returncode}):\n{proc.stdout}\n{proc.stderr}"
-        )
+        raise RuntimeError(f"mutmut run failed (exit {proc.returncode}):\n{proc.stdout}\n{proc.stderr}")
     results = subprocess.run(
         [sys.executable, "-m", "mutmut", "results"],
         cwd=REPO_ROOT,

@@ -14,13 +14,7 @@ from aetherdialect import (
     FederationInvariantError,
     FederationRuntimeError,
 )
-from aetherdialect._contracts_base import (
-    FederationMappings,
-    FederationPlanTemplate,
-    HavingParam,
-    PredicateGroup,
-    WhereParam,
-)
+from aetherdialect._contracts_base import HavingParam, NormalizedExpr, PredicateGroup, WhereParam
 from aetherdialect._contracts_core import (
     ConcreteIntent,
     FederatedPlan,
@@ -32,21 +26,27 @@ from aetherdialect._contracts_core import (
     SqlExecuteSuspendContext,
     SqlGenerationOutcome,
     Template,
-    TemplateStats,
     ValueHistory,
 )
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, SQLShape, TableMetadata
-from aetherdialect._federation import (
+from aetherdialect._contracts_schema import (
+    ColumnMetadata,
+    FederationMappings,
+    FederationPlanTemplate,
+    SchemaGraph,
+    SQLShape,
+    TableMetadata,
+    TemplateStats,
+)
+from aetherdialect._federation_execute import (
     credit_federation_plan_accept,
     load_federation_plan_templates,
-    parse_federation_manifest,
     save_federation_plan_template,
 )
-from aetherdialect._intent_process import NormalizedExpr
+from aetherdialect._federation_manifest import parse_federation_manifest
 from aetherdialect._main_execution import MainExecutionOps
-from aetherdialect._pipeline import replay_federated_prepare_from_plan_template
+from aetherdialect._pipeline_execute import replay_federated_prepare_from_plan_template
 from aetherdialect._schema_graph import recompute_join_paths_multi
-from aetherdialect._templates import TemplateOps
+from aetherdialect._templates_ops import TemplateOps
 
 
 def _graph(table: str, *, source_id: str) -> SchemaGraph:
@@ -161,7 +161,7 @@ def test_replay_federated_prepare_from_plan_template() -> None:
     )
     dialect = MagicMock()
     gen_out = SqlGenerationOutcome("SELECT id FROM left_t", True, None, tmpl)
-    with patch("aetherdialect._pipeline.generate_and_validate_sql", return_value=gen_out):
+    with patch("aetherdialect._pipeline_execute.generate_and_validate_sql", return_value=gen_out):
         replay = replay_federated_prepare_from_plan_template(
             plan,
             cached,
@@ -240,7 +240,7 @@ def test_run_sql_execution_for_gen_out_uses_federated_coordinator() -> None:
     owner._federation_dialects = {}
     owner._federation_source_runtimes = {}
     owner._federation_storage_dir = None
-    with patch("aetherdialect._main_execution.execute_federated_prepare") as mock_exec:
+    with patch("aetherdialect._main_interactive.execute_federated_prepare") as mock_exec:
         mock_exec.return_value = MagicMock(rows=[(1,)], bundle=MagicMock())
         rows, _bundle = MainExecutionOps._run_sql_execution_for_gen_out(
             intent=sub_intent,
@@ -303,9 +303,9 @@ def test_complete_interactive_execute_uses_suspend_federated_prepare() -> None:
     session = MagicMock()
     session._owner = owner
     with patch(
-        "aetherdialect._main_execution.MainExecutionOps._run_sql_execution_for_gen_out", return_value=([(1,)], None)
+        "aetherdialect._main_interactive.MainInteractiveOps._run_sql_execution_for_gen_out", return_value=([(1,)], None)
     ) as mock_run:
-        with patch("aetherdialect._main_execution.MainExecutionOps._offer_sql_feedback_after_execute"):
+        with patch("aetherdialect._main_interactive.MainInteractiveOps._offer_sql_feedback_after_execute"):
             MainExecutionOps._complete_interactive_execute(ctx, "y", choice_port=session)
     mock_run.assert_called_once()
     assert mock_run.call_args.kwargs["federated_prepare"] is fed_prep
@@ -313,7 +313,7 @@ def test_complete_interactive_execute_uses_suspend_federated_prepare() -> None:
 
 def test_union_missing_frames_raises_runtime_error() -> None:
     from aetherdialect._contracts_core import UnionSpec
-    from aetherdialect._federation import _render_union_relation_sql
+    from aetherdialect._federation_plan import _render_union_relation_sql
 
     spec = UnionSpec(logical_table="payment", member_source_ids=("a", "b"), semantics="union")
     with pytest.raises(FederationRuntimeError, match="missing member frames"):
@@ -321,7 +321,7 @@ def test_union_missing_frames_raises_runtime_error() -> None:
 
 
 def test_intersect_member_where_ops_uses_member_intersection() -> None:
-    from aetherdialect._federation import intersect_member_where_ops
+    from aetherdialect._federation_manifest import intersect_member_where_ops
 
     duck = MagicMock()
     duck.supports_ilike = True
@@ -337,9 +337,8 @@ def test_intersect_member_where_ops_uses_member_intersection() -> None:
 
 
 def test_generate_and_validate_sql_rejects_unsupported_federation_filter_op() -> None:
-    from aetherdialect._contracts_core import WhereParam
-    from aetherdialect._intent_process import NormalizedExpr
-    from aetherdialect._pipeline import generate_and_validate_sql
+    from aetherdialect._contracts_base import NormalizedExpr, WhereParam
+    from aetherdialect._pipeline_generate import generate_and_validate_sql
 
     composite = _graph("left_t", source_id="a")
     intent = RuntimeIntent(
@@ -376,7 +375,8 @@ def test_generate_and_validate_sql_rejects_unsupported_federation_filter_op() ->
 
 
 def test_cross_source_having_routes_to_residual() -> None:
-    from aetherdialect._federation import parse_federation_manifest, plan_federated_intent
+    from aetherdialect._federation_manifest import parse_federation_manifest
+    from aetherdialect._federation_plan import plan_federated_intent
 
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
     composite = SchemaGraph(
@@ -445,7 +445,8 @@ def test_cross_source_having_routes_to_residual() -> None:
 
 
 def test_cross_source_or_filter_marks_ineligible() -> None:
-    from aetherdialect._federation import parse_federation_manifest, plan_federated_intent
+    from aetherdialect._federation_manifest import parse_federation_manifest
+    from aetherdialect._federation_plan import plan_federated_intent
 
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
     composite = SchemaGraph(
@@ -491,7 +492,8 @@ def test_cross_source_or_filter_marks_ineligible() -> None:
 
 def test_federation_table_set_ignores_unreferenced_window_registry() -> None:
     from aetherdialect._contracts_schema import WindowRegistryStep, WindowSpec
-    from aetherdialect._federation import federation_table_set, parse_federation_manifest
+    from aetherdialect._federation_manifest import parse_federation_manifest
+    from aetherdialect._federation_plan import federation_table_set
 
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
     composite = SchemaGraph(
@@ -536,9 +538,8 @@ def test_federation_table_set_ignores_unreferenced_window_registry() -> None:
 
 
 def test_expand_fk_select_skips_cross_source_fk() -> None:
-    from aetherdialect._contracts_base import InferenceTag
-    from aetherdialect._contracts_schema import FKEdge
-    from aetherdialect._intent_repair import expand_fk_select_to_descriptive
+    from aetherdialect._contracts_schema import FKEdge, InferenceTag
+    from aetherdialect._intent_normalize import expand_fk_select_to_descriptive
 
     schema = SchemaGraph(
         tables={
@@ -590,9 +591,9 @@ def test_expand_fk_select_skips_cross_source_fk() -> None:
 
 
 def test_federation_residual_column_headers_from_select_cols() -> None:
+    from aetherdialect._contracts_base import NormalizedExpr
     from aetherdialect._contracts_core import ResidualSpec
-    from aetherdialect._federation import federation_residual_column_headers
-    from aetherdialect._intent_process import NormalizedExpr
+    from aetherdialect._federation_manifest import federation_residual_column_headers
 
     plan = FederatedPlan(
         steps=(),
@@ -604,7 +605,7 @@ def test_federation_residual_column_headers_from_select_cols() -> None:
 
 
 def test_insert_template_stamps_member_source_id() -> None:
-    from aetherdialect._templates import TemplateOps
+    from aetherdialect._templates_ops import TemplateOps
 
     composite = _graph("left_t", source_id="a")
     intent = RuntimeIntent(
@@ -632,12 +633,12 @@ def test_insert_template_stamps_member_source_id() -> None:
 
 def test_cross_source_join_feedback_routes_to_plan_store() -> None:
     from aetherdialect._contracts_core import GenerationPath, RejectionBucket
-    from aetherdialect._federation import (
+    from aetherdialect._federation_execute import (
         load_federation_plan_templates,
         lookup_federation_join_feedback,
         save_federation_plan_template,
     )
-    from aetherdialect._pipeline import complete_user_feedback_reject
+    from aetherdialect._pipeline_generate import complete_user_feedback_reject
 
     with tempfile.TemporaryDirectory() as fed_dir:
         save_federation_plan_template(
@@ -670,7 +671,7 @@ def test_cross_source_join_feedback_routes_to_plan_store() -> None:
         ctx.matched_rejected_template = None
         ctx.dialect = MagicMock()
         ctx.structural_match_templates = None
-        with patch("aetherdialect._templates.TemplateOps.summarize_failure_for_memory") as mock_summary:
+        with patch("aetherdialect._templates_ops.TemplateOps.summarize_failure_for_memory") as mock_summary:
             mock_summary.return_value = MagicMock(
                 summary="wrong declared join",
                 buckets=(RejectionBucket.WRONG_TABLES_OR_JOINS,),
@@ -691,15 +692,15 @@ def test_cross_source_join_feedback_routes_to_plan_store() -> None:
 
 
 def test_apply_federation_migration_remap_clears_plan_templates_and_writes_sidecar() -> None:
-    from aetherdialect._federation import (
+    from aetherdialect._federation_execute import (
         apply_federation_migration_map,
-        federation_artifact_paths,
         load_federation_plan_templates,
         parse_federation_migration_map,
     )
+    from aetherdialect._federation_manifest import federation_artifact_paths
 
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
-    mappings = FederationMappings(version="0.2.1")
+    mappings = FederationMappings(version="0.2.3")
     migration = parse_federation_migration_map(
         {
             "version": "1",
@@ -733,10 +734,8 @@ def test_apply_federation_migration_remap_clears_plan_templates_and_writes_sidec
 
 
 def test_federation_plan_template_topology_identity() -> None:
-    from aetherdialect._federation import (
-        federation_member_tuple_hash,
-        federation_plan_topology_identity,
-    )
+    from aetherdialect._federation_execute import federation_plan_topology_identity
+    from aetherdialect._federation_manifest import federation_member_tuple_hash
 
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
     members = {
@@ -749,7 +748,7 @@ def test_federation_plan_template_topology_identity() -> None:
 
 
 def test_validate_federated_sub_intent_rejects_unknown_column() -> None:
-    from aetherdialect._federation import validate_federated_sub_intent
+    from aetherdialect._federation_execute import validate_federated_sub_intent
 
     schema = _graph("left_t", source_id="a")
     intent = RuntimeIntent(
@@ -781,7 +780,10 @@ def test_federation_partial_failure_error_carries_attribution() -> None:
 
 
 def test_single_source_federated_intent_has_one_plan_step() -> None:
-    from aetherdialect._federation import federation_plan_is_degenerate, plan_federated_intent
+    from aetherdialect._federation_plan import (
+        federation_plan_is_degenerate,
+        plan_federated_intent,
+    )
 
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
     composite = SchemaGraph(
@@ -823,7 +825,7 @@ def test_single_source_federated_intent_has_one_plan_step() -> None:
 def test_single_source_federated_plan_byte_identical_sql() -> None:
     """A one-node federated plan renders the same SQL as the standalone member engine."""
     from aetherdialect._dialect import DialectRegistry
-    from aetherdialect._federation import plan_federated_intent
+    from aetherdialect._federation_plan import plan_federated_intent
     from aetherdialect._sql_gen import build_deterministic_sql
 
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
@@ -869,9 +871,8 @@ def test_single_source_federated_plan_byte_identical_sql() -> None:
 
 
 def test_narrow_bind_map_for_sub_intent_keeps_referenced_keys_only() -> None:
-    from aetherdialect._contracts_core import WhereParam
+    from aetherdialect._contracts_base import NormalizedExpr, WhereParam
     from aetherdialect._intent_expr import narrow_bind_map_for_sub_intent
-    from aetherdialect._intent_process import NormalizedExpr
 
     sub_intent = RuntimeIntent(
         tables=["left_t"],
@@ -902,7 +903,7 @@ def test_narrow_bind_map_for_sub_intent_keeps_referenced_keys_only() -> None:
 def test_collect_param_slot_meta_includes_structural_keys() -> None:
     from aetherdialect._contracts_core import ConcreteIntent
     from aetherdialect._intent_expr import extract_structural_params
-    from aetherdialect._templates import TemplateOps
+    from aetherdialect._templates_ops import TemplateOps
 
     runtime = RuntimeIntent(
         tables=["left_t"],
@@ -926,13 +927,14 @@ def test_collect_param_slot_meta_includes_structural_keys() -> None:
         limit_param_key=tagged.limit_param_key,
         param_values=tagged.param_values,
     )
-    slots = TemplateOps._collect_param_slot_meta(intent_sig)
+    slots = TemplateOps.collect_param_slot_meta(intent_sig)
     assert tagged.limit_param_key in slots
 
 
 def test_render_federation_residual_sql_binds_filter_values() -> None:
-    from aetherdialect._contracts_core import ResidualSpec, WhereParam
-    from aetherdialect._federation import render_federation_residual_sql
+    from aetherdialect._contracts_base import WhereParam
+    from aetherdialect._contracts_core import ResidualSpec
+    from aetherdialect._federation_plan import render_federation_residual_sql
 
     fp = WhereParam(
         left_expr=NormalizedExpr.from_column("left_t.name"),
@@ -955,17 +957,55 @@ def test_render_federation_residual_sql_binds_filter_values() -> None:
 
 
 def test_render_combine_select_keyword_requires_explicit_projection() -> None:
-    from aetherdialect._federation import _render_combine_select_keyword, _render_join_select_keyword
+    from aetherdialect._federation_plan import _render_join_select_keyword, render_combine_select_keyword
 
     with pytest.raises(FederationRuntimeError, match="explicit column projection"):
-        _render_combine_select_keyword(None)
+        render_combine_select_keyword(None)
     with pytest.raises(FederationRuntimeError, match="explicit column projection"):
         _render_join_select_keyword(None, left_alias="l", right_alias="r", left_cols=set(), right_cols=set())
 
 
+@pytest.mark.fast
+def test_intent_exprs_local_to_tables_projects_combine_keys_when_select_empty() -> None:
+    from aetherdialect._federation_plan import _intent_exprs_local_to_tables
+
+    intent = RuntimeIntent(
+        tables=["left_t", "right_t"],
+        grain="row_level",
+        select_cols=[SelectCol(expr=NormalizedExpr.from_column("right_t.id"))],
+        group_by_cols=[],
+        order_by_cols=[],
+        where=None,
+    )
+    result = _intent_exprs_local_to_tables(
+        intent,
+        {"left_t"},
+        multi_source=True,
+        combine_key_cols=["left_t.id"],
+    )
+    assert len(result.select_cols or []) == 1
+    assert "left_t.id" in str(result.select_cols[0].expr)
+
+
+@pytest.mark.fast
+def test_intent_exprs_local_to_tables_raises_when_select_empty_and_no_keys() -> None:
+    from aetherdialect._federation_plan import _intent_exprs_local_to_tables
+
+    intent = RuntimeIntent(
+        tables=["left_t", "right_t"],
+        grain="row_level",
+        select_cols=[SelectCol(expr=NormalizedExpr.from_column("right_t.id"))],
+        group_by_cols=[],
+        order_by_cols=[],
+        where=None,
+    )
+    with pytest.raises(FederationRuntimeError, match="requires at least one select column"):
+        _intent_exprs_local_to_tables(intent, {"left_t"}, multi_source=True)
+
+
 def test_render_federation_residual_sql_adds_deterministic_order_by() -> None:
     from aetherdialect._contracts_core import ResidualSpec
-    from aetherdialect._federation import render_federation_residual_sql
+    from aetherdialect._federation_plan import render_federation_residual_sql
 
     residual = ResidualSpec(
         select_cols=(
@@ -976,11 +1016,13 @@ def test_render_federation_residual_sql_adds_deterministic_order_by() -> None:
     )
     sql = render_federation_residual_sql("SELECT * FROM joined", residual)
     assert "ORDER BY" in sql.upper()
+    order_by_clause = sql.upper().split("ORDER BY", 1)[1]
+    assert " AS " not in order_by_clause
 
 
 def test_execute_federation_coordinator_empty_aggregate_returns_identity_row() -> None:
     from aetherdialect._contracts_core import ResidualSpec
-    from aetherdialect._federation import execute_federation_coordinator
+    from aetherdialect._federation_execute import execute_federation_coordinator
 
     plan = FederatedPlan(
         steps=(),
@@ -995,7 +1037,7 @@ def test_execute_federation_coordinator_empty_aggregate_returns_identity_row() -
 
 
 def test_execute_federation_coordinator_enforces_scalar_grain() -> None:
-    from aetherdialect._federation import execute_federation_coordinator
+    from aetherdialect._federation_execute import execute_federation_coordinator
 
     sub_intent = RuntimeIntent(
         tables=["a"],
@@ -1015,7 +1057,7 @@ def test_execute_federation_coordinator_enforces_scalar_grain() -> None:
 
 
 def test_build_result_dataframe_prefers_driver_column_names() -> None:
-    from aetherdialect._pipeline import build_result_dataframe
+    from aetherdialect._pipeline_execute import build_result_dataframe
 
     intent = RuntimeIntent(
         tables=["left_t"],
@@ -1037,14 +1079,11 @@ def test_build_result_dataframe_prefers_driver_column_names() -> None:
 
 def test_unattributable_raw_sql_marks_plan_ineligible() -> None:
     from aetherdialect._contracts_base import NormalizedExpr
-    from aetherdialect._federation import (
-        _semijoin_reduction_stage_dependencies,
-        federation_ineligible_answerable_hint,
-        plan_federated_intent,
-    )
+    from aetherdialect._federation_execute import federation_ineligible_answerable_hint
+    from aetherdialect._federation_plan import _semijoin_reduction_stage_dependencies, plan_federated_intent
 
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
-    mappings = FederationMappings(version="0.2.1")
+    mappings = FederationMappings(version="0.2.3")
     schema_a = _graph("left_t", source_id="a")
     schema_b = _graph("right_t", source_id="b")
     schema = SchemaGraph(
@@ -1068,7 +1107,7 @@ def test_unattributable_raw_sql_marks_plan_ineligible() -> None:
 
 
 def test_probe_federation_member_connections_executes_select_one() -> None:
-    from aetherdialect._federation import probe_federation_member_connections
+    from aetherdialect._federation_execute import probe_federation_member_connections
 
     mock_engine = MagicMock()
     mock_engine.dialect = "postgresql"
@@ -1089,13 +1128,17 @@ def test_probe_federation_member_connections_executes_select_one() -> None:
 
 
 def test_rewrite_logical_references_updates_cte_column_maps() -> None:
-    from aetherdialect._contracts_base import FederationMappings, LogicalTableMapping, LogicalTableMember
     from aetherdialect._contracts_core import RuntimeCteStep
-    from aetherdialect._federation import _rewrite_logical_references
+    from aetherdialect._contracts_schema import (
+        FederationMappings,
+        LogicalTableMapping,
+        LogicalTableMember,
+    )
+    from aetherdialect._federation_plan import _rewrite_logical_references
 
     schema = _graph("left_t", source_id="a")
     mappings = FederationMappings(
-        version="0.2.1",
+        version="0.2.3",
         logical_tables=[
             LogicalTableMapping(
                 logical="left_t",
@@ -1126,7 +1169,7 @@ def test_rewrite_logical_references_updates_cte_column_maps() -> None:
 
 def test_partition_cte_steps_for_source_deep_copies_steps() -> None:
     from aetherdialect._contracts_core import RuntimeCteStep
-    from aetherdialect._federation import _partition_cte_steps_for_source
+    from aetherdialect._federation_plan import _partition_cte_steps_for_source
 
     cte = RuntimeCteStep(
         cte_name="cte1",
@@ -1143,7 +1186,7 @@ def test_partition_cte_steps_for_source_deep_copies_steps() -> None:
 
 def test_result_columns_for_session_uses_federated_residual_headers() -> None:
     from aetherdialect._contracts_core import FederatedPlan, GenerationPath, ResidualSpec
-    from aetherdialect._pipeline import result_columns_for_session
+    from aetherdialect._pipeline_execute import result_columns_for_session
 
     plan = FederatedPlan(
         steps=(),
@@ -1163,7 +1206,7 @@ def test_result_columns_for_session_uses_federated_residual_headers() -> None:
 
 def test_build_result_dataframe_uses_federated_residual_headers() -> None:
     from aetherdialect._contracts_core import ResidualSpec
-    from aetherdialect._pipeline import build_result_dataframe
+    from aetherdialect._pipeline_execute import build_result_dataframe
 
     plan = FederatedPlan(
         steps=(),
@@ -1192,7 +1235,7 @@ def test_build_result_dataframe_uses_federated_residual_headers() -> None:
 
 def test_display_final_results_to_stdout_uses_federated_residual_headers() -> None:
     from aetherdialect._contracts_core import ResidualSpec
-    from aetherdialect._pipeline import display_final_results_to_stdout
+    from aetherdialect._pipeline_execute import display_final_results_to_stdout
 
     plan = FederatedPlan(
         steps=(),
@@ -1208,8 +1251,8 @@ def test_display_final_results_to_stdout_uses_federated_residual_headers() -> No
         order_by_cols=[],
         where=None,
     )
-    with patch("aetherdialect._pipeline._final_display_sql_for_results", return_value="SELECT id"):
-        with patch("aetherdialect._pipeline.print_query_result") as mock_print:
+    with patch("aetherdialect._pipeline_execute.final_display_sql_for_results", return_value="SELECT id"):
+        with patch("aetherdialect._pipeline_execute.print_query_result") as mock_print:
             display_final_results_to_stdout(
                 "show ids",
                 intent,
@@ -1223,7 +1266,7 @@ def test_display_final_results_to_stdout_uses_federated_residual_headers() -> No
 
 
 def test_result_columns_for_session_skips_display_sql_on_federation_path() -> None:
-    from aetherdialect._pipeline import result_columns_for_session
+    from aetherdialect._pipeline_execute import result_columns_for_session
 
     rows = [(1,), (2,)]
     cols = result_columns_for_session(
@@ -1236,7 +1279,7 @@ def test_result_columns_for_session_skips_display_sql_on_federation_path() -> No
 
 def test_stamp_sql_shape_uses_federated_plan() -> None:
     from aetherdialect._contracts_core import FederatedPlan, GenerationPath, JoinSpec, ResidualSpec
-    from aetherdialect._pipeline import stamp_sql_shape
+    from aetherdialect._pipeline_generate import stamp_sql_shape
 
     plan = FederatedPlan(
         steps=(),
@@ -1271,7 +1314,7 @@ def test_stamp_sql_shape_uses_federated_plan() -> None:
     assert intent.sql_shape.has_agg is True
 
 
-def test_runtime_intent_planner_cte_names_round_trip() -> None:
+def test_runtime_intent_interpret_cte_names_round_trip() -> None:
     intent = RuntimeIntent(
         tables=["left_t"],
         grain="many",
@@ -1279,16 +1322,16 @@ def test_runtime_intent_planner_cte_names_round_trip() -> None:
         group_by_cols=[],
         order_by_cols=[],
         where=None,
-        planner_cte_names=["ranked", "totals"],
+        interpret_cte_names=["ranked", "totals"],
     )
     rebuilt = RuntimeIntent.from_dict(intent.to_dict())
-    assert rebuilt.planner_cte_names == ["ranked", "totals"]
+    assert rebuilt.interpret_cte_names == ["ranked", "totals"]
 
 
 def test_extract_fuzzy_reuse_params_uses_intent_slots_not_sql() -> None:
-    from aetherdialect._contracts_core import ConcreteIntent, WhereParam
-    from aetherdialect._intent_process import NormalizedExpr
-    from aetherdialect._pipeline import extract_fuzzy_reuse_params
+    from aetherdialect._contracts_base import NormalizedExpr, WhereParam
+    from aetherdialect._contracts_core import ConcreteIntent
+    from aetherdialect._pipeline_generate import extract_fuzzy_reuse_params
 
     intent_sig = ConcreteIntent(
         intent_id="t1",
@@ -1332,7 +1375,7 @@ def test_extract_fuzzy_reuse_params_uses_intent_slots_not_sql() -> None:
         captured["user"] = user
         return '{"param_values": {"p1": "Comedy"}}'
 
-    with patch("aetherdialect._pipeline.LLMProvider.chat", side_effect=fake_llm_chat):
+    with patch("aetherdialect._llm_provider.LLMProvider.chat", side_effect=fake_llm_chat):
         result = extract_fuzzy_reuse_params(
             "comedy films",
             template,
@@ -1347,7 +1390,7 @@ def test_extract_fuzzy_reuse_params_uses_intent_slots_not_sql() -> None:
 
 def test_build_result_dataframe_uses_federated_plan_without_generation_path() -> None:
     from aetherdialect._contracts_core import ResidualSpec
-    from aetherdialect._pipeline import build_result_dataframe
+    from aetherdialect._pipeline_execute import build_result_dataframe
 
     plan = FederatedPlan(
         steps=(),
@@ -1375,7 +1418,7 @@ def test_build_result_dataframe_uses_federated_plan_without_generation_path() ->
 
 def test_execute_reuse_with_params_uses_federated_residual_headers() -> None:
     from aetherdialect._contracts_core import ResidualSpec
-    from aetherdialect._pipeline import execute_reuse_with_params
+    from aetherdialect._pipeline_execute import execute_reuse_with_params
 
     plan = FederatedPlan(
         steps=(),
@@ -1427,22 +1470,23 @@ def test_execute_reuse_with_params_uses_federated_residual_headers() -> None:
         effective_structural_hash="eff_a_left_t",
     )
     store = TemplateOps.empty_template_store(schema.schema_graph_id)
-    with patch("aetherdialect._pipeline._run_sql_validation_cascade", return_value=(True, None, None, ())):
-        with patch("aetherdialect._pipeline._should_prompt_direct_reuse_user", return_value=False):
-            with patch("aetherdialect._pipeline.print_query_result") as mock_print:
-                outcome = execute_reuse_with_params(
-                    "show customers",
-                    template,
-                    {},
-                    dialect,
-                    store,
-                    {},
-                    {},
-                    schema,
-                    reuse_path=GenerationPath.FEDERATION_PLAN,
-                    prompt=False,
-                    federated_plan=plan,
-                )
+    with patch("aetherdialect._pipeline_execute.run_sql_validation_cascade", return_value=(True, None, None, ())):
+        with patch("aetherdialect._validation_sql.validate_sql", return_value=(True, None, None, [])):
+            with patch("aetherdialect._pipeline_execute.should_prompt_direct_reuse_user", return_value=False):
+                with patch("aetherdialect._pipeline_execute.print_query_result") as mock_print:
+                    outcome = execute_reuse_with_params(
+                        "show customers",
+                        template,
+                        {},
+                        dialect,
+                        store,
+                        {},
+                        {},
+                        schema,
+                        reuse_path=GenerationPath.FEDERATION_PLAN,
+                        prompt=False,
+                        federated_plan=plan,
+                    )
     assert outcome is not None
     mock_print.assert_called_once()
     assert mock_print.call_args.kwargs["headers"] == ["customer_id"]
@@ -1450,7 +1494,7 @@ def test_execute_reuse_with_params_uses_federated_residual_headers() -> None:
 
 @pytest.mark.fast
 def test_ask_phase_vocabulary_includes_decompose_and_combine() -> None:
-    from aetherdialect._constants import (
+    from aetherdialect._constants_runtime import (
         ASK_PHASE_H,
         ASK_PHASE_I,
         ASK_PHASE_J,
@@ -1490,7 +1534,7 @@ def test_two_member_federation_fixture_declares_cross_source_join(two_member_fed
 def test_display_final_results_skips_extract_column_headers_with_column_names() -> None:
     from unittest.mock import patch
 
-    from aetherdialect._pipeline import display_final_results_to_stdout
+    from aetherdialect._pipeline_execute import display_final_results_to_stdout
 
     intent = RuntimeIntent(
         tables=["left_t"],
@@ -1501,8 +1545,8 @@ def test_display_final_results_skips_extract_column_headers_with_column_names() 
         where=None,
     )
     with (
-        patch("aetherdialect._pipeline.extract_column_headers") as mock_extract,
-        patch("aetherdialect._pipeline.print_query_result") as mock_print,
+        patch("aetherdialect._pipeline_execute.extract_column_headers") as mock_extract,
+        patch("aetherdialect._pipeline_execute.print_query_result") as mock_print,
     ):
         display_final_results_to_stdout(
             "show ids",
@@ -1513,3 +1557,123 @@ def test_display_final_results_skips_extract_column_headers_with_column_names() 
         )
     mock_extract.assert_not_called()
     assert mock_print.call_args.kwargs["headers"] == ["id"]
+
+
+@pytest.mark.fast
+def test_build_source_sub_intent_rewrites_payment_to_receipts_before_finalize() -> None:
+    """Logistics member sub-intents must use physical receipts, not logical payment."""
+    from aetherdialect._federation_compose import compose_composite_graph
+    from aetherdialect._federation_manifest import parse_federation_declaration
+    from aetherdialect._federation_plan import _build_source_sub_intent, federation_table_set
+    from tests.federation_helpers import stamp_sandbox_payment_union_profiling
+    from tests.test_federation_regression_coverage import _sandbox_federation_member_graphs
+
+    members = _sandbox_federation_member_graphs()
+    stamp_sandbox_payment_union_profiling(members)
+    declaration_path = (
+        __import__("pathlib").Path(__file__).resolve().parents[1] / "scripts" / "data" / "federation_declaration.json"
+    )
+    if not declaration_path.is_file():
+        pytest.skip("sandbox federation declaration is not present")
+    manifest, mappings = parse_federation_declaration(
+        __import__("json").loads(declaration_path.read_text(encoding="utf-8")),
+        include_derived_roster=True,
+    )
+    composite = compose_composite_graph(members, manifest, mappings)
+    intent = RuntimeIntent(
+        tables=["payment"],
+        grain="scalar",
+        select_cols=[SelectCol(expr=NormalizedExpr.from_agg("sum", "payment.amount"))],
+        group_by_cols=[],
+        order_by_cols=[],
+        where=None,
+    )
+    table_set = federation_table_set(intent, composite, manifest, mappings)
+    step = _build_source_sub_intent(
+        intent,
+        "logistics",
+        set(table_set.tables),
+        dict(table_set.source_by_table),
+        mappings,
+        composite,
+        manifest,
+        multi_source=True,
+        member_schema=members["logistics"],
+        chosen_specs=(),
+    )
+    assert step is not None
+    sub = step.sub_intent
+    assert sub.tables == ["receipts"]
+    assert "payment" not in (sub.tables or [])
+    select_text = str(sub.select_cols)
+    assert "receipts" in select_text
+    assert "payment" not in select_text
+
+
+@pytest.mark.fast
+def test_federation_table_set_does_not_widen_unrelated_delivery() -> None:
+    """Cross-source scope must not pull delivery when only rental and inventory are referenced."""
+    from aetherdialect._federation_compose import compose_composite_graph
+    from aetherdialect._federation_manifest import parse_federation_declaration
+    from aetherdialect._federation_plan import federation_table_set
+    from tests.federation_helpers import stamp_sandbox_payment_union_profiling
+    from tests.test_federation_regression_coverage import _sandbox_federation_member_graphs
+
+    members = _sandbox_federation_member_graphs()
+    stamp_sandbox_payment_union_profiling(members)
+    declaration_path = (
+        __import__("pathlib").Path(__file__).resolve().parents[1] / "scripts" / "data" / "federation_declaration.json"
+    )
+    if not declaration_path.is_file():
+        pytest.skip("sandbox federation declaration is not present")
+    manifest, mappings = parse_federation_declaration(
+        __import__("json").loads(declaration_path.read_text(encoding="utf-8")),
+        include_derived_roster=True,
+    )
+    composite = compose_composite_graph(members, manifest, mappings)
+    intent = RuntimeIntent(
+        tables=["rental", "inventory"],
+        grain="scalar",
+        select_cols=[SelectCol(expr=NormalizedExpr.from_agg("count", "rental.rental_id"))],
+        group_by_cols=[],
+        order_by_cols=[],
+        where=None,
+    )
+    table_set = federation_table_set(intent, composite, manifest, mappings)
+    assert "delivery" not in table_set.tables
+
+
+@pytest.mark.fast
+def test_payment_union_plan_uses_receipts_without_delivery_fanout() -> None:
+    """Payment union COUNT must plan cleanly and rewrite logistics to receipts without delivery."""
+    from aetherdialect._federation_compose import compose_composite_graph
+    from aetherdialect._federation_manifest import parse_federation_declaration
+    from aetherdialect._federation_plan import plan_federated_intent
+    from tests.federation_helpers import stamp_sandbox_payment_union_profiling
+    from tests.test_federation_regression_coverage import _sandbox_federation_member_graphs
+
+    members = _sandbox_federation_member_graphs()
+    stamp_sandbox_payment_union_profiling(members)
+    declaration_path = (
+        __import__("pathlib").Path(__file__).resolve().parents[1] / "scripts" / "data" / "federation_declaration.json"
+    )
+    if not declaration_path.is_file():
+        pytest.skip("sandbox federation declaration is not present")
+    manifest, mappings = parse_federation_declaration(
+        __import__("json").loads(declaration_path.read_text(encoding="utf-8")),
+        include_derived_roster=True,
+    )
+    composite = compose_composite_graph(members, manifest, mappings)
+    intent = RuntimeIntent(
+        tables=["payment"],
+        grain="scalar",
+        select_cols=[SelectCol(expr=NormalizedExpr.from_agg("count", "payment.payment_id"))],
+        group_by_cols=[],
+        order_by_cols=[],
+        where=None,
+    )
+    plan = plan_federated_intent(intent, composite, manifest, mappings)
+    assert plan.ineligible_reason is None
+    assert "delivery" not in {table for step in plan.steps for table in (step.sub_intent.tables or [])}
+    logistics = next(step for step in plan.steps if step.source_id == "logistics")
+    assert logistics.sub_intent.tables == ["receipts"]

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-from ._seed_helpers import seeded_runner
+from .live_support import seeded_runner
 
 _FORBIDDEN_PATTERNS = (
     re.compile(r"\bUNION\b", re.IGNORECASE),

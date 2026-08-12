@@ -83,6 +83,40 @@
     },
     {
       "authoritative_source": "storefront",
+      "logical": "city",
+      "members": [
+        {
+          "columns": {},
+          "source": "storefront",
+          "table": "city"
+        },
+        {
+          "columns": {},
+          "source": "catalog",
+          "table": "city"
+        }
+      ],
+      "semantics": "replica"
+    },
+    {
+      "authoritative_source": "storefront",
+      "logical": "country",
+      "members": [
+        {
+          "columns": {},
+          "source": "storefront",
+          "table": "country"
+        },
+        {
+          "columns": {},
+          "source": "catalog",
+          "table": "country"
+        }
+      ],
+      "semantics": "replica"
+    },
+    {
+      "authoritative_source": "storefront",
       "logical": "customer",
       "members": [
         {
@@ -121,5 +155,5 @@
       "semantics": "replica"
     }
   ],
-  "version": "0.2.1"
+  "version": "0.2.3"
 }

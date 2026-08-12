@@ -19,9 +19,9 @@ from aetherdialect._constants import (
     TEMPLATE_STORE_PARTITION_PREFIX,
     WRITE_QUEUE_FILENAME,
 )
-from aetherdialect._core_utils import write_artifact_manifest
 from aetherdialect._main_execution import MainExecutionOps
-from aetherdialect._templates import TemplateOps
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils_artifacts import write_artifact_manifest
 
 
 def _template_store_dir(artifacts_dir: str) -> str:
@@ -51,9 +51,9 @@ def test_every_keyed_artifact_collected_after_rotation(tmp_path: Path) -> None:
 
     lattice_dir = tmp_path / SeedWarmupConfig.WARMUP_ANCHOR_LATTICE_SUBDIR
     lattice_dir.mkdir()
-    stale_lattice = lattice_dir / f"lattice_{old_id}_v3.json"
+    stale_lattice = lattice_dir / f"lattice_{old_id}_v4.json"
     stale_lattice.write_text("{}", encoding="utf-8")
-    active_lattice = lattice_dir / f"lattice_{new_id}_v3.json"
+    active_lattice = lattice_dir / f"lattice_{new_id}_v4.json"
     active_lattice.write_text("{}", encoding="utf-8")
 
     skeleton_path = tmp_path / "qsim_skeletons.json.gz"

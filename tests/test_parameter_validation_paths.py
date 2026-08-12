@@ -22,19 +22,21 @@ from aetherdialect._contracts_core import (
     SelectCol,
     SourceStep,
     Template,
-    TemplateStats,
     ValueHistory,
 )
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, SQLShape, TableMetadata
-from aetherdialect._federation import execute_federation_coordinator
+from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, SQLShape, TableMetadata, TemplateStats
+from aetherdialect._federation_execute import execute_federation_coordinator
 from aetherdialect._main_execution import MainExecutionOps
-from aetherdialect._pipeline import execute_reuse_with_params, execute_stored_template_by_ref
+from aetherdialect._pipeline_execute import (
+    execute_reuse_with_params,
+    execute_stored_template_by_ref,
+)
 from aetherdialect._schema_graph import recompute_join_paths_multi
 from aetherdialect._seed_warmup import SeedWarmupCacheSession
-from aetherdialect._validation_execute import execute_guarded_sql
-from aetherdialect._validation_schema import (
+from aetherdialect._validation_sql import (
     assert_execution_parameters_validated,
     assert_residual_execution_parameters_validated,
+    execute_guarded_sql,
 )
 
 execute_warmup_sql_rows = SeedWarmupCacheSession.execute_warmup_sql_rows
@@ -139,6 +141,7 @@ def _dialect() -> MagicMock:
     dialect.execute.return_value = [(1,)]
     dialect.can_explain.return_value = False
     dialect.sqlglot_dialect = "duckdb"
+    dialect.ast_validate_full.return_value = []
     return dialect
 
 
@@ -153,14 +156,14 @@ def _run_path(path_name: str) -> None:
         tmpl = _template()
         store: dict = {"templates": {tmpl.id: tmpl}}
         with (
-            patch("aetherdialect._pipeline.validate_sql", return_value=(True, None, None, [])),
-            patch("aetherdialect._templates.TemplateOps.save_template_store"),
-            patch("aetherdialect._templates.TemplateOps.templates_to_store", side_effect=lambda s, t: s),
-            patch("aetherdialect._templates.TemplateOps.delete_rejected_templates_matching_question"),
-            patch("aetherdialect._pipeline.save_result_csv_for_store"),
-            patch("aetherdialect._pipeline.print_query_result"),
-            patch("aetherdialect._templates.TemplateOps.promote_trust"),
-            patch("aetherdialect._pipeline.LLMProvider.chat", return_value='{"aliases":{}}'),
+            patch("aetherdialect._validation_sql.validate_sql", return_value=(True, None, None, [])),
+            patch("aetherdialect._templates_ops.TemplateOps.save_template_store"),
+            patch("aetherdialect._templates_ops.TemplateOps.templates_to_store", side_effect=lambda s, t: s),
+            patch("aetherdialect._templates_ops.TemplateOps.delete_rejected_templates_matching_question"),
+            patch("aetherdialect._pipeline_execute.save_result_csv_for_store"),
+            patch("aetherdialect._pipeline_execute.print_query_result"),
+            patch("aetherdialect._templates_ops.TemplateOps.promote_trust"),
+            patch("aetherdialect._llm_provider.LLMProvider.chat", return_value='{"aliases":{}}'),
         ):
             execute_reuse_with_params(
                 "list active items",
@@ -179,14 +182,14 @@ def _run_path(path_name: str) -> None:
         tmpl = _template()
         store = {"templates": {tmpl.id: tmpl}}
         with (
-            patch("aetherdialect._pipeline.validate_sql", return_value=(True, None, None, [])),
-            patch("aetherdialect._templates.TemplateOps.save_template_store"),
-            patch("aetherdialect._templates.TemplateOps.templates_to_store", side_effect=lambda s, t: s),
-            patch("aetherdialect._templates.TemplateOps.delete_rejected_templates_matching_question"),
-            patch("aetherdialect._pipeline.save_result_csv_for_store"),
-            patch("aetherdialect._pipeline.print_query_result"),
-            patch("aetherdialect._templates.TemplateOps.promote_trust"),
-            patch("aetherdialect._pipeline.LLMProvider.chat", return_value='{"aliases":{}}'),
+            patch("aetherdialect._validation_sql.validate_sql", return_value=(True, None, None, [])),
+            patch("aetherdialect._templates_ops.TemplateOps.save_template_store"),
+            patch("aetherdialect._templates_ops.TemplateOps.templates_to_store", side_effect=lambda s, t: s),
+            patch("aetherdialect._templates_ops.TemplateOps.delete_rejected_templates_matching_question"),
+            patch("aetherdialect._pipeline_execute.save_result_csv_for_store"),
+            patch("aetherdialect._pipeline_execute.print_query_result"),
+            patch("aetherdialect._templates_ops.TemplateOps.promote_trust"),
+            patch("aetherdialect._llm_provider.LLMProvider.chat", return_value='{"aliases":{}}'),
         ):
             execute_stored_template_by_ref(
                 tmpl.id,
@@ -205,7 +208,7 @@ def _run_path(path_name: str) -> None:
         )
         return
     if path_name == "federated_member":
-        with patch("aetherdialect._validation_execute.validate_sql", return_value=(True, None, None, [])):
+        with patch("aetherdialect._validation_sql.validate_sql", return_value=(True, None, None, [])):
             execute_guarded_sql(
                 dialect,
                 intent.sql_param,
@@ -234,8 +237,8 @@ def _run_path(path_name: str) -> None:
         )
         frames = {"a": pd.DataFrame({"items.id": [1], "items.status": ["active"]})}
         with (
-            patch("aetherdialect._federation._import_coordinator_duckdb") as import_mock,
-            patch("aetherdialect._federation._validate_coordinator_glue_sql"),
+            patch("aetherdialect._federation_execute._import_coordinator_duckdb") as import_mock,
+            patch("aetherdialect._federation_execute._validate_coordinator_glue_sql"),
         ):
             conn = MagicMock()
             conn.execute.return_value = MagicMock(fetchdf=lambda: pd.DataFrame({"items.id": [1]}))
@@ -267,33 +270,19 @@ def test_every_execution_path_validates_parameters(path_name: str, monkeypatch: 
         assert_residual_execution_parameters_validated(residual, param_values, schema)
 
     monkeypatch.setattr(
-        "aetherdialect._validation_schema.assert_execution_parameters_validated",
+        "aetherdialect._validation_sql.assert_execution_parameters_validated",
         _track_intent,
     )
-    monkeypatch.setattr(
-        "aetherdialect._main_execution.assert_execution_parameters_validated",
-        _track_intent,
-    )
-    monkeypatch.setattr(
-        "aetherdialect._pipeline.assert_execution_parameters_validated",
-        _track_intent,
-    )
-    monkeypatch.setattr(
+    for target in (
+        "aetherdialect._validation_sql.assert_execution_parameters_validated",
         "aetherdialect._seed_warmup.assert_execution_parameters_validated",
-        _track_intent,
-    )
-    monkeypatch.setattr(
-        "aetherdialect._validation_execute.assert_execution_parameters_validated",
-        _track_intent,
-    )
-    monkeypatch.setattr(
-        "aetherdialect._validation_schema.assert_residual_execution_parameters_validated",
-        _track_residual,
-    )
-    monkeypatch.setattr(
-        "aetherdialect._federation.assert_residual_execution_parameters_validated",
-        _track_residual,
-    )
+    ):
+        monkeypatch.setattr(target, _track_intent)
+    for target in (
+        "aetherdialect._validation_sql.assert_residual_execution_parameters_validated",
+        "aetherdialect._federation_execute.assert_residual_execution_parameters_validated",
+    ):
+        monkeypatch.setattr(target, _track_residual)
 
     _run_path(path_name)
 

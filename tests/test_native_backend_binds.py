@@ -1,4 +1,4 @@
-"""Databricks connector and Snowflake Arrow backends must pass bind maps to execute."""
+"""Databricks connector/Spark and Snowflake Arrow backends must pass bind maps to execute."""
 
 from __future__ import annotations
 
@@ -7,7 +7,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from aetherdialect._dialect_sqlglot_engines import DatabricksConnectorBackend, SnowflakeArrowBackend
+from aetherdialect._dialect_sqlglot_engines import (
+    DatabricksConnectorBackend,
+    DatabricksSparkBackend,
+    SnowflakeArrowBackend,
+)
 
 
 def _cursor_with_rows(rows: list[tuple[Any, ...]]) -> MagicMock:
@@ -30,6 +34,24 @@ def test_databricks_connector_receives_bound_values() -> None:
     assert cursor.execute.call_count == 1
     executed_sql, executed_params = cursor.execute.call_args.args
     assert ":p1" not in executed_sql
+    assert executed_params == {"p1": "electronics"}
+
+
+@pytest.mark.fast
+def test_databricks_spark_receives_bound_values() -> None:
+    spark = MagicMock()
+    df = MagicMock()
+    df.collect.return_value = [(42,)]
+    spark.sql.return_value = df
+    backend = DatabricksSparkBackend(spark)
+    sql = "SELECT amount FROM orders WHERE category = :p1"
+    params = {"p1": "electronics"}
+    rows = backend.fetch_rows(sql, params)
+    assert rows == [(42,)]
+    assert spark.sql.call_count == 1
+    executed_sql, executed_params = spark.sql.call_args.args
+    assert ":p1" not in executed_sql
+    assert "%(p1)s" in executed_sql
     assert executed_params == {"p1": "electronics"}
 
 

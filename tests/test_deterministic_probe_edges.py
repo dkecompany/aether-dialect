@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from aetherdialect._contracts_core import RuntimeCteStep, RuntimeIntent, SelectCol
+from aetherdialect._constants import JOIN_CHOICE_SCOPE_MAIN
+from aetherdialect._contracts_base import NormalizedExpr
+from aetherdialect._contracts_core import RuntimeCteStep, RuntimeIntent, ScopeClass, SelectCol
 from aetherdialect._contracts_schema import (
     ColumnMetadata,
     ColumnRole,
@@ -12,11 +14,8 @@ from aetherdialect._contracts_schema import (
     TableMetadata,
 )
 from aetherdialect._intent_expr import build_virtual_table_specs
-from aetherdialect._intent_process import NormalizedExpr
 from aetherdialect._schema_graph import recompute_join_paths_multi
 from aetherdialect._sql_gen import (
-    JOIN_CHOICE_SCOPE_MAIN,
-    ScopeClass,
     apply_probe_edge_lineage_resolution,
     build_deterministic_sql,
     classify_scope_candidates,

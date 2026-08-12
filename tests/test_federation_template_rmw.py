@@ -9,11 +9,15 @@ from unittest.mock import patch
 
 import pytest
 
-import aetherdialect._federation
-from aetherdialect._contracts_base import FederationPlanTemplate
-from aetherdialect._federation import load_federation_plan_templates, save_federation_plan_template
+import aetherdialect._federation_execute
+import aetherdialect._utils_artifacts
+from aetherdialect._contracts_schema import FederationPlanTemplate
+from aetherdialect._federation_execute import (
+    load_federation_plan_templates,
+    save_federation_plan_template,
+)
 
-_ORIGINAL_ARTIFACT_LOCK = aetherdialect._federation.artifact_lock
+_ORIGINAL_ARTIFACT_LOCK = aetherdialect._utils_artifacts.artifact_lock
 
 
 def _stored_template(template_id: str) -> FederationPlanTemplate:
@@ -25,7 +29,7 @@ def _stored_template(template_id: str) -> FederationPlanTemplate:
         combine_hash="combine_hash",
         question="show joined entities",
         accepted_questions=("accepted q",),
-        format_version="0.2.1",
+        format_version="0.2.3",
         member_template_ids=(("alpha", "T0001"), ("beta", "T0002")),
         residual_hash="residual_hash",
         join_feedback=("join hint",),
@@ -69,7 +73,7 @@ def test_two_writers_both_plans_survive() -> None:
 
         with (
             patch("builtins.open", side_effect=coordinating_open),
-            patch.object(aetherdialect._federation, "artifact_lock", tracking_artifact_lock),
+            patch.object(aetherdialect._federation_execute, "artifact_lock", tracking_artifact_lock),
         ):
             threads = [
                 threading.Thread(target=_save, args=(template_a,)),

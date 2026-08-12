@@ -14,11 +14,10 @@ from aetherdialect import AetherEngine
 from aetherdialect._config import EngineConfig, QSimConfig
 from aetherdialect._contracts_base import EngineContext
 from aetherdialect._contracts_core import LiveTestRunner
-from aetherdialect._core_utils import write_gzip_json_atomic
 from aetherdialect._live_testing import run_and_assert
-from aetherdialect._templates import TemplateOps
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils_artifacts import write_gzip_json_atomic
 
-from ._dialect_scenarios import dialect_databricks_scenarios
 from .conftest import (
     _domain_notes_path,
     _env_file,
@@ -26,6 +25,7 @@ from .conftest import (
     _relax_rental_shop_selectability,
     write_live_env_file_to_temp_config_toml,
 )
+from .mydb_scenarios import dialect_databricks_scenarios
 
 
 def _dbr_param(name: str, default: str) -> str:

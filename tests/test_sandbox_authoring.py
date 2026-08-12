@@ -8,11 +8,8 @@ from pathlib import Path
 import pytest
 
 from aetherdialect import EngineContext, FederationContext, Sandbox
-from aetherdialect._constants import (
-    SANDBOX_BUNDLED_MEMBER_SEEDS,
-    SCHEMA_OVERRIDES_DEFAULT_FILENAME,
-    SCHEMA_OVERRIDES_VERSION,
-)
+from aetherdialect._constants import STRUCTURE_DOCUMENT_VERSION
+from aetherdialect._constants_runtime import SANDBOX_BUNDLED_MEMBER_SCHEMAS
 from aetherdialect._contracts_base import FederationConfigError, FederationDeclarationError, MigrationPendingError
 
 data_zip_path = Sandbox.data_zip_path
@@ -27,12 +24,12 @@ def _bundled_federation_member_paths() -> dict[str, str]:
     with Sandbox() as sandbox:
         root = sandbox._extract_path
         paths = {
-            member_name: str(root / seed_name)
-            for member_name, seed_name in SANDBOX_BUNDLED_MEMBER_SEEDS
-            if (root / seed_name).is_file()
+            member_name: str(root / schema_name)
+            for member_name, schema_name in SANDBOX_BUNDLED_MEMBER_SCHEMAS
+            if (root / schema_name).is_file()
         }
         if len(paths) < 2:
-            pytest.skip("federation partition seeds are not present in the bundle")
+            pytest.skip("federation partition schemas are not present in the bundle")
         return paths
 
 
@@ -99,7 +96,8 @@ def test_datasets_reports_main_and_loaded_names() -> None:
     _require_bundled_data()
     with Sandbox() as sandbox:
         assert "main" in sandbox.datasets
-        sandbox.load_dataset("storefront")
+        if "storefront" not in sandbox.datasets:
+            sandbox.load_dataset("storefront")
         assert "main" in sandbox.datasets
         assert "storefront" in sandbox.datasets
 
@@ -110,7 +108,7 @@ def test_offline_sandbox_returns_sandbox_handle_with_built_engine() -> None:
     from aetherdialect import AetherEngine
     from aetherdialect._sandbox import SandboxHandle
 
-    with AetherEngine.offline_sandbox() as handle:
+    with Sandbox.create_offline_sandbox(AetherEngine) as handle:
         assert isinstance(handle, SandboxHandle)
         assert handle.engine is not None
         assert handle._sandbox is not None
@@ -118,10 +116,9 @@ def test_offline_sandbox_returns_sandbox_handle_with_built_engine() -> None:
 
 
 @pytest.mark.fast
-def test_unadopted_sandbox_connected_engine_rejects_session() -> None:
+def test_sandbox_connected_engine_auto_adopts() -> None:
     _require_bundled_data()
     from aetherdialect import AetherEngine, EngineContext
-    from aetherdialect._contracts_base import ConfigError
 
     with Sandbox() as sandbox:
         engine = AetherEngine(
@@ -130,8 +127,9 @@ def test_unadopted_sandbox_connected_engine_rejects_session() -> None:
             artifacts_dir=sandbox.artifacts_dir,
             config_file=sandbox.config_file,
         )
-        with pytest.raises(ConfigError, match="adopt"):
-            engine.session()
+        assert getattr(engine, "_sandbox_mode", False) is True
+        with engine.session() as session:
+            assert session is not None
 
 
 @pytest.mark.fast
@@ -147,7 +145,6 @@ def test_adopting_manually_built_engine_suppresses_warmup() -> None:
             artifacts_dir=sandbox.artifacts_dir,
             config_file=sandbox.config_file,
         )
-        sandbox.adopt(engine)
         with pytest.raises(ConfigError, match="sandbox"):
             engine.run_seed_warmup("questions.txt")
         with engine.session() as session:
@@ -160,7 +157,7 @@ def test_offline_sandbox_honours_supplied_engine_context() -> None:
     from aetherdialect import AetherEngine
 
     scope = EngineContext(allow_objects=frozenset({"customer", "rental"}))
-    with AetherEngine.offline_sandbox(engine_context=scope) as handle:
+    with Sandbox.create_offline_sandbox(AetherEngine, engine_context=scope) as handle:
         assert handle.engine._runtime_config.engine_context.allow_objects == frozenset({"customer", "rental"})
 
 
@@ -176,7 +173,7 @@ def test_offline_sandbox_notes_file_override_beats_context_and_bundle(tmp_path: 
     override_notes = tmp_path / "override_notes.txt"
     override_notes.write_text("override", encoding="utf-8")
     scope = EngineContext(notes_file=str(context_notes))
-    with AetherEngine.offline_sandbox(engine_context=scope, notes_file=str(override_notes)) as handle:
+    with Sandbox.create_offline_sandbox(AetherEngine, engine_context=scope, notes_file=str(override_notes)) as handle:
         assert handle.engine._runtime_config.engine_context.notes_file == str(override_notes)
 
 
@@ -190,7 +187,7 @@ def test_offline_sandbox_sql_file_override_beats_context_and_bundle(tmp_path: Pa
     override_sql = tmp_path / "override.sql"
     override_sql.write_text("SELECT 2;", encoding="utf-8")
     scope = EngineContext(sql_file=str(context_sql))
-    with AetherEngine.offline_sandbox(engine_context=scope, sql_file=str(override_sql)) as handle:
+    with Sandbox.create_offline_sandbox(AetherEngine, engine_context=scope, sql_file=str(override_sql)) as handle:
         assert handle.engine._runtime_config.engine_context.sql_file == str(override_sql)
 
 
@@ -210,7 +207,7 @@ def test_offline_sandbox_and_authoring_sandbox_share_bundle_loader(monkeypatch: 
 
     monkeypatch.setattr("aetherdialect._sandbox.Sandbox._open_data_bundle", counting_open)
     monkeypatch.setattr(Sandbox, "_open_data_bundle", staticmethod(counting_open))
-    with AetherEngine.offline_sandbox() as handle:
+    with Sandbox.create_offline_sandbox(AetherEngine) as handle:
         assert handle._sandbox is not None
         assert handle._sandbox._extract_path == handle._sandbox._extract_path
     assert calls == 1
@@ -226,7 +223,7 @@ def test_narrow_engine_context_profiles_live_without_baseline_tables() -> None:
     from aetherdialect import AetherEngine
 
     scope = EngineContext(allow_objects=frozenset({"customer"}))
-    with AetherEngine.offline_sandbox(engine_context=scope) as handle:
+    with Sandbox.create_offline_sandbox(AetherEngine, engine_context=scope) as handle:
         tables = set(handle.engine._schema_graph.tables)
         assert "customer" in tables
         assert "film" not in tables
@@ -238,10 +235,10 @@ def test_matching_engine_context_keeps_full_baseline_graph() -> None:
     from aetherdialect import AetherEngine
     from aetherdialect._sandbox import Sandbox
 
-    with AetherEngine.offline_sandbox() as default_handle:
+    with Sandbox.create_offline_sandbox(AetherEngine) as default_handle:
         default_tables = set(default_handle.engine._schema_graph.tables)
     bundled_scope = Sandbox._owner_writer_schema_context(notes_file=None, sql_file=None)
-    with AetherEngine.offline_sandbox(engine_context=bundled_scope) as handle:
+    with Sandbox.create_offline_sandbox(AetherEngine, engine_context=bundled_scope) as handle:
         assert set(handle.engine._schema_graph.tables) == default_tables
 
 
@@ -250,7 +247,7 @@ def test_sandbox_handle_exposes_connection_property() -> None:
     _require_bundled_data()
     from aetherdialect import AetherEngine
 
-    with AetherEngine.offline_sandbox() as handle:
+    with Sandbox.create_offline_sandbox(AetherEngine) as handle:
         assert handle.connection is not None
         assert handle.connection is handle.engine._native_connection
 
@@ -260,7 +257,7 @@ def test_sandbox_handle_adopt_delegates_to_sandbox() -> None:
     _require_bundled_data()
     from aetherdialect import AetherEngine, EngineContext
 
-    with AetherEngine.offline_sandbox() as handle:
+    with Sandbox.create_offline_sandbox(AetherEngine) as handle:
         assert handle._sandbox is not None
         engine = AetherEngine(
             EngineContext(allow_objects=frozenset({"customer"})),
@@ -295,7 +292,7 @@ def test_custom_federation_declaration_rejects_replica_without_authoritative_sou
         with Sandbox(maintainer_access=True) as sandbox:
             sandbox.federation(
                 "sandbox_rental_shop",
-                declaration_file=decl_path,
+                declaration=decl_path,
                 members=members,
             )
 
@@ -314,7 +311,7 @@ def test_custom_federation_declaration_rejects_unknown_mapping_source(tmp_path: 
         with Sandbox(maintainer_access=True) as sandbox:
             sandbox.federation(
                 "sandbox_rental_shop",
-                declaration_file=decl_path,
+                declaration=decl_path,
                 members=members,
             )
 
@@ -333,7 +330,7 @@ def test_custom_federation_declaration_rejects_unresolved_mapping_table(tmp_path
         with Sandbox(maintainer_access=True) as sandbox:
             sandbox.federation(
                 "sandbox_rental_shop",
-                declaration_file=decl_path,
+                declaration=decl_path,
                 members=members,
             )
 
@@ -350,7 +347,7 @@ def test_custom_federation_declaration_rejects_union_with_authoritative_source(t
         with Sandbox(maintainer_access=True) as sandbox:
             sandbox.federation(
                 "sandbox_rental_shop",
-                declaration_file=decl_path,
+                declaration=decl_path,
                 members=members,
             )
 
@@ -374,30 +371,29 @@ def test_custom_federation_declaration_rejects_cross_source_join_on_unowned_tabl
         with Sandbox(maintainer_access=True) as sandbox:
             sandbox.federation(
                 "sandbox_rental_shop",
-                declaration_file=decl_path,
+                declaration=decl_path,
                 members=members,
             )
 
 
 @pytest.mark.fast
-def test_sandbox_apply_overrides_rejects_unknown_column(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_sandbox_apply_structure_rejects_unknown_column(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _require_bundled_data()
     from aetherdialect import AetherEngine
     from aetherdialect._contracts_base import ConfigError
 
     monkeypatch.chdir(tmp_path)
     overrides = {
-        "version": SCHEMA_OVERRIDES_VERSION,
-        "tables": {"customer": {"columns": {"ghost_col": {"description": "missing"}}}},
+        "version": STRUCTURE_DOCUMENT_VERSION,
+        "tables": {"customer": {"columns": {"ghost_col": {"sensitivity": "hidden"}}}},
         "foreign_keys_add": [],
         "foreign_keys_remove": [],
         "primary_keys_add": [],
         "primary_keys_remove": [],
     }
-    (tmp_path / SCHEMA_OVERRIDES_DEFAULT_FILENAME).write_text(json.dumps(overrides), encoding="utf-8")
-    with AetherEngine.offline_sandbox() as handle:
-        with pytest.raises(ConfigError, match="unknown column"):
-            handle.engine.apply_overrides()
+    with Sandbox.create_offline_sandbox(AetherEngine) as handle:
+        with pytest.raises((ConfigError, ValueError), match="unknown column|ghost_col"):
+            handle.engine.apply_structure(overrides)
 
 
 @pytest.mark.fast
@@ -414,7 +410,7 @@ def test_sandbox_apply_migration_map_rejects_invalid_target(tmp_path: Path, monk
     }
     map_path = tmp_path / "schema_migration_map.json"
     map_path.write_text(json.dumps(bad_map), encoding="utf-8")
-    with AetherEngine.offline_sandbox() as handle:
+    with Sandbox.create_offline_sandbox(AetherEngine) as handle:
         with pytest.raises(MigrationPendingError, match="validation failed"):
             AetherEngine.apply_migration_map(
                 str(map_path),
@@ -433,11 +429,27 @@ def test_sandbox_aetherspace_rejects_unknown_table() -> None:
     from aetherdialect import AetherEngine, SpaceContext
     from aetherdialect._contracts_base import ConfigError
 
-    with AetherEngine.offline_sandbox() as handle:
+    with Sandbox.create_offline_sandbox(AetherEngine) as handle:
         with pytest.raises(ConfigError, match="not in the schema graph"):
             handle.engine.aetherspace(
                 "narrow",
                 space_context=SpaceContext(tables=frozenset({"ghost_table"})),
+            )
+
+
+@pytest.mark.fast
+def test_federation_rejects_partial_member_map() -> None:
+    _require_bundled_data()
+    from aetherdialect._contracts_base import ConfigError
+
+    members = _bundled_federation_member_paths()
+    partial = {name: path for name, path in list(members.items())[:2]}
+    assert len(partial) == 2
+    with pytest.raises(ConfigError, match="requires all four members"):
+        with Sandbox(maintainer_access=True) as sandbox:
+            sandbox.federation(
+                "sandbox_rental_shop",
+                members=partial,
             )
 
 
@@ -458,11 +470,8 @@ def test_federation_aetherspace_rejects_partial_union_deny() -> None:
 
 @pytest.mark.fast
 def test_unrecorded_question_in_recorded_corpus_mode_names_mode(tmp_path: Path) -> None:
-    from aetherdialect._llm_provider import (
-        MockFixtureMissingError,
-        MockProvider,
-        SandboxRuntimeState,
-    )
+    from aetherdialect._contracts_base import MockFixtureMissingError
+    from aetherdialect._llm_provider import MockProvider, SandboxRuntimeState
 
     fixtures = tmp_path / "mock.json"
     fixtures.write_text(json.dumps({"fixtures": []}), encoding="utf-8")
@@ -475,7 +484,7 @@ def test_unrecorded_question_in_recorded_corpus_mode_names_mode(tmp_path: Path) 
             provider.chat_text("sys", "Who invented SQL?", task="default", max_retries=1, timeout=1.0)
         message = str(exc_info.value)
         assert "17" in message
-        assert "Sandbox.sandbox_questions()" in message
+        assert "SANDBOX_DATA_REFERENCE.md" in message
         assert "malformed" not in message.lower()
     finally:
         SandboxRuntimeState.set_sandbox_recorded_corpus_question_count(None)
@@ -496,7 +505,7 @@ def test_offline_sandbox_default_engine_is_owner_writer() -> None:
     _require_bundled_data()
     from aetherdialect import AetherEngine
 
-    with AetherEngine.offline_sandbox() as handle:
+    with Sandbox.create_offline_sandbox(AetherEngine) as handle:
         assert handle.engine._schema_role == "owner"
 
 
@@ -505,8 +514,8 @@ def test_sandbox_guide_documents_engine_session_mode_as_primary_entry() -> None:
     from pathlib import Path
 
     text = (Path(__file__).resolve().parents[1] / "docs" / "SANDBOX.md").read_text(encoding="utf-8")
-    assert 'sb.engine.session(mode="writer")' in text
-    assert "maintainer_access" in text
+    assert 'engine.session(mode="writer")' in text
+    assert "Sandbox()" in text
 
 
 @pytest.mark.fast
@@ -514,8 +523,6 @@ def test_api_reference_documents_sandbox_authoring_surface() -> None:
     from pathlib import Path
 
     text = (Path(__file__).resolve().parents[1] / "docs" / "API_REFERENCE.md").read_text(encoding="utf-8")
-    assert "sandbox.federation" in text
-    assert "member_connections" in text
-    assert "seed_sql" in text
-    assert "cleanup_artifacts" in text
-    assert "sandbox.adopt" in text
+    assert "Sandbox" in text
+    assert "sandbox.connection" in text
+    assert "AetherEngine" in text

@@ -8,7 +8,8 @@ import pytest
 
 from aetherdialect._constants import SESSION_KIND_ERROR
 from aetherdialect._contracts_base import FailureCategory
-from aetherdialect._main_execution import PipelineSession
+from aetherdialect._contracts_core import SessionOutcome
+from aetherdialect._main_session import PipelineSession
 
 
 def _session_owner() -> MagicMock:
@@ -35,5 +36,8 @@ def test_cancel_step_kind_is_error() -> None:
     step = sess._completed_step()
 
     assert step.kind == SESSION_KIND_ERROR
-    assert step.status is not None
-    assert step.status == FailureCategory.FEDERATION_TURN_CANCELLED.value
+    assert step.error is not None
+    assert step.error.code == SessionOutcome.CANCELLED
+    assert step.error.source_id == "src_a"
+    assert step.error.phase == "member"
+    assert FailureCategory.FEDERATION_TURN_CANCELLED.value  # failure kind still recorded upstream

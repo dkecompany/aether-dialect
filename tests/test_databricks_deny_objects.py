@@ -11,7 +11,7 @@ from aetherdialect._contracts_schema import (
     TableMetadata,
 )
 from aetherdialect._schema_graph import recompute_join_paths_multi
-from aetherdialect._schema_overrides import load_or_create_schema_databricks
+from aetherdialect._schema_reflect import load_or_create_schema_databricks
 
 
 def _tables_meta(table_names: tuple[str, ...]) -> dict[str, dict[str, object]]:
@@ -30,7 +30,7 @@ def _tables_meta(table_names: tuple[str, ...]) -> dict[str, dict[str, object]]:
 def test_databricks_load_or_create_schema_applies_deny_objects(monkeypatch: pytest.MonkeyPatch) -> None:
     """Denied tables are removed from Databricks-built graphs before return."""
     monkeypatch.setattr(
-        "aetherdialect._schema_overrides.extract_tables_from_catalog_sql_connector",
+        "aetherdialect._schema_reflect.extract_tables_from_catalog_sql_connector",
         lambda *args, **kwargs: _tables_meta(("orders", "secret")),
     )
 

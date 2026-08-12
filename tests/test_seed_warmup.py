@@ -1,4 +1,4 @@
-"""Unit tests for aetherdialect._seed_warmup module (mirrors ``seed_warmup.py``)."""
+"""Unit tests for aetherdialect._seed_warmup."""
 
 import json
 import os
@@ -11,7 +11,6 @@ import pytest
 from aetherdialect._config import SeedWarmupConfig
 from aetherdialect._contracts_base import (
     HavingParam,
-    LlmJsonExhausted,
     NormalizedExpr,
     PredicateGroup,
     WhereParam,
@@ -20,6 +19,7 @@ from aetherdialect._contracts_base import (
 from aetherdialect._contracts_core import (
     ConcreteIntent,
     GenerationPath,
+    LlmJsonExhausted,
     RuntimeIntent,
     SeedWarmupIntent,
     SeedWarmupResult,
@@ -34,9 +34,9 @@ from aetherdialect._contracts_schema import (
     TemplateStats,
     ValueDomain,
 )
-from aetherdialect._core_utils import debug
 from aetherdialect._dialect_postgres import PostgresDialect
 from aetherdialect._seed_warmup import SeedWarmupCacheSession
+from aetherdialect._utils import debug
 
 _abstract_values = SeedWarmupCacheSession._abstract_values
 _allocate_stratum_quotas = SeedWarmupCacheSession._allocate_stratum_quotas
@@ -590,11 +590,11 @@ class TestRunSeedQuestionNormalization:
         assert "1. One" in txt
 
     @patch("aetherdialect._seed_warmup.LLMProvider.json")
-    def test_falls_back_when_llm_returns_no_lines(self, mock_llm):
+    def test_raises_when_llm_returns_no_lines(self, mock_llm):
         mock_llm.return_value = {"lines": "not-a-list"}
         seeds = [{"number": 5, "question": "orig"}]
-        phrases, _, _ = SeedWarmupCacheSession.run_seed_question_normalization(seeds)
-        assert phrases[5]["normalized"] == "orig"
+        with pytest.raises(ValueError, match="lines"):
+            SeedWarmupCacheSession.run_seed_question_normalization(seeds)
 
     @patch("aetherdialect._seed_warmup.LLMProvider.json")
     def test_falls_back_to_originals_when_llm_json_exhausted(self, mock_llm):
@@ -1610,7 +1610,7 @@ class TestWarmupSyntheticStorePathBlocks:
         monkeypatch.setattr("aetherdialect._seed_warmup.structural_compare", lambda _r, _t: CR())
         assert SeedWarmupCacheSession._warmup_synthetic_store_path_blocks(intent, rt, {}) is None
 
-    def test_path41_blocked_for_synthetic(self, monkeypatch):
+    def test_union_template_widen_blocked_for_synthetic(self, monkeypatch):
         intent = _warmup_intent(source="synthetic")
         rt = intent.to_runtime_intent()
 
@@ -1644,16 +1644,16 @@ class TestWarmupSyntheticStorePathBlocks:
         )
         assert (
             SeedWarmupCacheSession._warmup_synthetic_store_path_blocks(intent, rt, {"T1": tmpl})
-            == "warmup_path41_not_allowed"
+            == "warmup_union_template_widen_not_allowed"
         )
 
 
 class TestQuestionFromSqlIntegration:
     """``generate_question_from_sql`` with LLM mocked (lives in utils, used by warmup)."""
 
-    @patch("aetherdialect._utils.LLMProvider.json")
+    @patch("aetherdialect._utils_intent.LLMProvider.json")
     def test_realistic_question_returned(self, mock_llm, schema_graph):
-        from aetherdialect._utils import generate_question_from_sql
+        from aetherdialect._utils_intent import generate_question_from_sql
 
         mock_llm.return_value = {
             "question": "How many orders exist?",
@@ -1669,9 +1669,9 @@ class TestQuestionFromSqlIntegration:
         assert result["is_realistic"] is True
         assert "orders" in result["question"].lower()
 
-    @patch("aetherdialect._utils.LLMProvider.json")
+    @patch("aetherdialect._utils_intent.LLMProvider.json")
     def test_unrealistic_dropped(self, mock_llm, schema_graph):
-        from aetherdialect._utils import generate_question_from_sql
+        from aetherdialect._utils_intent import generate_question_from_sql
 
         mock_llm.return_value = {
             "question": "",
@@ -1687,9 +1687,9 @@ class TestQuestionFromSqlIntegration:
         assert result["is_realistic"] is False
         assert "meaningless" in result["drop_reason"]
 
-    @patch("aetherdialect._utils.LLMProvider.json", side_effect=Exception("timeout"))
+    @patch("aetherdialect._utils_intent.LLMProvider.json", side_effect=Exception("timeout"))
     def test_llm_failure_propagates(self, mock_llm, schema_graph):
-        from aetherdialect._utils import generate_question_from_sql
+        from aetherdialect._utils_intent import generate_question_from_sql
 
         with pytest.raises(Exception, match="timeout"):
             generate_question_from_sql(
@@ -1725,13 +1725,16 @@ class TestCheckIntentAgainstExpectation:
         intent = {
             "tables": ["reservation"],
             "grain": "scalar",
-            "where": [
-                {
-                    "left_expr": "reservation.status",
-                    "op": "=",
-                    "param_key": "p1",
-                }
-            ],
+            "where": {
+                "op": "and",
+                "predicates": [
+                    {
+                        "left_expr": "reservation.status",
+                        "op": "=",
+                        "param_key": "p1",
+                    }
+                ],
+            },
             "param_values": {"p1": "expired"},
         }
         failures = SeedWarmupCacheSession.check_intent_against_expectation(

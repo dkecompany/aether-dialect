@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import pytest
-from live_tests._federation_equivalence_questions import generate_federation_equivalence_questions
+from live_tests.live_support import generate_federation_equivalence_questions
 
-from aetherdialect._contracts_base import ColumnRole
-from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
+from aetherdialect._contracts_schema import ColumnMetadata, ColumnRole, FKEdge, SchemaGraph, TableMetadata
 from aetherdialect._schema_graph import recompute_join_paths_multi
 
 

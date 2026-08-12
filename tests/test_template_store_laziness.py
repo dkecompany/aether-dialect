@@ -9,17 +9,12 @@ import pytest
 
 from aetherdialect._config import EngineConfig, PolicyConfig
 from aetherdialect._constants import TEMPLATE_STORE_PARTITION_LRU_MAX
-from aetherdialect._contracts_core import (
-    ConcreteIntent,
-    SelectCol,
-    Template,
-    TemplateStats,
-    ValueHistory,
-)
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, SQLShape, TableMetadata
-from aetherdialect._intent_process import NormalizedExpr
+from aetherdialect._contracts_base import NormalizedExpr
+from aetherdialect._contracts_core import ConcreteIntent, SelectCol, Template, ValueHistory
+from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, SQLShape, TableMetadata, TemplateStats
 from aetherdialect._schema_graph import recompute_join_paths_multi
-from aetherdialect._templates import TemplateOps, TemplateStoreView
+from aetherdialect._templates import TemplateStoreView
+from aetherdialect._templates_ops import TemplateOps
 
 
 def _tiny_schema(*, schema_graph_id: str = "sg_test000000000001__abcd1234") -> SchemaGraph:

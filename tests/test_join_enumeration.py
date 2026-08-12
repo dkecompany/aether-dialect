@@ -5,21 +5,23 @@ from __future__ import annotations
 import pytest
 
 from aetherdialect._config import PolicyConfig
-from aetherdialect._constants import DIAGNOSTIC_CODE_JOIN_CANDIDATE_CAP, JOIN_PATH_TIE_REFUSAL_CEILING
-from aetherdialect._contracts_core import NormalizedExpr, RuntimeIntent, SelectCol
-from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import (
-    drain_diagnostic_collector,
-    reset_diagnostic_collector,
-    set_diagnostic_collector,
-)
-from aetherdialect._federation import federation_scaled_join_candidate_cap
-from aetherdialect._schema_graph import recompute_join_paths_multi
-from aetherdialect._sql_gen import (
+from aetherdialect._constants import (
+    DIAGNOSTIC_CODE_JOIN_CANDIDATE_CAP,
     JOIN_CHOICE_SCOPE_MAIN,
+    JOIN_PATH_TIE_REFUSAL_CEILING,
+)
+from aetherdialect._contracts_base import NormalizedExpr
+from aetherdialect._contracts_core import (
     JoinCandidateCapExceededError,
     JoinProbeEdgeKindMismatchError,
+    RuntimeIntent,
     ScopeClass,
+    SelectCol,
+)
+from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
+from aetherdialect._federation_manifest import federation_scaled_join_candidate_cap
+from aetherdialect._schema_graph import recompute_join_paths_multi
+from aetherdialect._sql_gen import (
     _candidate_join_paths_for_tables,
     _order_join_candidates_stable,
     classify_scope_candidates,
@@ -27,6 +29,11 @@ from aetherdialect._sql_gen import (
     join_hints_multi,
     join_scope_pass1_plan,
     normalize_probe_edges_in_join_path_signature,
+)
+from aetherdialect._utils import (
+    drain_diagnostic_collector,
+    reset_diagnostic_collector,
+    set_diagnostic_collector,
 )
 from tests.test_join_path_tie_ceiling import _cross_product_ambiguity_schema
 

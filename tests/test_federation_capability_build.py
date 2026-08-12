@@ -6,27 +6,24 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aetherdialect._contracts_base import PredicateGroup, WhereParam
+from aetherdialect._contracts_base import NormalizedExpr, PredicateGroup, WhereParam
 from aetherdialect._contracts_core import (
     RuntimeCteStep,
     RuntimeIntent,
     SelectCol,
 )
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import (
-    _coordinator_promotes_spanning_windows,
-    _spanning_cte_names,
-    compose_composite_graph,
-    inject_semijoin_where,
+from aetherdialect._federation_compose import compose_composite_graph, spanning_cte_names
+from aetherdialect._federation_execute import inject_semijoin_where
+from aetherdialect._federation_manifest import (
+    intersect_member_database_feature_capabilities,
     intersect_member_where_ops,
     parse_federation_manifest,
-    plan_federated_stages,
     stamp_federation_member_graph,
 )
-from aetherdialect._intent_process import NormalizedExpr
+from aetherdialect._federation_plan import _coordinator_promotes_spanning_windows, plan_federated_stages
 from aetherdialect._schema_graph import (
     compute_database_feature_capability,
-    intersect_member_database_feature_capabilities,
     recompute_join_paths_multi,
 )
 
@@ -121,7 +118,7 @@ def test_intersect_member_where_ops_uses_engine_types() -> None:
 
 
 def test_apply_deny_objects_filter_on_full_build_path() -> None:
-    from aetherdialect._schema_build import apply_full_build_deny_objects
+    from aetherdialect._schema_reflect import apply_full_build_deny_objects
 
     tables = {
         "orders": TableMetadata(
@@ -162,7 +159,7 @@ def test_plan_federated_stages_emits_spanning_cte_stage() -> None:
         where=None,
         cte_steps=[cte],
     )
-    assert _spanning_cte_names(intent.cte_steps or (), source_by_table) == ("span_cte",)
+    assert spanning_cte_names(intent.cte_steps or (), source_by_table) == ("span_cte",)
     stages = plan_federated_stages(
         {"a", "b"},
         (),
@@ -282,7 +279,7 @@ def test_federation_eligibility_checked_before_intent_confirm() -> None:
     owner._federation_mappings = None
     choice_port = MagicMock(_owner=owner)
 
-    with patch("aetherdialect._main_execution.MainExecutionOps._handle_federation_ineligible_plan") as mock_handle:
+    with patch("aetherdialect._main_interactive.MainInteractiveOps._handle_federation_ineligible_plan") as mock_handle:
         assert (
             MainExecutionOps._check_federation_eligibility_before_confirm(
                 ineligible_intent,
@@ -321,7 +318,7 @@ def test_federation_eligibility_checked_before_intent_confirm() -> None:
 def test_predicate_renderer_refuses_unbound_contains_param() -> None:
     from unittest.mock import MagicMock
 
-    from aetherdialect._contracts_core import WhereParam
+    from aetherdialect._contracts_base import WhereParam
     from aetherdialect._sql_gen import _render_predicate_clause
 
     pred = WhereParam(
@@ -366,7 +363,7 @@ def test_cross_source_distinct_is_coordinator_residual() -> None:
         where=None,
         distinct_select_index=0,
     )
-    from aetherdialect._federation import plan_federated_intent
+    from aetherdialect._federation_plan import plan_federated_intent
 
     plan = plan_federated_intent(intent, composite, manifest)
     assert plan.ineligible_reason is None
@@ -377,9 +374,8 @@ def test_cross_source_distinct_is_coordinator_residual() -> None:
 
 @pytest.mark.fast
 def test_cross_source_order_by_is_coordinator_residual() -> None:
-    from aetherdialect._contracts_base import MulGroup
-    from aetherdialect._contracts_core import OrderByCol
-    from aetherdialect._federation import plan_federated_intent
+    from aetherdialect._contracts_base import MulGroup, OrderByCol
+    from aetherdialect._federation_plan import plan_federated_intent
 
     manifest = parse_federation_manifest(
         {
@@ -421,7 +417,7 @@ def test_cross_source_order_by_is_coordinator_residual() -> None:
 
 @pytest.mark.fast
 def test_cross_source_where_group_disjunction_is_ineligible() -> None:
-    from aetherdialect._federation import plan_federated_intent
+    from aetherdialect._federation_plan import plan_federated_intent
 
     manifest = parse_federation_manifest(_CROSS_SOURCE_MANIFEST, include_derived_roster=True)
     composite = compose_composite_graph(
@@ -462,7 +458,7 @@ def test_cross_source_where_group_disjunction_is_ineligible() -> None:
 @pytest.mark.fast
 def test_cross_source_window_above_join_routes_to_residual() -> None:
     from aetherdialect._contracts_schema import WindowRegistryStep, WindowSpec
-    from aetherdialect._federation import plan_federated_intent
+    from aetherdialect._federation_plan import plan_federated_intent
 
     manifest = parse_federation_manifest(_CROSS_SOURCE_MANIFEST, include_derived_roster=True)
     composite = compose_composite_graph(
@@ -499,7 +495,7 @@ def test_cross_source_window_above_join_routes_to_residual() -> None:
 @pytest.mark.fast
 def test_cross_source_window_without_combine_is_ineligible() -> None:
     from aetherdialect._contracts_schema import WindowRegistryStep, WindowSpec
-    from aetherdialect._federation import plan_federated_intent
+    from aetherdialect._federation_plan import plan_federated_intent
 
     manifest = parse_federation_manifest(
         {
@@ -548,7 +544,7 @@ def test_cross_source_window_without_combine_is_ineligible() -> None:
 
 @pytest.mark.fast
 def test_cross_source_scalar_subquery_cte_is_ineligible() -> None:
-    from aetherdialect._federation import plan_federated_intent
+    from aetherdialect._federation_plan import plan_federated_intent
 
     manifest = parse_federation_manifest(_CROSS_SOURCE_MANIFEST, include_derived_roster=True)
     composite = compose_composite_graph(
@@ -583,7 +579,7 @@ def test_cross_source_scalar_subquery_cte_is_ineligible() -> None:
 
 @pytest.mark.fast
 def test_cross_source_stddev_aggregate_is_ineligible() -> None:
-    from aetherdialect._federation import plan_federated_intent
+    from aetherdialect._federation_plan import plan_federated_intent
 
     manifest = parse_federation_manifest(_CROSS_SOURCE_MANIFEST, include_derived_roster=True)
     composite = compose_composite_graph(
@@ -604,7 +600,7 @@ def test_cross_source_stddev_aggregate_is_ineligible() -> None:
 
 def test_federation_flat_predicate_conjunction_is_not_nested() -> None:
     from aetherdialect._contracts_base import DatabaseFeatureCapability
-    from aetherdialect._federation import _federation_ir_capability_reason
+    from aetherdialect._federation_manifest import federation_ir_capability_reason
 
     cap = DatabaseFeatureCapability(
         table_count=1,
@@ -639,4 +635,4 @@ def test_federation_flat_predicate_conjunction_is_not_nested() -> None:
         order_by_cols=[],
         where=where,
     )
-    assert _federation_ir_capability_reason(intent, cap) is None
+    assert federation_ir_capability_reason(intent, cap) is None
