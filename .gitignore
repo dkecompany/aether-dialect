@@ -106,6 +106,7 @@ typings/
 .cursor/
 .trae/
 .idea/
+.cursorrules
 
 # OS
 .DS_Store

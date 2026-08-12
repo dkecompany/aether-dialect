@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aetherdialect"
-version = "0.2.3"
+version = "0.2.4"
 description = "The deterministic Text-to-SQL engine"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
@@ -30,12 +30,10 @@ dependencies = [
     "platformdirs>=2.0.0,<5",
     "sqlglot>=29.0,<30",
     "SQLAlchemy>=2.0,<3",
+    "duckdb-engine>=0.13,<1",
 ]
 
 [project.optional-dependencies]
-duckdb = ["duckdb>=1.0,<2"]
-federation = ["duckdb>=1.0,<2"]
-sandbox = ["duckdb>=1.0,<2", "duckdb-engine>=0.13,<1"]
 csv = ["openpyxl>=3.1,<4"]
 mysql = ["pymysql>=1.1,<2"]
 mariadb = ["pymysql>=1.1,<2"]

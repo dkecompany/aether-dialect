@@ -11,6 +11,8 @@ import pytest
 _ROOT = Path(__file__).resolve().parents[2]
 _SRC = _ROOT / "src" / "aetherdialect"
 _SCRIPTS = _ROOT / "scripts"
+# ``ast.TypeAlias`` (PEP 695 ``type X = ...``) exists only on Python 3.12+.
+_AST_TYPE_ALIAS: type[ast.AST] | None = getattr(ast, "TypeAlias", None)
 
 # Public façades only: definitions in config/constants/contracts are scanned for cross-module ``_`` leaks.
 _PREFIX_EXEMPT = {
@@ -38,7 +40,7 @@ _REEXPORT_ALLOWED = {
 _FACADE_MODULES = frozenset({"__init__", "aetherdialect"})
 
 # (module_stem, symbol) pairs exempt from the private-import ban.
-_ALLOWED_PRIVATE_SYMBOL_IMPORTS = frozenset()
+_ALLOWED_PRIVATE_SYMBOL_IMPORTS: frozenset[tuple[str, str]] = frozenset()
 
 _DATA_MODULES = frozenset({"_constants", "_constants_runtime"})
 
@@ -425,9 +427,14 @@ def _is_bare_type_expression(node: ast.AST | None) -> bool:
     return isinstance(node, ast.Subscript)
 
 
+def _is_pep695_type_alias(node: ast.AST) -> bool:
+    """Return True when *node* is a PEP 695 ``type`` statement (Python 3.12+ only)."""
+    return _AST_TYPE_ALIAS is not None and isinstance(node, _AST_TYPE_ALIAS)
+
+
 def _is_type_alias_assignment(node: ast.AST) -> bool:
     """Return True for module-level type-alias forms (``type``, ``TypeAlias``, or bare typing RHS)."""
-    if isinstance(node, ast.TypeAlias):
+    if _is_pep695_type_alias(node):
         return True
     if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
         if _annotation_is_typealias(node.annotation):
@@ -452,8 +459,10 @@ def _data_module_assignment_names(node: ast.AST) -> list[tuple[str, int]]:
                 names.append((target.id, node.lineno))
     elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
         names.append((node.target.id, node.lineno))
-    elif isinstance(node, ast.TypeAlias) and isinstance(node.name, ast.Name):
-        names.append((node.name.id, node.lineno))
+    elif _is_pep695_type_alias(node):
+        name_node = getattr(node, "name", None)
+        if isinstance(name_node, ast.Name):
+            names.append((name_node.id, node.lineno))
     return names
 
 
@@ -1054,8 +1063,9 @@ def test_constants_define_no_classes_or_literal_types() -> None:
     for node in tree.body:
         if not _is_type_alias_assignment(node):
             continue
-        if isinstance(node, ast.TypeAlias) and isinstance(node.name, ast.Name):
-            names = node.name.id
+        if _is_pep695_type_alias(node):
+            name_node = getattr(node, "name", None)
+            names = name_node.id if isinstance(name_node, ast.Name) else "<type>"
         elif isinstance(node, ast.Assign):
             names = ", ".join(t.id for t in node.targets if isinstance(t, ast.Name))
         else:
@@ -1239,3 +1249,92 @@ def test_no_public_private_name_twins() -> None:
                     )
     if violations:
         pytest.fail("Public/private name-twin violations:\n" + "\n".join(violations))
+
+
+# Modules allowed to load ``aetherdialect.*`` via importlib (lazy public API, dialect
+# registry trampolines pending DAG purge, plugin paths, or already-loaded debug patching).
+_ALLOWED_AETHERDIALECT_IMPORTLIB_MODULES = frozenset(
+    {
+        "__init__",
+        "_schema_graph",
+        "_schema_profile",
+        "_utils",
+        "_dialect",
+    }
+)
+
+_BANNED_CYCLE_HACK_MARKERS = (
+    "register_profile_schema_native_dispatch",
+    "_PROFILE_SCHEMA_NATIVE_DISPATCH",
+)
+
+
+def _importlib_aetherdialect_target(arg: ast.AST) -> str | None:
+    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+        return arg.value
+    if isinstance(arg, ast.JoinedStr):
+        parts: list[str] = []
+        for value in arg.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                parts.append(value.value)
+            else:
+                parts.append("{…}")
+        return "".join(parts)
+    return None
+
+
+@pytest.mark.fast
+def test_no_pip_install_recipes_in_src() -> None:
+    """Install how-tos stay in docs; package source must not embed ``pip install`` strings."""
+    violations: list[str] = []
+    for path in _get_src_files():
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            if "pip install" in line.lower():
+                violations.append(f"{path.name}:{lineno}: {line.strip()}")
+    if violations:
+        pytest.fail("pip install recipe(s) in src:\n" + "\n".join(violations))
+
+
+@pytest.mark.fast
+def test_no_sibling_importlib_cycle_dodges() -> None:
+    """Ban deferred ``importlib.import_module('aetherdialect…')`` cycle hacks outside the allowlist."""
+    violations: list[str] = []
+    for path in _get_src_files():
+        stem = _module_stem(path)
+        if stem in _ALLOWED_AETHERDIALECT_IMPORTLIB_MODULES:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not node.args:
+                continue
+            func = node.func
+            is_import_module = (
+                isinstance(func, ast.Attribute)
+                and func.attr == "import_module"
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "importlib"
+            ) or (isinstance(func, ast.Name) and func.id == "import_module")
+            if not is_import_module:
+                continue
+            target = _importlib_aetherdialect_target(node.args[0])
+            if target is None:
+                continue
+            if target == "aetherdialect" or target.startswith("aetherdialect."):
+                violations.append(f"{path.name}:{node.lineno}: importlib.import_module({target!r})")
+    if violations:
+        pytest.fail("Deferred aetherdialect importlib load(s):\n" + "\n".join(violations))
+
+
+@pytest.mark.fast
+def test_no_profile_schema_dispatch_register_slot() -> None:
+    """Profile dispatch must use Dialect method override, not a ClassVar register slot."""
+    violations: list[str] = []
+    for path in _get_src_files():
+        text = path.read_text(encoding="utf-8")
+        for marker in _BANNED_CYCLE_HACK_MARKERS:
+            if marker in text:
+                for lineno, line in enumerate(text.splitlines(), start=1):
+                    if marker in line:
+                        violations.append(f"{path.name}:{lineno}: {marker}")
+    if violations:
+        pytest.fail("Banned profile-dispatch cycle hack marker(s):\n" + "\n".join(violations))

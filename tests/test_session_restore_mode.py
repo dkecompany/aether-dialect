@@ -1,4 +1,4 @@
-"""restore_serialized_state must preserve reader mode and consumer gates."""
+"""restore_serialized_state must preserve reader mode and consumer writer learning."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aetherdialect._contracts_base import OwnerOnlyOperationError
 from aetherdialect._main_session import PipelineSession
 
 
@@ -24,8 +23,6 @@ def test_reader_restore_stays_reader() -> None:
 
     def _session(**kwargs):
         mode = kwargs.get("mode", "reader")
-        if owner._schema_role == "consumer" and mode == "writer":
-            raise OwnerOnlyOperationError("PipelineSession(mode='writer')")
         restored_reader._session_mode = mode
         restored_reader._space_name = str(kwargs.get("space", "master"))
         restored_reader._data_row_cap = kwargs.get("data_row_cap")
@@ -65,5 +62,5 @@ def test_reader_restore_stays_reader() -> None:
     assert sess.space_name == "analytics"
     assert sess._data_row_cap == 25
 
-    with pytest.raises(OwnerOnlyOperationError):
-        _session(mode="writer", space="analytics")
+    writer = _session(mode="writer", space="analytics")
+    assert writer._session_mode == "writer"

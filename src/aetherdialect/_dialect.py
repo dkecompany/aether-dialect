@@ -1,10 +1,10 @@
-"""Database dialect abstraction: AST/EXPLAIN validation, CTE extraction, and execution helpers. ``sqlglot`` is a required core dependency. Engine-specific dialect implementations live in companion modules registered at package import time. ``register_profile_schema_native_dispatch`` is invoked from ``_dialect_sqlglot_helper`` at module load so native profiling can call back without ``_dialect`` importing that helper module."""
+"""Database dialect abstraction: AST/EXPLAIN validation, CTE extraction, and execution helpers. ``sqlglot`` is a required core dependency. Engine-specific dialect implementations live in companion modules registered at package import time."""
 
 from __future__ import annotations
 
 import importlib
 import inspect
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from typing import Any, ClassVar, Literal, Protocol, cast
 
@@ -78,7 +78,6 @@ class Dialect:
     registry_window_frames_excluded: ClassVar[bool] = False
     registry_array_contains_excluded: ClassVar[bool] = False
     registry_toml_section: ClassVar[str | None] = None
-    _PROFILE_SCHEMA_NATIVE_DISPATCH: ClassVar[Callable[..., None] | None] = None
 
     @staticmethod
     def trace_finalize_render_stage(stage: str, sql_in: str, sql_out: str) -> None:
@@ -513,11 +512,6 @@ class Dialect:
     def _reflect_include_for_schema_build(ctx: EngineContext) -> SchemaInclude:
         """Return the single-kind include selector for schema-build reflection scopes."""
         return ctx.include
-
-    @staticmethod
-    def register_profile_schema_native_dispatch(fn: Callable[..., None]) -> None:
-        """Store the native schema-profiling callback registered by ``_dialect_sqlglot_helper`` at module load time."""
-        Dialect._PROFILE_SCHEMA_NATIVE_DISPATCH = fn
 
     @staticmethod
     def _sqlglot_identifier_name(node: Any) -> str:
@@ -1248,9 +1242,7 @@ class Dialect:
 
     def profile_schema_dispatch(self, sg: SchemaGraph) -> None:
         """Profile tables using the active native backend chain with SQLAlchemy fallback."""
-        if Dialect._PROFILE_SCHEMA_NATIVE_DISPATCH is None:
-            raise NotImplementedError(f"{type(self).__name__} has no profiling backend")
-        Dialect._PROFILE_SCHEMA_NATIVE_DISPATCH(self, sg)
+        raise NotImplementedError(f"{type(self).__name__} has no profiling backend")
 
     def profile_schema(self, sg: SchemaGraph) -> None:
         """Populate column statistics and physical metadata on *sg* in place."""

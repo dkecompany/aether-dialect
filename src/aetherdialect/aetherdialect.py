@@ -667,6 +667,7 @@ class AetherEngine:
                     ("issues_json", stable_json(report.to_json_dict()["issues"])),
                 ),
             )
+        Sandbox.maybe_auto_adopt(self)
 
     def _reinit_bundle_kwargs(self) -> dict[str, Any]:
         """Keyword arguments for :func:`initialize_aether_engine` when reloading state."""
@@ -797,6 +798,21 @@ class AetherEngine:
             uids = ", ".join(m.uid for m in matches)
             raise ConfigError(f"ambiguous aetherspace name {norm!r}; matches uids {uids}")
         raise ConfigError(f"unknown aetherspace {name!r}")
+
+    def _raise_if_duplicate_aetherspace_name(self, display: str, *, exclude_uid: str | None = None) -> None:
+        """Refuse create/rename when *display* already labels another visible space."""
+        try:
+            existing = self._resolve_aetherspace_visible_by_name(display)
+        except ConfigError as exc:
+            msg = str(exc)
+            if "unknown aetherspace" in msg:
+                return
+            if "ambiguous aetherspace name" in msg:
+                raise ConfigError(f"duplicate aetherspace name {display!r}") from exc
+            raise
+        if exclude_uid is not None and existing.uid == exclude_uid:
+            return
+        raise ConfigError(f"duplicate aetherspace name {display!r}; update with uid={existing.uid!r}")
 
     def _require_production_api(self, operation: str) -> None:
         if getattr(self, "_sandbox_mode", False):
@@ -1310,13 +1326,11 @@ class AetherEngine:
         ephemeral_scope: SpaceContext | None = None,
         data_row_cap: int | None = None,
     ) -> PipelineSession:
-        """Return a programmatic session sharing this instance's schema graph and template store. ``writer`` mode may mutate artifacts and takes ``_pipeline_writer_lock`` only around store and write-queue mutations; ``reader`` mode is read-only and never takes that lock."""
+        """Return a programmatic session sharing this instance's schema graph and template store. ``writer`` mode persists space-partition learning and takes ``_pipeline_writer_lock`` only around store and write-queue mutations; ``reader`` mode is read-only and never takes that lock. Consumers may open ``writer`` for learning only; structural APIs stay owner-only."""
         self._require_open("session")
         if getattr(self, "_sandbox_closed", False) is True:
             raise RuntimeError("Sandbox handle is closed; create a new Sandbox instance.")
         Sandbox.require_sandbox_adoption(self)
-        if self._schema_role == SchemaRole.CONSUMER and mode == "writer":
-            raise OwnerOnlyOperationError("PipelineSession(mode='writer')")
         desc, space_tables, space_columns, space_deny_objects, space_deny_columns = self._resolve_aetherspace(
             self._resolve_session_space(space)
         )
@@ -1417,6 +1431,8 @@ class AetherEngine:
                 )
             desc = self._resolve_aetherspace(uid_norm)[0]
             display = name_norm if name_norm else desc.name
+            if name_norm and name_norm != desc.name:
+                self._raise_if_duplicate_aetherspace_name(display, exclude_uid=uid_norm)
         else:
             if not name_norm:
                 raise ConfigError("aetherspace create requires name")
@@ -1428,6 +1444,7 @@ class AetherEngine:
                 display = TemplateOps.validate_space_name(name_norm)
             except ValueError as exc:
                 raise ConfigError(f"invalid aetherspace name: {name!r}") from exc
+            self._raise_if_duplicate_aetherspace_name(display)
             uid_norm = allocate_aetherspace_uid(str(self._artifacts_dir))
         scope_ctx, visible = self._caller_visibility()
         validate_aetherspace_define_within_visibility(
@@ -2081,7 +2098,10 @@ class AetherFederation:
         try:
             require_driver("duckdb")
         except ConfigError as exc:
-            raise ConfigError("pip install aetherdialect[federation]") from exc
+            raise ConfigError(
+                "DuckDB support is part of the base aetherdialect install; "
+                "the environment is missing the duckdb package."
+            ) from exc
         self._members = federation_members_mapping(cast(Sequence[FederationMemberEngine], members))
         self._declaration_parsed: tuple[FederationManifest, FederationMappings] | None
         if isinstance(declaration, Mapping):
@@ -2154,6 +2174,7 @@ class AetherFederation:
             schema_hash=None,
             details=(("federation", self._name), ("members", str(len(self._members)))),
         )
+        Sandbox.maybe_auto_adopt(self)
 
     @classmethod
     def inspect_persisted(
@@ -2806,6 +2827,21 @@ class AetherFederation:
             raise ConfigError(f"ambiguous aetherspace name {norm!r}; matches uids {uids}")
         raise ConfigError(f"unknown aetherspace {name!r}")
 
+    def _raise_if_duplicate_aetherspace_name(self, display: str, *, exclude_uid: str | None = None) -> None:
+        """Refuse create/rename when *display* already labels another visible space."""
+        try:
+            existing = self._resolve_aetherspace_visible_by_name(display)
+        except ConfigError as exc:
+            msg = str(exc)
+            if "unknown aetherspace" in msg:
+                return
+            if "ambiguous aetherspace name" in msg:
+                raise ConfigError(f"duplicate aetherspace name {display!r}") from exc
+            raise
+        if exclude_uid is not None and existing.uid == exclude_uid:
+            return
+        raise ConfigError(f"duplicate aetherspace name {display!r}; update with uid={existing.uid!r}")
+
     def _ensure_llm(self) -> None:
         if not EngineConfig.llm_credentials_configured():
             raise ConfigError(
@@ -2852,8 +2888,6 @@ class AetherFederation:
         self._require_open("session")
         if self._sandbox_closed:
             raise RuntimeError("Sandbox handle is closed; create a new Sandbox instance.")
-        if self._schema_role == SchemaRole.CONSUMER and mode == "writer":
-            raise OwnerOnlyOperationError("PipelineSession(mode='writer')")
         desc, space_tables, space_columns, space_deny_objects, space_deny_columns = self._resolve_aetherspace(
             self._resolve_session_space(space)
         )
@@ -3047,6 +3081,8 @@ class AetherFederation:
                 )
             desc = self._resolve_aetherspace(uid_norm)[0]
             display = name_norm if name_norm else desc.name
+            if name_norm and name_norm != desc.name:
+                self._raise_if_duplicate_aetherspace_name(display, exclude_uid=uid_norm)
         else:
             if not name_norm:
                 raise ConfigError("aetherspace create requires name")
@@ -3058,6 +3094,7 @@ class AetherFederation:
                 display = TemplateOps.validate_space_name(name_norm)
             except ValueError as exc:
                 raise ConfigError(f"invalid aetherspace name: {name!r}") from exc
+            self._raise_if_duplicate_aetherspace_name(display)
             uid_norm = allocate_aetherspace_uid(str(self._artifacts_dir))
         mappings = self._federation_mappings or FederationMappings(version=FEDERATION_MAPPINGS_VERSION)
         scope_ctx, visible = self._caller_visibility()
@@ -3681,6 +3718,8 @@ try:
     __version__ = version("aetherdialect")
 except PackageNotFoundError:
     __version__ = "0.0.0+dev"
+
+Sandbox.bind_facade_types(AetherEngine, AetherFederation)
 
 _PUBLIC_API = (
     AccessError,

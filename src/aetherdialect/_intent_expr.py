@@ -3089,17 +3089,37 @@ def interpret_plan_is_unanswerable(plan: InterpretPlan) -> bool:
     return bool(plan.schema_invalid) and not plan.tables
 
 
-def interpret_plan_references_absent_entities(plan: InterpretPlan, allowed_tables: frozenset[str]) -> bool:
-    """True when the interpret plan names tables outside the filtered schema payload."""
+def interpret_plan_references_absent_entities(
+    plan: InterpretPlan,
+    allowed_tables: frozenset[str],
+    columns_by_table: Mapping[str, frozenset[str]] | None = None,
+) -> bool:
+    """True when the interpret plan names entities outside the filtered schema payload. Grounding ``ref`` values must be an allowed table name or ``table.column`` (exactly one qualifier). Bare column or enum tokens are refused. When ``columns_by_table`` is supplied, ``table.column`` must name a column present on that table."""
     if not allowed_tables:
-        return bool(plan.tables) or any(ref.split(".", 1)[0].strip() for ref, _ in plan.grounding)
+        return bool(plan.tables) or any(ref.strip() for ref, _ in plan.grounding)
     for table in plan.tables:
         if table not in allowed_tables:
             return True
     for ref, _ in plan.grounding:
-        base = ref.split(".", 1)[0].strip()
-        if base and base not in allowed_tables:
+        token = str(ref or "").strip()
+        if not token:
             return True
+        if "." not in token:
+            if token not in allowed_tables:
+                return True
+            continue
+        parts = token.split(".")
+        if len(parts) != 2:
+            return True
+        table_name, column_name = parts[0].strip(), parts[1].strip()
+        if not table_name or not column_name:
+            return True
+        if table_name not in allowed_tables:
+            return True
+        if columns_by_table is not None:
+            cols = columns_by_table.get(table_name)
+            if cols is None or column_name not in cols:
+                return True
     return False
 
 

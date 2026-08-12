@@ -75,10 +75,20 @@ def test_requires_python_ceiling_matches_ci() -> None:
 
 
 @pytest.mark.fast
-def test_dev_extra_includes_csv_and_sandbox_packages() -> None:
+def test_dev_extra_includes_csv_and_duckdb_engine() -> None:
     dev = _load_pyproject()["project"]["optional-dependencies"]["dev"]
     assert any(dep.startswith("openpyxl") for dep in dev), "dev extra must include csv (openpyxl)"
-    assert any(dep.startswith("duckdb-engine") for dep in dev), "dev extra must include sandbox (duckdb-engine)"
+    assert any(dep.startswith("duckdb-engine") for dep in dev), "dev extra must include duckdb-engine"
+
+
+@pytest.mark.fast
+def test_core_depends_on_duckdb_engine() -> None:
+    deps = _load_pyproject()["project"]["dependencies"]
+    assert any(dep.startswith("duckdb-engine") for dep in deps)
+    extras = set(_load_pyproject()["project"].get("optional-dependencies", {}))
+    assert "duckdb" not in extras
+    assert "federation" not in extras
+    assert "sandbox" not in extras
 
 
 @pytest.mark.fast

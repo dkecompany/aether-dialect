@@ -433,7 +433,7 @@ Lifecycle methods [`refresh`](#shared-lifecycle) and [`close`](#shared-lifecycle
 | `export_knowledge(space=None)` | `dict` | Knowledge payload for the default or one named space. See [Knowledge document](#knowledge-document). |
 | `apply_knowledge(space, document)` **(owner)** | `None` | Replace space domain knowledge and description overlays from one exported document. |
 | `apply_migration_map(document)` **(owner)** | `None` | Validate and persist a schema migration map document, then call `refresh()`. |
-| `session(*, mode="writer", space=None, ephemeral_scope=None, data_row_cap=None)` | [`PipelineSession`](#pipelinesession) | Programmatic session sharing this instance's schema graph and template store. `writer` may mutate artifacts; `reader` is read-only. |
+| `session(*, mode="writer", space=None, ephemeral_scope=None, data_row_cap=None)` | [`PipelineSession`](#pipelinesession) | Programmatic session sharing this instance's schema graph and template store. `writer` persists space-partition learning; `reader` is read-only. Consumers may open `writer` for learning only — structural APIs stay owner-only. |
 | `asession(*, mode="writer", space=None)` | [`AsyncPipelineSession`](#asyncpipelinesession) | Async wrapper around [`session`](#pipelinesession) using worker threads. |
 | `run_interactive(*, space=None)` | `None` | Stdout interactive loop; prefer `session` for services. |
 | `run_seed_warmup(seed_filepath, interactive_gold=True, *, abort_on_gold_failure=False, max_kept_intents=2000)` **(owner)** | `None` | Full seed warmup; `max_kept_intents=None` keeps every intent that passes quality checks. |
@@ -553,7 +553,7 @@ Mutating facade methods take the instance writer lock and run serially. Guarded 
 | `export_knowledge(space=None)` | `dict` | Knowledge payload for the default or one named space on the composite graph. See [Knowledge document](#knowledge-document). |
 | `apply_knowledge(space, document)` **(owner)** | `None` | Replace space domain knowledge and description overlays from one exported document. |
 | `apply_migration_map(document)` **(owner)** | `None` | Validate and persist a federation migration map document, then recompose. |
-| `session(*, mode="writer", space=None, ephemeral_scope=None, data_row_cap=None)` | [`PipelineSession`](#pipelinesession) | Programmatic session sharing the composite schema graph and template store. |
+| `session(*, mode="writer", space=None, ephemeral_scope=None, data_row_cap=None)` | [`PipelineSession`](#pipelinesession) | Programmatic session sharing the composite schema graph and template store. `writer` persists space-partition learning; consumers may open `writer` for learning only. |
 | `asession(*, mode="writer", space=None)` | [`AsyncPipelineSession`](#asyncpipelinesession) | Async wrapper around [`session`](#pipelinesession) using worker threads. |
 | `run_interactive(*, space=None)` | `None` | Stdout interactive loop; prefer `session` for services. |
 | `run_seed_warmup(...)` **(owner)** | — | Raises `ConfigError` (`warmup is not supported on AetherFederation`). Run seed warmup on each member [`AetherEngine`](#aetherengine). |
@@ -619,7 +619,7 @@ Read-only descriptor returned by [`aetherspace`](#aetherengine). Durable identit
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `uid` | `str` | Stable opaque identity (`master` or `S####`) |
-| `name` | `str` | Display label (may duplicate across spaces) |
+| `name` | `str` | Display label (unique among visible spaces on create) |
 | `tables` | `tuple[str, ...]` | Table names in this space subset |
 | `columns` | `tuple[str, ...]` | Qualified `table.column` names in this subset |
 | `notes` | `str` \| `None` | Merged notes text baked at define time |
@@ -645,7 +645,7 @@ Sync session from [`AetherEngine.session`](#aetherengine) or [`AetherFederation.
 | `cancel()` | `bool` | Cooperative cancel for the in-flight turn |
 | `__enter__` / `__exit__` | context manager | Exit calls `cancel()` then `reset()` |
 
-`mode="reader"` skips durable template writes. `mode="writer"` serialises writer turns on the instance lock. Suspend `kind` values: [Troubleshooting — SessionStep kinds](TROUBLESHOOTING.md#sessionstep-kind-values).
+`mode="reader"` skips durable template writes. `mode="writer"` persists space-partition learning and serialises writer turns on the instance lock; consumers may use `writer` for learning only. Suspend `kind` values: [Troubleshooting — SessionStep kinds](TROUBLESHOOTING.md#sessionstep-kind-values).
 
 ### AsyncPipelineSession
 
@@ -998,10 +998,10 @@ Offline sandbox entry point. Walkthrough: [Sandbox guide](SANDBOX.md). Corpus re
 | `sandbox.connection(name="main")` | connection | DuckDB connection for manual construction |
 | `sandbox.artifacts_dir` | `str` | Shared artifacts root |
 | `sandbox.config_file` | `str` \| `None` | TOML path for sandbox LLM configuration |
-| `sandbox.adopt(engine)` | `None` | Apply sandbox mock configuration to a caller-built engine |
+| `sandbox.adopt(engine)` | `None` | Idempotent: apply sandbox mock configuration (auto-runs on construction for sandbox-hosted connections) |
 | `sandbox.close()` | `None` | Release connections, temp extract dir, and owned artifacts |
 
-`with Sandbox() as sandbox: engine = sandbox.engine()` is the supported offline entry point. Warmup and QSim raise `ConfigError` on sandbox instances.
+`with Sandbox() as sandbox:` plus production-shaped `AetherEngine(..., native_connection=sandbox.connection(), ...)` is the supported offline entry point. `sandbox.engine()` is a convenience wrapper over that constructor. Warmup and QSim raise `ConfigError` on sandbox instances.
 
 ### SandboxHandle
 
@@ -1013,7 +1013,7 @@ Returned when using sandbox helpers that own ephemeral resources. Not exported f
 | `connection` | Primary DuckDB connection |
 | `member_connections` | Per-member connections for federation handles, else `None` |
 | `artifacts_dir` | Artifacts directory string |
-| `adopt(engine)` | Apply sandbox configuration to a caller-built engine |
+| `adopt(engine)` | Idempotent sandbox configuration for a caller-built engine (auto-runs on construction for sandbox-hosted connections) |
 | `close()` | Release temp resources and owned artifacts |
 
 ---

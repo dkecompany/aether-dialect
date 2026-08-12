@@ -532,9 +532,14 @@ def _refuse_if_interpret_references_absent_entities(
     interpret_plan: InterpretPlan,
     allowed_tables: frozenset[str],
     phase: str,
+    columns_by_table: Mapping[str, frozenset[str]] | None = None,
 ) -> bool:
     """Refuse before ground/compose when interpret names entities outside the filtered payload."""
-    if not interpret_plan_references_absent_entities(interpret_plan, allowed_tables):
+    if not interpret_plan_references_absent_entities(
+        interpret_plan,
+        allowed_tables,
+        columns_by_table=columns_by_table,
+    ):
         return False
     debug(f"[{phase}] interpret plan references entities outside filtered schema payload")
     stash_intent_parse_refusal(DIAGNOSTIC_CODE_REFUSAL_PERMISSION_DENIED, PERMISSION_DENIED_USER_MESSAGE)
@@ -1867,7 +1872,15 @@ def _full_intent_parse_body(
             continue
 
         interpret_plan = interpret_candidate
-        if _refuse_if_interpret_references_absent_entities(interpret_plan, frozenset(table_list), ASK_PHASE_B):
+        columns_by_table = {
+            name: frozenset(meta.columns.keys()) for name, meta in schema_graph.tables.items() if name in table_list
+        }
+        if _refuse_if_interpret_references_absent_entities(
+            interpret_plan,
+            frozenset(table_list),
+            ASK_PHASE_B,
+            columns_by_table=columns_by_table,
+        ):
             return None, [], llm_calls, interpret_plan
         if interpret_plan_is_unanswerable(interpret_plan):
             debug(

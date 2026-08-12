@@ -56,7 +56,6 @@ from ._contracts_base import (
     FederationMemberExecutionError,
     FederationMemberProbeError,
     FederationPartialFailureError,
-    OwnerOnlyOperationError,
     ParamValue,
     SchemaRole,
     SessionActiveError,
@@ -928,9 +927,6 @@ class PipelineSession(PipelineSessionMarker, InteractiveChoicePort):
     ) -> None:
         if mode not in ("reader", "writer"):
             raise ValueError("mode must be 'reader' or 'writer'")
-        role = getattr(owner, "_schema_role", None)
-        if role == SchemaRole.CONSUMER and mode == "writer":
-            raise OwnerOnlyOperationError("PipelineSession(mode='writer')")
         self._owner = owner
         self._session_mode = mode
         self._visible_objects = visible_objects
@@ -2174,9 +2170,15 @@ class PipelineSession(PipelineSessionMarker, InteractiveChoicePort):
                         if adir:
                             MainSpaceOps.reload_reader_learning_if_manifest_drift(self._owner)
                         return _run_turn()
+                    consumer_writer = self._session_schema_role() == SchemaRole.CONSUMER
                     if lock is not None and adir:
                         with lock:
-                            MainSpaceOps.drain_write_queue(self._owner, adir)
+                            MainSpaceOps.drain_write_queue(
+                                self._owner,
+                                adir,
+                                space_uid=self._space_name if consumer_writer else None,
+                                consumer_writer=consumer_writer,
+                            )
                     return _run_turn()
         finally:
             pop_turn_timing(*turn_timing_tokens)
@@ -2230,7 +2232,13 @@ class PipelineSession(PipelineSessionMarker, InteractiveChoicePort):
                 if self._session_mode == "writer" and lock is not None:
                     with lock:
                         if adir:
-                            MainSpaceOps.drain_write_queue(self._owner, adir)
+                            consumer_writer = self._session_schema_role() == SchemaRole.CONSUMER
+                            MainSpaceOps.drain_write_queue(
+                                self._owner,
+                                adir,
+                                space_uid=self._space_name if consumer_writer else None,
+                                consumer_writer=consumer_writer,
+                            )
                 with llm_usage_session_scope():
                     _resume_work()
         except PipelineSuspended as ex2:

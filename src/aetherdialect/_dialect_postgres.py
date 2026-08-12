@@ -266,9 +266,7 @@ class PostgresDialect(Dialect):
             try:
                 _pgl_runtime = _PgLastRuntime()
             except ImportError as exc:
-                raise ImportError(
-                    "PostgresDialect requires the 'pglast' package. Install with: pip install aetherdialect[postgresql]"
-                ) from exc
+                raise ImportError("PostgresDialect requires the 'pglast' package (optional postgresql extra).") from exc
         return _pgl_runtime
 
     @staticmethod
@@ -435,9 +433,7 @@ class PostgresDialect(Dialect):
         try:
             self.require_pglast()
         except ImportError as e:
-            raise ImportError(
-                "PostgresDialect requires the 'pglast' package. Install with: pip install aetherdialect[postgresql]"
-            ) from e
+            raise ImportError("PostgresDialect requires the 'pglast' package (optional postgresql extra).") from e
         super().__init__(config)
         pg_config = cast(PostgresRuntimeConfig, config)
         pool_kwargs = sqlalchemy_pool_kwargs_from_limits(limits or EngineLimits())

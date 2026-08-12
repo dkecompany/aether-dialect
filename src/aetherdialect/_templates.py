@@ -3394,7 +3394,7 @@ class TemplateStoreLifecycleOps:
             TemplateStoreLifecycleOps.ensure_template_store_space_layout(adir)
             store_dir = TemplateStoreLifecycleOps.template_store_dir_for_space(adir, space_name)
 
-        with artifact_lock(adir):
+        with artifact_lock(store_dir):
             return TemplateStoreLifecycleOps._load_template_store_locked(store_dir, adir, schema_graph_id, schema)
 
     @staticmethod
@@ -3672,7 +3672,7 @@ class TemplateStoreLifecycleOps:
         if TemplateStoreLifecycleOps._prune_template_store_size(store):
             debug("[templates.save_template_store] pruned store to policy limits")
         adir = TemplateStoreLifecycleOps.artifacts_dir_for_template_store(store_dir)
-        with artifact_lock(adir):
+        with artifact_lock(store_dir):
             disk = TemplateStoreLifecycleOps._load_partitioned_view_unlocked(store_dir)
             if disk is None:
                 disk = TemplateStoreView.empty(store_dir, str(store.schema_graph_id or ""))

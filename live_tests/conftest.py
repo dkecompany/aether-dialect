@@ -107,11 +107,10 @@ def _session_includes_live_tests(session: pytest.Session) -> bool:
 _LIVE_RUN_ARTIFACTS_READY = False
 
 
-def pytest_collection_finish(session: pytest.Session) -> None:
-    """Allocate live invoice/results only when selected items are under ``live_tests/``."""
+def _ensure_live_run_artifacts() -> None:
+    """Allocate results/invoice files once for a live execution session (not collect-only)."""
     global _results_trace_pending_sep, _LIVE_RUN_ARTIFACTS_READY
-    if not _session_includes_live_tests(session):
-        _LIVE_RUN_ARTIFACTS_READY = False
+    if _LIVE_RUN_ARTIFACTS_READY:
         return
     _results_trace_pending_sep = False
     chosen = allocate_run_artifact_path(_RESULTS_BASE)
@@ -123,6 +122,17 @@ def pytest_collection_finish(session: pytest.Session) -> None:
     _LIVE_RUN_ARTIFACTS_READY = True
     print(f"Live tests results: {chosen.resolve()}", flush=True)
     print(f"Live tests invoice: {invoice.resolve()}", flush=True)
+
+
+def pytest_collection_finish(session: pytest.Session) -> None:
+    """Skip results/invoice allocation on collect-only; live runs allocate on first setup."""
+    global _LIVE_RUN_ARTIFACTS_READY
+    if not _session_includes_live_tests(session):
+        _LIVE_RUN_ARTIFACTS_READY = False
+        return
+    if bool(getattr(session.config.option, "collectonly", False)):
+        _LIVE_RUN_ARTIFACTS_READY = False
+        return
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
@@ -158,6 +168,8 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[Any]) -> No
 
 def pytest_runtest_setup(item: Any) -> None:
     _ = item
+    if _session_includes_live_tests(item.session):
+        _ensure_live_run_artifacts()
 
 
 @pytest.fixture(autouse=True)

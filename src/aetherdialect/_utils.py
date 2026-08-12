@@ -485,13 +485,17 @@ def release_construction_orphan_identity(token: Token[EngineIdentity | None]) ->
 
 
 def require_driver(engine_name: str) -> None:
-    """Import the driver for *engine_name* or raise :class:`ConfigError` with install guidance."""
+    """Import the driver for *engine_name* or raise :class:`ConfigError` naming the missing package."""
     spec = ENGINE_DRIVER_REQUIREMENTS.get(str(engine_name).strip().lower())
     if spec is None:
         return
-    import_names, _distribution, extra_name = spec
+    import_names, distribution, _extra_name = spec
     if isinstance(import_names, str):
         import_names = (import_names,)
+    if isinstance(distribution, str):
+        distribution_label = distribution
+    else:
+        distribution_label = " or ".join(distribution)
     last_exc: ImportError | None = None
     for import_name in import_names:
         try:
@@ -499,10 +503,10 @@ def require_driver(engine_name: str) -> None:
             return
         except ImportError as exc:
             last_exc = exc
-    driver_label = " or ".join(import_names)
-    if len(import_names) > 1:
-        raise ConfigError(f"pip install aetherdialect[{extra_name}] (requires {driver_label})") from last_exc
-    raise ConfigError(f"pip install aetherdialect[{extra_name}]") from last_exc
+    raise ConfigError(
+        f"Missing required package for engine {engine_name!r}: {distribution_label}. "
+        "See Getting started / API reference for optional extras."
+    ) from last_exc
 
 
 _ACTIVE_ENGINE_LIMITS: ContextVar[EngineLimits | None] = ContextVar("aetherdialect_active_engine_limits", default=None)

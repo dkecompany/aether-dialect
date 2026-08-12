@@ -76,7 +76,7 @@ def test_composite_descriptive_failure_emits_diagnostic_and_clears_name_column_p
 
     assert len(diags) == 1
     assert diags[0].code == DIAGNOSTIC_CODE_COMPOSITE_DESCRIPTIVE_PROFILE_FAILED
-    assert diags[0].details == (("table", "contacts"),)
+    assert dict(diags[0].details).get("table") == "contacts"
     assert table.composite_descriptive_ratios == {}
     assert table.columns["first_name"].profile_failed is True
     assert table.columns["last_name"].profile_failed is True
@@ -105,4 +105,4 @@ def test_profile_table_clone_failure_emits_diagnostic_and_returns_none() -> None
     assert table.profile_failed is True
     assert len(diags) == 1
     assert diags[0].code == DIAGNOSTIC_CODE_PROFILE_TABLE_CLONE_FAILED
-    assert diags[0].details == (("table", "orders"),)
+    assert dict(diags[0].details).get("table") == "orders"

@@ -47,11 +47,12 @@ def _make_engine(*, role: str = "owner", graph_id: str = "sg_test000000000001__a
 
 
 class TestOwnerConsumerGate:
-    def test_consumer_writer_session_raises(self) -> None:
+    def test_consumer_writer_session_allowed(self) -> None:
         t = _make_engine(role="consumer")
-        with pytest.raises(OwnerOnlyOperationError, match="writer"):
-            with t.session(mode="writer"):
-                pass
+        with t.session(mode="writer") as sess:
+            assert isinstance(sess, PipelineSession)
+            assert sess.visible_objects is None
+            assert sess.execution_visible_objects == frozenset({"a"})
 
     def test_consumer_reader_session_allowed(self) -> None:
         t = _make_engine(role="consumer")

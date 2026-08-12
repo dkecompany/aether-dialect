@@ -804,8 +804,8 @@ class SqlalchemyExecutionMixin:
 
         if importlib.util.find_spec("duckdb_engine") is None:
             raise ConfigError(
-                "DuckDB SQLAlchemy URLs require the 'duckdb-engine' package. "
-                "Install with: pip install aetherdialect[sandbox]"
+                "DuckDB SQLAlchemy support requires the 'duckdb-engine' package, "
+                "which is part of the base aetherdialect install."
             )
 
     @staticmethod
@@ -1201,7 +1201,7 @@ class SqlglotEngineDialect(SqlglotParseMixin, SqlalchemyExecutionMixin, Dialect)
 
     def profile_schema_dispatch(self, sg: SchemaGraph) -> None:
         """Profile tables using the active native backend chain with SQLAlchemy fallback."""
-        super().profile_schema_dispatch(sg)
+        SqlglotEngineDialect.profile_schema_native_dispatch(self, sg)
 
     def apply_execute_cost_limits(self, target: Any) -> None:
         """Apply engine-specific execute-time cost caps to a driver handle or job config."""
@@ -2863,6 +2863,3 @@ class OracleResultBackend(SqlAlchemyResultBackend):
         self, sql: str, params: dict[str, Any] | None = None, *, timeout_ms: int | None = None
     ) -> list[tuple[Any, ...]]:
         return super().fetch_rows(sql, params, timeout_ms=timeout_ms)
-
-
-Dialect.register_profile_schema_native_dispatch(SqlglotEngineDialect.profile_schema_native_dispatch)

@@ -3329,7 +3329,7 @@ def _fk_edge_matches(
     return False
 
 
-def _fk_points_to_parent(child_tbl: str, parent_tbl: str, cols_on_child: list[str], schema: SchemaGraph | None) -> bool:
+def fk_points_to_parent(child_tbl: str, parent_tbl: str, cols_on_child: list[str], schema: SchemaGraph | None) -> bool:
     if schema is None:
         return False
     child_cols_norm = [c.strip() for c in cols_on_child if c.strip()]

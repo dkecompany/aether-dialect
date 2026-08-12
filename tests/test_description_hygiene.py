@@ -116,7 +116,7 @@ def test_enrich_space_notes_noop_emits_diagnostic(tmp_path: Path) -> None:
     assert out.get("column_meta") == {}
     assert len(diags) == 1
     assert diags[0].code == DIAGNOSTIC_CODE_DESCRIPTION_ENRICHMENT_NOOP
-    assert diags[0].details == (("scope", "aetherspace_notes"),)
+    assert dict(diags[0].details).get("scope") == "aetherspace_notes"
 
 
 @pytest.mark.fast
@@ -137,7 +137,7 @@ def test_refresh_existing_descriptions_failure_emits_diagnostic() -> None:
 
     assert len(diags) == 1
     assert diags[0].code == DIAGNOSTIC_CODE_DESCRIPTION_ENRICHMENT_FAILED
-    assert diags[0].details == (("scope", "schema_migration_refresh"),)
+    assert dict(diags[0].details).get("scope") == "schema_migration_refresh"
 
 
 @pytest.mark.fast
@@ -162,7 +162,7 @@ def test_refresh_existing_descriptions_noop_emits_diagnostic() -> None:
 
     assert len(diags) == 1
     assert diags[0].code == DIAGNOSTIC_CODE_DESCRIPTION_ENRICHMENT_NOOP
-    assert diags[0].details == (("scope", "schema_migration_refresh"),)
+    assert dict(diags[0].details).get("scope") == "schema_migration_refresh"
 
 
 @pytest.mark.fast

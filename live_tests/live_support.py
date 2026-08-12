@@ -494,6 +494,7 @@ def isolated_runner(schema: Any, schema_terms: set[str], t2s: Any, *, label: str
             rejected={},
             schema_terms=set(schema_terms),
             csv_dir=t2s._artifacts_dir,
+            dialect=getattr(t2s, "_dialect", None),
         )
         _instrument_runner(runner)
         yield runner

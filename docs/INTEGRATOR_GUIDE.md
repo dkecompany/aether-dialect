@@ -260,7 +260,7 @@ Method table: [API reference — AsyncPipelineSession](API_REFERENCE.md#asyncpip
 
 More than one process can share one artifacts directory when you split write responsibility:
 
-- **Writer** (`mode="writer"`, default): persists learning. Writer-mode turns drain `write_queue.jsonl` at turn start under the artifacts lock. One active writer per artifacts directory is recommended.
+- **Writer** (`mode="writer"`, default): persists learning into the active space partition under that partition's advisory lock. Writer-mode turns drain `write_queue.jsonl` at turn start under the engine artifacts lock (consumers apply only learning events for their space). Concurrent writers on different spaces use separate partition locks.
 - **Reader** (`mode="reader"`): keeps learning session-local. Readers do not enqueue durable write-queue events.
 
 Mechanism detail: [How it works — Concurrent sessions and durability](HOW_IT_WORKS.md#8-concurrent-sessions-and-durability). Offline demo: [Sandbox guide — Reader/writer sessions](SANDBOX.md#readerwriter-sessions).
@@ -273,13 +273,13 @@ Owner/consumer builds directly on the reader/writer split and the shared artifac
 
 Pattern for **any supported database engine**:
 
-1. **Owner writer** — one process with `role="owner"`, `mode="writer"`, full `EngineContext`, and durable `artifacts_dir` on shared storage. Builds the default graph and persists learning.
-2. **Consumer readers** — processes with `role="consumer"`, restricted database credentials, and `mode="reader"`. On open the library loads the owner `schema_graph.json.gz`, runs a cheap SQL privilege probe, and builds a credential **subset** working graph.
+1. **Owner writer** — one process with `role="owner"`, `mode="writer"`, full `EngineContext`, and durable `artifacts_dir` on shared storage. Builds the default graph and persists learning; owns structural APIs.
+2. **Consumer writers or readers** — processes with `role="consumer"`, restricted database credentials. On open the library loads the owner `schema_graph.json.gz`, runs a cheap SQL privilege probe, and builds a credential **subset** working graph. `mode="writer"` persists template/feedback learning into the active space partition only; `mode="reader"` keeps learning session-local. Structural define/apply APIs stay owner-only.
 3. **Credential-default AetherSpace** — the library auto-ensures a notes-free system space for the caller's selectable grant fingerprint and defaults `session()` to that space for consumers (`default_space_uid`). Product catalogs must omit it: `list_aetherspaces()` excludes it unless `include_system=True`.
 4. **Align scope** — `EngineContext.allow_objects` / `allow_columns` (or `FederationContext` on a composite) intersect credential visibility on security gates. Security RBAC is context ∩ credentials ∩ non-HIDDEN. A space narrows which objects a turn may reference and refuses questions that reach past it, and it is not a permission boundary because it can neither be defined nor entered beyond what credentials already permit.
 5. **User AetherSpaces** — further narrow model focus per team or product surface; create scope must stay ⊆ effective visibility (owner-only create).
 
-Readers share the owner's artifacts directory but never mutate it directly.
+Consumers share the owner's artifacts directory. Writer consumers mutate only their space learning partition; they never call owner-only structural APIs.
 
 ```python
 owner = AetherEngine(
@@ -294,7 +294,7 @@ consumer = AetherEngine(
     config_file="./aetherdialect.toml",
     role="consumer",
 )
-with consumer.session(mode="reader") as session:
+with consumer.session(mode="writer") as session:
     session.accept_until_done("How many orders last month?")
 ```
 

@@ -64,7 +64,7 @@ import aetherdialect
 
 
 @pytest.mark.fast
-def test_federation_construction_names_the_extra(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_federation_construction_requires_duckdb() -> None:
     real_import = builtins.__import__
 
     def _blocked_import(name: str, *args: object, **kwargs: object) -> object:
@@ -73,7 +73,7 @@ def test_federation_construction_names_the_extra(monkeypatch: pytest.MonkeyPatch
         return real_import(name, *args, **kwargs)
 
     with patch("builtins.__import__", side_effect=_blocked_import):
-        with pytest.raises(ConfigError, match=r"pip install aetherdialect\[(federation|duckdb)\]"):
+        with pytest.raises(ConfigError, match=r"duckdb"):
             AetherFederation(
                 "fed",
                 members=(object(), object()),

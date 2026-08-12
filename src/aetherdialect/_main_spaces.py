@@ -138,6 +138,7 @@ from ._schema_profile import (
     llm_enrich_schema_from_structural_knowledge,
     out_of_scope_description_tokens,
     raise_if_flat_descriptions_name_out_of_scope_entities,
+    sanitize_description_text,
 )
 from ._schema_reflect import (
     resolve_federation_qualified_ref,
@@ -147,6 +148,7 @@ from ._templates import LazyTemplateMapping, TemplateStoreView
 from ._templates_ops import TemplateOps
 from ._utils import (
     debug,
+    description_neutrality_violations,
     format_versions_match,
     load_domain_knowledge_artifact,
     norm_schema_identifier,
@@ -2122,7 +2124,7 @@ class MainSpaceOps:
         notes: str | None = None,
         engine_domain_knowledge: Sequence[DomainKnowledgeEntry] | None = None,
     ) -> dict[str, Any]:
-        """Attach space/master knowledge and scope descriptions for the space subset. Space notes are optional. When absent, master structural knowledge and domain knowledge are carried through without merging. When only one side has knowledge, that side is final. Merge runs only when both sides contribute. Description scoping always runs when LLM credentials are configured: with space notes, start from profile base descriptions; without space notes, inherit master notes-enriched prose when present, otherwise profile base — then remove out-of-scope mentions."""
+        """Attach space/master knowledge and scope descriptions for the space subset. Space notes are optional. When absent, master structural knowledge and domain knowledge are carried through without merging. When only one side has knowledge, that side is final. Merge runs only when both sides contribute. Description scoping always runs: with space notes, start from profile base descriptions; without space notes, inherit master notes-enriched prose when present, otherwise profile base — then scrub out-of- scope mentions before persist. User notes that name out-of-scope identifiers raise."""
         if notes is not None and notes_file is not None:
             raise ConfigError("set at most one of notes and notes_file")
         notes_content: str | None = None
@@ -2160,55 +2162,76 @@ class MainSpaceOps:
         out["domain_knowledge"] = [MainSpaceOps._domain_knowledge_entry_to_dict(e) for e in final_dk]
         out["domain_knowledge_digest"] = DomainKnowledgeState.digest_for(final_dk)
         out["structural_knowledge"] = [f.to_dict() for f in final_structural]
-        if not EngineConfig.llm_credentials_configured():
-            return out
-        has_master_notes = MainSpaceOps._master_graph_has_notes_enrichment(master_graph, engine_dk)
-        prefer_base = True if has_space_notes else (not has_master_notes)
-        classifications = llm_enrich_schema_from_structural_knowledge(
-            subset_sg,
-            final_structural,
-            prefer_base_descriptions=prefer_base,
-        )
-        table_descriptions = dict(out.get("table_descriptions") or {})
-        column_meta = dict(out.get("column_meta") or {})
-        scope_cols = frozenset(str(c) for c in (out.get("columns") or ()))
-        enriched_any = False
-        description_owner = DescriptionOwner.SPACE_NOTES if has_space_notes else DescriptionOwner.LLM_REFINEMENT
-        for tname in out.get("tables") or ():
-            if tname not in classifications:
-                continue
-            _table_role, desc, col_classes = classifications[tname]
-            if desc and str(desc).strip():
-                table_descriptions[str(tname)] = str(desc).strip()
-                enriched_any = True
-            tm = subset_sg.tables.get(str(tname))
-            if tm is None:
-                continue
-            for col_name, (_col_role, col_description, sensitivity) in col_classes.items():
-                if col_name not in tm.columns:
-                    continue
-                qc = f"{tname}.{col_name}"
-                if scope_cols and qc not in scope_cols:
-                    continue
-                entry = dict(column_meta.get(qc) or {})
-                if col_description and str(col_description).strip():
-                    entry["description"] = str(col_description).strip()
-                    entry["description_owner"] = description_owner.value
-                    enriched_any = True
-                if sensitivity is not None and str(sensitivity) not in ("", "none"):
-                    entry["sensitivity"] = str(sensitivity)
-                if entry:
-                    column_meta[qc] = entry
-        if table_descriptions:
-            out["_table_description_owners"] = {str(t): description_owner.value for t in table_descriptions}
-        out["table_descriptions"] = table_descriptions
-        out["column_meta"] = column_meta
         verify_scope = KnowledgeScope.from_visible_tables(master_graph, space_table_names or None)
         verify_tokens = out_of_scope_description_tokens(master_graph, verify_scope)
+        if notes_text:
+            note_hits = description_neutrality_violations(notes_text, verify_tokens)
+            if note_hits:
+                raise ConfigError(f"aetherspace notes name an out-of-scope identifier: {note_hits[0]!r}")
+        table_descriptions = dict(out.get("table_descriptions") or {})
+        column_meta = dict(out.get("column_meta") or {})
+        enriched_any = False
+        if EngineConfig.llm_credentials_configured():
+            has_master_notes = MainSpaceOps._master_graph_has_notes_enrichment(master_graph, engine_dk)
+            prefer_base = True if has_space_notes else (not has_master_notes)
+            classifications = llm_enrich_schema_from_structural_knowledge(
+                subset_sg,
+                final_structural,
+                prefer_base_descriptions=prefer_base,
+            )
+            scope_cols = frozenset(str(c) for c in (out.get("columns") or ()))
+            description_owner = DescriptionOwner.SPACE_NOTES if has_space_notes else DescriptionOwner.LLM_REFINEMENT
+            for tname in out.get("tables") or ():
+                if tname not in classifications:
+                    continue
+                _table_role, desc, col_classes = classifications[tname]
+                if desc and str(desc).strip():
+                    table_descriptions[str(tname)] = str(desc).strip()
+                    enriched_any = True
+                tm = subset_sg.tables.get(str(tname))
+                if tm is None:
+                    continue
+                for col_name, (_col_role, col_description, sensitivity) in col_classes.items():
+                    if col_name not in tm.columns:
+                        continue
+                    qc = f"{tname}.{col_name}"
+                    if scope_cols and qc not in scope_cols:
+                        continue
+                    entry = dict(column_meta.get(qc) or {})
+                    if col_description and str(col_description).strip():
+                        entry["description"] = str(col_description).strip()
+                        entry["description_owner"] = description_owner.value
+                        enriched_any = True
+                    if sensitivity is not None and str(sensitivity) not in ("", "none"):
+                        entry["sensitivity"] = str(sensitivity)
+                    if entry:
+                        column_meta[qc] = entry
+            if table_descriptions:
+                out["_table_description_owners"] = {str(t): description_owner.value for t in table_descriptions}
+        scrubbed_tables: dict[str, str] = {}
+        for tname, desc in table_descriptions.items():
+            cleaned = sanitize_description_text(str(desc or ""), verify_tokens)
+            if cleaned:
+                scrubbed_tables[str(tname)] = cleaned
+        scrubbed_meta: dict[str, dict[str, Any]] = {}
+        for qc, meta in column_meta.items():
+            entry = dict(meta) if isinstance(meta, Mapping) else {}
+            raw_desc = entry.get("description")
+            if raw_desc is not None and str(raw_desc).strip():
+                cleaned_col = sanitize_description_text(str(raw_desc), verify_tokens)
+                if cleaned_col:
+                    entry["description"] = cleaned_col
+                else:
+                    entry.pop("description", None)
+                    entry.pop("description_owner", None)
+            if entry:
+                scrubbed_meta[str(qc)] = entry
+        out["table_descriptions"] = scrubbed_tables
+        out["column_meta"] = scrubbed_meta
         raise_if_flat_descriptions_name_out_of_scope_entities(
-            table_descriptions, column_meta, verify_tokens, context="aetherspace description"
+            scrubbed_tables, scrubbed_meta, verify_tokens, context="aetherspace description"
         )
-        if not enriched_any and notes_text:
+        if EngineConfig.llm_credentials_configured() and not enriched_any and notes_text:
             emit_description_enrichment_noop("aetherspace_notes")
         return out
 
@@ -3740,7 +3763,12 @@ class MainSpaceOps:
 
     @staticmethod
     def _drain_write_queue_at_path(
-        owner: Any, artifacts_dir: str, *, target: _WriteQueueDrainTarget | None = None
+        owner: Any,
+        artifacts_dir: str,
+        *,
+        target: _WriteQueueDrainTarget | None = None,
+        space_uid: str | None = None,
+        consumer_writer: bool = False,
     ) -> int:
         """Drain one artifact tree's write queue under the artifact lock."""
         path = os.path.join(artifacts_dir, WRITE_QUEUE_FILENAME)
@@ -3777,6 +3805,7 @@ class MainSpaceOps:
             store_checkpoints: dict[int, Any] = {}
             store_spaces: dict[int, str] = {}
             pending_suffix: list[str] = []
+            deferred_lines: list[str] = []
             for idx, raw_line in enumerate(raw_lines):
                 stripped = raw_line.strip()
                 if not stripped:
@@ -3801,6 +3830,13 @@ class MainSpaceOps:
                     )
                     continue
                 event_space = explicit_space
+                if consumer_writer:
+                    if evt.kind == "override_proposal":
+                        deferred_lines.append(raw_line if raw_line.endswith("\n") else raw_line + "\n")
+                        continue
+                    if space_uid is not None and event_space != space_uid:
+                        deferred_lines.append(raw_line if raw_line.endswith("\n") else raw_line + "\n")
+                        continue
                 if target is not None and evt.schema_graph_id == str(
                     getattr(target.schema_graph, "schema_graph_id", "") or ""
                 ):
@@ -3857,22 +3893,41 @@ class MainSpaceOps:
                                 break
                     return 0
             with open(path, "wb") as out:
+                if deferred_lines:
+                    out.write("".join(deferred_lines).encode("utf-8"))
                 if pending_suffix:
                     out.write("".join(pending_suffix).encode("utf-8"))
                 out.write(tail)
         return applied
 
     @staticmethod
-    def drain_write_queue(owner: Any, artifacts_dir: str) -> int:
+    def drain_write_queue(
+        owner: Any,
+        artifacts_dir: str,
+        *,
+        space_uid: str | None = None,
+        consumer_writer: bool = False,
+    ) -> int:
         """Drain deferred reader events under the artifact lock; returns the number of events applied."""
-        applied = MainSpaceOps._drain_write_queue_at_path(owner, artifacts_dir)
+        applied = MainSpaceOps._drain_write_queue_at_path(
+            owner,
+            artifacts_dir,
+            space_uid=space_uid,
+            consumer_writer=consumer_writer,
+        )
         seen_dirs = {os.path.abspath(os.fspath(artifacts_dir))}
         for member_dir, member_target in MainSpaceOps._federation_member_write_queue_targets(owner):
             member_abs = os.path.abspath(os.fspath(member_dir))
             if member_abs in seen_dirs:
                 continue
             seen_dirs.add(member_abs)
-            applied += MainSpaceOps._drain_write_queue_at_path(owner, member_dir, target=member_target)
+            applied += MainSpaceOps._drain_write_queue_at_path(
+                owner,
+                member_dir,
+                target=member_target,
+                space_uid=space_uid,
+                consumer_writer=consumer_writer,
+            )
         return applied
 
     @staticmethod

@@ -18,7 +18,7 @@ from dataclasses import dataclass, replace
 from importlib import resources
 from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 if TYPE_CHECKING:
     from aetherdialect._main_session import PipelineSession
@@ -75,7 +75,6 @@ from aetherdialect._contracts_base import (
     FederationContext,
     MigrationPendingError,
     NormalizedExpr,
-    OwnerOnlyOperationError,
     PredicateGroup,
     SandboxBuildSection,
     SandboxLlmMode,
@@ -373,9 +372,10 @@ class _SandboxPendingMethods:
 
     @staticmethod
     def _aether_federation_cls() -> type[Any]:
-        """Resolve ``AetherFederation`` without a circular import at ``_sandbox`` load time."""
-        mod = importlib.import_module("aetherdialect.aetherdialect")
-        return cast(type[Any], mod.AetherFederation)
+        """Return the bound ``AetherFederation`` facade type."""
+        if Sandbox._FEDERATION_CLS is None:
+            raise RuntimeError("AetherFederation facade is not bound; import aetherdialect first")
+        return Sandbox._FEDERATION_CLS
 
     @staticmethod
     def _federation_partition_tables_from_bundle(extract_path: Path, source_id: str) -> frozenset[str]:
@@ -2199,11 +2199,8 @@ class _SandboxCorpusMethods:
             role=SchemaRole.CONSUMER,
             engine_context=catalog_ctx,
         ) as sb:
-            try:
-                with sb.engine.session(mode="writer"):
-                    pass
-            except OwnerOnlyOperationError:
-                print("  OwnerOnlyOperationError on consumer writer")
+            with sb.engine.session(mode="writer"):
+                print("  consumer writer session opened for space-partition learning")
 
     @staticmethod
     def _recipe_column_security(engine_cls: type[Any]) -> None:
@@ -2355,6 +2352,9 @@ class _SandboxCorpusMethods:
 
 class Sandbox(_SandboxPendingMethods, _SandboxNormalizeHelpers, _SandboxCorpusMethods):
     """Authoring environment: seeded in-memory databases, shared artifacts, and production-shaped engines."""
+
+    _ENGINE_CLS: ClassVar[type[Any] | None] = None
+    _FEDERATION_CLS: ClassVar[type[Any] | None] = None
 
     __slots__ = (
         "_artifacts_dir",
@@ -2855,8 +2855,16 @@ class Sandbox(_SandboxPendingMethods, _SandboxNormalizeHelpers, _SandboxCorpusMe
 
     @staticmethod
     def _aether_engine_cls() -> type[Any]:
-        mod = importlib.import_module("aetherdialect.aetherdialect")
-        return cast(type[Any], mod.AetherEngine)
+        """Return the bound ``AetherEngine`` facade type."""
+        if Sandbox._ENGINE_CLS is None:
+            raise RuntimeError("AetherEngine facade is not bound; import aetherdialect first")
+        return Sandbox._ENGINE_CLS
+
+    @classmethod
+    def bind_facade_types(cls, engine_cls: type[Any], federation_cls: type[Any]) -> None:
+        """Bind facade classes from ``aetherdialect`` after they are defined (one-way wiring)."""
+        cls._ENGINE_CLS = engine_cls
+        cls._FEDERATION_CLS = federation_cls
 
     @staticmethod
     def _mark_sandbox_managed_connection(connection: Any, sandbox: Sandbox) -> None:
@@ -2874,14 +2882,30 @@ class Sandbox(_SandboxPendingMethods, _SandboxNormalizeHelpers, _SandboxCorpusMe
 
     @staticmethod
     def require_sandbox_adoption(engine: Any) -> None:
-        """Raise when *engine* uses a sandbox connection but has not been adopted."""
-        connection = getattr(engine, "_native_connection", None)
-        if connection is None:
+        """Ensure sandbox-hosted engines are adopted before ``session()``."""
+        Sandbox.maybe_auto_adopt(engine)
+
+    @staticmethod
+    def maybe_auto_adopt(engine: Any) -> None:
+        """Adopt *engine* when it uses a sandbox-hosted connection and is not yet adopted."""
+        if getattr(engine, "_sandbox_mode", False):
             return
-        if Sandbox.sandbox_host_for_connection(connection) is not None and not getattr(engine, "_sandbox_mode", False):
-            raise ConfigError(
-                "This engine uses a Sandbox connection but has not been adopted; call sandbox.adopt(engine) before session().",
-            )
+        connection = getattr(engine, "_native_connection", None)
+        host: Sandbox | None = None
+        if connection is not None:
+            host = Sandbox.sandbox_host_for_connection(connection)
+        if host is None:
+            members = getattr(engine, "_members", None)
+            if isinstance(members, Mapping):
+                for member in members.values():
+                    member_conn = getattr(member, "_native_connection", None)
+                    if member_conn is None:
+                        continue
+                    host = Sandbox.sandbox_host_for_connection(member_conn)
+                    if host is not None:
+                        break
+        if host is not None:
+            host.adopt(engine)
 
     @staticmethod
     def _sandbox_questions_from_path(extract_path: Path) -> tuple[str, ...]:

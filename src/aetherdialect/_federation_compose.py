@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import copy
 import hashlib
-import importlib
 import json
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -110,6 +109,7 @@ from ._utils import (
     pipeline_trace,
     structural_hash_fp,
 )
+from ._validation_shape import fk_points_to_parent
 
 
 def scrub_federation_member_description_source_tokens(
@@ -763,7 +763,7 @@ def _join_endpoint_is_many_side_of_fk(
     schema: SchemaGraph, table_name: str, column_name: str, peer_table_name: str
 ) -> bool:
     """Return True when *column_name* on *table_name* references *peer_table_name* as parent."""
-    if _fk_points_to_parent(schema, table_name, peer_table_name, [column_name]):
+    if fk_points_to_parent(table_name, peer_table_name, [column_name], schema):
         return True
     table = schema.tables.get(table_name)
     if table is None:
@@ -775,11 +775,6 @@ def _join_endpoint_is_many_side_of_fk(
     if column is not None and column.fk_target and column.fk_target[0] == peer_table_name:
         return True
     return False
-
-
-def _fk_points_to_parent(schema: SchemaGraph, child_tbl: str, parent_tbl: str, cols_on_child: list[str]) -> bool:
-    validation_schema = importlib.import_module("aetherdialect._validation_shape")
-    return cast(bool, validation_schema._fk_points_to_parent(child_tbl, parent_tbl, cols_on_child, schema))
 
 
 def _validate_cross_source_inner_join_keys(

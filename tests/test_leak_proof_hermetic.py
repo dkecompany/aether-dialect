@@ -350,8 +350,8 @@ def test_cross_space_partition_read_guard_session_cannot_list_other_space_templa
 
 
 @pytest.mark.fast
-def test_post_define_rescoping_rejects_out_of_scope_description_text() -> None:
-    """Define-path snapshot enrichment must hard-fail when LLM prose names out-of-scope entities."""
+def test_post_define_rescoping_scrubs_out_of_scope_description_text() -> None:
+    """Define-path snapshot enrichment scrubs LLM prose that names out- of-scope entities."""
     graph = _scope_pair_schema()
     snapshot = MainSpaceOps.subset_graph_for_space(graph, SpaceContext(tables=frozenset({"orders"})))
     space_ctx = SpaceContext(tables=frozenset({"orders"}))
@@ -368,19 +368,39 @@ def test_post_define_rescoping_rejects_out_of_scope_description_text() -> None:
             "aetherdialect._main_spaces.llm_enrich_schema_from_structural_knowledge",
             return_value=bad_classifications,
         ),
+    ):
+        out = MainSpaceOps.enrich_space_snapshot_with_notes(
+            snapshot,
+            graph,
+            space_ctx,
+            notes="space-only notes.\n",
+        )
+    desc = str((out.get("table_descriptions") or {}).get("orders") or "")
+    assert "payroll" not in desc.lower()
+    assert "staff" not in desc.lower()
+
+
+@pytest.mark.fast
+def test_post_define_notes_naming_out_of_scope_raise() -> None:
+    """User-authored space notes that name out-of-scope identifiers hard-fail."""
+    graph = _scope_pair_schema()
+    snapshot = MainSpaceOps.subset_graph_for_space(graph, SpaceContext(tables=frozenset({"orders"})))
+    space_ctx = SpaceContext(tables=frozenset({"orders"}))
+    with (
+        patch("aetherdialect._main_spaces.EngineConfig.llm_credentials_configured", return_value=False),
         pytest.raises(ConfigError, match="out-of-scope identifier"),
     ):
         MainSpaceOps.enrich_space_snapshot_with_notes(
             snapshot,
             graph,
             space_ctx,
-            notes="space-only notes.\n",
+            notes="Orders join the staff table for payroll.\n",
         )
 
 
 @pytest.mark.fast
-def test_post_migration_rescoping_rejects_out_of_scope_description_text(tmp_path: Path) -> None:
-    """Re-enrichment after migration must reject out-of-scope description/DK prose on write."""
+def test_post_migration_rescoping_scrubs_out_of_scope_description_text(tmp_path: Path) -> None:
+    """Re-enrichment after migration scrubs out-of-scope description prose on write."""
     graph = _scope_pair_schema()
     engine_dir = tmp_path / "engine"
     engine_dir.mkdir()
@@ -403,9 +423,12 @@ def test_post_migration_rescoping_rejects_out_of_scope_description_text(tmp_path
             "aetherdialect._main_spaces.llm_enrich_schema_from_structural_knowledge",
             return_value=bad_classifications,
         ),
-        pytest.raises(ConfigError, match="out-of-scope identifier"),
     ):
         MainSpaceOps.reenrich_aetherspace_snapshots_with_notes(str(engine_dir), graph)
+    loaded = MainSpaceOps.load_aetherspace_snapshot(str(engine_dir), uid)
+    assert loaded is not None
+    desc = str((loaded.get("table_descriptions") or {}).get("orders") or "")
+    assert "staff" not in desc.lower()
 
 
 @pytest.mark.fast

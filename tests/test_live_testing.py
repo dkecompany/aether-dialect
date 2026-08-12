@@ -621,9 +621,10 @@ def _make_failing_result() -> StepResult:
 class _StepDeferredRunner:
     """Single-attempt runner returning scripted ``StepResult`` values from ``run_deferred``."""
 
-    def __init__(self, step_results: list[StepResult]) -> None:
+    def __init__(self, step_results: list[StepResult], *, dialect: object | None = None) -> None:
         self._step_results = list(step_results)
         self.run_deferred_calls: list[tuple[Scenario, int]] = []
+        self.dialect = dialect
 
     def run_deferred(self, scenario: Scenario, retries: int = 0) -> StepResult:
         self.run_deferred_calls.append((scenario, retries))
@@ -636,10 +637,11 @@ class _StepDeferredRunner:
 class _DeferredRetryRunner:
     """Root runner with ``clone`` / ``adopt_state_from`` matching ``run_and_assert`` expectations."""
 
-    def __init__(self, attempts: list[list[StepResult]]) -> None:
+    def __init__(self, attempts: list[list[StepResult]], *, dialect: object | None = None) -> None:
         self._attempts = list(attempts)
         self.clone_count = 0
         self.last_attempt: _StepDeferredRunner | None = None
+        self.dialect = dialect
 
     def clone(self) -> _StepDeferredRunner:
         if self.clone_count >= len(self._attempts):
@@ -647,7 +649,7 @@ class _DeferredRetryRunner:
         else:
             seq = self._attempts[self.clone_count]
         self.clone_count += 1
-        self.last_attempt = _StepDeferredRunner(seq)
+        self.last_attempt = _StepDeferredRunner(seq, dialect=self.dialect)
         return self.last_attempt
 
     def adopt_state_from(self, _other: object) -> None:
@@ -688,6 +690,26 @@ class TestRunAndAssert:
         run_and_assert(runner, scenario, header="[T1]", retries=3)
         assert runner.last_attempt is not None
         assert runner.last_attempt.run_deferred_calls == [(scenario, 3)]
+
+    def test_binds_runner_identity_for_join_assert(self, unbound_engine_identity):
+        """Assert + feedback run under the runner dialect identity (not the ambient default)."""
+        _ = unbound_engine_identity
+        from aetherdialect._config import PostgresRuntimeConfig
+        from aetherdialect._dialect import Dialect
+
+        dialect = SimpleNamespace(name="postgresql", config=PostgresRuntimeConfig())
+        result = StepResult(
+            scenario_id="T1",
+            question="test?",
+            status="ok",
+            sql="SELECT * FROM a JOIN b ON a.id = b.id",
+            rows=[(1,)],
+        )
+        runner = _DeferredRetryRunner([[result]], dialect=dialect)
+        scenario = Scenario(id="T1", question="test?", expected=Expected(contains_join=True, min_rows=1))
+        run_and_assert(runner, scenario, header="[T1]")
+        with pytest.raises(RuntimeError, match="no active engine identity"):
+            Dialect.active_sqlglot_dialect()
 
 
 class TestRunSequenceAndAssert:
@@ -810,6 +832,8 @@ class TestAssertScenarioInternalLogsAndImplicitStatus:
 
     def test_live_testing_ops_run_and_assert_surfaces_internal_log_failure(self):
         class _Runner:
+            dialect = None
+
             def clone(self):
                 return self
 

@@ -106,7 +106,7 @@ def run_live_test(runner: LiveTestRunner, scenario: Scenario, retries: int = 0) 
         t0 = time.monotonic()
         try:
             with pipeline_capture(list(auto), scenario.reject_reason, csv_dir=runner.csv_dir) as cap:
-                identity_token = _push_runner_engine_identity(runner.dialect)
+                identity_token = _push_runner_engine_identity(getattr(runner, "dialect", None))
                 try:
                     step = _run_pipeline_core(
                         question=scenario.question,
@@ -153,7 +153,7 @@ def run_live_test_deferred(runner: LiveTestRunner, scenario: Scenario, retries: 
         t0 = time.monotonic()
         try:
             with pipeline_capture(list(auto), scenario.reject_reason, csv_dir=runner.csv_dir) as cap:
-                identity_token = _push_runner_engine_identity(runner.dialect)
+                identity_token = _push_runner_engine_identity(getattr(runner, "dialect", None))
                 try:
                     step = _run_pipeline_core(
                         question=scenario.question,
@@ -338,7 +338,10 @@ def _run_pipeline_core(
                 result.intent = _build_reuse_intent(best_template)
                 return result
 
-    validation = validate_question(raw_question)
+    validation = validate_question(
+        raw_question,
+        table_names=tuple(getattr(schema, "tables", {}) or {}),
+    )
     if not validation.accepted:
         result.status = "restricted" if validation.route == QuestionRoute.RESTRICTED else "invalid_question"
         return result
@@ -909,11 +912,16 @@ def run_and_assert(
                 status="error",
                 error="runner returned no result",
             )
-        last_soft = _assert_scenario(result, scenario.expected)
-        if last_soft.passed:
-            commit_pending_feedback(result)
-            runner.adopt_state_from(attempt_runner)
-            return
+        identity_token = _push_runner_engine_identity(getattr(attempt_runner, "dialect", None))
+        try:
+            last_soft = _assert_scenario(result, scenario.expected)
+            if last_soft.passed:
+                commit_pending_feedback(result)
+                runner.adopt_state_from(attempt_runner)
+                return
+        finally:
+            if identity_token is not None:
+                pop_engine_identity(identity_token)
     if last_soft is not None:
         last_soft.report(header=header)
 
@@ -936,10 +944,15 @@ def run_sequence_and_assert(
                     status="error",
                     error="runner returned no result",
                 )
-            _assert_scenario(result, step_scenario.expected, soft=last_soft)
-            if not last_soft.passed:
-                break
-            commit_pending_feedback(result)
+            identity_token = _push_runner_engine_identity(getattr(attempt_runner, "dialect", None))
+            try:
+                _assert_scenario(result, step_scenario.expected, soft=last_soft)
+                if not last_soft.passed:
+                    break
+                commit_pending_feedback(result)
+            finally:
+                if identity_token is not None:
+                    pop_engine_identity(identity_token)
         if last_soft.passed:
             runner.adopt_state_from(attempt_runner)
             return

@@ -84,6 +84,12 @@ def _sandbox_engine(tmp_path: Path) -> tuple[Sandbox, object]:
         def _domain_knowledge_entries(self) -> object:
             return AetherEngine._domain_knowledge_entries(self)
 
+        def _resolve_aetherspace_visible_by_name(self, name: str) -> object:
+            return AetherEngine._resolve_aetherspace_visible_by_name(self, name)
+
+        def _raise_if_duplicate_aetherspace_name(self, display: str, *, exclude_uid: str | None = None) -> None:
+            return AetherEngine._raise_if_duplicate_aetherspace_name(self, display, exclude_uid=exclude_uid)
+
         def aetherspace(self, *args: object, **kwargs: object) -> object:
             return AetherEngine.aetherspace(self, *args, **kwargs)
 

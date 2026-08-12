@@ -29,17 +29,22 @@ pip install aetherdialect
 ```
 
 ```python
-from aetherdialect import Sandbox
+from aetherdialect import AetherEngine, EngineContext, Sandbox
 
 with Sandbox() as sandbox:
-    engine = sandbox.engine()
+    engine = AetherEngine(
+        EngineContext(),
+        native_connection=sandbox.connection(),
+        artifacts_dir=sandbox.artifacts_dir,
+        config_file=sandbox.config_file,
+    )
     with engine.session() as session:
         step = session.accept_until_done("How many films are there?")
     print(step.sql)
     print(step.data)
 ```
 
-Each `Sandbox()` handle is self-contained. When the `with` block ends, temp extract directories and owned artifacts are deleted. Full sandbox walkthrough: [Sandbox guide](SANDBOX.md).
+This is the same constructor shape as production: `Sandbox()` supplies the DuckDB connection, artifacts root, and throwaway TOML; construction on a sandbox-hosted connection auto-adopts mock fixtures. Each `Sandbox()` handle is self-contained. When the `with` block ends, temp extract directories and owned artifacts are deleted. Full sandbox walkthrough: [Sandbox guide](SANDBOX.md).
 
 ---
 
@@ -61,7 +66,7 @@ There is no separate `excel` engine. CSV and Excel (`.xlsx`) uploads both use th
 | Engine | `pip install` | TOML `selected` | TOML section | Upload suffixes |
 | --- | --- | --- | --- | --- |
 | SQLite | `pip install aetherdialect` (stdlib driver; no extra) | `sqlite` | `[sqlite]` | - |
-| DuckDB | `aetherdialect[duckdb]` | `duckdb` | `[duckdb]` | - |
+| DuckDB | `pip install aetherdialect` (core; no extra) | `duckdb` | `[duckdb]` | - |
 | CSV / Excel | `aetherdialect[csv]` | `csv` | `[csv]` | `.csv` and `.xlsx` |
 | MySQL | `aetherdialect[mysql]` | `mysql` | `[mysql]` | - |
 | MariaDB | `aetherdialect[mariadb]` | `mariadb` | `[mariadb]` | - |

@@ -75,32 +75,25 @@ def _engine(tmp_path: Path) -> AetherEngine:
 
 
 @pytest.mark.fast
-def test_duplicate_display_names_mint_distinct_uids(tmp_path: Path) -> None:
+def test_duplicate_display_names_raise(tmp_path: Path) -> None:
     engine = _engine(tmp_path)
     a = engine.aetherspace("analytics", SpaceContext(tables=frozenset({"film"})))
-    b = engine.aetherspace("analytics", SpaceContext(tables=frozenset({"customer"})))
-    assert a.name == "analytics"
-    assert b.name == "analytics"
-    assert a.uid != b.uid
+    with pytest.raises(ConfigError, match="duplicate aetherspace name"):
+        engine.aetherspace("analytics", SpaceContext(tables=frozenset({"customer"})))
     assert a.uid.startswith("S")
-    assert b.uid.startswith("S")
     listed = engine.list_aetherspaces()
     names = [s.name for s in listed if s.uid != "master"]
-    assert names.count("analytics") == 2
-    uids = {s.uid for s in listed}
-    assert a.uid in uids and b.uid in uids
+    assert names.count("analytics") == 1
 
 
 @pytest.mark.fast
 def test_session_by_uid_and_ambiguous_name(tmp_path: Path) -> None:
     engine = _engine(tmp_path)
     a = engine.aetherspace("analytics", SpaceContext(tables=frozenset({"film"})))
-    engine.aetherspace("analytics", SpaceContext(tables=frozenset({"customer"})))
     with engine.session(mode="reader", space=a.uid) as session:
         assert session.space_name == a.uid
-    with pytest.raises(ConfigError, match="ambiguous aetherspace name"):
-        with engine.session(mode="reader", space="analytics"):
-            pass
+    with engine.session(mode="reader", space="analytics") as session:
+        assert session.space_name == a.uid
     unique = engine.aetherspace("solo", SpaceContext(tables=frozenset({"film"})))
     with engine.session(mode="reader", space="solo") as session:
         assert session.space_name == unique.uid

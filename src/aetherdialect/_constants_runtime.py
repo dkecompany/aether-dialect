@@ -185,7 +185,8 @@ INTERPRET_SUPPORTED_CAPABILITIES: tuple[str, ...] = (
     "Infer whether the question needs row-level output, grouped output, a scalar answer, staged intermediate computation, a windowed comparison, or a conditional bucketed result.",
     "Recognize existence, absence, set difference, one-row-per-partition, and outer-join preservation needs and describe them in plain language without SQL operators.",
     "Use only the domain schema descriptions and enum heads to ground domain concepts; capture any missing or ambiguous binding as internal planning uncertainty rather than refusing.",
-    "Record grounding traceability for tables, enum values, and filter, having, or group_by constraints only; do not enumerate select output columns in grounding.",
+    "Record grounding traceability for tables and for filter, having, or group_by constraints using only table names or "
+    f"{INSTRUCTIONAL_QUALIFIED_COLUMN_PLACEHOLDER} refs; never bare column or enum tokens; do not enumerate select output columns in grounding.",
 )
 
 GROUND_SUPPORTED_CAPABILITIES: tuple[str, ...] = (
@@ -1207,7 +1208,10 @@ INTENT_INTERPRET_SYSTEM: str = (
     "approach: plain-language steps describing entities to return, row conditions, grouping or per-entity breakdown, ordering or ranking, row caps, aggregates, conditional labels, and time-window or duration reasoning. Do not use "
     f"{INSTRUCTIONAL_QUALIFIED_COLUMN_PLACEHOLDER} syntax, SQL, IR tokens, join paths, or set operators. "
     "tables: semantic base tables whose concepts are needed; omit junction tables unless the many-to-many set itself is the answer. "
-    "grounding: traceability only. Record each table in tables, each enum head or value used to resolve domain terms, and any column or enum specifically driving filter, having, or group_by reasoning named in approach. Do not enumerate select output columns in grounding. Each entry is ref plus used_for. "
+    "grounding: traceability only. Each ref must be either a table name listed in tables, or a qualified "
+    f"{INSTRUCTIONAL_QUALIFIED_COLUMN_PLACEHOLDER} from the payload — never a bare column name, bare enum token, or unqualified identifier. "
+    "Record each table in tables, and any column or enum column specifically driving filter, having, or group_by reasoning named in approach as "
+    f"{INSTRUCTIONAL_QUALIFIED_COLUMN_PLACEHOLDER}. Do not enumerate select output columns in grounding. Each entry is ref plus used_for. "
     "When the question cannot be answered from the tables and columns in this payload (for example it needs entities not present in the schema), set schema_invalid true, put a short note in missing, and leave approach as an empty string, tables as [], and grounding as []. Do not invent substitute tables. "
     "When schema binding is only partially incomplete but you can still outline a usable plan on in-scope tables, set schema_invalid true as a UI signal and still complete approach and tables from in-scope names only. "
     "Use only names from the payload. Express only computations in supported_capabilities; reformulate unsupported constructs in plain language."

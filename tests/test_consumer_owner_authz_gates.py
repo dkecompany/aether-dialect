@@ -84,33 +84,38 @@ def _resolve_space_patch(engine: AetherEngine, member: str) -> MagicMock:
         "run_interactive",
     ],
 )
-def test_consumer_writer_blocked_by_door(member: str, door: str, tmp_path: Path) -> None:
+def test_consumer_writer_allowed_by_door(member: str, door: str, tmp_path: Path) -> None:
     engine = _make_consumer_engine(member=member)
     engine._artifacts_dir = tmp_path
+    engine._schema_terms = set()
+    engine._schema_stats = {"total_filterable": 1}
 
     if door == "facade_session":
         with _resolve_space_patch(engine, member):
-            with pytest.raises(OwnerOnlyOperationError, match="writer"):
-                engine.session(mode="writer")
+            session = engine.session(mode="writer")
+        assert isinstance(session, PipelineSession)
+        assert session._session_mode == "writer"
         return
 
     if door == "pipeline_session":
-        with pytest.raises(OwnerOnlyOperationError, match="PipelineSession"):
-            PipelineSession(engine)
+        session = PipelineSession(engine)
+        assert isinstance(session, PipelineSession)
+        assert session._session_mode == "writer"
         return
 
     with (
         _resolve_space_patch(engine, member),
         patch("aetherdialect.aetherdialect.AetherEngine._ensure_llm"),
-        patch("aetherdialect.aetherdialect.input", return_value="show customers"),
+        patch("aetherdialect.aetherdialect.input", return_value=""),
         patch("aetherdialect.aetherdialect.push_diagnostic_sink", return_value=MagicMock()),
         patch("aetherdialect.aetherdialect.pop_diagnostic_sink"),
         patch("aetherdialect.aetherdialect.notify"),
         patch("aetherdialect.aetherdialect.echo_user_text"),
         patch("aetherdialect.aetherdialect.Sandbox.require_sandbox_adoption"),
+        patch("aetherdialect.aetherdialect.diagnostic_print_listener"),
+        patch("aetherdialect.aetherdialect.terminated"),
     ):
-        with pytest.raises(OwnerOnlyOperationError, match="writer"):
-            engine.run_interactive()
+        engine.run_interactive()
 
 
 @pytest.mark.fast

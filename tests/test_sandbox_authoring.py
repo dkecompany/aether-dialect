@@ -116,10 +116,9 @@ def test_offline_sandbox_returns_sandbox_handle_with_built_engine() -> None:
 
 
 @pytest.mark.fast
-def test_unadopted_sandbox_connected_engine_rejects_session() -> None:
+def test_sandbox_connected_engine_auto_adopts() -> None:
     _require_bundled_data()
     from aetherdialect import AetherEngine, EngineContext
-    from aetherdialect._contracts_base import ConfigError
 
     with Sandbox() as sandbox:
         engine = AetherEngine(
@@ -128,8 +127,9 @@ def test_unadopted_sandbox_connected_engine_rejects_session() -> None:
             artifacts_dir=sandbox.artifacts_dir,
             config_file=sandbox.config_file,
         )
-        with pytest.raises(ConfigError, match="adopt"):
-            engine.session()
+        assert getattr(engine, "_sandbox_mode", False) is True
+        with engine.session() as session:
+            assert session is not None
 
 
 @pytest.mark.fast
@@ -145,7 +145,6 @@ def test_adopting_manually_built_engine_suppresses_warmup() -> None:
             artifacts_dir=sandbox.artifacts_dir,
             config_file=sandbox.config_file,
         )
-        sandbox.adopt(engine)
         with pytest.raises(ConfigError, match="sandbox"):
             engine.run_seed_warmup("questions.txt")
         with engine.session() as session:
@@ -525,4 +524,5 @@ def test_api_reference_documents_sandbox_authoring_surface() -> None:
 
     text = (Path(__file__).resolve().parents[1] / "docs" / "API_REFERENCE.md").read_text(encoding="utf-8")
     assert "Sandbox" in text
-    assert "sandbox.adopt" in text
+    assert "sandbox.connection" in text
+    assert "AetherEngine" in text

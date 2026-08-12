@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import importlib
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -110,6 +109,7 @@ from ._federation_manifest import (
     validate_federation_cross_source_join_kind,
 )
 from ._intent_expr import extract_columns_from_expr
+from ._intent_loop import apply_runtime_post_processing
 from ._intent_normalize import (
     apply_column_replacer_to_intent,
     build_column_term_replacer,
@@ -142,6 +142,7 @@ from ._utils import (
     notify,
     parse_numeric_type_arguments,
 )
+from ._validation_sql import validate_aggregate_join_fan_out
 
 _WINDOW_FINALITY_CTX: SimpleNamespace | None = None
 
@@ -1461,8 +1462,7 @@ def validate_federated_residual_aggregate_fan_out(
         case_registry=list(residual.case_registry),
         chosen_join_path_signature=signature,
     )
-    validation_execute = importlib.import_module("aetherdialect._validation_sql")
-    issues = validation_execute.validate_aggregate_join_fan_out(
+    issues = validate_aggregate_join_fan_out(
         intent,
         schema,
         "federation coordinator residual",
@@ -3224,12 +3224,11 @@ def _remap_member_schema_logical_tables(
 
 def _finalize_member_sub_intent(sub: RuntimeIntent, member_schema: SchemaGraph) -> RuntimeIntent:
     """Run shared-key expansion and post-compose processing against *member_schema*."""
-    intent_process = importlib.import_module("aetherdialect._intent_loop")
     expanded = expand_shared_pk_tables_for_refs(sub, member_schema)
     question_fallback = (sub.natural_language or "").strip()
     processed, post_issues = cast(
         tuple[RuntimeIntent | None, list[Any]],
-        intent_process.apply_runtime_post_processing(expanded, member_schema, question_fallback=question_fallback),
+        apply_runtime_post_processing(expanded, member_schema, question_fallback=question_fallback),
     )
     if processed is None:
         raise FederationRuntimeError("federated member sub-intent post-processing incomplete")

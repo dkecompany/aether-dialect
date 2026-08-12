@@ -10,6 +10,7 @@ Teams need answers from relational data without shipping opaque generated SQL. A
 
 ```bash
 pip install aetherdialect
+pip install "aetherdialect[csv]"          # CSV / Excel uploads
 pip install "aetherdialect[mysql]"        # MySQL
 pip install "aetherdialect[mariadb]"      # MariaDB
 pip install "aetherdialect[sqlserver]"    # SQL Server
@@ -22,25 +23,30 @@ pip install "aetherdialect[bigquery]"     # Google BigQuery
 pip install "aetherdialect[mysql,postgresql]"  # pick any subset
 ```
 
-Requires Python 3.11 or newer. SQLite and DuckDB need no extra install. Configure the LLM and database via a TOML `config_file` (recommended) and/or process environment; the full key list lives in the [API reference](https://github.com/dkecompany/aether-dialect/blob/main/docs/API_REFERENCE.md).
+Requires Python 3.11 or newer. SQLite and DuckDB need no extra install (`duckdb-engine` is a core dependency). Configure the LLM and database via a TOML `config_file` (recommended) and/or process environment; the full key list lives in the [API reference](https://github.com/dkecompany/aether-dialect/blob/main/docs/API_REFERENCE.md).
 
 ## Quick start
 
 **New here?** Follow the [Getting started guide](https://github.com/dkecompany/aether-dialect/blob/main/docs/GETTING_STARTED.md): try the offline sandbox first, then wire any supported database with inlined TOML examples, first-run profiling expectations, and `run_interactive` vs `session()`.
 
-**No database yet?** Try the sandbox:
+**No database yet?** Enter `Sandbox()`, then construct production-shaped `AetherEngine` on the bundled rental shop:
 
 ```python
-from aetherdialect import Sandbox
+from aetherdialect import AetherEngine, EngineContext, Sandbox
 
 with Sandbox() as sandbox:
-    engine = sandbox.engine()
+    engine = AetherEngine(
+        EngineContext(),
+        native_connection=sandbox.connection(),
+        artifacts_dir=sandbox.artifacts_dir,
+        config_file=sandbox.config_file,
+    )
     with engine.session() as session:
         step = session.accept_until_done("How many films are there?")
     print(step.sql)
 ```
 
-See the [Sandbox guide](https://github.com/dkecompany/aether-dialect/blob/main/docs/SANDBOX.md).
+Sandbox-hosted connections auto-adopt mock fixtures and warmup suppression. Full walkthrough: [Sandbox guide](https://github.com/dkecompany/aether-dialect/blob/main/docs/SANDBOX.md).
 
 ## What makes this different
 
@@ -64,7 +70,7 @@ See the [Sandbox guide](https://github.com/dkecompany/aether-dialect/blob/main/d
 
 **What "safe" means here:** `SELECT`-only enforcement, forbidden-SQL regex, dialect AST validation, schema alignment, and `EXPLAIN` before execution; sensitivity tiers ([User guide](https://github.com/dkecompany/aether-dialect/blob/main/docs/USER_GUIDE.md#sensitivity-classification)) and deny lists gate what appears in prompts. This complements your database IAM and network controls; it does not replace them. Detail: [Security — Threat model](https://github.com/dkecompany/aether-dialect/blob/main/docs/SECURITY.md#1-threat-model).
 
-**Production checklist:** least-privilege DB role; explicit stable `artifacts_dir` on durable storage; reviewed `notes_file` / `EngineContext.sql_file` content; `config_file` or env secrets not committed; one writer process per `artifacts_dir`; plan for `schema_migration_map.json` when the catalog changes.
+**Production checklist:** least-privilege DB role; explicit stable `artifacts_dir` on durable storage; reviewed `notes_file` / `EngineContext.sql_file` content; `config_file` or env secrets not committed; one writer process per `artifacts_dir`; expect a `schema_migration_map.json` stop when the catalog changes.
 
 No warehouse or LLM keys yet? [Sandbox guide](https://github.com/dkecompany/aether-dialect/blob/main/docs/SANDBOX.md) → [Getting started](https://github.com/dkecompany/aether-dialect/blob/main/docs/GETTING_STARTED.md) → [User guide](https://github.com/dkecompany/aether-dialect/blob/main/docs/USER_GUIDE.md).
 
@@ -74,8 +80,8 @@ No warehouse or LLM keys yet? [Sandbox guide](https://github.com/dkecompany/aeth
 | --- | --- |
 | [Getting started](https://github.com/dkecompany/aether-dialect/blob/main/docs/GETTING_STARTED.md) | First run: offline sandbox or warehouse TOML, construction wait, `run_interactive` vs `session()`. |
 | [User guide](https://github.com/dkecompany/aether-dialect/blob/main/docs/USER_GUIDE.md) | Operator manual: scope, notes, structure documents, asking questions, migration, warmup, CSV upload validation, pitfalls — minimal code. |
-| [Integrator guide](https://github.com/dkecompany/aether-dialect/blob/main/docs/INTEGRATOR_GUIDE.md) | Embedding: suspend/terminal steps, reader/writer queue, multi-user deployment, observability. |
-| [Sandbox guide](https://github.com/dkecompany/aether-dialect/blob/main/docs/SANDBOX.md) | Bundled rental shop with mock LLM; same session API as production. |
+| [Integrator guide](https://github.com/dkecompany/aether-dialect/blob/main/docs/INTEGRATOR_GUIDE.md) | Embedding: suspend/terminal steps, reader/writer queue, multi-user deployment, federation, observability, guarantees. |
+| [Sandbox guide](https://github.com/dkecompany/aether-dialect/blob/main/docs/SANDBOX.md) | Bundled rental shop with mock LLM; `Sandbox()` → `AetherEngine` / `AetherFederation`; same session API as production. |
 | [API reference](https://github.com/dkecompany/aether-dialect/blob/main/docs/API_REFERENCE.md) | Exported types, TOML schema, methods, document shapes, exceptions. |
 | [Troubleshooting](https://github.com/dkecompany/aether-dialect/blob/main/docs/TROUBLESHOOTING.md) | Session outcomes, diagnostic codes, refusal catalogue, audit events. |
 | [Sandbox data reference](https://github.com/dkecompany/aether-dialect/blob/main/docs/SANDBOX_DATA_REFERENCE.md) | Bundled rental-shop schema, federation topology, question corpus. |

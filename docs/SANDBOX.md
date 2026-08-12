@@ -50,10 +50,15 @@ pip install aetherdialect
 ```
 
 ```python
-from aetherdialect import Sandbox
+from aetherdialect import AetherEngine, EngineContext, Sandbox
 
 with Sandbox() as sandbox:
-    engine = sandbox.engine()
+    engine = AetherEngine(
+        EngineContext(),
+        native_connection=sandbox.connection(),
+        artifacts_dir=sandbox.artifacts_dir,
+        config_file=sandbox.config_file,
+    )
     with engine.session(mode="writer") as session:
         step = session.accept_until_done("How many films are there?")
     print(step.sql)
@@ -69,7 +74,7 @@ Each `Sandbox()` handle is self-contained inside the package. Learning does not 
 
 ### Production-shaped authoring
 
-**`Sandbox()`** is the authoring entry point: you supply `EngineContext`, pass `sandbox.connection()` as `native_connection`, and call **`sandbox.adopt(engine)`** before opening a session when building engines manually. Adoption applies sandbox mode (sandbox fixtures, warmup suppression, and pinned schema literals). An engine built on a sandbox connection without adoption raises on `session()`.
+**`Sandbox()`** is the authoring entry point: you supply `EngineContext`, pass `sandbox.connection()` as `native_connection`, and use the same `AetherEngine(...)` constructor as production. Construction on a sandbox-hosted connection auto-adopts sandbox mode (sandbox fixtures, warmup suppression, and pinned schema literals).
 
 ```python
 from aetherdialect import AetherEngine, EngineContext, EngineLimits, Sandbox
@@ -82,12 +87,13 @@ with Sandbox() as sandbox:
         config_file=sandbox.config_file,
         limits=EngineLimits(),
     )
-    sandbox.adopt(engine)
     with engine.session(mode="writer") as session:
         step = session.accept_until_done("How many rentals are there?")
 ```
 
 Behavioural caps use constructor `limits=` the same way as production. `[limits]` in a TOML file applies only when you load it explicitly with `EngineLimits.from_config_file(path)` and pass the result as `limits=`.
+
+For a ready owner engine on the full default dataset without spelling the constructor args, `sandbox.engine()` remains available as a convenience wrapper around the same production constructor.
 
 Federation authoring uses the same environment:
 
@@ -185,7 +191,7 @@ The sandbox uses the same **owner/consumer** split as production.
 | Role | Typical session mode | What loads | Learning |
 | --- | --- | --- | --- |
 | owner (default) | `writer` | Full **rental_shop** seed (~34 tables) and owner schema baseline from the bundled corpus | Templates and structure persist locally for that handle |
-| consumer | `reader` | Same seed, narrowed by your `EngineContext.allow_objects` | Shared learning is session-local; consumers cannot call owner-only structural APIs |
+| consumer | `writer` or `reader` | Same seed, narrowed by your `EngineContext.allow_objects` | Writer persists space-partition learning; structural APIs stay owner-only |
 
 ```python
 from aetherdialect import EngineContext, Sandbox
@@ -228,7 +234,7 @@ with Sandbox() as sandbox:
 
 Production reader/writer sharing uses a durable `artifacts_dir` on disk. The sandbox does not require a durable artifacts directory for ordinary sessions.
 
-Reader sessions keep learning session-local. An owner writer on the same shared artifacts root persists templates and feedback under the artifacts lock and drains `write_queue.jsonl` at writer turn start. Readers do **not** enqueue durable write-queue events.
+Reader sessions keep learning session-local. An owner or consumer writer on the same shared artifacts root persists templates and feedback into the active space partition and drains `write_queue.jsonl` at writer turn start. Readers do **not** enqueue durable write-queue events.
 
 ```python
 import tempfile

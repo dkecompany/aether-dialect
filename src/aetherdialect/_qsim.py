@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib
 import json
 import math
 import os
@@ -69,6 +68,7 @@ from ._utils import (
     stable_bucket,
 )
 from ._utils_artifacts import artifact_lock, read_gzip_json, write_gzip_json_atomic
+from ._utils_intent import generate_question
 
 _active_qsim_engine_owner: ContextVar[object | None] = ContextVar("aetherdialect_qsim_engine_owner", default=None)
 _active_simulation_partition_fp: ContextVar[str] = ContextVar("aetherdialect_simulation_partition_fp", default="")
@@ -2081,17 +2081,13 @@ def _generate_question_from_intent(intent: QSimIntent, schema: SchemaGraph) -> s
             cond = f"{h.op} {intent.param_values.get(f'h{hidx}', '?')}"
         having_descriptions.append({"expression": h.expression, "condition": cond})
 
-    generate_question = importlib.import_module("aetherdialect._utils_intent").generate_question
-    return cast(
-        str | None,
-        generate_question(
-            intent.tables,
-            intent.select_cols,
-            filter_descriptions,
-            intent.group_by_cols,
-            having_descriptions,
-            schema,
-        ),
+    return generate_question(
+        intent.tables,
+        intent.select_cols,
+        filter_descriptions,
+        intent.group_by_cols,
+        having_descriptions,
+        schema,
     )
 
 

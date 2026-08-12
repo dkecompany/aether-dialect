@@ -207,15 +207,15 @@ Deleting a named AetherSpace removes its snapshot and per-space learning partiti
 
 ### Reader and writer modes
 
-Reader sessions do not persist shared learning; writer sessions on the same artifacts directory persist templates and feedback under the artifacts lock. Readers never mutate the partitioned template files directly.
+Reader sessions do not persist shared learning; writer sessions persist templates and feedback into the active space partition under that partition's advisory lock. Engine-root mutations (schema, structure, space catalog) use the engine artifacts lock. Readers never mutate the partitioned template files directly.
 
 ### Write queue
 
-When multiple processes share one artifacts directory, writer-mode turns **drain `write_queue.jsonl` at turn start** under the artifacts lock before applying new learning. The queue carries template accepts, rejections, and structure proposals from cooperating writers. Reader sessions do **not** enqueue durable write-queue events — reader learning stays session-local.
+When multiple processes share one artifacts directory, writer-mode turns **drain `write_queue.jsonl` at turn start** under the engine artifacts lock before applying new learning. The queue carries template accepts, rejections, and structure proposals. Consumer writers apply only learning events for their active space and leave structure proposals and foreign-space events on the queue. Reader sessions do **not** enqueue durable write-queue events — reader learning stays session-local.
 
 ### Locks, atomic writes, and retention
 
-An advisory artifact lock serializes cooperating processes on a local filesystem path. Writes use atomic replace patterns; orphan pruning and retention policies cap template store growth. Federation `clear_all_learning()` clears federation and member template stores.
+Advisory locks serialize cooperating processes on a local filesystem: one lock domain for the engine (or federation) root, and one lock domain per space learning partition. Writes use atomic replace patterns; orphan pruning and retention policies cap template store growth. Federation `clear_all_learning()` clears federation and member template stores.
 
 ### Cancellation
 
